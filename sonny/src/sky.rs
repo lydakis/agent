@@ -419,8 +419,8 @@ pub struct View {
     runtime: tokio::runtime::Handle,
 }
 
-/// A haiku as its copy sends it back: who wrote it, since when it held
-/// the title as its claim says, and its lines.
+/// A haiku its copy wrote, kept for every sky: who wrote it, when it was
+/// kept, and its lines.
 type Poem = (String, i64, Vec<String>);
 
 /// A haiku on the sky: who wrote it, its lines, when it starts to show,
@@ -766,22 +766,9 @@ impl View {
     /// Take the haikus written and let an hour-old one go; then, live,
     /// pass the busiest title by its rule, and have a new holder write.
     fn reign(&mut self, now: Instant) {
-        while let Ok((by, since, lines)) = self.poems.1.try_recv() {
-            // Only for the claim it was written for: one a newer claim
-            // took over while it was written is let go.
-            let (current, kept) = haiku::Kept::update(&self.socket, |kept| {
-                let current = kept.by == by && kept.since_ms == since;
-                if current {
-                    kept.lines = lines.clone();
-                    kept.at_ms = wall_ms();
-                }
-                current
-            });
-            // Else what took it over shows as the file is next read.
-            if current {
-                self.shown = (by.clone(), kept.at_ms);
-                self.recite(by, lines, now);
-            }
+        while let Ok((by, at, lines)) = self.poems.1.try_recv() {
+            self.shown = (by.clone(), at);
+            self.recite(by, lines, now);
         }
         if (self.verse.as_ref())
             .is_some_and(|verse| now.saturating_duration_since(verse.from) > HOUR)
@@ -833,13 +820,25 @@ impl View {
         }
         let since = wall_ms();
         let rule = self.title.rule;
-        let (claimed, _) =
-            haiku::Kept::update(&self.socket, |kept| kept.claim(&rule, &name, since, since));
+        // Counted in the file before it is spent, or not written at all.
+        let claimed =
+            haiku::Kept::update(&self.socket, |kept| kept.claim(&rule, &name, since, since))
+                .is_some_and(|(claimed, _)| claimed);
         if claimed {
             let (socket, send) = (self.socket.clone(), self.poems.0.clone());
+            // Kept for every sky as it comes, this one closed or not; only
+            // for its claim, should a newer one have taken over meanwhile.
             self.runtime.spawn(async move {
-                if let Some(lines) = haiku::write(socket, name.clone()).await {
-                    let _ = send.send((name, since, lines));
+                let Some(lines) = haiku::write(socket.clone(), name.clone()).await else {
+                    return;
+                };
+                let kept = tokio::task::spawn_blocking(move || {
+                    let at = wall_ms();
+                    haiku::Kept::publish(&socket, &name, since, &lines, at)
+                        .then_some((name, at, lines))
+                });
+                if let Ok(Some(poem)) = kept.await {
+                    let _ = send.send(poem);
                 }
             });
         }
@@ -4565,14 +4564,9 @@ mod tests {
             "the pull request waits for me",
             "morning merges in",
         ];
-        // The claim it was written for.
-        let since = wall_ms() - 60_000;
-        haiku::Kept::update(&view.socket, |kept| {
-            (kept.by, kept.since_ms) = ("shop.lead".into(), since);
-        });
         let poem = (
             "shop.lead".to_owned(),
-            since,
+            wall_ms(),
             lines.map(str::to_owned).to_vec(),
         );
         view.poems.0.send(poem).unwrap();
@@ -4592,41 +4586,16 @@ mod tests {
             assert!(shown.contains(line), "{shown}");
         }
         assert!(shown.contains("— shop lead, busiest for 1m"), "{shown}");
-        // One written for a claim since taken over is let go.
-        let stale = (
-            "shop.lead".to_owned(),
-            since - 1,
-            vec!["x".into(), "y".into(), "z".into()],
-        );
-        view.poems.0.send(stale).unwrap();
-        view.drain();
-        assert!(view.fading.is_none());
-        assert_eq!(haiku::Kept::load(&view.socket).lines, lines);
-        // Nor does letting one go hide what another sky wrote meanwhile.
-        haiku::Kept::update(&view.socket, |kept| {
-            kept.lines = vec!["d".into(), "e".into(), "f".into()];
-            kept.at_ms = wall_ms() + 1;
-        });
-        let stale = (
-            "shop.lead".to_owned(),
-            since - 1,
-            vec!["x".into(), "y".into(), "z".into()],
-        );
-        view.poems.0.send(stale).unwrap();
-        view.weighed = None;
-        view.drain();
-        assert_eq!(view.verse.as_ref().unwrap().lines, ["d", "e", "f"]);
-        view.fading = None;
-        view.verse.as_mut().unwrap().from -= Duration::from_secs(10);
         // The next fades the last out first.
         let poem = (
             "shop.lead".to_owned(),
-            since,
+            wall_ms() + 1,
             vec!["a".into(), "b".into(), "c".into()],
         );
         view.poems.0.send(poem).unwrap();
         view.drain();
-        assert_eq!(view.fading.as_ref().unwrap().0.lines, ["d", "e", "f"]);
+        assert!(text(&view.card(150, 40)).contains("morning merges in"));
+        assert!(view.fading.is_some());
         // Zen keeps it, over the sky.
         view.verse.as_mut().unwrap().from -= Duration::from_secs(10);
         view.zen = true;
@@ -4646,7 +4615,7 @@ mod tests {
             "a build turns green at dawn",
             "nobody saw it",
         ];
-        let ((), _) = haiku::Kept::update(&view.socket, |kept| {
+        haiku::Kept::update(&view.socket, |kept| {
             (kept.by, kept.lines) = ("shop.lead".into(), lines.map(str::to_owned).to_vec());
             kept.at_ms = wall_ms();
             kept.since_ms = wall_ms() - 60_000;
