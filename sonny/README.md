@@ -749,8 +749,9 @@ way `/react` does, and each note in the margin has its own `↩`.
   generations of tasks a line has: 2 by default, so the lead's tasks start
   helpers and those helpers start none; 1 keeps starting to the lead; 0
   has no end. A task's helper is started from the lead's folder, in its
-  project and repository, in the repository the task works in, on the last commit of its branch, so it
-  builds on the task's work, and the lead hears it as one of its line. A
+  project, in the repository the task works in, on the last commit of the
+  task's branch, so it builds on the task's work; the lead hears it as one
+  of its line. A
   start deeper than the setting allows is refused (`task_depth_reached`),
   and a task removes only agents of its own line.
 - **Forking a task with its files:** after each turn a task completes, the
