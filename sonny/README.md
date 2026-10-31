@@ -63,7 +63,15 @@ window instead, a task or any other the daemon keeps (a name in this project
 may leave out the project); `/switch` alone, the `↗` beside the name of an
 agent open in the pane, or Ctrl+G moves that agent into the window. `/goal WHAT` asks the agent to set a goal
 on itself and work until WHAT is done (`/goal` shows goals, `/goal clear`
-clears its own; see [Goals](../docs/SONNY.md#goals)). A lead hears of, shows and lists in
+clears its own; see [Goals](../docs/SONNY.md#goals)). `/zen FOCUS` asks the agent to talk with you about
+that one thing and hold everything else back, and shows only your turns and
+its questions, in the middle of the window, under a footer of the focus and
+what needs you; it interrupts only with a question, and `/zen` again ends it
+and has the agent say what it held.
+
+![Zen: only the person's turns and the agent's question, centred](../docs/sonny/zen.png)
+
+A lead hears of, shows and lists in
 `/status` only its own tasks. It is told to send work for another lead's task
 to that lead, to leave changes it did not make alone and never to switch the
 folder's branch, since the leads share one checkout; the instructions,

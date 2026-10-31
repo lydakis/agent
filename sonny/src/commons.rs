@@ -543,7 +543,8 @@ async fn everyone(client: &agent_client::Client, author: &str) -> Vec<String> {
 /// Invites one agent to the thread `started` began, as `invite` says: a
 /// queued note, which starts its turn. One drawn at random from those
 /// whose turns mention the title's words, or, on a golden ticket, from
-/// every agent. The one invited, if any; else the invite is given back.
+/// every agent, never one in zen. The one invited, if any; else the
+/// invite is given back.
 /// A thread started in a turn the commons itself began brings none: as an
 /// automatic reply never answers another (RFC 3834), so an invited agent's
 /// threads cannot set off a chain of invites with no person behind them.
@@ -567,10 +568,12 @@ pub async fn invite(home: &Path, started: &Value, author: &str, invite: &Value) 
                 return None;
             }
         }
-        let found = match golden {
+        let mut found = match golden {
             true => everyone(&client, author).await,
             false => touched(&client, title, author).await,
         };
+        // An agent in zen talks about its focus alone: invite another.
+        found.retain(|bot| crate::zen::focus_in(home, bot).is_none());
         let bot = found.get(draw() % found.len().max(1))?.clone();
         let note = invited(thread, title, author, golden);
         let submit = json!({"bot": bot, "prompt": note, "delivery": "queue",
