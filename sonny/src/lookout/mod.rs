@@ -1027,6 +1027,7 @@ impl Service {
                     }
                     for lookout in self.lookouts.values_mut() {
                         lookout.updates.expire(now);
+                        lookout.flush();
                     }
                 }
             }
@@ -1734,6 +1735,8 @@ struct Lookout {
     /// Where what its sources said waits, untold, so a restart loses none
     /// of what a digest or a busy subscriber held.
     held: Option<PathBuf>,
+    /// What is held changed since it was last handed to the writer.
+    dirty: bool,
     /// A note under way when the lookout last stopped, sent again as it
     /// was, under its request, so the daemon takes it at most once.
     resend: Vec<sources::Heard>,
@@ -1787,6 +1790,7 @@ impl Lookout {
             heard_since: None,
             told_sources: HashMap::new(),
             held: None,
+            dirty: false,
             resend: Vec::new(),
             sending: None,
             sourcing: None,
@@ -2396,12 +2400,16 @@ impl Lookout {
         self.keep();
     }
 
-    /// Writes what waits to be told, and when each source was last told,
-    /// to its file; none waiting, the file goes.
-    fn keep(&self) {
-        let Some(path) = &self.held else {
-            return;
-        };
+    /// What waits to be told, or when each source was last told, has
+    /// changed: written on the next tick, off the event loop.
+    fn keep(&mut self) {
+        self.dirty = self.held.is_some();
+    }
+
+    /// What waits to be told, and when each source was last told, as its
+    /// file should hold it: none waiting, no file.
+    fn kept(&self) -> Option<(PathBuf, Option<Vec<u8>>)> {
+        let path = self.held.clone()?;
         let json = |heard: &sources::Heard| heard.event.to_json();
         let sending: Vec<Value> = match &self.sourcing {
             Some((sent, ..)) => sent.iter().map(json).collect(),
@@ -2409,8 +2417,7 @@ impl Lookout {
         };
         let events: Vec<Value> = self.heard.iter().map(json).collect();
         if events.is_empty() && sending.is_empty() && self.told_sources.is_empty() {
-            let _ = std::fs::remove_file(path);
-            return;
+            return Some((path, None));
         }
         let (now, epoch) = (Instant::now(), epoch_ms());
         let told: serde_json::Map<String, Value> = (self.told_sources.iter())
@@ -2421,17 +2428,23 @@ impl Lookout {
             .collect();
         let body = json!({"bot_id": self.updates.lead_id(), "sending": sending, "events": events,
             "told": told});
-        if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
+        Some((path, Some(body.to_string().into_bytes())))
+    }
+
+    /// Hands what changed to the writer, once a tick.
+    fn flush(&mut self) {
+        if std::mem::take(&mut self.dirty)
+            && let Some((path, body)) = self.kept()
+        {
+            held::write(path, body);
         }
-        let _ = agent_client::files::replace_mode(path, body.to_string().as_bytes(), 0o600);
     }
 
     /// The subscriber is gone or subscribed to nothing: what waited for it
     /// is no one's.
     fn unheld(&self) {
         if let Some(path) = &self.held {
-            let _ = std::fs::remove_file(path);
+            held::write(path.clone(), None);
         }
     }
 
@@ -2584,6 +2597,75 @@ impl Lookout {
         if let Some(path) = &self.log {
             append(path, line);
         }
+    }
+}
+
+/// The one thread that writes what lookouts hold, so a write and its
+/// syncs never hold up the event loop: the newest body for each file
+/// wins, in the order handed over.
+mod held {
+    use std::path::PathBuf;
+    use std::sync::{Mutex, OnceLock, mpsc};
+
+    enum Job {
+        Write(PathBuf, Option<Vec<u8>>),
+        #[cfg_attr(not(test), allow(dead_code))]
+        Done(mpsc::Sender<()>),
+    }
+
+    fn sender() -> &'static Mutex<mpsc::Sender<Job>> {
+        static SENDER: OnceLock<Mutex<mpsc::Sender<Job>>> = OnceLock::new();
+        SENDER.get_or_init(|| {
+            let (send, jobs) = mpsc::channel::<Job>();
+            std::thread::spawn(move || {
+                while let Ok(job) = jobs.recv() {
+                    let mut writes: Vec<(PathBuf, Option<Vec<u8>>)> = Vec::new();
+                    let mut done = Vec::new();
+                    for job in std::iter::once(job).chain(jobs.try_iter()) {
+                        match job {
+                            Job::Write(path, body) => {
+                                writes.retain(|(had, _)| *had != path);
+                                writes.push((path, body));
+                            }
+                            Job::Done(tell) => done.push(tell),
+                        }
+                    }
+                    for (path, body) in writes {
+                        match body {
+                            None => {
+                                let _ = std::fs::remove_file(&path);
+                            }
+                            Some(body) => {
+                                if let Some(dir) = path.parent() {
+                                    let _ = std::fs::create_dir_all(dir);
+                                }
+                                let _ = agent_client::files::replace_mode(&path, &body, 0o600);
+                            }
+                        }
+                    }
+                    for tell in done {
+                        let _ = tell.send(());
+                    }
+                }
+            });
+            Mutex::new(send)
+        })
+    }
+
+    pub fn write(path: PathBuf, body: Option<Vec<u8>>) {
+        if let Ok(send) = sender().lock() {
+            let _ = send.send(Job::Write(path, body));
+        }
+    }
+
+    /// Waits for every write handed over before it.
+    #[cfg(test)]
+    pub fn written() {
+        let (tell, told) = mpsc::channel();
+        if let Ok(send) = sender().lock() {
+            let _ = send.send(Job::Done(tell));
+        }
+        let _ = told.recv();
     }
 }
 
@@ -3347,6 +3429,7 @@ mod tests {
         service.subscribers.clear();
         service.resubscribe(true);
         assert!(service.lookouts.is_empty());
+        self::held::written();
         assert!(!held.exists());
     }
 
@@ -3899,7 +3982,8 @@ mod tests {
         lookout.heard_from(&slack("one", false));
         let told = Instant::now() - Duration::from_secs(60);
         lookout.told_sources.insert("slack".into(), told);
-        lookout.keep();
+        lookout.flush();
+        held::written();
         // Watched again, it hears what waited, and when its source was told.
         let mut again = made();
         again.restore(path.clone());
@@ -3919,6 +4003,8 @@ mod tests {
         sending.heard_from(&slack("three", false));
         sending.held = Some(path.clone());
         sending.keep();
+        sending.flush();
+        held::written();
         let mut back = made();
         back.restore(path.clone());
         assert_eq!(back.resend.len(), 1);
@@ -3930,6 +4016,8 @@ mod tests {
         other.subs.push(hears("chat"));
         (other.updates).seat(&json!({"name": "calc.lead", "bot_id": 2, "status": "idle"}));
         other.restore(path.clone());
+        other.flush();
+        held::written();
         assert!(other.heard.is_empty());
         assert!(!path.exists());
         let _ = std::fs::remove_dir_all(&dir);
