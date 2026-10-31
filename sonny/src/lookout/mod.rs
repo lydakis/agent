@@ -336,30 +336,6 @@ pub(crate) fn beside(store: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
-/// Set when the tool host signals that a call wrote files the lookout
-/// reads.
-static REREAD_NOW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-fn reread_now() -> bool {
-    REREAD_NOW.swap(false, std::sync::atomic::Ordering::Relaxed)
-}
-
-/// Tell `store`'s lookout to read the subscription and goal files now: the
-/// process its lock names, if one holds it.
-pub(crate) fn tell_reread(store: &Path) {
-    let lock = beside(store, ".lookout.lock");
-    let pid: Option<i32> = (std::fs::read_to_string(&lock).ok())
-        .and_then(|pid| pid.trim().parse().ok())
-        .filter(|pid| *pid > 0);
-    if let Some(pid) = pid
-        && held(&lock)
-    {
-        // SAFETY: a signal to the process the held lock names, which reads
-        // its files again on it.
-        unsafe { libc::kill(pid, libc::SIGUSR1) };
-    }
-}
-
 /// This Sonny, told apart from another build of it: its version and when
 /// its binary was written.
 pub(crate) fn identity() -> String {
@@ -469,22 +445,12 @@ async fn serve(settings: Settings) -> Result<(), String> {
         taken: HashMap::new(),
         watchers: HashMap::new(),
         started: true,
+        rewriting: HashSet::new(),
     };
     println!(
         "{}",
         json!({"event": "watching", "pid": std::process::id()})
     );
-    // Told by the tool host that a call wrote subscription or goal files:
-    // read them at once rather than at the next reread.
-    if let Ok(mut told) =
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())
-    {
-        tokio::spawn(async move {
-            while told.recv().await.is_some() {
-                REREAD_NOW.store(true, std::sync::atomic::Ordering::Relaxed);
-            }
-        });
-    }
     // Asked to give way, as by another build's lookout: what it still
     // runs stops first, since that one runs it again.
     if let Ok(mut term) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
@@ -582,6 +548,9 @@ struct Service {
     /// Not connected yet since it started: its stream starts again where
     /// the last lookout's would.
     started: bool,
+    /// The `subscriptions` and `goal` calls under way, by bot, turn and
+    /// ID, whose end means the files the lookout reads changed.
+    rewriting: HashSet<(String, i64, String)>,
 }
 
 /// Every bot that one of `made` made, and what those made, as the daemon
@@ -835,10 +804,13 @@ impl Service {
                     }
                     streaming |= event["event"] == "follow_live";
                     self.snapshot(&event, streaming);
-                    // A `subscriptions` call the tool host answered counts
-                    // from the next event on, not from the next tick.
-                    if reread_now() {
+                    // A `subscriptions` or `goal` call the tool host
+                    // answered counts from the next event on: its end is in
+                    // the stream before any event that follows it.
+                    if self.rewrote(&event) {
                         reread = Some(Instant::now());
+                        self.goals.reread();
+                        self.runner.reload();
                         self.reread(&client).await;
                     }
                     let cursor = event["cursor"].as_i64();
@@ -998,9 +970,8 @@ impl Service {
                 _ = tick.tick() => {
                     let now = Instant::now();
                     self.save_cursor();
-                    // What `subscriptions` calls wrote since: at once for
-                    // one the tool host said it answered, else now and then.
-                    if reread_now() || reread.is_none_or(|at| now >= at + REREAD) {
+                    // What the person or a script wrote since, now and then.
+                    if reread.is_none_or(|at| now >= at + REREAD) {
                         reread = Some(now);
                         self.goals.reread();
                         self.runner.reload();
@@ -1237,6 +1208,39 @@ impl Service {
                 false
             }
             Err(()) => true,
+        }
+    }
+
+    /// Whether `event` ends a call of Sonny's that wrote files the lookout
+    /// reads, a `subscriptions` or `goal` call, which the tool host
+    /// answers. A turn that ends forgets the calls it left under way.
+    fn rewrote(&mut self, event: &Value) -> bool {
+        let (Some(bot), Some(turn)) = (event["bot"].as_str(), event["turn"].as_i64()) else {
+            return false;
+        };
+        let data = &event["data"];
+        let call = || {
+            (
+                bot.to_owned(),
+                turn,
+                data["call_id"].as_str().unwrap_or("").to_owned(),
+            )
+        };
+        match event["event"].as_str() {
+            Some("tool_started")
+                if data["answered_by"] == crate::served::TAG
+                    && (data["name"] == crate::served::SUBSCRIPTIONS
+                        || data["name"] == crate::served::GOAL) =>
+            {
+                self.rewriting.insert(call());
+                false
+            }
+            Some("tool_completed") => self.rewriting.remove(&call()),
+            Some("turn_finished") => {
+                self.rewriting.retain(|(b, t, _)| b != bot || *t != turn);
+                false
+            }
+            _ => false,
         }
     }
 
@@ -2938,6 +2942,7 @@ mod tests {
             taken: HashMap::new(),
             watchers: HashMap::new(),
             started: false,
+            rewriting: HashSet::new(),
             goals: goals::Goals::new(Path::new("/nonexistent"), Path::new("")),
             fires: HashMap::new(),
         }
@@ -3250,6 +3255,29 @@ mod tests {
             told.iter().any(|line| line.contains("turn:calc.fix/2")),
             "{told:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_subscriptions_call_s_end_rereads_before_the_events_after_it() {
+        let mut service = service(PathBuf::from("/nonexistent"), &[]);
+        let event = |kind: &str, call: &str, data: Value| {
+            let mut data = data;
+            data["call_id"] = json!(call);
+            json!({"event": kind, "bot": "reviewer", "turn": 2, "data": data})
+        };
+        let started = |name: &str, call: &str| {
+            event("tool_started", call, json!({"name": name, "answered_by": "sonny"}))
+        };
+        assert!(!service.rewrote(&started("subscriptions", "a")));
+        assert!(!service.rewrote(&started("memory", "b")));
+        assert!(!service.rewrote(&event("tool_started", "c", json!({"name": "goal"}))));
+        assert!(!service.rewrote(&event("tool_completed", "b", json!({}))));
+        assert!(service.rewrote(&event("tool_completed", "a", json!({}))));
+        assert!(!service.rewrote(&event("tool_completed", "a", json!({}))));
+        // A turn that ends forgets a call it never ended.
+        assert!(!service.rewrote(&started("goal", "d")));
+        assert!(!service.rewrote(&event("turn_finished", "", json!({}))));
+        assert!(service.rewriting.is_empty());
     }
 
     #[tokio::test]

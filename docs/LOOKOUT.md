@@ -44,10 +44,10 @@ to `STORE.lookout.jsonl`.
 The lookout only watches and tells. The tools Sonny gives its agents are
 answered by another companion, `sonny-tool-host` (`sonny tool-host`; see
 SONNY.md, Sonny's tool host), so a tool that runs long, crashes or holds
-memory, as an MCP server can, never holds up a lead's news. When a call of
-the `subscriptions` or `goal` tool changes a file the lookout reads, the
-tool host sends the process holding `STORE.lookout.lock` `SIGUSR1`, and the
-lookout reads its files at once rather than at its next reread.
+memory, as an MCP server can, never holds up a lead's news. The lookout
+follows those calls' starts and ends: when a `subscriptions` or `goal` call
+ends, it reads its files again before the next event, which the stream
+puts after that end, rather than at its next reread.
 
 It keeps a cursor in `STORE.lookout.cursor`: the newest event it saw, or
 just before the oldest one whose news it has not told yet. A lookout that

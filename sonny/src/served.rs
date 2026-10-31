@@ -789,13 +789,7 @@ async fn serve(store: PathBuf, socket: PathBuf, nudge: Arc<Notify>, serving: Ser
                             let mut asked = json!({"bot": call["bot"], "turn": call["turn"],
                                 "call_id": call["call_id"]});
                             match answer {
-                                Ok(output) => {
-                                    // Files the lookout reads, read now.
-                                    if call["name"] == SUBSCRIPTIONS || call["name"] == GOAL {
-                                        crate::lookout::tell_reread(&store);
-                                    }
-                                    asked["output"] = json!(cut(output))
-                                }
+                                Ok(output) => asked["output"] = json!(cut(output)),
                                 Err((code, detail)) => {
                                     asked["error"] = json!({"code": code, "detail": cut(detail)})
                                 }
