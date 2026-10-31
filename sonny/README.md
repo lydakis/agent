@@ -94,8 +94,10 @@ list says how to fix it (`aws sso login --profile NAME` for an expired AWS
 session), and Enter lists again. The pick is kept as `model`, and a new
 `config.toml` starts with comments saying what each setting does. Setup
 ends with what it chose and with any tool agents need that is missing
-(bubblewrap for the sandbox on Linux, ripgrep), with the command that
-installs it. When Claude Code, Codex, OpenCode or Kiro have MCP servers set
+(bubblewrap for the sandbox on Linux, ripgrep, agent-browser), with the
+command that installs it. When agent-browser finds no Chrome to drive,
+setup offers to download Chrome for Testing for it (`agent-browser
+install`). When Claude Code, Codex, OpenCode or Kiro have MCP servers set
 up (in your home or this folder), setup offers them too, all ticked, as
 `sonny mcp import` does. When no way to reach a model is ready, setup also
 offers each of those agents found on `PATH` ("Let Claude Code set up
@@ -526,8 +528,8 @@ way `/react` does, and each note in the margin has its own `↩`.
   runs it outside without asking, as a Codex rule that allows a command
   does. Each entry is a command's first words (`"docker compose"`), and a
   call runs outside only when everything it runs is named, so
-  `mcpx … | jq` still asks. Sonny gives a lead the list again when it opens
-  it.
+  `mcpx … | jq` still asks. agent-browser, which Sonny ships, is on the
+  list already. Sonny gives a lead the list again when it opens it.
 - `/retry` lists the calls the reviewer denied while Sonny watched, with
   the reason for each. Enter writes the call out whole, and a second
   Enter sends your approval of that exact call as your own message, so
@@ -791,6 +793,9 @@ it alone, offering its new text through the first bot you open after an
 upgrade, as for its roles. Sonny notes what it last wrote of each in `~/.agent/sonny/skills`;
 a skill of the same name it has no note of writing (yours, or one an
 earlier Sonny wrote) is left alone too. Remove its folder to get Sonny's.
+With agent-browser installed, Sonny also writes its `agent-browser` skill
+the same way, as `agent-browser skills get agent-browser` prints it for
+the version installed, and removes it when agent-browser is gone.
 [docs/SONNY.md](../docs/SONNY.md) has the details of triggers, memory,
 skills and MCP.
 Sonny starts its lookout, `sonny lookout`, when it opens a project: one
