@@ -77,6 +77,22 @@ const FLASH_GROWTH: f32 = std::f32::consts::SQRT_2;
 /// The biggest, about two dozen at once, as wide as 0.7.0's commons
 /// ripple spread.
 const FLASH_MAX: f32 = 24.0;
+/// The andon cord, pulled: it drops from the sky's top to whoever pulled
+/// it, is tugged, and the stop rings out from them across the whole sky,
+/// each star going still as the ring passes, as a line stops station by
+/// station. Pulls are rare, so this is the sky's one loud moment.
+const CORD_DROP: Duration = Duration::from_millis(450);
+const CORD_TUG: Duration = Duration::from_millis(300);
+/// How long a stop's or a start's rings take to cross the sky, how many
+/// there are, and how far apart they set off.
+const CORD_WAVE: Duration = Duration::from_millis(2600);
+const CORD_RINGS: usize = 3;
+const CORD_RING_GAP: Duration = Duration::from_millis(260);
+/// Resumed: the cord drawn back up, and the start rings out from whoever
+/// resumed, each star waking as it passes.
+const CORD_LIFT: Duration = Duration::from_millis(600);
+/// While the cord hangs, its puller pulses this often, slowly.
+const CORD_PULSE: Duration = Duration::from_millis(2400);
 /// The pairs that talked, newest kept, each a curve: the web of who
 /// works with whom, as in 0.7.0.
 const TALKS: usize = 96;
@@ -396,6 +412,8 @@ pub struct View {
     /// and its id when known): what one
     /// does is drawn on its agent, as the approver's judgments light it.
     copies: HashMap<String, (String, Option<i64>)>,
+    /// The andon cord, while it hangs or its start rings out.
+    cord: Option<Cord>,
 }
 
 /// A replay: the daemon's events from a time on, played as they happened,
@@ -499,6 +517,50 @@ struct Note {
     written: Option<i64>,
 }
 
+/// The andon cord while it hangs: who pulled it, why and when; once
+/// resumed, who resumed it and when, until the start has rung out.
+struct Cord {
+    /// The agent that pulled it, by name, or none for the person.
+    by: Option<String>,
+    reason: String,
+    /// When it was pulled here: none for a pause already holding when the
+    /// view opened, which hangs without its drop.
+    pulled: Option<Instant>,
+    /// When it was pulled, in Unix ms, for how long the line stood still.
+    at_ms: Option<i64>,
+    /// Who resumed it (an agent by name, or none for the person), and when.
+    lifted: Option<(Option<String>, Instant)>,
+}
+
+/// The cord's rope: where it hangs to, the share of the way down, the
+/// dots past while tugged, its ink and its gap.
+#[derive(Clone, Copy, Debug)]
+struct Rope {
+    to: (f32, f32),
+    share: f32,
+    past: f32,
+    ink: Ink,
+    gap: usize,
+}
+
+/// The cord as one frame draws it, in dots.
+#[derive(Default)]
+struct CordFrame {
+    /// The rope down to who pulled it.
+    rope: Option<Rope>,
+    /// The stop's or the start's rings: where from, how wide, what ink.
+    rings: Vec<((f32, f32), f32, Ink)>,
+    /// Bursts round who pulled or resumed.
+    flares: Vec<((f32, f32), f32, Ink)>,
+    /// Where the stop has reached: stars within this many dots of the
+    /// point are still while it rings out, or, once resumed, beyond it.
+    front: Option<((f32, f32), f32, bool)>,
+    /// Who pulled it, drawn in the cord's colour while it hangs.
+    puller: Option<End>,
+    /// Who resumed it, named while the start rings out.
+    resumer: Option<End>,
+}
+
 /// A place drawn on the way from one to another.
 #[derive(Clone, Copy, Default)]
 struct Glide {
@@ -556,6 +618,7 @@ impl View {
             down: None,
             replay: None,
             copies: HashMap::new(),
+            cord: None,
         }
     }
 
@@ -595,6 +658,8 @@ impl View {
         self.forget();
         self.live = false;
         self.down = None;
+        // The new connection's greeting says whether it still hangs.
+        self.cord = None;
     }
 
     /// Let go of every agent and what they did, to draw them again.
@@ -700,6 +765,7 @@ impl View {
         }
         self.play(now);
         self.sweep();
+        self.sweep_cord(now);
         self.land(now);
     }
 
@@ -990,6 +1056,12 @@ impl View {
     /// One of the daemon's events: `{cursor, bot, turn, event, data}`,
     /// what is particular to its kind in `data`.
     fn event(&mut self, event: &Value, now: Instant, live: bool) {
+        // The cord is the daemon's, no one agent's: its notices name no bot.
+        match event["event"].as_str() {
+            Some("paused") => return self.pulled(&event["pause"], now, live),
+            Some("resumed") => return self.lifted(event, now, live),
+            _ => {}
+        }
         let Some(name) = event["bot"].as_str() else {
             return;
         };
@@ -1226,6 +1298,238 @@ impl View {
             }
             _ => {}
         }
+    }
+
+    /// The cord pulled: live, it drops and the stop rings out; a pause
+    /// already holding when the view opened just hangs there.
+    fn pulled(&mut self, pause: &Value, now: Instant, live: bool) {
+        let by = pause["by"].as_str().map(str::to_owned);
+        let reason = pause["reason"].as_str().unwrap_or("").to_owned();
+        if live {
+            let who = self.called(&by);
+            let about: Vec<usize> = by
+                .as_deref()
+                .and_then(|name| self.agent(name))
+                .into_iter()
+                .collect();
+            let said = match reason.as_str() {
+                "" => format!("■ {who} pulled the cord"),
+                why => format!("■ {who} pulled the cord: {why}"),
+            };
+            self.say(now, said, Some(NEEDS), &about);
+        }
+        self.cord = Some(Cord {
+            by,
+            reason,
+            pulled: live.then_some(now),
+            at_ms: pause["at_ms"].as_i64(),
+            lifted: None,
+        });
+    }
+
+    /// The cord let go: drawn back up, and the start rings out from
+    /// whoever resumed. A resume read from the past just clears it.
+    fn lifted(&mut self, event: &Value, now: Instant, live: bool) {
+        if !live {
+            self.cord = None;
+            return;
+        }
+        let by = event["by"].as_str().map(str::to_owned);
+        let who = self.called(&by);
+        let stood = (event["pause"]["at_ms"].as_i64())
+            .or(self.cord.as_ref().and_then(|cord| cord.at_ms))
+            .map(|at| Duration::from_millis((wall_ms() - at).max(0) as u64));
+        let said = match stood {
+            Some(stood) => format!("▶ {who} resumed, after {}", span(stood)),
+            None => format!("▶ {who} resumed"),
+        };
+        let about: Vec<usize> = by
+            .as_deref()
+            .and_then(|name| self.agent(name))
+            .into_iter()
+            .collect();
+        self.say(now, said, None, &about);
+        // One the view never saw pulled still lifts, from the middle.
+        let cord = self.cord.get_or_insert_with(|| Cord {
+            by: None,
+            reason: String::new(),
+            pulled: None,
+            at_ms: None,
+            lifted: None,
+        });
+        cord.lifted = Some((by, now));
+    }
+
+    /// The cord this frame: dropping, tugged and ringing the stop out,
+    /// hanging, or drawn up again with the start ringing out.
+    fn cord_frame(&self, sky: &Sky, now: Instant) -> Option<CordFrame> {
+        let cord = self.cord.as_ref()?;
+        let since = |at: Instant| now.duration_since(at).as_secs_f32();
+        let pulled_by = self.cord_end(&cord.by);
+        let puller = self.end(pulled_by);
+        let wave = CORD_WAVE.as_secs_f32();
+        let gap = CORD_RING_GAP.as_secs_f32();
+        // A ring's width, `t` into its crossing: fast, then slowing as it
+        // reaches the sky's far edge, fading as it goes.
+        let ring = |from: (f32, f32), t: f32, strong: Ink, weak: Ink| {
+            let p = t / wave;
+            let ink = match p {
+                ..0.45 => strong,
+                ..0.75 => weak,
+                _ => Ink::Faint,
+            };
+            (from, sky.reach(from) * (1.0 - (1.0 - p).powi(2)), ink)
+        };
+        let rope = |share, past, ink, gap| Rope {
+            to: puller,
+            share,
+            past,
+            ink,
+            gap,
+        };
+        let mut frame = CordFrame::default();
+        match &cord.lifted {
+            None => {
+                frame.puller = Some(pulled_by);
+                let (drop, tug) = (CORD_DROP.as_secs_f32(), CORD_TUG.as_secs_f32());
+                // A pause the view opened on has long rung out.
+                let t = cord.pulled.map_or(f32::MAX, since);
+                let start = drop + tug * 0.3;
+                frame.rope = Some(if t < drop {
+                    rope(ease(t / drop), 0.0, Ink::Color(NEEDS, true), 1)
+                } else if t < drop + tug {
+                    let tugged = (std::f32::consts::PI * (t - drop) / tug).sin() * 4.0;
+                    rope(1.0, tugged, Ink::Color(NEEDS, true), 1)
+                } else if t < start + wave {
+                    rope(1.0, 0.0, Ink::Color(NEEDS, true), 1)
+                } else {
+                    // Hanging: the system's middle weight, not a siren.
+                    rope(1.0, 0.0, Ink::Color(NEEDS, false), 2)
+                });
+                // The tug bursts round the one who pulled.
+                let burst = t - drop;
+                if (0.0..tug + 0.5).contains(&burst) {
+                    let q = burst / (tug + 0.5);
+                    let ink = Ink::Color(NEEDS, q < 0.5);
+                    frame.flares.push((puller, 2.0 + 9.0 * ease(q), ink));
+                    frame.flares.push((puller, 1.0 + 4.5 * ease(q), ink));
+                }
+                for i in 0..CORD_RINGS {
+                    let t = t - start - i as f32 * gap;
+                    if (0.0..wave).contains(&t) {
+                        let strong = match i {
+                            0 => Ink::Color(NEEDS, true),
+                            _ => Ink::Color(NEEDS, false),
+                        };
+                        frame.rings.push(ring(puller, t, strong, Ink::Muted));
+                    }
+                }
+                frame.front = Some(match t - start {
+                    t if t < 0.0 => (puller, 0.0, true),
+                    t if t < wave => (puller, ring(puller, t, Ink::Faint, Ink::Faint).1, true),
+                    _ => (puller, f32::MAX, true),
+                });
+                // Then it hangs, its puller pulsing slowly: the line is
+                // still stopped, and by whom.
+                let held = cord.pulled.map_or(self.opened, |at| {
+                    at + CORD_DROP + CORD_TUG + CORD_WAVE + CORD_RING_GAP * CORD_RINGS as u32
+                });
+                if now >= held {
+                    let pulse = CORD_PULSE.as_secs_f32();
+                    let phase = (since(held) % pulse) / pulse;
+                    if phase < 0.5 {
+                        let ink = match phase < 0.25 {
+                            true => Ink::Color(NEEDS, false),
+                            false => Ink::Muted,
+                        };
+                        frame.flares.push((puller, 2.0 + 16.0 * phase, ink));
+                    }
+                }
+            }
+            Some((by, at)) => {
+                let resumed_by = self.cord_end(by);
+                let resumer = self.end(resumed_by);
+                frame.resumer = Some(resumed_by);
+                let u = since(*at);
+                let lift = CORD_LIFT.as_secs_f32();
+                if u < lift {
+                    let share = 1.0 - ease(u / lift);
+                    frame.rope = Some(rope(share, 0.0, Ink::Color(NEEDS, false), 2));
+                }
+                if u < 0.5 {
+                    frame
+                        .flares
+                        .push((resumer, 2.0 + 8.0 * ease(u / 0.5), Ink::Bright));
+                }
+                let start = 0.15;
+                for i in 0..2 {
+                    let t = u - start - i as f32 * gap;
+                    if (0.0..wave).contains(&t) {
+                        let strong = match i {
+                            0 => Ink::Bright,
+                            _ => Ink::Plain,
+                        };
+                        frame.rings.push(ring(resumer, t, strong, Ink::Muted));
+                    }
+                }
+                let t = u - start;
+                if t < wave {
+                    let front = ring(resumer, t.max(0.0), Ink::Faint, Ink::Faint).1;
+                    frame.front = Some((resumer, front, false));
+                }
+            }
+        }
+        Some(frame)
+    }
+
+    /// Whether the cord's stop holds a star still this frame.
+    fn stilled(frame: Option<&CordFrame>, sky: &Sky, at: (f32, f32)) -> bool {
+        frame
+            .and_then(|frame| frame.front)
+            .is_some_and(|(from, front, inside)| (sky.apart(from, at) <= front) == inside)
+    }
+
+    /// Lets go of a start that has rung out.
+    fn sweep_cord(&mut self, now: Instant) {
+        let done = CORD_WAVE + CORD_RING_GAP * 2;
+        if let Some((_, at)) = self.cord.as_ref().and_then(|cord| cord.lifted.as_ref())
+            && now.duration_since(*at) > done
+        {
+            self.cord = None;
+        }
+    }
+
+    /// Who pulled or resumed, as the sky says it: an agent by its short
+    /// name, or the person.
+    fn called(&self, by: &Option<String>) -> String {
+        match by {
+            Some(name) => short(name),
+            None => "you".into(),
+        }
+    }
+
+    /// The agents who pulled and resumed the cord, while it is drawn.
+    fn cord_ends(&self) -> [Option<usize>; 2] {
+        let end = |by: &Option<String>| match self.cord_end(by) {
+            End::Agent(at) => Some(at),
+            _ => None,
+        };
+        match &self.cord {
+            None => [None, None],
+            Some(cord) => [
+                end(&cord.by),
+                cord.lifted.as_ref().and_then(|(by, _)| end(by)),
+            ],
+        }
+    }
+
+    /// Where one who pulled or resumed is: their star, or the person's
+    /// place for the person or an agent not on the sky.
+    fn cord_end(&self, by: &Option<String>) -> End {
+        // A throwaway copy pulls it as the agent it is drawn on.
+        (by.as_deref())
+            .and_then(|name| self.agent(name).or_else(|| self.copied(name)))
+            .map_or(End::Person, End::Agent)
     }
 
     /// Who sent a prompt: another agent, a client named by its origin or
@@ -1754,10 +2058,21 @@ impl View {
         // faint cloud on their arm (Furnas' degree of interest). What
         // needs the person or failed always draws.
         let room = (sky_cols * sky_rows / 24).max(8);
-        let shown = self.shown(now, room, &[picked, centre]);
+        // Who pulled or resumed the cord keeps a star, for it to hang from
+        // and ring out of.
+        let ends = self.cord_ends();
+        let shown = self.shown(now, room, &[picked, centre, ends[0], ends[1]]);
+        let cord = self.cord_frame(&sky, now);
+        let puller = cord.as_ref().and_then(|cord| cord.puller);
+        let resumer = cord.as_ref().and_then(|cord| cord.resumer);
         // The person: the place and the word say who. In the middle, or
-        // on a ring when an agent is centred.
-        sky.text_at(self.person.at, "you", Style::default().bold());
+        // on a ring when an agent is centred; in the cord's colour while
+        // the cord they pulled hangs.
+        let you = match puller {
+            Some(End::Person) => Style::default().fg(NEEDS).bold(),
+            _ => Style::default().bold(),
+        };
+        sky.text_at(self.person.at, "you", you);
         // Who made whom: dotted lines, dim, as all that says how things
         // stand rather than what happens.
         for (at, agent) in self.agents.iter().enumerate().filter(|(_, a)| !a.gone) {
@@ -1848,6 +2163,15 @@ impl View {
                 }
             }
         }
+        // The cord and its rings, over the web and under the stars.
+        if let Some(cord) = &cord {
+            for &(at, radius, ink) in &cord.rings {
+                sky.wave(at, radius, ink);
+            }
+            if let Some(rope) = cord.rope {
+                sky.rope(rope);
+            }
+        }
         let shade = Shade::now();
         let hues: HashMap<String, Color> = self.hues().into_iter().collect();
         // The folded: a faint dot each, so a cloud's density says its size,
@@ -1862,7 +2186,9 @@ impl View {
             cloud.0 += 1;
             cloud.1 = (cloud.1.0 + agent.at.0, cloud.1.1 + agent.at.1);
         }
-        for (_, agent) in (self.agents.iter().enumerate()).filter(|(at, a)| !a.gone && shown[*at]) {
+        for (index, agent) in
+            (self.agents.iter().enumerate()).filter(|(at, a)| !a.gone && shown[*at])
+        {
             if let Some((at, color, work)) = agent.twinkle
                 && now.duration_since(at) < TWINKLE
             {
@@ -1876,7 +2202,13 @@ impl View {
             let hue = (self.models)
                 .then(|| hues.get(agent.model_or_unknown()).copied())
                 .flatten();
+            let stilled = Self::stilled(cord.as_ref(), &sky, agent.at);
             let (ink, big) = match (hue, agent.state()) {
+                // Who pulled the cord, in its colour while it hangs.
+                _ if puller == Some(End::Agent(index)) => (Ink::Color(NEEDS, true), true),
+                // The stop holds the rest still, as it reaches them; what
+                // needs the person or failed keeps its colour.
+                (_, None | Some(State::Working)) if stilled => (Ink::Muted, false),
                 (Some(hue), state) => {
                     let big = state.is_some() || agent.glow(now) > 0.4;
                     (Ink::Color(hue, big), big)
@@ -1887,6 +2219,9 @@ impl View {
                 (None, _) => (Ink::Plain, agent.glow(now) > 0.4),
             };
             sky.star(agent.at, ink, big);
+        }
+        for &(at, radius, ink) in cord.iter().flat_map(|cord| &cord.flares) {
+            sky.circle(at, radius, ink);
         }
         // Names: every star's that has room, leads and what works or was
         // just lit before the quiet, nearest the middle first, never over
@@ -1909,7 +2244,14 @@ impl View {
                 true
             })
             .collect();
-        for at in picked.into_iter().chain(centre) {
+        let cord_names: Vec<usize> = [puller, resumer]
+            .into_iter()
+            .filter_map(|end| match end {
+                Some(End::Agent(at)) if !self.agents[at].gone => Some(at),
+                _ => None,
+            })
+            .collect();
+        for &at in picked.iter().chain(&centre).chain(&cord_names) {
             if !named.contains(&at) {
                 named.push(at);
             }
@@ -1923,6 +2265,7 @@ impl View {
         named.sort_by_key(|&at| {
             let agent = &self.agents[at];
             (
+                !cord_names.contains(&at),
                 Some(at) != picked,
                 Some(at) != centre,
                 agent.state() != Some(State::NeedsYou),
@@ -1948,6 +2291,9 @@ impl View {
                 _ => None,
             };
             let style = match (Some(at) == picked, Some(at) == centre) {
+                // Who pulled the cord, in its colour; who resumed it, bold.
+                _ if puller == Some(End::Agent(at)) => Style::default().fg(NEEDS).bold(),
+                _ if resumer == Some(End::Agent(at)) => Style::default().bold(),
                 // The pick reversed, as a picker's selection is.
                 (true, _) => Style::default().reversed(),
                 (_, true) => Style::default().bold(),
@@ -2154,6 +2500,10 @@ impl View {
                 Span::styled("⠁⠈", Ink::Muted.style()),
                 vec![says("  who made whom, who talked")],
             ),
+            row(
+                Span::raw("⡇").fg(NEEDS),
+                vec![says("   the cord, down to who pulled it")],
+            ),
             Line::default(),
             Line::from(says("now")),
             Line::default(),
@@ -2324,6 +2674,19 @@ impl View {
             ))
             .dim(),
         ];
+        // The cord, while it hangs: by whom and how long, before anything
+        // else is counted; why, at the end, as far as it fits.
+        let hanging = self.cord.as_ref().filter(|cord| cord.lifted.is_none());
+        if let Some(cord) = hanging {
+            let mut said = format!(" paused by {}", self.called(&cord.by));
+            if let Some(at) = cord.at_ms {
+                let stood = Duration::from_millis((wall_ms() - at).max(0) as u64);
+                said.push_str(&format!(", {}", span(stood)));
+            }
+            spans.push(Span::raw(" · ").dim());
+            spans.push(Span::raw("■").fg(NEEDS));
+            spans.push(Span::raw(said).fg(NEEDS));
+        }
         // On `m`, which colour is which model, as many as fit.
         if self.models {
             for (model, hue) in self.hues() {
@@ -2371,8 +2734,15 @@ impl View {
         );
         // The states first: the messages' count goes where it won't fit.
         let used: usize = spans.iter().map(|span| span.content.width()).sum();
-        if used + sent.width() <= width {
+        if used + sent.width() <= width && hanging.is_none() {
             spans.push(Span::raw(sent).dim());
+        }
+        if let Some(cord) = hanging.filter(|cord| !cord.reason.is_empty()) {
+            let used: usize = spans.iter().map(|span| span.content.width()).sum();
+            let room = width.saturating_sub(used + 3);
+            if room >= 8 {
+                spans.push(Span::raw(format!(" · {}", cut(&cord.reason, room))).dim());
+            }
         }
         Line::from(spans)
     }
@@ -2570,6 +2940,18 @@ fn wrapped(text: &str, room: usize) -> Vec<String> {
         }
     }
     lines
+}
+
+/// How long something lasted, as the chat log says it: `40s`, `12m`,
+/// `2h 5m`.
+fn span(lasted: Duration) -> String {
+    let s = lasted.as_secs();
+    match s {
+        0..=59 => format!("{s}s"),
+        60..=3599 => format!("{}m", s / 60),
+        _ if s % 3600 < 60 => format!("{}h", s / 3600),
+        _ => format!("{}h {}m", s / 3600, s % 3600 / 60),
+    }
 }
 
 /// Words cut to `room` columns, an ellipsis saying so.
@@ -2976,6 +3358,43 @@ impl Sky {
         }
     }
 
+    /// A ring of `r` braille dots as wide as the sky: a dot every dot and a
+    /// half of its length however wide, where a mark's ring thins out.
+    fn wave(&mut self, at: (f32, f32), r: f32, ink: Ink) {
+        let (x, y) = self.spot(at);
+        let steps = (TAU * r / 1.5).clamp(8.0, 4096.0) as usize;
+        for step in 0..steps {
+            let a = TAU * step as f32 / steps as f32;
+            self.plot(x + r * a.cos(), y + r * a.sin(), ink);
+        }
+    }
+
+    /// Dots from a point to the canvas's farthest corner: how far a ring
+    /// from it goes to cross the whole sky.
+    fn reach(&self, at: (f32, f32)) -> f32 {
+        let (x, y) = self.spot(at);
+        let (w, h) = (self.cols as f32 * 2.0, self.rows as f32 * 4.0);
+        (x.max(w - x)).hypot(y.max(h - y))
+    }
+
+    /// Dots between two points.
+    fn apart(&self, a: (f32, f32), b: (f32, f32)) -> f32 {
+        let ((ax, ay), (bx, by)) = (self.spot(a), self.spot(b));
+        (ax - bx).hypot(ay - by)
+    }
+
+    /// The cord: every `gap`th dot straight down from the canvas's top,
+    /// `share` of the way to a point and `past` dots beyond.
+    fn rope(&mut self, rope: Rope) {
+        let (x, y) = self.spot(rope.to);
+        let end = y * rope.share.clamp(0.0, 1.0) + rope.past;
+        let mut down = 0.0;
+        while down <= end {
+            self.plot(x, down, rope.ink);
+            down += rope.gap.max(1) as f32;
+        }
+    }
+
     /// Every `gap`th dot of a straight line.
     fn line(&mut self, a: (f32, f32), b: (f32, f32), ink: Ink, gap: usize) {
         let (ax, ay) = self.spot(a);
@@ -3285,6 +3704,17 @@ async fn follow(socket: PathBuf, send: mpsc::UnboundedSender<Feed>) {
             return;
         }
     };
+    // A cord already pulled when the sky opens hangs, without its drop;
+    // `paused` and `resumed` notices tell of what comes after.
+    if !client.paused().is_null()
+        && send
+            .send(Feed::Past(
+                json!({"event": "paused", "pause": client.paused()}),
+            ))
+            .is_err()
+    {
+        return;
+    }
     if !roll(&client, &send).await {
         return;
     }
@@ -3416,7 +3846,9 @@ fn slim(mut event: Value) -> Value {
 /// or the daemon has gone.
 async fn taped(client: &Client, event: Value, send: &mpsc::UnboundedSender<Feed>) -> bool {
     let sent = match event["event"].as_str() {
-        Some("pruned") => return true,
+        // A pause's notices tell of now, not of the past a replay plays,
+        // and are no events to seek through: a replay leaves the cord out.
+        Some("pruned" | "paused" | "resumed") => return true,
         // As live: a new model is read again, for `m`.
         Some("configured") => match configured(client, &event).await {
             Some(model) => send.send(model),
@@ -3559,6 +3991,166 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    fn cord_sky() -> (View, mpsc::UnboundedSender<Feed>) {
+        let (mut view, send) = view();
+        send.send(Feed::Roll(vec![
+            json!({"name": "shop.lead", "running_turn": 3}),
+            json!({"name": "shop.pricing", "created_by": "shop.lead", "running_turn": 4}),
+            json!({"name": "shop.search", "created_by": "shop.lead"}),
+        ]))
+        .unwrap();
+        send.send(Feed::Ready).unwrap();
+        view.drain();
+        (view, send)
+    }
+
+    #[tokio::test]
+    async fn sonny_sky_drops_the_cord_on_whoever_pulled_it_and_hangs_it_there() {
+        let (mut view, send) = cord_sky();
+        let pause = json!({"reason": "the deploy is about to touch prod", "by": "shop.pricing",
+            "at_ms": wall_ms() - 90_000});
+        send.send(Feed::Live(
+            json!({"event": "paused", "pause": pause, "durable": false}),
+        ))
+        .unwrap();
+        view.drain();
+        // Who pulled it, and why, in the log in the cord's colour.
+        let note = view.ticker.back().unwrap();
+        assert_eq!(
+            note.text,
+            "■ pricing pulled the cord: the deploy is about to touch prod"
+        );
+        assert_eq!(note.hue, Some(NEEDS));
+        assert_eq!(note.about, vec!["shop.pricing".to_owned()]);
+        // The footer says by whom and how long, and why where it fits.
+        let footer = text(&[view.footer(120)]);
+        assert!(footer.contains("■ paused by pricing, 1m"), "{footer}");
+        assert!(
+            footer.contains("the deploy is about to touch prod"),
+            "{footer}"
+        );
+        // The cord drops on its puller, in its colour, and the stop rings
+        // out from there; the puller's name is drawn in it too.
+        let sky = Sky::new(60, 30);
+        let pricing = view.agent("shop.pricing").unwrap();
+        let at = Instant::now() + CORD_DROP + CORD_TUG + Duration::from_millis(400);
+        let frame = view.cord_frame(&sky, at).unwrap();
+        assert_eq!(frame.puller, Some(End::Agent(pricing)));
+        assert_eq!(frame.rope.unwrap().to, view.agents[pricing].at);
+        assert!(!frame.rings.is_empty());
+        let card = view.card(100, 40);
+        let yellow = (card.iter().flat_map(|line| &line.spans))
+            .any(|span| span.content.contains("pricing") && span.style.fg == Some(NEEDS));
+        assert!(yellow, "{}", text(&card));
+        // Once rung out, it hangs, the whole sky still and no rings.
+        let later = Instant::now() + Duration::from_secs(10);
+        let frame = view.cord_frame(&sky, later).unwrap();
+        assert!(frame.rings.is_empty());
+        assert_eq!(frame.rope.unwrap().ink, Ink::Color(NEEDS, false));
+        let search = view.agents[view.agent("shop.search").unwrap()].at;
+        assert!(View::stilled(Some(&frame), &sky, search));
+    }
+
+    #[tokio::test]
+    async fn sonny_sky_keeps_a_star_for_whoever_pulled_or_resumed_a_crowded_sky() {
+        let (mut view, send) = view();
+        let mut bots = vec![json!({"name": "shop.lead"})];
+        for n in 0..40 {
+            bots.push(json!({"name": format!("shop.a{n}"), "created_by": "shop.lead"}));
+        }
+        send.send(Feed::Roll(bots)).unwrap();
+        send.send(Feed::Ready).unwrap();
+        let pause = json!({"reason": "look", "by": "shop.a17", "at_ms": wall_ms()});
+        send.send(Feed::Live(json!({"event": "paused", "pause": pause})))
+            .unwrap();
+        send.send(Feed::Live(
+            json!({"event": "resumed", "pause": pause, "by": "shop.a29"}),
+        ))
+        .unwrap();
+        view.drain();
+        let ends = view.cord_ends();
+        let (a17, a29) = (view.agent("shop.a17"), view.agent("shop.a29"));
+        assert_eq!(ends, [a17, a29]);
+        // Idle, both would fold into the cloud; the cord keeps them stars.
+        let shown = view.shown(Instant::now(), 8, &ends);
+        assert!(shown[a17.unwrap()] && shown[a29.unwrap()]);
+        assert!(shown.iter().filter(|&&star| star).count() <= 10);
+    }
+
+    #[tokio::test]
+    async fn sonny_sky_shows_the_person_pulling_the_cord_and_one_already_hanging() {
+        let (mut view, send) = cord_sky();
+        // A pause the sky opened on hangs from the person, with no drop
+        // and nothing said: it happened before.
+        send.send(Feed::Past(json!({"event": "paused",
+            "pause": {"reason": "lunch", "by": null, "at_ms": wall_ms()}})))
+            .unwrap();
+        view.drain();
+        assert!(view.ticker.is_empty());
+        let sky = Sky::new(60, 30);
+        let frame = view.cord_frame(&sky, Instant::now()).unwrap();
+        assert_eq!(frame.puller, Some(End::Person));
+        assert!(frame.rings.is_empty());
+        assert!(text(&[view.footer(120)]).contains("paused by you"));
+        // "you", in the cord's colour.
+        let card = view.card(100, 40);
+        let you = (card.iter().flat_map(|line| &line.spans))
+            .any(|span| span.content.contains("you") && span.style.fg == Some(NEEDS));
+        assert!(you, "{}", text(&card));
+        // Pulled live by the person: said so.
+        send.send(Feed::Live(json!({"event": "paused",
+            "pause": {"reason": "", "by": null, "at_ms": wall_ms()}})))
+            .unwrap();
+        view.drain();
+        assert_eq!(view.ticker.back().unwrap().text, "■ you pulled the cord");
+    }
+
+    #[tokio::test]
+    async fn sonny_sky_draws_the_cord_up_and_wakes_the_sky_from_whoever_resumed() {
+        let (mut view, send) = cord_sky();
+        let pause = json!({"reason": "look", "by": "shop.pricing", "at_ms": wall_ms() - 252_000});
+        send.send(Feed::Live(json!({"event": "paused", "pause": pause})))
+            .unwrap();
+        view.drain();
+        send.send(Feed::Live(
+            json!({"event": "resumed", "pause": pause, "by": "shop.lead"}),
+        ))
+        .unwrap();
+        view.drain();
+        assert_eq!(
+            view.ticker.back().unwrap().text,
+            "▶ shop lead resumed, after 4m"
+        );
+        // The footer lets go of it at once; the start rings out from the
+        // one who resumed, waking the sky as it goes.
+        assert!(!text(&[view.footer(120)]).contains("paused"));
+        let sky = Sky::new(60, 30);
+        let lead = view.agent("shop.lead").unwrap();
+        let frame = view
+            .cord_frame(&sky, Instant::now() + Duration::from_millis(400))
+            .unwrap();
+        assert_eq!(frame.resumer, Some(End::Agent(lead)));
+        assert_eq!(frame.puller, None);
+        assert!(!frame.rings.is_empty());
+        let (from, front, inside) = frame.front.unwrap();
+        assert_eq!((from, inside), (view.agents[lead].at, false));
+        assert!(!View::stilled(Some(&frame), &sky, view.agents[lead].at));
+        assert!(front < sky.reach(from));
+        // Once rung out, the cord is gone.
+        view.sweep_cord(Instant::now() + Duration::from_secs(5));
+        assert!(view.cord.is_none());
+        // A resume by the person, of a pause the sky never saw, still
+        // rings out, from the middle.
+        send.send(Feed::Live(
+            json!({"event": "resumed", "pause": null, "by": null}),
+        ))
+        .unwrap();
+        view.drain();
+        assert_eq!(view.ticker.back().unwrap().text, "▶ you resumed");
+        let frame = view.cord_frame(&sky, Instant::now()).unwrap();
+        assert_eq!(frame.resumer, Some(End::Person));
     }
 
     #[tokio::test]

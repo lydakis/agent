@@ -669,6 +669,10 @@ holds, every window says above the footer who paused and why. Agents pull the
 same cord from their shell with `"$AGENT_BIN" pause --reason WHY`, and get no
 tool for it: `task.md` and `lead.md` say to, when they see agents doing harm
 someone needs to look at, and that resuming is the person's call.
+`/sky` shows a pull from whoever pulled it (the `pause`'s `by`, the person
+when none) and a resume from whoever resumed (the `resumed` notice's `by`),
+from the notices every session hears, and a pause already holding from
+`ready`; a replay has none, since the notices are not events.
 
 ## Skills
 
