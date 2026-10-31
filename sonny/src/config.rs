@@ -49,7 +49,7 @@ fn short(key: &str) -> &str {
 }
 
 /// Every key `agent_client::config` reads.
-pub const SETTINGS: [Setting; 21] = [
+pub const SETTINGS: [Setting; 22] = [
     Setting {
         key: "model",
         about: "a new agent's model, when none is named (provider/model)",
