@@ -440,22 +440,16 @@ impl Layout {
         self.placed = None;
     }
 
+    /// A close or rename is not confirmed by its multiplexer, so the
+    /// home is read again after rather than guessed.
     fn close_block(&mut self, block: &str) {
         self.backend.close_block(block);
-        if let Some((_, listed)) = &mut self.listed {
-            listed.retain(|b| b.id != block);
-        }
-        self.placed = None;
+        self.forget();
     }
 
     fn rename_block(&mut self, block: &str, label: &str) {
         self.backend.rename_block(block, label);
-        if let Some((_, listed)) = &mut self.listed {
-            for b in listed.iter_mut().filter(|b| b.id == block) {
-                b.label = label.to_owned();
-            }
-        }
-        self.placed = None;
+        self.forget();
     }
 
     /// Close the shell a home made just now came with, now that it holds
