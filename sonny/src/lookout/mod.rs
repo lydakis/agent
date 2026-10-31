@@ -674,11 +674,16 @@ fn updates_for(
     updates
 }
 
-/// The subscribers other than this one.
+/// The subscribers other than this one that watch agents of their own,
+/// which are no one's tasks. One that hears only sources, as a task that
+/// posted in the commons does, is still its lead's.
 fn others(subscriber: &str, subscribers: &HashMap<String, Vec<subs::Sub>>) -> HashSet<String> {
-    (subscribers.keys())
-        .filter(|name| *name != subscriber)
-        .cloned()
+    (subscribers.iter())
+        .filter(|(name, _)| *name != subscriber)
+        .filter(|(_, subs)| {
+            (subs.iter()).any(|sub| !sub.tasks_of.is_empty() || !sub.bots.is_empty())
+        })
+        .map(|(name, _)| name.clone())
         .collect()
 }
 
@@ -3304,6 +3309,22 @@ mod tests {
     }
 
     #[test]
+    fn a_task_that_only_hears_sources_is_still_its_lead_s() {
+        let mut subscribers = HashMap::new();
+        subscribers.insert(
+            "calc.lead".to_owned(),
+            vec![subs::Sub::lead("calc.lead", "calc")],
+        );
+        subscribers.insert("calc.fix".to_owned(), vec![subs::Sub::commons("flaky")]);
+        subscribers.insert(
+            "ops.lead".to_owned(),
+            vec![subs::Sub::lead("ops.lead", "ops")],
+        );
+        let others = others("calc.lead", &subscribers);
+        assert_eq!(others, HashSet::from(["ops.lead".to_owned()]));
+    }
+
+    #[test]
     fn a_lead_is_watched_only_for_what_its_file_subscribes_it_to() {
         let record = |name: &str, id: i64, by: Option<&str>| {
             json!({"name": name, "bot_id": id, "workspace": "/", "status": "idle",
@@ -3350,10 +3371,12 @@ mod tests {
             (told.items.iter().map(|l| l.text.as_str())).collect::<Vec<_>>(),
             ["- calc.fix: turn:calc.fix/1 completed, asked by you"]
         );
-        // A task that subscribes after its news came: no one's task now.
+        // A task that subscribes to agents of its own after its news came:
+        // no one's task now.
         turn(lookout, "calc.ops", 1);
         assert!(lookout.updates.due());
-        service.subscribers.insert("calc.ops".into(), Vec::new());
+        let watches = vec![sub("ops", &[], &["ops.*"])];
+        service.subscribers.insert("calc.ops".into(), watches);
         service.resubscribe(true);
         let lookout = service.lookouts.get_mut("calc.lead").unwrap();
         assert!(!lookout.updates.due());
