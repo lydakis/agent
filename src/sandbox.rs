@@ -898,10 +898,32 @@ mod linux {
             .map_err(|e| invalid(&e))?,
         ])
         .map_err(|e| invalid(&e))?;
+        // A pair of datagram sockets, which Linux makes of a raw one too,
+        // sends to any socket's path, not only to its other end.
+        let datagrams = [libc::SOCK_DGRAM, libc::SOCK_RAW].map(|kind| {
+            SeccompRule::new(vec![
+                SeccompCondition::new(
+                    0,
+                    SeccompCmpArgLen::Dword,
+                    SeccompCmpOp::Eq,
+                    libc::AF_UNIX as u64,
+                )?,
+                SeccompCondition::new(
+                    1,
+                    SeccompCmpArgLen::Dword,
+                    SeccompCmpOp::MaskedEq(0xf),
+                    kind as u64,
+                )?,
+            ])
+        });
+        let datagrams = (datagrams.into_iter())
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| invalid(&e))?;
         let mut rules = std::collections::BTreeMap::new();
         rules.insert(libc::SYS_io_uring_setup, Vec::new());
         if policy.sockets.is_empty() {
             rules.insert(libc::SYS_socket, vec![unix.clone()]);
+            rules.insert(libc::SYS_socketpair, datagrams.clone());
         }
         // x86_64's x32 calls share its architecture, numbered past this bit.
         if arch == TargetArch::x86_64 {
@@ -909,6 +931,7 @@ mod linux {
             rules.insert(X32 | libc::SYS_io_uring_setup, Vec::new());
             if policy.sockets.is_empty() {
                 rules.insert(X32 | libc::SYS_socket, vec![unix]);
+                rules.insert(X32 | libc::SYS_socketpair, datagrams);
             }
         }
         let filter = SeccompFilter::new(

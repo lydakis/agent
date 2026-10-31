@@ -2380,7 +2380,7 @@ read-only mount doesn't stop `connect`, a seccomp filter bubblewrap loads
 refuses every Unix socket a command would make, as Codex's Linux sandbox
 does; a filter can't see the path, so a bot whose `unix_sockets` names any
 reaches them all, as Claude Code's `allowAllUnixSockets` does. Socket pairs
-stay allowed. The filter also refuses `io_uring`, whose calls it can't see,
+stay allowed, but not of datagrams, which send to any socket's path. The filter also refuses `io_uring`, whose calls it can't see,
 and ends a command that makes system calls of another architecture.
 
 A sandboxed bot's commands reach the daemon through the bot's own socket,
@@ -2393,7 +2393,10 @@ network on or off. On Linux, where the command makes no Unix socket, the
 daemon hands it connections, as a broker does: `AGENT_SOCKET_FD` names a
 descriptor the command inherits, and each byte written to it is answered
 with a connection to the bot's own socket, passed over it, or none when
-that socket is gone. The bot's socket is also bound over the daemon's in
+that socket is gone. Like make's jobserver descriptors, it reaches only
+the processes that keep it: a launcher that closes what it didn't open,
+as Python's `subprocess` does, passes it on (`pass_fds`), or the client
+says which descriptor went missing. The bot's socket is also bound over the daemon's in
 the sandbox, and the folder of the bots' sockets is hidden. Either way the
 command's `AGENT_SOCKET` names it, the clients connect as it says, and no
 command reaches another bot's. A request on it:

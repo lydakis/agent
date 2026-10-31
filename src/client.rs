@@ -589,7 +589,7 @@ impl Connection {
                 // In a Linux sandbox, the connection the daemon hands this
                 // command.
                 if let Some(stream) = agent_client::socket::handed(socket)
-                    .map_err(|_| Error::new("daemon_unavailable"))?
+                    .map_err(|e| Error::with("daemon_unavailable", e.to_string()))?
                 {
                     return Ok(stream);
                 }

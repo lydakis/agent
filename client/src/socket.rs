@@ -97,9 +97,20 @@ pub fn handed(socket: &Path) -> std::io::Result<Option<std::os::unix::net::UnixS
     if own.as_deref().and_then(same) != same(socket) {
         return Ok(None);
     }
-    // SAFETY: fcntl on any number only reads its flags.
-    if unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
-        return Ok(None);
+    if !handing(fd) {
+        // A launcher that closes what it didn't open, as Python's
+        // subprocess does, closed it: outside a sandbox the path still
+        // serves, and inside one the command learns what went missing.
+        return match std::os::unix::net::UnixStream::connect(socket) {
+            Err(error) if error.raw_os_error() == Some(libc::EPERM) => {
+                Err(std::io::Error::other(format!(
+                    "the sandbox reaches the daemon only by descriptor {fd} ({HANDED}), \
+                     which a launcher closed; keep it open, as Python's subprocess does \
+                     with pass_fds"
+                )))
+            }
+            connected => connected.map(Some),
+        };
     }
     // SAFETY: the byte outlives the call.
     let sent = unsafe { libc::send(fd, [0u8].as_ptr().cast(), 1, libc::MSG_NOSIGNAL) };
@@ -141,6 +152,29 @@ pub fn handed(socket: &Path) -> std::io::Result<Option<std::os::unix::net::UnixS
             Received::Later => continue,
         }
     }
+}
+
+/// Whether `fd` is still the descriptor the daemon hands connections on:
+/// a Unix socket of packets. Once closed, its number may name anything.
+#[cfg(target_os = "linux")]
+fn handing(fd: i32) -> bool {
+    let option = |name| {
+        let mut value: libc::c_int = 0;
+        let mut length = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: an int and its length, for the call's length.
+        let got = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                name,
+                (&mut value as *mut libc::c_int).cast(),
+                &mut length,
+            )
+        };
+        (got == 0).then_some(value)
+    };
+    option(libc::SO_DOMAIN) == Some(libc::AF_UNIX)
+        && option(libc::SO_TYPE) == Some(libc::SOCK_SEQPACKET)
 }
 
 /// Elsewhere a sandbox reaches the bot's own socket by its path.
