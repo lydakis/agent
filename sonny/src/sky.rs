@@ -51,6 +51,9 @@ const LIVE: &[&str] = &[
 ];
 /// How long a spark takes to cross.
 const FLIGHT: Duration = Duration::from_millis(1100);
+/// How long stars take to glide to new places, when the lens or the centre
+/// changes.
+const GLIDE: Duration = Duration::from_millis(800);
 /// How long a commons post's ripple spreads.
 const RIPPLE: Duration = Duration::from_millis(1400);
 /// How long a tool call twinkles.
@@ -169,6 +172,38 @@ impl State {
     }
 }
 
+/// A way of looking at the same agents and events, swapped with Tab: the
+/// colours and marks hold in each, only the grouping and the lines change.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Lens {
+    /// Who made whom, and who talked in the last minute.
+    #[default]
+    Live,
+    /// Who made whom, and who talked in the last hour, the busier a pair
+    /// the denser its trail: where patterns show.
+    Talk,
+    /// Each model in a lead's place, the agents it runs round it.
+    Models,
+}
+
+impl Lens {
+    fn next(self) -> Lens {
+        match self {
+            Lens::Live => Lens::Talk,
+            Lens::Talk => Lens::Models,
+            Lens::Models => Lens::Live,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Lens::Live => "live",
+            Lens::Talk => "talk",
+            Lens::Models => "models",
+        }
+    }
+}
+
 struct Spark {
     from: End,
     to: End,
@@ -198,14 +233,27 @@ struct Agent {
     last: Option<(Instant, String)>,
     /// Who sent its running turn's prompt.
     sender: Option<End>,
+    /// The model it runs.
+    model: String,
     gone: bool,
-    // Laid out:
+    // Laid out: where it is drawn now, gliding from where it was to where
+    // the layout puts it.
     at: (f32, f32),
+    from: (f32, f32),
+    goal: Option<(f32, f32)>,
     angle: f32,
     root: bool,
 }
 
 impl Agent {
+    /// Its model as the models lens groups it.
+    fn model_or_unknown(&self) -> &str {
+        match self.model.as_str() {
+            "" => "unknown",
+            model => model,
+        }
+    }
+
     fn state(&self) -> Option<State> {
         if self.asking || !self.held.is_empty() {
             Some(State::NeedsYou)
@@ -250,8 +298,9 @@ pub struct View {
     calls: VecDeque<Instant>,
     /// Turns already sparked, so a queued prompt's start is not a second.
     sent: HashSet<(String, i64)>,
-    /// The chat log: when, what, and the hue of what needs you or failed.
-    ticker: VecDeque<(Instant, String, Option<Color>)>,
+    /// The chat log: when, what, the hue of what needs you or failed, and
+    /// the agents it is about, so a centred sky keeps only its agent's.
+    ticker: VecDeque<(Instant, String, Option<Color>, Vec<String>)>,
     /// When messages were sent: an hour of it.
     recent: VecDeque<Instant>,
     /// When the view opened: breaths count from it, and the hour's counts
@@ -268,7 +317,27 @@ pub struct View {
     /// Only the sky: no chat log, no counts, no names but what needs the
     /// person or failed.
     pub zen: bool,
+    pub lens: Lens,
+    /// The agent in the middle in the person's place, by name: its own,
+    /// or the label or project it was asked for by.
+    centre: Option<String>,
+    /// The star picked with the arrows, to centre on with Enter.
+    pick: Option<String>,
+    /// Where the person is: the middle, or a ring of a centred sky.
+    person: Glide,
+    /// The models' names and where each sits, in the models lens.
+    groups: Vec<(String, (f32, f32))>,
+    /// When the stars last set off for new places.
+    moved: Option<Instant>,
     down: Option<String>,
+}
+
+/// A place drawn on the way from one to another.
+#[derive(Clone, Copy, Default)]
+struct Glide {
+    at: (f32, f32),
+    from: (f32, f32),
+    goal: (f32, f32),
 }
 
 impl Drop for View {
@@ -308,6 +377,12 @@ impl View {
             paused: false,
             legend: false,
             zen: false,
+            lens: Lens::Live,
+            centre: None,
+            pick: None,
+            person: Glide::default(),
+            groups: Vec::new(),
+            moved: None,
             down: None,
         }
     }
@@ -477,6 +552,11 @@ impl View {
             .map(str::to_owned);
         agent.made_by_id = bot["created_by_id"].as_i64();
         agent.running = bot["running_turn"].as_i64();
+        let model = bot["model"].as_str().unwrap_or_default();
+        if agent.model != model {
+            agent.model = model.to_owned();
+            self.laid = self.laid && self.lens != Lens::Models;
+        }
         Some(at)
     }
 
@@ -590,7 +670,11 @@ impl View {
                     if let End::Agent(by) = from {
                         self.agents[by].last = Some((now, format!("to {to}")));
                     }
-                    self.say(now, format!("{by} → {to}"), None);
+                    let about = match from {
+                        End::Agent(by) => vec![by, at],
+                        _ => vec![at],
+                    };
+                    self.say(now, format!("{by} → {to}"), None, &about);
                 }
             }
             "tool_started" if live => {
@@ -604,7 +688,7 @@ impl View {
                 if tool == crate::asks::TOOL {
                     if self.agents[at].state() != Some(State::NeedsYou) {
                         let said = format!("? {} asks you", self.short(at));
-                        self.say(now, said, Some(NEEDS));
+                        self.say(now, said, Some(NEEDS), &[at]);
                     }
                     self.agents[at].asking = true;
                 }
@@ -612,7 +696,7 @@ impl View {
                     self.agents[at].ripple = Some(now);
                     self.agents[at].last = Some((now, "posted to the commons".into()));
                     let said = format!("{} posted to the commons", self.short(at));
-                    self.say(now, said, None);
+                    self.say(now, said, None, &[at]);
                 }
             }
             // A call waits for the person: one gated for them, or one the
@@ -666,7 +750,7 @@ impl View {
                 if live && agent.failed {
                     agent.last = Some((now, "failed".into()));
                     let said = format!("✗ {} failed", self.short(at));
-                    self.say(now, said, Some(FAILED));
+                    self.say(now, said, Some(FAILED), &[at]);
                 }
                 // The answer to the person flies back to the middle.
                 let agent = &mut self.agents[at];
@@ -720,12 +804,16 @@ impl View {
     fn waits(&mut self, at: usize, waiting: bool, now: Instant) {
         if !waiting && self.agents[at].state() == Some(State::NeedsYou) {
             let said = format!("? {} waits for you", self.short(at));
-            self.say(now, said, Some(NEEDS));
+            self.say(now, said, Some(NEEDS), &[at]);
         }
     }
 
-    fn say(&mut self, now: Instant, text: String, hue: Option<Color>) {
-        self.ticker.push_back((now, text, hue));
+    fn say(&mut self, now: Instant, text: String, hue: Option<Color>, about: &[usize]) {
+        let about = about
+            .iter()
+            .map(|&at| self.agents[at].name.clone())
+            .collect();
+        self.ticker.push_back((now, text, hue, about));
         if self.ticker.len() > LOG {
             self.ticker.pop_front();
         }
@@ -745,15 +833,133 @@ impl View {
         short(&self.agents[at].name)
     }
 
-    /// Lay the agents out as a radial tree: each root's arm as wide as the
-    /// agents under it, leads first, the made agents a ring further out
-    /// for each generation.
-    fn lay(&mut self) {
+    /// Lay the agents out. The list always follows the tree of who made
+    /// whom; the sky follows the lens, or rings by hops round a centred
+    /// agent. Stars already placed glide to their new places, so the eye
+    /// keeps its bearings (Yee et al. 2001).
+    fn lay(&mut self, now: Instant) {
         if self.laid {
             return;
         }
         self.laid = true;
-        self.order.clear();
+        let count = self.agents.len();
+        let (roots, children) = self.tree();
+        let (tree, order) = radial(&roots, &children, count);
+        self.order = order;
+        for agent in &mut self.agents {
+            agent.root = false;
+        }
+        for &root in &roots {
+            self.agents[root].root = true;
+        }
+        self.groups.clear();
+        let mut person = (0.0, 0.0);
+        let places = match (self.centred(), self.lens) {
+            (Some(centre), _) => {
+                // The person is a node too, next to the leads they made.
+                let you = count;
+                let mut near: Vec<Vec<usize>> = vec![Vec::new(); count + 1];
+                let mut link = |a: usize, b: usize| {
+                    if a != b && !near[a].contains(&b) {
+                        near[a].push(b);
+                        near[b].push(a);
+                    }
+                };
+                for (at, kids) in children.iter().enumerate() {
+                    for &kid in kids {
+                        link(at, kid);
+                    }
+                }
+                for &root in &roots {
+                    link(you, root);
+                }
+                for &(_, a, b) in &self.said {
+                    link(a, b);
+                }
+                let name = |at: &usize| match self.agents.get(*at) {
+                    Some(agent) => (agent.name.clone(), 0),
+                    None => (String::new(), 1),
+                };
+                for list in &mut near {
+                    list.sort_by_key(name);
+                }
+                // Breadth first from the centre: each ring one hop further.
+                let mut kids: Vec<Vec<usize>> = vec![Vec::new(); count + 1];
+                let mut seen = vec![false; count + 1];
+                seen[centre] = true;
+                let mut queue = VecDeque::from([centre]);
+                while let Some(at) = queue.pop_front() {
+                    for &next in &near[at] {
+                        if !seen[next] && next >= count || !seen[next] && !self.agents[next].gone {
+                            seen[next] = true;
+                            kids[at].push(next);
+                            queue.push_back(next);
+                        }
+                    }
+                }
+                let (mut places, _) = radial(&kids[centre], &kids, count + 1);
+                places[centre] = Some(((0.0, 0.0), 0.0));
+                if let Some((at, _)) = places[you] {
+                    person = at;
+                }
+                places
+            }
+            (None, Lens::Models) => {
+                let mut models: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+                for (at, agent) in self.agents.iter().enumerate().filter(|(_, a)| !a.gone) {
+                    models.entry(agent.model_or_unknown()).or_default().push(at);
+                }
+                let names: Vec<String> = models.keys().map(|m| (*m).to_owned()).collect();
+                let mut kids: Vec<Vec<usize>> = vec![Vec::new(); count + names.len()];
+                for (n, agents) in models.into_values().enumerate() {
+                    let mut agents = agents;
+                    agents.sort_by_key(|&at| self.agents[at].name.clone());
+                    kids[count + n] = agents;
+                }
+                let groups: Vec<usize> = (count..count + names.len()).collect();
+                let (places, _) = radial(&groups, &kids, count + names.len());
+                for (n, name) in names.into_iter().enumerate() {
+                    if let Some((at, _)) = places[count + n] {
+                        self.groups.push((name, at));
+                    }
+                }
+                places
+            }
+            (None, _) => tree,
+        };
+        let first = self.moved.is_none() && self.agents.iter().all(|a| a.goal.is_none());
+        for (at, agent) in self.agents.iter_mut().enumerate() {
+            let Some(Some((goal, angle))) = places.get(at).copied() else {
+                continue;
+            };
+            agent.from = match agent.goal {
+                Some(_) => agent.at,
+                None => goal,
+            };
+            agent.goal = Some(goal);
+            agent.angle = angle;
+            if agent.from == goal {
+                agent.at = goal;
+            }
+        }
+        self.person.from = self.person.at;
+        self.person.goal = person;
+        if !first {
+            self.moved = Some(now);
+        } else {
+            self.person = Glide {
+                at: person,
+                from: person,
+                goal: person,
+            };
+        }
+        self.glide(now);
+    }
+
+    /// Who made whom: the roots (leads first, then by name) and each
+    /// agent's children. A cycle of makers has no root: its agents are
+    /// roots then.
+    fn tree(&self) -> (Vec<usize>, Vec<Vec<usize>>) {
         let count = self.agents.len();
         let mut children: Vec<Vec<usize>> = vec![Vec::new(); count];
         let mut roots = Vec::new();
@@ -768,103 +974,127 @@ impl View {
                 None => roots.push(at),
             }
         }
-        // A cycle of makers has no root: its agents are roots then.
-        let mut placed = vec![false; count];
         let name = |at: &usize| self.agents[*at].name.clone();
         roots.sort_by_key(|at| (!project::is_lead(&self.agents[*at].name), name(at)));
         for kids in &mut children {
             kids.sort_by_key(name);
         }
-        fn leaves(at: usize, children: &[Vec<usize>], seen: &mut Vec<bool>) -> usize {
-            if seen[at] {
-                return 0;
-            }
-            seen[at] = true;
-            let below: usize = (children[at].iter())
-                .map(|&kid| leaves(kid, children, seen))
-                .sum();
-            below.max(1)
-        }
         let mut seen = vec![false; count];
-        let weights: Vec<usize> = (roots.iter())
-            .map(|&at| leaves(at, &children, &mut seen))
-            .collect();
+        let mut stack = roots.clone();
+        while let Some(at) = stack.pop() {
+            if !std::mem::replace(&mut seen[at], true) {
+                stack.extend(&children[at]);
+            }
+        }
         for (at, agent) in self.agents.iter().enumerate() {
             if !seen[at] && !agent.gone {
                 roots.push(at);
+                let mut stack = vec![at];
+                while let Some(at) = stack.pop() {
+                    if !std::mem::replace(&mut seen[at], true) {
+                        stack.extend(&children[at]);
+                    }
+                }
             }
         }
-        let mut weights = weights;
-        weights.resize(roots.len(), 1);
-        let total: usize = weights.iter().sum::<usize>().max(1);
-        let deep = !children.iter().all(Vec::is_empty);
-        let mut from = -PI / 2.0;
-        for (root, weight) in roots.iter().zip(weights) {
-            let span = TAU * weight as f32 / total as f32;
-            self.place(*root, from, span, 0, deep, &children, &mut placed);
-            self.agents[*root].root = true;
-            from += span;
-        }
-        // The outermost ring reaches the rim, whatever the generations.
-        let far = (self.agents.iter())
-            .filter(|a| !a.gone)
-            .map(|a| a.at.0.hypot(a.at.1))
-            .fold(0.0f32, f32::max);
-        if far > 0.0 {
-            let grow = 0.9 / far;
-            for agent in &mut self.agents {
-                agent.at = (agent.at.0 * grow, agent.at.1 * grow);
+        (roots, children)
+    }
+
+    /// Move each star along its way to its new place, easing in and out.
+    fn glide(&mut self, now: Instant) {
+        let t = self.moved.map_or(1.0, |at| {
+            (now.duration_since(at).as_secs_f32() / GLIDE.as_secs_f32()).min(1.0)
+        });
+        let e = ease(t);
+        let mix = |from: (f32, f32), goal: (f32, f32)| {
+            (
+                from.0 + (goal.0 - from.0) * e,
+                from.1 + (goal.1 - from.1) * e,
+            )
+        };
+        for agent in &mut self.agents {
+            if let Some(goal) = agent.goal {
+                agent.at = mix(agent.from, goal);
             }
+        }
+        self.person.at = mix(self.person.from, self.person.goal);
+    }
+
+    /// The agent in the middle: the one asked for by its name, else by
+    /// its label, else the lead of the project named.
+    fn centred(&self) -> Option<usize> {
+        let want = self.centre.as_deref()?;
+        let lead = format!("{want}.lead");
+        self.agent(want)
+            .or_else(|| {
+                (0..self.agents.len())
+                    .find(|&at| !self.agents[at].gone && short(&self.agents[at].name) == want)
+            })
+            .or_else(|| self.agent(&lead))
+    }
+
+    /// Put the agent asked for in the middle, or the person again.
+    pub fn centre_on(&mut self, name: Option<String>) {
+        if self.centre != name {
+            self.centre = name;
+            self.laid = false;
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn place(
-        &mut self,
-        at: usize,
-        from: f32,
-        span: f32,
-        depth: usize,
-        deep: bool,
-        children: &[Vec<usize>],
-        placed: &mut Vec<bool>,
-    ) {
-        if placed[at] {
-            return;
+    /// A key the sky takes: Tab the next lens, the arrows pick a star,
+    /// Enter centres on it, `?` the legend, `z` zen. Esc lets go of the
+    /// pick, then of the centre; false when there was nothing to let go
+    /// of, or the key isn't the sky's.
+    pub fn press(&mut self, code: ratatui::crossterm::event::KeyCode) -> bool {
+        use ratatui::crossterm::event::KeyCode;
+        match code {
+            KeyCode::Char('?') => self.legend = !self.legend,
+            KeyCode::Char('z') => self.zen = !self.zen,
+            KeyCode::Tab => {
+                self.lens = self.lens.next();
+                self.laid = false;
+            }
+            KeyCode::Up => self.step((0.0, -1.0)),
+            KeyCode::Down => self.step((0.0, 1.0)),
+            KeyCode::Left => self.step((-1.0, 0.0)),
+            KeyCode::Right => self.step((1.0, 0.0)),
+            KeyCode::Enter => match self.pick.take() {
+                Some(pick) => self.centre_on(Some(pick)),
+                None => return false,
+            },
+            KeyCode::Esc if self.pick.is_some() => self.pick = None,
+            KeyCode::Esc if self.centre.is_some() => self.centre_on(None),
+            _ => return false,
         }
-        placed[at] = true;
-        self.order.push((at, depth));
-        let radius = match (deep, depth) {
-            (false, _) => 0.62,
-            (true, 0) => 0.4,
-            (true, depth) => (0.66 + 0.14 * (depth - 1) as f32).min(0.95),
-        };
-        let angle = from + span / 2.0;
-        let agent = &mut self.agents[at];
-        agent.angle = angle;
-        agent.at = (radius * angle.cos(), radius * angle.sin());
-        agent.root = false;
-        let kids = &children[at];
-        if kids.is_empty() {
-            return;
-        }
-        let weights: Vec<f32> = kids
-            .iter()
-            .map(|&kid| weight(kid, children) as f32)
-            .collect();
-        let total: f32 = weights.iter().sum();
-        let mut start = from;
-        for (kid, w) in kids.iter().zip(weights) {
-            let part = span * w / total;
-            self.place(*kid, start, part, depth + 1, deep, children, placed);
-            start += part;
+        true
+    }
+
+    /// Pick the star nearest the picked one, or the middle, that way.
+    fn step(&mut self, way: (f32, f32)) {
+        let from = (self.pick.as_deref())
+            .and_then(|name| self.agent(name))
+            .map_or((0.0, 0.0), |at| self.agents[at].at);
+        let picked = self.pick.as_deref().and_then(|name| self.agent(name));
+        let best = (0..self.agents.len())
+            .filter(|&at| !self.agents[at].gone && Some(at) != picked)
+            .filter_map(|at| {
+                let to = self.agents[at].at;
+                let (dx, dy) = (to.0 - from.0, to.1 - from.1);
+                let along = dx * way.0 + dy * way.1;
+                let across = (dx * way.1 - dy * way.0).abs();
+                (along > 0.01).then_some((along + 2.0 * across, at))
+            })
+            .min_by(|a, b| a.0.total_cmp(&b.0));
+        if let Some((_, at)) = best {
+            self.pick = Some(self.agents[at].name.clone());
         }
     }
 
     /// The sky `cols` wide and `rows` high, what happened under it.
     pub fn card(&mut self, cols: usize, rows: usize) -> Vec<Line<'static>> {
-        self.lay();
         let now = Instant::now();
+        self.lay(now);
+        self.glide(now);
         let cols = cols.max(20);
         let mut lines = Vec::new();
         let shown = self.agents.iter().filter(|a| !a.gone).count();
@@ -903,33 +1133,63 @@ impl View {
             (false, false) => (cols, rows.saturating_sub(TICKER + 3).clamp(8, cols / 2 + 1)),
         };
         let mut sky = Sky::new(sky_cols, sky_rows);
-        // The person in the middle: the place and the word say who.
-        sky.text_at((0.0, 0.0), "you", Style::default().bold());
+        let centre = self.centred();
+        // The person: the place and the word say who. In the middle, or
+        // on a ring when an agent is centred.
+        sky.text_at(self.person.at, "you", Style::default().bold());
         // Who made whom: dotted lines, faint, as all that says how things
-        // stand rather than what happens.
-        for (at, agent) in self.agents.iter().enumerate().filter(|(_, a)| !a.gone) {
-            if let Some(by) = self.maker(at)
-                && !agent.root
-            {
-                sky.line(self.agents[by].at, agent.at, Ink::Faint, 3);
+        // stand rather than what happens. In the models lens none: each
+        // model's agents sit together round its muted name, and lines from
+        // a name to every agent were a hairball.
+        if self.lens != Lens::Models || centre.is_some() {
+            for (at, agent) in self.agents.iter().enumerate().filter(|(_, a)| !a.gone) {
+                if let Some(by) = self.maker(at)
+                    && !agent.root
+                {
+                    sky.line(self.agents[by].at, agent.at, Ink::Faint, 3);
+                }
             }
         }
-        // Who talked in the last minute: a faint trail for each pair, its
-        // dots thinning out as it ages.
-        let mut trails: HashMap<(usize, usize), Instant> = HashMap::new();
+        // Who talked: a faint trail for each pair. Live, the last minute,
+        // its dots thinning out as it ages; in the talk lens the last hour,
+        // denser the more the pair talked, the busiest reaching muted.
+        let span = match self.lens {
+            Lens::Talk => HOUR,
+            _ => TRAIL,
+        };
+        let mut trails: HashMap<(usize, usize), (Instant, usize)> = HashMap::new();
         for &(when, by, to) in self.said.iter().rev() {
-            if now.duration_since(when) > TRAIL {
+            if now.duration_since(when) > span {
                 break;
             }
-            trails.entry((by.min(to), by.max(to))).or_insert(when);
+            trails
+                .entry((by.min(to), by.max(to)))
+                .or_insert((when, 0))
+                .1 += 1;
         }
-        for ((a, b), when) in trails {
+        let busiest = trails.values().map(|&(_, n)| n).max().unwrap_or(1);
+        for ((a, b), (when, n)) in trails {
             if self.agents[a].gone || self.agents[b].gone {
                 continue;
             }
-            let age = now.duration_since(when).as_secs_f32() / TRAIL.as_secs_f32();
+            let (ink, gap) = match self.lens {
+                Lens::Talk => {
+                    // Gaps from 10 dots for one message down to 2.
+                    let share = n as f32 / busiest as f32;
+                    let ink = if share > 0.6 && n >= 4 {
+                        Ink::Muted
+                    } else {
+                        Ink::Faint
+                    };
+                    (ink, 2 + (8.0 * (1.0 - share.sqrt())) as usize)
+                }
+                _ => {
+                    let age = now.duration_since(when).as_secs_f32() / TRAIL.as_secs_f32();
+                    (Ink::Faint, 4 + (age * 8.0) as usize)
+                }
+            };
             let (a, b) = (self.agents[a].at, self.agents[b].at);
-            sky.curve(a, bend(a, b), b, Ink::Faint, 4 + (age * 8.0) as usize);
+            sky.curve(a, bend(a, b), b, ink, gap);
         }
         // Ripples, then sparks, then the stars over them.
         for agent in self.agents.iter().filter(|a| !a.gone) {
@@ -998,10 +1258,19 @@ impl View {
                         .is_some_and(|lit| now.duration_since(lit) < Duration::from_secs(4))
             })
             .collect();
-        // What needs the person is named first, so it is never crowded out.
+        let picked = self.pick.as_deref().and_then(|name| self.agent(name));
+        for at in picked.into_iter().chain(centre) {
+            if !named.contains(&at) {
+                named.push(at);
+            }
+        }
+        // The pick, the centre, then what needs the person, so none is
+        // ever crowded out.
         named.sort_by_key(|&at| {
             let agent = &self.agents[at];
             (
+                Some(at) != picked,
+                Some(at) != centre,
                 agent.state() != Some(State::NeedsYou),
                 !agent.root,
                 (agent.at.0.hypot(agent.at.1) * 100.0) as i32,
@@ -1018,8 +1287,18 @@ impl View {
                 }
                 _ => None,
             };
-            let style = name_style(agent.state(), agent.glow(now));
+            let style = match (Some(at) == picked, Some(at) == centre) {
+                // The pick reversed, as a picker's selection is.
+                (true, _) => Style::default().reversed(),
+                (_, true) => Style::default().bold(),
+                _ => name_style(agent.state(), agent.glow(now)),
+            };
             sky.label(agent.at, mark, &short(&agent.name), style);
+        }
+        if self.lens == Lens::Models && centre.is_none() && !self.zen {
+            for (model, at) in &self.groups {
+                sky.label(*at, None, model, Ink::Muted.style());
+            }
         }
         let drawn = sky.lines();
         if beside {
@@ -1055,12 +1334,16 @@ impl View {
     /// the follow is lost, or nothing has happened yet.
     fn ticked(&self, now: Instant, cols: usize, room: usize, tall: bool) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
-        let shown = self
-            .ticker
+        // Centred, only what the agent in the middle said or was told.
+        let centre = self.centred().map(|at| &self.agents[at].name);
+        let kept: Vec<_> = (self.ticker.iter())
+            .filter(|(.., about)| centre.is_none_or(|name| about.contains(name)))
+            .collect();
+        let shown = kept
             .len()
             .min(room.saturating_sub(usize::from(self.down.is_some())));
-        let entries: Vec<_> = self.ticker.iter().skip(self.ticker.len() - shown).collect();
-        for (n, (at, text, hue)) in entries.iter().enumerate() {
+        let entries = &kept[kept.len() - shown..];
+        for (n, (at, text, hue, _)) in entries.iter().enumerate() {
             let old = shown - 1 - n;
             let fresh = now.duration_since(*at).as_secs_f32();
             let weight = match (tall, old) {
@@ -1093,7 +1376,7 @@ impl View {
                 &format!("Couldn't follow the agents: {why}"),
                 cols,
             )));
-        } else if self.ticker.is_empty() {
+        } else if kept.is_empty() {
             let quiet = if self.live {
                 "Quiet. Messages light up here as they go."
             } else {
@@ -1207,7 +1490,7 @@ impl View {
 
     fn end(&self, end: End) -> (f32, f32) {
         match end {
-            End::Person => (0.0, 0.0),
+            End::Person => self.person.at,
             End::Agent(at) => self.agents[at].at,
             End::Rim(at) => {
                 let angle = self.agents[at].angle;
@@ -1309,6 +1592,20 @@ impl View {
                 spans.push(Span::raw(mark).fg(color));
                 spans.push(Span::raw(format!(" {n} {word}")).dim());
             }
+        }
+        // The lens, when not the live one, and who is in the middle.
+        let mut seen = String::new();
+        match self.lens {
+            Lens::Live => {}
+            Lens::Talk => seen.push_str(" · talk lens: the last hour"),
+            lens => seen.push_str(&format!(" · {} lens", lens.name())),
+        }
+        if let Some(at) = self.centred() {
+            seen.push_str(&format!(" · around {}", self.short(at)));
+        }
+        let used: usize = spans.iter().map(|span| span.content.width()).sum();
+        if !seen.is_empty() && used + seen.width() <= width {
+            spans.push(Span::raw(seen).dim());
         }
         let sent = self.minute(Instant::now());
         let sent = format!(
@@ -1416,6 +1713,74 @@ fn cut(text: &str, room: usize) -> String {
         out.push(ch);
     }
     out + "…"
+}
+
+/// A radial tree of `nodes` nodes: each root's arm as wide as the leaves
+/// under it, the roots on the inner ring, each generation a ring further
+/// out, the outermost reaching the rim. Each node placed gets its place
+/// and its angle; the order is the tree's, each node with its depth.
+#[allow(clippy::type_complexity)]
+fn radial(
+    roots: &[usize],
+    children: &[Vec<usize>],
+    nodes: usize,
+) -> (Vec<Option<((f32, f32), f32)>>, Vec<(usize, usize)>) {
+    let mut places = vec![None; nodes];
+    let mut order = Vec::new();
+    let deep = !children.iter().all(Vec::is_empty);
+    #[allow(clippy::too_many_arguments)]
+    fn place(
+        at: usize,
+        from: f32,
+        span: f32,
+        depth: usize,
+        deep: bool,
+        children: &[Vec<usize>],
+        places: &mut Vec<Option<((f32, f32), f32)>>,
+        order: &mut Vec<(usize, usize)>,
+    ) {
+        if places[at].is_some() {
+            return;
+        }
+        let radius = match (deep, depth) {
+            (false, _) => 0.62,
+            (true, 0) => 0.4,
+            (true, depth) => (0.66 + 0.14 * (depth - 1) as f32).min(0.95),
+        };
+        let angle = from + span / 2.0;
+        places[at] = Some(((radius * angle.cos(), radius * angle.sin()), angle));
+        order.push((at, depth));
+        let kids = &children[at];
+        let weights: Vec<f32> = kids
+            .iter()
+            .map(|&kid| weight(kid, children) as f32)
+            .collect();
+        let total: f32 = weights.iter().sum();
+        let mut start = from;
+        for (kid, w) in kids.iter().zip(weights) {
+            let part = span * w / total;
+            place(*kid, start, part, depth + 1, deep, children, places, order);
+            start += part;
+        }
+    }
+    let weights: Vec<usize> = roots.iter().map(|&root| weight(root, children)).collect();
+    let total: usize = weights.iter().sum::<usize>().max(1);
+    let mut from = -PI / 2.0;
+    for (&root, weight) in roots.iter().zip(weights) {
+        let span = TAU * weight as f32 / total as f32;
+        place(root, from, span, 0, deep, children, &mut places, &mut order);
+        from += span;
+    }
+    let far = (places.iter().flatten())
+        .map(|((x, y), _)| x.hypot(*y))
+        .fold(0.0f32, f32::max);
+    if far > 0.0 {
+        let grow = 0.9 / far;
+        for ((x, y), _) in places.iter_mut().flatten() {
+            (*x, *y) = (*x * grow, *y * grow);
+        }
+    }
+    (places, order)
 }
 
 fn weight(at: usize, children: &[Vec<usize>]) -> usize {
@@ -1784,19 +2149,24 @@ const FRAME: Duration = Duration::from_millis(60);
 /// How long `sonny sky` waits before following a daemon that went again.
 const RETRY: Duration = Duration::from_secs(3);
 /// What the keys do in `sonny sky`.
-const KEYS: &str = "z zen · ? legend · q quit";
+const KEYS: &str = "tab lens · ↑↓←→ pick · z zen · ? legend · q quit";
 
 /// `sonny sky`: the same sky, the whole terminal, on its own, to keep
 /// beside the work as btop is kept: its title and the keys over it, the
 /// counts under it. A daemon that goes is followed again once it is back.
 /// Its follow runs on `runtime`; the drawing and the keys on this thread.
-pub fn watch(runtime: &tokio::runtime::Runtime, socket: PathBuf) -> Result<(), String> {
+pub fn watch(
+    runtime: &tokio::runtime::Runtime,
+    socket: PathBuf,
+    centre: Option<String>,
+) -> Result<(), String> {
     use ratatui::crossterm::{
         cursor, event, execute,
         terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
     };
     let _inside = runtime.enter();
     let mut view = View::open(socket);
+    view.centre_on(centre);
     terminal::enable_raw_mode().map_err(|e| e.to_string())?;
     // The theme's colours, so muted reads as the measured gray it is in
     // the conversation, and `NO_COLOR` is honoured here too.
@@ -1831,13 +2201,9 @@ pub fn watch(runtime: &tokio::runtime::Runtime, socket: PathBuf) -> Result<(), S
                 if let event::Event::Key(key) = event::read().map_err(|e| e.to_string())?
                     && key.kind != event::KeyEventKind::Release
                 {
-                    if quits(&key) {
+                    // Esc lets go of the pick and the centre before it leaves.
+                    if !view.press(key.code) && quits(&key) {
                         return Ok(());
-                    }
-                    match key.code {
-                        event::KeyCode::Char('?') => view.legend = !view.legend,
-                        event::KeyCode::Char('z') => view.zen = !view.zen,
-                        _ => {}
                     }
                 }
             }
@@ -1847,7 +2213,8 @@ pub fn watch(runtime: &tokio::runtime::Runtime, socket: PathBuf) -> Result<(), S
     drawn
 }
 
-/// q, Esc and Ctrl+C leave `sonny sky`.
+/// q, Esc and Ctrl+C leave `sonny sky`, Esc once nothing is picked or
+/// centred.
 fn quits(key: &ratatui::crossterm::event::KeyEvent) -> bool {
     use ratatui::crossterm::event::{KeyCode, KeyModifiers};
     match key.code {
@@ -2132,7 +2499,7 @@ mod tests {
         ]))
         .unwrap();
         view.drain();
-        view.lay();
+        view.lay(Instant::now());
         let radius = |name: &str| {
             let at = view.agents[view.index[name]].at;
             at.0.hypot(at.1)
@@ -2141,6 +2508,59 @@ mod tests {
         assert!(view.agents[view.index["shop.lead"]].root);
         assert!(view.agents[view.index["lone"]].root);
         assert!(!view.agents[view.index["shop.cart"]].root);
+    }
+
+    #[tokio::test]
+    async fn a_centred_agent_sits_in_the_middle_with_rings_by_hops() {
+        use ratatui::crossterm::event::KeyCode;
+        let (mut view, send) = view();
+        send.send(Feed::Roll(vec![
+            json!({"name": "shop.lead", "model": "m1"}),
+            json!({"name": "shop.login", "created_by": "shop.lead", "model": "m2"}),
+            json!({"name": "shop.cart", "created_by": "shop.login", "model": "m2"}),
+            json!({"name": "notes.lead", "model": "m1"}),
+        ]))
+        .unwrap();
+        view.drain();
+        view.card(120, 40);
+        // Asked for by its project, the lead goes to the middle.
+        view.centre_on(Some("shop".into()));
+        view.card(120, 40);
+        view.moved = None;
+        view.glide(Instant::now());
+        let radius = |view: &View, name: &str| {
+            let at = view.agents[view.index[name]].at;
+            at.0.hypot(at.1)
+        };
+        assert!(radius(&view, "shop.lead") < 0.001);
+        // Its maker (the person) and what it made one ring out; two hops,
+        // the next ring.
+        let you = view.person.at.0.hypot(view.person.at.1);
+        assert!((you - radius(&view, "shop.login")).abs() < 0.01);
+        assert!(radius(&view, "shop.cart") > radius(&view, "shop.login") + 0.1);
+        assert!(radius(&view, "notes.lead") > you + 0.1);
+        assert!(view.footer(120).to_string().contains("around shop lead"));
+        // Esc lets go of the centre, then has nothing left to let go of.
+        assert!(view.press(KeyCode::Esc));
+        assert!(view.centred().is_none());
+        assert!(!view.press(KeyCode::Esc));
+        // An arrow picks a star; Enter centres on it.
+        view.card(120, 40);
+        assert!(view.press(KeyCode::Right));
+        let picked = view.pick.clone().expect("a star picked");
+        assert!(view.press(KeyCode::Enter));
+        assert_eq!(view.centre.as_deref(), Some(picked.as_str()));
+        assert!(view.pick.is_none());
+        // The models lens groups by model, its names muted on the sky.
+        view.centre_on(None);
+        assert!(view.press(KeyCode::Tab));
+        assert!(view.press(KeyCode::Tab));
+        assert_eq!(view.lens, Lens::Models);
+        view.card(120, 40);
+        view.moved = None;
+        let sky = text(&view.card(120, 40));
+        assert!(sky.contains("m1") && sky.contains("m2"), "{sky}");
+        assert_eq!(view.groups.len(), 2);
     }
 
     #[tokio::test]

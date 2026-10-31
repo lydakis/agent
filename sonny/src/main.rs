@@ -238,7 +238,7 @@ fn usage() -> String {
      sonny memory ... and sonny trigger ... are what ~/.agent/memory and ~/.agent/trigger\n\
      run, which Sonny writes at each start.\n\
      sonny sky draws every agent on the daemon lighting up as they talk, as /sky does,\n\
-     on its own in the whole terminal.\n\
+     on its own in the whole terminal; --center NAME puts an agent in the middle.\n\
      sonny lookout watches every lead on the daemon, tells it what happens in its tasks\n\
      and answers its agents' calls of Sonny's tools; Sonny starts one.\n\
      sonny agent ARGS... runs Sonny's own `agent` with ARGS, whatever `agent` is on PATH.\n\
@@ -844,16 +844,22 @@ fn main() -> std::process::ExitCode {
     }
 }
 
-/// `sonny sky [--store PATH] [--socket PATH]`: `/sky` on its own,
-/// the whole terminal, until q.
+/// `sonny sky [--center NAME] [--store PATH] [--socket PATH]`: `/sky` on
+/// its own, the whole terminal, until q; centred on an agent, by its name,
+/// its label or its project, when asked.
 fn sky_cli(args: &[String]) -> Result<(), String> {
-    let (mut store, mut socket) = (None, None);
+    let (mut store, mut socket, mut centre) = (None, None, None);
     let mut args = args.iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--store" => store = args.next().map(PathBuf::from),
             "--socket" => socket = args.next().map(PathBuf::from),
-            _ => return Err("usage: sonny sky [--store PATH] [--socket PATH]".into()),
+            "--center" | "--centre" => centre = args.next().cloned(),
+            _ => {
+                return Err(
+                    "usage: sonny sky [--center NAME] [--store PATH] [--socket PATH]".into(),
+                );
+            }
         }
     }
     let (_, socket) = daemon_paths(store, socket)?;
@@ -862,7 +868,7 @@ fn sky_cli(args: &[String]) -> Result<(), String> {
         .enable_all()
         .build()
         .map_err(|e| e.to_string())?;
-    sky::watch(&runtime, socket)
+    sky::watch(&runtime, socket, centre)
 }
 
 async fn run() -> Result<(), String> {
@@ -7413,23 +7419,24 @@ impl App {
             if self.pane_keys {
                 match key.code {
                     // Back to the margin from what is over it; the margin closed.
-                    KeyCode::Esc => self.close_pane(true),
-                    // `/sky` shows what its marks mean, or the ticker again.
-                    KeyCode::Char('?')
-                        if pane.is_card()
-                            && let Some(view) =
-                                self.watch.as_mut().and_then(|w| w.sky.as_mut()) =>
+                    KeyCode::Esc
+                        if !(pane.is_card()
+                            && self
+                                .watch
+                                .as_mut()
+                                .and_then(|w| w.sky.as_mut())
+                                .is_some_and(|view| view.press(KeyCode::Esc))) =>
                     {
-                        view.legend = !view.legend
+                        self.close_pane(true)
                     }
-                    // `/sky` alone: no chat log, no counts, few names.
-                    KeyCode::Char('z')
-                        if pane.is_card()
-                            && let Some(view) =
-                                self.watch.as_mut().and_then(|w| w.sky.as_mut()) =>
-                    {
-                        view.zen = !view.zen
-                    }
+                    KeyCode::Esc => {}
+                    // `/sky`'s own keys: its legend, zen, the lenses on Tab,
+                    // a star picked and centred on; Esc lets go of the pick
+                    // and the centre before it closes the pane.
+                    _ if pane.is_card()
+                        && !switches(key)
+                        && let Some(view) = self.watch.as_mut().and_then(|w| w.sky.as_mut())
+                        && view.press(key.code) => {}
                     // `/status` lists the resolved tasks, or only counts them.
                     KeyCode::Char('r')
                         if pane.is_card()
@@ -10431,7 +10438,7 @@ fn over(frame: &mut ratatui::Frame, rows: Vec<Line<'static>>, below: ratatui::la
 
 /// What the pane's title row says the keys do on `/status`.
 const STATUS_KEYS: &str = "esc close";
-const SKY_KEYS: &str = "z zen · ? legend · esc close";
+const SKY_KEYS: &str = "tab lens · ↑↓←→ pick · z zen · ? legend · esc close";
 
 /// What the title row says the keys do on `/status` itself.
 const PICK_KEYS: &str = "↑↓ pick · enter open · esc close";
