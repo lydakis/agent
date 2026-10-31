@@ -5,7 +5,7 @@
 //! labels need not be unique. Checked against rex 0.0.1792787366 (API rev 7)
 //! for `ls`, `new`, `split`, `block ls` and `block close`; `run`'s output is
 //! read the way `split`'s is.
-use crate::mux::{Backend, Block, Place, Places};
+use crate::mux::{Backend, Block, Heard, Place, Places, Stream, Watch};
 use serde_json::Value;
 use std::{
     collections::HashMap,
@@ -27,6 +27,23 @@ pub fn find() -> Option<PathBuf> {
             .find(|rex| rex.is_file())
     });
     on_path.or_else(|| Path::new(MAC_APP).is_file().then(|| PathBuf::from(MAC_APP)))
+}
+
+/// What a line of `rex events -s SESSION --json` says. A session's event
+/// comes wrapped in a `session_event`; a terminal's, once more, in a
+/// `block_event`, which moves no block, as focus and clients coming and
+/// going don't. Anything else may.
+fn heard(line: &Value) -> Heard {
+    match line["payload"]["event"]["type"].as_str() {
+        Some(
+            "block_event"
+            | "active_window_changed"
+            | "client_connected"
+            | "client_disconnected"
+            | "client_connection_changed",
+        ) => Heard::Same,
+        _ => Heard::Changed,
+    }
 }
 
 pub struct Rex {
@@ -273,6 +290,17 @@ impl Backend for Rex {
         }
     }
 
+    fn watch(&self) -> Option<Watch> {
+        let mut command = Command::new(&self.bin);
+        (command.env_remove("REX_SESSION").env_remove("REX_BLOCK"))
+            .args(&self.host)
+            .args(["events", "-s", &self.session, "--json"]);
+        Some(Watch {
+            from: Stream::Command(command),
+            heard: Box::new(heard),
+        })
+    }
+
     /// Where each block sits, by label: its tab, counted from 1, and in a
     /// split, its side of its neighbour (`right of`, `below`, … a label).
     fn places(&self) -> Places {
@@ -340,6 +368,20 @@ fn sides_of(node: &Value, sides: &mut HashMap<String, (&'static str, String)>) {
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn rex_news_of_a_terminal_or_focus_moves_no_block() {
+        use crate::mux::Heard;
+        let event = |kind: &str| {
+            serde_json::json!({"type": "session_event", "payload": {
+                "session_id": "session:01", "event": {"type": kind, "payload": {}}}})
+        };
+        assert_eq!(super::heard(&event("block_event")), Heard::Same);
+        assert_eq!(super::heard(&event("active_window_changed")), Heard::Same);
+        for kind in ["window_created", "block_closed", "session_view_changed"] {
+            assert_eq!(super::heard(&event(kind)), Heard::Changed);
+        }
+    }
 
     /// A stand-in rex, over a JSON file of sessions and their blocks, that
     /// logs each call it gets.

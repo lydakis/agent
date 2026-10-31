@@ -11,7 +11,7 @@
 //! cmux shows what Sonny is doing without any of this: the program status
 //! Sonny writes to its terminal (OSC 7501) is the workspace's status row,
 //! and its notifications (OSC 777) ring the pane they came from.
-use crate::mux::{Backend, Block, Place, Places};
+use crate::mux::{Backend, Block, Heard, Place, Places, Stream, Watch};
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
@@ -193,6 +193,15 @@ impl Resume {
             .args(["surface", "resume", "clear", "--surface", &self.surface])
             .status()
             .is_ok_and(|status| status.success())
+    }
+}
+
+/// What a line of `cmux events` says: an event, or its stream's `ack` or
+/// `heartbeat`.
+fn heard(line: &Value) -> Heard {
+    match line["type"].as_str() {
+        Some("event") => Heard::Changed,
+        _ => Heard::Same,
     }
 }
 
@@ -431,6 +440,21 @@ impl Backend for Cmux {
         }
     }
 
+    /// cmux's heartbeats keep the stream from outliving Sonny: the first
+    /// one written after it is gone ends the command.
+    fn watch(&self) -> Option<Watch> {
+        let mut command = Command::new(&self.bin);
+        for name in PLACE_VARS {
+            command.env_remove(name);
+        }
+        command.args(["events", "--category", "workspace"]);
+        command.args(["--category", "pane", "--category", "surface"]);
+        Some(Watch {
+            from: Stream::Command(command),
+            heard: Box::new(heard),
+        })
+    }
+
     /// Where each tab sits, by label: its number in its pane, and when the
     /// workspace is split, which side of the first other pane its pane is.
     fn places(&self) -> Places {
@@ -504,6 +528,14 @@ fn side_of(frame: &Value, other: &Value) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cmux_news_is_its_events_not_its_heartbeats() {
+        assert_eq!(heard(&json!({"type": "ack", "version": 1})), Heard::Same);
+        assert_eq!(heard(&json!({"type": "heartbeat"})), Heard::Same);
+        let closed = json!({"type": "event", "name": "surface.closed", "category": "surface"});
+        assert_eq!(heard(&closed), Heard::Changed);
+    }
     use crate::mux::Layout;
 
     /// A stand-in cmux over a JSON file of workspaces, panes and tabs, that

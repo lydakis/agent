@@ -3,8 +3,8 @@
 //! labelled with each bot's name. Every call goes through the `herdr` CLI,
 //! which prints the socket API's JSON reply; ids are kept because labels
 //! need not be unique. Written against herdr 0.9.5's CLI and API schema.
-use crate::mux::{Backend, Block, Place, Places};
-use serde_json::Value;
+use crate::mux::{Backend, Block, Heard, Place, Places, Stream, Watch};
+use serde_json::{Value, json};
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
@@ -267,6 +267,32 @@ fn run(bin: &Path, args: &[&str], limit: Duration) -> bool {
                 return false;
             }
         }
+    }
+}
+
+/// The events that may move, label or end a pane: `pane.updated` says a
+/// pane was renamed, among others.
+const CHANGES: [&str; 10] = [
+    "tab.created",
+    "tab.closed",
+    "tab.moved",
+    "pane.created",
+    "pane.closed",
+    "pane.updated",
+    "pane.moved",
+    "pane.exited",
+    "layout.updated",
+    "workspace.closed",
+];
+
+/// What a line of an `events.subscribe` stream says: the reply that it
+/// started, an event, or an error, as when it fell behind (`events_lost`),
+/// after which Herdr closes it.
+fn heard(line: &Value) -> Heard {
+    match (line.get("error"), line.get("result")) {
+        (Some(_), _) => Heard::Over,
+        (None, Some(_)) => Heard::Same,
+        (None, None) => Heard::Changed,
     }
 }
 
@@ -539,6 +565,21 @@ impl Backend for Herdr {
         }
     }
 
+    /// Herdr's CLI has no stream; its socket does, and Herdr names it in
+    /// every pane it runs, as in the one Sonny runs in.
+    fn watch(&self) -> Option<Watch> {
+        let socket = std::env::var_os("HERDR_SOCKET_PATH").filter(|s| !s.is_empty())?;
+        let ask = json!({
+            "id": "sonny-layout",
+            "method": "events.subscribe",
+            "params": {"subscriptions": CHANGES.map(|kind| json!({"type": kind}))},
+        });
+        Some(Watch {
+            from: Stream::Socket(socket.into(), ask.to_string()),
+            heard: Box::new(heard),
+        })
+    }
+
     /// Where each pane sits, by label: its tab's number, and beside the
     /// tab's first other pane, which side of it.
     fn places(&self) -> Places {
@@ -611,6 +652,16 @@ fn side_of(rect: &Value, other: &Value) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn herdr_news_starts_with_a_reply_and_ends_on_an_error() {
+        let started = json!({"id": "sonny-layout", "result": {"type": "subscription_started"}});
+        let event = json!({"event": "tab_created", "data": {}});
+        let lost = json!({"id": "sonny-layout", "error": {"code": "events_lost"}});
+        assert_eq!(heard(&started), Heard::Same);
+        assert_eq!(heard(&event), Heard::Changed);
+        assert_eq!(heard(&lost), Heard::Over);
+    }
     use crate::mux::{Layout, Placement};
     use serde_json::json;
 
