@@ -1057,7 +1057,7 @@ another changes nothing and answers the first with `changed: false`.
 the pause it lifted, or null when none held, and who lifted it (`by`, 1 to
 128 bytes, as `pause` takes it); what waited,
 and the turns the pause parked, start as capacity allows. Time parked by a
-pause is not counted in `paced_ms`. Protocol 32 parks running turns on a
+pause is not counted in `paced_ms`. Protocol 33 parks running turns on a
 pull; before it, they ended `interrupted`. A
 sandboxed bot's own socket refuses it with `not_permitted`, so a command
 left running in a sandbox cannot let the line go on. Each
