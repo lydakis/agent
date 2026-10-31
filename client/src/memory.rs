@@ -1057,6 +1057,7 @@ fn noted(root: &Path, caller: Option<&str>, path: &Path, now: Option<&str>) -> R
 /// their folders and commit them: how many facts, and each folder whose
 /// index is now past the limit (the cleanup's removals had made room for
 /// saves the revert brings back beside). Nothing saved is dropped to fit.
+/// The caller holds every folder's lock.
 fn put_back(root: &Path) -> Result<(usize, Vec<PathBuf>), String> {
     let others = root.join(OTHERS);
     let Ok(listed) = std::fs::read_to_string(&others) else {
@@ -1084,9 +1085,10 @@ fn put_back(root: &Path) -> Result<(usize, Vec<PathBuf>), String> {
     for (path, text) in &last {
         let path = root.join(path);
         let Some(dir) = path.parent() else { continue };
-        let _lock = lock(dir)?;
         match text {
-            Some(text) => write(&path, text)?,
+            Some(text) => std::fs::create_dir_all(dir)
+                .map_err(|e| format!("memory_failed: {}: {e}", dir.display()))
+                .and_then(|()| write(&path, text))?,
             None => match std::fs::remove_file(&path) {
                 Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
                     return Err(format!("memory_failed: {}: {e}", path.display()));
@@ -1100,7 +1102,6 @@ fn put_back(root: &Path) -> Result<(usize, Vec<PathBuf>), String> {
     }
     let mut full = Vec::new();
     for dir in &dirs {
-        let _lock = lock(dir)?;
         let index = render_index(dir, &facts(dir)?);
         if index.len() > LIMIT {
             full.push(dir.clone());
@@ -1136,6 +1137,16 @@ fn cleanup_finish(root: &Path) -> Result<Value, String> {
             state.display()
         ));
     };
+    // Every folder stays locked until the cleanup is done, so no save or
+    // removal lands between its commit, its revert and the put-back of
+    // what others changed: theirs wait, and come after. In one order,
+    // since another finish takes them all too.
+    let mut dirs = scopes(root)?;
+    dirs.sort();
+    let _locks = dirs
+        .iter()
+        .map(|dir| lock(dir))
+        .collect::<Result<Vec<_>, _>>()?;
     // A file that is not a fact keeps the cleanup open until it is fixed.
     let after = all_facts(root)?;
     git(root, &["add", "-A"])?;
