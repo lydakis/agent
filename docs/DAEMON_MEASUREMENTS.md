@@ -6429,6 +6429,43 @@ container's four cores busy encoding and sending 132,000 events beside
 the probe. The history flood, which this change
 does not touch, is the control and holds still.
 
+## Lasting processes under one cap, terminals killed whole (#562)
+
+Terminals and detached commands now share one `--max-lasting` cap. A
+terminal takes its permit before it spawns. A kill sweeps the command's
+whole session, and a terminal read holds back a secret field's value
+until it ends. The Perf workflow's matched screen, base main d617c75
+against the PR head e58304f, on the GitHub runner (2026-10-31):
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 46.117 | 45.963 | -0.3% |
+| admission | burst submit p99, ms | 6.528 | 6.343 | -2.8% |
+| completion | release to terminal p99, ms | 17.337 | 17.419 | +0.5% |
+| footprint | idle RSS, MiB | 20.07 | 20.137 | +0.3% |
+| footprint | per idle bot, KiB | 1.53 | 1.404 | -8.2% |
+| footprint | RSS after a turn each, MiB | 27.799 | 27.979 | +0.6% |
+| footprint | CPU per turn, ms | 1.625 | 1.622 | -0.2% |
+| lifecycle | CPU, s | 1.395 | 1.375 | -1.4% |
+| lifecycle | p95 turn, ms | 582.885 | 582.713 | -0.0% |
+| lifecycle | peak RSS, MiB | 26.797 | 26.783 | -0.1% |
+
+Store jobs per turn held at about 7.5. These benches run no terminal, so
+the terminal read itself was timed separately, in a release build on a
+4-core Linux container. Three credentials and three secret fields were
+set, and each read decoded, held back and redacted a buffer the way a
+`write_stdin` read does. Two alternating rounds:
+
+| Read | Base, µs | Head, µs |
+| --- | ---: | ---: |
+| 64 KiB of `ls -l` lines, ending in a prompt | 822 / 801 | 818 / 791 |
+| one 26-byte line | 1.41 / 1.41 | 1.55 / 1.42 |
+
+The field scan looks at the last 4 KiB at most, and the copy of the
+opening covers only a field's name and separator, so the cost of a read
+stays with the redaction it already did. The session sweep runs once per
+terminal or detached command, at its end, off the runtime thread.
+
 ## Request bytes read on credit
 
 `bench/ingress_credits.py`: 400 clients connect to one socket daemon and each
