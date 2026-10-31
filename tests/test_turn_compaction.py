@@ -62,6 +62,43 @@ class TurnCompactionTests(ModelFixture):
             self.assertEqual(asked[:len(answered)], answered)
             self.assertLessEqual(len(asked) - len(answered), 1)
 
+    def test_a_message_sent_to_the_turn_stays_whole_after_its_prompt_once_summarized(self):
+        # A correction steered into a long turn is covered by the cuts that
+        # follow. Each later request carries it verbatim right after the
+        # prompt, so the prompt never reads as the newer instruction, and
+        # the summary does not stand in for it.
+        client = self.client(tools='shell,read', settings={'context_bytes': 24576})
+        client.request('create', bot='Bob', workspace=str(self.path), tools=['shell', 'read'],
+                       compaction_instructions='Summarize.')
+        turn = client.request('submit', bot='Bob', request_id='1', prompt='long:40')['result']['turn']
+        client.receive(lambda m: m.get('event') == 'tool_started' and m.get('turn') == turn
+                       and m.get('data', {}).get('call_id') == 'long-3')
+        correction = 'steer: round half to even instead'
+        steer = client.request('submit', bot='Bob', request_id='s', prompt=correction,
+                               delivery='steer', expected_turn=turn)['result']['turn']
+        ended = client.finished(turn, timeout=30)
+        self.assertEqual(ended['data']['status'], 'completed', ended)
+        self.assertEqual(client.finished(steer)['data']['status'], 'steered')
+        events = all_events(client, 'Bob')
+        compacted = [e['data'] for e in events if e['event'] == 'compacted']
+        self.assertGreaterEqual(len(compacted), 2)
+        self.assertTrue(all(c['pinned'] for c in compacted))
+        kept = [c for c in compacted if c['pinned_messages']]
+        self.assertTrue(kept)
+        # Once a cut covers it, every cut keeps the same message.
+        self.assertEqual(compacted[compacted.index(kept[0]):], kept)
+        self.assertTrue(all(c['pinned_messages'] == kept[0]['pinned_messages'] for c in kept))
+        texts = lambda r: [i['content'][0]['text'] for i in r['input'] if i.get('role') == 'user']
+        work = [r for r in drain(self.model) if not is_summary(r)]
+        self.assertTrue(all(encoded(r['input']) <= 24576 for r in work))
+        after = [r for r in work if 'covering the start of turn 1]' in texts(r)[0]]
+        self.assertTrue(after)
+        last = texts(after[-1])
+        prompt = last.index('long:40')
+        self.assertEqual(last[prompt:prompt + 2], ['long:40', correction])
+        self.assertEqual(last.count(correction), 1)
+        self.assertNotIn(correction, last[0])
+
     def test_a_summary_inside_a_turn_runs_beside_its_calls(self):
         # Each summary takes a second. Inside the turn, it runs beside the
         # call its boundary sends, with the view as it is, and is installed

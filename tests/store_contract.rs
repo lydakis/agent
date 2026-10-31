@@ -12965,6 +12965,82 @@ fn a_pinned_prompt_under_the_floor_counts_as_its_stub() {
 }
 
 #[test]
+fn a_cut_s_kept_pictures_count_toward_the_picture_bound() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    converse(&mut db, "Bob", 1);
+    let look = |delivery| TurnOptions {
+        delivery,
+        images: vec![noise(40); 20],
+        ..TurnOptions::default()
+    };
+    let turn = db
+        .begin(
+            "Bob",
+            "r2",
+            "long task",
+            true,
+            &look(Delivery::default()),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let prompt = db.inspect("Bob").unwrap().head.unwrap();
+    exchange(&mut db, turn, "c0", &lines(0, 50));
+    db.window("Bob", i64::MAX, i64::MAX).unwrap().unwrap();
+    db.begin(
+        "Bob",
+        "s",
+        "this too",
+        true,
+        &look(Delivery::Steer),
+        allow_provider,
+    )
+    .unwrap();
+    db.absorb(
+        turn,
+        None,
+        8 << 20,
+        4096,
+        ContextUsage::default(),
+        false,
+        true,
+    )
+    .unwrap();
+    let steer = db.inspect("Bob").unwrap().head.unwrap();
+    for n in 1..6 {
+        exchange(&mut db, turn, &format!("c{n}"), &lines(n, 50));
+    }
+    let plan = compaction_plan(&db, "Bob", 1, 64 << 10, 256)
+        .unwrap()
+        .unwrap();
+    assert_eq!(plan.pinned, Some(prompt));
+    let limit = ContextUsage {
+        bytes: 64 << 10,
+        items: 256,
+    };
+    db.compact("Bob", &plan, "summary", None, 0, limit, Value::Null)
+        .unwrap();
+    let window = db.window("Bob", 64 << 10, 256).unwrap().unwrap();
+    assert_eq!(&window.ids[..2], &[prompt, steer]);
+    assert_eq!(window.pictures, 40);
+    // The tail has none; the prompt's and the steer's are past the bound,
+    // and any floor in the tail takes them.
+    let plan = db
+        .picture_elision_plan("Bob", 30, i64::MAX)
+        .unwrap()
+        .unwrap();
+    db.elide("Bob", &plan).unwrap();
+    let window = db.window("Bob", 64 << 10, 256).unwrap().unwrap();
+    assert_eq!(window.pictures, 0);
+    assert!(
+        db.picture_elision_plan("Bob", 30, i64::MAX)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
 fn usage_sums_turns_by_bot_model_and_bucket_from_where_each_started() {
     let path = std::env::temp_dir().join(format!("agent-usage-{}.sqlite", std::process::id()));
     let _ = std::fs::remove_file(&path);

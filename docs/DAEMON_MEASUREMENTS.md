@@ -6033,3 +6033,31 @@ difference of about a third of a KiB across runs of the same size, within
 what earlier screens moved by (#447 measured 1.40 and 1.45). The benches
 run standard bots, so the new path costs one match per call; a fast
 Anthropic bot's key is one short string built per call.
+
+## Messages sent to a turn stay whole after a cut (#479)
+
+Building a window after a cut inside a turn now reads the messages the cut
+keeps beside its prompt (`pins`, by its compaction, indexed) and their
+total since the summary, and a turn's usage adds their bytes. A window with
+no cut inside a turn, which is every bench's, runs neither read. The Perf
+workflow's matched screen, base main 7ae53d8 against the PR head 82161f4,
+on the GitHub runner (2026-10-31):
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 39.948 | 40.457 | +1.3% |
+| admission | burst submit p99, ms | 6.266 | 6.188 | -1.2% |
+| completion | release to terminal p99, ms | 13.804 | 13.78 | -0.2% |
+| footprint | idle RSS, MiB | 19.102 | 19.236 | +0.7% |
+| footprint | per idle bot, KiB | 1.472 | 1.46 | -0.8% |
+| footprint | RSS after a turn each, MiB | 27.438 | 27.547 | +0.4% |
+| footprint | CPU per turn, ms | 1.271 | 1.287 | +1.2% |
+| lifecycle | CPU, s | 1.15 | 1.135 | -1.3% |
+| lifecycle | p95 turn, ms | 578.239 | 578.803 | +0.1% |
+| lifecycle | peak RSS, MiB | 24.805 | 25.504 | +2.8% |
+
+Store jobs per turn did not change (about 7.5 on both), and nothing passed
+the gate's 15% in the direction that costs. The later head that counts the
+kept pictures toward a request's picture bound adds one indexed read to
+picture elision only, which runs when a request carries too many pictures,
+never in these benches.
