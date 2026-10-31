@@ -338,7 +338,7 @@ fn sent(dir: &Path) -> Vec<Value> {
     load(dir).0
 }
 
-/// How many agents took a turn in the last week, as the last invite sent
+/// How many agents took a turn in the last week, as the last new thread
 /// counted them; 0 before any was.
 fn agents(dir: &Path) -> u64 {
     (json_file(&dir.join(INVITES)).get("agents"))
@@ -364,6 +364,22 @@ fn counted(dir: &Path, agents: u64) {
     };
     let (sent, count) = load(dir);
     write(dir, &sent, count, agents);
+}
+
+/// Counts again the agents that took a turn in the last week, before a
+/// new thread takes one of the day's invites, so the day's allowance
+/// follows the agents there are now, even once the last count's ran out.
+/// Without the daemon the last count stands.
+pub async fn recount(home: &Path) {
+    let Ok((_, socket)) = crate::daemon_paths(None, None) else {
+        return;
+    };
+    let Ok((client, _events)) = agent_client::Client::connect(&socket).await else {
+        return;
+    };
+    if let Some(agents) = active(&client).await {
+        counted(&dir(home), agents);
+    }
 }
 
 /// How many agents took a turn in the last week, from the daemon's usage:
@@ -639,10 +655,6 @@ pub async fn invite(home: &Path, started: &Value, author: &str, invite: &Value) 
     let invited = async {
         let (_, socket) = crate::daemon_paths(None, None).ok()?;
         let (client, _events) = agent_client::Client::connect(&socket).await.ok()?;
-        // The next invite's allowance follows the agents there are now.
-        if let Some(agents) = active(&client).await {
-            counted(&dir(home), agents);
-        }
         if let Ok(turn) = std::env::var("AGENT_TURN") {
             let turn: i64 = turn.parse().ok()?;
             // Someone who steered it there, a person or an agent, is behind it.
