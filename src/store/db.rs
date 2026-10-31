@@ -1480,9 +1480,8 @@ pub struct Database {
     files_gone: Vec<String>,
 }
 
-/// A pause's columns, as `pause_row` reads them.
-const PAUSE_COLUMNS: &str = "id,reason,pulled_by,at_ms,parked,resumed_by,resumed_ms";
-/// A pause as clients read it: `parked` holds the agents whose running turns
+/// A pause as clients read it, from its columns in the order
+/// `id,reason,pulled_by,at_ms,parked,resumed_by,resumed_ms`: `parked` holds the agents whose running turns
 /// it parked (`bots`, the first of them, and `total`); a lifted one also says
 /// who lifted it and when.
 fn pause_row(r: &rusqlite::Row) -> rusqlite::Result<Value> {
@@ -4605,9 +4604,9 @@ impl Database {
     pub fn pause(&self) -> Result<Option<Value>> {
         Ok(self
             .conn
-            .prepare_cached(&format!(
-                "SELECT {PAUSE_COLUMNS} FROM pauses WHERE resumed_ms IS NULL"
-            ))?
+            .prepare_cached(
+                "SELECT id,reason,pulled_by,at_ms,parked,resumed_by,resumed_ms FROM pauses WHERE resumed_ms IS NULL",
+            )?
             .query_row([], pause_row)
             .optional()?)
     }
@@ -4637,10 +4636,10 @@ impl Database {
     pub fn remove_pause(&mut self, by: Option<&str>, at_ms: i64) -> Result<Option<Value>> {
         Ok(self
             .conn
-            .prepare_cached(&format!(
+            .prepare_cached(
                 "UPDATE pauses SET resumed_by=?1,resumed_ms=?2 WHERE resumed_ms IS NULL
-                 RETURNING {PAUSE_COLUMNS}"
-            ))?
+                 RETURNING id,reason,pulled_by,at_ms,parked,resumed_by,resumed_ms",
+            )?
             .query_row(params![by, at_ms], pause_row)
             .optional()?)
     }
@@ -4660,10 +4659,11 @@ impl Database {
                 "limit must be 1 to 256, after 0 or more and before 1 or more",
             );
         }
-        let order = if newest { "DESC" } else { "ASC" };
-        let mut statement = self.conn.prepare_cached(&format!(
-            "SELECT {PAUSE_COLUMNS} FROM pauses WHERE id>?1 AND id<?2 ORDER BY id {order} LIMIT ?3"
-        ))?;
+        let mut statement = self.conn.prepare_cached(if newest {
+            "SELECT id,reason,pulled_by,at_ms,parked,resumed_by,resumed_ms FROM pauses WHERE id>?1 AND id<?2 ORDER BY id DESC LIMIT ?3"
+        } else {
+            "SELECT id,reason,pulled_by,at_ms,parked,resumed_by,resumed_ms FROM pauses WHERE id>?1 AND id<?2 ORDER BY id LIMIT ?3"
+        })?;
         let rows = statement.query_map(
             params![after, before.unwrap_or(i64::MAX), (limit + 1) as i64],
             pause_row,
