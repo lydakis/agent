@@ -10631,6 +10631,55 @@ fn a_result_s_text_parts_elide_together() {
 }
 
 #[test]
+fn a_custom_tool_s_pictures_are_read_without_their_bytes() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let turn = db
+        .begin(
+            "Bob",
+            "r1",
+            "task",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let call = ToolCall {
+        custom: true,
+        name: "shot".into(),
+        call_id: "c0".into(),
+        arguments: "page".into(),
+    };
+    let item = json!({"type":"custom_tool_call","call_id":"c0","name":"shot","input":"page"});
+    db.append(
+        turn,
+        vec![serde_json::to_vec(&item).unwrap().into()],
+        std::slice::from_ref(&call),
+        None,
+    )
+    .unwrap();
+    db.tool_start(turn, &call).unwrap();
+    let data = "A".repeat(4096);
+    let outcome = Outcome {
+        parts: vec![agent_runtime::codec::Part::Image(
+            agent_runtime::codec::Image {
+                media_type: "image/png".into(),
+                data: data.clone(),
+            },
+        )],
+        ..result("a page")
+    };
+    let (_, entry) = db.tool_finish(turn, "c0", &outcome).unwrap();
+    let read = read_item(&db, "Bob", entry["data"]["node"].as_i64().unwrap()).unwrap();
+    assert_eq!(read["type"], "custom_tool_call_output");
+    assert_eq!(
+        read["output"][1],
+        json!({"type":"input_image","image_url":"data:image/png;base64,","omitted_bytes":data.len()})
+    );
+}
+
+#[test]
 fn schema_29_adds_elision_without_rewriting_stored_results() {
     let path = std::env::temp_dir().join(format!("agent-stubs-{}.sqlite", std::process::id()));
     let _ = std::fs::remove_file(&path);

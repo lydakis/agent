@@ -10509,7 +10509,7 @@ THEN CASE WHEN json_extract(CAST(item AS TEXT),'$.role')='user' AND json_type(CA
                 '$.omitted_bytes',length(json_extract(b.value,'$.source.data')))
             ELSE json(b.value) END END)
         FROM json_each(CAST(item AS TEXT),'$.content') AS b)) AS BLOB)
-    WHEN json_extract(CAST(item AS TEXT),'$.type')='function_call_output' AND json_type(CAST(item AS TEXT),'$.output')='array'
+    WHEN json_extract(CAST(item AS TEXT),'$.type') IN ('function_call_output','custom_tool_call_output') AND json_type(CAST(item AS TEXT),'$.output')='array'
     THEN CAST(json_set(CAST(item AS TEXT),'$.output',(SELECT json_group_array(CASE
         WHEN json_extract(p.value,'$.type')='input_image' AND json_extract(p.value,'$.image_url') LIKE 'data:%'
         THEN json_set(p.value,'$.image_url',substr(json_extract(p.value,'$.image_url'),1,instr(json_extract(p.value,'$.image_url'),',')),
