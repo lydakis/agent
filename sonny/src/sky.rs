@@ -446,15 +446,18 @@ impl Replay {
         }
     }
 
-    /// Gives `name` its new model wherever a step back would seat it from.
-    fn remodel(&mut self, name: &str, model: &str) {
+    /// Gives agents their new models, by name, wherever a step back would
+    /// seat them from: one pass over the cast and the tape, however many.
+    fn remodel(&mut self, models: &HashMap<&str, &str>) {
+        let new = |name: &Value| name.as_str().and_then(|name| models.get(name).copied());
         for bot in &mut self.cast {
-            if bot["name"] == name {
+            if let Some(model) = new(&bot["name"]) {
                 bot["model"] = json!(model);
             }
         }
         for event in &mut self.tape {
-            if event["bot"] == name && matches!(event["event"].as_str(), Some("created" | "forked"))
+            if matches!(event["event"].as_str(), Some("created" | "forked"))
+                && let Some(model) = new(&event["bot"])
             {
                 event["data"]["model"] = json!(model);
             }
@@ -628,13 +631,10 @@ impl View {
                     // The listing's model is each agent's model now, which
                     // no event says again: an agent made in the replay
                     // takes it too, from the roll read once the tape is in.
-                    for bot in &bots {
-                        if let (Some(name), Some(model)) =
-                            (bot["name"].as_str(), bot["model"].as_str())
-                        {
-                            replay.remodel(name, model);
-                        }
-                    }
+                    let models: HashMap<&str, &str> = (bots.iter())
+                        .filter_map(|bot| Some((bot["name"].as_str()?, bot["model"].as_str()?)))
+                        .collect();
+                    replay.remodel(&models);
                     replay.cast = bots;
                 }
                 Feed::Tape(event) => {
@@ -678,7 +678,7 @@ impl View {
                     // cast and its tape: they take the new model too, as
                     // the listing gives every agent its model of now.
                     if let Some(replay) = &mut self.replay {
-                        replay.remodel(&name, &model);
+                        replay.remodel(&HashMap::from([(name.as_str(), model.as_str())]));
                     }
                     if let Some(at) = self.agent(&name)
                         && self.agents[at].model != model
@@ -755,15 +755,27 @@ impl View {
         }
         if at < replay.at || replay.played == 0 {
             replay.played = 0;
-            let made: HashSet<String> = (replay.tape.iter())
-                .filter(|e| matches!(e["event"].as_str(), Some("created" | "forked")))
-                .filter_map(|e| e["bot"].as_str().map(str::to_owned))
-                .collect();
+            // Who the tape makes waits for its making; a name used again
+            // is someone else, told apart by id as `seat` tells them.
+            let mut made: HashMap<&str, Vec<Option<i64>>> = HashMap::new();
+            for event in &replay.tape {
+                if matches!(event["event"].as_str(), Some("created" | "forked"))
+                    && let Some(name) = event["bot"].as_str()
+                {
+                    made.entry(name)
+                        .or_default()
+                        .push(event["data"]["bot_id"].as_i64());
+                }
+            }
             let cast: Vec<Value> = (replay.cast.iter())
                 .filter(|bot| {
-                    bot["name"]
-                        .as_str()
-                        .is_some_and(|name| !made.contains(name))
+                    let Some(name) = bot["name"].as_str() else {
+                        return false;
+                    };
+                    let id = bot["bot_id"].as_i64();
+                    !made.get(name).is_some_and(|ids| {
+                        id.is_none() || ids.iter().any(|made| made.is_none() || *made == id)
+                    })
                 })
                 .cloned()
                 .collect();
@@ -3776,10 +3788,28 @@ mod tests {
         let mut replay = Replay::new(0);
         replay.cast = vec![json!({"name": "a", "model": "m1"})];
         replay.keep(json!({"event": "created", "bot": "b", "data": {"model": "m1"}}));
-        replay.remodel("a", "m2");
-        replay.remodel("b", "m3");
+        replay.remodel(&HashMap::from([("a", "m2"), ("b", "m3")]));
         assert_eq!(replay.cast[0]["model"], "m2");
         assert_eq!(replay.tape[0]["data"]["model"], "m3");
+    }
+
+    #[tokio::test]
+    async fn a_replay_keeps_who_had_a_name_before_it_was_used_again() {
+        let (mut view, send) = view();
+        let from = wall_ms() - 3_600_000;
+        view.replay = Some(Replay::new(from));
+        send.send(Feed::Roll(vec![json!({"name": "shop.a", "bot_id": 1})]))
+            .unwrap();
+        send.send(Feed::Tape(json!({"event": "deleted", "bot": "shop.a",
+            "written_ms": from + 60_000})))
+            .unwrap();
+        send.send(Feed::Tape(json!({"event": "created", "bot": "shop.a",
+            "written_ms": from + 90_000, "data": {"bot_id": 2}})))
+            .unwrap();
+        send.send(Feed::Ready).unwrap();
+        view.drain();
+        // At the start, the first one, not waiting on the second's making.
+        assert_eq!(view.agents[view.index["shop.a"]].id, Some(1));
     }
 
     #[tokio::test]
