@@ -446,6 +446,21 @@ impl Replay {
         }
     }
 
+    /// Gives `name` its new model wherever a step back would seat it from.
+    fn remodel(&mut self, name: &str, model: &str) {
+        for bot in &mut self.cast {
+            if bot["name"] == name {
+                bot["model"] = json!(model);
+            }
+        }
+        for event in &mut self.tape {
+            if event["bot"] == name && matches!(event["event"].as_str(), Some("created" | "forked"))
+            {
+                event["data"]["model"] = json!(model);
+            }
+        }
+    }
+
     fn new(from: i64) -> Self {
         Replay {
             from,
@@ -649,6 +664,12 @@ impl View {
                     self.event(&event, now, true);
                 }
                 Feed::Model(name, model) => {
+                    // A replay seats agents again on a step back, from its
+                    // cast and its tape: they take the new model too, as
+                    // the listing gives every agent its model of now.
+                    if let Some(replay) = &mut self.replay {
+                        replay.remodel(&name, &model);
+                    }
                     if let Some(at) = self.agent(&name)
                         && self.agents[at].model != model
                     {
@@ -3738,6 +3759,17 @@ mod tests {
             .map(|bot| (bot["name"].clone(), bot["bot_id"].clone()))
             .collect();
         assert_eq!(cast, [(json!("new"), json!(9))]);
+    }
+
+    #[test]
+    fn a_replay_seats_an_agent_with_its_new_model_after_a_step_back() {
+        let mut replay = Replay::new(0);
+        replay.cast = vec![json!({"name": "a", "model": "m1"})];
+        replay.keep(json!({"event": "created", "bot": "b", "data": {"model": "m1"}}));
+        replay.remodel("a", "m2");
+        replay.remodel("b", "m3");
+        assert_eq!(replay.cast[0]["model"], "m2");
+        assert_eq!(replay.tape[0]["data"]["model"], "m3");
     }
 
     #[tokio::test]
