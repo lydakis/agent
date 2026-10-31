@@ -6003,3 +6003,33 @@ the gate's 15%. The benches start the daemon with `serve` and no redact
 flags, so the head runs no field scan where the base does. With the flags
 the CLI passes, the scan is the base's code over the same twelve names, so
 a CLI-started daemon does the base's work per tool result.
+
+## A bot's speed tier (#467)
+
+Each provider call now picks its pace pool through `pool_key`, which
+appends the speed for an Anthropic bot served fast, and learns its limits
+through `limits`, which reads the fast-mode headers for such a bot. The
+request prefix gains two optional fields. The Perf workflow's matched
+screen, base main 2b5bf4b against the PR head 8d5ddf5 (the daemon is the
+same at later heads, which change only Sonny), on the GitHub runner
+(2026-10-30):
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 39.013 | 39.342 | +0.8% |
+| admission | burst submit p99, ms | 6.396 | 6.125 | -4.2% |
+| completion | release to terminal p99, ms | 13.691 | 13.623 | -0.5% |
+| footprint | idle RSS, MiB | 18.986 | 19.09 | +0.5% |
+| footprint | per idle bot, KiB | 1.636 | 1.35 | -17.5% |
+| footprint | RSS after a turn each, MiB | 27.18 | 27.805 | +2.3% |
+| footprint | CPU per turn, ms | 1.261 | 1.251 | -0.8% |
+| lifecycle | CPU, s | 1.125 | 1.125 | +0.0% |
+| lifecycle | p95 turn, ms | 580.268 | 586.311 | +1.0% |
+| lifecycle | peak RSS, MiB | 25.506 | 25.271 | -0.9% |
+
+Store jobs per turn did not change (about 7.5 on both), and nothing passed
+the gate's 15% in the direction that costs. The per idle bot figure is a
+difference of about a third of a KiB across runs of the same size, within
+what earlier screens moved by (#447 measured 1.40 and 1.45). The benches
+run standard bots, so the new path costs one match per call; a fast
+Anthropic bot's key is one short string built per call.
