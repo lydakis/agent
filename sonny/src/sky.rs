@@ -2101,7 +2101,9 @@ mod tests {
     #[tokio::test]
     async fn a_full_small_pane_keeps_the_newest_log_line_in_its_rows() {
         let (mut view, send) = view();
-        let bots: Vec<Value> = (0..31).map(|n| json!({"name": format!("a{n:02}")})).collect();
+        let bots: Vec<Value> = (0..31)
+            .map(|n| json!({"name": format!("a{n:02}")}))
+            .collect();
         send.send(Feed::Roll(bots)).unwrap();
         send.send(Feed::Ready).unwrap();
         for n in 0..5 {
@@ -2113,7 +2115,10 @@ mod tests {
         let card = text(&view.card(50, 20));
         let lines: Vec<&str> = card.lines().collect();
         assert!(lines.len() <= 20, "{card}");
-        assert!(lines.last().unwrap().trim_end().ends_with("you → a04"), "{card}");
+        assert!(
+            lines.last().unwrap().trim_end().ends_with("you → a04"),
+            "{card}"
+        );
     }
 
     #[tokio::test]
