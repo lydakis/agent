@@ -378,7 +378,7 @@ you wrote to run after it, as Codex does, Esc interrupts, `y`/`n` answer a
 pending approval, Ctrl-C clears the composer or quits. Shift-Enter or
 Alt-Enter (or Ctrl-J) starts a new line. The composer takes a shell's editing
 keys, as Codex's does: Ctrl-A/E and Ctrl-B/F move, Alt-B/F (or Alt- or
-Ctrl-arrows) move a word, Ctrl-P/N move a row, Ctrl-H and Ctrl-D delete a
+Ctrl-arrows) move a word, Up and Down (or Ctrl-P/N) move a row, Ctrl-H and Ctrl-D delete a
 character, Ctrl-W (or Alt-Backspace) and Alt-D (or Alt-Delete) a word,
 Ctrl-U and Ctrl-K to the line's start and end, and Ctrl-Y puts back what the
 last of those took. Shift-Enter needs a terminal that speaks the kitty
@@ -388,6 +388,16 @@ or Ctrl-J still start a line. Markdown shows in the composer as it will
 read, its marks kept and dim: `**bold**` bold, `` `code` `` in code's colour,
 a `#` line as a heading, a `>` quote in italics, a link's label underlined;
 what is sent is the text as typed.
+
+Up and Down also bring back what you sent before, as a shell's history
+and Codex's and Claude Code's do: Up on the composer's first row goes back
+a prompt, Down on its last row comes forward, and past the newest what you
+were writing comes back. A prompt of several rows opens at its top going
+back and at its end coming forward, so the next press keeps going; in
+between, the arrows move through its rows. Every window keeps its prompts in
+`~/.agent/sonny/history.jsonl` (only you can read it), and recalls its own
+first, newest first, then those any window sent before it opened. Edit a
+prompt brought back and it is yours to send, or Up starts again from it.
 
 Alt-T boosts the next message: the turn it starts runs at a higher effort
 (`xhigh`, or `high` where the model has no `xhigh`), Alt-T again at `max`

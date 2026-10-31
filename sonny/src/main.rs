@@ -56,6 +56,7 @@ mod plan;
 mod project;
 mod prompt;
 mod reactions;
+mod recall;
 mod resolved;
 mod rex;
 mod said;
@@ -1965,6 +1966,8 @@ struct App {
     /// The model's context window, as the daemon says it with each round.
     window: Option<u64>,
     input: prompt::Prompt,
+    /// The prompts sent before, which Up and Down bring back.
+    recall: recall::Recall,
     /// Lines waiting to be written into the conversation, and what marks
     /// the rows of some, by their place among them.
     pending: Vec<Line<'static>>,
@@ -3006,6 +3009,7 @@ impl App {
             context: None,
             window: None,
             input: prompt::Prompt::default(),
+            recall: recall::Recall::default(),
             pending: Vec::new(),
             marks: Vec::new(),
             any_history: false,
@@ -3187,6 +3191,7 @@ impl App {
         self.width = terminal.size().map(|s| s.width as usize).unwrap_or(80);
         self.reactions = reactions::Reactions::load(self.reactions_key.as_deref());
         self.picks = fuzzy::Picks::load("commands");
+        self.recall = recall::Recall::load();
         self.margin = margin::Margin::load(self.reactions_key.as_deref());
         self.picked = reactions::Picked::load(self.reactions_key.as_deref());
         self.history().await;
@@ -7514,7 +7519,11 @@ impl App {
     /// starts with `/`, best first, with where the letters typed are in
     /// each: the person's own picks rank first among equal matches.
     fn menu(&self) -> Vec<(&'static str, &'static str, Vec<usize>)> {
-        if !self.input.starts_with('/') || self.input.contains(char::is_whitespace) {
+        // A command brought back with Up is walked past, not picked.
+        if !self.input.starts_with('/')
+            || self.input.contains(char::is_whitespace)
+            || self.recall.showing(&self.input)
+        {
             return Vec::new();
         }
         let names = COMMANDS.iter().map(|(name, _)| &name[1..]);
@@ -7998,6 +8007,7 @@ impl App {
         let rows = [
             ("enter", "send, or steer the running turn"),
             ("tab", "queue for after the running turn"),
+            ("↑↓", "earlier prompts, past the first or last row"),
             ("shift+enter", "new line (alt+enter, ctrl+j)"),
             ("esc", "interrupt, or stop a ! command"),
             ("/", "commands"),
@@ -8938,11 +8948,27 @@ impl App {
                     {
                         self.step_ask(key.code == KeyCode::Down)
                     }
+                    // Past the first row, the prompts sent before, as a
+                    // shell's history; past the last, back to the newest
+                    // and what was being written.
                     KeyCode::Up => {
-                        self.input.up(self.prose());
+                        if !self.input.up(self.prose())
+                            && let Some(text) = self.recall.older(&self.input)
+                        {
+                            self.input.set(&text);
+                            // One of several rows starts at its top, so Up
+                            // keeps going back.
+                            if self.input.layout(self.prose()).len() > 1 {
+                                self.input.top();
+                            }
+                        }
                     }
                     KeyCode::Down => {
-                        self.input.down(self.prose());
+                        if !self.input.down(self.prose())
+                            && let Some(text) = self.recall.newer(&self.input)
+                        {
+                            self.input.set(&text);
+                        }
                     }
                     // Alt-Enter too, for terminals that send Shift-Enter
                     // as a plain Enter.
@@ -9018,6 +9044,7 @@ impl App {
         if prompt.is_empty() {
             return;
         }
+        self.recall.sent(&prompt);
         // A command run, so the menu ranks it first next time.
         let word = prompt.split_whitespace().next().unwrap_or_default();
         if COMMANDS.iter().any(|(name, _)| *name == word) {
@@ -15640,6 +15667,53 @@ mod tests {
             &*app.input, "w?",
             "typed after a word, it is a question mark"
         );
+    }
+
+    #[tokio::test]
+    async fn up_and_down_past_the_rows_walk_the_prompts_sent() {
+        let mut app = app(daemon_answering(|_| json!({})).await);
+        app.recall.sent("/status");
+        app.recall.sent("first line\nsecond line");
+        let key = |code| Event::Key(event::KeyEvent::new(code, KeyModifiers::NONE));
+        // A draft of two rows: Up moves through it before going back.
+        app.input.set("draft\nmore");
+        app.key(key(KeyCode::Up)).await;
+        assert_eq!(&*app.input, "draft\nmore");
+        app.key(key(KeyCode::Up)).await;
+        assert_eq!(&*app.input, "first line\nsecond line");
+        let rows = app.input.layout(app.prose());
+        assert_eq!(
+            app.input.cursor(&rows).0,
+            0,
+            "on its top row, so Up goes on"
+        );
+        // Ctrl-P is Up, as in a shell.
+        let ctrl_p = event::KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL);
+        app.key(Event::Key(ctrl_p)).await;
+        assert_eq!(&*app.input, "/status");
+        assert!(
+            app.menu().is_empty(),
+            "a recalled command is not picked from"
+        );
+        app.key(key(KeyCode::Up)).await;
+        assert_eq!(&*app.input, "/status", "the oldest stays");
+        app.key(key(KeyCode::Down)).await;
+        assert_eq!(&*app.input, "first line\nsecond line");
+        let rows = app.input.layout(app.prose());
+        assert_eq!(
+            app.input.cursor(&rows).0,
+            1,
+            "on its last row, so Down goes on"
+        );
+        app.key(key(KeyCode::Down)).await;
+        assert_eq!(&*app.input, "draft\nmore", "the draft comes back");
+        app.key(key(KeyCode::Down)).await;
+        assert_eq!(&*app.input, "draft\nmore");
+        // What is sent is the newest.
+        app.input.set("ship it");
+        app.submit().await;
+        app.key(key(KeyCode::Up)).await;
+        assert_eq!(&*app.input, "ship it");
     }
 
     #[tokio::test]
