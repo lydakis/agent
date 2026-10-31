@@ -11657,6 +11657,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_message_the_daemon_dated_counts_by_when_it_was_written() {
+        let said_ = |text: &str| {
+            json!({"type": "message", "role": "user",
+            "content": [{"type": "input_text", "text": text}]})
+        };
+        // A long turn that started before the last cleanup: one line came
+        // into it before the cleanup and one after, and one reaction each.
+        let items = json!([
+            {"node": 15, "item": said_("👍"), "written_ms": 1500},
+            {"node": 14, "item": said_("And the docs."), "written_ms": 1400},
+            {"node": 13, "item": {"type": "message", "role": "assistant",
+                "content": [{"type": "output_text", "text": "On it."}]}, "written_ms": 1300},
+            {"node": 12, "item": said_("👀"), "written_ms": 700},
+            {"node": 11, "item": said_("Use tabs."), "written_ms": 600},
+            {"node": 10, "item": said_("Start the migration."), "written_ms": 400}]);
+        let nodes: Vec<Value> = (items.as_array().unwrap().iter())
+            .map(|entry| json!({"node": entry["node"], "turn": 6}))
+            .collect();
+        let client =
+            daemon_answering(
+                move |asked| match asked["op"].as_str().unwrap_or_default() {
+                    "bots" => json!({"bots": [{"name": "shop.lead"}], "next_after": null}),
+                    "turns" => {
+                        json!({"turns": [{"turn": 6, "started_ms": 400, "finished_ms": null}],
+                "next_before": null})
+                    }
+                    "history_nodes" => json!({"nodes": nodes, "next_from": null}),
+                    "history_items" => json!({"items": items}),
+                    _ => json!({"error": {"code": "unexpected", "message": asked.to_string()}}),
+                },
+            )
+            .await;
+        let read = said::said(&client, None, 1000).await.unwrap();
+        let entry =
+            |text: &str| json!({"bot": "shop.lead", "turn": 6, "text": text, "project": null});
+        let mut liked = entry("👍");
+        liked["reacted_to"] = json!("On it.");
+        assert_eq!(read["said"], json!([liked, entry("And the docs.")]));
+    }
+
+    #[tokio::test]
     async fn a_night_the_person_wrote_is_cleaned_up_though_no_agent_saved() {
         let home = std::env::temp_dir().join(format!("said-changed-{}", std::process::id()));
         let root = home.join(".agents/memory");
