@@ -8,8 +8,9 @@ fastest harness. The [first measurements](RUST_MEASUREMENTS.md) passed it.
 
 ## Build and validate
 
-Development builds use Rust 1.98.0, pinned in `rust-toolchain.toml` with Clippy
-and rustfmt. The declared minimum supported Rust version remains 1.92.
+Development builds use Rust 1.99.1, pinned in `rust-toolchain.toml` with Clippy
+and rustfmt. The declared minimum supported Rust version is 1.95, which the
+atomics' `try_update` needs.
 Dependencies are locked; build outputs and the optional repository-local Cargo
 cache stay under ignored `.local/`.
 
