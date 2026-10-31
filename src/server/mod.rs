@@ -1608,7 +1608,7 @@ pub async fn run(config: Configuration) -> Result<()> {
         jobs: JoinSet::new(),
         replays: JoinSet::new(),
         retention: JoinSet::new(),
-        lane: lane::Lane::new(limits.readers.saturating_sub(1)),
+        lane: lane::Lane::new(limits.readers.saturating_sub(1), deliver),
         // Queued turns that survived a restart start as capacity allows.
         ready_hint: true,
         tokens: Arc::default(),
@@ -1716,8 +1716,10 @@ pub async fn run(config: Configuration) -> Result<()> {
                     reply(&mut service, &mut sessions, stdio_owner, session, &output, id, result).await?;
                 }
                 // A read answered: its session's next request may be taken.
-                Some((asker, result)) = service.lane.next(), if !service.lane.is_empty() => {
-                    reply(&mut service, &mut sessions, stdio_owner, asker.session, &asker.output, asker.id, result).await?;
+                Some((asker, sent)) = service.lane.next(), if !service.lane.is_empty() => {
+                    if !sent {
+                        unanswered(&mut service, &mut sessions, stdio_owner, asker.session)?;
+                    }
                     inbound.unpark(asker.session);
                 }
                 message = inbound.recv() => {
@@ -4501,23 +4503,31 @@ async fn answer_observed(
     stdio_owner: bool,
 ) {
     let by = tokio::time::Instant::now() + Duration::from_secs(5);
-    while let Ok(Some((asker, result))) = tokio::time::timeout_at(by, service.lane.next()).await {
-        let lost = reply(
-            service,
-            sessions,
-            stdio_owner,
-            asker.session,
-            &asker.output,
-            asker.id,
-            result,
-        )
-        .await
-        .is_err();
-        if lost && asker.session == 0 && stdio_owner {
+    while let Ok(Some((asker, sent))) = tokio::time::timeout_at(by, service.lane.next()).await {
+        if !sent && unanswered(service, sessions, stdio_owner, asker.session).is_err() {
             break;
         }
     }
     service.lane.stop().await;
+}
+
+/// A session that could not take its answer goes, as `reply` drops it;
+/// for the stdio owner, the daemon ends.
+fn unanswered(
+    service: &mut Service,
+    sessions: &mut HashMap<u64, Output>,
+    stdio_owner: bool,
+    session: u64,
+) -> Result<()> {
+    if session == 0 && stdio_owner {
+        return fail("output_closed");
+    }
+    if sessions.remove(&session).is_some() {
+        service.sessions = sessions.len();
+        service.hub.close_session(session);
+        service.handles.close_session(session);
+    }
+    Ok(())
 }
 
 /// Answer a request: the stdio owner gets bounded backpressure, and losing
@@ -4615,7 +4625,20 @@ async fn delete_pieces(
 
 /// Match ordinary replies: the stdio owner (session zero) gets bounded
 /// backpressure; socket clients cannot hold up a reply task when they lag.
-async fn retention_reply(session: u64, output: &Output, id: Value, result: Result<Value>) {
+/// Answer a read from the observation lane, in its own task.
+fn deliver(
+    session: u64,
+    output: Output,
+    id: Value,
+    result: Result<Value>,
+) -> futures_util::future::BoxFuture<'static, bool> {
+    Box::pin(async move { retention_reply(session, &output, id, result).await })
+}
+
+/// Answer a request from a task of its own: the stdio owner waits a few
+/// seconds for room, and a socket client that cannot take it is closed.
+/// Whether it was sent.
+async fn retention_reply(session: u64, output: &Output, id: Value, result: Result<Value>) -> bool {
     let sent = if session == 0 {
         matches!(
             tokio::time::timeout(Duration::from_secs(5), output.respond(id, result)).await,
@@ -4627,6 +4650,7 @@ async fn retention_reply(session: u64, output: &Output, id: Value, result: Resul
     if !sent {
         output.close();
     }
+    sent
 }
 
 /// One `provider_models` reply carries every listing, so it must fit one
@@ -5030,7 +5054,7 @@ mod tests {
             jobs: JoinSet::new(),
             replays: JoinSet::new(),
             retention: JoinSet::new(),
-            lane: lane::Lane::default(),
+            lane: lane::Lane::new(2, deliver),
             ready_hint: false,
             tokens: Arc::default(),
             wakes: Wakes::default(),
@@ -5232,7 +5256,7 @@ mod tests {
             jobs: JoinSet::new(),
             replays: JoinSet::new(),
             retention: JoinSet::new(),
-            lane: lane::Lane::default(),
+            lane: lane::Lane::new(2, deliver),
             ready_hint: false,
             tokens: Arc::default(),
             wakes: Wakes::default(),
@@ -5454,7 +5478,7 @@ mod tests {
             jobs: JoinSet::new(),
             replays: JoinSet::new(),
             retention: JoinSet::new(),
-            lane: lane::Lane::default(),
+            lane: lane::Lane::new(2, deliver),
             ready_hint: false,
             tokens: Arc::default(),
             wakes: Wakes::default(),
@@ -5684,7 +5708,7 @@ mod tests {
             jobs: JoinSet::new(),
             replays: JoinSet::new(),
             retention: JoinSet::new(),
-            lane: lane::Lane::default(),
+            lane: lane::Lane::new(2, deliver),
             ready_hint: false,
             tokens: Arc::default(),
             wakes: Wakes::default(),

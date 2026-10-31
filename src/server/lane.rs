@@ -21,34 +21,35 @@ pub struct Asker {
     pub id: Value,
 }
 
+/// Sends a read's answer to its asker, saying whether it was sent. It runs
+/// in the read's own task: a page of history can be megabytes to write out,
+/// which the service loop does not wait for either.
+pub type Deliver = fn(u64, Output, Value, Result<Value>) -> BoxFuture<'static, bool>;
+
 pub struct Lane {
-    running: JoinSet<Result<Value>>,
+    running: JoinSet<bool>,
     askers: HashMap<Id, Asker>,
     waiting: VecDeque<(Asker, BoxFuture<'static, Result<Value>>)>,
     /// Sessions given a read since the run loop last looked: it parks them.
     parked: Vec<u64>,
     limit: usize,
-}
-
-impl Default for Lane {
-    fn default() -> Self {
-        Self::new(2)
-    }
+    deliver: Deliver,
 }
 
 impl Lane {
-    pub fn new(limit: usize) -> Self {
+    pub fn new(limit: usize, deliver: Deliver) -> Self {
         Lane {
             running: JoinSet::new(),
             askers: HashMap::new(),
             waiting: VecDeque::new(),
             parked: Vec::new(),
             limit: limit.max(1),
+            deliver,
         }
     }
 
-    /// Run `read` for `asker` once a seat is free; its session is parked
-    /// until the answer comes back from `next`.
+    /// Run `read` for `asker` once a seat is free, and answer it; its
+    /// session is parked until `next` says it was answered.
     pub fn observe(
         &mut self,
         asker: Asker,
@@ -69,17 +70,22 @@ impl Lane {
         self.running.is_empty() && self.waiting.is_empty()
     }
 
-    /// The next read answered, and who asked for it; the next waiting read
-    /// takes its seat. Cancel-safe.
-    pub async fn next(&mut self) -> Option<(Asker, Result<Value>)> {
+    /// The next read answered, who asked for it, and whether the answer
+    /// reached them; the next waiting read takes its seat. Cancel-safe.
+    pub async fn next(&mut self) -> Option<(Asker, bool)> {
         let joined = self.running.join_next_with_id().await?;
-        let (task, result) = match joined {
-            Ok((task, result)) => (task, result),
-            Err(error) => (error.id(), Err(Error::new("observation_failed"))),
+        let (task, sent) = match joined {
+            Ok((task, sent)) => (task, Some(sent)),
+            Err(error) => (error.id(), None),
         };
         let asker = self.askers.remove(&task).expect("every read has its asker");
+        // A task that failed answered nothing: a small refusal says so.
+        let sent = sent.unwrap_or_else(|| {
+            let failed = Err(Error::new("observation_failed"));
+            asker.output.try_respond(asker.id.clone(), failed).is_ok()
+        });
         self.seat();
-        Some((asker, result))
+        Some((asker, sent))
     }
 
     /// Stop every read: at shutdown, answering is no longer owed, and the
@@ -95,7 +101,12 @@ impl Lane {
         while self.running.len() < self.limit
             && let Some((asker, read)) = self.waiting.pop_front()
         {
-            let task = self.running.spawn(read).id();
+            let (session, output, id) = (asker.session, asker.output.clone(), asker.id.clone());
+            let deliver = self.deliver;
+            let task = self
+                .running
+                .spawn(async move { deliver(session, output, id, read.await).await })
+                .id();
             self.askers.insert(task, asker);
         }
     }
@@ -104,8 +115,20 @@ impl Lane {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
     use std::time::Duration;
     use tokio::sync::oneshot;
+
+    /// What each test's reads answered, by session.
+    static ANSWERED: Mutex<Vec<(u64, std::result::Result<Value, String>)>> = Mutex::new(Vec::new());
+
+    fn noted(session: u64, _: Output, _: Value, result: Result<Value>) -> BoxFuture<'static, bool> {
+        ANSWERED
+            .lock()
+            .unwrap()
+            .push((session, result.map_err(|e| e.code)));
+        Box::pin(async { true })
+    }
 
     fn asker(session: u64) -> Asker {
         Asker {
@@ -115,9 +138,17 @@ mod tests {
         }
     }
 
+    fn answered(session: u64) -> Vec<std::result::Result<Value, String>> {
+        let answered = ANSWERED.lock().unwrap();
+        (answered.iter())
+            .filter(|(asked, _)| *asked == session)
+            .map(|(_, answer)| answer.clone())
+            .collect()
+    }
+
     #[tokio::test]
     async fn reads_past_the_seats_wait_in_order_and_each_answer_names_its_asker() {
-        let mut lane = Lane::new(1);
+        let mut lane = Lane::new(1, noted);
         let (first, held) = oneshot::channel::<()>();
         lane.observe(asker(1), async move {
             let _ = held.await;
@@ -128,21 +159,36 @@ mod tests {
         // The second waits for the first's seat.
         let early = tokio::time::timeout(Duration::from_millis(20), lane.next()).await;
         assert!(early.is_err(), "a read ran past the lane's seats");
+        assert!(answered(2).is_empty());
         first.send(()).unwrap();
-        let (asker, answer) = lane.next().await.unwrap();
-        assert_eq!((asker.session, answer.unwrap()), (1, Value::from("one")));
-        let (asker, answer) = lane.next().await.unwrap();
-        assert_eq!((asker.session, answer.unwrap()), (2, Value::from("two")));
+        let (asker, sent) = lane.next().await.unwrap();
+        assert_eq!((asker.session, sent), (1, true));
+        assert_eq!(answered(1), [Ok(Value::from("one"))]);
+        let (asker, sent) = lane.next().await.unwrap();
+        assert_eq!((asker.session, sent), (2, true));
+        assert_eq!(answered(2), [Ok(Value::from("two"))]);
         assert!(lane.is_empty());
         assert!(lane.next().await.is_none());
     }
 
     #[tokio::test]
     async fn a_read_that_panics_still_answers_its_asker() {
-        let mut lane = Lane::new(2);
-        lane.observe(asker(7), async { panic!("a broken read") });
-        let (asker, answer) = lane.next().await.unwrap();
-        assert_eq!(asker.session, 7);
-        assert_eq!(answer.unwrap_err().code, "observation_failed");
+        let mut lane = Lane::new(2, noted);
+        let (daemon, client) = tokio::io::duplex(4096);
+        let asked = Asker {
+            session: 7,
+            output: Output::writer(daemon),
+            id: Value::from(70),
+        };
+        lane.observe(asked, async { panic!("a broken read") });
+        let (asker, sent) = lane.next().await.unwrap();
+        assert_eq!((asker.session, sent), (7, true));
+        let mut lines = tokio::io::AsyncBufReadExt::lines(tokio::io::BufReader::new(client));
+        let line = lines.next_line().await.unwrap().unwrap();
+        let answer: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(
+            (&answer["id"], &answer["error"]),
+            (&Value::from(70), &Value::from("observation_failed"))
+        );
     }
 }

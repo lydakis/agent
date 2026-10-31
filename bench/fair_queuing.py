@@ -114,6 +114,8 @@ def main():
     parser.add_argument('--flooders', type=int, default=1)
     # The probe lists bots, a read itself, rather than inspecting one.
     parser.add_argument('--probe-bots', action='store_true')
+    # The daemon's store reader connections; its default when left out.
+    parser.add_argument('--readers', type=int)
     # Finished turns each task gets first, and each prompt's bytes.
     parser.add_argument('--history-turns', type=int, default=0)
     parser.add_argument('--history-bytes', type=int, default=16384)

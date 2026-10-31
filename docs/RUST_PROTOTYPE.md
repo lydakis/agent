@@ -996,7 +996,10 @@ requests from all sessions together, each session's in its own queue, and
 the service takes the sessions with one queued in turn, one request each, as
 Redis and NATS serve their clients: a client that pipelines thousands of
 requests holds every other session up by one of them, not by all it sent
-first. A session's own requests keep their order. Storage queues at most 32
+first. Each session reads at most 8 requests ahead, and one waiting for an
+[observation read](#observation-reads) reads no further than its next, so a
+few busy sessions never fill the queue for the rest. A session's own
+requests keep their order. Storage queues at most 32
 operations.
 
 ### Observation reads
