@@ -17,9 +17,9 @@ turns those start, are not shown.
 What follows `/zen` is the person's note, maybe a few hurried words. Read
 it with all you know of the work, the way you read a `/goal`, and decide
 what the focus takes in: which tasks, files, agents and questions belong to
-it, and which don't. Then write your reading, in a few words they would
-recognise, to `~/.agent/sonny/zen/$AGENT_BOT`, in place of what Sonny wrote
-there. Sonny shows it at the bottom of their window once your turn ends.
+it, and which don't. Then run `sonny zen READING`, your reading in a few
+words they would recognise, in place of what they typed. Sonny shows it at
+the bottom of their window once your turn ends.
 Start your reply by saying in one line what you take the focus to be, so
 they can correct it. If it could mean very different things, ask instead.
 
@@ -27,10 +27,9 @@ they can correct it. If it could mean very different things, ask instead.
 
 The person may ask for zen without the command, such as "let's go into zen
 on the receipts" or "focus on the release with me, hold everything else".
-Turn it on yourself: write your reading of the focus to that file (make the
-folder if it is missing), then carry on as if they had written `/zen
-FOCUS`. When they ask in words to leave zen, delete the file and give your
-digest (see Ending). Sonny's windows take the change when your turn ends.
+Turn it on yourself with `sonny zen READING`, then carry on as if they had
+written `/zen FOCUS`. When they ask in words to leave zen, run `sonny zen
+off` and give your digest (see Ending). Sonny's windows take the change when your turn ends.
 Do this only on the person's own word, never on your own or another
 agent's.
 

@@ -797,6 +797,8 @@ fn main() -> std::process::ExitCode {
         Some((verb, rest)) if verb == "approver" => approver::run(rest),
         Some((verb, rest)) if verb == "mcp" => mcp::cli(rest),
         Some((verb, rest)) if verb == "sky" => sky_cli(rest),
+        // An agent's shell runs this, for zen it was asked for in words.
+        Some((verb, rest)) if verb == "zen" => zen::cli(rest),
         Some((verb, rest)) if verb == "home" => {
             return std::process::ExitCode::from(home::cli(rest) as u8);
         }
@@ -983,7 +985,7 @@ async fn run() -> Result<(), String> {
     let settings = settings::Settings::load();
     app.sounds.chime = settings.chime;
     app.verbose = settings.verbose;
-    app.zen = zen::focus(&name);
+    app.zen = zen::focus(app.reactions_key.as_deref());
     app.margin_opens = settings.margin_opens;
     // A bot keeps the model it was made with; --model runs this window's
     // turns on another.
@@ -9552,12 +9554,20 @@ impl App {
     /// This agent's zen as its file now says, set elsewhere: drawn again
     /// in the other view when it starts or ends, and told.
     fn zen_taken_up(&mut self) {
-        let focus = zen::focus(&self.bot);
+        let focus = zen::focus(self.reactions_key.as_deref());
         if focus.is_some() != self.zen.is_some() {
             self.notice = Some(zen_notice(focus.is_some()));
-            self.repaint = true;
+            self.zen_view_changed();
         }
         self.zen = focus;
+    }
+
+    /// Zen started or ended: drawn again in the other view, and what
+    /// reply, copy and react point at is found again in what it draws.
+    fn zen_view_changed(&mut self) {
+        self.replies.clear();
+        self.last_reply.clear();
+        self.repaint = true;
     }
 
     /// `/zen FOCUS` or `/zen off`: sent to the agent as typed, whose zen
@@ -9572,7 +9582,7 @@ impl App {
             return;
         }
         self.input.clear();
-        if let Err(error) = zen::set(&self.bot, focus.as_deref()) {
+        if let Err(error) = zen::set(self.reactions_key.as_deref(), focus.as_deref()) {
             self.notice = Some(error);
         }
         let changed = self.zen.is_some() != focus.is_some();
@@ -9581,7 +9591,7 @@ impl App {
         self.pane_keys = false;
         // Drawn again in the other view; a new focus redraws nothing.
         if changed {
-            self.repaint = true;
+            self.zen_view_changed();
         }
     }
 
@@ -11983,10 +11993,14 @@ mod tests {
         }));
     }
 
+    /// The test agent's key, as the store and its id would make it.
+    const ZEN_KEY: &str = "0000-2";
+
     fn app_in_zen(client: Arc<Client>) -> App {
         let mut app = app(client);
+        app.reactions_key = Some(ZEN_KEY.into());
         app.width = 100;
-        zen::set("b", Some("the rounding")).unwrap();
+        zen::set(Some(ZEN_KEY), Some("the rounding")).unwrap();
         app.zen = Some("the rounding".into());
         app
     }
@@ -12069,13 +12083,20 @@ mod tests {
     #[tokio::test]
     async fn zen_set_in_another_window_is_taken_up_at_the_next_turn() {
         let mut app = app(zen_daemon().await);
-        zen::set("b", Some("the rounding")).unwrap();
+        app.reactions_key = Some(ZEN_KEY.into());
+        // A reply drawn before zen, from a turn zen will hide.
+        app.saw_reply(5, "Noted what shop.fix said.");
+        app.last_reply = "Noted what shop.fix said.".into();
+        zen::set(Some(ZEN_KEY), Some("the rounding")).unwrap();
         app.daemon(turn_event("accepted", 4, json!({"node": 11})))
             .await;
         assert_eq!(app.zen.as_deref(), Some("the rounding"));
         assert!(app.repaint);
+        // Reply, copy and react find their targets again in what zen draws.
+        assert!(app.replies.is_empty());
+        assert!(app.last_reply.is_empty());
         app.repaint = false;
-        zen::set("b", None).unwrap();
+        zen::set(Some(ZEN_KEY), None).unwrap();
         app.daemon(turn_event("steered", 4, json!({"node": 11})))
             .await;
         assert_eq!(app.zen, None);
@@ -12085,11 +12106,12 @@ mod tests {
     #[tokio::test]
     async fn zen_the_agent_set_when_asked_in_words_is_taken_up_as_its_turn_ends() {
         let mut app = app(zen_daemon().await);
+        app.reactions_key = Some(ZEN_KEY.into());
         app.daemon(turn_event("accepted", 4, json!({"node": 11})))
             .await;
         assert_eq!(app.zen, None);
         // The person asked in words; the agent wrote the focus itself.
-        zen::set("b", Some("the rounding")).unwrap();
+        zen::set(Some(ZEN_KEY), Some("the rounding")).unwrap();
         app.daemon(turn_event(
             "turn_finished",
             4,
@@ -12102,7 +12124,7 @@ mod tests {
         // The agent puts the person's scribble in its own words, as with
         // a goal; the footer takes them at the turn's end, nothing redrawn.
         app.repaint = false;
-        zen::set("b", Some("rounding in total()")).unwrap();
+        zen::set(Some(ZEN_KEY), Some("rounding in total()")).unwrap();
         app.daemon(turn_event(
             "turn_finished",
             4,
@@ -12138,6 +12160,7 @@ mod tests {
         .await;
         let mut app = app(client);
         app.bot = "zen-test.lead".into();
+        app.reactions_key = Some("0000-9".into());
         app.input.set("/zen");
         app.submit().await;
         assert_eq!(
@@ -12148,7 +12171,7 @@ mod tests {
         app.submit().await;
         assert_eq!(app.zen.as_deref(), Some("the receipts' currency"));
         assert_eq!(
-            zen::focus("zen-test.lead").as_deref(),
+            zen::focus(Some("0000-9")).as_deref(),
             Some("the receipts' currency")
         );
         assert!(app.repaint && app.input.is_empty());
@@ -12162,7 +12185,7 @@ mod tests {
         app.input.set("/zen");
         app.submit().await;
         assert_eq!(app.zen, None);
-        assert_eq!(zen::focus("zen-test.lead"), None);
+        assert_eq!(zen::focus(Some("0000-9")), None);
         assert!(app.repaint);
         let prompts: Vec<String> = (asked.lock().unwrap().iter())
             .filter(|op| op["op"] == "submit")
