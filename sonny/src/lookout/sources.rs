@@ -1,17 +1,22 @@
 //! Sources: news from outside the daemon. The person sets each up under
 //! `[sonny.sources.NAME]` in `~/.agent/config.toml`, a command the lookout
 //! runs with `sh -c`; every line it prints is one event, plain text or a
-//! JSON object with `text` and maybe `id`, `from`, `url` and `urgent`, which
-//! cuts into a subscriber's turn instead of waiting for it. One that exits
-//! runs again `every` while later (a minute unless set), so a poller that
-//! prints what is new and exits and a stream that never exits both work.
-//! Agents subscribe to a source by name and never set one up: the command
-//! runs as the person, outside any sandbox. Nothing judges sources: every
-//! event is told, and the person's command says what is urgent.
+//! JSON object with `text` and maybe `id`, `topic`, `from`, `url` and
+//! `urgent`, which cuts into a subscriber's turn instead of waiting for it.
+//! One that exits runs again `every` while later (a minute unless set), so
+//! a poller that prints what is new and exits and a stream that never
+//! exits both work. Agents subscribe to a source by name, or to one topic
+//! of it as `NAME:TOPIC`, and never set one up: the command runs as the
+//! person, outside any sandbox. Nothing judges sources: every event is
+//! told, and the person's command says what is urgent. A source's `digest`
+//! says how often at most a subscriber hears it, as Slack batches email.
+//!
+//! Sonny makes one source of its own: the commons, whose events are new
+//! posts, a thread's name their topic.
 //!
 //! What a source says is no one's words here: its note goes with an
 //! origin, so the approver never reads it as the person's.
-use agent_client::config::Source;
+use agent_client::config::{COMMONS_SOURCE, Source};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -41,8 +46,11 @@ pub const FROM_SOURCES: &str = "From your sources: ";
 /// The origin its note goes with: a client's own, not the person's.
 pub const ORIGIN: &str = "lookout.sources";
 
-/// The names of the sources the person set up, sorted; none when the
-/// settings cannot be read.
+/// How often the commons source looks for new posts.
+const COMMONS_EVERY: &str = "10s";
+
+/// The names of the sources there are, sorted; none when the settings
+/// cannot be read.
 pub fn names() -> Vec<String> {
     let mut names: Vec<String> = (configured().unwrap_or_default().into_iter())
         .map(|s| s.name)
@@ -51,9 +59,20 @@ pub fn names() -> Vec<String> {
     names
 }
 
-/// The sources the person set up.
+/// The sources the person set up, and the commons while agents have it:
+/// a source with no command is Sonny's own.
 pub fn configured() -> Result<Vec<Source>, String> {
-    agent_client::config::load().map(|config| config.sonny.sources)
+    let config = agent_client::config::load()?.sonny;
+    let mut sources = config.sources;
+    if config.commons {
+        sources.push(Source {
+            name: COMMONS_SOURCE.into(),
+            command: String::new(),
+            every: Some(COMMONS_EVERY.into()),
+            digest: Some(config.commons_digest),
+        });
+    }
+    Ok(sources)
 }
 
 /// How long after it exits a source runs again: `every` as `30s`, `5m`
@@ -62,20 +81,27 @@ pub fn every(source: &Source) -> Result<Duration, String> {
     let Some(every) = source.every.as_deref() else {
         return Ok(EVERY);
     };
-    let bad = || {
-        format!(
-            "sonny.sources.{}.every is a number and s, m or h, as 30s or 5m, not {every:?}",
-            source.name
-        )
-    };
-    let (count, unit) = [("s", 1), ("m", 60), ("h", 3600)]
-        .into_iter()
-        .find_map(|(suffix, unit)| Some((every.strip_suffix(suffix)?, unit)))
-        .ok_or_else(bad)?;
-    let count: u64 = count.parse().map_err(|_| bad())?;
-    match count.checked_mul(unit) {
-        None | Some(0) => Err(bad()),
-        Some(n) => Ok(Duration::from_secs(n)),
+    let key = format!("sonny.sources.{}.every", source.name);
+    match agent_client::config::span(&key, every)? {
+        0 => Err(format!("{key} is more than none, not {every:?}")),
+        secs => Ok(Duration::from_secs(secs)),
+    }
+}
+
+/// How often at most a subscriber hears a source: its `digest`; none for
+/// as events come.
+pub fn digest(source: &Source) -> Option<Duration> {
+    let key = format!("sonny.sources.{}.digest", source.name);
+    let secs = agent_client::config::span(&key, source.digest.as_deref()?).ok()?;
+    (secs > 0).then(|| Duration::from_secs(secs))
+}
+
+/// What a subscription names a source by: `NAME`, every event, or
+/// `NAME:TOPIC`, its events on that topic alone.
+pub fn named(name: &str) -> (&str, Option<&str>) {
+    match name.split_once(':') {
+        Some((source, topic)) => (source, Some(topic)),
+        None => (name, None),
     }
 }
 
@@ -85,12 +111,18 @@ pub struct Event {
     pub source: String,
     /// The source's own ID for it: printed again, it is not news again.
     pub id: Option<String>,
+    /// What it is about, as the source names it: a subscription to
+    /// `SOURCE:TOPIC` hears it, as one to the source does.
+    pub topic: Option<String>,
     pub text: String,
     /// Who wrote it, as the source names them.
     pub from: Option<String>,
     pub url: Option<String>,
     /// It cuts into a subscriber's turn instead of waiting for it to end.
     pub urgent: bool,
+    /// How often at most a subscriber hears its source, as it was set
+    /// when the event came.
+    pub digest: Option<Duration>,
     /// When the lookout read it, and its place among what this lookout
     /// read: together they key its note.
     pub at_ms: u128,
@@ -105,13 +137,20 @@ impl Event {
             return None;
         }
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let event = |text: &str, id, from: Option<String>, url: Option<String>, urgent| Event {
+        let event = |text: &str,
+                     id,
+                     topic: Option<String>,
+                     from: Option<String>,
+                     url: Option<String>,
+                     urgent| Event {
             source: source.to_owned(),
             id,
+            topic: topic.map(|topic: String| cut(&topic, FIELD_CHARS)),
             text: cut(text, TEXT_CHARS),
             from: from.map(|from| cut(&from, FIELD_CHARS)),
             url: url.map(|url| cut(&url, FIELD_CHARS)),
             urgent,
+            digest: None,
             at_ms,
             seq: SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         };
@@ -120,7 +159,7 @@ impl Event {
             .flatten()
             .filter(Value::is_object);
         let Some(object) = object else {
-            return Some(event(line, None, None, None, false));
+            return Some(event(line, None, None, None, None, false));
         };
         let said = |key: &str| match &object[key] {
             Value::String(s) if !s.trim().is_empty() => Some(s.trim().to_owned()),
@@ -129,7 +168,16 @@ impl Event {
         };
         let text = said("text")?;
         let urgent = object["urgent"] == true;
-        Some(event(&text, said("id"), said("from"), said("url"), urgent))
+        // A topic is what a subscription names after the colon.
+        let topic = said("topic").filter(|topic| !topic.contains(':'));
+        Some(event(
+            &text,
+            said("id"),
+            topic,
+            said("from"),
+            said("url"),
+            urgent,
+        ))
     }
 }
 
@@ -174,6 +222,8 @@ pub struct Runner {
     running: HashMap<String, (Source, tokio::task::JoinHandle<()>)>,
     /// Why the settings did not read, last time.
     unreadable: Option<String>,
+    /// Tells Sonny's own sources to look now.
+    poked: std::sync::Arc<tokio::sync::Notify>,
 }
 
 impl Runner {
@@ -183,7 +233,15 @@ impl Runner {
             sent,
             running: HashMap::new(),
             unreadable: None,
+            poked: std::sync::Arc::new(tokio::sync::Notify::new()),
         }
+    }
+
+    /// Sonny's own sources look now, not at their next while: a call that
+    /// wrote what they read has ended, so its posts are told before what
+    /// the stream says after it.
+    pub fn poke(&self) {
+        self.poked.notify_waiters();
     }
 
     /// Run the sources the settings name now. Settings that do not read
@@ -229,7 +287,11 @@ impl Runner {
                 }
             };
             let dir = self.dir.join(&source.name);
-            let task = tokio::spawn(run(source.clone(), every, dir, self.sent.clone()));
+            let sent = self.sent.clone();
+            let task = match source.command.is_empty() {
+                true => tokio::spawn(own(source.clone(), every, dir, sent, self.poked.clone())),
+                false => tokio::spawn(run(source.clone(), every, dir, sent)),
+            };
             println!(
                 "{}",
                 json!({"event": "source_started", "source": source.name})
@@ -269,6 +331,52 @@ async fn run(source: Source, every: Duration, dir: PathBuf, sent: Sender<Event>)
         }
         tokio::time::sleep(every).await;
     }
+}
+
+/// Sonny's own source, the commons: the lines it would print, read in the
+/// lookout every while, until the task is aborted.
+async fn own(
+    source: Source,
+    every: Duration,
+    dir: PathBuf,
+    sent: Sender<Event>,
+    poked: std::sync::Arc<tokio::sync::Notify>,
+) {
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return;
+    };
+    let mut seen = Seen::default();
+    loop {
+        let (home, dir) = (home.clone(), dir.clone());
+        let lines = tokio::task::spawn_blocking(move || crate::commons::news(&home, &dir))
+            .await
+            .unwrap_or_default();
+        for line in lines {
+            if !emit(&source, &line, &mut seen, &sent).await {
+                return;
+            }
+        }
+        if sent.is_closed() {
+            return;
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(every) => {}
+            _ = poked.notified() => {}
+        }
+    }
+}
+
+/// Send what a source printed, unless its ID was news lately: false once
+/// the lookout stopped.
+async fn emit(source: &Source, line: &str, seen: &mut Seen, sent: &Sender<Event>) -> bool {
+    let Some(mut event) = Event::parse(&source.name, line, super::epoch_ms()) else {
+        return true;
+    };
+    if event.id.as_deref().is_some_and(|id| !seen.first(id)) {
+        return true;
+    }
+    event.digest = digest(source);
+    sent.send(event).await.is_ok()
 }
 
 /// IDs a source printed lately.
@@ -361,14 +469,8 @@ async fn once(
             }
         }
         let text = String::from_utf8_lossy(&line);
-        let Some(event) = Event::parse(&source.name, &text, super::epoch_ms()) else {
-            continue;
-        };
-        if event.id.as_deref().is_some_and(|id| !seen.first(id)) {
-            continue;
-        }
         // The lookout is stopping: the command stops with it.
-        if sent.send(event).await.is_err() {
+        if !emit(source, &text, seen, sent).await {
             return Err("the lookout stopped".into());
         }
     }
@@ -425,6 +527,9 @@ pub struct Heard {
 pub fn line(item: &Heard) -> String {
     let event = &item.event;
     let mut what = event.source.clone();
+    if let Some(topic) = &event.topic {
+        what.push_str(&format!(":{topic}"));
+    }
     if let Some(from) = &event.from {
         what.push_str(&format!(", from {}", json!(from)));
     }
@@ -468,6 +573,7 @@ mod tests {
             name: "slack".into(),
             command: "true".into(),
             every: every.map(str::to_owned),
+            digest: None,
         }
     }
 
@@ -494,6 +600,22 @@ mod tests {
     }
 
     #[test]
+    fn a_digest_is_a_span_and_none_is_as_events_come() {
+        let with = |digest: Option<&str>| Source {
+            digest: digest.map(str::to_owned),
+            ..source(None)
+        };
+        assert_eq!(digest(&with(None)), None);
+        assert_eq!(digest(&with(Some("0"))), None);
+        assert_eq!(digest(&with(Some("1h"))), Some(Duration::from_secs(3600)));
+        assert_eq!(
+            named("commons:sqlite-stalls"),
+            ("commons", Some("sqlite-stalls"))
+        );
+        assert_eq!(named("slack"), ("slack", None));
+    }
+
+    #[test]
     fn a_line_is_text_or_an_object_with_text() {
         let plain = Event::parse("slack", "  deploy failed \n", 7).unwrap();
         assert_eq!(
@@ -513,6 +635,11 @@ mod tests {
         assert_eq!(object.url.as_deref(), Some("https://x.test/41"));
         assert_eq!(Event::parse("slack", "   ", 0), None);
         assert_eq!(Event::parse("slack", r#"{"id": 1}"#, 0), None);
+        let topical = Event::parse("slack", r#"{"text": "x", "topic": "deploys"}"#, 0).unwrap();
+        assert_eq!(topical.topic.as_deref(), Some("deploys"));
+        // A topic with a colon could not be named by a subscription.
+        let colon = Event::parse("slack", r#"{"text": "x", "topic": "a:b"}"#, 0).unwrap();
+        assert_eq!(colon.topic, None);
         // Not an object: the line itself.
         assert_eq!(Event::parse("slack", "{half", 0).unwrap().text, "{half");
         let long = Event::parse("slack", &"a".repeat(TEXT_CHARS + 10), 0).unwrap();
@@ -563,10 +690,12 @@ mod tests {
         let event = |text: &str, from: Option<&str>, urgent| Event {
             source: "slack".into(),
             id: None,
+            topic: None,
             text: text.into(),
             from: from.map(str::to_owned),
             url: None,
             urgent,
+            digest: None,
             at_ms: 0,
             seq: 0,
         };
@@ -594,6 +723,12 @@ mod tests {
              Act where something changes your work, and tell the person, briefly, what they would want to \
              hear. If nothing, end your turn with an empty reply."
         );
+        let mut topical = event("on it", Some("b.y"), false);
+        topical.topic = Some("deploys".into());
+        assert!(
+            super::note(&[heard(topical, &["eng"])], 0)
+                .contains("- slack:deploys, from \"b.y\" (for your eng): \"on it\"")
+        );
         let urgent = super::note(&[heard(event("prod is down", None, true), &["eng"])], 0);
         assert!(urgent.contains("- slack (for your eng, urgent): \"prod is down\""));
         assert!(urgent.ends_with("Handle what cannot wait, then carry on with your turn."));
@@ -612,6 +747,7 @@ mod tests {
             name: "count".into(),
             command: command.into(),
             every: Some("1s".into()),
+            digest: Some("5m".into()),
         }]);
         let mut texts = Vec::new();
         while texts.len() < 3 {
@@ -619,6 +755,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
+            assert_eq!(event.digest, Some(Duration::from_secs(300)));
             texts.push(event.text);
         }
         assert_eq!(texts, ["run 1 of count", "same", "run 2 of count"]);

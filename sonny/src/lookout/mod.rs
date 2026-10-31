@@ -704,6 +704,16 @@ impl Service {
                 crate::snapshot::housed(name, Some(&crate::snapshot::writable(bot)));
             }
         }
+        // Agents that posted in the commons before posting subscribed them
+        // are subscribed to its threads, once.
+        if crate::commons::on()
+            && let Some(home) = std::env::var_os("HOME").map(PathBuf::from)
+        {
+            let names = (bots.iter())
+                .filter_map(|b| b["name"].as_str().map(str::to_owned))
+                .collect();
+            crate::commons::subscribe_posters(&home, &self.store, &names);
+        }
         self.subscribers = subs::all(&self.store).into_iter().collect();
         for bot in &bots {
             self.seat(&client, bot).await;
@@ -811,14 +821,15 @@ impl Service {
                     }
                     streaming |= event["event"] == "follow_live";
                     self.snapshot(&event, streaming);
-                    // A `subscriptions` or `goal` call the tool host
-                    // answered counts from the next event on: its end is in
-                    // the stream before any event that follows it.
+                    // A `subscriptions`, `goal` or `commons` call the tool
+                    // host answered counts from the next event on: its end
+                    // is in the stream before any event that follows it.
                     if self.rewrote(&event) {
                         reread = Some(Instant::now());
                         self.goals.reread();
                         self.runner.reload();
                         self.reread(&client).await;
+                        self.runner.poke();
                     }
                     let cursor = event["cursor"].as_i64();
                     // A call is read from the replay too, so one that ends
@@ -1224,8 +1235,8 @@ impl Service {
     }
 
     /// Whether `event` ends a call of Sonny's that wrote files the lookout
-    /// reads, a `subscriptions` or `goal` call, which the tool host
-    /// answers. A turn that ends forgets the calls it left under way.
+    /// reads, a `subscriptions`, `goal` or `commons` call (posting
+    /// subscribes), which the tool host answers. A turn that ends forgets the calls it left under way.
     fn rewrote(&mut self, event: &Value) -> bool {
         let (Some(bot), Some(turn)) = (event["bot"].as_str(), event["turn"].as_i64()) else {
             return false;
@@ -1242,7 +1253,8 @@ impl Service {
             Some("tool_started")
                 if data["answered_by"] == crate::served::TAG
                     && (data["name"] == crate::served::SUBSCRIPTIONS
-                        || data["name"] == crate::served::GOAL) =>
+                        || data["name"] == crate::served::GOAL
+                        || data["name"] == crate::served::COMMONS) =>
             {
                 self.rewriting.insert(call());
                 false
@@ -1653,6 +1665,9 @@ struct Lookout {
     heard: Vec<sources::Heard>,
     /// When the first of those came.
     heard_since: Option<Instant>,
+    /// When a note last told the subscriber each source, which a source's
+    /// digest counts from.
+    told_sources: HashMap<String, Instant>,
     /// A note on its way: what it tells, its key and how it goes, until
     /// the daemon answers.
     sending: Option<(updates::Told, Vec<String>, &'static str)>,
@@ -1701,6 +1716,7 @@ impl Lookout {
             from: None,
             heard: Vec::new(),
             heard_since: None,
+            told_sources: HashMap::new(),
             sending: None,
             sourcing: None,
             asking: None,
@@ -2197,6 +2213,9 @@ impl Lookout {
                 match submitted {
                     Ok(()) => {
                         self.refused = None;
+                        for heard in &sent {
+                            self.told_sources.insert(heard.event.source.clone(), now);
+                        }
                         self.write(&json!({"at_ms": epoch_ms(), "lead": self.lead, "woke": key,
                             "delivery": delivery, "sources": true}));
                     }
@@ -2260,12 +2279,31 @@ impl Lookout {
     }
 
     /// The last note was refused lately: even a steer waits the gap after.
-    /// The subscriptions that hear a source now.
-    fn hearing(&self, source: &str) -> Vec<String> {
+    /// The subscriptions that hear an event now: those naming its source,
+    /// or its source and topic. What the subscriber itself said is no news
+    /// to it.
+    fn hearing(&self, event: &sources::Event) -> Vec<String> {
+        if event.from.as_deref() == Some(self.lead.as_str()) {
+            return Vec::new();
+        }
+        let hears = |name: &String| match sources::named(name) {
+            (source, None) => source == event.source,
+            (source, topic) => source == event.source && topic == event.topic.as_deref(),
+        };
         (self.subs.iter())
-            .filter(|sub| sub.sources.iter().any(|name| name == source))
+            .filter(|sub| sub.sources.iter().any(hears))
             .map(|sub| sub.name.clone())
             .collect()
+    }
+
+    /// Whether an event may be told now: urgent, or its source's digest
+    /// has passed since a note last told it.
+    fn ready(&self, heard: &sources::Heard, now: Instant) -> bool {
+        let event = &heard.event;
+        event.urgent
+            || event.digest.is_none_or(|digest| {
+                (self.told_sources.get(&event.source)).is_none_or(|at| now >= *at + digest)
+            })
     }
 
     /// Events still waiting, told through the subscriptions that hear
@@ -2273,7 +2311,7 @@ impl Lookout {
     fn rehear(&mut self) {
         let mut heard = std::mem::take(&mut self.heard);
         heard.retain_mut(|heard| {
-            heard.subs = self.hearing(&heard.event.source);
+            heard.subs = self.hearing(&heard.event);
             !heard.subs.is_empty()
         });
         self.heard = heard;
@@ -2285,7 +2323,7 @@ impl Lookout {
     /// A source's event, held for the next note when a subscription
     /// hears that source.
     fn heard_from(&mut self, event: &sources::Event) {
-        let subs = self.hearing(&event.source);
+        let subs = self.hearing(event);
         if subs.is_empty() {
             return;
         }
@@ -2304,14 +2342,18 @@ impl Lookout {
     }
 
     /// Tell the subscriber what its sources said: at once for an event its
-    /// source marked urgent, else once it rests and the news has settled.
-    /// The note goes with the lookout's origin, never as the person's words,
-    /// beside the stream as `wake`'s does.
+    /// source marked urgent, else once it rests and the news has settled,
+    /// and no sooner than its source's digest after the last note that told
+    /// that source. The note goes with the lookout's origin, never as the
+    /// person's words, beside the stream as `wake`'s does.
     fn wake_sources(&mut self, client: &Arc<Client>, woken: &Woken) {
         let now = Instant::now();
         let Some(since) = self.heard_since else {
             return;
         };
+        if !self.heard.iter().any(|heard| self.ready(heard, now)) {
+            return;
+        }
         // A missed event would hold the note until the subscriber's next
         // turn: once news has waited on it a while, ask the daemon.
         if self.updates.waited(now, since) {
@@ -2324,17 +2366,23 @@ impl Lookout {
         if self.refused(now) || !(steer || (now >= since + SETTLE && self.updates.idle())) {
             return;
         }
-        // A bounded note sends what is urgent first, and always at least one.
-        self.heard.sort_by_key(|heard| !heard.event.urgent);
+        // A bounded note sends what is urgent first, and always at least
+        // one; what a digest still holds waits after the rest.
+        let (mut ready, held): (Vec<_>, Vec<_>) = std::mem::take(&mut self.heard)
+            .into_iter()
+            .partition(|heard| self.ready(heard, now));
+        ready.sort_by_key(|heard| !heard.event.urgent);
         let mut bytes = 0;
-        let take = (self.heard.iter().take(NOTE_ITEMS))
+        let take = (ready.iter().take(NOTE_ITEMS))
             .take_while(|heard| {
                 bytes += sources::line(heard).len() + 1;
                 bytes <= sources::NOTE_BYTES
             })
             .count()
             .max(1);
-        let sent: Vec<sources::Heard> = self.heard.drain(..take).collect();
+        let sent: Vec<sources::Heard> = ready.drain(..take).collect();
+        ready.extend(held);
+        self.heard = ready;
         let prompt = sources::note(&sent, self.heard.len());
         let key: Vec<String> = (sent.iter())
             .map(|heard| {
@@ -3315,6 +3363,9 @@ mod tests {
         assert!(!service.rewrote(&started("goal", "d")));
         assert!(!service.rewrote(&event("turn_finished", "", json!({}))));
         assert!(service.rewriting.is_empty());
+        // Posting in the commons subscribes the poster.
+        assert!(!service.rewrote(&started("commons", "e")));
+        assert!(service.rewrote(&event("tool_completed", "e", json!({}))));
     }
 
     #[tokio::test]
@@ -3523,10 +3574,12 @@ mod tests {
         sources::Event {
             source: "slack".into(),
             id: None,
+            topic: None,
             text: text.into(),
             from: Some("ana".into()),
             url: None,
             urgent,
+            digest: None,
             at_ms: 1,
             seq: 0,
         }
@@ -3565,6 +3618,88 @@ mod tests {
         lookout.subs.clear();
         lookout.rehear();
         assert!(lookout.heard.is_empty() && lookout.heard_since.is_none());
+    }
+
+    #[test]
+    fn a_topic_is_heard_by_its_subscriptions_and_the_source_s() {
+        let mut lookout = lookout();
+        let mut thread = sub("commons.flaky", &[], &[]);
+        thread.sources = vec!["commons:flaky".into()];
+        let mut all = sub("all", &[], &[]);
+        all.sources = vec!["commons".into()];
+        lookout.subs = vec![thread, all];
+        let post = |topic: &str, from: &str| sources::Event {
+            source: "commons".into(),
+            topic: Some(topic.into()),
+            from: Some(from.into()),
+            ..slack("x", false)
+        };
+        assert_eq!(
+            lookout.hearing(&post("flaky", "b.y")),
+            ["commons.flaky", "all"]
+        );
+        assert_eq!(lookout.hearing(&post("other", "b.y")), ["all"]);
+        // What the subscriber said itself is no news to it.
+        assert!(lookout.hearing(&post("flaky", "calc.lead")).is_empty());
+        let untopical = sources::Event {
+            source: "commons".into(),
+            ..slack("x", false)
+        };
+        assert_eq!(lookout.hearing(&untopical), ["all"]);
+    }
+
+    #[tokio::test]
+    async fn a_digest_tells_its_source_at_most_once_a_while() {
+        let (client, mut got) = submits().await;
+        let mut lookout = lookout();
+        lookout.updates.live = true;
+        lookout.subs.push(hears("chat"));
+        (lookout.updates).seat(&json!({"name": "calc.lead", "bot_id": 1, "status": "idle"}));
+        let hour = Duration::from_secs(3600);
+        let digested = |text: &str, urgent| sources::Event {
+            digest: Some(hour),
+            ..slack(text, urgent)
+        };
+        // The first is told as it comes.
+        lookout.heard_from(&digested("one", false));
+        lookout.heard_since = Some(Instant::now() - SETTLE);
+        wake_sources(&mut lookout, &client).await;
+        assert!(
+            got.recv().await.unwrap()["prompt"]
+                .as_str()
+                .unwrap()
+                .contains("one")
+        );
+        // The next waits out the digest.
+        lookout.heard_from(&digested("two", false));
+        lookout.heard_since = Some(Instant::now() - SETTLE);
+        wake_sources(&mut lookout, &client).await;
+        assert_eq!(lookout.heard.len(), 1);
+        assert!(got.try_recv().is_err());
+        // What is urgent does not, and the held one waits on.
+        lookout.heard_from(&digested("down", true));
+        wake_sources(&mut lookout, &client).await;
+        let prompt = got.recv().await.unwrap()["prompt"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(
+            prompt.contains("down") && !prompt.contains("two"),
+            "{prompt}"
+        );
+        assert_eq!(lookout.heard.len(), 1);
+        // Once it has passed, what waited is told.
+        let past = Instant::now() - hour;
+        lookout.told_sources.insert("slack".into(), past);
+        lookout.heard_since = Some(past);
+        wake_sources(&mut lookout, &client).await;
+        assert!(
+            got.recv().await.unwrap()["prompt"]
+                .as_str()
+                .unwrap()
+                .contains("two")
+        );
+        assert!(lookout.heard.is_empty());
     }
 
     /// A daemon that greets, answers each request with `{}` and sends each

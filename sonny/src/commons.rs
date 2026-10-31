@@ -13,6 +13,7 @@ use ratatui::{
 };
 use serde_json::{Value, json};
 use std::borrow::Cow;
+use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -1033,10 +1034,10 @@ pub fn told(replied: &Value, author: &str) -> String {
     }
 }
 
-/// Tells each of `tell` of the reply `replied`, as an attach note: it
-/// joins that agent's next model call, starting no turn. An agent invited
-/// to the thread whose invite has tokens left is woken instead: the note
-/// starts its turn, capped at what is left. The ones told.
+/// Wakes each of `tell` whose invite to the thread has tokens left with
+/// the reply `replied`: the note starts its turn, capped at what is left.
+/// The rest hear of it through their subscription to the thread, as the
+/// lookout tells the commons source (`news`). The ones woken.
 pub async fn tell(home: &Path, replied: &Value, author: &str, tell: &Value) -> Vec<String> {
     let Ok((_, socket)) = crate::daemon_paths(None, None) else {
         return Vec::new();
@@ -1063,19 +1064,17 @@ pub async fn tell(home: &Path, replied: &Value, author: &str, tell: &Value) -> V
             Some((turns, pays)) => left(&client, bot, turns, *pays).await,
             None => 0,
         };
-        let mut submit = match left {
-            0 => json!({"bot": bot, "prompt": note, "delivery": "attach",
-                "origin": ORIGIN, "request_id": request}),
-            left => json!({"bot": bot, "prompt": note, "delivery": "queue",
-                "origin": ORIGIN, "request_id": format!("{request}.woken"),
-                "budget_tokens": left}),
-        };
+        if left == 0 {
+            continue;
+        }
+        let mut submit = json!({"bot": bot, "prompt": note, "delivery": "queue",
+            "origin": ORIGIN, "request_id": format!("{request}.woken"),
+            "budget_tokens": left});
         if told_one["bot_id"].is_i64() {
             submit["bot_id"] = told_one["bot_id"].clone();
         }
         let sent = client.request("submit", submit).await;
         if let Ok(started) = &sent
-            && left > 0
             && let Some(turn) = started["turn"].as_i64()
         {
             paid(&dir(home), thread, bot, turn);
@@ -1087,6 +1086,112 @@ pub async fn tell(home: &Path, replied: &Value, author: &str, tell: &Value) -> V
         }
     }
     told
+}
+
+/// What the commons source says: a line for each post since the last
+/// look, as a source's command would print it, its thread the topic.
+/// `cursor` is the source's own folder, where how far each thread was
+/// read is kept; the first look reads none, so an upgrade or a new
+/// store is not told the commons' past.
+pub fn news(home: &Path, cursor: &Path) -> Vec<String> {
+    let dir = dir(home);
+    let path = cursor.join("read.json");
+    let first = !path.exists();
+    let mut read = json_file(&path);
+    let mut lines = Vec::new();
+    let mut changed = first;
+    let entries = std::fs::read_dir(&dir).into_iter().flatten().flatten();
+    for entry in entries {
+        let file = entry.path();
+        let Some(thread) = (file.extension().is_some_and(|e| e == "jsonl"))
+            .then(|| file.file_stem())
+            .flatten()
+            .and_then(|stem| stem.to_str())
+            .map(str::to_owned)
+        else {
+            continue;
+        };
+        // A thread whose file has not grown has nothing new.
+        let bytes = entry.metadata().map_or(0, |m| m.len());
+        let had = read.get(&thread).cloned().unwrap_or_default();
+        if had["bytes"].as_u64() == Some(bytes) {
+            continue;
+        }
+        let Ok(posts) = posts(&file) else {
+            continue;
+        };
+        let had = had["posts"].as_u64().unwrap_or(0) as usize;
+        let title = posts
+            .first()
+            .and_then(|p| p["title"].as_str())
+            .unwrap_or_default();
+        for (n, post) in posts.iter().enumerate().skip(had).filter(|_| !first) {
+            let text = post["text"].as_str().unwrap_or_default();
+            let text = match n {
+                0 => format!("new thread {thread}, \"{title}\": {text}"),
+                _ => format!("reply in {thread}, \"{title}\": {text}"),
+            };
+            let mut line = json!({"id": format!("{thread}/{n}"), "topic": thread, "text": text});
+            if let Some(by) = post["by"].as_str() {
+                line["from"] = json!(by);
+            }
+            lines.push(line.to_string());
+        }
+        read.insert(thread, json!({"posts": posts.len(), "bytes": bytes}));
+        changed = true;
+    }
+    if changed && std::fs::create_dir_all(cursor).is_ok() {
+        let partial = path.with_extension("json.partial");
+        if std::fs::write(&partial, Value::Object(read).to_string()).is_ok() {
+            let _ = std::fs::rename(&partial, &path);
+        }
+    }
+    lines
+}
+
+/// Subscribes `bot` to the posts of `thread`, as posting in it does,
+/// unless it holds a subscription by that name: whether it was added. An
+/// agent that unsubscribed is subscribed again only by posting again.
+pub fn subscribe(store: &Path, bot: &str, thread: &str) -> Result<bool, String> {
+    crate::lookout::subs::ensure(store, bot, crate::lookout::subs::Sub::commons(thread))
+}
+
+/// The migration that subscribes the agents who posted before posting
+/// subscribed them.
+pub const POSTERS: &str = "commons-subscriptions";
+
+/// Subscribes each of `bots`, the agents of `store`, to every thread it
+/// posted in, once for the store (`upgrade::once`, its record beside the
+/// store), so one that unsubscribed since stays so.
+pub fn subscribe_posters(home: &Path, store: &Path, bots: &HashSet<String>) {
+    let mut record = store.as_os_str().to_owned();
+    record.push(".migrated");
+    crate::upgrade::once(Path::new(&record), POSTERS, || {
+        subscribe_all(home, store, bots)
+    });
+}
+
+/// Every one of `bots` subscribed to the threads it posted in: whether
+/// each was.
+fn subscribe_all(home: &Path, store: &Path, bots: &HashSet<String>) -> bool {
+    let mut all = true;
+    let entries = std::fs::read_dir(dir(home)).into_iter().flatten().flatten();
+    for entry in entries {
+        let file = entry.path();
+        let Some(thread) = (file.extension().is_some_and(|e| e == "jsonl"))
+            .then(|| file.file_stem())
+            .flatten()
+            .and_then(|stem| stem.to_str())
+        else {
+            continue;
+        };
+        for post in posts(&file).unwrap_or_default() {
+            if let Some(by) = post["by"].as_str().filter(|by| bots.contains(*by)) {
+                all &= subscribe(store, by, thread).is_ok();
+            }
+        }
+    }
+    all
 }
 
 /// `/commons` in the pane: the threads, newest first, and one opened to
@@ -1350,6 +1455,71 @@ mod tests {
             std::env::temp_dir().join(format!("sonny-commons-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
         home
+    }
+
+    #[test]
+    fn the_commons_source_tells_each_new_post_once_with_its_thread() {
+        let home = home("news");
+        let cursor = home.join("cursor");
+        let post = |by: &str, arguments: Value| call(&home, by, None, None, &arguments).unwrap();
+        post(
+            "a.x",
+            json!({"post": {"name": "old", "title": "Before", "text": "past"}}),
+        );
+        // The first look tells none of the past.
+        assert!(news(&home, &cursor).is_empty());
+        post(
+            "b.y",
+            json!({"reply": {"thread": "old", "text": "and now"}}),
+        );
+        post(
+            "c.z",
+            json!({"post": {"name": "new", "title": "Fresh", "text": "hello"}}),
+        );
+        let mut lines: Vec<Value> = (news(&home, &cursor).iter())
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        lines.sort_by_key(|line| line["id"].as_str().unwrap().to_owned());
+        assert_eq!(
+            lines,
+            [
+                json!({"id": "new/0", "topic": "new", "from": "c.z",
+                    "text": "new thread new, \"Fresh\": hello"}),
+                json!({"id": "old/1", "topic": "old", "from": "b.y",
+                    "text": "reply in old, \"Before\": and now"}),
+            ]
+        );
+        assert!(news(&home, &cursor).is_empty());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn agents_that_posted_are_subscribed_to_their_threads_once() {
+        let home = home("posters");
+        let store = home.join("state.sqlite");
+        let post = |by: &str, arguments: Value| call(&home, by, None, None, &arguments).unwrap();
+        post(
+            "a.x",
+            json!({"post": {"name": "t", "title": "T", "text": "x"}}),
+        );
+        post("b.y", json!({"reply": {"thread": "t", "text": "y"}}));
+        post("gone.z", json!({"reply": {"thread": "t", "text": "z"}}));
+        let bots: HashSet<String> = ["a.x".to_owned(), "b.y".to_owned()].into();
+        subscribe_posters(&home, &store, &bots);
+        let names = |bot: &str| -> Vec<String> {
+            (crate::lookout::subs::read(&store, bot).into_iter())
+                .map(|sub| sub.name)
+                .collect()
+        };
+        assert_eq!(names("a.x"), ["commons.t"]);
+        assert_eq!(names("b.y"), ["commons.t"]);
+        // An agent of another store is not this store's to subscribe.
+        assert!(names("gone.z").is_empty());
+        // One that unsubscribed since stays so.
+        crate::lookout::subs::remove(&store, "b.y", "commons.t").unwrap();
+        subscribe_posters(&home, &store, &bots);
+        assert!(names("b.y").is_empty());
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]

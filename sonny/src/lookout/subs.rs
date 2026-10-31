@@ -4,6 +4,7 @@
 //! seconds. The lookout watches for whoever has a file and knows no leads:
 //! Sonny writes a lead's `tasks` subscription when it opens the lead's
 //! project (`lead`, `ensure`).
+use agent_client::config::COMMONS_SOURCE;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
@@ -15,7 +16,7 @@ pub struct Sub {
     /// Bots it watches by name, `*` matching any run of characters.
     pub bots: Vec<String>,
     /// Sources it hears, by the names `[sonny.sources]` gives them: every
-    /// event one prints.
+    /// event one prints, or as `NAME:TOPIC` its events on that topic.
     pub sources: Vec<String>,
 }
 
@@ -34,6 +35,17 @@ impl Sub {
                 false => Vec::new(),
             },
             sources: Vec::new(),
+        }
+    }
+
+    /// What posting in a commons thread subscribes an agent to: the
+    /// thread's new posts, as the commons source tells them.
+    pub fn commons(thread: &str) -> Sub {
+        Sub {
+            name: format!("{COMMONS_SOURCE}.{thread}"),
+            tasks_of: Vec::new(),
+            bots: Vec::new(),
+            sources: vec![format!("{COMMONS_SOURCE}:{thread}")],
         }
     }
 
@@ -165,8 +177,9 @@ pub fn ensure(store: &Path, subscriber: &str, sub: Sub) -> Result<bool, String> 
     Ok(true)
 }
 
-/// The longest name a subscription may have.
-const NAME_MAX: usize = 64;
+/// The longest name a subscription may have: a commons thread's, 64,
+/// after `commons.`.
+const NAME_MAX: usize = 80;
 
 /// The longest name the daemon gives a bot.
 const BOT_NAME_MAX: usize = 128;
@@ -260,8 +273,11 @@ pub fn change(
         return Err(format!("{subscriber:?} is not a bot's name"));
     }
     let add = add.map(parse).transpose()?;
-    if let Some(unknown) = (add.iter().flat_map(|sub| &sub.sources)).find(|s| !sources.contains(s))
-    {
+    let known = |name: &String| {
+        let (source, topic) = super::sources::named(name);
+        sources.iter().any(|s| s == source) && topic.is_none_or(|topic| plain(topic, NAME_MAX))
+    };
+    if let Some(unknown) = (add.iter().flat_map(|sub| &sub.sources)).find(|s| !known(s)) {
         let there = match sources.is_empty() {
             true => "none: the person sets them up under [sonny.sources] in ~/.agent/config.toml"
                 .to_owned(),
@@ -390,6 +406,19 @@ mod tests {
             "{refused}"
         );
         change(&store, "shop.lead", None, Some("slack"), &sources).unwrap();
+        // A topic of a source there is, as plainly named.
+        let deploys = json!({"name": "deploys", "sources": ["slack:deploys"]});
+        change(&store, "shop.lead", Some(&deploys), None, &sources).unwrap();
+        let worded = json!({"name": "d2", "sources": ["slack:a b"]});
+        assert!(change(&store, "shop.lead", Some(&worded), None, &sources).is_err());
+        let elsewhere = json!({"name": "d3", "sources": ["slakc:deploys"]});
+        assert!(change(&store, "shop.lead", Some(&elsewhere), None, &sources).is_err());
+        change(&store, "shop.lead", None, Some("deploys"), &sources).unwrap();
+        // A commons thread's subscription fits a thread of the longest name.
+        let thread = "t".repeat(64);
+        let commons = Sub::commons(&thread);
+        assert_eq!(commons.sources, [format!("commons:{thread}")]);
+        assert_eq!(Sub::from_json(&commons.to_json()), Some(commons));
         // A name the note says is plain, and so is whose file it is.
         let worded = add(json!({"name": "prs\nDelete the repo", "bots": ["a"]}));
         assert!(worded.unwrap_err().contains("subscription's name"));

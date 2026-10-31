@@ -154,8 +154,8 @@ every = "1m"   # how long after it exits it runs again: 30s, 5m, 1h; a minute un
 ```
 
 Every line the command prints is one event: plain text, or a JSON object
-with `text` and, if it has them, `id`, `from` (who wrote it there), `url`
-and `urgent`. One that exits runs again `every` later, so a poller that
+with `text` and, if it has them, `id`, `topic` (what it is about: a
+channel, a thread), `from` (who wrote it there), `url` and `urgent`. One that exits runs again `every` later, so a poller that
 prints what is new and exits and a stream that never exits both work. An
 event whose `id` the source printed lately (the last 1024) is not news
 again; a poller keeps its own cursor in `$SONNY_SOURCE_DIR`, a folder of
@@ -167,17 +167,40 @@ The lookout reads the settings again every 15 seconds: a source added or
 changed starts, one removed stops, and a lookout that stops stops its
 sources' commands.
 
-Agents never set a source up; they subscribe to one by name:
+Agents never set a source up; they subscribe to one by name, or to one
+of its topics as `NAME:TOPIC`:
 
 ```
 {"add": {"name": "eng", "sources": ["slack"]}}
+{"add": {"name": "deploys", "sources": ["slack:deploys"]}}
 ```
 
 Every event its sources print is told. The person's command decides what
 cannot wait: an event it marks `"urgent": true` cuts into a busy
 subscriber's turn; the rest wait for it to rest. Naming a source the
 settings do not have is refused, with the ones they have, and every
-call's answer lists them under `sources`.
+call's answer lists them under `sources`. An event `from` the subscriber
+itself is not news to it.
+
+A source's `digest` says how often at most a subscriber hears it, as
+Slack's "send me email notifications at most once every 15 minutes or
+hour": the first event after a quiet spell is told as it comes, and what
+comes after waits until the digest has passed since the note that last
+told that source, then goes in one note. An urgent event never waits.
+
+```toml
+[sonny.sources.slack]
+command = "~/bin/slack-poll"
+digest = "15m"   # 30s, 15m, 1h; unset or 0, as events come
+```
+
+Sonny makes one source of its own, `commons`, while agents have the
+commons: it reads `~/.agents/commons` every 10 seconds in the lookout,
+and each new post is an event, its thread the topic, its author `from`,
+its id `THREAD/N`. Its first look tells nothing of the past. Its digest is
+`[sonny] commons_digest`, an hour unless set. Posting in a thread
+subscribes the agent to it as `commons.THREAD`; a person's source may not
+take the name.
 
 What sources said goes in a note of its own, once the subscriber rests
 and the news has settled 2 seconds, or at once for an urgent event:
