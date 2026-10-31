@@ -3386,10 +3386,11 @@ fn request_id(trigger: &Trigger, id: i64, ask: Option<&Asked>) -> String {
 }
 
 /// Whether a fire of `trigger` already waits behind `bot`'s work; `None`
-/// when the agent's turns could not be read. Work waiting (queued, ready,
-/// or a note attached to the next turn) is always an agent's newest, since
-/// queued work starts in order: the turns are read newest first, a page at
-/// a time, until one that started or ended.
+/// when the agent's turns could not be read. Queued work starts in order,
+/// so nothing older than a turn that started still waits: the turns are
+/// read newest first, a page at a time, until one that started. Rows that
+/// never ran (a steer the running turn took in, a message cancelled while
+/// it waited, a note attached to the next turn) are passed over.
 async fn waiting_fire(client: &Client, trigger: &Trigger, bot: &str) -> Option<bool> {
     let ours = sent_by(trigger);
     let mut before: Option<i64> = None;
@@ -3401,14 +3402,14 @@ async fn waiting_fire(client: &Client, trigger: &Trigger, bot: &str) -> Option<b
         let read = client.request("turns", page).await.ok()?;
         let turns = read["turns"].as_array()?;
         for turn in turns {
-            let status = turn["status"].as_str()?;
-            if !matches!(status, "queued" | "ready" | "attached") {
-                return Some(false);
-            }
-            if status != "attached"
-                && (turn["request_id"].as_str()).is_some_and(|id| id.starts_with(&ours))
-            {
-                return Some(true);
+            match turn["status"].as_str()? {
+                "running" | "waiting" | "paced" | "completed" | "failed" => return Some(false),
+                "queued" | "ready"
+                    if (turn["request_id"].as_str()).is_some_and(|id| id.starts_with(&ours)) =>
+                {
+                    return Some(true);
+                }
+                _ => {}
             }
         }
         match turns.last().and_then(|turn| turn["turn"].as_i64()) {
