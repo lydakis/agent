@@ -477,7 +477,9 @@ pub struct View {
     booking: bool,
     /// Schedules `triggers` calls are making, by call; and those made, by
     /// name, so a read of the triggers tells of them no second time.
-    bookings: HashMap<String, Booking>,
+    /// `triggers` calls under way, by agent, turn and call: a call id is
+    /// unique only within its turn.
+    bookings: HashMap<(String, i64, String), Booking>,
     told: HashMap<String, Instant>,
 }
 
@@ -1849,7 +1851,8 @@ impl View {
                     && let Some(call) = data["call_id"].as_str()
                     && let Some(booking) = booking(&data["arguments"], name)
                 {
-                    self.bookings.insert(call.to_owned(), booking);
+                    let key = (name.to_owned(), turn, call.to_owned());
+                    self.bookings.insert(key, booking);
                 }
                 if tool == crate::asks::TOOL && own {
                     if self.agents[at].state() != Some(State::NeedsYou) {
@@ -1906,7 +1909,8 @@ impl View {
             "tool_completed" if live => {
                 if let Some(id) = data["call_id"].as_str() {
                     self.agents[at].held.remove(id);
-                    if let Some(booking) = self.bookings.remove(id)
+                    let key = (name.to_owned(), turn, id.to_owned());
+                    if let Some(booking) = self.bookings.remove(&key)
                         && data["failed"] != true
                         && data["denied"] != true
                     {
@@ -3027,7 +3031,7 @@ impl View {
         if !self.zen {
             lines.push(Line::default());
             lines.extend(match self.legend {
-                true => legend(false),
+                true => self.legend_under(cols),
                 false => self.ticked(now, cols, TICKER, false),
             });
         }
@@ -3197,6 +3201,8 @@ impl View {
             Line::from(says("now")),
             Line::default(),
         ]);
+        // The legend's marks, between its title and what is now.
+        let marks = lines.len() - 5;
         let shown: Vec<&Agent> = self.agents.iter().filter(|a| !a.gone).collect();
         let leads = shown.iter().filter(|a| project::is_lead(&a.name)).count();
         let projects: HashSet<&str> = (shown.iter())
@@ -3233,10 +3239,23 @@ impl View {
         if let Some(busiest) = busiest {
             stat("busiest pair", busiest);
         }
-        // The next schedules to fire, soonest first, then those that
-        // watch a file or a repository.
+        for (n, next) in self.next_up().into_iter().enumerate() {
+            stat(if n == 0 { "next up" } else { "" }, next);
+        }
+        // Short of rows, the legend's last rows give way, not what is now.
+        if let Some(over) = lines.len().checked_sub(rows).filter(|&over| over > 0) {
+            let over = over.min(marks);
+            lines.drain(2 + marks - over..2 + marks);
+        }
+        lines.truncate(rows);
+        lines
+    }
+
+    /// The next three schedules to fire, soonest first, then those that
+    /// watch a file or a repository.
+    fn next_up(&self) -> Vec<String> {
         let wall = wall_ms() / 1000;
-        let next: Vec<String> = (self.schedules.iter().filter(|u| keeps_time(u)).take(3))
+        (self.schedules.iter().filter(|u| keeps_time(u)).take(3))
             .map(|upcoming| {
                 let who = self
                     .agent(&upcoming.bot)
@@ -3247,11 +3266,35 @@ impl View {
                     None => format!("{who} on change"),
                 }
             })
-            .collect();
-        for (n, next) in next.into_iter().enumerate() {
-            stat(if n == 0 { "next up" } else { "" }, next);
+            .collect()
+    }
+
+    /// The legend under the sky, with a row for schedules and what is next
+    /// up.
+    fn legend_under(&self, cols: usize) -> Vec<Line<'static>> {
+        let says = |text: &str| Span::raw(text.to_owned()).dim();
+        let mut lines = legend(false);
+        let mut row = vec![
+            Span::styled("⠒", Ink::Muted.style()),
+            says(" a schedule, lit as it nears"),
+        ];
+        let next = self.next_up();
+        if !next.is_empty() {
+            row.extend([says("   next up "), Span::raw(next.join(" · "))]);
         }
-        lines.truncate(rows);
+        let mut width = 0;
+        let row: Vec<Span<'static>> = (row.into_iter())
+            .map_while(|span| {
+                let room = cols.saturating_sub(width);
+                (room > 0).then(|| {
+                    let text = cut(&span.content, room);
+                    width += text.width();
+                    Span::styled(text, span.style)
+                })
+            })
+            .collect();
+        lines.push(Line::from(row));
+        lines.truncate(LEGEND);
         lines
     }
 
@@ -5483,6 +5526,20 @@ mod tests {
             json!({"call_id": "c2", "failed": true}),
         ))
         .unwrap();
+        // A call id is unique only within its turn: another agent's call
+        // of the same id, or this agent's in another turn, is not this one.
+        send.send(Feed::Live(
+            json!({"event": "tool_completed", "bot": "shop.login",
+            "turn": 1, "data": {"call_id": "c1"}}),
+        ))
+        .unwrap();
+        send.send(Feed::Live(
+            json!({"event": "tool_completed", "bot": "shop.lead",
+            "turn": 2, "data": {"call_id": "c1"}}),
+        ))
+        .unwrap();
+        view.drain();
+        assert!(view.ticker.is_empty());
         send.send(live("tool_completed", json!({"call_id": "c1"})))
             .unwrap();
         view.drain();
@@ -5535,6 +5592,19 @@ mod tests {
         assert!(key.contains("shop lead in 8h"), "{key}");
         assert!(key.contains("login on change"), "{key}");
         assert!(!key.contains("in 2h"), "{key}");
+        // A pane 24 rows tall keeps what is next up; the legend gives way.
+        let short = view.key(Instant::now(), 24);
+        assert_eq!(short.len(), 24);
+        let short = text(&short);
+        assert!(short.contains("next up       login in 12m"), "{short}");
+        assert!(short.starts_with("legend"), "{short}");
+        // Under a narrow sky, the legend's last row says it too.
+        let under = text(&view.legend_under(100));
+        assert!(
+            under.contains("a schedule, lit as it nears   next up login in 12m"),
+            "{under}"
+        );
+        assert!(view.legend_under(100).len() <= LEGEND);
     }
 
     #[test]
