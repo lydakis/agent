@@ -819,7 +819,7 @@ pub fn still_there(lead: &str) -> Vec<(String, String)> {
 
 /// The folders Sonny made `lead`'s tasks, from its folder `here`, whose
 /// task is no longer there, removed some other way than `remove_task`,
-/// such as by a prune of finished agents: each by name and the space it
+/// such as by `agent rm`: each by name and the space it
 /// takes. Found without running anything in them: by their records, or
 /// for the worktrees of `here`'s repository, by its list of them. None
 /// when the agents can't be listed, so a task still there is never
