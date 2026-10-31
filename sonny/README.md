@@ -148,7 +148,9 @@ A lead's transcript starts with a welcome, as Claude Code's does: Sonny,
 the robot the client is named for, as a portrait drawn in half blocks,
 beside the folder, the lead's model and a few commands. A new lead opens
 on it; a long conversation shows it above its first message, once scrolling
-up has reached it. A side chat has none.
+up has reached it. A side chat has none. Until you type or scroll, Sonny
+blinks or glances every 8 to 16 seconds, a different gesture each time;
+each redraws six cells.
 
 Sonny's two roles are normal profiles the person can read and edit in
 `~/.agents/agents`, beside their own: `lead.md`
