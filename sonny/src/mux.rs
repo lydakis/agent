@@ -9,7 +9,7 @@ use std::{
     io::Read,
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
-    sync::mpsc,
+    sync::{Arc, Mutex, mpsc},
     time::{Duration, Instant},
 };
 
@@ -103,7 +103,7 @@ pub enum Placement {
 /// split, its side of its neighbour (`right of`, `below`, … a label).
 pub type Places = HashMap<String, (usize, Option<(String, String)>)>;
 
-pub trait Backend {
+pub trait Backend: Send {
     /// The project's home as the person reads it: `Rex session shop`.
     fn home(&self) -> String;
     /// Whether that home is the one Sonny runs in.
@@ -408,6 +408,98 @@ impl Layout {
     }
 }
 
+/// A job for a [`Worker`]'s layout.
+type Job = Box<dyn FnOnce(&mut Layout) + Send>;
+
+enum Work {
+    Job(Job),
+    /// Naming the windows, which one sent after it makes needless.
+    Names(Job),
+    /// Reading where each block sits again.
+    Places,
+}
+
+/// A [`Layout`] worked on a thread of its own, so that no multiplexer
+/// call holds up Sonny's screen: jobs run in the order they are sent,
+/// a naming of the windows that another follows is skipped, and where
+/// each block sits is kept to be read at once.
+pub struct Worker {
+    work: mpsc::Sender<Work>,
+    home: String,
+    here: bool,
+    places: Arc<Mutex<Places>>,
+}
+
+impl Worker {
+    pub fn new(layout: Layout) -> Self {
+        let (work, queue) = mpsc::channel::<Work>();
+        let places = Arc::new(Mutex::new(Places::new()));
+        let kept = places.clone();
+        let (home, here) = (layout.home(), layout.here());
+        std::thread::spawn(move || {
+            let mut layout = layout;
+            while let Ok(first) = queue.recv() {
+                let batch: Vec<Work> = std::iter::once(first).chain(queue.try_iter()).collect();
+                let last_names = batch.iter().rposition(|w| matches!(w, Work::Names(_)));
+                let read = batch.iter().any(|w| matches!(w, Work::Places));
+                for (n, work) in batch.into_iter().enumerate() {
+                    match work {
+                        Work::Job(job) => job(&mut layout),
+                        Work::Names(job) if Some(n) == last_names => job(&mut layout),
+                        Work::Names(_) | Work::Places => {}
+                    }
+                }
+                if read {
+                    let read = layout.places();
+                    if let Ok(mut places) = kept.lock() {
+                        *places = read;
+                    }
+                }
+            }
+        });
+        Self {
+            work,
+            home,
+            here,
+            places,
+        }
+    }
+
+    /// Run `job` on the layout, after those sent before it.
+    pub fn send(&self, job: impl FnOnce(&mut Layout) + Send + 'static) {
+        let _ = self.work.send(Work::Job(Box::new(job)));
+    }
+
+    /// Name the windows with `job`, unless another naming follows it.
+    pub fn names(&self, job: impl FnOnce(&mut Layout) + Send + 'static) {
+        let _ = self.work.send(Work::Names(Box::new(job)));
+    }
+
+    /// Where each block sat when last read, read again in the background.
+    pub fn places(&self) -> Places {
+        let _ = self.work.send(Work::Places);
+        self.places.lock().map(|p| p.clone()).unwrap_or_default()
+    }
+
+    pub fn home(&self) -> &str {
+        &self.home
+    }
+
+    pub fn here(&self) -> bool {
+        self.here
+    }
+
+    /// Wait until every job sent so far has run.
+    #[cfg(test)]
+    pub fn settle(&self) {
+        let (done, settled) = mpsc::channel();
+        self.send(move |_| {
+            let _ = done.send(());
+        });
+        let _ = settled.recv();
+    }
+}
+
 /// The multiplexers Sonny lays work out in, by the CLI that drives each.
 enum Kind {
     Rex(PathBuf),
@@ -653,6 +745,33 @@ mod tests {
         let error = super::output_within(hung.arg("30"), std::time::Duration::from_millis(200));
         assert_eq!(error.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn a_worker_runs_jobs_in_order_and_skips_a_naming_that_another_follows() {
+        let worker = Worker::new(Layout::new(Box::new(Fake::default())));
+        assert_eq!((worker.home(), worker.here()), ("Fake home", true));
+        let named = Arc::new(Mutex::new(Vec::new()));
+        // Held until all are sent, so they arrive as one batch.
+        let (go, wait) = mpsc::channel::<()>();
+        worker.send(move |_| {
+            let _ = wait.recv();
+        });
+        let sonny = ["sonny".to_owned()];
+        worker.send(move |layout| {
+            layout.show("shop.fix", "fix", &sonny).unwrap();
+        });
+        for n in 0..3 {
+            let named = named.clone();
+            worker.names(move |layout| {
+                let windows = layout.windows();
+                named.lock().unwrap().push((n, windows.len()));
+            });
+        }
+        go.send(()).unwrap();
+        worker.settle();
+        // Only the last naming ran, after the task's window was opened.
+        assert_eq!(*named.lock().unwrap(), [(2, 1)]);
     }
 
     #[test]

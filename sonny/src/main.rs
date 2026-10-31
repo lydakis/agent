@@ -2254,7 +2254,12 @@ struct App {
 /// each task while it works, opened as its turn starts. It follows every
 /// bot on its own connection, so the lead's own view is not disturbed.
 struct Fleet {
-    layout: mux::Layout,
+    /// Worked on a thread of its own, so the multiplexer never holds up
+    /// the screen.
+    layout: mux::Worker,
+    /// What its jobs have to say in the lead's view, as they finish.
+    said: tokio::sync::mpsc::UnboundedReceiver<String>,
+    tell: tokio::sync::mpsc::UnboundedSender<String>,
     client: Arc<Client>,
     events: Events,
     socket: PathBuf,
@@ -2274,8 +2279,8 @@ struct Fleet {
     note: Option<String>,
     /// What each bot is doing, as its window says.
     doing: HashMap<String, &'static str>,
-    /// The name each window was given.
-    named: HashMap<String, String>,
+    /// The name each window was given, kept by the worker.
+    named: Arc<std::sync::Mutex<HashMap<String, String>>>,
     /// What to ring for, taken by the app after each event.
     alerts: Vec<(sound::Alert, String)>,
     /// Tasks whose last turn completed, and that turn: its window closes
@@ -2398,6 +2403,74 @@ fn lineage_of(bots: &[Value], lead: &str, first: bool) -> std::collections::Hash
     mine
 }
 
+/// What a lead's windows are named from: its project, the lead, what
+/// each of its bots is doing, and every bot of its lineage.
+struct Naming {
+    project: String,
+    lead: String,
+    doing: HashMap<String, &'static str>,
+    lineage: std::collections::HashSet<String>,
+}
+
+impl Naming {
+    /// A bot's name in its project's session: `lead`, or the task's name.
+    fn short<'a>(&self, bot: &'a str) -> &'a str {
+        if bot == self.lead {
+            return "lead";
+        }
+        bot.strip_prefix(&format!("{}.", self.project))
+            .unwrap_or(bot)
+    }
+
+    /// The bot as the person tells it apart from every other project's:
+    /// the lead by its project, as `shop lead`, a task by its own name.
+    fn named(&self, bot: &str) -> String {
+        match bot == self.lead {
+            true => lead_title(&self.project, bot),
+            false => self.short(bot).to_owned(),
+        }
+    }
+
+    /// Whether a block is the project's: a bot's, or a command one asked
+    /// for (`BOT/NAME`).
+    fn owns(&self, label: &str) -> bool {
+        let bot = label.split_once('/').map_or(label, |(bot, _)| bot);
+        self.doing.contains_key(bot) || self.lineage.contains(bot)
+    }
+
+    /// The name of a window holding the blocks labelled `labels`: after
+    /// the lead, or its first bot, and what that bot is doing, with a count
+    /// of the others that are working or need the person: `shop lead ·
+    /// done · 2 working`. None for a window that also holds the person's
+    /// own blocks, as when Sonny was opened beside them, which keeps the
+    /// name they gave it.
+    fn window(&self, labels: &[String]) -> Option<String> {
+        if !labels.iter().all(|label| self.owns(label)) {
+            return None;
+        }
+        let bots: Vec<&String> = labels
+            .iter()
+            .filter(|l| self.doing.contains_key(*l))
+            .collect();
+        let first = bots
+            .iter()
+            .find(|b| **b == &self.lead)
+            .or_else(|| bots.first())
+            .copied()?;
+        let mut name = format!("{} · {}", self.named(first), self.doing[first]);
+        for state in ["needs you", "working"] {
+            let others = bots
+                .iter()
+                .filter(|b| **b != first && self.doing.get(**b) == Some(&state))
+                .count();
+            if others > 0 {
+                name.push_str(&format!(" · {others} {state}"));
+            }
+        }
+        Some(name)
+    }
+}
+
 impl Fleet {
     async fn start(options: &Options, project: &str, lead: &str) -> Option<Self> {
         let layout = mux::here(&options.socket, project, options.rex_host.as_deref())?;
@@ -2421,8 +2494,11 @@ impl Fleet {
         // Said only when the tasks go somewhere this pane is not.
         let note = (!layout.here()).then(|| format!("tasks open in {}", layout.home()));
         mux::install_skill(options.rex_host.as_deref());
+        let (tell, said) = tokio::sync::mpsc::unbounded_channel();
         let mut fleet = Self {
-            layout,
+            layout: mux::Worker::new(layout),
+            said,
+            tell,
             client: client.clone(),
             events,
             socket: options.socket.clone(),
@@ -2435,14 +2511,17 @@ impl Fleet {
             command,
             note,
             doing: HashMap::new(),
-            named: HashMap::new(),
+            named: Default::default(),
             alerts: Vec::new(),
             ended: HashMap::new(),
             waits: Default::default(),
             returned: Vec::new(),
             resolving: Default::default(),
         };
-        fleet.layout.adopt_own(lead);
+        let own = lead.to_owned();
+        fleet.layout.send(move |layout| layout.adopt_own(&own));
+        // Read now, so `/status` has where each task sits when it opens.
+        let _ = fleet.layout.places();
         fleet.doing(lead, "idle");
         fleet.reconcile().await;
         Some(fleet)
@@ -2501,7 +2580,7 @@ impl Fleet {
             // one that started makes the last ending stale.
             self.ended.remove(name);
             if running && name != self.lead {
-                let _ = self.show(name);
+                self.show(name, false);
             } else if !running
                 && self
                     .doing
@@ -2514,13 +2593,35 @@ impl Fleet {
         self.name_windows();
     }
 
-    fn show(&mut self, bot: &str) -> Result<bool, String> {
+    /// Open the task's window, unless it has one. With `tell`, the lead's
+    /// view hears where it opened, when not beside it, or why it did not.
+    fn show(&mut self, bot: &str, tell: bool) {
         let mut command = self.command.clone();
         command.extend(["--agent".into(), bot.into()]);
         let name = format!("{} · working", self.short(bot));
-        let opened = self.layout.show(bot, &name, &command)?;
+        let (bot_name, home, here) = (
+            bot.to_owned(),
+            self.layout.home().to_owned(),
+            self.layout.here(),
+        );
+        let told = self.tell.clone();
+        self.layout.send(move |layout| {
+            let said = match layout.show(&bot_name, &name, &command) {
+                Ok(true) if !here => Some(format!("{bot_name} is in {home}")),
+                Ok(_) => None,
+                Err(error) => Some(error),
+            };
+            if let Some(said) = said.filter(|_| tell) {
+                let _ = told.send(said);
+            }
+        });
         self.doing(bot, "working");
-        Ok(opened)
+    }
+
+    /// Close the task's window, and every block it asked for.
+    fn close(&self, bot: &str) {
+        let bot = bot.to_owned();
+        self.layout.send(move |layout| layout.close(&bot));
     }
 
     /// A finished task's window closes once its result is taken: its turn
@@ -2594,7 +2695,7 @@ impl Fleet {
             for (task, turn) in calls::returned(&printed) {
                 if task != self.lead && self.ended.get(&task) == Some(&turn) {
                     self.ended.remove(&task);
-                    self.layout.close(&task);
+                    self.close(&task);
                     self.doing.remove(&task);
                     self.name_windows();
                 }
@@ -2609,7 +2710,7 @@ impl Fleet {
             && !matches!(self.doing.get(task), Some(&"working" | &"needs you"))
         {
             self.ended.remove(task);
-            self.layout.close(task);
+            self.close(task);
             self.doing.remove(task);
             self.name_windows();
         }
@@ -2617,19 +2718,16 @@ impl Fleet {
 
     /// A bot's name in its project's session: `lead`, or the task's name.
     fn short<'a>(&self, bot: &'a str) -> &'a str {
-        if bot == self.lead {
-            return "lead";
-        }
-        bot.strip_prefix(&format!("{}.", self.project))
-            .unwrap_or(bot)
+        self.naming().short(bot)
     }
 
-    /// The bot as the person tells it apart from every other project's:
-    /// the lead by its project, as `shop lead`, a task by its own name.
-    fn named(&self, bot: &str) -> String {
-        match bot == self.lead {
-            true => lead_title(&self.project, bot),
-            false => self.short(bot).to_owned(),
+    /// What names the windows, as things stand.
+    fn naming(&self) -> Naming {
+        Naming {
+            project: self.project.clone(),
+            lead: self.lead.clone(),
+            doing: self.doing.clone(),
+            lineage: self.lineage.clone(),
         }
     }
 
@@ -2656,50 +2754,25 @@ impl Fleet {
         }
     }
 
-    /// Each window holding the project's bots is named after the lead, or
-    /// its first bot, and what that bot is doing, with a count of the others
-    /// that are working or need the person: `shop lead · done · 2 working`. A
-    /// window that also holds the person's own blocks, as when Sonny was
-    /// opened beside them, keeps the name they gave it.
+    /// Name each window holding the project's bots after what they are
+    /// doing ([`Naming::window`]), on the worker, from its blocks then.
     fn name_windows(&mut self) {
-        for (window, labels) in self.layout.windows() {
-            if !labels.iter().all(|label| self.owns(label)) {
-                continue;
-            }
-            let bots: Vec<&String> = labels
-                .iter()
-                .filter(|l| self.doing.contains_key(*l))
-                .collect();
-            let Some(first) = bots
-                .iter()
-                .find(|b| **b == &self.lead)
-                .or_else(|| bots.first())
-                .copied()
-            else {
-                continue;
+        let naming = self.naming();
+        let named = self.named.clone();
+        self.layout.names(move |layout| {
+            let Ok(mut named) = named.lock() else {
+                return;
             };
-            let mut name = format!("{} · {}", self.named(first), self.doing[first]);
-            for state in ["needs you", "working"] {
-                let others = bots
-                    .iter()
-                    .filter(|b| **b != first && self.doing.get(**b) == Some(&state))
-                    .count();
-                if others > 0 {
-                    name.push_str(&format!(" · {others} {state}"));
+            for (window, labels) in layout.windows() {
+                let Some(name) = naming.window(&labels) else {
+                    continue;
+                };
+                if named.get(&window) != Some(&name) {
+                    layout.rename_window(&window, &name);
+                    named.insert(window, name);
                 }
             }
-            if self.named.get(&window) != Some(&name) {
-                self.layout.rename_window(&window, &name);
-                self.named.insert(window, name);
-            }
-        }
-    }
-
-    /// Whether a block is the project's: a bot's, or a command one asked
-    /// for (`BOT/NAME`).
-    fn owns(&self, label: &str) -> bool {
-        let bot = label.split_once('/').map_or(label, |(bot, _)| bot);
-        self.doing.contains_key(bot) || self.lineage.contains(bot)
+        });
     }
 
     /// Follow every bot again on a new connection; what changed while
@@ -2799,15 +2872,12 @@ impl Fleet {
                 }
                 None
             }
-            "accepted" if bot != self.lead && self.lineage.contains(bot) => match self.show(bot) {
-                Ok(true) if !self.layout.here() => {
-                    Some(format!("{bot} is in {}", self.layout.home()))
-                }
-                Ok(_) => None,
-                Err(error) => Some(error),
-            },
+            "accepted" if bot != self.lead && self.lineage.contains(bot) => {
+                self.show(bot, true);
+                None
+            }
             "deleted" => {
-                self.layout.close(bot);
+                self.close(bot);
                 self.lineage.remove(bot);
                 self.doing.remove(bot);
                 None
@@ -3087,12 +3157,24 @@ impl App {
                     None => self.dropped(),
                 },
                 Some(key) = keys.recv() => self.key(key).await,
-                event = async {
+                news = async {
                     match &mut self.fleet {
-                        Some(fleet) if !fleet.down => fleet.events.recv().await,
-                        _ => std::future::pending().await,
+                        Some(fleet) => tokio::select! {
+                            Some(said) = fleet.said.recv() => Err(said),
+                            event = fleet.events.recv(), if !fleet.down => Ok(event),
+                            else => std::future::pending().await,
+                        },
+                        None => std::future::pending().await,
                     }
                 } => {
+                    // What the layout's worker said, between the daemon's events.
+                    let event = match news {
+                        Ok(event) => event,
+                        Err(said) => {
+                            self.fleet_said(said);
+                            continue;
+                        }
+                    };
                     let Some(event) = event else {
                         if let Some(fleet) = &mut self.fleet {
                             fleet.down = true;
@@ -3115,12 +3197,7 @@ impl App {
                         self.sounds.alert(alert, &what);
                     }
                     if let Some(said) = said {
-                        // After the call that started the task, not above it.
-                        self.held.push(Line::from(format!("  ↳ {said}")).dim());
-                        if self.calls.is_empty() {
-                            let held = std::mem::take(&mut self.held);
-                            self.commit(held);
-                        }
+                        self.fleet_said(said);
                     }
                 }
                 _ = tick.tick() => {}
@@ -7880,6 +7957,16 @@ impl App {
             "background" if self.options.side.is_none() => self.background(),
             "status" | "background" => {}
             _ => self.press_row(what).await,
+        }
+    }
+
+    /// What the lead's tasks' layout says, as a line for the lead's view:
+    /// after the call that started the task, not above it.
+    fn fleet_said(&mut self, said: String) {
+        self.held.push(Line::from(format!("  ↳ {said}")).dim());
+        if self.calls.is_empty() {
+            let held = std::mem::take(&mut self.held);
+            self.commit(held);
         }
     }
 

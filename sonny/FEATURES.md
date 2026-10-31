@@ -61,7 +61,7 @@ per feature; group small things into the row they belong to.
 
 | Feature | Status | History | Why | Used? |
 |---|---|---|---|---|
-| Rex: tasks in Rex windows, one Rex home per project | shipped | added 10-26 #146; one home per project 10-26 #160; multiplexer interface 10-26 #166 | Watch and click into every agent from the multiplexer | ? |
+| Rex: tasks in Rex windows, one Rex home per project | shipped | added 10-26 #146; one home per project 10-26 #160; multiplexer interface 10-26 #166; every host call off the screen thread, window names coalesced 10-31 #492 | Watch and click into every agent from the multiplexer | ? |
 | Herdr: the same layout in Herdr, Sonny as a Herdr harness | shipped | added 10-26 #167; as Herdr's own agents 10-27 #178; survives Herdr restarts 10-28 #231; host calls time out, small split above/left fixed 10-31 #489 | George's other multiplexer | ? |
 | cmux: the same layout in cmux, Automation mode for agents | experimental | added 10-29 #300, #323 | A third multiplexer to try | ? |
 | Sessions for leads, tabs for tasks, a split only to show something now (`sonny run`, `sonny show`) | shipped | `sonny run` renamed `sonny split` 10-26 #165; sessions and tabs 10-27 #200; no programs started while a window idles 10-29 #311 | Tabs are a job stream to click into; a split is for attention now | ? |
