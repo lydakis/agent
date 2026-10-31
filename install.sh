@@ -12,8 +12,14 @@
 # PREFIX/opt/sonny at it and links PREFIX/bin/sonny to its Sonny. Earlier
 # versions stay where they are, since a running daemon may still use one.
 #
+# It also installs, with the system's package manager (through sudo when
+# not root), what Sonny's own features need and the release cannot carry:
+# bubblewrap, which the daemon's default sandbox runs commands in, and
+# ripgrep, which its agents search code with.
+#
 #   SONNY_VERSION  a release such as 0.4.1 (default: the latest)
 #   PREFIX         where to install (default: ~/.local)
+#   SONNY_PACKAGES set to 0 to leave the system's packages alone
 set -eu
 
 repo=https://github.com/lydakis/agent
@@ -21,6 +27,59 @@ repo=https://github.com/lydakis/agent
 fail() {
     echo "install.sh: $*" >&2
     exit 1
+}
+
+# The folders the daemon looks for bubblewrap in (src/sandbox.rs, BWRAP):
+# never PATH, which a sandboxed command could plant a `bwrap` on.
+bwrap_found() {
+    for bwrap in /usr/bin/bwrap /bin/bwrap /usr/local/bin/bwrap /run/current-system/sw/bin/bwrap; do
+        [ -x "$bwrap" ] && return 0
+    done
+    return 1
+}
+
+packages() {
+    missing=""
+    bwrap_found || missing="bubblewrap"
+    command -v rg >/dev/null || missing="$missing ripgrep"
+    missing=${missing# }
+    [ -n "$missing" ] || return 0
+    hint="Sonny's sandbox and code search need $missing; install with your package manager"
+    if [ "${SONNY_PACKAGES:-1}" = 0 ]; then
+        echo "$hint"
+        return 0
+    fi
+    if command -v apt-get >/dev/null; then
+        install="apt-get install -y"
+    elif command -v dnf >/dev/null; then
+        install="dnf install -y"
+    elif command -v pacman >/dev/null; then
+        install="pacman -S --needed --noconfirm"
+    elif command -v zypper >/dev/null; then
+        install="zypper --non-interactive install"
+    elif command -v apk >/dev/null; then
+        install="apk add"
+    else
+        echo "$hint"
+        return 0
+    fi
+    if [ "$(id -u)" = 0 ]; then
+        sudo=""
+    elif command -v sudo >/dev/null; then
+        sudo="sudo "
+    else
+        echo "$hint"
+        return 0
+    fi
+    echo "Installing $missing: $sudo$install $missing"
+    # A fresh image's apt has no package lists yet.
+    # shellcheck disable=SC2086
+    if ! $sudo$install $missing; then
+        case "$install" in
+            apt-get*) $sudo apt-get update && $sudo$install $missing && return 0 ;;
+        esac
+        echo "install.sh: could not install $missing; $hint" >&2
+    fi
 }
 
 main() {
@@ -84,6 +143,7 @@ main() {
     ln -sfn "../opt/sonny/bin/sonny" "$prefix/bin/sonny"
 
     echo "Installed $("$prefix/bin/sonny" --version) at $prefix/bin/sonny"
+    packages
     case ":$PATH:" in
         *":$prefix/bin:"*) ;;
         *) echo "Add $prefix/bin to your PATH, for example in your shell's profile:
