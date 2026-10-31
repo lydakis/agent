@@ -586,12 +586,17 @@ way `/react` does, and each note in the margin has its own `↩`.
   agents take it at once. The list holds for every folder, so a program
   named from the folder it runs in (`./build.sh`) is never offered.
 
-  A program listening on a Unix socket runs what it is asked outside the
-  sandbox, as Docker's does, so a sandboxed agent reaches none, even one
-  it made in its own folder, where a hard link could name any other. A
-  row's `unix_sockets` names those it may reach, each a socket or a folder
-  of them, as Claude Code's `allowUnixSockets` does. On Linux the sandbox
-  can't tell sockets apart, so a row that names any reaches them all.
+  An agent that reaches the network reaches every Unix socket too, as
+  Codex's full network does, so MCPX, Docker and ssh-agent just work; and
+  every row that writes writes Sonny's zen folder too, so `sonny zen`
+  works from an agent's shell. One
+  kept off the network reaches none, since a program listening on a socket
+  runs what it is asked outside the sandbox, as Docker's does: its row's
+  `unix_sockets` names those it may reach, each a socket or a folder of
+  them, as Claude Code's `allowUnixSockets` does. On Linux the sandbox
+  can't tell sockets apart, so a row that names any reaches them all. No
+  agent reaches the daemon's own socket, only its own, through which the
+  `agent` and `sonny` commands work as that agent.
 
   ![An approval prompt offering to always allow cargo test](../docs/sonny/permissions-always.png)
 
@@ -750,7 +755,16 @@ way `/react` does, and each note in the margin has its own `↩`.
   running turns end and what arrives meanwhile waits, across restarts too.
   Every window says who paused and why. Agents pull the same cord with
   `agent pause --reason` from their shell
-  ([docs/SONNY.md](../docs/SONNY.md#pause)).
+  ([docs/SONNY.md](../docs/SONNY.md#pause)). In `/sky` a pull is the one
+  loud moment: a yellow cord drops from the top to whoever pulled it, an
+  agent's star or you in the middle, and three yellow rings sweep out from
+  them across the sky, each star going still as a ring passes; the cord
+  then hangs there, calmer, until the line goes on. A resume draws it back
+  up while white rings sweep out from whoever resumed, waking each star.
+  The chat log says who pulled it and why, then who resumed and after how
+  long, and the footer says who paused it and how long ago.
+
+  ![/sky as an agent pulls the cord](../docs/sonny/sky-cord.png)
 - `/mcp` lists your MCP servers (`[sonny.mcp_servers]` in
   `~/.agent/config.toml`, kept with `sonny mcp add|remove|list|import|tool`), each with
   its tools or why it did not start. Agents reach them through one `exec`
@@ -919,8 +933,8 @@ session, its answers read from agent-browser's JSON, and a screenshot
 comes back as a picture, up to 20 a call. It refuses what would
 reach past the browser: flags that launch another program or load an
 extension, plugins, the clipboard, the browser's DevTools address, and
-files outside the agent's folder; a sandboxed agent's browser opens no
-`file://` page, as Playwright's MCP server keeps them closed by default.
+writes outside the agent's folder. It opens `file://` pages anywhere,
+as the agent's sandbox reads anywhere, as Codex's does.
 The actions in `sonny.browser_confirm` (`eval`, `download`, `upload` and
 `state` by default), signing in from agent-browser's vault, and every
 call of an agent kept off the network wait for the agent's approvals,

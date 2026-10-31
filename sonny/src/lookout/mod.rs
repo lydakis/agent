@@ -14,6 +14,7 @@
 //!
 //! A subscriber hears it all in one note, which starts "Task updates: ".
 pub(crate) mod goals;
+pub(crate) mod pattern;
 pub(crate) mod sources;
 pub(crate) mod subs;
 mod updates;
@@ -2288,20 +2289,14 @@ impl Lookout {
 
     /// The last note was refused lately: even a steer waits the gap after.
     /// The subscriptions that hear an event now: those naming its source,
-    /// or its source and topic. What the subscriber itself said is no news
-    /// to it.
+    /// or its source and topic, whose filter, if any, matches it. What the
+    /// subscriber itself said is no news to it.
     fn hearing(&self, event: &sources::Event) -> Vec<String> {
-        if event.from.as_deref() == Some(self.lead.as_str())
-            || event.told.contains(&self.lead)
-        {
+        if event.from.as_deref() == Some(self.lead.as_str()) || event.told.contains(&self.lead) {
             return Vec::new();
         }
-        let hears = |name: &String| match sources::named(name) {
-            (source, None) => source == event.source,
-            (source, topic) => source == event.source && topic == event.topic.as_deref(),
-        };
         (self.subs.iter())
-            .filter(|sub| sub.sources.iter().any(hears))
+            .filter(|sub| sub.hears(event))
             .map(|sub| sub.name.clone())
             .collect()
     }
@@ -2581,6 +2576,7 @@ mod tests {
             tasks_of: tasks_of.iter().map(|b| b.to_string()).collect(),
             bots: bots.iter().map(|b| b.to_string()).collect(),
             sources: Vec::new(),
+            filter: None,
         }
     }
 
@@ -3652,6 +3648,7 @@ mod tests {
             url: None,
             urgent,
             digest: None,
+            fields: std::sync::Arc::new(json!({"text": text})),
             told: Vec::new(),
             at_ms: 1,
             seq: 0,
@@ -3816,6 +3813,31 @@ mod tests {
                 .contains("two")
         );
         assert!(lookout.heard.is_empty());
+    }
+
+    #[test]
+    fn a_filtered_subscription_hears_only_the_events_it_matches() {
+        let mut lookout = lookout();
+        let mut billing = hears("billing");
+        billing.filter = Some(json!({"paths": [{"prefix": "src/billing/"}]}));
+        lookout.subs.push(billing);
+        lookout.subs.push(hears("all"));
+        let change = |paths: Value| {
+            let line = json!({"text": "CR-7", "id": paths.to_string(), "paths": paths});
+            sources::Event::parse("slack", &line.to_string(), 1).unwrap()
+        };
+        lookout.heard_from(&change(json!(["src/billing/tax.rs", "README.md"])));
+        lookout.heard_from(&change(json!(["src/search/index.rs"])));
+        let subs: Vec<_> = lookout.heard.iter().map(|h| h.subs.clone()).collect();
+        assert_eq!(subs, [vec!["billing", "all"], vec!["all"]]);
+        // Without the subscription that hears all, the other is dropped.
+        lookout.subs.retain(|sub| sub.name == "billing");
+        lookout.rehear();
+        assert_eq!(lookout.heard.len(), 1);
+        assert_eq!(lookout.heard[0].subs, ["billing"]);
+        // A filter matches nothing on a plain line that lacks its field.
+        lookout.heard_from(&slack("src/billing/ is down", false));
+        assert_eq!(lookout.heard.len(), 1);
     }
 
     /// A daemon that greets, answers each request with `{}` and sends each
