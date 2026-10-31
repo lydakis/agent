@@ -219,10 +219,10 @@ pub struct Declared {
     /// before it ends `tool_unserved`; `ANSWER_EXPIRE_MS` when left out.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expire_ms: Option<u64>,
-    /// Whether a bot this one creates takes the tool too; `false` keeps it
-    /// the declaring bot's own.
-    #[serde(default = "inherited", skip_serializing_if = "is_inherited")]
-    pub inherit: bool,
+    /// Which bots this one creates take the tool too: every generation
+    /// (`true`), none (`false`, the declaring bot's own), or that many.
+    #[serde(default, skip_serializing_if = "Inherit::is_all")]
+    pub inherit: Inherit,
     /// Whether a gate that names the tool judges the steps its client puts
     /// to it with `approve_step` instead of the call as a whole: a script
     /// whose nested calls are each approved, as in Codex's code mode.
@@ -240,11 +240,72 @@ impl Declared {
         Some(started_ms + self.expire_ms.unwrap_or(ANSWER_EXPIRE_MS))
     }
 }
-fn inherited() -> bool {
-    true
+/// How far down the bots a bot creates a declared tool goes: to every
+/// generation, the default, or to `Generations(n)`, each bot that takes it
+/// passing it on one generation fewer, as a packet's hop count does. On the
+/// wire it is `true`, `false` (no generation) or the count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Inherit {
+    #[default]
+    All,
+    Generations(u32),
 }
-fn is_inherited(inherit: &bool) -> bool {
-    *inherit
+impl Inherit {
+    fn is_all(&self) -> bool {
+        *self == Inherit::All
+    }
+    /// Whether a bot this one creates takes the tool.
+    pub fn passes(self) -> bool {
+        self != Inherit::Generations(0)
+    }
+    /// Whether the tool goes no further down than `bound` lets it.
+    pub fn within(self, bound: Inherit) -> bool {
+        match (self, bound) {
+            (_, Inherit::All) => true,
+            (Inherit::All, Inherit::Generations(_)) => false,
+            (Inherit::Generations(n), Inherit::Generations(most)) => n <= most,
+        }
+    }
+    /// What a bot this one creates takes with the tool.
+    pub fn passed(self) -> Inherit {
+        match self {
+            Inherit::All => Inherit::All,
+            Inherit::Generations(n) => Inherit::Generations(n.saturating_sub(1)),
+        }
+    }
+}
+impl Serialize for Inherit {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        match self {
+            Inherit::All => serializer.serialize_bool(true),
+            Inherit::Generations(0) => serializer.serialize_bool(false),
+            Inherit::Generations(n) => serializer.serialize_u32(*n),
+        }
+    }
+}
+impl<'de> Deserialize<'de> for Inherit {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Wire {
+            Every(bool),
+            Count(u32),
+        }
+        Ok(
+            match Wire::deserialize(deserializer).map_err(|_| {
+                serde::de::Error::custom("inherit is true, false or a whole number of generations")
+            })? {
+                Wire::Every(true) => Inherit::All,
+                Wire::Every(false) => Inherit::Generations(0),
+                Wire::Count(n) => Inherit::Generations(n),
+            },
+        )
+    }
 }
 /// The most tools a bot may have declared, and the most bytes they take.
 pub const MAX_DECLARED: usize = 32;
@@ -882,6 +943,64 @@ impl ReadSource {
     }
 }
 
+/// Files in a bot's outputs folder that hold an outcome's cut streams
+/// whole: each stream's name and the file's path. Until the store records
+/// them they are the outcome's own and go with it, as a temporary file goes
+/// unless it is kept: an outcome dropped before its record, by a stopped
+/// turn or a write that failed, removes them, wherever it waited. Copies
+/// share them; the last one dropped unrecorded removes them. None, the
+/// usual case, allocates nothing.
+#[derive(Debug, Default, Clone)]
+pub struct Files(Option<std::sync::Arc<Owned>>);
+#[derive(Debug)]
+struct Owned {
+    files: Vec<(&'static str, String)>,
+    recorded: std::sync::atomic::AtomicBool,
+}
+impl Files {
+    pub fn new(files: Vec<(&'static str, String)>) -> Self {
+        Self((!files.is_empty()).then(|| {
+            std::sync::Arc::new(Owned {
+                files,
+                recorded: Default::default(),
+            })
+        }))
+    }
+    /// The store's record names them now: they last as it does.
+    pub fn recorded(&self) {
+        if let Some(owned) = &self.0 {
+            owned
+                .recorded
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+impl std::ops::Deref for Files {
+    type Target = [(&'static str, String)];
+    fn deref(&self) -> &Self::Target {
+        self.0.as_deref().map_or(&[], |owned| &owned.files)
+    }
+}
+impl Drop for Owned {
+    // Dropped wherever its outcome goes, the runtime thread too, so the
+    // removal runs on a blocking worker when there is one.
+    fn drop(&mut self) {
+        if *self.recorded.get_mut() {
+            return;
+        }
+        let files: Vec<String> = self.files.drain(..).map(|(_, file)| file).collect();
+        let remove = move || {
+            for file in &files {
+                let _ = std::fs::remove_file(file);
+            }
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => drop(runtime.spawn_blocking(remove)),
+            Err(_) => remove(),
+        }
+    }
+}
+
 /// Model-facing result text plus any full outputs that were truncated.
 #[derive(Debug, Clone)]
 pub struct Outcome {
@@ -889,7 +1008,7 @@ pub struct Outcome {
     pub artifacts: Vec<(&'static str, Vec<u8>)>,
     /// Retained streams written whole to a file in the bot's outputs
     /// folder, in place of a copy in the store: each one's path.
-    pub files: Vec<(&'static str, String)>,
+    pub files: Files,
     /// What follows the output, in order: an image file read's picture, or
     /// the pictures, and the words between them, a client answered with.
     pub parts: Vec<crate::codec::Part>,
@@ -922,7 +1041,7 @@ impl Outcome {
         Self {
             output,
             artifacts: Vec::new(),
-            files: Vec::new(),
+            files: Files::default(),
             parts: Vec::new(),
             note: None,
             failed: false,
@@ -1674,7 +1793,7 @@ impl Registry {
         Outcome {
             output: output.to_string(),
             artifacts,
-            files: Vec::new(),
+            files: Files::default(),
             parts: Vec::new(),
             note: None,
             failed: !success,
@@ -1724,7 +1843,7 @@ impl Registry {
         Outcome {
             output: output.to_string(),
             artifacts,
-            files: Vec::new(),
+            files: Files::default(),
             parts: Vec::new(),
             note: None,
             failed: !success,

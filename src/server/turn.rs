@@ -21,7 +21,7 @@ use agent_runtime::{
         Bot, CallAnswer, ContextPrefix, ContextUsage, Database, ElisionPlan, Gated, Settings, Slot,
         Store, Strip, TURN_VIEW_ACCOUNTING, Waiting, Window, unserved,
     },
-    tools::{Outcome, Prepared, ReadSource, Registry},
+    tools::{Files, Outcome, Prepared, ReadSource, Registry},
 };
 use bytes::Bytes;
 use futures_util::{StreamExt, stream};
@@ -3815,7 +3815,7 @@ impl Turn {
                     let outcome = Outcome {
                         output: json!({"bytes":text.len(),"cleared":text.is_empty()}).to_string(),
                         artifacts: Vec::new(),
-                        files: Vec::new(),
+                        files: Files::default(),
                         parts: Vec::new(),
                         note: Some(text),
                         failed: false,
@@ -4706,7 +4706,7 @@ impl Turn {
                 Err(error) => (
                     json!({"error":error.code,"detail":error.detail}),
                     Vec::new(),
-                    Vec::new(),
+                    Files::default(),
                 ),
             };
             // Commit the result and overflow together before waking waiters.
@@ -4714,7 +4714,9 @@ impl Turn {
             let recorded = value.clone();
             match store
                 .op("process_finish", move |db| {
-                    db.process_finish(id, &recorded, &artifacts, &files)
+                    db.process_finish(id, &recorded, &artifacts, &files)?;
+                    files.recorded();
+                    Ok(())
                 })
                 .await
             {
@@ -4874,7 +4876,7 @@ impl Outputs {
             if self.exposed() {
                 return Kept {
                     stored: artifacts,
-                    files: Vec::new(),
+                    files: Files::default(),
                 };
             }
             let mut stored = Vec::new();
@@ -4902,13 +4904,16 @@ impl Outputs {
                 .into_iter()
                 .map(|(stream, path, _)| (stream, path))
                 .collect();
-            Kept { stored, files }
+            Kept {
+                stored,
+                files: Files::new(files),
+            }
         })
         .await;
         // A task that failed took the data with it: the cut text stands alone.
-        if let Ok(mut kept) = kept {
-            outcome.artifacts = std::mem::take(&mut kept.stored);
-            outcome.files = std::mem::take(&mut kept.files);
+        if let Ok(Kept { stored, files }) = kept {
+            outcome.artifacts = stored;
+            outcome.files = files;
         }
         outcome
     }
@@ -4960,30 +4965,10 @@ impl Outputs {
 }
 
 /// A call's cut streams once kept: those the store keeps, and the files
-/// that hold the others, removed again unless the call's outcome takes them.
+/// that hold the others.
 struct Kept {
     stored: Vec<(&'static str, Vec<u8>)>,
-    files: Vec<(&'static str, String)>,
-}
-
-impl Drop for Kept {
-    // A stopped turn drops its keeper's result wherever the handle goes,
-    // the runtime thread too, so the removal runs on a blocking worker.
-    fn drop(&mut self) {
-        if self.files.is_empty() {
-            return;
-        }
-        let files: Vec<String> = self.files.drain(..).map(|(_, file)| file).collect();
-        let remove = move || {
-            for file in &files {
-                let _ = std::fs::remove_file(file);
-            }
-        };
-        match tokio::runtime::Handle::try_current() {
-            Ok(runtime) => drop(runtime.spawn_blocking(remove)),
-            Err(_) => remove(),
-        }
-    }
+    files: Files,
 }
 
 /// `data` to a new file at `path`, never through a link, on disk before
@@ -5490,7 +5475,7 @@ fn failure(error: Error) -> Outcome {
     Outcome {
         output: json!({"error":error.code,"detail":error.detail}).to_string(),
         artifacts: Vec::new(),
-        files: Vec::new(),
+        files: Files::default(),
         parts: Vec::new(),
         note: None,
         failed: true,

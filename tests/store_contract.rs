@@ -7,7 +7,7 @@ use agent_runtime::{
         Delivery, Fork, Gate, Gated, Planning, QuoteRef, Settings, Strip, TurnBudget, TurnOptions,
         Wake,
     },
-    tools::{Declared, Outcome},
+    tools::{Declared, Inherit, Outcome},
 };
 use bytes::Bytes;
 use rusqlite::Connection;
@@ -88,7 +88,7 @@ fn result(output: &str) -> Outcome {
         parts: Vec::new(),
         note: None,
         failed: false,
-        files: Vec::new(),
+        files: Default::default(),
     }
 }
 
@@ -1115,7 +1115,7 @@ fn a_failure_after_a_later_call_lapsed_keeps_its_request() {
     std::thread::sleep(std::time::Duration::from_millis(60));
     let failed = Outcome {
         failed: true,
-        files: Vec::new(),
+        files: Default::default(),
         ..result("{}")
     };
     db.tool_finish(turn, "r1", &failed).unwrap();
@@ -1415,7 +1415,7 @@ fn a_call_announced_again_is_found_by_a_listing_already_past_it() {
     ));
     let failed = Outcome {
         failed: true,
-        files: Vec::new(),
+        files: Default::default(),
         ..result("{}")
     };
     db.tool_finish(turn, "s1", &failed).unwrap();
@@ -2756,6 +2756,128 @@ fn schema_64_had_no_people_and_no_quotes() {
     std::fs::remove_file(path).unwrap();
 }
 
+/// A turn of Bob's that says "Shall I deploy?" and then streams what says
+/// nothing a person reads: reasoning, and content that is not parts.
+fn ask_and_finish(db: &mut Database, key: &str) -> (i64, i64) {
+    let turn = db
+        .begin(
+            "Bob",
+            key,
+            "go",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let quiet = |item: Value| Bytes::from(serde_json::to_vec(&item).unwrap());
+    let entries = db
+        .append(
+            turn,
+            vec![
+                assistant("Looking."),
+                assistant("Shall I deploy?"),
+                quiet(json!({"type":"reasoning","id":"rs_1","summary":[]})),
+                quiet(json!({"type":"message","role":"assistant","content":"plain"})),
+                assistant(" \n"),
+            ],
+            &[],
+            None,
+        )
+        .unwrap();
+    db.finish(turn, None).unwrap();
+    (turn, entries[1]["data"]["node"].as_i64().unwrap())
+}
+
+#[test]
+fn a_finished_turns_reply_outlives_retention() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    db.create("Carol", Some("/synthetic"), binding()).unwrap();
+    let (asked, _) = ask_and_finish(&mut db, "r1");
+    let answered = db
+        .begin(
+            "Bob",
+            "r2",
+            "yes",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    db.append(answered, vec![assistant("Deployed.")], &[], None)
+        .unwrap();
+    db.finish(answered, None).unwrap();
+    assert!(db.prune("Bob", 1).unwrap()["events"].as_i64().unwrap() > 0);
+    // Its outcome is gone, as retention promises.
+    assert_eq!(
+        db.turn_outcome("Bob", asked).unwrap_err().code,
+        "turn_result_pruned"
+    );
+    // The words a person's "yes" answered are still read with it.
+    assert_eq!(
+        db.prompts("Bob", answered, 64 * 1024).unwrap()["prompts"][0]["reply"]["text"],
+        "Shall I deploy?"
+    );
+    // And the reply can still be quoted.
+    let options = TurnOptions {
+        quotes: vec![quote("Bob", asked, true)],
+        ..TurnOptions::default()
+    };
+    let quoting = db
+        .begin("Carol", "c1", "see this", true, &options, allow_provider)
+        .unwrap()
+        .turn;
+    assert_eq!(
+        db.prompts("Carol", quoting, 64 * 1024).unwrap()["prompts"][0]["quotes"][0]["text"],
+        "Shall I deploy?"
+    );
+}
+
+#[test]
+fn schema_69_finds_each_finished_turns_reply() {
+    let path = std::env::temp_dir().join(format!(
+        "agent-schema69-reply-{}.sqlite",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let (asked, node, silent) = {
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        db.create("Bob", Some("/synthetic"), binding()).unwrap();
+        let (asked, node) = ask_and_finish(&mut db, "r1");
+        let silent = db
+            .begin(
+                "Bob",
+                "r2",
+                "hush",
+                true,
+                &TurnOptions::default(),
+                allow_provider,
+            )
+            .unwrap()
+            .turn;
+        db.finish(silent, None).unwrap();
+        (asked, node, silent)
+    };
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch("ALTER TABLE turns DROP COLUMN reply_node; PRAGMA user_version=69;")
+        .unwrap();
+    drop(Database::initialize(Connection::open(&path).unwrap()).unwrap());
+    let conn = Connection::open(&path).unwrap();
+    let reply = |turn: i64| -> Option<i64> {
+        conn.query_row("SELECT reply_node FROM turns WHERE id=?", [turn], |r| {
+            r.get(0)
+        })
+        .unwrap()
+    };
+    assert_eq!(reply(asked), Some(node));
+    assert_eq!(reply(silent), None);
+    drop(conn);
+    std::fs::remove_file(path).unwrap();
+}
+
 #[test]
 fn events_keep_when_they_were_written_and_a_time_finds_its_cursor() {
     let path = std::env::temp_dir().join(format!("agent-written-{}.sqlite", std::process::id()));
@@ -2865,7 +2987,7 @@ fn an_event_is_never_written_before_the_one_before_it() {
 
 #[test]
 fn schema_68_events_had_no_times() {
-    let path = std::env::temp_dir().join(format!("agent-schema68-{}.sqlite", std::process::id()));
+    let path = std::env::temp_dir().join(format!("agent-schema69-{}.sqlite", std::process::id()));
     let _ = std::fs::remove_file(&path);
     let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
     db.create("Bob", Some("/synthetic"), binding()).unwrap();
@@ -3051,7 +3173,7 @@ fn prompts_name_who_wrote_each_and_what_the_turn_ran() {
     db.tool_start(turn, &round[0]).unwrap();
     let failed = Outcome {
         failed: true,
-        files: Vec::new(),
+        files: Default::default(),
         ..result("exit 1")
     };
     let (_, completed) = db.tool_finish(turn, "c1", &failed).unwrap();
@@ -3887,7 +4009,7 @@ fn declared_tools_pass_to_created_bots_and_forks_and_a_forks_allow_narrows_them(
         description: "React to a message.".into(),
         parameters: json!({"type":"object","properties":{"emoji":{"type":"string"}}}),
         result: "ok".into(),
-        inherit: true,
+        inherit: Inherit::All,
         answered_by: None,
         expire_ms: None,
         grammar: None,
@@ -3899,7 +4021,7 @@ fn declared_tools_pass_to_created_bots_and_forks_and_a_forks_allow_narrows_them(
         description: "Resolve a task.".into(),
         parameters: json!({"type":"object"}),
         result: "ok".into(),
-        inherit: false,
+        inherit: Inherit::Generations(0),
         answered_by: None,
         expire_ms: None,
         grammar: None,
@@ -3991,6 +4113,71 @@ fn declared_tools_pass_to_created_bots_and_forks_and_a_forks_allow_narrows_them(
 }
 
 #[test]
+fn a_tool_declared_for_some_generations_goes_that_far_down_and_no_further() {
+    let mut db = db();
+    let start = Declared {
+        name: "start".into(),
+        description: "Start a task.".into(),
+        parameters: json!({"type":"object"}),
+        result: "ok".into(),
+        inherit: Inherit::Generations(2),
+        answered_by: None,
+        expire_ms: None,
+        grammar: None,
+        steps: false,
+    };
+    let (lead, _) = db
+        .create(
+            "Lead",
+            Some("/synthetic"),
+            Binding {
+                declared: Some(std::slice::from_ref(&start)),
+                ..binding()
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(&lead).unwrap()["declared"][0]["inherit"],
+        2
+    );
+    let made = |db: &mut Database, name: &str, by: &str, by_id: i64| {
+        let mut b = binding();
+        b.created_by = Some(by);
+        b.created_by_id = Some(by_id);
+        db.create(name, Some("/synthetic"), b).unwrap().0
+    };
+    // Each generation passes it on one fewer, the last as its own.
+    let task = made(&mut db, "Task", "Lead", lead.bot_id);
+    assert_eq!(task.declared[0].inherit, Inherit::Generations(1));
+    let helper = made(&mut db, "Helper", "Task", task.bot_id);
+    assert_eq!(helper.declared[0].inherit, Inherit::Generations(0));
+    assert_eq!(
+        serde_json::to_value(&helper).unwrap()["declared"][0]["inherit"],
+        false
+    );
+    assert!(
+        made(&mut db, "Deeper", "Helper", helper.bot_id)
+            .declared
+            .is_empty()
+    );
+    // A fork is a copy, not a generation: it keeps what its source has.
+    converse(&mut db, "Task", 1);
+    let copy = db.fork("Task", "Copy", Fork::default()).unwrap().0;
+    assert_eq!(copy.declared[0].inherit, Inherit::Generations(1));
+    // On the wire it is true, false or a count, and nothing else.
+    let read = |inherit: Value| {
+        serde_json::from_value::<Declared>(json!({"name":"t","description":"d",
+            "parameters":{"type":"object"},"inherit":inherit}))
+        .map(|tool| tool.inherit)
+    };
+    assert_eq!(read(json!(true)).unwrap(), Inherit::All);
+    assert_eq!(read(json!(false)).unwrap(), Inherit::Generations(0));
+    assert_eq!(read(json!(0)).unwrap(), Inherit::Generations(0));
+    assert_eq!(read(json!(3)).unwrap(), Inherit::Generations(3));
+    assert!(read(json!(-1)).is_err() && read(json!("all")).is_err());
+}
+
+#[test]
 fn waiting_calls_page_past_held_answers_and_an_answer_out_of_time_is_refused() {
     let mut db = db();
     let start = Declared {
@@ -4002,7 +4189,7 @@ fn waiting_calls_page_past_held_answers_and_an_answer_out_of_time_is_refused() {
         expire_ms: None,
         grammar: None,
         steps: false,
-        inherit: true,
+        inherit: Inherit::All,
     };
     db.create(
         "Lead",
@@ -4076,7 +4263,7 @@ fn a_parked_answer_s_pictures_are_stored_once_its_result_is() {
         expire_ms: None,
         grammar: None,
         steps: false,
-        inherit: true,
+        inherit: Inherit::All,
     };
     db.create(
         "Lead",
@@ -4292,7 +4479,7 @@ fn artifacts_are_scoped_to_the_owning_bot_and_lineage_checks_use_depth() {
         parts: Vec::new(),
         note: None,
         failed: false,
-        files: Vec::new(),
+        files: Default::default(),
     };
     let (_, entry) = db.tool_finish(turn, "c1", &outcome).unwrap();
     assert_eq!(entry["data"]["artifacts"][0], "stdout");
@@ -9825,7 +10012,7 @@ fn carry_forward_notes_are_versioned_by_result_node_and_forks_bind_by_checkpoint
             parts: Vec::new(),
             note: Some(text.to_owned()),
             failed: false,
-            files: Vec::new(),
+            files: Default::default(),
         };
         let (_, entry) = db.tool_finish(turn, &call.call_id, &outcome).unwrap();
         let version = entry["data"]["note"].as_i64().unwrap();
@@ -14112,7 +14299,7 @@ fn a_waiting_step_ended_in_a_group_that_fails_is_told_of_once_one_commits() {
         expire_ms: None,
         grammar: None,
         steps: true,
-        inherit: true,
+        inherit: Inherit::All,
     };
     let gate = Gate {
         tag: "manual".into(),

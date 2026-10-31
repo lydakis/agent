@@ -374,23 +374,28 @@ mod tests {
             passes,
         };
         // Two deep: the lead's tasks start their own, which start none.
-        assert_eq!(a_lead(), role(true, true, true));
-        assert_eq!(a_task(), role(false, true, false));
-        assert_eq!(a_helper(), role(false, false, false));
+        assert_eq!(a_lead(), role(true, true, Some(1)));
+        assert_eq!(a_task(), role(false, true, Some(0)));
+        assert_eq!(a_helper(), role(false, false, Some(0)));
         // One deep: only the lead starts tasks.
-        assert_eq!(Role::at(0, 1), role(true, true, false));
-        assert_eq!(Role::at(1, 1), role(false, false, false));
+        assert_eq!(Role::at(0, 1), role(true, true, Some(0)));
+        assert_eq!(Role::at(1, 1), role(false, false, Some(0)));
+        // Three deep: the lead's start goes two generations down.
+        assert_eq!(Role::at(0, 3), role(true, true, Some(2)));
         // No end.
-        assert_eq!(Role::at(40, 0), role(false, true, true));
+        assert_eq!(Role::at(40, 0), role(false, true, None));
         let named = |role: Role, name: &str| -> Option<Value> {
             tools(role).into_iter().find(|tool| tool["name"] == name)
         };
-        // A lead's start and removal go to its tasks from their first
-        // turn; a task's stay its own, so its helpers start none.
+        // A lead's start and removal go down as many generations as have
+        // room, from their first turn: its tasks' stay their own, so their
+        // helpers start none.
         for name in [crate::served::START, crate::served::REMOVE] {
-            assert_eq!(named(a_lead(), name).unwrap().get("inherit"), None);
+            assert_eq!(named(a_lead(), name).unwrap()["inherit"], 1);
             assert_eq!(named(a_task(), name).unwrap()["inherit"], false);
             assert_eq!(named(a_helper(), name), None);
+            assert_eq!(named(Role::at(0, 3), name).unwrap()["inherit"], 2);
+            assert_eq!(named(Role::at(5, 0), name).unwrap().get("inherit"), None);
         }
         // Making projects is a lead's alone, and never passed on.
         assert_eq!(

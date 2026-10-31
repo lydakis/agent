@@ -70,7 +70,9 @@ const SPLIT: [&str; 4] = crate::mux::SIDES;
 pub struct Role {
     pub lead: bool,
     pub starts: bool,
-    pub passes: bool,
+    /// How many generations below it start tasks too, `None` for no end:
+    /// the daemon passes its start down that far, one fewer each time.
+    pub passes: Option<u64>,
 }
 
 impl Role {
@@ -78,17 +80,16 @@ impl Role {
     pub const ALL: Role = Role {
         lead: true,
         starts: true,
-        passes: true,
+        passes: None,
     };
 
     /// The role of an agent `depth` generations below its lead, the lead
     /// itself at 0, in a line `limit` generations deep, 0 for no end.
     pub fn at(depth: u64, limit: u64) -> Role {
-        let room = |depth: u64| limit == 0 || depth < limit;
         Role {
             lead: depth == 0,
-            starts: room(depth),
-            passes: room(depth + 1),
+            starts: limit == 0 || depth < limit,
+            passes: (limit != 0).then(|| limit.saturating_sub(depth + 1)),
         }
     }
 
@@ -110,11 +111,14 @@ pub fn tools(role: Role) -> Vec<Value> {
     let mut tools = Vec::new();
     if role.starts {
         tools.extend([start(), remove()]);
-        // What the daemon gives the agents this one makes is all it
-        // declared but those it keeps to itself.
-        if !role.passes {
+        // The daemon gives them to the agents this one makes, and theirs,
+        // as many generations down as have room, `false` for none.
+        if let Some(generations) = role.passes {
             for tool in &mut tools {
-                tool["inherit"] = json!(false);
+                tool["inherit"] = match generations {
+                    0 => json!(false),
+                    n => json!(n),
+                };
             }
         }
     }

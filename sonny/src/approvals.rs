@@ -201,6 +201,18 @@ pub fn footer(name: &str) -> Option<String> {
     })
 }
 
+/// The mark the footer leads the row `name` with, as Claude Code marks
+/// its modes: `⏵⏵` runs that never stop to ask, `⏸` the approvals that
+/// stop it, `⊘` writes refused. A row of the person's own has none.
+pub fn mark(name: &str) -> Option<&'static str> {
+    match name {
+        "full" => Some("⏵⏵"),
+        "ask" => Some("⏸"),
+        "read-only" => Some("⊘"),
+        _ => None,
+    }
+}
+
 /// Who approves for a bot, from its record's gates: `None` for a gate
 /// Sonny did not set.
 fn reviewer(record: &Value) -> Option<Reviewer> {

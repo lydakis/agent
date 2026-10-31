@@ -500,7 +500,8 @@ fn agent(words: &[String], stdin: Option<&str>, output: &str, failed: bool) -> O
                 said.what = "every agent".into();
             }
         }
-        "prune" => said.verb = "Pruned finished agents".into(),
+        // It drops a bot's old replay records; the agent and its history stay.
+        "prune" => said.verb = "Pruned the old turn records of".into(),
         "stats" => said.verb = "Read the daemon's stats".into(),
         "interrupt" => said.verb = "Interrupted".into(),
         "inspect" => said.verb = "Looked up".into(),
@@ -947,6 +948,24 @@ mod tests {
 
     fn text(line: &Line) -> String {
         line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn a_prune_names_the_records_not_the_agent() {
+        let said = said(
+            "\"$AGENT_BIN\" prune --bot calc --keep-turns 8",
+            "{}",
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            format!("{} {}", said.verb, said.what),
+            "Pruned the old turn records of calc"
+        );
+        assert_eq!(
+            attempted(&said.verb),
+            "Couldn't prune the old turn records of"
+        );
     }
 
     #[test]

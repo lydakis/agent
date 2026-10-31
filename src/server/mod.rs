@@ -1993,11 +1993,12 @@ impl Service {
             Ok(())
         };
         // A tool a client answers is one the caller may pass on: one it has,
-        // may call, and gives the bots it makes, answered by the same client
-        // and gated as a whole unless the caller's is gated by its steps.
-        // Another could get a client to act for it.
+        // may call, and gives the bots it makes, answered by the same client,
+        // gated as a whole unless the caller's is gated by its steps, and
+        // passed down no further than the caller's goes. Another could get
+        // a client to act for it.
         let callable = |own: &agent_runtime::tools::Declared| {
-            own.inherit
+            own.inherit.passes()
                 && me
                     .allowed
                     .as_ref()
@@ -2010,6 +2011,7 @@ impl Service {
                         && own.name == tool.name
                         && own.answered_by == tool.answered_by
                         && (own.steps || !tool.steps)
+                        && tool.inherit.within(own.inherit.passed())
                 })
         };
         // The folders a request would give a bot, each of which the caller
@@ -2030,15 +2032,19 @@ impl Service {
                     return refuse("declare a tool a client answers that it can't pass on");
                 }
                 // Without its own list, a bot takes the tools its creator
-                // passes on: none a client answers that the caller may not call.
-                if declare.is_none() && me.declared.iter().any(|own| own.inherit && !passes(own)) {
-                    *declare = Some(
-                        me.declared
-                            .iter()
-                            .filter(|own| own.inherit && passes(own))
-                            .cloned()
-                            .collect(),
-                    );
+                // passes on, a generation fewer: none a client answers that
+                // the caller may not call.
+                if declare.is_none() {
+                    let passed: Vec<_> = (me.declared.iter())
+                        .filter(|own| own.inherit.passes())
+                        .map(|own| agent_runtime::tools::Declared {
+                            inherit: own.inherit.passed(),
+                            ..own.clone()
+                        })
+                        .collect();
+                    if passed.iter().any(|tool| !passes(tool)) {
+                        *declare = Some(passed.into_iter().filter(|tool| passes(tool)).collect());
+                    }
                 }
                 folders.extend(workspace.clone());
                 folders.extend(settings.writable.iter().cloned());
@@ -3646,7 +3652,7 @@ impl Service {
                         Outcome {
                             output: json!({"error":code,"detail":detail}).to_string(),
                             artifacts: Vec::new(),
-                            files: Vec::new(),
+                            files: Default::default(),
                             parts: Vec::new(),
                             note: None,
                             failed: true,

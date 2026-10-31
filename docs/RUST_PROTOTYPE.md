@@ -1463,8 +1463,8 @@ behind a line naming it, `[Quoted from turn:BOT/TURN, written by a
 person:]` or `[Quoted from the reply of turn:BOT/TURN, written by the agent
 BOT:]` (`sent by ORIGIN`, `written by PERSON`, `written by the agent NAME
 in turn:NAME/TURN`); `hide_senders` leaves the lines out too. A turn that
-does not exist, a steer's reply, or a turn with no reply left (it ended
-without one, or pruning took its message events) is `quote_not_found`; a
+does not exist, a steer's reply, or a turn that ended without a reply
+(or whose events were pruned before schema 70) is `quote_not_found`; a
 reply of an unfinished turn `quote_unfinished`; more than 64 quotes, those
 quoted prompts bring counted (marked `nested` in the record, which a retry
 leaves out), or words and quotes past 256 KiB together, each quote's line
@@ -2173,7 +2173,11 @@ deleted once idle:
   removes those results after completion. The
   transcript and the turn rows themselves stay, so the context window, the
   `history` tool, `history_items`, forks, and accounting are unaffected; what shrinks
-  is replay and artifact retrieval. New `wait` calls for an expired
+  is replay and artifact retrieval. A finished turn's row names the message
+  with text it ended on, set in the write that finishes it, so a quote of its
+  reply and the `reply` a `prompts` read of the next turn carries are
+  unaffected too, and read it by key rather than searching events. Schema 70
+  adds it, found for finished turns from the events retention had left. New `wait` calls for an expired
   turn outcome return the turn's view with `error: turn_result_pruned`; they
   never report an empty success.
   On a pruning notice, `agent run` and `agent follow` reconcile their selected
@@ -2603,6 +2607,15 @@ waiting`), an answer to the call ends them (the waiting request gets
 drops them all. Schema 63 adds the steps' and paused calls' columns. Protocol 24
 also adds `history_search`, the history tool's query for clients (see
 `history_nodes` above).
+
+Protocol version 29 lets `inherit` be a count of generations as well as
+`true` or `false`: a tool declared with `"inherit": 2` goes to the bots
+its bot creates with `"inherit": 1`, to theirs with `false`, and no
+further, as a packet's hop count runs down. `false` is no generation and
+`true`, still the default and still left out, every one. A fork is a copy,
+not a generation, and keeps the count its source has. A client bounding
+how deep its agents delegate gives its tool for starting them that count,
+so each bot's tools are right from its first turn.
 
 ### Tool approval
 
