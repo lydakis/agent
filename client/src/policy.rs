@@ -82,6 +82,22 @@ what is done, in progress, and blocked; key decisions and why; files read or cha
 Keep exact names, paths, commands, values, and error text. Omit chatter, repeated tool output, and anything superseded. \
 Reply with the summary only.";
 
+/// Where a new bot's tool outputs cut for the model go whole by default:
+/// the outputs folder beside its daemon's store.
+pub fn outputs_beside(store: &Path) -> Option<String> {
+    Some(store.parent()?.join("outputs").to_str()?.to_owned())
+}
+
+/// [`outputs_beside`] the store a client reaches by default:
+/// `AGENT_STORE`, else `~/.agent/state.sqlite`.
+pub fn default_outputs() -> Option<String> {
+    let store = match std::env::var_os("AGENT_STORE") {
+        Some(store) => PathBuf::from(store),
+        None => PathBuf::from(std::env::var_os("HOME")?).join(".agent/state.sqlite"),
+    };
+    outputs_beside(&store)
+}
+
 /// One instruction file that went into the text, for the client to show.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Source {

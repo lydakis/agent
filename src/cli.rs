@@ -21,7 +21,7 @@ const COMMANDS: &[Command] = &[
         about: "Send a prompt to a bot, or make one with --new; prints the turn as it runs",
         usage: "run [OPTIONS] [--] PROMPT...",
         flags: "--bot --new --fork --allow --expires --detach --delivery --turn --model --workspace --effort --turn-budget-tokens --image --agents --profile --request-id --bot-id --pretty --no-spawn",
-        settings: "--tools --instructions --instructions-file --budget-tokens --compaction-instructions --compaction-instructions-file --compaction-model --no-compaction --fallback --approval --approve --context-bytes --context-items --note-turns --compact-at --compact-keep --compact-tokens --max-rounds --keep-turns --approval-hold --max-output-tokens --keep-warm --cache-ttl --speed --sandbox --writable --network --hide-senders --unsandboxed",
+        settings: "--tools --instructions --instructions-file --budget-tokens --compaction-instructions --compaction-instructions-file --compaction-model --no-compaction --fallback --approval --approve --context-bytes --context-items --note-turns --compact-at --compact-keep --compact-tokens --max-rounds --keep-turns --approval-hold --max-output-tokens --keep-warm --cache-ttl --speed --sandbox --writable --network --hide-senders --unsandboxed --outputs",
         startup: true,
     },
     Command {
@@ -430,6 +430,10 @@ fn print_flags(flags: &str) {
                 "Another folder a workspace-write bot may change; repeat for more",
             ),
             "--network" => ("", "A workspace-write bot's commands may use the network"),
+            "--outputs" => (
+                "PATH",
+                "Where a new bot's tool outputs cut for the model are written whole, one file per stream; default the outputs folder beside the store",
+            ),
             "--hide-senders" => (
                 "",
                 "A new bot's model reads what other bots and clients send it with no line naming the sender",

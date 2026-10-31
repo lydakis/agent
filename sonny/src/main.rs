@@ -1161,6 +1161,9 @@ pub(crate) fn made(
     if let Some(ttl) = agent_client::policy::cache_ttl(model) {
         settings.insert("cache_ttl".into(), json!(ttl));
     }
+    if let Some(outputs) = agent_client::policy::default_outputs() {
+        settings.insert("outputs".into(), json!(outputs));
+    }
     if config.hide_senders {
         settings.insert("hide_senders".into(), json!(true));
     }
