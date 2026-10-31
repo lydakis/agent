@@ -378,21 +378,23 @@ pub fn stub(
 }
 
 /// What a request sends in place of a result that carried pictures (an
-/// image file read) below the bot's elision floor: its text, without the
-/// pictures, which the file holds if the model needs them again. Any saving
+/// image file read, a client's answer) below the bot's elision floor: its
+/// text, without the pictures, which calling the tool again would show.
+/// `custom` keeps the result's kind for its call. Any saving
 /// makes one, so that a request can always leave older pictures out (see
 /// [`prompt_stub`]); `None` when it would weigh as much as `weight`, what the
 /// result weighs with its pictures at their token cost.
 pub fn picture_stub(
     family: Family,
     call_id: &str,
+    custom: bool,
     output: &str,
     weight: usize,
 ) -> Result<Option<Vec<u8>>> {
     let text = format!(
         "[tool result's pictures elided from this request; call the tool again to see them. Its text:]\n{output}"
     );
-    let stub = family.tool_result_item(call_id, false, &text)?;
+    let stub = family.tool_result_item(call_id, custom, &text)?;
     Ok((stub.len() < weight).then_some(stub))
 }
 
@@ -703,7 +705,7 @@ mod tests {
             let (read, call_id, text) = tool_result(&item).unwrap();
             assert_eq!((read, call_id.as_str()), (family, "c1"));
             assert_eq!(text, "a.png: a PNG image");
-            let stub = picture_stub(family, "c1", &text, item.len())
+            let stub = picture_stub(family, "c1", false, &text, item.len())
                 .unwrap()
                 .unwrap();
             let (_, _, stubbed) = tool_result(&stub).unwrap();
@@ -713,6 +715,15 @@ mod tests {
             );
             assert!(stubbed.ends_with("a.png: a PNG image"));
         }
+        // A custom tool's result elides to a custom tool's result.
+        let item = Family::Responses
+            .tool_result_item_with("c1", true, "shot", &images)
+            .unwrap();
+        let stub = picture_stub(Family::Responses, "c1", true, "shot", item.len())
+            .unwrap()
+            .unwrap();
+        let stub: serde_json::Value = serde_json::from_slice(&stub).unwrap();
+        assert_eq!(stub["type"], "custom_tool_call_output");
     }
 
     #[test]

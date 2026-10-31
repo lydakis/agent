@@ -915,6 +915,20 @@ fn check_images(images: &[&agent_runtime::codec::Image], carrier: &str) -> Resul
     }
     Ok(())
 }
+/// [`check_images`] off the runtime thread, since decoding grows with the
+/// pictures: `held` comes back once the pictures `images` finds in it pass.
+async fn images_checked<T: Send + 'static>(
+    held: T,
+    images: fn(&T) -> Vec<&agent_runtime::codec::Image>,
+    carrier: &'static str,
+) -> Result<T> {
+    if images(&held).is_empty() {
+        return Ok(held);
+    }
+    tokio::task::spawn_blocking(move || check_images(&images(&held), carrier).map(|()| held))
+        .await
+        .unwrap_or_else(|join| std::panic::resume_unwind(join.into_panic()))
+}
 fn workspace(path: &str) -> Result<String> {
     if !Path::new(path).is_absolute() || !Path::new(path).is_dir() {
         return fail("workspace_must_exist_and_be_absolute");
@@ -3541,10 +3555,12 @@ impl Service {
                                 format!("output's text may be up to {ANSWER_BYTES} bytes"),
                             );
                         }
-                        check_images(
-                            &parts.iter().filter_map(Part::image).collect::<Vec<_>>(),
+                        let parts = images_checked(
+                            parts,
+                            |parts| parts.iter().filter_map(Part::image).collect(),
                             "a tool result",
-                        )?;
+                        )
+                        .await?;
                         let mut parts: Vec<Part> = parts
                             .into_iter()
                             .map(|part| match part {
@@ -4015,8 +4031,12 @@ impl Service {
                 images,
             } => {
                 name("request_id", &request_id)?;
-                let images = images.unwrap_or_default();
-                check_images(&images.iter().collect::<Vec<_>>(), "a prompt")?;
+                let images = images_checked(
+                    images.unwrap_or_default(),
+                    |images| images.iter().collect(),
+                    "a prompt",
+                )
+                .await?;
                 if origin.is_some() && from.is_some() {
                     return fail_with("invalid_origin", "from and origin are mutually exclusive");
                 }

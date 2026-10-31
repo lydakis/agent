@@ -6028,7 +6028,7 @@ impl Database {
         let pictured = Pictured::of_all(outcome.images());
         let weight = (item.len() as i64 - pictured.extra) as usize;
         let stub = if pictured.count > 0 {
-            super::context::picture_stub(family, call_id, &outcome.words(), weight)?
+            super::context::picture_stub(family, call_id, custom, &outcome.words(), weight)?
         } else if bot.tools.iter().any(|tool| tool == "read") {
             super::context::stub(family, call_id, custom, &outcome.output, next, weight)?
         } else {
