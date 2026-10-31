@@ -289,8 +289,13 @@ runs at a time, also across a restart of the scheduler: a fire holds a lock
 on its own file in `~/.agent/triggers/.scheduler` while it runs, which a daemon
 it starts does not inherit. At most four fires per core (eight at least)
 run at once, as make's and cargo's jobs scale with the machine: a burst of
-due triggers waits its turn. A fire that cannot start stays due, and is
-tried again after a wait that doubles from a second up to five minutes. A ring of its doorbell, the FIFO `~/.agent/triggers/.ring`, has it
+due triggers waits its turn, and a place a fire leaves goes to the trigger
+that has waited longest, not to one just served. A fire that cannot start
+stays due, and is tried again after a wait that doubles from a second up to
+five minutes; one whose lock a fire from before a restart of the scheduler
+holds waits the same way, up to a minute, or, due only for an ask, leaves
+the ask in its queue for the next look. An ask that comes while its
+trigger's fire runs is looked at when that fire ends. A ring of its doorbell, the FIFO `~/.agent/triggers/.ring`, has it
 look again at once, and so does a fire that ends; else it sleeps until the
 next calendar time, and at most a minute, and looks at watched paths every
 two seconds. A lock of its own there keeps one scheduler per HOME. It also
@@ -299,7 +304,10 @@ its start when `start_at_boot` is on, and the backup's sync every ten
 minutes once setup ran its first (a clone put in `~/agent-home` by hand
 is not set up: a sync from it would push this machine's home over the one
 it holds). When Sonny is upgraded in
-place it runs the new Sonny in its stead; when its HOME is gone (a test's
+place it runs the new Sonny in its stead, and so it does when the
+machine's time zone changes (where `/etc/localtime` points, or the file
+there), as the C library keeps the zone it read at the start: the new one
+works out each calendar time again from the times kept; when its HOME is gone (a test's
 HOME deleted with its scheduler running) it lets its own job go and ends.
 A fire whose HOME is gone sends nothing.
 
