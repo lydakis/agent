@@ -3,8 +3,9 @@
 Does memory carry what one task learned to a later task, and does a later
 task catch a remembered fact that the code now contradicts? This is plan
 decision 7: a run on real models on George's Mac, which happens only with
-his go-ahead. Written 2026-10-10. It ran once on 2026-10-10; the
-[first run](#first-run-2026-10-10) has the results.
+his go-ahead. Written 2026-10-10. It ran on 2026-10-10
+([first run](#first-run-2026-10-10)) and again on 2026-10-31 with the
+`learned` condition ([second run](#second-run-2026-10-31)).
 
 ## What it runs
 
@@ -31,8 +32,8 @@ There are three conditions:
   a fresh agent in the same HOME gets the task in its worktree. Only what
   the first agent chose to save carries the fact over. `stale` has no
   `learned` run, since its fact is wrong on purpose. Each row records
-  `day_one`: its status, its time and the facts it saved, with their text;
-  the summary counts `day_one_saved`.
+  `day_one`: its status, rounds, tokens, time and the facts it saved, with
+  their text; the summary counts `day_one_saved`.
 
 There are three scenarios. Each pairs a fact the code does not show with a
 task that needs it:
@@ -200,3 +201,48 @@ What it shows, as observations from three trials per cell:
 The raw result stays in George's local `.local/memory-eval/`. The bots'
 folders and transcripts stay in the temporary folder it names as
 `bots_dir`.
+
+## Second run, 2026-10-31
+
+Measured on George's Mac at revision 510037d with the defaults, on
+`openai/gpt-6.1-sol` through an API key: the ChatGPT plan was over its
+usage limit that day. All 30 turns completed; every bot left the visible
+tests passing.
+
+| Condition | Scenario | Correct | Rounds | Input | Cached | Output |
+| --- | --- | --- | --- | --- | --- | --- |
+| `none` | `decision` | 0/3 | 5, 5, 5 | 84,219 | 65,663 | 1,304 |
+| `none` | `preference` | 0/3 | 6, 6, 6 | 97,326 | 79,710 | 1,164 |
+| `none` | `stale` | 3/3 | 5, 5, 5 | 89,055 | 69,027 | 2,281 |
+| `memory` | `decision` | 3/3 | 8, 6, 6 | 154,496 | 126,454 | 2,012 |
+| `memory` | `preference` | 3/3 | 6, 6, 6 | 140,786 | 114,111 | 1,444 |
+| `memory` | `stale` | 3/3 | 6, 6, 6 | 145,810 | 116,732 | 3,099 |
+| `learned` | `decision` | 3/3 | 6, 6, 6 | 142,887 | 115,328 | 2,097 |
+| `learned` | `preference` | 3/3 | 6, 6, 6 | 139,379 | 113,008 | 1,397 |
+
+The `learned` rows are day two only. At that revision the script looked
+up every turn as `/1`, but day two is the daemon's second turn, so its
+rows came back `turn_not_found` with no totals. The work ran and was
+scored; the rounds and tokens above were read from the kept stores with
+`agent turns`. The script now takes the turn from the run's `accepted`
+event, and records day one's rounds and tokens too.
+
+What it shows, as observations from three trials per cell:
+
+- **Learning carries over.** Every day-one agent saved the fact it heard
+  in passing, one file each, and every day-two agent read that file and
+  got the task right: 6/6, the same as `memory`, where `none` got 0/6.
+  The decision went to the project (`projects/shop/api-timestamp-format.md`)
+  and the preference to the person (`error-message-codes.md`, type
+  `feedback`), each with its reason, which is where the `memory` skill
+  says they belong.
+- **Recall and verification** repeat the first run on another model:
+  `memory` beat `none` on `decision` and `preference`, and the wrong
+  `stale` fact misled no one.
+- **Cost.** Day two cost about the same as `memory`, about 47,000 input
+  tokens per bot against about 31,000 for `none`. The whole run used about
+  1.1 million input tokens, about 85% cached, besides day one's input,
+  which this revision didn't record.
+
+The raw result is in George's local
+`.local/memory-eval/learned-2026-10-31.json`.

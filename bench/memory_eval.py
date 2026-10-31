@@ -385,11 +385,15 @@ def one_turn(agent, env, name, workspace, model, budget, timeout, message):
         stream, error = out.decode() if isinstance(out, bytes) else out, 'timeout'
         subprocess.run([*agent, 'interrupt', '--bot', name], env=env, capture_output=True, timeout=30)
     wall = round(time.monotonic() - started, 1)
+    # Turn numbers count across the daemon's bots, so a day two's turn is
+    # not /1: take its number from what the run streamed.
+    number = next((e['turn'] for e in events(stream) if e['event'] == 'accepted' and 'turn' in e), 1)
+    ref = f'turn:{name}/{number}'
     # A finished turn returns at once; an interrupted one once it settles.
-    view = subprocess.run([*agent, 'wait', '--timeout', '60s', f'turn:{name}/1'], env=env,
+    view = subprocess.run([*agent, 'wait', '--timeout', '60s', ref], env=env,
                           capture_output=True, text=True, timeout=90)
     try:
-        turn = json.loads(view.stdout)['results'][f'turn:{name}/1']
+        turn = json.loads(view.stdout)['results'][ref]
     except (ValueError, KeyError, TypeError):
         turn = {'error': view.stderr[-500:]}
     return stream, error, turn, wall
@@ -410,7 +414,9 @@ def run_bot(binary, app, model, env, out_dir, condition, scenario, trial, budget
                                              model, budget, timeout, LEARN[scenario])
         saved = memory_files(bot_home)
         day_one = {'status': turn.get('status'), 'error': turn.get('error') or (error if not stream else None),
-                   'output_tokens': turn.get('output_tokens'), 'wall_s': wall,
+                   **{key: turn.get(key) for key in ('model_rounds', 'input_tokens', 'cached_input_tokens',
+                                                      'output_tokens')},
+                   'wall_s': wall,
                    'memory_saved': {k: v for k, v in saved.items() if empty.get(k) != v},
                    'answer': answer(events(stream))}
     before = memory_files(bot_home)
