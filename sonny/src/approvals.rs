@@ -255,9 +255,11 @@ fn mode_in(record: &Value, modes: &[Mode]) -> Option<&'static str> {
     });
     let network = settings["network"].as_bool().unwrap_or(false);
     let reached = list(settings, "unix_sockets");
-    // Its own folders, past its repositories' git folders.
+    // Its own folders, past its repositories' git folders and the zen
+    // folder every sandboxed row writes.
+    let zen = zen_root();
     let folders: Vec<&str> = (writable.iter().copied())
-        .filter(|path| !path.ends_with(".git"))
+        .filter(|path| !path.ends_with(".git") && Some(*path) != zen.as_deref())
         .collect();
     // How well a row fits: whether its folders there now are the bot's,
     // then how many there are.
@@ -374,13 +376,18 @@ pub fn sandbox(name: &str, workspace: &std::path::Path) -> Map<String, Value> {
     // adds its own folders to the roots it may write.
     if let Some(Value::Array(writable)) = fields.get_mut("writable")
         && writable.len() < MAX_WRITABLE
-        && let Some(zen) = (crate::zen::folder())
-            .and_then(|zen| std::fs::canonicalize(zen).ok())
-            .and_then(|zen| zen.to_str().map(str::to_owned))
+        && let Some(zen) = zen_root()
     {
         writable.push(json!(zen));
     }
     fields
+}
+
+/// The zen folder by its real path, as a sandboxed row writes it beside
+/// the row's own folders.
+fn zen_root() -> Option<String> {
+    let zen = std::fs::canonicalize(crate::zen::folder()?).ok()?;
+    zen.to_str().map(str::to_owned)
 }
 
 /// [`sandbox`]'s fields, with `unsandboxed` the commands let out of it.
@@ -984,6 +991,10 @@ mod tests {
             json!({"sandbox": "workspace-write", "writable": [], "network": false})
         );
         assert_eq!(mode_in(&strict, &modes), Some("strict"));
+        // As Sonny gives it, with the zen folder too, still strict.
+        let mut zen = strict.clone();
+        zen["settings"]["writable"] = json!([zen_root().unwrap()]);
+        assert_eq!(mode_in(&zen, &modes), Some("strict"));
         // Its folder made since, it is still strict, not widened to auto.
         std::fs::create_dir(&later).unwrap();
         assert_eq!(mode_in(&strict, &modes), Some("strict"));
