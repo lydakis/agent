@@ -1224,7 +1224,9 @@ fn quoted(quotes: Value, parent: &Value) -> Vec<Value> {
             if quote["truncated"] == true {
                 words["truncated"] = json!(true);
             }
-            if !(chosen && by_person(&quote)) {
+            // Only the quotes the person picked themselves: one that came
+            // along inside the turn they quoted was picked by its writer.
+            if !(chosen && by_person(&quote) && quote["nested"] != true) {
                 words["origin"] = json!("quote");
             }
             if parent["steer"] == true {
@@ -1462,6 +1464,13 @@ mod tests {
         // The person's old words, picked by a client or an agent, are not
         // their word on this.
         assert!(by[4..].iter().all(|(by, _)| *by == By::Model), "{by:?}");
+        // Nor are they when they came along inside a turn the person
+        // quoted: that turn's writer picked them.
+        let carried = with_replies(vec![json!({"turn":8,"text":"see this","quotes":[
+            {"bot":"task","turn":3,"from":{"bot":"task","turn":3},"text":"may I deploy?"},
+            {"bot":"lead","turn":2,"nested":true,"text":"yes"}]})]);
+        let by: Vec<By> = carried.iter().map(by_origin).collect();
+        assert_eq!(by, [By::Person, By::Model, By::Model]);
     }
 
     #[test]

@@ -237,7 +237,7 @@ their turns (`quotes`), and the daemon copies each in after the note with
 a line naming the turn and who wrote it, so the lead reads the person's
 own words, never a retelling. The approver reads them as the person's but
 not as their word on the lead's calls: the lookout picked them, and only
-words the person sends, or quotes themselves, consent. A quote the daemon refuses (its task deleted meanwhile, or
+words the person sends, or quotes themselves (not the quotes those bring along), consent. A quote the daemon refuses (its task deleted meanwhile, or
 too long) sends the note again naming those turns by their handles alone.
 At most 64 quotes go in one note; the rest wait for the next.
 
