@@ -35,8 +35,8 @@ use std::{
 pub const VERB: &str = "trigger";
 /// What a trigger's job runs.
 pub const FIRE_FLAG: &str = "--trigger-fire";
-/// Every trigger's launchd label and systemd unit name starts with this;
-/// the rest is its name.
+/// Every trigger's launchd label and systemd unit name starts with this,
+/// then its HOME's tag ([`home_tag`]) and a dot; the rest is its name.
 const LABEL: &str = "me.lydakis.agent.trigger.";
 /// A message is a reminder of what to do, not a document.
 const MAX_MESSAGE: usize = 16 * 1024;
@@ -90,16 +90,24 @@ impl Scheduler {
 /// Where triggers live: `jobs` holds their definitions (the LaunchAgents
 /// folder, or systemd's user unit folder), and `~/.agent/triggers` what
 /// each one's fires did.
+///
+/// launchd keeps one domain per user, and systemd one manager, whatever
+/// HOME is: a test or eval HOME adds its jobs where the user's own are. So
+/// a trigger's label starts with its HOME's tag (`prefix`), and each HOME
+/// has labels of its own.
 #[derive(Clone)]
 pub struct Places {
     pub jobs: PathBuf,
     pub state: PathBuf,
     pub scheduler: Scheduler,
+    prefix: String,
 }
 
 impl Places {
     pub fn home() -> Result<Self, String> {
-        let home = PathBuf::from(std::env::var_os("HOME").ok_or("no HOME for triggers")?);
+        let home = std::env::var_os("HOME").ok_or("no HOME for triggers")?;
+        let prefix = format!("{LABEL}{}.", home_tag(&home));
+        let home = PathBuf::from(home);
         let scheduler = Scheduler::here();
         Ok(Self {
             jobs: match scheduler {
@@ -109,12 +117,17 @@ impl Places {
             },
             state: home.join(".agent/triggers"),
             scheduler,
+            prefix,
         })
+    }
+    /// The trigger's launchd label, or its systemd units' name.
+    fn label(&self, name: &str) -> String {
+        format!("{}{name}", self.prefix)
     }
     /// The trigger's definition: its plist, or its service.
     fn job(&self, name: &str) -> PathBuf {
         self.jobs
-            .join(format!("{LABEL}{name}{}", self.scheduler.suffix()))
+            .join(format!("{}{}", self.label(name), self.scheduler.suffix()))
     }
     fn last(&self, name: &str) -> PathBuf {
         self.state.join(format!("{name}.json"))
@@ -134,6 +147,24 @@ impl Places {
     fn receipt(&self, name: &str, file: &str) -> PathBuf {
         self.state.join(format!(".fired.{name}.{file}"))
     }
+}
+
+/// A HOME's tag in its triggers' labels: eight hex digits of a 64-bit
+/// FNV-1a hash of its path, folded to 32 bits, with any trailing `/` left
+/// out. A fire finds it from its HOME alone, even one deleted since.
+fn home_tag(home: &std::ffi::OsStr) -> String {
+    use std::os::unix::ffi::OsStrExt;
+    let bytes = home.as_bytes();
+    let end = bytes
+        .iter()
+        .rposition(|&b| b != b'/')
+        .map_or(1, |at| at + 1);
+    let hash = bytes[..end.min(bytes.len())]
+        .iter()
+        .fold(0xcbf2_9ce4_8422_2325_u64, |hash, &b| {
+            (hash ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+        });
+    format!("{:08x}", (hash ^ (hash >> 32)) as u32)
 }
 
 /// An XDG base folder: its variable when set to a full path, else its
@@ -1176,15 +1207,22 @@ pub fn commit(value: &str) -> Result<(When, PathBuf), String> {
 
 /// A trigger's definition, as its scheduler reads it.
 pub fn definition(
-    scheduler: Scheduler,
+    places: &Places,
     app: &Path,
     trigger: &Trigger,
     when: &When,
     asks: &Path,
     environment: &[(&str, String)],
 ) -> String {
-    match scheduler {
-        Scheduler::Launchd => plist(app, trigger, when, asks, environment),
+    match places.scheduler {
+        Scheduler::Launchd => plist(
+            &places.label(&trigger.name),
+            app,
+            trigger,
+            when,
+            asks,
+            environment,
+        ),
         Scheduler::Systemd => unit(app, trigger, when, asks, environment),
     }
 }
@@ -1201,6 +1239,7 @@ fn is_plist(text: &str) -> bool {
 /// or a watched path, launchd runs it only when asked (`fire`): an ask is a
 /// file in `asks`, which launchd watches as a queue.
 pub fn plist(
+    label: &str,
     app: &Path,
     trigger: &Trigger,
     when: &When,
@@ -1211,10 +1250,7 @@ pub fn plist(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n",
     );
     let string = |s: &str| format!("<string>{}</string>", escape(s));
-    out += &format!(
-        "  <key>Label</key>\n  {}\n",
-        string(&format!("{LABEL}{}", trigger.name))
-    );
+    out += &format!("  <key>Label</key>\n  {}\n", string(label));
     out += "  <key>ProgramArguments</key>\n  <array>\n";
     for arg in std::iter::once(app.to_string_lossy().into_owned()).chain(trigger.args()) {
         out += &format!("    {}\n", string(&arg));
@@ -1510,13 +1546,14 @@ fn read_trigger(path: &Path) -> Read {
 /// Walk one plist at a time when refreshing Sonny's path.
 fn read_all(places: &Places) -> impl Iterator<Item = (String, Read)> {
     let suffix = places.scheduler.suffix();
+    let prefix = places.prefix.clone();
     std::fs::read_dir(&places.jobs)
         .into_iter()
         .flatten()
         .flatten()
         .filter_map(move |e| {
             let file = e.file_name().into_string().ok()?;
-            let name = file.strip_prefix(LABEL)?.strip_suffix(suffix)?.to_owned();
+            let name = file.strip_prefix(&prefix)?.strip_suffix(suffix)?.to_owned();
             Some((name, read_trigger(&e.path())))
         })
 }
@@ -1544,7 +1581,11 @@ fn state(places: &Places, trigger: &Trigger) -> Value {
 pub fn list(places: &Places, after: Option<&str>) -> Value {
     let mut names = std::collections::BTreeSet::new();
     for (dir, prefix, suffix) in [
-        (&places.jobs, LABEL, places.scheduler.suffix()),
+        (
+            &places.jobs,
+            places.prefix.as_str(),
+            places.scheduler.suffix(),
+        ),
         (&places.state, "", ".json"),
     ] {
         for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
@@ -1710,8 +1751,9 @@ pub fn install(
             .find(|f| f != file && f.eq_ignore_ascii_case(file))
     };
     let suffix = places.scheduler.suffix();
-    let taken = taken(&places.jobs, &format!("{LABEL}{}{suffix}", trigger.name))
-        .map(|f| f[LABEL.len()..f.len() - suffix.len()].to_owned())
+    let prefix = &places.prefix;
+    let taken = taken(&places.jobs, &format!("{prefix}{}{suffix}", trigger.name))
+        .map(|f| f[prefix.len()..f.len() - suffix.len()].to_owned())
         .or_else(|| {
             taken(&places.state, &format!("{}.json", trigger.name))
                 .map(|f| f[..f.len() - ".json".len()].to_owned())
@@ -1740,17 +1782,10 @@ pub fn install(
                     // and to run it with the environment it is added with now.
                     if watched(&text) != when.watch || !runs_with(&text, environment) {
                         let asks = places.asks(&there.name);
-                        let want = definition(
-                            places.scheduler,
-                            &there_app,
-                            &there,
-                            when,
-                            &asks,
-                            environment,
-                        );
+                        let want = definition(places, &there_app, &there, when, &asks, environment);
                         swap(
                             &path,
-                            &format!("{LABEL}{}", there.name),
+                            &places.label(&there.name),
                             Some(&text),
                             &want,
                             launchd,
@@ -1779,8 +1814,8 @@ pub fn install(
                     }
                     let asks = places.asks(&trigger.name);
                     queues(&asks)?;
-                    let want = definition(places.scheduler, app, trigger, when, &asks, environment);
-                    let label = format!("{LABEL}{}", trigger.name);
+                    let want = definition(places, app, trigger, when, &asks, environment);
+                    let label = places.label(&trigger.name);
                     swap(&path, &label, Some(&text), &want, launchd)?;
                     // Without what it keeps the new one would start over:
                     // the old one goes back in.
@@ -1803,9 +1838,9 @@ pub fn install(
     queues(&asks)?;
     swap(
         &path,
-        &format!("{LABEL}{}", trigger.name),
+        &places.label(&trigger.name),
         None,
-        &definition(places.scheduler, app, trigger, when, &asks, environment),
+        &definition(places, app, trigger, when, &asks, environment),
         launchd,
     )?;
     Ok(None)
@@ -2246,7 +2281,7 @@ fn retire(places: &Places, name: &str, keep: bool, launchd: Loader) -> Result<bo
         }
     }
     let here = !aside.is_empty();
-    let unloaded = match launchd(Job::Unload(&format!("{LABEL}{name}"))) {
+    let unloaded = match launchd(Job::Unload(&places.label(name))) {
         Ok(()) => Ok(true),
         Err(error) if error.starts_with(NOT_LOADED) => Ok(here),
         Err(error) => {
@@ -2320,19 +2355,21 @@ pub fn finish(places: &Places, launchd: Loader) {
     let mut cut = Vec::new();
     let ours = dots(&places.jobs)
         .into_iter()
-        .filter(|f| f.starts_with(LABEL))
+        .filter(|f| f.starts_with(&places.prefix))
         .map(|f| (places.jobs.join(format!(".{f}")), f));
     let state = dots(&places.state)
         .into_iter()
         .filter(|f| f != "lock")
         .map(|f| (places.state.join(format!(".{f}")), f));
     for (path, file) in ours.chain(state) {
-        // `.NAME.EXT.retiring`, or `.LABELNAME.plist.retiring`.
+        // `.NAME.EXT.retiring`, or `.PREFIXNAME.plist.retiring`.
         match file
             .strip_suffix(".retiring")
             .and_then(|f| f.rsplit_once('.'))
         {
-            Some((name, _)) => cut.push(name.strip_prefix(LABEL).unwrap_or(name).to_owned()),
+            Some((name, _)) => {
+                cut.push(name.strip_prefix(&places.prefix).unwrap_or(name).to_owned())
+            }
             None => {
                 if let Err(error) = forget(&path) {
                     log(error);
@@ -2398,7 +2435,7 @@ pub fn refresh(places: &Places, app: &Path, launchd: Loader) {
         let moved = with_app(&text, &was, app);
         let _ = swap(
             &path,
-            &format!("{LABEL}{}", trigger.name),
+            &places.label(&trigger.name),
             Some(&text),
             &moved,
             launchd,
@@ -2442,7 +2479,7 @@ pub fn restamp(places: &Places, identity: &str, lineage: &str, launchd: Loader) 
         }
         let _ = swap(
             &path,
-            &format!("{LABEL}{}", trigger.name),
+            &places.label(&trigger.name),
             Some(&text),
             &stamped,
             launchd,
@@ -2638,16 +2675,123 @@ pub(crate) fn error_json(message: &str) -> Value {
     }
 }
 
-/// At Sonny's start, off its way: finish what a fire cut short, and point
-/// every trigger at this Sonny when it moved.
+/// At Sonny's start, off its way: finish what a fire cut short, give
+/// triggers made before labels had HOME's tag their tag, and point every
+/// trigger at this Sonny when it moved.
 pub fn at_start() {
     let (Ok(places), Some(sonny)) = (Places::home(), crate::skills::sonny_path()) else {
         return;
     };
     std::thread::spawn(move || {
         finish(&places, &schedule);
+        relabel(&places, &schedule);
         refresh(&places, &sonny, &schedule);
     });
+}
+
+/// Each trigger whose label has no HOME's tag, from before labels had one,
+/// takes its tag: launchd lets go of the old label and loads the job again
+/// under the new one, from its definition moved to the new file. One that
+/// will not load under it goes back as it was, for the next start to try.
+pub fn relabel(places: &Places, launchd: Loader) {
+    let suffix = places.scheduler.suffix();
+    let untagged: Vec<String> = std::fs::read_dir(&places.jobs)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter_map(|f| Some(f.strip_prefix(LABEL)?.strip_suffix(suffix)?.to_owned()))
+        .filter(|rest| !tagged(rest) && valid_name(rest).is_ok())
+        .collect();
+    for name in untagged {
+        if let Err(error) = relabeled(places, &name, launchd) {
+            eprintln!("{}", error_json(&error));
+        }
+    }
+}
+
+/// Whether a label, past [`LABEL`], starts with a HOME's tag.
+fn tagged(rest: &str) -> bool {
+    let bytes = rest.as_bytes();
+    bytes.get(8) == Some(&b'.')
+        && bytes[..8]
+            .iter()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b))
+}
+
+/// Under the lock, move one untagged trigger to its tagged label.
+fn relabeled(places: &Places, name: &str, launchd: Loader) -> Result<(), String> {
+    let _lock = Lock::take(places)?;
+    let old = places
+        .jobs
+        .join(format!("{LABEL}{name}{}", places.scheduler.suffix()));
+    // Read again under the lock: an `rm` may have come first.
+    let text = match std::fs::read_to_string(&old) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(format!("{}: {e}", old.display())),
+    };
+    // Only a trigger's definition moves; anything else is left as it is.
+    if read_job(&text).is_none() {
+        return Ok(());
+    }
+    let new = places.job(name);
+    if stored(&new) {
+        return Err(format!(
+            "trigger_exists: {name}: {} and {} are both there; rm the trigger and add it again",
+            old.display(),
+            new.display()
+        ));
+    }
+    let (was, label) = (format!("{LABEL}{name}"), places.label(name));
+    // A unit names no label inside: its file's name is its label.
+    let want = match is_plist(&text) {
+        true => text.replacen(
+            &format!("<string>{}</string>", escape(&was)),
+            &format!("<string>{}</string>", escape(&label)),
+            1,
+        ),
+        false => text.clone(),
+    };
+    unload(&was, launchd)?;
+    if let Err(error) = replace(&new, &want).and_then(|()| launchd(Job::Load(&new))) {
+        let _ = forget(&new);
+        let _ = launchd(Job::Load(&old));
+        return Err(error);
+    }
+    forget(&old)
+}
+
+/// The label this process runs under, when it is the job of the trigger
+/// `name`: launchd names it in `XPC_SERVICE_NAME`, systemd in the
+/// process's cgroup.
+fn own_label(name: &str) -> Option<String> {
+    let end = format!(".{name}");
+    let launchd = std::env::var("XPC_SERVICE_NAME").ok();
+    let systemd = std::fs::read_to_string("/proc/self/cgroup")
+        .ok()
+        .and_then(|groups| {
+            groups.lines().find_map(|line| {
+                Some(
+                    line.rsplit('/')
+                        .next()?
+                        .strip_suffix(".service")?
+                        .to_owned(),
+                )
+            })
+        });
+    launchd
+        .into_iter()
+        .chain(systemd)
+        .find(|label| label.starts_with(LABEL) && label.ends_with(&end))
+}
+
+/// Whether HOME is gone: the trigger's job was added from a HOME deleted
+/// since, such as a test's or an eval's, and has nothing left to fire into.
+fn orphaned() -> bool {
+    std::env::var_os("HOME").is_some_and(|home| {
+        matches!(std::fs::symlink_metadata(home), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+    })
 }
 
 /// `sonny trigger add|ls|show|fire|rm`, as `~/.agent/trigger` runs it.
@@ -3678,6 +3822,27 @@ pub fn fire_cli(args: &[String]) -> i32 {
             return 1;
         }
     };
+    // A job outliving its HOME unloads itself. Its definition goes too: a
+    // systemd unit can sit outside HOME, where the user manager reads it.
+    if orphaned() {
+        let label = own_label(&trigger.name).unwrap_or_else(|| places.label(&trigger.name));
+        eprintln!(
+            "{}",
+            error_json(&format!(
+                "home_gone: {label}: its HOME is gone; unloading it"
+            ))
+        );
+        let definition = places
+            .jobs
+            .join(format!("{label}{}", places.scheduler.suffix()));
+        return match forget(&definition).and_then(|()| unload(&label, &schedule)) {
+            Ok(()) => 0,
+            Err(error) => {
+                eprintln!("{}", error_json(&error));
+                1
+            }
+        };
+    }
     let asked = match take_ask(&places, &trigger) {
         Ok(asked) => asked,
         Err(error) => {
@@ -4215,6 +4380,7 @@ mod tests {
         let s = trigger();
         let when = every("30m", clock(2026, 9, 28, 23, 52)).unwrap();
         let text = plist(
+            "me.lydakis.agent.trigger.p.fix-login",
             Path::new("/Applications/Agent.app/Contents/MacOS/agent-app"),
             &s,
             &when,
@@ -4267,7 +4433,14 @@ mod tests {
             watch: Some("/r/.git/logs/HEAD".into()),
             ..fired()
         };
-        let text = plist(Path::new("/A/app"), &full, &watched, Path::new("/q"), &[]);
+        let text = plist(
+            "L",
+            Path::new("/A/app"),
+            &full,
+            &watched,
+            Path::new("/q"),
+            &[],
+        );
         assert!(
             text.contains(
                 "<key>WatchPaths</key>\n  <array>\n    <string>/r/.git/logs/HEAD</string>"
@@ -4276,7 +4449,7 @@ mod tests {
         assert!(!text.contains("StartCalendarInterval"));
         assert_eq!(read_job(&text).unwrap().0, full);
         // Only `fire` runs one with neither.
-        let text = plist(Path::new("/A/app"), &s, &fired(), Path::new("/q"), &[]);
+        let text = plist("L", Path::new("/A/app"), &s, &fired(), Path::new("/q"), &[]);
         assert!(!text.contains("StartCalendarInterval") && !text.contains("WatchPaths"));
         for bad in [
             vec!["--bot", "x"],
@@ -4419,7 +4592,9 @@ mod tests {
         let path = w.places.job(&s.name);
         assert_eq!(
             path,
-            w.places.jobs.join(format!("{LABEL}p.fix-login.service"))
+            w.places
+                .jobs
+                .join(format!("{}.service", w.places.label("p.fix-login")))
         );
         assert_eq!(w.state(&s.name), (true, true, false));
         assert!(
@@ -4551,6 +4726,7 @@ mod tests {
                 }),
                 state: root.join(".agent/triggers"),
                 scheduler,
+                prefix: format!("{LABEL}{}.", home_tag(root.as_os_str())),
             };
             Self {
                 root,
@@ -4581,10 +4757,7 @@ mod tests {
         fn state(&self, name: &str) -> (bool, bool, bool) {
             (
                 self.places.job(name).exists(),
-                self.fake
-                    .loaded
-                    .borrow()
-                    .contains(&format!("{LABEL}{name}")),
+                self.fake.loaded.borrow().contains(&self.places.label(name)),
                 self.places.last(name).exists(),
             )
         }
@@ -4766,6 +4939,7 @@ mod tests {
         assert_eq!(
             w.plist(&s.name),
             plist(
+                &w.places.label(&s.name),
                 Path::new("/A/agent-app"),
                 &s,
                 &every("1d", clock(2026, 9, 28, 9, 7)).unwrap(),
@@ -4829,7 +5003,7 @@ mod tests {
             ..trigger()
         };
         let app = Path::new("/A/agent-app");
-        assert!(plist(app, &s, &broad, Path::new("/q"), &[]).len() as u64 > MAX_RECORD);
+        assert!(plist("L", app, &s, &broad, Path::new("/q"), &[]).len() as u64 > MAX_RECORD);
         let refused = install(&w.places, app, &s, &broad, &[], false, &|what| {
             w.fake.call(what)
         });
@@ -4884,6 +5058,7 @@ mod tests {
         std::fs::write(
             w.places.job(&s.name),
             plist(
+                &w.places.label(&s.name),
                 Path::new("/A/app"),
                 &changed,
                 &fired(),
@@ -4896,7 +5071,14 @@ mod tests {
         assert_eq!(w.rows()[0]["sent"], 0);
         std::fs::write(
             w.places.job(&s.name),
-            plist(Path::new("/A/app"), &s, &fired(), Path::new("/q"), &[]),
+            plist(
+                &w.places.label(&s.name),
+                Path::new("/A/app"),
+                &s,
+                &fired(),
+                Path::new("/q"),
+                &[],
+            ),
         )
         .unwrap();
         assert_eq!(w.rows()[0]["last"]["turn"], 7);
@@ -4908,7 +5090,14 @@ mod tests {
             };
             std::fs::write(
                 w.places.job(&item.name),
-                plist(Path::new("/A/app"), &item, &fired(), Path::new("/q"), &[]),
+                plist(
+                    &w.places.label(&item.name),
+                    Path::new("/A/app"),
+                    &item,
+                    &fired(),
+                    Path::new("/q"),
+                    &[],
+                ),
             )
             .unwrap();
         }
@@ -4993,10 +5182,7 @@ mod tests {
         };
         assert!(w.install(&cased).unwrap_err().starts_with("name_taken"));
         // A creation over a job loaded without its plist replaces that job.
-        w.fake
-            .loaded
-            .borrow_mut()
-            .insert(format!("{LABEL}{}", odd.name));
+        w.fake.loaded.borrow_mut().insert(w.places.label(&odd.name));
         w.install(&odd).unwrap();
         assert_eq!(w.state(&odd.name), (true, true, false));
     }
@@ -5082,9 +5268,9 @@ mod tests {
         std::fs::write(w.places.last("p.stuck"), "{}").unwrap();
         let blocked = w.places.state.join(".p.stuck.json.retiring");
         std::fs::create_dir_all(blocked.join("x")).unwrap();
-        w.fake.loaded.borrow_mut().insert(format!("{LABEL}p.stuck"));
+        w.fake.loaded.borrow_mut().insert(w.places.label("p.stuck"));
         assert!(retire(&w.places, "p.stuck", false, &|x| w.fake.call(x)).is_err());
-        assert!(w.fake.loaded.borrow().contains(&format!("{LABEL}p.stuck")));
+        assert!(w.fake.loaded.borrow().contains(&w.places.label("p.stuck")));
         assert_eq!(std::fs::read_to_string(&stuck).unwrap(), "plist");
         assert!(w.places.last("p.stuck").exists());
         std::fs::remove_dir_all(&blocked).unwrap();
@@ -5776,10 +5962,7 @@ mod tests {
         w.remove(&s.name).unwrap();
         assert_eq!(w.state(&s.name), (false, false, false));
         // A job loaded without its plist.
-        w.fake
-            .loaded
-            .borrow_mut()
-            .insert(format!("{LABEL}{}", s.name));
+        w.fake.loaded.borrow_mut().insert(w.places.label(&s.name));
         w.remove(&s.name).unwrap();
         assert_eq!(w.state(&s.name), (false, false, false));
         // A one-off still there two days after its time is listed as missed.
@@ -5846,10 +6029,7 @@ mod tests {
                 std::fs::rename(&path, tomb(&path)).unwrap();
             }
             if !loaded {
-                w.fake
-                    .loaded
-                    .borrow_mut()
-                    .remove(&format!("{LABEL}{}", s.name));
+                w.fake.loaded.borrow_mut().remove(&w.places.label(&s.name));
             }
         };
         for loaded in [false, true] {
@@ -5868,7 +6048,9 @@ mod tests {
         std::fs::write(tomb(&w.places.last(&s.name)), "{}").unwrap();
         let temporaries = [
             w.places.state.join(format!(".{}.json.4242", s.name)),
-            w.places.jobs.join(format!(".{LABEL}{}.plist.4242", s.name)),
+            w.places
+                .jobs
+                .join(format!(".{}.plist.4242", w.places.label(&s.name))),
         ];
         for path in &temporaries {
             std::fs::write(path, "half").unwrap();
@@ -6008,6 +6190,84 @@ mod tests {
                 now
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn each_home_has_its_own_labels() {
+        use std::ffi::OsStr;
+        // tests/test_trigger.py computes the same tag.
+        assert_eq!(home_tag(OsStr::new("/Users/lydakis")), "11c173e6");
+        assert_eq!(home_tag(OsStr::new("/Users/lydakis/")), "11c173e6");
+        assert_eq!(home_tag(OsStr::new("/tmp/eval-1")), "535e3091");
+        assert_eq!(home_tag(OsStr::new("/")), "29622bb2");
+        assert!(tagged("11c173e6.p.fix-login"));
+        assert!(!tagged("p.fix-login") && !tagged("11C173E6.x") && !tagged("11c173e6"));
+        // Two HOMEs with a trigger of one name keep two jobs.
+        let (a, b) = (World::new("home-a"), World::new("home-b"));
+        assert_ne!(a.places.label("x"), b.places.label("x"));
+    }
+
+    #[test]
+    fn a_trigger_from_before_home_tags_takes_its_tag_once() {
+        let w = World::new("relabel");
+        let s = trigger();
+        assert_eq!(w.install(&s).unwrap(), None);
+        // As an earlier Sonny left it: under the label with no tag.
+        let (label, was) = (w.places.label(&s.name), format!("{LABEL}{}", s.name));
+        let old = w.places.jobs.join(format!("{was}.plist"));
+        let text = w.plist(&s.name).replace(&label, &was);
+        std::fs::write(&old, &text).unwrap();
+        std::fs::remove_file(w.places.job(&s.name)).unwrap();
+        w.fake.loaded.borrow_mut().remove(&label);
+        w.fake.loaded.borrow_mut().insert(was.clone());
+        assert!(w.rows().is_empty());
+        // One that will not load under its tag stays as it was.
+        w.fake.refuse_load.set(true);
+        relabel(&w.places, &|c| w.fake.call(c));
+        w.fake.refuse_load.set(false);
+        assert!(old.exists() && !w.places.job(&s.name).exists());
+        assert_eq!(std::fs::read_to_string(&old).unwrap(), text);
+        // The next start moves it.
+        relabel(&w.places, &|c| w.fake.call(c));
+        assert!(!old.exists());
+        assert_eq!(w.state(&s.name), (true, true, false));
+        assert!(!w.fake.loaded.borrow().contains(&was));
+        assert!(
+            w.plist(&s.name)
+                .contains(&format!("<string>{label}</string>"))
+        );
+        assert_eq!(read_job(&w.plist(&s.name)).unwrap().0, s);
+        assert_eq!(w.rows().len(), 1);
+        // Once: a tagged one is left as it is.
+        let unloads = w.fake.unloads.get();
+        relabel(&w.places, &|c| w.fake.call(c));
+        assert_eq!(w.fake.unloads.get(), unloads);
+    }
+
+    #[test]
+    fn a_unit_from_before_home_tags_takes_its_tag() {
+        let w = World::systemd("relabel-unit");
+        let s = trigger();
+        assert_eq!(w.install(&s).unwrap(), None);
+        let (label, was) = (w.places.label(&s.name), format!("{LABEL}{}", s.name));
+        let text = std::fs::read_to_string(w.places.job(&s.name)).unwrap();
+        std::fs::rename(
+            w.places.job(&s.name),
+            w.places.jobs.join(format!("{was}.service")),
+        )
+        .unwrap();
+        w.fake.loaded.borrow_mut().remove(&label);
+        w.fake.loaded.borrow_mut().insert(was.clone());
+        relabel(&w.places, &|c| w.fake.call(c));
+        assert_eq!(
+            std::fs::read_to_string(w.places.job(&s.name)).unwrap(),
+            text
+        );
+        assert!(!w.places.jobs.join(format!("{was}.service")).exists());
+        assert_eq!(
+            *w.fake.loaded.borrow(),
+            std::collections::BTreeSet::from([label])
         );
     }
 }
