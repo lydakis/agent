@@ -4,7 +4,8 @@ use agent_runtime::{
     provider::{ToolCall, Usage},
     store::{
         Answered, Binding, Bot, CacheTtl, CompactionPlan, ContextUsage, Database, Decision,
-        Delivery, Fork, Gate, Gated, Planning, Settings, Strip, TurnBudget, TurnOptions, Wake,
+        Delivery, Fork, Gate, Gated, Planning, QuoteRef, Settings, Strip, TurnBudget, TurnOptions,
+        Wake,
     },
     tools::{Declared, Outcome},
 };
@@ -160,6 +161,8 @@ fn historical_fork_and_exact_resume_preserve_independent_lineage() {
         expected_turn: None,
         from: None,
         origin: None,
+        person: None,
+        quotes: Vec::new(),
         budget_tokens: None,
         images: Vec::new(),
     };
@@ -2326,6 +2329,430 @@ fn history_items_name_who_sent_each_prompt_after_its_turns_are_gone() {
     assert_eq!(senders(&db, "Branch"), expected);
 }
 
+/// A turn's prompt, or with `reply` the reply it ended with, to quote.
+fn quote(bot: &str, turn: i64, reply: bool) -> QuoteRef {
+    QuoteRef {
+        bot: bot.into(),
+        turn,
+        reply,
+    }
+}
+
+#[test]
+fn a_quote_copies_a_turns_words_with_who_wrote_them() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    db.create("Carol", Some("/synthetic"), binding()).unwrap();
+    // The daemon's own person asks Bob for something, and Bob replies.
+    let asked = db
+        .begin(
+            "Bob",
+            "p1",
+            "ship it",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    db.append(asked, vec![assistant("shipped")], &[], None)
+        .unwrap();
+    db.finish(asked, None).unwrap();
+    // A person the client names writes to Bob too.
+    let by_ana = TurnOptions {
+        person: Some("ana".into()),
+        ..TurnOptions::default()
+    };
+    let started = db
+        .begin("Bob", "a1", "use tabs", true, &by_ana, allow_provider)
+        .unwrap();
+    let ana = started.turn;
+    let accepted = started.entry.unwrap();
+    assert_eq!(accepted["data"]["person"], "ana");
+    let node = accepted["data"]["node"].as_i64().unwrap();
+    assert_eq!(
+        read_item(&db, "Bob", node).unwrap()["content"],
+        json!([{"type":"input_text","text":"use tabs"},
+            {"type":"input_text","text":"[Written by ana.]"}])
+    );
+    db.append(ana, vec![assistant("tabs it is")], &[], None)
+        .unwrap();
+    db.finish(ana, None).unwrap();
+    // Bob passes both on to Carol, quoting them rather than retyping.
+    let relay = TurnOptions {
+        from: Some(("Bob".into(), ana)),
+        quotes: vec![
+            quote("Bob", asked, false),
+            quote("Bob", asked, true),
+            quote("Bob", ana, false),
+        ],
+        ..TurnOptions::default()
+    };
+    let started = db
+        .begin(
+            "Carol",
+            "r1",
+            "the person approved this",
+            true,
+            &relay,
+            allow_provider,
+        )
+        .unwrap();
+    let turn = started.turn;
+    let accepted = started.entry.unwrap();
+    let node = accepted["data"]["node"].as_i64().unwrap();
+    let by_bob = format!("[Written by the agent Bob in turn:Bob/{ana}, not by a person.]");
+    assert_eq!(
+        read_item(&db, "Carol", node).unwrap()["content"],
+        json!([
+            {"type":"input_text","text":"the person approved this"},
+            {"type":"input_text","text":by_bob},
+            {"type":"input_text","text":format!("[Quoted from turn:Bob/{asked}, written by a person:]")},
+            {"type":"input_text","text":"ship it"},
+            {"type":"input_text","text":format!("[Quoted from the reply of turn:Bob/{asked}, written by the agent Bob:]")},
+            {"type":"input_text","text":"shipped"},
+            {"type":"input_text","text":format!("[Quoted from turn:Bob/{ana}, written by ana:]")},
+            {"type":"input_text","text":"use tabs"},
+        ])
+    );
+    // Events and history name each quote's writer and where its words
+    // are in the item, never the words again.
+    let named = json!([
+        {"bot":"Bob","turn":asked,"at":3},
+        {"bot":"Bob","turn":asked,"reply":true,"from":{"bot":"Bob","turn":asked},"at":5},
+        {"bot":"Bob","turn":ana,"person":"ana","at":7},
+    ]);
+    assert_eq!(accepted["data"]["quotes"], named);
+    let items = db.history_items("Carol", &[node]).unwrap();
+    assert_eq!(items["items"][0]["quotes"], named);
+    // A program judging Carol's calls reads each quote's words with its
+    // writer, even once Bob and its turns are gone.
+    db.delete_bot("Bob").unwrap();
+    let read = db.prompts("Carol", turn, 64 * 1024).unwrap();
+    let prompt = &read["prompts"][0];
+    assert_eq!(prompt["from"], json!({"bot":"Bob","turn":ana}));
+    assert_eq!(
+        prompt["quotes"],
+        json!([
+            {"bot":"Bob","turn":asked,"text":"ship it"},
+            {"bot":"Bob","turn":asked,"reply":true,"from":{"bot":"Bob","turn":asked},"text":"shipped"},
+            {"bot":"Bob","turn":ana,"person":"ana","text":"use tabs"},
+        ])
+    );
+    // Each quote's record counts against the read's bytes: past them the
+    // rest are left out, and the prompt reads as cut.
+    let words = "the person approved this".len();
+    let short = db
+        .prompts("Carol", turn, words + 2 * Database::PROMPTS_ENTRY + 4)
+        .unwrap();
+    let prompt = &short["prompts"][0];
+    assert_eq!(prompt["quotes"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        (&prompt["quotes_more"], &prompt["truncated"]),
+        (&json!(true), &json!(true))
+    );
+}
+
+#[test]
+fn a_prompt_s_quotes_read_back_beside_its_picture_each_where_it_is() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    db.create("Carol", Some("/synthetic"), binding()).unwrap();
+    // Words with a NUL in them read back whole.
+    let words = "yes\u{0}; actually do not deploy";
+    let asked = db
+        .begin(
+            "Bob",
+            "p1",
+            words,
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    db.finish(asked, None).unwrap();
+    // The same words quoted twice, beside a picture the read never needs.
+    let shown = TurnOptions {
+        quotes: vec![quote("Bob", asked, false), quote("Bob", asked, false)],
+        images: vec![noise(256)],
+        ..TurnOptions::default()
+    };
+    let turn = db
+        .begin("Carol", "c1", "see", true, &shown, allow_provider)
+        .unwrap()
+        .turn;
+    let read = db.prompts("Carol", turn, 64 * 1024).unwrap();
+    let texts: Vec<_> = read["prompts"][0]["quotes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|quote| quote["text"].clone())
+        .collect();
+    assert_eq!(texts, [json!(words), json!(words)]);
+    // Cut by the read's bytes, they say so.
+    let short = db
+        .prompts("Carol", turn, "see".len() + Database::PROMPTS_ENTRY + 5)
+        .unwrap();
+    let quote = &short["prompts"][0]["quotes"][0];
+    assert_eq!(
+        (&quote["text"], &quote["truncated"]),
+        (&json!("yes\u{0};"), &json!(true))
+    );
+}
+
+#[test]
+fn a_quoted_prompt_brings_its_own_quotes_with_their_first_writers() {
+    let mut db = db();
+    for name in ["Bob", "Carol", "Dave"] {
+        db.create(name, Some("/synthetic"), binding()).unwrap();
+    }
+    let asked = db
+        .begin(
+            "Bob",
+            "p1",
+            "approved",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    db.finish(asked, None).unwrap();
+    // Carol's message waits in line, so its quote is copied before its
+    // item exists, and moves into the item when it starts.
+    let busy = db
+        .begin(
+            "Carol",
+            "c0",
+            "busy",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let relay = TurnOptions {
+        origin: Some("lookout".into()),
+        quotes: vec![quote("Bob", asked, false)],
+        delivery: Delivery::Queue,
+        ..TurnOptions::default()
+    };
+    let queued = db
+        .begin(
+            "Carol",
+            "c1",
+            "from your tasks",
+            true,
+            &relay,
+            allow_provider,
+        )
+        .unwrap();
+    assert_eq!(
+        queued.entry.unwrap()["data"]["quotes"],
+        json!([{"bot":"Bob","turn":asked}])
+    );
+    db.finish(busy, None).unwrap();
+    let (accepted, _) = db.start(queued.turn, allow_provider).unwrap();
+    assert_eq!(
+        accepted["data"]["quotes"],
+        json!([{"bot":"Bob","turn":asked,"at":3}])
+    );
+    let carol = queued.turn;
+    let pass_on = TurnOptions {
+        quotes: vec![quote("Carol", carol, false)],
+        ..TurnOptions::default()
+    };
+    let started = db
+        .begin("Dave", "d1", "see this", true, &pass_on, allow_provider)
+        .unwrap();
+    let node = started.entry.unwrap()["data"]["node"].as_i64().unwrap();
+    assert_eq!(
+        read_item(&db, "Dave", node).unwrap()["content"],
+        json!([
+            {"type":"input_text","text":"see this"},
+            {"type":"input_text","text":format!("[Quoted from turn:Carol/{carol}, sent by lookout:]")},
+            {"type":"input_text","text":"from your tasks"},
+            {"type":"input_text","text":format!("[Quoted from turn:Bob/{asked}, written by a person:]")},
+            {"type":"input_text","text":"approved"},
+        ])
+    );
+    // A retry names the turns the request named, not those they brought.
+    let again = db
+        .begin("Dave", "d1", "see this", true, &pass_on, allow_provider)
+        .unwrap();
+    assert_eq!(again.turn, started.turn);
+    // Quotes they bring count against the prompt's quotes: each is a part
+    // of its own.
+    let many = TurnOptions {
+        quotes: vec![quote("Dave", started.turn, false); 30],
+        ..TurnOptions::default()
+    };
+    let error = db
+        .begin("Bob", "p2", "all of it", true, &many, allow_provider)
+        .unwrap_err();
+    assert_eq!(error.code, "quote_too_large");
+}
+
+#[test]
+fn a_quote_names_a_turn_that_has_the_words() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    db.create("Carol", Some("/synthetic"), binding()).unwrap();
+    let running = db
+        .begin(
+            "Bob",
+            "p1",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let steer = db
+        .begin(
+            "Bob",
+            "p2",
+            "and more",
+            true,
+            &TurnOptions {
+                delivery: Delivery::Steer,
+                ..TurnOptions::default()
+            },
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let send = |db: &mut Database, id: &str, quotes: Vec<QuoteRef>, prompt: &str| {
+        let options = TurnOptions {
+            quotes,
+            delivery: Delivery::Queue,
+            ..TurnOptions::default()
+        };
+        db.begin("Carol", id, prompt, true, &options, allow_provider)
+            .map(|started| started.turn)
+            .map_err(|error| error.code)
+    };
+    assert_eq!(
+        send(&mut db, "q1", vec![quote("Bob", running + 99, false)], "x"),
+        Err("quote_not_found".into())
+    );
+    assert_eq!(
+        send(&mut db, "q2", vec![quote("Carol", running, false)], "x"),
+        Err("quote_not_found".into())
+    );
+    // A running turn's words are there; the reply it ends with is not yet.
+    assert!(send(&mut db, "q3", vec![quote("Bob", running, false)], "x").is_ok());
+    assert_eq!(
+        send(&mut db, "q4", vec![quote("Bob", running, true)], "x"),
+        Err("quote_unfinished".into())
+    );
+    db.absorb(
+        running,
+        None,
+        8 << 20,
+        4096,
+        ContextUsage::default(),
+        false,
+        true,
+    )
+    .unwrap();
+    db.finish(running, None).unwrap();
+    // A steer replied in the turn it joined; a turn that said nothing
+    // has no reply.
+    assert_eq!(
+        send(&mut db, "q5", vec![quote("Bob", steer, true)], "x"),
+        Err("quote_not_found".into())
+    );
+    assert_eq!(
+        send(&mut db, "q6", vec![quote("Bob", running, true)], "x"),
+        Err("quote_not_found".into())
+    );
+    assert!(send(&mut db, "q7", vec![quote("Bob", steer, false)], "x").is_ok());
+    // The prompt and its quotes are bounded together, as a prompt alone.
+    let words = "w".repeat(Database::QUOTED_BYTES - 3);
+    assert_eq!(
+        send(&mut db, "q8", vec![quote("Bob", running, false)], &words),
+        Err("quote_too_large".into())
+    );
+    // A retry names the same turns, or it is another request.
+    let first = send(&mut db, "q9", vec![quote("Bob", running, false)], "x").unwrap();
+    assert_eq!(
+        send(&mut db, "q9", vec![quote("Bob", running, false)], "x"),
+        Ok(first)
+    );
+    assert_eq!(
+        send(&mut db, "q9", vec![quote("Bob", steer, false)], "x"),
+        Err("idempotency_conflict".into())
+    );
+}
+
+#[test]
+fn a_bot_that_hides_senders_reads_quoted_words_without_their_lines() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let mut quiet = binding();
+    quiet.settings.hide_senders = true;
+    db.create("Carol", Some("/synthetic"), quiet).unwrap();
+    let asked = db
+        .begin(
+            "Bob",
+            "p1",
+            "ship it",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let options = TurnOptions {
+        person: Some("ana".into()),
+        quotes: vec![quote("Bob", asked, false)],
+        ..TurnOptions::default()
+    };
+    let started = db
+        .begin("Carol", "c1", "see this", true, &options, allow_provider)
+        .unwrap();
+    let data = &started.entry.unwrap()["data"];
+    assert_eq!(data["quotes"], json!([{"bot":"Bob","turn":asked,"at":1}]));
+    let node = data["node"].as_i64().unwrap();
+    assert_eq!(
+        read_item(&db, "Carol", node).unwrap()["content"],
+        json!([{"type":"input_text","text":"see this"},
+            {"type":"input_text","text":"ship it"}])
+    );
+}
+
+#[test]
+fn schema_64_had_no_people_and_no_quotes() {
+    let path = std::env::temp_dir().join(format!("agent-schema64-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            "ALTER TABLE turns DROP COLUMN person; ALTER TABLE turns DROP COLUMN quotes;
+             ALTER TABLE senders DROP COLUMN person; ALTER TABLE senders DROP COLUMN quotes;
+             ALTER TABLE nodes DROP COLUMN written_ms; PRAGMA user_version=64;",
+        )
+        .unwrap();
+    drop(Database::initialize(Connection::open(&path).unwrap()).unwrap());
+    let conn = Connection::open(&path).unwrap();
+    let columns: i64 = conn
+        .query_row(
+            "SELECT (SELECT count(*) FROM pragma_table_info('turns') WHERE name IN ('person','quotes'))
+                  + (SELECT count(*) FROM pragma_table_info('senders') WHERE name IN ('person','quotes'))
+                  + (SELECT count(*) FROM pragma_table_info('nodes') WHERE name='written_ms')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(columns, 5);
+    drop(conn);
+    std::fs::remove_file(path).unwrap();
+}
+
 #[test]
 fn a_bot_that_hides_senders_reads_only_the_words() {
     let mut db = db();
@@ -4112,6 +4539,8 @@ fn turn_options_are_recorded_and_part_of_idempotency() {
         expected_turn: None,
         from: None,
         origin: None,
+        person: None,
+        quotes: Vec::new(),
         budget_tokens: None,
         images: Vec::new(),
     };
@@ -4242,6 +4671,8 @@ fn a_bot_without_a_default_workspace_needs_one_per_submission() {
         expected_turn: None,
         from: None,
         origin: None,
+        person: None,
+        quotes: Vec::new(),
         budget_tokens: None,
         images: Vec::new(),
     };
@@ -5076,6 +5507,8 @@ fn forks_start_at_any_answered_message_and_default_to_the_head() {
                 expected_turn: None,
                 from: None,
                 origin: None,
+                person: None,
+                quotes: Vec::new(),
                 budget_tokens: None,
                 images: Vec::new(),
             },
@@ -8904,6 +9337,168 @@ fn pending_counters_follow_every_transition_and_bound_admission() {
         assert_eq!(db.pending().unwrap(), (2, 8));
     }
     std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn quoted_words_wait_with_their_turn_and_count_against_the_pending_bytes() {
+    let path = std::env::temp_dir().join(format!(
+        "agent-pending-quotes-{}.sqlite",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let quoting = |delivery| TurnOptions {
+        delivery,
+        quotes: vec![quote("Ann", 1, false)],
+        ..TurnOptions::default()
+    };
+    let words = "x".repeat(4096);
+    let waiting = {
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        db.create("Ann", Some("/synthetic"), binding()).unwrap();
+        db.create("Bob", Some("/synthetic"), binding()).unwrap();
+        let said = db
+            .begin(
+                "Ann",
+                "a1",
+                &words,
+                true,
+                &TurnOptions::default(),
+                allow_provider,
+            )
+            .unwrap()
+            .turn;
+        assert_eq!(said, 1);
+        db.finish(said, None).unwrap();
+        let running = db
+            .begin(
+                "Bob",
+                "b1",
+                "go",
+                true,
+                &TurnOptions::default(),
+                allow_provider,
+            )
+            .unwrap()
+            .turn;
+        // An empty prompt quoting 4 KiB waits with those 4 KiB.
+        db.begin(
+            "Bob",
+            "b2",
+            "",
+            true,
+            &quoting(Delivery::Queue),
+            allow_provider,
+        )
+        .unwrap();
+        let (turns, bytes) = db.pending().unwrap();
+        assert_eq!(turns, 1);
+        assert!(bytes as usize > words.len(), "{bytes}");
+        // The bound counts them too.
+        db.set_pending_limits(0, bytes as usize + 1024);
+        assert_eq!(
+            db.begin(
+                "Bob",
+                "b3",
+                "",
+                true,
+                &quoting(Delivery::Queue),
+                allow_provider
+            )
+            .unwrap_err()
+            .code,
+            "pending_limit"
+        );
+        db.set_pending_limits(0, 0);
+        // A steer quoting them leaves the count when it is taken in.
+        db.begin(
+            "Bob",
+            "b4",
+            "",
+            true,
+            &quoting(Delivery::Steer),
+            allow_provider,
+        )
+        .unwrap();
+        assert_eq!(db.pending().unwrap(), (2, 2 * bytes));
+        db.absorb(
+            running,
+            None,
+            8 << 20,
+            4096,
+            ContextUsage::default(),
+            false,
+            true,
+        )
+        .unwrap();
+        assert_eq!(db.pending().unwrap(), (1, bytes));
+        bytes
+    };
+    // Recounted at open: the waiting turn still holds its quoted words.
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    assert_eq!(db.pending().unwrap(), (1, waiting));
+    let (_, turn) = db.next_ready().unwrap().unwrap();
+    db.start(turn, |_, _| Ok(())).unwrap();
+    assert_eq!(db.pending().unwrap(), (0, 0));
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn one_absorption_takes_in_quoted_words_within_its_batch_bytes() {
+    let mut db = db();
+    db.create("Ann", Some("/synthetic"), binding()).unwrap();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let said = db
+        .begin(
+            "Ann",
+            "a1",
+            &"x".repeat(200 * 1024),
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    db.finish(said, None).unwrap();
+    let running = db
+        .begin(
+            "Bob",
+            "b1",
+            "go",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    // Two short steers quoting 200 KiB each: the first is always taken in,
+    // the second waits for the next batch.
+    let steer = TurnOptions {
+        delivery: Delivery::Steer,
+        quotes: vec![quote("Ann", said, false)],
+        ..TurnOptions::default()
+    };
+    for id in ["s1", "s2"] {
+        db.begin("Bob", id, "", true, &steer, allow_provider)
+            .unwrap();
+    }
+    let absorb = |db: &mut Database, through| {
+        db.absorb(
+            running,
+            through,
+            8 << 20,
+            4096,
+            ContextUsage::default(),
+            false,
+            true,
+        )
+        .unwrap()
+    };
+    let absorbed = absorb(&mut db, None);
+    assert_eq!(absorbed.outcomes.len(), 1);
+    assert!(absorbed.next_through.is_some());
+    let absorbed = absorb(&mut db, absorbed.next_through);
+    assert_eq!(absorbed.outcomes.len(), 1);
+    assert_eq!(db.pending().unwrap(), (0, 0));
 }
 
 #[test]
@@ -13446,4 +14041,42 @@ fn a_waiting_step_ended_in_a_group_that_fails_is_told_of_once_one_commits() {
         .unwrap();
     db.commit_group().unwrap();
     assert_eq!(stepped(&mut db), [approval]);
+}
+
+#[test]
+fn each_item_says_when_it_joined_the_history() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let before = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let turn = db
+        .begin(
+            "Bob",
+            "r1",
+            "hello",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    db.append(turn, vec![assistant("hi")], &[], None).unwrap();
+    db.finish(turn, None).unwrap();
+    let page = db.history_nodes("Bob", None, 400, None, false).unwrap();
+    let nodes: Vec<i64> = (page["nodes"].as_array().unwrap().iter())
+        .map(|n| n["node"].as_i64().unwrap())
+        .collect();
+    let items = db.history_items("Bob", &nodes).unwrap();
+    for (listed, read) in page["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .zip(items["items"].as_array().unwrap())
+    {
+        let written = listed["written_ms"].as_i64().unwrap();
+        assert!(written >= before, "{listed}");
+        assert_eq!(read["written_ms"], written);
+    }
 }

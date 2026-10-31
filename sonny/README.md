@@ -505,31 +505,70 @@ way `/react` does, and each note in the margin has its own `↩`.
   role, `AGENTS.md`, skills and memory. Sonny does this on its own when
   it opens a lead whose instructions it saw composed from the folder, and
   leaves ones set any other way alone.
-- `/approvals` picks whether calls wait for a review: `auto`, a reviewer
-  model (a new lead starts here, and Sonny keeps `sonny approver` as the
-  daemon's companion when nothing serves it), `ask`, you, or `full`, none. Tasks the lead makes take
-  the gate it had; a pick reaches every agent the lead made too, one busy
-  now once it is idle. While the reviewer looks at a call the status row says
-  `Reviewing approval request`, and a denied call is drawn as
-  `✗ Request denied for …` with the reviewer's reason, in either view.
-  The mode sets the lead's sandbox too, as Codex's modes do: in `auto`
-  and `ask` its commands, writes and edits stay in its folder (and
-  `/tmp`), reach the network, and may commit to the folder's repository,
-  whose hooks and config stay read-only; a call that leaves the sandbox
-  waits for the review. In `full` the lead runs unconfined. Every task
-  is sandboxed the same way in its own folder, but in `full`, where
-  nothing would answer a call that asks to leave the sandbox, tasks run
-  unconfined too, as under Codex's full access; a pick sets the tasks'
-  sandboxes along with their gates.
-  A lead made before Sonny sandboxed leads is sandboxed when Sonny opens
-  it. On Linux sandboxes need bubblewrap. A tool that keeps a daemon of its
-  own, such as mcpx, can't run inside a sandbox: name it in
-  `~/.agent/config.toml`, `[sonny] unsandboxed = ["mcpx"]`, and every agent
-  runs it outside without asking, as a Codex rule that allows a command
-  does. Each entry is a command's first words (`"docker compose"`), and a
-  call runs outside only when everything it runs is named, so
-  `mcpx … | jq` still asks. Sonny gives a lead the list again when it opens
-  it.
+- `/permissions` picks what agents may do, and who approves the rest, as
+  Codex's `/permissions` pairs a sandbox with a reviewer:
+
+  | Row | Sandbox | Anything more |
+  | --- | --- | --- |
+  | Auto (a new lead starts here) | its folder | a reviewer model approves |
+  | Ask me | its folder | you approve |
+  | Read only | reads anything, writes nothing, no network | you approve |
+  | Full access | none | nothing asks |
+
+  "Its folder" is Codex's `workspace-write`, loosened: commands, writes
+  and edits stay in the lead's folder (and `/tmp`), reach the network, and
+  may commit to the folder's repository, whose hooks and config stay
+  read-only. Reads run without asking in every row. A call that leaves
+  the sandbox waits for whoever approves; while the reviewer looks at one
+  the status row says `Reviewing approval request` (Sonny keeps
+  `sonny approver` as the daemon's companion when nothing serves it), and
+  a denied call is drawn as `✗ Request denied for …` with the reviewer's
+  reason, in either view; one you allow is drawn as `✓ Request allowed
+  for …`, as Codex records each decision. The status row above the
+  composer shows only the keys, since the call is written out whole right
+  above it. The footer names the row unless it is the one new leads start
+  in, full access in the text's own weight rather than muted (no hue:
+  yellow is for what needs you).
+
+  ![/permissions: Sonny's four rows, then one of the config's](../docs/sonny/permissions.png)
+
+  ![The footer naming full access](../docs/sonny/permissions-full-footer.png)
+
+  Rows of your own follow Sonny's, as Codex's permission profiles do, from
+  `~/.agent/config.toml`:
+
+  ```toml
+  [sonny]
+  default_permissions = "strict"   # the row a new lead starts in
+
+  [sonny.permissions.strict]
+  description = "Offline, commits ask"
+  extends = "auto"        # auto, ask or read-only
+  network = false
+  git = "read-only"       # "write" lets commits run without asking
+  writable = ["~/.cargo"] # folders it writes besides its own, whole paths
+  reviewer = "model"      # model, you, or none: refused, and told to do without
+  ```
+
+  Tasks the lead makes take the row it had, each sandboxed in its own
+  folder (read only too); a pick reaches every agent the lead made, one
+  busy now once it is idle. In full access tasks run unconfined, as under
+  Codex's. A lead made before Sonny sandboxed leads is sandboxed when Sonny
+  opens it. On Linux sandboxes need bubblewrap.
+
+  A tool that keeps a daemon of its own, such as mcpx, can't run inside a
+  sandbox: `[sonny] unsandboxed = ["mcpx"]` has every agent run it outside
+  without asking, as a Codex rule that allows a command does. Each entry
+  is a command's first words (`"docker compose"`), and a call runs outside
+  only when everything it runs is named, so `mcpx … | jq` still asks.
+  When you approve a plain command that asked to leave, `a` (always allow
+  `cargo test`) adds its first words to the list, and the lead and its
+  agents take it at once. The list holds for every folder, so a program
+  named from the folder it runs in (`./build.sh`) is never offered.
+
+  ![An approval prompt offering to always allow cargo test](../docs/sonny/permissions-always.png)
+
+  ![The call allowed, and cargo test outside the sandbox from now on](../docs/sonny/permissions-allowed.png)
 - `/retry` lists the calls the reviewer denied while Sonny watched, with
   the reason for each. Enter writes the call out whole, and a second
   Enter sends your approval of that exact call as your own message, so
@@ -632,7 +671,12 @@ way `/react` does, and each note in the margin has its own `↩`.
   Enter puts it in the middle: its maker, what it made and whoever it
   talked to in the last hour on the first ring, two hops on the next, the
   chat log only its own; the stars glide to their places. Esc lets go of
-  the pick, then the centre. Under 60 columns or 24 rows the sky becomes a list, a firefly
+  the pick, then the centre. With thousands of agents the sky folds: a
+  star for every agent that needs you, failed, works or was just lit, and
+  for the leads, as many as the pane has room for; the rest are a faint
+  dot each, so a cloud's density says how big it is, and the biggest
+  clouds carry their count. Names keep a row apart, the leads of the
+  biggest projects first. Under 60 columns or 24 rows the sky becomes a list, a firefly
   per agent and the last it said or was told. `sonny sky` draws the same
   sky on its own, in the whole terminal, to keep in another one beside the
   work, with your theme's grays and `NO_COLOR` honoured, and
@@ -649,6 +693,8 @@ way `/react` does, and each note in the margin has its own `↩`.
   ![/sky's talk lens](../docs/sonny/sky-talk.png)
 
   ![/sky's models lens](../docs/sonny/sky-models.png)
+
+  ![/sky folded at 10,000 agents](../docs/sonny/sky-10000.png)
 
   ![/sky centred on the shop lead](../docs/sonny/sky-centre.png)
 
@@ -668,7 +714,7 @@ way `/react` does, and each note in the margin has its own `↩`.
   ([docs/SONNY.md](../docs/SONNY.md#mcp-servers)). As in Codex, each call
   a script makes is approved on its own: a tool its server marks
   destructive, and not read-only, waits for the agent's verdict
-  (`/approvals`), unless the server's `approval_mode` says otherwise.
+  (`/permissions`), unless the server's `approval_mode` says otherwise.
 
   ![An exec call drawn as one line with what its script printed](../docs/sonny/exec-script.png)
 
@@ -749,14 +795,14 @@ the model and records each call: `react`, `ask`, `plan`, `margin` and
 those, running each call in the calling agent's folder, so they work with
 every Sonny window closed; a call nobody answers in time ends as
 `tool_unserved`, and the agent goes on. All but `show_agent` wait for a
-verdict wherever the agent's other calls do (`/approvals`): a start runs
+verdict wherever the agent's other calls do (`/permissions`): a start runs
 the folder's setup script, a new project makes a lead, a removal can drop
 work, a subscription sends other bots' words to the subscriber's judge,
 a pane runs a command outside the agent's sandbox, and a trigger is a
 job of the system's scheduler (a LaunchAgent, or a systemd user service)
 that runs as you. An agent whose
 gate Sonny did not set, as another client's, goes without these until the
-person picks a mode in `/approvals`. An agent of Sonny's reaches Sonny only through these tools: none
+person picks a row in `/permissions`. An agent of Sonny's reaches Sonny only through these tools: none
 of them has a command form. Sonny draws the calls, live and from history,
 and a call answered with an error reads as what it tried, `✗ Couldn't start fix`, with why under it. A task's own
 `resolve_task` is read from its history: its last turn resolved it. The
@@ -997,7 +1043,7 @@ With nothing typed, `?` lists every key beside the conversation. Every
 hint on screen is written one way, as Codex writes them: the key, then
 what it does muted, `·` between them (`↑↓ pick · enter open · esc
 close`). Every list over the composer (the slash menu, `/model`,
-`/approvals`, `/retry`, a reply to react to) is one list: up to 8 rows
+`/permissions`, `/retry`, a reply to react to) is one list: up to 8 rows
 under a blank one, the pick in reverse video, `•` before what is in
 effect.
 

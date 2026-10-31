@@ -49,7 +49,7 @@ fn short(key: &str) -> &str {
 }
 
 /// Every key `agent_client::config` reads.
-pub const SETTINGS: [Setting; 19] = [
+pub const SETTINGS: [Setting; 20] = [
     Setting {
         key: "model",
         about: "a new agent's model, when none is named (provider/model)",
@@ -163,6 +163,12 @@ pub const SETTINGS: [Setting; 19] = [
         about: "the tokens an invite pays for in its thread: its turn, and the turns replies there start while any are left",
         values: &[],
         default: "1000000",
+    },
+    Setting {
+        key: "sonny.default_permissions",
+        about: "the /permissions row a new lead starts in; a [sonny.permissions] row of your own is typed into the file",
+        values: &["auto", "ask", "read-only", "full"],
+        default: "auto",
     },
 ];
 

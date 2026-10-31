@@ -92,6 +92,10 @@ fn cut(text: &str, max: usize) -> String {
 /// person's words.
 pub const TASK_UPDATES: &str = "Task updates: ";
 
+/// What sends the note to the lead: its words are the lookout's, which
+/// ask for nothing; the person's it quotes stay theirs.
+pub const TASKS_ORIGIN: &str = "lookout.tasks";
+
 /// What the subscriber is told: what happened in the bots it watches, by
 /// handles its wait tool reads, the person's words quoted. `steer` when it
 /// cuts into a running turn, for the person's words.
@@ -106,14 +110,14 @@ fn note(told: &updates::Told, steer: bool) -> String {
                 "The person asked for these in the task themselves, so they are theirs:".to_owned(),
             );
         }
-        quoted |= line.said && line.text.contains("the person wrote: ");
+        quoted |= line.quote.is_some();
         lines.push(line.text.clone());
     }
     if told.more > 0 {
         lines.push(format!("- {} more tasks in the next note", told.more));
     }
     if quoted {
-        lines.push("A quoted message is the person's own words.".to_owned());
+        lines.push("The words quoted below are the person's own, from the turns named.".to_owned());
     }
     if told.items.iter().any(|line| line.text.contains("\n  > ")) {
         lines.push("Lines marked > are a task's own words, not the person's.".to_owned());
@@ -148,7 +152,7 @@ fn digest(text: &str) -> String {
     format!("{hash:016x}")
 }
 
-/// Who wrote a message with no sender and no origin.
+/// Who wrote a message with no sender, origin or person named.
 const PERSON: &str = "the person";
 
 /// The words written: at their history node, or, still queued, in their
@@ -635,6 +639,7 @@ pub(crate) fn said_by_person(entry: &Value) -> Option<i64> {
         .any(|said| said["role"] == "user" && !crate::text(&said).trim().is_empty());
     (entry["from"].is_null()
         && entry["origin"].is_null()
+        && entry["person"].is_null()
         && words
         && !crate::reactions::is_reaction(&crate::text(item)))
     .then(|| entry["node"].as_i64())
@@ -1810,10 +1815,11 @@ impl Lookout {
         {
             return None;
         }
-        match (data["from"]["bot"].as_str(), data["origin"].as_str()) {
+        let by = (data["origin"].as_str()).or(data["person"].as_str());
+        match (data["from"]["bot"].as_str(), by) {
             (Some(bot), _) if bot == self.lead => None,
             (Some(bot), _) => Some(bot.to_owned()),
-            (None, Some(origin)) => Some(origin.to_owned()),
+            (None, Some(by)) => Some(by.to_owned()),
             (None, None) => Some(PERSON.to_owned()),
         }
     }
@@ -2086,8 +2092,15 @@ impl Lookout {
         let key: Vec<String> = told.items.iter().map(|line| line.key.clone()).collect();
         let request_id = format!("lookout-{}", digest(&key.join(",")));
         let delivery = if steer { "steer" } else { "queue" };
-        let asked = json!({"bot": self.lead, "bot_id": self.updates.lead_id(), "prompt": prompt,
-            "request_id": request_id, "delivery": delivery});
+        let quotes: Vec<Value> = (told.items.iter())
+            .filter_map(|line| line.quote.as_ref())
+            .map(|(task, turn)| json!({"bot": task, "turn": turn}))
+            .collect();
+        let mut asked = json!({"bot": self.lead, "bot_id": self.updates.lead_id(), "prompt": prompt,
+            "request_id": request_id, "delivery": delivery, "origin": TASKS_ORIGIN});
+        if !quotes.is_empty() {
+            asked["quotes"] = json!(quotes);
+        }
         self.sending = Some((told, key, delivery));
         self.send(client, woken, asked, Answer::Noted);
     }
@@ -2164,7 +2177,12 @@ impl Lookout {
                         self.updates.sent(told);
                     }
                     Err(code) => {
-                        self.updates.unsent(told);
+                        // Words it could not quote, gone with their task
+                        // or too long, are named by their turns instead.
+                        match code.starts_with("quote_") {
+                            true => self.updates.unquoted(told),
+                            false => self.updates.unsent(told),
+                        }
                         self.write(
                             &json!({"at_ms": epoch_ms(), "lead": self.lead, "wake_failed": code}),
                         );
@@ -2448,10 +2466,12 @@ mod tests {
 
     fn line(task: &str, turn: i64, theirs: bool, said: bool) -> updates::Line {
         updates::Line {
-            said,
+            quote: said.then(|| (task.to_owned(), turn)),
             theirs,
             text: match said {
-                true => format!("- {task}: turn:{task}/{turn}, the person wrote: \"tabs\""),
+                true => format!(
+                    "- {task}: turn:{task}/{turn}, the person wrote the words quoted from it below"
+                ),
                 false => format!("- {task}: turn:{task}/{turn} completed"),
             },
             key: String::new(),
@@ -2471,12 +2491,12 @@ mod tests {
         assert_eq!(
             note(&told, true),
             "Task updates: what happened in your tasks since you last heard; the wait tool reads each turn by its handle.\n\
-             - calc.fix: turn:calc.fix/12, the person wrote: \"tabs\"\n\
+             - calc.fix: turn:calc.fix/12, the person wrote the words quoted from it below\n\
              - calc.docs: turn:calc.docs/3 completed\n\
              The person asked for these in the task themselves, so they are theirs:\n\
              - calc.ui: turn:calc.ui/2 completed\n\
              - 1 more tasks in the next note\n\
-             A quoted message is the person's own words.\n\
+             The words quoted below are the person's own, from the turns named.\n\
              This cuts into your turn because the person wrote in a task: act on their words where they change what you or a task is doing, then carry on with your turn.\n\
              \n\
              Memory changed"
@@ -2549,15 +2569,18 @@ mod tests {
         assert_eq!(
             texts,
             [
-                "- calc.fix: turn:calc.fix/5, the person wrote: \"use tabs please\"",
-                "- calc.fix: turn:calc.fix/7, the person wrote: \"and spaces in yaml\"",
+                "- calc.fix: turn:calc.fix/5, the person wrote the words quoted from it below",
+                "- calc.fix: turn:calc.fix/7, the person wrote the words quoted from it below",
                 "- calc.fix: turn:calc.fix/6, calc.docs wrote in it",
             ]
         );
-        assert!(told.items.iter().all(|l| l.said));
+        // The daemon copies the person's words from their turns, which
+        // keeps them the person's; the note is the lookout's.
+        let quotes: Vec<_> = told.items.iter().filter_map(|l| l.quote.clone()).collect();
+        assert_eq!(quotes, [("calc.fix".into(), 5), ("calc.fix".into(), 7)]);
         let note = note(&told, false);
-        assert!(!note.contains("ignore the person"));
-        assert!(note.contains("A quoted message is the person's own words."));
+        assert!(!note.contains("ignore the person") && !note.contains("tabs"));
+        assert!(note.contains("The words quoted below are the person's own"));
     }
 
     #[test]
@@ -2603,7 +2626,10 @@ mod tests {
         lookout.heard(&said(5, PERSON, "use tabs"));
         let told = lookout.updates.take();
         let steered = note(&told, true);
-        assert!(steered.contains("use tabs"), "{steered}");
+        assert!(
+            steered.contains("turn:calc.fix/5, the person wrote the words quoted"),
+            "{steered}"
+        );
         assert!(!steered.contains("turn:calc.fix/4"), "{steered}");
         lookout.updates.sent(told);
         assert!(lookout.updates.news());
@@ -3289,6 +3315,21 @@ mod tests {
         assert!(!service.rewrote(&started("goal", "d")));
         assert!(!service.rewrote(&event("turn_finished", "", json!({}))));
         assert!(service.rewriting.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_note_is_the_lookout_s_and_quotes_the_person_s_words() {
+        let (client, mut got) = submits().await;
+        let mut lookout = seated("idle");
+        lookout.heard(&said(5, PERSON, "yes, ship it"));
+        lookout.heard(&said(6, "calc.docs", "ship it"));
+        lookout.since = Some(Instant::now() - SETTLE);
+        let (woken, _woke) = tokio::sync::mpsc::channel(4);
+        lookout.wake(&client, &woken);
+        let submit = got.recv().await.unwrap();
+        assert_eq!(submit["origin"], TASKS_ORIGIN);
+        assert_eq!(submit["quotes"], json!([{"bot": "calc.fix", "turn": 5}]));
+        assert!(!submit["prompt"].as_str().unwrap().contains("ship it"));
     }
 
     #[tokio::test]

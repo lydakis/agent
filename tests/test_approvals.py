@@ -904,6 +904,25 @@ class PromptReadTests(ModelFixture):
         self.assertEqual(read['earlier'], [{'turn': first, 'text': 'shell:exit 3'}])
         self.assertEqual((read['status'], read['workspace'], read['more']), ('finished', str(self.path), False))
         self.assertEqual(client.request('prompts', bot='Bob', turn=second, bytes=0)['error'], 'invalid_limit')
+        # A person the client names wrote it; and a prompt may quote turns,
+        # whose words the daemon copies with who wrote them.
+        self.assertEqual(client.request('submit', bot='Bob', request_id='p', prompt='hi',
+                                        person='not a name')['error'], 'invalid_person')
+        self.assertEqual(client.request('submit', bot='Bob', request_id='pf', prompt='hi', person='ana',
+                                        origin='tasks')['error'], 'invalid_person')
+        self.assertEqual(client.request('submit', bot='Bob', request_id='q0', prompt='hi',
+                                        quotes=[{'bot': 'Bob', 'turn': 0}])['error'], 'invalid_quote')
+        self.assertEqual(client.request('submit', bot='Bob', request_id='q1', prompt='hi',
+                                        quotes=[{'bot': 'Bob', 'turn': second + 99}])['error'], 'quote_not_found')
+        third = client.request('submit', bot='Bob', request_id='q2', prompt='as asked', person='ana',
+                               quotes=[{'bot': 'Bob', 'turn': first},
+                                       {'bot': 'Bob', 'turn': second, 'reply': True}])['result']['turn']
+        self.assertEqual(client.finished(third)['data']['status'], 'completed')
+        [read] = client.request('prompts', bot='Bob', turn=third)['result']['prompts']
+        self.assertEqual((read['text'], read['person']), ('as asked', 'ana'))
+        self.assertEqual(read['quotes'][0], {'bot': 'Bob', 'turn': first, 'text': 'shell:exit 3'})
+        self.assertEqual(read['quotes'][1]['from'], {'bot': 'Bob', 'turn': second})
+        self.assertEqual(read['quotes'][1]['text'], 'reply:done')
 
 
 @unittest.skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'set AGENT_TEST_RUNTIME=1 after a Rust release build')

@@ -354,6 +354,15 @@ turn with a level sees it in its shell as `AGENT_EFFORT`, and a new bot that tak
 from `AGENT_MODEL` takes its level from `AGENT_EFFORT`, so a peer started
 on its creator's model thinks as hard as its creator; a bot given
 `--model` or a profile's model gets only its own `--effort`.
+`run --quote BOT/TURN` copies that turn's prompt after this prompt, with a
+line saying who wrote it; `BOT/TURN:reply` copies the reply the finished
+turn ended with. It repeats, up to 64, the quotes a quoted prompt brings
+counted. The daemon copies the words, so the model reads what was written
+and by whom, never the sender's retelling; a turn without those words is
+refused (`quote_not_found`, `quote_unfinished`, `quote_too_large`). Sonny's
+approver takes a quote of the person's words as consent only when the
+person sent the quoting prompt: an agent could otherwise quote an old
+"yes" for a new ask.
 `run --instructions` and `--instructions-file` set a new bot's instructions,
 with the CLI's built-in text as the default; the daemon has none. `run
 --tools LIST` chooses a new bot's tools from those the daemon registers,

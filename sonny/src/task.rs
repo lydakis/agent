@@ -350,7 +350,7 @@ pub fn start(here: &Path, lead: &str, start: &Start) -> Result<String, String> {
     // committing to its repository and running the commands the config
     // lets out of it, or, in `full`, unconfined, as nothing would answer a
     // call that asks to leave.
-    let mode = lead_mode(&agent, lead).unwrap_or(crate::approvals::MODES[0].0);
+    let mode = lead_mode(&agent, lead).unwrap_or_else(crate::approvals::default);
     for (key, value) in crate::approvals::sandbox(mode, &place.dir) {
         let flag = format!("--{key}");
         match value {
@@ -782,7 +782,7 @@ fn ends_name(after: &str, part_of_name: impl Fn(char) -> bool) -> bool {
     }
 }
 
-/// The approvals mode of the lead `name`, from its gates.
+/// The permissions row of the lead `name`, from its gates and sandbox.
 fn lead_mode(agent: &Path, name: &str) -> Option<&'static str> {
     let output = Command::new(agent)
         .args(["inspect", "--bot", name])
