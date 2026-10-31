@@ -95,13 +95,14 @@ The implementation must satisfy the whole path from admission to delivery:
    `inspect` returns a bounded bot view: `instructions` and
    `compaction_instructions` (64 KiB each today) are read through the
    range protocol rather than inlined. Bound the SQLite work behind a
-   page, not only its output: oldest-first `history_nodes` orders the
-   whole ancestry before its `LIMIT`, and `history_items` walks from the
-   head to the oldest requested node. Bound the work in each scheduled
+   page, not only its output. `history_nodes` and `history_items` now
+   reach any ancestor through skip pointers in O(log n) steps (#472),
+   where they used to order the whole ancestry before a `LIMIT` or walk
+   from the head to the oldest requested node. Bound the work in each scheduled
    chunk and make progress resumable, so one request cannot hold the
    reader for the length of a history. That bounds each chunk, not the
-   total cost of reaching a deep page. Choose an index (such as a stored
-   depth) only after measuring its write and storage cost. Update the
+   total cost of reaching a deep page. The skip pointers' write and
+   storage cost is measured in `DAEMON_MEASUREMENTS.md`. Update the
    CLI (including `follow` and `interrupt`), shared client, and app to
    consume the new pages.
 3. **Hold the charge through delivery.** Queued, materialized, serialized,

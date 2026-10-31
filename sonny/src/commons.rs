@@ -1890,14 +1890,20 @@ mod tests {
 
     #[test]
     fn with_the_commons_off_no_role_sonny_ships_names_it() {
+        let shipped = crate::project::BUILTINS
+            .into_iter()
+            .chain([("coordination", crate::project::COORDINATION)]);
         for (cut, _) in CUTS {
-            let roles = crate::project::BUILTINS.iter();
             assert!(
-                roles.filter(|(_, text)| text.contains(cut)).count() == 1,
+                shipped
+                    .clone()
+                    .filter(|(_, text)| text.contains(cut))
+                    .count()
+                    == 1,
                 "{cut}"
             );
         }
-        for (name, text) in crate::project::BUILTINS {
+        for (name, text) in shipped {
             assert!(!without(text).contains("commons"), "{name}");
         }
     }
