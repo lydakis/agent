@@ -240,8 +240,10 @@ jobs:
           for binary in "$stage/bin/sonny" "$stage/libexec/agent"; do
             file "$binary" | grep -q 'static'
           done
-          test "$("$stage/bin/sonny" --version)" = "sonny ${version}"
-          test "$("$stage/libexec/agent" --version)" = "agent-runtime ${version}"
+          # Built from the tag's checkout, each names its commit too.
+          short=$(git rev-parse --short=9 HEAD)
+          test "$("$stage/bin/sonny" --version)" = "sonny ${version} (${short})"
+          test "$("$stage/libexec/agent" --version)" = "agent-runtime ${version} (${short})"
           tar -C "$RUNNER_TEMP" -czf "dist/$name.tar.gz" "$name"
           cd dist
           sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"

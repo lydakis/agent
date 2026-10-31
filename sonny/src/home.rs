@@ -425,16 +425,25 @@ fn run_git(
         .stderr(std::process::Stdio::piped())
         .spawn()
         .map_err(|e| format!("backup_git_failed: git: {e}"))?;
-    if let (Some(text), Some(mut stdin)) = (input, child.stdin.take()) {
-        // Written whole before reading: git reads all of a check's paths
-        // before it answers, and its answer is at most as long.
-        stdin
-            .write_all(text.as_bytes())
-            .map_err(|e| format!("backup_git_failed: git: {e}"))?;
-    }
+    // Written beside the reads: git answers as it reads, and an answer that
+    // fills its pipe stops it reading.
+    let writer = match (input, child.stdin.take()) {
+        (Some(text), Some(mut stdin)) => {
+            let text = text.to_owned();
+            Some(std::thread::spawn(move || stdin.write_all(text.as_bytes())))
+        }
+        _ => None,
+    };
     let out = child
         .wait_with_output()
         .map_err(|e| format!("backup_git_failed: git: {e}"))?;
+    if let Some(writer) = writer {
+        match writer.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(format!("backup_git_failed: git: {e}")),
+            Err(_) => return Err("backup_git_failed: git: its input was not written".into()),
+        }
+    }
     Ok((
         out.status.code(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -442,10 +451,12 @@ fn run_git(
     ))
 }
 
-/// What under `from` the repository's own ignore files leave out, as
-/// paths relative to `from`, so the copy at `at` (a folder of the
-/// repository) never holds it: walked a level at a time, asking git once a
-/// level, and never into a folder left out.
+/// What under `from` the ignore files leave out, as paths relative to
+/// `from`, so the copy at `at` (a folder of the repository) never holds it:
+/// walked a level at a time, asking git once a level, and never into a
+/// folder left out. The rules are the ones coming in: each folder's
+/// `.gitignore` is copied from `from` before its level is asked, and what
+/// the copy has where `from` now has a folder goes, as the copy would.
 fn ignored(
     repo: &Path,
     at: &str,
@@ -454,8 +465,23 @@ fn ignored(
 ) -> Result<std::collections::HashSet<PathBuf>, String> {
     let mut left_out = std::collections::HashSet::new();
     let mut level = vec![PathBuf::new()];
+    let copy = repo.join(at);
+    let fail = |e: std::io::Error| format!("backup_copy_failed: {e}");
     while !level.is_empty() {
         let mut asked = Vec::new();
+        for dir in &level {
+            let (here, there) = (from.join(dir), copy.join(dir));
+            if !std::fs::symlink_metadata(&there).is_ok_and(|m| m.is_dir()) {
+                let _ = std::fs::remove_file(&there);
+            }
+            let rules = here.join(".gitignore");
+            if std::fs::symlink_metadata(&rules).is_ok_and(|m| m.is_file()) {
+                std::fs::create_dir_all(&there).map_err(fail)?;
+                std::fs::copy(&rules, there.join(".gitignore")).map_err(fail)?;
+            } else if std::fs::symlink_metadata(there.join(".gitignore")).is_ok() {
+                let _ = std::fs::remove_file(there.join(".gitignore"));
+            }
+        }
         for dir in &level {
             let Ok(entries) = std::fs::read_dir(from.join(dir)) else {
                 continue;
@@ -473,12 +499,20 @@ fn ignored(
             break;
         }
         // A folder is asked with its slash, so a pattern only for folders
-        // (`monitor/`) matches it.
+        // (`monitor/`) matches it; what the copy has there that is not a
+        // folder would stop git, so it goes first. Paths end in NUL, as
+        // git then reads and writes them unquoted.
+        for (path, folder) in &asked {
+            let there = copy.join(path);
+            if *folder && !std::fs::symlink_metadata(&there).map_or(true, |m| m.is_dir()) {
+                std::fs::remove_file(&there).map_err(fail)?;
+            }
+        }
         let input: String = asked
             .iter()
             .map(|(path, folder)| {
                 format!(
-                    "{at}/{}{}\n",
+                    "{at}/{}{}\0",
                     path.to_string_lossy(),
                     if *folder { "/" } else { "" }
                 )
@@ -488,7 +522,7 @@ fn ignored(
         // from now on.
         let (status, out, err) = run_git(
             repo,
-            &["check-ignore", "--no-index", "--stdin"],
+            &["check-ignore", "--no-index", "--stdin", "-z"],
             env,
             Some(&input),
         )?;
@@ -499,8 +533,10 @@ fn ignored(
                 err.trim()
             ));
         }
-        let named: std::collections::HashSet<&str> =
-            out.lines().map(|line| line.trim_end_matches('/')).collect();
+        let named: std::collections::HashSet<&str> = (out.split('\0'))
+            .filter(|path| !path.is_empty())
+            .map(|path| path.trim_end_matches('/'))
+            .collect();
         level = Vec::new();
         for (path, folder) in asked {
             let full = format!("{at}/{}", path.to_string_lossy());
@@ -1066,6 +1102,77 @@ mod tests {
             held.lines().collect::<Vec<_>>(),
             [".gitignore", "agents/memory/fact.md"]
         );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn the_home_s_own_new_ignore_rules_hold_from_the_sync_that_brings_them() {
+        let root = scratch("rules");
+        sh(&root, &["init", "--quiet", "--bare", "remote.git"]);
+        let at = places(&root.join("one"));
+        write(&at.agents.join("memory/fact.md"), "fact");
+        write(
+            &at.agents.join("memory/café.md"),
+            "kept until a rule names it",
+        );
+        std::fs::create_dir_all(at.agents.join("skills")).unwrap();
+        std::os::unix::fs::symlink("/nowhere", at.agents.join("skills/plan")).unwrap();
+        adopt(&at, &root.join("remote.git").to_string_lossy(), None).unwrap();
+        sh(&at.repo, &["config", "user.email", "t@example.com"]);
+        sh(&at.repo, &["config", "user.name", "T"]);
+        sync(&at, None).unwrap();
+        assert!(at.repo.join("agents/memory/café.md").exists());
+        // A rule in the home, for a name git would quote, and a link that
+        // became a folder.
+        write(&at.agents.join("memory/café.md"), "a secret now");
+        write(&at.agents.join("memory/.gitignore"), "café.md\n");
+        std::fs::remove_file(at.agents.join("skills/plan")).unwrap();
+        write(&at.agents.join("skills/plan/SKILL.md"), "plan");
+        sync(&at, None).unwrap();
+        let held = |what: &str| {
+            sh(
+                &root.join("remote.git"),
+                &["log", "--all", "-p", "--", what],
+            )
+        };
+        assert!(!held("agents/memory/café.md").contains("a secret now"));
+        let tree = sh(
+            &root.join("remote.git"),
+            &["ls-tree", "-r", "--name-only", "-z", "HEAD"],
+        );
+        assert_eq!(
+            tree.split('\0')
+                .filter(|p| !p.is_empty())
+                .collect::<Vec<_>>(),
+            [
+                "agents/memory/.gitignore",
+                "agents/memory/fact.md",
+                "agents/skills/plan/SKILL.md"
+            ]
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn many_paths_at_one_level_are_checked_without_a_stall() {
+        let root = scratch("many");
+        sh(&root, &["init", "--quiet", "--bare", "remote.git"]);
+        let at = places(&root.join("one"));
+        for n in 0..3000 {
+            write(
+                &at.agents
+                    .join(format!("cache/entry-with-a-long-name-{n:05}.tmp")),
+                "",
+            );
+        }
+        write(&at.agents.join("memory/fact.md"), "fact");
+        adopt(&at, &root.join("remote.git").to_string_lossy(), None).unwrap();
+        write(&at.repo.join(".gitignore"), "*.tmp\n");
+        sh(&at.repo, &["config", "user.email", "t@example.com"]);
+        sh(&at.repo, &["config", "user.name", "T"]);
+        sync(&at, None).unwrap();
+        let copied = std::fs::read_dir(at.repo.join("agents/cache")).map_or(0, |d| d.count());
+        assert_eq!(copied, 0);
         std::fs::remove_dir_all(&root).unwrap();
     }
 

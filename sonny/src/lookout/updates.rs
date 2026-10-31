@@ -247,8 +247,10 @@ pub struct Updates {
     from: HashMap<Key, String>,
     origin: HashMap<Key, String>,
     /// Turns seen starting: who asked for one started before the lookout
-    /// watched is not known, so its end names no one.
+    /// watched is read with its reply, and its end names no one until then.
     started: HashSet<Key>,
+    /// Ended turns not seen starting, until who asked for them is read.
+    unknown: HashSet<Key>,
     answer_to: HashMap<Key, i64>,
     /// Turns whose answer a trigger passes to the lead, or whose end
     /// waits for their goal's check.
@@ -349,6 +351,7 @@ impl Updates {
             from: HashMap::new(),
             origin: HashMap::new(),
             started: HashSet::new(),
+            unknown: HashSet::new(),
             answer_to: HashMap::new(),
             forwarding: HashMap::new(),
             goaled: HashSet::new(),
@@ -615,7 +618,12 @@ impl Updates {
                 let from = self.from.remove(&key(turn));
                 let origin = match self.started.remove(&key(turn)) {
                     true => self.origin.remove(&key(turn)),
-                    false => Some(UNKNOWN.to_owned()),
+                    false => {
+                        if self.live {
+                            self.unknown.insert(key(turn));
+                        }
+                        Some(UNKNOWN.to_owned())
+                    }
                 };
                 let answered = self.answer_to.remove(&key(turn));
                 let noted = self.noted.remove(&key(turn));
@@ -747,6 +755,7 @@ impl Updates {
     pub fn replied(&mut self, name: &str, turn: i64, text: &str) {
         // Read, whether or not it found words: the turn waits no more.
         self.replying.remove(&(name.to_owned(), turn));
+        self.unknown.remove(&(name.to_owned(), turn));
         let text = text.trim();
         if !self.live {
             return;
@@ -766,6 +775,74 @@ impl Updates {
             t.reply = Some(reply);
         } else if let Some(forwarding) = self.forwarding.get_mut(&(name.to_owned(), turn)) {
             forwarding.reply = Some(text.to_owned());
+        }
+    }
+
+    /// Whether who asked for a turn that just ended is still to be read.
+    pub fn asker_unknown(&self, name: &str, turn: i64) -> bool {
+        self.unknown.contains(&(name.to_owned(), turn))
+    }
+
+    /// Who asked for a turn the lookout did not see start, read with its
+    /// reply: its end names them as it would have.
+    pub fn asked_by(
+        &mut self,
+        name: &str,
+        turn: i64,
+        from: Option<String>,
+        origin: Option<String>,
+    ) {
+        let key = (name.to_owned(), turn);
+        if !self.unknown.remove(&key) {
+            return;
+        }
+        if let Some(forward) = self.forwarding.get_mut(&key) {
+            forward.from = from.clone();
+            forward.origin = origin.clone();
+        }
+        let Some(at) = self.tasks.iter().position(|(task, _)| task == name) else {
+            return;
+        };
+        let told = self.tasks[at].1.act.as_ref();
+        let Some(status) = told
+            .filter(|t| t.turn == turn && t.count == 1 && t.by.is_none())
+            .filter(|t| ![APPROVAL, QUIET].contains(&t.status.as_str()))
+            .map(|t| t.status.clone())
+        else {
+            return;
+        };
+        let by = self.by(&status, from, origin);
+        let news = &mut self.tasks[at].1;
+        let mut told = news.act.take().expect("found above");
+        told.by = by;
+        // The person's own completed turn is theirs, as when it was seen.
+        news.merge(
+            match told.by.as_deref() == Some("the person") && status == "completed" {
+                true => News {
+                    theirs: Some(told),
+                    ..News::default()
+                },
+                false => News {
+                    act: Some(told),
+                    ..News::default()
+                },
+            },
+        );
+    }
+
+    /// The reply of a turn could not be read: its end is told without it.
+    pub fn reply_unread(&mut self, name: &str, turn: i64) {
+        self.replying.remove(&(name.to_owned(), turn));
+        self.unknown.remove(&(name.to_owned(), turn));
+    }
+
+    /// Who a turn's end names as having asked for it.
+    fn by(&self, status: &str, from: Option<String>, origin: Option<String>) -> Option<String> {
+        match status {
+            APPROVAL | QUIET => None,
+            _ if from.as_deref() == Some(self.lead.as_str()) => Some("you".to_owned()),
+            _ if from.is_none() && origin.as_deref() == Some(UNKNOWN) => None,
+            _ => Some(from.or(origin).unwrap_or_else(|| "the person".into())),
         }
     }
 
@@ -828,12 +905,7 @@ impl Updates {
         if goal.is_none() && self.bots[&self.lead].waiting_on.contains(&handle) {
             return;
         }
-        let by = match status {
-            APPROVAL | QUIET => None,
-            _ if from.as_deref() == Some(self.lead.as_str()) => Some("you".to_owned()),
-            _ if from.is_none() && origin.as_deref() == Some(UNKNOWN) => None,
-            _ => Some(from.or(origin).unwrap_or_else(|| "the person".into())),
-        };
+        let by = self.by(status, from, origin);
         let news = self.news_of(name);
         let answered = news.act.as_ref().is_some_and(|asked| {
             asked.turn == turn && [APPROVAL, QUIET].contains(&asked.status.as_str())
@@ -1666,6 +1738,46 @@ mod tests {
         let told = updates.take();
         assert_eq!(text(&told), "- shop.fix: turn:shop.fix/4 failed");
         assert!(!told.items[0].theirs);
+    }
+
+    #[test]
+    fn who_asked_for_a_turn_not_seen_starting_is_named_once_read() {
+        let mut updates = fleet();
+        let now = Instant::now();
+        let done = |turn| {
+            ev(
+                "shop.fix",
+                Some(turn),
+                "turn_finished",
+                json!({"status": "completed"}),
+            )
+        };
+        updates.event(&done(4), now);
+        assert!(updates.asker_unknown("shop.fix", 4));
+        updates.reading_reply("shop.fix", 4);
+        updates.asked_by("shop.fix", 4, None, None);
+        updates.replied("shop.fix", 4, "done");
+        let told = updates.take();
+        assert!(
+            text(&told).starts_with("- shop.fix: turn:shop.fix/4 completed, asked by the person"),
+            "{}",
+            text(&told)
+        );
+        assert!(told.items[0].theirs);
+        // A trigger's, read the same way.
+        updates.event(&done(5), now);
+        updates.asked_by("shop.fix", 5, None, Some("trigger".into()));
+        updates.replied("shop.fix", 5, "");
+        assert!(updates.take().items.is_empty());
+        // A reply that could not be read leaves the end as it was told.
+        updates.event(&done(6), now);
+        updates.reading_reply("shop.fix", 6);
+        updates.reply_unread("shop.fix", 6);
+        assert!(!updates.asker_unknown("shop.fix", 6));
+        assert_eq!(
+            text(&updates.take()),
+            "- shop.fix: turn:shop.fix/6 completed"
+        );
     }
 
     #[test]

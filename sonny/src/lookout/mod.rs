@@ -72,6 +72,23 @@ struct Seen {
     /// person wrote to it since.
     brief: Option<i64>,
     text: String,
+    /// For a reply: who asked for the turn, read with it when the lookout
+    /// did not see the turn start, and whether the reply could not be read.
+    asked: Asked,
+}
+
+/// Who asked for a turn whose reply is read, when that is still to find.
+#[derive(Clone, Debug, Default, PartialEq)]
+enum Asked {
+    /// Known already, or not a reply.
+    #[default]
+    Known,
+    /// To read with the reply.
+    Unknown,
+    /// Read: the bot that asked, or the client or person a client named.
+    Read(Option<String>, Option<String>),
+    /// The reply could not be read.
+    Unread,
 }
 
 /// Long text kept at both ends, where a message's ask usually is.
@@ -160,7 +177,7 @@ const PERSON: &str = "the person";
 /// turn's record; or the reply the turn ended with.
 async fn event_text(client: &Client, seen: &Seen) -> String {
     if seen.reply {
-        return reply_text(client, seen).await;
+        return reply_text(client, seen).await.unwrap_or_default();
     }
     match seen.node {
         Some(node) => node_text(client, &seen.task, node).await,
@@ -181,34 +198,50 @@ const REPLY_NODES: usize = 30;
 
 /// The last thing the task said in the turn, read back from where the turn
 /// left its history, not from wherever it has moved on to.
-async fn reply_text(client: &Client, seen: &Seen) -> String {
-    let Ok(page) = client
+async fn reply_text(client: &Client, seen: &Seen) -> Option<String> {
+    let page = client
         .request(
             "history_nodes",
             json!({"bot": seen.task, "limit": REPLY_NODES, "oldest_first": false, "from": seen.node}),
         )
         .await
-    else {
-        return String::new();
-    };
+        .ok()?;
     let nodes: Vec<i64> = (page["nodes"].as_array().into_iter())
         .flatten()
         .filter(|n| n["turn"].as_i64() == Some(seen.turn))
         .filter_map(|n| n["node"].as_i64())
         .collect();
-    let Ok(read) = client
+    let read = client
         .request("history_items", json!({"bot": seen.task, "nodes": nodes}))
         .await
-    else {
-        return String::new();
-    };
+        .ok()?;
     // Anthropic tasks keep calls as blocks inside a message.
-    (read["items"].as_array().into_iter())
-        .flatten()
-        .flat_map(|entry| crate::responses(&entry["item"]))
-        .find(|item| item["role"] == "assistant" && !crate::text(item).trim().is_empty())
-        .map(|item| crate::text(&item))
-        .unwrap_or_default()
+    Some(
+        (read["items"].as_array().into_iter())
+            .flatten()
+            .flat_map(|entry| crate::responses(&entry["item"]))
+            .find(|item| item["role"] == "assistant" && !crate::text(item).trim().is_empty())
+            .map(|item| crate::text(&item))
+            .unwrap_or_default(),
+    )
+}
+
+/// Who asked for a task's turn, as its prompt records it: the bot whose turn
+/// sent it, or the client or person a client named; neither for the person.
+async fn asker(client: &Client, seen: &Seen) -> Option<(Option<String>, Option<String>)> {
+    let read = client
+        .request(
+            "prompts",
+            json!({"bot": seen.task, "turn": seen.turn, "bytes": 1}),
+        )
+        .await
+        .ok()?;
+    let prompt = &read["prompts"][0];
+    let from = prompt["from"]["bot"].as_str().map(str::to_owned);
+    let origin = (prompt["origin"].as_str())
+        .or(prompt["person"].as_str())
+        .map(str::to_owned);
+    Some((from, origin))
 }
 
 /// `event`, a `margin` call's start whose arguments were cut before the
@@ -281,6 +314,26 @@ async fn unattributed(client: &Client, seen: &Seen, text: &str) -> bool {
 
 /// The message as read for the note: its words, and who wrote them.
 async fn read_event(client: &Client, seen: Seen) -> Seen {
+    if seen.reply {
+        let Some(text) = reply_text(client, &seen).await else {
+            return Seen {
+                asked: Asked::Unread,
+                ..seen
+            };
+        };
+        let asked = match seen.asked {
+            Asked::Unknown => match asker(client, &seen).await {
+                Some((from, origin)) => Asked::Read(from, origin),
+                None => Asked::Unknown,
+            },
+            asked => asked,
+        };
+        return Seen {
+            text,
+            asked,
+            ..seen
+        };
+    }
     let text = event_text(client, &seen).await;
     let from = match unattributed(client, &seen, &text).await {
         true => "someone".to_owned(),
@@ -1982,6 +2035,10 @@ impl Lookout {
             },
             // What it replied goes with how the turn ended.
             "turn_finished" => {
+                let asked = match self.updates.asker_unknown(bot, turn) {
+                    true => Asked::Unknown,
+                    false => Asked::Known,
+                };
                 self.due.push(Seen {
                     task: bot.to_owned(),
                     turn,
@@ -1990,6 +2047,7 @@ impl Lookout {
                     reply: true,
                     brief: None,
                     text: String::new(),
+                    asked,
                 });
             }
             _ => {}
@@ -2021,6 +2079,7 @@ impl Lookout {
             reply: false,
             brief: self.briefs.get(task).copied(),
             text: String::new(),
+            asked: Asked::Known,
         });
     }
 
@@ -2109,7 +2168,21 @@ impl Lookout {
     /// into the subscriber's running turn, as their words to it would.
     fn heard(&mut self, seen: &Seen) {
         if seen.reply {
-            return self.updates.replied(&seen.task, seen.turn, &seen.text);
+            return match &seen.asked {
+                // Told as it ended, without its reply.
+                Asked::Unread => self.updates.reply_unread(&seen.task, seen.turn),
+                asked => {
+                    if let Asked::Read(from, origin) = asked {
+                        (self.updates).asked_by(
+                            &seen.task,
+                            seen.turn,
+                            from.clone(),
+                            origin.clone(),
+                        );
+                    }
+                    self.updates.replied(&seen.task, seen.turn, &seen.text)
+                }
+            };
         }
         let words = (seen.from == PERSON).then_some(seen.text.as_str());
         let news = (self.updates).said(&seen.task, seen.turn, &seen.from, words);
@@ -2522,6 +2595,7 @@ mod tests {
             reply: false,
             brief: None,
             text: text.into(),
+            asked: Asked::Known,
         }
     }
 
