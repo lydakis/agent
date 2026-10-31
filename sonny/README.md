@@ -874,7 +874,15 @@ a skill of the same name it has no note of writing (yours, or one an
 earlier Sonny wrote) is left alone too. Remove its folder to get Sonny's.
 With agent-browser installed, Sonny also writes its `agent-browser` skill
 the same way, as `agent-browser skills get agent-browser` prints it for
-the version installed, and removes it when agent-browser is gone.
+the version installed, and removes it when agent-browser is gone. Agents
+drive it through the `browser` tool, which the tool host answers outside
+their sandbox: it runs the skill's commands in each agent's own browser
+session, and a screenshot comes back as a picture. It refuses what would
+reach past the browser: flags that launch another program or load an
+extension, plugins, the clipboard, and files outside the agent's folder.
+The actions in `sonny.browser_confirm` (`eval`, `download`, `upload` and
+`state` by default) wait for the agent's approvals, like any call that
+leaves its sandbox.
 [docs/SONNY.md](../docs/SONNY.md) has the details of triggers, memory,
 skills and MCP.
 Sonny starts its lookout, `sonny lookout`, when it opens a project: one

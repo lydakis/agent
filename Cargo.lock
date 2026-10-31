@@ -3011,6 +3011,7 @@ dependencies = [
  "rquickjs",
  "serde_json",
  "sha2",
+ "shell-words",
  "similar",
  "syntect",
  "tokio",

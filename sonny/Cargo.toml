@@ -13,6 +13,8 @@ publish = false
 agent-client = { path = "../client" }
 # Already built for the runtime; encodes program status titles (OSC 7501).
 base64 = "0.22"
+# Splits the browser tool's command lines as a shell would, running none.
+shell-words = "1"
 # Scroll regions write history rows without padding them to the width, so
 # a pane that narrows later does not re-wrap them.
 # Asks the terminal for its background (theme.rs).

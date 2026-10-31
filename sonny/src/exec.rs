@@ -525,10 +525,15 @@ impl Steps {
         }
     }
 
-    /// Put the call of `tool` to the agent's gate: none, an allow, or why
-    /// it may not run. An allow a gate gave names the step, to say how it
-    /// ended once it ran.
-    async fn ask(&self, tool: &str, arguments: Value) -> Result<Option<String>, String> {
+    /// Put the call of `tool`, which the agent knows as `called`, to the
+    /// agent's gate: none, an allow, or why it may not run. An allow a gate
+    /// gave names the step, to say how it ended once it ran.
+    pub async fn ask(
+        &self,
+        tool: &str,
+        called: &str,
+        arguments: Value,
+    ) -> Result<Option<String>, String> {
         let step = format!(
             "{}.{}",
             self.run,
@@ -542,16 +547,16 @@ impl Steps {
                 .is_some_and(|approvals| !approvals.is_empty())
                 .then_some(step)),
             Ok(reply) => Err(format!(
-                "tools.{tool} was not approved: {}",
+                "{called} was not approved: {}",
                 reply["reason"].as_str().unwrap_or("denied")
             )),
-            Err(error) => Err(format!("tools.{tool} could not be approved: {error}")),
+            Err(error) => Err(format!("{called} could not be approved: {error}")),
         }
     }
 
     /// Tell the agent how an allowed step ended, so its judge counts it
     /// among the calls done. Its turn may be gone by then: nothing to tell.
-    async fn ran(&self, step: String, failed: bool) {
+    pub async fn ran(&self, step: String, failed: bool) {
         let ran = json!({"bot": self.bot, "turn": self.turn, "call_id": self.call_id,
             "step": step, "failed": failed});
         let _ = self.client.request("step_result", ran).await;
@@ -1369,7 +1374,10 @@ impl Caller {
             };
             let stopped = self.clock.stop();
             let asking = Arc::clone(&steps);
-            let approval = Abort(self.host.spawn(async move { asking.ask(&id, asked).await }));
+            let approval = Abort(
+                self.host
+                    .spawn(async move { asking.ask(&id, &format!("tools.{id}"), asked).await }),
+            );
             let approved = approval.await;
             // Whatever the verdict, the script runs on from here, its time
             // starting again once it has a place, as a new script's does.
@@ -1514,6 +1522,15 @@ fn image(item: &str) -> Result<Picture, String> {
         bytes: bytes.len(),
         data: base64::engine::general_purpose::STANDARD.encode(bytes),
     })
+}
+
+/// The picture file `bytes` hold, as a part of a tool's answer, fitted as
+/// a script's picture is.
+pub fn picture(bytes: &[u8]) -> Result<Value, String> {
+    use base64::Engine;
+    let (media_type, bytes) = fitted(bytes)?;
+    Ok(json!({"type": "image", "media_type": media_type,
+        "data": base64::engine::general_purpose::STANDARD.encode(bytes)}))
 }
 
 /// The longest side a picture is sent at, and the most bytes it is sent

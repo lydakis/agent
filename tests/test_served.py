@@ -4,8 +4,10 @@ call's output."""
 import json
 import os
 import queue
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import unittest
 from pathlib import Path
@@ -64,14 +66,15 @@ class ServedToolTests(ModelFixture):
         """The lookout, which tells leads and checks goals."""
         return self.companion('lookout', 'watching', **extra)
 
-    def call(self, bot, name, arguments, **submit):
-        """`bot` calls `name` once; the call's output. The script runs on
-        from the calls a bot's earlier turns made."""
+    def call(self, bot, name, arguments, wait=5, **submit):
+        """`bot` calls `name` once, its turn ending within `wait` seconds;
+        the call's output. The script runs on from the calls a bot's earlier
+        turns made."""
         self.script.append((name, arguments))
         self.model.call_script = self.script
         turn = self.daemon.request('submit', bot=bot, request_id=f'{name}-{time.monotonic()}',
                                    prompt='script', **submit)['result']['turn']
-        self.assertEqual(self.daemon.finished(turn)['data']['status'], 'completed')
+        self.assertEqual(self.daemon.finished(turn, wait)['data']['status'], 'completed')
         return self.output(bot, turn)
 
     def output(self, bot, turn):
@@ -297,6 +300,66 @@ class ServedToolTests(ModelFixture):
         self.assertTrue(answered['output'][0]['text'].endswith('Output:\nbefore'), answered)
         self.assertEqual(answered['output'][1]['image_url'], f"data:image/png;base64,{shot['data']}")
         self.assertEqual(answered['output'][2]['text'], 'after')
+
+    def browser(self, **create):
+        """A lead with the browser tool, and the tool host, with
+        agent-browser on its PATH."""
+        tool = {**declared('browser'), 'steps': True}
+        self.daemon.request('create', bot='calc.lead', workspace=str(self.path), model='openai/synthetic-model',
+                            instructions='Lead.', declare=[tool], **create)
+        program = shutil.which('agent-browser')
+        # Its sockets beside its session's name, under the 104 bytes a
+        # socket's path may have.
+        sockets = Path(tempfile.mkdtemp(prefix='ab', dir='/tmp'))
+        self.addCleanup(lambda: subprocess.run([program, 'close', '--all'], capture_output=True,
+                                               env={**clean_env(), 'HOME': str(self.path),
+                                                    'AGENT_BROWSER_SOCKET_DIR': str(sockets)}))
+        self.host(PATH=f"{Path(program).parent}:{os.environ['PATH']}", AGENT_BROWSER_SOCKET_DIR=str(sockets))
+
+    @unittest.skipUnless(shutil.which('agent-browser'), 'agent-browser is not installed')
+    def test_an_agent_s_browser_shows_it_the_page_and_refuses_what_reaches_the_host(self):
+        self.browser()
+        self.model.requests = queue.Queue()
+        page = 'data:text/html,<title>Calc</title><h1>Sums</h1><button>Add</button>'
+        # The first command starts Chrome, which can take a while.
+        self.call('calc.lead', 'browser', {'commands': [f'open "{page}"', 'snapshot -i', 'screenshot']}, wait=60)
+        requests = []
+        while not self.model.requests.empty():
+            requests.append(self.model.requests.get())
+        [answered] = [i for i in requests[-1]['input'] if i.get('call_id') == 'script-0' and 'output' in i]
+        self.assertIsInstance(answered['output'], list, answered['output'][:2000])
+        kinds = [part['type'] for part in answered['output']]
+        self.assertEqual(kinds, ['input_text', 'input_image'], answered)
+        said = answered['output'][0]['text']
+        # The snapshot, between agent-browser's markers for page content.
+        self.assertIn('button "Add" [ref=e2]', said)
+        self.assertTrue(said.endswith('$ screenshot\n✓ Screenshot, shown below'), said)
+        self.assertIn('AGENT_BROWSER_PAGE_CONTENT nonce=', said)
+        self.assertTrue(answered['output'][1]['image_url'].startswith('data:image/png;base64,'))
+        refused = json.loads(self.call('calc.lead', 'browser',
+                                       {'commands': ['open about:blank --executable-path /bin/sh']}))
+        self.assertEqual(refused['error'], 'browser_refused')
+        self.assertIn('--executable-path', refused['detail'])
+
+    @unittest.skipUnless(shutil.which('agent-browser'), 'agent-browser is not installed')
+    def test_an_action_agent_browser_confirms_waits_for_the_agent_s_gate(self):
+        self.browser(approve=['browser'], approver='manual')
+        self.call('calc.lead', 'browser', {'commands': ['open "data:text/html,<title>Calc</title>"']}, wait=60)
+        for decision, said in (('deny', 'browser was not approved'), ('allow', '"Calc"')):
+            self.script.append(('browser', {'commands': ['eval document.title']}))
+            self.model.call_script = self.script
+            turn = self.daemon.request('submit', bot='calc.lead', request_id=f'eval-{decision}',
+                                       prompt='script')['result']['turn']
+            deadline = time.monotonic() + 30
+            while not (asked := self.daemon.request('approvals', bot='calc.lead')['result']['approvals']):
+                self.assertLess(time.monotonic(), deadline, 'no approval was asked')
+                time.sleep(.05)
+            self.assertEqual(asked[0]['name'], 'browser')
+            self.assertEqual(asked[0]['arguments']['command'], 'eval document.title')
+            self.daemon.request('answer', bot='calc.lead', turn=turn, call_id=asked[0]['call_id'],
+                                request=asked[0]['request'], decision=decision, by='test')
+            self.assertEqual(self.daemon.finished(turn, 30)['data']['status'], 'completed')
+            self.assertIn(said, self.output('calc.lead', turn))
 
     def test_an_agent_saves_memory_through_the_host(self):
         self.daemon.request('create', bot='calc.lead', workspace=str(self.path), model='openai/synthetic-model',
