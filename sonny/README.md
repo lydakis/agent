@@ -177,11 +177,13 @@ and a file that no longer matches, or one Sonny never wrote, is the
 person's. When a new Sonny brings new text for a role or skill you
 edited, it sets that text beside yours in `~/.agent/sonny/upgrades`, with
 what you started from in `~/.agent/sonny/shipped` when it kept it, and
-the first bot you open after the upgrade tells you and offers to bring
+the first lead you open after the upgrade tells you and offers to bring
 Sonny's changes into your copy. A copy left the same as Sonny's new text
-is Sonny's again from the next start. That bot also tells you what is new
-since the Sonny you last heard of, from [FEATURES.md](FEATURES.md), and
-offers once each new setup step you have not done. A folder's own
+is Sonny's again from the next start. That lead also tells you what is new
+since the Sonny you last heard of, from [FEATURES.md](FEATURES.md),
+offers once each new setup step you have not done, and does what the
+upgrade asks to move your things to how Sonny works now, asking you first
+for anything that cannot be undone. A folder's own
 `.agents/agents/lead.md` or `task.md` comes first. The task settings from `.agents/project.toml` are composed after
 the lead's role, not kept in the file.
 

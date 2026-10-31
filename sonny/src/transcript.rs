@@ -1439,7 +1439,8 @@ fn news(text: &str) -> Option<Vec<String>> {
         return Some(sourced(rest));
     }
     // "- the lead role: theirs at …" is the lead role, "- set up backup: …"
-    // the backup, and a register's rows are what's new.
+    // the backup, "- do move; …" the step it asks, and a register's rows
+    // are what's new.
     if let Some(rest) = text.strip_prefix(crate::skills::UPGRADED) {
         let mut parts = vec!["Sonny upgraded".to_owned()];
         if rest.lines().any(|line| line.starts_with("| ")) {
@@ -1448,6 +1449,10 @@ fn news(text: &str) -> Option<Vec<String>> {
         parts.extend(rest.lines().filter_map(|line| {
             if let Some(step) = line.strip_prefix("- set up ") {
                 return Some(format!("set up {}", step.split_once(": ")?.0));
+            }
+            // "- do move; copy …", its words indented under it.
+            if let Some(step) = line.strip_prefix("- do ") {
+                return step.split([';', ' ']).next().map(str::to_owned);
             }
             let what = line.strip_prefix("- the ")?.split_once(": ")?.0;
             Some(format!("{what} edited"))
@@ -3087,6 +3092,17 @@ mod tests {
         assert_eq!(
             text(&super::prompt(&note, None, 90)),
             ["↳ Sonny upgraded · what's new · set up backup"]
+        );
+        let note = format!(
+            "{}This upgrade needs you to do these for the person now:\n\
+             - do move-rows; copy a file of the person's to /h/before/move-rows before you change it:\n  \
+             Move their rows.\n  - the old ones too\n\
+             Do what you can undo yourself.",
+            crate::skills::UPGRADED
+        );
+        assert_eq!(
+            text(&super::prompt(&note, None, 90)),
+            ["↳ Sonny upgraded · move-rows"]
         );
     }
 

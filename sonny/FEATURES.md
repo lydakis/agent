@@ -18,6 +18,14 @@ here in the same pull request: a new row for a new feature, `, changed
 MM-DD #N` or `, removed MM-DD #N` on an old one, and the status. One row
 per feature; group small things into the row they belong to.
 
+A change that leaves the person's existing state to be moved says how in
+the same pull request ([upgrade.rs](src/upgrade.rs)): a migration in code
+when a script would do it the same everywhere, or an upgrade step,
+`upgrades/ID.md`, that the folder's lead does after the upgrade when it
+needs judgment or reaches what is the person's own. A step's file starts
+`Feature: ROW` with the first words of its row here, and the row's history
+names it: upgrade step `ID`. Both name the release they are deleted in.
+
 - **Status.** `experimental`: built to try, kept only if it proves itself
   in daily use. `shipped`: part of Sonny's settled experience. `removed`:
   gone; the row stays, with why.
@@ -88,7 +96,7 @@ per feature; group small things into the row they belong to.
 | Zen (`/zen FOCUS`, `/zen` to leave, or asked in words): the agent reads the focus as it reads a goal, puts it in its own words for the footer, and talks about it alone, holds back what other agents, tasks, the commons and its own looks send, interrupts only with a question (whose bar it learns from memory), and says what it held when zen ends; the window shows only the person's turns and the agent's questions, with no welcome and no guess at the next message (it reads what is held back), the column centred, the footer the focus and what needs you; the commons invites another agent | experimental | added 10-31 | George wanted to work on one thing with a lead getting news from many agents: a behaviour, not only a view, after Apple's Focus (held back, a way through, a summary after) | ? |
 | Reply: `↩` in place of a message's bullet under the mouse, on each margin note, and `/reply`, each quoting it into the composer | experimental | added 10-31 | George asked for a reply glyph: answer one message, as Slack and Discord quote, without copying it by hand | ? |
 | Welcome and first run: sets itself up and says hello | shipped | added 10-28 #253; heads every lead's history 10-29 #320; finds keys, ChatGPT and AWS profiles, ranks the models, `sonny setup` 10-30 #402; setup flags and `--json`, the sonny-setup skill, hand-off to another agent 10-30 #428; Sonny blinks or glances now and then until you type or scroll 10-31 | A new person gets going without docs | ? |
-| After an upgrade: the first lead tells what's new from this register and offers new setup once | experimental | added 10-30 #420 | The person hears of what changed and sets up what is new without reading release notes | ? |
+| After an upgrade: the first lead tells what's new from this register, offers new setup once, and does the upgrade steps a change asks for (each checked by Sonny, asked again with the next upgrade until done, retired two releases on) | experimental | added 10-30 #420; upgrade steps the lead does, only a lead told, one-off upgrade work retired by a test 10-31 | The person hears of what changed and sets up what is new without reading release notes | ? |
 | `sonny view`: long writing beside the lead | removed | added 10-27 #197; reverted 10-27 #198 | Viewers are skills, not Sonny; long writing stays in a file | ? |
 
 ## Composer
