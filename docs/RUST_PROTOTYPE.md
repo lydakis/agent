@@ -2100,10 +2100,12 @@ prompt nodes alone, so deleting the source bot does not remove a surviving
 fork's previews. Turn numbers are ordinals along the lineage
 (`turn_seq`, stored on each turn's first item and indexed), so a fork's numbering
 continues its source's. The `history` tool returns one turn's prompt, replies,
-tool calls, and results as provider JSONL with only the top-level
-`encrypted_content` field removed from reasoning items. Reasoning records and
-readable summaries remain, as do Anthropic thinking and signatures. Stored
-items, raw `history_items` reads, forks, and provider replay remain unchanged.
+tool calls, and results as provider JSONL without the opaque state a provider
+hands back only to be replayed: the top-level `encrypted_content` of reasoning
+items, a thinking block's `signature`, a redacted thinking block's `data`, and
+a web search result's `encrypted_content`. Reasoning records, readable
+summaries and thinking text remain. Stored items, raw `history_items` reads,
+forks, and provider replay remain unchanged.
 With `bot`, it reads another agent's turn the same way, numbered along that
 agent's lineage and as it stands, a running turn included; with `bot` and no
 `turn`, it lists that agent's newest 20 turns, newest first, each with its
