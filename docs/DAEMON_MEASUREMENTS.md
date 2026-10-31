@@ -6283,3 +6283,56 @@ Store jobs per turn held at about 7.5 on both sides (7.488 to 7.499 base,
 in each round, and the change adds nothing to a turn's path; read them as
 no cost, not a gain. The Perf workflow screens the pull request with the
 admission and completion bursts as well.
+
+## Reads beside the service loop, on a reader pool (#391)
+
+Observation reads (`history_nodes`, `history_items`, `history_search`,
+`turns`, `bots`, `events`, `usage`, `prompts`) now run in a lane beside the
+service loop, on a pool of reader connections (`--max-readers`, one per
+logical CPU), taking all but one of them. A session waits for its read
+before its next request is taken and reads at most 8 requests ahead; what
+it queues while it waits does not count against the shared input queue.
+
+`bench/fair_queuing.py` gained floods of whole histories and searches
+across every bot, several flooding sessions at once (`--flooders`), deep
+histories (`--history-turns`, `--history-bytes`), a probe that lists bots
+(`--probe-bots`), and a probe in a process of its own, so parsing the
+flood's replies no longer holds it up. 4-core Linux container, 210 bots
+each with 10 turns of 64 KiB prompts (129 MiB store), 4 sessions flooding
+at once, probe p50 / p95 / max in ms, base main 9a34fc2 against the head:
+
+| Flood (4 sessions) | Probe | Base | Head | Flood rate, base / head |
+| --- | --- | ---: | ---: | ---: |
+| none | `inspect` | 1.3 / 1.6 / 4.6 | 1.1 / 1.5 / 10.5 | |
+| 8,000 `history_nodes` | `inspect` | 8.8 / 11.6 / 20.8 | 1.1 / 2.3 / 5.5 | 1,146 / 1,172 per s |
+| 1,600 `bots` | `inspect` | 18.0 / 25.5 / 33.5 | 2.4 / 4.8 / 6.9 | 509 / 903 per s |
+| 320 `history_search` of `*` | `inspect` | 1.2 / 1.7 / 63.4 | 1.1 / 2.1 / 11.0 | 3 / 8 per s |
+| none | `bots` | 3.8 / 5.1 / 14.7 | 3.5 / 4.5 / 10.2 | |
+| 8,000 `history_nodes` | `bots` | 11.4 / 15.0 / 26.4 | 4.3 / 6.6 / 21.3 | 957 / 1,195 per s |
+| 320 `history_search` of `*` | `bots` | 4.5 / 7.0 / 94,543 | 4.7 / 364 / 465 | 3 / 7 per s |
+
+The search row is the one #391 named: on main a `bots` listing queued on
+the one reader behind every search already sent, and the first probe
+waited 95 s. Now it waits for a free seat, behind at most the searches
+already running. Searches no longer wait for each other either, so the
+flood finishes in 44 s rather than 101 s. Main already answered searches
+off the loop, which is why `inspect` was quiet there; floods of history
+pages and listings, which main answered in the loop, held every other
+session's request behind one read each.
+
+A lone session pipelining cheap reads pays for the hand-off: one read at a
+time, each through the lane and back. The original single-session floods
+(210 bots, shallow histories, probe `inspect`):
+
+| Flood (1 session) | Base probe | Head probe | Flood rate, base / head |
+| --- | ---: | ---: | ---: |
+| 5,000 `inspect` | 1.0 / 1.9 / 10.5 | 1.0 / 1.5 / 5.1 | 6,050 / 4,813 per s |
+| 5,000 `events` | 1.1 / 1.7 / 4.0 | 1.0 / 1.5 / 5.7 | 4,897 / 2,204 per s |
+| 1,000 `bots` | 5.8 / 8.3 / 9.4 | 1.3 / 2.4 / 14.2 | 667 / 524 per s |
+| 2,500 `create` + `delete` | 5.2 / 7.7 / 30.6 | 3.5 / 5.4 / 13.4 | 974 / 951 per s |
+
+So a session that pipelines thousands of `events` pages gets about half
+the rate it had, in exchange for no other session waiting behind them.
+Several sessions reading at once get more than before in total, since
+reads now run side by side. Each reader connection keeps its own 2 MiB
+page cache and statement cache.
