@@ -228,8 +228,12 @@ fn row_lines(row: &Row, width: usize) -> Vec<Line<'static>> {
         Span::raw(""),
         Span::raw("   "),
     ));
+    let model = match row.model.as_str() {
+        "" => String::new(),
+        id => crate::models::named(id),
+    };
     let facts: Vec<&str> = [
-        row.model.as_str(),
+        model.as_str(),
         row.place.as_str(),
         row.pr.as_str(),
         row.background.as_str(),
@@ -344,14 +348,14 @@ mod tests {
         let folded = text(false);
         assert_eq!(folded[0], "calc · 3 tasks · 1 need you · 1 to review");
         assert_eq!(folded[1], " ● lead working · 42s");
-        assert_eq!(folded[2], "   chatgpt/gpt-6.1-sol · tab 1");
+        assert_eq!(folded[2], "   GPT 6.1 Sol · chatgpt · tab 1");
         assert_eq!(folded[4], "Needs you · 1");
         assert_eq!(folded[5], " ? zero needs you · 42s");
         assert_eq!(folded[8], "Ready for review · 1");
         assert_eq!(folded[9], " ◆ equal done · took 42s");
         assert_eq!(
             folded[10],
-            "   chatgpt/gpt-6.1-sol · tab 1 · o/r#9 · ↻ 1 automation"
+            "   GPT 6.1 Sol · chatgpt · tab 1 · o/r#9 · ↻ 1 automation"
         );
         assert_eq!(folded.last().unwrap(), "1 resolved · r shows them");
         let (_, named) = card("calc", &rows, 100, false);
