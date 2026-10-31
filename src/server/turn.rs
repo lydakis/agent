@@ -3802,7 +3802,13 @@ impl Turn {
                         .op("process_start", move |db| db.process_start(turn, &started))
                         .await?;
                     let (sender, receiver) = oneshot::channel();
-                    self.collect(id, &call.call_id, receiver, self.outputs(record, workspace));
+                    self.collect(
+                        id,
+                        &call.call_id,
+                        receiver,
+                        self.outputs(record, workspace),
+                        Some(self.registry.clone()),
+                    );
                     let start = self.registry.terminal(
                         record.bot_id,
                         id,
@@ -4805,7 +4811,7 @@ impl Turn {
             queued,
             sender,
         );
-        self.collect(id, call_id, receiver, outputs);
+        self.collect(id, call_id, receiver, outputs, None);
         Ok(Outcome::text(
             json!({"handle":format!("proc:{id}"),"background":true}).to_string(),
         ))
@@ -4834,20 +4840,23 @@ impl Turn {
         tokio::spawn(async move {
             let _ = sender.send(run.await);
         });
-        self.collect(id, call_id, receiver, outputs);
+        self.collect(id, call_id, receiver, outputs, None);
         Ok(Outcome::text(
             json!({"handle":format!("proc:{id}"),"background":true,"steered":true}).to_string(),
         ))
     }
 
     /// Record a background command's result when it arrives and wake those
-    /// waiting on its handle.
+    /// waiting on its handle. A terminal's, `terminal`, stays in the
+    /// registry with its end until then, so a poll never finds it gone
+    /// with no result.
     fn collect(
         &self,
         id: i64,
         call_id: &str,
         receiver: oneshot::Receiver<Result<Outcome>>,
         outputs: Option<Outputs>,
+        terminal: Option<Registry>,
     ) {
         let turn = self.turn;
         let (store, handles, failures, call_id_for_refs) = (
@@ -4896,6 +4905,9 @@ impl Turn {
                     // A closed receiver means the service has already exited.
                     let _ = failures.send(error);
                 }
+            }
+            if let Some(registry) = terminal {
+                registry.forget_terminal(id);
             }
         });
     }

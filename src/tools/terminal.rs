@@ -148,7 +148,10 @@ fn least_used(
     owner: i64,
     share: usize,
 ) -> Option<Arc<Terminal>> {
-    let own = terminals.values().filter(|t| t.owner == owner);
+    // An ended terminal waiting for its result to be recorded runs nothing.
+    let own = terminals
+        .values()
+        .filter(|t| t.owner == owner && !*t.exited.borrow());
     if own.clone().count() < share {
         return None;
     }
@@ -565,17 +568,25 @@ impl Registry {
                     state.end = Some((end, rest));
                     last
                 };
-                registry
-                    .terminals
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .remove(&handle);
+                // The terminal stays in the registry, its end held, until
+                // its handle's result is recorded and `forget_terminal`
+                // lets it go: a parked poll that wakes between the two
+                // reads the end here.
                 let _ = exit.send(true);
                 let _ = done.send(Ok(last));
             });
         }
         terminal.settle(yield_ms).await;
         Ok(terminal.take(self, handle))
+    }
+
+    /// Let terminal `handle` go once its handle's result is recorded; it
+    /// ended before.
+    pub fn forget_terminal(&self, handle: i64) {
+        self.terminals
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&handle);
     }
 
     /// End `owner`'s least recently used terminal when it already runs its
@@ -623,6 +634,9 @@ impl Registry {
             MAX_YIELD_MS
         } else if input.is_empty() {
             yield_ms.unwrap_or(POLL_YIELD_MS)
+        } else if *terminal.exited.borrow() {
+            // An ended terminal takes no input: the write reports its end.
+            0
         } else {
             terminal.write(input.as_bytes()).await?;
             yield_ms.unwrap_or(WRITE_YIELD_MS)
@@ -806,5 +820,49 @@ mod tests {
         let many = format!("{}\n", "\r".repeat(60_000));
         assert_eq!(lines(&many), "\n");
         assert_eq!(lines("a\rb\r\r\nc\r"), "a\rb\nc\r");
+    }
+
+    /// A terminal that ended stays readable until its handle's result is
+    /// recorded, so a parked poll that wakes in between reads its end
+    /// instead of finding it gone.
+    #[tokio::test]
+    async fn an_ended_terminal_reports_its_end_until_its_result_is_recorded() {
+        use super::Registry;
+        let registry = Registry::new("echo").unwrap();
+        let (done, recorded) = tokio::sync::oneshot::channel();
+        let started = registry
+            .terminal(
+                1,
+                7,
+                "printf hi; exit 3".into(),
+                std::env::temp_dir(),
+                5_000,
+                Vec::new(),
+                None,
+                done,
+            )
+            .await
+            .unwrap();
+        assert!(
+            started.output.contains("\"exit_code\":3"),
+            "{}",
+            started.output
+        );
+        let result = recorded.await.unwrap().unwrap();
+        assert!(result.output.contains("\"exit_code\":3"));
+        // Its result is on its way to the store: a poll still reads the end.
+        let read = registry.poll_end(1, 7, None).unwrap();
+        assert!(read.output.contains("\"exit_code\":3"), "{}", read.output);
+        // Another bot's poll does not.
+        assert!(registry.poll_end(2, 7, None).is_err());
+        // A write that finds it ended reports the end and types nothing.
+        let typed = registry
+            .write_stdin(1, 7, "x\n", None, false, None)
+            .await
+            .unwrap();
+        assert!(typed.output.contains("\"exit_code\":3"), "{}", typed.output);
+        // Once it is recorded, the terminal goes, and the result tells.
+        registry.forget_terminal(7);
+        assert!(registry.poll_end(1, 7, None).is_err());
     }
 }
