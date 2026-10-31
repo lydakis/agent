@@ -118,7 +118,8 @@ of it ends `tool_unserved`, run the same command with
      dates, so a night read twice counts nothing twice.
 6. Call it with `cleanup` `finish`. It commits the cleanup, or
    refuses with `loss_guard` and puts memory back when the cleanup removed
-   more than a quarter of the facts (two at least). A refusal means you
+   more than a quarter of the facts (two at least). Only your changes go
+   back: what other agents saved meanwhile stays. A refusal means you
    removed too much: do not try again tonight.
 7. Reply with one line per change: what you saved, merged, removed or
    re-dated, and why, and a line for each server you could not read.

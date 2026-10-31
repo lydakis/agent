@@ -14,7 +14,8 @@
 //! `~/.agent/trigger`, whose agent follows the `memory-cleanup` skill
 //! between `cleanup start` and `cleanup finish`, which commit to a local
 //! git repository in `~/.agents/memory` and revert a cleanup that removed too
-//! many facts; `changed` gates the trigger so a quiet night costs no turn.
+//! many facts, keeping what other agents saved while it ran; `changed` gates
+//! the trigger so a quiet night costs no turn.
 use serde_json::{Value, json};
 use std::{
     io::Read,
@@ -155,10 +156,22 @@ fn run(
     args: &[String],
     stdin: &dyn Fn() -> Result<String, String>,
 ) -> Result<Value, String> {
+    let caller = std::env::var("AGENT_BOT_ID").ok();
+    run_as(root, cwd, args, stdin, caller.as_deref())
+}
+
+/// [`run`] for `caller`, the agent's id, or none for the person.
+fn run_as(
+    root: &Path,
+    cwd: &Path,
+    args: &[String],
+    stdin: &dyn Fn() -> Result<String, String>,
+    caller: Option<&str>,
+) -> Result<Value, String> {
     let usage = || format!("usage: {USAGE}");
     match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
         ["changed"] => return changed(root),
-        ["cleanup", "start"] => return cleanup_start(root),
+        ["cleanup", "start"] => return cleanup_start(root, caller),
         ["cleanup", "finish"] => return cleanup_finish(root),
         _ => {}
     }
@@ -267,10 +280,18 @@ fn run(
                 confirmed: counts[0].unwrap_or_default(),
                 pushed_back: counts[1].unwrap_or_default(),
             };
-            save(&scope()?, fact, counts, &text)
+            let dir = scope()?;
+            let saved = save(&dir, fact.clone(), counts, &text)?;
+            noted(root, caller, &dir.join(format!("{}.md", fact.name)))?;
+            Ok(saved)
         }
         ("read", Some(name), [None, None, None], None) => read(&scope()?, &name),
-        ("rm", Some(name), [None, None, None], None) => remove(&scope()?, &name),
+        ("rm", Some(name), [None, None, None], None) => {
+            let dir = scope()?;
+            let removed = remove(&dir, &name)?;
+            noted(root, caller, &dir.join(format!("{name}.md")))?;
+            Ok(removed)
+        }
         ("index", None, [None, None, None], None) => {
             let dir = scope()?;
             let _lock = lock(&dir)?;
@@ -709,7 +730,12 @@ const CLEANUP: &str = ".cleanup";
 /// When the last finished cleanup started, in ms: what the person wrote
 /// from then on is the next cleanup's to read.
 const SAID: &str = ".said";
-const IGNORE: &str = ".lock\n.reads\n/.cleanup\n/.said\n.DS_Store\n";
+/// What other agents saved and removed while a cleanup was open, one JSON
+/// line each: the fact's path under the memory folder and its text, null
+/// once removed. A cleanup the loss guard refuses puts them back over its
+/// revert, so the guard takes back only the cleanup's own changes.
+const OTHERS: &str = ".cleanup-others";
+const IGNORE: &str = ".lock\n.reads\n/.cleanup\n/.cleanup-others\n/.said\n.DS_Store\n";
 
 fn git(root: &Path, args: &[&str]) -> Result<String, String> {
     let mut command = std::process::Command::new("git");
@@ -893,7 +919,7 @@ fn changed(root: &Path) -> Result<Value, String> {
 /// Commit what agents saved since the last cleanup and remember where the
 /// cleanup starts. A start while one is open returns that one, so a
 /// cleanup cut short is measured from where it began.
-fn cleanup_start(root: &Path) -> Result<Value, String> {
+fn cleanup_start(root: &Path, caller: Option<&str>) -> Result<Value, String> {
     repo(root)?;
     let state = root.join(CLEANUP);
     if let Ok(text) = std::fs::read_to_string(&state) {
@@ -915,9 +941,15 @@ fn cleanup_start(root: &Path) -> Result<Value, String> {
     let at_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as i64);
+    match std::fs::remove_file(root.join(OTHERS)) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            return Err(format!("memory_failed: {OTHERS}: {e}"));
+        }
+        _ => {}
+    }
     write(
         &state,
-        &json!({"commit": commit, "facts": count, "at_ms": at_ms}).to_string(),
+        &json!({"commit": commit, "facts": count, "at_ms": at_ms, "by": caller}).to_string(),
     )?;
     started(root, &commit, count as u64, false)
 }
@@ -973,6 +1005,92 @@ fn fact_changes(listing: &str) -> (Vec<String>, Vec<String>, Vec<String>) {
     (removed, added, changed)
 }
 
+/// Note a fact another agent saved or removed while a cleanup is open, as
+/// it now is, for [`put_back`]. The cleanup's own agent's changes are the
+/// cleanup's.
+fn noted(root: &Path, caller: Option<&str>, path: &Path) -> Result<(), String> {
+    let Ok(open) = std::fs::read_to_string(root.join(CLEANUP)) else {
+        return Ok(());
+    };
+    let by = serde_json::from_str::<Value>(&open).unwrap_or_default()["by"].clone();
+    if by.as_str() == caller {
+        return Ok(());
+    }
+    let Ok(relative) = path.strip_prefix(root) else {
+        return Ok(());
+    };
+    let text = std::fs::read_to_string(path).ok();
+    let line = format!("{}\n", json!({"path": relative, "text": text}));
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let others = root.join(OTHERS);
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(&others)
+        .and_then(|mut file| file.write_all(line.as_bytes()))
+        .map_err(|e| format!("memory_failed: {}: {e}", others.display()))
+}
+
+/// Put back over a refused cleanup's revert what other agents saved and
+/// removed while it was open, each fact as they last left it, reindex
+/// their folders and commit them: how many facts.
+fn put_back(root: &Path) -> Result<usize, String> {
+    let others = root.join(OTHERS);
+    let Ok(listed) = std::fs::read_to_string(&others) else {
+        return Ok(0);
+    };
+    let mut last: Vec<(PathBuf, Option<String>)> = Vec::new();
+    for line in listed.lines() {
+        let Ok(noted) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let Some(path) = noted["path"].as_str().map(PathBuf::from) else {
+            continue;
+        };
+        // Only a fact under the memory folder, as `noted` wrote it.
+        if !path
+            .components()
+            .all(|c| matches!(c, std::path::Component::Normal(_)))
+        {
+            continue;
+        }
+        last.retain(|(had, _)| had != &path);
+        last.push((path, noted["text"].as_str().map(str::to_owned)));
+    }
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    for (path, text) in &last {
+        let path = root.join(path);
+        let Some(dir) = path.parent() else { continue };
+        let _lock = lock(dir)?;
+        match text {
+            Some(text) => write(&path, text)?,
+            None => match std::fs::remove_file(&path) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                    return Err(format!("memory_failed: {}: {e}", path.display()));
+                }
+                _ => {}
+            },
+        }
+        if !dirs.iter().any(|had| had == dir) {
+            dirs.push(dir.to_owned());
+        }
+    }
+    for dir in &dirs {
+        let _lock = lock(dir)?;
+        write(&dir.join(INDEX), &render_index(dir, &facts(dir)?))?;
+    }
+    if !last.is_empty() {
+        git(root, &["add", "-A"])?;
+        let message = format!("Memory saved while a refused cleanup ran, {}", today());
+        git(root, &["commit", "-q", "--allow-empty", "-m", &message])?;
+    }
+    std::fs::remove_file(&others)
+        .map_err(|e| format!("memory_failed: {}: {e}", others.display()))?;
+    Ok(last.len())
+}
+
 /// Commit the cleanup, or revert it when it removed more than a quarter of
 /// the facts it started with (two at least), OpenClaw's guard. Either way
 /// git keeps both versions.
@@ -1007,12 +1125,18 @@ fn cleanup_finish(root: &Path) -> Result<Value, String> {
     if removed.len() > limit {
         git(root, &["revert", "--no-edit", &head])?;
         private(root)?;
+        let kept = put_back(root)?;
         let _ = std::fs::remove_file(&state);
+        let others = match kept {
+            0 => String::new(),
+            n => format!(" with the {n} facts other agents saved or removed meanwhile"),
+        };
         return Err(format!(
-            "loss_guard: the cleanup removed {} of {before} facts, above {limit}; memory is back as it was at {start}, and the refused cleanup is commit {head}",
+            "loss_guard: the cleanup removed {} of {before} facts, above {limit}; memory is back as it was at {start}{others}, and the refused cleanup is commit {head}",
             removed.len()
         ));
     }
+    let _ = std::fs::remove_file(root.join(OTHERS));
     // A refused cleanup saved nothing of what the person wrote, so the
     // next one reads it again.
     if let Some(at_ms) = open["at_ms"].as_i64() {
@@ -1962,6 +2086,61 @@ mod tests {
         // A refused cleanup leaves what the person wrote to the next one.
         let after = run_(&["cleanup", "start"]).unwrap();
         assert_eq!(after["since_ms"], json!(since));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_refused_cleanup_keeps_what_other_agents_saved_meanwhile() {
+        let root = temp("cleanup-others");
+        let as_ = |caller: Option<&str>, line: &[&str]| {
+            run_as(&root, &root, &args(line), &|| Ok("-".into()), caller)
+        };
+        let save = |caller, name: &str, text: &str| {
+            let mut line = vec!["save", name, "--type", "feedback", "--description"];
+            line.extend([name, "--source", "test", "--user", "--", text]);
+            as_(caller, &line).unwrap();
+        };
+        repo(&root).unwrap();
+        for name in ["a", "b", "c", "d"] {
+            save(None, name, "before");
+        }
+        // The cleanup's agent is 7; agent 8 and the person save beside it.
+        as_(Some("7"), &["cleanup", "start"]).unwrap();
+        save(Some("8"), "c", "changed by 8");
+        save(Some("8"), "e", "new from 8");
+        save(None, "f", "new from the person");
+        save(Some("8"), "g", "saved then removed by 8");
+        as_(Some("8"), &["rm", "g", "--user"]).unwrap();
+        save(Some("7"), "a", "merged by the cleanup");
+        for name in ["b", "c", "d", "e"] {
+            as_(Some("7"), &["rm", name, "--user"]).unwrap();
+        }
+        let refused = as_(Some("7"), &["cleanup", "finish"]).unwrap_err();
+        assert!(
+            refused.contains("with the 4 facts other agents saved or removed meanwhile"),
+            "{refused}"
+        );
+        let text = |name: &str| std::fs::read_to_string(root.join(format!("{name}.md"))).ok();
+        // The cleanup's own changes are taken back; the others' stay, each
+        // as its agent last left it, even one the cleanup then removed.
+        assert!(text("a").unwrap().ends_with("before\n"), "{:?}", text("a"));
+        assert!(text("b").unwrap().ends_with("before\n"));
+        assert!(text("c").unwrap().ends_with("changed by 8\n"));
+        assert!(text("e").unwrap().ends_with("new from 8\n"));
+        assert!(text("f").unwrap().ends_with("new from the person\n"));
+        assert_eq!(text("g"), None);
+        assert_eq!(check(&root)["problems"], json!([]));
+        assert!(
+            std::fs::read_to_string(root.join(INDEX))
+                .unwrap()
+                .contains("- e (")
+        );
+        // Committed, and the next cleanup starts clean.
+        assert_eq!(
+            error_json(&changed(&root).unwrap_err())["error"],
+            "unchanged"
+        );
+        assert!(!root.join(OTHERS).exists());
         std::fs::remove_dir_all(root).unwrap();
     }
 
