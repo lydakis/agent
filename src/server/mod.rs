@@ -1981,7 +1981,7 @@ impl Service {
         // and gated as a whole unless the caller's is gated by its steps.
         // Another could get a client to act for it.
         let callable = |own: &agent_runtime::tools::Declared| {
-            own.inherit
+            own.inherit.passes()
                 && me
                     .allowed
                     .as_ref()
@@ -2015,12 +2015,20 @@ impl Service {
                 }
                 // Without its own list, a bot takes the tools its creator
                 // passes on: none a client answers that the caller may not call.
-                if declare.is_none() && me.declared.iter().any(|own| own.inherit && !passes(own)) {
+                if declare.is_none()
+                    && me
+                        .declared
+                        .iter()
+                        .any(|own| own.inherit.passes() && !passes(own))
+                {
                     *declare = Some(
                         me.declared
                             .iter()
-                            .filter(|own| own.inherit && passes(own))
-                            .cloned()
+                            .filter(|own| own.inherit.passes() && passes(own))
+                            .map(|own| agent_runtime::tools::Declared {
+                                inherit: own.inherit.passed(),
+                                ..own.clone()
+                            })
                             .collect(),
                     );
                 }

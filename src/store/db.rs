@@ -2415,7 +2415,7 @@ impl Database {
     }
     /// The tools the creating bot's client declared, which a bot it
     /// creates takes unless its own client declares others: all but those
-    /// declared as the creator's own.
+    /// declared as the creator's own, each passed on one generation fewer.
     fn creator_declared(conn: &Connection, creator: Option<i64>) -> Result<Option<String>> {
         let Some(id) = creator else {
             return Ok(None);
@@ -2426,7 +2426,10 @@ impl Database {
             return Ok(None);
         };
         let mut declared: Vec<Declared> = serde_json::from_str(&stored)?;
-        declared.retain(|tool| tool.inherit);
+        declared.retain(|tool| tool.inherit.passes());
+        for tool in &mut declared {
+            tool.inherit = tool.inherit.passed();
+        }
         stored_declared(&declared)
     }
     /// The bot holding identity `id`, whatever it is named.

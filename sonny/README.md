@@ -814,7 +814,8 @@ person sees, as a checklist), `margin` (notes beside the conversation),
 `resolve_task`, `subscriptions`, `show_agent` and
 `run_in_pane`; `start_task` and `remove_task` go to every agent the
 line's `task_depth` leaves room below, and its tasks take them only while
-they have room too; a lead's own, which its tasks never take, is
+they have room too, from their first turn, as the daemon counts the
+generations down (`inherit` as a count); a lead's own, which its tasks never take, is
 `new_project`. The daemon shows them to
 the model and records each call: `react`, `ask`, `plan`, `margin` and
 `resolve_task` run nothing, and the rest wait for Sonny's answer. Sonny's tool host answers

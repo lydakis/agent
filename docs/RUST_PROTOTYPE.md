@@ -2593,6 +2593,15 @@ drops them all. Schema 63 adds the steps' and paused calls' columns. Protocol 24
 also adds `history_search`, the history tool's query for clients (see
 `history_nodes` above).
 
+Protocol version 28 lets `inherit` be a count of generations as well as
+`true` or `false`: a tool declared with `"inherit": 2` goes to the bots
+its bot creates with `"inherit": 1`, to theirs with `false`, and no
+further, as a packet's hop count runs down. `false` is no generation and
+`true`, still the default and still left out, every one. A fork is a copy,
+not a generation, and keeps the count its source has. A client bounding
+how deep its agents delegate gives its tool for starting them that count,
+so each bot's tools are right from its first turn.
+
 ### Tool approval
 
 A bot may be created with a gate (one no bot made, which a client
