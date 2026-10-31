@@ -740,14 +740,26 @@ impl View {
                         .collect();
                     replay.remodel(&models);
                     // Who the tape's let-go start made is here then, though
-                    // the listing of now may no longer name them.
-                    let listed: HashSet<&str> =
-                        bots.iter().filter_map(|bot| bot["name"].as_str()).collect();
+                    // the listing of now may no longer name them. A name
+                    // used again is someone else, told apart by id as
+                    // `seek` tells them.
+                    let mut listed: HashMap<&str, Vec<Option<i64>>> = HashMap::new();
+                    for bot in &bots {
+                        if let Some(name) = bot["name"].as_str() {
+                            listed.entry(name).or_default().push(bot["bot_id"].as_i64());
+                        }
+                    }
                     let folded: Vec<Value> = (replay.folded.iter())
                         .filter(|bot| {
+                            let id = bot["bot_id"].as_i64();
                             !bot["name"]
                                 .as_str()
-                                .is_some_and(|name| listed.contains(name))
+                                .and_then(|name| listed.get(name))
+                                .is_some_and(|ids| {
+                                    ids.iter().any(|listed| {
+                                        id.is_none() || listed.is_none() || *listed == id
+                                    })
+                                })
                         })
                         .cloned()
                         .collect();
@@ -4621,6 +4633,30 @@ mod tests {
             .map(|bot| bot["name"].clone())
             .collect();
         assert_eq!(cast, [json!("shop.y"), json!("shop.x")]);
+    }
+
+    #[tokio::test]
+    async fn who_the_tape_let_go_of_stays_though_its_name_is_used_again() {
+        let (mut view, send) = view();
+        let mut replay = Replay::new(0);
+        // Made at the tape's start; deleted, and its name used again, after.
+        replay.keep(json!({"event": "created", "bot": "shop.x", "data": {"bot_id": 4}}));
+        for at in 0..TAPE as i64 {
+            replay.keep(json!({"event": "queued", "bot": "shop.y", "written_ms": at}));
+        }
+        replay.keep(json!({"event": "deleted", "bot": "shop.x", "written_ms": TAPE}));
+        replay.keep(
+            json!({"event": "created", "bot": "shop.x", "written_ms": TAPE + 1,
+            "data": {"bot_id": 9}}),
+        );
+        view.replay = Some(replay);
+        send.send(Feed::Roll(vec![json!({"name": "shop.x", "bot_id": 9})]))
+            .unwrap();
+        view.drain();
+        let cast: Vec<_> = (view.replay.as_ref().unwrap().cast.iter())
+            .map(|bot| bot["bot_id"].clone())
+            .collect();
+        assert_eq!(cast, [json!(9), json!(4)]);
     }
 
     #[test]
