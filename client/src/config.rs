@@ -34,6 +34,10 @@
 //! commons_invites = 3           # least invites a day new threads send (more with the square root of the week's agents), 0 none; answers add up to as many again
 //! commons_invite_tokens = 1000000  # what an invite pays for in its thread
 //! task_depth = 3                # generations of tasks below a lead, 2 by default (tasks' own start none); 0 no end
+//! sky_haikus = 0                # haikus a day from the sky's busiest agent, 8 by default; 0 none
+//! sky_haiku_window = 10         # minutes of messages and tool calls that make an agent busiest
+//! sky_haiku_margin = 50         # how much busier, in percent, a challenger must be to take the title
+//! sky_haiku_hold = 10           # minutes the title is held before it can pass
 //! unsandboxed = ["mcpx"]        # commands run outside agents' sandboxes
 //! default_permissions = "strict"   # the /permissions row a new lead starts in, auto by default
 //! browser_confirm = ["eval"]    # agent-browser actions the agent's gate approves; eval, download, upload and state by default
@@ -185,6 +189,16 @@ pub struct Sonny {
     /// How many generations below a lead its line goes: a lead's tasks
     /// are the first, and an agent of the last starts none; 0 for no end.
     pub task_depth: u64,
+    /// The haikus a day the sky's busiest agent writes, each time the
+    /// title passes; 0 for none.
+    pub sky_haikus: u64,
+    /// The minutes of messages and tool calls that make an agent busiest.
+    pub sky_haiku_window: u64,
+    /// How much busier, in percent, a challenger must be to take the
+    /// title, and the minutes it is held before it can pass: a
+    /// thermostat's margin and hold, so it does not flicker.
+    pub sky_haiku_margin: u64,
+    pub sky_haiku_hold: u64,
     /// What the lookout runs for news from outside, by name.
     pub sources: Vec<Source>,
     /// The agent-browser action categories that the `browser` tool puts
@@ -214,6 +228,10 @@ impl Default for Sonny {
             commons_invites: 3,
             commons_invite_tokens: 1_000_000,
             task_depth: 2,
+            sky_haikus: 8,
+            sky_haiku_window: 10,
+            sky_haiku_margin: 50,
+            sky_haiku_hold: 10,
             chime: true,
             verbose: false,
             start_at_boot: false,
@@ -599,6 +617,10 @@ fn parse(text: &str) -> Result<Config, String> {
                 "commons_invites",
                 "commons_invite_tokens",
                 "task_depth",
+                "sky_haikus",
+                "sky_haiku_window",
+                "sky_haiku_margin",
+                "sky_haiku_hold",
                 "unsandboxed",
                 "default_permissions",
                 "browser_confirm",
@@ -663,6 +685,10 @@ fn parse(text: &str) -> Result<Config, String> {
                 "commons_invites" => Some(&mut config.sonny.commons_invites),
                 "commons_invite_tokens" => Some(&mut config.sonny.commons_invite_tokens),
                 "task_depth" => Some(&mut config.sonny.task_depth),
+                "sky_haikus" => Some(&mut config.sonny.sky_haikus),
+                "sky_haiku_window" => Some(&mut config.sonny.sky_haiku_window),
+                "sky_haiku_margin" => Some(&mut config.sonny.sky_haiku_margin),
+                "sky_haiku_hold" => Some(&mut config.sonny.sky_haiku_hold),
                 _ => None,
             } {
                 *count = (value.as_integer())
@@ -1122,6 +1148,15 @@ mod tests {
         assert!(parse("[sonny]\nbrowser_confirm = \"eval\"").is_err());
         assert!(parse("[sonny]\ncommons_invites = -1").is_err());
         assert!(parse("[sonny]\ncommons_invites = \"3\"").is_err());
+        let sky = (config.sonny.sky_haikus, config.sonny.sky_haiku_window);
+        assert_eq!(sky, (8, 10));
+        let sky = (config.sonny.sky_haiku_margin, config.sonny.sky_haiku_hold);
+        assert_eq!(sky, (50, 10));
+        assert_eq!(
+            parse("[sonny]\nsky_haikus = 0").unwrap().sonny.sky_haikus,
+            0
+        );
+        assert!(parse("[sonny]\nsky_haiku_margin = 1.5").is_err());
         assert_eq!(config.sonny.task_depth, 2);
         assert_eq!(
             parse("[sonny]\ntask_depth = 0").unwrap().sonny.task_depth,
