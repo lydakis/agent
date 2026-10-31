@@ -111,6 +111,9 @@ const REPLAY_BACK: i64 = 3_600_000;
 const SKY_COLS: usize = 60;
 const SKY_ROWS: usize = 24;
 
+/// The most events a replay keeps to step back through.
+const TAPE: usize = 100_000;
+
 /// A tool call: code's colour, for its moment.
 const TOOL: Color = Color::Cyan;
 /// Working: the text's own, as a working star breathes instead. Needs
@@ -405,6 +408,23 @@ struct Replay {
 }
 
 impl Replay {
+    /// Puts an event on the tape. Past [`TAPE`] events, the oldest tenth
+    /// that has played goes and the replay starts where the rest does, as
+    /// a ring buffer keeps a recorder's last stretch: a replay left open
+    /// on a busy daemon stays bounded, and a step back reaches that far.
+    fn keep(&mut self, event: Value) {
+        self.tape.push(event);
+        let gone = TAPE / 10;
+        if self.tape.len() <= TAPE || self.played < gone {
+            return;
+        }
+        self.tape.drain(..gone);
+        self.played -= gone;
+        if let Some(first) = self.tape.first().and_then(|e| e["written_ms"].as_i64()) {
+            self.from = self.from.max(first);
+        }
+    }
+
     fn new(from: i64) -> Self {
         Replay {
             from,
@@ -573,7 +593,7 @@ impl View {
                 }
                 Feed::Tape(event) => {
                     if let Some(replay) = &mut self.replay {
-                        replay.tape.push(event);
+                        replay.keep(event);
                     }
                 }
                 Feed::Ready if self.replay.as_ref().is_some_and(|r| !r.ready) => {
@@ -3650,6 +3670,22 @@ mod tests {
         assert!(gone.is_some_and(|at| at >= before));
         let said = json!({"event": "queued", "bot": "a", "written_ms": 5});
         assert_eq!(slim(said)["written_ms"], 5);
+    }
+
+    #[test]
+    fn a_replay_s_tape_lets_its_oldest_played_tenth_go_past_its_bound() {
+        let mut replay = Replay::new(0);
+        for at in 0..TAPE as i64 {
+            replay.keep(json!({"event": "queued", "written_ms": at}));
+        }
+        // Nothing played yet: nothing goes.
+        replay.keep(json!({"event": "queued", "written_ms": TAPE}));
+        assert_eq!(replay.tape.len(), TAPE + 1);
+        replay.played = TAPE;
+        replay.keep(json!({"event": "queued", "written_ms": TAPE + 1}));
+        assert_eq!(replay.tape.len(), TAPE + 2 - TAPE / 10);
+        assert_eq!(replay.played, TAPE - TAPE / 10);
+        assert_eq!(replay.from, (TAPE / 10) as i64);
     }
 
     #[tokio::test]

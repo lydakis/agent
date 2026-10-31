@@ -697,7 +697,7 @@ way `/react` does, and each note in the margin has its own `↩`.
   and double the speed (up to 512 times), and Esc goes back to live; the
   footer is the replay's line, with a bar from where it started to now. It
   reads as far back as the daemon keeps events, from when they carry their
-  time. `sonny sky` draws the same sky on its own, in the whole terminal,
+  time, and keeps the last 100,000 to step back through. `sonny sky` draws the same sky on its own, in the whole terminal,
   to keep in another one beside the work, with your theme's grays and
   `NO_COLOR` honoured, and `sonny sky --center NAME` starts on an agent
   (its name, label or project) and `sonny sky --replay [WHEN]` plays the
