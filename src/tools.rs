@@ -258,6 +258,14 @@ impl Inherit {
     pub fn passes(self) -> bool {
         self != Inherit::Generations(0)
     }
+    /// Whether the tool goes no further down than `bound` lets it.
+    pub fn within(self, bound: Inherit) -> bool {
+        match (self, bound) {
+            (_, Inherit::All) => true,
+            (Inherit::All, Inherit::Generations(_)) => false,
+            (Inherit::Generations(n), Inherit::Generations(most)) => n <= most,
+        }
+    }
     /// What a bot this one creates takes with the tool.
     pub fn passed(self) -> Inherit {
         match self {
