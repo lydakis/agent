@@ -8336,7 +8336,7 @@ impl Database {
         // reply, and a `prompts` read of the turn after, find it once
         // retention has dropped the turn's events.
         tx.prepare_cached(&format!(
-            "UPDATE turns SET status=?1,finished_ms=?2,reply_node=({REPLY_NODE}) WHERE id=?3"
+            "UPDATE turns SET status=?1,finished_ms=?2,reply_node={REPLY_NODE} WHERE id=?3"
         ))?
         .execute(params![status, epoch_ms(), turn])?;
         // A request a safety classifier declined, and the bot's fallback
@@ -10316,17 +10316,17 @@ impl Database {
 }
 
 /// The node of the newest message with text that a turn streamed, as a
-/// subquery of a statement on `turns`: the text `assistant_text` reads, so
+/// subquery, in its parentheses, of a statement on `turns`: the text `assistant_text` reads, so
 /// calls and reasoning, which stream as messages too, are passed over. A
 /// turn's last message is nearly always its reply, so the search reads one
 /// node, through the events index, once per turn.
-const REPLY_NODE: &str = "SELECT n.id FROM events e JOIN nodes n ON n.id=json_extract(e.data,'$.node')
+const REPLY_NODE: &str = "(SELECT n.id FROM events e JOIN nodes n ON n.id=json_extract(e.data,'$.node')
     WHERE e.turn=turns.id AND e.kind='message'
     AND EXISTS(SELECT 1 FROM json_each(CAST(n.item AS TEXT),'$.content') c
         WHERE CASE c.type WHEN 'object' THEN json_extract(c.value,'$.type') IN ('output_text','text')
             AND json_type(c.value,'$.text')='text'
             AND trim(json_extract(c.value,'$.text'),' '||char(9,10,13))!='' END)
-    ORDER BY e.id DESC LIMIT 1";
+    ORDER BY e.id DESC LIMIT 1)";
 
 /// Text of an assistant item in either family encoding; other content is skipped.
 fn assistant_text(item: &Value) -> String {
@@ -12092,7 +12092,7 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
     )? {
         conn.execute_batch(&format!(
             "ALTER TABLE turns ADD COLUMN reply_node INTEGER;
-             UPDATE turns SET reply_node=({REPLY_NODE})
+             UPDATE turns SET reply_node={REPLY_NODE}
              WHERE started_ms IS NOT NULL AND finished_ms IS NOT NULL;"
         ))?;
     }
