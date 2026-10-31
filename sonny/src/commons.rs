@@ -540,10 +540,43 @@ async fn everyone(client: &agent_client::Client, author: &str) -> Vec<String> {
     bots
 }
 
+/// The agents in zen now, by name, found by the key their zen is kept
+/// under.
+async fn in_zen(client: &agent_client::Client, home: &Path) -> Vec<String> {
+    let Ok((store, _)) = crate::daemon_paths(None, None) else {
+        return Vec::new();
+    };
+    let store = std::fs::canonicalize(&store).unwrap_or(store);
+    let mut zen = Vec::new();
+    let mut after = json!("");
+    while let Ok(page) = client
+        .request("bots", json!({"after": after, "limit": 256}))
+        .await
+    {
+        zen.extend(
+            (page["bots"].as_array().into_iter().flatten())
+                .filter(|bot| {
+                    bot["bot_id"].as_i64().is_some_and(|id| {
+                        let key = crate::reactions::key(&store, id);
+                        crate::zen::focus_in(home, &key).is_some()
+                    })
+                })
+                .filter_map(|bot| bot["name"].as_str())
+                .map(str::to_owned),
+        );
+        match &page["next_after"] {
+            Value::Null => break,
+            next => after = next.clone(),
+        }
+    }
+    zen
+}
+
 /// Invites one agent to the thread `started` began, as `invite` says: a
 /// queued note, which starts its turn. One drawn at random from those
 /// whose turns mention the title's words, or, on a golden ticket, from
-/// every agent. The one invited, if any; else the invite is given back.
+/// every agent, never one in zen. The one invited, if any; else the
+/// invite is given back.
 /// A thread started in a turn the commons itself began brings none: as an
 /// automatic reply never answers another (RFC 3834), so an invited agent's
 /// threads cannot set off a chain of invites with no person behind them.
@@ -567,10 +600,15 @@ pub async fn invite(home: &Path, started: &Value, author: &str, invite: &Value) 
                 return None;
             }
         }
-        let found = match golden {
+        let mut found = match golden {
             true => everyone(&client, author).await,
             false => touched(&client, title, author).await,
         };
+        // An agent in zen talks about its focus alone: invite another.
+        if crate::zen::any_in(home) {
+            let zen = in_zen(&client, home).await;
+            found.retain(|bot| !zen.contains(bot));
+        }
         let bot = found.get(draw() % found.len().max(1))?.clone();
         let note = invited(thread, title, author, golden);
         let submit = json!({"bot": bot, "prompt": note, "delivery": "queue",

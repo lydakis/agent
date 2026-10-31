@@ -63,7 +63,17 @@ window instead, a task or any other the daemon keeps (a name in this project
 may leave out the project); `/switch` alone, the `↗` beside the name of an
 agent open in the pane, or Ctrl+G moves that agent into the window. `/goal WHAT` asks the agent to set a goal
 on itself and work until WHAT is done (`/goal` shows goals, `/goal clear`
-clears its own; see [Goals](../docs/SONNY.md#goals)). A lead hears of, shows and lists in
+clears its own; see [Goals](../docs/SONNY.md#goals)). `/zen FOCUS` asks the agent to talk with you about
+that one thing and hold everything else back, and shows only your turns and
+its questions, in the middle of the window, under a footer of the focus and
+what needs you; it interrupts only with a question, and `/zen` again ends it
+and has the agent say what it held. Like a goal, the focus is the agent's to
+read: a few hurried words are enough, and the footer shows the focus in its
+words. Asking in words ("let's go into zen on the receipts") works too.
+
+![Zen: only the person's turns and the agent's question, centred](../docs/sonny/zen.png)
+
+A lead hears of, shows and lists in
 `/status` only its own tasks. It is told to send work for another lead's task
 to that lead, to leave changes it did not make alone and never to switch the
 folder's branch, since the leads share one checkout; the instructions,
@@ -498,8 +508,8 @@ way `/react` does, and each note in the margin has its own `↩`.
   serves standard alone, as Bedrock does for Claude, says so instead.
 
   ![/fast: standard in effect, fast and ultrafast with what each costs](../docs/sonny/fast-mode-menu.png)
-- `/compact` summarizes the lead's conversation before its next model
-  call: at the running turn's next step, or before an idle lead's next
+- `/compact` asks first, then summarizes the lead's conversation before
+  its next model call: at the running turn's next step, or before an idle lead's next
   reply. The daemon also compacts on its own once a call's input reaches
   the bot's `compact_tokens`, which follows the model's context window
   unless set (900,000 tokens on a 1M window).
@@ -1061,11 +1071,27 @@ what it does muted, `·` between them (`↑↓ pick · enter open · esc
 close`). Every list over the composer (the slash menu, `/model`,
 `/permissions`, `/retry`, a reply to react to) is one list: up to 8 rows
 under a blank one, the pick in reverse video, `•` before what is in
-effect.
+effect, and its keys where the footer was.
 
 ![? with nothing typed: every key beside the conversation](../docs/sonny/shortcuts.png)
 
-![The slash menu: 8 commands under a blank row, each described as an imperative; the footer says ? 1 needs you](../docs/sonny/slash-menu.png)
+Every list you narrow by typing (the slash menu, `/model`, `sonny setup`'s
+pickers) finds rows one way: the letters typed, in order, the first of
+them starting the name or a word in it, so `/cms` finds `/commons` and
+`g6l` finds `gpt-6-luna`; the letters found are bold. The whole name
+ranks first, then names it starts, then a word in a name it starts, then
+the letters. Among equal matches in the slash menu, the commands you run
+more often and more lately come first (each run counts half as much a
+week on, kept in `~/.agent/sonny/picks.json`), so once you use `/commons`
+more than `/compact`, `/co` and Enter opens `/commons`.
+
+Enter runs the command marked, even on part of its name. `/compact`, which
+can't be undone, then asks first: Enter compacts, any other key keeps the
+conversation.
+
+![/co with /compact marked, then /compact asking: compact the lead's conversation? It can't be undone · enter compact · esc cancel](../docs/sonny/slash-compact-confirm.png)
+
+![/co after /commons was run: /commons ranks first; /cms finds /commons with c, m and s in bold](../docs/sonny/slash-ranked-fuzzy.png)
 
 The pane's place, when nothing else is open there, is the margin. Its
 first row is a glance at what runs for the agent: a red `✗` for what
