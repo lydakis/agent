@@ -48,7 +48,7 @@ rmcp = { version = "3.8", default-features = false, features = ["client", "trans
 rquickjs = { version = "0.14", features = ["futures", "disable-assertions"] }
 serde_json = "1"
 # Digests an MCP server's config, secrets and all, for its listing's cache.
-sha2 = "0.10"
+sha2 = "0.11"
 # Checks an edited project file before it replaces the person's, as the
 # client reads it.
 toml = "0.9"
