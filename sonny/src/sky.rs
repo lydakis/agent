@@ -53,7 +53,7 @@ const LIVE: &[&str] = &[
 const FLIGHT: Duration = Duration::from_millis(1100);
 /// How long stars take to glide to new places, when the lens or the centre
 /// changes.
-const GLIDE: Duration = Duration::from_millis(800);
+const GLIDE: Duration = Duration::from_millis(330);
 /// How long a commons post's ripple spreads.
 const RIPPLE: Duration = Duration::from_millis(1400);
 /// How long a tool call twinkles.
@@ -974,10 +974,37 @@ impl View {
                 None => roots.push(at),
             }
         }
-        let name = |at: &usize| self.agents[*at].name.clone();
-        roots.sort_by_key(|at| (!project::is_lead(&self.agents[*at].name), name(at)));
+        // In the order they started, by the daemon's ids, so a new agent
+        // takes the next place rather than reshuffling the rest (Misue et
+        // al. 1995: keep the mental map). Roots go by when their project
+        // started, its lead first.
+        let project = |at: usize| {
+            let name = &self.agents[at].name;
+            name.split('.').next().unwrap_or(name).to_owned()
+        };
+        let started = |at: usize| {
+            (
+                self.agents[at].id.unwrap_or(i64::MAX),
+                self.agents[at].name.clone(),
+            )
+        };
+        let mut first: HashMap<String, (i64, String)> = HashMap::new();
+        for at in (0..count).filter(|&at| !self.agents[at].gone) {
+            let when = started(at);
+            first
+                .entry(project(at))
+                .and_modify(|was| *was = (*was).clone().min(when.clone()))
+                .or_insert(when);
+        }
+        roots.sort_by_key(|&at| {
+            (
+                first[&project(at)].clone(),
+                !project::is_lead(&self.agents[at].name),
+                started(at),
+            )
+        });
         for kids in &mut children {
-            kids.sort_by_key(name);
+            kids.sort_by_key(|&at| started(at));
         }
         let mut seen = vec![false; count];
         let mut stack = roots.clone();
@@ -1763,11 +1790,15 @@ fn radial(
             start += part;
         }
     }
-    let weights: Vec<usize> = roots.iter().map(|&root| weight(root, children)).collect();
-    let total: usize = weights.iter().sum::<usize>().max(1);
+    // Each arm as wide as the square root of what is under it, so one
+    // big project can't squeeze the rest to nothing.
+    let weights: Vec<f32> = (roots.iter())
+        .map(|&root| (weight(root, children) as f32).sqrt())
+        .collect();
+    let total: f32 = weights.iter().sum::<f32>().max(1.0);
     let mut from = -PI / 2.0;
     for (&root, weight) in roots.iter().zip(weights) {
-        let span = TAU * weight as f32 / total as f32;
+        let span = TAU * weight / total;
         place(root, from, span, 0, deep, children, &mut places, &mut order);
         from += span;
     }
@@ -1946,8 +1977,19 @@ impl Sky {
     /// The dot a point of the unit disc falls on.
     fn spot(&self, (x, y): (f32, f32)) -> (f32, f32) {
         let (w, h) = (self.cols as f32 * 2.0, self.rows as f32 * 4.0);
-        let scale = (w.min(h) / 2.0 - 2.0).max(1.0);
-        (w / 2.0 + x * scale, h / 2.0 + y * scale)
+        let (across, down) = self.scale();
+        (w / 2.0 + x * across, h / 2.0 + y * down)
+    }
+
+    /// How many dots the unit disc's radius takes across and down: an
+    /// ellipse that fills the canvas, two dots in from its edges, never
+    /// more than twice as wide as high, so a wide pane's sky has no empty
+    /// sides and a ring still reads as one.
+    fn scale(&self) -> (f32, f32) {
+        let (w, h) = (self.cols as f32 * 2.0, self.rows as f32 * 4.0);
+        let down = (h / 2.0 - 2.0).max(1.0);
+        let across = (w / 2.0 - 2.0).clamp(1.0, 2.0 * down);
+        (across, down)
     }
 
     fn plot(&mut self, x: f32, y: f32, ink: Ink) {
@@ -2012,8 +2054,9 @@ impl Sky {
 
     fn ring(&mut self, at: (f32, f32), radius: f32, ink: Ink) {
         let (x, y) = self.spot(at);
-        let (r, _) = self.spot((radius, 0.0));
-        let r = r - self.spot((0.0, 0.0)).0;
+        // Round, whatever the ellipse: a ring is a mark, not a place.
+        let (across, down) = self.scale();
+        let r = radius * across.min(down);
         let steps = (r * 6.0).clamp(8.0, 160.0) as usize;
         for step in 0..steps {
             let a = TAU * step as f32 / steps as f32;
@@ -2508,6 +2551,33 @@ mod tests {
         assert!(view.agents[view.index["shop.lead"]].root);
         assert!(view.agents[view.index["lone"]].root);
         assert!(!view.agents[view.index["shop.cart"]].root);
+    }
+
+    #[tokio::test]
+    async fn a_new_project_takes_the_next_place_and_the_rest_stay() {
+        let (mut view, send) = view();
+        let roll = |names: &[(&str, i64)]| {
+            let bots = names
+                .iter()
+                .map(|(name, id)| json!({"name": name, "bot_id": id}))
+                .collect();
+            Feed::Roll(bots)
+        };
+        send.send(roll(&[("zoo.lead", 1), ("apps.lead", 2)]))
+            .unwrap();
+        view.drain();
+        view.card(120, 40);
+        let angle = |view: &View, name: &str| view.agents[view.index[name]].angle;
+        // Started first, so first round from the top, though named later.
+        assert!(angle(&view, "zoo.lead") < angle(&view, "apps.lead"));
+        let (zoo, apps) = (angle(&view, "zoo.lead"), angle(&view, "apps.lead"));
+        send.send(roll(&[("zoo.lead", 1), ("apps.lead", 2), ("mid.lead", 3)]))
+            .unwrap();
+        view.drain();
+        view.card(120, 40);
+        // The newcomer goes last; the others keep their order.
+        assert!(angle(&view, "apps.lead") < angle(&view, "mid.lead"));
+        assert!(angle(&view, "zoo.lead") <= zoo && angle(&view, "apps.lead") <= apps);
     }
 
     #[tokio::test]

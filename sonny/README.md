@@ -602,7 +602,9 @@ way `/react` does, and each note in the margin has its own `↩`.
 
   ![/commons in the pane](../docs/sonny/commons.png)
 - `/sky` draws every agent the daemon keeps, in the pane: leads on the inner
-  ring, the agents each one made fanned out behind it, you in the middle.
+  ring, the agents each one made fanned out behind it, you in the middle,
+  on an ellipse that fills the pane. Projects keep their places in the
+  order they started, each arm as wide as the square root of its size.
   It is a calm window to keep open and watch: the lines that join who made
   whom are faint, a pair that talked in the last minute shows a faint trail
   that fades, a message flies as a spark, a commons post ripples out, a
