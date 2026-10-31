@@ -53,7 +53,7 @@ sha2 = "0.10"
 # client reads it.
 toml = "0.9"
 # Line and word diffs for edits, as Codex's TUI uses it.
-similar = { version = "2", features = ["inline"] }
+similar = { version = "3", features = ["inline"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros", "process", "signal"] }
 # Moves the cursor and wraps by what the terminal draws as one character.
 unicode-segmentation = "1"
