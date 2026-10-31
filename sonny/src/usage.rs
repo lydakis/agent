@@ -308,23 +308,16 @@ impl View {
         out.push(Line::default());
         // The project's agents by name; every agent's by project, as a
         // fleet's names start with theirs.
-        let mut rows: Vec<(String, Spent)> = Vec::new();
+        let mut rows: Vec<Row> = Vec::new();
         for bot in usage["bots"].as_array().into_iter().flatten() {
             let name = bot["bot"].as_str().unwrap_or("?");
             let name = match self.all {
                 true => name.split('.').next().unwrap_or(name).to_owned(),
                 false => self.scope.short(name),
             };
-            match rows.iter_mut().find(|(n, _)| *n == name) {
-                Some((_, spent)) => spent.add(Spent::of(bot)),
-                None => rows.push((name, Spent::of(bot))),
-            }
+            add(&mut rows, name, String::new(), Spent::of(bot));
         }
-        rows.sort_by(|a, b| {
-            b.1.total(self.cached)
-                .cmp(&a.1.total(self.cached))
-                .then_with(|| a.0.cmp(&b.0))
-        });
+        self.sort(&mut rows);
         let (heading, noun) = match self.all {
             true => ("By project", "projects"),
             false => ("By agent", "agents"),
@@ -332,7 +325,7 @@ impl View {
         // Past the first few, and the bots the daemon summed, on one row.
         let hidden = rows.len().saturating_sub(LISTED);
         let mut rest = Spent::default();
-        for (_, spent) in rows.drain(rows.len() - hidden..) {
+        for (_, _, spent) in rows.drain(rows.len() - hidden..) {
             rest.add(spent);
         }
         let summed = usage["other_bots"].is_object();
@@ -341,40 +334,46 @@ impl View {
         }
         match (hidden, summed) {
             (0, false) => {}
-            (n, false) => rows.push((format!("{n} more {noun}"), rest)),
-            (_, true) => rows.push(("the rest".to_owned(), rest)),
+            (n, false) => rows.push((format!("{n} more {noun}"), String::new(), rest)),
+            (_, true) => rows.push(("the rest".to_owned(), String::new(), rest)),
         }
         out.extend(self.bars(heading, &rows, &total, width));
-        let mut models: Vec<(String, Spent)> = usage["models"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .map(|m| (m["model"].as_str().unwrap_or("?").to_owned(), Spent::of(m)))
-            .collect();
+        // Each model by its name, its provider beside it: ids that name
+        // the same model from one provider, as two Bedrock regions' or a
+        // longer window's, are one row.
+        let mut models: Vec<Row> = Vec::new();
+        for row in usage["models"].as_array().into_iter().flatten() {
+            let id = row["model"].as_str().unwrap_or("?");
+            let provider = crate::models::provider(id).unwrap_or_default();
+            let name = crate::models::label(id);
+            add(&mut models, name, provider.to_owned(), Spent::of(row));
+        }
+        self.sort(&mut models);
         if models.len() > LISTED {
             let mut more = Spent::default();
             let n = models.len() - LISTED;
-            for (_, spent) in models.drain(LISTED..) {
+            for (_, _, spent) in models.drain(LISTED..) {
                 more.add(spent);
             }
-            models.push((format!("{n} more models"), more));
+            models.push((format!("{n} more models"), String::new(), more));
         }
         out.push(Line::default());
         out.extend(self.bars("By model", &models, &total, width));
         // What Sonny's own features started, by the origin it gave their
         // turns; one with none was a prompt, a person's or an agent's.
-        let origins: Vec<(String, Spent)> = usage["origins"]
+        let origins: Vec<Row> = usage["origins"]
             .as_array()
             .into_iter()
             .flatten()
             .map(|o| {
                 (
                     o["origin"].as_str().unwrap_or("prompts").to_owned(),
+                    String::new(),
                     Spent::of(o),
                 )
             })
             .collect();
-        if origins.iter().any(|(origin, _)| origin != "prompts") {
+        if origins.iter().any(|(origin, _, _)| origin != "prompts") {
             out.push(Line::default());
             out.extend(self.bars("By what started it", &origins, &total, width));
         }
@@ -459,37 +458,58 @@ impl View {
         out
     }
 
-    /// `rows` as stacked bars under `heading`, each its share of `total`.
-    fn bars(
-        &self,
-        heading: &str,
-        rows: &[(String, Spent)],
-        total: &Spent,
-        width: usize,
-    ) -> Vec<Line<'static>> {
+    /// Most first, then by name.
+    fn sort(&self, rows: &mut [Row]) {
+        rows.sort_by(|a, b| {
+            (b.2.total(self.cached).cmp(&a.2.total(self.cached)))
+                .then_with(|| (&a.0, &a.1).cmp(&(&b.0, &b.1)))
+        });
+    }
+
+    /// `rows` as stacked bars under `heading`, each its share of `total`;
+    /// a row's detail, a model's provider, muted in a column of its own.
+    fn bars(&self, heading: &str, rows: &[Row], total: &Spent, width: usize) -> Vec<Line<'static>> {
         let mut out = vec![Line::from(heading.to_owned()).bold()];
         let name_width = rows
             .iter()
-            .map(|(name, _)| name.width())
+            .map(|(name, _, _)| name.width())
             .max()
             .unwrap_or(0)
             .clamp(4, 28);
+        let detail_width = (rows.iter())
+            .map(|(_, detail, _)| detail.width())
+            .max()
+            .unwrap_or(0)
+            .min(16);
         let all = total.total(self.cached).max(1);
         let most = rows
             .iter()
-            .map(|(_, s)| s.total(self.cached))
+            .map(|(_, _, s)| s.total(self.cached))
             .max()
             .unwrap_or(0)
             .max(1);
-        // The name, the bar, then the tokens and share.
+        // The name, its detail, the bar, then the tokens and share.
         let figures = 13;
-        let room = width.saturating_sub(name_width + 2 + figures).clamp(4, 60);
-        for (name, spent) in rows {
+        let detail_room = match detail_width {
+            0 => 0,
+            n => n + 2,
+        };
+        let room = (width.saturating_sub(name_width + 2 + detail_room + figures)).clamp(4, 60);
+        for (name, detail, spent) in rows {
             let sum = spent.total(self.cached);
             let mut spans = vec![Span::raw(format!(
                 "{:<name_width$}  ",
                 crate::transcript::cut(name, name_width)
             ))];
+            if detail_width > 0 {
+                spans.push(
+                    Span::raw(format!(
+                        "{:<detail_width$}  ",
+                        crate::transcript::cut(detail, detail_width)
+                    ))
+                    .dim(),
+                );
+            }
             spans.extend(hbar(&spent.parts(self.cached), most, room));
             spans.push(Span::raw(format!(" {:>7}", tokens(sum))));
             spans.push(Span::raw(format!(" {:>3}%", sum * 100 / all)).dim());
@@ -511,6 +531,17 @@ impl View {
         Line::from(crate::hint::spans(&format!(
             "  d/w/m period · {scope} · {cached} · esc close"
         )))
+    }
+}
+
+/// A row of bars: its name, a detail muted beside it, and what it spent.
+type Row = (String, String, Spent);
+
+/// `spent` onto the row with `name` and `detail`, or a new row.
+fn add(rows: &mut Vec<Row>, name: String, detail: String, spent: Spent) {
+    match (rows.iter_mut()).find(|(n, d, _)| *n == name && *d == detail) {
+        Some((_, _, sum)) => sum.add(spent),
+        None => rows.push((name, detail, spent)),
     }
 }
 
@@ -740,7 +771,11 @@ mod tests {
                     {"bot": "p.fix", "turns": 1, "input_tokens": 1000, "cached_input_tokens": 500, "output_tokens": 100},
                 ],
                 "other_bots": null,
-                "models": [{"model": "openai/gpt-6-sol", "turns": 3, "input_tokens": 3000, "cached_input_tokens": 2000, "output_tokens": 300}],
+                "models": [
+                    {"model": "bedrock/us.anthropic.claude-opus-5-5-v1:0", "turns": 1, "input_tokens": 1000, "cached_input_tokens": 500, "output_tokens": 100},
+                    {"model": "openai/gpt-6-sol", "turns": 1, "input_tokens": 1000, "cached_input_tokens": 1000, "output_tokens": 100},
+                    {"model": "bedrock/global.anthropic.claude-opus-5-5-v1:0", "turns": 1, "input_tokens": 1000, "cached_input_tokens": 500, "output_tokens": 100},
+                ],
                 "origins": [
                     {"origin": null, "turns": 2, "input_tokens": 2000, "cached_input_tokens": 1500, "output_tokens": 200},
                     {"origin": "commons", "turns": 1, "input_tokens": 1000, "cached_input_tokens": 500, "output_tokens": 100},
@@ -760,7 +795,16 @@ mod tests {
         assert!(card.contains("By agent"), "{card}");
         assert!(card.contains("lead "), "{card}");
         assert!(card.contains("fix "), "{card}");
-        assert!(card.contains("openai/gpt-6-sol"), "{card}");
+        // Each model by its name, its provider muted beside it; two
+        // regions' ids of one model are one row.
+        let models: Vec<&str> = (card.lines())
+            .skip_while(|line| *line != "By model")
+            .skip(1)
+            .take_while(|line| !line.is_empty())
+            .collect();
+        assert_eq!(models.len(), 2, "{card}");
+        assert!(models[0].starts_with("Opus 5.5   bedrock  █"), "{card}");
+        assert!(models[1].starts_with("GPT 6 Sol  openai   █"), "{card}");
         // What the commons started, beside the prompts.
         assert!(card.contains("By what started it"), "{card}");
         assert!(card.contains("commons "), "{card}");

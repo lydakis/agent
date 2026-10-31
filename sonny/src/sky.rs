@@ -320,11 +320,13 @@ struct Agent {
 }
 
 impl Agent {
-    /// Its model, as `m` colours it.
-    fn model_or_unknown(&self) -> &str {
+    /// Its model, as `m` colours it: by name and provider, so one
+    /// model's ids from one provider, as two Bedrock regions', share a
+    /// colour.
+    fn model_or_unknown(&self) -> String {
         match self.model.as_str() {
-            "" => "unknown",
-            model => model,
+            "" => "unknown".to_owned(),
+            model => crate::models::named(model),
         }
     }
 
@@ -2716,7 +2718,7 @@ impl View {
             // On `m`, each in its model's colour instead, bold while it
             // works.
             let hue = (self.models)
-                .then(|| hues.get(agent.model_or_unknown()).copied())
+                .then(|| hues.get(&agent.model_or_unknown()).copied())
                 .flatten();
             let stilled = Self::stilled(cord.as_ref(), &sky, agent.at);
             let (ink, big) = match (hue, agent.state()) {
@@ -3084,14 +3086,14 @@ impl View {
     /// Each model's colour on `m`: the most agents' first, then by name,
     /// a hue each while they last; the rest share the text's.
     fn hues(&self) -> Vec<(String, Color)> {
-        let mut models: HashMap<&str, usize> = HashMap::new();
+        let mut models: HashMap<String, usize> = HashMap::new();
         for agent in self.agents.iter().filter(|a| !a.gone) {
             *models.entry(agent.model_or_unknown()).or_default() += 1;
         }
-        let mut models: Vec<(&str, usize)> = models.into_iter().collect();
-        models.sort_by_key(|&(model, n)| (std::cmp::Reverse(n), model));
+        let mut models: Vec<(String, usize)> = models.into_iter().collect();
+        models.sort_by(|(a, n), (b, m)| m.cmp(n).then_with(|| a.cmp(b)));
         (models.into_iter())
-            .map(|(model, _)| model.to_owned())
+            .map(|(model, _)| model)
             .zip(
                 MODEL_HUES
                     .iter()
@@ -3217,9 +3219,24 @@ impl View {
             spans.push(Span::raw("■").fg(NEEDS));
             spans.push(Span::raw(said).fg(NEEDS));
         }
-        // On `m`, which colour is which model, as many as fit.
+        // On `m`, which colour is which model, as many as fit: by name
+        // alone, as the footer names it, and with its provider where two
+        // providers serve one model.
         if self.models {
-            for (model, hue) in self.hues() {
+            let hues = self.hues();
+            let names: HashMap<String, String> = (self.agents.iter())
+                .filter(|a| !a.model.is_empty())
+                .map(|a| (a.model_or_unknown(), crate::models::label(&a.model)))
+                .collect();
+            let named: Vec<String> = (hues.iter())
+                .map(|(key, _)| names.get(key).unwrap_or(key).clone())
+                .collect();
+            for ((key, hue), short) in hues.iter().zip(&named) {
+                let model = match named.iter().filter(|n| *n == short).count() {
+                    1 => short,
+                    _ => key,
+                };
+                let hue = *hue;
                 let key = format!(" ⠛ {model}");
                 let used: usize = spans.iter().map(|span| span.content.width()).sum();
                 if used + 3 + key.width() > width {
@@ -4895,6 +4912,32 @@ mod tests {
         // The newcomer goes last; the others keep their order.
         assert!(angle(&view, "apps.lead") < angle(&view, "mid.lead"));
         assert!(angle(&view, "zoo.lead") <= zoo && angle(&view, "apps.lead") <= apps);
+    }
+
+    #[tokio::test]
+    async fn the_model_key_names_models_and_a_provider_where_two_serve_one() {
+        use ratatui::crossterm::event::KeyCode;
+        let (mut view, send) = view();
+        send.send(Feed::Roll(vec![
+            json!({"name": "a.lead", "model": "bedrock/us.anthropic.claude-opus-5-5-v1:0"}),
+            json!({"name": "b.lead", "model": "bedrock/global.anthropic.claude-opus-5-5-v1:0"}),
+            json!({"name": "c.lead", "model": "anthropic/claude-opus-5-5"}),
+            json!({"name": "d.lead", "model": "chatgpt/gpt-6.1-sol"}),
+        ]))
+        .unwrap();
+        view.drain();
+        view.card(160, 40);
+        assert!(view.press(KeyCode::Char('m')));
+        // Two Bedrock regions' ids of one model share a colour.
+        assert_eq!(view.hues().len(), 3);
+        let footer = view.footer(160).to_string();
+        assert!(
+            footer.contains("⠛ Opus 5.5 · bedrock")
+                && footer.contains("⠛ Opus 5.5 · anthropic")
+                && footer.contains("⠛ GPT 6.1 Sol")
+                && !footer.contains("chatgpt"),
+            "{footer}"
+        );
     }
 
     #[tokio::test]

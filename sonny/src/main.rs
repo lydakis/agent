@@ -10707,8 +10707,12 @@ impl App {
             if let Some(picker) = &self.picker {
                 let at = picker.at();
                 let items: Vec<list::Item> = (picker.found().into_iter())
+                    // Each model by its name and provider, its id muted
+                    // after them, as one region's Bedrock id differs from
+                    // another's only there.
                     .map(|(model, found)| {
-                        list::Item::new(model, "")
+                        let id = model.split_once('/').map_or(model, |(_, id)| id);
+                        list::Item::new(models::named(model), id)
                             .current(model == self.model)
                             .found(&found)
                     })
