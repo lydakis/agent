@@ -362,6 +362,11 @@ pub struct View {
     sparks: Vec<Spark>,
     /// Who told whom, and when, agent to agent: an hour of it.
     said: VecDeque<(Instant, usize, usize)>,
+    /// How often each pair (the lower index first) told the other in that
+    /// hour, kept as `said` changes, so a frame and a new message look a
+    /// pair up rather than go through the hour (rolling counters, as a
+    /// time-series store keeps them).
+    pairs: HashMap<(usize, usize), usize>,
     /// Who has told whom, past turns and live, the last told at the back.
     talks: VecDeque<(usize, usize)>,
     /// When tools were called: an hour of it.
@@ -437,45 +442,63 @@ struct Replay {
     played: usize,
     /// The tape holds all the past; what comes after is live.
     ready: bool,
+    /// Events not played yet went off the tape's start, so where it plays
+    /// from is seated again (`drain`).
+    cut: bool,
+    /// Who the tape's start made, folded into the cast as it went: kept
+    /// apart too, so the listing read once the past is in, which names
+    /// only who is here now, does not lose one deleted later on the tape.
+    folded: Vec<Value>,
 }
 
 impl Replay {
     /// Puts an event on the tape. Past [`TAPE`] events, the oldest tenth
-    /// that has played goes and the replay starts where the rest does, as
-    /// a ring buffer keeps a recorder's last stretch: a replay left open
-    /// on a busy daemon stays bounded, and a step back reaches that far.
+    /// goes and the replay starts where the rest does, as a ring buffer
+    /// keeps a recorder's last stretch: a replay left open on a busy
+    /// daemon stays bounded, and a step back reaches that far. That holds
+    /// while the past loads and while paused too: what had not played
+    /// yet goes all the same, and the replay starts again from the start
+    /// that is left.
     /// Who was made or removed in what goes is folded into the cast, as a
     /// keyframe takes in the frames before it.
     fn keep(&mut self, event: Value) {
         self.tape.push(event);
         let gone = TAPE / 10;
-        if self.tape.len() <= TAPE || self.played < gone {
+        if self.tape.len() <= TAPE {
             return;
         }
+        self.cut |= self.played < gone;
         for event in self.tape.drain(..gone) {
             let Some(name) = event["bot"].as_str() else {
                 continue;
             };
             match event["event"].as_str() {
                 Some("created" | "forked") => {
+                    let bot = made(name, &event["data"]);
                     self.cast.retain(|bot| bot["name"] != name);
-                    self.cast.push(made(name, &event["data"]));
+                    self.cast.push(bot.clone());
+                    self.folded.retain(|bot| bot["name"] != name);
+                    self.folded.push(bot);
                 }
-                Some("deleted") => self.cast.retain(|bot| bot["name"] != name),
+                Some("deleted") => {
+                    self.cast.retain(|bot| bot["name"] != name);
+                    self.folded.retain(|bot| bot["name"] != name);
+                }
                 _ => {}
             }
         }
-        self.played -= gone;
+        self.played = self.played.saturating_sub(gone);
         if let Some(first) = self.tape.first().and_then(|e| e["written_ms"].as_i64()) {
             self.from = self.from.max(first);
         }
+        self.at = self.at.max(self.from as f64);
     }
 
     /// Gives agents their new models, by name, wherever a step back would
     /// seat them from: one pass over the cast and the tape, however many.
     fn remodel(&mut self, models: &HashMap<&str, &str>) {
         let new = |name: &Value| name.as_str().and_then(|name| models.get(name).copied());
-        for bot in &mut self.cast {
+        for bot in self.cast.iter_mut().chain(&mut self.folded) {
             if let Some(model) = new(&bot["name"]) {
                 bot["model"] = json!(model);
             }
@@ -500,6 +523,8 @@ impl Replay {
             tape: Vec::new(),
             played: 0,
             ready: false,
+            cut: false,
+            folded: Vec::new(),
         }
     }
 }
@@ -595,6 +620,7 @@ impl View {
             index: HashMap::new(),
             sparks: Vec::new(),
             said: VecDeque::new(),
+            pairs: HashMap::new(),
             talks: VecDeque::new(),
             calls: VecDeque::new(),
             sent: HashSet::new(),
@@ -667,6 +693,7 @@ impl View {
         self.agents.clear();
         self.index.clear();
         self.said.clear();
+        self.pairs.clear();
         self.talks.clear();
         self.sent.clear();
         self.laid = false;
@@ -697,7 +724,11 @@ impl View {
     /// Take what the follow brought, and let what landed light up.
     pub fn drain(&mut self) {
         let now = Instant::now();
-        while let Ok(feed) = self.feed.try_recv() {
+        // At most half a frame's work: what is left waits for the next
+        // frame, so a burst slows the sky's catching up, not its keys.
+        while now.elapsed() < FRAME / 2
+            && let Ok(feed) = self.feed.try_recv()
+        {
             match feed {
                 // A replay seats who was here once its tape is in.
                 Feed::Roll(bots) if let Some(replay) = &mut self.replay => {
@@ -708,7 +739,32 @@ impl View {
                         .filter_map(|bot| Some((bot["name"].as_str()?, bot["model"].as_str()?)))
                         .collect();
                     replay.remodel(&models);
+                    // Who the tape's let-go start made is here then, though
+                    // the listing of now may no longer name them. A name
+                    // used again is someone else, told apart by id as
+                    // `seek` tells them.
+                    let mut listed: HashMap<&str, Vec<Option<i64>>> = HashMap::new();
+                    for bot in &bots {
+                        if let Some(name) = bot["name"].as_str() {
+                            listed.entry(name).or_default().push(bot["bot_id"].as_i64());
+                        }
+                    }
+                    let folded: Vec<Value> = (replay.folded.iter())
+                        .filter(|bot| {
+                            let id = bot["bot_id"].as_i64();
+                            !bot["name"]
+                                .as_str()
+                                .and_then(|name| listed.get(name))
+                                .is_some_and(|ids| {
+                                    ids.iter().any(|listed| {
+                                        id.is_none() || listed.is_none() || *listed == id
+                                    })
+                                })
+                        })
+                        .cloned()
+                        .collect();
                     replay.cast = bots;
+                    replay.cast.extend(folded);
                 }
                 Feed::Tape(event) => {
                     if let Some(replay) = &mut self.replay {
@@ -720,6 +776,7 @@ impl View {
                     let at = self.replay.as_ref().map_or(0.0, |r| r.at);
                     if let Some(replay) = &mut self.replay {
                         replay.ready = true;
+                        replay.cut = false;
                         replay.tick = now;
                     }
                     self.seek(at, now);
@@ -762,6 +819,13 @@ impl View {
                 Feed::Ready => self.live = true,
                 Feed::Down(why) => self.down = Some(why),
             }
+        }
+        // The tape let go of what had not played: the replay starts again
+        // from what is left, seated as it was then.
+        if let Some(replay) = self.replay.as_mut().filter(|r| r.ready && r.cut) {
+            replay.cut = false;
+            let from = replay.from as f64;
+            self.seek(from, now);
         }
         self.play(now);
         self.sweep();
@@ -904,6 +968,10 @@ impl View {
         self.said = (self.said.iter())
             .filter_map(|&(when, a, b)| Some((when, moved[a]?, moved[b]?)))
             .collect();
+        self.pairs = HashMap::new();
+        for &(_, a, b) in &self.said {
+            *self.pairs.entry(pair(a, b)).or_default() += 1;
+        }
         self.talks = (self.talks.iter())
             .filter_map(|&(a, b)| Some((moved[a]?, moved[b]?)))
             .collect();
@@ -950,10 +1018,17 @@ impl View {
             self.calls.pop_front();
         }
         while self.said.front().is_some_and(|(at, ..)| old(at)) {
-            if let Some((_, a, b)) = self.said.pop_front()
-                && self.centre.is_some()
-                && !(self.said.iter()).any(|&(_, x, y)| (x, y) == (a, b) || (x, y) == (b, a))
-            {
+            let Some((_, a, b)) = self.said.pop_front() else {
+                break;
+            };
+            let quiet = match self.pairs.get_mut(&pair(a, b)) {
+                Some(told) if *told > 1 => {
+                    *told -= 1;
+                    false
+                }
+                _ => self.pairs.remove(&pair(a, b)).is_some(),
+            };
+            if quiet && self.centre.is_some() {
                 // A pair gone quiet moves the rings of a centred sky.
                 self.laid = false;
             }
@@ -1556,7 +1631,9 @@ impl View {
     /// Remembers that `by` talked to `at` for the hour's weights. A pair new
     /// to the hour moves the rings of a centred sky, past turns as live ones.
     fn hear(&mut self, when: Instant, by: usize, at: usize) {
-        let new = !(self.said.iter()).any(|&(_, a, b)| (a, b) == (by, at) || (a, b) == (at, by));
+        let told = self.pairs.entry(pair(by, at)).or_default();
+        let new = *told == 0;
+        *told += 1;
         self.laid = self.laid && !(new && self.centre.is_some());
         self.said.push_back((when, by, at));
     }
@@ -1690,7 +1767,7 @@ impl View {
                 for &root in &roots {
                     link(you, root);
                 }
-                for &(_, a, b) in &self.said {
+                for &(a, b) in self.pairs.keys() {
                     link(a, b);
                 }
                 let name = |at: &usize| match self.agents.get(*at) {
@@ -2087,13 +2164,7 @@ impl View {
         // as in 0.7.0; told both ways, two, as each bends its own way. The
         // more a pair talked this hour the heavier its curve: denser, and
         // plain for the busiest, so where the work is shows.
-        let mut hour: HashMap<(usize, usize), usize> = HashMap::new();
-        for &(when, by, to) in self.said.iter().rev() {
-            if now.duration_since(when) > HOUR {
-                break;
-            }
-            *hour.entry((by.min(to), by.max(to))).or_default() += 1;
-        }
+        let hour = &self.pairs;
         let busiest = hour.values().copied().max().unwrap_or(1);
         for &(by, to) in &self.talks {
             if !(shown[by] && shown[to]) || self.agents[by].gone || self.agents[to].gone {
@@ -2522,11 +2593,8 @@ impl View {
         let calls = (self.calls.iter())
             .filter(|at| now.duration_since(**at) <= minute)
             .count();
-        let mut pairs: HashMap<(usize, usize), usize> = HashMap::new();
-        for &(_, by, to) in &self.said {
-            *pairs.entry((by.min(to), by.max(to))).or_default() += 1;
-        }
-        let busiest = (pairs.into_iter())
+        let busiest = (self.pairs.iter())
+            .map(|(&pair, &n)| (pair, n))
             .filter(|((a, b), _)| !self.agents[*a].gone && !self.agents[*b].gone)
             .max_by_key(|&((a, b), n)| (n, std::cmp::Reverse((a, b))))
             .map(|((a, b), _)| format!("{} ⇄ {}", self.short(a), self.short(b)));
@@ -3842,6 +3910,11 @@ fn slim(mut event: Value) -> Value {
     event
 }
 
+/// A pair of agents as `pairs` keys it: either way round, one key.
+fn pair(a: usize, b: usize) -> (usize, usize) {
+    (a.min(b), a.max(b))
+}
+
 /// An event of a replay's connection onto its tape; false once the sky
 /// or the daemon has gone.
 async fn taped(client: &Client, event: Value, send: &mpsc::UnboundedSender<Feed>) -> bool {
@@ -4465,19 +4538,41 @@ mod tests {
     }
 
     #[test]
-    fn a_replay_s_tape_lets_its_oldest_played_tenth_go_past_its_bound() {
+    fn a_replay_s_tape_lets_its_oldest_tenth_go_past_its_bound() {
         let mut replay = Replay::new(0);
         for at in 0..TAPE as i64 {
             replay.keep(json!({"event": "queued", "written_ms": at}));
         }
-        // Nothing played yet: nothing goes.
-        replay.keep(json!({"event": "queued", "written_ms": TAPE}));
-        assert_eq!(replay.tape.len(), TAPE + 1);
         replay.played = TAPE;
-        replay.keep(json!({"event": "queued", "written_ms": TAPE + 1}));
-        assert_eq!(replay.tape.len(), TAPE + 2 - TAPE / 10);
+        replay.keep(json!({"event": "queued", "written_ms": TAPE}));
+        assert_eq!(replay.tape.len(), TAPE + 1 - TAPE / 10);
         assert_eq!(replay.played, TAPE - TAPE / 10);
         assert_eq!(replay.from, (TAPE / 10) as i64);
+        assert!(!replay.cut);
+        // Loading the past, nothing played: twice the bound is kept to it,
+        // the newest of it, and the replay starts where that does.
+        let mut replay = Replay::new(0);
+        for at in 0..2 * TAPE as i64 {
+            replay.keep(json!({"event": "queued", "written_ms": at}));
+        }
+        assert!(replay.tape.len() <= TAPE);
+        assert_eq!(replay.played, 0);
+        assert!(replay.cut);
+        assert!(replay.at >= replay.from as f64);
+        assert_eq!(
+            replay.tape.last().unwrap()["written_ms"],
+            2 * TAPE as i64 - 1
+        );
+        // Paused with a fifth played, twice the bound more stays bound too.
+        let mut replay = Replay::new(0);
+        for at in 0..TAPE as i64 {
+            replay.keep(json!({"event": "queued", "written_ms": at}));
+        }
+        replay.played = TAPE / 5;
+        for at in TAPE as i64..3 * TAPE as i64 {
+            replay.keep(json!({"event": "queued", "written_ms": at}));
+        }
+        assert!(replay.tape.len() <= TAPE);
         // Who was made, or removed, in what went is in the cast now.
         let mut replay = Replay::new(0);
         replay.cast = vec![json!({"name": "old"})];
@@ -4494,6 +4589,74 @@ mod tests {
             .map(|bot| (bot["name"].clone(), bot["bot_id"].clone()))
             .collect();
         assert_eq!(cast, [(json!("new"), json!(9))]);
+    }
+
+    #[tokio::test]
+    async fn the_hour_s_pair_counts_follow_what_was_said() {
+        let (mut view, _send) = view();
+        let now = Instant::now();
+        let long_ago = now - HOUR - Duration::from_secs(1);
+        view.hear(long_ago, 0, 1);
+        view.hear(now, 1, 0);
+        view.hear(now, 2, 1);
+        assert_eq!(view.pairs, HashMap::from([((0, 1), 2), ((1, 2), 1)]));
+        // The hour lets the oldest go: its pair counts one less.
+        view.land(now);
+        assert_eq!(view.pairs, HashMap::from([((0, 1), 1), ((1, 2), 1)]));
+        let counted = |view: &View| {
+            let mut pairs = HashMap::new();
+            for &(_, a, b) in &view.said {
+                *pairs.entry(pair(a, b)).or_default() += 1;
+            }
+            pairs
+        };
+        assert_eq!(view.pairs, counted(&view));
+    }
+
+    #[tokio::test]
+    async fn who_the_tape_let_go_of_stays_in_the_cast_past_the_last_listing() {
+        let (mut view, send) = view();
+        let mut replay = Replay::new(0);
+        // Made at the tape's start, deleted after it: the listing of now
+        // no longer names it.
+        replay.keep(json!({"event": "created", "bot": "shop.x", "data": {"bot_id": 4}}));
+        for at in 0..TAPE as i64 {
+            replay.keep(json!({"event": "queued", "bot": "shop.y", "written_ms": at}));
+        }
+        replay.keep(json!({"event": "deleted", "bot": "shop.x", "written_ms": TAPE}));
+        assert!(replay.folded.iter().any(|bot| bot["name"] == "shop.x"));
+        view.replay = Some(replay);
+        send.send(Feed::Roll(vec![json!({"name": "shop.y", "bot_id": 5})]))
+            .unwrap();
+        view.drain();
+        let cast: Vec<_> = (view.replay.as_ref().unwrap().cast.iter())
+            .map(|bot| bot["name"].clone())
+            .collect();
+        assert_eq!(cast, [json!("shop.y"), json!("shop.x")]);
+    }
+
+    #[tokio::test]
+    async fn who_the_tape_let_go_of_stays_though_its_name_is_used_again() {
+        let (mut view, send) = view();
+        let mut replay = Replay::new(0);
+        // Made at the tape's start; deleted, and its name used again, after.
+        replay.keep(json!({"event": "created", "bot": "shop.x", "data": {"bot_id": 4}}));
+        for at in 0..TAPE as i64 {
+            replay.keep(json!({"event": "queued", "bot": "shop.y", "written_ms": at}));
+        }
+        replay.keep(json!({"event": "deleted", "bot": "shop.x", "written_ms": TAPE}));
+        replay.keep(
+            json!({"event": "created", "bot": "shop.x", "written_ms": TAPE + 1,
+            "data": {"bot_id": 9}}),
+        );
+        view.replay = Some(replay);
+        send.send(Feed::Roll(vec![json!({"name": "shop.x", "bot_id": 9})]))
+            .unwrap();
+        view.drain();
+        let cast: Vec<_> = (view.replay.as_ref().unwrap().cast.iter())
+            .map(|bot| bot["bot_id"].clone())
+            .collect();
+        assert_eq!(cast, [json!(9), json!(4)]);
     }
 
     #[test]

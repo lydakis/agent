@@ -1,12 +1,12 @@
 //! The person's home kept off the machine: `~/.agents` (memory, skills,
 //! profiles) and `~/.agent/config.toml`, copied into a git repository,
-//! `~/agent-home`, and pushed every ten minutes by the system's scheduler,
+//! `~/agent-home`, and pushed every ten minutes by Sonny's scheduler,
 //! so a machine that dies takes at most that much with it. Keys
 //! (`~/.agent/env`), logins and the daemon's store stay out.
 //!
 //! `sonny setup backup URL` sets it up, and restores a home the repository
 //! already holds, which is how a new machine starts; `sonny home sync` is
-//! what the job runs, and `sonny home status` says how the last one went.
+//! what the scheduler runs, and `sonny home status` says how the last one went.
 //!
 //! Memory is copied without its own `.git`: a commit inside
 //! `~/.agents/memory` would make `memory changed` find nothing and skip the
@@ -17,9 +17,10 @@ use std::{
     path::{Path, PathBuf},
 };
 
-/// The job's launchd label and systemd unit name.
-const LABEL: &str = "me.lydakis.agent.backup";
-/// How often the job runs.
+/// The job the backup had of its own before Sonny's scheduler ran it,
+/// which Sonny's start lets go of once.
+pub(crate) const OLD_LABEL: &str = "me.lydakis.agent.backup";
+/// How often the scheduler runs a sync.
 pub const EVERY_SECONDS: u32 = 600;
 /// Names never copied, at any depth: a repository's own, and what memory
 /// keeps out of its history (a lock, read counts, an open cleanup that
@@ -27,29 +28,22 @@ pub const EVERY_SECONDS: u32 = 600;
 const SKIP: [&str; 5] = [".git", ".lock", ".reads", ".cleanup", ".DS_Store"];
 pub const USAGE: &str = "usage: home sync | home status\n       setup backup [URL]";
 
-/// Where the home, its copy and the job live.
+/// Where the home, its copy and what its syncs did live.
 pub struct Places {
     agents: PathBuf,
     config: PathBuf,
     repo: PathBuf,
     state: PathBuf,
-    job: PathBuf,
 }
 
 impl Places {
     pub fn home() -> Result<Self, String> {
         let home = PathBuf::from(std::env::var_os("HOME").ok_or("set HOME")?);
-        let jobs = crate::trigger::Places::home()?;
-        let job = match jobs.scheduler {
-            crate::trigger::Scheduler::Launchd => jobs.jobs.join(format!("{LABEL}.plist")),
-            crate::trigger::Scheduler::Systemd => jobs.jobs.join(format!("{LABEL}.service")),
-        };
         Ok(Self {
             agents: home.join(".agents"),
             config: home.join(".agent/config.toml"),
             repo: home.join("agent-home"),
             state: home.join(".agent/sonny/home.json"),
-            job,
         })
     }
 }
@@ -58,7 +52,7 @@ impl Places {
 pub fn cli(args: &[String]) -> i32 {
     let done = Places::home().and_then(|places| match args {
         [verb] if verb == "sync" => sync(&places, None),
-        // The scheduler's run: git with the login shell's environment,
+        // Sonny's scheduler's run: git with the login shell's environment,
         // which holds the person's SSH agent and credential helpers.
         [verb, job] if verb == "sync" && job == "--job" => {
             let environment = crate::login::environment();
@@ -90,9 +84,29 @@ fn error_json(message: &str) -> Value {
     }
 }
 
-/// Set up for this setup step: a repository with a remote, and the job.
+/// Set up for this setup step: a repository with a remote.
 pub fn done(places: &Places) -> bool {
-    places.job.exists() && origin(&places.repo, None).is_some()
+    origin(&places.repo, None).is_some()
+}
+
+/// Whether the scheduler runs a sync now: backup is set up here and the
+/// last sync is ten minutes old. Read without running git, as the
+/// scheduler asks every minute.
+pub fn due(places: &Places, now_ms: u128) -> bool {
+    timed(places)
+        && last(places)
+            .and_then(|last| last["at_ms"].as_u64())
+            .is_some_and(|at| {
+                now_ms.saturating_sub(u128::from(at)) >= u128::from(EVERY_SECONDS) * 1000
+            })
+}
+
+/// Whether the scheduler keeps the backup: `~/agent-home` is a repository
+/// and a sync ran, as setup runs the first after restoring. A clone put
+/// there by hand is not set up: a sync from it would push this machine's
+/// home over the one it holds, before setup restored it.
+fn timed(places: &Places) -> bool {
+    places.repo.join(".git").exists() && last(places).is_some()
 }
 
 /// What the last sync did, with whether backup is set up.
@@ -107,7 +121,7 @@ pub fn status(places: &Places) -> Value {
 }
 
 /// `sonny setup backup [URL]`: clone or adopt `~/agent-home`, restore the
-/// home it holds when this machine has never synced, install the job and
+/// home it holds when this machine has never synced, set up the scheduler and
 /// run the first sync.
 pub fn set_up(places: &Places, url: Option<&str>) -> Result<(), String> {
     let url = match url {
@@ -135,10 +149,10 @@ pub fn set_up(places: &Places, url: Option<&str>) -> Result<(), String> {
             crate::tilde(&places.config.to_string_lossy())
         );
     }
-    // The first backup before the job, so a machine whose scheduler
-    // refuses it is still backed up once.
+    // The first backup before the scheduler, so a machine whose scheduler
+    // cannot run is still backed up once.
     let synced = sync(places, None)?;
-    if let Err(error) = install_job(places) {
+    if let Err(error) = crate::scheduler::ensure() {
         println!("Backed up once to {url}, but not again on a timer.");
         return Err(error);
     }
@@ -551,84 +565,22 @@ fn secret_in(config: &str) -> Option<String> {
     walk(&value, "")
 }
 
-/// At Sonny's start: a job set up by an earlier Sonny runs this one, as
-/// triggers are moved to it.
+/// At Sonny's start: the job of its own an earlier Sonny kept let go of,
+/// and the scheduler running while the backup is set up.
 pub fn at_start() {
-    let (Ok(places), Some(sonny)) = (Places::home(), crate::skills::sonny_path()) else {
+    let Ok(places) = Places::home() else {
         return;
     };
-    let Ok(text) = std::fs::read_to_string(&places.job) else {
-        return;
-    };
-    // Only the program decides: the environment is the shell's that set it up.
-    let program = match crate::trigger::Scheduler::here() {
-        crate::trigger::Scheduler::Launchd => {
-            format!(
-                "<string>{}</string>",
-                crate::trigger::escape(&sonny.to_string_lossy())
-            )
+    std::thread::spawn(move || {
+        if timed(&places)
+            && let Err(error) = crate::scheduler::ring()
+        {
+            eprintln!("{}", error_json(&error));
         }
-        crate::trigger::Scheduler::Systemd => {
-            format!(
-                "ExecStart={} ",
-                crate::trigger::quoted(&sonny.to_string_lossy(), true)
-            )
-        }
-    };
-    if !text.contains(&program) {
-        std::thread::spawn(move || {
-            let _ = install_job(&places);
-        });
-    }
+    });
 }
 
-/// Write the job's definition and load it, replacing one loaded before.
-fn install_job(places: &Places) -> Result<(), String> {
-    let sonny = crate::skills::sonny_path().ok_or("backup_failed: Sonny's own path is unknown")?;
-    let scheduler = crate::trigger::Scheduler::here();
-    let text = definition(scheduler, &sonny, &crate::trigger::environment(scheduler));
-    if let Some(dir) = places.job.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-    }
-    if scheduler == crate::trigger::Scheduler::Launchd {
-        // bootstrap refuses a label already loaded.
-        let _ = crate::trigger::schedule(crate::trigger::Job::Unload(LABEL));
-    }
-    std::fs::write(&places.job, text).map_err(|e| e.to_string())?;
-    let loaded = crate::trigger::schedule(crate::trigger::Job::Load(&places.job));
-    // A job the scheduler refused is not set up.
-    if loaded.is_err() {
-        let _ = std::fs::remove_file(&places.job);
-    }
-    loaded
-}
-
-/// The job: `sonny home sync --job` every ten minutes, a LaunchAgent on a
-/// Mac, a user service whose timer catches up after sleep elsewhere. It
-/// runs with `environment` (HOME, SHELL, PATH as triggers keep them), so
-/// the sync finds the login shell whose credentials git pushes with.
-fn definition(
-    scheduler: crate::trigger::Scheduler,
-    sonny: &Path,
-    environment: &[(&str, String)],
-) -> String {
-    let sonny = sonny.to_string_lossy();
-    match scheduler {
-        crate::trigger::Scheduler::Launchd => format!(
-            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n  <key>Label</key>\n  <string>{LABEL}</string>\n  <key>ProgramArguments</key>\n  <array>\n    <string>{}</string>\n    <string>home</string>\n    <string>sync</string>\n    <string>--job</string>\n  </array>\n  <key>StartInterval</key>\n  <integer>{EVERY_SECONDS}</integer>\n{}  <key>ProcessType</key>\n  <string>Background</string>\n</dict>\n</plist>\n",
-            crate::trigger::escape(&sonny),
-            crate::trigger::environment_section(environment)
-        ),
-        crate::trigger::Scheduler::Systemd => format!(
-            "# Sonny's backup of ~/.agents and config.toml to ~/agent-home.\n[Unit]\nDescription=Sonny home backup\n\n[Service]\nType=oneshot\nExecStart={} home sync --job\n{}\n[X-Timer]\nOnCalendar=*:0/{}\nPersistent=true\n",
-            crate::trigger::quoted(&sonny, true),
-            crate::trigger::unit_environment(environment),
-            EVERY_SECONDS / 60
-        ),
-    }
-}
-
-fn now_ms() -> u128 {
+pub(crate) fn now_ms() -> u128 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
@@ -652,7 +604,6 @@ mod tests {
             config: root.join("home/.agent/config.toml"),
             repo: root.join("home/agent-home"),
             state: root.join("home/.agent/sonny/home.json"),
-            job: root.join("jobs/backup.service"),
         }
     }
 
@@ -930,24 +881,14 @@ mod tests {
     }
 
     #[test]
-    fn the_job_runs_the_sync_every_ten_minutes() {
-        let sonny = Path::new("/opt/homebrew/opt/sonny/bin/sonny");
-        let environment = [
-            ("HOME", "/Users/me".to_owned()),
-            ("SHELL", "/bin/zsh".to_owned()),
-        ];
-        let plist = definition(crate::trigger::Scheduler::Launchd, sonny, &environment);
-        assert!(plist.contains("<string>me.lydakis.agent.backup</string>"));
-        assert!(plist.contains("<string>/opt/homebrew/opt/sonny/bin/sonny</string>\n    <string>home</string>\n    <string>sync</string>\n    <string>--job</string>"));
-        assert!(plist.contains("<key>StartInterval</key>\n  <integer>600</integer>"));
-        assert!(plist.contains("<key>SHELL</key><string>/bin/zsh</string>"));
-        let unit = definition(
-            crate::trigger::Scheduler::Systemd,
-            Path::new("/home/me/.local/bin/sonny"),
-            &environment,
-        );
-        assert!(unit.contains("ExecStart=\"/home/me/.local/bin/sonny\" home sync --job\n"));
-        assert!(unit.contains("[X-Timer]\nOnCalendar=*:0/10\nPersistent=true\n"));
-        assert!(unit.contains("Environment=\"SHELL=/bin/zsh\"\n"));
+    fn a_sync_is_due_ten_minutes_after_the_last() {
+        let root = scratch("due");
+        let places = places(&root);
+        assert!(!due(&places, 1_000_000), "no repository, no sync");
+        std::fs::create_dir_all(places.repo.join(".git")).unwrap();
+        assert!(!due(&places, 1_000_000), "a clone setup never synced from");
+        write(&places.state, "{\"at_ms\": 1000000}");
+        assert!(!due(&places, 1_000_000 + 599_999));
+        assert!(due(&places, 1_000_000 + 600_000));
     }
 }

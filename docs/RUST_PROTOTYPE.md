@@ -1165,8 +1165,11 @@ against that bot's lineage with one ancestry walk and returns a prefix as
 `items: [{node: ID, item: VALUE}, ...]` in request order. A prompt a bot's turn
 wrote also carries `from: {bot, turn, bot_id}`, with `bot_id` the identity the bot's name
 held when it wrote it, and one a client sent with an `origin` carries that, so a
-client can say who each message came from without reading every turn. The store
-keeps both with the prompt's node (`senders`), so they last as long as the item:
+client can say who each message came from without reading every turn. A prompt
+sent with `delivery: "attach"` that a call took in also carries `attached: true`:
+it rode along on that call rather than reaching the bot as a message of its own,
+so a client can draw it apart from steers. The store
+keeps these with the prompt's node (`senders`), so they last as long as the item:
 after the turn's rows go with a deleted fork source, and after its sender is
 deleted or its name reused. The reply targets
 768 KiB; one larger item may be returned alone if it fits the 1 MiB frame limit.
@@ -1397,8 +1400,9 @@ the refused call's `name` and argument preview as `tool_started` would),
 verdict it waits for, and its wake-up), `turn_paced` (a turn parked at its model-call boundary because its
 provider's pool is closed by a rate limit, with `resume_at_ms`; it resumes
 through `turn_resumed` like a parked wait), `steered` (a steer's item joining
-the running turn: `steer` names the steer's turn, `node` its item, and `from`
-or `origin` its sender as on `accepted`), and
+the running turn: `steer` names the steer's turn, `node` its item, `from`
+or `origin` its sender as on `accepted`, and `attached: true` when it was sent
+with `delivery: "attach"`), and
 `turn_finished` (with status, checkpoint, error code, and detail; a steered
 turn's carries `into` and `node`). A `submit` response includes the turn's
 `handle`, `turn:BOT/N`, and its `status`.
@@ -2371,18 +2375,22 @@ unconfined.
 
 A Unix socket is a way out of any sandbox: a program listening on one runs
 what it is asked outside, as a browser's daemon launches a browser or Docker
-runs a container. So, as Claude Code's sandbox and Codex's managed network
-block them by default, a sandboxed bot's commands reach only the Unix
-sockets its `unix_sockets` names. Not even those in its own folders: a hard
-link there to any socket, which needs no right to the socket, would reach
-it, and a named folder the bot may write lets one in the same way. On macOS
-Seatbelt holds them to those paths, network on or off. On Linux, where a
-read-only mount doesn't stop `connect`, a seccomp filter bubblewrap loads
-refuses every Unix socket a command would make, as Codex's Linux sandbox
-does; a filter can't see the path, so a bot whose `unix_sockets` names any
-reaches them all, as Claude Code's `allowAllUnixSockets` does. Socket pairs
-stay allowed, but not of datagrams, which send to any socket's path. The filter also refuses `io_uring`, whose calls it can't see,
-and ends a command that makes system calls of another architecture.
+runs a container. A bot with the network on reaches every Unix socket but
+the daemon's and the other bots' (below), as Codex's full network does, so
+Docker, ssh-agent and a tool's own daemon just work. One kept off the
+network reaches only the Unix sockets its `unix_sockets` names, as Claude
+Code's sandbox and Codex's managed network block them by default. Not even
+those in its own folders: a hard link there to any socket, which needs no
+right to the socket, would reach it, and a named folder the bot may write
+lets one in the same way. On macOS Seatbelt holds an offline bot to those
+paths. On Linux, where a read-only mount doesn't stop `connect`, a seccomp
+filter bubblewrap loads refuses every Unix socket an offline bot's command
+would make, as Codex's Linux sandbox does; a filter can't see the path, so
+a bot whose `unix_sockets` names any reaches them all, as Claude Code's
+`allowAllUnixSockets` does, and with the network on the filter lets them
+all through. Socket pairs stay allowed, but not of datagrams, which send to
+any socket's path. The filter also refuses `io_uring`, whose calls it can't
+see, and ends a command that makes system calls of another architecture.
 
 A sandboxed bot's commands reach the daemon through the bot's own socket,
 never the daemon's: so `agent` and the clients built on it work in its shell,

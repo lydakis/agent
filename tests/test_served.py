@@ -717,7 +717,7 @@ class ServedToolTests(ModelFixture):
         note = self.note_for('calc.lead', 'its goal')
         self.assertIn(f'- calc.fix: turn:calc.fix/{turn} completed, asked by the person, and gave up its goal', note)
 
-    @unittest.skipIf(sys.platform == 'darwin', 'launchd keeps triggers on a Mac')
+    @unittest.skipIf(sys.platform == 'darwin', "launchd runs Sonny's scheduler on a Mac")
     def test_a_trigger_with_no_systemd_running_is_refused_and_says_why(self):
         self.daemon.request('create', bot='calc.lead', workspace=str(self.path), model='openai/synthetic-model',
                             instructions='Lead.', declare=[declared('triggers')])
@@ -729,6 +729,7 @@ class ServedToolTests(ModelFixture):
         self.assertEqual(refused['error'], 'trigger_refused')
         self.assertIn('triggers_unsupported', refused['detail'])
         self.assertEqual(list((self.path / '.config/systemd/user').glob('*.service')), [])
+        self.assertEqual(list((self.path / '.agent/triggers/jobs').glob('*.json')), [])
 
     def test_a_lookout_another_build_started_gives_way(self):
         old = self.lookout()

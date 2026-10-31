@@ -56,7 +56,7 @@ fn short(key: &str) -> &str {
 }
 
 /// Every key `agent_client::config` reads.
-pub const SETTINGS: [Setting; 22] = [
+pub const SETTINGS: [Setting; 23] = [
     Setting {
         key: "model",
         about: "a new agent's model, when none is named (provider/model)",
@@ -188,6 +188,12 @@ pub const SETTINGS: [Setting; 22] = [
         about: "how many generations of tasks a lead's line has: 2 lets its tasks start their own, which start none; 0 for no end",
         values: &[],
         default: "2",
+    },
+    Setting {
+        key: "sonny.tool_processes",
+        about: "processes each of Sonny's companions runs for agents at once (the tool host's tool calls, the lookout's goal checks), each agent at most half; 0 for twice the CPUs",
+        values: &[],
+        default: "0",
     },
 ];
 

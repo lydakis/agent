@@ -1312,6 +1312,18 @@ async fn answer(client: &Client, call: &Value, me: &Path, store: &Path, socket: 
             }
         }
     }
+    // A place among the processes Sonny runs for agents, within the call's
+    // time: held until its process is done.
+    let owner = str_of(&caller["name"]);
+    let _place = tokio::time::timeout(left(call), crate::budget::processes().admit(&owner))
+        .await
+        .map_err(|_| {
+            (
+                "tool_unserved",
+                "ran out of time waiting for one of Sonny's processes (sonny.tool_processes)"
+                    .to_owned(),
+            )
+        })?;
     let mut child = command
         .spawn()
         .map_err(|e| ("tool_failed", format!("{}: {e}", me.display())))?;

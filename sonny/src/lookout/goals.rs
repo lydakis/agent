@@ -808,6 +808,21 @@ async fn run(goal: &Goal, store: &Path, socket: &Path) -> (Option<i32>, String) 
     for key in crate::task::kept_keys() {
         command.env_remove(key);
     }
+    // A place among the processes Sonny runs for agents, held while the
+    // check runs; waiting for one counts against its timeout.
+    let started = std::time::Instant::now();
+    let Ok(_place) = tokio::time::timeout(
+        Duration::from_secs(goal.timeout_s),
+        crate::budget::processes().admit(&goal.bot),
+    )
+    .await
+    else {
+        return (
+            None,
+            "the check waited its whole timeout for one of Sonny's processes (sonny.tool_processes)"
+                .into(),
+        );
+    };
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => return (None, format!("the check did not start: {error}")),
@@ -822,17 +837,21 @@ async fn run(goal: &Goal, store: &Path, socket: &Path) -> (Option<i32>, String) 
         let (stdout, stderr) = tokio::join!(last(stdout), last(stderr));
         (child.wait().await, stdout, stderr)
     };
-    let (status, stdout, stderr) =
-        match tokio::time::timeout(Duration::from_secs(goal.timeout_s), ran).await {
-            Ok((Ok(status), stdout, stderr)) => (status, stdout, stderr),
-            Ok((Err(error), ..)) => return (None, format!("the check failed to run: {error}")),
-            Err(_) => {
-                return (
-                    None,
-                    format!("the check ran past {} s and was stopped", goal.timeout_s),
-                );
-            }
-        };
+    let (status, stdout, stderr) = match tokio::time::timeout(
+        Duration::from_secs(goal.timeout_s).saturating_sub(started.elapsed()),
+        ran,
+    )
+    .await
+    {
+        Ok((Ok(status), stdout, stderr)) => (status, stdout, stderr),
+        Ok((Err(error), ..)) => return (None, format!("the check failed to run: {error}")),
+        Err(_) => {
+            return (
+                None,
+                format!("the check ran past {} s and was stopped", goal.timeout_s),
+            );
+        }
+    };
     let mut text = String::from_utf8_lossy(&stdout).into_owned();
     let errors = String::from_utf8_lossy(&stderr);
     if !errors.trim().is_empty() {
