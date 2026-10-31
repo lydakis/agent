@@ -514,6 +514,12 @@ pub fn is_tool_result(item: &[u8]) -> bool {
             })
 }
 
+/// Whether a stored item is a message someone sent the bot: neither the
+/// model's own output nor a tool result.
+pub fn is_message(item: &[u8]) -> bool {
+    !model_output(item) && !is_tool_result(item)
+}
+
 /// Whether a stored item is the model's own output, as opposed to a user
 /// message or a tool result.
 pub fn model_output(item: &[u8]) -> bool {

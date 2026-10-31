@@ -75,6 +75,7 @@ mod task;
 mod term;
 #[cfg(test)]
 mod testing;
+mod tool_host;
 mod transcript;
 mod tree;
 mod trigger;
@@ -234,11 +235,11 @@ fn usage() -> String {
      tasks open beside it in Rex or Herdr, each in a git worktree of its own. Type /status\n\
      for the project's agents, /lead for the folder's leads.\n\
      Agents start tasks, put windows and panes where the person looks, make projects\n\
-     and follow agents in the lookout with tools Sonny gives them, which the lookout answers.\n\
+     and follow agents in the lookout with tools Sonny gives them, which its tool host answers.\n\
      sonny memory ... and sonny trigger ... are what ~/.agent/memory and ~/.agent/trigger\n\
      run, which Sonny writes at each start.\n\
      sonny sky draws every agent on the daemon lighting up as they talk, as /sky does,\n\
-     on its own in the whole terminal.\n\
+     on its own in the whole terminal; --center NAME puts an agent in the middle.\n\
      sonny lookout watches every lead on the daemon, tells it what happens in its tasks\n\
      and answers its agents' calls of Sonny's tools; Sonny starts one.\n\
      sonny agent ARGS... runs Sonny's own `agent` with ARGS, whatever `agent` is on PATH.\n\
@@ -474,22 +475,18 @@ async fn serve_auto(client: &Client, model: &str) -> Result<(), String> {
     keep(client, APPROVER, &bin, args, json!({"AGENT_MODEL": model})).await
 }
 
-/// The lookout, `sonny lookout`, which tells leads what happens in their
-/// tasks and answers Sonny's tools: the daemon's companion, so it runs for
-/// as long as the daemon does, whether or not a window is open, and comes
-/// back with the next daemon. This Sonny's own build replaces another's:
-/// the build is part of what the daemon keeps, so a Sonny upgraded in
-/// place has the daemon start the new one.
-async fn start_lookout(client: &Client) -> Result<(), String> {
+/// Sonny's companions in the daemon, so they run for as long as it does,
+/// whether or not a window is open, and come back with the next daemon:
+/// the lookout, `sonny lookout`, which tells leads what happens in their
+/// tasks, and the tool host, `sonny tool-host`, which answers the tools
+/// Sonny gives its agents. This Sonny's own build replaces another's: the
+/// build is part of what the daemon keeps, so a Sonny upgraded in place
+/// has the daemon start the new ones.
+async fn start_companions(client: &Client) -> Result<(), String> {
     let me = std::env::current_exe().map_err(|e| e.to_string())?;
-    keep(
-        client,
-        LOOKOUT,
-        &me,
-        daemon_args("lookout"),
-        json!({"SONNY_BUILD": lookout::identity()}),
-    )
-    .await
+    let build = json!({"SONNY_BUILD": lookout::identity()});
+    keep(client, LOOKOUT, &me, daemon_args("lookout"), build.clone()).await?;
+    keep(client, TOOL_HOST, &me, daemon_args(tool_host::NAME), build).await
 }
 
 /// How long a word waits on the daemon to say whether it names an agent.
@@ -497,6 +494,7 @@ const NAME_LOOKUP: Duration = Duration::from_secs(2);
 
 /// What Sonny names its companions in the daemon.
 const LOOKOUT: &str = "sonny-lookout";
+const TOOL_HOST: &str = "sonny-tool-host";
 const APPROVER: &str = "approver-auto";
 
 /// A companion's arguments: its store and socket come from the daemon
@@ -766,7 +764,7 @@ fn main() -> std::process::ExitCode {
     }
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.split_first() {
-        // The lookout runs this for each call of a tool Sonny answers.
+        // The tool host runs this for each call of a tool Sonny answers.
         Some((tool, rest)) if tool == "tool" => served::answer_here(rest),
         // `~/.agent/memory` runs this, from agents' shells.
         Some((verb, rest)) if verb == "memory" => {
@@ -793,6 +791,7 @@ fn main() -> std::process::ExitCode {
             return std::process::ExitCode::from(trigger::fire_cli(rest) as u8);
         }
         Some((lookout, rest)) if lookout == "lookout" => lookout::run(rest),
+        Some((verb, rest)) if verb == tool_host::NAME => tool_host::run(rest),
         Some((verb, rest)) if verb == "approver" => approver::run(rest),
         Some((verb, rest)) if verb == "mcp" => mcp::cli(rest),
         Some((verb, rest)) if verb == "sky" => sky_cli(rest),
@@ -844,16 +843,22 @@ fn main() -> std::process::ExitCode {
     }
 }
 
-/// `sonny sky [--store PATH] [--socket PATH]`: `/sky` on its own,
-/// the whole terminal, until q.
+/// `sonny sky [--center NAME] [--store PATH] [--socket PATH]`: `/sky` on
+/// its own, the whole terminal, until q; centred on an agent, by its name,
+/// its label or its project, when asked.
 fn sky_cli(args: &[String]) -> Result<(), String> {
-    let (mut store, mut socket) = (None, None);
+    let (mut store, mut socket, mut centre) = (None, None, None);
     let mut args = args.iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--store" => store = args.next().map(PathBuf::from),
             "--socket" => socket = args.next().map(PathBuf::from),
-            _ => return Err("usage: sonny sky [--store PATH] [--socket PATH]".into()),
+            "--center" | "--centre" => centre = args.next().cloned(),
+            _ => {
+                return Err(
+                    "usage: sonny sky [--center NAME] [--store PATH] [--socket PATH]".into(),
+                );
+            }
         }
     }
     let (_, socket) = daemon_paths(store, socket)?;
@@ -862,7 +867,7 @@ fn sky_cli(args: &[String]) -> Result<(), String> {
         .enable_all()
         .build()
         .map_err(|e| e.to_string())?;
-    sky::watch(&runtime, socket)
+    sky::watch(&runtime, socket, centre)
 }
 
 async fn run() -> Result<(), String> {
@@ -1014,8 +1019,8 @@ async fn run() -> Result<(), String> {
     {
         app.notice = Some(format!("the lookout: {error}"));
     }
-    // It answers the tools Sonny gives every agent, a lead or not.
-    if let Err(error) = start_lookout(&app.client).await {
+    // They answer the tools Sonny gives every agent, a lead or not.
+    if let Err(error) = start_companions(&app.client).await {
         app.notice = Some(error);
     }
     // The lead told what its folder tells it today (skills and memory added
@@ -1129,34 +1134,50 @@ async fn create(client: &Client, options: &Options, bot: &str) -> Result<(), Str
         agent_client::policy::instructions(&workspace, None, &memory).map_err(|e| e.to_string())?;
     let info = agent_client::project::read(&workspace)?;
     let instructions = project::as_task(&workspace, &info, &composed.text)?;
-    let declare = json!(declared::tools(false));
-    let config = agent_client::config::load()?;
-    let tools = agent_client::default_tools(client.providers(), &model, config.web_search);
     let mut asked = json!({"bot": bot, "workspace": workspace, "model": model,
-        "instructions": instructions, "tools": tools, "declare": declare,
-        "compaction_instructions": agent_client::policy::DEFAULT_COMPACTION_INSTRUCTIONS,
-        "request_id": unique("tui-create")});
+        "instructions": instructions, "request_id": unique("tui-create")});
+    made(client, &mut asked, &model, &workspace)?;
+    client
+        .request("create", asked)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// What every agent Sonny makes starts with, whoever asks for it: the
+/// person's `--new` or a trigger's `--start`. Its tools and Sonny's, gated
+/// and sandboxed as the first mode (`auto`) confines them, and the
+/// person's settings for its model. One way in, so no kind of agent gets
+/// another policy by being made elsewhere (#404).
+pub(crate) fn made(
+    client: &Client,
+    asked: &mut Value,
+    model: &str,
+    workspace: &Path,
+) -> Result<(), String> {
+    let config = agent_client::config::load()?;
+    let declare = json!(declared::tools(false));
+    let tools = agent_client::default_tools(client.providers(), model, config.web_search);
+    asked["tools"] = json!(tools);
+    asked["declare"] = declare.clone();
+    asked["compaction_instructions"] = json!(agent_client::policy::DEFAULT_COMPACTION_INSTRUCTIONS);
     // Confined from the start, as the mode it is made with confines it.
-    let mut settings = approvals::sandbox(approvals::MODES[0].0, &workspace);
-    if let Some(ttl) = agent_client::policy::cache_ttl(&model) {
+    let mut settings = approvals::sandbox(approvals::MODES[0].0, workspace);
+    if let Some(ttl) = agent_client::policy::cache_ttl(model) {
         settings.insert("cache_ttl".into(), json!(ttl));
     }
     if config.hide_senders {
         settings.insert("hide_senders".into(), json!(true));
     }
     asked["settings"] = Value::Object(settings);
-    if let Some(fallback) = config.fallbacks.get(&model) {
+    if let Some(fallback) = config.fallbacks.get(model) {
         asked["fallback"] = json!(fallback);
     }
     let tools: Vec<String> = tools.into_iter().map(String::from).collect();
     let tools = approvals::gateable(&tools, &declare);
-    if let Value::Object(fields) = &mut asked {
+    if let Value::Object(fields) = asked {
         fields.extend(approvals::gate(approvals::MODES[0].0, &tools));
     }
-    client
-        .request("create", asked)
-        .await
-        .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -2431,17 +2452,22 @@ impl Fleet {
     /// afresh: at start, and after a reconnect whose missed events are not
     /// replayed. One that stopped meanwhile is marked idle, quietly.
     async fn reconcile(&mut self) {
-        let Ok(page) = self
-            .client
-            .request(
-                "bots",
-                json!({"name": format!("{}.*", self.project), "limit": 256}),
-            )
-            .await
-        else {
-            return;
-        };
-        let bots = page["bots"].as_array().cloned().unwrap_or_default();
+        // Every page of them: a project past one page still finds a task
+        // running that sorts after it.
+        let mut bots = Vec::new();
+        let mut after = Value::Null;
+        loop {
+            let asked =
+                json!({"name": format!("{}.*", self.project), "limit": 256, "after": after});
+            let Ok(page) = self.client.request("bots", asked).await else {
+                return;
+            };
+            bots.extend(page["bots"].as_array().cloned().unwrap_or_default());
+            after = page["next_after"].clone();
+            if after.is_null() {
+                break;
+            }
+        }
         // A project inside this one has a lead, and a home, of its own: its
         // lead opens there and its tasks are its own.
         let names = bots.iter().filter_map(|bot| bot["name"].as_str());
@@ -3859,7 +3885,7 @@ impl App {
                 .await;
             // A daemon that restarted brings back its companions; one
             // started anew, as by another store's Sonny, gets them now.
-            if let Err(error) = start_lookout(&self.client).await {
+            if let Err(error) = start_companions(&self.client).await {
                 self.notice = Some(error);
             }
             if self.mode == Some("auto")
@@ -6620,10 +6646,11 @@ impl App {
 
     /// What the lookout does for this window's lead.
     fn lookout_line(&self) -> String {
-        match &self.project {
+        let lookout = match &self.project {
             Some(_) => lookout::status(&self.options.store, &self.bot),
             None => String::new(),
-        }
+        };
+        tool_host::with_status(lookout, &self.options.store)
     }
 
     /// The agents `/status` and `/background` cover: the project's, and
@@ -7413,15 +7440,24 @@ impl App {
             if self.pane_keys {
                 match key.code {
                     // Back to the margin from what is over it; the margin closed.
-                    KeyCode::Esc => self.close_pane(true),
-                    // `/sky` shows what its marks mean, or the ticker again.
-                    KeyCode::Char('?')
-                        if pane.is_card()
-                            && let Some(view) =
-                                self.watch.as_mut().and_then(|w| w.sky.as_mut()) =>
+                    KeyCode::Esc
+                        if !(pane.is_card()
+                            && self
+                                .watch
+                                .as_mut()
+                                .and_then(|w| w.sky.as_mut())
+                                .is_some_and(|view| view.press(KeyCode::Esc))) =>
                     {
-                        view.legend = !view.legend
+                        self.close_pane(true)
                     }
+                    KeyCode::Esc => {}
+                    // `/sky`'s own keys: its legend, zen, the lenses on Tab,
+                    // a star picked and centred on; Esc lets go of the pick
+                    // and the centre before it closes the pane.
+                    _ if pane.is_card()
+                        && !switches(key)
+                        && let Some(view) = self.watch.as_mut().and_then(|w| w.sky.as_mut())
+                        && view.press(key.code) => {}
                     // `/status` lists the resolved tasks, or only counts them.
                     KeyCode::Char('r')
                         if pane.is_card()
@@ -9618,7 +9654,7 @@ impl App {
                     })
                     .collect();
                 pane.set_card(lines, SKY_KEYS);
-                pane.foot = Some(view.footer(width));
+                pane.foot = (!view.zen).then(|| view.footer(width));
             } else if let Some(view) = &watch.background {
                 // Its card, with what was done or the keys the pick takes
                 // kept in view under it.
@@ -10423,7 +10459,7 @@ fn over(frame: &mut ratatui::Frame, rows: Vec<Line<'static>>, below: ratatui::la
 
 /// What the pane's title row says the keys do on `/status`.
 const STATUS_KEYS: &str = "esc close";
-const SKY_KEYS: &str = "? legend · esc close";
+const SKY_KEYS: &str = "tab lens · ↑↓←→ pick · z zen · ? legend · esc close";
 
 /// What the title row says the keys do on `/status` itself.
 const PICK_KEYS: &str = "↑↓ pick · enter open · esc close";

@@ -423,7 +423,8 @@ impl View {
         if self.confirm.is_some() && self.items.get(self.selected).map(key_of) != self.confirm {
             self.confirm = None;
         }
-        self.lookout = lookout::status(&self.store, &self.bot);
+        self.lookout =
+            crate::tool_host::with_status(lookout::status(&self.store, &self.bot), &self.store);
     }
 
     /// How the turns ended, as the window has since asked the daemon.

@@ -1634,7 +1634,7 @@ impl Database {
     /// Stored schema version, kept in `PRAGMA user_version`. Stores created
     /// before versioning and stores from newer binaries are rejected; an older
     /// versioned store is migrated forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 65;
+    pub const SCHEMA: i32 = 66;
     /// Verbatim user prompts a compaction keeps: per-prompt text, and the
     /// total text plus `(ordinal, String)` entry metadata. Empty entries cost
     /// space too, so the retained list cannot grow with conversation length.
@@ -1738,6 +1738,9 @@ impl Database {
             CREATE INDEX IF NOT EXISTS compactions_previous ON compactions(previous);
             CREATE INDEX IF NOT EXISTS compactions_cut ON compactions(cut);
             CREATE INDEX IF NOT EXISTS compactions_pinned ON compactions(pinned) WHERE pinned IS NOT NULL;
+            CREATE TABLE IF NOT EXISTS pins(compaction INTEGER NOT NULL REFERENCES compactions(node),
+                node INTEGER NOT NULL REFERENCES nodes(id), PRIMARY KEY(compaction,node)) WITHOUT ROWID;
+            CREATE INDEX IF NOT EXISTS pins_node ON pins(node);
             CREATE TABLE IF NOT EXISTS stubs(node INTEGER PRIMARY KEY REFERENCES nodes(id),
                 item BLOB NOT NULL);
             CREATE TABLE IF NOT EXISTS declined(node INTEGER PRIMARY KEY REFERENCES nodes(id),
@@ -3046,8 +3049,34 @@ impl Database {
             .pinned
             .filter(|&(.., at_start, _)| at_start && state.start.is_some())
             .map(|(id, size, seq, depth, _, pictured)| (id, size, seq, depth, pictured));
+        // And the messages sent to the turn before the cut, each whole after
+        // the prompt, in order; under the floor, one with a stub goes as it.
+        let pins: Vec<(i64, i64, Pictured)> = match (pinned, &state.compaction) {
+            (Some(_), Some((version, ..))) => self
+                .conn
+                .prepare_cached(
+                    "SELECT n.id,n.total_bytes-COALESCE(p.total_bytes,0),n.pictured,n.pictures,n.elided
+                     FROM pins x JOIN nodes n ON n.id=x.node LEFT JOIN nodes p ON p.id=n.parent
+                     WHERE x.compaction=? ORDER BY n.id",
+                )?
+                .query_map([version], |r| {
+                    let (id, size, elided): (i64, i64, i64) = (r.get(0)?, r.get(1)?, r.get(4)?);
+                    Ok(match elided > 0 && id <= state.elided {
+                        true => (id, size - elided, Pictured::default()),
+                        false => (id, size, Pictured {
+                            count: r.get(3)?,
+                            extra: r.get(2)?,
+                        }),
+                    })
+                })?
+                .collect::<rusqlite::Result<_>>()?,
+            _ => Vec::new(),
+        };
+        let pins_bytes: i64 = pins.iter().map(|(_, size, _)| size + 1).sum();
         let lead = |index: usize| match pinned {
-            Some((_, size, ..)) if index == saved_start => (size + 1, 1),
+            Some((_, size, ..)) if index == saved_start => {
+                (size + 1 + pins_bytes, 1 + pins.len() as i64)
+            }
             _ => (0, 0),
         };
         let fits = |index: usize, bytes_limit: i64, items_limit: i64| {
@@ -3094,6 +3123,10 @@ impl Database {
         let start = &rows[chosen];
         let window = &rows[..=chosen];
         let pinned = pinned.filter(|_| chosen == saved_start);
+        let pins = match pinned {
+            Some(_) => pins,
+            None => Vec::new(),
+        };
         let compaction = match state.compaction {
             Some((version, summary, prompts, from, to)) => Some(CompactionView {
                 version,
@@ -3116,15 +3149,34 @@ impl Database {
             ),
             None => Default::default(),
         };
+        for (id, size, pictures) in &pins {
+            ids.push(*id);
+            sizes.push(clamp(*size));
+            thinking.push(0);
+            pictured.push(signed(pictures.extra));
+        }
         ids.extend(window.iter().rev().map(|r| r.id));
         sizes.extend(sent[..=chosen].iter().rev().map(|&b| clamp(b)));
         thinking.extend(window.iter().rev().map(|r| clamp(r.thinking)));
         pictured.extend(window.iter().rev().map(|r| signed(r.pictured)));
-        // The view since the summary includes the prompt it keeps in full.
+        // The view since the summary includes the prompt it keeps in full,
+        // and the messages kept beside it.
         let mut unsummarized = state.unsummarized;
         if let Some((_, size, ..)) = state.pinned {
             unsummarized.bytes += size as usize;
             unsummarized.items += 1;
+            if let Some(version) = compaction.as_ref().map(|c| c.version) {
+                let (bytes, items): (i64, i64) = self
+                    .conn
+                    .prepare_cached(
+                        "SELECT COALESCE(SUM(n.total_bytes-COALESCE(p.total_bytes,0)),0),COUNT(*)
+                         FROM pins x JOIN nodes n ON n.id=x.node LEFT JOIN nodes p ON p.id=n.parent
+                         WHERE x.compaction=?",
+                    )?
+                    .query_row([version], |r| Ok((r.get(0)?, r.get(1)?)))?;
+                unsummarized.bytes += bytes as usize;
+                unsummarized.items += items as usize;
+            }
         }
         Ok(Some(Window {
             family: Family::parse(&state.family).ok_or(Error::new("store_family_unsupported"))?,
@@ -3132,17 +3184,25 @@ impl Database {
             sizes,
             thinking,
             pictured,
-            item_bytes: through[chosen] + pinned.map_or(0, |(_, size, ..)| size),
+            item_bytes: through[chosen]
+                + pinned.map_or(0, |(_, size, ..)| size)
+                + pins.iter().map(|(_, size, _)| size).sum::<i64>(),
             unsummarized,
             omitted_items: pinned.map_or(start.depth, |(.., depth, _)| depth) - 1,
             omitted_turns: pinned.map_or(start.turn_seq.unwrap_or(1), |(_, _, seq, ..)| seq) - 1,
-            omitted_in_turn: pinned.map_or(0, |(.., depth, _)| start.depth - 1 - depth),
+            omitted_in_turn: pinned.map_or(0, |(.., depth, _)| {
+                start.depth - 1 - depth - pins.len() as i64
+            }),
             history: state.history,
             note: state.note,
             compaction,
             elided: state.elided,
             pictures: window.iter().map(|r| r.pictures).sum::<i64>()
-                + pinned.map_or(0, |(.., pictures)| pictures.count),
+                + pinned.map_or(0, |(.., pictures)| pictures.count)
+                + pins
+                    .iter()
+                    .map(|(.., pictures)| pictures.count)
+                    .sum::<i64>(),
         }))
     }
     /// Where to move the bot's elision floor so the newest `keep_bytes` of
@@ -3249,12 +3309,46 @@ impl Database {
                 break;
             }
         }
+        // A cut's prompt and the messages kept beside it go ahead of the
+        // tail, older than all of it, so a floor anywhere in the tail takes
+        // their pictures too: when only they are past the bound, the floor
+        // goes through the tail's oldest row.
+        let lead: Vec<Row> = match keep_pictures {
+            Some(_) => self
+                .conn
+                .prepare_cached(
+                    "WITH lead(node) AS (
+                        SELECT c.pinned FROM bots b JOIN compactions c ON c.node=b.compaction
+                        WHERE b.name=?1 AND c.cut=b.context_start AND c.pinned IS NOT NULL
+                        UNION ALL SELECT x.node FROM bots b JOIN compactions c ON c.node=b.compaction
+                        JOIN pins x ON x.compaction=c.node
+                        WHERE b.name=?1 AND c.cut=b.context_start AND c.pinned IS NOT NULL)
+                     SELECT n.id,0,n.elided,
+                        CASE WHEN n.id<=?2 AND n.elided>0 THEN 0 ELSE n.pictures END,
+                        CASE WHEN n.id<=?2 AND n.elided>0 THEN 0 ELSE n.pictured END
+                     FROM lead JOIN nodes n ON n.id=lead.node",
+                )?
+                .query_map(params![name, elided], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+                })?
+                .collect::<rusqlite::Result<_>>()?,
+            None => Vec::new(),
+        };
+        if edge == rows.len() {
+            for &(.., pictures, pictured) in &lead {
+                count += pictures;
+                extra += pictured.max(0);
+            }
+            if count > keep_count || extra > keep_extra {
+                edge = rows.len() - 1;
+            }
+        }
         let floor = edge.max(answered);
         let Some(&(through, ..)) = rows.get(floor) else {
             return Ok(None);
         };
         let (mut results, mut saved_bytes) = (0, 0);
-        for row in &rows[floor..] {
+        for row in rows[floor..].iter().chain(&lead) {
             if let &(id, _, saves, ..) = row
                 && id > elided
                 && saves > 0
@@ -3967,63 +4061,60 @@ impl Database {
             )?,
             None => (None, None),
         };
+        let old_pins = match bot.compaction {
+            Some(id) if old_pinned.is_some() => self.pins(id)?,
+            _ => Vec::new(),
+        };
         let before = self.compaction_context_usage(
             &bot,
             old_cut,
-            old_pinned,
+            old_pinned.map(|prompt| (prompt, &old_pins[..])),
             old.as_ref(),
             note_turns,
             input_limit,
         )?;
-        let after = self.compaction_context_usage(
-            &bot,
-            Some(plan.cut),
-            plan.pinned,
-            Some(&candidate),
-            note_turns,
-            input_limit,
-        )?;
-        if after.bytes >= before.bytes || after.items > before.items {
-            return fail_with(
-                "compaction_not_smaller",
-                "the summary, retained prompts and omission listing did not reduce the context view",
-            );
-        }
-        // Catch-up may leave an oversized backlog, but it must not install a
-        // pinned prefix that makes even the active turn impossible to send.
-        // Optional previews yield during request fitting. Exclude them from
-        // this minimum check, also avoiding another omitted-turn traversal.
-        if !after.fits(input_limit)
-            && let Some(turn) = bot.running_turn
-        {
-            // The least the active turn can be cut to: its prompt ahead of
-            // its newest round, or, before its first result, all of it.
-            let prompt: i64 =
-                self.conn
-                    .query_row("SELECT id FROM nodes WHERE turn=?", [turn], |r| r.get(0))?;
-            let head = bot.head.ok_or(Error::new("storage_error"))?;
-            let (start, pinned) = match self.newest_round(head, prompt)? {
-                Some(round) => (round, Some(prompt)),
-                None => match plan.pinned {
-                    Some(pinned) => (plan.cut, Some(pinned)),
-                    None => (prompt, None),
-                },
-            };
-            let minimum = self.compaction_context_usage(
+        // A cut inside the turn keeps, beside its prompt, the messages sent
+        // to the turn before the cut, whole and in order, so none of them
+        // reads older than the prompt. Those the room cannot take go oldest
+        // first: a later one may overrule them, never the other way round.
+        let mut pins = match (plan.pinned, old_cut) {
+            (Some(prompt), Some(old_cut)) if old_pinned == Some(prompt) => {
+                let mut pins = old_pins.clone();
+                pins.extend(self.turn_messages(plan.cut, old_cut - 1)?);
+                pins
+            }
+            (Some(prompt), _) => self.turn_messages(plan.cut, prompt)?,
+            (None, _) => Vec::new(),
+        };
+        let after = loop {
+            let after = self.compaction_context_usage(
                 &bot,
-                Some(start),
-                pinned,
+                Some(plan.cut),
+                plan.pinned.map(|prompt| (prompt, &pins[..])),
                 Some(&candidate),
-                0,
+                note_turns,
                 input_limit,
             )?;
-            if !minimum.fits(input_limit) {
-                return fail_with(
-                    "compaction_context_limit",
-                    "the new pinned prefix leaves insufficient room for the active turn",
-                );
+            let smaller = after.bytes < before.bytes && after.items <= before.items;
+            let fits = smaller
+                && self.active_turn_fits(&bot, plan, &pins, &candidate, after, input_limit)?;
+            if fits || pins.is_empty() {
+                if !smaller {
+                    return fail_with(
+                        "compaction_not_smaller",
+                        "the summary, retained prompts and omission listing did not reduce the context view",
+                    );
+                }
+                if !fits {
+                    return fail_with(
+                        "compaction_context_limit",
+                        "the new pinned prefix leaves insufficient room for the active turn",
+                    );
+                }
+                break after;
             }
-        }
+            pins.remove(0);
+        };
         let tx = self.conn.savepoint()?;
         let previous = if bot.compaction == bot.head {
             // Another step before the model answers at this head, since the
@@ -4064,11 +4155,16 @@ impl Database {
             )?;
             bot.compaction
         };
+        tx.execute("DELETE FROM pins WHERE compaction=?", [bot.head])?;
+        for pin in &pins {
+            tx.prepare_cached("INSERT INTO pins(compaction,node) VALUES (?,?)")?
+                .execute(params![bot.head, pin])?;
+        }
         tx.execute(
             "UPDATE bots SET compaction=?,context_start=? WHERE name=?",
             params![bot.head, plan.cut, name],
         )?;
-        let data = json!({"version":bot.head,"cut":plan.cut,"pinned":plan.pinned,"previous":previous,"covered_turns":[covered_from, plan.covered.1],
+        let data = json!({"version":bot.head,"cut":plan.cut,"pinned":plan.pinned,"pinned_messages":pins,"previous":previous,"covered_turns":[covered_from, plan.covered.1],
             "span_turns":[plan.covered.0, plan.covered.1],
             "items":plan.ids.len(),"bytes":plan.sizes.iter().map(|s| *s as u64).sum::<u64>(),
             "summary_bytes":summary.len(),"prompt_bytes":plan.prompts.iter().map(|(_, p)| p.len()).sum::<usize>(),
@@ -4094,14 +4190,96 @@ impl Database {
         tx.commit()?;
         Ok(entry(cursor, name, bot.running_turn, "compacted", data))
     }
+    /// Whether the active turn, cut to the least it can be, still fits
+    /// beside a new compaction's pinned prefix. Catch-up may leave an
+    /// oversized backlog, but it must not install a prefix that makes even
+    /// the active turn impossible to send. Optional previews yield during
+    /// request fitting, so they are left out here, which also avoids another
+    /// omitted-turn traversal.
+    fn active_turn_fits(
+        &self,
+        bot: &Bot,
+        plan: &CompactionPlan,
+        pins: &[i64],
+        candidate: &CompactionView,
+        after: super::ContextUsage,
+        input_limit: super::ContextUsage,
+    ) -> Result<bool> {
+        let Some(turn) = bot.running_turn else {
+            return Ok(true);
+        };
+        if after.fits(input_limit) {
+            return Ok(true);
+        }
+        // The least the active turn can be cut to: its prompt and the
+        // messages kept beside it ahead of its newest round, or, before its
+        // first result, all of it.
+        let prompt: i64 =
+            self.conn
+                .query_row("SELECT id FROM nodes WHERE turn=?", [turn], |r| r.get(0))?;
+        let head = bot.head.ok_or(Error::new("storage_error"))?;
+        let (start, pinned, pins) = match self.newest_round(head, prompt)? {
+            Some(round) => {
+                let kept = match plan.pinned {
+                    Some(pinned) if pinned == prompt => pins.to_vec(),
+                    _ => Vec::new(),
+                };
+                (round, Some(prompt), kept)
+            }
+            None => match plan.pinned {
+                Some(pinned) => (plan.cut, Some(pinned), pins.to_vec()),
+                None => (prompt, None, Vec::new()),
+            },
+        };
+        let minimum = self.compaction_context_usage(
+            bot,
+            Some(start),
+            pinned.map(|prompt| (prompt, &pins[..])),
+            Some(candidate),
+            0,
+            input_limit,
+        )?;
+        Ok(minimum.fits(input_limit))
+    }
+    /// The messages someone sent the bot between `bound` and `cut`, both
+    /// left out, oldest first: the nodes along the cut's lineage that are
+    /// neither the model's output nor a tool result. Read when a cut inside
+    /// a turn is made, over the span it covers.
+    fn turn_messages(&self, cut: i64, bound: i64) -> Result<Vec<i64>> {
+        let mut statement = self.conn.prepare_cached(
+            "WITH RECURSIVE chain(id,parent) AS (
+                SELECT id,parent FROM nodes WHERE id=(SELECT parent FROM nodes WHERE id=?1) AND id>?2
+                UNION ALL SELECT n.id,n.parent FROM nodes n JOIN chain c ON n.id=c.parent WHERE n.id>?2)
+             SELECT c.id,n.item FROM chain c JOIN nodes n ON n.id=c.id ORDER BY c.id",
+        )?;
+        let mut rows = statement.query(params![cut, bound])?;
+        let mut messages = Vec::new();
+        while let Some(row) = rows.next()? {
+            let item = row.get_ref(1)?;
+            let item = item.as_blob().map_err(|_| Error::new("storage_error"))?;
+            if super::context::is_message(item) {
+                messages.push(row.get(0)?);
+            }
+        }
+        Ok(messages)
+    }
+    /// The messages a compaction version keeps beside its pinned prompt,
+    /// oldest first.
+    fn pins(&self, compaction: i64) -> Result<Vec<i64>> {
+        Ok(self
+            .conn
+            .prepare_cached("SELECT node FROM pins WHERE compaction=? ORDER BY node")?
+            .query_map([compaction], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?)
+    }
     /// The view a compaction leaves: `view` ahead of the items from `cut`,
     /// or, for a cut inside a turn, ahead of that turn's `pinned` prompt and
-    /// then the items from the cut.
+    /// the messages kept beside it, `pins`, then the items from the cut.
     fn compaction_context_usage(
         &self,
         bot: &Bot,
         cut: Option<i64>,
-        pinned: Option<i64>,
+        pinned: Option<(i64, &[i64])>,
         view: Option<&CompactionView>,
         note_turns: usize,
         input_limit: super::ContextUsage,
@@ -4117,7 +4295,7 @@ impl Database {
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )?;
         let mut in_turn = 0;
-        if let Some(prompt) = pinned {
+        if let Some((prompt, pins)) = pinned {
             // Under the floor, a prompt with a stub goes as it.
             let (size, seq, depth): (i64, i64, i64) = self.conn.query_row(
                 "SELECT n.total_bytes-COALESCE(p.total_bytes,0)
@@ -4133,6 +4311,18 @@ impl Database {
             in_turn = omitted - depth;
             omitted = depth - 1;
             turns = seq - 1;
+            // The messages kept beside it, each as the prompt goes.
+            let mut sized = self.conn.prepare_cached(
+                "SELECT n.total_bytes-COALESCE(p.total_bytes,0)
+                    -CASE WHEN n.id<=COALESCE(e.through,0) AND n.elided>0 THEN n.elided ELSE 0 END
+                 FROM nodes n LEFT JOIN nodes p ON p.id=n.parent
+                 LEFT JOIN elisions e ON e.node=?2 WHERE n.id=?1",
+            )?;
+            for pin in pins {
+                bytes += sized.query_row(params![pin, bot.elision], |r| r.get::<_, i64>(0))?;
+                items += 1;
+                in_turn -= 1;
+            }
         }
         let note: Option<(i64, String)> = self
             .conn
@@ -4142,7 +4332,7 @@ impl Database {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
-        let listed = match pinned.or(cut) {
+        let listed = match pinned.map(|(prompt, _)| prompt).or(cut) {
             Some(start) if note_turns > 0 && omitted > 0 => {
                 self.omitted_turns(start, note_turns)?
             }
@@ -4382,7 +4572,8 @@ impl Database {
     }
     /// Bytes and items in the active turn alone. Older turns can be removed
     /// from the context window; the current turn cannot, though a compaction
-    /// cut inside it leaves only its prompt and what follows the cut. The
+    /// cut inside it leaves only its prompt, the messages kept beside it, and
+    /// what follows the cut. The
     /// indexed first node, cut, and head supply cumulative totals without
     /// walking the turn.
     pub fn turn_usage(&self, name: &str, turn: i64) -> Result<(Family, usize, usize)> {
@@ -4396,7 +4587,12 @@ impl Database {
                             ELSE cp.total_bytes-MIN(cp.total_elided,COALESCE(e.saved,0))
                                 -s.total_bytes+COALESCE(p.total_bytes,0)
                                 +CASE WHEN s.id<=COALESCE(e.through,0) AND s.elided>0 THEN s.elided ELSE 0 END END,
-                    h.depth-CASE WHEN c.node IS NULL THEN COALESCE(p.depth,0) ELSE cp.depth-1 END
+                    h.depth-CASE WHEN c.node IS NULL THEN COALESCE(p.depth,0) ELSE cp.depth-1 END,
+                    (SELECT COALESCE(SUM(n.total_bytes-q.total_bytes
+                        -CASE WHEN n.id<=COALESCE(e.through,0) AND n.elided>0 THEN n.elided ELSE 0 END),0)
+                     FROM pins x JOIN nodes n ON n.id=x.node JOIN nodes q ON q.id=n.parent
+                     WHERE x.compaction=c.node),
+                    (SELECT COUNT(*) FROM pins WHERE compaction=c.node)
              FROM bots b JOIN nodes h ON h.id=b.head JOIN nodes s ON s.turn=?2
              LEFT JOIN nodes p ON p.id=s.parent LEFT JOIN elisions e ON e.node=b.elision
              LEFT JOIN compactions c ON c.node=b.compaction AND c.pinned=s.id
@@ -4404,7 +4600,11 @@ impl Database {
              WHERE b.name=?1 AND b.running_turn=?2",
             )?
             .query_row(params![name, turn], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                Ok((
+                    r.get(0)?,
+                    r.get::<_, i64>(1)? + r.get::<_, i64>(3)?,
+                    r.get::<_, i64>(2)? + r.get::<_, i64>(4)?,
+                ))
             })
             .optional()?;
         let Some((family, bytes, items)) = row else {
@@ -4467,7 +4667,8 @@ impl Database {
         let (omitted, turns, in_turn, history, note) = self
             .conn
             .prepare_cached(
-                "SELECT s.depth-1,s.turn_seq-1,COALESCE(cut.depth-1-s.depth,0),
+                "SELECT s.depth-1,s.turn_seq-1,
+                    COALESCE(cut.depth-1-s.depth-(SELECT COUNT(*) FROM pins WHERE compaction=c.node),0),
                     instr(','||b.tools||',',',history,')>0,n.node,n.text
              FROM bots b JOIN nodes s ON s.turn=?2 LEFT JOIN notes n ON n.node=b.note
              LEFT JOIN compactions c ON c.node=b.compaction AND c.pinned=s.id
@@ -9000,6 +9201,7 @@ impl Database {
                 tx.query_row("SELECT parent FROM nodes WHERE id=?", [id], |r| r.get(0))?;
             tx.execute("UPDATE bots SET head=? WHERE name=?", params![parent, name])?;
             tx.execute("DELETE FROM notes WHERE node=?", [id])?;
+            tx.execute("DELETE FROM pins WHERE compaction=?", [id])?;
             tx.execute("DELETE FROM compactions WHERE node=?", [id])?;
             tx.execute("DELETE FROM elisions WHERE node=?", [id])?;
             tx.execute("DELETE FROM stubs WHERE node=?", [id])?;
@@ -11338,13 +11540,15 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
         }
     }
     // 63 -> 64: the daemon's pause, in a table the schema creates; none held.
+    // 64 -> 65: the messages a cut inside a turn keeps beside its prompt, in
+    // a table the schema creates; earlier cuts kept the prompt alone.
     if conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='answers')
          AND NOT EXISTS(SELECT 1 FROM pragma_table_info('answers') WHERE name='parts')",
         [],
         |r| r.get::<_, bool>(0),
     )? {
-        // 64 -> 65: a client's answer may come with pictures, in parts after
+        // 65 -> 66: a client's answer may come with pictures, in parts after
         // its output. None did.
         conn.execute_batch("ALTER TABLE answers ADD COLUMN parts TEXT;")?;
     }

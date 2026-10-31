@@ -308,17 +308,63 @@ fn claim_in(dir: &Path, prompt: &str, cwd: &Path) -> Option<String> {
     })
 }
 
-/// The bot the thread `session` is, for its next start.
-pub fn remember(session: &str, bot: &str) {
-    if let Some(dir) = dir("sessions") {
-        let _ = std::fs::create_dir_all(&dir);
-        let _ = std::fs::write(dir.join(file_name(session)), bot);
+/// The bot a thread is: its name, and once bound, its identity and its
+/// store's lineage, so a thread that comes back is that bot or none: not
+/// another made since under its name, nor one of another store's.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Pinned {
+    pub bot: String,
+    pub bot_id: Option<i64>,
+    pub store: Option<String>,
+}
+
+impl Pinned {
+    /// A bot known by name only, as a task waiting for its thread is.
+    pub fn named(bot: String) -> Pinned {
+        Pinned {
+            bot,
+            bot_id: None,
+            store: None,
+        }
     }
 }
 
-pub fn recall(session: &str) -> Option<String> {
-    let text = std::fs::read_to_string(dir("sessions")?.join(file_name(session))).ok()?;
-    Some(text.trim().to_owned()).filter(|bot| !bot.is_empty())
+/// The bot the thread `session` is, for its next start.
+pub fn remember(session: &str, pinned: &Pinned) {
+    if let Some(dir) = dir("sessions") {
+        remember_in(&dir, session, pinned);
+    }
+}
+
+fn remember_in(dir: &Path, session: &str, pinned: &Pinned) {
+    let record = json!({"bot": pinned.bot, "bot_id": pinned.bot_id, "store": pinned.store});
+    let _ = std::fs::create_dir_all(dir);
+    let _ = std::fs::write(dir.join(file_name(session)), record.to_string());
+}
+
+pub fn recall(session: &str) -> Option<Pinned> {
+    recall_in(&dir("sessions")?, session)
+}
+
+fn recall_in(dir: &Path, session: &str) -> Option<Pinned> {
+    let text = std::fs::read_to_string(dir.join(file_name(session))).ok()?;
+    let record = match serde_json::from_str::<Value>(&text) {
+        Ok(record @ Value::Object(_)) => record,
+        // A thread kept before identities were: its name, which binding it
+        // once pins.
+        _ => {
+            let bot = text.trim();
+            return (!bot.is_empty()).then(|| Pinned::named(bot.to_owned()));
+        }
+    };
+    Some(Pinned {
+        bot: record["bot"]
+            .as_str()
+            .filter(|bot| !bot.is_empty())?
+            .to_owned(),
+        bot_id: record["bot_id"].as_i64(),
+        store: record["store"].as_str().map(str::to_owned),
+    })
 }
 
 #[cfg(test)]
@@ -395,5 +441,26 @@ mod tests {
             result("launch", failed),
             Err("T3 Code's launch: no project".into())
         );
+    }
+
+    #[test]
+    fn a_thread_remembers_its_bot_s_identity_and_store() {
+        let dir = std::env::temp_dir().join(format!("sonny-t3-pinned-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let pinned = Pinned {
+            bot: "cart/fix".into(),
+            bot_id: Some(7),
+            store: Some("00ab".into()),
+        };
+        remember_in(&dir, "s1", &pinned);
+        assert_eq!(recall_in(&dir, "s1"), Some(pinned));
+        assert_eq!(recall_in(&dir, "s2"), None);
+        // One kept by name only binds by name once, and is pinned then.
+        std::fs::write(dir.join("s3"), "errand.lead\n").unwrap();
+        assert_eq!(
+            recall_in(&dir, "s3"),
+            Some(Pinned::named("errand.lead".into()))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

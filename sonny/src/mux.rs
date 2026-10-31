@@ -380,7 +380,7 @@ pub fn here(socket: &Path, project: &str, host: Option<&str>) -> Option<Layout> 
     Some(Layout::new(backend))
 }
 
-/// The project's home, for an agent's call, from the lookout answering it,
+/// The project's home, for an agent's call, from the tool host answering it,
 /// whose multiplexer variables would name the terminal Sonny started it
 /// in: where the lead's Sonny last laid the project out, in that
 /// multiplexer; without one, in Herdr or cmux when the project's lead is in
