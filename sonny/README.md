@@ -630,7 +630,12 @@ way `/react` does, and each note in the margin has its own `↩`.
   Enter puts it in the middle: its maker, what it made and whoever it
   talked to in the last hour on the first ring, two hops on the next, the
   chat log only its own; the stars glide to their places. Esc lets go of
-  the pick, then the centre. Under 60 columns or 24 rows the sky becomes a list, a firefly
+  the pick, then the centre. With thousands of agents the sky folds: a
+  star for every agent that needs you, failed, works or was just lit, and
+  for the leads, as many as the pane has room for; the rest are a faint
+  dot each, so a cloud's density says how big it is, and the biggest
+  clouds carry their count. Names keep a row apart, the leads of the
+  biggest projects first. Under 60 columns or 24 rows the sky becomes a list, a firefly
   per agent and the last it said or was told. `sonny sky` draws the same
   sky on its own, in the whole terminal, to keep in another one beside the
   work, with your theme's grays and `NO_COLOR` honoured, and
@@ -647,6 +652,8 @@ way `/react` does, and each note in the margin has its own `↩`.
   ![/sky's talk lens](../docs/sonny/sky-talk.png)
 
   ![/sky's models lens](../docs/sonny/sky-models.png)
+
+  ![/sky folded at 10,000 agents](../docs/sonny/sky-10000.png)
 
   ![/sky centred on the shop lead](../docs/sonny/sky-centre.png)
 
