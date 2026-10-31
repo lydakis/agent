@@ -3186,6 +3186,13 @@ async fn configured(client: &Client, event: &Value) -> Option<Feed> {
 /// An event as a replay's tape keeps it: a tool's arguments only for a
 /// commons post, which is all the sky reads of them.
 fn slim(mut event: Value) -> Value {
+    // What the daemon sends unwritten, such as a deletion, happened when
+    // it came: dated so, it plays at its time and not at the start.
+    if event["written_ms"].is_null()
+        && let Some(fields) = event.as_object_mut()
+    {
+        fields.insert("written_ms".into(), json!(wall_ms()));
+    }
     if event["event"] == "tool_started"
         && event["data"]["name"] != "commons"
         && let Some(data) = event["data"].as_object_mut()
@@ -3232,7 +3239,8 @@ async fn tape(socket: PathBuf, from: i64, send: mpsc::UnboundedSender<Feed>) {
                 return;
             }
             // What the sky reads of a tool's arguments is a commons post;
-            // the rest stays with the daemon, not in the tape.
+            // the rest stays with the daemon, not in the tape. An unwritten
+            // event is dated as it comes.
             _ => send.send(Feed::Tape(slim(event))),
         };
         if sent.is_err() {
@@ -3616,11 +3624,18 @@ mod tests {
     }
 
     #[test]
-    fn a_replay_s_tape_keeps_tool_arguments_only_for_a_commons_post() {
+    fn a_replay_s_tape_keeps_tool_arguments_only_for_a_commons_post_and_dates_the_unwritten() {
         let call = |name: &str| json!({"event": "tool_started", "bot": "a", "data": {"name": name, "arguments": "{}"}});
         assert!(slim(call("shell"))["data"]["arguments"].is_null());
         assert_eq!(slim(call("commons"))["data"]["arguments"], "{}");
         assert_eq!(slim(call("shell"))["data"]["name"], "shell");
+        // A deletion comes unwritten: it is dated as it comes, and what is
+        // written keeps its date.
+        let before = wall_ms();
+        let gone = slim(json!({"event": "deleted", "bot": "a"}))["written_ms"].as_i64();
+        assert!(gone.is_some_and(|at| at >= before));
+        let said = json!({"event": "queued", "bot": "a", "written_ms": 5});
+        assert_eq!(slim(said)["written_ms"], 5);
     }
 
     #[test]
