@@ -606,7 +606,9 @@ class TriggerFireTests(ModelFixture):
         self.assertTrue(loaded())
         self.assertTrue(until(lambda: len(self.turns('p.task')) == 2, 150), 'launchd did not fire it')
         self.assertTrue(until(lambda: not loaded() and not plist.exists(), 30), 'it did not end itself')
-        self.assertEqual(json.loads(trigger('ls').stdout)['triggers'], [])
+        # Its row stays, ended, until its turn is known to be done (#442).
+        rows = json.loads(trigger('ls').stdout)['triggers']
+        self.assertEqual([(r['name'], r['ended']) for r in rows], [(name, True)], rows)
         # A file trigger: a write to the file fires it; the same add again is that trigger.
         watched = self.path / 'notes.md'
         trigger('add', '--bot', 'p.task', '--name', name, '--file', str(watched), '--', 'notes changed')
@@ -689,7 +691,9 @@ class TriggerFireTests(ModelFixture):
         self.assertTrue(until(lambda: len(self.turns('p.task')) == 2, 150), 'the timer did not fire it')
         self.assertTrue(until(lambda: not loaded() and not service.exists(), 30), 'it did not end itself')
         self.assertEqual(list(units.glob(f'{label}.*')), [])
-        self.assertEqual(json.loads(trigger('ls').stdout)['triggers'], [])
+        # Its row stays, ended, until its turn is known to be done (#442).
+        rows = json.loads(trigger('ls').stdout)['triggers']
+        self.assertEqual([(r['name'], r['ended']) for r in rows], [(name, True)], rows)
         # A file trigger: a write to the file fires it; the same add again is that trigger.
         watched = self.path / 'notes.md'
         trigger('add', '--bot', 'p.task', '--name', name, '--file', str(watched), '--', 'notes changed')
