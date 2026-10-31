@@ -1032,6 +1032,13 @@ class SocketAndCliTests(ModelFixture):
                                       'nodes': [completed['data']['node']]}) + '\n').encode())
             preview = json.loads(json.loads(reader.readline())['result']['items'][0]['item']['output'])
             self.assertIn('bytes omitted', preview['stdout'])
+        # The cut names a file beside the store holding what was kept, for
+        # the model's own grep.
+        named = re.search(r'retained in (\S+), to search with grep', preview['stdout'])
+        self.assertIsNotNone(named, preview['stdout'][32760:33000])
+        spilled = Path(named.group(1))
+        self.assertEqual(spilled.parent, self.store.parent / 'outputs')
+        self.assertEqual(spilled.read_text(), 'y' * 1048576)
 
 
 @unittest.skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'requires built Rust runtime')

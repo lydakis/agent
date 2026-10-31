@@ -202,7 +202,7 @@ class AccountingTests(ModelFixture):
         raw = client.request('artifact', bot='Fork', turn=big, call_id='shell-1', stream='stdout', offset=0, limit=64)
         self.assertIn('line-0', raw['result']['text'])
         result = json.loads(self.tool_output(client, 'Bob', 'shell-1'))
-        self.assertIn('read them with the read tool', result['stdout'])
+        self.assertIn("in this result's artifacts for the read tool", result['stdout'])
         self.assertEqual(result['artifacts'], [f'{big}/shell-1/stdout'])
         page = client.request('submit', bot='Bob', request_id='page',
                               prompt=f'readart:{big}/shell-1/stdout 19999,5')['result']['turn']
