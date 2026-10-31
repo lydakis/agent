@@ -856,6 +856,7 @@ fn cut(mut text: String) -> String {
 async fn script(hub: &crate::mcp::Hub, client: &Arc<Client>, call: &Value) -> Answer {
     let input = call["arguments"]["input"].as_str().unwrap_or_default();
     let bot = str_of(&call["bot"]);
+    unreviewed(client, &bot, &Value::Null, EXEC).await?;
     let steps = crate::exec::Steps::new(
         client.clone(),
         bot.clone(),
@@ -865,6 +866,34 @@ async fn script(hub: &crate::mcp::Hub, client: &Arc<Client>, call: &Value) -> An
     crate::exec::answer(hub, &bot, input, left(call), Some(steps))
         .await
         .map_err(|e| ("exec_refused", e))
+}
+
+/// Refuses `tool`, one Sonny gates, to `bot` when it acts outside a
+/// sandbox no one reviews calls from. The sandbox is read from `inspect`,
+/// which a `bots` listing leaves out; `bot_id`, when given, pins the bot.
+async fn unreviewed(
+    client: &Client,
+    bot: &str,
+    bot_id: &Value,
+    tool: &str,
+) -> Result<(), (&'static str, String)> {
+    if !GATED.contains(&tool) {
+        return Ok(());
+    }
+    let inspected = client
+        .request("inspect", json!({"bot": bot, "bot_id": bot_id}))
+        .await
+        .map_err(|e| ("caller_unknown", e.to_string()))?;
+    match crate::approvals::may_run(&inspected, tool) {
+        true => Ok(()),
+        false => Err((
+            "escalation_refused",
+            format!(
+                "{tool} acts outside your sandbox, and no one reviews calls for you; \
+                 do without it"
+            ),
+        )),
+    }
 }
 
 /// The time a call has left before the daemon gives up on it.
@@ -952,24 +981,8 @@ async fn answer(client: &Client, call: &Value, me: &Path, store: &Path, socket: 
         None => record.clone(),
     };
     let name = call["name"].as_str().unwrap_or_default();
-    // A tool that acts outside the sandbox is weighed against the bot's
-    // sandbox, which `inspect` gives and a `bots` listing does not: that
-    // bot, by its id, not one given its name since.
-    if GATED.contains(&name) {
-        let inspected = client
-            .request("inspect", json!({"bot": bot, "bot_id": record["bot_id"]}))
-            .await
-            .map_err(|e| ("caller_unknown", e.to_string()))?;
-        if !crate::approvals::may_run(&inspected, name) {
-            return Err((
-                "escalation_refused",
-                format!(
-                    "{name} acts outside your sandbox, and no one reviews calls for you; \
-                     do without it"
-                ),
-            ));
-        }
-    }
+    // That bot, by its id, not one given its name since.
+    unreviewed(client, bot, &record["bot_id"], name).await?;
     // As the calling turn runs, which keeps its folder and model when the
     // bot's own change for a turn after it.
     let turn = call["turn"].as_i64().unwrap_or(0);
@@ -1156,8 +1169,10 @@ mod tests {
         // The listing leaves the sandbox out; the bot's own record says it.
         let client = crate::tests::daemon_answering(|asked| match asked["op"].as_str() {
             Some("bots") => json!({"bots": [{"name": "calc", "bot_id": 7, "gates": []}]}),
-            Some("inspect") if asked["bot_id"] == 7 => json!({"name": "calc",
-                "bot_id": 7, "gates": [], "settings": {"sandbox": "read-only"}}),
+            Some("inspect") if asked["bot_id"] == 7 || asked["bot_id"].is_null() => {
+                json!({"name": "calc",
+                "bot_id": 7, "gates": [], "settings": {"sandbox": "read-only"}})
+            }
             _ => json!({"error": {"code": "unexpected"}}),
         })
         .await;
@@ -1165,6 +1180,12 @@ mod tests {
             "arguments": {"command": "touch /tmp/x"}});
         let none = Path::new("/nowhere");
         let refused = answer(&client, &call, none, none, none).await;
+        assert_eq!(refused.map_err(|(code, _)| code), Err("escalation_refused"));
+        // A script calls MCP servers, which run as the person too.
+        let script_call = json!({"bot": "calc", "turn": 1, "call_id": "c1", "name": EXEC,
+            "arguments": {"input": "1"}});
+        let hub = crate::mcp::Hub::new(None);
+        let refused = script(&hub, &client, &script_call).await;
         assert_eq!(refused.map_err(|(code, _)| code), Err("escalation_refused"));
     }
 

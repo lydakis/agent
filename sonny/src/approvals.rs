@@ -459,14 +459,37 @@ pub fn always(call: &Value) -> Option<String> {
 /// agent's sandbox lets it out from the next time Sonny sets it.
 pub fn allow_always(prefix: &str) -> Result<(), String> {
     let path = agent_client::config::path().ok_or("no config file to keep it in")?;
-    let mut commands = agent_client::config::read(&path)?.sonny.unsandboxed;
-    if commands.iter().any(|command| command == prefix) {
+    let commands = agent_client::config::read(&path)?.sonny.unsandboxed;
+    let Some(commands) = adding(commands, prefix)? else {
         return Ok(());
-    }
-    commands.push(prefix.to_owned());
+    };
     let value = toml::Value::Array(commands.into_iter().map(toml::Value::String).collect());
     agent_client::config::write(&path, &[("sonny.unsandboxed", Some(value))])
 }
+
+/// `commands` with `prefix` added, None when it is there already, or why
+/// not when the daemon's bound on them would refuse every sandbox Sonny
+/// sets after: at most 64 commands, each of at most 1 KiB.
+fn adding(mut commands: Vec<String>, prefix: &str) -> Result<Option<Vec<String>>, String> {
+    if commands.iter().any(|command| command == prefix) {
+        return Ok(None);
+    }
+    if prefix.len() > MAX_COMMAND {
+        return Err("it is longer than a command let out may be".into());
+    }
+    if commands.len() >= MAX_UNSANDBOXED {
+        return Err(format!(
+            "[sonny] unsandboxed holds the most commands it may, {MAX_UNSANDBOXED}"
+        ));
+    }
+    commands.push(prefix.to_owned());
+    Ok(Some(commands))
+}
+
+/// The most commands a sandbox lets out, and the longest, as the daemon
+/// bounds them.
+const MAX_UNSANDBOXED: usize = 64;
+const MAX_COMMAND: usize = 1024;
 
 /// The git folder of the repository `dir` is in, which its linked
 /// worktrees share, by its real path as the daemon keeps it. Only one
@@ -957,6 +980,17 @@ mod tests {
         assert!(may_run(&bot(json!("read-only"), gated), run));
         assert!(may_run(&bot(json!("danger-full-access"), json!([])), run));
         assert!(may_run(&bot(Value::Null, json!([])), run));
+    }
+
+    #[test]
+    fn a_command_is_kept_only_within_the_daemon_s_bound() {
+        let kept: Vec<String> = (0..63).map(|n| format!("tool{n}")).collect();
+        let more = adding(kept.clone(), "cargo test").unwrap().unwrap();
+        assert_eq!(more.last().map(String::as_str), Some("cargo test"));
+        // One there already changes nothing, even with no room left.
+        assert_eq!(adding(more.clone(), "tool3"), Ok(None));
+        assert!(adding(more, "make").is_err());
+        assert!(adding(kept, &"x".repeat(MAX_COMMAND + 1)).is_err());
     }
 
     #[test]
