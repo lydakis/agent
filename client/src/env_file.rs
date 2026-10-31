@@ -137,7 +137,14 @@ pub fn set(path: &Path, pairs: &[(&str, &str)]) -> Result<(), String> {
     let failed =
         |error: std::io::Error| format!("env_file_unwritable: {}: {error}", path.display());
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(failed)?;
+        use std::os::unix::fs::DirBuilderExt;
+        // `~/.agent` is its owner's alone when a client makes it, as when
+        // the daemon does; one that exists keeps its mode.
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(parent)
+            .map_err(failed)?;
     }
     let staged = path.with_file_name(format!(".env.{}", std::process::id()));
     let written = (|| {
@@ -225,6 +232,11 @@ mod tests {
         assert_eq!(
             std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
             0o600
+        );
+        // The folder it made with the file is its owner's alone too.
+        assert_eq!(
+            std::fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+            0o700
         );
         std::fs::write(&file, "# mine\nexport AGENT_MODEL=a/b\nOTHER=1\n").unwrap();
         set(&file, &[("AGENT_MODEL", "c/d"), ("AWS_PROFILE", " dev ")]).unwrap();

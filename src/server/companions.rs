@@ -322,7 +322,12 @@ impl Run {
     async fn spawn(&self) -> std::result::Result<tokio::process::Child, String> {
         // Off the runtime thread: a slow disk, or a FIFO at the log's
         // path, holds only this companion.
-        tokio::fs::create_dir_all(self.log.parent().expect("in its folder"))
+        // Its folder and log are the daemon's user's alone, as the store
+        // they sit beside: a companion's output carries what bots say.
+        tokio::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(self.log.parent().expect("in its folder"))
             .await
             .map_err(|e| e.to_string())?;
         // Nonblocking, so a FIFO there with no reader fails at once rather
@@ -330,6 +335,7 @@ impl Run {
         let log = tokio::fs::OpenOptions::new()
             .create(true)
             .append(true)
+            .mode(0o600)
             .custom_flags(libc::O_NONBLOCK)
             .open(&self.log)
             .await
@@ -513,6 +519,22 @@ mod tests {
             dead_before_restart,
             "the exited companion left its child running"
         );
+    }
+
+    #[tokio::test]
+    async fn a_companion_s_log_and_its_folder_are_the_daemon_user_s_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("companions-mode-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut companions = Companions::new(&dir.join("state.sqlite"), vec![], true);
+        companions.keep("quiet", spec("sleep", &["30"]));
+        until(|| companions.shown("quiet").unwrap()["running"] == true).await;
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&dir.join("state.sqlite.companions")), 0o700);
+        assert_eq!(mode(&dir.join("state.sqlite.companions/quiet.log")), 0o600);
+        companions.stop().await;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
