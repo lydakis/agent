@@ -1014,7 +1014,10 @@ on a task goes to its own tab, where the lead laid it out in Rex, Herdr or
 cmux; a right click (or a click, with no tab) opens it in the pane: its own
 Sonny, live, to watch and to talk to, as a side chat is. `[sonny]
 agent_opens = "beside"` swaps the two. In the pane, its name in the title
-goes to its tab too, as Ctrl+T does. Ctrl+\ takes the keys back to the conversation and
+goes to its tab too, drawn in the agents' blue, as Ctrl+T does; where the
+title is narrow, its keys go from the last before the name is cut.
+
+![The pane's title at 72, 59 and 40 columns, outside a multiplexer and laid out, with the keys in the pane and in the chat](../docs/sonny/agent-pane-title.png) Ctrl+\ takes the keys back to the conversation and
 gives them to the pane again; from the conversation Ctrl+[ hides the task
 and Ctrl+] shows it again.
 
