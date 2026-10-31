@@ -856,13 +856,8 @@ impl View {
         // file's shows anew.
         (self.verse, self.fading) = (None, None);
         self.shown = (String::new(), 0);
-        if self.replay.is_some() {
-            let (store, socket) = (self.store.clone(), self.socket.clone());
-            let send = self.heard.0.clone();
-            self.runtime.spawn_blocking(move || {
-                let _ = send.send(Heard::Poems(haiku::Kept::load(&store, &socket).past));
-            });
-        }
+        // Read at once, the day's haikus or the file's.
+        self.weighed = None;
         self.restart();
     }
 
@@ -1007,8 +1002,9 @@ impl View {
                     self.recite(by, lines, at, now);
                 }
                 Heard::Poems(poems) => {
+                    self.reading = false;
                     if let Some(replay) = &mut self.replay {
-                        (replay.poems, replay.poem) = (poems, None);
+                        replay.poems = poems;
                     }
                 }
                 Heard::Read(kept, rule) => {
@@ -1030,7 +1026,7 @@ impl View {
         if (self.fading.as_ref()).is_some_and(|(_, at)| now.duration_since(*at) > FADE) {
             self.fading = None;
         }
-        if !self.live || self.replay.is_some() {
+        if !self.live {
             return;
         }
         if self
@@ -1043,7 +1039,16 @@ impl View {
         // The file read again, for what other skies wrote, and the rule as
         // /config says now and then: haikus turned on or off, or the cap
         // moved, since the sky opened.
-        if !self.reading {
+        if !self.reading && self.replay.is_some() {
+            // A replay reads the day's haikus again as it goes: one another
+            // sky writes while it plays shows when the replay reaches it.
+            self.reading = true;
+            let (store, socket) = (self.store.clone(), self.socket.clone());
+            let send = self.heard.0.clone();
+            self.runtime.spawn_blocking(move || {
+                let _ = send.send(Heard::Poems(haiku::Kept::load(&store, &socket).past));
+            });
+        } else if !self.reading {
             self.reading = true;
             let rule = self
                 .ruled
@@ -1058,7 +1063,7 @@ impl View {
                 let _ = send.send(Heard::Read(haiku::Kept::load(&store, &socket), rule));
             });
         }
-        if self.title.rule.daily == 0 {
+        if self.replay.is_some() || self.title.rule.daily == 0 {
             return;
         }
         if let Some((name, since)) = self.heir.take()
@@ -5061,6 +5066,20 @@ mod tests {
         assert_eq!(prior.told.len(), 2);
         assert!(prior.told.values().all(|e| e["data"]["prompt"].is_null()));
         send.send(Feed::Prior(prior)).unwrap();
+        // The day's haikus as the file keeps them.
+        let lines = |first: &str| vec![first.to_owned(), "b".into(), "c".into()];
+        let poem = |by: &str, at: i64, first: &str| haiku::Poem {
+            by: by.into(),
+            lines: lines(first),
+            at_ms: at,
+            since_ms: at - 300_000,
+        };
+        haiku::Kept::update(&view.store, &view.socket, |kept| {
+            kept.past = vec![
+                poem("shop.cart", from - 2 * 3_600_000, "old"),
+                poem("shop.lead", from + 1_800_000, "dawn"),
+            ];
+        });
         send.send(Feed::Ready).unwrap();
         view.drain();
         // The web of who had talked is there from the first frame, as live.
@@ -5073,22 +5092,13 @@ mod tests {
         assert_eq!(view.pairs, HashMap::from([(pair(lead, cart), 1)]));
         assert!(view.ticker.is_empty());
         // The haiku up at the replay's time shows, as it did then; none
-        // before it was written, nor an hour after.
-        let lines = |first: &str| vec![first.to_owned(), "b".into(), "c".into()];
-        let poem = |by: &str, at: i64, first: &str| haiku::Poem {
-            by: by.into(),
-            lines: lines(first),
-            at_ms: at,
-            since_ms: at - 300_000,
-        };
-        view.heard
-            .0
-            .send(Heard::Poems(vec![
-                poem("shop.cart", from - 2 * 3_600_000, "old"),
-                poem("shop.lead", from + 1_800_000, "dawn"),
-            ]))
-            .unwrap();
-        view.drain();
+        // before it was written, nor an hour after. Read off the drawing
+        // thread, and heard back.
+        while view.reading {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            view.drain();
+        }
+        assert_eq!(view.replay.as_ref().unwrap().poems.len(), 2);
         assert!(view.verse.is_none());
         view.seek(from as f64 + 1_860_000.0, Instant::now());
         view.drain();
@@ -5107,6 +5117,20 @@ mod tests {
         view.seek(from as f64 + 1_900_000.0, Instant::now());
         view.drain();
         assert_eq!(view.verse.as_ref().unwrap().lines, lines("dawn"));
+        // One another sky writes while the replay plays is read as it goes,
+        // and shows when the replay reaches it.
+        haiku::Kept::update(&view.store, &view.socket, |kept| {
+            kept.past.push(poem("shop.cart", from + 5_700_000, "late"));
+        });
+        view.weighed = None;
+        view.drain();
+        while view.reading {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            view.drain();
+        }
+        view.seek(from as f64 + 5_800_000.0, Instant::now());
+        view.drain();
+        assert_eq!(view.verse.as_ref().unwrap().lines, lines("late"));
     }
 
     #[test]
