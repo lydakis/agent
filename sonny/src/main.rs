@@ -114,11 +114,16 @@ use std::{
 use transcript::Markdown;
 use unicode_width::UnicodeWidthStr;
 
-/// Rows kept at the bottom: the reply's unfinished line, the status, a gap,
-/// the composer and the footer.
-const VIEWPORT: u16 = 5;
+/// Rows kept at the bottom: the reply's unfinished line, the status, the
+/// composer between a row of its band above and below, and the footer.
+const VIEWPORT: u16 = 6;
 /// The most rows a long prompt's composer grows to; it shows its end.
 const COMPOSER_ROWS: usize = 8;
+/// An agent in a folder: what a profile shown in the footer was read for.
+type Seat = (String, String);
+/// How many lines of a message a reply quotes; the rest is the agent's
+/// own history.
+const QUOTE_LINES: usize = 6;
 /// How many of the bot's latest replies `/react` offers.
 const REACTABLE: usize = 9;
 /// How much of a reply's first line a reaction quotes.
@@ -1194,15 +1199,40 @@ fn remote_without_display(var: &dyn Fn(&str) -> Option<std::ffi::OsString>) -> b
             .any(|key| set(key))
 }
 
-/// The viewport's rows, top to bottom: the reply's open line, the status,
-/// a gap, the composer (as many rows as are left) and the footer.
-/// The live area is `live` rows: the reply's open line, wrapped.
-fn areas(area: ratatui::layout::Rect, live: u16) -> [ratatui::layout::Rect; 5] {
+/// The composer's edge: the band the person's messages sit on, from the
+/// row above it to the row below, the conversation's width, as Codex
+/// draws its composer and the user's messages on one shade: what was
+/// written and what is being written read as one thing, the words in the
+/// middle of it, and the composer's limits show in any theme. Without
+/// colour (`NO_COLOR`) a muted rule above it.
+fn edge(frame: &mut ratatui::Frame, gap: Rect, composer: Rect, pad: Rect) {
+    let width = composer.width.min(PROSE as u16);
+    if look::no_color() {
+        let rule = Line::from("─".repeat(width as usize)).dim();
+        frame.render_widget(Paragraph::new(rule), Rect { width, ..gap });
+        return;
+    }
+    let band = Rect {
+        y: gap.y,
+        height: pad.bottom().saturating_sub(gap.y),
+        width,
+        ..composer
+    };
+    frame
+        .buffer_mut()
+        .set_style(band, Style::default().bg(look::band()));
+}
+
+/// The viewport's rows, top to bottom: the reply's open line (`live`
+/// rows, wrapped), the status, a row of the composer's band, the composer
+/// (as many rows as are left), its band's row under it, and the footer.
+fn areas(area: ratatui::layout::Rect, live: u16) -> [ratatui::layout::Rect; 6] {
     Layout::vertical([
         Constraint::Length(live.max(1)),
         Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Min(1),
+        Constraint::Length(1),
         Constraint::Length(1),
     ])
     .areas(area)
@@ -1673,7 +1703,7 @@ fn hold(unsent: &mut Vec<String>, record: String) {
 /// The slash commands, as the menu lists them: name and what it does.
 /// `/agents` and `/ps` also open `/status`, `/triggers` and `/lookout`
 /// open `/background`, and `/settings` opens `/config`, unlisted.
-const COMMANDS: [(&str, &str); 26] = [
+const COMMANDS: [(&str, &str); 27] = [
     ("/side", "Start a side chat with a copy of this agent"),
     ("/model", "Pick the model and effort"),
     (
@@ -1718,6 +1748,7 @@ const COMMANDS: [(&str, &str); 26] = [
         "Show every tool call, or only what moves the work on",
     ),
     ("/react", "React to one of the agent's replies"),
+    ("/reply", "Answer one of the agent's replies, quoted"),
     ("/copy", "Copy the last reply as Markdown"),
     ("/open", "Open the last HTML page in your browser"),
     ("/quit", "Quit; the agents keep working"),
@@ -1896,6 +1927,8 @@ struct App {
     replies: Vec<(i64, String)>,
     /// `/react`'s list is open, at this reply from the newest.
     reacting: Option<usize>,
+    /// The list is `/reply`'s: the pick is quoted, not reacted to.
+    quoting: bool,
     /// What Ctrl+F looks for on the full screen, while it does.
     finding: Option<String>,
     /// The reply `/react` picked, which the next emoji sent answers.
@@ -1905,6 +1938,9 @@ struct App {
     /// Messages attached to the bot's next call, by their turns, until a
     /// call takes them in: the footer's clip.
     attached: Vec<i64>,
+    /// The profile the agent runs as when not its seat's own, for the
+    /// agent and folder it was read for.
+    profile: std::cell::RefCell<Option<(Seat, Option<String>)>>,
     /// The tools to declare on the bot so it can react, sent once no turn
     /// runs.
     declare: Option<Value>,
@@ -2798,11 +2834,13 @@ impl App {
             pictures: Vec::new(),
             reactions: reactions::Reactions::default(),
             replies: Vec::new(),
+            quoting: false,
             reacting: None,
             finding: None,
             react_to: None,
             reaction_turn: None,
             attached: Vec::new(),
+            profile: Default::default(),
             declare: None,
             bot_reactions: Vec::new(),
             react_calls: HashMap::new(),
@@ -4720,7 +4758,9 @@ impl App {
     /// The bot's words at `node`, as replayed: their last row tagged,
     /// and the person's reactions to them right under it.
     fn commit_said(&mut self, node: i64, lines: Vec<Line<'static>>) {
+        let count = lines.len();
         self.commit(lines);
+        self.mark_first(count);
         self.mark_last(screen::Mark::Tag(screen::Tag::End(node)));
         if let Some(row) = self.reacted_row(node) {
             self.commit_after(vec![row], false);
@@ -4781,6 +4821,14 @@ impl App {
     }
 
     /// `mark` on the last row written so far, waiting or drawn.
+    /// The first of the last `count` lines waiting marked as a message's
+    /// first row.
+    fn mark_first(&mut self, count: usize) {
+        if count > 0 && self.pending.len() >= count {
+            (self.marks).push((self.pending.len() - count, screen::Mark::Opens));
+        }
+    }
+
     fn mark_last(&mut self, mark: screen::Mark) {
         match self.pending.len() {
             0 => {
@@ -5630,6 +5678,9 @@ impl App {
         if live.gap && !live.spilled {
             self.pending.push(Line::default());
         }
+        if !live.spilled {
+            self.marks.push((self.pending.len(), screen::Mark::Opens));
+        }
         self.rows_drawn += live.rows.len();
         self.pending.extend(match words {
             Words::Step => transcript::quiet(live.rows),
@@ -5662,6 +5713,9 @@ impl App {
         if live.spilled || live.rows.len() > (self.height / 2).max(4) {
             if live.gap && !live.spilled {
                 self.pending.push(Line::default());
+            }
+            if !live.spilled {
+                self.marks.push((self.pending.len(), screen::Mark::Opens));
             }
             live.spilled = true;
             self.rows_drawn += live.rows.len();
@@ -7321,6 +7375,14 @@ impl App {
                 match key.code {
                     // Back to the margin from what is over it; the margin closed.
                     KeyCode::Esc => self.close_pane(true),
+                    // `/sky` shows what its marks mean, or the ticker again.
+                    KeyCode::Char('?')
+                        if pane.is_card()
+                            && let Some(view) =
+                                self.watch.as_mut().and_then(|w| w.sky.as_mut()) =>
+                    {
+                        view.legend = !view.legend
+                    }
                     // `/status` lists the resolved tasks, or only counts them.
                     KeyCode::Char('r')
                         if pane.is_card()
@@ -7687,6 +7749,28 @@ impl App {
     async fn press(&mut self, what: &str) {
         let (verb, id) = what.split_once('/').unwrap_or((what, ""));
         match verb {
+            // A margin note answered, quoted the same way.
+            "reply-note" => match self.margin.quoted(id) {
+                Some(said) => self.quote(&said),
+                None => self.notice = Some("that note is no longer in the margin".into()),
+            },
+            // A message answered: quoted where the person writes.
+            "reply" => {
+                let Ok(node) = id.parse::<i64>() else {
+                    return;
+                };
+                let read = self
+                    .client
+                    .request("history_items", json!({"bot": self.bot, "nodes": [node]}))
+                    .await;
+                match read {
+                    Ok(read) => {
+                        let said = text(&read["items"][0]["item"]);
+                        self.quote(&said);
+                    }
+                    Err(error) => self.notice = Some(error.to_string()),
+                }
+            }
             "close" => {
                 if self.margin.note(id).is_none() {
                     return;
@@ -8015,8 +8099,16 @@ impl App {
                     KeyCode::Down => *pick = (*pick + count - 1) % count,
                     KeyCode::Enter => {
                         let at = self.replies.len().saturating_sub(1 + *pick);
-                        self.react_to = self.replies.get(at).cloned();
+                        let picked = self.replies.get(at).cloned();
                         self.reacting = None;
+                        match std::mem::take(&mut self.quoting) {
+                            true => {
+                                if let Some((node, _)) = picked {
+                                    self.pressed.push(format!("reply/{node}"));
+                                }
+                            }
+                            false => self.react_to = picked,
+                        }
                     }
                     KeyCode::Esc => self.reacting = None,
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -8554,10 +8646,14 @@ impl App {
             );
             return;
         }
-        if prompt == "/react" {
+        if prompt == "/react" || prompt == "/reply" {
             self.input.clear();
+            self.quoting = prompt == "/reply";
             if self.replies.is_empty() {
-                self.notice = Some("no reply to react to yet".into());
+                self.notice = Some(match self.quoting {
+                    true => "no reply to answer yet".into(),
+                    false => "no reply to react to yet".into(),
+                });
             } else {
                 self.reacting = Some(0);
             }
@@ -9447,8 +9543,8 @@ impl App {
                         Line::from(spans).style(line.style)
                     })
                     .collect();
-                pane.set_card(lines, STATUS_KEYS);
-                pane.foot = Some(Line::from(format!("  {}", view.footer())).dim());
+                pane.set_card(lines, SKY_KEYS);
+                pane.foot = Some(view.footer(width));
             } else if let Some(view) = &watch.background {
                 // Its card, with what was done or the keys the pick takes
                 // kept in view under it.
@@ -9592,7 +9688,7 @@ impl App {
             };
             self.screen.render(history, frame.buffer_mut(), file);
             linked.extend(self.screen.link_cells(frame.buffer_mut()));
-            let [live, status, _, composer, footer] = areas(view, live_rows);
+            let [live, status, gap, composer, pad, footer] = areas(view, live_rows);
             frame.render_widget(Paragraph::new(open_rows.clone()), live);
             frame.render_widget(Paragraph::new(self.status_line()), status);
             let menu = self.menu();
@@ -9601,12 +9697,8 @@ impl App {
                 let items: Vec<list::Item> = (menu.iter())
                     .map(|(name, about)| list::Item::new(*name, *about))
                     .collect();
-                let [_, _, _, composer_row, _] = areas(view, live_rows);
-                over(
-                    frame,
-                    list::lines(&items, pick, width, composer_row.y as usize),
-                    composer_row,
-                );
+                // Over the rows above the composer's band.
+                over(frame, list::lines(&items, pick, width, gap.y as usize), gap);
             }
             if let Some(query) = &self.finding {
                 let line = Line::from(vec![Span::raw("find ").dim(), Span::raw(query.clone())]);
@@ -9640,12 +9732,19 @@ impl App {
                     list::lines(&items, pick, width, composer.y as usize),
                     composer,
                 );
-                let line = Line::from(vec![
-                    Span::raw("› ").bold(),
-                    Span::raw("which reply to react to").dim(),
-                ]);
+                let (asked, keys) = match self.quoting {
+                    true => (
+                        "which reply to answer",
+                        "  ↑↓ pick · enter quote · esc close",
+                    ),
+                    false => (
+                        "which reply to react to",
+                        "  ↑↓ pick · enter react · esc close",
+                    ),
+                };
+                let line = Line::from(vec![Span::raw("› ").bold(), Span::raw(asked).dim()]);
                 frame.render_widget(Paragraph::new(line), composer);
-                let keys = Line::from(hint::spans("  ↑↓ pick · enter react · esc close"));
+                let keys = Line::from(hint::spans(keys));
                 frame.render_widget(Paragraph::new(keys), footer);
                 return;
             }
@@ -9785,6 +9884,7 @@ impl App {
                 frame.render_widget(Paragraph::new(keys), footer);
                 return;
             }
+            edge(frame, gap, composer, pad);
             frame.render_widget(Paragraph::new(composer_rows), composer);
             composer_at = first_row.map(|first| (composer, first, width.min(PROSE)));
             // Keys in the pane: no cursor where they do not go.
@@ -9794,7 +9894,9 @@ impl App {
                     composer.y + (cursor_row as u16).min(composer.height.saturating_sub(1)),
                 ));
             }
-            let (line, counter) = self.footer(width);
+            // Under the composer's band and no wider: one column, its
+            // right edge where the band's is.
+            let (line, counter) = self.footer(width.min(PROSE));
             frame.render_widget(Paragraph::new(line), footer);
             counter_at = counter.map(|at| (footer.y, footer.x + at.start..footer.x + at.end));
         };
@@ -10000,6 +10102,47 @@ impl App {
         }
     }
 
+    /// A message quoted before what the person is writing, as a mail or a
+    /// GitHub reply quotes: `> ` before each of its lines, the first
+    /// [`QUOTE_LINES`] of them, a blank line, then the cursor.
+    fn quote(&mut self, said: &str) {
+        let lines: Vec<&str> = said.trim().lines().collect();
+        let mut quoted: Vec<String> = (lines.iter().take(QUOTE_LINES))
+            .map(|line| format!("> {line}").trim_end().to_owned())
+            .collect();
+        if lines.len() > QUOTE_LINES {
+            quoted.push("> …".into());
+        }
+        let typed = self.input.trim().to_owned();
+        self.input.set(&format!("{}\n\n{typed}", quoted.join("\n")));
+        self.pane_keys = false;
+    }
+
+    /// The profile the agent runs as, when it isn't its seat's own: a
+    /// lead's other than `lead`, a task's other than `task`, as its
+    /// project or the config sets them. Read again only for another agent
+    /// or folder.
+    fn profile(&self) -> Option<String> {
+        let key = (self.bot.clone(), self.workspace.clone());
+        if let Some((read, profile)) = &*self.profile.borrow()
+            && *read == key
+        {
+            return profile.clone();
+        }
+        let here = std::path::Path::new(&self.workspace);
+        let info = |dir: &std::path::Path| agent_client::project::read(dir).ok();
+        let profile = match (&self.project, task::source_folder(here)) {
+            (Some(_), _) => (info(here).and_then(|info| project::lead_profile(&info).ok()))
+                .filter(|profile| profile != "lead"),
+            (None, Some(source)) => (info(&source))
+                .and_then(|info| project::task_profile(&info).ok())
+                .filter(|profile| profile != "task"),
+            (None, None) => None,
+        };
+        *self.profile.borrow_mut() = Some((key, profile.clone()));
+        profile
+    }
+
     #[cfg(test)]
     fn footer_line(&self, width: usize) -> Line<'static> {
         self.footer(width).0
@@ -10041,6 +10184,10 @@ impl App {
         }
         if let Some(speed) = &self.speed {
             left.push_str(&format!(" {speed}"));
+        }
+        // A lead or task told more than its seat's own role says so.
+        if let Some(profile) = self.profile() {
+            left.push_str(&format!(" · {profile}"));
         }
         // What waits for the turn to end, so a pick is not taken as lost.
         if let Some((model, effort)) = &self.switch {
@@ -10186,6 +10333,7 @@ fn over(frame: &mut ratatui::Frame, rows: Vec<Line<'static>>, below: ratatui::la
 
 /// What the pane's title row says the keys do on `/status`.
 const STATUS_KEYS: &str = "esc close";
+const SKY_KEYS: &str = "? legend · esc close";
 
 /// What the title row says the keys do on `/status` itself.
 const PICK_KEYS: &str = "↑↓ pick · enter open · esc close";
@@ -12194,6 +12342,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_reply_quotes_the_message_before_what_is_being_written() {
+        let client = daemon_with(json!([])).await;
+        let mut app = app(client);
+        app.input.set("Yes, merge it");
+        let said: String = (1..=8).map(|n| format!("line {n}\n")).collect();
+        app.quote(&said);
+        let quoted = "> line 1\n> line 2\n> line 3\n> line 4\n> line 5\n> line 6\n> …";
+        assert_eq!(&*app.input, format!("{quoted}\n\nYes, merge it"));
+        app.input.clear();
+        app.quote("Merged it.\n\nThe tests pass.");
+        assert_eq!(&*app.input, "> Merged it.\n>\n> The tests pass.\n\n");
+    }
+
+    #[tokio::test]
+    async fn the_footer_names_a_profile_only_when_it_is_not_the_seats_own() {
+        let client = daemon_with(json!([])).await;
+        let mut app = app(client);
+        let dir = std::env::temp_dir().join(format!("sonny-footer-profile-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join(".agents")).unwrap();
+        std::fs::write(dir.join(".agents/project.toml"), "name = \"top\"\n").unwrap();
+        app.workspace = dir.to_string_lossy().into_owned();
+        app.project = Some("top".into());
+        assert!(!app.footer_line(140).to_string().contains("lead ·"));
+        // Read again once the agent or its folder changes.
+        std::fs::write(
+            dir.join(".agents/project.toml"),
+            "name = \"top\"\nprofile = \"superlead\"\n",
+        )
+        .unwrap();
+        app.bot = "top.lead".into();
+        let text = app.footer_line(140).to_string();
+        assert!(
+            text.starts_with(&format!("  {} · superlead · ", app.model)),
+            "{text}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
     async fn a_failure_is_counted_until_the_person_looks_at_it() {
         let client = daemon_with(json!([])).await;
         let mut app = app(client);
@@ -12360,19 +12547,19 @@ mod tests {
             app.daemon(turn_event("tool_completed", 1, json!({"call_id": id})))
                 .await;
         }
-        assert_eq!(drawn(&mut app), ["› merged, thanks", "   👀 👍 "]);
+        assert_eq!(drawn(&mut app), ["", "› merged, thanks", "", "   👀 👍 "]);
         app.daemon(react(1, "c3", json!({"emoji": "👀", "remove": true})))
             .await;
         app.daemon(turn_event("tool_completed", 1, json!({"call_id": "c3"})))
             .await;
-        assert_eq!(drawn(&mut app), ["› merged, thanks", "   👍 "]);
+        assert_eq!(drawn(&mut app), ["", "› merged, thanks", "", "   👍 "]);
         app.daemon(turn_event(
             "turn_finished",
             1,
             json!({"status": "completed"}),
         ))
         .await;
-        assert_eq!(drawn(&mut app), ["› merged, thanks", "   👍 "]);
+        assert_eq!(drawn(&mut app), ["", "› merged, thanks", "", "   👍 "]);
         // One that answers too: under its own message, not the reply.
         app.daemon(turn_event("accepted", 2, json!({"node": 5})))
             .await;
@@ -12397,9 +12584,13 @@ mod tests {
         ))
         .await;
         let rows = drawn(&mut app);
-        assert_eq!(rows[2..5], ["", "› and the notes?", "   🎉 "]);
-        assert!(rows[6].starts_with("─ Worked"), "{rows:?}");
-        assert_eq!(rows[7..], ["", "• Updated."]);
+        assert_eq!(
+            rows[4..9],
+            ["", "", "› and the notes?", "", "   🎉 "],
+            "{rows:?}"
+        );
+        assert!(rows[10].starts_with("─ Worked"), "{rows:?}");
+        assert_eq!(rows[11..], ["", "• Updated."]);
         // Once that message is no longer in the conversation, a reaction
         // to it draws no row of its own.
         app.seen_node = 0;
@@ -12454,7 +12645,7 @@ mod tests {
         ))
         .await;
         let rows = drawn(&mut app);
-        assert_eq!(rows[..2], ["› ship it", "   👀 👍 "], "{rows:?}");
+        assert_eq!(rows[..4], ["", "› ship it", "", "   👀 👍 "], "{rows:?}");
         assert!(!rows.iter().any(|row| row.contains("reacted")), "{rows:?}");
     }
 
@@ -12466,19 +12657,22 @@ mod tests {
         app.commit(vec![Line::from("• Shipped.")]);
         app.picked.set(5, "calc.lead", "👀", false);
         app.place_picked(5);
-        assert_eq!(drawn(&mut app)[..2], ["› ship it", "   👀 calc.lead "]);
+        assert_eq!(
+            drawn(&mut app)[..4],
+            ["", "› ship it", "", "   👀 calc.lead "]
+        );
         // The bot's own go first, the lead's under them.
         app.bot_reactions = vec!["👍".into()];
         app.draw_bot_reactions();
         assert_eq!(
-            drawn(&mut app)[..3],
-            ["› ship it", "   👍 ", "   👀 calc.lead "]
+            drawn(&mut app)[..5],
+            ["", "› ship it", "", "   👍 ", "   👀 calc.lead "]
         );
         // Taken off, its row goes; no row ever says so.
         app.picked.set(5, "calc.lead", "👀", true);
         app.place_picked(5);
         let rows = drawn(&mut app);
-        assert_eq!(rows[..2], ["› ship it", "   👍 "], "{rows:?}");
+        assert_eq!(rows[..4], ["", "› ship it", "", "   👍 "], "{rows:?}");
         assert!(
             !rows.iter().any(|row| row.contains("calc.lead")),
             "{rows:?}"
@@ -12524,10 +12718,14 @@ mod tests {
         assert_eq!(
             drawn(&mut app),
             [
+                "",
                 "› merged, thanks",
+                "",
                 "   👍 ",
                 "",
+                "",
                 "› and the notes?",
+                "",
                 "   🎉 ",
                 "",
                 "• Updated.",
@@ -12821,7 +13019,7 @@ mod tests {
         app.reactions.toggle(1, "🎉").unwrap();
         app.history().await;
         let rows: Vec<String> = app.pending.iter().map(|l| l.to_string()).collect();
-        assert_eq!(rows, ["• Merged it.", "   🎉 ", "", "› what next?"]);
+        assert_eq!(rows, ["• Merged it.", "   🎉 ", "", "", "› what next?", ""]);
         assert_eq!(app.replies, [(1, "Merged it.".to_owned())]);
     }
 
@@ -12981,7 +13179,7 @@ mod tests {
         );
         // The person's own words are drawn as ever.
         app.land(7, "thanks", None, false);
-        assert_eq!(drawn(&mut app).last().unwrap(), "› thanks");
+        assert_eq!(drawn(&mut app).iter().rev().nth(1).unwrap(), "› thanks");
         // A message a page drawn again put in a newer cluster opens there,
         // not in the cluster its rows were let go from.
         app.next_group = 9;

@@ -94,6 +94,9 @@ pub enum Mark {
     /// Links on parts of the row's first line, by the columns they take:
     /// several buttons on one row.
     Buttons(Buttons),
+    /// The first row of a message, whatever its lead: a reply that opens
+    /// with a heading has no bullet to say so.
+    Opens,
 }
 
 /// A row on the screen: one of the conversation's rows, or the part of
@@ -123,6 +126,8 @@ struct Row {
     link: Option<String>,
     tag: Option<Tag>,
     buttons: Buttons,
+    /// It is a message's first row.
+    opens: bool,
 }
 
 impl Row {
@@ -133,6 +138,7 @@ impl Row {
             link: None,
             tag: None,
             buttons: Vec::new(),
+            opens: false,
         }
     }
 
@@ -141,6 +147,7 @@ impl Row {
             Mark::Tag(tag) => self.tag = Some(tag),
             Mark::Link(url) => self.link = Some(url),
             Mark::Buttons(buttons) => self.buttons = buttons,
+            Mark::Opens => self.opens = true,
         }
     }
 }
@@ -216,7 +223,15 @@ pub struct Screen {
     pages: Vec<Page>,
     /// Where each page is drawn in `shown`, as of `laid`.
     placed: Option<(usize, Vec<std::ops::Range<usize>>)>,
+    /// Where the mouse rests over the rows, unpressed.
+    hover: Option<(u16, u16)>,
+    /// The reply mark drawn last, over the gutter of the message under
+    /// the mouse: its row and first column, and the message's node.
+    reply: Option<(u16, u16, i64)>,
 }
+
+/// The mark a message's gutter shows under the mouse: a click answers it.
+pub const REPLY: &str = "↩";
 
 /// The place found is to be picked again, the rows having been drawn anew.
 const AGAIN: usize = usize::MAX;
@@ -619,6 +634,7 @@ impl Screen {
             link: None,
             tag: None,
             buttons: Vec::new(),
+            opens: false,
         });
         self.swap(0, rows.collect());
         self.pages.splice(0..1, pages);
@@ -785,6 +801,7 @@ impl Screen {
                     link: None,
                     tag: None,
                     buttons: Vec::new(),
+                    opens: false,
                 }),
             );
             self.shown.splice(
@@ -1365,6 +1382,18 @@ impl Screen {
                 }
             }
         }
+        // The message under the mouse shows its reply mark in place of its
+        // bullet, muted as the gutter's marks are.
+        self.reply = None;
+        if let Some((at, node)) = self.hovered()
+            && (top..bottom).contains(&at)
+        {
+            let y = area.y + (at - top) as u16;
+            buf[(area.x, y)]
+                .set_symbol(REPLY)
+                .set_style(Style::new().add_modifier(Modifier::DIM));
+            self.reply = Some((y, area.x, node));
+        }
         if let Some(selection) = &self.selection {
             let (start, end) = self.extent(selection);
             for row in start.0.max(top)..=end.0.min(bottom.saturating_sub(1)) {
@@ -1385,6 +1414,59 @@ impl Screen {
                 }
             }
         }
+    }
+
+    /// The message under the mouse, by its rows in `shown`: where it opens
+    /// and its node. A message opens on a row that starts with the
+    /// agent's `• ` or the person's `› ` and ends on the row tagged
+    /// [`Tag::End`]; a row between another opening and that end (a call,
+    /// a note) belongs to no message.
+    fn hovered(&self) -> Option<(usize, i64)> {
+        let (column, row) = self.hover?;
+        if !self.area.contains((column, row).into()) || self.selection.is_some() {
+            return None;
+        }
+        let (at, _) = self.spot(column, row)?;
+        // Each row's first shown line, so rows and shown lines map.
+        let firsts: Vec<usize> = (self.shown.iter().enumerate())
+            .filter(|(_, shown)| shown.first)
+            .map(|(at, _)| at)
+            .collect();
+        let row = firsts
+            .partition_point(|&first| first <= at)
+            .checked_sub(1)?;
+        let opens = |row: &Row| {
+            if row.opens {
+                return true;
+            }
+            let lead: String = (row.line.spans.iter())
+                .flat_map(|span| span.content.chars())
+                .take(2)
+                .collect();
+            lead == "• " || lead == "› "
+        };
+        let mut end = None;
+        for (k, candidate) in self.rows.iter().enumerate().skip(row) {
+            if k > row && opens(candidate) {
+                return None;
+            }
+            if let Some(Tag::End(node)) = candidate.tag {
+                end = Some((k, node));
+                break;
+            }
+        }
+        let (end, node) = end?;
+        let start = (0..=end).rev().find(|&k| opens(&self.rows[k]))?;
+        match start <= row {
+            true => Some((*firsts.get(start)?, node)),
+            false => None,
+        }
+    }
+
+    /// The node of the message whose reply mark is at a cell, if one is.
+    fn reply_at(&self, column: u16, row: u16) -> Option<i64> {
+        let (y, x, node) = self.reply?;
+        (row == y && (x..x + 2).contains(&column)).then_some(node)
     }
 
     /// The cells of the links drawn last, from `buf` they were drawn in,
@@ -1540,8 +1622,16 @@ impl Screen {
         match event.kind {
             MouseEventKind::ScrollUp => self.scroll(WHEEL as isize),
             MouseEventKind::ScrollDown => self.scroll(-(WHEEL as isize)),
+            MouseEventKind::Moved => self.hover = Some((event.column, event.row)),
             MouseEventKind::Down(MouseButton::Left) if !inside => {
                 self.selection = None;
+            }
+            // The reply mark: the message, quoted in the composer.
+            MouseEventKind::Down(MouseButton::Left)
+                if let Some(node) = self.reply_at(event.column, event.row) =>
+            {
+                self.selection = None;
+                return Some(Action::Open(format!("{BUTTON}reply/{node}")));
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 let spot = self.spot(event.column, event.row)?;
@@ -1936,6 +2026,71 @@ mod tests {
 
     fn row(buf: &Buffer, y: u16) -> String {
         (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect()
+    }
+
+    #[test]
+    fn the_message_under_the_mouse_shows_a_reply_mark_that_quotes_it() {
+        let mut screen = Screen::default();
+        screen.push(vec![
+            Line::from("• Ran cargo test"),
+            Line::default(),
+            Line::from("• The tests pass."),
+            Line::default(),
+            Line::from("  Merged it."),
+        ]);
+        screen.mark_last(Mark::Tag(Tag::End(5)));
+        screen.push(vec![Line::default(), Line::from("› thanks")]);
+        screen.mark_last(Mark::Tag(Tag::End(6)));
+        let area = Rect::new(0, 0, 30, 8);
+        let draw = |screen: &mut Screen| {
+            let mut buf = Buffer::empty(area);
+            screen.render(area, &mut buf, |_| None);
+            buf
+        };
+        let buf = draw(&mut screen);
+        assert!(!row(&buf, 2).starts_with(REPLY));
+        // Anywhere over the message, its bullet becomes the mark.
+        screen.mouse(mouse(MouseEventKind::Moved, 6, 4));
+        let buf = draw(&mut screen);
+        assert!(
+            row(&buf, 2).starts_with("↩ The tests pass."),
+            "{:?}",
+            row(&buf, 2)
+        );
+        assert!(row(&buf, 0).starts_with("• Ran"));
+        // A click on it answers that message.
+        assert_eq!(
+            screen.mouse(mouse(MouseEventKind::Down(MouseButton::Left), 0, 2)),
+            Some(Action::Open(format!("{BUTTON}reply/5")))
+        );
+        // A call is no message: nothing to answer.
+        screen.mouse(mouse(MouseEventKind::Moved, 3, 0));
+        let buf = draw(&mut screen);
+        assert!((0..8).all(|y| !row(&buf, y).starts_with(REPLY)));
+        // The person's own message too.
+        screen.mouse(mouse(MouseEventKind::Moved, 3, 6));
+        let buf = draw(&mut screen);
+        assert!(row(&buf, 6).starts_with("↩ thanks"), "{:?}", row(&buf, 6));
+    }
+
+    #[test]
+    fn a_reply_that_opens_with_a_heading_shows_its_mark_on_its_own_first_row() {
+        let mut screen = Screen::default();
+        screen.push(vec![Line::from("• Ran cargo test"), Line::default()]);
+        screen.push_marked(
+            vec![
+                Line::from("  ## Fixed"),
+                Line::default(),
+                Line::from("  It rounds."),
+            ],
+            vec![(0, Mark::Opens), (2, Mark::Tag(Tag::End(5)))],
+        );
+        let area = Rect::new(0, 0, 30, 5);
+        screen.mouse(mouse(MouseEventKind::Moved, 4, 4));
+        let mut buf = Buffer::empty(area);
+        screen.render(area, &mut buf, |_| None);
+        assert!(row(&buf, 2).starts_with("↩ ## Fixed"), "{:?}", row(&buf, 2));
+        assert!(row(&buf, 0).starts_with("• Ran"));
     }
 
     #[test]

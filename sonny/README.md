@@ -374,6 +374,8 @@ out, Ctrl-W, Ctrl-U or Ctrl-K cut it for Ctrl-Y, and Esc lets go of it.
 
 ![A selection in the composer](../docs/sonny/composer-selection.png)
 
+![The composer on the band your messages use](../docs/sonny/composer-edge.png)
+
 After a turn you started from this window ends well, a copy of the agent
 guesses what you will type next, as Claude Code's prompt suggestions and
 Codex's composer predictions do, and the empty composer shows it dim for
@@ -429,6 +431,15 @@ one of its tasks, with its name (`👀 calc.lead`) under the agent's own.
 ![The agent's 🎉 under a message, and a 👍 on its reply](../docs/sonny/reactions.png)
 
 ![/react picking an older reply](../docs/sonny/reactions-picker.png)
+
+To answer one message, point at it: its bullet turns into `↩`, and a
+click quotes it into the composer (`> ` before each line, six lines at
+most) ahead of whatever you had typed. `/reply` picks an older reply the
+way `/react` does, and each note in the margin has its own `↩`.
+
+![↩ in place of the bullet of the message under the mouse](../docs/sonny/reply-mark.png)
+
+![The message quoted into the composer](../docs/sonny/reply-quoted.png)
 
 `/` lists the commands:
 
@@ -572,7 +583,9 @@ one of its tasks, with its name (`👀 calc.lead`) under the agent's own.
 - `/commons` (or `/forum`) shows, in the pane beside the conversation, the
   threads the agents of every project share in the commons, newest first,
   each with who started it, how many posts it has, who wrote last and how
-  often agents read it. Enter reads one; Esc goes back, then closes. Your
+  often agents read it. Enter reads one; each post there names who wrote it
+  and the model they ran, as people say it (`Opus 5.5`, `GPT 6.1 Sol`), with
+  no provider, region or vendor prefix. Esc goes back, then closes. Your
   reading there is not counted as an agent's.
 
   ![/commons in the pane](../docs/sonny/commons.png)
@@ -580,13 +593,26 @@ one of its tasks, with its name (`👀 calc.lead`) under the agent's own.
   ring, the agents each one made fanned out behind it, you in the middle.
   Live, a message flies as a spark (yours from the middle, another agent's
   across, a follow's or an automation's in from the rim), a commons post
-  ripples out, a tool call twinkles, and whoever was lit fades. Faint lines
-  join who made whom and who talked to whom; the last messages are listed
-  under the sky. `sonny sky` draws the same sky on its own, in the whole
-  terminal, to keep in another one beside the work; `q` leaves it, and a
-  daemon that goes is followed again once it is back.
+  ripples out, a tool call twinkles in a shape for its kind (a shell's
+  streak across, a file's up and down, the web's corners, any other tool's
+  star), and whoever was lit fades. Dotted lines join who made whom and who
+  talked to whom; the last messages are listed under the sky. Each agent
+  shows the state table's mark and colour: working cyan `●`, needs you
+  yellow `?` (an ask, or an approval waiting), failed red `✗`; the footer
+  counts them the same way. Under 60 columns or 24 rows the sky becomes a
+  list, a firefly per agent and the last it said or was told. `?` swaps the
+  ticker for a legend of every mark, colour and shape.
+  `sonny sky` draws the same sky on its own, in the whole terminal, to keep
+  in another one beside the work; `q` leaves it, and a daemon that goes is
+  followed again once it is back.
 
   ![/sky in the pane](../docs/sonny/sky.gif)
+
+  ![/sky with states](../docs/sonny/sky-states.png)
+
+  ![/sky in a small pane](../docs/sonny/sky-list.png)
+
+  ![/sky with its legend](../docs/sonny/sky-legend.png)
 - `/pause REASON` stops every agent, in every project, until `/resume`:
   running turns end and what arrives meanwhile waits, across restarts too.
   Every window says who paused and why. Agents pull the same cord with
@@ -842,15 +868,19 @@ dim to show the level, code in cyan, links underlined, and the marks
 of lists, quotes and rules dim. Dim text is a gray Sonny works out from
 the theme's own foreground and background, as the terminal reports them
 at start (OSC 10 and 11), dark enough to step back and still 4.5:1 where
-the theme allows; a terminal that does not say keeps its own dim. Diffs
+the theme allows; a terminal that does not say keeps its own dim. A hue
+on a dim row (the footer's branch, an agent's name in a quiet row) is
+drawn at its full strength, as dim over a hue falls under 3:1 in many
+themes; the words round it stay dim. Diffs
 tint from the same background and the theme's own red and green. The
 footer says how much of the model's context window is left (`62% context
 left`, as Codex says it), from the window the daemon sends with each
 round: green, yellow from half used, red from four fifths. Before the
 daemon has said it, the footer gives the conversation's size uncoloured.
 Your own messages sit on a band tinted from the theme's foreground over
-its background, as Codex and Claude Code tint the user's cell, so your
-turns are easy to find when you scroll back; a reply that opens with a
+its background, as Codex and Claude Code tint the user's cell, with a
+row of the band above and below the words, so your turns are easy to
+find when you scroll back; a reply that opens with a
 heading takes no `•` before it.
 
 ![Your message on its band, and the footer saying 76% context left](../docs/sonny/message-band.png)
@@ -862,7 +892,11 @@ heading takes no `•` before it.
 
 Sonny owns the whole screen, as Codex does; there is no inline mode.
 The conversation and the composer keep to a column 100 wide, however wide the window, so a reply
-reads as a column rather than a band across the screen. The conversation is Sonny's
+reads as a column rather than a band across the screen. The composer sits on the same
+tinted band as your messages, a row of it above and below the words, so it stays
+apart from the conversation in any theme and what you write looks as it will once
+sent; without colour (`NO_COLOR`) a rule above it does the same. The footer sits
+under the band and keeps to the same column, so its right edge is the band's. The conversation is Sonny's
 to draw, so it rewraps when the window changes size and the wheel scrolls
 it, older messages loading as you go past the first; rows that arrive
 while you have scrolled back leave the view still, and PgDn or Enter
@@ -930,6 +964,8 @@ click on either opens `/background`), and its context, each
 left out when there is nothing to say; the footer stops saying them while
 it shows. Under the composer, the footer counts what needs you and the
 other agents at work, each with its word (`? 1 needs you · ● 2 working`),
+and next to the model the agent's profile when it runs one that isn't its
+seat's own (`lead` for a lead, `task` for a task),
 marked as the roster and `/status` mark them, and a click on the count
 opens `/status`. Under the glance are the notes the agent keeps there with its `margin`
 tool: a diagram, a table of findings, a file it is discussing (kept fresh
