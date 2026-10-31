@@ -505,13 +505,18 @@ fn ignored(
             break;
         }
         // A folder is asked with its slash, so a pattern only for folders
-        // (`monitor/`) matches it; what the copy has there that is not a
-        // folder would stop git, so it goes first. Paths end in NUL, as
-        // git then reads and writes them unquoted.
+        // (`monitor/`) matches it. Git judges a path by what the copy has
+        // there too, so what changed kind goes first, as the copy would
+        // replace it: what is not a folder where the home has one, and a
+        // folder where the home has none (else `cache/` would leave out the
+        // home's file `cache`). Paths end in NUL, as git then reads and
+        // writes them unquoted.
         for (path, folder) in &asked {
             let there = copy.join(path);
-            if *folder && !std::fs::symlink_metadata(&there).map_or(true, |m| m.is_dir()) {
-                std::fs::remove_file(&there).map_err(fail)?;
+            match std::fs::symlink_metadata(&there) {
+                Ok(m) if *folder && !m.is_dir() => std::fs::remove_file(&there).map_err(fail)?,
+                Ok(m) if !*folder && m.is_dir() => std::fs::remove_dir_all(&there).map_err(fail)?,
+                _ => {}
             }
         }
         let input: String = asked
@@ -1183,6 +1188,28 @@ mod tests {
         sync(&at, None).unwrap();
         assert_eq!(std::fs::read_to_string(&outside).unwrap(), "untouched");
         assert!(!at.repo.join("agents/memory/fact.md").exists());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_folder_that_became_a_file_is_kept_past_a_rule_for_folders() {
+        let root = scratch("folder-file");
+        sh(&root, &["init", "--quiet", "--bare", "remote.git"]);
+        let at = places(&root.join("one"));
+        write(&at.agents.join("cache/old.md"), "old");
+        adopt(&at, &root.join("remote.git").to_string_lossy(), None).unwrap();
+        sh(&at.repo, &["config", "user.email", "t@example.com"]);
+        sh(&at.repo, &["config", "user.name", "T"]);
+        sync(&at, None).unwrap();
+        assert!(at.repo.join("agents/cache/old.md").exists());
+        std::fs::remove_dir_all(at.agents.join("cache")).unwrap();
+        write(&at.agents.join("cache"), "a file now");
+        write(&at.agents.join(".gitignore"), "cache/\n");
+        sync(&at, None).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(at.repo.join("agents/cache")).unwrap(),
+            "a file now"
+        );
         std::fs::remove_dir_all(&root).unwrap();
     }
 
