@@ -141,7 +141,7 @@ environment: a LaunchAgent run at login on a Mac, or a systemd user
 service wanted by `default.target` elsewhere, which starts at boot once
 the user lingers (Sonny runs `loginctl enable-linger`, and says when that
 needs `sudo`). The daemon brings back the companions it keeps, the lookout
-among them. Turning it off removes the job and leaves a running daemon
+and the tool host among them. Turning it off removes the job and leaves a running daemon
 running.
 
 A lead's transcript starts with a welcome, as Claude Code's does: Sonny,
@@ -272,14 +272,14 @@ then cmux offers it to run by hand); quitting Sonny clears it. cmux lets
 only programs started in its tabs reach it, by default; agents' shells run
 in the daemon, not in cmux, so set cmux's Settings > Automation to
 "Automation mode" (your own programs, no ancestry check) for agents to run
-commands in tabs and read them. The lookout, the daemon's companion, reaches it
+commands in tabs and read them. The tool host, the daemon's companion, reaches it
 either way when the daemon started from a cmux tab; otherwise it needs
 Automation mode too.
 The place a
 project was laid out in is kept in `~/.agent/sonny/places`, so an agent's
 `run_in_pane` and `show_agent` calls go to that Herdr or cmux workspace or
 Rex session, in that multiplexer, rather than one guessed from where the
-lookout answering them runs, which is in neither. A task's window
+tool host answering them runs, which is in neither. A task's window
 closes once its work is taken: its turn completed and the lead (or the task
 that started it) waited on it. One that failed, stopped or waits on you stays
 open, and a task given more work opens again; ask the lead to show one, or
@@ -317,7 +317,7 @@ provider, configure it by hand as a local command, and give it the
 executable `sonny` (or the full path `command -v sonny` prints) with the one
 argument `acp`. A thread opened in a folder is a lead of that folder, set
 up as the one `sonny` there opens: its rules, skills and memory, Sonny's
-tools, its approval mode and sandbox, and the lookout. Each new thread is a
+tools, its approval mode and sandbox, the lookout and the tool host. Each new thread is a
 lead of its own, named after the first words it is sent (the folder's first
 lead when it has none yet), unless those words are `/lead NAME`, which
 binds the thread to that lead of the folder, or `/lead new [NAME]`. A call that
@@ -723,7 +723,7 @@ person sees, as a checklist), `margin` (notes beside the conversation),
 `run_in_pane`; a lead's own, which its tasks don't take, are `start_task`,
 `remove_task` and `new_project`. The daemon shows them to
 the model and records each call: `react`, `ask`, `plan`, `margin` and
-`resolve_task` run nothing, and the rest wait for Sonny's answer. Sonny's lookout answers
+`resolve_task` run nothing, and the rest wait for Sonny's answer. Sonny's tool host answers
 those, running each call in the calling agent's folder, so they work with
 every Sonny window closed; a call nobody answers in time ends as
 `tool_unserved`, and the agent goes on. All but `show_agent` wait for a
@@ -764,7 +764,7 @@ in `~/.agents/skills` (replacing links the Agent app left there), and
 and `sonny trigger ...` (jobs that wake an agent, kept by launchd on a Mac
 and systemd's user manager on Linux), which other harnesses, scripts and
 those schedulers run too; Sonny's own agents use the
-`memory` and `triggers` tools instead, which the lookout answers outside
+`memory` and `triggers` tools instead, which the tool host answers outside
 their sandbox. A skill Sonny wrote is rewritten when Sonny's
 text changes, until you edit it: from then on it is yours, and Sonny leaves
 it alone, offering its new text through the first bot you open after an
@@ -787,10 +787,13 @@ set, and with the judge `off` sends the task updates alone. Any agent can
 subscribe to more with its `subscriptions` tool (other agents' tasks, bots
 by name, sources outside such as a chat you poll, questions of its own),
 and `/background` lists what it watches;
-see [docs/LOOKOUT.md](../docs/LOOKOUT.md). The lookout also answers
-Sonny's tools. A Sonny that finds another build's lookout running, as one
-an upgrade left, stops it and starts its own, so its agents' new tools are
-answered.
+see [docs/LOOKOUT.md](../docs/LOOKOUT.md). The lookout only watches and
+tells: Sonny's tools are answered by the tool host, `sonny tool-host`, the
+daemon's other companion, so a slow or crashing tool never holds up a
+lead's news. A Sonny that finds another build's lookout or tool host
+running, as one an upgrade left, stops it and starts its own, so its
+agents' new tools are answered. `/status` says when no tool host runs, as
+"tools not answered".
 
 The look follows Codex's TUI (openai/codex, `codex-rs/tui`): replies stream a line at a time, each message the bot sends its own block, as
 it keeps them (two in one answer no longer run together), a tool call is one `• Ran …` line with a

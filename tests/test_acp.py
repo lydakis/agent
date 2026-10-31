@@ -186,10 +186,12 @@ class AcpTests(ModelFixture):
         thread.send({'id': asked['id'], 'result': {'outcome': {'outcome': 'selected', 'optionId': 'allow'}}})
         answered, updates = thread.answer_of(prompt)
         self.assertEqual(answered['result'], {'stopReason': 'end_turn'})
-        # The lookout that answered it is the daemon's, not the thread's.
-        [lookout] = self.daemon.request('companions')['result']['companions']
-        self.assertEqual((lookout['name'], lookout['command'], lookout['args'][0]),
-                         ('sonny-lookout', str(self.sonny.resolve()), 'lookout'))
+        # The tool host that answered it is the daemon's, not the thread's,
+        # as is the lookout.
+        companions = self.daemon.request('companions')['result']['companions']
+        self.assertEqual(sorted((c['name'], c['command'], c['args'][0]) for c in companions),
+                         [('sonny-lookout', str(self.sonny.resolve()), 'lookout'),
+                          ('sonny-tool-host', str(self.sonny.resolve()), 'tool-host')])
         # The task was T3 Code's child of this prompt before it was answered.
         delegated = self.t3.calls.get_nowait()
         kinds = [u['sessionUpdate'] for u in updates]

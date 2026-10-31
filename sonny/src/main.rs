@@ -75,6 +75,7 @@ mod task;
 mod term;
 #[cfg(test)]
 mod testing;
+mod tool_host;
 mod transcript;
 mod tree;
 mod trigger;
@@ -234,7 +235,7 @@ fn usage() -> String {
      tasks open beside it in Rex or Herdr, each in a git worktree of its own. Type /status\n\
      for the project's agents, /lead for the folder's leads.\n\
      Agents start tasks, put windows and panes where the person looks, make projects\n\
-     and follow agents in the lookout with tools Sonny gives them, which the lookout answers.\n\
+     and follow agents in the lookout with tools Sonny gives them, which its tool host answers.\n\
      sonny memory ... and sonny trigger ... are what ~/.agent/memory and ~/.agent/trigger\n\
      run, which Sonny writes at each start.\n\
      sonny sky draws every agent on the daemon lighting up as they talk, as /sky does,\n\
@@ -474,22 +475,18 @@ async fn serve_auto(client: &Client, model: &str) -> Result<(), String> {
     keep(client, APPROVER, &bin, args, json!({"AGENT_MODEL": model})).await
 }
 
-/// The lookout, `sonny lookout`, which tells leads what happens in their
-/// tasks and answers Sonny's tools: the daemon's companion, so it runs for
-/// as long as the daemon does, whether or not a window is open, and comes
-/// back with the next daemon. This Sonny's own build replaces another's:
-/// the build is part of what the daemon keeps, so a Sonny upgraded in
-/// place has the daemon start the new one.
-async fn start_lookout(client: &Client) -> Result<(), String> {
+/// Sonny's companions in the daemon, so they run for as long as it does,
+/// whether or not a window is open, and come back with the next daemon:
+/// the lookout, `sonny lookout`, which tells leads what happens in their
+/// tasks, and the tool host, `sonny tool-host`, which answers the tools
+/// Sonny gives its agents. This Sonny's own build replaces another's: the
+/// build is part of what the daemon keeps, so a Sonny upgraded in place
+/// has the daemon start the new ones.
+async fn start_companions(client: &Client) -> Result<(), String> {
     let me = std::env::current_exe().map_err(|e| e.to_string())?;
-    keep(
-        client,
-        LOOKOUT,
-        &me,
-        daemon_args("lookout"),
-        json!({"SONNY_BUILD": lookout::identity()}),
-    )
-    .await
+    let build = json!({"SONNY_BUILD": lookout::identity()});
+    keep(client, LOOKOUT, &me, daemon_args("lookout"), build.clone()).await?;
+    keep(client, TOOL_HOST, &me, daemon_args(tool_host::NAME), build).await
 }
 
 /// How long a word waits on the daemon to say whether it names an agent.
@@ -497,6 +494,7 @@ const NAME_LOOKUP: Duration = Duration::from_secs(2);
 
 /// What Sonny names its companions in the daemon.
 const LOOKOUT: &str = "sonny-lookout";
+const TOOL_HOST: &str = "sonny-tool-host";
 const APPROVER: &str = "approver-auto";
 
 /// A companion's arguments: its store and socket come from the daemon
@@ -766,7 +764,7 @@ fn main() -> std::process::ExitCode {
     }
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.split_first() {
-        // The lookout runs this for each call of a tool Sonny answers.
+        // The tool host runs this for each call of a tool Sonny answers.
         Some((tool, rest)) if tool == "tool" => served::answer_here(rest),
         // `~/.agent/memory` runs this, from agents' shells.
         Some((verb, rest)) if verb == "memory" => {
@@ -793,6 +791,7 @@ fn main() -> std::process::ExitCode {
             return std::process::ExitCode::from(trigger::fire_cli(rest) as u8);
         }
         Some((lookout, rest)) if lookout == "lookout" => lookout::run(rest),
+        Some((verb, rest)) if verb == tool_host::NAME => tool_host::run(rest),
         Some((verb, rest)) if verb == "approver" => approver::run(rest),
         Some((verb, rest)) if verb == "mcp" => mcp::cli(rest),
         Some((verb, rest)) if verb == "sky" => sky_cli(rest),
@@ -1014,8 +1013,8 @@ async fn run() -> Result<(), String> {
     {
         app.notice = Some(format!("the lookout: {error}"));
     }
-    // It answers the tools Sonny gives every agent, a lead or not.
-    if let Err(error) = start_lookout(&app.client).await {
+    // They answer the tools Sonny gives every agent, a lead or not.
+    if let Err(error) = start_companions(&app.client).await {
         app.notice = Some(error);
     }
     // The lead told what its folder tells it today (skills and memory added
@@ -3880,7 +3879,7 @@ impl App {
                 .await;
             // A daemon that restarted brings back its companions; one
             // started anew, as by another store's Sonny, gets them now.
-            if let Err(error) = start_lookout(&self.client).await {
+            if let Err(error) = start_companions(&self.client).await {
                 self.notice = Some(error);
             }
             if self.mode == Some("auto")
@@ -6641,10 +6640,11 @@ impl App {
 
     /// What the lookout does for this window's lead.
     fn lookout_line(&self) -> String {
-        match &self.project {
+        let lookout = match &self.project {
             Some(_) => lookout::status(&self.options.store, &self.bot),
             None => String::new(),
-        }
+        };
+        tool_host::with_status(lookout, &self.options.store)
     }
 
     /// The agents `/status` and `/background` cover: the project's, and
