@@ -15,6 +15,9 @@
 //! What a prompt was sent with (its pictures) comes back with this
 //! window's own prompts, and the draft's with the draft; the file keeps
 //! text alone, so a prompt from it comes back with nothing attached.
+//! Only the newest prompts' attachments are kept, up to a budget of
+//! bytes, so a long-lived window does not hold every picture it sent:
+//! an older prompt comes back as text alone, as one from the file does.
 use serde_json::json;
 use std::{
     io::{Read, Seek, SeekFrom, Write},
@@ -31,8 +34,11 @@ pub struct Recall<A> {
     /// When this window opened, in milliseconds: the file's prompts from
     /// before then are walked after this window's own.
     opened: i64,
-    /// This window's prompts, oldest first, with what each was sent with.
-    mine: Vec<(String, A)>,
+    /// This window's prompts, oldest first, with what each was sent with
+    /// and its size in bytes.
+    mine: Vec<(String, A, usize)>,
+    /// How many bytes of attachments the newest prompts keep together.
+    keep: usize,
     /// The file's, oldest first, read the first time Up is pressed.
     before: Option<Vec<String>>,
     walk: Option<Walk<A>>,
@@ -51,18 +57,26 @@ struct Walk<A> {
 }
 
 impl<A: Clone + Default + PartialEq> Recall<A> {
-    /// The prompts kept under `HOME`.
-    pub fn load() -> Self {
+    /// The prompts kept under `HOME`, the newest keeping `keep` bytes of
+    /// attachments together.
+    pub fn load(keep: usize) -> Self {
         match std::env::var_os("HOME").filter(|h| !h.is_empty()) {
-            Some(home) => Self::kept(&PathBuf::from(home).join(".agent/sonny/history.jsonl")),
-            None => Self::default(),
+            Some(home) => Self::kept(
+                &PathBuf::from(home).join(".agent/sonny/history.jsonl"),
+                keep,
+            ),
+            None => Self {
+                keep,
+                ..Self::default()
+            },
         }
     }
 
-    pub fn kept(file: &Path) -> Self {
+    pub fn kept(file: &Path, keep: usize) -> Self {
         Self {
             file: Some(file.to_owned()),
             opened: now_ms(),
+            keep,
             ..Self::default()
         }
     }
@@ -72,18 +86,24 @@ impl<A: Clone + Default + PartialEq> Recall<A> {
         self.walk.as_ref().is_some_and(|walk| walk.shown == text)
     }
 
-    /// Notes `prompt` sent with `attached`, and ends any walk.
-    pub fn sent(&mut self, prompt: &str, attached: A) {
+    /// Notes `prompt` sent with `attached`, of `bytes`, and ends any
+    /// walk. Older prompts let go of their attachments past the budget.
+    pub fn sent(&mut self, prompt: &str, attached: A, bytes: usize) {
         self.walk = None;
         if prompt.is_empty()
-            || self
-                .mine
-                .last()
-                .is_some_and(|last| last.0 == prompt && last.1 == attached)
+            || (self.mine.last()).is_some_and(|last| last.0 == prompt && last.1 == attached)
         {
             return;
         }
-        self.mine.push((prompt.to_owned(), attached));
+        self.mine.push((prompt.to_owned(), attached, bytes));
+        let mut held = 0;
+        for (_, attached, bytes) in self.mine.iter_mut().rev() {
+            held += *bytes;
+            if held > self.keep {
+                *attached = A::default();
+                *bytes = 0;
+            }
+        }
         if let Some(file) = &self.file {
             let _ = append(file, prompt, now_ms());
         }
@@ -103,8 +123,9 @@ impl<A: Clone + Default + PartialEq> Recall<A> {
             });
         }
         let back = self.walk.as_ref().map_or(0, |walk| walk.back);
-        // The same prompt twice in a row is shown once.
-        let to = (back + 1..=self.len()).find(|&to| self.nth(to).0 != current)?;
+        // The same prompt twice in a row, with the same attached, is
+        // shown once.
+        let to = (back + 1..=self.len()).find(|&to| !self.same(to, current, attached))?;
         let (text, with) = self.nth(to);
         let (text, with) = (text.to_owned(), with.cloned().unwrap_or_default());
         let (draft, draft_attached) = match self.walk.take() {
@@ -130,7 +151,10 @@ impl<A: Clone + Default + PartialEq> Recall<A> {
             return None;
         }
         let walk = self.walk.take()?;
-        match (1..walk.back).rev().find(|&to| self.nth(to).0 != current) {
+        match (1..walk.back)
+            .rev()
+            .find(|&to| !self.same(to, current, attached))
+        {
             Some(to) => {
                 let (text, with) = self.nth(to);
                 let text = text.to_owned();
@@ -149,6 +173,12 @@ impl<A: Clone + Default + PartialEq> Recall<A> {
         }
     }
 
+    /// Whether the prompt `back` from now is `text` with `attached`.
+    fn same(&self, back: usize, text: &str, attached: &A) -> bool {
+        let (prompt, with) = self.nth(back);
+        prompt == text && with.cloned().unwrap_or_default() == *attached
+    }
+
     fn len(&self) -> usize {
         self.mine.len() + self.before.as_ref().map_or(0, Vec::len)
     }
@@ -158,7 +188,7 @@ impl<A: Clone + Default + PartialEq> Recall<A> {
     fn nth(&self, back: usize) -> (&str, Option<&A>) {
         let mine = self.mine.len();
         if back <= mine {
-            let (text, with) = &self.mine[mine - back];
+            let (text, with, _) = &self.mine[mine - back];
             return (text, Some(with));
         }
         let before = self.before.as_deref().unwrap_or_default();
@@ -242,7 +272,7 @@ mod tests {
     fn up_goes_back_and_down_comes_forward_to_the_draft() {
         let mut recall = Recall::default();
         for prompt in ["one", "two", "two", "three"] {
-            recall.sent(prompt, ());
+            recall.sent(prompt, (), 0);
         }
         assert_eq!(
             walk(&mut recall, "↑↑↑↑↓↓↓↓", "half typed".into()),
@@ -266,7 +296,7 @@ mod tests {
     fn an_edited_recall_is_a_draft_of_its_own() {
         let mut recall = Recall::default();
         for prompt in ["one", "two", "three"] {
-            recall.sent(prompt, ());
+            recall.sent(prompt, (), 0);
         }
         assert_eq!(walk(&mut recall, "↑↑", String::new()), ["three", "two"]);
         assert!(recall.showing("two"));
@@ -275,7 +305,7 @@ mod tests {
         assert_eq!(walk(&mut recall, "↑↓", "two!".into()), ["three", "two!"]);
         // Sending ends the walk.
         recall.older("", &mut ());
-        recall.sent("three", ());
+        recall.sent("three", (), 0);
         assert!(!recall.showing("three"));
         assert_eq!(walk(&mut recall, "↑", String::new()), ["three"]);
     }
@@ -286,8 +316,8 @@ mod tests {
         let file = dir.join("history.jsonl");
         let _ = std::fs::remove_dir_all(&dir);
         append(&file, "from the file [Image #1]", 0).unwrap();
-        let mut recall = Recall::kept(&file);
-        recall.sent("look [Image #1]", vec!["sent picture"]);
+        let mut recall = Recall::kept(&file, 2);
+        recall.sent("look [Image #1]", vec!["sent picture"], 1);
         let mut attached = vec!["draft picture"];
         assert_eq!(
             recall.older("draft [Image #1]", &mut attached).as_deref(),
@@ -310,16 +340,48 @@ mod tests {
     }
 
     #[test]
+    fn the_same_words_with_other_pictures_are_two_steps_and_the_oldest_let_go() {
+        let mut recall = Recall {
+            keep: 2,
+            ..Recall::default()
+        };
+        for shot in ["first", "second", "third"] {
+            recall.sent("look [Image #1]", vec![shot], 1);
+        }
+        let mut attached = Vec::new();
+        let shown: Vec<_> = (0..3)
+            .map(|_| {
+                let text = recall.older("look [Image #1]", &mut attached);
+                (text, attached.clone())
+            })
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                (Some("look [Image #1]".into()), vec!["third"]),
+                (Some("look [Image #1]".into()), vec!["second"]),
+                (Some("look [Image #1]".into()), vec![]),
+            ],
+            "the oldest's picture is past the budget"
+        );
+        assert_eq!(
+            recall.newer("look [Image #1]", &mut attached),
+            Some("look [Image #1]".into())
+        );
+        assert_eq!(attached, ["second"]);
+    }
+
+    #[test]
     fn this_windows_prompts_come_before_the_files() {
         let dir = std::env::temp_dir().join(format!("sonny-recall-{}", std::process::id()));
         let file = dir.join("history.jsonl");
         let _ = std::fs::remove_dir_all(&dir);
         append(&file, "from before", 1).unwrap();
         append(&file, "older still", 0).unwrap();
-        let mut other = Recall::kept(&file);
-        let mut recall = Recall::kept(&file);
-        other.sent("another window, after this one opened", ());
-        recall.sent("mine", ());
+        let mut other = Recall::kept(&file, 0);
+        let mut recall = Recall::kept(&file, 0);
+        other.sent("another window, after this one opened", (), 0);
+        recall.sent("mine", (), 0);
         std::fs::write(
             &file,
             format!("{}half a li", std::fs::read_to_string(&file).unwrap()),

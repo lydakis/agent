@@ -3191,7 +3191,9 @@ impl App {
         self.width = terminal.size().map(|s| s.width as usize).unwrap_or(80);
         self.reactions = reactions::Reactions::load(self.reactions_key.as_deref());
         self.picks = fuzzy::Picks::load("commands");
-        self.recall = recall::Recall::load();
+        // The newest prompts' pictures, up to as much as one message
+        // may carry.
+        self.recall = recall::Recall::load(attach::MOST_BYTES);
         self.margin = margin::Margin::load(self.reactions_key.as_deref());
         self.picked = reactions::Picked::load(self.reactions_key.as_deref());
         self.history().await;
@@ -9056,7 +9058,8 @@ impl App {
             true => attached,
             false => Vec::new(),
         };
-        self.recall.sent(&prompt, attached);
+        let bytes = (attached.iter().flatten()).map(|p| p.data.len()).sum();
+        self.recall.sent(&prompt, attached, bytes);
         // A command run, so the menu ranks it first next time.
         let word = prompt.split_whitespace().next().unwrap_or_default();
         if COMMANDS.iter().any(|(name, _)| *name == word) {
@@ -15684,8 +15687,8 @@ mod tests {
     #[tokio::test]
     async fn up_and_down_past_the_rows_walk_the_prompts_sent() {
         let mut app = app(daemon_answering(|_| json!({})).await);
-        app.recall.sent("/status", Vec::new());
-        app.recall.sent("first line\nsecond line", Vec::new());
+        app.recall.sent("/status", Vec::new(), 0);
+        app.recall.sent("first line\nsecond line", Vec::new(), 0);
         let key = |code| Event::Key(event::KeyEvent::new(code, KeyModifiers::NONE));
         // A draft of two rows: Up moves through it before going back.
         app.input.set("draft\nmore");
