@@ -155,6 +155,61 @@ const BROWSER_SCHEMES: [&str; 6] = [
     "javascript",
 ];
 
+/// agent-browser's global flags, which its `clean_args` takes out of the
+/// words a command reads (agent-browser 0.27, `cli/src/flags.rs`): those
+/// that take a value, and switches that may take `true` or `false`.
+const GLOBAL_VALUED: [&str; 30] = [
+    "--session",
+    "--headers",
+    "--executable-path",
+    "--cdp",
+    "--extension",
+    "--init-script",
+    "--enable",
+    "--profile",
+    "--state",
+    "--proxy",
+    "--proxy-bypass",
+    "--args",
+    "--user-agent",
+    "-p",
+    "--provider",
+    "--device",
+    "--session-name",
+    "--color-scheme",
+    "--download-path",
+    "--max-output",
+    "--allowed-domains",
+    "--action-policy",
+    "--confirm-actions",
+    "--config",
+    "--engine",
+    "--screenshot-dir",
+    "--screenshot-quality",
+    "--screenshot-format",
+    "--idle-timeout",
+    "--model",
+];
+const GLOBAL_SWITCHES: [&str; 17] = [
+    "--json",
+    "--headed",
+    "--debug",
+    "--ignore-https-errors",
+    "--allow-file-access",
+    "--auto-connect",
+    "--annotate",
+    "--content-boundaries",
+    "--confirm-interactive",
+    "--no-auto-dialog",
+    "-v",
+    "--verbose",
+    "-q",
+    "--quiet",
+    "--offline",
+    "--quick",
+    "--fix",
+];
+
 /// Where a command's files may be: the agent's folder, with the folders its
 /// sandbox writes, or anywhere for an agent that runs unconfined.
 #[derive(Clone, Debug)]
@@ -195,9 +250,26 @@ impl Reach {
 
     /// `path` as a file the browser writes, inside the reach, or why not.
     fn output(&self, path: &str) -> Result<String, String> {
-        match self.writes {
-            true => self.file(path),
-            false => Err(format!("{path}: your sandbox writes no files")),
+        if !self.writes {
+            return Err(format!("{path}: your sandbox writes no files"));
+        }
+        let file = self.file(path)?;
+        // What the sandbox keeps read-only inside its folders, the browser
+        // writes no more than the agent may: git's own files, the project's
+        // agent settings, and the like.
+        let kept = (self.roots.iter().flatten()).find_map(|root| {
+            let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.clone());
+            let always = agent_client::PROTECTED.iter().map(|name| root.join(name));
+            let existing = (agent_client::PROTECTED_EXISTING.iter())
+                .map(|name| root.join(name))
+                .filter(|folder| folder.exists());
+            always
+                .chain(existing)
+                .find(|folder| Path::new(&file).starts_with(folder))
+        });
+        match kept {
+            Some(folder) => Err(format!("{path}: {} is kept read-only", folder.display())),
+            None => Ok(file),
         }
     }
 
@@ -303,7 +375,18 @@ fn number(word: &str) -> bool {
 struct Checked {
     args: Vec<String>,
     picture: Option<PathBuf>,
+    /// Whether it is put to the agent's gate before it runs, whatever
+    /// agent-browser would confirm.
+    ask: bool,
 }
+
+/// Each session's lock, held through a call, with the confirmations its
+/// browser was started with, once this tool host has started it.
+static SESSIONS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, Held>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// A session's lock, with the confirmations its browser started with.
+type Held = Arc<tokio::sync::Mutex<Option<String>>>;
 
 /// Pictures the tool host named, so two at once differ.
 static PICTURES: AtomicU64 = AtomicU64::new(0);
@@ -330,11 +413,9 @@ fn checked(line: &str, reach: &Reach) -> Result<Checked, String> {
     let refused = |why: &str| Err(format!("`{command}` {why}"));
     // Its flags, each checked, and its other words, in order.
     let mut args = vec![command.clone()];
-    let mut plain: Vec<(usize, String)> = Vec::new();
     let mut words = words.into_iter().skip(1);
     while let Some(word) = words.next() {
         if !word.starts_with('-') || number(&word) || word == "-" {
-            plain.push((args.len(), word.clone()));
             args.push(word);
             continue;
         }
@@ -391,32 +472,76 @@ fn checked(line: &str, reach: &Reach) -> Result<Checked, String> {
             ));
         }
     }
-    let word = |n: usize| plain.get(n).map(|(_, word)| word.as_str());
-    let mut set = |n: usize, to: String| {
-        if let Some((at, _)) = plain.get(n) {
-            args[*at] = to;
+    // The words the command itself reads, as agent-browser's `clean_args`
+    // leaves them: all but its global flags and their values. Its commands
+    // index these as they are, flags and all, so they are checked so too.
+    let rest: Vec<usize> = {
+        let (mut rest, mut n) = (Vec::new(), 1);
+        while n < args.len() {
+            let arg = args[n].as_str();
+            if GLOBAL_VALUED.contains(&arg) {
+                n += 2;
+                continue;
+            }
+            if GLOBAL_SWITCHES.contains(&arg) {
+                n += 1 + usize::from(matches!(
+                    args.get(n + 1).map(String::as_str),
+                    Some("true" | "false")
+                ));
+                continue;
+            }
+            rest.push(n);
+            n += 1;
         }
+        rest
     };
+    // Any word a page could be opened by, whatever the command makes of it,
+    // opens only what the agent may: `open --name file:///etc x` opens the
+    // first word not a flag, which is the file.
+    for &at in &rest {
+        if !args[at].starts_with("--") {
+            args[at] = reach.url(&args[at])?;
+        }
+    }
+    macro_rules! word {
+        ($n:expr) => {
+            rest.get($n).map(|&at| args[at].as_str())
+        };
+    }
+    macro_rules! set {
+        ($n:expr, $to:expr) => {
+            if let Some(&at) = rest.get($n) {
+                args[at] = $to;
+            }
+        };
+    }
+    let has =
+        |args: &[String], flags: &[&str]| rest.iter().any(|&at| flags.contains(&args[at].as_str()));
     let mut picture = None;
+    let mut ask = false;
     match command.as_str() {
-        "open" | "goto" | "navigate" | "pushstate" | "read" | "vitals" | "a11y" => {
-            if let Some(url) = word(0) {
-                set(0, reach.url(url)?);
-            }
-        }
-        "tab" => {
-            if word(0) == Some("new")
-                && let Some(url) = word(1)
-            {
-                set(1, reach.url(url)?);
-            }
-        }
+        "open" | "goto" | "navigate" | "pushstate" | "read" | "vitals" | "a11y" | "tab" => {}
         "screenshot" => {
-            let path = (0..plain.len()).find(|&n| word(n).is_some_and(picture_file));
+            // As agent-browser reads them: of the words but --full, two are
+            // a selector and a path, and one is a path when it reads as one.
+            let positional: Vec<usize> = (0..rest.len())
+                .filter(|&n| !matches!(word!(n), Some("--full" | "-f")))
+                .collect();
+            let path = match positional.as_slice() {
+                [_, second, ..] => Some(*second),
+                [first] => {
+                    let first_word = word!(*first).unwrap_or_default();
+                    let relative = first_word.starts_with("./") || first_word.starts_with("../");
+                    let selector = !relative && first_word.starts_with(['.', '#', '@']);
+                    let path = relative || first_word.contains('/') || picture_file(first_word);
+                    (!selector && path).then_some(*first)
+                }
+                [] => None,
+            };
             match path {
                 Some(n) => {
-                    let file = reach.output(word(n).unwrap_or_default())?;
-                    set(n, file);
+                    let file = reach.output(word!(n).unwrap_or_default())?;
+                    set!(n, file);
                 }
                 None => {
                     let jpeg = args
@@ -435,80 +560,88 @@ fn checked(line: &str, reach: &Reach) -> Result<Checked, String> {
         }
         "pdf" | "download" => {
             let n = if command == "pdf" { 0 } else { 1 };
-            let Some(path) = word(n) else {
+            let Some(path) = word!(n) else {
                 return refused("needs a file to save to");
             };
             let file = reach.output(path)?;
-            set(n, file);
+            set!(n, file);
         }
         "upload" => {
-            for n in 1..plain.len() {
-                let file = reach.file(word(n).unwrap_or_default())?;
-                set(n, file);
+            for n in 1..rest.len() {
+                let file = reach.file(word!(n).unwrap_or_default())?;
+                set!(n, file);
             }
         }
         "record" | "trace" | "profiler" => {
-            let path = match (command.as_str(), word(0)) {
+            let path = match (command.as_str(), word!(0)) {
                 ("record", Some("start" | "restart")) => Some(1),
                 (_, Some("stop")) if command != "record" => Some(1),
                 (_, Some("start" | "stop")) => None,
                 _ => return refused("is start or stop here"),
             };
-            if let Some(n) = path.filter(|&n| word(n).is_some()) {
-                let file = reach.output(word(n).unwrap_or_default())?;
-                set(n, file);
-            }
-            if command == "record"
-                && let Some(url) = word(2)
-            {
-                set(2, reach.url(url)?);
+            if let Some(n) = path.filter(|&n| word!(n).is_some()) {
+                let file = reach.output(word!(n).unwrap_or_default())?;
+                set!(n, file);
             }
         }
-        "network" => match (word(0), word(1)) {
+        "network" => match (word!(0), word!(1)) {
             (Some("har"), Some("stop")) => {
-                if let Some(path) = word(2) {
+                if let Some(path) = word!(2) {
                     let file = reach.output(path)?;
-                    set(2, file);
+                    set!(2, file);
                 }
             }
             (Some("har"), Some("start")) | (Some("route" | "unroute" | "requests"), _) => {}
             _ => return refused("is route, unroute, requests or har here"),
         },
-        "diff" => match word(0) {
-            Some("snapshot" | "screenshot") => {}
-            Some("url") => {
-                for n in [1, 2] {
-                    if let Some(url) = word(n) {
-                        set(n, reach.url(url)?);
+        "diff" => match word!(0) {
+            Some("snapshot" | "screenshot") => {
+                // Its baseline is read and its output written, wherever.
+                for n in 1..rest.len() {
+                    let file = match word!(n) {
+                        Some("-b" | "--baseline") => word!(n + 1).map(|path| reach.file(path)),
+                        Some("-o" | "--output") => word!(n + 1).map(|path| reach.output(path)),
+                        _ => None,
+                    };
+                    if let Some(file) = file {
+                        set!(n + 1, file?);
                     }
                 }
             }
+            Some("url") => {}
             _ => return refused("is snapshot, screenshot or url here"),
         },
-        "state" => match word(0) {
+        "state" => match word!(0) {
             Some(how @ ("save" | "load")) => {
-                let Some(path) = word(1) else {
+                let Some(path) = word!(1) else {
                     return refused("needs a file");
                 };
                 let file = match how {
                     "save" => reach.output(path)?,
                     _ => reach.file(path)?,
                 };
-                set(1, file);
+                set!(1, file);
             }
             _ => return refused("is save or load here: the person's saved states are their own"),
         },
-        "auth" => match word(0) {
-            Some("login" | "list" | "show") => {}
+        // The vault holds the person's sign-ins: using or reading one is
+        // theirs to allow.
+        "auth" => match word!(0) {
+            Some("login" | "list" | "show") => ask = true,
             _ => return refused("is login, list or show here: the vault is the person's"),
         },
-        "cookies" if word(0) == Some("set") && args.iter().any(|arg| arg == "--curl") => {
+        // The browser's DevTools address would let the agent drive it
+        // around every check here.
+        "get" if word!(0) == Some("cdp-url") => {
+            return refused("cdp-url is not given: the browser is driven through this tool only");
+        }
+        "cookies" if word!(0) == Some("set") && has(&args, &["--curl"]) => {
             return refused("set reads no file here");
         }
-        "close" if args.iter().any(|arg| arg == "--all") => {
+        "close" if has(&args, &["--all"]) => {
             return refused("closes your own session's browser only");
         }
-        "wait" if args.iter().any(|arg| arg == "--download") => {
+        "wait" if has(&args, &["--download", "-d"]) => {
             return refused(
                 "--download is not taken here; use download with a file in your folder",
             );
@@ -525,7 +658,7 @@ fn checked(line: &str, reach: &Reach) -> Result<Checked, String> {
             );
         }
     }
-    Ok(Checked { args, picture })
+    Ok(Checked { args, picture, ask })
 }
 
 /// What a session of the agent `bot` is called: agent-browser's session
@@ -630,6 +763,18 @@ impl Ran {
         let answer = (stdout.lines().rev())
             .find_map(|line| serde_json::from_str::<Value>(line.trim()).ok())
             .filter(Value::is_object);
+        // A confirmed action's own answer is inside the confirmation's,
+        // under `data.result`, without the markers the outer one names.
+        let answer = answer.map(|answer| match &answer["data"]["result"] {
+            result @ Value::Object(inner) if inner.contains_key("success") => {
+                let mut result = result.clone();
+                if result["_boundary"].is_null() {
+                    result["_boundary"] = answer["_boundary"].clone();
+                }
+                result
+            }
+            _ => answer,
+        });
         let mut ran = match answer {
             None => Ran {
                 said: stdout.trim_end().to_owned(),
@@ -849,6 +994,20 @@ pub async fn answer(
         Err(_) => confirmed(&agent_client::config::BROWSER_CONFIRM.map(str::to_owned)),
     };
     let session = session(call["bot"].as_str().unwrap_or_default());
+    // One call at a time in a session, through its confirmations:
+    // agent-browser holds one pending action a session and confirms it
+    // whatever ID it is given, so another call's would be confirmed too.
+    let held = {
+        let mut sessions = SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
+        sessions.entry(session.clone()).or_default().clone()
+    };
+    let mut policy = held.lock().await;
+    // Its browser keeps the confirmations it started with, so a session
+    // started under another policy, or before this tool host, starts again.
+    if policy.as_deref() != Some(confirm.as_str()) {
+        let _ = run(&session, &["close".into()], &confirm).await;
+        *policy = Some(confirm.clone());
+    }
     let mut parts: Vec<Value> = Vec::new();
     let mut text = String::new();
     let mut shown = 0;
@@ -856,7 +1015,23 @@ pub async fn answer(
         if lines.len() > 1 {
             text.push_str(&format!("$ {line}\n"));
         }
-        let mut ran = run(&session, &command.args, &confirm).await;
+        let mut ran = match command.ask {
+            true => match steps.ask(NAME, NAME, json!({"command": line})).await {
+                Ok(step) => {
+                    let ran = run(&session, &command.args, &confirm).await;
+                    if let Some(step) = step {
+                        steps.ran(step, !ran.ok).await;
+                    }
+                    ran
+                }
+                Err(why) => Ran {
+                    said: why,
+                    ok: false,
+                    confirmation: None,
+                },
+            },
+            false => run(&session, &command.args, &confirm).await,
+        };
         if let Some(id) = ran.confirmation.take() {
             let asked = json!({"command": line, "confirmation": ran.said});
             match steps.ask(NAME, NAME, asked).await {
@@ -1093,6 +1268,68 @@ mod tests {
         std::fs::create_dir_all(real.join("shots")).unwrap();
         let shot = args("screenshot in/page.png", &real).unwrap();
         assert_eq!(shot[1], real.join("shots/page.png").to_string_lossy());
+    }
+
+    #[test]
+    fn words_are_checked_as_agent_browser_reads_them() {
+        let real = scratch("grammar");
+        for line in [
+            // It opens the first word not a `--` flag, values and all.
+            "open --name file:///etc/passwd about:blank",
+            // Two words are a selector and a file, whatever the file's name.
+            "screenshot body /tmp/out --screenshot-format png",
+            "screenshot body /tmp/out",
+            "wait -d /tmp/x",
+            "wait --download /tmp/x",
+            "record start /tmp/r.webm",
+            "record start r.webm file:///etc/passwd",
+            "diff screenshot --baseline /etc/x.png",
+            "diff snapshot -o /tmp/d.txt",
+            "trace stop /tmp/t.zip",
+            "get cdp-url",
+        ] {
+            assert!(args(line, &real).is_err(), "{line} ran");
+        }
+        let shot = args("screenshot body out", &real).unwrap();
+        assert_eq!(
+            shot,
+            ["screenshot", "body", &real.join("out").to_string_lossy()]
+        );
+        let shot = checked("screenshot body", &reach(&real)).unwrap();
+        assert_eq!(shot.args.len(), 3);
+        assert!(shot.picture.is_some());
+        assert!(args("record start r.webm https://example.com", &real).is_ok());
+        // What the sandbox keeps read-only, the browser does not write.
+        std::fs::create_dir_all(real.join(".aws")).unwrap();
+        for line in [
+            "pdf .git/config",
+            "screenshot ./.codex/x.png",
+            "download @e1 .agents/x",
+            "pdf .aws/config",
+        ] {
+            assert!(args(line, &real).is_err(), "{line} ran");
+        }
+        assert!(args("pdf report.pdf", &real).is_ok());
+        assert!(args("upload @e1 .git/config", &real).is_ok());
+        // The person's sign-ins are used only when they allow it.
+        assert!(checked("auth login site", &reach(&real)).unwrap().ask);
+        assert!(!checked("get text body", &reach(&real)).unwrap().ask);
+    }
+
+    #[test]
+    fn a_confirmed_action_answers_with_its_own_result() {
+        let failed = r#"{"success":true,"data":{"result":{"success":false,"data":null,"error":"boom"}},"error":null}"#;
+        assert_eq!(
+            Ran::of(failed, "", true),
+            Ran {
+                said: "boom".into(),
+                ok: false,
+                confirmation: None
+            }
+        );
+        let done = r#"{"success":true,"_boundary":{"nonce":"n","origin":"unknown"},"data":{"result":{"success":true,"data":{"result":"Calc"}}}}"#;
+        let ran = Ran::of(done, "", true);
+        assert!(ran.ok && ran.said.contains("Calc"), "{ran:?}");
     }
 
     #[test]
