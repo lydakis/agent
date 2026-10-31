@@ -3,6 +3,7 @@ event log, and its runner must work end to end before any paid run."""
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -538,6 +539,21 @@ class LongTaskScoreTests(unittest.TestCase):
         self.assertEqual(scored['step_commands_to_review'], [*odd, '[cut] ' + long[:160]])
         for counter in ('filtered_step_commands', 'combined_step_commands'):
             self.assertEqual(scored[counter], before[counter])
+
+    def test_step_detection_finishes_on_ambiguous_prefixes(self):
+        # Model-generated shell commands reach this parser through event previews.
+        # Both shapes made the old regex backtrack for longer than the deadline.
+        cases = ('env' + ' -! 0= timeout' * 40 + ' nonsense',
+                 'make' + ' -C -! ' * 40 + 'nonsense')
+        for command in cases:
+            with self.subTest(command=command[:30]):
+                result = subprocess.run(
+                    [sys.executable, '-c',
+                     'from bench.long_task_eval import step_command_faults; import sys; '
+                     'print(step_command_faults(sys.argv[1]))', command],
+                    cwd=Path(__file__).resolve().parents[1], capture_output=True, text=True,
+                    timeout=3, check=True)
+                self.assertEqual(result.stdout.strip(), '(False, False)')
 
     def test_a_step_run_in_the_background_goes_unread(self):
         # A background or detached call returns a handle, not the step's
