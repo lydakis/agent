@@ -298,9 +298,10 @@ fn lost(tag: &str, lease: u64) -> Value {
     json!({"event":"approvals_lost","tag":tag,"lease":lease,"durable":false})
 }
 impl Hub {
-    /// Replay pages read on `seats` reader connections at once.
-    pub fn with_page_seats(mut self, seats: usize) -> Self {
-        self.pages = Arc::new(Semaphore::new(seats.max(1)));
+    /// Replay pages take `seats`, shared with the observation lane, so
+    /// together they leave a reader for turns' own reads.
+    pub fn with_page_seats(mut self, seats: Arc<Semaphore>) -> Self {
+        self.pages = seats;
         self
     }
     /// Hand `tag` to `session` under a new lease, not yet live: the job
@@ -708,19 +709,24 @@ pub async fn replay(store: Store, hub: Hub, bot: String, sub: Sub) -> Result<()>
         let mut cursor = after;
         if events.is_empty() {
             let (switch_sub, switch_bot) = (sub.clone(), bot.clone());
-            let live = store
+            let (live, pruned) = store
                 .op("follow_live", move |db| {
                     let mut s = switch_sub.lock().unwrap();
                     let behind = event_page(db, &switch_bot, s.last_cursor, 1)?;
                     if s.cancelled || behind["events"].as_array().is_some_and(|e| !e.is_empty()) {
-                        return Ok(false);
+                        return Ok((false, None));
                     }
                     s.live = true;
-                    Ok(true)
+                    Ok((true, behind["pruned_before"].as_i64()))
                 })
                 .await?;
             if !live {
                 continue;
+            }
+            // A deletion since the empty page may have removed events past
+            // the cursor: the switch's own check is the one to report.
+            if let Some(before) = pruned {
+                page["pruned_before"] = before.into();
             }
         } else if let Some(next) = page["next_cursor"].as_i64() {
             let mut s = sub.lock().unwrap();

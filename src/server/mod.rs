@@ -1487,7 +1487,10 @@ pub async fn run(config: Configuration) -> Result<()> {
         .with_daemon(daemon)
         .with_process_budget(limits.processes)
         .with_detached_budget(limits.detached);
-    let hub = Hub::default().with_page_seats(limits.readers.saturating_sub(1));
+    // Observation reads and replay pages share all but one reader, so turns'
+    // own reads always find one.
+    let lane = lane::Lane::new(limits.readers.saturating_sub(1), deliver);
+    let hub = Hub::default().with_page_seats(lane.seats());
     let lineage = store.op("store_identity", |db| db.store_identity()).await?;
     let identity = store.instance_identity(lineage)?;
     // A pause outlives the daemon that took it.
@@ -1620,7 +1623,7 @@ pub async fn run(config: Configuration) -> Result<()> {
         jobs: JoinSet::new(),
         replays: JoinSet::new(),
         retention: JoinSet::new(),
-        lane: lane::Lane::new(limits.readers.saturating_sub(1), deliver),
+        lane,
         // Queued turns that survived a restart start as capacity allows.
         ready_hint: true,
         tokens: Arc::default(),

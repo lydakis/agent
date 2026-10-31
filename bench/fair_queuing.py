@@ -170,12 +170,16 @@ def main():
             replies = [None] * len(flooders)
 
             def flood(index):
-                if kind == 'follow':
-                    replies[index] = []
-                    events[index] = replaying(bench.socket, len(plans[index][kind]))
-                else:
-                    replies[index] = flooders[index].many(plans[index][kind], timeout=600)
+                try:
+                    if kind == 'follow':
+                        replies[index] = []
+                        events[index] = replaying(bench.socket, len(plans[index][kind]))
+                    else:
+                        replies[index] = flooders[index].many(plans[index][kind], timeout=600)
+                except Exception as error:  # raised again once the threads end
+                    failed[index] = error
             events = [0] * len(flooders)
+            failed = [None] * len(flooders)
             threads = [threading.Thread(target=flood, args=(i,)) for i in range(len(flooders))]
             started = time.monotonic()
             for thread in threads:
@@ -183,6 +187,10 @@ def main():
             for thread in threads:
                 thread.join()
             elapsed = time.monotonic() - started
+            # A flood that failed measured nothing: no result is written.
+            for error in failed:
+                if error is not None:
+                    raise RuntimeError(f'{kind} flood failed') from error
             sent = sum(len(plan[kind]) for plan in plans)
             bad = [r for each in replies for r in each if 'error' in r]
             results[kind] = {'requests': sent, 'flood_s': round(elapsed, 2),
