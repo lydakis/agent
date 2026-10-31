@@ -1567,6 +1567,8 @@ struct Relayed {
     /// What its shut row says, as [`transcript::relayed_head`] has it.
     head: String,
     from: Option<String>,
+    /// Whether `from` names a person, whom no agents' colour marks.
+    person: bool,
     /// The whole message while it is open, read again from the history
     /// when it opens, so a long conversation keeps none of them.
     text: Option<String>,
@@ -4445,7 +4447,7 @@ impl App {
             let text = match self.relayed[&node].text {
                 Some(_) => None,
                 None => match self.items(&[node]).await.first() {
-                    Some(item) => Some(text(item)),
+                    Some(item) => Some(quoting(item)),
                     None => {
                         self.notice = Some("could not read that message".into());
                         return;
@@ -4671,12 +4673,19 @@ impl App {
     /// they ran as it was when it ran, its last row tagged, and the
     /// message the bot now answers. Drawn `older` than the rest, what
     /// they ran is no part of what this window ran.
-    fn land(&mut self, node: i64, said: &str, from: Option<&str>, older: bool) {
+    fn land(
+        &mut self,
+        node: i64,
+        (said, quotes): (&str, &str),
+        from: Option<&str>,
+        person: bool,
+        older: bool,
+    ) {
         // Reactions from here on answer this one.
         self.bot_reactions.clear();
         // Words between agents are one quiet row a click opens.
         if transcript::relays(said, from) {
-            self.land_relayed(node, said, from);
+            self.land_relayed(node, said, from, person);
         } else {
             let prose = self.prose();
             let lines = match older {
@@ -4684,6 +4693,10 @@ impl App {
                 false => landed(said, &mut self.ran_here, prose),
             };
             if !lines.is_empty() {
+                let lines = match quotes.is_empty() {
+                    true => lines,
+                    false => transcript::with_quotes(lines, quotes, prose),
+                };
                 self.commit(lines);
                 self.mark_last(screen::Mark::Tag(screen::Tag::End(node)));
                 // What another agent reacted with before it was drawn.
@@ -4697,10 +4710,11 @@ impl App {
 
     /// The message between agents at `node`: one quiet row a click opens,
     /// gathered with those right before it into one that lists them.
-    fn land_relayed(&mut self, node: i64, said: &str, from: Option<&str>) {
+    fn land_relayed(&mut self, node: i64, said: &str, from: Option<&str>, person: bool) {
         let relayed = Relayed {
             head: transcript::relayed_head(said, from),
             from: from.map(str::to_owned),
+            person,
             text: None,
         };
         self.relayed.insert(node, relayed);
@@ -4790,7 +4804,11 @@ impl App {
                 lines.extend(transcript::indented(calls, 2));
                 lines
             }
-            None => transcript::relayed_shut(&relayed.head, relayed.from.as_deref(), width),
+            None => {
+                // Only an agent's name takes the agents' colour.
+                let agent = relayed.from.as_deref().filter(|_| !relayed.person);
+                transcript::relayed_shut(&relayed.head, agent, width)
+            }
         }
     }
 
@@ -4860,7 +4878,7 @@ impl App {
         }
         for (node, item) in read {
             if let Some(relayed) = self.relayed.get_mut(&node) {
-                relayed.text = Some(text(&item));
+                relayed.text = Some(quoting(&item));
             }
         }
         let clusters: Vec<usize> = self.clusters.keys().copied().collect();
@@ -5241,13 +5259,26 @@ impl App {
             rest = &rest[entries.len().min(rest.len())..];
             items.extend(entries.iter().flat_map(|entry| {
                 let node = entry["node"].as_i64().unwrap_or(0);
-                // Who sent a prompt, when another bot did or a client from
-                // outside (the commons, an automation).
-                let from =
-                    transcript::sender(entry["from"]["bot"].as_str(), entry["origin"].as_str());
+                // Who sent a prompt, when another bot did, a client from
+                // outside (the commons, an automation) or another person.
+                let from = transcript::sender(
+                    entry["from"]["bot"].as_str(),
+                    entry["origin"].as_str(),
+                    entry["person"].as_str(),
+                );
+                let quotes = entry.get("quotes").cloned();
                 responses(&entry["item"]).into_iter().map(move |mut item| {
                     if let Some(from) = from.as_ref().filter(|_| item["role"] == "user") {
                         item["from"] = json!(from);
+                        // A person, not an agent or a client, wrote it.
+                        if entry["person"].is_string() && entry["from"].is_null() {
+                            item["person"] = json!(true);
+                        }
+                    }
+                    // Where its quoted words are among its parts, and who
+                    // wrote them.
+                    if let Some(quotes) = quotes.as_ref().filter(|_| item["role"] == "user") {
+                        item["quotes"] = quotes.clone();
                     }
                     (node, item)
                 })
@@ -5477,7 +5508,13 @@ impl App {
                         if !older {
                             asks::close(&mut self.asks, &text(&item));
                         }
-                        self.land(node, &text(&item), item["from"].as_str(), older);
+                        self.land(
+                            node,
+                            (&text(&item), &quotes_of(&item)),
+                            item["from"].as_str(),
+                            item["person"] == true,
+                            older,
+                        );
                     }
                     (_, Some("assistant")) => {
                         let reply = text(&item);
@@ -5985,7 +6022,13 @@ impl App {
                     && !self.note_closed(node, &text(item))
                     && !quiet_message(&text(item))
                 {
-                    self.land(node, &text(item), item["from"].as_str(), false);
+                    self.land(
+                        node,
+                        (&text(item), &quotes_of(item)),
+                        item["from"].as_str(),
+                        item["person"] == true,
+                        false,
+                    );
                     self.answered(&text(item));
                 }
             }
@@ -6002,7 +6045,13 @@ impl App {
                     // What the bot reacted with so far answered the
                     // message before this one.
                     self.draw_bot_reactions();
-                    self.land(node, &text(item), item["from"].as_str(), false);
+                    self.land(
+                        node,
+                        (&text(item), &quotes_of(item)),
+                        item["from"].as_str(),
+                        item["person"] == true,
+                        false,
+                    );
                     self.answered(&text(item));
                 }
             }
@@ -10805,6 +10854,42 @@ fn text(item: &Value) -> String {
     }
 }
 
+/// A message's own words and, under them, the words it quotes, each
+/// after a line naming who wrote it: what reading the message in full shows.
+fn quoting(item: &Value) -> String {
+    text(item) + &quotes_of(item)
+}
+
+/// The words a message quotes, each under a line naming who wrote it, as
+/// Markdown quotes them; nothing when it quotes none.
+fn quotes_of(item: &Value) -> String {
+    let mut out = String::new();
+    let parts = item["content"].as_array();
+    for quote in item["quotes"].as_array().into_iter().flatten() {
+        let words = (quote["at"].as_u64())
+            .and_then(|at| parts?.get(at as usize)?["text"].as_str())
+            .unwrap_or_default();
+        let who = transcript::sender(
+            quote["from"]["bot"].as_str(),
+            quote["origin"].as_str(),
+            quote["person"].as_str(),
+        )
+        .unwrap_or_else(|| "you".into());
+        let did = match quote["reply"] == true {
+            true => "replied",
+            false => "wrote",
+        };
+        out.push_str(&format!("\n\n{who} {did}:"));
+        for line in words.lines() {
+            out.push_str(&format!(
+                "\n>{}{line}",
+                if line.is_empty() { "" } else { " " }
+            ));
+        }
+    }
+    out
+}
+
 /// Text, or the text of a list of parts, leaving out the pictures.
 fn joined(content: &Value) -> String {
     match content {
@@ -12856,6 +12941,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_person_s_message_shows_what_it_quotes_under_its_words() {
+        let client = daemon_answering(|_| json!({})).await;
+        let mut app = app(client);
+        app.width = 80;
+        let quotes = "\n\ncalc.fix replied:\n> Fixed **it**.\n> 1\n> 2\n> 3\n> 4\n> 5\n> 6\n> 7";
+        app.land(6, ("ship that", quotes), None, false, false);
+        let rows = drawn(&mut app);
+        let rows: Vec<&str> = rows.iter().map(|row| row.trim_end()).collect();
+        assert_eq!(
+            rows,
+            [
+                "",
+                "› ship that",
+                "",
+                "  calc.fix replied:",
+                "  ▌ Fixed it.",
+                "  ▌ 1",
+                "  ▌ 2",
+                "  ▌ 3",
+                "  ▌ 4",
+                "  ▌ 5",
+                "  ▌ … +2 lines",
+                "",
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn a_reaction_to_an_older_reply_goes_under_that_reply() {
         let client = daemon_answering(|_| json!({"turn": 9})).await;
         let mut app = app(client);
@@ -12864,7 +12977,7 @@ mod tests {
             transcript::reply("Merged it.", 80, std::path::Path::new("/")),
         );
         app.saw_reply(4, "Merged it.");
-        app.land(6, "and tag it", None, false);
+        app.land(6, ("and tag it", ""), None, false, false);
         app.commit_said(
             8,
             transcript::reply("Tagged 0.4.0.", 80, std::path::Path::new("/")),
@@ -13006,7 +13119,7 @@ mod tests {
         };
         // Attached mid-turn: the history drew the message and what the bot
         // reacted with so far, and the turn's start comes again after it.
-        app.land(5, "ship it", None, false);
+        app.land(5, ("ship it", ""), None, false, false);
         app.daemon(react("c1", "👀")).await;
         app.daemon(turn_event("tool_completed", 4, json!({"call_id": "c1"})))
             .await;
@@ -13032,7 +13145,7 @@ mod tests {
     async fn the_leads_reaction_goes_under_the_persons_message_wherever_it_is() {
         let client = daemon_answering(|_| json!({})).await;
         let mut app = app(client);
-        app.land(5, "ship it", None, false);
+        app.land(5, ("ship it", ""), None, false, false);
         app.commit(vec![Line::from("• Shipped.")]);
         app.picked.set(5, "calc.lead", "👀", false);
         app.place_picked(5);
@@ -13058,7 +13171,7 @@ mod tests {
         );
         // Reacted to before it landed: under it once it does.
         app.picked.set(7, "calc.lead", "👀", false);
-        app.land(7, "and the notes", None, false);
+        app.land(7, ("and the notes", ""), None, false, false);
         assert_eq!(drawn(&mut app).last().unwrap(), "   👀 calc.lead ");
     }
 
@@ -13485,11 +13598,30 @@ mod tests {
         app.width = 80;
         app.land(
             4,
-            "The build is green.\nI pushed the fix to calc.add.",
+            ("The build is green.\nI pushed the fix to calc.add.", ""),
             Some("calc.add"),
+            false,
             false,
         );
         assert_eq!(drawn(&mut app), ["↳ From calc.add ▸"]);
+        // An agent's name takes the agents' colour; a person's never does.
+        let blue = |app: &App, node| {
+            (app.relayed_lines(node, &[], 80).iter())
+                .flat_map(|line| &line.spans)
+                .any(|span| span.style.fg == Some(Color::Blue))
+        };
+        assert!(blue(&app, 4));
+        app.relayed.insert(
+            40,
+            Relayed {
+                head: "From ana".into(),
+                from: Some("ana".into()),
+                person: true,
+                text: None,
+            },
+        );
+        assert!(!blue(&app, 40));
+        app.relayed.remove(&40);
         // A click on one opens it whole, and again shuts it.
         app.follow("sonny:said/4");
         let button = app.pressed.pop().unwrap();
@@ -13514,7 +13646,7 @@ mod tests {
         // with what the agent did about them while it said nothing.
         let updates = "Task updates: what happened in your tasks since you last heard.\n\
             - calc.neg: turn:calc.neg/3 completed";
-        app.land(5, updates, None, false);
+        app.land(5, (updates, ""), None, false, false);
         let steer =
             r#""$AGENT_BIN" run --detach --delivery steer --bot calc.neg -- 'Check div too.'"#;
         app.commit_call(
@@ -13550,7 +13682,7 @@ mod tests {
         );
         // The agent's words end it: what comes after starts anew.
         app.commit(vec![Line::from("• calc.neg is done.")]);
-        app.land(6, updates, None, false);
+        app.land(6, (updates, ""), None, false, false);
         assert_eq!(
             drawn(&mut app)[2..],
             [
@@ -13560,12 +13692,12 @@ mod tests {
             ]
         );
         // The person's own words are drawn as ever.
-        app.land(7, "thanks", None, false);
+        app.land(7, ("thanks", ""), None, false, false);
         assert_eq!(drawn(&mut app).iter().rev().nth(1).unwrap(), "› thanks");
         // A message a page drawn again put in a newer cluster opens there,
         // not in the cluster its rows were let go from.
         app.next_group = 9;
-        app.land(8, updates, None, false);
+        app.land(8, (updates, ""), None, false, false);
         let stale = Cluster {
             messages: vec![Clustered {
                 node: 8,
@@ -14670,6 +14802,26 @@ mod tests {
             transcript::fullness(48_500, None),
             ("48.5k".into(), " context", None)
         );
+    }
+
+    #[test]
+    fn a_message_read_in_full_shows_the_words_it_quotes_under_who_wrote_them() {
+        let item = json!({"role": "user", "content": [
+            {"type": "input_text", "text": "News from your tasks."},
+            {"type": "input_text", "text": "[Sent by lookout.tasks.]"},
+            {"type": "input_text", "text": "[Quoted from turn:calc.fix/5, written by a person:]"},
+            {"type": "input_text", "text": "yes, ship it\nand tag it"},
+            {"type": "input_text", "text": "[Quoted from the reply of turn:calc.fix/6, written by ana:]"},
+            {"type": "input_text", "text": "tagged"}],
+            "quotes": [{"bot": "calc.fix", "turn": 5, "at": 3},
+                {"bot": "calc.fix", "turn": 6, "reply": true, "person": "ana", "at": 5}]});
+        assert_eq!(
+            quoting(&item),
+            "News from your tasks.\n\nyou wrote:\n> yes, ship it\n> and tag it\n\n\
+             ana replied:\n> tagged"
+        );
+        // Its own words are all a message without quotes shows.
+        assert_eq!(text(&item), "News from your tasks.");
     }
 
     #[test]

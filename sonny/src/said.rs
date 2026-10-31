@@ -389,7 +389,11 @@ pub async fn walk(
 /// feedback on that reply: its node, the first line of the reply when the
 /// reaction quotes it, and the emoji.
 fn reaction(entry: &Value) -> Option<(i64, Option<String>, String)> {
-    if !(entry["from"].is_null() && entry["origin"].is_null() && entry["item"]["role"] == "user") {
+    if !(entry["from"].is_null()
+        && entry["origin"].is_null()
+        && entry["person"].is_null()
+        && entry["item"]["role"] == "user")
+    {
         return None;
     }
     let text = crate::text(&entry["item"]);

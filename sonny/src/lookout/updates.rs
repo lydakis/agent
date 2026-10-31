@@ -4,9 +4,10 @@
 //! a trigger asked for, an approval only the person can give, and a
 //! running turn that has printed nothing for a long while are always news;
 //! turns the person asked for in the task themselves are listed apart, as
-//! theirs. The person's words are quoted; anyone else's stay behind the
-//! turn's handle, as the note reaches the approver as the person's own. A
-//! turn the lead waits on is not news, nor its own forks.
+//! theirs. The person's words are quoted from their turns, by the daemon,
+//! which names who wrote them; anyone else's stay behind the turn's handle.
+//! The note itself is the lookout's, not the person's. A turn the lead
+//! waits on is not news, nor its own forks.
 //!
 //! Only live turns count. The lookout sends the news as soon as the lead
 //! rests, or at once when the person wrote in a task mid-turn; one note
@@ -25,9 +26,12 @@ use std::{
 pub const DOUBT: Duration = Duration::from_secs(60);
 const WAKE_TASKS: usize = 32;
 /// About what one note may take, well under the daemon's 256 KiB prompt
-/// limit; a message counts as its quoted words and `LINE_BYTES`, and a
-/// turn as its line and reply as they read.
+/// limit, which counts what it quotes too; a message counts as its quoted
+/// words and `LINE_BYTES`, and a turn as its line and reply as they read.
 const NOTE_BYTES: usize = 192 * 1024;
+/// The most of the person's messages one note quotes, the most the daemon
+/// copies into one prompt.
+const NOTE_QUOTES: usize = 64;
 const LINE_BYTES: usize = 160;
 /// How many messages a task's news keeps the person's words for.
 const PENDING: usize = 128;
@@ -71,12 +75,14 @@ struct Turn {
 }
 
 /// A message written in a task: who wrote it, and the words, only when
-/// the person did.
+/// the person did, kept to know the same words again; the note quotes
+/// them whole, `bytes` long.
 #[derive(Clone, Debug, PartialEq)]
 struct Said {
     turn: i64,
     from: String,
     words: Option<String>,
+    bytes: usize,
 }
 
 /// A note a task put in its own margin, changed or took away: by its
@@ -204,8 +210,8 @@ pub struct Told {
 }
 
 pub struct Line {
-    /// Words written in the task, not how a turn ended.
-    pub said: bool,
+    /// The person's turn whose words the note quotes for this line.
+    pub quote: Option<(String, i64)>,
     /// Asked for by the person in the task: theirs, not the lead's.
     pub theirs: bool,
     pub text: String,
@@ -463,8 +469,10 @@ impl Updates {
                             }
                         }
                     }
-                } else if let Some(origin) = data["origin"].as_str() {
-                    self.origin.insert(key(turn), origin.to_owned());
+                } else if let Some(by) = data["origin"].as_str().or(data["person"].as_str()) {
+                    // A client, or another person a client named: not the
+                    // person's own turn.
+                    self.origin.insert(key(turn), by.to_owned());
                 }
                 // A trigger's fire with --reply-to ends its request ID
                 // `.to.ID`: the bot the turn's answer goes to.
@@ -704,11 +712,13 @@ impl Updates {
         }
         // Only what a note quotes is kept.
         let line = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let bytes = words.map_or(0, str::len);
         let words = words.map(|words| line(&super::cut(&line(words), super::QUOTE_CHARS)));
         let said = Said {
             turn,
             from: from.to_owned(),
             words,
+            bytes,
         };
         self.news_of(name).merge(News {
             said: vec![said],
@@ -1042,7 +1052,7 @@ impl Updates {
         let mut sent = Vec::new();
         // What does not fit in this note's bytes waits for the next.
         let mut later = held;
-        let mut bytes = 0;
+        let (mut bytes, mut quotes) = (0, 0);
         for (name, mut news) in tasks {
             if bytes >= NOTE_BYTES {
                 later.push((name, news));
@@ -1050,10 +1060,15 @@ impl Updates {
             }
             let (mut kept, mut wait) = (Vec::new(), Vec::new());
             for message in std::mem::take(&mut news.said) {
-                let size = message.words.as_ref().map_or(0, String::len) + LINE_BYTES;
+                let quote = usize::from(message.words.is_some());
+                let size = quote * message.bytes + LINE_BYTES;
                 let first = items.is_empty() && kept.is_empty();
-                if wait.is_empty() && (first || bytes + size <= NOTE_BYTES) {
+                if wait.is_empty()
+                    && quotes + quote <= NOTE_QUOTES
+                    && (first || bytes + size <= NOTE_BYTES)
+                {
                     bytes += size;
+                    quotes += quote;
                     kept.push(message);
                 } else {
                     wait.push(message);
@@ -1134,6 +1149,18 @@ impl Updates {
         if let Some(seen) = told.seen {
             self.memory_seen = Some(seen);
         }
+    }
+
+    /// The note could not be sent as the daemon could not copy the words
+    /// it quotes, gone with their task, say: its news comes first next
+    /// time, the person's messages named by their turns alone.
+    pub fn unquoted(&mut self, mut told: Told) {
+        for (_, news) in &mut told.sent {
+            for said in &mut news.said {
+                said.words = None;
+            }
+        }
+        self.unsent(told);
     }
 
     /// The note could not be sent: its news comes first next time.
@@ -1290,7 +1317,7 @@ fn line(name: &str, theirs: bool, t: &Turn) -> Line {
     }
     let which = t.which.as_deref().unwrap_or("");
     Line {
-        said: false,
+        quote: None,
         theirs,
         text,
         key: format!("{name}/{}/{}/{theirs}/{which}", t.turn, t.status),
@@ -1314,7 +1341,7 @@ fn note_line(name: &str, noted: &Noted) -> Line {
         ),
     };
     Line {
-        said: false,
+        quote: None,
         theirs: false,
         text,
         key: format!("{name}/{turn}/note/{id}/{removed}/{call}"),
@@ -1343,7 +1370,7 @@ fn ask_line(name: &str, asked: &Asked) -> Line {
     quote(&mut text, question);
     quote(&mut text, &numbered.join(" · "));
     Line {
-        said: false,
+        quote: None,
         theirs: false,
         text,
         key: format!("{name}/{turn}/ask/{call}"),
@@ -1351,12 +1378,12 @@ fn ask_line(name: &str, asked: &Asked) -> Line {
 }
 
 /// What was written in a task, as the note says it: each of the person's
-/// messages quoted, unless the note quoted the same words for another task
-/// already, and everyone else's in one line by its latest turn.
+/// messages quoted from its turn, unless the note quoted the same words for
+/// another task already, and everyone else's in one line by its latest turn.
 fn said(name: &str, said: &[Said], quoted: &mut HashMap<String, String>) -> Vec<Line> {
     let mut lines = Vec::new();
-    let line = |turn: i64, text: String| Line {
-        said: true,
+    let line = |turn: i64, text: String, quote: bool| Line {
+        quote: quote.then(|| (name.to_owned(), turn)),
         theirs: false,
         text,
         key: format!("{name}/{turn}/said"),
@@ -1365,14 +1392,21 @@ fn said(name: &str, said: &[Said], quoted: &mut HashMap<String, String>) -> Vec<
         let Some(words) = &message.words else {
             continue;
         };
-        // Kept as told: one line, cut at the quote's length.
         let handle = format!("turn:{name}/{}", message.turn);
-        let text = match quoted.get(words) {
-            Some(first) => format!("- {name}: {handle}, the person wrote the same as in {first}"),
-            None => format!("- {name}: {handle}, the person wrote: \"{words}\""),
+        let line = match quoted.get(words) {
+            Some(first) => line(
+                message.turn,
+                format!("- {name}: {handle}, the person wrote the same as in {first}"),
+                false,
+            ),
+            None => line(
+                message.turn,
+                format!("- {name}: {handle}, the person wrote the words quoted from it below"),
+                true,
+            ),
         };
         quoted.entry(words.clone()).or_insert(handle);
-        lines.push(line(message.turn, text));
+        lines.push(line);
     }
     let others: Vec<&Said> = said.iter().filter(|s| s.words.is_none()).collect();
     if let Some(last) = others.last() {
@@ -1391,7 +1425,7 @@ fn said(name: &str, said: &[Said], quoted: &mut HashMap<String, String>) -> Vec<
                 from.join(", ")
             ),
         };
-        lines.push(line(last.turn, text));
+        lines.push(line(last.turn, text, false));
     }
     lines
 }
@@ -1494,6 +1528,24 @@ mod tests {
             &ev(bot, Some(turn), "turn_finished", json!({"status": status})),
             now,
         );
+    }
+
+    #[test]
+    fn a_turn_another_person_asked_for_is_theirs_not_the_person_s() {
+        let mut updates = fleet();
+        turn(
+            &mut updates,
+            "shop.fix",
+            4,
+            json!({"person": "ana"}),
+            "completed",
+        );
+        let told = updates.take();
+        assert_eq!(
+            text(&told),
+            "- shop.fix: turn:shop.fix/4 completed, asked by ana"
+        );
+        assert!(told.items.iter().all(|line| !line.theirs));
     }
 
     #[test]
@@ -1873,7 +1925,7 @@ mod tests {
         updates.event(&ev("shop.fix", Some(7), "accepted", from), now);
         assert_eq!(
             text(&updates.take()),
-            "- shop.fix: turn:shop.fix/8, the person wrote: \"and tabs\"\n\
+            "- shop.fix: turn:shop.fix/8, the person wrote the words quoted from it below\n\
              - shop.fix: turn:shop.fix/7, shop.docs wrote in it\n\
              - shop.fix: turn:shop.fix/6 completed, asked by shop.docs"
         );
@@ -1911,6 +1963,33 @@ mod tests {
     }
 
     #[test]
+    fn a_note_quotes_as_many_messages_as_the_daemon_copies() {
+        let mut updates = fleet();
+        for turn in 1..=100 {
+            updates.said("shop.fix", turn, "the person", Some(&format!("{turn}")));
+        }
+        let first = updates.take();
+        let quotes = first.items.iter().filter(|i| i.quote.is_some()).count();
+        assert_eq!(quotes, NOTE_QUOTES);
+        updates.sent(first);
+        let second = updates.take();
+        assert_eq!(second.items.len(), 100 - NOTE_QUOTES);
+        // Words the daemon could not copy, their task gone, are named by
+        // their turns next time.
+        updates.unquoted(second);
+        let third = updates.take();
+        assert!(third.items.iter().all(|i| i.quote.is_none()));
+        assert_eq!(
+            text(&third),
+            format!(
+                "- shop.fix: turn:shop.fix/100, {} messages in it since turn:shop.fix/{}, from the person",
+                100 - NOTE_QUOTES,
+                NOTE_QUOTES + 1
+            )
+        );
+    }
+
+    #[test]
     fn the_person_s_words_go_first_in_a_bounded_note() {
         let mut updates = fleet();
         for n in 0..WAKE_TASKS + 8 {
@@ -1923,7 +2002,7 @@ mod tests {
         let told = updates.take();
         assert_eq!(
             told.items[0].text,
-            "- shop.fix: turn:shop.fix/2, the person wrote: \"stop\""
+            "- shop.fix: turn:shop.fix/2, the person wrote the words quoted from it below"
         );
         assert_eq!(told.more, 9);
         assert!(!updates.quoting());
