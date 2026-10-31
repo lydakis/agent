@@ -602,10 +602,15 @@ way `/react` does, and each note in the margin has its own `↩`.
 
   ![/commons in the pane](../docs/sonny/commons.png)
 - `/sky` draws every agent the daemon keeps, in the pane: leads on the inner
-  ring, the agents each one made fanned out behind it, you in the middle.
+  ring, the agents each one made fanned out behind it, you in the middle,
+  on an ellipse that fills the pane. Projects keep their places in the
+  order they started, each arm as wide as the square root of its size.
   It is a calm window to keep open and watch: the lines that join who made
   whom are faint, a pair that talked in the last minute shows a faint trail
-  that fades, a message flies as a spark, a commons post ripples out, a
+  that fades, a message flies as a spark and flashes where it lands (the
+  more an agent is messaged, the bigger, within bounds), a commons post
+  ripples out as far as its thread reaches (everyone who read it or
+  posted in it; a post to an empty board stays small), a
   tool call twinkles in cyan in a shape for its kind (a shell's streak
   across, a file's up and down, the web's corners, any other tool's star).
   A working agent breathes, slowly, between the text's colour and a brighter
@@ -618,10 +623,19 @@ way `/react` does, and each note in the margin has its own `↩`.
   legend of every mark and shape and a few numbers: projects, leads,
   agents, messages and tool calls a minute and this hour, the busiest pair.
   `z` is zen: the sky alone, no log, no footer, no names but what needs you
-  or failed. Under 60 columns or 24 rows the sky becomes a list, a firefly
+  or failed. Tab swaps lenses on the same agents: live (the default), talk
+  (an hour of trails, denser the more a pair talked, where loops and
+  storms show) and models (each model in a lead's place, its agents round
+  its muted name); the footer names the lens. The arrows pick a star and
+  Enter puts it in the middle: its maker, what it made and whoever it
+  talked to in the last hour on the first ring, two hops on the next, the
+  chat log only its own; the stars glide to their places. Esc lets go of
+  the pick, then the centre. Under 60 columns or 24 rows the sky becomes a list, a firefly
   per agent and the last it said or was told. `sonny sky` draws the same
   sky on its own, in the whole terminal, to keep in another one beside the
-  work, with your theme's grays and `NO_COLOR` honoured; `q` leaves it, and
+  work, with your theme's grays and `NO_COLOR` honoured, and
+  `sonny sky --center NAME` starts on an agent (its name, label or
+  project); `q` leaves it, and
   a daemon that goes is followed again once it is back.
 
   ![/sky in the pane](../docs/sonny/sky.gif)
@@ -629,6 +643,12 @@ way `/react` does, and each note in the margin has its own `↩`.
   ![/sky with states and its chat log](../docs/sonny/sky-states.png)
 
   ![/sky in zen](../docs/sonny/sky-zen.png)
+
+  ![/sky's talk lens](../docs/sonny/sky-talk.png)
+
+  ![/sky's models lens](../docs/sonny/sky-models.png)
+
+  ![/sky centred on the shop lead](../docs/sonny/sky-centre.png)
 
   ![/sky in a small pane](../docs/sonny/sky-list.png)
 
