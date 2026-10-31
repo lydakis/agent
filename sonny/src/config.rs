@@ -32,6 +32,13 @@ fn number(setting: &Setting) -> bool {
     setting.values.is_empty() && setting.default.parse::<u64>().is_ok()
 }
 
+/// Whether a setting is a span of time, as `30s`, `15m` or `1h`.
+fn span(setting: &Setting) -> bool {
+    setting.values.is_empty()
+        && !number(setting)
+        && agent_client::config::span(setting.key, setting.default).is_ok()
+}
+
 /// The rows `/config` takes with room for all: the blank one, a heading
 /// for each table, and the settings.
 pub fn height() -> usize {
@@ -49,7 +56,7 @@ fn short(key: &str) -> &str {
 }
 
 /// Every key `agent_client::config` reads.
-pub const SETTINGS: [Setting; 26] = [
+pub const SETTINGS: [Setting; 27] = [
     Setting {
         key: "model",
         about: "a new agent's model, when none is named (provider/model)",
@@ -165,6 +172,12 @@ pub const SETTINGS: [Setting; 26] = [
         default: "1000000",
     },
     Setting {
+        key: "sonny.commons_digest",
+        about: "how often at most an agent hears of new posts in the commons threads it posted in, as 30s, 15m or 1h; 0 for as they come",
+        values: &[],
+        default: "1h",
+    },
+    Setting {
         key: "sonny.default_permissions",
         about: "the /permissions row a new lead starts in; a [sonny.permissions] row of your own is typed into the file",
         values: &["auto", "ask", "read-only", "full"],
@@ -216,6 +229,7 @@ pub fn skill() -> String {
         .map(|setting| {
             let values = match setting.values {
                 [] if number(setting) => "a whole number".to_owned(),
+                [] if span(setting) => "a span, as `30s`, `15m` or `1h`".to_owned(),
                 [] => "a name".to_owned(),
                 values => (values.iter())
                     .map(|value| format!("`{value}`"))
@@ -534,9 +548,10 @@ mod tests {
         };
         for (at, setting) in SETTINGS.iter().enumerate() {
             view.pick = at;
-            let named = match number(setting) {
-                true => "7",
-                false => "a/b",
+            let named = match (number(setting), span(setting)) {
+                (true, _) => "7",
+                (_, true) => "15m",
+                _ => "a/b",
             };
             let value = setting.values.last().copied().unwrap_or(named);
             view.write(Some(value.to_owned()));
