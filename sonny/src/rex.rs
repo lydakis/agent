@@ -31,12 +31,18 @@ pub fn find() -> Option<PathBuf> {
 
 /// What a line of `rex events -s SESSION --json` says. A session's event
 /// comes wrapped in a `session_event`; a terminal's, once more, in a
-/// `block_event`, which moves no block, as focus and clients coming and
-/// going don't. Anything else may.
+/// `block_event`, which moves no block, as focus, ownership and clients
+/// coming and going (each CLI call is one) don't. A block renamed says
+/// only `session_view_changed`. The stream goes on once its session is
+/// gone, so `session_destroyed` ends it.
 fn heard(line: &Value) -> Heard {
+    if line["type"] == "session_destroyed" {
+        return Heard::Over;
+    }
     match line["payload"]["event"]["type"].as_str() {
         Some(
             "block_event"
+            | "block_owner_changed"
             | "active_window_changed"
             | "client_connected"
             | "client_disconnected"
@@ -378,9 +384,12 @@ mod tests {
         };
         assert_eq!(super::heard(&event("block_event")), Heard::Same);
         assert_eq!(super::heard(&event("active_window_changed")), Heard::Same);
+        assert_eq!(super::heard(&event("client_connected")), Heard::Same);
         for kind in ["window_created", "block_closed", "session_view_changed"] {
             assert_eq!(super::heard(&event(kind)), Heard::Changed);
         }
+        let gone = serde_json::json!({"type": "session_destroyed", "payload": {"session_id": "session:01"}});
+        assert_eq!(super::heard(&gone), Heard::Over);
     }
 
     /// A stand-in rex, over a JSON file of sessions and their blocks, that
