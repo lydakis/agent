@@ -246,8 +246,8 @@ pub struct Settings {
     /// ([`crate::sandbox::unsandboxed`]).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unsandboxed: Vec<String>,
-    /// Unix sockets, or folders of them, a sandbox's commands reach
-    /// besides those in the bot's own folders, each an absolute path
+    /// Unix sockets, or folders of them, the only ones a sandbox's commands
+    /// reach, each an absolute path
     /// ([`crate::sandbox::Policy::sockets`]).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unix_sockets: Vec<String>,

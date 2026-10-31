@@ -448,7 +448,7 @@ fn print_flags(flags: &str) {
             ),
             "--unix-socket" => (
                 "PATH",
-                "A Unix socket, or a folder of them, a sandboxed bot's commands reach besides those in its own folders; repeat for more",
+                "A Unix socket, or a folder of them, the only ones a sandboxed bot's commands reach; repeat for more",
             ),
             "--fallback" => (
                 "PROVIDER/MODEL",

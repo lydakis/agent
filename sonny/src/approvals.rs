@@ -26,8 +26,8 @@ pub struct Mode {
 pub enum Sandbox {
     /// Its folder, temp and `writable` written; the network reached when
     /// `network`, and its repositories committed to when `git`, their
-    /// hooks and config kept read-only; the Unix sockets in its folders
-    /// and `unix_sockets` reached.
+    /// hooks and config kept read-only; only the Unix sockets
+    /// `unix_sockets` names reached.
     Workspace {
         network: bool,
         git: bool,

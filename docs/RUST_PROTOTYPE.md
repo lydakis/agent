@@ -435,7 +435,7 @@ keep-warm when it sets any of them.
 | `hide_senders` (`--hide-senders`) | Its model reads what other bots and clients send it without the line naming the sender (see [fleet controllers](#fleet-controllers)); `senders = "hidden"` in `~/.agent/config.toml` sets it on the bots the CLI and Sonny make. | off |
 | `outputs` (`--outputs`) | An absolute folder that holds each tool output stream cut for the model whole, one file per stream, in place of the store's copy (see [retained outputs](#retained-outputs)). The daemon makes it, owner-only, and writes there only while the bot's sandbox cannot write it; otherwise the stream stays in the store. `agent run --new` and Sonny name `outputs` beside the store unless told otherwise. | none |
 | `unsandboxed` (`--unsandboxed`, repeatable) | Commands a sandboxed bot runs outside its sandbox without asking, each by its first words, such as `mcpx` or `docker compose` (see [sandbox](#sandbox)). At most 64, each at most 1 KiB. | none |
-| `unix_sockets` (`--unix-socket`, repeatable) | Absolute Unix sockets, or folders of them, a sandboxed bot's commands reach besides those in its own folders, such as a Docker or SSH agent socket (see [sandbox](#sandbox)). Each is stored by its real path while it exists. At most 64. | none |
+| `unix_sockets` (`--unix-socket`, repeatable) | Absolute Unix sockets, or folders of them, the only ones a sandboxed bot's commands reach, such as a Docker or SSH agent socket (see [sandbox](#sandbox)). Each is stored by its real path while it exists. At most 64. | none |
 
 Provider requests multiplex over HTTP/2, and one connection carries at most
 the 100 streams the provider advertises; the HTTP layer queues the rest, so a
@@ -2370,11 +2370,12 @@ unconfined.
 
 A Unix socket is a way out of any sandbox: a program listening on one runs
 what it is asked outside, as a browser's daemon launches a browser or Docker
-runs a container. So, as Claude Code's sandbox blocks them by default, a
-`workspace-write` bot's commands reach only the Unix sockets in its own
-folder and its `writable` folders, where its own programs make theirs, and
-those its `unix_sockets` names; a `read-only` bot's only those named. On
-macOS Seatbelt holds them to those paths, network on or off. Linux does not
+runs a container. So, as Claude Code's sandbox and Codex's managed network
+block them by default, a sandboxed bot's commands reach only the Unix
+sockets its `unix_sockets` names. Not even those in its own folders: a hard
+link there to any socket, which needs no right to the socket, would reach
+it, and a named folder the bot may write lets one in the same way. On macOS
+Seatbelt holds them to those paths, network on or off. Linux does not
 hold them yet: bubblewrap's read-only root still lets a command connect to
 any socket it can see.
 

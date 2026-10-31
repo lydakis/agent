@@ -43,7 +43,7 @@
 //! network = false               # whether commands reach the network
 //! git = "read-only"             # "write" lets commits run without asking
 //! writable = ["~/.cargo"]       # folders it writes besides its own
-//! unix_sockets = ["~/.colima"]  # sockets, or their folders, its commands reach besides its own
+//! unix_sockets = ["~/.colima"]  # the only sockets, or their folders, its commands reach
 //! reviewer = "model"            # who approves anything more: model, you or none
 //!
 //! [sonny.mcp_servers.linear]    # an MCP server Sonny's agents reach
@@ -253,8 +253,8 @@ pub struct Permissions {
     pub git: Option<bool>,
     /// Folders, `~` for home, it writes besides its own.
     pub writable: Vec<String>,
-    /// Unix sockets, or folders of them, `~` for home, its commands reach
-    /// besides those in its own folders.
+    /// Unix sockets, or folders of them, `~` for home, the only ones its
+    /// commands reach.
     pub unix_sockets: Vec<String>,
     /// Who approves what leaves the sandbox.
     pub reviewer: Option<Reviewer>,

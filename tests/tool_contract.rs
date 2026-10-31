@@ -753,6 +753,87 @@ async fn a_sandboxed_command_cannot_reach_the_daemon_socket() {
     std::fs::remove_dir_all(base).unwrap();
 }
 
+/// On macOS a sandboxed command reaches only the Unix sockets its settings
+/// name, network on or off: not the daemon's, even inside its folder, nor
+/// one in its folder, which could be a hard link to any socket.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn a_sandboxed_command_reaches_only_the_sockets_it_names() {
+    use agent_runtime::sandbox::{Daemon, Mode, Policy};
+    if !sandboxes() {
+        return;
+    }
+    let base = std::fs::canonicalize(env!("CARGO_TARGET_TMPDIR"))
+        .unwrap()
+        .join(format!("agent-sockets-{}", std::process::id()));
+    let (workspace, outside) = (base.join("ws"), base.join("out"));
+    std::fs::create_dir_all(workspace.join(".local")).unwrap();
+    std::fs::create_dir_all(outside.join("named")).unwrap();
+    let socket = workspace.join(".local/agent.sock");
+    let listen = |path: &std::path::Path| std::os::unix::net::UnixListener::bind(path).unwrap();
+    let paths = [
+        socket.clone(),
+        workspace.join("own.sock"),
+        outside.join("other.sock"),
+        outside.join("one.sock"),
+        outside.join("named/in.sock"),
+    ];
+    let _listeners: Vec<_> = paths.iter().map(|path| listen(path)).collect();
+    let tools = Registry::new("shell").unwrap();
+    let reaches = |policy: Policy, path: std::path::PathBuf| {
+        let tools = tools.clone();
+        let workspace = workspace.clone();
+        async move {
+            let connect = format!(
+                "python3 -c 'import socket; socket.socket(socket.AF_UNIX).connect(\"{}\")'",
+                path.display()
+            );
+            let prepared = tools
+                .prepare("shell", &json!({"command": connect}).to_string())
+                .unwrap();
+            let output = tools
+                .execute(prepared, &workspace, &[], Some(std::sync::Arc::new(policy)))
+                .await
+                .unwrap()
+                .output;
+            serde_json::from_str::<Value>(&output).unwrap()["exit_code"] == 0
+        }
+    };
+    let named = [
+        paths[3].display().to_string(),
+        outside.join("named").display().to_string(),
+    ];
+    for network in [false, true] {
+        let daemon = Daemon {
+            socket: Some(socket.clone()),
+            ..protecting()
+        };
+        let policy = Policy::new(
+            Some(Mode::WorkspaceWrite),
+            Some(&workspace),
+            &[],
+            network,
+            &daemon,
+        )
+        .unwrap()
+        .unwrap()
+        .with_sockets(&named);
+        let reached = [
+            reaches(policy.clone(), paths[0].clone()).await,
+            reaches(policy.clone(), paths[1].clone()).await,
+            reaches(policy.clone(), paths[2].clone()).await,
+            reaches(policy.clone(), paths[3].clone()).await,
+            reaches(policy.clone(), paths[4].clone()).await,
+        ];
+        assert_eq!(
+            reached,
+            [false, false, false, true, true],
+            "network {network}"
+        );
+    }
+    std::fs::remove_dir_all(base).unwrap();
+}
+
 /// A folder a bot may write that something swapped for a link since is
 /// refused, never bound where the link points: a bot's creator may write
 /// the folder above it. Each confined call builds its policy anew.
