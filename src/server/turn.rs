@@ -4967,9 +4967,21 @@ struct Kept {
 }
 
 impl Drop for Kept {
+    // A stopped turn drops its keeper's result wherever the handle goes,
+    // the runtime thread too, so the removal runs on a blocking worker.
     fn drop(&mut self) {
-        for (_, file) in &self.files {
-            let _ = std::fs::remove_file(file);
+        if self.files.is_empty() {
+            return;
+        }
+        let files: Vec<String> = self.files.drain(..).map(|(_, file)| file).collect();
+        let remove = move || {
+            for file in &files {
+                let _ = std::fs::remove_file(file);
+            }
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => drop(runtime.spawn_blocking(remove)),
+            Err(_) => remove(),
         }
     }
 }
