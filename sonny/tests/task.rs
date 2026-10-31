@@ -1086,13 +1086,20 @@ fn a_task_starts_its_own_helper_on_its_branch_as_deep_as_the_config_lets_it() {
     // The lead's task starts a helper from where it works, in its lead's
     // project and repository, on its own branch's last commit.
     *lab.bot.borrow_mut() = "demo.fix".into();
-    let call = serde_json::json!({"name": "review", "brief": "review it"});
+    let brief = format!("review {}", fix.join("src/lib.rs").display());
+    let call = serde_json::json!({"name": "review", "brief": brief});
     let (ok, said) = lab.tool(&fix.join("src"), "start_task", call, false);
     assert!(ok, "{said}");
     let review = lab.home.join(".agent/worktrees/demo.review");
     assert_eq!(
         std::fs::read_to_string(review.join("src/lib.rs")).unwrap(),
         "fixed\n"
+    );
+    // A path in the task's worktree names the helper's copy.
+    let told = lab.ran().last().cloned().unwrap();
+    assert_eq!(
+        told,
+        format!("review {}", review.join("src/lib.rs").display())
     );
     assert_eq!(
         lab.git(&review, &["branch", "--show-current"]),
@@ -1167,7 +1174,20 @@ fn a_helper_of_a_task_in_a_repository_inside_the_lead_s_folder_starts_on_its_bra
         std::fs::read_to_string(review.join("src/lib.rs")).unwrap(),
         "fixed\n"
     );
-    // And the task removes it from there.
+    // A fork of the task is made where the task works, not told a folder.
+    snapshot(&lab, &fix, 12, 77);
+    let task = serde_json::json!({"name": "demo.fix", "bot_id": 5,
+        "created_by": "demo.lead", "workspace": fix});
+    std::fs::write(
+        lab.scratch.join("run.log.ls"),
+        serde_json::json!([lead, task]).to_string(),
+    )
+    .unwrap();
+    let call = serde_json::json!({"name": "try", "brief": "b", "from": "fix"});
+    let (ok, said) = lab.tool(&fix, "start_task", call, false);
+    assert!(ok, "{said}");
+    assert!(lab.home.join(".agent/worktrees/demo.try").exists());
+    // And the task removes its helper from there.
     let helper = serde_json::json!({"name": "demo.review", "created_by": "demo.fix"});
     std::fs::write(
         lab.scratch.join("run.log.ls"),

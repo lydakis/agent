@@ -117,12 +117,14 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
         flags.extend(["--effort".to_owned(), effort]);
     }
     // A helper works in the repository inside the lead's folder that its
-    // task works in, unless told another.
+    // task works in, unless told another; a fork works where its source did.
     let theirs = match (&start.builds_on, start.own_folder) {
-        (Some(task), false) if start.folder.is_none() => match recorded(task) {
-            Some((source, Made::Worktree(repo))) if same(&source, here) => Some(repo),
-            _ => None,
-        },
+        (Some(task), false) if start.folder.is_none() && start.from.is_none() => {
+            match recorded(task) {
+                Some((source, Made::Worktree(repo))) if same(&source, here) => Some(repo),
+                _ => None,
+            }
+        }
         _ => None,
     };
     let theirs = theirs.map(|repo| repo.to_string_lossy().into_owned());
@@ -162,6 +164,9 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
         Some(from) => Some(source(&agent, project, from, start)?),
         None => None,
     };
+    // The worktree of the task a helper builds on, whose files it starts
+    // with as they were at its last commit.
+    let mut helped = None;
     let mut place = match &source {
         Some(source) => forked(&agent, name, source)?,
         None if info["threads_in"] == "project" => in_place(here, name),
@@ -170,6 +175,9 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
             // On the last commit of the branch of the task it helps, in
             // the repository the helper is made of, when it has one there.
             let base = (start.builds_on.as_deref()).and_then(|task| branch_of(&at, task));
+            if let (Some(task), Some(_)) = (&start.builds_on, &base) {
+                helped = worktree_of(&at, task);
+            }
             worktree(&at, name, base.as_deref().unwrap_or("HEAD"))?
         }
     };
@@ -405,6 +413,10 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
             brief = in_copy(&brief, &source.top, worktree).0;
         }
     }
+    // A helper's are where they were in its task's worktree.
+    if let (Some(top), Some((_, worktree))) = (&helped, &place.copy) {
+        brief = in_copy(&brief, top, worktree).0;
+    }
     let (brief, moved) = match &place.copy {
         Some((from, to)) => in_copy(&brief, from, to),
         None => (brief, 0),
@@ -505,6 +517,21 @@ fn branch_of(here: &Path, name: &str) -> Option<String> {
     )
     .ok()?;
     Some(branch)
+}
+
+/// Where the task `name`'s branch is checked out, in the repository at
+/// `here`.
+fn worktree_of(here: &Path, name: &str) -> Option<PathBuf> {
+    let list = git(here, &["worktree", "list", "--porcelain"]).ok()?;
+    let branch = format!("branch refs/heads/agent/{name}");
+    (list.split("\n\n"))
+        .find(|entry| entry.lines().any(|line| line == branch))
+        .and_then(|entry| {
+            entry
+                .lines()
+                .find_map(|line| line.strip_prefix("worktree "))
+        })
+        .map(PathBuf::from)
 }
 
 /// Whether git would take `name` for the branch `agent/NAME`.
