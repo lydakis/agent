@@ -1059,7 +1059,9 @@ is `invalid_json` with a null `id`; JSON of the wrong shape is
 names the unknown or ill-typed field.
 Notifications carry `event`; durable ones carry `cursor`, `bot`, `turn`, and
 `data`, in exactly the shape `events` replays them, and `written_ms`, the Unix
-ms the event joined the store, set by the insert that writes it; events from
+ms the event joined the store, set by the insert that writes it and never
+earlier than the event before it (should the clock go back, events keep the
+last time until it catches up, as a log's time index does); events from
 before schema 68 have none. Durable events reach
 followers in commit order: the storage worker itself hands each group's
 committed events, and the outcomes of turns its jobs ended, to one publisher

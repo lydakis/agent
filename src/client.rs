@@ -1682,10 +1682,12 @@ fn follow(options: &Options) -> Result<i32> {
     // Choose the turn before subscribing. If it finishes during attachment,
     // replay still delivers its terminal event; a later idle snapshot cannot
     // make us abandon events queued while waiting for an RPC response.
-    let state = connection.request("inspect", json!({"bot":bot}))?;
-    let turn = state["running_turn"].as_i64();
+    // A time to follow from is taken first, so a turn ending after the
+    // snapshot ends after it too, and its end is replayed.
     let mut request = follow_from(options)?;
     request["bot"] = json!(bot);
+    let state = connection.request("inspect", json!({"bot":bot}))?;
+    let turn = state["running_turn"].as_i64();
     connection.request("follow", request)?;
     let mut renderer = Renderer::new(options.pretty, turn, &options.target);
     loop {

@@ -9201,15 +9201,19 @@ impl Database {
         ))
     }
     /// The cursor just before the first event written at or after `since_ms`:
-    /// where a follow from that time starts. Cursors and times rise together,
-    /// so it is found by halving the cursor range, a few point reads however
-    /// many events there are; events with no time count as older.
+    /// where a follow from that time starts. Cursors and times rise together
+    /// (an event is never written before the one before it), so it is found
+    /// by halving the cursor range, a few point reads however many events
+    /// there are; events with no time count as older.
     pub fn cursor_since(&self, since_ms: i64) -> Result<i64> {
         let mut at = self.conn.prepare_cached(
             "SELECT id,COALESCE(written_ms,-1) FROM events WHERE id>=? ORDER BY id LIMIT 1",
         )?;
         let (mut low, mut high): (i64, i64) = self.conn.query_row(
-            "SELECT COALESCE(MIN(id),1),COALESCE(MAX(id),0)+1 FROM events",
+            // Each bound its own subquery: SQLite reads a lone MIN or MAX
+            // from the end of the key, but scans for both in one.
+            "SELECT COALESCE((SELECT MIN(id) FROM events),1),
+                    COALESCE((SELECT MAX(id) FROM events),0)+1",
             [],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
@@ -10853,9 +10857,16 @@ fn flush(tx: &Connection, turn: i64, live: Option<&Live>) -> Result<()> {
     }
     Ok(())
 }
+/// Store an event, written now or, should the clock have gone back, when
+/// the event before it was: times rise with cursors, as a log's time index
+/// keeps them (Kafka's), so a follow from a time skips nothing.
 fn event(conn: &Connection, bot: &str, turn: Option<i64>, kind: &str, data: Value) -> Result<i64> {
-    conn.prepare_cached("INSERT INTO events(bot,turn,kind,data,written_ms) VALUES (?,?,?,?,?)")?
-        .execute(params![bot, turn, kind, data.to_string(), epoch_ms()])?;
+    conn.prepare_cached(
+        "INSERT INTO events(bot,turn,kind,data,written_ms) VALUES (?1,?2,?3,?4,
+            MAX(?5,COALESCE((SELECT written_ms FROM events
+                WHERE id=(SELECT MAX(id) FROM events)),?5)))",
+    )?
+    .execute(params![bot, turn, kind, data.to_string(), epoch_ms()])?;
     Ok(conn.last_insert_rowid())
 }
 /// Append an item. Stored history has no lifetime cap; the per-request

@@ -2832,6 +2832,35 @@ fn events_keep_when_they_were_written_and_a_time_finds_its_cursor() {
 }
 
 #[test]
+fn an_event_is_never_written_before_the_one_before_it() {
+    let path = std::env::temp_dir().join(format!("agent-clock-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    drop(db);
+    // The last event written an hour ahead, as before the clock went back.
+    let ahead = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+        + 3_600_000;
+    Connection::open(&path)
+        .unwrap()
+        .execute("UPDATE events SET written_ms=?", [ahead])
+        .unwrap();
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    db.create("Carol", Some("/synthetic"), binding()).unwrap();
+    let page = db.events_after(0, 256).unwrap();
+    let times: Vec<i64> = (page["events"].as_array().unwrap().iter())
+        .map(|e| e["written_ms"].as_i64().unwrap())
+        .collect();
+    assert_eq!(times, [ahead, ahead], "{page}");
+    assert_eq!(db.cursor_since(ahead).unwrap(), 0);
+    drop(db);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn schema_67_events_had_no_times() {
     let path = std::env::temp_dir().join(format!("agent-schema67-{}.sqlite", std::process::id()));
     let _ = std::fs::remove_file(&path);
