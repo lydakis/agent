@@ -2328,17 +2328,9 @@ impl Lookout {
                     return;
                 };
                 match submitted {
-                    Ok(()) => {
-                        self.refused = None;
-                        for heard in &sent {
-                            self.told_sources.insert(heard.event.source.clone(), now);
-                        }
-                        self.write(&json!({"at_ms": epoch_ms(), "lead": self.lead, "woke": key,
-                            "delivery": delivery, "sources": true}));
-                    }
-                    // The same news twice is one note.
-                    Err(code) if code == "idempotency_conflict" => {}
-                    Err(code) => {
+                    // The same news twice is one note: the daemon took it
+                    // before, so its sources were told then.
+                    Err(code) if code != "idempotency_conflict" => {
                         let mut back = sent;
                         back.append(&mut self.heard);
                         self.heard = back;
@@ -2348,6 +2340,16 @@ impl Lookout {
                         self.refused = Some(now);
                         self.keep();
                         return;
+                    }
+                    submitted => {
+                        self.refused = None;
+                        for heard in &sent {
+                            self.told_sources.insert(heard.event.source.clone(), now);
+                        }
+                        if submitted.is_ok() {
+                            self.write(&json!({"at_ms": epoch_ms(), "lead": self.lead,
+                                "woke": key, "delivery": delivery, "sources": true}));
+                        }
                     }
                 }
                 self.heard_since = (!self.heard.is_empty()).then_some(now);
@@ -4331,6 +4333,19 @@ mod tests {
         let urgent = got.recv().await.unwrap();
         assert_eq!(urgent["delivery"], "steer");
         assert!(urgent["prompt"].as_str().unwrap().contains("down"));
+    }
+
+    #[test]
+    fn a_note_the_daemon_already_took_starts_the_digest() {
+        let mut lookout = lookout();
+        let sent = vec![sources::Heard {
+            event: slack("first", false),
+            subs: vec!["chat".into()],
+        }];
+        lookout.sourcing = Some((sent, vec!["k".into()], "queue"));
+        lookout.answered(Answer::Sourced(Err("idempotency_conflict".into())));
+        assert!(lookout.told_sources.contains_key("slack"));
+        assert!(lookout.heard.is_empty());
     }
 
     #[tokio::test]
