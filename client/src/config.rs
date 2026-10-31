@@ -29,6 +29,7 @@
 //! chime = false                 # rings when work ends or waits, the default
 //! verbose = true                # every tool call drawn, not the clean view
 //! margin_opens = "never"         # "always", the default, or "unless-closed"
+//! agent_opens = "beside"        # a click on an agent's name: "tab", the default, or "beside"
 //! suggest = false               # no guess at the next message, on by default
 //! commons = false               # agents go without the commons, on by default
 //! commons_invites = 3           # least invites a day new threads send (more with the square root of the week's agents), 0 none; answers add up to as many again
@@ -167,6 +168,9 @@ pub struct Sonny {
     pub verbose: bool,
     /// When a note the agent puts up or changes opens the margin.
     pub margin_opens: MarginOpens,
+    /// Where a click on an agent's name takes the person; a right click
+    /// takes them to the other.
+    pub agent_opens: AgentOpens,
     /// Whether a copy of the agent guesses the person's next message after
     /// a turn they started, shown in the empty composer for Tab to take.
     pub suggest: bool,
@@ -218,6 +222,7 @@ impl Default for Sonny {
             verbose: false,
             start_at_boot: false,
             margin_opens: MarginOpens::default(),
+            agent_opens: AgentOpens::default(),
             sources: Vec::new(),
             browser_confirm: BROWSER_CONFIRM.map(str::to_owned).to_vec(),
         }
@@ -279,6 +284,17 @@ pub enum Reviewer {
     Model,
     You,
     None,
+}
+
+/// Where a click on an agent's name takes the person: `"tab"`, the
+/// default, to the agent's own tab, where a lead in Rex, Herdr or cmux laid
+/// it out; or `"beside"`, a look at it beside the conversation. A right
+/// click takes them to the other, and an agent with no tab opens beside.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AgentOpens {
+    #[default]
+    Tab,
+    Beside,
 }
 
 /// A command Sonny's lookout runs, whose every printed line is news for
@@ -593,6 +609,7 @@ fn parse(text: &str) -> Result<Config, String> {
                 "chime",
                 "verbose",
                 "margin_opens",
+                "agent_opens",
                 "suggest",
                 "start_at_boot",
                 "commons",
@@ -719,6 +736,16 @@ fn parse(text: &str) -> Result<Config, String> {
                         return Err(format!(
                             "sonny.margin_opens is always, unless-closed or never, not {other}"
                         ));
+                    }
+                };
+                continue;
+            }
+            if key == "agent_opens" {
+                config.sonny.agent_opens = match value.as_str() {
+                    "tab" => AgentOpens::Tab,
+                    "beside" => AgentOpens::Beside,
+                    other => {
+                        return Err(format!("sonny.agent_opens is tab or beside, not {other}"));
                     }
                 };
                 continue;
@@ -1141,6 +1168,10 @@ mod tests {
         assert_eq!(config.sonny.margin_opens, MarginOpens::Always);
         let never = parse("[sonny]\nmargin_opens = \"never\"").unwrap();
         assert_eq!(never.sonny.margin_opens, MarginOpens::Never);
+        assert_eq!(config.sonny.agent_opens, AgentOpens::Tab);
+        let beside = parse("[sonny]\nagent_opens = \"beside\"").unwrap();
+        assert_eq!(beside.sonny.agent_opens, AgentOpens::Beside);
+        assert!(parse("[sonny]\nagent_opens = \"window\"").is_err());
         let closed = parse("[sonny]\nmargin_opens = \"unless-closed\"").unwrap();
         assert_eq!(closed.sonny.margin_opens, MarginOpens::UnlessClosed);
         assert!(config.sonny.chime && !config.sonny.verbose);

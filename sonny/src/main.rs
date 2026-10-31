@@ -1026,6 +1026,7 @@ async fn run() -> Result<(), String> {
     app.verbose = settings.verbose;
     app.zen = zen::focus(app.reactions_key.as_deref());
     app.margin_opens = settings.margin_opens;
+    app.agent_opens = settings.agent_opens;
     // A bot keeps the model it was made with; --model runs this window's
     // turns on another.
     if let Some(model) = options.model.as_ref().filter(|m| **m != app.model) {
@@ -2146,6 +2147,8 @@ struct App {
     /// last looked at, and whether such a note opens it.
     margin_posted: u64,
     margin_opens: agent_client::config::MarginOpens,
+    /// Where a click on an agent's name takes the person.
+    agent_opens: agent_client::config::AgentOpens,
     /// The pane closed last, with its `/status` or `/background`, which
     /// Ctrl+] opens again.
     closed: Option<(pane::Pane, Option<Watch>)>,
@@ -3119,6 +3122,7 @@ impl App {
             pane_keys: false,
             margin_posted: 0,
             margin_opens: Default::default(),
+            agent_opens: Default::default(),
             pane_mouse: false,
             closed: None,
             composer_at: None,
@@ -4469,6 +4473,19 @@ impl App {
 
     /// The task `bot` opened in the pane: its own Sonny, to watch it and
     /// talk to it.
+    /// An agent named or picked: to its own tab, when the lead's layout
+    /// has one for it, or a look at it in the pane, as `[sonny]
+    /// agent_opens` says; `other`, a right click, the one it doesn't. With
+    /// no tab, it opens in the pane.
+    fn open_agent(&mut self, bot: &str, other: bool) {
+        use agent_client::config::AgentOpens;
+        let tab = (self.agent_opens == AgentOpens::Tab) != other;
+        match &self.fleet {
+            Some(fleet) if tab && fleet.layout.places().contains_key(bot) => fleet.go_to(bot),
+            _ => self.open_task(bot),
+        }
+    }
+
     fn open_task(&mut self, bot: &str) {
         let name = (self.tasks.values().flatten())
             .find(|task| task.bot == bot)
@@ -4547,7 +4564,9 @@ impl App {
     /// What a button clicked in the conversation does: `fold/N` opens or
     /// folds the calls folded as N; `said/NODE` opens or shuts the message
     /// between agents at NODE; `task/BOT`, and `agent/BOT` on BOT's name
-    /// in the conversation, opens BOT in the pane; `answer/N/ID` answers the question
+    /// in the conversation, goes to BOT (see `open_agent`), and
+    /// `other/BOT`, a right click on either, the other way;
+    /// `answer/N/ID` answers the question
     /// call ID asked with its option N, while it is open.
     async fn press_row(&mut self, button: &str) {
         if let Some(at) = button
@@ -4563,7 +4582,10 @@ impl App {
             }
         }
         if let Some(bot) = (button.strip_prefix("task/")).or(button.strip_prefix("agent/")) {
-            self.open_task(bot);
+            self.open_agent(bot, false);
+        }
+        if let Some(bot) = button.strip_prefix("other/") {
+            self.open_agent(bot, true);
         }
         if let Some(node) = button
             .strip_prefix("said/")
@@ -7752,7 +7774,8 @@ impl App {
                 };
                 if key.code == KeyCode::Enter {
                     if let Some(at) = pick {
-                        self.open_task(&bots[at]);
+                        let bot = bots[at].clone();
+                        self.open_agent(&bot, false);
                     }
                 } else if let Some(watch) = &mut self.watch {
                     watch.pick = pick;
@@ -8789,6 +8812,7 @@ impl App {
             let settings = settings::Settings::load();
             self.sounds.chime = settings.chime;
             self.margin_opens = settings.margin_opens;
+            self.agent_opens = settings.agent_opens;
             if self.verbose != settings.verbose {
                 self.verbose = settings.verbose;
                 self.repaint = true;

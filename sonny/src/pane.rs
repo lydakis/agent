@@ -476,10 +476,13 @@ impl Pane {
             false => format!("  {switch} "),
         };
         let mut style = Style::new();
-        // A file's name is a link to it, as a laid out agent's is to its
-        // tab.
-        if self.link.is_some() || self.tab {
+        // A file's name is a link to it. A laid out agent's goes to its
+        // tab, so it is drawn as any agent's name that opens it is: in the
+        // agents' color, never underlined.
+        if self.link.is_some() {
             style = style.add_modifier(Modifier::UNDERLINED);
+        } else if self.tab {
+            style = style.fg(ratatui::style::Color::Blue);
         }
         if !focused {
             style = style.add_modifier(Modifier::DIM);

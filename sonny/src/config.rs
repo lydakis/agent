@@ -135,6 +135,12 @@ pub const SETTINGS: [Setting; 21] = [
         default: "always",
     },
     Setting {
+        key: "sonny.agent_opens",
+        about: "where a click on an agent's name takes you: its tab in Rex, Herdr or cmux, or a look beside the conversation; a right click, the other",
+        values: &["tab", "beside"],
+        default: "tab",
+    },
+    Setting {
         key: "sonny.suggest",
         about: "after a turn you started, a copy of the agent guesses your next message for Tab to take; one small call",
         values: SWITCH,

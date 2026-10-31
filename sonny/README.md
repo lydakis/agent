@@ -245,6 +245,7 @@ at its model's own effort (`AGENT_EFFORT` when its model is
 | A guess at your next message | `[sonny] suggest` (true, the default, or false) | |
 | Whether agents have the commons | `[sonny] commons` (true, the default, or false) | |
 | When a note opens the margin | `[sonny] margin_opens` (`always`, the default, `unless-closed` or `never`) | |
+| Where a click on an agent's name goes | `[sonny] agent_opens` (`tab`, the default, or `beside`) | |
 | The daemon started with the machine | `[sonny] start_at_boot` (true or false, the default) | |
 | News from outside for the lookout | `[sonny.sources.NAME] command`, `every` | |
 
@@ -491,7 +492,7 @@ way `/react` does, and each note in the margin has its own `↩`.
 - `/config` (or `/settings`) lists every key `~/.agent/config.toml` takes,
   with its value or what its default is, over the composer. ↑/↓ picks
   one; ←/→ steps a key with a few values (efforts, `web_search`,
-  `senders`, `side_chat`, `chime`, `verbose`, `margin_opens`, `suggest`,
+  `senders`, `side_chat`, `chime`, `verbose`, `margin_opens`, `agent_opens`, `suggest`,
   `start_at_boot`) through them
   and its default; Enter types one that takes a name (`model`, `provider`,
   `judge.model`, the profiles), empty for its default; ⌫
@@ -617,8 +618,8 @@ way `/react` does, and each note in the margin has its own `↩`.
   reopens it. Each agent's
   time is how long its running turn has been at it, or how long its last
   turn took. An agent with automations or follows of its own
-  shows `↻ 2 automations` beside its model. A click on an agent's name opens
-  it in the pane, as a click on a task in a roster does, and so does
+  shows `↻ 2 automations` beside its model. A click on an agent's name goes
+  to it as a click on a task in a roster does (below), and so does
   Enter on the agent ↑ and ↓ pick (`›`); ‹ in its title,
   or Ctrl+[ from the conversation, goes back to `/status`. It opens
   with the agent the conversation named last already picked, so
@@ -1009,15 +1010,18 @@ say did not fail, but did not reply either, so it reads `no reply`, not
 once a turn ends, and `checked` once its goal's check passed.
 
 ![A task whose goal's check passed beside one still checking and one only done](../docs/sonny/tasks-checked.png) A click
-on a task opens it in the pane: its own Sonny, live, to watch and to talk
-to, as a side chat is. Ctrl+\ takes the keys back to the conversation and
+on a task goes to its own tab, where the lead laid it out in Rex, Herdr or
+cmux; a right click (or a click, with no tab) opens it in the pane: its own
+Sonny, live, to watch and to talk to, as a side chat is. `[sonny]
+agent_opens = "beside"` swaps the two. In the pane, its name in the title
+goes to its tab too, as Ctrl+T does. Ctrl+\ takes the keys back to the conversation and
 gives them to the pane again; from the conversation Ctrl+[ hides the task
 and Ctrl+] shows it again.
 
 ![Three tasks started together, each with what it does now](../docs/sonny/tasks-roster.png)
 
-An agent's name anywhere in the conversation opens that agent in the
-pane, as a GitHub `@name` links to its account: in a reply ("tally.halves
+An agent's name anywhere in the conversation goes to that agent, as a
+click on a task does, the way a GitHub `@name` links to its account: in a reply ("tally.halves
 has a question for you"), in a row of task updates, in a message from
 another agent, and in the pane's own text. Only a name the daemon knows
 is one, so it is drawn in the agents' blue, and a word that only looks
