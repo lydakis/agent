@@ -5353,6 +5353,23 @@ impl App {
         // and words of the person's in it make it theirs.
         let mut aside = !older && self.elsewhere;
         let mut began = std::collections::HashSet::new();
+        // A page that starts inside a turn lacks its first message: in zen,
+        // the turn's own prompt says who started it.
+        if self.zen.is_some()
+            && let Some(&turn) = nodes.first().and_then(|node| turns.get(node))
+            && let Ok(read) = (self.client)
+                .request(
+                    "prompts",
+                    json!({"bot": self.bot, "turn": turn, "bytes": 4096}),
+                )
+                .await
+            && let Some(prompt) = read["prompts"].get(0)
+        {
+            let from =
+                transcript::sender(prompt["from"]["bot"].as_str(), prompt["origin"].as_str());
+            aside = transcript::relays(prompt["text"].as_str().unwrap_or(""), from.as_deref());
+            began.insert(turn);
+        }
         // A chunk read at a time, what it held let go before the next.
         let mut chunks = nodes.chunks(100);
         let mut after = Some(after);
@@ -5815,6 +5832,15 @@ impl App {
         }
         if event["bot"] != self.bot.as_str() {
             return;
+        }
+        // Zen set in another window of this agent: its message starts or
+        // joins a turn, so a turn is when to look.
+        if matches!(kind, "accepted" | "steered") {
+            let focus = zen::focus(&self.bot);
+            if focus.is_some() != self.zen.is_some() {
+                self.repaint = true;
+            }
+            self.zen = focus;
         }
         let data = &event["data"];
         let turn = event["turn"].as_i64();
@@ -11764,6 +11790,11 @@ mod tests {
     /// message started, in which the agent asks, one the lead's task
     /// news started, and the person's again.
     async fn zen_daemon() -> Arc<Client> {
+        zen_daemon_from(1).await
+    }
+
+    /// The same conversation, its history page starting at node `first`.
+    async fn zen_daemon_from(first: i64) -> Arc<Client> {
         let say = |role: &str, text: &str| {
             let kind = if role == "user" {
                 "input_text"
@@ -11813,8 +11844,14 @@ mod tests {
         ];
         daemon_answering(move |asked| match asked["op"].as_str() {
             Some("history_nodes") => json!({"nodes": items.iter().rev()
+                .filter(|(node, _, _)| *node >= first)
                 .map(|(node, turn, _)| json!({"node": node, "turn": turn}))
                 .collect::<Vec<_>>(), "next_from": null}),
+            Some("prompts") => match asked["turn"].as_i64() {
+                Some(2) => json!({"prompts": [{"turn": 2, "text": "The release build broke.",
+                    "from": {"bot": "shop.fix", "turn": 1}}]}),
+                turn => json!({"prompts": [{"turn": turn, "text": "Fix the rounding"}]}),
+            },
             Some("history_items") => json!({"items": asked["nodes"].as_array().into_iter()
                 .flatten()
                 .filter_map(|node| items.iter().find(|(n, _, _)| Some(*n) == node.as_i64()))
@@ -11866,6 +11903,7 @@ mod tests {
     fn app_in_zen(client: Arc<Client>) -> App {
         let mut app = app(client);
         app.width = 100;
+        zen::set("b", Some("the rounding")).unwrap();
         app.zen = Some("the rounding".into());
         app
     }
@@ -11934,6 +11972,31 @@ mod tests {
         let rows = drawn(&mut app).join("\n");
         assert!(rows.contains("Push it"), "{rows}");
         assert!(rows.contains("Pushed as 4f2c1a0."), "{rows}");
+    }
+
+    #[tokio::test]
+    async fn a_page_starting_inside_a_turn_asks_who_started_it() {
+        let mut app = app_in_zen(zen_daemon_from(6).await);
+        app.history().await;
+        let rows = drawn(&mut app).join("\n");
+        assert!(!rows.contains("Noted what shop.fix said."), "{rows}");
+        assert!(rows.contains("Pushed as 4f2c1a0."), "{rows}");
+    }
+
+    #[tokio::test]
+    async fn zen_set_in_another_window_is_taken_up_at_the_next_turn() {
+        let mut app = app(zen_daemon().await);
+        zen::set("b", Some("the rounding")).unwrap();
+        app.daemon(turn_event("accepted", 4, json!({"node": 11})))
+            .await;
+        assert_eq!(app.zen.as_deref(), Some("the rounding"));
+        assert!(app.repaint);
+        app.repaint = false;
+        zen::set("b", None).unwrap();
+        app.daemon(turn_event("steered", 4, json!({"node": 11})))
+            .await;
+        assert_eq!(app.zen, None);
+        assert!(app.repaint);
     }
 
     #[tokio::test]

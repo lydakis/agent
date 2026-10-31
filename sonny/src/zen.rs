@@ -47,10 +47,12 @@ fn home() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
 }
 
-/// Tests keep their zen apart from the person's.
+/// Tests keep their zen apart from the person's, and from each other's.
 #[cfg(test)]
 fn home() -> Option<PathBuf> {
-    Some(std::env::temp_dir().join(format!("sonny-zen-home-{}", std::process::id())))
+    let thread = format!("{:?}", std::thread::current().id());
+    let thread: String = thread.chars().filter(char::is_ascii_digit).collect();
+    Some(std::env::temp_dir().join(format!("sonny-zen-{}-{thread}", std::process::id())))
 }
 
 /// The focus `bot` is in zen on, if it is.
