@@ -372,7 +372,7 @@ fn origin(repo: &Path, env: Option<&[(OsString, OsString)]>) -> Option<String> {
 fn git(dir: &Path, args: &[&str], env: Option<&[(OsString, OsString)]>) -> Result<String, String> {
     let (status, out, err) = run_git(dir, args, env, None)?;
     match status == Some(0) {
-        true => Ok(out),
+        true => Ok(String::from_utf8_lossy(&out).into_owned()),
         false => Err(format!(
             "backup_git_failed: git {}: {}",
             args.iter().find(|a| !a.starts_with('-')).unwrap_or(&""),
@@ -387,8 +387,8 @@ fn run_git(
     dir: &Path,
     args: &[&str],
     env: Option<&[(OsString, OsString)]>,
-    input: Option<&str>,
-) -> Result<(Option<i32>, String, String), String> {
+    input: Option<&[u8]>,
+) -> Result<(Option<i32>, Vec<u8>, String), String> {
     use std::io::Write;
     let mut command = std::process::Command::new("git");
     if let Some(env) = env {
@@ -428,9 +428,9 @@ fn run_git(
     // Written beside the reads: git answers as it reads, and an answer that
     // fills its pipe stops it reading.
     let writer = match (input, child.stdin.take()) {
-        (Some(text), Some(mut stdin)) => {
-            let text = text.to_owned();
-            Some(std::thread::spawn(move || stdin.write_all(text.as_bytes())))
+        (Some(bytes), Some(mut stdin)) => {
+            let bytes = bytes.to_owned();
+            Some(std::thread::spawn(move || stdin.write_all(&bytes)))
         }
         _ => None,
     };
@@ -446,7 +446,7 @@ fn run_git(
     }
     Ok((
         out.status.code(),
-        String::from_utf8_lossy(&out.stdout).into_owned(),
+        out.stdout,
         String::from_utf8_lossy(&out.stderr).into_owned(),
     ))
 }
@@ -519,16 +519,22 @@ fn ignored(
                 _ => {}
             }
         }
-        let input: String = asked
-            .iter()
-            .map(|(path, folder)| {
-                format!(
-                    "{at}/{}{}\0",
-                    path.to_string_lossy(),
-                    if *folder { "/" } else { "" }
-                )
-            })
-            .collect();
+        // Byte for byte: a name that is not UTF-8 is still the name a rule
+        // names.
+        use std::os::unix::ffi::OsStrExt;
+        let full = |path: &Path| {
+            let mut bytes = format!("{at}/").into_bytes();
+            bytes.extend_from_slice(path.as_os_str().as_bytes());
+            bytes
+        };
+        let mut input = Vec::new();
+        for (path, folder) in &asked {
+            input.extend(full(path));
+            if *folder {
+                input.push(b'/');
+            }
+            input.push(0);
+        }
         // Tracked or not: a file the ignore files name now is left out
         // from now on.
         let (status, out, err) = run_git(
@@ -544,14 +550,13 @@ fn ignored(
                 err.trim()
             ));
         }
-        let named: std::collections::HashSet<&str> = (out.split('\0'))
+        let named: std::collections::HashSet<&[u8]> = (out.split(|b| *b == 0))
             .filter(|path| !path.is_empty())
-            .map(|path| path.trim_end_matches('/'))
+            .map(|path| path.strip_suffix(b"/").unwrap_or(path))
             .collect();
         level = Vec::new();
         for (path, folder) in asked {
-            let full = format!("{at}/{}", path.to_string_lossy());
-            if named.contains(full.as_str()) {
+            if named.contains(full(&path).as_slice()) {
                 left_out.insert(path);
             } else if folder {
                 level.push(path);
@@ -1210,6 +1215,28 @@ mod tests {
             std::fs::read_to_string(at.repo.join("agents/cache")).unwrap(),
             "a file now"
         );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // macOS keeps only UTF-8 names, so there is no such name to make.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_name_that_is_not_utf8_is_checked_as_it_is() {
+        use std::os::unix::ffi::OsStrExt;
+        let root = scratch("raw-name");
+        sh(&root, &["init", "--quiet", "--bare", "remote.git"]);
+        let at = places(&root.join("one"));
+        let name = std::ffi::OsStr::from_bytes(b"private-\xff.txt");
+        write(&at.agents.join(name), "before");
+        adopt(&at, &root.join("remote.git").to_string_lossy(), None).unwrap();
+        sh(&at.repo, &["config", "user.email", "t@example.com"]);
+        sh(&at.repo, &["config", "user.name", "T"]);
+        sync(&at, None).unwrap();
+        assert!(at.repo.join("agents").join(name).exists());
+        write(&at.agents.join(name), "secret");
+        write(&at.agents.join(".gitignore"), "private-*\n");
+        sync(&at, None).unwrap();
+        assert!(!at.repo.join("agents").join(name).exists());
         std::fs::remove_dir_all(&root).unwrap();
     }
 

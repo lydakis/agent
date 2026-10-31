@@ -22,6 +22,8 @@ from bench.runtime_client import PROTECTING, Client, node_item, poll, serve_args
 
 # Longer than 256 bytes, with text a shell would run if pasted unquoted.
 ODD_CALL_ID = "odd $(touch pwned) 'x'\n" + 'L' * 300
+# The line Sonny ends a message to a bot with: when it was sent.
+SENT = re.compile(r'\n\n\[Sent [A-Z][a-z]{2} \d{1,2} [A-Z][a-z]{2} \d{4} \d{2}:\d{2}, UTC[+-]\d{2}:\d{2}\.\]$')
 
 
 
@@ -129,6 +131,8 @@ class Model(http.server.BaseHTTPRequestHandler):
             # A trigger's message comes after its one-line header.
             if user.startswith('[trigger ') and '\n' in user:
                 user = user.split('\n', 1)[1]
+            # Sonny's message ends with a line naming when it was sent.
+            user = SENT.sub('', user)
             if user in getattr(self.server, 'refused_prompts', ()):
                 # A refusal with no usage: the turn fails without a model round.
                 body = b'{"error":{"message":"synthetic refusal"}}'
@@ -808,7 +812,7 @@ class AnthropicModel(http.server.BaseHTTPRequestHandler):
                     blocks.append({'type': 'text', 'text': 'echo:' + last['content'][0]['content']})
                 stop = 'refusal' if details else 'end_turn'
             else:
-                user = last['content'][0]['text']
+                user = SENT.sub('', last['content'][0]['text'])
                 if user == 'think-only':
                     stop = 'end_turn'
                 elif user == 'silent':
