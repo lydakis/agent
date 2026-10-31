@@ -166,6 +166,35 @@ pub const SETTINGS: [Setting; 19] = [
     },
 ];
 
+/// The `sonny-config` skill: where the settings live and every key of the
+/// file, from [`SETTINGS`], so it says what this Sonny reads.
+pub fn skill() -> String {
+    let rows: Vec<String> = SETTINGS
+        .iter()
+        .map(|setting| {
+            let values = match setting.values {
+                [] if number(setting) => "a whole number".to_owned(),
+                [] => "a name".to_owned(),
+                values => (values.iter())
+                    .map(|value| format!("`{value}`"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            };
+            format!(
+                "| `{}` | {} | {values} | {} |",
+                setting.key, setting.about, setting.default
+            )
+        })
+        .collect();
+    let table = format!(
+        "| Key | What it sets | Values | Unset |\n| --- | --- | --- | --- |\n{}",
+        rows.join("\n")
+    );
+    include_str!("../skills/sonny-config/SKILL.md")
+        .replace("{{VERSION}}", env!("CARGO_PKG_VERSION"))
+        .replace("{{SETTINGS}}", &table)
+}
+
 /// What the keys say: open in `/config`.
 pub enum Key {
     Stay,
@@ -424,6 +453,25 @@ impl View {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_config_skill_lists_every_key_as_this_sonny_reads_it() {
+        let skill = skill();
+        assert!(skill.starts_with("---\nname: sonny-config\n"));
+        assert!(!skill.contains("{{"));
+        assert!(skill.contains(env!("CARGO_PKG_VERSION")));
+        for setting in &SETTINGS {
+            assert!(
+                skill.contains(&format!("| `{}` |", setting.key)),
+                "{}",
+                setting.key
+            );
+        }
+        assert!(skill.contains("| `sonny.margin_opens` |"));
+        assert!(skill.contains("`always`, `unless-closed`, `never` | always |"));
+        assert!(skill.contains("| `sonny.commons_invites` |"));
+        assert!(skill.contains("| a whole number | 3 |"));
+    }
     use ratatui::crossterm::event::KeyEvent;
 
     fn press(view: &mut View, code: KeyCode) {

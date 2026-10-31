@@ -95,8 +95,10 @@ pub struct Pane {
     main_at: Option<(u16, u16)>,
 }
 
-/// The button on an agent's title that opens it in the main view.
-const MAIN: &str = "↗ main view";
+/// The button beside an agent's name that opens it in the main view: the
+/// visual system's opens mark, its words in the keys beside it, as `←`
+/// is back's.
+const MAIN: &str = " ↗";
 /// What the keys do on an agent's Sonny in the pane.
 const AGENT_KEYS: &str = "ctrl+g main view · ctrl+\\ chat";
 
@@ -488,27 +490,24 @@ impl Pane {
                 // An agent's Sonny opens in the main view from its title,
                 // where there is room for the button beside the name.
                 let button = match &self.agent {
-                    Some(_) => format!("  {MAIN}"),
-                    None => String::new(),
+                    Some(_) => MAIN,
+                    None => "",
                 };
                 let used: usize = head.iter().map(|s| s.content.width()).sum();
                 let room = (area.width as usize).saturating_sub(used + keys.width());
                 let button = match self.title.width() + button.width() <= room {
                     true => button,
-                    false => String::new(),
+                    false => "",
                 };
                 let title = crate::transcript::cut(&self.title, room - button.width());
                 let gap = (area.width as usize)
                     .saturating_sub(used + title.width() + button.width() + keys.width());
-                let at = area.x + (used + title.width()) as u16 + 2;
+                let at = area.x + (used + title.width() + 1) as u16;
                 head.push(Span::styled(title, style));
                 self.main_at = None;
                 if !button.is_empty() {
-                    self.main_at = Some((at, at + MAIN.width() as u16));
-                    head.push(Span::raw("  "));
-                    // The visual system's opens mark, the words plain.
-                    head.push(Span::raw("↗").fg(ratatui::style::Color::Cyan));
-                    head.push(Span::raw(MAIN.trim_start_matches('↗')));
+                    self.main_at = Some((at, at + 1));
+                    head.push(Span::raw(button).fg(ratatui::style::Color::Cyan));
                 }
                 head.push(Span::raw(" ".repeat(gap)));
                 head.extend(key_spans);
@@ -763,13 +762,15 @@ mod tests {
         let mut pane = Pane::card("shop.fix", "esc close");
         pane.as_agent("shop.fix");
         let head = rows(&mut pane, 60, 3).remove(0);
-        assert!(head.starts_with(" shop.fix  ↗ main view"), "{head}");
-        let column = " shop.fix  ".width() as u16;
+        assert!(head.starts_with(" shop.fix ↗ "), "{head}");
+        assert!(head.ends_with("ctrl+g main view · ctrl+\\ chat"), "{head}");
+        let column = " shop.fix ".width() as u16;
         assert_eq!(
             pane.head_button(column).as_deref(),
             Some("sonny:main/shop.fix")
         );
         assert_eq!(pane.head_button(1), None);
+        assert_eq!(pane.head_button(column + 1), None);
         // Too narrow for both: the name stays, the button goes.
         let head = rows(&mut pane, 24, 3).remove(0);
         assert!(!head.contains('↗'), "{head}");

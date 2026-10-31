@@ -60,8 +60,8 @@ first), and `--new-lead NAME` makes one (numbered, as `lead.2`, with no
 name). In a window, `/lead` lists the folder's leads, `/lead NAME` opens one
 and `/lead new [NAME]` makes one. `/switch NAME` opens any agent in the
 window instead, a task or any other the daemon keeps (a name in this project
-may leave out the project); `/switch` alone, or `↗ main view` on the title of
-an agent open in the pane, or Ctrl+G, moves that agent into the window. `/goal WHAT` asks the agent to set a goal
+may leave out the project); `/switch` alone, the `↗` beside the name of an
+agent open in the pane, or Ctrl+G moves that agent into the window. `/goal WHAT` asks the agent to set a goal
 on itself and work until WHAT is done (`/goal` shows goals, `/goal clear`
 clears its own; see [Goals](../docs/SONNY.md#goals)). A lead hears of, shows and lists in
 `/status` only its own tasks. It is told to send work for another lead's task
@@ -363,7 +363,17 @@ Ctrl-U and Ctrl-K to the line's start and end, and Ctrl-Y puts back what the
 last of those took. Shift-Enter needs a terminal that speaks the kitty
 keyboard protocol, which Sonny asks for as Codex does (Kitty, Ghostty,
 WezTerm, iTerm2, Herdr and others); elsewhere it reads as Enter, and Alt-Enter
-or Ctrl-J still start a line.
+or Ctrl-J still start a line. Markdown shows in the composer as it will
+read, its marks kept and dim: `**bold**` bold, `` `code` `` in code's colour,
+a `#` line as a heading, a `>` quote in italics, a link's label underlined;
+what is sent is the text as typed.
+
+Alt-T boosts the next message: the turn it starts runs at a higher effort
+(`xhigh`, or `high` where the model has no `xhigh`), Alt-T again at `max`
+where the model takes it, and again back to the agent's own. The footer
+shows `↑xhigh` beside the effort until a message takes it; a message that
+steers a running turn leaves it for the next. The agent's own effort never
+changes, as `/model` changes it.
 
 ![A message queued with Tab waits under the running turn](../docs/sonny/tab-queues.png)
 
