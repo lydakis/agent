@@ -2468,8 +2468,13 @@ see, and ends a command that makes system calls of another architecture.
 A sandboxed bot's commands reach the daemon through the bot's own socket,
 never the daemon's: so `agent` and the clients built on it work in its shell,
 as that bot and only as far as a sandboxed bot may go. The daemon opens the
-socket, `SOCKET.d/BOT_ID` beside its own, the first time one of the bot's
-commands runs, and closes it when the bot is deleted. On macOS Seatbelt
+socket, `SOCKET.d/BOT_ID` beside its own, when one of the bot's turns
+needs it, and keeps it listening while any of the bot's live turns or
+running commands (foreground, background, detached or a terminal) holds
+it, as systemd's socket activation keeps a unit's socket. Thirty seconds
+after the last one goes, or at once when the bot is deleted, it closes;
+connections it already accepted keep their sessions, and the bot's next
+turn opens it again. So a fleet of idle bots holds no listening sockets. On macOS Seatbelt
 denies the daemon's socket and that folder and allows the bot's own,
 network on or off. On Linux, where the command makes no Unix socket, the
 daemon hands it connections, as a broker does: `AGENT_SOCKET_FD` names a
