@@ -1056,10 +1056,16 @@ pub fn next_after(entries: &[Entry], after: i64) -> Option<i64> {
                     if entry.hour.is_some() {
                         ats.truncate(1);
                     }
-                    if let Some(at) = ats.into_iter().find(|at| *at >= first) {
+                    if let Some((i, at)) = ats.into_iter().enumerate().find(|(_, at)| *at >= first)
+                    {
                         best = Some(best.map_or(at, |b| b.min(at)));
-                        // Later minutes this hour, and later hours, are later.
-                        break 'hours;
+                        // Later minutes this hour, and later hours, come
+                        // later than a first time. A second time does not:
+                        // after 01:30 the first time round, 01:31 comes
+                        // before the second 01:00, so the search goes on.
+                        if i == 0 {
+                            break 'hours;
+                        }
                     }
                 }
             }
@@ -1268,6 +1274,16 @@ mod tests {
         assert_eq!(
             next_after(&every_minute.entries, repeated),
             Some(repeated + 60)
+        );
+        // Every minute as cron writes it, halfway through the first 01:00
+        // hour: 01:31 that first time, not the second 01:00.
+        let cron_every = trigger::cron("* * * * *").unwrap();
+        let half = repeated - 3600 + 30 * 60;
+        assert_eq!(next_after(&cron_every.entries, half), Some(half + 60));
+        // And halfway through the second, 01:31 the second time.
+        assert_eq!(
+            next_after(&cron_every.entries, repeated + 30 * 60),
+            Some(repeated + 31 * 60)
         );
         // A set time, 01:30, came once already, at its first.
         let set = trigger::cron("30 1 * * *").unwrap();
