@@ -6428,3 +6428,20 @@ small job per replay, so what is left of the p95 is most likely the
 container's four cores busy encoding and sending 132,000 events beside
 the probe. The history flood, which this change
 does not touch, is the control and holds still.
+
+## Redaction cost by size (#316)
+
+This measures `Credentials::redact` in release mode with the CLI's default
+fields (`agent_client::SECRET_FIELDS`), the `PRIVATE KEY` block, and eight
+credentials, over prose that mentions `password` and `key:` on every line.
+Each figure is the mean of 20 runs on a 4-core Linux container.
+
+| Output | 4 KiB | 16 KiB | 64 KiB | 256 KiB | 1 MiB | 4 MiB |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Redaction | 0.04 ms | 0.13 ms | 0.49 ms | 2.2 ms | 7.7 ms | 35 ms |
+
+Output up to 64 KiB is still redacted inline, which costs at most half a
+millisecond. Anything larger goes to `spawn_blocking` under a byte budget of
+two of the largest results per logical CPU. A busy fleet's 1 MiB shell
+outputs and 4 MiB pages therefore no longer stall the daemon's runtime for
+8 to 35 ms each.

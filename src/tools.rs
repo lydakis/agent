@@ -490,6 +490,9 @@ pub struct Registry {
     daemon: Arc<Daemon>,
     /// Request encodings per (family, selection); see `encoded`.
     encodings: Encodings,
+    /// Bytes of tool output being redacted off the runtime at once; see
+    /// `off_runtime`.
+    heavy: Arc<Semaphore>,
 }
 type Encodings = Arc<std::sync::Mutex<HashMap<(Family, String), Arc<RawValue>>>>;
 /// What a file that is not text holds, named by its first bytes, as `file`
@@ -1097,6 +1100,7 @@ impl Registry {
             environment: Arc::new(Vec::new()),
             daemon: Arc::default(),
             encodings: Arc::default(),
+            heavy: Arc::new(Semaphore::new(heavy_bytes())),
         })
     }
     /// A bot's selection must name registered tools, each once.
@@ -1638,7 +1642,11 @@ impl Registry {
             Prepared::Note { .. } => fail("note_requires_runtime"),
             Prepared::Declared(_) => fail("declared_requires_runtime"),
             Prepared::WebSearch(_) => fail("web_search_requires_runtime"),
-            Prepared::WebFetch(url) => Ok(self.fetched(fetch::fetch(url).await?)),
+            Prepared::WebFetch(url) => {
+                let page = fetch::fetch(url).await?;
+                self.off_runtime(page.text.len(), move |registry| registry.fetched(page))
+                    .await
+            }
             Prepared::Shell {
                 command,
                 timeout_ms,
@@ -1900,7 +1908,12 @@ impl Registry {
                 sandbox.as_deref(),
             )
             .await?;
-            Ok(registry.shell_outcome(stdout, stderr, exit, elapsed))
+            let bytes = stdout.len() + stderr.len();
+            registry
+                .off_runtime(bytes, move |registry| {
+                    registry.shell_outcome(stdout, stderr, exit, elapsed)
+                })
+                .await
         }
     }
 
@@ -1943,7 +1956,12 @@ impl Registry {
                     sandbox.as_deref(),
                 )
                 .await?;
-                Ok(registry.shell_outcome(stdout, stderr, exit, elapsed))
+                let bytes = stdout.len() + stderr.len();
+                registry
+                    .off_runtime(bytes, move |registry| {
+                        registry.shell_outcome(stdout, stderr, exit, elapsed)
+                    })
+                    .await
             };
             // A command still running as the daemon stops is dropped, which
             // kills its group; its handle then reports the process lost, as
@@ -2160,6 +2178,49 @@ fn truncate(text: &str, dropped: u64) -> String {
     )
 }
 
+/// Output up to this many bytes is redacted on the runtime's thread: about
+/// half a millisecond with the default fields and blocks and a few
+/// credentials. Past it the scans take milliseconds (8 ms a MiB), so they
+/// run on a blocking thread.
+const INLINE_BYTES: usize = 64 * 1024;
+
+/// Bytes of output redacted on blocking threads at once: a few of the
+/// largest results for each logical CPU, so a burst of large outputs waits
+/// its turn rather than taking every blocking thread.
+fn heavy_bytes() -> usize {
+    let cpus = std::thread::available_parallelism().map_or(4, |n| n.get());
+    (cpus * 2 * (ARTIFACT_BYTES + PREVIEW_BYTES)).min(u32::MAX as usize)
+}
+
+impl Registry {
+    /// Run `work` over `bytes` of output: here when they are few, or else on
+    /// a blocking thread once the bytes being worked on there leave room,
+    /// as Tokio's `spawn_blocking` is meant for CPU-bound work.
+    async fn off_runtime<T: Send + 'static>(
+        &self,
+        bytes: usize,
+        work: impl FnOnce(&Registry) -> T + Send + 'static,
+    ) -> Result<T> {
+        if bytes <= INLINE_BYTES {
+            return Ok(work(self));
+        }
+        let wanted = bytes.min(heavy_bytes()) as u32;
+        let permit = self
+            .heavy
+            .clone()
+            .acquire_many_owned(wanted)
+            .await
+            .map_err(|_| Error::new("tool_scheduler_closed"))?;
+        let registry = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            work(&registry)
+        })
+        .await
+        .map_err(|_| Error::new("tool_redaction_failed"))
+    }
+}
+
 /// What a stream wrote, bounded: all of it up to `ARTIFACT_BYTES`, past
 /// that its first and last `KEPT_END` bytes and a count of the rest.
 #[derive(Default)]
@@ -2169,6 +2230,9 @@ struct Captured {
     dropped: u64,
 }
 impl Captured {
+    fn len(&self) -> usize {
+        self.head.len() + self.tail.len()
+    }
     /// Output past the head. Once the whole would pass the bound, the tail
     /// keeps only its last `KEPT_END` bytes.
     fn keep(&mut self, bytes: &[u8]) {
