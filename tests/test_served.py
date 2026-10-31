@@ -336,6 +336,14 @@ class ServedToolTests(ModelFixture):
         self.assertTrue(said.endswith('$ screenshot\n✓ Screenshot, shown below'), said)
         self.assertIn('AGENT_BROWSER_PAGE_CONTENT nonce=', said)
         self.assertTrue(answered['output'][1]['image_url'].startswith('data:image/png;base64,'))
+        # As many pictures as one result holds, and words for the rest.
+        requests = self.model.requests = queue.Queue()
+        self.call('calc.lead', 'browser', {'commands': ['screenshot'] * 21}, wait=60)
+        while not requests.empty():
+            last = requests.get()
+        [answered] = [i for i in last['input'] if i.get('call_id') == 'script-1' and 'output' in i]
+        self.assertEqual([part['type'] for part in answered['output']].count('input_image'), 20)
+        self.assertIn('not shown: a result holds up to 20 pictures', answered['output'][-1]['text'])
         refused = json.loads(self.call('calc.lead', 'browser',
                                        {'commands': ['open about:blank --executable-path /bin/sh']}))
         self.assertEqual(refused['error'], 'browser_refused')
@@ -345,7 +353,7 @@ class ServedToolTests(ModelFixture):
     def test_an_action_agent_browser_confirms_waits_for_the_agent_s_gate(self):
         self.browser(approve=['browser'], approver='manual')
         self.call('calc.lead', 'browser', {'commands': ['open "data:text/html,<title>Calc</title>"']}, wait=60)
-        for decision, said in (('deny', 'browser was not approved'), ('allow', '"Calc"')):
+        for decision, said in (('deny', 'browser was not approved'), ('allow', 'Calc')):
             self.script.append(('browser', {'commands': ['eval document.title']}))
             self.model.call_script = self.script
             turn = self.daemon.request('submit', bot='calc.lead', request_id=f'eval-{decision}',

@@ -671,8 +671,8 @@ const CLOSE: char = '\u{E001}';
 
 /// The most pictures one result holds, and their bytes together, as the
 /// daemon takes them: a prompt's.
-const PICTURES: usize = 20;
-const PICTURE_BYTES: usize = crate::attach::MOST_BYTES;
+pub const PICTURES: usize = 20;
+pub const PICTURE_BYTES: usize = crate::attach::MOST_BYTES;
 
 /// A picture a script passed to `image()`, as the daemon takes it.
 struct Picture {

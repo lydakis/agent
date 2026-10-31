@@ -877,7 +877,8 @@ the same way, as `agent-browser skills get agent-browser` prints it for
 the version installed, and removes it when agent-browser is gone. Agents
 drive it through the `browser` tool, which the tool host answers outside
 their sandbox: it runs the skill's commands in each agent's own browser
-session, and a screenshot comes back as a picture. It refuses what would
+session, its answers read from agent-browser's JSON, and a screenshot
+comes back as a picture, up to 20 a call. It refuses what would
 reach past the browser: flags that launch another program or load an
 extension, plugins, the clipboard, and files outside the agent's folder.
 The actions in `sonny.browser_confirm` (`eval`, `download`, `upload` and

@@ -3019,6 +3019,7 @@ dependencies = [
  "two-face",
  "unicode-segmentation",
  "unicode-width",
+ "url",
  "vt100",
 ]
 
