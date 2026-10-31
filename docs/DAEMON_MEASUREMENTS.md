@@ -6283,3 +6283,114 @@ Store jobs per turn held at about 7.5 on both sides (7.488 to 7.499 base,
 in each round, and the change adds nothing to a turn's path; read them as
 no cost, not a gain. The Perf workflow screens the pull request with the
 admission and completion bursts as well.
+
+## Reads beside the service loop, on a reader pool (#391)
+
+Observation reads (`history_nodes`, `history_items`, `history_search`,
+`turns`, `bots`, `events`, `usage`, `prompts`) now run in a lane beside the
+service loop, on a pool of reader connections (`--max-readers`, one per
+logical CPU), taking all but one of them. A session waits for its read
+before its next request is taken and reads at most 8 requests ahead; what
+it queues while it waits does not count against the shared input queue.
+
+`bench/fair_queuing.py` gained floods of whole histories and searches
+across every bot, several flooding sessions at once (`--flooders`), deep
+histories (`--history-turns`, `--history-bytes`), a probe that lists bots
+(`--probe-bots`), and a probe in a process of its own, so parsing the
+flood's replies no longer holds it up. 4-core Linux container, 210 bots
+each with 10 turns of 64 KiB prompts (129 MiB store), 4 sessions flooding
+at once, probe p50 / p95 / max in ms, base main 9a34fc2 against the head:
+
+| Flood (4 sessions) | Probe | Base | Head | Flood rate, base / head |
+| --- | --- | ---: | ---: | ---: |
+| none | `inspect` | 1.3 / 1.6 / 4.6 | 1.1 / 1.5 / 10.5 | |
+| 8,000 `history_nodes` | `inspect` | 8.8 / 11.6 / 20.8 | 1.1 / 2.3 / 5.5 | 1,146 / 1,172 per s |
+| 1,600 `bots` | `inspect` | 18.0 / 25.5 / 33.5 | 2.4 / 4.8 / 6.9 | 509 / 903 per s |
+| 320 `history_search` of `*` | `inspect` | 1.2 / 1.7 / 63.4 | 1.1 / 2.1 / 11.0 | 3 / 8 per s |
+| none | `bots` | 3.8 / 5.1 / 14.7 | 3.5 / 4.5 / 10.2 | |
+| 8,000 `history_nodes` | `bots` | 11.4 / 15.0 / 26.4 | 4.3 / 6.6 / 21.3 | 957 / 1,195 per s |
+| 320 `history_search` of `*` | `bots` | 4.5 / 7.0 / 94,543 | 4.7 / 364 / 465 | 3 / 7 per s |
+
+The search row is the one #391 named: on main a `bots` listing queued on
+the one reader behind every search already sent, and the first probe
+waited 95 s. Now it waits for a free seat, behind at most the searches
+already running. Searches no longer wait for each other either, so the
+flood finishes in 44 s rather than 101 s. Main already answered searches
+off the loop, which is why `inspect` was quiet there; floods of history
+pages and listings, which main answered in the loop, held every other
+session's request behind one read each.
+
+A lone session pipelining cheap reads pays for the hand-off: one read at a
+time, each through the lane and back. The original single-session floods
+(210 bots, shallow histories, probe `inspect`):
+
+| Flood (1 session) | Base probe | Head probe | Flood rate, base / head |
+| --- | ---: | ---: | ---: |
+| 5,000 `inspect` | 1.0 / 1.9 / 10.5 | 1.0 / 1.5 / 5.1 | 6,050 / 4,813 per s |
+| 5,000 `events` | 1.1 / 1.7 / 4.0 | 1.0 / 1.5 / 5.7 | 4,897 / 2,204 per s |
+| 1,000 `bots` | 5.8 / 8.3 / 9.4 | 1.3 / 2.4 / 14.2 | 667 / 524 per s |
+| 2,500 `create` + `delete` | 5.2 / 7.7 / 30.6 | 3.5 / 5.4 / 13.4 | 974 / 951 per s |
+
+So a session that pipelines thousands of `events` pages gets about half
+the rate it had, in exchange for no other session waiting behind them.
+Several sessions reading at once get more than before in total, since
+reads now run side by side. Each reader connection keeps its own 2 MiB
+page cache and statement cache.
+
+## History reads reach any ancestor in O(log n) (#472)
+
+`history_nodes` and `history_items` used to walk a bot's lineage node by
+node: an oldest-first page ordered the whole ancestry past its floor
+before its `LIMIT`, checking `from` walked from the head to it, and a
+batch of items walked from the head to the oldest one asked for. Each
+node now has a narrow `lineage` row (parent, depth, a skip pointer chosen
+as Bitcoin Core's block index chooses `pskip`, and its turn's start),
+written by the insert that writes the node, so those reads take O(log n)
+point lookups. A page also stops at 256 KiB sent.
+
+A synthetic store of one bot with 2,000 turns of ten 2 KB nodes (20,000
+nodes, 77.5 MiB), release build, main 16a9324 against the branch, two
+alternating runs each (2026-10-31, the cloud container):
+
+| Measure | Main | Branch |
+| --- | ---: | ---: |
+| writes, µs per node (each its own commit) | 906, 956 | 1,008, 1,022 |
+| store size, MiB | 77.5 | 77.7 |
+| newest page of 400, ms | 0.75, 0.74 | 1.06, 0.89 |
+| oldest-first page after the first 10%, ms | 50.5, 48.6 | 1.4, 1.2 |
+| oldest-first page after half, ms | 28.4, 29.1 | 1.3, 1.2 |
+| page from an early node, ms | 44.8, 43.2 | 0.96, 0.86 |
+| one early item, ms | 48.0, 48.1 | 0.61, 0.95 |
+| 100 items spread over the history, ms | 46.9, 58.7 | 4.4, 6.5 |
+
+The deep reads no longer grow with the history: they are 30 to 80 times
+faster here, and the gap widens with depth. A write costs about 7 to 11%
+more, mostly the lineage row's page in the same commit plus a skip walk of
+O(log n) point reads, and storage grows about 10 bytes a node. The newest
+page costs about 0.2 ms more, for sizing the page against its byte budget.
+Stores from before schema 73 place every node when they open, in one pass
+in id order with the places held in memory.
+
+The write side under the hot-path screens, from the Perf workflow on the
+pull request (GitHub runner, base main 30845ba against head 9a49159,
+alternating rounds, medians):
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 45.728 | 46.527 | +1.7% |
+| admission | burst submit p99, ms | 6.214 | 6.152 | -1.0% |
+| completion | release to terminal p99, ms | 16.832 | 17.781 | +5.6% |
+| footprint | idle RSS, MiB | 20.059 | 20.152 | +0.5% |
+| footprint | per idle bot, KiB | 1.506 | 1.42 | -5.7% |
+| footprint | RSS after a turn each, MiB | 27.76 | 28.107 | +1.3% |
+| footprint | CPU per turn, ms | 1.592 | 1.64 | +3.0% |
+| lifecycle | CPU, s | 1.38 | 1.32 | -4.3% |
+| lifecycle | p95 turn, ms | 586.813 | 589.251 | +0.4% |
+| lifecycle | peak RSS, MiB | 26.826 | 26.877 | +0.2% |
+
+Store jobs per turn held at about 7.5 on both sides (the lineage row rides
+the node's own insert, so no job is added), and nothing passed the gate's
+15% line; per-round completion p99s on both sides ran from about 16 to
+20 ms, so its +0.9 ms is inside the noise. The extra per-write work shows in the
+single-commit microbenchmark above and not at fleet scale, where group
+commits carry it.

@@ -255,7 +255,8 @@ class Bench:
         self.env = {'PATH': os.environ['PATH'], 'HOME': str(self.home)}
         self.daemon = subprocess.Popen(
             [str(self.agent), 'serve', '--store', str(self.store), '--provider',
-             f'openai=responses,{self.url}', '--socket', str(self.socket)],
+             f'openai=responses,{self.url}', '--socket', str(self.socket),
+             *(['--max-readers', str(args.readers)] if getattr(args, 'readers', None) else [])],
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
             stderr=open(self.out / 'daemon.err', 'w'), env=self.env, start_new_session=True)
         deadline = time.monotonic() + 10

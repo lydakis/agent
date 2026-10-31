@@ -268,25 +268,26 @@ fn subscriptions() -> Value {
             The person's own words cut into your running turn; the rest waits until your turn ends. Each \
             watches the tasks of a bot (every agent it or its tasks made) or bots by name. It also hears the \
             sources the person set up outside (a chat, a mailbox, a feed), each by name, in a note starting \
-            \"From your sources\": every event, at once when the source marks it urgent, or only those its \
-            filter matches. Add one, or remove one by name; with neither, or after either, the result lists \
-            them all, with the sources there are and the fields their events lately had, to filter on. \
-            Adding one again changes nothing; one by a name in use that differs is refused with the field, \
-            so remove it first.",
+            \"From your sources\": every event, at once when the source marks it urgent, or one topic of a \
+            source as NAME:TOPIC, or only those its filter matches. The commons is a source too, each thread \
+            a topic: posting in a thread subscribes you to it as commons.THREAD, and removing that leaves it. \
+            Add one, or remove one by name; with neither, or after either, the result lists them all, with \
+            the sources there are and the fields their events lately had, to filter on. Adding one again \
+            changes nothing; one by a name in use that differs is refused with the field, so remove it first.",
         "parameters": {
             "type": "object",
             "properties": {
                 "add": {
                     "type": "object",
                     "properties": {
-                        "name": {"type": "string", "pattern": "^[A-Za-z0-9_-][A-Za-z0-9._-]{0,63}$"},
+                        "name": {"type": "string", "pattern": "^[A-Za-z0-9_-][A-Za-z0-9._-]{0,79}$"},
                         "tasks_of": {"type": "array", "items": {"type": "string", "minLength": 1},
                             "description": "Bots whose tasks it watches."},
                         "bots": {"type": "array", "items": {"type": "string", "minLength": 1},
                             "description": "Bots it watches by name, * matching any run of characters; \
                                 another lead, which has subscriptions of its own, counts only where named as it is."},
                         "sources": {"type": "array", "items": {"type": "string", "minLength": 1},
-                            "description": "Sources it hears, by name: every event each says, unless filtered."},
+                            "description": "Sources it hears, by name: every event each says, unless filtered; or NAME:TOPIC, one topic of it."},
                         "filter": {"type": "object",
                             "description": "Only the sources' events this matches are heard: an event pattern as \
                                 AWS EventBridge writes one. Each field the event must have maps to a list of values, \
@@ -757,6 +758,15 @@ async fn called(name: &str, arguments: &Value) -> Answer {
             let mut said =
                 crate::commons::call(&home, &caller, caller_id, model.as_deref(), arguments)
                     .map_err(|e| ("commons_refused", e))?;
+            // Posting in a thread subscribes the agent to it, in its store.
+            if (arguments["post"].is_object() || arguments["reply"].is_object())
+                && let Some(thread) = said["thread"].as_str().map(str::to_owned)
+                && let Ok((store, _)) = crate::daemon_paths(None, None)
+                && crate::commons::subscribe(&store, &caller, caller_id, &thread).is_ok()
+            {
+                said["subscription"] =
+                    json!(crate::lookout::subs::Sub::commons(&thread, caller_id).name);
+            }
             if let Some(tell) = said.as_object_mut().and_then(|said| said.remove("tell")) {
                 said["told"] = json!(crate::commons::tell(&home, &said, &caller, &tell).await);
             }
@@ -765,6 +775,25 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                     json!(crate::commons::invite(&home, &said, &caller, &invite).await);
             }
             Ok(said.to_string())
+        }
+        crate::asks::TOOL => {
+            // A deadline is a trigger, whose add runs on a runtime of its own.
+            // Its card is in the history of the bot that asked, a side chat
+            // included, so the deadline is that bot's, not its source's.
+            let (arguments, call) = (arguments.clone(), std::env::var("AGENT_CALL").ok());
+            let asker = std::env::var("AGENT_CALL_BOT").unwrap_or(caller);
+            let turn = std::env::var("AGENT_TURN")
+                .ok()
+                .and_then(|t| t.parse().ok());
+            let (Some(call), Some(turn)) = (call, turn) else {
+                return Err(("no_caller", "AGENT_CALL or AGENT_TURN is not set".into()));
+            };
+            tokio::task::spawn_blocking(move || {
+                crate::asks::served(&arguments, &asker, turn, &call)
+            })
+            .await
+            .map_err(|e| ("tool_failed", e.to_string()))?
+            .map_err(|e| ("ask_refused", e))
         }
         TRIGGERS => {
             // A trigger's add runs on a runtime of its own.
@@ -1269,6 +1298,10 @@ async fn answer(client: &Client, call: &Value, me: &Path, store: &Path, socket: 
         .env("AGENT_BOT", str_of(&caller["name"]))
         .env("AGENT_BOT_ID", caller["bot_id"].to_string())
         .env("AGENT_TURN", call["turn"].to_string())
+        .env("AGENT_CALL", str_of(&call["call_id"]))
+        // The bot whose turn made the call, which a side chat's AGENT_BOT
+        // is not: an ask's deadline looks for the call in its history.
+        .env("AGENT_CALL_BOT", bot)
         .env("AGENT_STORE", store)
         .env("AGENT_SOCKET", socket)
         .env("AGENT_MODEL", model)

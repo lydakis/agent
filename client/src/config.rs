@@ -33,6 +33,8 @@
 //! commons = false               # agents go without the commons, on by default
 //! commons_invites = 3           # least threads a day that send invites (more with the square root of the week's agents), 0 none; answers add up to as many again
 //! commons_invite_tokens = 1000000  # what an invite pays for in its thread
+//! commons_digest = "1h"         # an agent hears its commons threads at most this often, unless asked sooner; 0 at once
+//! ask_wait_minutes = 60         # how long an unanswered ask waits to go ahead or remind; 0 never
 //! task_depth = 3                # generations of tasks below a lead, 2 by default (tasks' own start none); 0 no end
 //! sky_haikus = 0                # haikus a day from the sky's busiest agent, 8 by default; 0 none
 //! sky_haiku_window = 10         # minutes of messages and tool calls that make an agent busiest
@@ -58,6 +60,7 @@
 //! [sonny.sources.slack]         # what Sonny's lookout runs for news
 //! command = "~/bin/slack-poll"  # run with sh -c; each line it prints is one event
 //! every = "1m"                  # how long after it exits it runs again
+//! digest = "15m"                # a subscriber hears it at most this often; unset, as it comes
 //! ```
 //!
 //! Each unset value is the model's own, or, for a task, its lead's.
@@ -187,6 +190,14 @@ pub struct Sonny {
     pub commons_invites: u64,
     /// The tokens an invite pays for in its thread.
     pub commons_invite_tokens: u64,
+    /// How often at most an agent hears of new posts in its commons
+    /// threads, as a `digest` of the commons source: `1h`, or `0` for as
+    /// they come.
+    pub commons_digest: String,
+    /// How long an `ask` the person has not answered waits, in minutes,
+    /// before its agent goes on with what it recommended, where it said
+    /// it could, or is reminded of it; 0 lets every ask wait for them.
+    pub ask_wait_minutes: u64,
     /// How many generations below a lead its line goes: a lead's tasks
     /// are the first, and an agent of the last starts none; 0 for no end.
     pub task_depth: u64,
@@ -216,6 +227,31 @@ pub struct Sonny {
 /// saved state, which carries sign-ins.
 pub const BROWSER_CONFIRM: [&str; 4] = ["eval", "download", "upload", "state"];
 
+/// How often at most an agent hears of its commons threads, unless the
+/// config says otherwise: an hour, as Slack's slowest email batching.
+pub const COMMONS_DIGEST: &str = "1h";
+
+/// The name of the source Sonny's lookout makes of the commons.
+pub const COMMONS_SOURCE: &str = "commons";
+
+/// A span of time as a count and `s`, `m` or `h`, as `30s`, `5m` or `1h`,
+/// in seconds; `0` alone is none. `key` names it in the error.
+pub fn span(key: &str, text: &str) -> Result<u64, String> {
+    if text == "0" {
+        return Ok(0);
+    }
+    let bad = || format!("{key} is a number and s, m or h, as 30s or 5m, not {text:?}");
+    let (count, unit) = [("s", 1), ("m", 60), ("h", 3600)]
+        .into_iter()
+        .find_map(|(suffix, unit)| Some((text.strip_suffix(suffix)?, unit)))
+        .ok_or_else(bad)?;
+    if !count.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(bad());
+    }
+    let count: u64 = count.parse().map_err(|_| bad())?;
+    count.checked_mul(unit).ok_or_else(bad)
+}
+
 impl Default for Sonny {
     fn default() -> Self {
         Sonny {
@@ -232,6 +268,8 @@ impl Default for Sonny {
             commons: true,
             commons_invites: 3,
             commons_invite_tokens: 1_000_000,
+            commons_digest: COMMONS_DIGEST.to_owned(),
+            ask_wait_minutes: 60,
             task_depth: 2,
             sky_haikus: 8,
             sky_haiku_window: 10,
@@ -315,6 +353,9 @@ pub struct Source {
     /// How long after it exits it runs again, as `30s`, `5m` or `1h`;
     /// unset, a minute.
     pub every: Option<String>,
+    /// How often at most a subscriber hears it, as `every` is written,
+    /// unless an event is urgent; unset or `0`, as events come.
+    pub digest: Option<String>,
 }
 
 /// An MCP server, under Codex's key names for `[mcp_servers.NAME]`: a
@@ -622,6 +663,8 @@ fn parse(text: &str) -> Result<Config, String> {
                 "commons",
                 "commons_invites",
                 "commons_invite_tokens",
+                "commons_digest",
+                "ask_wait_minutes",
                 "task_depth",
                 "sky_haikus",
                 "sky_haiku_window",
@@ -691,6 +734,7 @@ fn parse(text: &str) -> Result<Config, String> {
             if let Some(count) = match key.as_str() {
                 "commons_invites" => Some(&mut config.sonny.commons_invites),
                 "commons_invite_tokens" => Some(&mut config.sonny.commons_invite_tokens),
+                "ask_wait_minutes" => Some(&mut config.sonny.ask_wait_minutes),
                 "task_depth" => Some(&mut config.sonny.task_depth),
                 "sky_haikus" => Some(&mut config.sonny.sky_haikus),
                 "sky_haiku_window" => Some(&mut config.sonny.sky_haiku_window),
@@ -742,6 +786,11 @@ fn parse(text: &str) -> Result<Config, String> {
                     "fork" => SideChat::Fork,
                     other => return Err(format!("sonny.side_chat is answer or fork, not {other}")),
                 };
+                continue;
+            }
+            if key == "commons_digest" {
+                span(&format!("{name}.{key}"), &value)?;
+                config.sonny.commons_digest = value;
                 continue;
             }
             if key == "margin_opens" {
@@ -901,14 +950,25 @@ fn sources(value: &toml::Value) -> Result<Vec<Source>, String> {
                 "sonny.sources.{name}: a source's name is 1 to 64 of A-Z a-z 0-9 _ -"
             ));
         }
+        if name == COMMONS_SOURCE {
+            return Err(format!(
+                "sonny.sources.{name}: the commons is a source of Sonny's own; name yours another way"
+            ));
+        }
         let fields =
             (source.as_table()).ok_or_else(|| format!("sonny.sources.{name} must be a table"))?;
         let mut command = None;
         let mut every = None;
+        let mut digest = None;
         for (field, value) in fields {
             match field.as_str() {
                 "command" => command = Some(string(&key(field), value)?),
                 "every" => every = Some(string(&key(field), value)?),
+                "digest" => {
+                    let value = string(&key(field), value)?;
+                    span(&key(field), &value)?;
+                    digest = Some(value);
+                }
                 _ => return Err(format!("unknown key {}", key(field))),
             }
         }
@@ -916,6 +976,7 @@ fn sources(value: &toml::Value) -> Result<Vec<Source>, String> {
             name: name.clone(),
             command: command.ok_or_else(|| format!("{} is missing", key("command")))?,
             every,
+            digest,
         });
     }
     Ok(sources)
@@ -1145,6 +1206,10 @@ mod tests {
             (sonny.commons_invites, sonny.commons_invite_tokens),
             (0, 500)
         );
+        assert_eq!(config.sonny.ask_wait_minutes, 60);
+        let asks = parse("[sonny]\nask_wait_minutes = 0").unwrap().sonny;
+        assert_eq!(asks.ask_wait_minutes, 0);
+        assert!(parse("[sonny]\nask_wait_minutes = \"1h\"").is_err());
         assert_eq!(config.sonny.browser_confirm, BROWSER_CONFIRM);
         let browser =
             parse("[sonny]\nbrowser_confirm = [\"eval\", \"plugin:vault:credential.read\"]");
@@ -1431,12 +1496,38 @@ mod tests {
     }
 
     #[test]
+    fn a_span_is_a_count_and_a_unit_or_nothing() {
+        assert_eq!(span("k", "0"), Ok(0));
+        assert_eq!(span("k", "0m"), Ok(0));
+        assert_eq!(span("k", "30s"), Ok(30));
+        assert_eq!(span("k", "5m"), Ok(300));
+        assert_eq!(span("k", "2h"), Ok(7200));
+        for bad in [
+            "",
+            "5",
+            "m",
+            "5 m",
+            "1d",
+            "-1m",
+            "+1m",
+            "5秒",
+            "99999999999999999h",
+        ] {
+            assert!(span("k", bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
     fn sources_are_named_commands() {
         let config = parse(
-            "[sonny]\nlead_effort = \"low\"\n\n[sonny.sources.slack]\ncommand = \"~/bin/slack-poll\"\nevery = \"5m\"\n\n[sonny.sources.mail]\ncommand = \"mail-poll\"\n",
+            "[sonny]\nlead_effort = \"low\"\n\n[sonny.sources.slack]\ncommand = \"~/bin/slack-poll\"\nevery = \"5m\"\ndigest = \"15m\"\n\n[sonny.sources.mail]\ncommand = \"mail-poll\"\n",
         )
         .unwrap();
         assert_eq!(config.sonny.lead_effort.as_deref(), Some("low"));
+        let digests: Vec<Option<&str>> = (config.sonny.sources.iter())
+            .map(|s| s.digest.as_deref())
+            .collect();
+        assert_eq!(digests, [None, Some("15m")]);
         let named: Vec<(&str, &str, Option<&str>)> = (config.sonny.sources.iter())
             .map(|s| (s.name.as_str(), s.command.as_str(), s.every.as_deref()))
             .collect();
@@ -1451,6 +1542,18 @@ mod tests {
             (
                 "[sonny.sources.slack]\nevery = \"1m\"",
                 "sonny.sources.slack.command is missing",
+            ),
+            (
+                "[sonny.sources.slack]\ncommand = \"x\"\ndigest = \"1d\"",
+                "sonny.sources.slack.digest is a number and s, m or h, as 30s or 5m, not \"1d\"",
+            ),
+            (
+                "[sonny.sources.commons]\ncommand = \"x\"",
+                "sonny.sources.commons: the commons is a source of Sonny's own; name yours another way",
+            ),
+            (
+                "[sonny]\ncommons_digest = \"an hour\"",
+                "sonny.commons_digest is a number and s, m or h, as 30s or 5m, not \"an hour\"",
             ),
             (
                 "[sonny.sources.slack]\ncommand = \"x\"\nargs = \"y\"",
