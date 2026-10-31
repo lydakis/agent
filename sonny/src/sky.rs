@@ -111,6 +111,13 @@ const REPLAY_BACK: i64 = 3_600_000;
 const SKY_COLS: usize = 60;
 const SKY_ROWS: usize = 24;
 
+/// An agent as its making tells of it, as the listing would.
+fn made(name: &str, data: &Value) -> Value {
+    json!({"name": name, "bot_id": data["bot_id"],
+        "created_by": data["created_by"], "created_by_id": data["created_by_id"],
+        "running_turn": data["running_turn"], "model": data["model"]})
+}
+
 /// The most events a replay keeps to step back through.
 const TAPE: usize = 100_000;
 
@@ -412,13 +419,27 @@ impl Replay {
     /// that has played goes and the replay starts where the rest does, as
     /// a ring buffer keeps a recorder's last stretch: a replay left open
     /// on a busy daemon stays bounded, and a step back reaches that far.
+    /// Who was made or removed in what goes is folded into the cast, as a
+    /// keyframe takes in the frames before it.
     fn keep(&mut self, event: Value) {
         self.tape.push(event);
         let gone = TAPE / 10;
         if self.tape.len() <= TAPE || self.played < gone {
             return;
         }
-        self.tape.drain(..gone);
+        for event in self.tape.drain(..gone) {
+            let Some(name) = event["bot"].as_str() else {
+                continue;
+            };
+            match event["event"].as_str() {
+                Some("created" | "forked") => {
+                    self.cast.retain(|bot| bot["name"] != name);
+                    self.cast.push(made(name, &event["data"]));
+                }
+                Some("deleted") => self.cast.retain(|bot| bot["name"] != name),
+                _ => {}
+            }
+        }
         self.played -= gone;
         if let Some(first) = self.tape.first().and_then(|e| e["written_ms"].as_i64()) {
             self.from = self.from.max(first);
@@ -887,10 +908,7 @@ impl View {
         let data = &event["data"];
         match event["event"].as_str().unwrap_or("") {
             "created" | "forked" => {
-                let record = json!({"name": name, "bot_id": data["bot_id"],
-                    "created_by": data["created_by"], "created_by_id": data["created_by_id"],
-                    "running_turn": data["running_turn"], "model": data["model"]});
-                if let Some(at) = self.seat(&record) {
+                if let Some(at) = self.seat(&made(name, data)) {
                     self.agents[at].lit = Some(now);
                 }
                 return;
@@ -3686,6 +3704,22 @@ mod tests {
         assert_eq!(replay.tape.len(), TAPE + 2 - TAPE / 10);
         assert_eq!(replay.played, TAPE - TAPE / 10);
         assert_eq!(replay.from, (TAPE / 10) as i64);
+        // Who was made, or removed, in what went is in the cast now.
+        let mut replay = Replay::new(0);
+        replay.cast = vec![json!({"name": "old"})];
+        replay.keep(json!({"event": "created", "bot": "new", "data": {"bot_id": 9}}));
+        replay.keep(json!({"event": "deleted", "bot": "old"}));
+        for at in 0..TAPE as i64 {
+            replay.keep(json!({"event": "queued", "written_ms": at}));
+        }
+        replay.played = TAPE;
+        replay.keep(json!({"event": "queued", "written_ms": TAPE}));
+        let cast: Vec<_> = replay
+            .cast
+            .iter()
+            .map(|bot| (bot["name"].clone(), bot["bot_id"].clone()))
+            .collect();
+        assert_eq!(cast, [(json!("new"), json!(9))]);
     }
 
     #[tokio::test]
