@@ -3663,7 +3663,9 @@ impl Turn {
                             .map(Outcome::text)
                     };
                     match self.run_tool(search, None, warm.as_deref_mut()).await? {
-                        Ran::Done(Ok(outcome)) => annotate(outcome, turn, &call.call_id),
+                        Ran::Done(Ok(outcome)) => {
+                            self.kept(outcome, record, workspace, &call.call_id).await
+                        }
                         Ran::Done(Err(error)) => failure(error),
                         Ran::Lifted(_) => unreachable!("only a command moves to the background"),
                     }
@@ -3704,6 +3706,7 @@ impl Turn {
                             timeout_ms,
                             environment.to_vec(),
                             sandbox,
+                            self.outputs(record, workspace),
                         )
                         .await
                     {
@@ -3719,7 +3722,7 @@ impl Turn {
                         .op("process_start", move |db| db.process_start(turn, &started))
                         .await?;
                     let (sender, receiver) = oneshot::channel();
-                    self.collect(id, &call.call_id, receiver);
+                    self.collect(id, &call.call_id, receiver, self.outputs(record, workspace));
                     let start = self.registry.terminal(
                         record.bot_id,
                         id,
@@ -3812,6 +3815,7 @@ impl Turn {
                     let outcome = Outcome {
                         output: json!({"bytes":text.len(),"cleared":text.is_empty()}).to_string(),
                         artifacts: Vec::new(),
+                        files: Vec::new(),
                         parts: Vec::new(),
                         note: Some(text),
                         failed: false,
@@ -3854,12 +3858,17 @@ impl Turn {
                         .run_tool(run, Some((&self.lift, running)), warm.as_deref_mut())
                         .await?
                     {
-                        Ran::Done(Ok(outcome)) => annotate(outcome, turn, &call.call_id),
+                        Ran::Done(Ok(outcome)) => {
+                            self.kept(outcome, record, workspace, &call.call_id).await
+                        }
                         Ran::Done(Err(error)) if error.code == "tool_scheduler_closed" => {
                             return Err(error);
                         }
                         Ran::Done(Err(error)) => failure(error),
-                        Ran::Lifted(run) => self.lift_shell(&call.call_id, run).await?,
+                        Ran::Lifted(run) => {
+                            let outputs = self.outputs(record, workspace);
+                            self.lift_shell(&call.call_id, run, outputs).await?
+                        }
                     }
                 }
                 Ok(prepared) => match self
@@ -3871,7 +3880,9 @@ impl Turn {
                     )
                     .await?
                 {
-                    Ran::Done(Ok(outcome)) => annotate(outcome, turn, &call.call_id),
+                    Ran::Done(Ok(outcome)) => {
+                        self.kept(outcome, record, workspace, &call.call_id).await
+                    }
                     Ran::Done(Err(error)) if error.code == "tool_scheduler_closed" => {
                         return Err(error);
                     }
@@ -3961,7 +3972,14 @@ impl Turn {
                 (Prepared::Shell { .. }, Err(error)) => Err(error.clone()),
                 (_, sandbox) => Ok(sandbox.clone().unwrap_or_default()),
             };
-            self.run_parallel(call.call_id, prepared, workspace, environment, sandbox)
+            self.run_parallel(
+                call.call_id,
+                prepared,
+                record,
+                workspace,
+                environment,
+                sandbox,
+            )
         });
         let record = async {
             // Results go to the store in call order as they come, each
@@ -4015,6 +4033,7 @@ impl Turn {
         &self,
         call_id: String,
         prepared: Prepared,
+        record: &Bot,
         workspace: &std::path::Path,
         environment: &[(String, String)],
         sandbox: Result<Option<Arc<Policy>>>,
@@ -4052,7 +4071,13 @@ impl Turn {
                 };
                 match finished {
                     Some(result) => result,
-                    None => return (call_id.clone(), self.lift_shell(&call_id, run).await),
+                    None => {
+                        let outputs = self.outputs(record, workspace);
+                        return (
+                            call_id.clone(),
+                            self.lift_shell(&call_id, run, outputs).await,
+                        );
+                    }
                 }
             }
             prepared => {
@@ -4062,11 +4087,45 @@ impl Turn {
             }
         };
         let outcome = match ran {
-            Ok(outcome) => Ok(annotate(outcome, self.turn, &call_id)),
+            Ok(outcome) => Ok(self.kept(outcome, record, workspace, &call_id).await),
             Err(error) if error.code == "tool_scheduler_closed" => Err(error),
             Err(error) => Ok(failure(error)),
         };
         (call_id, outcome)
+    }
+
+    /// Where the bot's cut outputs go whole, when its settings name a
+    /// folder.
+    fn outputs(&self, record: &Bot, workspace: &std::path::Path) -> Option<Outputs> {
+        let settings = self.settings();
+        Some(Outputs {
+            folder: PathBuf::from(settings.outputs.as_ref()?),
+            settings: settings.clone(),
+            root: record
+                .workspace
+                .as_ref()
+                .map_or_else(|| workspace.to_owned(), PathBuf::from),
+            daemon: self.registry.daemon().clone(),
+        })
+    }
+
+    /// A call's outcome as the model and the store take it: its cut
+    /// streams in the bot's outputs folder where it has one, then named.
+    async fn kept(
+        &self,
+        outcome: Outcome,
+        record: &Bot,
+        workspace: &std::path::Path,
+        call_id: &str,
+    ) -> Outcome {
+        let outcome = match outcome.artifacts.is_empty() {
+            true => outcome,
+            false => match self.outputs(record, workspace) {
+                Some(outputs) => outputs.keep(outcome, self.turn, call_id).await,
+                None => outcome,
+            },
+        };
+        annotate(outcome, self.turn, call_id)
     }
 
     /// The bot's sandbox, built from its settings. Reading its roots
@@ -4547,6 +4606,7 @@ impl Turn {
 
     /// Start a command now; its result is retrievable through a proc handle
     /// that the store keeps unique and durable.
+    #[allow(clippy::too_many_arguments)]
     async fn background(
         &self,
         call_id: &str,
@@ -4555,6 +4615,7 @@ impl Turn {
         timeout_ms: u64,
         environment: Vec<(String, String)>,
         sandbox: Option<Arc<Policy>>,
+        outputs: Option<Outputs>,
     ) -> Result<Outcome> {
         // The place in line is taken before anything durable is written.
         let queued = self.registry.queue()?;
@@ -4573,7 +4634,7 @@ impl Turn {
             queued,
             sender,
         );
-        self.collect(id, call_id, receiver);
+        self.collect(id, call_id, receiver, outputs);
         Ok(Outcome::text(
             json!({"handle":format!("proc:{id}"),"background":true}).to_string(),
         ))
@@ -4583,7 +4644,12 @@ impl Turn {
     /// process slot and timeout, and its result arrives on a proc handle as
     /// a background command's does. A failure to record it drops the
     /// command, which kills it.
-    async fn lift_shell<F>(&self, call_id: &str, run: std::pin::Pin<Box<F>>) -> Result<Outcome>
+    async fn lift_shell<F>(
+        &self,
+        call_id: &str,
+        run: std::pin::Pin<Box<F>>,
+        outputs: Option<Outputs>,
+    ) -> Result<Outcome>
     where
         F: Future<Output = Result<Outcome>> + Send + 'static,
     {
@@ -4597,7 +4663,7 @@ impl Turn {
         tokio::spawn(async move {
             let _ = sender.send(run.await);
         });
-        self.collect(id, call_id, receiver);
+        self.collect(id, call_id, receiver, outputs);
         Ok(Outcome::text(
             json!({"handle":format!("proc:{id}"),"background":true,"steered":true}).to_string(),
         ))
@@ -4605,7 +4671,13 @@ impl Turn {
 
     /// Record a background command's result when it arrives and wake those
     /// waiting on its handle.
-    fn collect(&self, id: i64, call_id: &str, receiver: oneshot::Receiver<Result<Outcome>>) {
+    fn collect(
+        &self,
+        id: i64,
+        call_id: &str,
+        receiver: oneshot::Receiver<Result<Outcome>>,
+        outputs: Option<Outputs>,
+    ) {
         let turn = self.turn;
         let (store, handles, failures, call_id_for_refs) = (
             self.store.clone(),
@@ -4615,17 +4687,25 @@ impl Turn {
         );
         tokio::spawn(async move {
             let result = receiver.await.unwrap_or_else(|_| fail("process_lost"));
-            let (value, artifacts) = match result {
+            let (value, artifacts, files) = match result {
                 Ok(outcome) => {
+                    let outcome = match outputs {
+                        Some(outputs) if !outcome.artifacts.is_empty() => {
+                            outputs.keep(outcome, turn, &call_id_for_refs).await
+                        }
+                        _ => outcome,
+                    };
                     let outcome = annotate(outcome, turn, &call_id_for_refs);
                     (
                         serde_json::from_str(&outcome.output)
                             .unwrap_or(json!({"output":outcome.output})),
                         outcome.artifacts,
+                        outcome.files,
                     )
                 }
                 Err(error) => (
                     json!({"error":error.code,"detail":error.detail}),
+                    Vec::new(),
                     Vec::new(),
                 ),
             };
@@ -4634,7 +4714,7 @@ impl Turn {
             let recorded = value.clone();
             match store
                 .op("process_finish", move |db| {
-                    db.process_finish(id, &recorded, &artifacts)
+                    db.process_finish(id, &recorded, &artifacts, &files)
                 })
                 .await
             {
@@ -4757,21 +4837,196 @@ fn backoff(attempt: u32, seed: u64) -> std::time::Duration {
     std::time::Duration::from_millis((base as i64 + base as i64 * spread / 100).max(1) as u64)
 }
 
+/// Where a bot's cut outputs go whole: the outputs folder its settings
+/// name, and what decides whether its sandbox may write there.
+#[derive(Clone)]
+struct Outputs {
+    folder: PathBuf,
+    settings: Settings,
+    root: PathBuf,
+    daemon: agent_runtime::sandbox::Daemon,
+}
+
+impl Outputs {
+    /// Write each retained stream of `outcome` whole to a file of its own,
+    /// `TURN-CALL_ID-STREAM`, in place of the store's copy, off the runtime
+    /// thread. Only while the bot's sandbox cannot write the folder: a
+    /// command that could would put a link there for the daemon to follow.
+    /// Files are made new, never through a link, readable by their owner
+    /// alone. A stream that cannot be written stays in the store.
+    async fn keep(self, mut outcome: Outcome, turn: i64, call_id: &str) -> Outcome {
+        if outcome.artifacts.is_empty() {
+            return outcome;
+        }
+        let name: String = call_id
+            .chars()
+            .map(
+                |c| match c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                    true => c,
+                    false => '_',
+                },
+            )
+            .collect();
+        let artifacts = std::mem::take(&mut outcome.artifacts);
+        // A turn stopped while this runs drops what it returns, and the
+        // files with it: no record will name them.
+        let kept = tokio::task::spawn_blocking(move || {
+            if self.exposed() {
+                return Kept {
+                    stored: artifacts,
+                    files: Vec::new(),
+                };
+            }
+            let mut stored = Vec::new();
+            let mut written = Vec::new();
+            for (stream, data) in artifacts {
+                let file = self.folder.join(format!("{turn}-{name}-{stream}"));
+                match write_new(&file, &data).ok().and(file.to_str()) {
+                    Some(path) => written.push((stream, path.to_owned(), data)),
+                    None => stored.push((stream, data)),
+                }
+            }
+            // The store commits only where a file is: its name must last
+            // as its bytes do, or the store keeps them after all.
+            if !written.is_empty()
+                && std::fs::File::open(&self.folder)
+                    .and_then(|folder| folder.sync_all())
+                    .is_err()
+            {
+                for (stream, path, data) in written.drain(..) {
+                    let _ = std::fs::remove_file(path);
+                    stored.push((stream, data));
+                }
+            }
+            let files = written
+                .into_iter()
+                .map(|(stream, path, _)| (stream, path))
+                .collect();
+            Kept { stored, files }
+        })
+        .await;
+        // A task that failed took the data with it: the cut text stands alone.
+        if let Ok(mut kept) = kept {
+            outcome.artifacts = std::mem::take(&mut kept.stored);
+            outcome.files = std::mem::take(&mut kept.files);
+        }
+        outcome
+    }
+
+    /// Whether the bot's commands may write the folder, made first so the
+    /// answer is about the folder itself, or it is not a folder. A sandbox
+    /// that can't be built counts as one that may.
+    fn exposed(&self) -> bool {
+        use std::os::unix::fs::DirBuilderExt;
+        let found = |path: &std::path::Path| std::fs::symlink_metadata(path).is_ok();
+        let existing = self.folder.ancestors().find(|path| found(path));
+        if std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&self.folder)
+            .is_err()
+            || !std::fs::symlink_metadata(&self.folder).is_ok_and(|found| found.is_dir())
+        {
+            return true;
+        }
+        // Folders it made last only once the folders that name them are
+        // synced; the folder itself is synced with what is written in it.
+        if existing != Some(self.folder.as_path()) {
+            for parent in self.folder.ancestors().skip(1) {
+                if std::fs::File::open(parent)
+                    .and_then(|folder| folder.sync_all())
+                    .is_err()
+                {
+                    return true;
+                }
+                if Some(parent) == existing {
+                    break;
+                }
+            }
+        }
+        match Policy::new(
+            self.settings.sandbox,
+            Some(&self.root),
+            &self.settings.writable,
+            self.settings.network,
+            &self.daemon,
+        ) {
+            Ok(Some(policy)) => policy.can_write(&self.folder),
+            // Unconfined, its commands may write whatever the daemon may.
+            Ok(None) => false,
+            Err(_) => true,
+        }
+    }
+}
+
+/// A call's cut streams once kept: those the store keeps, and the files
+/// that hold the others, removed again unless the call's outcome takes them.
+struct Kept {
+    stored: Vec<(&'static str, Vec<u8>)>,
+    files: Vec<(&'static str, String)>,
+}
+
+impl Drop for Kept {
+    // A stopped turn drops its keeper's result wherever the handle goes,
+    // the runtime thread too, so the removal runs on a blocking worker.
+    fn drop(&mut self) {
+        if self.files.is_empty() {
+            return;
+        }
+        let files: Vec<String> = self.files.drain(..).map(|(_, file)| file).collect();
+        let remove = move || {
+            for file in &files {
+                let _ = std::fs::remove_file(file);
+            }
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => drop(runtime.spawn_blocking(remove)),
+            Err(_) => remove(),
+        }
+    }
+}
+
+/// `data` to a new file at `path`, never through a link, on disk before
+/// it returns, as the store's commit is.
+fn write_new(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    if let Err(error) = file.write_all(data).and_then(|()| file.sync_all()) {
+        let _ = std::fs::remove_file(path);
+        return Err(error);
+    }
+    Ok(())
+}
+
 /// Name retained streams in the model-facing result so the model can read
-/// them back: `TURN/CALL_ID/STREAM`.
+/// them back: `TURN/CALL_ID/STREAM`, and the files that hold any of them
+/// whole, by path.
 fn annotate(mut outcome: Outcome, turn: i64, call_id: &str) -> Outcome {
-    if outcome.artifacts.is_empty() {
+    if outcome.artifacts.is_empty() && outcome.files.is_empty() {
         return outcome;
     }
-    let refs: Vec<String> = outcome
-        .artifacts
-        .iter()
-        .map(|(stream, _)| format!("{turn}/{call_id}/{stream}"))
+    let refs: Vec<String> = (outcome.artifacts.iter().map(|(stream, _)| *stream))
+        .chain(outcome.files.iter().map(|(stream, _)| *stream))
+        .map(|stream| format!("{turn}/{call_id}/{stream}"))
         .collect();
     if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&outcome.output)
         && value.is_object()
     {
         value["artifacts"] = json!(refs);
+        if !outcome.files.is_empty() {
+            let files: Vec<&str> = outcome
+                .files
+                .iter()
+                .map(|(_, file)| file.as_str())
+                .collect();
+            value["files"] = json!(files);
+        }
         outcome.output = value.to_string();
     }
     outcome
@@ -5235,6 +5490,7 @@ fn failure(error: Error) -> Outcome {
     Outcome {
         output: json!({"error":error.code,"detail":error.detail}).to_string(),
         artifacts: Vec::new(),
+        files: Vec::new(),
         parts: Vec::new(),
         note: None,
         failed: true,

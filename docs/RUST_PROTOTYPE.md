@@ -360,6 +360,22 @@ read inherited outputs, but cannot read later source turns or unrelated branches
 A stream the call never retained answers `artifact_not_found`, a turn outside
 the reader's lineage `turn_not_found`, and a turn whose records retention has
 removed `artifact_pruned` (see Retention).
+
+<a id="retained-outputs"></a>A bot with an `outputs` folder keeps each such
+stream there whole instead, as `TURN-CALL_ID-STREAM`, and its result lists
+those paths as `files` beside `artifacts`, so any command or tool reads them.
+The store keeps one row per stream naming the file and none of its bytes
+(schema 68), and `artifact` and `read artifact=` read the file. Each file is
+made new (0600, never through a link) and synced with its folder before the
+store records it, off the runtime thread, and only while
+the bot's sandbox cannot write the folder, checked after the folder is made: a
+command that could write there could put a link for the daemon to follow. An unconfined bot's
+commands can already write whatever the daemon can. A stream whose file cannot
+be written stays in the store, and a turn stopped while its files are written
+removes them. Retention and deletion remove a turn's files once removing its
+records commits; a file removed by hand reads `artifact_not_found`. A daemon
+that dies between writing a file and recording its call leaves the file, which
+no record names.
 Line pages are assembled on the storage worker; only the bounded page crosses
 into the async runtime. Byte-oriented protocol pages continue to use SQL slicing.
 
@@ -417,6 +433,7 @@ keep-warm when it sets any of them.
 | `writable` (`--writable`, repeatable) | Absolute folders a `workspace-write` bot may write besides its own; each must exist and is stored by its real path. At most 64, 32 KiB as JSON. | none |
 | `network` (`--network`) | A `workspace-write` bot's commands may use the network. | off |
 | `hide_senders` (`--hide-senders`) | Its model reads what other bots and clients send it without the line naming the sender (see [fleet controllers](#fleet-controllers)); `senders = "hidden"` in `~/.agent/config.toml` sets it on the bots the CLI and Sonny make. | off |
+| `outputs` (`--outputs`) | An absolute folder that holds each tool output stream cut for the model whole, one file per stream, in place of the store's copy (see [retained outputs](#retained-outputs)). The daemon makes it, owner-only, and writes there only while the bot's sandbox cannot write it; otherwise the stream stays in the store. `agent run --new` and Sonny name `outputs` beside the store unless told otherwise. | none |
 | `unsandboxed` (`--unsandboxed`, repeatable) | Commands a sandboxed bot runs outside its sandbox without asking, each by its first words, such as `mcpx` or `docker compose` (see [sandbox](#sandbox)). At most 64, each at most 1 KiB. | none |
 
 Provider requests multiplex over HTTP/2, and one connection carries at most
@@ -1434,7 +1451,7 @@ person:]` or `[Quoted from the reply of turn:BOT/TURN, written by the agent
 BOT:]` (`sent by ORIGIN`, `written by PERSON`, `written by the agent NAME
 in turn:NAME/TURN`); `hide_senders` leaves the lines out too. A turn that
 does not exist, a steer's reply, or a turn that ended without a reply
-(or whose events were pruned before schema 68) is `quote_not_found`; a
+(or whose events were pruned before schema 69) is `quote_not_found`; a
 reply of an unfinished turn `quote_unfinished`; more than 64 quotes, those
 quoted prompts bring counted (marked `nested` in the record, which a retry
 leaves out), or words and quotes past 256 KiB together, each quote's line
@@ -2146,7 +2163,7 @@ deleted once idle:
   is replay and artifact retrieval. A finished turn's row names the message
   with text it ended on, set in the write that finishes it, so a quote of its
   reply and the `reply` a `prompts` read of the next turn carries are
-  unaffected too, and read it by key rather than searching events. Schema 68
+  unaffected too, and read it by key rather than searching events. Schema 69
   adds it, found for finished turns from the events retention had left. New `wait` calls for an expired
   turn outcome return the turn's view with `error: turn_result_pruned`; they
   never report an empty success.
@@ -2251,7 +2268,8 @@ it as `queued_processes`, a subset of `running_processes`, which counts every
 accepted command whose result is not yet recorded. stdout and stderr are each
 retained up to 1 MiB; beyond 64 KiB the model receives a head and tail with the
 omission stated and the full stream is stored as an artifact retrievable through
-the `artifact` operation. Output is redacted before it is stored or sent,
+the `artifact` operation, or written to the bot's `outputs` folder (see
+[retained outputs](#retained-outputs)). Output is redacted before it is stored or sent,
 artifacts included, as every tool's result is: each credential the daemon
 holds, wherever it appears; the value printed after a field name ending in
 one the daemon was started with (`--redact-field`, any case, with or without

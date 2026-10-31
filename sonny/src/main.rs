@@ -649,6 +649,18 @@ fn start_daemon(
 }
 
 /// The store and socket given, else the environment's, else Agent's own.
+/// The store this Sonny reaches, once [`daemon_paths`] chose it.
+static STORE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// The outputs folder a new agent's cut tool outputs go to: beside the
+/// store this Sonny reaches.
+pub(crate) fn outputs() -> Option<String> {
+    match STORE.get() {
+        Some(store) => agent_client::policy::outputs_beside(store),
+        None => agent_client::policy::default_outputs(),
+    }
+}
+
 fn daemon_paths(
     store: Option<PathBuf>,
     socket: Option<PathBuf>,
@@ -660,6 +672,7 @@ fn daemon_paths(
     };
     // One store under two names is one lookout's.
     let store = agent_client::socket::canonical_store(&store).map_err(|e| e.to_string())?;
+    let _ = STORE.set(store.clone());
     let socket = match socket.or_else(|| std::env::var_os("AGENT_SOCKET").map(PathBuf::from)) {
         Some(socket) => socket,
         None => agent_client::socket::default_socket(&store).map_err(|e| e.to_string())?,
@@ -982,7 +995,11 @@ async fn run() -> Result<(), String> {
     // The person's agent can react to them; a side chat has its agent's
     // tools, or none.
     if options.side.is_none() {
-        app.declare = declared::declare(&bot, project.is_some());
+        app.role = match project {
+            Some(_) => served::Role::of(0),
+            None => declared::role(&app.client, &bot).await,
+        };
+        app.declare = declared::declare(&bot, app.role);
     }
     app.sounds = sound::Sounds::new(options.sound);
     let settings = settings::Settings::load();
@@ -1157,7 +1174,7 @@ pub(crate) fn made(
     workspace: &Path,
 ) -> Result<(), String> {
     let config = agent_client::config::load()?;
-    let declare = json!(declared::tools(false));
+    let declare = json!(declared::tools(served::Role::of(1)));
     let tools = agent_client::default_tools(client.providers(), model, config.web_search);
     asked["tools"] = json!(tools);
     asked["declare"] = declare.clone();
@@ -1167,6 +1184,9 @@ pub(crate) fn made(
     let mut settings = approvals::sandbox(mode, workspace);
     if let Some(ttl) = agent_client::policy::cache_ttl(model) {
         settings.insert("cache_ttl".into(), json!(ttl));
+    }
+    if let Some(outputs) = outputs() {
+        settings.insert("outputs".into(), json!(outputs));
     }
     if config.hide_senders {
         settings.insert("hide_senders".into(), json!(true));
@@ -1918,6 +1938,9 @@ struct App {
     /// Sonny's welcome heads the transcript once it is drawn back to the
     /// conversation's first item, as Claude Code's does.
     welcome: bool,
+    /// Sonny's blinks and glances in the welcome, until the person types
+    /// or scrolls.
+    eyes: Option<banner::Eyes>,
     width: usize,
     /// The terminal's rows, which bound how much of the bot's words is held.
     height: usize,
@@ -2009,6 +2032,8 @@ struct App {
     /// The tools to declare on the bot so it can react, sent once no turn
     /// runs.
     declare: Option<Value>,
+    /// What its tools let it do, by where it stands in its lead's line.
+    role: served::Role,
     /// The bot's reactions in the running turn so far, drawn when it ends.
     bot_reactions: Vec<String>,
     /// The bot's `react` calls not yet completed, by call id.
@@ -2986,10 +3011,12 @@ impl App {
             attached: Vec::new(),
             profile: Default::default(),
             declare: None,
+            role: served::Role::at(2, 2),
             bot_reactions: Vec::new(),
             react_calls: HashMap::new(),
             picked: reactions::Picked::default(),
             picked_read: Instant::now(),
+            eyes: Some(banner::Eyes::new(Instant::now())),
             answering: None,
             rows_drawn: 0,
             thought: String::new(),
@@ -3425,8 +3452,7 @@ impl App {
         // A bot that went without the tools Sonny gates, as its gate was
         // not Sonny's, has them with the mode the person picks.
         if declare.is_none() && gating.is_some() && self.mode.is_none() {
-            declare =
-                declared::declare(&json!({"declared": self.declared}), self.project.is_some());
+            declare = declared::declare(&json!({"declared": self.declared}), self.role);
         }
         // New tools are gated as the bot's mode gates the rest, so a tool
         // Sonny gates never runs unjudged where the mode judges.
@@ -3709,8 +3735,7 @@ impl App {
         // Back to the first node this window drew, not only the newest page.
         match self.first_node {
             Some(first) => {
-                let welcome = self.welcome();
-                self.commit(welcome);
+                self.commit_welcome();
                 self.history_since(first - 1, true).await;
             }
             None => {
@@ -3853,8 +3878,7 @@ impl App {
         let clustering = self.clustering.take();
         let stacked = self.stacked.take();
         if paged.first {
-            let welcome = self.welcome();
-            self.commit(welcome);
+            self.commit_welcome();
         }
         let unpaired = self
             .draw_nodes(&paged.nodes, &paged.turns, true, after, None)
@@ -4942,7 +4966,7 @@ impl App {
     /// The welcome over the newest page just read, known to start the
     /// conversation only once it is.
     fn welcome_above(&mut self) {
-        let mut welcome = self.welcome();
+        let (mut welcome, eyes) = self.welcome();
         if !welcome.is_empty() {
             if self.any_history {
                 welcome.push(Line::default());
@@ -4953,15 +4977,31 @@ impl App {
                 *at += welcome.len();
             }
             self.pending.splice(0..0, welcome);
+            if let Some(eyes) = eyes {
+                self.marks
+                    .push((eyes, screen::Mark::Tag(screen::Tag::Eyes)));
+            }
+        }
+    }
+
+    /// The welcome written under what is waiting, its eyes' line marked.
+    fn commit_welcome(&mut self) {
+        let (welcome, eyes) = self.welcome();
+        let count = welcome.len();
+        self.commit(welcome);
+        if let Some(eyes) = eyes {
+            let at = self.pending.len() - count + eyes;
+            self.marks.push((at, screen::Mark::Tag(screen::Tag::Eyes)));
         }
     }
 
     /// The welcome, when this window has one and draws the conversation
     /// from its first item: none above a page with older ones before it.
-    fn welcome(&self) -> Vec<Line<'static>> {
+    /// With its portrait, the line the eyes are on.
+    fn welcome(&self) -> (Vec<Line<'static>>, Option<usize>) {
         match self.welcome && self.older.is_none() {
             true => banner::welcome(&tilde(&self.workspace), &self.model, self.width),
-            false => Vec::new(),
+            false => (Vec::new(), None),
         }
     }
 
@@ -7311,17 +7351,23 @@ impl App {
     /// the selection, and the keys that scroll. Whether it took `event`.
     fn full_screen(&mut self, event: &Event) -> bool {
         use ratatui::crossterm::event::MouseEventKind;
-        // A key, or the wheel, ends the way up to the first turn.
+        // A key, or the wheel, ends the way up to the first turn, and
+        // Sonny's eyes moving for good: it was a welcome.
         match event {
-            Event::Key(key) if key.kind != KeyEventKind::Release => self.to_first = false,
+            Event::Key(key) if key.kind != KeyEventKind::Release => {
+                self.to_first = false;
+                self.eyes = None;
+            }
             Event::Mouse(mouse)
                 if matches!(
                     mouse.kind,
                     MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
                 ) =>
             {
-                self.to_first = false
+                self.to_first = false;
+                self.eyes = None;
             }
+            Event::Paste(_) => self.eyes = None,
             _ => {}
         }
         let key = match event {
@@ -9991,6 +10037,11 @@ impl App {
                 ..history
             };
             self.screen.render(history, frame.buffer_mut(), file);
+            if let Some(eyes) = &mut self.eyes
+                && let Some(y) = self.screen.drawn_at(screen::Tag::Eyes)
+            {
+                banner::draw_eyes(frame.buffer_mut(), history.x, y, eyes.look(Instant::now()));
+            }
             linked.extend(self.screen.link_cells(frame.buffer_mut()));
             let [live, status, gap, composer, pad, footer] = areas(view, live_rows);
             frame.render_widget(Paragraph::new(open_rows.clone()), live);
@@ -13276,7 +13327,7 @@ mod tests {
         })
         .await;
         let mut app = app(client);
-        app.declare = declared::declare(&json!({}), false);
+        app.declare = declared::declare(&json!({}), served::Role::at(2, 2));
         app.running = Some(Running {
             turn: 1,
             started: Instant::now(),
@@ -13290,7 +13341,10 @@ mod tests {
         assert!(app.configure().await);
         let sent = asked.lock().unwrap()[0].clone();
         assert_eq!(sent["op"], "configure");
-        assert_eq!(sent["declare"], json!(declared::tools(false)));
+        assert_eq!(
+            sent["declare"],
+            json!(declared::tools(served::Role::at(2, 2)))
+        );
         assert!(app.declare.is_none());
     }
 
@@ -13515,7 +13569,7 @@ mod tests {
         app.tools = vec!["shell".into()];
         let custom = json!({"gates": [{"tag": "ci", "tools": ["shell"]}]});
         app.mode = approvals::mode(&custom);
-        app.declared = declared::declare(&custom, true).unwrap();
+        app.declared = declared::declare(&custom, served::Role::at(0, 2)).unwrap();
         app.gating = Some("ask");
         assert!(app.configure().await);
         let sent = asked.lock().unwrap()[0].clone();

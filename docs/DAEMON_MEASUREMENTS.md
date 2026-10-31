@@ -6095,3 +6095,34 @@ over six runs each was 1.28 to 1.44 KiB on the base and 1.42 to 1.75 KiB on
 the head, a median gap of about 60 bytes, inside the spread earlier screens
 moved by (#467 measured 1.64 and 1.35 for one daemon). Idle bots write no
 nodes and carry no new state, so nothing in this change adds to them.
+
+## Cut outputs as files in a bot's outputs folder (#485)
+
+A tool call whose output is cut for the model now asks, when its bot has
+an `outputs` folder, whether its sandbox may write that folder, and writes
+each cut stream there, synced, on a blocking thread, in place of the
+store's LZ4 copy. A call with no cut stream, or a bot with no folder, pays
+one check of an empty list. Retention and deletion read a turn's file
+names before its rows go. The Perf workflow's matched screen, base main
+678876e against the PR head bc36668, on the GitHub runner (2026-10-31):
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 40.431 | 39.977 | -1.1% |
+| admission | burst submit p99, ms | 6.342 | 6.098 | -3.9% |
+| completion | release to terminal p99, ms | 13.964 | 13.472 | -3.5% |
+| footprint | idle RSS, MiB | 18.641 | 19.195 | +3.0% |
+| footprint | per idle bot, KiB | 1.476 | 1.46 | -1.1% |
+| footprint | RSS after a turn each, MiB | 28.119 | 27.91 | -0.7% |
+| footprint | CPU per turn, ms | 1.272 | 1.278 | +0.5% |
+| lifecycle | CPU, s | 1.155 | 1.175 | +1.7% |
+| lifecycle | p95 turn, ms | 579.309 | 577.968 | -0.2% |
+| lifecycle | peak RSS, MiB | 25.453 | 25.283 | -0.7% |
+
+Nothing passed the gate's 15% in the direction that costs; idle RSS moved
+by half a MiB, inside what earlier screens of unchanged idle code moved
+by (#479 measured 19.10 and 19.24). The benches' outputs are short, so
+none is cut: the screen shows the path every call takes, and a cut call
+adds a file write and two syncs on a blocking thread, not the runtime's.
+The later head that syncs each file and removes pruned files after the
+group commits changes only cut calls and retention.

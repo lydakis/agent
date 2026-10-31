@@ -62,13 +62,64 @@ const SWEEP: Duration = Duration::from_secs(30);
 
 const SPLIT: [&str; 4] = crate::mux::SIDES;
 
-/// Sonny's answered tools, as it declares them on a lead, or on another
-/// bot: the lead's own, which the tasks it starts do not take, and those
-/// every agent has, `exec` while the person has MCP servers.
-pub fn tools(lead: bool) -> Vec<Value> {
+/// What an agent may do beyond what every agent may: a lead makes
+/// projects, and an agent with room below it in its lead's line, as the
+/// config's `task_depth` bounds it, starts and removes tasks, which the
+/// agents it starts take too while they have room of their own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Role {
+    pub lead: bool,
+    pub starts: bool,
+    pub passes: bool,
+}
+
+impl Role {
+    /// Every tool: for telling Sonny's tools from others by name.
+    pub const ALL: Role = Role {
+        lead: true,
+        starts: true,
+        passes: true,
+    };
+
+    /// The role of an agent `depth` generations below its lead, the lead
+    /// itself at 0, in a line `limit` generations deep, 0 for no end.
+    pub fn at(depth: u64, limit: u64) -> Role {
+        let room = |depth: u64| limit == 0 || depth < limit;
+        Role {
+            lead: depth == 0,
+            starts: room(depth),
+            passes: room(depth + 1),
+        }
+    }
+
+    /// [`Role::at`] in the line the person's config bounds.
+    pub fn of(depth: u64) -> Role {
+        Role::at(depth, depth_limit())
+    }
+}
+
+/// How many generations of tasks a lead's line has, as the config says.
+pub fn depth_limit() -> u64 {
+    agent_client::config::load().map_or(2, |config| config.sonny.task_depth)
+}
+
+/// Sonny's answered tools, as it declares them on a bot in `role`: a
+/// lead's own and a starter's, and those every agent has, `exec` while the
+/// person has MCP servers.
+pub fn tools(role: Role) -> Vec<Value> {
     let mut tools = Vec::new();
-    if lead {
-        tools.extend([start(), remove(), project()]);
+    if role.starts {
+        tools.extend([start(), remove()]);
+        // What the daemon gives the agents this one makes is all it
+        // declared but those it keeps to itself.
+        if !role.passes {
+            for tool in &mut tools {
+                tool["inherit"] = json!(false);
+            }
+        }
+    }
+    if role.lead {
+        tools.push(project());
     }
     tools.extend([subscriptions(), show(), run(), triggers(), memory()]);
     if crate::commons::on() {
@@ -82,9 +133,11 @@ pub fn tools(lead: bool) -> Vec<Value> {
 fn start() -> Value {
     json!({
         "name": START,
-        "description": "Start a new task. Unless this project's tasks all work in this folder, Sonny makes the \
-            task a git worktree of this repository on the branch agent/NAME, from the last commit, so uncommitted \
-            changes here are not in it; outside git, the task works in this folder itself, shared with you and \
+        "description": "Start a new task. A lead starts tasks for the person's work; any other agent starts one \
+            only for help inside its own brief, such as a review, research or a watch on something, and asks its \
+            lead for a task for separate work. Unless this project's tasks all work in one folder, Sonny makes the \
+            task a git worktree of its lead's repository on the branch agent/NAME, from the last commit (a task's \
+            own helper, from the last commit on that task's branch), so uncommitted changes are not in it; outside git, the task works in this folder itself, shared with you and \
             its other tasks. With own_folder, it gets an empty folder of its own instead, where it makes what it \
             changes, such as a workspace made with this folder's tooling, as the brief says how, and reads this \
             folder where it is. With setup, the folder's .agents/setup runs in the task's folder first. The task starts there with this folder's rules, skills and \
@@ -138,8 +191,7 @@ fn start() -> Value {
         },
         "answered_by": TAG,
         // A setup script may build for minutes.
-        "expire_ms": 20 * 60 * 1000,
-        "inherit": false
+        "expire_ms": 20 * 60 * 1000
     })
 }
 
@@ -164,8 +216,7 @@ fn remove() -> Value {
             "additionalProperties": false
         },
         "answered_by": TAG,
-        "expire_ms": 5 * 60 * 1000,
-        "inherit": false
+        "expire_ms": 5 * 60 * 1000
     })
 }
 
@@ -502,13 +553,35 @@ async fn called(name: &str, arguments: &Value) -> Answer {
         std::env::var("AGENT_BOT").map_err(|_| ("no_caller", "AGENT_BOT is not set".into()))?;
     match name {
         START => {
-            // Work that one of the lead's tasks may hold already goes to
-            // it, unless the lead says why it is separate; a fork is a
+            let line = Line::of(&caller, &here);
+            // A side chat is gone soon, and what it started with it out of
+            // its task's sight; the task starts its own.
+            if let Some(task) = &line.side_of {
+                return Err((
+                    "task_not_started",
+                    format!(
+                        "a side chat of {task} starts no tasks; ask in {task}'s own conversation"
+                    ),
+                ));
+            }
+            if !line.role.starts {
+                return Err((
+                    "task_depth_reached",
+                    format!(
+                        "{caller} is as deep in its lead's line as task_depth ({}) in the \
+                         person's config lets agents start tasks: do this work yourself, or ask \
+                         your lead for a task of its own",
+                        line.limit
+                    ),
+                ));
+            }
+            // Work that one of the starter's tasks may hold already goes to
+            // it, unless the starter says why it is separate; a fork is a
             // second try beside its source by its nature.
             if text("from").is_none()
                 && text("reason").is_none_or(|reason| reason.trim().is_empty())
             {
-                let there = crate::task::still_there(&caller);
+                let there = crate::task::still_there(&line.project, &caller);
                 if !there.is_empty() {
                     let listed: Vec<String> = (there.iter())
                         .map(|(name, status)| format!("{name} ({status})"))
@@ -534,11 +607,16 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                 folder: text("folder"),
                 from: text("from"),
                 turn: arguments["turn"].as_i64(),
+                // A task's own helper builds on its work.
+                builds_on: (!line.role.lead).then(|| caller.clone()),
             };
-            let started =
-                crate::task::start(&here, &caller, &start).map_err(|e| ("task_not_started", e))?;
+            let started = crate::task::start(&line.folder, &line.project, &caller, &start)
+                .map_err(|e| ("task_not_started", e))?;
             // What the lead's gone tasks left, which only it can clear.
-            let left = crate::task::left_behind(&here, &caller);
+            let left = match line.role.lead {
+                true => crate::task::left_behind(&line.folder, &line.project),
+                false => Vec::new(),
+            };
             Ok(match left.is_empty() {
                 true => started,
                 false => {
@@ -555,10 +633,19 @@ async fn called(name: &str, arguments: &Value) -> Answer {
             })
         }
         REMOVE => {
+            let line = Line::of(&caller, &here);
             let task = text("task").unwrap_or_default();
-            let task = crate::resolved::call(&json!({"task": task}), &project_of(&caller))
+            let task = crate::resolved::call(&json!({"task": task}), &line.project)
                 .ok_or(("invalid_arguments", "a task's name, without /".to_owned()))?;
-            crate::task::remove(&here, &task, arguments["discard"] == true)
+            // A lead removes any of its project's; another agent only one
+            // of its own line, so no task removes its lead's others.
+            if !line.role.lead && !Line::made(&task, &caller) {
+                return Err((
+                    "task_not_removed",
+                    format!("{task} is not a task you or yours started; ask your lead"),
+                ));
+            }
+            crate::task::remove(&line.folder, &task, arguments["discard"] == true)
                 .map_err(|e| ("task_not_removed", e))
         }
         SHOW => crate::show(
@@ -700,6 +787,89 @@ async fn called(name: &str, arguments: &Value) -> Answer {
             Ok(said.to_string())
         }
         _ => Err(("unknown_tool", format!("Sonny answers no tool {name}"))),
+    }
+}
+
+/// Where the agent calling a tool stands in its lead's line, as the
+/// person's config bounds it: what it may start, the folder its tasks
+/// start from, its lead's, and the project they are named in.
+struct Line {
+    role: Role,
+    limit: u64,
+    folder: PathBuf,
+    project: String,
+    /// The task a side chat of a task is a copy of, which starts that
+    /// task's helpers itself.
+    side_of: Option<String>,
+}
+
+impl Line {
+    /// `caller`'s, whose own folder is `here`: a lead's folder is its own,
+    /// and so is that of an agent no lead heads the line of. Read with the
+    /// daemon's CLI, as the start itself is made.
+    fn of(caller: &str, here: &Path) -> Line {
+        let limit = depth_limit();
+        let mut side_of = None;
+        let (depth, lead) = match crate::project::is_lead(caller) {
+            true => (0, None),
+            false => {
+                let record =
+                    crate::task::record_of_bot(caller).unwrap_or_else(|| json!({"name": caller}));
+                side_of = crate::side_copy(&record).map(str::to_owned);
+                crate::declared::line_by(&record, limit, |at| {
+                    crate::task::record_of_bot(at["created_by"].as_str()?)
+                })
+            }
+        };
+        let lead = lead.as_ref().and_then(|lead| {
+            let name = lead["name"].as_str()?;
+            let folder = lead["workspace"].as_str().filter(|f| !f.is_empty())?;
+            Some((name.to_owned(), PathBuf::from(folder)))
+        });
+        let project = project_of(lead.as_ref().map_or(caller, |(lead, _)| lead));
+        let folder = match lead {
+            Some((_, folder)) if depth > 0 => folder,
+            _ => here.to_owned(),
+        };
+        Line {
+            role: Role::at(depth, limit),
+            limit,
+            folder,
+            project,
+            // A lead's side chat starts its tasks as the lead does.
+            side_of: side_of.filter(|_| depth > 0),
+        }
+    }
+
+    /// Whether `caller` made the agent `task`, or made one that made it:
+    /// by the ids each was made by, so an agent that took the name of a
+    /// removed one owns nothing that one made.
+    fn made(task: &str, caller: &str) -> bool {
+        let Some(me) = crate::task::record_of_bot(caller).and_then(|r| r["bot_id"].as_i64()) else {
+            return false;
+        };
+        let Some(mut record) = crate::task::record_of_bot(task) else {
+            return false;
+        };
+        for _ in 0..256 {
+            let (Some(by), Some(by_id)) = (
+                record["created_by"].as_str(),
+                record["created_by_id"].as_i64(),
+            ) else {
+                return false;
+            };
+            if by_id == me {
+                return true;
+            }
+            if crate::project::is_lead(by) {
+                return false;
+            }
+            match crate::task::record_of_bot(by) {
+                Some(maker) if maker["bot_id"].as_i64() == Some(by_id) => record = maker,
+                _ => return false,
+            }
+        }
+        false
     }
 }
 
@@ -1172,11 +1342,12 @@ pub fn stop() {
 
 /// The error codes `sonny tool` answers with, as static names.
 fn code(said: &str) -> &'static str {
-    const CODES: [&str; 15] = [
+    const CODES: [&str; 16] = [
         "not_in_folder",
         "no_caller",
         "invalid_arguments",
         "task_not_started",
+        "task_depth_reached",
         "tasks_exist",
         "task_not_removed",
         "not_shown",
@@ -1267,31 +1438,23 @@ mod tests {
                 .filter(|name| name != EXEC)
                 .collect()
         };
-        assert_eq!(
-            names(tools(false)),
-            [SUBSCRIPTIONS, SHOW, RUN, TRIGGERS, MEMORY, COMMONS, GOAL]
-        );
-        assert_eq!(
-            names(tools(true)),
-            [
-                START,
-                REMOVE,
-                PROJECT,
-                SUBSCRIPTIONS,
-                SHOW,
-                RUN,
-                TRIGGERS,
-                MEMORY,
-                COMMONS,
-                GOAL
-            ]
-        );
-        for tool in tools(true).into_iter().filter(|t| t["name"] != EXEC) {
+        let every = [SUBSCRIPTIONS, SHOW, RUN, TRIGGERS, MEMORY, COMMONS, GOAL];
+        assert_eq!(names(tools(Role::at(2, 2))), every);
+        let mut task = vec![START, REMOVE];
+        task.extend(every);
+        assert_eq!(names(tools(Role::at(1, 2))), task);
+        let mut lead = vec![START, REMOVE, PROJECT];
+        lead.extend(every);
+        assert_eq!(names(tools(Role::at(0, 2))), lead);
+        for tool in tools(Role::at(0, 1))
+            .into_iter()
+            .filter(|t| t["name"] != EXEC)
+        {
             assert_eq!(tool["answered_by"], TAG);
-            // A lead's own are not its tasks'.
+            // A lead's own are not its tasks', in a line one deep.
             assert_eq!(
                 tool.get("inherit").is_some(),
-                !names(tools(false)).contains(&str_of(&tool["name"]))
+                !every.contains(&str_of(&tool["name"]).as_str())
             );
         }
         assert_eq!(project_of("shop.web.lead"), "shop.web");

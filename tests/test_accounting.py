@@ -1,14 +1,20 @@
 """Budgets, turn listings, results, artifact reads by the model, idle exit, schema versions."""
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
+import sys
+import tempfile
 import time
 import unittest
+from pathlib import Path
 
 from bench.runtime_client import node_item, poll, serve_args
 from bench.targets import clean_env
 from tests.test_runtime import ModelFixture
+
+ROOT = Path(__file__).resolve().parent.parent
 
 
 @unittest.skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'set AGENT_TEST_RUNTIME=1 after a Rust release build')
@@ -256,6 +262,74 @@ class AccountingTests(ModelFixture):
         self.assertIn('result', client.request('delete', bot='Bob'))
         self.assertEqual(client.request('artifact', bot='Fork', turn=big, call_id='shell-1', stream='stdout')['error'], 'artifact_pruned')
         self.assertEqual(client.request('submit', bot='Bob', request_id='big', prompt='retry')['error'], 'bot_not_found')
+
+    def test_cut_outputs_go_whole_to_the_outputs_folder_and_leave_with_their_turn(self):
+        # Outside the temporary directories, which a sandbox may write.
+        (ROOT / '.local').mkdir(exist_ok=True)
+        parent = Path(tempfile.mkdtemp(dir=ROOT / '.local'))
+        self.addCleanup(shutil.rmtree, parent)
+        outputs = parent / 'outputs'
+        client = self.client('echo,shell,read')
+        lines = "shell:i=0; while [ $i -lt 20000 ]; do echo line-$i; i=$((i+1)); done"
+        expected = ''.join(f'line-{i}\n' for i in range(20000))
+
+        def run(bot, request_id, prompt=lines):
+            turn = client.request('submit', bot=bot, request_id=request_id, prompt=prompt)['result']['turn']
+            self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+            return turn
+
+        client.request('create', bot='Bob', workspace=str(self.path), settings={'outputs': str(outputs)})
+        big = run('Bob', 'big')
+        result = json.loads(self.tool_output(client, 'Bob', 'shell-1'))
+        self.assertEqual(result['artifacts'], [f'{big}/shell-1/stdout'])
+        file = Path(result['files'][0])
+        self.assertEqual(file, outputs / f'{big}-shell-1-stdout')
+        self.assertEqual(file.read_text(), expected)
+        self.assertEqual((outputs.stat().st_mode & 0o777, file.stat().st_mode & 0o777), (0o700, 0o600))
+        # One copy: the store names the file and holds none of it.
+        with sqlite3.connect(self.path / 'state.sqlite') as db:
+            self.assertEqual(db.execute('SELECT length(data),file FROM artifacts WHERE turn=?', (big,)).fetchall(),
+                             [(0, str(file))])
+        page = client.request('artifact', bot='Bob', turn=big, call_id='shell-1', stream='stdout',
+                              offset=7, limit=12)['result']
+        self.assertEqual((page['text'], page['next_offset']), (expected[7:19], 19))
+        # Bytes that are not UTF-8 come back as replacement characters, up
+        # to three times as many bytes, and still read whole.
+        wide = run('Bob', 'wide', "shell:head -c 400000 /dev/zero | tr '\\0' '\\377'")
+        page = client.request('artifact', bot='Bob', turn=wide, call_id='shell-1', stream='stdout',
+                              offset=1199997, limit=8)['result']
+        self.assertEqual((page['text'], page['done']), ('\ufffd', True))
+        read = run('Bob', 'read', f'readart:{big}/shell-1/stdout 1,2')
+        self.assertIn('line-1', self.tool_output(client, 'Bob', 'readart-1'))
+        # Pruning the turn removes its file; reading it says so.
+        run('Bob', 'later', 'later')
+        self.assertIn('result', client.request('prune', bot='Bob', keep_turns=1))
+        self.assertEqual(os.listdir(outputs), [])
+        self.assertFalse(file.exists())
+        self.assertEqual(client.request('artifact', bot='Bob', turn=big, call_id='shell-1', stream='stdout')['error'],
+                         'artifact_pruned')
+        self.assertLess(big, read)
+        if not (shutil.which('bwrap') or sys.platform == 'darwin'):
+            return
+        # A sandbox that may write the folder keeps its output in the store,
+        # so no command can put a link there for the daemon to follow.
+        client.request('create', bot='Kid', workspace=str(parent),
+                       settings={'outputs': str(outputs), 'sandbox': 'workspace-write'})
+        kid = run('Kid', 'big')
+        result = json.loads(self.tool_output(client, 'Kid', 'shell-1'))
+        self.assertEqual((result['artifacts'], 'files' in result), ([f'{kid}/shell-1/stdout'], False))
+        self.assertEqual(os.listdir(outputs), [])
+        self.assertEqual(client.request('artifact', bot='Kid', turn=kid, call_id='shell-1', stream='stdout',
+                                        offset=0, limit=10)['result']['text'], expected[:10])
+        # One that cannot writes there, and deleting the bot removes the file.
+        client.request('create', bot='Ann', workspace=str(self.path),
+                       settings={'outputs': str(outputs), 'sandbox': 'workspace-write'})
+        ann = run('Ann', 'big')
+        file = Path(json.loads(self.tool_output(client, 'Ann', 'shell-1'))['files'][0])
+        self.assertEqual(file.read_text(), expected)
+        self.assertIn('result', client.request('delete', bot='Ann'))
+        self.assertFalse(file.exists())
+        self.assertNotEqual(ann, kid)
 
     def test_unversioned_and_newer_stores_are_refused_with_clear_codes(self):
         path = self.path / 'old.sqlite'
