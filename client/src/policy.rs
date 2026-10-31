@@ -681,6 +681,61 @@ fn entry_row(entry: &Entry) -> String {
     )
 }
 
+/// How short each summary may become, in characters, before entries are
+/// left out: Codex trims its skill descriptions before it drops skills.
+const SUMMARY_STEPS: [usize; 4] = [160, 80, 40, 0];
+
+/// A list of `entries` within `room` bytes, with the entries it lists:
+/// whole when it fits; else each summary shortened, step by step; else
+/// without summaries and without the last entries by name, with a line
+/// saying how many were left out. Empty when not even that fits.
+fn fit(kind: Kind, entries: Vec<Entry>, room: usize) -> (String, Vec<Entry>) {
+    if entries.is_empty() {
+        return (String::new(), entries);
+    }
+    let header = kind.header();
+    let block = |entries: &[Entry], chars: usize| {
+        let mut block = header.clone();
+        for entry in entries {
+            block.push_str(&entry_row(&Entry {
+                summary: entry.summary.chars().take(chars).collect(),
+                ..entry.clone()
+            }));
+        }
+        block
+    };
+    for chars in SUMMARY_STEPS {
+        let whole = block(&entries, chars);
+        if whole.len() <= room {
+            let kept = (entries.into_iter())
+                .map(|entry| Entry {
+                    summary: entry.summary.chars().take(chars).collect(),
+                    ..entry
+                })
+                .collect();
+            return (whole, kept);
+        }
+    }
+    let total = entries.len();
+    let mut kept = entries;
+    for entry in &mut kept {
+        entry.summary.clear();
+    }
+    let note = |left: usize| {
+        format!("\n- {left} more not listed, for room; list the folders above to see them all.")
+    };
+    let mut listed = block(&kept, 0);
+    while !kept.is_empty() && listed.len() + note(total - kept.len()).len() > room {
+        let gone = kept.pop().expect("an entry");
+        listed.truncate(listed.len() - entry_row(&gone).len());
+    }
+    if kept.is_empty() {
+        return (String::new(), kept);
+    }
+    listed.push_str(&note(total - kept.len()));
+    (listed, kept)
+}
+
 fn search(workspace: &Path, kind: Kind) -> Vec<PathBuf> {
     // Visit the winning directory first, so a later directory can only add
     // entries. A budget failure can never be undone by an override.
@@ -1130,28 +1185,11 @@ pub fn instructions(
         let header = agents_header(&path);
         sources.extend(append(&mut text, path, &header)?);
     }
-    let mut lists = Vec::new();
-    for kind in [Kind::Skills, Kind::Profiles] {
-        let entries = index(
-            search(workspace, kind),
-            kind,
-            MAX_INSTRUCTIONS.saturating_sub(text.len() + kind.header().len()),
-        )?;
-        if !entries.is_empty() {
-            let mut block = kind.header();
-            for entry in &entries {
-                block.push_str(&entry_row(entry));
-            }
-            if text.len() + block.len() > MAX_INSTRUCTIONS {
-                return Err(Failure::TooLong {
-                    path: entries[0].path.clone(),
-                    total: text.len() + block.len(),
-                });
-            }
-            text.push_str(&block);
-        }
-        lists.push(entries);
-    }
+    // Memory and the role go whole, so they are composed first, and the
+    // skill and profile lists take the room they leave: shortened, then
+    // cut, rather than failing, as Codex and Claude Code size their skill
+    // lists. The text keeps its order: files, lists, memory, role.
+    let mut after = text.clone();
     // Memory follows: what earlier agents saved, as it stands when the bot
     // is made. An index carries its own heading, so it goes in as it is;
     // one not written yet is none.
@@ -1159,23 +1197,33 @@ pub fn instructions(
     for path in memory {
         match std::fs::symlink_metadata(path) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => not_dangling(path)?,
-            _ => indexes.extend(append(&mut text, path.clone(), "\n\n")?),
+            _ => indexes.extend(append(&mut after, path.clone(), "\n\n")?),
         }
     }
     // The role comes last: the most specific text a bot is given.
     if let Some(role) = role.filter(|r| !r.body.is_empty()) {
         let block = format!("{ROLE_HEADING}{}\n\n{}", role.name, with_cli(&role.body));
-        if text.len() + block.len() > MAX_INSTRUCTIONS {
+        if after.len() + block.len() > MAX_INSTRUCTIONS {
             return Err(Failure::TooLong {
                 path: role
                     .path
                     .clone()
                     .unwrap_or_else(|| PathBuf::from(&role.name)),
-                total: text.len() + block.len(),
+                total: after.len() + block.len(),
             });
         }
-        text.push_str(&block);
+        after.push_str(&block);
     }
+    let tail = after.split_off(text.len());
+    let mut lists = Vec::new();
+    for kind in [Kind::Skills, Kind::Profiles] {
+        let entries = index(search(workspace, kind), kind, usize::MAX)?;
+        let room = MAX_INSTRUCTIONS.saturating_sub(text.len() + tail.len());
+        let (block, kept) = fit(kind, entries, room);
+        text.push_str(&block);
+        lists.push(kept);
+    }
+    text.push_str(&tail);
     let profiles = lists.pop().unwrap_or_default();
     let skills = lists.pop().unwrap_or_default();
     Ok(Instructions {
@@ -1425,6 +1473,57 @@ mod tests {
             "instructions_unreadable"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_skill_list_past_the_room_is_shortened_then_cut_rather_than_failing() {
+        let root = temp("skill-room");
+        let skills = root.join(".agents/skills");
+        let add = |count: usize| {
+            for i in 0..count {
+                let dir = skills.join(format!("skill-{i:04}"));
+                std::fs::create_dir_all(&dir).unwrap();
+                let about = format!("description: {}\n", "d".repeat(150));
+                std::fs::write(dir.join("SKILL.md"), format!("---\n{about}---\n# Body")).unwrap();
+            }
+        };
+        let role = Profile {
+            name: "lead".into(),
+            path: None,
+            model: None,
+            tools: None,
+            body: "r".repeat(20_000),
+        };
+        // Few: listed whole.
+        add(3);
+        let composed = instructions(&root, Some(&role), &[]).unwrap();
+        assert!(composed.text.contains(&"d".repeat(150)));
+        assert_eq!(composed.skills.len(), 3);
+        // More than the room at 160 characters each: shorter summaries.
+        add(180);
+        let composed = instructions(&root, Some(&role), &[]).unwrap();
+        assert!(composed.text.len() <= MAX_INSTRUCTIONS);
+        assert_eq!(composed.skills.len(), 180);
+        assert!(!composed.text.contains(&"d".repeat(81)));
+        assert!(
+            composed.text.ends_with(&"r".repeat(20_000)),
+            "the role stays whole"
+        );
+        // Far more: the last by name left out, and the list says so.
+        add(1200);
+        let composed = instructions(&root, Some(&role), &[]).unwrap();
+        assert!(composed.text.len() <= MAX_INSTRUCTIONS);
+        let listed = composed.skills.len();
+        assert!(listed < 1200 && listed > 100, "{listed}");
+        assert_eq!(composed.skills[0].name, "skill-0000");
+        assert!(composed.skills.iter().all(|s| s.summary.is_empty()));
+        assert!(
+            composed
+                .text
+                .contains(&format!("- {} more not listed, for room", 1200 - listed))
+        );
+        assert!(composed.text.ends_with(&"r".repeat(20_000)));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

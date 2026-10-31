@@ -611,7 +611,7 @@ class AnthropicModel(http.server.BaseHTTPRequestHandler):
             assert 'fallbacks' not in request
             assert self.headers.get('anthropic-beta') == (
                 'thinking-binding-controls-2026-08-01,fallback-credit-2026-07-01,'
-                'server-side-fallback-2026-07-01')
+                'server-side-fallback-2026-07-01,fast-mode-2026-02-01')
             if 'fallback_credit_token' in request:
                 assert request['fallback_credit_token'] == 'credit-1' and request['model'] == 'synthetic-claude-2'
                 self.server.credits = getattr(self.server, 'credits', 0) + 1
@@ -1121,6 +1121,26 @@ class AnthropicRuntimeTests(unittest.TestCase):
         model.cache_control = {'type': 'ephemeral', 'ttl': '1h'}
         turn = client.request('submit', bot='Bob', request_id='c1', prompt='hello')['result']['turn']
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+
+    def test_configure_serves_a_bot_in_fast_mode_and_back(self):
+        client, model, path = self.start()
+        client.request('create', bot='Bob', workspace=str(path), effort='low')
+        self.assertEqual(client.request('inspect', bot='Bob')['result']['settings']['speed'], 'standard')
+        # The Claude API serves fast alone; the refusal names what it serves.
+        refused = client.request('configure', bot='Bob', speed='ultrafast')
+        self.assertEqual(refused['error'], 'invalid_speed')
+        self.assertEqual(refused['speeds'], ['fast'])
+        self.assertEqual(client.request('configure', bot='Bob', speed='fast')['result']['changed'], ['speed'])
+        self.assertEqual(client.request('configure', bot='Bob', speed='fast')['result']['changed'], [])
+        turn = client.request('submit', bot='Bob', request_id='f1', prompt='hello')['result']['turn']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        self.assertEqual(model.requests.get(timeout=5)['speed'], 'fast')
+        # Back to standard, its calls name no speed.
+        self.assertEqual(client.request('configure', bot='Bob', speed='standard')['result']['changed'], ['speed'])
+        turn = client.request('submit', bot='Bob', request_id='f2', prompt='hello')['result']['turn']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        self.assertNotIn('speed', model.requests.get(timeout=5))
+        self.assertEqual(client.ready['providers']['anthropic']['speeds'], ['fast'])
 
     def test_a_short_tool_call_sends_no_refresh(self):
         client, model, path = self.start()

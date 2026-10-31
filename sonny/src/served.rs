@@ -640,8 +640,11 @@ async fn called(name: &str, arguments: &Value) -> Answer {
             let caller_id = std::env::var("AGENT_BOT_ID")
                 .ok()
                 .and_then(|id| id.parse().ok());
-            let mut said = crate::commons::call(&home, &caller, caller_id, arguments)
-                .map_err(|e| ("commons_refused", e))?;
+            // The model its turn runs, as the lookout set it for the call.
+            let model = std::env::var("AGENT_MODEL").ok();
+            let mut said =
+                crate::commons::call(&home, &caller, caller_id, model.as_deref(), arguments)
+                    .map_err(|e| ("commons_refused", e))?;
             if let Some(tell) = said.as_object_mut().and_then(|said| said.remove("tell")) {
                 said["told"] = json!(crate::commons::tell(&home, &said, &caller, &tell).await);
             }

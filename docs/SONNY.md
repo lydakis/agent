@@ -30,7 +30,13 @@ model, effort}`, `reply_to`, `if`, `runs`, `turn_budget_tokens`, `replace`
 and `message`), `remove`, `fire` or `show` NAME, or nothing to list them.
 A row whose last fire sent a turn says how that turn ended, as the daemon
 has it: `last.turn_status`, and `last.turn_error` when it did not complete,
-so an agent sees the failure the person sees in `/background`.
+so an agent sees the failure the person sees in `/background`. It does not
+have to look: when a turn a fire sent fails (not one whose model said
+nothing), the lookout tells the agent that added a `start` trigger, else
+the agent the fire messaged, with a note it reads in its next model call,
+as a fire that sent nothing is told (`[trigger NAME · TIME · turn N it sent
+BOT failed: WHY]`). A fire with `reply_to` passes the failure on with its
+answer instead.
 It waits for a verdict wherever the agent's other calls do (`/approvals`),
 since a trigger runs as the person and its `if` command outside any
 sandbox. For people, scripts and other harnesses, Sonny writes
@@ -611,7 +617,11 @@ as a file; `memory`, what to save for later agents; `commons`, the threads
 agents share (see Commons); `memory-cleanup`, the
 nightly cleanup (see Memory); `automation`, for recurring jobs (see
 Triggers); `sonny-setup`, how any agent sets Sonny up with `sonny setup`'s
-flags and `--json` ([SKILL.md](../sonny/skills/sonny-setup/SKILL.md)); and,
+flags and `--json` ([SKILL.md](../sonny/skills/sonny-setup/SKILL.md));
+`sonny-config`, where the settings live and every key of
+`~/.agent/config.toml` with its values and default, written from the keys
+`/config` lists so it matches the Sonny installed
+([SKILL.md](../sonny/skills/sonny-config/SKILL.md)); and,
 depending on where it runs, `pictures`, `rex-windows`,
 `herdr-panes` or `cmux-tabs`. They are normal skills, real files
 ([skills.rs](../sonny/src/skills.rs)). Sonny notes a fingerprint of each file

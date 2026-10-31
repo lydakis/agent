@@ -425,6 +425,13 @@ fn parse(args: &[String]) -> Result<Options> {
                             .insert("cache_ttl".to_owned(), json!(value));
                         options.settings_flags.push(flag.to_owned());
                     }
+                    "--speed" => {
+                        if !matches!(value.as_str(), "standard" | "fast" | "ultrafast") {
+                            return fail_with("usage", "--speed needs standard, fast or ultrafast");
+                        }
+                        options.settings.insert("speed".to_owned(), json!(value));
+                        options.settings_flags.push(flag.to_owned());
+                    }
                     "--budget-tokens" => {
                         options.budget_tokens = Some(value.parse().map_err(|_| {
                             Error::with("usage", "--budget-tokens needs an integer")
