@@ -887,8 +887,9 @@ impl ReadSource {
 pub struct Outcome {
     pub output: String,
     pub artifacts: Vec<(&'static str, Vec<u8>)>,
-    /// Pictures that go to the model after the text: an image file read.
-    pub images: Vec<crate::codec::Image>,
+    /// What follows the output, in order: an image file read's picture, or
+    /// the pictures, and the words between them, a client answered with.
+    pub parts: Vec<crate::codec::Part>,
     /// A carry-forward note to record with this result; empty text clears.
     pub note: Option<String>,
     /// The call failed: an error, or a command that did not succeed. Set by
@@ -896,11 +897,29 @@ pub struct Outcome {
     pub failed: bool,
 }
 impl Outcome {
+    /// The pictures among its parts.
+    pub fn images(&self) -> impl Iterator<Item = &crate::codec::Image> {
+        self.parts.iter().filter_map(crate::codec::Part::image)
+    }
+    /// All its words: the output, then each text part on its own line.
+    pub fn words(&self) -> std::borrow::Cow<'_, str> {
+        let mut words = std::borrow::Cow::Borrowed(self.output.as_str());
+        for part in &self.parts {
+            if let crate::codec::Part::Text { text } = part {
+                let joined = words.to_mut();
+                if !joined.is_empty() {
+                    joined.push('\n');
+                }
+                joined.push_str(text);
+            }
+        }
+        words
+    }
     pub fn text(output: String) -> Self {
         Self {
             output,
             artifacts: Vec::new(),
-            images: Vec::new(),
+            parts: Vec::new(),
             note: None,
             failed: false,
         }
@@ -1528,7 +1547,7 @@ impl Registry {
                     && let Some((image, line)) = picture::read_apart(read_bounded(&file)).await?
                 {
                     return Ok(Outcome {
-                        images: vec![image],
+                        parts: vec![crate::codec::Part::Image(image)],
                         ..Outcome::text(format!("{path}: {line}"))
                     });
                 }
@@ -1651,7 +1670,7 @@ impl Registry {
         Outcome {
             output: output.to_string(),
             artifacts,
-            images: Vec::new(),
+            parts: Vec::new(),
             note: None,
             failed: !success,
         }
@@ -1700,7 +1719,7 @@ impl Registry {
         Outcome {
             output: output.to_string(),
             artifacts,
-            images: Vec::new(),
+            parts: Vec::new(),
             note: None,
             failed: !success,
         }
@@ -2393,8 +2412,10 @@ mod tests {
                 png.len()
             )
         );
-        assert_eq!(outcome.images.len(), 1);
-        assert_eq!(outcome.images[0].media_type, "image/png");
+        let [crate::codec::Part::Image(image)] = &outcome.parts[..] else {
+            panic!("one picture: {:?}", outcome.parts);
+        };
+        assert_eq!(image.media_type, "image/png");
         let error = read("doc.pdf").await.unwrap_err();
         assert_eq!(error.code, "file_not_text");
         assert_eq!(

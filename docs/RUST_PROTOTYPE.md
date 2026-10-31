@@ -2435,7 +2435,14 @@ reads, or with `"error":{"code","detail"?}` in place of `output`, a refusal
 the model reads as `{"error":CODE,"detail":DETAIL}` (a code is 1 to 64
 lowercase letters, digits or `_`; output and detail each up to 64 KiB,
 redacted as command output is; anything else is `invalid_tool_result` or
-`tool_output_limit`). The first answer counts: another is
+`tool_output_limit`). `output` may instead be a list of parts the model
+reads in that order, as providers' own tool results and MCP's take them:
+`{"type":"text","text"}` and `{"type":"image","media_type","data"}`. Its
+text is up to 64 KiB together, redacted the same way, and its pictures
+are a prompt's: up to 20 of PNG, JPEG, GIF or WebP, 5 MiB together once
+decoded, else `invalid_image` or `image_limit`. A picture counts at its
+token cost, and a result with pictures elides to its text as a read
+picture does. The client scales a picture; the daemon sends it as given. The first answer counts: another is
 `call_already_answered`, one for a call that ended or ran out of time is
 `no_pending_call` or, once its turn ended, `stale_turn`. There is no lease: a tag is the client's
 to serve.

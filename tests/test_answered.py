@@ -6,6 +6,7 @@ import unittest
 
 from bench.runtime_client import node_item
 from bench.socket_client import Connection, SocketClient
+from tests.test_images import image
 from tests.test_runtime import ModelFixture
 
 START = {'name': 'start_task', 'description': 'Start a task.',
@@ -131,6 +132,40 @@ class AnsweredToolTests(ModelFixture):
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
         self.assertEqual(json.loads(self.output(client)), {'error': 'task_exists', 'detail': 'fix exists'})
         self.assertEqual(len(self.events(client, turn, 'turn_resumed')), 1)
+
+    def answered_pictures(self, hold):
+        shot = image()
+        part = dict(shot, type='image')
+        client = self.lead(settings={'approval_hold_ms': hold})
+        turn = self.submit(client)
+        if hold:
+            self.started(client, turn)
+        else:
+            client.receive(lambda m: m.get('event') == 'turn_waiting' and m.get('turn') == turn)
+        self.assertEqual(self.answer(client, turn, output=[dict(image(b'nope'), type='image')])['error'],
+                         'invalid_image')
+        self.assertEqual(self.answer(client, turn, output=[part] * 21)['error'], 'image_limit')
+        self.assertEqual(self.answer(client, turn, output=[{'type': 'text', 'text': 'x' * 65537}])['error'],
+                         'tool_output_limit')
+        self.assertEqual(self.answer(client, turn, output=[{'type': 'video'}])['error'], 'invalid_request')
+        # Words and pictures reach the model in the order given.
+        self.assertIn('result', self.answer(client, turn, output=[
+            {'type': 'text', 'text': 'before'}, part, {'type': 'text', 'text': 'after'}, part]))
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        requests = []
+        while not self.model.requests.empty():
+            requests.append(self.model.requests.get())
+        [answered] = [i for i in requests[-1]['input'] if i.get('call_id') == 'script-0' and 'output' in i]
+        url = f"data:image/png;base64,{shot['data']}"
+        self.assertEqual(answered['output'], [
+            {'type': 'input_text', 'text': 'before'}, {'type': 'input_image', 'image_url': url},
+            {'type': 'input_text', 'text': 'after'}, {'type': 'input_image', 'image_url': url}])
+
+    def test_an_answer_s_pictures_reach_the_model_after_its_output(self):
+        self.answered_pictures(hold=250)
+
+    def test_a_parked_call_s_answer_keeps_its_pictures(self):
+        self.answered_pictures(hold=0)
 
     def test_a_call_nobody_answers_in_time_is_unserved_and_the_turn_goes_on(self):
         # Out of time within the hold, and while parked.

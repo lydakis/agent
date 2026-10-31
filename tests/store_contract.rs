@@ -84,7 +84,7 @@ fn result(output: &str) -> Outcome {
     Outcome {
         output: output.into(),
         artifacts: Vec::new(),
-        images: Vec::new(),
+        parts: Vec::new(),
         note: None,
         failed: false,
     }
@@ -3498,6 +3498,89 @@ fn waiting_calls_page_past_held_answers_and_an_answer_out_of_time_is_refused() {
 }
 
 #[test]
+fn a_parked_answer_s_pictures_are_stored_once_its_result_is() {
+    let path =
+        std::env::temp_dir().join(format!("agent-parked-parts-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    let start = Declared {
+        name: "start".into(),
+        description: "Start.".into(),
+        parameters: json!({"type":"object"}),
+        result: "ok".into(),
+        answered_by: Some("sonny".into()),
+        expire_ms: None,
+        grammar: None,
+        steps: false,
+        inherit: true,
+    };
+    db.create(
+        "Lead",
+        Some("/synthetic"),
+        Binding {
+            declared: Some(std::slice::from_ref(&start)),
+            ..binding()
+        },
+    )
+    .unwrap();
+    let turn = db
+        .begin(
+            "Lead",
+            "request",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let call = ToolCall {
+        name: "start".into(),
+        call_id: "c1".into(),
+        arguments: "{}".into(),
+        custom: false,
+    };
+    db.append(turn, vec![], std::slice::from_ref(&call), None)
+        .unwrap();
+    db.tool_start(turn, &call).unwrap();
+    assert!(
+        db.suspend_answer(turn, "c1", &[], 0, None, None)
+            .unwrap()
+            .is_some()
+    );
+    let pictured = Outcome {
+        parts: vec![agent_runtime::codec::Part::Image(
+            agent_runtime::codec::Image {
+                media_type: "image/png".into(),
+                data: "A".repeat(4096),
+            },
+        )],
+        ..result("a page")
+    };
+    db.answer_call("Lead", turn, "c1", pictured.clone(), 0)
+        .unwrap();
+    let kept = |path: &std::path::Path| -> Option<String> {
+        Connection::open(path)
+            .unwrap()
+            .query_row("SELECT parts FROM answers WHERE call_id='c1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap()
+    };
+    assert!(kept(&path).is_some());
+    db.resume(turn).unwrap();
+    let agent_runtime::store::CallAnswer::Given(answer) = db.answer_take(turn, "c1", 0).unwrap()
+    else {
+        panic!("the parked answer was not taken");
+    };
+    assert_eq!(answer.parts, pictured.parts);
+    db.tool_finish(turn, "c1", &answer).unwrap();
+    assert_eq!(kept(&path), None);
+    drop(db);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn schema_52_bots_declare_no_tools() {
     let path = std::env::temp_dir().join(format!("agent-declared-{}.sqlite", std::process::id()));
     let _ = std::fs::remove_file(&path);
@@ -3642,7 +3725,7 @@ fn artifacts_are_scoped_to_the_owning_bot_and_lineage_checks_use_depth() {
             ("stdout", b"full output".to_vec()),
             ("stderr", "\"\né🙂".repeat(100_000).into_bytes()),
         ],
-        images: Vec::new(),
+        parts: Vec::new(),
         note: None,
         failed: false,
     };
@@ -9004,7 +9087,7 @@ fn carry_forward_notes_are_versioned_by_result_node_and_forks_bind_by_checkpoint
         let outcome = Outcome {
             output: "{}".into(),
             artifacts: Vec::new(),
-            images: Vec::new(),
+            parts: Vec::new(),
             note: Some(text.to_owned()),
             failed: false,
         };
@@ -10166,7 +10249,7 @@ fn pictures_count_at_their_weight_and_go_whole() {
     .unwrap();
     db.tool_start(turn, &call).unwrap();
     let read = Outcome {
-        images: vec![photo.clone()],
+        parts: vec![agent_runtime::codec::Part::Image(photo.clone())],
         ..result("photo.png: a PNG image, 600×600; it follows")
     };
     db.tool_finish(turn, "c1", &read).unwrap();
@@ -10213,7 +10296,7 @@ fn pictures_count_at_their_weight_and_go_whole() {
         items[2]["output"]
             .as_str()
             .unwrap()
-            .starts_with("[tool result's picture elided")
+            .starts_with("[tool result's pictures elided")
     );
 }
 
@@ -10575,6 +10658,108 @@ fn a_bot_without_read_stores_no_stubs() {
     assert!(db.elision_plan("Bob", 1, 1).unwrap().is_none());
     drop(db);
     std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn a_result_s_text_parts_elide_together() {
+    // A short output then a long text part: the stub counts and quotes
+    // the whole text, as a read of the result returns it.
+    let path = std::env::temp_dir().join(format!("agent-parts-stub-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let turn = db
+        .begin(
+            "Bob",
+            "r1",
+            "task",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let call = ToolCall {
+        custom: false,
+        name: "shell".into(),
+        call_id: "c0".into(),
+        arguments: "{}".into(),
+    };
+    let item = json!({"type":"function_call","call_id":"c0","name":"shell","arguments":"{}"});
+    db.append(
+        turn,
+        vec![serde_json::to_vec(&item).unwrap().into()],
+        std::slice::from_ref(&call),
+        None,
+    )
+    .unwrap();
+    db.tool_start(turn, &call).unwrap();
+    let long = format!("{}the end", lines(0, 400));
+    let outcome = Outcome {
+        parts: vec![agent_runtime::codec::Part::Text { text: long.clone() }],
+        ..result("intro")
+    };
+    db.tool_finish(turn, "c0", &outcome).unwrap();
+    let stub: Vec<u8> = Connection::open(&path)
+        .unwrap()
+        .query_row("SELECT item FROM stubs", [], |r| r.get(0))
+        .unwrap();
+    let stub: Value = serde_json::from_slice(&stub).unwrap();
+    let text = stub["output"].as_str().unwrap();
+    let whole = format!("intro\n{long}");
+    assert!(text.contains(&format!("{} bytes", whole.len())), "{text}");
+    assert!(text.ends_with("the end"), "{text}");
+    drop(db);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn a_custom_tool_s_pictures_are_read_without_their_bytes() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let turn = db
+        .begin(
+            "Bob",
+            "r1",
+            "task",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let call = ToolCall {
+        custom: true,
+        name: "shot".into(),
+        call_id: "c0".into(),
+        arguments: "page".into(),
+    };
+    let item = json!({"type":"custom_tool_call","call_id":"c0","name":"shot","input":"page"});
+    db.append(
+        turn,
+        vec![serde_json::to_vec(&item).unwrap().into()],
+        std::slice::from_ref(&call),
+        None,
+    )
+    .unwrap();
+    db.tool_start(turn, &call).unwrap();
+    let data = "A".repeat(4096);
+    let outcome = Outcome {
+        parts: vec![agent_runtime::codec::Part::Image(
+            agent_runtime::codec::Image {
+                media_type: "image/png".into(),
+                data: data.clone(),
+            },
+        )],
+        ..result("a page")
+    };
+    let (_, entry) = db.tool_finish(turn, "c0", &outcome).unwrap();
+    let read = read_item(&db, "Bob", entry["data"]["node"].as_i64().unwrap()).unwrap();
+    assert_eq!(read["type"], "custom_tool_call_output");
+    assert_eq!(
+        read["output"][1],
+        json!({"type":"input_image","image_url":"data:image/png;base64,","omitted_bytes":data.len()})
+    );
 }
 
 #[test]
