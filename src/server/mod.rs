@@ -1247,10 +1247,11 @@ impl Active {
     }
     /// Cancel the turn with `code` unless a cause is already set: the first
     /// cause wins, so shutdown never relabels a client's pending interrupt.
+    /// A pause only parks the turn, so an interrupt after it still ends it.
     /// False when the task has already dropped its receiver.
     fn cancel(&self, code: &'static str) -> bool {
         self.cancel.send_if_modified(|cause| {
-            cause.is_none() && {
+            (cause.is_none() || (*cause == Some(turn::PAUSED) && code == turn::INTERRUPTED)) && {
                 *cause = Some(code);
                 true
             }
@@ -2789,7 +2790,14 @@ impl Service {
             // Keep the cancellation receiver alive through completion so an
             // interrupt cannot mistake this task for an unreaped parked turn.
             let mut cancelled = cancelled;
-            let exit = task.execute(cancelled.clone()).await;
+            let mut exit = task.execute(cancelled.clone()).await;
+            // An interrupt that came as the turn parked, after it last
+            // looked, still ends it: its requester was told it would.
+            if !matches!(exit, turn::Exit::Finished(_))
+                && *cancelled.borrow() == Some(turn::INTERRUPTED)
+            {
+                exit = turn::Exit::Finished(Some(Error::new(turn::INTERRUPTED)));
+            }
             let result = match &exit {
                 turn::Exit::Finished(error) => {
                     ending.store(true, std::sync::atomic::Ordering::Release);
@@ -5007,6 +5015,32 @@ mod tests {
             "bot_not_found"
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+    #[test]
+    fn an_interrupt_supersedes_a_pause_and_nothing_relabels_an_interrupt() {
+        let active = |cancel| Active {
+            turn: 1,
+            task: 1,
+            cancel,
+            steers: Arc::default(),
+            compact: Arc::default(),
+            lift: Arc::default(),
+            ending: Arc::default(),
+        };
+        // A pause only parks the turn: an interrupt after it ends it.
+        let (cancel, cause) = watch::channel(None);
+        let pulled = active(cancel);
+        assert!(pulled.cancel(turn::PAUSED));
+        assert!(pulled.cancel(turn::INTERRUPTED));
+        assert_eq!(*cause.borrow(), Some(turn::INTERRUPTED));
+        // Nothing relabels an interrupt, and shutdown leaves a pause's park.
+        assert!(pulled.cancel(turn::PAUSED));
+        assert_eq!(*cause.borrow(), Some(turn::INTERRUPTED));
+        let (cancel, cause) = watch::channel(None);
+        let parked = active(cancel);
+        parked.cancel(turn::PAUSED);
+        parked.cancel(turn::SHUTDOWN);
+        assert_eq!(*cause.borrow(), Some(turn::PAUSED));
     }
     #[tokio::test]
     async fn interrupt_reconciles_a_parked_task_before_it_is_reaped() {
