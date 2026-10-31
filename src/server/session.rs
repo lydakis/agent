@@ -2,7 +2,7 @@
 //! each feeding bounded JSONL requests into the service loop.
 use super::{Command, Request, hub::Hub};
 use agent_runtime::{Error, Result, fail, output::Output};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{BufRead, Read};
 use std::sync::{Arc, Mutex};
 use tokio::{
@@ -58,8 +58,11 @@ impl Shared {
 #[derive(Default)]
 struct Queues {
     sessions: HashMap<u64, VecDeque<Inbound>>,
-    /// The sessions with a message queued, each once, next first.
+    /// The sessions with a message queued, each once, next first; a parked
+    /// one leaves until it is unparked.
     turns: VecDeque<u64>,
+    /// Sessions whose messages wait for one already taken to be answered.
+    parked: HashSet<u64>,
     senders: usize,
 }
 
@@ -76,7 +79,7 @@ impl Sender {
         let queues = &mut *guard;
         let session = message.session();
         let queue = queues.sessions.entry(session).or_default();
-        if queue.is_empty() {
+        if queue.is_empty() && !queues.parked.contains(&session) {
             queues.turns.push_back(session);
         }
         queue.push_back(message);
@@ -138,6 +141,27 @@ impl Receiver {
                 }
             }
             self.0.arrived.notified().await;
+        }
+    }
+}
+impl Receiver {
+    /// Take no more of `session`'s messages until `unpark`: its next ones
+    /// wait for the one it sent last to be answered, so a session's own
+    /// requests keep their order while the loop serves other sessions.
+    pub fn park(&self, session: u64) {
+        let mut queues = self.0.lock();
+        if queues.parked.insert(session) {
+            queues.turns.retain(|turn| *turn != session);
+        }
+    }
+    /// Take `session`'s messages again, in its turn.
+    pub fn unpark(&self, session: u64) {
+        let mut guard = self.0.lock();
+        let queues = &mut *guard;
+        if queues.parked.remove(&session) && queues.sessions.contains_key(&session) {
+            queues.turns.push_back(session);
+            drop(guard);
+            self.0.arrived.notify_one();
         }
     }
 }
@@ -321,6 +345,32 @@ mod tests {
             taken.push(inbound.recv().await.unwrap());
         }
         assert_eq!(order(&taken), [1, 2, 3, 1, 2, 1]);
+    }
+
+    #[tokio::test]
+    async fn a_parked_session_waits_while_the_others_take_turns() {
+        let (sender, mut inbound) = channel(64);
+        for session in [1, 1, 2, 2] {
+            sender.send(Inbound::Closed(session)).await.unwrap();
+        }
+        assert_eq!(inbound.recv().await.unwrap().session(), 1);
+        inbound.park(1);
+        sender.send(Inbound::Closed(1)).await.unwrap();
+        assert_eq!(inbound.recv().await.unwrap().session(), 2);
+        assert_eq!(inbound.recv().await.unwrap().session(), 2);
+        let waiting = tokio::time::timeout(std::time::Duration::from_millis(20), inbound.recv());
+        assert!(
+            waiting.await.is_err(),
+            "a parked session's message was taken"
+        );
+        inbound.unpark(1);
+        assert_eq!(inbound.recv().await.unwrap().session(), 1);
+        assert_eq!(inbound.recv().await.unwrap().session(), 1);
+        // Parked with nothing queued, then unparked: nothing to take.
+        inbound.park(3);
+        inbound.unpark(3);
+        sender.send(Inbound::Closed(3)).await.unwrap();
+        assert_eq!(inbound.recv().await.unwrap().session(), 3);
     }
 
     #[tokio::test]

@@ -393,6 +393,7 @@ bound; the operating system is then the only limit.
 | `--max-active` | Turns with a live task: a model call in flight or a foreground tool. Parked turns never count. | 4,096 |
 | `--max-pending` | Submissions waiting to start: queued behind a bot's own work or ready for a slot, daemon-wide. A submission that would wait past the bound answers `pending_limit` and writes nothing; one that starts at once is never refused by it. | none |
 | `--max-pending-bytes` | UTF-8 bytes of those waiting submissions: their prompts and the words they quote, which wait with them. | none |
+| `--max-readers` | Store reader connections, each on its own thread, for the reads clients ask for that decide nothing ([observation reads](#observation-reads)), which take all but one, and for turns' own reads. At least 1. | one per logical CPU |
 | `--max-connecting` | Provider requests awaiting response headers, a Bedrock Runtime call's body digest included. Established streams are not capped. Both providers hold headers until the first token, so a permit is held for the whole time to first token; a bound of N caps throughput at N calls per first-token latency. | none |
 | `--stall-timeout` | How long an established provider stream may go without a content frame before the attempt fails as `provider_stream_stalled` and is retried. Keepalives do not count. Whole seconds, `1s` to `24h`. | `2m` |
 | `--idle-exit` | How long, in whole seconds, before a socket daemon with no sessions, no live turns, and no running background commands exits. Parked turns are durable and resume on the next start; the client restarts the daemon on demand. | none |
@@ -996,7 +997,24 @@ the service takes the sessions with one queued in turn, one request each, as
 Redis and NATS serve their clients: a client that pipelines thousands of
 requests holds every other session up by one of them, not by all it sent
 first. A session's own requests keep their order. Storage queues at most 32
-operations. HTTP client internal buffers,
+operations.
+
+### Observation reads
+
+Reads that decide nothing run beside the service loop, not in it:
+`history_nodes`, `history_items`, `history_search`, `turns`, `bots`,
+`events`, `usage` and `prompts`. Each runs on one of the store's reader
+connections (`--max-readers`, one per logical CPU by default; WAL readers
+do not block each other or the writer). They take at most all but one of
+the connections, the rest waiting in the order they came, so a turn's own
+reads (its context, a compaction plan) always find one free, as Kubernetes'
+API Priority and Fairness keeps seats for each priority level. Meanwhile the loop serves every other
+session, so one client's deep history read or search across every bot
+holds up no other client's submit, interrupt or pause. The session that
+asked waits for its read's answer before its next request is taken, so its
+own requests keep their order and each session has at most one read
+running or waiting. At shutdown, reads still running get a few seconds to
+answer. A read whose task fails answers `observation_failed`. HTTP client internal buffers,
 active histories, allocator retention, and filesystem cache remain part of the
 memory accounting.
 
@@ -1341,8 +1359,9 @@ bots whose name matches a SQLite GLOB pattern (1 to 256 bytes; case-sensitive
 like names), read from the name index's range for the pattern's literal
 prefix, and `active: true` keeps those with a turn running, read from a partial
 index of only them (`bots_running`). Filtered pages page and bound like any
-other. `bots` and `turns` run on the store's reader connection, so a listing
-never waits behind, or holds up, the writer.
+other. `bots` and `turns` run on the store's reader connections, beside the
+service loop ([observation reads](#observation-reads)), so a listing never
+waits behind, or holds up, the writer or another client.
 
 Protocol 23 adds `usage`, what bots' turns spent, also a read on the reader
 connection: one grouped statement over `turns`, so one snapshot. `name` keeps
@@ -1361,9 +1380,9 @@ features cost. With `bucket_ms` it adds `series`, one row for each bucket
 of that width from `since_ms` that has turns, at its `at_ms`; it needs a
 `since_ms` and fewer than 1024 buckets to now (`invalid_usage_window`). Usage
 is read from `turns`, so a deleted bot's turns, and the judge's own copies once
-deleted, no longer count. Its cost grows with the turns it matches, so it is
-answered off the dispatch path, like `provider_models`, and other requests go
-on while it reads; it holds only the reader connection. As an observation, not
+deleted, no longer count. Its cost grows with the turns it matches; like every
+observation read it is answered beside the service loop, and other sessions'
+requests go on while it reads. As an observation, not
 a screen: the same statement in Python's SQLite over a synthetic store of 164k
 turns took about 0.3 s for every bot's month and 0.07 s for one project's day.
 Sonny's `/usage` draws it, reading again once a minute while it is open.

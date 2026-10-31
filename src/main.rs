@@ -135,6 +135,7 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
     let mut max_connecting = None;
     let mut max_pending = None;
     let mut max_pending_bytes = None;
+    let mut max_readers = None;
     let mut idle_exit = None;
     let mut stall_timeout = None;
     let mut shell_excludes = Vec::new();
@@ -170,7 +171,8 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
             | "--max-active"
             | "--max-connecting"
             | "--max-pending"
-            | "--max-pending-bytes" => {
+            | "--max-pending-bytes"
+            | "--max-readers" => {
                 let parsed: usize = value
                     .parse()
                     .map_err(|_| Error::with("usage", format!("{flag} needs an integer")))?;
@@ -180,6 +182,10 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
                     "--max-active" => max_active = Some(parsed),
                     "--max-pending" => max_pending = Some(parsed),
                     "--max-pending-bytes" => max_pending_bytes = Some(parsed),
+                    "--max-readers" if parsed == 0 => {
+                        return fail_with("usage", "--max-readers needs at least 1");
+                    }
+                    "--max-readers" => max_readers = Some(parsed),
                     _ => max_connecting = Some(parsed),
                 }
             }
@@ -205,6 +211,7 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
         max_connecting,
         max_pending,
         max_pending_bytes,
+        max_readers,
         stall_timeout,
         idle_exit,
         shell_excludes,
