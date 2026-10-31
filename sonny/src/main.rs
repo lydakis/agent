@@ -4875,9 +4875,10 @@ impl App {
     }
 
     /// The welcome, when this window has one and draws the conversation
-    /// from its first item: none above a page with older ones before it.
+    /// from its first item: none above a page with older ones before it,
+    /// and none in zen, which draws only what is said.
     fn welcome(&self) -> Vec<Line<'static>> {
-        match self.welcome && self.older.is_none() {
+        match self.welcome && self.older.is_none() && self.zen.is_none() {
             true => banner::welcome(&tilde(&self.workspace), &self.model, self.width),
             false => Vec::new(),
         }
@@ -9317,10 +9318,14 @@ impl App {
     /// A guess at the person's next message, after a turn of theirs ended
     /// well, made by a copy of this bot on this window's model; unless the
     /// config's `[sonny] suggest` is off, or the bot asked a question,
-    /// which its own card answers.
+    /// which its own card answers, or it is in zen: the guess reads all
+    /// the agent holds back, and could tell it.
     fn suggest(&mut self) {
         self.suggestion = None;
-        if !self.asks.is_empty() || !agent_client::config::load().is_ok_and(|c| c.sonny.suggest) {
+        if !self.asks.is_empty()
+            || self.zen.is_some()
+            || !agent_client::config::load().is_ok_and(|c| c.sonny.suggest)
+        {
             return;
         }
         self.suggesting = Some(tokio::spawn(suggest::guess(
@@ -11943,6 +11948,24 @@ mod tests {
         }
         // The question still needs the person.
         assert_eq!(app.asks.len(), 1);
+        // No welcome above it: zen draws only what is said.
+        app.welcome = true;
+        assert!(app.welcome().is_empty());
+        app.zen = None;
+        assert!(!app.welcome().is_empty());
+    }
+
+    #[tokio::test]
+    async fn in_zen_no_guess_at_the_next_message_is_made() {
+        let mut app = app_in_zen(zen_daemon().await);
+        app.suggest();
+        assert!(app.suggesting.is_none());
+        app.zen = None;
+        app.suggest();
+        assert!(app.suggesting.take().is_some_and(|job| {
+            job.abort();
+            true
+        }));
     }
 
     fn app_in_zen(client: Arc<Client>) -> App {
