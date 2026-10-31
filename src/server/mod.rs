@@ -981,7 +981,7 @@ fn confine(settings: &mut Settings) -> Result<()> {
     // By its real path, as Seatbelt matches it: a socket comes and goes
     // with its program, so what of it is there, and the rest as written.
     for path in &mut settings.unix_sockets {
-        if let Some(real) = agent_runtime::sandbox::real(std::path::Path::new(&*path))
+        if let Some(real) = agent_client::files::real(std::path::Path::new(&*path))
             .and_then(|real| real.to_str().map(str::to_owned))
         {
             *path = real;

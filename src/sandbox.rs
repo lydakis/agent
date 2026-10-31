@@ -11,6 +11,7 @@
 //! unless the bot's client turned it on.
 
 use crate::{Result, fail_with};
+use agent_client::files::real;
 use serde::{Deserialize, Serialize};
 use std::path::{Component, Path, PathBuf};
 
@@ -641,49 +642,6 @@ fn gitdir(file: &Path) -> Option<PathBuf> {
 
 fn depth(path: &Path) -> usize {
     path.components().count()
-}
-
-/// `path` with what exists of it resolved to its real path and the rest
-/// appended; `None` when the rest climbs out with `..`, which can't be
-/// known without making it. A symlink whose target is missing is followed
-/// to that target, as a write through it would be.
-pub fn real(path: &Path) -> Option<PathBuf> {
-    real_within(path, 40)
-}
-
-fn real_within(path: &Path, links: u32) -> Option<PathBuf> {
-    let mut existing = path.to_owned();
-    let mut rest = Vec::new();
-    loop {
-        let found = std::fs::canonicalize(&existing).ok().or_else(|| {
-            // canonicalize fails on a dangling link as on a missing name.
-            let link = std::fs::read_link(&existing).ok()?;
-            let mut target = existing.parent()?.join(link);
-            for part in rest.iter().rev() {
-                target.push(part);
-            }
-            rest.clear();
-            real_within(&target, links.checked_sub(1)?)
-        });
-        if let Some(mut resolved) = found {
-            for part in rest.iter().rev() {
-                resolved.push(part);
-            }
-            return Some(resolved);
-        }
-        if std::fs::symlink_metadata(&existing).is_ok_and(|found| found.file_type().is_symlink()) {
-            return None;
-        }
-        let name = existing.file_name()?.to_owned();
-        if !matches!(
-            Path::new(&name).components().next(),
-            Some(Component::Normal(_))
-        ) {
-            return None;
-        }
-        rest.push(name);
-        existing = existing.parent()?.to_owned();
-    }
 }
 
 /// Whether this machine can run sandboxed commands, or why not: refused when
