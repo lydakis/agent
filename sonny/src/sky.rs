@@ -883,10 +883,12 @@ impl View {
                 (false, false) => 2,
             };
             lines.extend(self.list(now, cols, rows.saturating_sub(under).max(3)));
+            // The list takes the rows; the log, its newest line, the one
+            // kept for it under the list's blank.
             if !self.zen {
                 lines.extend(match self.legend {
                     true => legend(true),
-                    false => self.ticked(now, cols, TICKER, false),
+                    false => self.ticked(now, cols, under - 1, false),
                 });
             }
             return lines;
@@ -2094,6 +2096,24 @@ mod tests {
         assert!(key(KeyCode::Esc, KeyModifiers::NONE));
         assert!(key(KeyCode::Char('c'), KeyModifiers::CONTROL));
         assert!(!key(KeyCode::Char('c'), KeyModifiers::NONE));
+    }
+
+    #[tokio::test]
+    async fn a_full_small_pane_keeps_the_newest_log_line_in_its_rows() {
+        let (mut view, send) = view();
+        let bots: Vec<Value> = (0..31).map(|n| json!({"name": format!("a{n:02}")})).collect();
+        send.send(Feed::Roll(bots)).unwrap();
+        send.send(Feed::Ready).unwrap();
+        for n in 0..5 {
+            let event = json!({"cursor": n + 1, "event": "accepted", "bot": format!("a{n:02}"),
+                "turn": 1, "data": {}});
+            send.send(Feed::Live(event)).unwrap();
+        }
+        view.drain();
+        let card = text(&view.card(50, 20));
+        let lines: Vec<&str> = card.lines().collect();
+        assert!(lines.len() <= 20, "{card}");
+        assert!(lines.last().unwrap().trim_end().ends_with("you → a04"), "{card}");
     }
 
     #[tokio::test]
