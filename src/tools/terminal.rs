@@ -48,6 +48,9 @@ pub struct Terminal {
 struct State {
     /// Output not yet read: at most its last `PREVIEW_BYTES`.
     unread: Vec<u8>,
+    /// A secret field's name and separator the last read showed, with no
+    /// value yet: the next read is redacted as read after it.
+    opening: Vec<u8>,
     dropped: u64,
     /// How the command ended, with what it wrote that no write read.
     end: Option<(Value, String)>,
@@ -106,15 +109,20 @@ impl Terminal {
     /// What the command wrote since the last read, and how it ended once
     /// it has.
     fn take(&self, registry: &Registry, handle: i64) -> Outcome {
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let state = &mut *guard;
         state.used = Instant::now();
         let dropped = std::mem::take(&mut state.dropped);
         let (text, end) = match &mut state.end {
             Some((end, rest)) => (std::mem::take(rest), Some(end.clone())),
-            None => (text(&mut state.unread, Some(&registry.credentials)), None),
+            None => {
+                let credentials = &registry.credentials;
+                let (read, before) = text(&mut state.unread, &mut state.opening, Some(credentials));
+                (credentials.redact_after(&before, read), None)
+            }
         };
-        drop(state);
-        report(registry, Some(handle), text, dropped, end)
+        drop(guard);
+        report(Some(handle), text, dropped, end)
     }
 
     /// Wait up to `yield_ms` for the command to end.
@@ -143,16 +151,10 @@ fn least_used(
         .cloned()
 }
 
-/// A start's, a write's, or an end's result: the output, and how the
-/// command ended once it has, or that it runs.
-fn report(
-    registry: &Registry,
-    handle: Option<i64>,
-    text: String,
-    dropped: u64,
-    end: Option<Value>,
-) -> Outcome {
-    let mut output = json!({"output":registry.redact(text)});
+/// A start's, a write's, or an end's result: the output, redacted, and how
+/// the command ended once it has, or that it runs.
+fn report(handle: Option<i64>, text: String, dropped: u64, end: Option<Value>) -> Outcome {
+    let mut output = json!({"output":text});
     if let Some(handle) = handle {
         output["handle"] = format!("proc:{handle}").into();
     }
@@ -178,22 +180,38 @@ fn report(
 
 /// Decode what was read, keeping for the next read a character split
 /// across reads and, while the command runs, the carriage returns and the
-/// start of a credential that more output may finish; a terminal's line
-/// ends read as plain newlines.
-fn text(unread: &mut Vec<u8>, running: Option<&Credentials>) -> String {
+/// start of a credential or a secret field's value that more output may
+/// finish; a terminal's line ends read as plain newlines. Returns the text
+/// with the field opening shown before it, which `opening` now holds the
+/// next of: the text is redacted as read after it.
+fn text(
+    unread: &mut Vec<u8>,
+    opening: &mut Vec<u8>,
+    running: Option<&Credentials>,
+) -> (String, String) {
     let mut whole = match std::str::from_utf8(unread) {
         Err(error) if error.error_len().is_none() => error.valid_up_to(),
         _ => unread.len(),
     };
+    let before = std::mem::take(opening);
     if let Some(credentials) = running {
         while whole > 0 && unread[whole - 1] == b'\r' {
             whole -= 1;
         }
-        whole -= credentials.unfinished(&unread[..whole]);
+        // Read after the opening shown, so a value begun after a name the
+        // last read showed is held too.
+        let mut joined = before.clone();
+        joined.extend_from_slice(&unread[..whole]);
+        let held = credentials.unfinished(&joined).min(whole);
+        whole -= held;
+        joined.truncate(joined.len() - held);
+        let open = credentials.opening(&joined);
+        *opening = joined.split_off(joined.len() - open);
     }
     let rest = unread.split_off(whole);
     let read = std::mem::replace(unread, rest);
-    lines(&String::from_utf8_lossy(&read))
+    let before = String::from_utf8_lossy(&before).into_owned();
+    (lines(&String::from_utf8_lossy(&read)), before)
 }
 
 /// `text` with each run of carriage returns before a newline dropped: a
@@ -425,6 +443,7 @@ impl Registry {
             group,
             state: Mutex::new(State {
                 unread: Vec::new(),
+                opening: Vec::new(),
                 dropped: 0,
                 end: None,
                 used: Instant::now(),
@@ -526,14 +545,10 @@ impl Registry {
                 // read; a write that sees the end reports that too.
                 let last = {
                     let mut state = terminal.state.lock().unwrap_or_else(|e| e.into_inner());
-                    let rest = text(&mut state.unread, None);
-                    let last = report(
-                        &registry,
-                        None,
-                        rest.clone(),
-                        state.dropped,
-                        Some(end.clone()),
-                    );
+                    let state = &mut *state;
+                    let (rest, before) = text(&mut state.unread, &mut state.opening, None);
+                    let rest = registry.credentials.redact_after(&before, rest);
+                    let last = report(None, rest.clone(), state.dropped, Some(end.clone()));
                     state.end = Some((end, rest));
                     last
                 };
@@ -634,14 +649,26 @@ impl Registry {
 mod tests {
     use super::{Credentials, lines, text};
 
+    /// Read `more` as a running terminal's next output, redacted.
+    fn read(
+        credentials: &Credentials,
+        unread: &mut Vec<u8>,
+        opening: &mut Vec<u8>,
+        more: &[u8],
+    ) -> String {
+        unread.extend_from_slice(more);
+        let (read, before) = text(unread, opening, Some(credentials));
+        credentials.redact_after(&before, read)
+    }
+
     #[test]
     fn a_character_split_across_reads_waits_for_its_end() {
         let none = Credentials::default();
-        let mut unread = "a\r\r\né".as_bytes().to_vec();
-        let last = unread.pop().unwrap();
-        assert_eq!(text(&mut unread, Some(&none)), "a\n");
-        unread.push(last);
-        assert_eq!(text(&mut unread, Some(&none)), "é");
+        let (mut unread, mut opening) = (Vec::new(), Vec::new());
+        let typed = "a\r\r\né".as_bytes();
+        let (head, last) = typed.split_at(typed.len() - 1);
+        assert_eq!(read(&none, &mut unread, &mut opening, head), "a\n");
+        assert_eq!(read(&none, &mut unread, &mut opening, last), "é");
         assert!(unread.is_empty());
     }
 
@@ -649,51 +676,59 @@ mod tests {
     fn a_credential_split_across_reads_is_redacted_whole() {
         let credentials = Credentials::default();
         credentials.set("KEY", "sk-secret-1234");
-        let mut unread = b"key: sk-sec".to_vec();
-        assert_eq!(text(&mut unread, Some(&credentials)), "key: ");
-        unread.extend_from_slice(b"ret-1234\r\n> ");
-        let read = text(&mut unread, Some(&credentials));
-        assert_eq!(credentials.redact(read), "[REDACTED]\n> ");
+        let (mut unread, mut opening) = (Vec::new(), Vec::new());
+        let mut read = |more: &[u8]| read(&credentials, &mut unread, &mut opening, more);
+        assert_eq!(read(b"key: sk-sec"), "key: ");
+        assert_eq!(read(b"ret-1234\r\n> "), "[REDACTED]\n> ");
         // A whole credential that ends with its own start is not split.
         credentials.set("OTHER", "sk-example-s");
-        unread.extend_from_slice(b"sk-example-s");
-        assert_eq!(
-            credentials.redact(text(&mut unread, Some(&credentials))),
-            "[REDACTED]"
-        );
+        let mut read =
+            |more: &[u8]| super::tests::read(&credentials, &mut unread, &mut opening, more);
+        assert_eq!(read(b"sk-example-s"), "[REDACTED]");
         assert!(unread.is_empty());
         // A command's end holds nothing back.
         unread.extend_from_slice(b"sk-");
-        assert_eq!(text(&mut unread, None), "sk-");
+        assert_eq!(text(&mut unread, &mut opening, None).0, "sk-");
     }
 
     #[test]
     fn a_secret_field_split_across_reads_is_redacted_whole() {
         let credentials = Credentials::default();
         credentials.redact_also(&["password".to_owned(), "api_key".to_owned()], &[]);
-        let read = |unread: &mut Vec<u8>, more: &[u8]| {
-            unread.extend_from_slice(more);
-            credentials.redact(text(unread, Some(&credentials)))
-        };
-        let mut unread = Vec::new();
-        // The name and separator wait for their value, and the value for
-        // its end.
-        assert_eq!(read(&mut unread, b"login ok\npassword="), "login ok\n");
-        assert_eq!(read(&mut unread, b"fake9fake9"), "");
-        assert_eq!(read(&mut unread, b"fake9\n> "), "password=[REDACTED]\n> ");
-        // So does a name cut inside, from four bytes of a field's start.
-        assert_eq!(read(&mut unread, b"export MY_PASS"), "export ");
-        assert_eq!(
-            read(&mut unread, b"WORD=abcd1234efgh\n"),
-            "MY_PASSWORD=[REDACTED]\n"
-        );
+        let (mut unread, mut opening) = (Vec::new(), Vec::new());
+        let mut read = |more: &[u8]| read(&credentials, &mut unread, &mut opening, more);
+        // The name and separator are shown at once, as a prompt to answer
+        // is; the value waits for its end, and is redacted after them.
+        assert_eq!(read(b"login ok\nPassword: "), "login ok\nPassword: ");
+        assert_eq!(read(b"fake9fake9"), "");
+        assert_eq!(read(b"fake9\n> "), "[REDACTED]\n> ");
+        assert_eq!(read(b"password="), "password=");
+        assert_eq!(read(b"fake9fake9fake9\n"), "[REDACTED]\n");
+        // So is a name cut inside, from four bytes of a field's start.
+        assert_eq!(read(b"export MY_PASS"), "export MY_PASS");
+        assert_eq!(read(b"WORD=abcd1234efgh\n"), "WORD=[REDACTED]\n");
         // Other words, and fields whose values ended, go out as typed.
-        assert_eq!(read(&mut unread, b"ls -la\n> "), "ls -la\n> ");
-        assert_eq!(read(&mut unread, b"api_key: set\n"), "api_key: set\n");
+        assert_eq!(read(b"ls -la\n> "), "ls -la\n> ");
+        assert_eq!(read(b"api_key: set\n"), "api_key: set\n");
+        assert_eq!(read(b"password: "), "password: ");
         assert!(unread.is_empty());
-        // A command's end holds nothing back.
-        unread.extend_from_slice(b"password=");
-        assert_eq!(text(&mut unread, None), "password=");
+        // A command's end holds nothing back, and still redacts after what
+        // the last read showed.
+        unread.extend_from_slice(b"abcd1234efgh");
+        let (rest, before) = text(&mut unread, &mut opening, None);
+        assert_eq!(credentials.redact_after(&before, rest), "[REDACTED]");
+        assert!(opening.is_empty());
+    }
+
+    #[test]
+    fn a_field_name_in_any_script_is_matched_without_a_panic() {
+        let credentials = Credentials::default();
+        credentials.redact_also(&["密码".to_owned()], &[]);
+        let (mut unread, mut opening) = (Vec::new(), Vec::new());
+        assert_eq!(
+            read(&credentials, &mut unread, &mut opening, b"pass"),
+            "pass"
+        );
     }
 
     #[test]

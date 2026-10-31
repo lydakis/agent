@@ -2385,8 +2385,10 @@ and returns what the command wrote since the last read, after waiting
 `yield_time_ms` (250 ms after typing, 5 s when only reading); `kill: true` ends
 the command's process group. Output merges stdout and stderr, as a terminal
 does, keeps its last 64 KiB unread, counting what it drops, and is redacted
-like any other; a secret field's name, cut off at the end of a read, waits
-with its value for the next one, so the value is redacted whole. A
+like any other; a secret field's value, cut off at the end of a read, waits
+for the next one so it is redacted whole, while its name and separator are
+shown at once, so a prompt such as `Password: ` reaches the bot, and the
+next read is redacted as read after them. A
 terminal takes no process slot and no timeout: it runs until
 it exits or is killed, across turns, and `wait` on its handle reports how it
 ended, with what no write read. It takes a `--max-lasting` slot before it
