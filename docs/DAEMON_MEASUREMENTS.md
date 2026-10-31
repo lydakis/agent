@@ -6465,3 +6465,42 @@ The field scan looks at the last 4 KiB at most, and the copy of the
 opening covers only a field's name and separator, so the cost of a read
 stays with the redaction it already did. The session sweep runs once per
 terminal or detached command, at its end, off the runtime thread.
+
+## A planned stop parks running turns (#565)
+
+A turn now reads the daemon's stopping flag, one relaxed atomic load, at
+the top of each model round, again just before each model call, before
+each call a round runs in order, and as each call of a parallel batch
+starts. No store job is added to a turn that is not stopping; the park
+itself is the pull cord's one job.
+
+The Perf workflow's screen, run here by hand: 4-core Linux container,
+base main d617c75 against the head on the same base, both release builds,
+two alternating rounds as `.github/workflows/perf.yml` runs them
+(`bench.admission_burst` and `bench.completion_burst` 5 runs each,
+`bench.footprint` 2, `bench.lifecycle` 32-bot socket echo 1), medians:
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 74.8 | 72.4 | -3.2% |
+| admission | burst submit p99, ms | 10.6 | 11.7 | +10.5% |
+| completion | release to terminal p99, ms | 31.5 | 25.9 | -17.7% |
+| footprint | idle RSS, MiB | 20.2 | 20.4 | +1.1% |
+| footprint | per idle bot, KiB | 1.44 | 1.49 | +3.9% |
+| footprint | RSS after a turn each, MiB | 28.6 | 28.6 | +0.2% |
+| footprint | CPU per turn, ms | 2.40 | 2.53 | +5.2% |
+| lifecycle | CPU, s (5 rounds) | 2.40 | 2.53 | +5.4% |
+| lifecycle | p95 turn, ms | 633 | 610 | -3.6% |
+| lifecycle | peak RSS, MiB | 27.0 | 27.0 | -0.1% |
+
+Store work per turn is the same on both: every counted operation in the
+admission, completion and footprint benches matches, and footprint's store
+jobs per turn are 7.48-7.50 on the base and 7.47-7.51 on the head (how
+jobs fall into group commits moves with timing). No timing passes the
+gate's warning (15% on the median with no overlap). Lifecycle CPU's two
+head runs both came out above the base's two, so it ran three more
+alternating rounds: across five, the base spans 2.20-2.53 s and the head
+2.30-2.64 s, and the medians are 5% apart. The burst p99 runs overlap the
+same way (base 8.3-14.3 ms, head 9.1-15.2 ms). A relaxed load per round
+is nanoseconds against a turn's milliseconds, so these moves are taken as
+the container's noise.
