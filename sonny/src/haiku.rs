@@ -325,7 +325,7 @@ pub async fn write(socket: PathBuf, bot: String) -> Option<Vec<String>> {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis();
-    let name = format!("{bot}.haiku-{:x}", stamp % 0x100_0000);
+    let name = copy_name(&bot, stamp);
     let forked = client
         .request(
             "fork",
@@ -339,6 +339,18 @@ pub async fn write(socket: PathBuf, bot: String) -> Option<Vec<String>> {
         .request("delete", json!({"bot": name, "bot_id": forked["bot_id"]}))
         .await;
     clean(&reply?)
+}
+
+/// The copy's name: `bot` cut short enough that the name, and the
+/// submit's request id after it, stay within the daemon's 128 bytes.
+fn copy_name(bot: &str, stamp: u128) -> String {
+    let tail = format!(".haiku-{:06x}", stamp % 0x100_0000);
+    // Room for the ".1" the submit's request id adds.
+    let mut keep = (126 - tail.len()).min(bot.len());
+    while !bot.is_char_boundary(keep) {
+        keep -= 1;
+    }
+    format!("{}{tail}", &bot[..keep])
 }
 
 /// The copy's reply, interrupting a turn that runs past `WAIT`.
@@ -400,6 +412,16 @@ mod tests {
             margin: 50,
             hold: Duration::from_secs(600),
         }
+    }
+
+    #[test]
+    fn a_copy_s_name_and_request_id_fit_the_daemon_s_names() {
+        assert_eq!(copy_name("sky", 0xabc), "sky.haiku-000abc");
+        let long = "b".repeat(128);
+        let name = copy_name(&long, 0x1234_5678);
+        assert_eq!(name.len(), 126);
+        assert!(name.ends_with(".haiku-345678"));
+        assert!(format!("{name}.1").len() <= 128);
     }
 
     #[test]
