@@ -522,6 +522,10 @@ way `/react` does, and each note in the margin has its own `↩`.
   reason, in either view. The footer names the row unless it is the one new
   leads start in, full access in yellow.
 
+  ![/permissions: Sonny's four rows, then one of the config's](../docs/sonny/permissions.png)
+
+  ![The footer naming full access in yellow](../docs/sonny/permissions-full-footer.png)
+
   Rows of your own follow Sonny's, as Codex's permission profiles do, from
   `~/.agent/config.toml`:
 
@@ -552,6 +556,8 @@ way `/react` does, and each note in the margin has its own `↩`.
   When you approve a plain command that asked to leave, `a` (always allow
   `cargo test`) adds its first words to the list, and the lead and its
   agents take it at once.
+
+  ![An approval prompt offering to always allow cargo test](../docs/sonny/permissions-always.png)
 - `/retry` lists the calls the reviewer denied while Sonny watched, with
   the reason for each. Enter writes the call out whole, and a second
   Enter sends your approval of that exact call as your own message, so

@@ -10178,9 +10178,7 @@ impl App {
             ];
             if let Some(prefix) = approvals::always(call) {
                 line.push(Span::raw("a"));
-                line.push(Span::raw(" always allow ").dim());
-                line.push(Span::raw(prefix));
-                line.push(Span::raw(" · ").dim());
+                line.push(Span::raw(format!(" always allow {prefix} · ")).dim());
             }
             line.extend([Span::raw("n"), Span::raw(" deny  ").dim(), Span::raw(what)]);
             return Line::from(line);

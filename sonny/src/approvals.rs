@@ -96,7 +96,12 @@ fn own(name: &str, row: &Permissions) -> Option<Mode> {
     mode.name = intern(name);
     mode.about = (row.description.clone())
         .unwrap_or_else(|| format!("Like {}, as ~/.agent/config.toml changes it", mode.label));
-    mode.label = name.to_owned();
+    // Its name, written as the list writes Sonny's: a capital first.
+    let mut chars = name.chars();
+    mode.label = chars
+        .next()
+        .map(|first| first.to_uppercase().chain(chars).collect())
+        .unwrap_or_default();
     if let Sandbox::Workspace {
         network,
         git,
