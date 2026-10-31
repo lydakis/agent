@@ -30,7 +30,13 @@ model, effort}`, `reply_to`, `if`, `runs`, `turn_budget_tokens`, `replace`
 and `message`), `remove`, `fire` or `show` NAME, or nothing to list them.
 A row whose last fire sent a turn says how that turn ended, as the daemon
 has it: `last.turn_status`, and `last.turn_error` when it did not complete,
-so an agent sees the failure the person sees in `/background`.
+so an agent sees the failure the person sees in `/background`. It does not
+have to look: when a turn a fire sent fails (not one whose model said
+nothing), the lookout tells the agent that added a `start` trigger, else
+the agent the fire messaged, with a note it reads in its next model call,
+as a fire that sent nothing is told (`[trigger NAME · TIME · turn N it sent
+BOT failed: WHY]`). A fire with `reply_to` passes the failure on with its
+answer instead.
 It waits for a verdict wherever the agent's other calls do (`/approvals`),
 since a trigger runs as the person and its `if` command outside any
 sandbox. For people, scripts and other harnesses, Sonny writes
@@ -626,7 +632,11 @@ as a file; `memory`, what to save for later agents; `commons`, the threads
 agents share (see Commons); `memory-cleanup`, the
 nightly cleanup (see Memory); `automation`, for recurring jobs (see
 Triggers); `sonny-setup`, how any agent sets Sonny up with `sonny setup`'s
-flags and `--json` ([SKILL.md](../sonny/skills/sonny-setup/SKILL.md)); and,
+flags and `--json` ([SKILL.md](../sonny/skills/sonny-setup/SKILL.md));
+`sonny-config`, where the settings live and every key of
+`~/.agent/config.toml` with its values and default, written from the keys
+`/config` lists so it matches the Sonny installed
+([SKILL.md](../sonny/skills/sonny-config/SKILL.md)); and,
 depending on where it runs, `pictures`, `rex-windows`,
 `herdr-panes` or `cmux-tabs`. They are normal skills, real files
 ([skills.rs](../sonny/src/skills.rs)). Sonny notes a fingerprint of each file
@@ -740,12 +750,21 @@ at most 10,000 tokens, longer output keeping its start and end and saving
 the whole to a file; saved outputs and images are kept a week. A first
 line such as
 `// @exec: {"max_output_tokens": 1000, "timeout_ms": 60000}` sets those.
+Its time counts from the call: waiting for a place and starting servers
+to list their tools spend it. What lives outside its 256 MB is bounded as
+it runs: its output past 1 MB keeps its first half and its latest, as
+Codex keeps a command's; eight of its calls are in flight at once, and a
+result over 16 MB is refused, as rmcp refuses such a message. Two tools
+whose identifiers would be the same (`my-server` and `my_server`'s
+`search`) are neither on `tools`, the description saying why.
 
 The lookout runs the scripts and keeps the servers
 ([mcp.rs](../sonny/src/mcp.rs)): one connection per server for every agent,
 started by the first call and stopped after ten idle minutes, with each
-server's tool list kept in `~/.agent/sonny/mcp` so agents are told of its
-tools without starting it. Servers run as the person, beside the lookout and
+server's tool list kept in `~/.agent/sonny/mcp`, readable by the person
+alone and keyed by a digest of its config rather than the config's
+secrets, so agents are told of its tools without starting it. A server's
+stderr is kept by its last twenty lines, each cut at 1 KB, for when it fails. Servers run as the person, beside the lookout and
 outside every agent's sandbox, as Codex starts its own: a sandboxed task
 reaches them only through `exec`. A turn that ends, as one the person
 interrupts, stops its script and the calls it has in flight.

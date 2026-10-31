@@ -114,11 +114,16 @@ use std::{
 use transcript::Markdown;
 use unicode_width::UnicodeWidthStr;
 
-/// Rows kept at the bottom: the reply's unfinished line, the status, a gap,
-/// the composer and the footer.
-const VIEWPORT: u16 = 5;
+/// Rows kept at the bottom: the reply's unfinished line, the status, the
+/// composer between a row of its band above and below, and the footer.
+const VIEWPORT: u16 = 6;
 /// The most rows a long prompt's composer grows to; it shows its end.
 const COMPOSER_ROWS: usize = 8;
+/// An agent in a folder: what a profile shown in the footer was read for.
+type Seat = (String, String);
+/// How many lines of a message a reply quotes; the rest is the agent's
+/// own history.
+const QUOTE_LINES: usize = 6;
 /// How many of the bot's latest replies `/react` offers.
 const REACTABLE: usize = 9;
 /// How much of a reply's first line a reaction quotes.
@@ -1210,15 +1215,40 @@ fn remote_without_display(var: &dyn Fn(&str) -> Option<std::ffi::OsString>) -> b
             .any(|key| set(key))
 }
 
-/// The viewport's rows, top to bottom: the reply's open line, the status,
-/// a gap, the composer (as many rows as are left) and the footer.
-/// The live area is `live` rows: the reply's open line, wrapped.
-fn areas(area: ratatui::layout::Rect, live: u16) -> [ratatui::layout::Rect; 5] {
+/// The composer's edge: the band the person's messages sit on, from the
+/// row above it to the row below, the conversation's width, as Codex
+/// draws its composer and the user's messages on one shade: what was
+/// written and what is being written read as one thing, the words in the
+/// middle of it, and the composer's limits show in any theme. Without
+/// colour (`NO_COLOR`) a muted rule above it.
+fn edge(frame: &mut ratatui::Frame, gap: Rect, composer: Rect, pad: Rect) {
+    let width = composer.width.min(PROSE as u16);
+    if look::no_color() {
+        let rule = Line::from("─".repeat(width as usize)).dim();
+        frame.render_widget(Paragraph::new(rule), Rect { width, ..gap });
+        return;
+    }
+    let band = Rect {
+        y: gap.y,
+        height: pad.bottom().saturating_sub(gap.y),
+        width,
+        ..composer
+    };
+    frame
+        .buffer_mut()
+        .set_style(band, Style::default().bg(look::band()));
+}
+
+/// The viewport's rows, top to bottom: the reply's open line (`live`
+/// rows, wrapped), the status, a row of the composer's band, the composer
+/// (as many rows as are left), its band's row under it, and the footer.
+fn areas(area: ratatui::layout::Rect, live: u16) -> [ratatui::layout::Rect; 6] {
     Layout::vertical([
         Constraint::Length(live.max(1)),
         Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Min(1),
+        Constraint::Length(1),
         Constraint::Length(1),
     ])
     .areas(area)
@@ -1226,7 +1256,7 @@ fn areas(area: ratatui::layout::Rect, live: u16) -> [ratatui::layout::Rect; 5] {
 
 /// At most `keep` of `rows`, as near the end as still shows `row`; and
 /// where `row` is among them.
-fn window(mut rows: Vec<Line<'static>>, row: usize, keep: usize) -> (Vec<Line<'static>>, usize) {
+fn window<T>(mut rows: Vec<T>, row: usize, keep: usize) -> (Vec<T>, usize) {
     let start = rows.len().saturating_sub(keep).min(row);
     rows.drain(..start);
     rows.truncate(keep);
@@ -1549,6 +1579,33 @@ struct Clustered {
     calls: Vec<Vec<Line<'static>>>,
 }
 
+/// The efforts Alt+T steps through for `model` (`provider/name`), whose
+/// own is `effort`: `xhigh` or else `high`, then `max`, as the provider's
+/// family takes them, each only when above `effort`.
+fn boosts(providers: &Value, model: &str, effort: Option<&str>) -> Vec<String> {
+    let provider = model
+        .split_once('/')
+        .map_or(model, |(provider, _)| provider);
+    let takes: Vec<&str> = (providers[provider]["efforts"].as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect();
+    let rank = |level: &str| takes.iter().position(|l| *l == level);
+    let above = |level: &&str| match effort.and_then(rank) {
+        Some(own) => rank(level).is_some_and(|at| at > own),
+        None => true,
+    };
+    let first = ["xhigh", "high"].into_iter().find(|l| takes.contains(l));
+    let most = Some("max").filter(|l| takes.contains(l));
+    [first, most]
+        .into_iter()
+        .flatten()
+        .filter(above)
+        .map(str::to_owned)
+        .collect()
+}
+
 /// Ctrl+\, which moves the keys between the conversation and the pane:
 /// no terminal or multiplexer takes it, as many take Shift+Tab. Without
 /// the keyboard protocol it arrives as Ctrl+4.
@@ -1637,6 +1694,31 @@ struct Running {
     /// The lookout's note started it: it ends quietly unless the bot
     /// says something.
     note: bool,
+    /// The effort it runs at, when the daemon said: a boost is this turn's
+    /// alone, so the bot's own stays in `App::effort`.
+    effort: Option<String>,
+}
+
+/// The lists of a setting's values `/approvals` and `/fast` open over
+/// the composer.
+#[derive(Clone, Copy, PartialEq)]
+enum Choice {
+    Approvals,
+    Speed,
+}
+
+/// The speeds `/fast` lists, each where the provider serves it.
+const SPEEDS: [(&str, &str); 3] = [
+    ("standard", "the model's own speed and price"),
+    ("fast", "faster, at a higher price per token"),
+    ("ultrafast", "fastest, at a higher price still"),
+];
+
+/// The tier faster than standard a bot's record says it is served at.
+fn speed(record: &Value) -> Option<String> {
+    (record["settings"]["speed"].as_str())
+        .filter(|speed| *speed != "standard")
+        .map(str::to_owned)
 }
 
 /// Whether the lookout sent the turn: its note, by its request ID.
@@ -1667,9 +1749,13 @@ fn hold(unsent: &mut Vec<String>, record: String) {
 /// The slash commands, as the menu lists them: name and what it does.
 /// `/agents` and `/ps` also open `/status`, `/triggers` and `/lookout`
 /// open `/background`, and `/settings` opens `/config`, unlisted.
-const COMMANDS: [(&str, &str); 25] = [
+const COMMANDS: [(&str, &str); 27] = [
     ("/side", "Start a side chat with a copy of this agent"),
     ("/model", "Pick the model and effort"),
+    (
+        "/fast",
+        "Choose how fast this agent is served, and at what price",
+    ),
     (
         "/compact",
         "Summarize the lead's conversation before its next call",
@@ -1708,6 +1794,7 @@ const COMMANDS: [(&str, &str); 25] = [
         "Show every tool call, or only what moves the work on",
     ),
     ("/react", "React to one of the agent's replies"),
+    ("/reply", "Answer one of the agent's replies, quoted"),
     ("/copy", "Copy the last reply as Markdown"),
     ("/open", "Open the last HTML page in your browser"),
     ("/quit", "Quit; the agents keep working"),
@@ -1796,6 +1883,11 @@ struct App {
     place_read: Option<(String, Instant)>,
     model: String,
     effort: Option<String>,
+    /// Boost: the effort the next message that starts a turn runs at,
+    /// that turn's alone (Alt+T).
+    boost: Option<String>,
+    /// The tier faster than standard its calls are served at, if any.
+    speed: Option<String>,
     /// How big the conversation was after its last model round, as the
     /// next round reads it, once known.
     context: Option<u64>,
@@ -1884,6 +1976,8 @@ struct App {
     replies: Vec<(i64, String)>,
     /// `/react`'s list is open, at this reply from the newest.
     reacting: Option<usize>,
+    /// The list is `/reply`'s: the pick is quoted, not reacted to.
+    quoting: bool,
     /// What Ctrl+F looks for on the full screen, while it does.
     finding: Option<String>,
     /// The reply `/react` picked, which the next emoji sent answers.
@@ -1893,6 +1987,9 @@ struct App {
     /// Messages attached to the bot's next call, by their turns, until a
     /// call takes them in: the footer's clip.
     attached: Vec<i64>,
+    /// The profile the agent runs as when not its seat's own, for the
+    /// agent and folder it was read for.
+    profile: std::cell::RefCell<Option<(Seat, Option<String>)>>,
     /// The tools to declare on the bot so it can react, sent once no turn
     /// runs.
     declare: Option<Value>,
@@ -2052,6 +2149,8 @@ struct App {
     /// The prompt-cache lifetime a bot made before Sonny gave its model
     /// one takes, set once no turn runs.
     cache: Option<&'static str>,
+    /// `/fast`: the speed picked, set once no turn runs.
+    pace: Option<&'static str>,
     /// The bot's tools, which an approval mode gates.
     tools: Vec<String>,
     /// The tools its client declared, of which a mode gates Sonny's that
@@ -2059,8 +2158,8 @@ struct App {
     declared: Value,
     /// Its approval mode, when it is one of Sonny's.
     mode: Option<&'static str>,
-    /// `/approvals`, open over the composer: the mode picked.
-    choosing: Option<usize>,
+    /// `/approvals` or `/fast`, open over the composer: the row picked.
+    choosing: Option<(Choice, usize)>,
     /// Calls the approver serving `auto` is reviewing in this turn.
     reviewing: std::collections::HashSet<String>,
     /// Calls it denied while Sonny watched, newest last: what `/retry`
@@ -2731,6 +2830,8 @@ impl App {
             place_read: None,
             model,
             effort: record["effort"].as_str().map(str::to_owned),
+            boost: None,
+            speed: speed(record),
             context: None,
             window: None,
             input: prompt::Prompt::default(),
@@ -2749,6 +2850,7 @@ impl App {
                 started: Instant::now(),
                 phase: "Working".into(),
                 note: false,
+                effort: None,
             }),
             calls: HashMap::new(),
             approvals: Vec::new(),
@@ -2788,11 +2890,13 @@ impl App {
             pictures: Vec::new(),
             reactions: reactions::Reactions::default(),
             replies: Vec::new(),
+            quoting: false,
             reacting: None,
             finding: None,
             react_to: None,
             reaction_turn: None,
             attached: Vec::new(),
+            profile: Default::default(),
             declare: None,
             bot_reactions: Vec::new(),
             react_calls: HashMap::new(),
@@ -2858,6 +2962,7 @@ impl App {
             listing: None,
             switch: None,
             cache: None,
+            pace: None,
             tools: record["tools"]
                 .as_array()
                 .into_iter()
@@ -3210,6 +3315,7 @@ impl App {
             && self.gating.is_none()
             && self.declare.is_none()
             && self.cache.is_none()
+            && self.pace.is_none()
         {
             return true;
         }
@@ -3218,6 +3324,7 @@ impl App {
         }
         let (text, switch, gating) = (self.instruct.take(), self.switch.take(), self.gating.take());
         let cache = self.cache.take();
+        let pace = self.pace.take();
         let mut declare = self.declare.take();
         // A bot that went without the tools Sonny gates, as its gate was
         // not Sonny's, has them with the mode the person picks.
@@ -3244,6 +3351,9 @@ impl App {
         }
         if let Some(ttl) = cache {
             asked["cache_ttl"] = json!(ttl);
+        }
+        if let Some(speed) = pace {
+            asked["speed"] = json!(speed);
         }
         if let (Some(mode), Value::Object(fields)) = (gating, &mut asked) {
             let declared = declare.as_ref().unwrap_or(&self.declared);
@@ -3279,8 +3389,15 @@ impl App {
                     }
                     self.model = model;
                     self.effort = effort;
-                    // The bot's own model now, for this window's turns too.
+                    // The bot's own model now, for this window's turns too,
+                    // and a boost armed against the old effort let go.
                     self.turn_model = None;
+                    self.boost = None;
+                }
+                if let Some(speed) = pace {
+                    self.speed = Some(speed)
+                        .filter(|speed| *speed != "standard")
+                        .map(str::to_owned);
                 }
                 if let Some(mode) = gating {
                     self.mode = Some(mode);
@@ -3297,6 +3414,7 @@ impl App {
                 self.gating = gating;
                 self.declare = declare;
                 self.cache = cache;
+                self.pace = pace;
                 return false;
             }
             Err(error) => {
@@ -3366,6 +3484,44 @@ impl App {
         }
     }
 
+    /// The rows `/fast` lists: standard, and each tier faster than it
+    /// the bot's provider serves.
+    fn speed_rows(&self) -> Vec<(&'static str, &'static str)> {
+        let serves = self.speeds();
+        (SPEEDS.into_iter())
+            .filter(|(speed, _)| *speed == "standard" || serves.iter().any(|s| s == speed))
+            .collect()
+    }
+
+    /// Serves the bot at `speed` from now, or from when no turn runs.
+    async fn pace_at(&mut self, speed: &'static str) {
+        let now = (self.pace).unwrap_or(self.speed.as_deref().unwrap_or("standard"));
+        if speed == now {
+            return;
+        }
+        self.pace = Some(speed);
+        self.notice = Some(match (self.configure().await, self.pace.is_some()) {
+            (true, _) if speed == "standard" => "standard speed from the next call".into(),
+            (true, _) => format!("{speed} from the next call, at a higher price per token"),
+            (false, true) => "applies when idle".into(),
+            // Refused: the notice already says why.
+            (false, false) => return,
+        });
+    }
+
+    /// The tiers faster than standard the bot's provider serves.
+    fn speeds(&self) -> Vec<String> {
+        let provider = self
+            .model
+            .split_once('/')
+            .map_or("", |(provider, _)| provider);
+        (self.client.providers()[provider]["speeds"].as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|speed| speed.as_str().map(str::to_owned))
+            .collect()
+    }
+
     /// What the footer and pickers show of the bot, from its record.
     /// A changed model replaces the one this window's turns run on.
     fn refresh(&mut self, record: &Value, model: bool) {
@@ -3376,10 +3532,12 @@ impl App {
             self.model = format!("{provider}/{model}");
             self.turn_model = None;
             self.effort = record["effort"].as_str().map(str::to_owned);
+            self.boost = None;
         }
         if let Some(workspace) = record["workspace"].as_str() {
             self.workspace = workspace.to_owned();
         }
+        self.speed = speed(record);
         self.mode = approvals::mode(record);
     }
 
@@ -3713,6 +3871,7 @@ impl App {
                     started: Instant::now(),
                     phase: "Working".into(),
                     note: false,
+                    effort: None,
                 });
                 self.turn_began().await;
                 status_report("working", &self.bot);
@@ -4659,7 +4818,9 @@ impl App {
     /// The bot's words at `node`, as replayed: their last row tagged,
     /// and the person's reactions to them right under it.
     fn commit_said(&mut self, node: i64, lines: Vec<Line<'static>>) {
+        let count = lines.len();
         self.commit(lines);
+        self.mark_first(count);
         self.mark_last(screen::Mark::Tag(screen::Tag::End(node)));
         if let Some(row) = self.reacted_row(node) {
             self.commit_after(vec![row], false);
@@ -4720,6 +4881,14 @@ impl App {
     }
 
     /// `mark` on the last row written so far, waiting or drawn.
+    /// The first of the last `count` lines waiting marked as a message's
+    /// first row.
+    fn mark_first(&mut self, count: usize) {
+        if count > 0 && self.pending.len() >= count {
+            (self.marks).push((self.pending.len() - count, screen::Mark::Opens));
+        }
+    }
+
     fn mark_last(&mut self, mark: screen::Mark) {
         match self.pending.len() {
             0 => {
@@ -5569,6 +5738,9 @@ impl App {
         if live.gap && !live.spilled {
             self.pending.push(Line::default());
         }
+        if !live.spilled {
+            self.marks.push((self.pending.len(), screen::Mark::Opens));
+        }
         self.rows_drawn += live.rows.len();
         self.pending.extend(match words {
             Words::Step => transcript::quiet(live.rows),
@@ -5601,6 +5773,9 @@ impl App {
         if live.spilled || live.rows.len() > (self.height / 2).max(4) {
             if live.gap && !live.spilled {
                 self.pending.push(Line::default());
+            }
+            if !live.spilled {
+                self.marks.push((self.pending.len(), screen::Mark::Opens));
             }
             live.spilled = true;
             self.rows_drawn += live.rows.len();
@@ -5664,6 +5839,9 @@ impl App {
                 if changed("instructions") && self.instruct.take().is_some() {
                     dropped.push("instructions");
                 }
+                if changed("speed") && self.pace.take().is_some() {
+                    dropped.push("speed");
+                }
                 if !dropped.is_empty() {
                     self.notice = Some(format!(
                         "{} changed elsewhere; your pick was dropped",
@@ -5691,6 +5869,7 @@ impl App {
                     started: Instant::now(),
                     phase: "Working".into(),
                     note: from_lookout(data),
+                    effort: data["effort"].as_str().map(str::to_owned),
                 });
                 // What this turn runs on and in: the bot may have moved, or
                 // a client chosen another model for it.
@@ -5700,7 +5879,6 @@ impl App {
                 if let Some(model) = data["model"].as_str() {
                     self.model = model.to_owned();
                 }
-                self.effort = data["effort"].as_str().map(str::to_owned);
                 status_report("working", &self.bot);
                 // A turn the history drew still answers the message it
                 // drew, with what the bot reacted to it with so far.
@@ -7417,7 +7595,8 @@ impl App {
             ("tab", "with nothing typed, keys to the pane"),
             ("ctrl+\\", "keys to the pane and back"),
             ("ctrl+[ ctrl+]", "hide the pane, show it again"),
-            ("ctrl+g", "the agent in the pane to the main view"),
+            ("ctrl+g", "open the pane's agent in the main view"),
+            ("alt+t", "boost the next message; again for more"),
             ("ctrl+v", "paste a picture"),
             ("ctrl+c", "copy the selection, clear, or quit"),
             ("ctrl+l", "draw the screen again"),
@@ -7631,6 +7810,28 @@ impl App {
     async fn press(&mut self, what: &str) {
         let (verb, id) = what.split_once('/').unwrap_or((what, ""));
         match verb {
+            // A margin note answered, quoted the same way.
+            "reply-note" => match self.margin.quoted(id) {
+                Some(said) => self.quote(&said),
+                None => self.notice = Some("that note is no longer in the margin".into()),
+            },
+            // A message answered: quoted where the person writes.
+            "reply" => {
+                let Ok(node) = id.parse::<i64>() else {
+                    return;
+                };
+                let read = self
+                    .client
+                    .request("history_items", json!({"bot": self.bot, "nodes": [node]}))
+                    .await;
+                match read {
+                    Ok(read) => {
+                        let said = text(&read["items"][0]["item"]);
+                        self.quote(&said);
+                    }
+                    Err(error) => self.notice = Some(error.to_string()),
+                }
+            }
             "close" => {
                 if self.margin.note(id).is_none() {
                     return;
@@ -7959,8 +8160,16 @@ impl App {
                     KeyCode::Down => *pick = (*pick + count - 1) % count,
                     KeyCode::Enter => {
                         let at = self.replies.len().saturating_sub(1 + *pick);
-                        self.react_to = self.replies.get(at).cloned();
+                        let picked = self.replies.get(at).cloned();
                         self.reacting = None;
+                        match std::mem::take(&mut self.quoting) {
+                            true => {
+                                if let Some((node, _)) = picked {
+                                    self.pressed.push(format!("reply/{node}"));
+                                }
+                            }
+                            false => self.react_to = picked,
+                        }
                     }
                     KeyCode::Esc => self.reacting = None,
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -8031,34 +8240,51 @@ impl App {
             }
             return;
         }
-        if let Some(pick) = &mut self.choosing {
+        if let Some((choice, mut pick)) = self.choosing {
             if let Event::Key(key) = event
                 && key.kind != KeyEventKind::Release
             {
-                let count = approvals::MODES.len();
+                let count = match choice {
+                    Choice::Approvals => approvals::MODES.len(),
+                    Choice::Speed => self.speed_rows().len(),
+                };
+                // Another client may have moved the bot to a provider
+                // that serves fewer tiers since the list opened.
+                pick = pick.min(count - 1);
                 match key.code {
-                    KeyCode::Up => *pick = (*pick + count - 1) % count,
-                    KeyCode::Down => *pick = (*pick + 1) % count,
+                    KeyCode::Up => pick = (pick + count - 1) % count,
+                    KeyCode::Down => pick = (pick + 1) % count,
                     KeyCode::Enter => {
-                        let mode = approvals::MODES[*pick].0;
                         self.choosing = None;
-                        // The agents the lead made take it too, even when
-                        // the lead has it already.
-                        self.spread = Some((mode, Instant::now()));
-                        if self.mode != Some(mode) {
-                            self.gating = Some(mode);
-                            self.configure().await;
-                            if self.gating.is_some() {
-                                self.notice = Some("applies when idle".into());
+                        match choice {
+                            Choice::Approvals => {
+                                let mode = approvals::MODES[pick].0;
+                                // The agents the lead made take it too, even
+                                // when the lead has it already.
+                                self.spread = Some((mode, Instant::now()));
+                                if self.mode != Some(mode) {
+                                    self.gating = Some(mode);
+                                    self.configure().await;
+                                    if self.gating.is_some() {
+                                        self.notice = Some("applies when idle".into());
+                                    }
+                                }
                             }
+                            Choice::Speed => self.pace_at(self.speed_rows()[pick].0).await,
                         }
+                        return;
                     }
-                    KeyCode::Esc => self.choosing = None,
+                    KeyCode::Esc => {
+                        self.choosing = None;
+                        return;
+                    }
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        self.choosing = None
+                        self.choosing = None;
+                        return;
                     }
                     _ => {}
                 }
+                self.choosing = Some((choice, pick));
             }
             return;
         }
@@ -8218,6 +8444,9 @@ impl App {
                     KeyCode::Char('b') if alt => self.input.word_left(),
                     KeyCode::Char('f') if alt => self.input.word_right(),
                     KeyCode::Char('d') if alt => self.input.delete_word_forward(),
+                    // Think harder for one message, as Claude Code's Alt+T
+                    // toggles thinking: again for the most, again for none.
+                    KeyCode::Char('t') if alt => self.boost_step(),
                     // With nothing typed, ? shows the keys, as it does in
                     // Codex and Claude Code.
                     KeyCode::Char('?')
@@ -8287,6 +8516,26 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// Alt+T: the next message's effort up a step from the agent's own,
+    /// to the most the model takes, then back to its own. The steps are
+    /// the model's family's: `xhigh` (else `high`), then `max` where it
+    /// has one, each only when above the effort set.
+    fn boost_step(&mut self) {
+        let model = self.turn_model.as_deref().unwrap_or(&self.model);
+        let levels = boosts(self.client.providers(), model, self.effort.as_deref());
+        if levels.is_empty() && self.boost.take().is_none() {
+            self.notice = Some("this model takes no higher effort".into());
+            return;
+        }
+        self.boost = match self.boost.as_deref() {
+            None => levels.first().cloned(),
+            Some(now) => (levels.iter())
+                .skip_while(|level| *level != now)
+                .nth(1)
+                .cloned(),
+        };
     }
 
     async fn submit(&mut self) {
@@ -8391,6 +8640,22 @@ impl App {
             }
             return;
         }
+        if prompt == "/fast" {
+            self.input.clear();
+            let rows = self.speed_rows();
+            if rows.len() < 2 {
+                let provider = self.model.split_once('/').map_or("", |(p, _)| p);
+                self.notice = Some(format!(
+                    "{provider} serves its models at standard speed only"
+                ));
+                return;
+            }
+            // On the pick still waiting for the turn to end, if there is one.
+            let now = (self.pace).unwrap_or(self.speed.as_deref().unwrap_or("standard"));
+            let at = rows.iter().position(|(speed, _)| *speed == now);
+            self.choosing = Some((Choice::Speed, at.unwrap_or(0)));
+            return;
+        }
         if prompt == "/model" {
             self.input.clear();
             let (send, receive) = tokio::sync::oneshot::channel();
@@ -8465,10 +8730,14 @@ impl App {
             );
             return;
         }
-        if prompt == "/react" {
+        if prompt == "/react" || prompt == "/reply" {
             self.input.clear();
+            self.quoting = prompt == "/reply";
             if self.replies.is_empty() {
-                self.notice = Some("no reply to react to yet".into());
+                self.notice = Some(match self.quoting {
+                    true => "no reply to answer yet".into(),
+                    false => "no reply to react to yet".into(),
+                });
             } else {
                 self.reacting = Some(0);
             }
@@ -8485,12 +8754,13 @@ impl App {
         if prompt == "/approvals" {
             self.input.clear();
             let current = self.gating.or(self.mode);
-            self.choosing = Some(
+            self.choosing = Some((
+                Choice::Approvals,
                 approvals::MODES
                     .iter()
                     .position(|(mode, _)| Some(*mode) == current)
                     .unwrap_or(0),
-            );
+            ));
             return;
         }
         if prompt == "/copy" {
@@ -8670,6 +8940,14 @@ impl App {
         };
         let steer = delivery == "steer";
         let model = (!steer).then(|| self.turn_model.clone()).flatten();
+        // A boost is the next turn's: a steer joins one running already.
+        let effort = match steer || origin.is_some() {
+            true => None,
+            false => self.boost.clone(),
+        };
+        if steer && origin.is_none() && self.boost.is_some() {
+            self.notice = Some("the boost waits for a message that starts a turn".into());
+        }
         // A steer never moves a bot, so a moved lead comes back with the
         // next message that starts a turn.
         let workspace = (!steer).then(|| self.move_to.clone()).flatten();
@@ -8679,10 +8957,13 @@ impl App {
                 "submit",
                 json!({"bot": self.bot, "request_id": unique("tui"), "prompt": prompt,
                     "delivery": delivery, "model": model, "workspace": workspace,
-                    "origin": origin, "images": attach::submitted(pictures)}),
+                    "effort": effort, "origin": origin, "images": attach::submitted(pictures)}),
             )
             .await
             .map_err(|error| error.to_string())?;
+        if effort.is_some() {
+            self.boost = None;
+        }
         // The lead the folder opens next time.
         if origin.is_none() && self.options.side.is_none() {
             project::wrote_to(self.client.store(), &self.workspace, &self.bot);
@@ -9502,7 +9783,7 @@ impl App {
             };
             self.screen.render(history, frame.buffer_mut(), file);
             linked.extend(self.screen.link_cells(frame.buffer_mut()));
-            let [live, status, _, composer, footer] = areas(view, live_rows);
+            let [live, status, gap, composer, pad, footer] = areas(view, live_rows);
             frame.render_widget(Paragraph::new(open_rows.clone()), live);
             frame.render_widget(Paragraph::new(self.status_line()), status);
             let menu = self.menu();
@@ -9511,12 +9792,8 @@ impl App {
                 let items: Vec<list::Item> = (menu.iter())
                     .map(|(name, about)| list::Item::new(*name, *about))
                     .collect();
-                let [_, _, _, composer_row, _] = areas(view, live_rows);
-                over(
-                    frame,
-                    list::lines(&items, pick, width, composer_row.y as usize),
-                    composer_row,
-                );
+                // Over the rows above the composer's band.
+                over(frame, list::lines(&items, pick, width, gap.y as usize), gap);
             }
             if let Some(query) = &self.finding {
                 let line = Line::from(vec![Span::raw("find ").dim(), Span::raw(query.clone())]);
@@ -9550,12 +9827,19 @@ impl App {
                     list::lines(&items, pick, width, composer.y as usize),
                     composer,
                 );
-                let line = Line::from(vec![
-                    Span::raw("› ").bold(),
-                    Span::raw("which reply to react to").dim(),
-                ]);
+                let (asked, keys) = match self.quoting {
+                    true => (
+                        "which reply to answer",
+                        "  ↑↓ pick · enter quote · esc close",
+                    ),
+                    false => (
+                        "which reply to react to",
+                        "  ↑↓ pick · enter react · esc close",
+                    ),
+                };
+                let line = Line::from(vec![Span::raw("› ").bold(), Span::raw(asked).dim()]);
                 frame.render_widget(Paragraph::new(line), composer);
-                let keys = Line::from(hint::spans("  ↑↓ pick · enter react · esc close"));
+                let keys = Line::from(hint::spans(keys));
                 frame.render_widget(Paragraph::new(keys), footer);
                 return;
             }
@@ -9594,7 +9878,27 @@ impl App {
                 frame.render_widget(Paragraph::new(keys), footer);
                 return;
             }
-            if let Some(pick) = self.choosing {
+            if let Some((Choice::Speed, pick)) = self.choosing {
+                let now = self.speed.as_deref().unwrap_or("standard");
+                let items: Vec<list::Item> = (self.speed_rows().into_iter())
+                    .map(|(speed, about)| list::Item::new(speed, about).current(speed == now))
+                    .collect();
+                let pick = pick.min(items.len() - 1);
+                over(
+                    frame,
+                    list::lines(&items, pick, width, composer.y as usize),
+                    composer,
+                );
+                let line = Line::from(vec![
+                    Span::raw("› ").bold(),
+                    Span::raw("speed for this agent").dim(),
+                ]);
+                frame.render_widget(Paragraph::new(line), composer);
+                let keys = Line::from(hint::spans("  ↑↓ pick · enter choose · esc close"));
+                frame.render_widget(Paragraph::new(keys), footer);
+                return;
+            }
+            if let Some((_, pick)) = self.choosing {
                 let items: Vec<list::Item> = (approvals::MODES.iter())
                     .map(|(mode, about)| {
                         list::Item::new(*mode, *about).current(Some(*mode) == self.mode)
@@ -9675,6 +9979,7 @@ impl App {
                 frame.render_widget(Paragraph::new(keys), footer);
                 return;
             }
+            edge(frame, gap, composer, pad);
             frame.render_widget(Paragraph::new(composer_rows), composer);
             composer_at = first_row.map(|first| (composer, first, width.min(PROSE)));
             // Keys in the pane: no cursor where they do not go.
@@ -9684,7 +9989,9 @@ impl App {
                     composer.y + (cursor_row as u16).min(composer.height.saturating_sub(1)),
                 ));
             }
-            let (line, counter) = self.footer(width);
+            // Under the composer's band and no wider: one column, its
+            // right edge where the band's is.
+            let (line, counter) = self.footer(width.min(PROSE));
             frame.render_widget(Paragraph::new(line), footer);
             counter_at = counter.map(|at| (footer.y, footer.x + at.start..footer.x + at.end));
         };
@@ -9776,31 +10083,6 @@ impl App {
         // A shell command is marked as one while it is typed.
         let shell = self.input.starts_with('!');
         let selected = self.input.selection();
-        let rows: Vec<Line<'static>> = layout
-            .iter()
-            .enumerate()
-            .map(|(at, part)| {
-                let lead = match at {
-                    0 if shell => Span::raw("› ").bold().fg(Color::Magenta),
-                    0 if answering.is_some() => Span::raw("? ").bold().fg(Color::Yellow),
-                    0 => Span::raw("› ").bold(),
-                    _ => Span::raw("  "),
-                };
-                let text = |range: std::ops::Range<usize>| Span::raw(self.input[range].to_owned());
-                match &selected {
-                    Some(sel) if sel.start < part.end && sel.end > part.start => {
-                        let (from, to) = (sel.start.max(part.start), sel.end.min(part.end));
-                        Line::from(vec![
-                            lead,
-                            text(part.start..from),
-                            text(from..to).reversed(),
-                            text(to..part.end),
-                        ])
-                    }
-                    _ => Line::from(vec![lead, text(part.start..part.end)]),
-                }
-            })
-            .collect();
         let keep = match self.choosing.is_some()
             || self.approving.is_some()
             || self.picker.is_some()
@@ -9811,16 +10093,39 @@ impl App {
             true => 1,
             false => COMPOSER_ROWS,
         };
-        let (rows, row) = match &self.composing {
+        let rows = layout.len();
+        let (layout, row) = match &self.composing {
             // While the mouse button is down the rows stay where the press
             // found them, so the text under the mouse is what it selects.
             Some((_, (_, first, _))) => {
-                let first = (*first).min(rows.len() - 1);
+                let first = (*first).min(rows - 1);
                 let row = row.saturating_sub(first).min(keep - 1);
-                (rows.into_iter().skip(first).take(keep).collect(), row)
+                (layout.into_iter().skip(first).take(keep).collect(), row)
             }
-            None => window(rows, row, keep),
+            None => window(layout, row, keep),
         };
+        // Markdown shows as it will read, its marks kept: styled on the
+        // rows shown alone, so a long paste costs no more to draw.
+        let marked = prompt::marks(&self.input);
+        let rows: Vec<Line<'static>> = layout
+            .iter()
+            .map(|part| {
+                let lead = match part.start {
+                    0 if shell => Span::raw("› ").bold().fg(Color::Magenta),
+                    0 if answering.is_some() => Span::raw("? ").bold().fg(Color::Yellow),
+                    0 => Span::raw("› ").bold(),
+                    _ => Span::raw("  "),
+                };
+                let mut spans = vec![lead];
+                spans.extend(prompt::spans(
+                    &self.input,
+                    part.start..part.end,
+                    &marked,
+                    selected.as_ref(),
+                ));
+                Line::from(spans)
+            })
+            .collect();
         (rows, (row, col))
     }
 
@@ -9890,6 +10195,47 @@ impl App {
         }
     }
 
+    /// A message quoted before what the person is writing, as a mail or a
+    /// GitHub reply quotes: `> ` before each of its lines, the first
+    /// [`QUOTE_LINES`] of them, a blank line, then the cursor.
+    fn quote(&mut self, said: &str) {
+        let lines: Vec<&str> = said.trim().lines().collect();
+        let mut quoted: Vec<String> = (lines.iter().take(QUOTE_LINES))
+            .map(|line| format!("> {line}").trim_end().to_owned())
+            .collect();
+        if lines.len() > QUOTE_LINES {
+            quoted.push("> …".into());
+        }
+        let typed = self.input.trim().to_owned();
+        self.input.set(&format!("{}\n\n{typed}", quoted.join("\n")));
+        self.pane_keys = false;
+    }
+
+    /// The profile the agent runs as, when it isn't its seat's own: a
+    /// lead's other than `lead`, a task's other than `task`, as its
+    /// project or the config sets them. Read again only for another agent
+    /// or folder.
+    fn profile(&self) -> Option<String> {
+        let key = (self.bot.clone(), self.workspace.clone());
+        if let Some((read, profile)) = &*self.profile.borrow()
+            && *read == key
+        {
+            return profile.clone();
+        }
+        let here = std::path::Path::new(&self.workspace);
+        let info = |dir: &std::path::Path| agent_client::project::read(dir).ok();
+        let profile = match (&self.project, task::source_folder(here)) {
+            (Some(_), _) => (info(here).and_then(|info| project::lead_profile(&info).ok()))
+                .filter(|profile| profile != "lead"),
+            (None, Some(source)) => (info(&source))
+                .and_then(|info| project::task_profile(&info).ok())
+                .filter(|profile| profile != "task"),
+            (None, None) => None,
+        };
+        *self.profile.borrow_mut() = Some((key, profile.clone()));
+        profile
+    }
+
     #[cfg(test)]
     fn footer_line(&self, width: usize) -> Line<'static> {
         self.footer(width).0
@@ -9926,8 +10272,20 @@ impl App {
         };
         let folder = tilde(&self.workspace);
         let mut left = format!("  {}", self.model);
-        if let Some(effort) = &self.effort {
+        // What the running turn runs at, as a boost has it; else the bot's.
+        let effort = (self.running.as_ref()).and_then(|running| running.effort.as_ref());
+        if let Some(effort) = effort.or(self.effort.as_ref()) {
             left.push_str(&format!(" {effort}"));
+        }
+        if let Some(boost) = &self.boost {
+            left.push_str(&format!(" ↑{boost}"));
+        }
+        if let Some(speed) = &self.speed {
+            left.push_str(&format!(" {speed}"));
+        }
+        // A lead or task told more than its seat's own role says so.
+        if let Some(profile) = self.profile() {
+            left.push_str(&format!(" · {profile}"));
         }
         // What waits for the turn to end, so a pick is not taken as lost.
         if let Some((model, effort)) = &self.switch {
@@ -9939,6 +10297,9 @@ impl App {
         }
         if let Some(mode) = self.gating {
             left.push_str(&format!(" · {mode} approvals when idle"));
+        }
+        if let Some(speed) = self.pace {
+            left.push_str(&format!(" · {speed} speed when idle"));
         }
         // The context, not what the bot ever spent: how full the next
         // round is.
@@ -10009,7 +10370,20 @@ impl App {
         // The branch in green, as shells show it; the agent's name in the
         // agents' color.
         let at = left.width() + place.width() + branch.width() + fill;
-        let mut spans = vec![Span::raw(left), Span::raw(place)];
+        // An armed boost in the text's own weight, not muted: what the
+        // next message will take, said without a hue.
+        let mut spans = match (self.boost.as_ref()).and_then(|boost| {
+            let armed = format!(" ↑{boost}");
+            Some((left.find(&armed)?, armed.len()))
+        }) {
+            Some((from, len)) => vec![
+                Span::raw(left[..from].to_owned()),
+                Span::raw(left[from..from + len].to_owned()).not_dim(),
+                Span::raw(left[from + len..].to_owned()),
+            ],
+            None => vec![Span::raw(left)],
+        };
+        spans.push(Span::raw(place));
         if let Some(name) = branch.strip_prefix(" on ") {
             spans.push(Span::raw(" on "));
             spans.push(Span::raw(name.to_owned()).fg(Color::Green));
@@ -10547,6 +10921,14 @@ mod tests {
     pub(crate) async fn daemon_answering(
         answer: impl Fn(&Value) -> Value + Send + 'static,
     ) -> Arc<Client> {
+        daemon_serving(json!({}), answer).await
+    }
+
+    /// A stand-in daemon whose ready event lists `providers`.
+    async fn daemon_serving(
+        providers: Value,
+        answer: impl Fn(&Value) -> Value + Send + 'static,
+    ) -> Arc<Client> {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         // Tests start stand-ins at once, within the same millisecond.
         static STARTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -10561,7 +10943,8 @@ mod tests {
         tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let (read, mut write) = stream.into_split();
-            let ready = json!({"event": "ready", "protocol": agent_client::PROTOCOL});
+            let ready = json!({"event": "ready", "protocol": agent_client::PROTOCOL,
+                "providers": providers});
             write
                 .write_all(format!("{ready}\n").as_bytes())
                 .await
@@ -10610,6 +10993,79 @@ mod tests {
 
     fn turn_event(event: &str, turn: i64, data: Value) -> Value {
         json!({"event": event, "bot": "b", "turn": turn, "data": data})
+    }
+
+    #[test]
+    fn boost_steps_to_the_familys_higher_efforts() {
+        let providers = json!({
+            "openai": {"family": "responses", "efforts": ["low", "medium", "high", "xhigh"]},
+            "anthropic": {"family": "anthropic",
+                "efforts": ["low", "medium", "high", "xhigh", "max"]},
+            "old": {"family": "responses", "efforts": ["low", "medium", "high"]},
+        });
+        let at = |model, effort| boosts(&providers, model, effort);
+        assert_eq!(at("anthropic/opus", None), ["xhigh", "max"]);
+        assert_eq!(at("anthropic/opus", Some("xhigh")), ["max"]);
+        assert_eq!(at("openai/gpt", Some("medium")), ["xhigh"]);
+        assert_eq!(at("old/gpt", None), ["high"]);
+        assert!(at("openai/gpt", Some("xhigh")).is_empty());
+        assert!(at("nowhere/x", None).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_boost_goes_with_the_next_turn_alone() {
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = asked.clone();
+        let client = daemon_answering(move |request| {
+            seen.lock().unwrap().push(request.clone());
+            json!({"turn": 1})
+        })
+        .await;
+        let mut app = app(client);
+        app.boost = Some("max".into());
+        assert!(app.footer_line(120).to_string().contains(" ↑max"));
+        app.send("Think it through".into(), None, false, false, &[])
+            .await
+            .unwrap();
+        app.send("And this".into(), None, false, false, &[])
+            .await
+            .unwrap();
+        let submits: Vec<Value> = (asked.lock().unwrap().iter())
+            .filter(|r| r["op"] == "submit")
+            .cloned()
+            .collect();
+        assert_eq!(submits[0]["effort"], "max");
+        assert!(submits[1]["effort"].is_null());
+        assert!(app.boost.is_none());
+        // The boosted turn runs at its effort, and the bot's own is what
+        // the next boost steps up from.
+        app.effort = Some("medium".into());
+        app.daemon(turn_event("accepted", 1, json!({"effort": "max"})))
+            .await;
+        assert!(app.footer_line(120).to_string().contains(" max"));
+        app.daemon(turn_event(
+            "turn_finished",
+            1,
+            json!({"status": "completed"}),
+        ))
+        .await;
+        assert_eq!(app.effort.as_deref(), Some("medium"));
+        let footer = app.footer_line(120).to_string();
+        assert!(
+            footer.contains(" medium") && !footer.contains(" max"),
+            "{footer}"
+        );
+        // One armed against an effort since changed is let go, and Alt+T
+        // turns one off where nothing is higher.
+        app.boost = Some("xhigh".into());
+        app.refresh(
+            &json!({"provider": "anthropic", "model": "opus", "effort": "max"}),
+            true,
+        );
+        assert!(app.boost.is_none());
+        app.boost = Some("xhigh".into());
+        app.boost_step();
+        assert!(app.boost.is_none() && app.notice.is_none());
     }
 
     #[tokio::test]
@@ -12070,6 +12526,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_reply_quotes_the_message_before_what_is_being_written() {
+        let client = daemon_with(json!([])).await;
+        let mut app = app(client);
+        app.input.set("Yes, merge it");
+        let said: String = (1..=8).map(|n| format!("line {n}\n")).collect();
+        app.quote(&said);
+        let quoted = "> line 1\n> line 2\n> line 3\n> line 4\n> line 5\n> line 6\n> …";
+        assert_eq!(&*app.input, format!("{quoted}\n\nYes, merge it"));
+        app.input.clear();
+        app.quote("Merged it.\n\nThe tests pass.");
+        assert_eq!(&*app.input, "> Merged it.\n>\n> The tests pass.\n\n");
+    }
+
+    #[tokio::test]
+    async fn the_footer_names_a_profile_only_when_it_is_not_the_seats_own() {
+        let client = daemon_with(json!([])).await;
+        let mut app = app(client);
+        let dir = std::env::temp_dir().join(format!("sonny-footer-profile-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join(".agents")).unwrap();
+        std::fs::write(dir.join(".agents/project.toml"), "name = \"top\"\n").unwrap();
+        app.workspace = dir.to_string_lossy().into_owned();
+        app.project = Some("top".into());
+        assert!(!app.footer_line(140).to_string().contains("lead ·"));
+        // Read again once the agent or its folder changes.
+        std::fs::write(
+            dir.join(".agents/project.toml"),
+            "name = \"top\"\nprofile = \"superlead\"\n",
+        )
+        .unwrap();
+        app.bot = "top.lead".into();
+        let text = app.footer_line(140).to_string();
+        assert!(
+            text.starts_with(&format!("  {} · superlead · ", app.model)),
+            "{text}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
     async fn a_failure_is_counted_until_the_person_looks_at_it() {
         let client = daemon_with(json!([])).await;
         let mut app = app(client);
@@ -12236,19 +12731,19 @@ mod tests {
             app.daemon(turn_event("tool_completed", 1, json!({"call_id": id})))
                 .await;
         }
-        assert_eq!(drawn(&mut app), ["› merged, thanks", "   👀 👍 "]);
+        assert_eq!(drawn(&mut app), ["", "› merged, thanks", "", "   👀 👍 "]);
         app.daemon(react(1, "c3", json!({"emoji": "👀", "remove": true})))
             .await;
         app.daemon(turn_event("tool_completed", 1, json!({"call_id": "c3"})))
             .await;
-        assert_eq!(drawn(&mut app), ["› merged, thanks", "   👍 "]);
+        assert_eq!(drawn(&mut app), ["", "› merged, thanks", "", "   👍 "]);
         app.daemon(turn_event(
             "turn_finished",
             1,
             json!({"status": "completed"}),
         ))
         .await;
-        assert_eq!(drawn(&mut app), ["› merged, thanks", "   👍 "]);
+        assert_eq!(drawn(&mut app), ["", "› merged, thanks", "", "   👍 "]);
         // One that answers too: under its own message, not the reply.
         app.daemon(turn_event("accepted", 2, json!({"node": 5})))
             .await;
@@ -12273,9 +12768,13 @@ mod tests {
         ))
         .await;
         let rows = drawn(&mut app);
-        assert_eq!(rows[2..5], ["", "› and the notes?", "   🎉 "]);
-        assert!(rows[6].starts_with("─ Worked"), "{rows:?}");
-        assert_eq!(rows[7..], ["", "• Updated."]);
+        assert_eq!(
+            rows[4..9],
+            ["", "", "› and the notes?", "", "   🎉 "],
+            "{rows:?}"
+        );
+        assert!(rows[10].starts_with("─ Worked"), "{rows:?}");
+        assert_eq!(rows[11..], ["", "• Updated."]);
         // Once that message is no longer in the conversation, a reaction
         // to it draws no row of its own.
         app.seen_node = 0;
@@ -12330,7 +12829,7 @@ mod tests {
         ))
         .await;
         let rows = drawn(&mut app);
-        assert_eq!(rows[..2], ["› ship it", "   👀 👍 "], "{rows:?}");
+        assert_eq!(rows[..4], ["", "› ship it", "", "   👀 👍 "], "{rows:?}");
         assert!(!rows.iter().any(|row| row.contains("reacted")), "{rows:?}");
     }
 
@@ -12342,19 +12841,22 @@ mod tests {
         app.commit(vec![Line::from("• Shipped.")]);
         app.picked.set(5, "calc.lead", "👀", false);
         app.place_picked(5);
-        assert_eq!(drawn(&mut app)[..2], ["› ship it", "   👀 calc.lead "]);
+        assert_eq!(
+            drawn(&mut app)[..4],
+            ["", "› ship it", "", "   👀 calc.lead "]
+        );
         // The bot's own go first, the lead's under them.
         app.bot_reactions = vec!["👍".into()];
         app.draw_bot_reactions();
         assert_eq!(
-            drawn(&mut app)[..3],
-            ["› ship it", "   👍 ", "   👀 calc.lead "]
+            drawn(&mut app)[..5],
+            ["", "› ship it", "", "   👍 ", "   👀 calc.lead "]
         );
         // Taken off, its row goes; no row ever says so.
         app.picked.set(5, "calc.lead", "👀", true);
         app.place_picked(5);
         let rows = drawn(&mut app);
-        assert_eq!(rows[..2], ["› ship it", "   👍 "], "{rows:?}");
+        assert_eq!(rows[..4], ["", "› ship it", "", "   👍 "], "{rows:?}");
         assert!(
             !rows.iter().any(|row| row.contains("calc.lead")),
             "{rows:?}"
@@ -12400,10 +12902,14 @@ mod tests {
         assert_eq!(
             drawn(&mut app),
             [
+                "",
                 "› merged, thanks",
+                "",
                 "   👍 ",
                 "",
+                "",
                 "› and the notes?",
+                "",
                 "   🎉 ",
                 "",
                 "• Updated.",
@@ -12427,6 +12933,7 @@ mod tests {
             started: Instant::now(),
             phase: "Working".into(),
             note: false,
+            effort: None,
         });
         assert!(!app.configure().await);
         assert!(asked.lock().unwrap().is_empty());
@@ -12462,6 +12969,7 @@ mod tests {
             started: Instant::now(),
             phase: "Working".into(),
             note: false,
+            effort: None,
         });
         let esc = || Event::Key(event::KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         // The question asks first: Esc sets it aside, the turn runs on.
@@ -12498,6 +13006,7 @@ mod tests {
             started: Instant::now(),
             phase: "Working".into(),
             note: false,
+            effort: None,
         });
         app.yours = Some(1);
         assert!(!app.status_line().to_string().contains("tab to queue"));
@@ -12559,6 +13068,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fast_lists_the_speeds_its_provider_serves_and_picks_one() {
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = asked.clone();
+        let providers = json!({"anthropic": {"speeds": ["fast"]}, "bedrock": {"speeds": []},
+            "openai": {"speeds": ["fast", "ultrafast"]}});
+        let client = daemon_serving(providers, move |request| {
+            seen.lock().unwrap().push(request.clone());
+            json!({"bot": "b", "changed": ["speed"]})
+        })
+        .await;
+        let mut app = app(client);
+        let key = |code: KeyCode| Event::Key(event::KeyEvent::new(code, KeyModifiers::NONE));
+        app.model = "anthropic/claude-opus-5-5".into();
+        app.input.set("/fast");
+        app.submit().await;
+        // Standard and the one tier Anthropic serves, standard in effect.
+        assert!(app.choosing == Some((Choice::Speed, 0)));
+        assert_eq!(
+            app.speed_rows(),
+            [
+                ("standard", "the model's own speed and price"),
+                ("fast", "faster, at a higher price per token")
+            ]
+        );
+        app.key(key(KeyCode::Down)).await;
+        app.key(key(KeyCode::Enter)).await;
+        assert!(app.choosing.is_none());
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("fast from the next call, at a higher price per token")
+        );
+        assert_eq!(app.speed.as_deref(), Some("fast"));
+        assert!(
+            app.footer_line(200)
+                .spans
+                .iter()
+                .any(|s| s.content.contains("claude-opus-5-5 fast"))
+        );
+        // It opens again on what is in effect.
+        app.input.set("/fast");
+        app.submit().await;
+        assert!(app.choosing == Some((Choice::Speed, 1)));
+        // Enter on it changes nothing; Esc closes the list.
+        app.key(key(KeyCode::Enter)).await;
+        assert_eq!(asked.lock().unwrap().len(), 1);
+        app.input.set("/fast");
+        app.submit().await;
+        app.key(key(KeyCode::Up)).await;
+        app.key(key(KeyCode::Enter)).await;
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("standard speed from the next call")
+        );
+        assert_eq!(app.speed, None);
+        let speeds: Vec<_> = (asked.lock().unwrap().iter())
+            .map(|sent| sent["speed"].clone())
+            .collect();
+        assert_eq!(speeds, [json!("fast"), json!("standard")]);
+        // Nothing to pick where the provider serves standard alone.
+        app.model = "bedrock/anthropic.claude-opus-5-5".into();
+        app.input.set("/fast");
+        app.submit().await;
+        assert!(app.choosing.is_none());
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("bedrock serves its models at standard speed only")
+        );
+        app.model = "openai/gpt-6.1-sol".into();
+        app.input.set("/fast");
+        app.submit().await;
+        assert_eq!(app.speed_rows().len(), 3);
+        app.key(key(KeyCode::Up)).await;
+        app.key(key(KeyCode::Enter)).await;
+        assert_eq!(app.speed.as_deref(), Some("ultrafast"));
+        // Moved meanwhile to a provider serving fewer tiers, the list
+        // takes its last row rather than one that is gone.
+        app.input.set("/fast");
+        app.submit().await;
+        assert!(app.choosing == Some((Choice::Speed, 2)));
+        app.model = "anthropic/claude-opus-5-5".into();
+        app.key(key(KeyCode::Enter)).await;
+        assert!(app.choosing.is_none());
+        assert_eq!(app.speed.as_deref(), Some("fast"));
+    }
+
+    #[tokio::test]
     async fn a_bot_gated_as_sonny_does_not_gets_its_gated_tools_with_a_picked_mode() {
         let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen = asked.clone();
@@ -12611,7 +13206,7 @@ mod tests {
         app.reactions.toggle(1, "🎉").unwrap();
         app.history().await;
         let rows: Vec<String> = app.pending.iter().map(|l| l.to_string()).collect();
-        assert_eq!(rows, ["• Merged it.", "   🎉 ", "", "› what next?"]);
+        assert_eq!(rows, ["• Merged it.", "   🎉 ", "", "", "› what next?", ""]);
         assert_eq!(app.replies, [(1, "Merged it.".to_owned())]);
     }
 
@@ -12771,7 +13366,7 @@ mod tests {
         );
         // The person's own words are drawn as ever.
         app.land(7, "thanks", None, false);
-        assert_eq!(drawn(&mut app).last().unwrap(), "› thanks");
+        assert_eq!(drawn(&mut app).iter().rev().nth(1).unwrap(), "› thanks");
         // A message a page drawn again put in a newer cluster opens there,
         // not in the cluster its rows were let go from.
         app.next_group = 9;

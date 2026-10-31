@@ -3206,6 +3206,7 @@ fn a_bot_keeps_its_settings_and_a_fork_copies_them() {
         keep_turns: Some(1),
         keep_warm: Some(0),
         cache_ttl: Some(CacheTtl::Hour),
+        speed: Some(agent_runtime::provider::Speed::Fast),
         ..Settings::default()
     };
     let (bob, _) = db
@@ -3224,7 +3225,7 @@ fn a_bot_keeps_its_settings_and_a_fork_copies_them() {
         serde_json::to_value(&bob).unwrap()["settings"],
         json!({"context_bytes":4096,"context_items":4096,"note_turns":48,"compact_at":75,
             "compact_keep":25,"compact_tokens":null,"keep_turns":1,"max_rounds":null,"approval_hold_ms":2000,"max_output_tokens":null,
-            "keep_warm":0,"cache_ttl":"1h","sandbox":null,"writable":[],"network":false,"hide_senders":false,"unsandboxed":[]})
+            "keep_warm":0,"cache_ttl":"1h","speed":"fast","sandbox":null,"writable":[],"network":false,"hide_senders":false,"unsandboxed":[]})
     );
     // Retention follows the bot's own setting.
     for n in 1..=3 {
@@ -3243,6 +3244,16 @@ fn a_bot_keeps_its_settings_and_a_fork_copies_them() {
     // A fork is an exact copy, its settings included.
     let fork = db.fork("Bob", "Fork", Fork::default()).unwrap().0;
     assert_eq!(fork.settings, settings);
+    // Back to standard, it holds no speed, as a bot that never chose one.
+    use agent_runtime::provider::Speed;
+    assert!(db.set_speed("Fork", None, Speed::Standard).unwrap());
+    assert_eq!(db.inspect("Fork").unwrap().settings.speed, None);
+    assert!(!db.set_speed("Fork", None, Speed::Standard).unwrap());
+    assert!(db.set_speed("Fork", None, Speed::Ultrafast).unwrap());
+    assert_eq!(
+        serde_json::to_value(db.inspect("Fork").unwrap()).unwrap()["settings"]["speed"],
+        "ultrafast"
+    );
     // A bot that chose nothing follows the defaults and keeps every turn.
     db.create("Plain", Some("/synthetic"), binding()).unwrap();
     for n in 1..=2 {

@@ -56,6 +56,25 @@ impl Pools {
     }
 }
 
+/// Which rate-limit headers a pool learns from: its family's, or those
+/// Anthropic publishes for fast mode, whose limits are its own
+/// (`anthropic-fast-input-tokens-*` and `anthropic-fast-output-tokens-*`,
+/// no request count; its fast-mode page, read 2026-10-30).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Limits {
+    Responses,
+    Anthropic,
+    AnthropicFast,
+}
+impl From<super::Family> for Limits {
+    fn from(family: super::Family) -> Limits {
+        match family {
+            super::Family::Responses => Limits::Responses,
+            super::Family::Anthropic => Limits::Anthropic,
+        }
+    }
+}
+
 /// What one call costs the pool, in the dimensions a provider may limit
 /// separately: total tokens, and the input and output shares of that total.
 /// Responses providers publish only the total; Anthropic publishes all three.
@@ -313,9 +332,9 @@ impl Reservation<'_> {
         self.dispatched = true;
         self.actual = self.estimated;
     }
-    pub fn learn(&mut self, headers: &reqwest::header::HeaderMap, family: super::Family) {
+    pub fn learn(&mut self, headers: &reqwest::header::HeaderMap, limits: impl Into<Limits>) {
         debug_assert!(self.dispatched && !self.reported[TOTAL]);
-        self.reported = self.pace.learn(headers, family, self.estimated, 1);
+        self.reported = self.pace.learn(headers, limits, self.estimated, 1);
         self.request_reported = true;
     }
     /// Final accounting by total tokens; the split is taken as input.
@@ -644,8 +663,8 @@ impl Pace {
     /// Learn the allowance from headers that precede every call they could
     /// count, such as a WebSocket upgrade's. Outstanding reservations stay
     /// reserved and are settled by their own usage.
-    pub fn seed(&self, headers: &reqwest::header::HeaderMap, family: super::Family) {
-        self.learn(headers, family, [0; DIMS], 0);
+    pub fn seed(&self, headers: &reqwest::header::HeaderMap, limits: impl Into<Limits>) {
+        self.learn(headers, limits, [0; DIMS], 0);
     }
     /// Learn the allowance from a response's rate-limit headers, per
     /// dimension the provider publishes. Returns which token dimensions
@@ -657,7 +676,7 @@ impl Pace {
     fn learn(
         &self,
         headers: &reqwest::header::HeaderMap,
-        family: super::Family,
+        limits: impl Into<Limits>,
         estimate: [u64; DIMS],
         request_count: u64,
     ) -> [bool; DIMS] {
@@ -671,8 +690,8 @@ impl Pace {
         // how long a full refill takes; the level itself is what to learn.
         // Blocking until a reset would idle the pool for a minute while the
         // provider was already accepting again.
-        let (requests, tokens): (_, [Option<(f64, f64)>; DIMS]) = match family {
-            super::Family::Responses => (
+        let (requests, tokens): (_, [Option<(f64, f64)>; DIMS]) = match limits.into() {
+            Limits::Responses => (
                 pair(
                     "x-ratelimit-limit-requests",
                     "x-ratelimit-remaining-requests",
@@ -683,7 +702,21 @@ impl Pace {
                     None,
                 ],
             ),
-            super::Family::Anthropic => (
+            Limits::AnthropicFast => (
+                None,
+                [
+                    None,
+                    pair(
+                        "anthropic-fast-input-tokens-limit",
+                        "anthropic-fast-input-tokens-remaining",
+                    ),
+                    pair(
+                        "anthropic-fast-output-tokens-limit",
+                        "anthropic-fast-output-tokens-remaining",
+                    ),
+                ],
+            ),
+            Limits::Anthropic => (
                 pair(
                     "anthropic-ratelimit-requests-limit",
                     "anthropic-ratelimit-requests-remaining",
@@ -1208,6 +1241,33 @@ mod tests {
         tokio::time::advance(Duration::from_secs(6)).await;
         pace.limited(None);
         assert_eq!(left(&pace), 2.0);
+    }
+
+    /// Claude's fast mode publishes its own limits, input and output with
+    /// no request count; its pool learns those and nothing of the standard
+    /// ones, and a standard pool ignores them.
+    #[test]
+    fn a_fast_pool_learns_the_fast_mode_limits_alone() {
+        let published = headers(&[
+            ("anthropic-ratelimit-requests-limit", "50"),
+            ("anthropic-ratelimit-requests-remaining", "50"),
+            ("anthropic-ratelimit-input-tokens-limit", "80000"),
+            ("anthropic-ratelimit-input-tokens-remaining", "80000"),
+            ("anthropic-fast-input-tokens-limit", "30000"),
+            ("anthropic-fast-input-tokens-remaining", "20000"),
+            ("anthropic-fast-output-tokens-limit", "6000"),
+            ("anthropic-fast-output-tokens-remaining", "6000"),
+        ]);
+        let fast = Pace::default();
+        fast.learn(&published, Limits::AnthropicFast, [0; DIMS], 0);
+        let [total, input, output] = fast.split_snapshot();
+        assert_eq!(
+            (total.0, input, output),
+            (None, (Some(30000.0), 20000.0), (Some(6000.0), 6000.0))
+        );
+        let standard = Pace::default();
+        standard.learn(&published, crate::codec::Family::Anthropic, [0; DIMS], 0);
+        assert_eq!(standard.split_snapshot()[INPUT].0, Some(80000.0));
     }
 
     #[tokio::test(start_paused = true)]

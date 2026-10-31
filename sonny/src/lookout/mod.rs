@@ -432,9 +432,11 @@ async fn serve(settings: Settings) -> Result<(), String> {
         cursor: None,
         saved: None,
         goals: goals::Goals::new(&settings.store, &settings.socket),
+        fires: HashMap::new(),
         resume: marks(&settings.store).0,
         replay: marks(&settings.store).1,
         in_flight: HashMap::new(),
+        telling: HashMap::new(),
         reacting: HashMap::new(),
         taken: HashMap::new(),
         watchers: HashMap::new(),
@@ -477,6 +479,15 @@ async fn serve(settings: Settings) -> Result<(), String> {
 }
 
 /// Every subscriber's lookout on one daemon.
+/// A failed fire's note under way.
+struct Telling {
+    note: tokio::task::AbortHandle,
+    /// The cursors of the turn's start and end: the replay that tells it
+    /// again starts before the one and reads the other as news.
+    began: Option<i64>,
+    ended: Option<i64>,
+}
+
 struct Service {
     store: PathBuf,
     /// The sources the person set up, running.
@@ -505,6 +516,13 @@ struct Service {
     saved: Option<(i64, i64)>,
     /// The agents' goals, whose turns it holds until their checks say.
     goals: goals::Goals,
+    /// Turns triggers' fires sent, by agent and turn, each with its
+    /// trigger's generation: one that fails is told (`trigger::tell_failed`).
+    fires: HashMap<(String, i64), String>,
+    /// Failed fires' turns whose note is under way, by agent and turn: held
+    /// as a goal's check is, so a restart or a reconnect before the daemon
+    /// takes the note replays the turn and tells it again, not never.
+    telling: HashMap<(String, i64), Telling>,
     /// Where the last lookout left off: events after it are news.
     resume: Option<i64>,
     /// Where the last lookout's stream starts again: before the oldest turn
@@ -747,6 +765,12 @@ impl Service {
             lookout.updates.replies_dropped();
         }
         self.goals.reconnected();
+        // Notes under way answer the old connection: the replay tells them
+        // again.
+        for (_, telling) in self.telling.drain() {
+            telling.note.abort();
+        }
+        let (told, mut taken) = tokio::sync::mpsc::channel(64);
         let (done, mut results) = tokio::sync::mpsc::channel(64);
         // What the daemon answered a note or a status check: beside the
         // stream, so no call to it ever holds the events up.
@@ -828,6 +852,28 @@ impl Service {
                     let bot_id = (event["bot"].as_str())
                         .and_then(|bot| self.records.get(bot))
                         .and_then(|record| record["bot_id"].as_i64());
+                    if let Some((generation, bot, turn, error)) = self.fired(&event, live)
+                        && let Some(store) = client.store().map(str::to_owned)
+                    {
+                        let (client, told) = (client.clone(), told.clone());
+                        let key = (bot.clone(), turn);
+                        let note = tokio::spawn(async move {
+                            let sent = crate::trigger::tell_failed(&client, &store, &generation, (&bot, bot_id, turn), &error)
+                                .await;
+                            // Taken, or refused for good: a dropped
+                            // connection's replay tells it again.
+                            if sent.is_err_and(|error| error.code == "daemon_disconnected") {
+                                return;
+                            }
+                            let _ = told.send((bot, turn)).await;
+                        });
+                        let telling = Telling {
+                            note: note.abort_handle(),
+                            began: self.in_flight.get(&key).copied(),
+                            ended: cursor,
+                        };
+                        self.telling.insert(key, telling);
+                    }
                     if let Some((bot, turn)) = self.goals.event(&event, bot_id, live, &client, &checked) {
                         for lookout in self.lookouts.values_mut() {
                             lookout.updates.goal_turn(&bot, turn);
@@ -839,7 +885,12 @@ impl Service {
                     let hearing = self.hearing(&event);
                     if let (Some(bot), Some(turn)) = (event["bot"].as_str(), event["turn"].as_i64()) {
                         match event["event"].as_str() {
-                            Some("accepted" | "queued") if !hearing.is_empty() => {
+                            // A fire's turn too, so a restart still sees
+                            // it end.
+                            Some("accepted" | "queued")
+                                if !hearing.is_empty()
+                                    || self.fires.contains_key(&(bot.to_owned(), turn)) =>
+                            {
                                 if let Some(at) = cursor {
                                     self.in_flight.entry((bot.to_owned(), turn)).or_insert(at);
                                 }
@@ -883,6 +934,9 @@ impl Service {
                         continue;
                     }
                     touched = Some(hearing);
+                }
+                Some(key) = taken.recv() => {
+                    self.telling.remove(&key);
                 }
                 Some(settled) = settled.recv() => {
                     self.goals.settled(&settled, &client, &checked);
@@ -954,6 +1008,33 @@ impl Service {
                 lookout.wake(&client, &woken);
                 lookout.wake_sources(&client, &woken);
             }
+        }
+    }
+
+    /// A turn a trigger's fire sent, noted as it starts; once it ends
+    /// failed, while live, its trigger's generation, agent, turn and why,
+    /// for the agent to be told. A model that said nothing did not fail.
+    fn fired(&mut self, event: &Value, live: bool) -> Option<(String, String, i64, String)> {
+        let (bot, turn) = (event["bot"].as_str()?, event["turn"].as_i64()?);
+        let data = &event["data"];
+        match event["event"].as_str()? {
+            "accepted" | "queued" => {
+                let generation = crate::trigger::fire_generation(data["request_id"].as_str()?)?;
+                // Bounded: a turn whose end was never seen is let go.
+                if self.fires.len() >= FIRES {
+                    self.fires.clear();
+                }
+                self.fires
+                    .insert((bot.to_owned(), turn), generation.to_owned());
+                None
+            }
+            "turn_finished" => {
+                let generation = self.fires.remove(&(bot.to_owned(), turn))?;
+                let error = data["error"].as_str().unwrap_or("no reason given");
+                (live && data["status"] == "failed" && error != "empty_completion")
+                    .then(|| (generation, bot.to_owned(), turn, error.to_owned()))
+            }
+            _ => None,
         }
     }
 
@@ -1290,8 +1371,9 @@ impl Service {
         }
     }
 
-    /// Up to just before the oldest news a lookout has not told, or the
-    /// oldest turn whose goal's check runs, which a restart or a reconnect
+    /// Up to just before the oldest news a lookout has not told, the
+    /// oldest turn whose goal's check runs, or the oldest failed fire whose
+    /// note is under way, which a restart or a reconnect
     /// takes up again: news only in memory, or a read or check a dropped
     /// connection cut short, is told or run again, not lost.
     fn floor(&mut self) -> Option<i64> {
@@ -1302,6 +1384,7 @@ impl Service {
         }
         let floor = (self.lookouts.values().filter_map(|l| l.from))
             .chain(self.goals.floor())
+            .chain(self.telling.values().filter_map(|telling| telling.ended))
             .min();
         match (self.cursor, floor) {
             (Some(at), Some(floor)) => Some(at.min(floor - 1)),
@@ -1328,9 +1411,13 @@ impl Service {
         }
     }
 
-    /// Just before the oldest turn under way that a lookout hears.
+    /// Just before the oldest turn under way that a lookout hears, or
+    /// whose failed fire's note is: its start says which trigger sent it.
     fn replay_floor(&self) -> Option<i64> {
-        self.in_flight.values().min().map(|at| at - 1)
+        (self.in_flight.values().copied())
+            .chain(self.telling.values().filter_map(|telling| telling.began))
+            .min()
+            .map(|at| at - 1)
     }
 }
 
@@ -1355,6 +1442,9 @@ fn cursor_path(store: &Path) -> PathBuf {
 /// they call, and each model call's usage, which says a quiet turn still
 /// works. The text a model streams, most of all events, is no one's news
 /// here.
+/// The most fires' turns noted at once.
+const FIRES: usize = 4096;
+
 const KINDS: [&str; 14] = [
     "created",
     "configured",
@@ -2781,6 +2871,62 @@ mod tests {
         assert!(lookout.watches("r.a") && lookout.watches("r.b"));
     }
 
+    #[tokio::test]
+    async fn a_fires_turn_that_failed_is_told_once_its_end_is_news() {
+        let mut service = service(PathBuf::from("/nonexistent"), &[]);
+        let fire = |turn| json!({"request_id": format!("trigger_12-34_9.1.2.{turn}")});
+        let failed = json!({"status": "failed", "error": "provider_error"});
+        // Its own turn, then a failed end: told, once.
+        assert_eq!(
+            service.fired(&ev("calc.lead", 4, "accepted", fire(4)), true),
+            None
+        );
+        assert_eq!(
+            service.fired(&ev("calc.lead", 4, "turn_finished", failed.clone()), true),
+            Some((
+                "12-34".into(),
+                "calc.lead".into(),
+                4,
+                "provider_error".into()
+            ))
+        );
+        assert_eq!(
+            service.fired(&ev("calc.lead", 4, "turn_finished", failed.clone()), true),
+            None
+        );
+        // A completed one, one that said nothing, the replay's: not told.
+        for (turn, end, live) in [
+            (5, json!({"status": "completed"}), true),
+            (
+                6,
+                json!({"status": "failed", "error": "empty_completion"}),
+                true,
+            ),
+            (7, failed.clone(), false),
+        ] {
+            service.fired(&ev("calc.lead", turn, "queued", fire(turn)), live);
+            assert_eq!(
+                service.fired(&ev("calc.lead", turn, "turn_finished", end), live),
+                None
+            );
+        }
+        // Nor a turn no fire sent, nor the answer one passes on.
+        service.fired(
+            &ev("calc.lead", 8, "accepted", json!({"request_id": "tui-1"})),
+            true,
+        );
+        assert_eq!(
+            service.fired(&ev("calc.lead", 8, "turn_finished", failed.clone()), true),
+            None
+        );
+        let reply = json!({"request_id": "trigger_12-34_reply.3.9"});
+        service.fired(&ev("calc.lead", 9, "queued", reply), true);
+        assert_eq!(
+            service.fired(&ev("calc.lead", 9, "turn_finished", failed), true),
+            None
+        );
+    }
+
     fn service(store: PathBuf, records: &[Value]) -> Service {
         Service {
             runner: sources::Runner::new(store.join("sources"), tokio::sync::mpsc::channel(1).0),
@@ -2800,11 +2946,13 @@ mod tests {
             resume: None,
             replay: None,
             in_flight: HashMap::new(),
+            telling: HashMap::new(),
             reacting: HashMap::new(),
             taken: HashMap::new(),
             watchers: HashMap::new(),
             started: false,
             goals: goals::Goals::new(Path::new("/nonexistent"), Path::new("")),
+            fires: HashMap::new(),
         }
     }
 
@@ -3117,8 +3265,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_stream_starts_again_before_the_oldest_turn_still_under_way() {
+    #[tokio::test]
+    async fn the_stream_starts_again_before_the_oldest_turn_still_under_way() {
         let dir = std::env::temp_dir().join(format!("lookout-marks-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let store = dir.join("state.sqlite");
@@ -3130,6 +3278,20 @@ mod tests {
         assert_eq!(marks(&store), (Some(90), Some(39)));
         // Nothing under way: it starts again where its news ended.
         service.in_flight.clear();
+        service.save_cursor();
+        assert_eq!(marks(&store), (Some(90), Some(90)));
+        // A failed fire whose note is under way is told again from its
+        // start: its end is news and its start names its trigger.
+        let telling = Telling {
+            note: tokio::spawn(async {}).abort_handle(),
+            began: Some(30),
+            ended: Some(50),
+        };
+        service.telling.insert(("calc.fix".into(), 7), telling);
+        service.save_cursor();
+        assert_eq!(marks(&store), (Some(49), Some(29)));
+        // The daemon took it: nothing holds the stream.
+        service.telling.clear();
         service.save_cursor();
         assert_eq!(marks(&store), (Some(90), Some(90)));
         std::fs::write(cursor_path(&store), "12").unwrap();

@@ -225,7 +225,11 @@ class AcpTests(ModelFixture):
         self.assertEqual(answered['result']['stopReason'], 'end_turn')
         self.assertTrue([u for u in updates if u['sessionUpdate'] == 'agent_message_chunk'])
         kept = self.path / '.agent/sonny/t3/sessions' / child_session
-        self.assertEqual(kept.read_text(), 'calc.fix')
+        fix = self.daemon.request('inspect', bot='calc.fix')['result']
+        # The thread is the task by its identity and store, not its name alone.
+        pinned = json.loads(kept.read_text())
+        self.assertEqual((pinned['bot'], pinned['bot_id']), ('calc.fix', fix['bot_id']))
+        self.assertRegex(pinned['store'], '^[0-9a-f]{16}$')
         self.assertEqual([b['name'] for b in self.daemon.request('bots')['result']['bots']],
                          ['calc.fix', 'calc.lead'])
         # T3 Code tells the lead's thread its child ended; the lead hears of
@@ -383,6 +387,32 @@ class AcpTests(ModelFixture):
         self.assertIn('result', self.daemon.request('delete', bot='calc.lead'))
         fifth, session = self.open(repo)
         self.adopt(fifth, session, 'again')
+
+    def resume(self, cwd, session):
+        thread = Thread(self, self.env, cwd)
+        thread.answer_of(thread.ask('initialize', {'protocolVersion': 2, 'clientCapabilities': {}}))
+        answered, _ = thread.answer_of(thread.ask('session/resume', {'sessionId': session, 'cwd': str(cwd),
+                                                                      'mcpServers': []}))
+        thread.close()
+        return answered
+
+    def test_a_thread_comes_back_as_its_bot_and_not_another_made_under_its_name(self):
+        repo = self.repo()
+        made = {'workspace': str(repo), 'model': 'openai/synthetic-model', 'instructions': 'Lead.'}
+        self.daemon.request('create', bot='calc.lead', **made)
+        thread, session = self.open(repo)
+        self.adopt(thread, session)
+        thread.close()
+        self.assertIn('result', self.resume(repo, session))
+        # The lead removed and another made under its name: the thread is
+        # neither, and is refused rather than bound to the new one.
+        self.assertIn('result', self.daemon.request('delete', bot='calc.lead'))
+        deadline = time.monotonic() + 10
+        while 'error' in self.daemon.request('create', bot='calc.lead', **made):
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.05)
+        refused = self.resume(repo, session)
+        self.assertIn('calc.lead is gone', refused['error']['message'])
 
     def test_a_thread_sonny_does_not_know_does_not_come_back(self):
         repo = self.repo()
