@@ -998,6 +998,8 @@ failure.
 
 ![The steer opened to what it told calc.neg](../docs/sonny/agent-call-opened.png)
 
+![A commons reply that rode along hanging as a 📎 row under the person's message, and an automation's under the step its call joined](../docs/sonny/attached-notes.png)
+
 ![Three task updates in a row gathered into one row that names the tasks](../docs/sonny/task-updates-gathered.png)
 
 ![That row opened: each update one row of its own](../docs/sonny/task-updates-listed.png)
