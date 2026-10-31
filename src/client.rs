@@ -586,6 +586,13 @@ impl Connection {
             .enable_time()
             .build()?
             .block_on(async {
+                // In a Linux sandbox, the connection the daemon hands this
+                // command.
+                if let Some(stream) = agent_client::socket::handed(socket)
+                    .map_err(|e| Error::with("daemon_unavailable", e.to_string()))?
+                {
+                    return Ok(stream);
+                }
                 tokio::time::timeout_at(deadline.into(), tokio::net::UnixStream::connect(socket))
                     .await
                     .map_err(|_| Error::new("daemon_start_timeout"))?

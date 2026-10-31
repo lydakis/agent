@@ -838,13 +838,204 @@ mod linux {
         rest: &[&str],
         detached: bool,
     ) -> Result<tokio::process::Command> {
+        use std::os::fd::AsRawFd;
         let mut command = tokio::process::Command::new(checked()?);
+        let filter = loaded(&filter(policy)?)?;
         command
             .args(args(policy, detached))
-            .arg("--")
-            .arg(program)
-            .args(rest);
+            .arg("--seccomp")
+            .arg(filter.as_raw_fd().to_string());
+        let mut kept = vec![filter];
+        if let Some(handing) = (policy.capability.as_deref().map(handing).transpose()?).flatten() {
+            command.env(
+                agent_client::socket::HANDED,
+                handing.as_raw_fd().to_string(),
+            );
+            kept.push(handing);
+        }
+        command.arg("--").arg(program).args(rest);
+        // SAFETY: fcntl is async-signal-safe; it only lets the descriptors
+        // through exec, into bubblewrap and the command.
+        unsafe {
+            command.pre_exec(move || {
+                for fd in &kept {
+                    if libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, 0) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                Ok(())
+            });
+        }
         Ok(command)
+    }
+
+    /// The seccomp filter bubblewrap loads, as Codex's Linux sandbox and
+    /// Claude Code's build theirs: what no path rule can hold. A command
+    /// makes no Unix socket, since bubblewrap's read-only root still lets
+    /// one connect to any it sees, the daemon's, Docker's or a desktop
+    /// session's bus that runs anything asked; one that names some is
+    /// let make them all, since seccomp can't tell them apart by path, as
+    /// Claude Code's `allowAllUnixSockets`. A pair (socketpair) it still
+    /// makes, which reaches nothing. io_uring, which makes sockets past
+    /// seccomp, it never sets up. Any other architecture's calls, which
+    /// number them otherwise, end the command.
+    pub(super) fn filter(policy: &Policy) -> Result<Vec<u8>> {
+        use seccompiler::{
+            BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition,
+            SeccompFilter, SeccompRule, TargetArch,
+        };
+        let invalid = |error: &dyn std::fmt::Display| {
+            Error::with("sandbox_unavailable", format!("seccomp filter: {error}"))
+        };
+        let arch = TargetArch::try_from(std::env::consts::ARCH).map_err(|e| invalid(&e))?;
+        let unix = SeccompRule::new(vec![
+            SeccompCondition::new(
+                0,
+                SeccompCmpArgLen::Dword,
+                SeccompCmpOp::Eq,
+                libc::AF_UNIX as u64,
+            )
+            .map_err(|e| invalid(&e))?,
+        ])
+        .map_err(|e| invalid(&e))?;
+        // A pair of datagram sockets, which Linux makes of a raw one too,
+        // sends to any socket's path, not only to its other end.
+        let datagrams = [libc::SOCK_DGRAM, libc::SOCK_RAW].map(|kind| {
+            SeccompRule::new(vec![
+                SeccompCondition::new(
+                    0,
+                    SeccompCmpArgLen::Dword,
+                    SeccompCmpOp::Eq,
+                    libc::AF_UNIX as u64,
+                )?,
+                SeccompCondition::new(
+                    1,
+                    SeccompCmpArgLen::Dword,
+                    SeccompCmpOp::MaskedEq(0xf),
+                    kind as u64,
+                )?,
+            ])
+        });
+        let datagrams = (datagrams.into_iter())
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| invalid(&e))?;
+        let mut rules = std::collections::BTreeMap::new();
+        rules.insert(libc::SYS_io_uring_setup, Vec::new());
+        if policy.sockets.is_empty() {
+            rules.insert(libc::SYS_socket, vec![unix.clone()]);
+            rules.insert(libc::SYS_socketpair, datagrams.clone());
+        }
+        // x86_64's x32 calls share its architecture, numbered past this bit.
+        if arch == TargetArch::x86_64 {
+            const X32: i64 = 0x4000_0000;
+            rules.insert(X32 | libc::SYS_io_uring_setup, Vec::new());
+            if policy.sockets.is_empty() {
+                rules.insert(X32 | libc::SYS_socket, vec![unix]);
+                rules.insert(X32 | libc::SYS_socketpair, datagrams);
+            }
+        }
+        let filter = SeccompFilter::new(
+            rules,
+            SeccompAction::Allow,
+            SeccompAction::Errno(libc::EPERM as u32),
+            arch,
+        )
+        .map_err(|e| invalid(&e))?;
+        let program: BpfProgram = filter.try_into().map_err(|e| invalid(&e))?;
+        Ok((program.iter())
+            .flat_map(|instruction| {
+                let mut bytes = Vec::with_capacity(8);
+                bytes.extend(instruction.code.to_ne_bytes());
+                bytes.push(instruction.jt);
+                bytes.push(instruction.jf);
+                bytes.extend(instruction.k.to_ne_bytes());
+                bytes
+            })
+            .collect())
+    }
+
+    /// `program` behind a pipe's read end, for bubblewrap's `--seccomp`.
+    fn loaded(program: &[u8]) -> Result<std::os::fd::OwnedFd> {
+        use std::io::Write;
+        let (read, write) = std::io::pipe()?;
+        // A filter is far smaller than a pipe holds, so this never waits.
+        std::fs::File::from(std::os::fd::OwnedFd::from(write)).write_all(program)?;
+        Ok(read.into())
+    }
+
+    /// The descriptor a command asks the daemon for connections on, as
+    /// [`agent_client::socket::handed`] does: each request is answered
+    /// with a connection the daemon opens to the bot's own socket, `own`,
+    /// for as long as any process of the command holds it. Without a
+    /// runtime to answer on, none.
+    fn handing(own: &Path) -> Result<Option<std::os::fd::OwnedFd>> {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return Ok(None);
+        };
+        let mut pair = [0; 2];
+        // SAFETY: socketpair writes two descriptors into `pair`.
+        if unsafe {
+            libc::socketpair(
+                libc::AF_UNIX,
+                libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+                0,
+                pair.as_mut_ptr(),
+            )
+        } < 0
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        // SAFETY: both are new and owned here alone.
+        let (ours, theirs) =
+            unsafe { (OwnedFd::from_raw_fd(pair[0]), OwnedFd::from_raw_fd(pair[1])) };
+        // The command's end blocks; each asker waits on it as it chooses.
+        // SAFETY: fcntl on a descriptor owned here.
+        unsafe {
+            let flags = libc::fcntl(theirs.as_raw_fd(), libc::F_GETFL);
+            libc::fcntl(theirs.as_raw_fd(), libc::F_SETFL, flags & !libc::O_NONBLOCK);
+        }
+        let ours = tokio::io::unix::AsyncFd::new(ours)?;
+        let own = own.to_owned();
+        runtime.spawn(async move {
+            let mut byte = [0u8; 1];
+            loop {
+                let Ok(mut ready) = ours.readable().await else {
+                    return;
+                };
+                // SAFETY: the byte outlives the call.
+                let read = unsafe {
+                    libc::recv(
+                        ours.get_ref().as_raw_fd(),
+                        byte.as_mut_ptr().cast(),
+                        1,
+                        libc::MSG_DONTWAIT,
+                    )
+                };
+                match read {
+                    // Every process of the command has let it go.
+                    0 => return,
+                    n if n < 0 => {
+                        match std::io::Error::last_os_error().kind() {
+                            std::io::ErrorKind::WouldBlock => ready.clear_ready(),
+                            std::io::ErrorKind::Interrupted => {}
+                            _ => return,
+                        }
+                        continue;
+                    }
+                    _ => {}
+                }
+                // Handed blocking, as a connection made in the command
+                // would be: the description is shared, and its flags with it.
+                let stream = (tokio::net::UnixStream::connect(&own).await)
+                    .and_then(tokio::net::UnixStream::into_std)
+                    .and_then(|stream| stream.set_nonblocking(false).map(|()| stream))
+                    .ok();
+                let fd = ours.get_ref().as_raw_fd();
+                let _ = agent_client::socket::hand(fd, stream.as_ref().map(|s| s.as_raw_fd()));
+            }
+        });
+        Ok(Some(theirs))
     }
 }
 

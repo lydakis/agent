@@ -686,7 +686,9 @@ async fn a_sandboxed_command_writes_only_its_roots() {
 }
 
 /// The daemon's socket is out of reach from inside a sandbox, network on
-/// or off, as Codex keeps its own.
+/// or off, as Codex keeps its own, and so is every other Unix socket, even
+/// one in its folder: the command makes none. It reaches the daemon only
+/// by the connections handed it, each to its bot's own socket.
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn a_sandboxed_command_cannot_reach_the_daemon_socket() {
@@ -700,14 +702,46 @@ async fn a_sandboxed_command_cannot_reach_the_daemon_socket() {
     std::fs::create_dir_all(&base).unwrap();
     let socket = base.join("agent.sock");
     let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let mine = base.join("mine.sock");
+    let _mine = std::os::unix::net::UnixListener::bind(&mine).unwrap();
     let tools = Registry::new("shell").unwrap();
-    let connect = format!(
-        "python3 -c 'import socket; socket.socket(socket.AF_UNIX).connect(\"{}\")'",
-        socket.display()
-    );
-    let run = |sandbox: Option<Policy>| {
+    let to = |path: &std::path::Path| {
+        format!(
+            "python3 -c 'import socket; socket.socket(socket.AF_UNIX).connect(\"{}\")'",
+            path.display()
+        )
+    };
+    let datagrams = base.join("datagrams.sock");
+    let datagram = std::os::unix::net::UnixDatagram::bind(&datagrams).unwrap();
+    datagram.set_nonblocking(true).unwrap();
+    std::fs::write(
+        base.join("handed.py"),
+        "import os, socket\n\
+         asked = socket.socket(fileno=int(os.environ['AGENT_SOCKET_FD']))\n\
+         asked.send(b'?')\n\
+         _, fds, _, _ = socket.recv_fds(asked, 1, 1)\n\
+         socket.socket(fileno=fds[0]).send(b'hi')\n",
+    )
+    .unwrap();
+    std::fs::write(
+        base.join("pair.py"),
+        format!(
+            "import socket, sys\n\
+             kind = getattr(socket, sys.argv[1])\n\
+             a, b = socket.socketpair(socket.AF_UNIX, kind)\n\
+             a.send(b'x'); assert b.recv(1) == b'x'\n\
+             if kind == socket.SOCK_DGRAM: a.sendto(b'x', '{}')\n",
+            datagrams.display()
+        ),
+    )
+    .unwrap();
+    let handed = "python3 handed.py";
+    // A launcher that closes what it didn't open keeps it when told.
+    let launched = "python3 -c 'import os, subprocess; subprocess.run([\"python3\", \"handed.py\"], \
+        pass_fds=[int(os.environ[\"AGENT_SOCKET_FD\"])], check=True)'";
+    let run = |sandbox: Option<Policy>, connect: String| {
         let tools = tools.clone();
-        let (base, connect) = (base.clone(), connect.clone());
+        let base = base.clone();
         async move {
             let prepared = tools
                 .prepare("shell", &json!({"command": connect}).to_string())
@@ -720,7 +754,9 @@ async fn a_sandboxed_command_cannot_reach_the_daemon_socket() {
             serde_json::from_str::<Value>(&output).unwrap()["exit_code"].clone()
         }
     };
-    assert_eq!(run(None).await, 0);
+    assert_eq!(run(None, to(&socket)).await, 0);
+    assert_eq!(run(None, "python3 pair.py SOCK_DGRAM".into()).await, 0);
+    assert!(datagram.recv(&mut [0u8; 1]).is_ok());
     for network in [false, true] {
         let daemon = Daemon {
             socket: Some(socket.clone()),
@@ -735,9 +771,25 @@ async fn a_sandboxed_command_cannot_reach_the_daemon_socket() {
         )
         .unwrap()
         .unwrap();
-        assert_ne!(run(Some(policy.clone())).await, 0, "network {network}");
+        assert_ne!(
+            run(Some(policy.clone()), to(&socket)).await,
+            0,
+            "network {network}"
+        );
+        assert_ne!(
+            run(Some(policy.clone()), to(&mine)).await,
+            0,
+            "network {network}"
+        );
+        // A pair of sockets is the command's own, but a pair of datagram
+        // sockets, which would send to any socket's path, it doesn't make.
+        let pair = |kind: &str| format!("python3 pair.py {kind}");
+        assert_eq!(run(Some(policy.clone()), pair("SOCK_STREAM")).await, 0);
+        assert_eq!(run(Some(policy.clone()), pair("SOCK_SEQPACKET")).await, 0);
+        assert_ne!(run(Some(policy.clone()), pair("SOCK_DGRAM")).await, 0);
+        assert!(datagram.recv(&mut [0u8; 1]).is_err());
         // With the bot's own socket, laid out as the daemon lays them out,
-        // the daemon's path reaches that one.
+        // the command is handed connections to that one, and only those.
         let folder = base.join(format!("agent.sock.d-{network}"));
         std::fs::create_dir_all(&folder).unwrap();
         let own = folder.join("1");
@@ -747,8 +799,33 @@ async fn a_sandboxed_command_cannot_reach_the_daemon_socket() {
             capability: Some(own),
             ..policy
         };
-        assert_eq!(run(Some(policy)).await, 0, "network {network}");
-        assert!(listener.accept().is_ok());
+        assert_ne!(
+            run(Some(policy.clone()), to(&socket)).await,
+            0,
+            "network {network}"
+        );
+        assert!(listener.accept().is_err());
+        assert_eq!(
+            run(Some(policy.clone()), handed.into()).await,
+            0,
+            "network {network}"
+        );
+        assert_eq!(
+            run(Some(policy.clone()), launched.into()).await,
+            0,
+            "network {network}"
+        );
+        for _ in 0..2 {
+            let (mut accepted, _) = listener.accept().unwrap();
+            accepted.set_nonblocking(false).unwrap();
+            let mut said = [0u8; 2];
+            std::io::Read::read_exact(&mut accepted, &mut said).unwrap();
+            assert_eq!(&said, b"hi");
+        }
+        // A bot that names a socket reaches every one, as seccomp can't
+        // tell them apart.
+        let naming = policy.with_sockets(&[mine.display().to_string()]);
+        assert_eq!(run(Some(naming), to(&mine)).await, 0, "network {network}");
     }
     std::fs::remove_dir_all(base).unwrap();
 }
