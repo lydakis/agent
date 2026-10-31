@@ -494,8 +494,8 @@ way `/react` does, and each note in the margin has its own `↩`.
   serves standard alone, as Bedrock does for Claude, says so instead.
 
   ![/fast: standard in effect, fast and ultrafast with what each costs](../docs/sonny/fast-mode-menu.png)
-- `/compact` summarizes the lead's conversation before its next model
-  call: at the running turn's next step, or before an idle lead's next
+- `/compact` asks first, then summarizes the lead's conversation before
+  its next model call: at the running turn's next step, or before an idle lead's next
   reply. The daemon also compacts on its own once a call's input reaches
   the bot's `compact_tokens`, which follows the model's context window
   unless set (900,000 tokens on a 1M window).
@@ -1054,11 +1054,11 @@ more often and more lately come first (each run counts half as much a
 week on, kept in `~/.agent/sonny/picks.json`), so once you use `/commons`
 more than `/compact`, `/co` and Enter opens `/commons`.
 
-Enter runs the command marked, even on part of its name, except
-`/compact`, which can't be taken back: on part of its name Enter fills it
-in, and a second Enter runs it. The key line says which Enter will do.
+Enter runs the command marked, even on part of its name. `/compact`, which
+can't be undone, then asks first: Enter compacts, any other key keeps the
+conversation.
 
-![/co with /compact marked: the keys read enter complete, again run; Enter put /compact in the composer and the keys now read enter run](../docs/sonny/slash-compact-whole.png)
+![/co with /compact marked, then /compact asking: compact the lead's conversation? It can't be undone · enter compact · esc cancel](../docs/sonny/slash-compact-confirm.png)
 
 ![/co after /commons was run: /commons ranks first; /cms finds /commons with c, m and s in bold](../docs/sonny/slash-ranked-fuzzy.png)
 
