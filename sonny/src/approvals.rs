@@ -112,29 +112,12 @@ fn sandbox_with(
     }
 }
 
-/// The tools Sonny ships that keep a daemon of their own, which a sandbox
-/// can't hold: agent-browser drives a browser from one.
-pub const SHIPPED_UNSANDBOXED: [&str; 1] = ["agent-browser"];
-
-/// The commands agents run outside their sandboxes: the tools Sonny ships
-/// that need it, then those the person's config names, read as none when
-/// it can't be, which Sonny reports on start.
+/// The commands the person's config lets agents run outside their
+/// sandboxes; none when it can't be read, which Sonny reports on start.
 pub fn unsandboxed() -> Vec<String> {
-    let named = agent_client::config::load()
+    agent_client::config::load()
         .map(|config| config.sonny.unsandboxed)
-        .unwrap_or_default();
-    with_shipped(named)
-}
-
-/// `named` after [`SHIPPED_UNSANDBOXED`], each once.
-fn with_shipped(named: Vec<String>) -> Vec<String> {
-    let mut commands: Vec<String> = SHIPPED_UNSANDBOXED.map(str::to_owned).into();
-    for command in named {
-        if !commands.contains(&command) {
-            commands.push(command);
-        }
-    }
-    commands
+        .unwrap_or_default()
 }
 
 /// The git folder of the repository `dir` is in, which its linked
@@ -365,12 +348,6 @@ mod tests {
             sandbox_with("full", &dir, &["mcpx".to_owned()])
                 .get("unsandboxed")
                 .is_none()
-        );
-        // What Sonny ships comes first, and a name the config repeats
-        // counts once.
-        assert_eq!(
-            with_shipped(vec!["mcpx".into(), "agent-browser".into()]),
-            ["agent-browser", "mcpx"]
         );
         // Outside a repository, only its own folder; with a git folder
         // named otherwise, whose hooks the daemon wouldn't know to keep,

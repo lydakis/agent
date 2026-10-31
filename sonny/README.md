@@ -528,8 +528,8 @@ way `/react` does, and each note in the margin has its own `↩`.
   runs it outside without asking, as a Codex rule that allows a command
   does. Each entry is a command's first words (`"docker compose"`), and a
   call runs outside only when everything it runs is named, so
-  `mcpx … | jq` still asks. agent-browser, which Sonny ships, is on the
-  list already. Sonny gives a lead the list again when it opens it.
+  `mcpx … | jq` still asks. Sonny gives a lead the list again when it opens
+  it.
 - `/retry` lists the calls the reviewer denied while Sonny watched, with
   the reason for each. Enter writes the call out whole, and a second
   Enter sends your approval of that exact call as your own message, so
