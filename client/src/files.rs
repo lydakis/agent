@@ -16,17 +16,22 @@ pub fn replace_mode(path: &Path, text: &[u8], mode: u32) -> Result<(), String> {
         std::process::id()
     ));
     let written = (|| {
+        // Made anew, never through what is there: the folder may be one a
+        // sandboxed agent writes, which could leave a link by that name to
+        // any file. An old temporary of this pid goes first; one made
+        // since fails the write.
+        match std::fs::remove_file(&temporary) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+            _ => {}
+        }
         let mut file = std::fs::OpenOptions::new()
             .write(true)
-            .create(true)
-            .truncate(true)
+            .create_new(true)
+            .custom_flags(libc::O_NOFOLLOW)
             .mode(mode)
             .open(&temporary)?;
-        // An old temporary of this pid may carry another mode.
-        std::fs::set_permissions(
-            &temporary,
-            std::os::unix::fs::PermissionsExt::from_mode(mode),
-        )?;
+        // Past the umask, on the file opened, not on its name.
+        file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(mode))?;
         file.write_all(text)?;
         file.sync_all()?;
         std::fs::rename(&temporary, path)?;
@@ -80,5 +85,28 @@ fn real_within(path: &Path, links: u32) -> Option<PathBuf> {
         }
         rest.push(name);
         existing = existing.parent()?.to_owned();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_link_left_by_the_temporary_s_name_is_never_written_through() {
+        let dir = std::env::temp_dir().join(format!("agent-replace-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let outside = dir.join("outside");
+        std::fs::write(&outside, "kept").unwrap();
+        let path = dir.join("focus");
+        let temporary = dir.join(format!(".focus.{}", std::process::id()));
+        std::os::unix::fs::symlink(&outside, &temporary).unwrap();
+        replace_mode(&path, b"the tests", 0o600).unwrap();
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "kept");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "the tests");
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

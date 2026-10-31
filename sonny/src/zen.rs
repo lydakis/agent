@@ -46,6 +46,20 @@ fn file(home: &Path, key: &str) -> Option<PathBuf> {
         .then(|| home.join(".agent/sonny/zen").join(key))
 }
 
+/// The folder of every agent's focus, made when missing: one a sandboxed
+/// agent may write, so `sonny zen` works from its shell. Only foci are kept
+/// there.
+pub fn folder() -> Option<PathBuf> {
+    use std::os::unix::fs::DirBuilderExt;
+    let folder = home()?.join(".agent/sonny/zen");
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&folder)
+        .ok()?;
+    Some(folder)
+}
+
 #[cfg(not(test))]
 fn home() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
