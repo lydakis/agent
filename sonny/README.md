@@ -364,8 +364,8 @@ which bot, by its identity and its store, is kept in `~/.agent/sonny/t3`, so
 a thread T3 Code resumes is the same bot or none: one removed and made again
 under its name, or a bot of another store, is refused, and each prompt names
 the bot's identity, so one sent after such a swap reaches neither. T3 Code's model picker lists what the providers list, as `/model`
-does, each by the name its provider lists (else its id) beside the provider,
-as "Global Claude Opus 5.5 · bedrock", with the full id and
+does, each by the name its provider lists (else the name Sonny gives it, as
+people say it) beside the provider, as "Global Claude Opus 5.5 · bedrock", with the full id and
 `~/.agent/models`' notes, and the models only that file names, after
 "Default", the model the lead or task runs; its effort picker lists the
 family's efforts after "Default" too. A pick made before the first prompt is
@@ -504,7 +504,8 @@ way `/react` does, and each note in the margin has its own `↩`.
 
   ![/config over the composer, side_chat set to fork](../docs/sonny/config.png)
 - `/model` picks the lead's model, from every model its provider family
-  lists, and its effort (←/→), and writes them to the project's
+  lists, each by its name and provider (`Opus 5.5 · bedrock`) with its id
+  muted after them, found by either, and its effort (←/→), and writes them to the project's
   `.agents/project.toml` when the folder has one. A pick made while a turn
   runs shows in the footer and applies when the lead is idle; one that
   another client overtakes is dropped.
@@ -662,7 +663,9 @@ way `/react` does, and each note in the margin has its own `↩`.
   the tokens the project's agents spent in the last 24 hours, as their
   retained history records them: in all, as
   stacked bars over time (output, input read fresh, and input read from the
-  provider's cache), by agent and by model. `d`, `w` and `m` show the last
+  provider's cache), by agent and by model: each model by its name, its
+  provider in a muted column beside it, and one model's ids from one
+  provider (two Bedrock regions', say) on one row. `d`, `w` and `m` show the last
   day, week or month, `a` every agent in the store, by project, and `c`
   hides the cached reads, so what the provider charges most for stands out.
   A turn counts where it started. It reads again every minute.
