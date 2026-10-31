@@ -1044,14 +1044,15 @@ recorded and wait, triggers and notes with them, and parked and paced turns
 stay parked. An `attach` is taken as usual. The answer is `{pause, changed,
 interrupted}`, where `pause` is `{reason, by, at_ms}`. While a pause holds,
 another changes nothing and answers the first with `changed: false`.
-`{"op":"resume"}` lifts it and answers `{pause, changed}` with the pause it
-lifted, or null when none held; what waited starts as capacity allows. A
+`{"op":"resume","by":NAME?}` lifts it and answers `{pause, by, changed}` with
+the pause it lifted, or null when none held, and who lifted it; what waited
+starts as capacity allows. A
 sandboxed bot's own socket refuses it with `not_permitted`, so a command
 left running in a sandbox cannot let the line go on. Each
 change is told to every session as a `paused` or `resumed` event, `{event,
-pause, durable: false}`. `ready` and `stats` carry `paused`, the pause or null.
-`agent pause --reason TEXT` sends it as `AGENT_BOT` when run in a bot's shell,
-and `agent resume` lifts it.
+pause, durable: false}`, a `resumed` one with `by` too. `ready` and `stats`
+carry `paused`, the pause or null. `agent pause --reason TEXT` and `agent
+resume` send `by` as `AGENT_BOT` when run in a bot's shell.
 
 On shutdown, committed turn events get up to five seconds to drain through
 the publisher. Background commands can keep the storage stream open; when

@@ -306,9 +306,10 @@ server; `--no-layout` turns the layout off. Sonny writes the skill for the
 multiplexer it runs in to `~/.agents/skills` (`rex-windows`,
 `herdr-panes` or `cmux-tabs`, from `skills/`), so any agent can run a long command where
 the person can watch it, and read it back: the `run_in_pane` tool
-(`name`, `command`, `split` right, left, above or below) opens a block
+(`name`, `command`, `split` right, left, above, below or float) opens a block
 labelled `AGENT/NAME` in a tab of its own (or on that side of the agent's
-own block) and gives its ID. The `show_agent` tool (`agent`, `split`,
+own block; `float`, in Rex, over the agent's window, for something
+looked at once and closed) and gives its ID. The `show_agent` tool (`agent`, `split`,
 `beside`) moves a task's window. Tabs are the default; the skills tell agents to split only
 to show the person something now, such as a server's or a tool's output, or
 an agent to watch beside them. Sessions are for leads, tabs and splits for
@@ -749,7 +750,16 @@ way `/react` does, and each note in the margin has its own `↩`.
   running turns end and what arrives meanwhile waits, across restarts too.
   Every window says who paused and why. Agents pull the same cord with
   `agent pause --reason` from their shell
-  ([docs/SONNY.md](../docs/SONNY.md#pause)).
+  ([docs/SONNY.md](../docs/SONNY.md#pause)). In `/sky` a pull is the one
+  loud moment: a yellow cord drops from the top to whoever pulled it, an
+  agent's star or you in the middle, and three yellow rings sweep out from
+  them across the sky, each star going still as a ring passes; the cord
+  then hangs there, calmer, until the line goes on. A resume draws it back
+  up while white rings sweep out from whoever resumed, waking each star.
+  The chat log says who pulled it and why, then who resumed and after how
+  long, and the footer says who paused it and how long ago.
+
+  ![/sky as an agent pulls the cord](../docs/sonny/sky-cord.png)
 - `/mcp` lists your MCP servers (`[sonny.mcp_servers]` in
   `~/.agent/config.toml`, kept with `sonny mcp add|remove|list|import|tool`), each with
   its tools or why it did not start. Agents reach them through one `exec`
