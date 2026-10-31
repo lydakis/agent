@@ -1685,7 +1685,7 @@ impl Database {
     /// Stored schema version, kept in `PRAGMA user_version`. Stores created
     /// before versioning and stores from newer binaries are rejected; an older
     /// versioned store is migrated forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 69;
+    pub const SCHEMA: i32 = 70;
     /// Verbatim user prompts a compaction keeps: per-prompt text, and the
     /// total text plus `(ordinal, String)` entry metadata. Empty entries cost
     /// space too, so the retained list cannot grow with conversation length.
@@ -1861,7 +1861,7 @@ impl Database {
                 delivery TEXT NOT NULL DEFAULT 'reject', expected_turn INTEGER,
                 cached_input_tokens INTEGER NOT NULL DEFAULT 0,
                 from_bot TEXT, from_turn INTEGER, from_id INTEGER, origin TEXT, reasoning TEXT, inherited_reasoning TEXT,
-                bot_model TEXT, bot_reasoning TEXT, images TEXT, person TEXT, quotes TEXT,
+                bot_model TEXT, bot_reasoning TEXT, images TEXT, person TEXT, quotes TEXT, reply_node INTEGER,
                 UNIQUE(bot,request_id));
             CREATE INDEX IF NOT EXISTS turns_bot_id ON turns(bot,id);
             CREATE INDEX IF NOT EXISTS turns_started ON turns(bot,id) WHERE started_ms IS NOT NULL;
@@ -7751,10 +7751,7 @@ impl Database {
                 let Some(text) = self.reply_text(*turn)? else {
                     return Err(Error::with(
                         "quote_not_found",
-                        format!(
-                            "{bot}'s turn {turn} has no reply to quote: it ended without one, \
-                             or its messages' events were pruned"
-                        ),
+                        format!("{bot}'s turn {turn} has no reply to quote: it ended without one"),
                     )
                     .facts(json!({"bot":bot,"turn":turn})));
                 };
@@ -7801,21 +7798,20 @@ impl Database {
         }
         Ok(Some(serde_json::to_string(&copied)?))
     }
-    /// The last message with text a turn streamed, whole: what it ended
-    /// with.
+    /// The last message with text a finished turn streamed, whole: what it
+    /// ended with.
     fn reply_text(&self, turn: i64) -> Result<Option<String>> {
-        let mut items = self.conn.prepare_cached(
-            "SELECT n.item FROM events e JOIN nodes n ON n.id=json_extract(e.data,'$.node')
-             WHERE e.turn=? AND e.kind='message' ORDER BY e.id DESC",
-        )?;
-        let mut rows = items.query([turn])?;
-        while let Some(r) = rows.next()? {
-            let text = assistant_text(&serde_json::from_slice(&r.get::<_, Vec<u8>>(0)?)?);
-            if !text.trim().is_empty() {
-                return Ok(Some(text));
-            }
+        let item: Option<Vec<u8>> = self
+            .conn
+            .prepare_cached(
+                "SELECT n.item FROM turns t JOIN nodes n ON n.id=t.reply_node WHERE t.id=?",
+            )?
+            .query_row([turn], |r| r.get(0))
+            .optional()?;
+        match item {
+            Some(item) => Ok(Some(assistant_text(&serde_json::from_slice(&item)?))),
+            None => Ok(None),
         }
-        Ok(None)
     }
     /// The most of the bot's last message before a turn that a `prompts`
     /// read returns, from its end.
@@ -7866,17 +7862,23 @@ impl Database {
         let mut first = self.prompt_entry(turn, words, &mut left)?;
         // What the bot last said before the words: what a person's short
         // answer, such as "yes", answers.
-        let previous: Option<i64> = self
+        // A finished turn keeps it past retention; one still going, which
+        // retention leaves alone, is read from its events.
+        let previous: Option<(i64, bool)> = self
             .conn
             .prepare_cached(
-                "SELECT id FROM turns WHERE bot=? AND id<? AND started_ms IS NOT NULL ORDER BY id DESC LIMIT 1",
+                "SELECT id,finished_ms IS NOT NULL FROM turns
+                 WHERE bot=? AND id<? AND started_ms IS NOT NULL ORDER BY id DESC LIMIT 1",
             )?
-            .query_row(params![name, turn], |r| r.get(0))
+            .query_row(params![name, turn], |r| Ok((r.get(0)?, r.get(1)?)))
             .optional()?;
-        if let Some(previous) = previous
-            && let Some(reply) = self.reply(previous, 0, i64::MAX, &mut left)?
-        {
-            first["reply"] = reply;
+        let said = match previous {
+            Some((previous, true)) => self.reply_text(previous)?,
+            Some((previous, false)) => self.said(previous, 0, i64::MAX)?,
+            None => None,
+        };
+        if let Some(said) = said {
+            first["reply"] = Self::reply(&said, &mut left);
         }
         let mut prompts = vec![first];
         let mut prompts_more = false;
@@ -7899,8 +7901,8 @@ impl Database {
             left -= Self::PROMPTS_ENTRY;
             let mut entry = self.prompt_entry(id, words, &mut left)?;
             entry["steer"] = json!(true);
-            if let Some(reply) = self.reply(turn, since, steered, &mut left)? {
-                entry["reply"] = reply;
+            if let Some(said) = self.said(turn, since, steered)? {
+                entry["reply"] = Self::reply(&said, &mut left);
             }
             since = steered;
             prompts.push(entry);
@@ -8066,24 +8068,27 @@ impl Database {
     /// The last message with text `turn` streamed between two of its events, as
     /// `{text}` with its end kept: at most `PROMPTS_REPLY` bytes, or the
     /// budget left, starting at a whole word when cut (`truncated`).
-    fn reply(&self, turn: i64, after: i64, before: i64, left: &mut usize) -> Result<Option<Value>> {
-        // The newest item with text: calls and reasoning stream as
-        // messages too, and say nothing a person answers.
+    /// The newest text a turn streamed between two events: calls and
+    /// reasoning stream as messages too, and say nothing a person answers.
+    fn said(&self, turn: i64, after: i64, before: i64) -> Result<Option<String>> {
         let mut items = self.conn.prepare_cached(
             "SELECT n.item FROM events e JOIN nodes n ON n.id=json_extract(e.data,'$.node')
              WHERE e.turn=? AND e.kind='message' AND e.id>? AND e.id<? ORDER BY e.id DESC",
         )?;
         let mut rows = items.query(params![turn, after, before])?;
-        let mut text = String::new();
-        while text.trim().is_empty() {
-            let Some(r) = rows.next()? else {
-                return Ok(None);
-            };
-            text = assistant_text(&serde_json::from_slice(&r.get::<_, Vec<u8>>(0)?)?);
+        while let Some(r) = rows.next()? {
+            let text = assistant_text(&serde_json::from_slice(&r.get::<_, Vec<u8>>(0)?)?);
+            if !text.trim().is_empty() {
+                return Ok(Some(text));
+            }
         }
+        Ok(None)
+    }
+    /// What a `prompts` read shows of the text: its end, within the budget.
+    fn reply(text: &str, left: &mut usize) -> Value {
         // Redacted whole before its end is kept: a private key whose
         // opening line is cut away would no longer read as one.
-        let text = agent_client::approver::Redactor::default().redact(&text);
+        let text = agent_client::approver::Redactor::default().redact(text);
         let limit = Self::PROMPTS_REPLY.min(*left);
         let mut start = text.len().saturating_sub(limit);
         while !text.is_char_boundary(start) {
@@ -8102,7 +8107,7 @@ impl Database {
         if truncated {
             reply["truncated"] = json!(true);
         }
-        Ok(Some(reply))
+        reply
     }
     /// The calls a turn was refused, and the steps of its running calls,
     /// that did not then run as they were, each `{name, arguments}` with its
@@ -8345,10 +8350,13 @@ impl Database {
         } else {
             "completed"
         };
-        tx.execute(
-            "UPDATE turns SET status=?,finished_ms=? WHERE id=?",
-            params![status, epoch_ms(), turn],
-        )?;
+        // The message it ended on is kept on the row, so a quote of the
+        // reply, and a `prompts` read of the turn after, find it once
+        // retention has dropped the turn's events.
+        tx.prepare_cached(&format!(
+            "UPDATE turns SET status=?1,finished_ms=?2,reply_node={REPLY_NODE} WHERE id=?3"
+        ))?
+        .execute(params![status, epoch_ms(), turn])?;
         // A request a safety classifier declined, and the bot's fallback
         // too: what it added since the model last answered goes to later
         // requests as notes in its place, since Anthropic says to remove it
@@ -10360,6 +10368,19 @@ impl Database {
     }
 }
 
+/// The node of the newest message with text that a turn streamed, as a
+/// subquery, in its parentheses, of a statement on `turns`: the text `assistant_text` reads, so
+/// calls and reasoning, which stream as messages too, are passed over. A
+/// turn's last message is nearly always its reply, so the search reads one
+/// node, through the events index, once per turn.
+const REPLY_NODE: &str = "(SELECT n.id FROM events e JOIN nodes n ON n.id=json_extract(e.data,'$.node')
+    WHERE e.turn=turns.id AND e.kind='message'
+    AND EXISTS(SELECT 1 FROM json_each(CAST(n.item AS TEXT),'$.content') c
+        WHERE CASE c.type WHEN 'object' THEN json_extract(c.value,'$.type') IN ('output_text','text')
+            AND json_type(c.value,'$.text')='text'
+            AND trim(json_extract(c.value,'$.text'),' '||char(9,10,13))!='' END)
+    ORDER BY e.id DESC LIMIT 1)";
+
 /// Text of an assistant item in either family encoding; other content is skipped.
 fn assistant_text(item: &Value) -> String {
     let mut text = String::new();
@@ -12129,6 +12150,21 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
         |r| r.get::<_, bool>(0),
     )? {
         conn.execute_batch("ALTER TABLE events ADD COLUMN written_ms INTEGER;")?;
+    }
+    // 69 -> 70: a finished turn keeps the message it ended on, found from
+    // the events retention has left. Nodes are freed only with their bot's
+    // turns, so the column needs no reference to check.
+    if conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='turns')
+         AND NOT EXISTS(SELECT 1 FROM pragma_table_info('turns') WHERE name='reply_node')",
+        [],
+        |r| r.get::<_, bool>(0),
+    )? {
+        conn.execute_batch(&format!(
+            "ALTER TABLE turns ADD COLUMN reply_node INTEGER;
+             UPDATE turns SET reply_node={REPLY_NODE}
+             WHERE started_ms IS NOT NULL AND finished_ms IS NOT NULL;"
+        ))?;
     }
     Ok(())
 }
