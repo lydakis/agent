@@ -1142,7 +1142,7 @@ fn a_task_starts_its_own_helper_on_its_branch_as_deep_as_the_config_lets_it() {
     let (ok, said) = lab.tool(&review.join("src"), "start_task", call, false);
     assert!(ok, "{said}");
     assert!(lab.home.join(".agent/worktrees/demo.deeper").exists());
-    // A side chat of the task starts one on the task's branch too.
+    // A side chat of the task starts none: the task starts its own.
     let side = serde_json::json!({"name": "demo.fix.side-a1", "bot_id": 4,
         "created_by": "demo.fix", "created_by_id": 2, "expire_ms": 1,
         "workspace": fix.join("src")});
@@ -1150,11 +1150,12 @@ fn a_task_starts_its_own_helper_on_its_branch_as_deep_as_the_config_lets_it() {
     *lab.bot.borrow_mut() = "demo.fix.side-a1".into();
     let call = serde_json::json!({"name": "peek", "brief": "b"});
     let (ok, said) = lab.tool(&fix.join("src"), "start_task", call, false);
-    assert!(ok, "{said}");
-    assert_eq!(
-        std::fs::read_to_string(lab.home.join(".agent/worktrees/demo.peek/src/lib.rs")).unwrap(),
-        "fixed\n"
+    assert!(!ok);
+    assert!(
+        said.contains("ask in demo.fix's own conversation"),
+        "{said}"
     );
+    assert!(!lab.home.join(".agent/worktrees/demo.peek").exists());
     // A task that took the name of a removed one owns nothing it made.
     let renamed = serde_json::json!({"name": "demo.fix", "bot_id": 9,
         "created_by": "demo.lead", "created_by_id": 1, "workspace": fix.join("src")});

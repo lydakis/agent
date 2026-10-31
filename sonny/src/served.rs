@@ -554,6 +554,16 @@ async fn called(name: &str, arguments: &Value) -> Answer {
     match name {
         START => {
             let line = Line::of(&caller, &here);
+            // A side chat is gone soon, and what it started with it out of
+            // its task's sight; the task starts its own.
+            if let Some(task) = &line.side_of {
+                return Err((
+                    "task_not_started",
+                    format!(
+                        "a side chat of {task} starts no tasks; ask in {task}'s own conversation"
+                    ),
+                ));
+            }
             if !line.role.starts {
                 return Err((
                     "task_depth_reached",
@@ -597,9 +607,8 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                 folder: text("folder"),
                 from: text("from"),
                 turn: arguments["turn"].as_i64(),
-                // A task's own helper builds on its work, a side chat's
-                // on its agent's.
-                builds_on: (!line.role.lead).then(|| line.own.clone()),
+                // A task's own helper builds on its work.
+                builds_on: (!line.role.lead).then(|| caller.clone()),
             };
             let started = crate::task::start(&line.folder, &line.project, &caller, &start)
                 .map_err(|e| ("task_not_started", e))?;
@@ -630,7 +639,7 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                 .ok_or(("invalid_arguments", "a task's name, without /".to_owned()))?;
             // A lead removes any of its project's; another agent only one
             // of its own line, so no task removes its lead's others.
-            if !line.role.lead && !Line::made(&task, &caller) && !Line::made(&task, &line.own) {
+            if !line.role.lead && !Line::made(&task, &caller) {
                 return Err((
                     "task_not_removed",
                     format!("{task} is not a task you or yours started; ask your lead"),
@@ -789,9 +798,9 @@ struct Line {
     limit: u64,
     folder: PathBuf,
     project: String,
-    /// The agent whose work the caller's is: a side chat's own agent,
-    /// else the caller.
-    own: String,
+    /// The task a side chat of a task is a copy of, which starts that
+    /// task's helpers itself.
+    side_of: Option<String>,
 }
 
 impl Line {
@@ -800,15 +809,13 @@ impl Line {
     /// daemon's CLI, as the start itself is made.
     fn of(caller: &str, here: &Path) -> Line {
         let limit = depth_limit();
-        let mut own = caller.to_owned();
+        let mut side_of = None;
         let (depth, lead) = match crate::project::is_lead(caller) {
             true => (0, None),
             false => {
                 let record =
                     crate::task::record_of_bot(caller).unwrap_or_else(|| json!({"name": caller}));
-                if let Some(source) = crate::side_copy(&record) {
-                    own = source.to_owned();
-                }
+                side_of = crate::side_copy(&record).map(str::to_owned);
                 crate::declared::line_by(&record, limit, |at| {
                     crate::task::record_of_bot(at["created_by"].as_str()?)
                 })
@@ -829,7 +836,8 @@ impl Line {
             limit,
             folder,
             project,
-            own,
+            // A lead's side chat starts its tasks as the lead does.
+            side_of: side_of.filter(|_| depth > 0),
         }
     }
 
