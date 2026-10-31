@@ -1244,15 +1244,10 @@ impl Provider {
             http = http.header(TURN_STATE, state);
         }
         // Signed last, at send time: the signature covers the moment it is made.
+        let signed_at = std::time::SystemTime::now();
         if let Some((aws, keys)) = &signer {
             let payload = payload.as_deref().unwrap_or(aws::UNSIGNED_PAYLOAD);
-            for (name, value) in aws.sign(
-                keys,
-                "POST",
-                &self.url,
-                std::time::SystemTime::now(),
-                payload,
-            ) {
+            for (name, value) in aws.sign(keys, "POST", &self.url, signed_at, payload) {
                 http = http.header(name, value);
             }
         }
@@ -1292,7 +1287,10 @@ impl Provider {
             }
             // A signature refused for its time is made again on the retry,
             // as AWS's SDKs retry their clock-skew codes.
-            if matches!(status, 401 | 403) && signer.is_some() && aws::clock_skewed(&headers) {
+            if matches!(status, 401 | 403)
+                && signer.is_some()
+                && aws::clock_skewed(&headers, signed_at)
+            {
                 reservation.settle(0);
                 return Err(Error::with(
                     "provider_signature_expired",
