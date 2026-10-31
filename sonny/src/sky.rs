@@ -4,7 +4,10 @@
 //! the middle. A message travels as a spark along its curve (the person's
 //! from the middle, another agent's across, a lookout's or automation's in
 //! from the rim), a commons post ripples out, a tool call twinkles, and
-//! whoever is lit fades like a firefly.
+//! whoever is lit fades like a firefly. Each agent's state is the state
+//! table's, mark and colour: working cyan `●`, needs you yellow `?`,
+//! failed red `✗`. Where the sky has no room, under about 60 columns or
+//! 24 rows, the same agents are a list, each with a firefly of its own.
 //!
 //! It reads only what the daemon already tells any client: one page of
 //! `bots`, then `follow` of `*`. The follow starts from the first cursor
@@ -26,7 +29,7 @@ use tokio::sync::mpsc;
 use unicode_width::UnicodeWidthStr;
 
 /// Past turns' events read for who talked to whom.
-const PAST: &[&str] = &["accepted", "steered"];
+const PAST: &[&str] = &["accepted", "steered", "turn_finished"];
 /// Live events: who is made, who talks, works, calls and posts.
 const LIVE: &[&str] = &[
     "created",
@@ -37,6 +40,10 @@ const LIVE: &[&str] = &[
     "steered",
     "tool_started",
     "tool_completed",
+    "approval_requested",
+    "approval_asked",
+    "step_decided",
+    "turn_resumed",
     "turn_finished",
 ];
 /// How long a spark takes to cross.
@@ -53,11 +60,17 @@ const TALKS: usize = 96;
 const SENT: usize = 1024;
 /// Lines of what happened under the sky.
 const TICKER: usize = 5;
+/// The least room the sky is drawn in; with less, a list.
+const SKY_COLS: usize = 60;
+const SKY_ROWS: usize = 24;
 
 /// Agent to agent.
 const TALK: Color = Color::Magenta;
 /// A tool call: code's colour.
 const TOOL: Color = Color::Cyan;
+/// The state table's: working, needs you.
+const WORKING: Color = Color::Cyan;
+const NEEDS: Color = Color::Yellow;
 /// A commons post.
 const BOARD: Color = Color::Green;
 /// A failed call.
@@ -68,6 +81,9 @@ enum Feed {
     /// Every agent there is now: who is listed is here, who isn't is gone.
     Roll(Vec<Value>),
     Past(Value),
+    /// The calls waiting for the person when the past was read, each with
+    /// its agent: what is answered after, live events let go.
+    Held(Vec<(String, String)>),
     Live(Value),
     /// Caught up: from here on, what happens.
     Ready,
@@ -81,6 +97,65 @@ enum End {
     Agent(usize),
     /// The rim, at this agent's angle: a lookout, an automation.
     Rim(usize),
+}
+
+/// What a tool call does, which its twinkle's shape tells: a shell's
+/// streak across, a file's up and down, the web's corners, any other
+/// tool's star.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Work {
+    Shell,
+    Files,
+    Web,
+    Other,
+}
+
+impl Work {
+    fn of(tool: &str) -> Work {
+        match tool {
+            "shell" | "exec" | "write_stdin" => Work::Shell,
+            "read" | "write" | "edit" | "apply_patch" => Work::Files,
+            "web_search" | "web_fetch" | "fetch" => Work::Web,
+            _ => Work::Other,
+        }
+    }
+
+    /// Dots around the star, in dot steps.
+    fn shape(self) -> &'static [(f32, f32)] {
+        match self {
+            Work::Shell => &[(-3.0, 0.0), (-2.0, 0.0), (2.0, 0.0), (3.0, 0.0)],
+            Work::Files => &[(0.0, -3.0), (0.0, -2.0), (0.0, 2.0), (0.0, 3.0)],
+            Work::Web => &[(-2.0, -2.0), (2.0, -2.0), (-2.0, 2.0), (2.0, 2.0)],
+            Work::Other => &[
+                (0.0, -3.0),
+                (0.0, 3.0),
+                (-3.0, 0.0),
+                (3.0, 0.0),
+                (-2.0, -2.0),
+                (2.0, -2.0),
+                (-2.0, 2.0),
+                (2.0, 2.0),
+            ],
+        }
+    }
+}
+
+/// Where an agent is, in the state table's words.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum State {
+    NeedsYou,
+    Working,
+    Failed,
+}
+
+impl State {
+    fn mark(self) -> (&'static str, Color, &'static str) {
+        match self {
+            State::NeedsYou => ("?", NEEDS, "needs you"),
+            State::Working => ("●", WORKING, "working"),
+            State::Failed => ("✗", FAILED, "failed"),
+        }
+    }
 }
 
 struct Spark {
@@ -101,8 +176,16 @@ struct Agent {
     running: Option<i64>,
     /// When it was last lit, and in what colour (none: the person's).
     lit: Option<(Instant, Option<Color>)>,
-    twinkle: Option<(Instant, Color)>,
+    twinkle: Option<(Instant, Color, Work)>,
     ripple: Option<Instant>,
+    /// It asked the person something, not yet answered.
+    asking: bool,
+    /// Its calls that wait for the person's approval.
+    held: HashSet<String>,
+    /// Its last turn failed.
+    failed: bool,
+    /// The last it said or was told, for the list.
+    last: Option<(Instant, String)>,
     /// Who sent its running turn's prompt.
     sender: Option<End>,
     gone: bool,
@@ -110,6 +193,27 @@ struct Agent {
     at: (f32, f32),
     angle: f32,
     root: bool,
+}
+
+impl Agent {
+    fn state(&self) -> Option<State> {
+        if self.asking || !self.held.is_empty() {
+            Some(State::NeedsYou)
+        } else if self.running.is_some() {
+            Some(State::Working)
+        } else if self.failed {
+            Some(State::Failed)
+        } else {
+            None
+        }
+    }
+
+    /// How lit it is, 1 just lit to 0.
+    fn glow(&self, now: Instant) -> f32 {
+        self.lit.map_or(0.0, |(at, _)| {
+            0.5f32.powf(now.duration_since(at).as_secs_f32() / HALF_LIFE)
+        })
+    }
 }
 
 pub struct View {
@@ -128,8 +232,12 @@ pub struct View {
     /// When messages were sent in the last minute.
     recent: VecDeque<Instant>,
     laid: bool,
+    /// The agents in the tree's order, each with its depth, for the list.
+    order: Vec<(usize, usize)>,
     live: bool,
     paused: bool,
+    /// What each mark, colour and shape means, in the ticker's place.
+    pub legend: bool,
     down: Option<String>,
 }
 
@@ -163,8 +271,10 @@ impl View {
             ticker: VecDeque::new(),
             recent: VecDeque::new(),
             laid: false,
+            order: Vec::new(),
             live: false,
             paused: false,
+            legend: false,
             down: None,
         }
     }
@@ -219,6 +329,13 @@ impl View {
                     }
                 }
                 Feed::Past(event) => self.event(&event, now, false),
+                Feed::Held(calls) => {
+                    for (bot, call) in calls {
+                        if let Some(at) = self.agent(&bot) {
+                            self.agents[at].held.insert(call);
+                        }
+                    }
+                }
                 Feed::Live(event) => {
                     self.live = true;
                     self.event(&event, now, true);
@@ -385,8 +502,22 @@ impl View {
                 // Past turns say who talked to whom; whether an agent works
                 // now is the listing's, and live events' after it.
                 if kind == "accepted" && live {
-                    self.agents[at].running = Some(turn);
-                    self.agents[at].sender = Some(from);
+                    let agent = &mut self.agents[at];
+                    agent.running = Some(turn);
+                    agent.sender = Some(from);
+                    // A new turn tries again what failed.
+                    agent.failed = false;
+                }
+                // What it asked is answered by the one it asked: the person,
+                // or the agent that made it.
+                if kind != "queued" && live {
+                    let maker = self.agents[at]
+                        .made_by
+                        .as_deref()
+                        .and_then(|by| self.agent(by));
+                    if from == End::Person || matches!(from, End::Agent(by) if Some(by) == maker) {
+                        self.agents[at].asking = false;
+                    }
                 }
                 // A queued prompt sparks when sent; its start, or the steer
                 // taking it, is the same message and ends the watch for it.
@@ -415,29 +546,67 @@ impl View {
                 }
                 if live {
                     self.send(from, End::Agent(at), now);
-                    let said = match from {
-                        End::Person => format!("you → {}", self.short(at)),
-                        End::Agent(by) => format!("{} → {}", self.short(by), self.short(at)),
-                        End::Rim(_) => format!(
-                            "{} → {}",
-                            crate::transcript::from_outside(data["origin"].as_str()),
-                            self.short(at)
-                        ),
+                    let by = match from {
+                        End::Person => "you".to_owned(),
+                        End::Agent(by) => self.short(by),
+                        End::Rim(_) => {
+                            crate::transcript::from_outside(data["origin"].as_str()).to_owned()
+                        }
                     };
-                    self.say(now, said);
+                    let to = self.short(at);
+                    self.agents[at].last = Some((now, format!("from {by}")));
+                    if let End::Agent(by) = from {
+                        self.agents[by].last = Some((now, format!("to {to}")));
+                    }
+                    self.say(now, format!("{by} → {to}"));
                 }
             }
             "tool_started" if live => {
-                self.agents[at].twinkle = Some((now, TOOL));
-                if data["name"] == "commons" && posted(&data["arguments"]) {
+                let tool = data["name"].as_str().unwrap_or("");
+                // A call approved starts.
+                if let Some(call) = data["call_id"].as_str() {
+                    self.agents[at].held.remove(call);
+                }
+                self.agents[at].twinkle = Some((now, TOOL, Work::of(tool)));
+                if tool == crate::asks::TOOL {
+                    self.agents[at].asking = true;
+                }
+                if tool == "commons" && posted(&data["arguments"]) {
                     self.agents[at].ripple = Some(now);
+                    self.agents[at].last = Some((now, "posted to the commons".into()));
                     let said = format!("{} posted to the commons", self.short(at));
                     self.say(now, said);
                 }
             }
+            // A call waits for the person: one gated for them, or one the
+            // reviewer handed them.
+            "approval_requested" if live => {
+                for call in data["calls"].as_array().into_iter().flatten() {
+                    let manual = (call["gates"].as_array())
+                        .is_some_and(|gates| gates.iter().any(|g| g == "manual"));
+                    if let (true, Some(id)) = (manual, call["call_id"].as_str()) {
+                        self.agents[at].held.insert(id.to_owned());
+                    }
+                }
+            }
+            "approval_asked" if live => {
+                if let Some(id) = data["call_id"].as_str() {
+                    self.agents[at].held.insert(id.to_owned());
+                }
+            }
+            // Each answer lets go of its call alone.
+            "step_decided" | "turn_resumed" if live => {
+                if let Some(id) = data["call_id"].as_str() {
+                    self.agents[at].held.remove(id);
+                }
+            }
             "tool_completed" if live => {
+                if let Some(id) = data["call_id"].as_str() {
+                    self.agents[at].held.remove(id);
+                }
                 if data["failed"] == true || data["denied"] == true {
-                    self.agents[at].twinkle = Some((now, FAILED));
+                    let work = Work::of(data["name"].as_str().unwrap_or(""));
+                    self.agents[at].twinkle = Some((now, FAILED, work));
                 }
             }
             // A steer the running turn absorbed finishes as a turn of its
@@ -449,6 +618,13 @@ impl View {
             {
                 let agent = &mut self.agents[at];
                 agent.running = None;
+                agent.held.clear();
+                // Its last turn's end, past or live, says whether it failed;
+                // one that ended with nothing to say ended as it should.
+                agent.failed = data["status"] == "failed" && data["error"] != "empty_completion";
+                if live && agent.failed {
+                    agent.last = Some((now, "failed".into()));
+                }
                 // The answer to the person flies back to the middle.
                 if live && agent.sender == Some(End::Person) && data["status"] == "completed" {
                     agent.lit = Some((now, None));
@@ -522,6 +698,7 @@ impl View {
             return;
         }
         self.laid = true;
+        self.order.clear();
         let count = self.agents.len();
         let mut children: Vec<Vec<usize>> = vec![Vec::new(); count];
         let mut roots = Vec::new();
@@ -601,6 +778,7 @@ impl View {
             return;
         }
         placed[at] = true;
+        self.order.push((at, depth));
         let radius = match (deep, depth) {
             (false, _) => 0.62,
             (true, 0) => 0.4,
@@ -642,16 +820,28 @@ impl View {
             }));
             return lines;
         }
+        // The list's rows say what the ticker would, agent by agent.
+        if cols < SKY_COLS || rows < SKY_ROWS {
+            let under = if self.legend { LEGEND } else { 2 };
+            lines.extend(self.list(now, cols, rows.saturating_sub(under).max(3)));
+            lines.extend(match self.legend {
+                true => legend(true),
+                false => self.ticked(now, cols, false),
+            });
+            return lines;
+        }
         let sky_rows = rows.saturating_sub(TICKER + 3).clamp(8, cols / 2 + 1);
         let mut sky = Sky::new(cols, sky_rows);
         // The person in the middle.
         sky.text_at((0.0, 0.0), "you", Style::default().bold());
-        // Who made whom: faint lines; who talked: faint curves.
+        // Who made whom: dotted lines; who talked: dotted curves. In the
+        // text's own colour at full weight, as dim braille all but
+        // vanishes in some themes; hues are kept for what happens now.
         for (at, agent) in self.agents.iter().enumerate().filter(|(_, a)| !a.gone) {
             if let Some(by) = self.maker(at)
                 && !agent.root
             {
-                sky.line(self.agents[by].at, agent.at, Ink::Faint, 3);
+                sky.line(self.agents[by].at, agent.at, Ink::Plain, 3);
             }
         }
         for &(by, to) in &self.talks {
@@ -659,7 +849,7 @@ impl View {
                 continue;
             }
             let (a, b) = (self.agents[by].at, self.agents[to].at);
-            sky.curve(a, bend(a, b), b, Ink::Faint, 4);
+            sky.curve(a, bend(a, b), b, Ink::Plain, 4);
         }
         // Ripples, then sparks, then the stars over them.
         for agent in self.agents.iter().filter(|a| !a.gone) {
@@ -694,9 +884,7 @@ impl View {
             }
         }
         for agent in self.agents.iter().filter(|a| !a.gone) {
-            let glow = agent.lit.map_or(0.0, |(at, _)| {
-                0.5f32.powf(now.duration_since(at).as_secs_f32() / HALF_LIFE)
-            });
+            let glow = agent.glow(now);
             let color = agent
                 .lit
                 .and_then(|(_, color)| color)
@@ -709,21 +897,15 @@ impl View {
                 };
                 sky.ring(agent.at, 0.015 + 0.045 * glow, ink);
             }
-            if let Some((at, color)) = agent.twinkle
+            if let Some((at, color, work)) = agent.twinkle
                 && now.duration_since(at) < TWINKLE
             {
-                sky.twinkle(agent.at, Ink::Color(color, true));
+                sky.twinkle(agent.at, work, Ink::Color(color, true));
             }
-            match agent.running.is_some() || glow > 0.4 {
-                true => sky.blob(
-                    agent.at,
-                    if agent.running.is_some() {
-                        Ink::Bright
-                    } else {
-                        Ink::Plain
-                    },
-                ),
-                false => sky.dot(agent.at, Ink::Plain),
+            // The star in its state's colour, else the text's.
+            match agent.state() {
+                Some(state) => sky.blob(agent.at, Ink::Color(state.mark().1, true)),
+                None => sky.blob(agent.at, Ink::Plain),
             }
         }
         // Names: leads always, others while working or lit, nearest the
@@ -733,48 +915,56 @@ impl View {
                 let agent = &self.agents[at];
                 !agent.gone
                     && (agent.root
-                        || agent.running.is_some()
+                        || agent.state().is_some()
                         || agent.lit.is_some_and(|(lit, _)| {
                             now.duration_since(lit) < Duration::from_secs(4)
                         }))
             })
             .collect();
+        // What needs the person is named first, so it is never crowded out.
         named.sort_by_key(|&at| {
+            let agent = &self.agents[at];
             (
-                !self.agents[at].root,
-                (self.agents[at].at.0.hypot(self.agents[at].at.1) * 100.0) as i32,
+                agent.state() != Some(State::NeedsYou),
+                !agent.root,
+                (agent.at.0.hypot(agent.at.1) * 100.0) as i32,
             )
         });
         for at in named {
             let agent = &self.agents[at];
-            let style = match agent.running.is_some() {
-                true => Style::default().bold(),
-                false => Style::default().add_modifier(Modifier::DIM),
+            // The mark says what the colour does: `? ` for an agent that
+            // needs you, `✗ ` for one that failed. Bold while it works.
+            let mark = match agent.state() {
+                Some(state @ (State::NeedsYou | State::Failed)) => {
+                    let (mark, color, _) = state.mark();
+                    Some((mark, Style::default().fg(color).bold()))
+                }
+                _ => None,
             };
-            sky.label(agent.at, &short(&agent.name), style);
+            let style = match agent.state() {
+                Some(State::Working | State::NeedsYou) => Style::default().bold(),
+                Some(State::Failed) => Style::default(),
+                None => Style::default().add_modifier(Modifier::DIM),
+            };
+            sky.label(agent.at, mark, &short(&agent.name), style);
         }
         lines.extend(sky.lines());
         lines.push(Line::default());
-        let ago = |at: Instant| {
-            let s = now.duration_since(at).as_secs();
-            match s {
-                0..=59 => format!("{s}s"),
-                _ => format!("{}m", s / 60),
-            }
-        };
-        for (at, text) in &self.ticker {
-            let mut text = text.clone();
-            let room = cols.saturating_sub(6);
-            if text.width() > room {
-                text = text
-                    .chars()
-                    .take(room.saturating_sub(1))
-                    .collect::<String>()
-                    + "…";
-            }
+        lines.extend(match self.legend {
+            true => legend(false),
+            false => self.ticked(now, cols, true),
+        });
+        lines
+    }
+
+    /// The ticker's lines: what happened last, how long ago; or that the
+    /// follow is lost, or nothing has happened yet.
+    fn ticked(&self, now: Instant, cols: usize, ticker: bool) -> Vec<Line<'static>> {
+        let mut lines = Vec::new();
+        for (at, text) in self.ticker.iter().filter(|_| ticker) {
             lines.push(Line::from(vec![
-                Span::raw(format!("{:>4}  ", ago(*at))).dim(),
-                Span::raw(text),
+                Span::raw(format!("{:>4}  ", ago(now, *at))).dim(),
+                Span::raw(cut(text, cols.saturating_sub(6))),
             ]));
         }
         if let Some(why) = &self.down {
@@ -800,22 +990,203 @@ impl View {
         }
     }
 
-    /// Counts in words: everyone, who works, how many messages a minute.
-    pub fn footer(&self) -> String {
-        let shown = self.agents.iter().filter(|a| !a.gone);
-        let working = shown.clone().filter(|a| a.running.is_some()).count();
-        let count = shown.count();
-        format!(
-            "{count} {} · {working} working · {} {} in the last minute",
-            if count == 1 { "agent" } else { "agents" },
-            self.recent.len(),
-            if self.recent.len() == 1 {
-                "message"
-            } else {
-                "messages"
-            },
-        )
+    /// The agents as a list where the sky has no room: the tree's order,
+    /// each row a firefly that lights as its agent talks and fades, its
+    /// state's mark, and the last it said or was told. When they don't all
+    /// fit, what needs the person, what failed, works or is lit come
+    /// first, the leads after them.
+    fn list(&self, now: Instant, cols: usize, rows: usize) -> Vec<Line<'static>> {
+        let rank = |at: usize| {
+            let agent = &self.agents[at];
+            let lit = agent.glow(now) > 0.08;
+            match agent.state() {
+                Some(State::NeedsYou) => 0,
+                Some(State::Failed) => 1,
+                Some(State::Working) => 2,
+                None if lit => 3,
+                None if agent.root => 4,
+                None => 5,
+            }
+        };
+        let mut kept: Vec<usize> = self.order.iter().map(|&(at, _)| at).collect();
+        let more = kept.len().saturating_sub(rows);
+        if more > 0 {
+            kept.sort_by_key(|&at| rank(at));
+            kept.truncate(rows.saturating_sub(1));
+        }
+        let mut lines = Vec::new();
+        for &(at, depth) in self.order.iter().filter(|(at, _)| kept.contains(at)) {
+            let agent = &self.agents[at];
+            let glow = agent.glow(now);
+            let color = (agent.lit)
+                .and_then(|(_, color)| color)
+                .filter(|c| *c != Color::Reset);
+            let firefly = match (glow, color) {
+                (g, Some(color)) if g > 0.4 => Span::raw("✦").fg(color).bold(),
+                (g, None) if g > 0.4 => Span::raw("✦").bold(),
+                (g, Some(color)) if g > 0.08 => Span::raw("•").fg(color),
+                (g, None) if g > 0.08 => Span::raw("•"),
+                _ => Span::raw("·").dim(),
+            };
+            let mark = match agent.state() {
+                Some(state) => {
+                    let (mark, color, _) = state.mark();
+                    Span::raw(mark).fg(color)
+                }
+                None => Span::raw(" "),
+            };
+            let name = short(&agent.name);
+            let name = match agent.state() {
+                Some(State::Working | State::NeedsYou) => Span::raw(name).bold(),
+                Some(State::Failed) => Span::raw(name),
+                None if glow > 0.08 => Span::raw(name),
+                None => Span::raw(name).dim(),
+            };
+            let indent = "  ".repeat(depth.min(4));
+            let used = 4 + indent.width() + name.content.width();
+            let mut spans = vec![
+                mark,
+                Span::raw(" "),
+                Span::raw(indent),
+                firefly,
+                Span::raw(" "),
+                name,
+            ];
+            if let Some((when, said)) = &agent.last
+                && cols > used + 12
+            {
+                let said = format!("{said} · {}", ago(now, *when));
+                spans.push(Span::raw(format!("  {}", cut(&said, cols - used - 2))).dim());
+            }
+            lines.push(Line::from(spans));
+        }
+        if more > 0 {
+            let hidden = self.order.len() - kept.len();
+            lines.push(Line::from(format!("  … {hidden} more, quiet")).dim());
+        }
+        lines.push(Line::default());
+        lines
     }
+
+    /// Counts as the footer gives them, each mark with its word: everyone,
+    /// what needs the person, who works, what failed, and how many
+    /// messages a minute.
+    pub fn footer(&self, width: usize) -> Line<'static> {
+        let shown: Vec<&Agent> = self.agents.iter().filter(|a| !a.gone).collect();
+        let count = shown.len();
+        let mut spans = vec![
+            Span::raw(format!(
+                "  {count} {}",
+                if count == 1 { "agent" } else { "agents" }
+            ))
+            .dim(),
+        ];
+        for state in [State::NeedsYou, State::Working, State::Failed] {
+            let n = shown.iter().filter(|a| a.state() == Some(state)).count();
+            if n > 0 || state == State::Working {
+                let (mark, color, word) = state.mark();
+                spans.push(Span::raw(" · ").dim());
+                spans.push(Span::raw(mark).fg(color));
+                spans.push(Span::raw(format!(" {n} {word}")).dim());
+            }
+        }
+        let sent = self.recent.len();
+        let sent = format!(
+            " · {sent} {} in the last minute",
+            if sent == 1 { "message" } else { "messages" }
+        );
+        // The states first: the messages' count goes where it won't fit.
+        let used: usize = spans.iter().map(|span| span.content.width()).sum();
+        if used + sent.width() <= width {
+            spans.push(Span::raw(sent).dim());
+        }
+        Line::from(spans)
+    }
+}
+
+/// The legend's rows, the ticker's room.
+const LEGEND: usize = TICKER;
+
+/// What the sky's marks mean, each drawn as the sky draws it: the states,
+/// the sparks, a tool's twinkle by kind, a commons post and the lines; in
+/// the list, the firefly in the sparks' place.
+fn legend(list: bool) -> Vec<Line<'static>> {
+    let mark = |text: &str, color: Color| Span::raw(text.to_owned()).fg(color);
+    let says = |text: &str| Span::raw(text.to_owned()).dim();
+    let mut lines = vec![Line::from(vec![
+        mark("●", WORKING),
+        says(" working  "),
+        mark("?", NEEDS),
+        says(" needs you  "),
+        mark("✗", FAILED),
+        says(" failed  "),
+        Span::raw("name").bold(),
+        says(" works, "),
+        says("name"),
+        says(" idle"),
+    ])];
+    if list {
+        lines.push(Line::from(vec![
+            mark("✦", TALK).bold(),
+            says(" just talked  "),
+            Span::raw("•"),
+            says(" a while ago  "),
+            says("· quiet"),
+        ]));
+        return lines;
+    }
+    lines.extend([
+        Line::from(vec![
+            Span::raw("•").bold(),
+            says(" a message: yours, or from outside  "),
+            mark("•", TALK),
+            says(" agent to agent"),
+        ]),
+        Line::from(vec![
+            mark("⠤⠤", TOOL),
+            says(" shell  "),
+            mark("⡇", TOOL),
+            says(" files  "),
+            mark("⡁⢈", TOOL),
+            says(" web  "),
+            mark("✳", TOOL),
+            says(" another tool  "),
+            mark("✳", FAILED),
+            says(" a call failed"),
+        ]),
+        Line::from(vec![
+            mark("◯", BOARD),
+            says(" a commons post  "),
+            Span::raw("⠁⠈⠁"),
+            says(" who made whom, who talked"),
+        ]),
+        Line::from(says("A star glows as its agent talks, then fades.")),
+    ]);
+    lines
+}
+
+/// How long ago, as the ticker says it.
+fn ago(now: Instant, at: Instant) -> String {
+    let s = now.duration_since(at).as_secs();
+    match s {
+        0..=59 => format!("{s}s"),
+        _ => format!("{}m", s / 60),
+    }
+}
+
+/// Words cut to `room` columns, an ellipsis saying so.
+fn cut(text: &str, room: usize) -> String {
+    if text.width() <= room {
+        return text.to_owned();
+    }
+    let mut out = String::new();
+    for ch in text.chars() {
+        if out.width() + ch.to_string().width() + 1 > room {
+            break;
+        }
+        out.push(ch);
+    }
+    out + "…"
 }
 
 fn weight(at: usize, children: &[Vec<usize>]) -> usize {
@@ -880,7 +1251,6 @@ fn ease(t: f32) -> f32 {
 /// takes the cell's colour only when it is at least as strong.
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Ink {
-    Faint,
     Plain,
     Bright,
     Color(Color, bool),
@@ -889,11 +1259,10 @@ enum Ink {
 impl Ink {
     fn rank(self) -> u8 {
         match self {
-            Ink::Faint => 0,
-            Ink::Plain => 1,
-            Ink::Color(_, false) => 2,
-            Ink::Bright => 3,
-            Ink::Color(_, true) => 4,
+            Ink::Plain => 0,
+            Ink::Color(_, false) => 1,
+            Ink::Bright => 2,
+            Ink::Color(_, true) => 3,
         }
     }
     fn fade(self) -> Ink {
@@ -905,7 +1274,6 @@ impl Ink {
     }
     fn style(self) -> Style {
         match self {
-            Ink::Faint => Style::default().add_modifier(Modifier::DIM),
             Ink::Plain => Style::default(),
             Ink::Bright => Style::default().bold(),
             Ink::Color(color, true) => Style::default().fg(color).bold(),
@@ -980,9 +1348,9 @@ impl Sky {
         }
     }
 
-    fn twinkle(&mut self, at: (f32, f32), ink: Ink) {
+    fn twinkle(&mut self, at: (f32, f32), work: Work, ink: Ink) {
         let (x, y) = self.spot(at);
-        for (dx, dy) in [(-2.0, -2.0), (2.0, -2.0), (-2.0, 2.0), (2.0, 2.0)] {
+        for (dx, dy) in work.shape() {
             self.plot(x + dx, y + dy, ink);
         }
     }
@@ -1020,11 +1388,16 @@ impl Sky {
         }
     }
 
-    /// Words beside a point, right of it where they fit, else left; never
-    /// over other words.
-    fn label(&mut self, at: (f32, f32), words: &str, style: Style) {
+    /// Words beside a point, a mark before them, right of it where they
+    /// fit, else left; never over other words.
+    fn label(&mut self, at: (f32, f32), mark: Option<(&str, Style)>, words: &str, style: Style) {
         let (x, y) = self.spot(at);
         let (col, row) = ((x / 2.0) as usize, (y / 4.0) as usize);
+        let marked = match mark {
+            Some((mark, _)) => format!("{mark} {words}"),
+            None => words.to_owned(),
+        };
+        let words = marked.as_str();
         let width = words.width();
         if row >= self.rows || width + 2 > self.cols {
             return;
@@ -1038,7 +1411,13 @@ impl Sky {
         let Some(start) = start else {
             return;
         };
-        self.put(row, start, words, style);
+        if self.put(row, start, words, style)
+            && let Some((mark, mark_style)) = mark
+        {
+            for (cell, ch) in (row * self.cols + start..).zip(mark.chars()) {
+                self.text[cell] = Some((ch, mark_style));
+            }
+        }
     }
 
     /// Words centred on a point.
@@ -1049,16 +1428,18 @@ impl Sky {
         self.put(row, start, words, style);
     }
 
-    fn put(&mut self, row: usize, start: usize, words: &str, style: Style) {
+    /// Words put at a place in a row; false when they don't fit there.
+    fn put(&mut self, row: usize, start: usize, words: &str, style: Style) -> bool {
         let cells = row * self.cols + start..row * self.cols + start + words.chars().count();
         if start + words.chars().count() > self.cols
             || self.text[cells.clone()].iter().any(Option::is_some)
         {
-            return;
+            return false;
         }
         for (cell, ch) in cells.zip(words.chars()) {
             self.text[cell] = Some((ch, style));
         }
+        true
     }
 
     fn lines(&self) -> Vec<Line<'static>> {
@@ -1097,7 +1478,7 @@ const FRAME: Duration = Duration::from_millis(60);
 /// How long `sonny sky` waits before following a daemon that went again.
 const RETRY: Duration = Duration::from_secs(3);
 /// What the keys do in `sonny sky`.
-const KEYS: &str = "q quit";
+const KEYS: &str = "? legend · q quit";
 
 /// `sonny sky`: the same sky, the whole terminal, on its own, to keep
 /// beside the work as btop is kept: its title and the keys over it, the
@@ -1137,9 +1518,13 @@ pub fn watch(runtime: &tokio::runtime::Runtime, socket: PathBuf) -> Result<(), S
                 }
                 if let event::Event::Key(key) = event::read().map_err(|e| e.to_string())?
                     && key.kind != event::KeyEventKind::Release
-                    && quits(&key)
                 {
-                    return Ok(());
+                    if quits(&key) {
+                        return Ok(());
+                    }
+                    if key.code == event::KeyCode::Char('?') {
+                        view.legend = !view.legend;
+                    }
                 }
             }
         });
@@ -1182,7 +1567,11 @@ impl ratatui::widgets::Widget for &mut View {
         {
             buf.set_line(area.x + 1, area.y + 2 + at as u16, &line, area.width - 1);
         }
-        let foot = Line::from(format!(" {}", self.footer())).dim();
+        // The footer's own margin, one column less, as the title's.
+        let mut foot = self.footer(width + 1);
+        if let Some(first) = foot.spans.first_mut() {
+            first.content = first.content.replacen(' ', "", 1).into();
+        }
         buf.set_line(area.x, area.bottom() - 1, &foot, area.width);
     }
 }
@@ -1214,6 +1603,19 @@ async fn follow(socket: PathBuf, send: mpsc::UnboundedSender<Feed>) {
             break;
         }
         if send.send(Feed::Past(event)).is_err() {
+            return;
+        }
+    }
+    // What waits for the person now; the live replay from the past's end
+    // brings what changed since.
+    match held(&client).await {
+        Ok(calls) => {
+            if send.send(Feed::Held(calls)).is_err() {
+                return;
+            }
+        }
+        Err(error) => {
+            let _ = send.send(Feed::Down(error.to_string()));
             return;
         }
     }
@@ -1291,6 +1693,37 @@ async fn roll(client: &Client, send: &mpsc::UnboundedSender<Feed>) -> bool {
     }
 }
 
+/// The calls a person must answer, as the conversation reads them: every
+/// one gated `manual`, and those the approver serving `auto` handed over.
+/// Each tag's listing reads only the calls still waiting on it.
+async fn held(client: &Client) -> agent_client::Result<Vec<(String, String)>> {
+    let mut calls = Vec::new();
+    for tag in ["manual", "auto"] {
+        let mut after = 0;
+        loop {
+            let page = client
+                .request(
+                    "approvals",
+                    json!({"tag": tag, "after": after, "limit": 256}),
+                )
+                .await?;
+            for call in page["approvals"].as_array().into_iter().flatten() {
+                if tag == "auto" && call["asked"].is_null() {
+                    continue;
+                }
+                if let (Some(bot), Some(id)) = (call["bot"].as_str(), call["call_id"].as_str()) {
+                    calls.push((bot.to_owned(), id.to_owned()));
+                }
+            }
+            match page["next_after"].as_i64() {
+                Some(next) => after = next,
+                None => break,
+            }
+        }
+    }
+    Ok(calls)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1336,7 +1769,7 @@ mod tests {
         assert!((2..29).any(|y| row(y).contains("shop lead")));
         assert_eq!(
             row(29),
-            " 1 agent · 1 working · 0 messages in the last minute"
+            " 1 agent · ● 1 working · 0 messages in the last minute"
         );
         // q, Esc and Ctrl+C leave it; other keys do not.
         use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -1396,9 +1829,9 @@ mod tests {
         let shown = text(&view.card(60, 40));
         assert!(shown.contains("shop lead → login"), "{shown}");
         assert!(shown.contains("you → shop lead"), "{shown}");
-        assert!(
-            view.footer()
-                .starts_with("2 agents · 2 working · 2 messages")
+        assert_eq!(
+            text(&[view.footer(100)]),
+            "  2 agents · ● 2 working · 2 messages in the last minute"
         );
     }
 
@@ -1434,7 +1867,7 @@ mod tests {
         view.drain();
         assert!(view.agents[0].ripple.is_some());
         assert_eq!(view.sparks[0].from, End::Rim(0));
-        let shown = text(&view.card(50, 30));
+        let shown = text(&view.card(60, 30));
         assert!(shown.contains("a posted to the commons"), "{shown}");
         assert!(shown.contains("a follow → a"), "{shown}");
     }
@@ -1594,6 +2027,8 @@ mod tests {
                         }
                         return;
                     }
+                } else if asked["op"] == "approvals" {
+                    out.push(json!({"id": id, "result": {"approvals": []}}));
                 } else {
                     follows += 1;
                     if follows == 2 {
@@ -1619,7 +2054,7 @@ mod tests {
                 Feed::Live(event) => event["cursor"].to_string(),
                 Feed::Roll(_) => "roll".into(),
                 Feed::Ready => "ready".into(),
-                Feed::Past(_) | Feed::Down(_) => continue,
+                Feed::Past(_) | Feed::Held(_) | Feed::Down(_) => continue,
             });
         }
         // Made, then started, once each in the store's order; then the roll
@@ -1717,6 +2152,235 @@ mod tests {
             text.iter()
                 .any(|line| line.contains("fell behind the daemon"))
         );
+    }
+
+    #[tokio::test]
+    async fn an_agent_shows_the_state_tables_mark_for_what_it_is_doing() {
+        let (mut view, send) = view();
+        send.send(Feed::Roll(vec![
+            json!({"name": "shop.lead"}),
+            json!({"name": "shop.login", "created_by": "shop.lead"}),
+            json!({"name": "shop.cart", "created_by": "shop.lead"}),
+        ]))
+        .unwrap();
+        let live = |bot: &str, kind: &str, turn: i64, data: Value| {
+            Feed::Live(json!({"event": kind, "bot": bot, "turn": turn, "data": data}))
+        };
+        for feed in [
+            live("shop.lead", "accepted", 1, json!({})),
+            live("shop.lead", "tool_started", 1, json!({"name": "ask"})),
+            live(
+                "shop.lead",
+                "turn_finished",
+                1,
+                json!({"status": "completed"}),
+            ),
+            live(
+                "shop.login",
+                "accepted",
+                2,
+                json!({"from": {"bot": "shop.lead"}}),
+            ),
+            live(
+                "shop.login",
+                "approval_requested",
+                2,
+                json!({"calls": [{"call_id": "c1", "gates": ["manual"]}]}),
+            ),
+            live(
+                "shop.cart",
+                "accepted",
+                3,
+                json!({"from": {"bot": "shop.lead"}}),
+            ),
+            live(
+                "shop.cart",
+                "turn_finished",
+                3,
+                json!({"status": "failed", "error": "provider_error"}),
+            ),
+        ] {
+            send.send(feed).unwrap();
+        }
+        view.drain();
+        let state = |view: &View, name: &str| view.agents[view.index[name]].state();
+        assert_eq!(state(&view, "shop.lead"), Some(State::NeedsYou));
+        assert_eq!(state(&view, "shop.login"), Some(State::NeedsYou));
+        assert_eq!(state(&view, "shop.cart"), Some(State::Failed));
+        let shown = text(&view.card(100, 40));
+        assert!(shown.contains("? shop lead"), "{shown}");
+        assert!(shown.contains("✗ cart"), "{shown}");
+        assert_eq!(
+            text(&[view.footer(100)]),
+            "  3 agents · ? 2 needs you · ● 0 working · ✗ 1 failed · 3 messages in the last minute"
+        );
+
+        // The call allowed, the agent works again; a new turn for what
+        // failed and what asked starts afresh.
+        for feed in [
+            live("shop.login", "tool_completed", 2, json!({"call_id": "c1"})),
+            live("shop.cart", "accepted", 4, json!({})),
+            live("shop.lead", "accepted", 5, json!({})),
+            live(
+                "shop.lead",
+                "turn_finished",
+                5,
+                json!({"status": "failed", "error": "empty_completion"}),
+            ),
+        ] {
+            send.send(feed).unwrap();
+        }
+        view.drain();
+        assert_eq!(state(&view, "shop.login"), Some(State::Working));
+        assert_eq!(state(&view, "shop.cart"), Some(State::Working));
+        assert_eq!(state(&view, "shop.lead"), None);
+    }
+
+    #[tokio::test]
+    async fn what_needs_the_person_stays_until_they_answer_it() {
+        let (mut view, send) = view();
+        send.send(Feed::Roll(vec![
+            json!({"name": "shop.lead"}),
+            json!({"name": "shop.login", "created_by": "shop.lead"}),
+            json!({"name": "shop.cart", "created_by": "shop.lead", "running_turn": 7}),
+            json!({"name": "shop.ops"}),
+        ]))
+        .unwrap();
+        // Read when the view opened: a failed last turn, and a call that
+        // already waited.
+        send.send(Feed::Past(
+            json!({"event": "turn_finished", "bot": "shop.ops",
+            "turn": 1, "data": {"status": "failed", "error": "provider_error"}}),
+        ))
+        .unwrap();
+        send.send(Feed::Held(vec![("shop.cart".into(), "c0".into())]))
+            .unwrap();
+        let live = |bot: &str, kind: &str, turn: i64, data: Value| {
+            Feed::Live(json!({"event": kind, "bot": bot, "turn": turn, "data": data}))
+        };
+        for feed in [
+            live(
+                "shop.login",
+                "accepted",
+                2,
+                json!({"from": {"bot": "shop.lead"}}),
+            ),
+            live("shop.login", "tool_started", 2, json!({"name": "ask"})),
+            live(
+                "shop.login",
+                "turn_finished",
+                2,
+                json!({"status": "completed"}),
+            ),
+            live(
+                "shop.lead",
+                "accepted",
+                3,
+                json!({"from": {"bot": "shop.ops"}}),
+            ),
+            live(
+                "shop.lead",
+                "approval_requested",
+                3,
+                json!({"calls": [{"call_id": "a", "gates": ["manual"]},
+                    {"call_id": "b", "gates": ["manual"]}]}),
+            ),
+            live("shop.lead", "tool_completed", 3, json!({"call_id": "a"})),
+            // A message from someone else is no answer to what it asked.
+            live(
+                "shop.login",
+                "accepted",
+                4,
+                json!({"from": {"bot": "shop.ops"}}),
+            ),
+        ] {
+            send.send(feed).unwrap();
+        }
+        view.drain();
+        let state = |view: &View, name: &str| view.agents[view.index[name]].state();
+        assert_eq!(state(&view, "shop.ops"), Some(State::Failed));
+        assert_eq!(state(&view, "shop.cart"), Some(State::NeedsYou));
+        assert_eq!(state(&view, "shop.lead"), Some(State::NeedsYou));
+        assert_eq!(state(&view, "shop.login"), Some(State::NeedsYou));
+
+        // The last call answered, the waiting one started, and the lead
+        // that made it answers what it asked.
+        for feed in [
+            live("shop.lead", "step_decided", 3, json!({"call_id": "b"})),
+            live(
+                "shop.cart",
+                "tool_started",
+                7,
+                json!({"call_id": "c0", "name": "shell"}),
+            ),
+            live(
+                "shop.login",
+                "steered",
+                4,
+                json!({"from": {"bot": "shop.lead"}}),
+            ),
+        ] {
+            send.send(feed).unwrap();
+        }
+        view.drain();
+        assert_eq!(state(&view, "shop.lead"), Some(State::Working));
+        assert_eq!(state(&view, "shop.cart"), Some(State::Working));
+        assert_eq!(state(&view, "shop.login"), Some(State::Working));
+    }
+
+    #[tokio::test]
+    async fn the_legend_takes_the_tickers_place() {
+        let (mut view, send) = view();
+        send.send(Feed::Roll(vec![json!({"name": "shop.lead"})]))
+            .unwrap();
+        view.drain();
+        view.legend = true;
+        let shown = text(&view.card(80, 30));
+        assert!(
+            shown.contains("● working  ? needs you  ✗ failed"),
+            "{shown}"
+        );
+        assert!(shown.contains("⠤⠤ shell  ⡇ files  ⡁⢈ web"), "{shown}");
+        assert!(!shown.contains("Catching up"), "{shown}");
+        let listed = text(&view.card(40, 12));
+        assert!(listed.contains("✦ just talked"), "{listed}");
+        view.legend = false;
+        assert!(text(&view.card(80, 30)).contains("Catching up"));
+    }
+
+    #[tokio::test]
+    async fn a_small_pane_lists_the_agents_with_a_firefly_each() {
+        let (mut view, send) = view();
+        let mut bots = vec![json!({"name": "shop.lead"})];
+        for n in 0..30 {
+            bots.push(json!({"name": format!("shop.t{n}"), "created_by": "shop.lead"}));
+        }
+        send.send(Feed::Roll(bots)).unwrap();
+        send.send(Feed::Live(
+            json!({"event": "accepted", "bot": "shop.t29", "turn": 1,
+            "data": {"from": {"bot": "shop.lead"}}}),
+        ))
+        .unwrap();
+        view.drain();
+        let shown = text(&view.card(50, 20));
+        let rows: Vec<&str> = shown.lines().collect();
+        // No braille: a list, the lead first, its agents under it.
+        assert!(
+            !shown
+                .chars()
+                .any(|c| ('\u{2801}'..='\u{28ff}').contains(&c)),
+            "{shown}"
+        );
+        assert!(rows[0].contains("shop lead"), "{shown}");
+        // The one at work is kept though it is last, and says who told it.
+        assert!(
+            rows.iter().any(|row| row.starts_with("●")
+                && row.contains("t29")
+                && row.contains("from shop lead")),
+            "{shown}"
+        );
+        assert!(shown.contains("more, quiet"), "{shown}");
+        assert!(rows.len() <= 20, "{shown}");
     }
 
     #[test]
