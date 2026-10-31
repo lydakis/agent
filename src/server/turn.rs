@@ -4868,9 +4868,14 @@ impl Outputs {
             )
             .collect();
         let artifacts = std::mem::take(&mut outcome.artifacts);
+        // A turn stopped while this runs drops what it returns, and the
+        // files with it: no record will name them.
         let kept = tokio::task::spawn_blocking(move || {
             if self.exposed() {
-                return (artifacts, Vec::new());
+                return Kept {
+                    stored: artifacts,
+                    files: Vec::new(),
+                };
             }
             let mut stored = Vec::new();
             let mut written = Vec::new();
@@ -4897,13 +4902,13 @@ impl Outputs {
                 .into_iter()
                 .map(|(stream, path, _)| (stream, path))
                 .collect();
-            (stored, files)
+            Kept { stored, files }
         })
         .await;
         // A task that failed took the data with it: the cut text stands alone.
-        if let Ok((stored, files)) = kept {
-            outcome.artifacts = stored;
-            outcome.files = files;
+        if let Ok(mut kept) = kept {
+            outcome.artifacts = std::mem::take(&mut kept.stored);
+            outcome.files = std::mem::take(&mut kept.files);
         }
         outcome
     }
@@ -4950,6 +4955,21 @@ impl Outputs {
             // Unconfined, its commands may write whatever the daemon may.
             Ok(None) => false,
             Err(_) => true,
+        }
+    }
+}
+
+/// A call's cut streams once kept: those the store keeps, and the files
+/// that hold the others, removed again unless the call's outcome takes them.
+struct Kept {
+    stored: Vec<(&'static str, Vec<u8>)>,
+    files: Vec<(&'static str, String)>,
+}
+
+impl Drop for Kept {
+    fn drop(&mut self) {
+        for (_, file) in &self.files {
+            let _ = std::fs::remove_file(file);
         }
     }
 }

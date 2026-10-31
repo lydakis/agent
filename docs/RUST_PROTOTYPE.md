@@ -371,9 +371,11 @@ store records it, off the runtime thread, and only while
 the bot's sandbox cannot write the folder, checked after the folder is made: a
 command that could write there could put a link for the daemon to follow. An unconfined bot's
 commands can already write whatever the daemon can. A stream whose file cannot
-be written stays in the store. Retention and deletion remove a turn's files
-once removing its records commits; a file removed by hand reads
-`artifact_not_found`.
+be written stays in the store, and a turn stopped while its files are written
+removes them. Retention and deletion remove a turn's files once removing its
+records commits; a file removed by hand reads `artifact_not_found`. A daemon
+that dies between writing a file and recording its call leaves the file, which
+no record names.
 Line pages are assembled on the storage worker; only the bounded page crosses
 into the async runtime. Byte-oriented protocol pages continue to use SQL slicing.
 

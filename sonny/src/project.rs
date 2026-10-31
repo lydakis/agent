@@ -902,7 +902,7 @@ async fn make(
     if agent_client::config::load()?.hide_senders {
         settings.insert("hide_senders".into(), json!(true));
     }
-    if let Some(outputs) = agent_client::policy::default_outputs() {
+    if let Some(outputs) = crate::outputs() {
         settings.insert("outputs".into(), json!(outputs));
     }
     let policy = json!({
