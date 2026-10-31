@@ -4323,6 +4323,11 @@ impl Turn {
             let (notify, lapse) = match first.take() {
                 Some(first) => first,
                 None => {
+                    // A drain that began while this waited for its verdict
+                    // starts nothing: the call is answered as not run.
+                    if self.stopping.load(Relaxed) {
+                        return Ok(Approval::Stop(Stop::Drained));
+                    }
                     // The job reads the clock when it judges, and the lapse
                     // is measured from a fresh read, so time spent queued for
                     // the worker moves neither.

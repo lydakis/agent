@@ -4,7 +4,7 @@ use agent_runtime::{
     provider::{ToolCall, Usage},
     store::{
         Answered, Binding, Bot, CacheTtl, CompactionPlan, ContextUsage, Database, Decision,
-        Delivery, Fork, Gate, Gated, Halt, Planning, QuoteRef, Settings, Strip, TurnBudget,
+        Delivery, Fork, Gate, Gated, Halt, Halted, Planning, QuoteRef, Settings, Strip, TurnBudget,
         TurnOptions, Wake,
     },
     tools::{Declared, Inherit, Outcome},
@@ -9619,6 +9619,65 @@ fn a_turn_parked_by_a_stop_continues_and_one_a_pull_parked_before_74_keeps_its_p
     assert!(!raw.contains("pulled"), "{raw}");
     drop(db);
     std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn a_halt_says_a_call_it_cut_off_has_an_unknown_outcome_and_one_it_never_started_is_cancelled() {
+    for halt in [Halt::Pause, Halt::Shutdown] {
+        let mut db = db();
+        db.create("Bob", Some("/synthetic"), binding()).unwrap();
+        let turn = db
+            .begin(
+                "Bob",
+                "request",
+                "work",
+                true,
+                &TurnOptions::default(),
+                allow_provider,
+            )
+            .unwrap()
+            .turn;
+        let calls = ["executing", "planned"].map(|id| ToolCall {
+            custom: false,
+            name: "write".into(),
+            call_id: id.into(),
+            arguments: r#"{"path":"file","content":"hello"}"#.into(),
+        });
+        let items = calls
+            .iter()
+            .map(|call| {
+                serde_json::to_vec(&json!({"type":"function_call","call_id":call.call_id,
+                    "name":call.name,"arguments":call.arguments}))
+                .unwrap()
+                .into()
+            })
+            .collect();
+        db.append(turn, items, &calls, None).unwrap();
+        db.tool_start(turn, &calls[0]).unwrap();
+        let Halted::Parked(events) = db.suspend_halted(turn, halt, 0, 0, 0, None).unwrap() else {
+            panic!("a running turn parks");
+        };
+        let completed: Vec<_> = events
+            .iter()
+            .filter(|event| event["event"] == "tool_completed")
+            .map(|event| {
+                let data = &event["data"];
+                (
+                    data["call_id"].clone(),
+                    data["outcome_unknown"].clone(),
+                    data["cancelled"].clone(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            completed,
+            [
+                (json!("executing"), json!(true), json!(false)),
+                (json!("planned"), json!(false), json!(true)),
+            ],
+            "{halt:?}"
+        );
+    }
 }
 
 #[test]

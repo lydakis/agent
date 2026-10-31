@@ -1067,7 +1067,10 @@ continues it, as capacity allows and with no `resume`: `turn_paced` says
 `waiting_on`. The reply it was writing is dropped and asked for again then.
 Each call it had not answered gets `{error: "daemon_shutdown", detail}`,
 saying the stop cut it off before its result was recorded (it may have had
-effects) or came before it ran, and none is run again. The time the daemon
+effects) or came before it ran, and none is run again; the first's
+`tool_completed` says `outcome_unknown`, the second's `cancelled`, as a pause
+says them. A call waiting for its verdict as the drain begins does not
+start, even if allowed then. The time the daemon
 was down is not counted in `paced_ms`. A client's `wait` still open is
 answered as its deadline would answer it, the parked turn reported pending
 as it stands. Background commands and terminals end with the daemon as

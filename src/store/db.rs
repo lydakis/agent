@@ -8758,7 +8758,9 @@ impl Database {
                 (Halt::Shutdown, false) => json!({"error":"daemon_shutdown","detail":
                     "the daemon stopped before this call ran; it did not run"}),
             };
-            (result, false)
+            // A call cut off while it ran may have had effects: its event
+            // says the outcome is unknown, as its result does.
+            (result, executing)
         })?;
         if head != bot.head {
             // Every call of the round is answered, so the round is closed.
