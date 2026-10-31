@@ -561,7 +561,8 @@ way `/react` does, and each note in the margin has its own `↩`.
   only when everything it runs is named, so `mcpx … | jq` still asks.
   When you approve a plain command that asked to leave, `a` (always allow
   `cargo test`) adds its first words to the list, and the lead and its
-  agents take it at once.
+  agents take it at once. The list holds for every folder, so a program
+  named from the folder it runs in (`./build.sh`) is never offered.
 
   ![An approval prompt offering to always allow cargo test](../docs/sonny/permissions-always.png)
 

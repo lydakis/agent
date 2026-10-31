@@ -440,7 +440,9 @@ pub fn always(call: &Value) -> Option<String> {
     }
     let words: Vec<&str> = command.split_whitespace().collect();
     let program = *words.first()?;
-    if program.contains('=') {
+    // A program named from the folder it runs in, `./build.sh`, is another
+    // one in every other folder, which the prefix would let out too.
+    if program.contains('=') || (program.contains('/') && !program.starts_with(['/', '~'])) {
         return None;
     }
     let subcommand = (words.get(1)).filter(|word| {
@@ -1013,8 +1015,8 @@ mod tests {
         assert_eq!(always(&cut), None);
         assert_eq!(always(&call("mcpx --list")).as_deref(), Some("mcpx"));
         assert_eq!(
-            always(&call("./build.sh fast")).as_deref(),
-            Some("./build.sh fast")
+            always(&call("/opt/tools/build fast")).as_deref(),
+            Some("/opt/tools/build fast")
         );
         // Anything that runs more than its first words say asks each time.
         for command in [
@@ -1023,6 +1025,8 @@ mod tests {
             "echo $HOME",
             "FOO=1 make",
             "a > b",
+            "./build.sh fast",
+            "scripts/release",
             "",
         ] {
             assert_eq!(always(&call(command)), None, "{command}");
