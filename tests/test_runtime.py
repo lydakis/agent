@@ -1587,6 +1587,8 @@ class RuntimeTests(ModelFixture):
         self.assertEqual((paused['changed'], paused['parked']), (True, 1))
         self.assertEqual(paused['pause']['reason'], 'the migration is deleting rows')
         self.assertEqual(paused['pause']['by'], 'calc.a')
+        # It names whose running turns it parked, so one can be stopped first.
+        self.assertEqual(paused['pause']['parked'], {'bots': ['Bob'], 'total': 1})
         heard = client.receive(lambda e: e.get('event') == 'paused')
         self.assertEqual(heard['pause'], paused['pause'])
         # The running turn parks now, to go on when the pause lifts.
@@ -1621,10 +1623,15 @@ class RuntimeTests(ModelFixture):
         self.assertEqual(restarted.request('resume', by='')['error'], 'invalid_by')
         self.assertEqual(restarted.request('stats')['result']['paused'], paused['pause'])
         resumed = restarted.request('resume', by='shop.b')['result']
-        self.assertEqual((resumed['changed'], resumed['pause'], resumed['by']), (True, paused['pause'], 'shop.b'))
+        lifted = resumed['pause']
+        self.assertEqual((resumed['changed'], resumed['by'], lifted['resumed_by']), (True, 'shop.b', 'shop.b'))
+        self.assertGreaterEqual(lifted['resumed_ms'], lifted['at_ms'])
+        self.assertEqual({k: v for k, v in lifted.items() if not k.startswith('resumed')}, paused['pause'])
         # Every session hears who let the line go on.
         heard = restarted.receive(lambda e: e.get('event') == 'resumed')
-        self.assertEqual((heard['pause'], heard['by']), (paused['pause'], 'shop.b'))
+        self.assertEqual((heard['pause'], heard['by']), (lifted, 'shop.b'))
+        # The pause stays in the history, held or lifted.
+        self.assertEqual(restarted.request('pauses')['result'], {'pauses': [lifted], 'more': False})
         waited = restarted.request('wait', handles=[handle, running], timeout_ms=5000)['result']
         self.assertEqual(waited['results'][handle]['status'], 'completed')
         self.assertEqual(waited['results'][running]['status'], 'completed')
@@ -1632,6 +1639,46 @@ class RuntimeTests(ModelFixture):
         self.assertLess(waited['results'][running]['paced_ms'], 300)
         self.assertEqual(restarted.request('resume')['result'], {'pause': None, 'by': None, 'changed': False})
         self.assertIsNone(restarted.request('stats')['result']['paused'])
+
+    def test_a_turn_a_pause_parked_can_be_stopped_before_the_resume(self):
+        self.model.release_headers = threading.Event()
+        self.model.all_streaming = self.model.release_headers
+        client = self.client()
+        self.addCleanup(lambda: client.close(kill=True))
+        client.request('create', bot='Bob', workspace=str(self.path))
+        turn = client.request('submit', bot='Bob', request_id='culprit', prompt='gate')['result']['turn']
+        self.model.requests.get(timeout=3)
+        client.request('pause', reason='Bob is deleting rows', by='calc.a')
+        client.receive(lambda e: e.get('event') == 'turn_paced' and e.get('turn') == turn)
+        self.model.release_headers.set()
+        client.request('interrupt', bot='Bob', turn=turn)
+        self.assertEqual(client.finished(turn)['data']['status'], 'interrupted')
+        client.request('resume')
+        time.sleep(.3)
+        self.assertTrue(self.model.requests.empty())
+
+    def test_every_pause_is_kept_with_who_pulled_and_who_lifted_it(self):
+        client = self.client()
+        self.addCleanup(lambda: client.close(kill=True))
+        self.assertEqual(client.request('pauses')['result'], {'pauses': [], 'more': False})
+        for n in range(3):
+            client.request('pause', reason=f'pull {n}', by='calc.a')
+            client.request('resume', by='shop.b')
+        held = client.request('pause', reason='pull 3')['result']['pause']
+        self.assertEqual(held['parked'], {'bots': [], 'total': 0})
+        first = client.request('pauses', limit=2)['result']
+        self.assertEqual(([p['reason'] for p in first['pauses']], first['more']), (['pull 0', 'pull 1'], True))
+        self.assertEqual({p['resumed_by'] for p in first['pauses']}, {'shop.b'})
+        rest = client.request('pauses', after=first['pauses'][-1]['id'])['result']
+        self.assertEqual(([p['reason'] for p in rest['pauses']], rest['more']), (['pull 2', 'pull 3'], False))
+        # The one that holds says nothing of a resume yet.
+        self.assertEqual(rest['pauses'][-1], held)
+        newest = client.request('pauses', newest=True, limit=1)['result']
+        self.assertEqual((newest['pauses'], newest['more']), ([held], True))
+        older = client.request('pauses', newest=True, before=held['id'], limit=1)['result']
+        self.assertEqual(older['pauses'][0]['reason'], 'pull 2')
+        for page in ({'limit': 0}, {'limit': 257}, {'after': -1}, {'before': 0}):
+            self.assertEqual(client.request('pauses', **page)['error'], 'invalid_pause_page')
 
     def test_a_pause_stops_a_running_command_and_the_turn_goes_on_without_rerunning_it(self):
         marker = self.path / 'ran'
@@ -1682,6 +1729,29 @@ class RuntimeTests(ModelFixture):
         while client.request('stats')['result']['running_processes'] and time.monotonic() < deadline:
             time.sleep(.05)
         self.assertEqual(client.request('stats')['result']['running_processes'], 0)
+
+    def test_a_pause_ends_the_detached_commands_agents_started(self):
+        client = self.client('shell')
+        self.addCleanup(lambda: client.close(kill=True))
+        client.request('create', bot='Bob', workspace=str(self.path), tools=['shell'])
+        turn = client.request('submit', bot='Bob', request_id='detached',
+                              prompt='detach:exec sleep 30')['result']['turn']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        events = client.request('events', bot='Bob', after=0, limit=64)['result']['events']
+        completed = next(e for e in events if e['turn'] == turn and e['event'] == 'tool_completed')
+        pid = json.loads(node_item(client, 'Bob', completed['data']['node'])['result']['output'])['pid']
+        self.addCleanup(lambda: subprocess.run(['kill', '-9', str(pid)], capture_output=True))
+        os.kill(pid, 0)
+        client.request('pause', reason='the loop is sending mail', by='calc.a')
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(.05)
+        else:
+            self.fail('the detached command outlived the pause')
 
     def test_a_pause_ends_a_command_a_steer_moved_to_the_background(self):
         self.model.slow_command = 'sleep 30'

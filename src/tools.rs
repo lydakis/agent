@@ -113,7 +113,7 @@ impl Tool {
                 "properties":{"text":{"type":"string"}},"required":["text"],"additionalProperties":false}),
             ),
             Tool::Shell => (
-                "Run a noninteractive bash command (sh where bash is not installed) in the workspace. stdout and stderr are returned separately; each is truncated to a head and tail beyond 64 KiB, with up to 1 MiB of it retained: past that, its first and last 512 KiB, and the command keeps running. Default timeout 120 s, maximum 600 s; a command that times out returns its output so far with timed_out. Every result reports wall_time_ms. Commands run with no terminal: TERM=dumb, NO_COLOR=1, and cat as the pager; AI_AGENT=agent tells tools an agent runs them. When the command returns or times out, every process it started is killed, so `cmd &` does not outlive it. With background=true the command is started and a proc handle is returned immediately; collect its result later with wait. A steer that arrives while a command runs moves it to the background: the result is its proc handle with steered=true, and the command keeps running. A background command runs until it exits, times out, or the daemon stops. With detach=true the command starts in its own session and its pid is returned at once; nothing kills or tracks it, so it outlives the turn and the daemon. Its output is discarded unless the command redirects it to a file. With tty=true it runs in a terminal, for a REPL or a program that prompts: the result is what it wrote within yield_time_ms (default 1000) and, while it runs, a proc handle for write_stdin.",
+                "Run a noninteractive bash command (sh where bash is not installed) in the workspace. stdout and stderr are returned separately; each is truncated to a head and tail beyond 64 KiB, with up to 1 MiB of it retained: past that, its first and last 512 KiB, and the command keeps running. Default timeout 120 s, maximum 600 s; a command that times out returns its output so far with timed_out. Every result reports wall_time_ms. Commands run with no terminal: TERM=dumb, NO_COLOR=1, and cat as the pager; AI_AGENT=agent tells tools an agent runs them. When the command returns or times out, every process it started is killed, so `cmd &` does not outlive it. With background=true the command is started and a proc handle is returned immediately; collect its result later with wait. A steer that arrives while a command runs moves it to the background: the result is its proc handle with steered=true, and the command keeps running. A background command runs until it exits, times out, or the daemon stops. With detach=true the command starts in its own session and its pid is returned at once; nothing tracks it and only a daemon pause kills it, so it outlives the turn and the daemon. Its output is discarded unless the command redirects it to a file. With tty=true it runs in a terminal, for a REPL or a program that prompts: the result is what it wrote within yield_time_ms (default 1000) and, while it runs, a proc handle for write_stdin.",
                 json!({"type":"object","properties":{"command":{"type":"string"},
                 "timeout_ms":{"type":"integer","minimum":1,"maximum":MAX_SHELL_TIMEOUT_MS},
                 "background":{"type":"boolean"},"detach":{"type":"boolean"},"tty":{"type":"boolean"},
@@ -1977,8 +1977,8 @@ impl Registry {
         }
     }
 
-    /// End every background command and terminal now, as the pull cord
-    /// stops the line. A detached command is no one's to stop.
+    /// End every background command, terminal and detached command this
+    /// daemon started now, as the pull cord stops the line.
     pub fn end_running(&self) {
         self.pulls.send_modify(|pulls| *pulls += 1);
         self.end_terminals();
@@ -2311,8 +2311,8 @@ fn sh(
 /// Start a command in a new session for a service that must outlive the
 /// turn and the daemon. Its output is discarded: a log the daemon wrote would
 /// bypass credential redaction, so a command that wants one redirects itself.
-/// No process slot, group kill, or handle applies to it. An async waiter
-/// reaps it on exit and releases its detached slot.
+/// No process slot or handle applies to it, and only the pull cord kills its
+/// session. An async waiter reaps it on exit and releases its detached slot.
 #[cfg(unix)]
 async fn detach(
     command: &str,
@@ -2363,9 +2363,20 @@ async fn detach(
     let held = crate::sandbox::hold_for(sandbox.as_deref()).await;
     let mut child = process.spawn()?;
     let pid = child.id().ok_or(Error::new("shell_spawn_failed"))?;
+    // It outlives turns and the daemon, but not the pull cord: a pull ends
+    // the session it leads, as it ends every other command an agent runs.
+    let mut pulls = registry.pulls.subscribe();
     tokio::spawn(async move {
         let _permit = permit;
-        let _ = child.wait().await;
+        tokio::select! {
+            _ = child.wait() => {}
+            Ok(()) = pulls.changed() => {
+                // SAFETY: kill with a negative pid signals the process group
+                // setsid made this child lead; it touches no memory.
+                unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+                let _ = child.wait().await;
+            }
+        }
         drop(held);
     });
     Ok(Outcome::text(

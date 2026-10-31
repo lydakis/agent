@@ -1264,6 +1264,16 @@ pub fn main(args: Vec<String>) -> Result<i32> {
             print_json(&resumed, options.pretty)?;
             Ok(0)
         }
+        "pauses" => {
+            let mut connection = ensure_existing_daemon(&options)?;
+            let page = connection.request(
+                "pauses",
+                json!({"after": options.after, "limit": options.limit.unwrap_or(64).min(256),
+                    "newest": options.newest}),
+            )?;
+            print_json(&page, options.pretty)?;
+            Ok(0)
+        }
         "shutdown" => {
             let mut connection = match Connection::connect(&options.socket) {
                 Ok(connection) => connection,

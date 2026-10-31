@@ -193,6 +193,14 @@ const COMMANDS: &[Command] = &[
         startup: false,
     },
     Command {
+        name: "pauses",
+        about: "Every pause, held or lifted: why, who pulled it and let it go, whose turns it parked",
+        usage: "pauses [--after ID] [--newest] [--limit N]",
+        flags: "--after --newest --limit --pretty --no-spawn",
+        settings: "",
+        startup: true,
+    },
+    Command {
         name: "serve",
         about: "Run the daemon in the foreground; other commands start it for you",
         usage: "serve --store PATH --provider SPEC... [OPTIONS]",

@@ -1480,6 +1480,24 @@ pub struct Database {
     files_gone: Vec<String>,
 }
 
+/// A pause's columns, as `pause_row` reads them.
+const PAUSE_COLUMNS: &str = "id,reason,pulled_by,at_ms,parked,resumed_by,resumed_ms";
+/// A pause as clients read it: `parked` holds the agents whose running turns
+/// it parked (`bots`, the first of them, and `total`); a lifted one also says
+/// who lifted it and when.
+fn pause_row(r: &rusqlite::Row) -> rusqlite::Result<Value> {
+    let parked: Option<String> = r.get(4)?;
+    let mut pause = json!({"id": r.get::<_, i64>(0)?, "reason": r.get::<_, String>(1)?,
+        "by": r.get::<_, Option<String>>(2)?, "at_ms": r.get::<_, i64>(3)?,
+        "parked": parked.and_then(|p| serde_json::from_str::<Value>(&p).ok())
+            .unwrap_or_else(|| json!({"bots": [], "total": 0}))});
+    if let Some(at) = r.get::<_, Option<i64>>(6)? {
+        pause["resumed_by"] = json!(r.get::<_, Option<String>>(5)?);
+        pause["resumed_ms"] = json!(at);
+    }
+    Ok(pause)
+}
+
 /// The columns of the turn view, from `turns t JOIN bots b ON b.name=t.bot`.
 /// A wait result, a `turns` item and an `interrupt` reply all start from it,
 /// so a client reads one shape wherever it meets a turn.
@@ -1722,7 +1740,7 @@ impl Database {
     /// Stored schema version, kept in `PRAGMA user_version`. Stores created
     /// before versioning and stores from newer binaries are rejected; an older
     /// versioned store is migrated forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 71;
+    pub const SCHEMA: i32 = 72;
     /// Verbatim user prompts a compaction keeps: per-prompt text, and the
     /// total text plus `(ordinal, String)` entry metadata. Empty entries cost
     /// space too, so the retained list cannot grow with conversation length.
@@ -1913,8 +1931,11 @@ impl Database {
             CREATE TABLE IF NOT EXISTS checkpoints(bot TEXT NOT NULL REFERENCES bots(name), head INTEGER NOT NULL REFERENCES nodes(id),
                 PRIMARY KEY(bot,head));
             CREATE TABLE IF NOT EXISTS companions(name TEXT PRIMARY KEY, spec TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS pause(singleton INTEGER PRIMARY KEY CHECK(singleton=1),
-                reason TEXT NOT NULL, pulled_by TEXT, at_ms INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS pauses(id INTEGER PRIMARY KEY AUTOINCREMENT,
+                reason TEXT NOT NULL, pulled_by TEXT, at_ms INTEGER NOT NULL, parked TEXT,
+                resumed_by TEXT, resumed_ms INTEGER);
+            CREATE UNIQUE INDEX IF NOT EXISTS pauses_held ON pauses(ifnull(resumed_ms,0))
+                WHERE resumed_ms IS NULL;
             CREATE TABLE IF NOT EXISTS tools(turn INTEGER NOT NULL REFERENCES turns(id), call_id TEXT NOT NULL,
                 status TEXT NOT NULL, custom INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(turn,call_id));
             CREATE TABLE IF NOT EXISTS approvals(id INTEGER PRIMARY KEY AUTOINCREMENT, turn INTEGER NOT NULL REFERENCES turns(id),
@@ -4580,40 +4601,78 @@ impl Database {
             == 1)
     }
     /// The pause that holds the daemon, if one does: why, who pulled it,
-    /// and when.
+    /// when, and the agents whose running turns it parked.
     pub fn pause(&self) -> Result<Option<Value>> {
         Ok(self
             .conn
-            .query_row(
-                "SELECT reason,pulled_by,at_ms FROM pause WHERE singleton=1",
-                [],
-                |r| {
-                    Ok(json!({"reason": r.get::<_, String>(0)?,
-                        "by": r.get::<_, Option<String>>(1)?, "at_ms": r.get::<_, i64>(2)?}))
-                },
-            )
+            .prepare_cached(&format!(
+                "SELECT {PAUSE_COLUMNS} FROM pauses WHERE resumed_ms IS NULL"
+            ))?
+            .query_row([], pause_row)
             .optional()?)
     }
     /// Hold the daemon paused, unless a pause already does: the pause that
-    /// holds, and whether it is this one.
+    /// holds, and whether it is this one. `parked` names the agents whose
+    /// running turns it parks, `parked_total` of them in all.
     pub fn put_pause(
         &mut self,
         reason: &str,
         by: Option<&str>,
         at_ms: i64,
+        parked: &[String],
+        parked_total: usize,
     ) -> Result<(Value, bool)> {
+        let parked = json!({"bots": parked, "total": parked_total}).to_string();
         let new = self.conn.execute(
-            "INSERT OR IGNORE INTO pause(singleton,reason,pulled_by,at_ms) VALUES(1,?1,?2,?3)",
-            params![reason, by, at_ms],
+            // Not OR IGNORE: an ignored insert would still spend an id.
+            "INSERT INTO pauses(reason,pulled_by,at_ms,parked) SELECT ?1,?2,?3,?4
+             WHERE NOT EXISTS(SELECT 1 FROM pauses WHERE resumed_ms IS NULL)",
+            params![reason, by, at_ms, parked],
         )? == 1;
         let held = self.pause()?.ok_or(Error::new("storage_error"))?;
         Ok((held, new))
     }
-    /// Lift the pause: the one lifted, if one held.
-    pub fn remove_pause(&mut self) -> Result<Option<Value>> {
-        let held = self.pause()?;
-        self.conn.execute("DELETE FROM pause", [])?;
-        Ok(held)
+    /// Lift the pause, as `by` lets the line go on: the one lifted, now
+    /// with who lifted it and when, if one held. It stays in the history.
+    pub fn remove_pause(&mut self, by: Option<&str>, at_ms: i64) -> Result<Option<Value>> {
+        Ok(self
+            .conn
+            .prepare_cached(&format!(
+                "UPDATE pauses SET resumed_by=?1,resumed_ms=?2 WHERE resumed_ms IS NULL
+                 RETURNING {PAUSE_COLUMNS}"
+            ))?
+            .query_row(params![by, at_ms], pause_row)
+            .optional()?)
+    }
+    /// Pauses, held and lifted, in the order pulled (newest first with
+    /// `newest`), after the pause `after` and before `before`: at most
+    /// `limit`, and whether more follow.
+    pub fn pauses(
+        &self,
+        after: i64,
+        before: Option<i64>,
+        limit: usize,
+        newest: bool,
+    ) -> Result<Value> {
+        if after < 0 || before.is_some_and(|b| b < 1) || !(1..=256).contains(&limit) {
+            return fail_with(
+                "invalid_pause_page",
+                "limit must be 1 to 256, after 0 or more and before 1 or more",
+            );
+        }
+        let order = if newest { "DESC" } else { "ASC" };
+        let mut statement = self.conn.prepare_cached(&format!(
+            "SELECT {PAUSE_COLUMNS} FROM pauses WHERE id>?1 AND id<?2 ORDER BY id {order} LIMIT ?3"
+        ))?;
+        let mut pauses = statement
+            .query_map(
+                params![after, before.unwrap_or(i64::MAX), (limit + 1) as i64],
+                pause_row,
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let more = pauses.len() > limit;
+        pauses.truncate(limit);
+        Ok(json!({"pauses": pauses, "more": more}))
     }
     pub fn store_identity(&self) -> Result<i64> {
         Ok(self
@@ -8650,7 +8709,10 @@ impl Database {
             )?
             .query_map([turn], |r| r.get(0))?
             .collect::<rusqlite::Result<_>>()?;
-        let pause = self.pause()?;
+        // Why, who and when; not whose turns it parked.
+        let pause = self
+            .pause()?
+            .map(|p| json!({"reason":p["reason"],"by":p["by"],"at_ms":p["at_ms"]}));
         let waiting = Waiting {
             turn,
             bot: bot.name.clone(),
@@ -12393,6 +12455,22 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
              INSERT OR IGNORE INTO senders(node) SELECT node FROM attached_nodes;
              UPDATE senders SET attached=1 WHERE node IN (SELECT node FROM attached_nodes);
              DROP TABLE attached_nodes;",
+        )?;
+    }
+    // 71 -> 72: pauses are kept once lifted, with who lifted them, and say
+    // whose turns they parked. A pause that holds goes on holding; which
+    // turns it parked was not kept.
+    if conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='pause')",
+        [],
+        |r| r.get::<_, bool>(0),
+    )? {
+        conn.execute_batch(
+            "CREATE TABLE pauses(id INTEGER PRIMARY KEY AUTOINCREMENT,
+                reason TEXT NOT NULL, pulled_by TEXT, at_ms INTEGER NOT NULL, parked TEXT,
+                resumed_by TEXT, resumed_ms INTEGER);
+             INSERT INTO pauses(reason,pulled_by,at_ms) SELECT reason,pulled_by,at_ms FROM pause;
+             DROP TABLE pause;",
         )?;
     }
     Ok(())

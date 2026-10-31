@@ -14553,3 +14553,49 @@ fn each_item_says_when_it_joined_the_history() {
         assert_eq!(read["written_ms"], written);
     }
 }
+
+#[test]
+fn schema_71_held_one_pause_and_forgot_it_when_lifted() {
+    let path = std::env::temp_dir().join(format!("agent-schema71-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            "DROP TABLE pauses;
+             CREATE TABLE pause(singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+                reason TEXT NOT NULL, pulled_by TEXT, at_ms INTEGER NOT NULL);
+             INSERT INTO pause VALUES(1,'the migration deletes rows','calc.a',5);
+             PRAGMA user_version=71;",
+        )
+        .unwrap();
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    // The pause that held goes on holding; whose turns it parked was not kept.
+    let held = db.pause().unwrap().unwrap();
+    assert_eq!(
+        held,
+        json!({"id": 1, "reason": "the migration deletes rows", "by": "calc.a", "at_ms": 5,
+            "parked": {"bots": [], "total": 0}})
+    );
+    let (again, new) = db.put_pause("another", None, 6, &[], 0).unwrap();
+    assert_eq!((again, new), (held, false));
+    let lifted = db.remove_pause(Some("shop.b"), 7).unwrap().unwrap();
+    assert_eq!(
+        (&lifted["resumed_by"], &lifted["resumed_ms"]),
+        (&json!("shop.b"), &json!(7))
+    );
+    assert!(db.pause().unwrap().is_none());
+    // A new pause is the next in the history.
+    let (next, new) = db
+        .put_pause("again", None, 8, &["calc.a".to_owned()], 3)
+        .unwrap();
+    assert!(new);
+    assert_eq!(
+        (&next["id"], &next["parked"]),
+        (&json!(2), &json!({"bots": ["calc.a"], "total": 3}))
+    );
+    let history = db.pauses(0, None, 64, false).unwrap();
+    assert_eq!(history, json!({"pauses": [lifted, next], "more": false}));
+    drop(db);
+    std::fs::remove_file(path).unwrap();
+}
