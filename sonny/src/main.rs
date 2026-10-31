@@ -839,7 +839,14 @@ fn main() -> std::process::ExitCode {
         {
             match &rest[1..] {
                 [] => home::Places::home().and_then(|places| home::set_up(&places, None)),
-                [url] => home::Places::home().and_then(|places| home::set_up(&places, Some(url))),
+                [help] if help == "-h" || help == "--help" => {
+                    println!("usage: {}", home::USAGE);
+                    Ok(())
+                }
+                // A flag is never a repository's URL.
+                [url] if !url.starts_with('-') => {
+                    home::Places::home().and_then(|places| home::set_up(&places, Some(url)))
+                }
                 _ => Err(format!("usage: {}", home::USAGE)),
             }
         }
@@ -915,7 +922,10 @@ fn sky_cli(args: &[String]) -> Result<(), String> {
 
 async fn run() -> Result<(), String> {
     if std::env::args().nth(1).as_deref() == Some("--version") {
-        println!("sonny {}", env!("CARGO_PKG_VERSION"));
+        match option_env!("SONNY_COMMIT") {
+            Some(commit) => println!("sonny {} ({commit})", env!("CARGO_PKG_VERSION")),
+            None => println!("sonny {}", env!("CARGO_PKG_VERSION")),
+        }
         return Ok(());
     }
     let options = parse()?;

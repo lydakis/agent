@@ -51,6 +51,9 @@ const MEMORY_LINES: usize = 20;
 const ACTIVE: [&str; 5] = ["running", "waiting", "paced", "queued", "ready"];
 const APPROVAL: &str = "waiting for the person's approval";
 const QUIET: &str = "has printed nothing for 30 minutes";
+/// The origin of a turn that started before the lookout watched: who asked
+/// for it is unknown, never taken for the person.
+const UNKNOWN: &str = "";
 /// How long a running turn may print nothing before it is news.
 const QUIET_AFTER: Duration = super::QUIET_AFTER;
 /// An approval is news once the approver has had its say: a call the
@@ -243,6 +246,9 @@ pub struct Updates {
     bots: HashMap<String, Bot>,
     from: HashMap<Key, String>,
     origin: HashMap<Key, String>,
+    /// Turns seen starting: who asked for one started before the lookout
+    /// watched is not known, so its end names no one.
+    started: HashSet<Key>,
     answer_to: HashMap<Key, i64>,
     /// Turns whose answer a trigger passes to the lead, or whose end
     /// waits for their goal's check.
@@ -342,6 +348,7 @@ impl Updates {
             bots: HashMap::new(),
             from: HashMap::new(),
             origin: HashMap::new(),
+            started: HashSet::new(),
             answer_to: HashMap::new(),
             forwarding: HashMap::new(),
             goaled: HashSet::new(),
@@ -449,6 +456,7 @@ impl Updates {
             }
             "accepted" | "queued" => {
                 let Some(turn) = turn else { return };
+                self.started.insert(key(turn));
                 if (data["request_id"].as_str()).is_some_and(|id| id.starts_with("lookout-")) {
                     self.noted.insert(key(turn));
                 }
@@ -605,7 +613,10 @@ impl Updates {
                 self.approvals.remove(&key(turn));
                 let status = data["status"].as_str().unwrap_or("?").to_owned();
                 let from = self.from.remove(&key(turn));
-                let origin = self.origin.remove(&key(turn));
+                let origin = match self.started.remove(&key(turn)) {
+                    true => self.origin.remove(&key(turn)),
+                    false => Some(UNKNOWN.to_owned()),
+                };
                 let answered = self.answer_to.remove(&key(turn));
                 let noted = self.noted.remove(&key(turn));
                 if let Some(bot) = self.bots.get_mut(name)
@@ -737,8 +748,11 @@ impl Updates {
         // Read, whether or not it found words: the turn waits no more.
         self.replying.remove(&(name.to_owned(), turn));
         let text = text.trim();
-        if !self.live || text.is_empty() {
+        if !self.live {
             return;
+        }
+        if text.is_empty() {
+            return self.said_nothing(name, turn);
         }
         let reply = quotable(text);
         let news = (self.tasks.iter_mut()).find(|(task, _)| task == name);
@@ -752,6 +766,29 @@ impl Updates {
             t.reply = Some(reply);
         } else if let Some(forwarding) = self.forwarding.get_mut(&(name.to_owned(), turn)) {
             forwarding.reply = Some(text.to_owned());
+        }
+    }
+
+    /// A trigger's run that went well and replied nothing is no news, as
+    /// cron mails a job's output only when it printed some: one that
+    /// failed, was stopped, resolved its task or ended a goal still is.
+    fn said_nothing(&mut self, name: &str, turn: i64) {
+        let Some(at) = self.tasks.iter().position(|(task, _)| task == name) else {
+            return;
+        };
+        let news = &mut self.tasks[at].1;
+        if news.act.as_ref().is_some_and(|t| {
+            t.turn == turn
+                && t.count == 1
+                && t.status == "completed"
+                && t.by.as_deref() == Some("trigger")
+                && !t.resolved
+                && t.goal.is_none()
+        }) {
+            news.act = None;
+            if news.empty() {
+                self.tasks.remove(at);
+            }
         }
     }
 
@@ -794,6 +831,7 @@ impl Updates {
         let by = match status {
             APPROVAL | QUIET => None,
             _ if from.as_deref() == Some(self.lead.as_str()) => Some("you".to_owned()),
+            _ if from.is_none() && origin.as_deref() == Some(UNKNOWN) => None,
             _ => Some(from.or(origin).unwrap_or_else(|| "the person".into())),
         };
         let news = self.news_of(name);
@@ -1610,6 +1648,45 @@ mod tests {
              and 1 earlier since turn:shop.fix/5\n\
              - shop.docs: turn:shop.docs/6 completed, asked by you"
         );
+    }
+
+    #[test]
+    fn a_turn_that_started_before_the_lookout_watched_names_no_one() {
+        let mut updates = fleet();
+        let now = Instant::now();
+        updates.event(
+            &ev(
+                "shop.fix",
+                Some(4),
+                "turn_finished",
+                json!({"status": "failed"}),
+            ),
+            now,
+        );
+        let told = updates.take();
+        assert_eq!(text(&told), "- shop.fix: turn:shop.fix/4 failed");
+        assert!(!told.items[0].theirs);
+    }
+
+    #[test]
+    fn a_trigger_s_run_that_went_well_and_said_nothing_is_no_news() {
+        let mut updates = fleet();
+        let trigger = || json!({"origin": "trigger"});
+        turn(&mut updates, "shop.fix", 4, trigger(), "completed");
+        updates.reading_reply("shop.fix", 4);
+        turn(&mut updates, "shop.docs", 2, trigger(), "failed");
+        updates.reading_reply("shop.docs", 2);
+        updates.replied("shop.fix", 4, "  \n");
+        updates.replied("shop.docs", 2, "");
+        // One that went wrong is told, words or none.
+        assert_eq!(
+            text(&updates.take()),
+            "- shop.docs: turn:shop.docs/2 failed, asked by trigger"
+        );
+        // One with words is told with them.
+        turn(&mut updates, "shop.fix", 5, trigger(), "completed");
+        updates.replied("shop.fix", 5, "posted 2 items");
+        assert!(text(&updates.take()).contains("posted 2 items"));
     }
 
     #[test]
