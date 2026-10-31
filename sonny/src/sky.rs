@@ -4,10 +4,13 @@
 //! the middle. A message travels as a spark along its curve (the person's
 //! from the middle, another agent's across, a lookout's or automation's in
 //! from the rim), a commons post ripples out, a tool call twinkles, and
-//! whoever is lit fades like a firefly. Each agent's state is the state
-//! table's, mark and colour: working cyan `●`, needs you yellow `?`,
-//! failed red `✗`. Where the sky has no room, under about 60 columns or
-//! 24 rows, the same agents are a list, each with a firefly of its own.
+//! whoever is lit fades like a firefly. It is a calm window, kept open to
+//! watch: lines and trails are faint, a working star breathes, and only
+//! what a glance can act on has a hue, yellow `?` for what needs you and
+//! red `✗` for what failed, with cyan for a tool call's moment. Beside it,
+//! where there is room, the chat log of who talked to whom, newest at the
+//! bottom, fading as it rises. Where the sky has no room, under about 60
+//! columns or 24 rows, the same agents are a list, each with a firefly.
 //!
 //! It reads only what the daemon already tells any client: one page of
 //! `bots`, then `follow` of `*`. The follow starts from the first cursor
@@ -54,24 +57,32 @@ const RIPPLE: Duration = Duration::from_millis(1400);
 const TWINKLE: Duration = Duration::from_millis(350);
 /// How fast a lit agent fades: its glow halves this often.
 const HALF_LIFE: f32 = 0.9;
-/// Pairs that talked, the newest kept as faint curves.
-const TALKS: usize = 96;
+/// How long a pair that talked keeps a trail.
+const TRAIL: Duration = Duration::from_secs(60);
+/// What was said and called, kept an hour for the counts.
+const HOUR: Duration = Duration::from_secs(3600);
+/// A working star's breath, in seconds: about thirteen a minute, the
+/// pace of Apple's sleep light, slow enough to stay in the corner of the
+/// eye.
+const BREATH: f32 = 4.6;
 /// Queued prompts remembered so their start does not spark again.
 const SENT: usize = 1024;
 /// Lines of what happened under the sky.
 const TICKER: usize = 5;
+/// Lines the chat log keeps.
+const LOG: usize = 64;
+/// The chat log's column beside the sky, and the gap before it.
+const LOG_COLS: usize = 36;
+const GAP: usize = 3;
 /// The least room the sky is drawn in; with less, a list.
 const SKY_COLS: usize = 60;
 const SKY_ROWS: usize = 24;
 
-/// Agent to agent: agents' colour, as their names.
-const TALK: Color = Color::Blue;
-/// To or from the person: theirs, as the `›` on their messages.
-const YOU: Color = Color::Magenta;
-/// A tool call: code's colour.
+/// A tool call: code's colour, for its moment.
 const TOOL: Color = Color::Cyan;
-/// The state table's: working, needs you.
-const WORKING: Color = Color::Cyan;
+/// Working: the text's own, as a working star breathes instead. Needs
+/// you: the state table's yellow.
+const WORKING: Color = Color::Reset;
 const NEEDS: Color = Color::Yellow;
 /// A failed call.
 const FAILED: Color = Color::Red;
@@ -162,7 +173,6 @@ struct Spark {
     from: End,
     to: End,
     born: Instant,
-    color: Option<Color>,
 }
 
 #[derive(Default)]
@@ -174,8 +184,8 @@ struct Agent {
     made_by_id: Option<i64>,
     /// The turn it runs, when it runs one.
     running: Option<i64>,
-    /// When it was last lit, and in what colour (none: the person's).
-    lit: Option<(Instant, Option<Color>)>,
+    /// When it was last lit.
+    lit: Option<Instant>,
     twinkle: Option<(Instant, Color, Work)>,
     ripple: Option<Instant>,
     /// It asked the person something, not yet answered.
@@ -210,9 +220,19 @@ impl Agent {
 
     /// How lit it is, 1 just lit to 0.
     fn glow(&self, now: Instant) -> f32 {
-        self.lit.map_or(0.0, |(at, _)| {
+        self.lit.map_or(0.0, |at| {
             0.5f32.powf(now.duration_since(at).as_secs_f32() / HALF_LIFE)
         })
+    }
+
+    /// Where its breath is, 0 to 1: each agent on a phase of its own, so
+    /// many working shimmer as stars do rather than pulse together.
+    fn breath(&self, now: Instant, start: Instant) -> f32 {
+        let phase =
+            (self.name.bytes()).fold(0u32, |h, b| h.wrapping_mul(31).wrapping_add(u32::from(b)));
+        let phase = (phase % 1000) as f32 / 1000.0 * TAU;
+        let t = now.duration_since(start).as_secs_f32();
+        0.5 - 0.5 * (TAU * t / BREATH + phase).cos()
     }
 }
 
@@ -224,20 +244,30 @@ pub struct View {
     agents: Vec<Agent>,
     index: HashMap<String, usize>,
     sparks: Vec<Spark>,
-    /// Pairs that talked, newest last.
-    talks: VecDeque<(usize, usize)>,
+    /// Who told whom, and when, agent to agent: an hour of it.
+    said: VecDeque<(Instant, usize, usize)>,
+    /// When tools were called: an hour of it.
+    calls: VecDeque<Instant>,
     /// Turns already sparked, so a queued prompt's start is not a second.
     sent: HashSet<(String, i64)>,
-    ticker: VecDeque<(Instant, String)>,
-    /// When messages were sent in the last minute.
+    /// The chat log: when, what, and the hue of what needs you or failed.
+    ticker: VecDeque<(Instant, String, Option<Color>)>,
+    /// When messages were sent: an hour of it.
     recent: VecDeque<Instant>,
+    /// When the view opened: breaths count from it, and the hour's counts
+    /// say "so far" until it is an hour old.
+    opened: Instant,
     laid: bool,
     /// The agents in the tree's order, each with its depth, for the list.
     order: Vec<(usize, usize)>,
     live: bool,
     paused: bool,
-    /// What each mark, colour and shape means, in the ticker's place.
+    /// What each mark, colour and shape means, and the counts, in the
+    /// chat log's place.
     pub legend: bool,
+    /// Only the sky: no chat log, no counts, no names but what needs the
+    /// person or failed.
+    pub zen: bool,
     down: Option<String>,
 }
 
@@ -266,15 +296,18 @@ impl View {
             agents: Vec::new(),
             index: HashMap::new(),
             sparks: Vec::new(),
-            talks: VecDeque::new(),
+            said: VecDeque::new(),
+            calls: VecDeque::new(),
             sent: HashSet::new(),
             ticker: VecDeque::new(),
             recent: VecDeque::new(),
+            opened: Instant::now(),
             laid: false,
             order: Vec::new(),
             live: false,
             paused: false,
             legend: false,
+            zen: false,
             down: None,
         }
     }
@@ -299,7 +332,7 @@ impl View {
         // is read again from the turns kept.
         self.agents.clear();
         self.index.clear();
-        self.talks.clear();
+        self.said.clear();
         self.sent.clear();
         self.laid = false;
         self.sparks.clear();
@@ -378,8 +411,8 @@ impl View {
                 }
                 _ => false,
             });
-        self.talks = (self.talks.iter())
-            .filter_map(|&(a, b)| Some((moved[a]?, moved[b]?)))
+        self.said = (self.said.iter())
+            .filter_map(|&(when, a, b)| Some((when, moved[a]?, moved[b]?)))
             .collect();
         self.index = (self.agents.iter().enumerate())
             .map(|(at, agent)| (agent.name.clone(), at))
@@ -392,21 +425,24 @@ impl View {
         self.sparks.retain(|spark| {
             let done = now.duration_since(spark.born) >= FLIGHT;
             if done {
-                landed.push((spark.to, spark.color));
+                landed.push(spark.to);
             }
             !done
         });
-        for (to, color) in landed {
+        for to in landed {
             if let End::Agent(at) = to {
-                self.agents[at].lit = Some((now, color));
+                self.agents[at].lit = Some(now);
             }
         }
-        while self
-            .recent
-            .front()
-            .is_some_and(|at| now.duration_since(*at) > Duration::from_secs(60))
-        {
+        let old = |at: &Instant| now.duration_since(*at) > HOUR;
+        while self.recent.front().is_some_and(old) {
             self.recent.pop_front();
+        }
+        while self.calls.front().is_some_and(old) {
+            self.calls.pop_front();
+        }
+        while self.said.front().is_some_and(|(at, ..)| old(at)) {
+            self.said.pop_front();
         }
     }
 
@@ -475,7 +511,7 @@ impl View {
                     "created_by": data["created_by"], "created_by_id": data["created_by_id"],
                     "running_turn": data["running_turn"]});
                 if let Some(at) = self.seat(&record) {
-                    self.agents[at].lit = Some((now, None));
+                    self.agents[at].lit = Some(now);
                 }
                 return;
             }
@@ -535,16 +571,12 @@ impl View {
                         self.sent.clear();
                     }
                 }
-                if let End::Agent(by) = from
-                    && by != at
-                {
-                    self.talks.retain(|pair| *pair != (by, at));
-                    self.talks.push_back((by, at));
-                    if self.talks.len() > TALKS {
-                        self.talks.pop_front();
-                    }
-                }
                 if live {
+                    if let End::Agent(by) = from
+                        && by != at
+                    {
+                        self.said.push_back((now, by, at));
+                    }
                     self.send(from, End::Agent(at), now);
                     let by = match from {
                         End::Person => "you".to_owned(),
@@ -558,7 +590,7 @@ impl View {
                     if let End::Agent(by) = from {
                         self.agents[by].last = Some((now, format!("to {to}")));
                     }
-                    self.say(now, format!("{by} → {to}"));
+                    self.say(now, format!("{by} → {to}"), None);
                 }
             }
             "tool_started" if live => {
@@ -568,19 +600,25 @@ impl View {
                     self.agents[at].held.remove(call);
                 }
                 self.agents[at].twinkle = Some((now, TOOL, Work::of(tool)));
+                self.calls.push_back(now);
                 if tool == crate::asks::TOOL {
+                    if self.agents[at].state() != Some(State::NeedsYou) {
+                        let said = format!("? {} asks you", self.short(at));
+                        self.say(now, said, Some(NEEDS));
+                    }
                     self.agents[at].asking = true;
                 }
                 if tool == "commons" && posted(&data["arguments"]) {
                     self.agents[at].ripple = Some(now);
                     self.agents[at].last = Some((now, "posted to the commons".into()));
                     let said = format!("{} posted to the commons", self.short(at));
-                    self.say(now, said);
+                    self.say(now, said, None);
                 }
             }
             // A call waits for the person: one gated for them, or one the
             // reviewer handed them.
             "approval_requested" if live => {
+                let waiting = self.agents[at].state() == Some(State::NeedsYou);
                 for call in data["calls"].as_array().into_iter().flatten() {
                     let manual = (call["gates"].as_array())
                         .is_some_and(|gates| gates.iter().any(|g| g == "manual"));
@@ -588,11 +626,14 @@ impl View {
                         self.agents[at].held.insert(id.to_owned());
                     }
                 }
+                self.waits(at, waiting, now);
             }
             "approval_asked" if live => {
+                let waiting = self.agents[at].state() == Some(State::NeedsYou);
                 if let Some(id) = data["call_id"].as_str() {
                     self.agents[at].held.insert(id.to_owned());
                 }
+                self.waits(at, waiting, now);
             }
             // Each answer lets go of its call alone.
             "step_decided" | "turn_resumed" if live => {
@@ -624,15 +665,17 @@ impl View {
                 agent.failed = data["status"] == "failed" && data["error"] != "empty_completion";
                 if live && agent.failed {
                     agent.last = Some((now, "failed".into()));
+                    let said = format!("✗ {} failed", self.short(at));
+                    self.say(now, said, Some(FAILED));
                 }
                 // The answer to the person flies back to the middle.
+                let agent = &mut self.agents[at];
                 if live && agent.sender == Some(End::Person) && data["status"] == "completed" {
-                    agent.lit = Some((now, Some(YOU)));
+                    agent.lit = Some(now);
                     self.sparks.push(Spark {
                         from: End::Agent(at),
                         to: End::Person,
                         born: now,
-                        color: Some(YOU),
                     });
                 }
                 self.agents[at].sender = None;
@@ -659,29 +702,41 @@ impl View {
         }
     }
 
+    /// A spark has no hue: its motion is what is seen, and where it starts
+    /// and lands says who.
     fn send(&mut self, from: End, to: End, now: Instant) {
-        let color = match from {
-            End::Agent(_) => Some(TALK),
-            End::Person => Some(YOU),
-            End::Rim(_) => Some(Color::Reset),
-        };
         if let End::Agent(at) = from {
-            self.agents[at].lit = Some((now, color));
+            self.agents[at].lit = Some(now);
         }
         self.sparks.push(Spark {
             from,
             to,
             born: now,
-            color,
         });
         self.recent.push_back(now);
     }
 
-    fn say(&mut self, now: Instant, text: String) {
-        self.ticker.push_back((now, text));
-        if self.ticker.len() > TICKER {
+    /// Told once when an agent comes to wait on the person's approval.
+    fn waits(&mut self, at: usize, waiting: bool, now: Instant) {
+        if !waiting && self.agents[at].state() == Some(State::NeedsYou) {
+            let said = format!("? {} waits for you", self.short(at));
+            self.say(now, said, Some(NEEDS));
+        }
+    }
+
+    fn say(&mut self, now: Instant, text: String, hue: Option<Color>) {
+        self.ticker.push_back((now, text, hue));
+        if self.ticker.len() > LOG {
             self.ticker.pop_front();
         }
+    }
+
+    /// Messages sent in the last minute.
+    fn minute(&self, now: Instant) -> usize {
+        let minute = Duration::from_secs(60);
+        (self.recent.iter().rev())
+            .take_while(|at| now.duration_since(**at) <= minute)
+            .count()
     }
 
     /// An agent's name as the sky labels it: a lead by its project, an
@@ -822,22 +877,34 @@ impl View {
         }
         // The list's rows say what the ticker would, agent by agent.
         if cols < SKY_COLS || rows < SKY_ROWS {
-            let under = if self.legend { LEGEND } else { 2 };
+            let under = match (self.zen, self.legend) {
+                (true, _) => 0,
+                (false, true) => LEGEND,
+                (false, false) => 2,
+            };
             lines.extend(self.list(now, cols, rows.saturating_sub(under).max(3)));
-            lines.extend(match self.legend {
-                true => legend(true),
-                false => self.ticked(now, cols, false),
-            });
+            if !self.zen {
+                lines.extend(match self.legend {
+                    true => legend(true),
+                    false => self.ticked(now, cols, TICKER, false),
+                });
+            }
             return lines;
         }
-        let sky_rows = rows.saturating_sub(TICKER + 3).clamp(8, cols / 2 + 1);
-        let mut sky = Sky::new(cols, sky_rows);
-        // The person in the middle.
-        sky.text_at((0.0, 0.0), "you", Style::default().fg(YOU).bold());
-        // Who made whom: dotted lines; who talked: dotted curves. Muted,
-        // as everything that says how it got here: the measured gray
-        // that still reads in every theme, where plain dim would vanish;
-        // hues are kept for what happens now.
+        // The chat log beside the sky where the sky has width to spare,
+        // else under it; in zen, neither.
+        let beside =
+            !self.zen && cols >= SKY_COLS + LOG_COLS + GAP && cols >= 2 * rows + LOG_COLS + GAP;
+        let (sky_cols, sky_rows) = match (self.zen, beside) {
+            (true, _) => (cols, rows),
+            (false, true) => (cols - LOG_COLS - GAP, rows),
+            (false, false) => (cols, rows.saturating_sub(TICKER + 3).clamp(8, cols / 2 + 1)),
+        };
+        let mut sky = Sky::new(sky_cols, sky_rows);
+        // The person in the middle: the place and the word say who.
+        sky.text_at((0.0, 0.0), "you", Style::default().bold());
+        // Who made whom: dotted lines, faint, as all that says how things
+        // stand rather than what happens.
         for (at, agent) in self.agents.iter().enumerate().filter(|(_, a)| !a.gone) {
             if let Some(by) = self.maker(at)
                 && !agent.root
@@ -845,21 +912,31 @@ impl View {
                 sky.line(self.agents[by].at, agent.at, Ink::Faint, 3);
             }
         }
-        for &(by, to) in &self.talks {
-            if self.agents[by].gone || self.agents[to].gone {
+        // Who talked in the last minute: a faint trail for each pair, its
+        // dots thinning out as it ages.
+        let mut trails: HashMap<(usize, usize), Instant> = HashMap::new();
+        for &(when, by, to) in self.said.iter().rev() {
+            if now.duration_since(when) > TRAIL {
+                break;
+            }
+            trails.entry((by.min(to), by.max(to))).or_insert(when);
+        }
+        for ((a, b), when) in trails {
+            if self.agents[a].gone || self.agents[b].gone {
                 continue;
             }
-            let (a, b) = (self.agents[by].at, self.agents[to].at);
-            sky.curve(a, bend(a, b), b, Ink::Faint, 4);
+            let age = now.duration_since(when).as_secs_f32() / TRAIL.as_secs_f32();
+            let (a, b) = (self.agents[a].at, self.agents[b].at);
+            sky.curve(a, bend(a, b), b, Ink::Faint, 4 + (age * 8.0) as usize);
         }
         // Ripples, then sparks, then the stars over them.
         for agent in self.agents.iter().filter(|a| !a.gone) {
             if let Some(at) = agent.ripple {
                 let t = now.duration_since(at).as_secs_f32() / RIPPLE.as_secs_f32();
                 if t < 1.0 {
-                    // No hue of its own: the ring says it.
-                    let ink = if t < 0.6 { Ink::Bright } else { Ink::Plain };
-                    sky.ring(agent.at, 0.04 + 0.26 * t, ink);
+                    // A commons post is the quietest event: nobody need act.
+                    let ink = if t < 0.5 { Ink::Muted } else { Ink::Faint };
+                    sky.ring(agent.at, 0.03 + 0.05 * t, ink);
                 }
             }
         }
@@ -870,10 +947,6 @@ impl View {
                 (End::Agent(_), End::Agent(_)) => bend(a, b),
                 _ => ((a.0 + b.0) / 2.0, (a.1 + b.1) / 2.0),
             };
-            let ink = match spark.color {
-                None | Some(Color::Reset) => Ink::Bright,
-                Some(color) => Ink::Color(color, true),
-            };
             for step in 0..6 {
                 let back = t - step as f32 * 0.035;
                 if back < 0.0 {
@@ -881,47 +954,46 @@ impl View {
                 }
                 let at = bezier(a, control, b, ease(back));
                 match step {
-                    0 => sky.blob(at, ink),
-                    _ => sky.dot(at, if step < 3 { ink } else { ink.fade() }),
+                    0 => sky.blob(at, Ink::Bright),
+                    1 | 2 => sky.dot(at, Ink::Bright),
+                    _ => sky.dot(at, Ink::Muted),
                 }
             }
         }
+        let shade = Shade::now();
         for agent in self.agents.iter().filter(|a| !a.gone) {
-            let glow = agent.glow(now);
-            let color = agent
-                .lit
-                .and_then(|(_, color)| color)
-                .filter(|c| *c != Color::Reset);
-            if glow > 0.08 {
-                let ink = match color {
-                    Some(color) => Ink::Color(color, glow > 0.4),
-                    None if glow > 0.4 => Ink::Bright,
-                    None => Ink::Plain,
-                };
-                sky.ring(agent.at, 0.015 + 0.045 * glow, ink);
-            }
             if let Some((at, color, work)) = agent.twinkle
                 && now.duration_since(at) < TWINKLE
             {
                 sky.twinkle(agent.at, work, Ink::Color(color, true));
             }
-            // The star in its state's colour, else the text's.
-            match agent.state() {
-                Some(state) => sky.blob(agent.at, Ink::Color(state.mark().1, true)),
-                None => sky.blob(agent.at, Ink::Plain),
-            }
+            // What needs the person or failed, still in its colour; a
+            // working star breathes; an idle one rests, muted.
+            let ink = match agent.state() {
+                Some(State::NeedsYou) => Ink::Color(NEEDS, true),
+                Some(State::Failed) => Ink::Color(FAILED, true),
+                Some(State::Working) => shade.breathe(agent.breath(now, self.opened)),
+                None => Ink::Muted,
+            };
+            sky.star(agent.at, ink);
         }
         // Names: leads always, others while working or lit, nearest the
-        // middle first, never over each other.
+        // middle first, never over each other. In zen, only what needs the
+        // person or failed.
         let mut named: Vec<usize> = (0..self.agents.len())
             .filter(|&at| {
                 let agent = &self.agents[at];
-                !agent.gone
-                    && (agent.root
-                        || agent.state().is_some()
-                        || agent.lit.is_some_and(|(lit, _)| {
-                            now.duration_since(lit) < Duration::from_secs(4)
-                        }))
+                if agent.gone {
+                    return false;
+                }
+                if self.zen {
+                    return matches!(agent.state(), Some(State::NeedsYou | State::Failed));
+                }
+                agent.root
+                    || agent.state().is_some()
+                    || agent
+                        .lit
+                        .is_some_and(|lit| now.duration_since(lit) < Duration::from_secs(4))
             })
             .collect();
         // What needs the person is named first, so it is never crowded out.
@@ -947,34 +1019,187 @@ impl View {
             let style = name_style(agent.state(), agent.glow(now));
             sky.label(agent.at, mark, &short(&agent.name), style);
         }
-        lines.extend(sky.lines());
-        lines.push(Line::default());
-        lines.extend(match self.legend {
-            true => legend(false),
-            false => self.ticked(now, cols, true),
-        });
+        let drawn = sky.lines();
+        if beside {
+            let column = match self.legend {
+                true => self.key(now, rows),
+                false => self.ticked(now, LOG_COLS, rows, true),
+            };
+            for (row, mut line) in drawn.into_iter().enumerate() {
+                line.spans.push(Span::raw(" ".repeat(GAP)));
+                if let Some(side) = column.get(row) {
+                    line.spans.extend(side.spans.iter().cloned());
+                }
+                lines.push(line);
+            }
+            return lines;
+        }
+        lines.extend(drawn);
+        if !self.zen {
+            lines.push(Line::default());
+            lines.extend(match self.legend {
+                true => legend(false),
+                false => self.ticked(now, cols, TICKER, false),
+            });
+        }
         lines
     }
 
-    /// The ticker's lines: what happened last, how long ago; or that the
-    /// follow is lost, or nothing has happened yet.
-    fn ticked(&self, now: Instant, cols: usize, ticker: bool) -> Vec<Line<'static>> {
+    /// The chat log's lines, `room` of them at most and `cols` wide: who
+    /// told whom and how long ago, what needs the person or failed in its
+    /// hue. In a column of its own, `tall`, it fills the column with the
+    /// newest at the bottom, the newest few plain, older ones muted, the
+    /// oldest faint, and a line just come in fades up from faint. Or that
+    /// the follow is lost, or nothing has happened yet.
+    fn ticked(&self, now: Instant, cols: usize, room: usize, tall: bool) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
-        for (at, text) in self.ticker.iter().filter(|_| ticker) {
+        let shown = self
+            .ticker
+            .len()
+            .min(room.saturating_sub(usize::from(self.down.is_some())));
+        let entries: Vec<_> = self.ticker.iter().skip(self.ticker.len() - shown).collect();
+        for (n, (at, text, hue)) in entries.iter().enumerate() {
+            let old = shown - 1 - n;
+            let fresh = now.duration_since(*at).as_secs_f32();
+            let weight = match (tall, old) {
+                _ if fresh < 0.3 => Ink::Faint,
+                _ if fresh < 0.6 => Ink::Muted,
+                (false, _) | (true, 0..=2) => Ink::Plain,
+                (true, 3..=11) => Ink::Muted,
+                (true, _) => Ink::Faint,
+            };
+            let words = match (hue, weight) {
+                (Some(hue), Ink::Plain | Ink::Muted) => Style::default().fg(*hue),
+                _ => weight.style(),
+            };
+            let words = if tall && old == 0 && fresh >= 0.6 {
+                words.bold()
+            } else {
+                words
+            };
+            let age = match weight {
+                Ink::Faint => Ink::Faint.style(),
+                _ => Ink::Muted.style(),
+            };
             lines.push(Line::from(vec![
-                Span::raw(format!("{:>4}  ", ago(now, *at))).dim(),
-                Span::raw(cut(text, cols.saturating_sub(6))),
+                Span::styled(format!("{:>4}  ", ago(now, *at)), age),
+                Span::styled(cut(text, cols.saturating_sub(6)), words),
             ]));
         }
         if let Some(why) = &self.down {
-            lines.push(Line::from(format!("Couldn't follow the agents: {why}")));
+            lines.push(Line::from(cut(
+                &format!("Couldn't follow the agents: {why}"),
+                cols,
+            )));
         } else if self.ticker.is_empty() {
-            lines.push(if self.live {
-                Line::from("Quiet. Messages light up here as they go.").dim()
+            let quiet = if self.live {
+                "Quiet. Messages light up here as they go."
             } else {
-                Line::from("Catching up with who talked to whom…").dim()
-            });
+                "Catching up with who is here…"
+            };
+            lines.push(Line::from(cut(quiet, cols)).dim());
         }
+        if tall {
+            let blank = room.saturating_sub(lines.len());
+            lines.splice(0..0, std::iter::repeat_n(Line::default(), blank));
+        }
+        lines
+    }
+
+    /// The legend and the counts, in the chat log's column: what each mark
+    /// means, drawn as the sky draws it, then how many projects, leads and
+    /// agents there are, how much was said and called, and the busiest
+    /// pair.
+    fn key(&self, now: Instant, rows: usize) -> Vec<Line<'static>> {
+        let says = |text: &str| Span::raw(text.to_owned()).dim();
+        let mut lines = vec![Line::from(says("legend")), Line::default()];
+        let row = |mark: Span<'static>, words: Vec<Span<'static>>| {
+            let mut spans = vec![Span::raw(" "), mark];
+            spans.extend(words);
+            Line::from(spans)
+        };
+        lines.extend([
+            row(Span::raw("⠛").dim(), vec![says("   an agent, at rest")]),
+            row(Span::raw("⠛").bold(), vec![says("   working: it breathes")]),
+            row(
+                Span::raw("⠛").fg(NEEDS),
+                vec![Span::raw("   ? needs you").fg(NEEDS)],
+            ),
+            row(
+                Span::raw("⠛").fg(FAILED),
+                vec![Span::raw("   ✗ failed").fg(FAILED)],
+            ),
+            row(Span::raw("⠶").bold(), vec![says("   a message on its way")]),
+            row(
+                Span::raw("⠤⠤").fg(TOOL),
+                vec![
+                    says("  shell  "),
+                    Span::raw("⡇").fg(TOOL),
+                    says(" files  "),
+                    Span::raw("⡁⢈").fg(TOOL),
+                    says(" web"),
+                ],
+            ),
+            row(
+                Span::raw("✳").fg(TOOL),
+                vec![
+                    says("   another tool  "),
+                    Span::raw("✳").fg(FAILED),
+                    says(" it failed"),
+                ],
+            ),
+            row(
+                Span::styled("◯", Ink::Muted.style()),
+                vec![says("   a commons post")],
+            ),
+            row(
+                Span::styled("⠁⠈", Ink::Faint.style()),
+                vec![says("  who made whom, who talked")],
+            ),
+            Line::default(),
+            Line::from(says("now")),
+            Line::default(),
+        ]);
+        let shown: Vec<&Agent> = self.agents.iter().filter(|a| !a.gone).collect();
+        let leads = shown.iter().filter(|a| project::is_lead(&a.name)).count();
+        let projects: HashSet<&str> = (shown.iter())
+            .filter_map(|a| a.name.split_once('.').map(|(project, _)| project))
+            .collect();
+        let hour = if now.duration_since(self.opened) >= HOUR {
+            "this hour"
+        } else {
+            "so far"
+        };
+        let minute = Duration::from_secs(60);
+        let calls = (self.calls.iter())
+            .filter(|at| now.duration_since(**at) <= minute)
+            .count();
+        let mut pairs: HashMap<(usize, usize), usize> = HashMap::new();
+        for &(_, by, to) in &self.said {
+            *pairs.entry((by.min(to), by.max(to))).or_default() += 1;
+        }
+        let busiest = (pairs.into_iter())
+            .filter(|((a, b), _)| !self.agents[*a].gone && !self.agents[*b].gone)
+            .max_by_key(|&((a, b), n)| (n, std::cmp::Reverse((a, b))))
+            .map(|((a, b), _)| format!("{} ⇄ {}", self.short(a), self.short(b)));
+        let mut stat = |what: &str, value: String| {
+            lines.push(Line::from(vec![
+                Span::raw(" "),
+                says(&format!("{what:<14}")),
+                Span::raw(cut(&value, LOG_COLS - 15)),
+            ]));
+        };
+        stat("projects", projects.len().to_string());
+        stat("leads", leads.to_string());
+        stat("agents", shown.len().to_string());
+        stat("messages", format!("{} a minute", self.minute(now)));
+        stat("", format!("{} {hour}", self.recent.len()));
+        stat("tool calls", format!("{calls} a minute"));
+        stat("", format!("{} {hour}", self.calls.len()));
+        if let Some(busiest) = busiest {
+            stat("busiest pair", busiest);
+        }
+        lines.truncate(rows);
         lines
     }
 
@@ -1017,14 +1242,9 @@ impl View {
         for &(at, depth) in self.order.iter().filter(|(at, _)| kept.contains(at)) {
             let agent = &self.agents[at];
             let glow = agent.glow(now);
-            let color = (agent.lit)
-                .and_then(|(_, color)| color)
-                .filter(|c| *c != Color::Reset);
-            let firefly = match (glow, color) {
-                (g, Some(color)) if g > 0.4 => Span::raw("✦").fg(color).bold(),
-                (g, None) if g > 0.4 => Span::raw("✦").bold(),
-                (g, Some(color)) if g > 0.08 => Span::raw("•").fg(color),
-                (g, None) if g > 0.08 => Span::raw("•"),
+            let firefly = match glow {
+                g if g > 0.4 => Span::raw("✦").bold(),
+                g if g > 0.08 => Span::raw("•"),
                 _ => Span::raw("·").dim(),
             };
             let mark = match agent.state() {
@@ -1078,12 +1298,17 @@ impl View {
             let n = shown.iter().filter(|a| a.state() == Some(state)).count();
             if n > 0 || state == State::Working {
                 let (mark, color, word) = state.mark();
+                let word = if state == State::NeedsYou && n != 1 {
+                    "need you"
+                } else {
+                    word
+                };
                 spans.push(Span::raw(" · ").dim());
                 spans.push(Span::raw(mark).fg(color));
                 spans.push(Span::raw(format!(" {n} {word}")).dim());
             }
         }
-        let sent = self.recent.len();
+        let sent = self.minute(Instant::now());
         let sent = format!(
             " · {sent} {} in the last minute",
             if sent == 1 { "message" } else { "messages" }
@@ -1107,8 +1332,8 @@ fn legend(list: bool) -> Vec<Line<'static>> {
     let mark = |text: &str, color: Color| Span::raw(text.to_owned()).fg(color);
     let says = |text: &str| Span::raw(text.to_owned()).dim();
     let mut lines = vec![Line::from(vec![
-        mark("●", WORKING),
-        says(" working  "),
+        Span::raw("⠛").bold(),
+        says(" working breathes  "),
         mark("?", NEEDS),
         says(" needs you  "),
         mark("✗", FAILED),
@@ -1120,7 +1345,7 @@ fn legend(list: bool) -> Vec<Line<'static>> {
     ])];
     if list {
         lines.push(Line::from(vec![
-            mark("✦", TALK).bold(),
+            Span::raw("✦").bold(),
             says(" just talked  "),
             Span::raw("•"),
             says(" a while ago  "),
@@ -1130,12 +1355,12 @@ fn legend(list: bool) -> Vec<Line<'static>> {
     }
     lines.extend([
         Line::from(vec![
-            mark("•", YOU).bold(),
-            says(" to or from you  "),
-            mark("•", TALK),
-            says(" agent to agent  "),
-            Span::raw("•").bold(),
-            says(" from outside"),
+            Span::raw("⠶").bold(),
+            says(" a message on its way  "),
+            Span::styled("◯", Ink::Muted.style()),
+            says(" a commons post  "),
+            Span::styled("⠁⠈⠁", Ink::Faint.style()),
+            says(" who made whom, who talked"),
         ]),
         Line::from(vec![
             mark("⠤⠤", TOOL),
@@ -1149,12 +1374,6 @@ fn legend(list: bool) -> Vec<Line<'static>> {
             mark("✳", FAILED),
             says(" a call failed"),
         ]),
-        Line::from(vec![
-            Span::raw("◯"),
-            says(" a commons post  "),
-            Span::raw("⠁⠈⠁"),
-            says(" who made whom, who talked"),
-        ]),
         Line::from(says("A star glows as its agent talks, then fades.")),
     ]);
     lines
@@ -1163,7 +1382,7 @@ fn legend(list: bool) -> Vec<Line<'static>> {
 /// A name: bold while it works or needs the person, muted while it is
 /// quiet. In the text's own colour: here every label is an agent's name,
 /// so agents' blue would say nothing a name doesn't, and the sky's hues
-/// are kept for what happens.
+/// are kept for what needs the person or failed.
 fn name_style(state: Option<State>, glow: f32) -> Style {
     match state {
         Some(State::Working | State::NeedsYou) => Style::default().bold(),
@@ -1259,8 +1478,13 @@ fn ease(t: f32) -> f32 {
 /// takes the cell's colour only when it is at least as strong.
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Ink {
+    /// Structure: the system's faint weight.
     Faint,
+    /// At rest: muted, as quiet text.
+    Muted,
     Plain,
+    /// A working star's breath: a shade of the text's colour.
+    Shade(Color),
     Bright,
     Color(Color, bool),
 }
@@ -1269,26 +1493,61 @@ impl Ink {
     fn rank(self) -> u8 {
         match self {
             Ink::Faint => 0,
-            Ink::Plain => 1,
-            Ink::Color(_, false) => 2,
-            Ink::Bright => 3,
-            Ink::Color(_, true) => 4,
-        }
-    }
-    fn fade(self) -> Ink {
-        match self {
-            Ink::Bright => Ink::Plain,
-            Ink::Color(color, _) => Ink::Color(color, false),
-            ink => ink,
+            Ink::Muted => 1,
+            Ink::Plain => 2,
+            Ink::Color(_, false) => 3,
+            Ink::Shade(_) | Ink::Bright => 4,
+            Ink::Color(_, true) => 5,
         }
     }
     fn style(self) -> Style {
         match self {
-            Ink::Faint => Style::default().add_modifier(Modifier::DIM),
+            Ink::Faint => match crate::look::faint() {
+                Some(color) => Style::default().fg(color),
+                None => Style::default().add_modifier(Modifier::DIM),
+            },
+            Ink::Muted => Style::default().add_modifier(Modifier::DIM),
             Ink::Plain => Style::default(),
+            Ink::Shade(color) => Style::default().fg(color).bold(),
             Ink::Bright => Style::default().bold(),
             Ink::Color(color, true) => Style::default().fg(color).bold(),
             Ink::Color(color, false) => Style::default().fg(color),
+        }
+    }
+}
+
+/// The two ends a working star breathes between: the theme's text and the
+/// text taken further from the background, toward white on a dark theme
+/// and black on a light one. Where the theme's colours are not known, or
+/// with `NO_COLOR`, the star holds still in bold: a breath stepped through
+/// bold and plain would blink, the most distracting motion there is.
+struct Shade(Option<(crate::term::Rgb, crate::term::Rgb)>);
+
+impl Shade {
+    fn now() -> Shade {
+        let theme = crate::term::theme();
+        Shade(
+            match (crate::look::no_color(), theme.foreground, theme.background) {
+                (false, Some(foreground), Some(_)) => {
+                    let far = if crate::term::light() {
+                        (0, 0, 0)
+                    } else {
+                        (255, 255, 255)
+                    };
+                    Some((foreground, crate::look::blend(far, foreground, 0.6)))
+                }
+                _ => None,
+            },
+        )
+    }
+
+    fn breathe(&self, level: f32) -> Ink {
+        match self.0 {
+            Some((rest, full)) => {
+                let (r, g, b) = crate::look::blend(full, rest, level);
+                Ink::Shade(Color::Rgb(r, g, b))
+            }
+            None => Ink::Bright,
         }
     }
 }
@@ -1301,6 +1560,8 @@ struct Sky {
     dots: Vec<u8>,
     inks: Vec<Option<Ink>>,
     text: Vec<Option<(char, Style)>>,
+    /// The cells an agent's star covers, which no name runs into.
+    stars: Vec<bool>,
 }
 
 impl Sky {
@@ -1311,6 +1572,7 @@ impl Sky {
             dots: vec![0; cols * rows],
             inks: vec![None; cols * rows],
             text: vec![None; cols * rows],
+            stars: vec![false; cols * rows],
         }
     }
 
@@ -1359,6 +1621,21 @@ impl Sky {
         }
     }
 
+    fn star(&mut self, at: (f32, f32), ink: Ink) {
+        self.blob(at, ink);
+        let (row, cols) = self.covers(at);
+        for col in cols.filter(|_| row < self.rows) {
+            self.stars[row * self.cols + col] = true;
+        }
+    }
+
+    /// The row and columns a star at a point covers.
+    fn covers(&self, at: (f32, f32)) -> (usize, std::ops::RangeInclusive<usize>) {
+        let (x, y) = self.spot(at);
+        let col = |x: f32| ((x.max(0.0) / 2.0) as usize).min(self.cols.saturating_sub(1));
+        ((y / 4.0) as usize, col(x - 0.5)..=col(x + 0.5))
+    }
+
     fn twinkle(&mut self, at: (f32, f32), work: Work, ink: Ink) {
         let (x, y) = self.spot(at);
         for (dx, dy) in work.shape() {
@@ -1400,7 +1677,7 @@ impl Sky {
     }
 
     /// Words beside a point, a mark before them, right of it where they
-    /// fit, else left; never over other words.
+    /// fit, else left; never over or against other words.
     fn label(&mut self, at: (f32, f32), mark: Option<(&str, Style)>, words: &str, style: Style) {
         let (x, y) = self.spot(at);
         let (col, row) = ((x / 2.0) as usize, (y / 4.0) as usize);
@@ -1415,20 +1692,34 @@ impl Sky {
         }
         let right = (col + 2 + width <= self.cols).then_some(col + 2);
         let left = col.checked_sub(width + 1);
-        let start = match at.0 >= 0.0 {
-            true => right.or(left),
-            false => left.or(right),
+        let sides = match at.0 >= 0.0 {
+            true => [right, left],
+            false => [left, right],
         };
-        let Some(start) = start else {
+        let (_, own) = self.covers(at);
+        let Some(start) = sides.into_iter().flatten().find(|&start| {
+            self.clear_of_stars(row, start, width, &own) && self.put(row, start, words, style)
+        }) else {
             return;
         };
-        if self.put(row, start, words, style)
-            && let Some((mark, mark_style)) = mark
-        {
+        if let Some((mark, mark_style)) = mark {
             for (cell, ch) in (row * self.cols + start..).zip(mark.chars()) {
                 self.text[cell] = Some((ch, mark_style));
             }
         }
+    }
+
+    /// No other agent's star in the cells words would take or the blank
+    /// either side of them.
+    fn clear_of_stars(
+        &self,
+        row: usize,
+        start: usize,
+        width: usize,
+        own: &std::ops::RangeInclusive<usize>,
+    ) -> bool {
+        (start.saturating_sub(1)..(start + width + 1).min(self.cols))
+            .all(|col| own.contains(&col) || !self.stars[row * self.cols + col])
     }
 
     /// Words centred on a point.
@@ -1439,12 +1730,14 @@ impl Sky {
         self.put(row, start, words, style);
     }
 
-    /// Words put at a place in a row; false when they don't fit there.
+    /// Words put at a place in a row, a blank cell kept either side so
+    /// two names never run together; false when they don't fit there.
     fn put(&mut self, row: usize, start: usize, words: &str, style: Style) -> bool {
-        let cells = row * self.cols + start..row * self.cols + start + words.chars().count();
-        if start + words.chars().count() > self.cols
-            || self.text[cells.clone()].iter().any(Option::is_some)
-        {
+        let count = words.chars().count();
+        let cells = row * self.cols + start..row * self.cols + start + count;
+        let around = row * self.cols + start.saturating_sub(1)
+            ..row * self.cols + (start + count + 1).min(self.cols);
+        if start + count > self.cols || self.text[around].iter().any(Option::is_some) {
             return false;
         }
         for (cell, ch) in cells.zip(words.chars()) {
@@ -1489,7 +1782,7 @@ const FRAME: Duration = Duration::from_millis(60);
 /// How long `sonny sky` waits before following a daemon that went again.
 const RETRY: Duration = Duration::from_secs(3);
 /// What the keys do in `sonny sky`.
-const KEYS: &str = "? legend · q quit";
+const KEYS: &str = "z zen · ? legend · q quit";
 
 /// `sonny sky`: the same sky, the whole terminal, on its own, to keep
 /// beside the work as btop is kept: its title and the keys over it, the
@@ -1539,8 +1832,10 @@ pub fn watch(runtime: &tokio::runtime::Runtime, socket: PathBuf) -> Result<(), S
                     if quits(&key) {
                         return Ok(());
                     }
-                    if key.code == event::KeyCode::Char('?') {
-                        view.legend = !view.legend;
+                    match key.code {
+                        event::KeyCode::Char('?') => view.legend = !view.legend,
+                        event::KeyCode::Char('z') => view.zen = !view.zen,
+                        _ => {}
                     }
                 }
             }
@@ -1583,6 +1878,10 @@ impl ratatui::widgets::Widget for &mut View {
             .enumerate()
         {
             buf.set_line(area.x + 1, area.y + 2 + at as u16, &line, area.width - 1);
+        }
+        // Zen keeps the sky alone.
+        if self.zen {
+            return;
         }
         // The footer's own margin, one column less, as the title's.
         let mut foot = self.footer(width + 1);
@@ -1842,10 +2141,8 @@ mod tests {
         assert_eq!(view.sparks.len(), 2);
         assert_eq!(view.sparks[0].from, End::Agent(view.index["shop.lead"]));
         assert_eq!(view.sparks[1].from, End::Person);
-        // Between agents in agents' blue; to or from the person in theirs.
-        assert_eq!(view.sparks[0].color, Some(Color::Blue));
-        assert_eq!(view.sparks[1].color, Some(Color::Magenta));
-        assert_eq!(view.talks.len(), 1);
+        // Only agent to agent is kept for the trails and the counts.
+        assert_eq!(view.said.len(), 1);
         let shown = text(&view.card(60, 40));
         assert!(shown.contains("shop lead → login"), "{shown}");
         assert!(shown.contains("you → shop lead"), "{shown}");
@@ -1856,7 +2153,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn past_turns_draw_who_talked_without_sparks() {
+    async fn past_turns_spark_nothing_and_leave_no_trail() {
         let (mut view, send) = view();
         send.send(Feed::Roll(vec![json!({"name": "a"}), json!({"name": "b"})]))
             .unwrap();
@@ -1865,8 +2162,9 @@ mod tests {
         ))
         .unwrap();
         view.drain();
+        // The past keeps no trails: they say what happens now.
         assert!(view.sparks.is_empty());
-        assert_eq!(view.talks.len(), 1);
+        assert!(view.said.is_empty());
         assert!(view.ticker.is_empty());
         assert!(view.agents.iter().all(|a| a.running.is_none()));
     }
@@ -1999,7 +2297,7 @@ mod tests {
         view.drain();
         assert_eq!(view.agents.len(), 2);
         let (b, c) = (view.index["b"], view.index["c"]);
-        assert_eq!(view.talks.back(), Some(&(b, c)));
+        assert_eq!(view.said.back().map(|&(_, by, to)| (by, to)), Some((b, c)));
         assert_eq!(view.agents[c].sender, Some(End::Agent(b)));
         assert!(view.sparks.iter().all(|spark| spark.to == End::Agent(c)));
     }
@@ -2131,7 +2429,7 @@ mod tests {
         .unwrap();
         view.drain();
         let b = view.index["b"];
-        assert!(view.talks.is_empty());
+        assert!(view.said.is_empty());
         assert_eq!(view.agents[b].sender, None);
         assert!(
             view.sparks
@@ -2232,7 +2530,7 @@ mod tests {
         assert!(shown.contains("✗ cart"), "{shown}");
         assert_eq!(
             text(&[view.footer(100)]),
-            "  3 agents · ? 2 needs you · ● 0 working · ✗ 1 failed · 3 messages in the last minute"
+            "  3 agents · ? 2 need you · ● 0 working · ✗ 1 failed · 3 messages in the last minute"
         );
 
         // The call allowed, the agent works again; a new turn for what
@@ -2357,15 +2655,69 @@ mod tests {
         view.legend = true;
         let shown = text(&view.card(80, 30));
         assert!(
-            shown.contains("● working  ? needs you  ✗ failed"),
+            shown.contains("⠛ working breathes  ? needs you  ✗ failed"),
             "{shown}"
         );
         assert!(shown.contains("⠤⠤ shell  ⡇ files  ⡁⢈ web"), "{shown}");
         assert!(!shown.contains("Catching up"), "{shown}");
         let listed = text(&view.card(40, 12));
         assert!(listed.contains("✦ just talked"), "{listed}");
+        // Beside a wide sky, the legend and the counts take the chat log's
+        // column.
+        let wide = text(&view.card(140, 40));
+        assert!(wide.contains("   working: it breathes"), "{wide}");
+        assert!(wide.contains(" leads         1"), "{wide}");
         view.legend = false;
         assert!(text(&view.card(80, 30)).contains("Catching up"));
+    }
+
+    #[tokio::test]
+    async fn a_wide_sky_keeps_its_chat_log_beside_it_newest_last() {
+        let (mut view, send) = view();
+        send.send(Feed::Roll(vec![json!({"name": "a"}), json!({"name": "b"})]))
+            .unwrap();
+        for turn in 1..=3 {
+            send.send(Feed::Live(
+                json!({"event": "accepted", "bot": "b", "turn": turn,
+                "data": {"from": {"bot": "a"}}}),
+            ))
+            .unwrap();
+            send.send(Feed::Live(
+                json!({"event": "turn_finished", "bot": "b", "turn": turn,
+                "data": {"status": "completed"}}),
+            ))
+            .unwrap();
+        }
+        send.send(Feed::Live(
+            json!({"event": "accepted", "bot": "a", "turn": 9, "data": {}}),
+        ))
+        .unwrap();
+        send.send(Feed::Live(
+            json!({"event": "tool_started", "bot": "a", "turn": 9,
+            "data": {"name": "ask"}}),
+        ))
+        .unwrap();
+        view.drain();
+        let rows: Vec<String> = view
+            .card(140, 40)
+            .iter()
+            .map(|line| text(std::slice::from_ref(line)))
+            .collect();
+        assert_eq!(rows.len(), 40);
+        // The newest at the bottom of the column, what needs you in its hue.
+        assert!(rows[39].ends_with("? a asks you"), "{:?}", rows[39]);
+        assert!(rows[38].ends_with("you → a"), "{:?}", rows[38]);
+        assert!(rows[37].ends_with("a → b"), "{:?}", rows[37]);
+        assert!(rows[0].trim().is_empty() || !rows[0].contains('→'));
+        // Zen: the sky alone, and no names but what needs the person.
+        view.zen = true;
+        let zen = text(&view.card(140, 40));
+        assert!(!zen.contains('→'), "{zen}");
+        assert!(zen.contains("? a"), "{zen}");
+        assert!(
+            !zen.lines().any(|row| row.trim_end().ends_with(" b")),
+            "{zen}"
+        );
     }
 
     #[tokio::test]
@@ -2415,9 +2767,9 @@ mod tests {
     fn braille_dots_land_in_their_cells() {
         let mut sky = Sky::new(2, 1);
         sky.plot(0.0, 0.0, Ink::Plain);
-        sky.plot(3.0, 3.0, Ink::Color(TALK, true));
+        sky.plot(3.0, 3.0, Ink::Color(NEEDS, true));
         let lines = sky.lines();
         assert_eq!(text(&lines), "⠁⢀");
-        assert_eq!(lines[0].spans[1].style.fg, Some(TALK));
+        assert_eq!(lines[0].spans[1].style.fg, Some(NEEDS));
     }
 }

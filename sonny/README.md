@@ -601,29 +601,32 @@ way `/react` does, and each note in the margin has its own `↩`.
   ![/commons in the pane](../docs/sonny/commons.png)
 - `/sky` draws every agent the daemon keeps, in the pane: leads on the inner
   ring, the agents each one made fanned out behind it, you in the middle.
-  Live, a message flies as a spark (yours from the middle, another agent's
-  across, a follow's or an automation's in from the rim), a commons post
-  ripples out, a tool call twinkles in a shape for its kind (a shell's
-  streak across, a file's up and down, the web's corners, any other tool's
-  star), and whoever was lit fades. Its colours are the rest of Sonny's:
-  what goes to or from you is magenta, as the `›` on your messages; what
-  goes between agents is blue, agents' colour; a follow's or an
-  automation's is the text's own, bold. Dotted lines join who made whom and
-  who talked to whom, muted, as everything that says how it got here; the
-  last messages are listed under the sky. Each agent
-  shows the state table's mark and colour: working cyan `●`, needs you
-  yellow `?` (an ask, or an approval waiting), failed red `✗`; the footer
-  counts them the same way. Under 60 columns or 24 rows the sky becomes a
-  list, a firefly per agent and the last it said or was told. `?` swaps the
-  ticker for a legend of every mark, colour and shape.
-  `sonny sky` draws the same sky on its own, in the whole terminal, to keep
-  in another one beside the work, with the same muted gray from your theme
-  and `NO_COLOR` honoured; `q` leaves it, and a daemon that goes is
-  followed again once it is back.
+  It is a calm window to keep open and watch: the lines that join who made
+  whom are faint, a pair that talked in the last minute shows a faint trail
+  that fades, a message flies as a spark, a commons post ripples out, a
+  tool call twinkles in cyan in a shape for its kind (a shell's streak
+  across, a file's up and down, the web's corners, any other tool's star).
+  A working agent breathes, slowly, between the text's colour and a brighter
+  shade; an idle one rests, muted. Only two hues sit on it: yellow `?` for
+  an agent that needs you (an ask, or an approval waiting) and red `✗` for
+  one that failed, still, each with its name; the footer counts them the
+  same way. Beside the sky, when the pane is wide, a chat log lists who
+  said what to whom, newest at the bottom, fading as it rises; in a
+  narrower pane the last few lines sit under it. `?` swaps the log for a
+  legend of every mark and shape and a few numbers: projects, leads,
+  agents, messages and tool calls a minute and this hour, the busiest pair.
+  `z` is zen: the sky alone, no log, no footer, no names but what needs you
+  or failed. Under 60 columns or 24 rows the sky becomes a list, a firefly
+  per agent and the last it said or was told. `sonny sky` draws the same
+  sky on its own, in the whole terminal, to keep in another one beside the
+  work, with your theme's grays and `NO_COLOR` honoured; `q` leaves it, and
+  a daemon that goes is followed again once it is back.
 
   ![/sky in the pane](../docs/sonny/sky.gif)
 
-  ![/sky with states](../docs/sonny/sky-states.png)
+  ![/sky with states and its chat log](../docs/sonny/sky-states.png)
+
+  ![/sky in zen](../docs/sonny/sky-zen.png)
 
   ![/sky in a small pane](../docs/sonny/sky-list.png)
 
