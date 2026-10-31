@@ -1918,6 +1918,9 @@ struct App {
     /// Sonny's welcome heads the transcript once it is drawn back to the
     /// conversation's first item, as Claude Code's does.
     welcome: bool,
+    /// Sonny's blinks and glances in the welcome, until the person types
+    /// or scrolls.
+    eyes: Option<banner::Eyes>,
     width: usize,
     /// The terminal's rows, which bound how much of the bot's words is held.
     height: usize,
@@ -2990,6 +2993,7 @@ impl App {
             react_calls: HashMap::new(),
             picked: reactions::Picked::default(),
             picked_read: Instant::now(),
+            eyes: Some(banner::Eyes::new(Instant::now())),
             answering: None,
             rows_drawn: 0,
             thought: String::new(),
@@ -3709,8 +3713,7 @@ impl App {
         // Back to the first node this window drew, not only the newest page.
         match self.first_node {
             Some(first) => {
-                let welcome = self.welcome();
-                self.commit(welcome);
+                self.commit_welcome();
                 self.history_since(first - 1, true).await;
             }
             None => {
@@ -3853,8 +3856,7 @@ impl App {
         let clustering = self.clustering.take();
         let stacked = self.stacked.take();
         if paged.first {
-            let welcome = self.welcome();
-            self.commit(welcome);
+            self.commit_welcome();
         }
         let unpaired = self
             .draw_nodes(&paged.nodes, &paged.turns, true, after, None)
@@ -4942,7 +4944,7 @@ impl App {
     /// The welcome over the newest page just read, known to start the
     /// conversation only once it is.
     fn welcome_above(&mut self) {
-        let mut welcome = self.welcome();
+        let (mut welcome, eyes) = self.welcome();
         if !welcome.is_empty() {
             if self.any_history {
                 welcome.push(Line::default());
@@ -4953,15 +4955,31 @@ impl App {
                 *at += welcome.len();
             }
             self.pending.splice(0..0, welcome);
+            if let Some(eyes) = eyes {
+                self.marks
+                    .push((eyes, screen::Mark::Tag(screen::Tag::Eyes)));
+            }
+        }
+    }
+
+    /// The welcome written under what is waiting, its eyes' line marked.
+    fn commit_welcome(&mut self) {
+        let (welcome, eyes) = self.welcome();
+        let count = welcome.len();
+        self.commit(welcome);
+        if let Some(eyes) = eyes {
+            let at = self.pending.len() - count + eyes;
+            self.marks.push((at, screen::Mark::Tag(screen::Tag::Eyes)));
         }
     }
 
     /// The welcome, when this window has one and draws the conversation
     /// from its first item: none above a page with older ones before it.
-    fn welcome(&self) -> Vec<Line<'static>> {
+    /// With its portrait, the line the eyes are on.
+    fn welcome(&self) -> (Vec<Line<'static>>, Option<usize>) {
         match self.welcome && self.older.is_none() {
             true => banner::welcome(&tilde(&self.workspace), &self.model, self.width),
-            false => Vec::new(),
+            false => (Vec::new(), None),
         }
     }
 
@@ -7311,17 +7329,23 @@ impl App {
     /// the selection, and the keys that scroll. Whether it took `event`.
     fn full_screen(&mut self, event: &Event) -> bool {
         use ratatui::crossterm::event::MouseEventKind;
-        // A key, or the wheel, ends the way up to the first turn.
+        // A key, or the wheel, ends the way up to the first turn, and
+        // Sonny's eyes moving for good: it was a welcome.
         match event {
-            Event::Key(key) if key.kind != KeyEventKind::Release => self.to_first = false,
+            Event::Key(key) if key.kind != KeyEventKind::Release => {
+                self.to_first = false;
+                self.eyes = None;
+            }
             Event::Mouse(mouse)
                 if matches!(
                     mouse.kind,
                     MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
                 ) =>
             {
-                self.to_first = false
+                self.to_first = false;
+                self.eyes = None;
             }
+            Event::Paste(_) => self.eyes = None,
             _ => {}
         }
         let key = match event {
@@ -9991,6 +10015,11 @@ impl App {
                 ..history
             };
             self.screen.render(history, frame.buffer_mut(), file);
+            if let Some(eyes) = &mut self.eyes
+                && let Some(y) = self.screen.drawn_at(screen::Tag::Eyes)
+            {
+                banner::draw_eyes(frame.buffer_mut(), history.x, y, eyes.look(Instant::now()));
+            }
             linked.extend(self.screen.link_cells(frame.buffer_mut()));
             let [live, status, gap, composer, pad, footer] = areas(view, live_rows);
             frame.render_widget(Paragraph::new(open_rows.clone()), live);
