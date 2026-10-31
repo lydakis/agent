@@ -770,6 +770,14 @@ impl View {
         for (when, to, color) in landed {
             if let End::Agent(at) = to {
                 let agent = &mut self.agents[at];
+                // A replay's jump can land an older message after the agent
+                // sent a newer one: it adds its heat, decayed to the newer
+                // time, and leaves that glow as it is.
+                if let Some(later) = agent.heated.filter(|&heated| heated > when) {
+                    let ago = later.duration_since(when).as_secs_f32();
+                    agent.heat += 0.5f32.powf(ago / HALF_LIFE);
+                    continue;
+                }
                 agent.lit = Some(when);
                 agent.heat = agent.warmth(when) + 1.0;
                 agent.heated = Some(when);
@@ -3227,7 +3235,13 @@ async fn tape(socket: PathBuf, from: i64, send: mpsc::UnboundedSender<Feed>) {
     }
     while let Some(event) = events.recv().await {
         let sent = match event["event"].as_str() {
-            Some("follow_live") => send.send(Feed::Ready),
+            // Who is here may have changed while the past was read, and a
+            // removal then is in neither the tape nor what follows: the cast
+            // is read again, as `follow` reads the roll again.
+            Some("follow_live") => match roll(&client, &send).await {
+                true => send.send(Feed::Ready),
+                false => return,
+            },
             Some("pruned") => continue,
             // As live: a new model is read again, for `m`.
             Some("configured") => match configured(&client, &event).await {
@@ -3636,6 +3650,29 @@ mod tests {
         assert!(gone.is_some_and(|at| at >= before));
         let said = json!({"event": "queued", "bot": "a", "written_ms": 5});
         assert_eq!(slim(said)["written_ms"], 5);
+    }
+
+    #[tokio::test]
+    async fn an_older_spark_landing_after_a_newer_send_keeps_the_newer_glow() {
+        let (mut view, send) = view();
+        send.send(Feed::Roll(vec![json!({"name": "a"}), json!({"name": "b"})]))
+            .unwrap();
+        view.drain();
+        let (a, b) = (view.index["a"], view.index["b"]);
+        let now = Instant::now();
+        // A jump plays a message to `a` a moment back, then `a` sending now.
+        view.sparks.push(Spark {
+            from: End::Agent(b),
+            to: End::Agent(a),
+            born: now - FLIGHT - Duration::from_millis(200),
+            color: Some(Color::Blue),
+        });
+        view.send(End::Agent(a), End::Agent(b), now);
+        let heat = view.agents[a].heat;
+        view.land(now);
+        let agent = &view.agents[a];
+        assert_eq!((agent.lit, agent.heated), (Some(now), Some(now)));
+        assert!(agent.heat > heat);
     }
 
     #[test]
