@@ -293,11 +293,18 @@ class AccountingTests(ModelFixture):
         page = client.request('artifact', bot='Bob', turn=big, call_id='shell-1', stream='stdout',
                               offset=7, limit=12)['result']
         self.assertEqual((page['text'], page['next_offset']), (expected[7:19], 19))
+        # Bytes that are not UTF-8 come back as replacement characters, up
+        # to three times as many bytes, and still read whole.
+        wide = run('Bob', 'wide', "shell:head -c 400000 /dev/zero | tr '\\0' '\\377'")
+        page = client.request('artifact', bot='Bob', turn=wide, call_id='shell-1', stream='stdout',
+                              offset=1199997, limit=8)['result']
+        self.assertEqual((page['text'], page['done']), ('\ufffd', True))
         read = run('Bob', 'read', f'readart:{big}/shell-1/stdout 1,2')
         self.assertIn('line-1', self.tool_output(client, 'Bob', 'readart-1'))
         # Pruning the turn removes its file; reading it says so.
         run('Bob', 'later', 'later')
         self.assertIn('result', client.request('prune', bot='Bob', keep_turns=1))
+        self.assertEqual(os.listdir(outputs), [])
         self.assertFalse(file.exists())
         self.assertEqual(client.request('artifact', bot='Bob', turn=big, call_id='shell-1', stream='stdout')['error'],
                          'artifact_pruned')

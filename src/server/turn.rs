@@ -4869,19 +4869,34 @@ impl Outputs {
             .collect();
         let artifacts = std::mem::take(&mut outcome.artifacts);
         let kept = tokio::task::spawn_blocking(move || {
-            let mut stored = Vec::new();
-            let mut files = Vec::new();
-            if !self.exposed() {
-                for (stream, data) in artifacts {
-                    let file = self.folder.join(format!("{turn}-{name}-{stream}"));
-                    match write_new(&file, &data).ok().and(file.to_str()) {
-                        Some(path) => files.push((stream, path.to_owned())),
-                        None => stored.push((stream, data)),
-                    }
-                }
-            } else {
-                stored = artifacts;
+            if self.exposed() {
+                return (artifacts, Vec::new());
             }
+            let mut stored = Vec::new();
+            let mut written = Vec::new();
+            for (stream, data) in artifacts {
+                let file = self.folder.join(format!("{turn}-{name}-{stream}"));
+                match write_new(&file, &data).ok().and(file.to_str()) {
+                    Some(path) => written.push((stream, path.to_owned(), data)),
+                    None => stored.push((stream, data)),
+                }
+            }
+            // The store commits only where a file is: its name must last
+            // as its bytes do, or the store keeps them after all.
+            if !written.is_empty()
+                && std::fs::File::open(&self.folder)
+                    .and_then(|folder| folder.sync_all())
+                    .is_err()
+            {
+                for (stream, path, data) in written.drain(..) {
+                    let _ = std::fs::remove_file(path);
+                    stored.push((stream, data));
+                }
+            }
+            let files = written
+                .into_iter()
+                .map(|(stream, path, _)| (stream, path))
+                .collect();
             (stored, files)
         })
         .await;
@@ -4922,7 +4937,8 @@ impl Outputs {
     }
 }
 
-/// `data` to a new file at `path`, never through a link.
+/// `data` to a new file at `path`, never through a link, on disk before
+/// it returns, as the store's commit is.
 fn write_new(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
@@ -4932,7 +4948,7 @@ fn write_new(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW)
         .open(path)?;
-    if let Err(error) = file.write_all(data) {
+    if let Err(error) = file.write_all(data).and_then(|()| file.sync_all()) {
         let _ = std::fs::remove_file(path);
         return Err(error);
     }

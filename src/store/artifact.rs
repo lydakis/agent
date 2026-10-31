@@ -39,6 +39,11 @@ fn encode(raw: &[u8]) -> Option<Vec<u8>> {
     (out.len() < raw.len() - raw.len() / 8).then_some(out)
 }
 
+/// The most a retained stream holds: `ARTIFACT_BYTES` of output made
+/// valid UTF-8, each invalid byte at most three. Past `ARTIFACT_BYTES`
+/// the store keeps a stream as it is, never encoded.
+const RETAINED_BYTES: usize = 3 * ARTIFACT_BYTES;
+
 pub(super) fn put(db: &Connection, turn: i64, call: &str, stream: &str, raw: &[u8]) -> Result<()> {
     let encoded = encode(raw);
     db.prepare("INSERT INTO artifacts(turn,call_id,stream,data,raw_bytes) VALUES (?,?,?,?,?)")?
@@ -80,11 +85,9 @@ pub(super) fn files(db: &Connection, turn: i64) -> Result<Vec<String>> {
         .collect::<rusqlite::Result<_>>()?)
 }
 
-/// Remove the files of outputs whose records are gone. A file someone
-/// already removed is gone either way; one a link replaced loses only the
-/// link, never what it points to. Should the records' commit still fail
-/// after this, they name a file that is gone, which reads as a stream not
-/// retained.
+/// Remove the files of outputs whose records are gone, once that is
+/// durable. A file someone already removed is gone either way; one a link
+/// replaced loses only the link, never what it points to.
 pub(super) fn remove(files: &[String]) {
     for file in files {
         let _ = std::fs::remove_file(file);
@@ -110,8 +113,8 @@ fn read_file(file: &str, offset: u64, limit: usize) -> Result<Option<(u64, Vec<u
         return Ok(None);
     }
     let total = found.len();
-    // No retained output is larger: one that is was not written here.
-    if total > ARTIFACT_BYTES as u64 {
+    // One that is larger was not written here.
+    if total > RETAINED_BYTES as u64 {
         return fail("storage_error");
     }
     if offset > total {

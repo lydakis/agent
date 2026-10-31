@@ -85,6 +85,7 @@ Reply with the summary only.";
 /// Where a new bot's tool outputs cut for the model go whole by default:
 /// the outputs folder beside its daemon's store.
 pub fn outputs_beside(store: &Path) -> Option<String> {
+    let store = std::path::absolute(store).ok()?;
     Some(store.parent()?.join("outputs").to_str()?.to_owned())
 }
 

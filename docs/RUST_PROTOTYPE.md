@@ -366,12 +366,14 @@ stream there whole instead, as `TURN-CALL_ID-STREAM`, and its result lists
 those paths as `files` beside `artifacts`, so any command or tool reads them.
 The store keeps one row per stream naming the file and none of its bytes
 (schema 66), and `artifact` and `read artifact=` read the file. Each file is
-made new (0600, never through a link) off the runtime thread, and only while
+made new (0600, never through a link) and synced with its folder before the
+store records it, off the runtime thread, and only while
 the bot's sandbox cannot write the folder, checked after the folder is made: a
 command that could write there could put a link for the daemon to follow. An unconfined bot's
 commands can already write whatever the daemon can. A stream whose file cannot
 be written stays in the store. Retention and deletion remove a turn's files
-once its records are gone; a file removed by hand reads `artifact_not_found`.
+once removing its records commits; a file removed by hand reads
+`artifact_not_found`.
 Line pages are assembled on the storage worker; only the bounded page crosses
 into the async runtime. Byte-oriented protocol pages continue to use SQL slicing.
 
