@@ -1233,12 +1233,18 @@ pub fn relayed(text: &str, from: Option<&str>, open: bool, width: usize) -> Vec<
     let head = cut(&format!("↳ {}", head.trim()), width.saturating_sub(2));
     let mut out = vec![Line::from(format!("{head} ▾"))];
     for line in text.lines() {
-        out.extend(wrap(
-            Line::from(line.to_string()),
-            width,
-            Span::raw("  "),
-            Span::raw("  "),
-        ));
+        // Words it quotes as Markdown draws a quote: a bar, in italics.
+        let (line, rest) = match line.strip_prefix("> ") {
+            Some(quoted) => (
+                Line::from(vec![
+                    Span::raw("▌ "),
+                    Span::raw(quoted.to_string()).italic(),
+                ]),
+                Span::raw("  ▌ "),
+            ),
+            None => (Line::from(line.to_string()), Span::raw("  ")),
+        };
+        out.extend(wrap(line, width, Span::raw("  "), rest));
     }
     out.into_iter().map(|line| line.dim()).collect()
 }

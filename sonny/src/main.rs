@@ -1567,6 +1567,8 @@ struct Relayed {
     /// What its shut row says, as [`transcript::relayed_head`] has it.
     head: String,
     from: Option<String>,
+    /// Whether `from` names a person, whom no agents' colour marks.
+    person: bool,
     /// The whole message while it is open, read again from the history
     /// when it opens, so a long conversation keeps none of them.
     text: Option<String>,
@@ -4671,12 +4673,12 @@ impl App {
     /// they ran as it was when it ran, its last row tagged, and the
     /// message the bot now answers. Drawn `older` than the rest, what
     /// they ran is no part of what this window ran.
-    fn land(&mut self, node: i64, said: &str, from: Option<&str>, older: bool) {
+    fn land(&mut self, node: i64, said: &str, from: Option<&str>, person: bool, older: bool) {
         // Reactions from here on answer this one.
         self.bot_reactions.clear();
         // Words between agents are one quiet row a click opens.
         if transcript::relays(said, from) {
-            self.land_relayed(node, said, from);
+            self.land_relayed(node, said, from, person);
         } else {
             let prose = self.prose();
             let lines = match older {
@@ -4697,10 +4699,11 @@ impl App {
 
     /// The message between agents at `node`: one quiet row a click opens,
     /// gathered with those right before it into one that lists them.
-    fn land_relayed(&mut self, node: i64, said: &str, from: Option<&str>) {
+    fn land_relayed(&mut self, node: i64, said: &str, from: Option<&str>, person: bool) {
         let relayed = Relayed {
             head: transcript::relayed_head(said, from),
             from: from.map(str::to_owned),
+            person,
             text: None,
         };
         self.relayed.insert(node, relayed);
@@ -4790,7 +4793,11 @@ impl App {
                 lines.extend(transcript::indented(calls, 2));
                 lines
             }
-            None => transcript::relayed_shut(&relayed.head, relayed.from.as_deref(), width),
+            None => {
+                // Only an agent's name takes the agents' colour.
+                let agent = relayed.from.as_deref().filter(|_| !relayed.person);
+                transcript::relayed_shut(&relayed.head, agent, width)
+            }
         }
     }
 
@@ -5252,6 +5259,10 @@ impl App {
                 responses(&entry["item"]).into_iter().map(move |mut item| {
                     if let Some(from) = from.as_ref().filter(|_| item["role"] == "user") {
                         item["from"] = json!(from);
+                        // A person, not an agent or a client, wrote it.
+                        if entry["person"].is_string() && entry["from"].is_null() {
+                            item["person"] = json!(true);
+                        }
                     }
                     // Where its quoted words are among its parts, and who
                     // wrote them.
@@ -5486,7 +5497,13 @@ impl App {
                         if !older {
                             asks::close(&mut self.asks, &text(&item));
                         }
-                        self.land(node, &text(&item), item["from"].as_str(), older);
+                        self.land(
+                            node,
+                            &text(&item),
+                            item["from"].as_str(),
+                            item["person"] == true,
+                            older,
+                        );
                     }
                     (_, Some("assistant")) => {
                         let reply = text(&item);
@@ -5994,7 +6011,13 @@ impl App {
                     && !self.note_closed(node, &text(item))
                     && !quiet_message(&text(item))
                 {
-                    self.land(node, &text(item), item["from"].as_str(), false);
+                    self.land(
+                        node,
+                        &text(item),
+                        item["from"].as_str(),
+                        item["person"] == true,
+                        false,
+                    );
                     self.answered(&text(item));
                 }
             }
@@ -6011,7 +6034,13 @@ impl App {
                     // What the bot reacted with so far answered the
                     // message before this one.
                     self.draw_bot_reactions();
-                    self.land(node, &text(item), item["from"].as_str(), false);
+                    self.land(
+                        node,
+                        &text(item),
+                        item["from"].as_str(),
+                        item["person"] == true,
+                        false,
+                    );
                     self.answered(&text(item));
                 }
             }
@@ -10829,12 +10858,12 @@ fn quoting(item: &Value) -> String {
             quote["person"].as_str(),
         )
         .unwrap_or_else(|| "you".into());
-        let what = match quote["reply"] == true {
-            true => "the reply of turn",
-            false => "turn",
+        let did = match quote["reply"] == true {
+            true => "replied",
+            false => "wrote",
         };
         let (bot, turn) = (quote["bot"].as_str().unwrap_or_default(), &quote["turn"]);
-        out.push_str(&format!("\n\n{who}, in {what}:{bot}/{turn}:"));
+        out.push_str(&format!("\n\n{who} {did} in turn:{bot}/{turn}:"));
         for line in words.lines() {
             out.push_str(&format!("\n> {line}"));
         }
@@ -12901,7 +12930,7 @@ mod tests {
             transcript::reply("Merged it.", 80, std::path::Path::new("/")),
         );
         app.saw_reply(4, "Merged it.");
-        app.land(6, "and tag it", None, false);
+        app.land(6, "and tag it", None, false, false);
         app.commit_said(
             8,
             transcript::reply("Tagged 0.4.0.", 80, std::path::Path::new("/")),
@@ -13043,7 +13072,7 @@ mod tests {
         };
         // Attached mid-turn: the history drew the message and what the bot
         // reacted with so far, and the turn's start comes again after it.
-        app.land(5, "ship it", None, false);
+        app.land(5, "ship it", None, false, false);
         app.daemon(react("c1", "👀")).await;
         app.daemon(turn_event("tool_completed", 4, json!({"call_id": "c1"})))
             .await;
@@ -13069,7 +13098,7 @@ mod tests {
     async fn the_leads_reaction_goes_under_the_persons_message_wherever_it_is() {
         let client = daemon_answering(|_| json!({})).await;
         let mut app = app(client);
-        app.land(5, "ship it", None, false);
+        app.land(5, "ship it", None, false, false);
         app.commit(vec![Line::from("• Shipped.")]);
         app.picked.set(5, "calc.lead", "👀", false);
         app.place_picked(5);
@@ -13095,7 +13124,7 @@ mod tests {
         );
         // Reacted to before it landed: under it once it does.
         app.picked.set(7, "calc.lead", "👀", false);
-        app.land(7, "and the notes", None, false);
+        app.land(7, "and the notes", None, false, false);
         assert_eq!(drawn(&mut app).last().unwrap(), "   👀 calc.lead ");
     }
 
@@ -13525,8 +13554,27 @@ mod tests {
             "The build is green.\nI pushed the fix to calc.add.",
             Some("calc.add"),
             false,
+            false,
         );
         assert_eq!(drawn(&mut app), ["↳ From calc.add ▸"]);
+        // An agent's name takes the agents' colour; a person's never does.
+        let blue = |app: &App, node| {
+            (app.relayed_lines(node, &[], 80).iter())
+                .flat_map(|line| &line.spans)
+                .any(|span| span.style.fg == Some(Color::Blue))
+        };
+        assert!(blue(&app, 4));
+        app.relayed.insert(
+            40,
+            Relayed {
+                head: "From ana".into(),
+                from: Some("ana".into()),
+                person: true,
+                text: None,
+            },
+        );
+        assert!(!blue(&app, 40));
+        app.relayed.remove(&40);
         // A click on one opens it whole, and again shuts it.
         app.follow("sonny:said/4");
         let button = app.pressed.pop().unwrap();
@@ -13551,7 +13599,7 @@ mod tests {
         // with what the agent did about them while it said nothing.
         let updates = "Task updates: what happened in your tasks since you last heard.\n\
             - calc.neg: turn:calc.neg/3 completed";
-        app.land(5, updates, None, false);
+        app.land(5, updates, None, false, false);
         let steer =
             r#""$AGENT_BIN" run --detach --delivery steer --bot calc.neg -- 'Check div too.'"#;
         app.commit_call(
@@ -13587,7 +13635,7 @@ mod tests {
         );
         // The agent's words end it: what comes after starts anew.
         app.commit(vec![Line::from("• calc.neg is done.")]);
-        app.land(6, updates, None, false);
+        app.land(6, updates, None, false, false);
         assert_eq!(
             drawn(&mut app)[2..],
             [
@@ -13597,12 +13645,12 @@ mod tests {
             ]
         );
         // The person's own words are drawn as ever.
-        app.land(7, "thanks", None, false);
+        app.land(7, "thanks", None, false, false);
         assert_eq!(drawn(&mut app).iter().rev().nth(1).unwrap(), "› thanks");
         // A message a page drawn again put in a newer cluster opens there,
         // not in the cluster its rows were let go from.
         app.next_group = 9;
-        app.land(8, updates, None, false);
+        app.land(8, updates, None, false, false);
         let stale = Cluster {
             messages: vec![Clustered {
                 node: 8,
@@ -14722,8 +14770,8 @@ mod tests {
                 {"bot": "calc.fix", "turn": 6, "reply": true, "person": "ana", "at": 5}]});
         assert_eq!(
             quoting(&item),
-            "News from your tasks.\n\nyou, in turn:calc.fix/5:\n> yes, ship it\n> and tag it\n\n\
-             ana, in the reply of turn:calc.fix/6:\n> tagged"
+            "News from your tasks.\n\nyou wrote in turn:calc.fix/5:\n> yes, ship it\n> and tag it\n\n\
+             ana replied in turn:calc.fix/6:\n> tagged"
         );
         // Its own words are all a message without quotes shows.
         assert_eq!(text(&item), "News from your tasks.");
