@@ -18,6 +18,7 @@ use serde_json::{Value, json};
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
+    sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -226,8 +227,10 @@ pub struct Updates {
     /// The memory folders whose facts are news: the person's and the
     /// project's, as the subscriber's own memory indexes name them.
     memory: Vec<PathBuf>,
-    /// Bots with subscriptions of their own: no one's tasks here.
-    subscribers: HashSet<String>,
+    /// Bots with subscriptions of their own, this lead among them: no
+    /// one's tasks here. One set every lookout shares, so the lookouts
+    /// hold it once, not each a copy of all the others.
+    subscribers: Arc<HashSet<String>>,
     /// The bots whose news this is, as the lookout's subscriptions with
     /// task updates name them.
     pub watched: HashSet<String>,
@@ -331,7 +334,7 @@ impl Updates {
         Self {
             lead: lead.to_owned(),
             memory,
-            subscribers: HashSet::new(),
+            subscribers: Arc::default(),
             watched: HashSet::new(),
             named: HashSet::new(),
             noted: HashSet::new(),
@@ -687,7 +690,7 @@ impl Updates {
     /// own, unless a subscription names it.
     fn task(&self, name: &str) -> bool {
         self.watched.contains(name)
-            && (!self.subscribers.contains(name) || self.named.contains(name))
+            && (!self.subscriber(name) || self.named.contains(name))
             && !name.starts_with(&format!("{}-", self.lead))
     }
 
@@ -1194,17 +1197,30 @@ impl Updates {
         self.approvals.clear();
     }
 
+    /// Whether `name` is another bot with subscriptions of its own.
+    fn subscriber(&self, name: &str) -> bool {
+        name != self.lead && self.subscribers.contains(name)
+    }
+
     /// The bots with subscriptions of their own, now: what was news of
-    /// them is no longer.
-    pub fn subscribed(&mut self, subscribers: HashSet<String>) {
-        let new: Vec<String> = (subscribers.difference(&self.subscribers))
+    /// them is no longer. Only the bots this lookout holds news of are
+    /// looked up, so taking the shared set costs what this lookout holds,
+    /// not the number of subscribers.
+    pub fn subscribed(&mut self, subscribers: Arc<HashSet<String>>) {
+        let before = std::mem::replace(&mut self.subscribers, subscribers);
+        let held = (self.tasks.iter().map(|(task, _)| task))
+            .chain(self.forwarding.keys().map(|(task, _)| task))
+            .chain(self.goaled.iter().map(|(task, _)| task))
+            .chain(self.approvals.keys().map(|(task, _)| task))
+            .chain(self.noted.iter().map(|(task, _)| task));
+        let new: HashSet<String> = held
+            .filter(|name| self.subscriber(name) && !before.contains(*name))
             .filter(|name| !self.named.contains(*name))
             .cloned()
             .collect();
         for name in new {
             self.drop_news(&name);
         }
-        self.subscribers = subscribers;
     }
 
     /// The bot under `name` is gone: drop its news, or all of it when it

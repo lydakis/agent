@@ -433,6 +433,7 @@ async fn serve(settings: Settings) -> Result<(), String> {
         records: HashMap::new(),
         working: HashMap::new(),
         subscribers: HashMap::new(),
+        registry: Arc::default(),
         socket: settings.socket.clone(),
         lookouts: HashMap::new(),
         log: PathBuf::from(log),
@@ -507,6 +508,10 @@ struct Service {
     /// Subscriptions by subscriber, as their files held them at the last
     /// read.
     subscribers: HashMap<String, Vec<subs::Sub>>,
+    /// The subscribers' names, one set every lookout shares (Kubernetes'
+    /// informer cache: one store, many readers), made again whenever
+    /// subscriptions are worked out.
+    registry: Arc<HashSet<String>>,
     socket: PathBuf,
     /// By subscriber name.
     lookouts: HashMap<String, Lookout>,
@@ -659,7 +664,7 @@ fn replaced(seated: &Value, listed: &Value) -> bool {
 fn updates_for(
     subscriber: &str,
     workspace: &Path,
-    subscribers: &HashMap<String, Vec<subs::Sub>>,
+    subscribers: Arc<HashSet<String>>,
     live: bool,
 ) -> updates::Updates {
     // What changed in the person's and the project's memory rides along
@@ -669,17 +674,9 @@ fn updates_for(
         .filter_map(|index| index.parent().map(Path::to_owned))
         .collect();
     let mut updates = updates::Updates::new(subscriber, memory);
-    updates.subscribed(others(subscriber, subscribers));
+    updates.subscribed(subscribers);
     updates.live = live;
     updates
-}
-
-/// The subscribers other than this one.
-fn others(subscriber: &str, subscribers: &HashMap<String, Vec<subs::Sub>>) -> HashSet<String> {
-    (subscribers.keys())
-        .filter(|name| *name != subscriber)
-        .cloned()
-        .collect()
 }
 
 impl Service {
@@ -713,14 +710,23 @@ impl Service {
         let listed: HashSet<String> = (bots.iter())
             .filter_map(|b| b["name"].as_str().map(str::to_owned))
             .collect();
+        // Each bot to the lookouts the index says hear it, rather than every
+        // lookout asking of every bot.
         for lookout in self.lookouts.values_mut() {
             // The replay's turns were news then; the live ones are now.
             lookout.updates.live = false;
-            for bot in &bots {
-                if (bot["name"].as_str()).is_some_and(|name| lookout.hears(name)) {
+        }
+        for bot in &bots {
+            let Some(name) = bot["name"].as_str() else {
+                continue;
+            };
+            for watcher in self.watchers.get(name).into_iter().flatten() {
+                if let Some(lookout) = self.lookouts.get_mut(watcher) {
                     lookout.updates.seat(bot);
                 }
             }
+        }
+        for lookout in self.lookouts.values_mut() {
             lookout.updates.seated(&listed);
             lookout.lineage.insert(lookout.lead.clone());
         }
@@ -1174,6 +1180,21 @@ impl Service {
         self.watchers = watchers;
     }
 
+    /// One lookout added to the index, its own name and the bots it
+    /// watches, without going through every other lookout again.
+    fn index_lookout(&mut self, name: &str) {
+        let Some(lookout) = self.lookouts.get(name) else {
+            return;
+        };
+        let heard = std::iter::once(name).chain(lookout.updates.watched.iter().map(String::as_str));
+        for bot in heard {
+            let watchers = self.watchers.entry(bot.to_owned()).or_default();
+            if !watchers.iter().any(|watcher| watcher == name) {
+                watchers.push(name.to_owned());
+            }
+        }
+    }
+
     /// Which lookouts hear one bot, after it was made or deleted.
     fn index_bot(&mut self, bot: &str) {
         let hear: Vec<String> = (self.lookouts.iter())
@@ -1336,7 +1357,11 @@ impl Service {
             return true;
         }
         let workspace = PathBuf::from(record["workspace"].as_str().unwrap_or("/"));
-        let updates = updates_for(lead, &workspace, &self.subscribers, self.live);
+        // Subscriptions read since the registry was made: made again, once.
+        if !self.registry.contains(lead) {
+            self.registry = Arc::new(self.subscribers.keys().cloned().collect());
+        }
+        let updates = updates_for(lead, &workspace, self.registry.clone(), self.live);
         let mut lookout = Lookout::new(lead);
         self.seated += 1;
         lookout.id = self.seated;
@@ -1376,7 +1401,7 @@ impl Service {
             }
         }
         if fresh {
-            self.index();
+            self.index_lookout(lead);
         }
     }
 
@@ -1385,11 +1410,12 @@ impl Service {
     /// again only where its subscriptions changed, or for `all` once the
     /// bots are listed afresh.
     fn resubscribe(&mut self, all: bool) {
+        self.registry = Arc::new(self.subscribers.keys().cloned().collect());
         let subscribers = &self.subscribers;
         self.lookouts
             .retain(|name, _| subscribers.contains_key(name));
         for (name, lookout) in self.lookouts.iter_mut() {
-            lookout.updates.subscribed(others(name, subscribers));
+            lookout.updates.subscribed(self.registry.clone());
             let subs = subscribers.get(name).cloned().unwrap_or_default();
             if all || subs != lookout.subs {
                 lookout.subs = subs;
@@ -2830,7 +2856,9 @@ mod tests {
         lookout.event(&json!({"event": "follow_live"}));
         // Another subscriber, so no task of this lead's until the person
         // has it watched by name.
-        lookout.updates.subscribed(["web.lead".to_owned()].into());
+        lookout.updates.subscribed(Arc::new(
+            ["calc.lead".to_owned(), "web.lead".to_owned()].into(),
+        ));
         let mut sub = subs::Sub::lead("calc.lead", "calc");
         sub.name = "web".into();
         sub.tasks_of.clear();
@@ -2963,6 +2991,7 @@ mod tests {
                 .collect(),
             working: HashMap::new(),
             subscribers: HashMap::new(),
+            registry: Arc::default(),
             socket: PathBuf::new(),
             lookouts: HashMap::new(),
             log: PathBuf::new(),

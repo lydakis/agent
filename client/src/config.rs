@@ -34,6 +34,7 @@
 //! commons_invites = 3           # least threads a day that send invites (more with the square root of the week's agents), 0 none; answers add up to as many again
 //! commons_invite_tokens = 1000000  # what an invite pays for in its thread
 //! task_depth = 3                # generations of tasks below a lead, 2 by default (tasks' own start none); 0 no end
+//! tool_processes = 8            # processes Sonny runs for agents at once (tool calls, goal checks) in each of its companions; 0, the default, twice the CPUs
 //! unsandboxed = ["mcpx"]        # commands run outside agents' sandboxes
 //! default_permissions = "strict"   # the /permissions row a new lead starts in, auto by default
 //! browser_confirm = ["eval"]    # agent-browser actions the agent's gate approves; eval, download, upload and state by default
@@ -185,6 +186,10 @@ pub struct Sonny {
     /// How many generations below a lead its line goes: a lead's tasks
     /// are the first, and an agent of the last starts none; 0 for no end.
     pub task_depth: u64,
+    /// The processes each of Sonny's companions runs for agents at once:
+    /// tool calls the tool host answers, goal checks. 0 for twice the
+    /// CPUs.
+    pub tool_processes: u64,
     /// What the lookout runs for news from outside, by name.
     pub sources: Vec<Source>,
     /// The agent-browser action categories that the `browser` tool puts
@@ -214,6 +219,7 @@ impl Default for Sonny {
             commons_invites: 3,
             commons_invite_tokens: 1_000_000,
             task_depth: 2,
+            tool_processes: 0,
             chime: true,
             verbose: false,
             start_at_boot: false,
@@ -599,6 +605,7 @@ fn parse(text: &str) -> Result<Config, String> {
                 "commons_invites",
                 "commons_invite_tokens",
                 "task_depth",
+                "tool_processes",
                 "unsandboxed",
                 "default_permissions",
                 "browser_confirm",
@@ -663,6 +670,7 @@ fn parse(text: &str) -> Result<Config, String> {
                 "commons_invites" => Some(&mut config.sonny.commons_invites),
                 "commons_invite_tokens" => Some(&mut config.sonny.commons_invite_tokens),
                 "task_depth" => Some(&mut config.sonny.task_depth),
+                "tool_processes" => Some(&mut config.sonny.tool_processes),
                 _ => None,
             } {
                 *count = (value.as_integer())

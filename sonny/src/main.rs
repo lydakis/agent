@@ -17,6 +17,7 @@ mod background;
 mod banner;
 mod boot;
 mod browser;
+mod budget;
 mod cache;
 mod calls;
 mod cmux;
@@ -140,6 +141,9 @@ const QUOTED: usize = 72;
 /// Draws in a row that may fail before the client gives up on its
 /// terminal: each failed cursor query waits up to 2 s, so about a minute.
 const DRAW_ATTEMPTS: u32 = 30;
+/// The least time between two draws the daemon's events bring: 30 a
+/// second, Ink's default cap.
+const DRAW_EVERY: Duration = Duration::from_millis(33);
 /// How much history is shown on attach.
 const HISTORY_ITEMS: u64 = 200;
 /// How much older history is drawn at a time as the view nears its top:
@@ -1917,7 +1921,7 @@ fn resolved_itself(items: &[Value], bot: &str) -> bool {
     })
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct Latest {
     /// Its latest step, as a line.
     step: String,
@@ -2050,6 +2054,10 @@ struct App {
     /// What `/status` read of each idle agent's history: its last turn
     /// then, and the question left open.
     asks_seen: HashMap<String, (i64, Seen)>,
+    /// What `/status` last read of each agent's latest items, and the
+    /// history head it read them at: a history that has not moved is not
+    /// read again.
+    status_read: HashMap<String, (Value, Latest)>,
     sounds: sound::Sounds,
     /// The reply text the current model call has streamed.
     said: String,
@@ -2579,14 +2587,38 @@ impl Naming {
     }
 }
 
+/// The kinds of event a lead's layout acts on (`Fleet::event`, `taken`,
+/// `Resolving::event`).
+const FLEET_KINDS: [&str; 11] = [
+    "created",
+    "forked",
+    "deleted",
+    "accepted",
+    "approval_requested",
+    "approval_asked",
+    "step_decided",
+    "tool_started",
+    "tool_completed",
+    "turn_resumed",
+    "turn_finished",
+];
+
+/// A lead's layout follows every agent from now, for the kinds it acts on:
+/// where they are now comes from the listing (`reconcile`), so the past is
+/// not replayed only to be passed over, and other projects' token traffic
+/// never reaches this window.
+fn fleet_follow() -> Value {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64);
+    json!({"bot": "*", "since_ms": now, "kinds": FLEET_KINDS})
+}
+
 impl Fleet {
     async fn start(options: &Options, project: &str, lead: &str) -> Option<Self> {
         let layout = mux::here(&options.socket, project, options.rex_host.as_deref())?;
         let (client, mut events) = Client::connect(&options.socket).await.ok()?;
-        client
-            .request("follow", json!({"bot": "*", "after": 0}))
-            .await
-            .ok()?;
+        client.request("follow", fleet_follow()).await.ok()?;
         caught_up(&mut events).await;
         let me = std::env::current_exe().ok()?;
         // Rex starts a block without this process's environment.
@@ -2892,11 +2924,7 @@ impl Fleet {
         let Ok((client, mut events)) = Client::connect(&self.socket).await else {
             return false;
         };
-        if client
-            .request("follow", json!({"bot": "*", "after": 0}))
-            .await
-            .is_err()
-        {
+        if client.request("follow", fleet_follow()).await.is_err() {
             return false;
         }
         caught_up(&mut events).await;
@@ -3071,6 +3099,7 @@ impl App {
             suggesting: None,
             suggestion: None,
             asks_seen: HashMap::new(),
+            status_read: HashMap::new(),
             sounds: sound::Sounds::new(false),
             said: String::new(),
             staged: Vec::new(),
@@ -3258,17 +3287,31 @@ impl App {
         // query a resize makes, and a draw then fails; the next tick draws
         // again, and only a terminal that keeps failing ends the client.
         let mut failed_draws = 0;
+        // Draws come at most `DRAW_EVERY` apart, as Ink caps its frames, so
+        // a burst of the daemon's events is one draw, not one each; a key
+        // draws at once, so typing never waits on the cap.
+        let mut drawn: Option<Instant> = None;
+        let mut keyed = false;
         loop {
-            match self.draw(terminal) {
-                Ok(()) => failed_draws = 0,
-                // What it wrote before failing is on the screen, not in
-                // what the next draw compares with.
-                Err(_) if failed_draws < DRAW_ATTEMPTS => {
-                    failed_draws += 1;
-                    self.stale = true;
+            let due = drawn.is_none_or(|at| at.elapsed() >= DRAW_EVERY);
+            let skipped = !(keyed || due || self.quit);
+            if !skipped {
+                keyed = false;
+                drawn = Some(Instant::now());
+                match self.draw(terminal) {
+                    Ok(()) => failed_draws = 0,
+                    // What it wrote before failing is on the screen, not in
+                    // what the next draw compares with.
+                    Err(_) if failed_draws < DRAW_ATTEMPTS => {
+                        failed_draws += 1;
+                        self.stale = true;
+                    }
+                    Err(error) => return Err(error.to_string()),
                 }
-                Err(error) => return Err(error.to_string()),
             }
+            // What came since the last draw waits for the next one, due
+            // once the cap allows.
+            let undrawn = drawn.filter(|_| skipped);
             if self.quit {
                 return Ok(());
             }
@@ -3277,7 +3320,11 @@ impl App {
                     Some(event) => self.daemon(event).await,
                     None => self.dropped(),
                 },
-                Some(key) = keys.recv() => self.key(key).await,
+                Some(key) = keys.recv() => {
+                    keyed = true;
+                    self.key(key).await
+                }
+                _ = tokio::time::sleep(undrawn.map_or(Duration::ZERO, |at| DRAW_EVERY.saturating_sub(at.elapsed()))), if undrawn.is_some() => {}
                 news = async {
                     match &mut self.fleet {
                         Some(fleet) => tokio::select! {
@@ -7085,13 +7132,24 @@ impl App {
             &self.turns,
             |bot| lookout::subs::matches(&pattern, bot),
         );
-        let Ok(page) = self
-            .client
-            .request("bots", json!({"name": pattern, "limit": 256}))
-            .await
-        else {
-            return Err("could not list the agents".into());
-        };
+        // Every page of the listing: past the first 256, agents are the
+        // project's too.
+        let mut listed = Vec::new();
+        let mut after: Option<String> = None;
+        loop {
+            let mut ask = json!({"name": pattern, "limit": 256});
+            if let Some(after) = &after {
+                ask["after"] = json!(after);
+            }
+            let Ok(page) = self.client.request("bots", ask).await else {
+                return Err("could not list the agents".into());
+            };
+            listed.extend(page["bots"].as_array().cloned().unwrap_or_default());
+            match page["next_after"].as_str() {
+                Some(next) if after.as_deref() != Some(next) => after = Some(next.to_owned()),
+                _ => break,
+            }
+        }
         let places = self
             .fleet
             .as_ref()
@@ -7105,7 +7163,6 @@ impl App {
         let mut rows = Vec::new();
         // With other leads in the folder, their tasks are theirs: each
         // lead shows as a row of its own.
-        let listed = page["bots"].as_array().cloned().unwrap_or_default();
         let shared = lead != format!("{project}.lead")
             || (listed.iter()).any(|bot| {
                 let name = bot["name"].as_str().unwrap_or("");
@@ -7114,7 +7171,8 @@ impl App {
         let mine = (shared && project::lead_project(&lead) == Some(project.as_str()))
             .then(|| lineage_of(&listed, &lead, lead == format!("{project}.lead")));
         // Side chats are not the project's agents.
-        for bot in page["bots"].as_array().into_iter().flatten() {
+        let mut kept = HashMap::new();
+        for bot in &listed {
             let Some(name) = bot["name"].as_str().filter(|_| bot["expire_ms"].is_null()) else {
                 continue;
             };
@@ -7132,6 +7190,18 @@ impl App {
                 .ok()
                 .and_then(|page| page["turns"].as_array().cloned())
                 .unwrap_or_default();
+            // Its latest items are read again only once its history moved:
+            // the same head is the same history. A failed read is kept
+            // for none, so the next refresh tries again.
+            let head = json!([bot["bot_id"], bot["head"]]);
+            let latest = match self.status_read.remove(name) {
+                Some((seen, latest)) if seen == head && !bot["head"].is_null() => Some(latest),
+                _ => self.read_latest(name).await,
+            };
+            if let Some(latest) = &latest {
+                kept.insert(name.to_owned(), (head, latest.clone()));
+            }
+            let latest = latest.unwrap_or_default();
             let turn = turns.first().cloned().unwrap_or(Value::Null);
             // A message steered into a running turn is recorded as a turn
             // of its own that never ran: the time is the one it joined. One
@@ -7191,7 +7261,7 @@ impl App {
                         .map(|(began, ended)| ended.saturating_sub(began) / 1000),
                 ),
             };
-            let Latest { mut step, pr, ask } = self.latest(name).await;
+            let Latest { mut step, pr, ask } = latest;
             // A question stays open until its answer lands, past work that
             // does not wait on it and messages that answer something else:
             // an idle agent's recent history is read once per turn it
@@ -7252,6 +7322,8 @@ impl App {
                 group,
             });
         }
+        // Agents gone from the listing are forgotten with it.
+        self.status_read = kept;
         // The lead first, then by group, the latest first in each.
         rows.sort_by_key(|row| {
             (
@@ -7341,27 +7413,30 @@ impl App {
     /// An agent's latest step, as a line; the pull request its latest
     /// reply links; and the question it asked the person, when that is
     /// still open. Its last few items say: asking ends a turn.
+    #[cfg(test)]
     async fn latest(&self, bot: &str) -> Latest {
-        let Ok(page) = self
+        self.read_latest(bot).await.unwrap_or_default()
+    }
+
+    /// `bot`'s latest step, question and pull request; none when a read
+    /// failed, which an empty history is not.
+    async fn read_latest(&self, bot: &str) -> Option<Latest> {
+        let page = self
             .client
             .request("history_nodes", json!({"bot": bot, "limit": 4}))
             .await
-        else {
-            return Latest::default();
-        };
+            .ok()?;
         let nodes: Vec<i64> = page["nodes"]
             .as_array()
             .into_iter()
             .flatten()
             .filter_map(|n| n["node"].as_i64())
             .collect();
-        let Ok(read) = self
+        let read = self
             .client
             .request("history_items", json!({"bot": bot, "nodes": nodes}))
             .await
-        else {
-            return Latest::default();
-        };
+            .ok()?;
         // Newest first, as the nodes were asked for.
         let entries = read["items"].as_array().cloned().unwrap_or_default();
         let items: Vec<Value> = entries.iter().map(|entry| entry["item"].clone()).collect();
@@ -7390,11 +7465,11 @@ impl App {
                     })
             })
             .collect();
-        Latest {
+        Some(Latest {
             ask: asks::open(&flat),
             pr,
             step: Self::step(items),
-        }
+        })
     }
 
     /// The newest of `items` that reads as a step, as a line.
@@ -12168,6 +12243,63 @@ mod tests {
             json!([against, cheered, launched, answer, liked, older])
         );
         std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[tokio::test]
+    async fn status_lists_every_page_and_reads_again_only_the_histories_that_moved() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let histories = Arc::new(AtomicUsize::new(0));
+        let moved = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (read, head) = (histories.clone(), moved.clone());
+        let failed = std::sync::atomic::AtomicBool::new(false);
+        let bot = |n: usize, head: i64| {
+            json!({"name": format!("shop.t{n:03}"), "bot_id": n, "head": head,
+                "status": "idle", "running_turn": null})
+        };
+        let client =
+            daemon_answering(
+                move |asked| match asked["op"].as_str().unwrap_or_default() {
+                    // The first page full, the 257th agent on the second.
+                    "bots" if asked["after"].is_null() => {
+                        json!({"bots": (0..256).map(|n| bot(n, 1)).collect::<Vec<_>>(),
+                    "next_after": "shop.t255"})
+                    }
+                    "bots" => {
+                        let last = if head.load(Ordering::SeqCst) { 2 } else { 1 };
+                        json!({"bots": [bot(256, last)], "next_after": null})
+                    }
+                    "turns" => json!({"turns": [], "next_before": null}),
+                    "history_nodes" => {
+                        read.fetch_add(1, Ordering::SeqCst);
+                        json!({"nodes": [], "next_from": null})
+                    }
+                    // The first agent's first read fails.
+                    "history_items"
+                        if asked["bot"] == "shop.t000" && !failed.swap(true, Ordering::SeqCst) =>
+                    {
+                        json!({"error": "storage_error", "detail": "a failed read"})
+                    }
+                    "history_items" => json!({"items": []}),
+                    _ => json!({"error": {"code": "unexpected", "message": asked.to_string()}}),
+                },
+            )
+            .await;
+        let mut app = app(client);
+        app.bot = "shop.lead".into();
+        let (_, rows) = app.status_rows().await.unwrap();
+        assert_eq!(rows.len(), 257);
+        assert!(rows.iter().any(|row| row.bot == "shop.t256"));
+        assert_eq!(histories.load(Ordering::SeqCst), 257);
+        // No history moved: only the one whose read failed is read again
+        // (and every agent's turns, as queued work moves no record).
+        app.status_rows().await.unwrap();
+        assert_eq!(histories.load(Ordering::SeqCst), 258);
+        app.status_rows().await.unwrap();
+        assert_eq!(histories.load(Ordering::SeqCst), 258);
+        // One agent's history grew: only its is.
+        moved.store(true, Ordering::SeqCst);
+        app.status_rows().await.unwrap();
+        assert_eq!(histories.load(Ordering::SeqCst), 259);
     }
 
     #[tokio::test]
