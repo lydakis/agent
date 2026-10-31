@@ -35,7 +35,9 @@ pub fn tools(role: Role) -> Vec<Value> {
 /// generations below the lead it is, 0 for the lead or a side chat of it,
 /// and the lead's record, `None` for a line no lead heads, such as one an
 /// agent the person made with `--new` starts. It walks no further than
-/// knowing the bot is `limit` deep needs, 0 for no end.
+/// knowing the bot is `limit` deep needs, 0 for no end. A line whose
+/// maker is gone is as deep as the limit: removing a finished task
+/// never gives what it made more room.
 pub async fn line(client: &Client, record: &Value, limit: u64) -> (u64, Option<Value>) {
     let mut depth = 0;
     let mut at = record.clone();
@@ -62,7 +64,7 @@ pub async fn line(client: &Client, record: &Value, limit: u64) -> (u64, Option<V
                 maker["name"] = json!(by);
                 at = maker;
             }
-            Err(_) => return (depth, None),
+            Err(_) => return (gone(depth, limit), None),
         }
     }
     (depth, None)
@@ -87,12 +89,31 @@ pub fn line_by(
         if limit != 0 && depth >= limit {
             return (depth, None);
         }
+        if !at["created_by"].is_string() {
+            return (depth, None);
+        }
+        // The maker by the id it made it with, not another of its name.
         match maker(&at) {
-            Some(next) => at = next,
-            None => return (depth, None),
+            Some(next)
+                if at["created_by_id"].is_null()
+                    || next["bot_id"].is_null()
+                    || next["bot_id"] == at["created_by_id"] =>
+            {
+                at = next
+            }
+            _ => return (gone(depth, limit), None),
         }
     }
     (depth, None)
+}
+
+/// How deep a line whose maker is gone counts: as deep as `limit` lets
+/// lines go, so it starts none.
+fn gone(depth: u64, limit: u64) -> u64 {
+    match limit {
+        0 => depth,
+        _ => depth.max(limit),
+    }
 }
 
 /// The role of the bot `record` describes, by where it stands in its
@@ -378,6 +399,34 @@ mod tests {
         );
         assert_eq!(named(a_task(), crate::served::PROJECT), None);
         assert_eq!(named(Role::at(3, 0), crate::served::PROJECT), None);
+    }
+
+    #[test]
+    fn a_line_whose_maker_is_gone_is_as_deep_as_lines_go() {
+        let bots = [
+            json!({"name": "shop.lead", "bot_id": 1}),
+            json!({"name": "shop.fix", "bot_id": 2, "created_by": "shop.lead", "created_by_id": 1}),
+            json!({"name": "shop.check", "bot_id": 3, "created_by": "shop.fix", "created_by_id": 2}),
+        ];
+        let maker = |bots: &[Value]| {
+            let bots = bots.to_vec();
+            move |at: &Value| bots.iter().find(|b| b["name"] == at["created_by"]).cloned()
+        };
+        assert_eq!(line_by(&bots[2], 2, maker(&bots)).0, 2);
+        assert_eq!(line_by(&bots[1], 3, maker(&bots)).0, 1);
+        // Its task removed, a helper gets no more room.
+        let without = [bots[0].clone(), bots[2].clone()];
+        assert_eq!(line_by(&bots[2], 3, maker(&without)).0, 3);
+        // Nor from another that took its task's name.
+        let renamed = json!({"name": "shop.fix", "bot_id": 9, "created_by": "shop.lead",
+            "created_by_id": 1});
+        let reused = [bots[0].clone(), renamed, bots[2].clone()];
+        assert_eq!(line_by(&bots[2], 3, maker(&reused)).0, 3);
+        // With no end to lines, none is counted deeper than it is.
+        assert_eq!(line_by(&bots[2], 0, maker(&without)).0, 1);
+        // One the person made, which no agent made, is its line's root.
+        let theirs = json!({"name": "shop.solo", "bot_id": 4});
+        assert_eq!(line_by(&theirs, 2, maker(&bots)).0, 1);
     }
 
     #[test]
