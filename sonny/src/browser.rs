@@ -322,10 +322,11 @@ impl Reach {
         }
     }
 
-    /// `url`, unless it opens the browser's own pages, or a file outside
-    /// the reach.
-    /// Read as the browser reads it, so `%2e%2e`, `file:/`, a host or a
-    /// tab inside the scheme mean to the check what they mean to it.
+    /// `url`, unless it opens the browser's own pages or a file on another
+    /// machine. A file page it opens anywhere, as the agent's sandbox reads
+    /// anywhere, Codex's as well. Read as the browser reads it, so `%2e%2e`,
+    /// `file:/`, a host or a tab inside the scheme mean to the check what
+    /// they mean to it.
     fn url(&self, url: &str) -> Result<String, String> {
         // One with no scheme agent-browser opens as https.
         let Ok(parsed) = url::Url::parse(url) else {
@@ -338,21 +339,11 @@ impl Reach {
         if scheme != "file" {
             return Ok(url.to_owned());
         }
-        // A file page may open any other file, and a page is read whole, so
-        // a confined agent's browser opens none, as Playwright's MCP server
-        // keeps file:// closed by default: its files it reads itself.
-        if self.roots.is_some() {
-            return Err(format!(
-                "{url}: file pages are not opened for a sandboxed agent; read the file \
-                 itself, or serve its folder on localhost"
-            ));
-        }
         if parsed.host_str().is_some_and(|host| host != "localhost") {
             return Err(format!("{url} is a file on another machine"));
         }
         let path = (parsed.to_file_path()).map_err(|()| format!("{url} names no file"))?;
-        let path = self.file(&path.to_string_lossy())?;
-        url::Url::from_file_path(&path)
+        url::Url::from_file_path(real(&path))
             .map(String::from)
             .map_err(|()| format!("{url} names no file"))
     }
@@ -549,13 +540,6 @@ fn checked(line: &str, reach: &Reach) -> Result<Checked, String> {
     let mut picture = None;
     let mut ask = false;
     let mut subaction = None;
-    // A link clicked into a new tab opens whatever it points at, unchecked.
-    if reach.roots.is_some()
-        && has(&args, &["--new-tab"])
-        && !matches!(command.as_str(), "open" | "goto" | "navigate" | "tab")
-    {
-        return refused("--new-tab is not taken here: click it, or open its address");
-    }
     match command.as_str() {
         "open" | "goto" | "navigate" | "pushstate" | "read" | "vitals" | "a11y" | "tab" => {}
         "screenshot" => {
@@ -1331,23 +1315,35 @@ mod tests {
             "download @e1 /tmp/x",
             "upload @e1 /etc/passwd",
             "screenshot --screenshot-dir /tmp",
-            "open file:///etc/passwd",
             "state load ../../state.json",
-            "open file:/etc/passwd",
-            "open FILE:///etc/passwd",
-            "open \"fi\tle:///etc/passwd\"",
             "open file://otherhost/etc/passwd",
         ] {
             assert!(args(line, &real).is_err(), "{line} ran");
         }
-        // Encoded parents mean to the check what they mean to the browser.
-        let up = format!("open file://{}/%2e%2e/%2E%2E/etc/passwd", real.display());
-        assert!(args(&up, &real).is_err(), "{up} ran");
         assert!(args("fill @e2 \"你好\"", &real).is_ok());
         assert!(args("fill @e2 \"-你好\"", &real).is_err());
-        // A file page could open any other, so a confined agent opens none.
-        assert!(args(&format!("open file://{}/index.html", real.display()), &real).is_err());
-        assert!(args("click a --new-tab", &real).is_err());
+        // File pages it opens anywhere, as its sandbox reads anywhere, by
+        // the path the browser would read: encoded parents mean to it what
+        // they mean to the browser.
+        for line in [
+            "open file:///etc/passwd",
+            "open file:/etc/passwd",
+            "open FILE:///etc/passwd",
+        ] {
+            assert_eq!(
+                args(line, &real).unwrap()[1],
+                "file:///etc/passwd",
+                "{line}"
+            );
+        }
+        let up = format!("open file://{}/%2e%2e/%2E%2E/etc/passwd", real.display());
+        let opened = args(&up, &real).unwrap();
+        assert!(
+            !opened[1].contains("%2e") && !opened[1].contains(".."),
+            "{opened:?}"
+        );
+        assert!(args(&format!("open file://{}/index.html", real.display()), &real).is_ok());
+        assert!(args("click a --new-tab", &real).is_ok());
         assert!(args("tab new https://example.com", &real).is_ok());
         // A link in the folder that points out of it leads out of it.
         std::os::unix::fs::symlink("/etc", real.join("out")).unwrap();
@@ -1390,7 +1386,7 @@ mod tests {
         // A confined agent with no folder named reaches no file.
         let lost = Reach::of(&json!({"settings": {"sandbox": "workspace-write"}}));
         assert!(checked("pdf page.pdf", &lost).is_err());
-        assert!(checked("open file:///etc/passwd", &lost).is_err());
+        assert!(checked("open file:///etc/passwd", &lost).is_ok());
         // The browser is handed the real path, not the link.
         std::os::unix::fs::symlink(real.join("shots"), real.join("in")).unwrap();
         std::fs::create_dir_all(real.join("shots")).unwrap();
@@ -1402,15 +1398,12 @@ mod tests {
     fn words_are_checked_as_agent_browser_reads_them() {
         let real = scratch("grammar");
         for line in [
-            // It opens the first word not a `--` flag, values and all.
-            "open --name file:///etc/passwd about:blank",
             // Two words are a selector and a file, whatever the file's name.
             "screenshot body /tmp/out --screenshot-format png",
             "screenshot body /tmp/out",
             "wait -d /tmp/x",
             "wait --download /tmp/x",
             "record start /tmp/r.webm",
-            "record start r.webm file:///etc/passwd",
             "diff screenshot --baseline /etc/x.png",
             "diff snapshot -o /tmp/d.txt",
             "trace stop /tmp/t.zip",

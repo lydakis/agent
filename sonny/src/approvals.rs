@@ -466,12 +466,21 @@ fn real(folders: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// The commands the person's config lets agents run outside their
-/// sandboxes; none when it can't be read, which Sonny reports on start.
+/// Sonny's own commands an agent's shell runs, which write only Sonny's
+/// state outside the agent's folder: let out of every sandbox, as the
+/// commands the person allows for good are.
+pub const OWN_UNSANDBOXED: [&str; 1] = ["sonny zen"];
+
+/// The commands agents run outside their sandboxes: Sonny's own, then
+/// those the person's config lets out; only Sonny's when it can't be read,
+/// which Sonny reports on start.
 pub fn unsandboxed() -> Vec<String> {
-    agent_client::config::load()
-        .map(|config| config.sonny.unsandboxed)
-        .unwrap_or_default()
+    let mut commands: Vec<String> = OWN_UNSANDBOXED.map(str::to_owned).to_vec();
+    if let Ok(config) = agent_client::config::load() {
+        commands.extend(config.sonny.unsandboxed);
+    }
+    commands.dedup();
+    commands
 }
 
 /// The command prefix the person may let out of every sandbox when they
@@ -546,9 +555,9 @@ fn adding(mut commands: Vec<String>, prefix: &str) -> Result<Option<Vec<String>>
     Ok(Some(commands))
 }
 
-/// The most commands a sandbox lets out, and the longest, as the daemon
-/// bounds them.
-const MAX_UNSANDBOXED: usize = 64;
+/// The most commands the person's config lets out, beside Sonny's own, and
+/// the longest, as the daemon bounds them.
+const MAX_UNSANDBOXED: usize = 64 - OWN_UNSANDBOXED.len();
 const MAX_COMMAND: usize = 1024;
 
 /// The git folder of the repository `dir` is in, which its linked
@@ -1105,7 +1114,8 @@ mod tests {
 
     #[test]
     fn a_command_is_kept_only_within_the_daemon_s_bound() {
-        let kept: Vec<String> = (0..63).map(|n| format!("tool{n}")).collect();
+        // Room is left for Sonny's own beside the person's.
+        let kept: Vec<String> = (1..MAX_UNSANDBOXED).map(|n| format!("tool{n}")).collect();
         let more = adding(kept.clone(), "cargo test").unwrap().unwrap();
         assert_eq!(more.last().map(String::as_str), Some("cargo test"));
         // One there already changes nothing, even with no room left.

@@ -354,10 +354,12 @@ class ServedToolTests(ModelFixture):
                                        {'commands': ['open about:blank --executable-path /bin/sh']}))
         self.assertEqual(refused['error'], 'browser_refused')
         self.assertIn('--executable-path', refused['detail'])
-        # Its folder as the daemon names it, and no file page.
-        outside = json.loads(self.call('calc.lead', 'browser', {'commands': ['open file:///etc/hostname']}))
-        self.assertEqual(outside['error'], 'browser_refused')
-        self.assertIn('file pages are not opened', outside['detail'])
+        # A file page it opens anywhere, as its sandbox reads anywhere; it
+        # writes only its folder, as the daemon names it.
+        (self.path / 'page.html').write_text('<title>Outside</title>')
+        self.call('calc.lead', 'browser', {'commands': [f'open file://{self.path}/page.html']}, wait=60)
+        opened = self.call('calc.lead', 'browser', {'commands': ['get title']}, wait=60)
+        self.assertIn('Outside', opened)
         outside = json.loads(self.call('calc.lead', 'browser', {'commands': ['pdf ../page.pdf']}))
         self.assertIn('outside your folder', outside['detail'])
 
