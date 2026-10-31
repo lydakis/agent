@@ -2375,18 +2375,22 @@ unconfined.
 
 A Unix socket is a way out of any sandbox: a program listening on one runs
 what it is asked outside, as a browser's daemon launches a browser or Docker
-runs a container. So, as Claude Code's sandbox and Codex's managed network
-block them by default, a sandboxed bot's commands reach only the Unix
-sockets its `unix_sockets` names. Not even those in its own folders: a hard
-link there to any socket, which needs no right to the socket, would reach
-it, and a named folder the bot may write lets one in the same way. On macOS
-Seatbelt holds them to those paths, network on or off. On Linux, where a
-read-only mount doesn't stop `connect`, a seccomp filter bubblewrap loads
-refuses every Unix socket a command would make, as Codex's Linux sandbox
-does; a filter can't see the path, so a bot whose `unix_sockets` names any
-reaches them all, as Claude Code's `allowAllUnixSockets` does. Socket pairs
-stay allowed, but not of datagrams, which send to any socket's path. The filter also refuses `io_uring`, whose calls it can't see,
-and ends a command that makes system calls of another architecture.
+runs a container. A bot with the network on reaches every Unix socket but
+the daemon's and the other bots' (below), as Codex's full network does, so
+Docker, ssh-agent and a tool's own daemon just work. One kept off the
+network reaches only the Unix sockets its `unix_sockets` names, as Claude
+Code's sandbox and Codex's managed network block them by default. Not even
+those in its own folders: a hard link there to any socket, which needs no
+right to the socket, would reach it, and a named folder the bot may write
+lets one in the same way. On macOS Seatbelt holds an offline bot to those
+paths. On Linux, where a read-only mount doesn't stop `connect`, a seccomp
+filter bubblewrap loads refuses every Unix socket an offline bot's command
+would make, as Codex's Linux sandbox does; a filter can't see the path, so
+a bot whose `unix_sockets` names any reaches them all, as Claude Code's
+`allowAllUnixSockets` does, and with the network on the filter lets them
+all through. Socket pairs stay allowed, but not of datagrams, which send to
+any socket's path. The filter also refuses `io_uring`, whose calls it can't
+see, and ends a command that makes system calls of another architecture.
 
 A sandboxed bot's commands reach the daemon through the bot's own socket,
 never the daemon's: so `agent` and the clients built on it work in its shell,
