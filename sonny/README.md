@@ -998,7 +998,12 @@ updates ▸`): a click lists them, a click on one opens it, and what the
 agent did about it while saying nothing, such as a task steered or a
 memory saved, is under it there rather than a row of its own. Quiet rows
 one after another (calls folded, notes put in the margin, messages
-between agents) sit together, with no blank row between. A turn that ends
+between agents) sit together, with no blank row between. Words that only
+rode along on a call, an attach note from an automation that found the
+agent busy or from another agent, are no message: once the agent reads
+them they hang right under what that call carried, your message or the
+step it joined, as `📎 From an automation ▸`, the clip the footer showed
+while they waited, and a click opens them the same way. A turn that ends
 with the model saying nothing (`empty_completion`) ends quietly, not as a
 failure.
 
@@ -1007,6 +1012,8 @@ failure.
 ![A message from calc.neg, the task updates and a steer, each one row](../docs/sonny/agent-calls-folded.png)
 
 ![The steer opened to what it told calc.neg](../docs/sonny/agent-call-opened.png)
+
+![A commons reply that rode along hanging as a 📎 row under the person's message, and an automation's under the step its call joined](../docs/sonny/attached-notes.png)
 
 ![Three task updates in a row gathered into one row that names the tasks](../docs/sonny/task-updates-gathered.png)
 

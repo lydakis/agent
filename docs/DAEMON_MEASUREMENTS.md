@@ -6221,3 +6221,32 @@ container, base cd2813f against the same head:
 | lifecycle | CPU, s | 1.19 | 1.16 | -2.5% |
 | lifecycle | p95 turn, ms | 588.705 | 582.925 | -1.0% |
 | lifecycle | peak RSS, MiB | 25.805 | 25.695 | -0.4% |
+
+## Words attached to a call say so (#535)
+
+`keep_sender`, the `INSERT … SELECT … RETURNING` that already runs as a
+turn's prompt is absorbed, now also copies whether the turn was delivered
+with `attach` into a new `senders.attached` column, and `history_items`
+reads that column with the rest of the sender row. No store job is added:
+the same statements run, one column wider. An attach from a client that
+names no sender (no bot, origin, person or quotes) now keeps a sender row
+where it kept none; steers and queued turns are unchanged. The Perf
+workflow's matched screen, base main 09fe6ee against the PR head 2209f50
+(the later head changes only Sonny's test and README examples), on the
+GitHub runner (2026-10-31):
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 40.309 | 39.361 | -2.4% |
+| admission | burst submit p99, ms | 6.253 | 6.197 | -0.9% |
+| completion | release to terminal p99, ms | 13.813 | 14.151 | +2.4% |
+| footprint | idle RSS, MiB | 19.088 | 19.211 | +0.6% |
+| footprint | per idle bot, KiB | 1.598 | 1.532 | -4.1% |
+| footprint | RSS after a turn each, MiB | 27.182 | 27.574 | +1.4% |
+| footprint | CPU per turn, ms | 1.277 | 1.269 | -0.6% |
+| lifecycle | CPU, s | 1.145 | 1.15 | +0.4% |
+| lifecycle | p95 turn, ms | 582.418 | 579.83 | -0.4% |
+| lifecycle | peak RSS, MiB | 25.004 | 25.391 | +1.5% |
+
+Store jobs per turn held at about 7.5, and nothing passed the gate's 15% in
+the direction that costs.

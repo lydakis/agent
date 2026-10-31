@@ -1704,7 +1704,7 @@ impl Database {
     /// Stored schema version, kept in `PRAGMA user_version`. Stores created
     /// before versioning and stores from newer binaries are rejected; an older
     /// versioned store is migrated forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 70;
+    pub const SCHEMA: i32 = 71;
     /// Verbatim user prompts a compaction keeps: per-prompt text, and the
     /// total text plus `(ordinal, String)` entry metadata. Empty entries cost
     /// space too, so the retained list cannot grow with conversation length.
@@ -1817,7 +1817,8 @@ impl Database {
             CREATE TABLE IF NOT EXISTS declined(node INTEGER PRIMARY KEY REFERENCES nodes(id),
                 item BLOB NOT NULL);
             CREATE TABLE IF NOT EXISTS senders(node INTEGER PRIMARY KEY REFERENCES nodes(id),
-                bot TEXT, bot_id INTEGER, turn INTEGER, origin TEXT, person TEXT, quotes TEXT);
+                bot TEXT, bot_id INTEGER, turn INTEGER, origin TEXT, person TEXT, quotes TEXT,
+                attached INTEGER);
             CREATE TABLE IF NOT EXISTS elisions(node INTEGER PRIMARY KEY REFERENCES nodes(id),
                 previous INTEGER REFERENCES elisions(node), through INTEGER NOT NULL,
                 saved INTEGER NOT NULL);
@@ -5650,6 +5651,7 @@ impl Database {
                 options.origin.as_deref(),
                 options.person.as_deref(),
                 quotes.as_deref(),
+                false,
             );
             (if attach { "attached" } else { "queued" }, data)
         };
@@ -9904,7 +9906,7 @@ impl Database {
         // bound is on the item as read, its pictures left out.
         let mut query = self.conn.prepare_cached(&format!(
             "SELECT CASE WHEN length(n.item)<=?2 THEN n.item END,s.bot,s.turn,s.bot_id,s.origin,
-                s.person,s.quotes,n.written_ms
+                s.person,s.quotes,n.written_ms,s.attached
              FROM (SELECT id,{PICTURELESS} AS item,written_ms FROM
                 (SELECT n.id,COALESCE(d.item,n.item) AS item,n.written_ms FROM nodes n LEFT JOIN declined d ON d.node=n.id WHERE n.id=?1)) n
              LEFT JOIN senders s ON s.node=n.id"
@@ -9919,9 +9921,10 @@ impl Database {
                 Option<String>,
                 Option<String>,
                 Option<i64>,
+                Option<bool>,
             );
-            let (raw, from, from_turn, bot_id, origin, person, quotes, written): Row = query
-                .query_row(params![node, maximum as i64], |r| {
+            let (raw, from, from_turn, bot_id, origin, person, quotes, written, attached): Row =
+                query.query_row(params![node, maximum as i64], |r| {
                     Ok((
                         r.get(0)?,
                         r.get(1)?,
@@ -9931,6 +9934,7 @@ impl Database {
                         r.get(5)?,
                         r.get(6)?,
                         r.get(7)?,
+                        r.get(8)?,
                     ))
                 })?;
             let mut entry = match raw {
@@ -9949,6 +9953,7 @@ impl Database {
                 origin.as_deref(),
                 person.as_deref(),
                 quotes.as_deref(),
+                attached.unwrap_or(false),
             );
             let mut size = serde_json::to_vec(&entry)?.len();
             // Leave room for the protocol envelope, including extra escaping
@@ -10973,14 +10978,17 @@ fn event(conn: &Connection, bot: &str, turn: Option<i64>, kind: &str, data: Valu
 /// bot's id is its id while the turn it wrote from still exists, so a later
 /// bot of that name is not taken for it.
 /// Keep who sent a turn's prompt with the node it became, and add the
-/// sender to `data`, the event that puts the node on the lineage.
+/// sender to `data`, the event that puts the node on the lineage. A prompt
+/// sent to ride along on a call (`attach`) says so too: it was read, not
+/// sent as a message of its own.
 fn keep_sender(tx: &Connection, turn: i64, node: i64, data: &mut Value) -> Result<()> {
     tx.prepare_cached(
-        "INSERT INTO senders(node,bot,bot_id,turn,origin,person,quotes)
-         SELECT ?2,t.from_bot,t.from_id,t.from_turn,t.origin,t.person,t.quotes
+        "INSERT INTO senders(node,bot,bot_id,turn,origin,person,quotes,attached)
+         SELECT ?2,t.from_bot,t.from_id,t.from_turn,t.origin,t.person,t.quotes,
+            CASE WHEN t.delivery='attach' THEN 1 END
          FROM turns t WHERE t.id=?1 AND (t.from_bot IS NOT NULL OR t.origin IS NOT NULL
-            OR t.person IS NOT NULL OR t.quotes IS NOT NULL)
-         RETURNING bot,turn,bot_id,origin,person,quotes",
+            OR t.person IS NOT NULL OR t.quotes IS NOT NULL OR t.delivery='attach')
+         RETURNING bot,turn,bot_id,origin,person,quotes,attached",
     )?
     .query_row(params![turn, node], |r| {
         let (from, origin): (Option<String>, Option<String>) = (r.get(0)?, r.get(3)?);
@@ -10993,6 +11001,7 @@ fn keep_sender(tx: &Connection, turn: i64, node: i64, data: &mut Value) -> Resul
             origin.as_deref(),
             person.as_deref(),
             quotes.as_deref(),
+            r.get::<_, Option<bool>>(6)?.unwrap_or(false),
         );
         Ok(())
     })
@@ -11010,7 +11019,11 @@ fn sender_fields(
     origin: Option<&str>,
     person: Option<&str>,
     quotes: Option<&str>,
+    attached: bool,
 ) {
+    if attached {
+        data["attached"] = json!(true);
+    }
     if let Some((bot, turn)) = from {
         data["from"] = json!({"bot":bot,"turn":turn,"bot_id":bot_id});
     }
@@ -12189,6 +12202,27 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
              UPDATE turns SET reply_node={REPLY_NODE}
              WHERE started_ms IS NOT NULL AND finished_ms IS NOT NULL;"
         ))?;
+    }
+    // 70 -> 71: a prompt that rode along on a call (`attach`) says so with
+    // its node, found from the `steered` events retention has left; one
+    // whose event is gone reads as a steer.
+    if conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='senders')
+         AND NOT EXISTS(SELECT 1 FROM pragma_table_info('senders') WHERE name='attached')",
+        [],
+        |r| r.get::<_, bool>(0),
+    )? {
+        conn.execute_batch(
+            "ALTER TABLE senders ADD COLUMN attached INTEGER;
+             CREATE TEMP TABLE attached_nodes AS
+                SELECT DISTINCT json_extract(e.data,'$.node') AS node FROM events e
+                JOIN turns t ON t.id=json_extract(e.data,'$.steer')
+                WHERE e.kind='steered' AND t.delivery='attach'
+                    AND EXISTS(SELECT 1 FROM nodes n WHERE n.id=json_extract(e.data,'$.node'));
+             INSERT OR IGNORE INTO senders(node) SELECT node FROM attached_nodes;
+             UPDATE senders SET attached=1 WHERE node IN (SELECT node FROM attached_nodes);
+             DROP TABLE attached_nodes;",
+        )?;
     }
     Ok(())
 }
