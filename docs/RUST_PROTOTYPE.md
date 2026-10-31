@@ -435,6 +435,7 @@ keep-warm when it sets any of them.
 | `hide_senders` (`--hide-senders`) | Its model reads what other bots and clients send it without the line naming the sender (see [fleet controllers](#fleet-controllers)); `senders = "hidden"` in `~/.agent/config.toml` sets it on the bots the CLI and Sonny make. | off |
 | `outputs` (`--outputs`) | An absolute folder that holds each tool output stream cut for the model whole, one file per stream, in place of the store's copy (see [retained outputs](#retained-outputs)). The daemon makes it, owner-only, and writes there only while the bot's sandbox cannot write it; otherwise the stream stays in the store. `agent run --new` and Sonny name `outputs` beside the store unless told otherwise. | none |
 | `unsandboxed` (`--unsandboxed`, repeatable) | Commands a sandboxed bot runs outside its sandbox without asking, each by its first words, such as `mcpx` or `docker compose` (see [sandbox](#sandbox)). At most 64, each at most 1 KiB. | none |
+| `unix_sockets` (`--unix-socket`, repeatable) | Absolute Unix sockets, or folders of them, the only ones a sandboxed bot's commands reach, such as a Docker or SSH agent socket (see [sandbox](#sandbox)). Each is stored by its real path while it exists. At most 64. | none |
 
 Provider requests multiplex over HTTP/2, and one connection carries at most
 the 100 streams the provider advertises; the HTTP layer queues the rest, so a
@@ -1293,9 +1294,9 @@ since its history is kept in that family's encoding
 `approve: []` alone removes them, including the gates a bot took from the
 bot that made it: whoever configures a bot decides, as a person overriding
 one does, and bots it already made keep theirs. The gate is checked before
-anything is written. `sandbox`, with `writable`, `network` and `unsandboxed`
-(as `create`'s settings name them), replaces the bot's sandbox, and those left
-out go back to none, off and none; a bot another bot made keeps no weaker a sandbox than its
+anything is written. `sandbox`, with `writable`, `network`, `unsandboxed` and
+`unix_sockets` (as `create`'s settings name them), replaces the bot's sandbox,
+and those left out go back to none, off, none and none; a bot another bot made keeps no weaker a sandbox than its
 creator's, as when it was made, and a bot's own socket may not configure
 at all. `cache_ttl` (`5m` or `1h`, as `create`'s settings name it) sets the
 bot's prompt-cache lifetime from its next model call, and `speed`
@@ -2366,6 +2367,17 @@ or includes other files stays read-only as a whole, since git reads those
 files wherever they are made. Network is
 off unless `network` is set. `danger-full-access`, or no `sandbox`, runs
 unconfined.
+
+A Unix socket is a way out of any sandbox: a program listening on one runs
+what it is asked outside, as a browser's daemon launches a browser or Docker
+runs a container. So, as Claude Code's sandbox and Codex's managed network
+block them by default, a sandboxed bot's commands reach only the Unix
+sockets its `unix_sockets` names. Not even those in its own folders: a hard
+link there to any socket, which needs no right to the socket, would reach
+it, and a named folder the bot may write lets one in the same way. On macOS
+Seatbelt holds them to those paths, network on or off. Linux does not
+hold them yet: bubblewrap's read-only root still lets a command connect to
+any socket it can see.
 
 A sandboxed bot's commands reach the daemon through the bot's own socket,
 never the daemon's: so `agent` and the clients built on it work in its shell,
