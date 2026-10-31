@@ -3266,7 +3266,11 @@ mod tests {
             json!({"event": kind, "bot": "reviewer", "turn": 2, "data": data})
         };
         let started = |name: &str, call: &str| {
-            event("tool_started", call, json!({"name": name, "answered_by": "sonny"}))
+            event(
+                "tool_started",
+                call,
+                json!({"name": name, "answered_by": "sonny"}),
+            )
         };
         assert!(!service.rewrote(&started("subscriptions", "a")));
         assert!(!service.rewrote(&started("memory", "b")));
