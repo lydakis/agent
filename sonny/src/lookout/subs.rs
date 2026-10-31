@@ -22,6 +22,9 @@ pub struct Sub {
     /// An event pattern on the fields of its sources' events, as
     /// `pattern` reads it: only those it matches are heard.
     pub filter: Option<Value>,
+    /// The bot it was made for, by ID, when Sonny made it on the bot's
+    /// behalf: another bot that takes the name does not hold it.
+    pub owner: Option<i64>,
 }
 
 impl Sub {
@@ -40,19 +43,29 @@ impl Sub {
             },
             sources: Vec::new(),
             filter: None,
+            owner: None,
         }
     }
 
     /// What posting in a commons thread subscribes an agent to: the
-    /// thread's new posts, as the commons source tells them.
-    pub fn commons(thread: &str) -> Sub {
+    /// thread's new posts, as the commons source tells them, for the bot
+    /// of that ID.
+    pub fn commons(thread: &str, owner: Option<i64>) -> Sub {
         Sub {
             name: format!("{COMMONS_SOURCE}.{thread}"),
             tasks_of: Vec::new(),
             bots: Vec::new(),
             sources: vec![format!("{COMMONS_SOURCE}:{thread}")],
             filter: None,
+            owner,
         }
+    }
+
+    /// Whether the bot of `record` holds it: one made for another bot of
+    /// its name does not.
+    pub fn held_by(&self, record: &Value) -> bool {
+        self.owner
+            .is_none_or(|owner| record["bot_id"].as_i64().is_none_or(|id| id == owner))
     }
 
     /// Whether it hears this event of a source: it names the source, or
@@ -77,6 +90,9 @@ impl Sub {
         }
         if !self.sources.is_empty() {
             out["sources"] = json!(self.sources);
+        }
+        if let Some(owner) = self.owner {
+            out["bot_id"] = json!(owner);
         }
         if let Some(filter) = &self.filter {
             out["filter"] = filter.clone();
@@ -108,6 +124,7 @@ impl Sub {
                     Err(_) => Some(Value::Bool(false)),
                 },
             },
+            owner: value["bot_id"].as_i64(),
         })
     }
 
@@ -223,6 +240,11 @@ pub fn all(store: &Path) -> Vec<(String, Vec<Sub>)> {
 pub fn ensure(store: &Path, subscriber: &str, sub: Sub) -> Result<bool, String> {
     let _held = held(store)?;
     let mut subs = read_whole(store, subscriber)?;
+    // One made for another bot of the name gives way to this bot's own.
+    let theirs = |s: &Sub| {
+        s.name == sub.name && s.owner.is_some() && sub.owner.is_some() && s.owner != sub.owner
+    };
+    subs.retain(|s| !theirs(s));
     if subs.iter().any(|s| s.name == sub.name) {
         return Ok(false);
     }
@@ -427,6 +449,7 @@ fn parse(value: &Value) -> Result<Sub, String> {
         bots: strings("bots"),
         sources: strings("sources"),
         filter,
+        owner: None,
     };
     if sub.tasks_of.is_empty() && sub.bots.is_empty() && sub.sources.is_empty() {
         return Err("a subscription watches tasks_of a bot, bots by name or sources".into());
@@ -448,10 +471,27 @@ mod tests {
         std::fs::create_dir_all(dir(&store)).unwrap();
         let path = file(&store, "calc.lead");
         std::fs::write(&path, "{torn").unwrap();
-        assert!(ensure(&store, "calc.lead", Sub::commons("t")).is_err());
+        assert!(ensure(&store, "calc.lead", Sub::commons("t", None)).is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "{torn");
         std::fs::remove_file(&path).unwrap();
-        assert_eq!(ensure(&store, "calc.lead", Sub::commons("t")), Ok(true));
+        assert_eq!(
+            ensure(&store, "calc.lead", Sub::commons("t", Some(1))),
+            Ok(true)
+        );
+        assert_eq!(
+            ensure(&store, "calc.lead", Sub::commons("t", Some(1))),
+            Ok(false)
+        );
+        // Another bot of the name, posting there, has its own.
+        assert_eq!(
+            ensure(&store, "calc.lead", Sub::commons("t", Some(2))),
+            Ok(true)
+        );
+        assert_eq!(read(&store, "calc.lead")[0].owner, Some(2));
+        let theirs = Sub::commons("t", Some(2));
+        assert!(theirs.held_by(&json!({"bot_id": 2})));
+        assert!(!theirs.held_by(&json!({"bot_id": 1})));
+        assert!(Sub::commons("t", None).held_by(&json!({"bot_id": 1})));
         let _ = std::fs::remove_dir_all(dir(&store));
     }
 
@@ -592,7 +632,7 @@ mod tests {
         change(&store, "shop.lead", None, Some("deploys"), &sources).unwrap();
         // A commons thread's subscription fits a thread of the longest name.
         let thread = "t".repeat(64);
-        let commons = Sub::commons(&thread);
+        let commons = Sub::commons(&thread, Some(7));
         assert_eq!(commons.sources, [format!("commons:{thread}")]);
         assert_eq!(Sub::from_json(&commons.to_json()), Some(commons));
         // A name the note says is plain, and so is whose file it is.

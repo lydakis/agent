@@ -441,8 +441,10 @@ class ServedToolTests(ModelFixture):
         self.assertEqual((started['posts'], started['subscription']), (1, 'commons.fake-home'), started)
         # Posting subscribes the poster to the thread.
         subscribed = json.loads((self.path / 'state.sqlite.lookout/calc.a.json').read_text())
+        # Held by this bot, not one that takes its name later.
+        calc_a = self.daemon.request('inspect', bot='calc.a')['result']['bot_id']
         self.assertEqual(subscribed['subscriptions'],
-                         [{'name': 'commons.fake-home', 'sources': ['commons:fake-home']}])
+                         [{'name': 'commons.fake-home', 'sources': ['commons:fake-home'], 'bot_id': calc_a}])
         replied = turn('shop.b', {'reply': {'thread': 'fake-home', 'text': 'Confirmed here too.'}})
         self.assertEqual((replied['posts'], replied['told'], replied['subscription']),
                          (2, [], 'commons.fake-home'), replied)

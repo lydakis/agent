@@ -762,9 +762,10 @@ async fn called(name: &str, arguments: &Value) -> Answer {
             if (arguments["post"].is_object() || arguments["reply"].is_object())
                 && let Some(thread) = said["thread"].as_str().map(str::to_owned)
                 && let Ok((store, _)) = crate::daemon_paths(None, None)
-                && crate::commons::subscribe(&store, &caller, &thread).is_ok()
+                && crate::commons::subscribe(&store, &caller, caller_id, &thread).is_ok()
             {
-                said["subscription"] = json!(crate::lookout::subs::Sub::commons(&thread).name);
+                said["subscription"] =
+                    json!(crate::lookout::subs::Sub::commons(&thread, caller_id).name);
             }
             if let Some(tell) = said.as_object_mut().and_then(|said| said.remove("tell")) {
                 said["told"] = json!(crate::commons::tell(&home, &said, &caller, &tell).await);

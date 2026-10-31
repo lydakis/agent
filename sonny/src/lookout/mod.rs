@@ -729,6 +729,7 @@ impl Service {
             crate::commons::subscribe_posters(&home, &self.store, &names);
         }
         self.subscribers = subs::all(&self.store).into_iter().collect();
+        self.registry = watchers(&self.subscribers);
         for bot in &bots {
             self.seat(&client, bot).await;
         }
@@ -1243,6 +1244,7 @@ impl Service {
             return;
         }
         self.subscribers = read;
+        self.registry = watchers(&self.subscribers);
         let records: Vec<Value> = (self.subscribers.keys())
             .filter_map(|name| self.records.get(name).cloned())
             .collect();
@@ -1388,10 +1390,6 @@ impl Service {
             return true;
         }
         let workspace = PathBuf::from(record["workspace"].as_str().unwrap_or("/"));
-        // Subscriptions read since the registry was made: made again, once.
-        if !self.registry.contains(lead) {
-            self.registry = watchers(&self.subscribers);
-        }
         let updates = updates_for(lead, &workspace, self.registry.clone(), self.live);
         let mut lookout = Lookout::new(lead);
         self.seated += 1;
@@ -1401,7 +1399,8 @@ impl Service {
         lookout.updates = updates;
         lookout.updates.seat(record);
         // What it subscribed to before it was made, or made again.
-        lookout.subs = file;
+        // Less what was made for another bot of its name.
+        lookout.subs = file.into_iter().filter(|sub| sub.held_by(record)).collect();
         lookout.roots(&self.records);
         let held = beside(&self.store, ".sources").join(".held");
         lookout.restore(held.join(format!("{lead}.json")));
@@ -1456,7 +1455,10 @@ impl Service {
         });
         for (name, lookout) in self.lookouts.iter_mut() {
             lookout.updates.subscribed(self.registry.clone());
-            let subs = subscribers.get(name).cloned().unwrap_or_default();
+            let subs: Vec<subs::Sub> = (subscribers.get(name).into_iter().flatten())
+                .filter(|sub| sub.held_by(&lookout.record))
+                .cloned()
+                .collect();
             if all || subs != lookout.subs {
                 lookout.subs = subs;
                 lookout.roots(&self.records);
@@ -2683,6 +2685,7 @@ mod tests {
             bots: bots.iter().map(|b| b.to_string()).collect(),
             sources: Vec::new(),
             filter: None,
+            owner: None,
         }
     }
 
@@ -3348,13 +3351,32 @@ mod tests {
     }
 
     #[test]
+    fn a_subscription_made_for_another_bot_of_the_name_is_not_held() {
+        let record = json!({"name": "calc.fix", "bot_id": 4, "workspace": "/", "status": "idle"});
+        let mut service = service(PathBuf::new(), std::slice::from_ref(&record));
+        let theirs = subs::Sub::commons("flaky", Some(2));
+        let own = subs::Sub::commons("tidy", Some(4));
+        (service.subscribers).insert("calc.fix".into(), vec![theirs, own.clone()]);
+        assert!(service.place(&record));
+        assert_eq!(
+            service.lookouts["calc.fix"].subs,
+            std::slice::from_ref(&own)
+        );
+        service.resubscribe(true);
+        assert_eq!(service.lookouts["calc.fix"].subs, [own]);
+    }
+
+    #[test]
     fn a_task_that_only_hears_sources_is_still_its_lead_s() {
         let mut subscribers = HashMap::new();
         subscribers.insert(
             "calc.lead".to_owned(),
             vec![subs::Sub::lead("calc.lead", "calc")],
         );
-        subscribers.insert("calc.fix".to_owned(), vec![subs::Sub::commons("flaky")]);
+        subscribers.insert(
+            "calc.fix".to_owned(),
+            vec![subs::Sub::commons("flaky", None)],
+        );
         subscribers.insert(
             "ops.lead".to_owned(),
             vec![subs::Sub::lead("ops.lead", "ops")],
@@ -3392,6 +3414,7 @@ mod tests {
         // A task that subscribes for itself is no one's task in the updates.
         let own = vec![sub("own", &["calc.review"], &[])];
         service.subscribers.insert("calc.review".into(), own);
+        service.registry = watchers(&service.subscribers);
         assert!(service.place(&lead));
         let turn = |lookout: &mut Lookout, bot: &str, n: i64| {
             lookout.event(&ev(

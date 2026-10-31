@@ -1225,8 +1225,8 @@ pub fn news(home: &Path, cursor: &Path) -> Vec<String> {
 /// Subscribes `bot` to the posts of `thread`, as posting in it does,
 /// unless it holds a subscription by that name: whether it was added. An
 /// agent that unsubscribed is subscribed again only by posting again.
-pub fn subscribe(store: &Path, bot: &str, thread: &str) -> Result<bool, String> {
-    crate::lookout::subs::ensure(store, bot, crate::lookout::subs::Sub::commons(thread))
+pub fn subscribe(store: &Path, bot: &str, id: Option<i64>, thread: &str) -> Result<bool, String> {
+    crate::lookout::subs::ensure(store, bot, crate::lookout::subs::Sub::commons(thread, id))
 }
 
 /// The migration that subscribes the agents who posted before posting
@@ -1290,7 +1290,7 @@ fn subscribe_all(home: &Path, store: &Path, bots: &HashMap<String, Option<i64>>)
                 (None, _) => false,
             };
             if let Some(by) = post["by"].as_str().filter(ours)
-                && let Err(error) = subscribe(store, by, thread)
+                && let Err(error) = subscribe(store, by, bots.get(by).copied().flatten(), thread)
             {
                 eprintln!("sonny: {POSTERS} waits on {by}'s subscriptions: {error}");
                 all = false;
