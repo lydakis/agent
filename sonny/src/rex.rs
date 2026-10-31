@@ -135,9 +135,9 @@ impl Rex {
         let kept = kept.and_then(|kept| sessions.iter().find(|(id, _)| id == kept));
         let lead = format!("{label}.lead");
         let leads = || {
-            sessions
-                .iter()
-                .find(|(id, _)| rex.blocks_in(id).iter().any(|b| b.label == lead))
+            sessions.iter().find(|(id, _)| {
+                (rex.blocks_in(id).unwrap_or_default().iter()).any(|b| b.label == lead)
+            })
         };
         (rex.session, rex.name) = match current {
             Some((id, now)) => {
@@ -159,11 +159,9 @@ impl Rex {
         Ok(rex)
     }
 
-    fn blocks_in(&self, session: &str) -> Vec<Block> {
-        let Ok(ls) = self.call(&["block", "ls", "-s", session, "--json"]) else {
-            return Vec::new();
-        };
-        ls["blocks"]
+    fn blocks_in(&self, session: &str) -> Result<Vec<Block>, String> {
+        let ls = self.call(&["block", "ls", "-s", session, "--json"])?;
+        Ok(ls["blocks"]
             .as_array()
             .into_iter()
             .flatten()
@@ -174,7 +172,7 @@ impl Rex {
                     window: b["window_id"].as_str().unwrap_or("").to_owned(),
                 })
             })
-            .collect()
+            .collect())
     }
 
     /// The new block's ID from `split`'s, `run`'s or `window new`'s reply.
@@ -201,7 +199,7 @@ impl Backend for Rex {
         self.made
     }
 
-    fn blocks(&self) -> Vec<Block> {
+    fn blocks(&self) -> Result<Vec<Block>, String> {
         self.blocks_in(&self.session)
     }
 
@@ -283,8 +281,7 @@ impl Backend for Rex {
 
     fn own_block(&self) -> Option<String> {
         let mine = std::env::var("REX_BLOCK").ok().filter(|b| !b.is_empty())?;
-        self.blocks()
-            .into_iter()
+        (self.blocks().ok()?.into_iter())
             .find(|b| b.id == mine || b.id.ends_with(&mine))
             .map(|b| b.id)
     }
@@ -309,11 +306,9 @@ impl Backend for Rex {
 
     /// Where each block sits, by label: its tab, counted from 1, and in a
     /// split, its side of its neighbour (`right of`, `below`, … a label).
-    fn places(&self) -> Places {
+    fn places(&self) -> Result<Places, String> {
         let mut places = HashMap::new();
-        let Ok(ls) = self.call(&["window", "ls", "-s", &self.session, "--json"]) else {
-            return places;
-        };
+        let ls = self.call(&["window", "ls", "-s", &self.session, "--json"])?;
         for (tab, window) in ls["windows"].as_array().into_iter().flatten().enumerate() {
             for layer in window["layers"].as_array().into_iter().flatten() {
                 let labels: HashMap<&str, &str> = layer["blocks"]
@@ -333,7 +328,7 @@ impl Backend for Rex {
                 }
             }
         }
-        places
+        Ok(places)
     }
 }
 

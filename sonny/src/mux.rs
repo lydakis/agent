@@ -116,8 +116,9 @@ pub trait Backend: Send {
     fn here(&self) -> bool;
     /// Whether that home was made just now, with a shell nobody asked for.
     fn made(&self) -> bool;
-    /// The home's blocks, in the multiplexer's order.
-    fn blocks(&self) -> Vec<Block>;
+    /// The home's blocks, in the multiplexer's order, or why they could
+    /// not be read.
+    fn blocks(&self) -> Result<Vec<Block>, String>;
     fn close_block(&self, block: &str);
     fn rename_block(&self, block: &str, label: &str);
     fn rename_window(&self, window: &str, name: &str);
@@ -148,7 +149,7 @@ pub trait Backend: Send {
     ) -> Result<String, String>;
     /// The block Sonny itself runs in, when in this home.
     fn own_block(&self) -> Option<String>;
-    fn places(&self) -> Places;
+    fn places(&self) -> Result<Places, String>;
     /// The home, to find again.
     fn place(&self) -> Place;
     /// Where the multiplexer says what changes in the home, when it can.
@@ -207,6 +208,29 @@ impl News {
 enum Watching {
     Command(Child),
     Socket(UnixStream),
+}
+
+impl Watching {
+    fn close(self) {
+        match self {
+            Self::Command(mut child) => {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            Self::Socket(socket) => {
+                let _ = socket.shutdown(std::net::Shutdown::Both);
+            }
+        }
+    }
+}
+
+/// The watch's stream, opened on its own thread so that a host slow to
+/// take it holds up no work. Once the layout is gone, one opened after
+/// is closed at once.
+#[derive(Default)]
+struct Following {
+    gone: bool,
+    stream: Option<Watching>,
 }
 
 /// A project's home, as its lead's Sonny last found it in the person's
@@ -289,20 +313,15 @@ pub struct Layout {
     listed: Option<(u64, Vec<Block>)>,
     placed: Option<(u64, Places)>,
     news: Arc<News>,
-    watching: Option<Watching>,
+    following: Arc<Mutex<Following>>,
 }
 
 impl Drop for Layout {
     fn drop(&mut self) {
-        match self.watching.take() {
-            Some(Watching::Command(mut child)) => {
-                let _ = child.kill();
-                let _ = child.wait();
-            }
-            Some(Watching::Socket(socket)) => {
-                let _ = socket.shutdown(std::net::Shutdown::Both);
-            }
-            None => {}
+        let mut following = self.following.lock().unwrap_or_else(|e| e.into_inner());
+        following.gone = true;
+        if let Some(stream) = following.stream.take() {
+            stream.close();
         }
     }
 }
@@ -310,7 +329,9 @@ impl Drop for Layout {
 impl Layout {
     pub fn new(backend: Box<dyn Backend>) -> Self {
         let spare = match backend.made() {
-            true => backend.blocks().into_iter().map(|b| b.id).collect(),
+            true => (backend.blocks().unwrap_or_default().into_iter())
+                .map(|b| b.id)
+                .collect(),
             false => Vec::new(),
         };
         Self {
@@ -320,7 +341,7 @@ impl Layout {
             listed: None,
             placed: None,
             news: Arc::default(),
-            watching: None,
+            following: Arc::default(),
         }
     }
 
@@ -332,38 +353,45 @@ impl Layout {
         let Some(Watch { from, heard }) = self.backend.watch() else {
             return;
         };
-        let lines: Box<dyn BufRead + Send> = match from {
-            Stream::Command(mut command) => {
-                let Ok(mut child) = command
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::null())
-                    .spawn()
-                else {
-                    return;
-                };
-                let Some(out) = child.stdout.take() else {
-                    return;
-                };
-                self.watching = Some(Watching::Command(child));
-                Box::new(BufReader::new(out))
-            }
-            Stream::Socket(path, ask) => {
-                let Ok(mut socket) = UnixStream::connect(&path) else {
-                    return;
-                };
-                let Ok(kept) = socket.try_clone() else {
-                    return;
-                };
-                if writeln!(socket, "{ask}").is_err() {
+        let news = self.news.clone();
+        let following = self.following.clone();
+        std::thread::spawn(move || {
+            let (stream, lines): (_, Box<dyn BufRead + Send>) = match from {
+                Stream::Command(mut command) => {
+                    let Ok(mut child) = command
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::null())
+                        .spawn()
+                    else {
+                        return;
+                    };
+                    let Some(out) = child.stdout.take() else {
+                        return;
+                    };
+                    (Watching::Command(child), Box::new(BufReader::new(out)))
+                }
+                Stream::Socket(path, ask) => {
+                    let Ok(mut socket) = UnixStream::connect(&path) else {
+                        return;
+                    };
+                    let Ok(kept) = socket.try_clone() else {
+                        return;
+                    };
+                    if writeln!(socket, "{ask}").is_err() {
+                        return;
+                    }
+                    (Watching::Socket(kept), Box::new(BufReader::new(socket)))
+                }
+            };
+            {
+                let mut following = following.lock().unwrap_or_else(|e| e.into_inner());
+                if following.gone {
+                    stream.close();
                     return;
                 }
-                self.watching = Some(Watching::Socket(kept));
-                Box::new(BufReader::new(socket))
+                following.stream = Some(stream);
             }
-        };
-        let news = self.news.clone();
-        std::thread::spawn(move || {
             for line in lines.lines() {
                 let Ok(line) = line else { break };
                 let said = serde_json::from_str(&line).map_or(Heard::Changed, |line| heard(&line));
@@ -390,7 +418,8 @@ impl Layout {
         }
     }
 
-    /// The home's blocks, as last read unless the home changed since.
+    /// The home's blocks, as last read unless the home changed since. A
+    /// read that failed is none, and tried again when next asked.
     fn listed(&mut self) -> Vec<Block> {
         let now = self.news.changes();
         if let Some((at, blocks)) = &self.listed
@@ -398,7 +427,9 @@ impl Layout {
         {
             return blocks.clone();
         }
-        let blocks = self.backend.blocks();
+        let Ok(blocks) = self.backend.blocks() else {
+            return Vec::new();
+        };
         self.listed = Some((now, blocks.clone()));
         blocks
     }
@@ -515,6 +546,7 @@ impl Layout {
     }
 
     /// Where each block sits, as last read unless the home changed since.
+    /// A read that failed is nowhere, and tried again when next asked.
     pub fn places(&mut self) -> Places {
         let now = self.news.changes();
         if let Some((at, places)) = &self.placed
@@ -522,7 +554,9 @@ impl Layout {
         {
             return places.clone();
         }
-        let places = self.backend.places();
+        let Ok(places) = self.backend.places() else {
+            return Places::new();
+        };
         self.placed = Some((now, places.clone()));
         places
     }
@@ -850,6 +884,8 @@ mod tests {
         made: bool,
         /// How many times the blocks were listed.
         lists: Arc<std::sync::atomic::AtomicUsize>,
+        /// While set, the blocks cannot be read.
+        down: Arc<AtomicBool>,
         news: RefCell<Option<Watch>>,
     }
 
@@ -875,15 +911,18 @@ mod tests {
         fn made(&self) -> bool {
             self.made
         }
-        fn blocks(&self) -> Vec<Block> {
+        fn blocks(&self) -> Result<Vec<Block>, String> {
             self.lists.fetch_add(1, Ordering::SeqCst);
-            (self.blocks.borrow().iter())
+            if self.down.load(Ordering::SeqCst) {
+                return Err("down".into());
+            }
+            Ok((self.blocks.borrow().iter())
                 .map(|b| Block {
                     id: b.id.clone(),
                     label: b.label.clone(),
                     window: b.window.clone(),
                 })
-                .collect()
+                .collect())
         }
         fn close_block(&self, block: &str) {
             self.blocks.borrow_mut().retain(|b| b.id != block);
@@ -928,8 +967,8 @@ mod tests {
         fn own_block(&self) -> Option<String> {
             self.own.clone()
         }
-        fn places(&self) -> Places {
-            Places::new()
+        fn places(&self) -> Result<Places, String> {
+            Ok(Places::new())
         }
         fn place(&self) -> Place {
             Place::Herdr {
@@ -995,6 +1034,7 @@ mod tests {
         let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
         let fake = Fake::default();
         let lists = fake.lists.clone();
+        let down = fake.down.clone();
         fake.add("shop.fix", "w1");
         *fake.news.borrow_mut() = Some(Watch {
             from: Stream::Socket(path, "{\"ask\":1}".into()),
@@ -1028,14 +1068,25 @@ mod tests {
         hear(&news, 2);
         layout.windows();
         assert_eq!(lists.load(Ordering::SeqCst), 2);
+        // A read that failed is not kept: it is tried again until it is
+        // read.
+        say("changed");
+        hear(&news, 3);
+        down.store(true, Ordering::SeqCst);
+        assert!(layout.windows().is_empty());
+        layout.windows();
+        down.store(false, Ordering::SeqCst);
+        assert_eq!(layout.windows().len(), 1);
+        layout.windows();
+        assert_eq!(lists.load(Ordering::SeqCst), 5);
         // Once the news ends, each batch reads the home again.
         say("over");
-        hear(&news, 3);
+        hear(&news, 4);
         assert!(!news.up.load(Ordering::SeqCst));
         layout.windows();
         layout.fresh();
         layout.windows();
-        assert_eq!(lists.load(Ordering::SeqCst), 4);
+        assert_eq!(lists.load(Ordering::SeqCst), 7);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

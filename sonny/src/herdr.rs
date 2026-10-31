@@ -453,11 +453,9 @@ impl Backend for Herdr {
         self.made
     }
 
-    fn blocks(&self) -> Vec<Block> {
-        let Ok(listed) = self.call(&["pane", "list", "--workspace", &self.workspace]) else {
-            return Vec::new();
-        };
-        listed["panes"]
+    fn blocks(&self) -> Result<Vec<Block>, String> {
+        let listed = self.call(&["pane", "list", "--workspace", &self.workspace])?;
+        Ok(listed["panes"]
             .as_array()
             .into_iter()
             .flatten()
@@ -468,7 +466,7 @@ impl Backend for Herdr {
                     window: p["tab_id"].as_str().unwrap_or("").to_owned(),
                 })
             })
-            .collect()
+            .collect())
     }
 
     fn close_block(&self, block: &str) {
@@ -582,14 +580,10 @@ impl Backend for Herdr {
 
     /// Where each pane sits, by label: its tab's number, and beside the
     /// tab's first other pane, which side of it.
-    fn places(&self) -> Places {
+    fn places(&self) -> Result<Places, String> {
         let mut places = HashMap::new();
-        let numbers: HashMap<String, usize> = self
-            .call(&["tab", "list", "--workspace", &self.workspace])
-            .ok()
-            .and_then(|tabs| tabs["tabs"].as_array().cloned())
-            .into_iter()
-            .flatten()
+        let tabs = self.call(&["tab", "list", "--workspace", &self.workspace])?;
+        let numbers: HashMap<String, usize> = (tabs["tabs"].as_array().into_iter().flatten())
             .filter_map(|t| {
                 Some((
                     t["tab_id"].as_str()?.to_owned(),
@@ -597,7 +591,7 @@ impl Backend for Herdr {
                 ))
             })
             .collect();
-        let blocks = self.blocks();
+        let blocks = self.blocks()?;
         let mut tabs: Vec<&str> = Vec::new();
         for block in &blocks {
             if !tabs.contains(&block.window.as_str()) {
@@ -609,14 +603,14 @@ impl Backend for Herdr {
             let panes: Vec<&Block> = blocks.iter().filter(|b| b.window == *tab).collect();
             let rects: HashMap<String, Value> = match panes.len() {
                 1 => HashMap::new(),
-                _ => self
-                    .call(&["pane", "layout", "--pane", &panes[0].id])
-                    .ok()
-                    .and_then(|l| l["layout"]["panes"].as_array().cloned())
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|p| Some((p["pane_id"].as_str()?.to_owned(), p["rect"].clone())))
-                    .collect(),
+                _ => {
+                    let layout = self.call(&["pane", "layout", "--pane", &panes[0].id])?;
+                    (layout["layout"]["panes"].as_array().into_iter().flatten())
+                        .filter_map(|p| {
+                            Some((p["pane_id"].as_str()?.to_owned(), p["rect"].clone()))
+                        })
+                        .collect()
+                }
             };
             for pane in &panes {
                 let side = panes
@@ -629,7 +623,7 @@ impl Backend for Herdr {
                 places.insert(pane.label.clone(), (number, side));
             }
         }
-        places
+        Ok(places)
     }
 }
 
@@ -916,7 +910,7 @@ if out is not None:
         let bin = find().expect("herdr on the PATH");
         let herdr = Herdr::open(bin, "sonnycheck", None, None).unwrap();
         let workspace = herdr.workspace.clone();
-        let lead = herdr.blocks()[0].id.clone();
+        let lead = herdr.blocks().unwrap()[0].id.clone();
         herdr.rename_block(&lead, "sonnycheck.lead");
         let mut layout = Layout::new(Box::new(herdr));
         let sleep = ["sh".to_owned(), "-c".into(), "echo task; sleep 60".into()];
@@ -973,7 +967,12 @@ if out is not None:
             "below"
         );
         layout.close("sonnycheck.fix");
-        let left: Vec<String> = check.blocks().into_iter().map(|b| b.label).collect();
+        let left: Vec<String> = check
+            .blocks()
+            .unwrap()
+            .into_iter()
+            .map(|b| b.label)
+            .collect();
         println!("after closing the task: {left:?}");
         assert!(!left.iter().any(|l| l.starts_with("sonnycheck.fix")));
         let _ = check.call(&["workspace", "close", &workspace]);

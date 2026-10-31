@@ -281,14 +281,13 @@ impl Cmux {
     }
 
     /// This workspace, as `system.tree` has it.
-    fn tree(&self) -> Option<Value> {
-        let tree = self
-            .call(
-                "system.tree",
-                json!({"all_windows": true, "workspace_id": self.workspace}),
-            )
-            .ok()?;
-        workspaces_of(&tree).find(|w| w["id"] == self.workspace.as_str())
+    fn tree(&self) -> Result<Value, String> {
+        let tree = self.call(
+            "system.tree",
+            json!({"all_windows": true, "workspace_id": self.workspace}),
+        )?;
+        (workspaces_of(&tree).find(|w| w["id"] == self.workspace.as_str()))
+            .ok_or_else(|| format!("cmux: no workspace {}", self.workspace))
     }
 
     /// The pane a task's tab goes in: the lead's, else this tab's, else the
@@ -328,17 +327,15 @@ impl Backend for Cmux {
 
     /// Each tab, pane by pane: its title is its label, and its pane stands
     /// for its window.
-    fn blocks(&self) -> Vec<Block> {
-        let Some(workspace) = self.tree() else {
-            return Vec::new();
-        };
-        surfaces(&workspace)
+    fn blocks(&self) -> Result<Vec<Block>, String> {
+        let workspace = self.tree()?;
+        Ok(surfaces(&workspace)
             .map(|(pane, surface, title)| Block {
                 id: surface.to_owned(),
                 label: title.to_owned(),
                 window: pane.to_owned(),
             })
-            .collect()
+            .collect())
     }
 
     fn close_block(&self, block: &str) {
@@ -374,7 +371,7 @@ impl Backend for Cmux {
             "initial_input": Self::input(command, keep),
             "focus": false,
         });
-        if let Some(pane) = self.home_pane(&self.blocks()) {
+        if let Some(pane) = self.home_pane(&self.blocks().unwrap_or_default()) {
             params["pane_id"] = pane.into();
         }
         if keep {
@@ -457,11 +454,9 @@ impl Backend for Cmux {
 
     /// Where each tab sits, by label: its number in its pane, and when the
     /// workspace is split, which side of the first other pane its pane is.
-    fn places(&self) -> Places {
+    fn places(&self) -> Result<Places, String> {
         let mut places = HashMap::new();
-        let Some(workspace) = self.tree() else {
-            return places;
-        };
+        let workspace = self.tree()?;
         let panes: Vec<&Value> = workspace["panes"]
             .as_array()
             .into_iter()
@@ -469,14 +464,12 @@ impl Backend for Cmux {
             .collect();
         let frames: HashMap<String, Value> = match panes.len() {
             0 | 1 => HashMap::new(),
-            _ => self
-                .call("pane.list", json!({"workspace_id": self.workspace}))
-                .ok()
-                .and_then(|listed| listed["panes"].as_array().cloned())
-                .into_iter()
-                .flatten()
-                .filter_map(|p| Some((p["id"].as_str()?.to_owned(), p["pixel_frame"].clone())))
-                .collect(),
+            _ => {
+                let listed = self.call("pane.list", json!({"workspace_id": self.workspace}))?;
+                (listed["panes"].as_array().into_iter().flatten())
+                    .filter_map(|p| Some((p["id"].as_str()?.to_owned(), p["pixel_frame"].clone())))
+                    .collect()
+            }
         };
         let label = |pane: &Value| {
             let selected = pane["selected_surface_id"].clone();
@@ -506,7 +499,7 @@ impl Backend for Cmux {
                 }
             }
         }
-        places
+        Ok(places)
     }
 }
 
@@ -792,7 +785,10 @@ print(json.dumps(out))
             "places",
             json!({"n": 10, "workspaces": [{"id": "ws-1", "title": "shop", "panes": [lead, right]}]}),
         );
-        let places = Cmux::open(bin, "shop", None, None).unwrap().places();
+        let places = Cmux::open(bin, "shop", None, None)
+            .unwrap()
+            .places()
+            .unwrap();
         let side = |s: &str, of: &str| Some((s.to_owned(), of.to_owned()));
         assert_eq!(
             places["shop.lead"],
