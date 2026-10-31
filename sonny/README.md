@@ -279,7 +279,9 @@ The place a
 project was laid out in is kept in `~/.agent/sonny/places`, so an agent's
 `run_in_pane` and `show_agent` calls go to that Herdr or cmux workspace or
 Rex session, in that multiplexer, rather than one guessed from where the
-tool host answering them runs, which is in neither. A task's window
+tool host answering them runs, which is in neither. A project whose lead is
+in no multiplexer gets none: such a call says nothing opened would be seen,
+and its agents get no layout skill. A task's window
 closes once its work is taken: its turn completed and the lead (or the task
 that started it) waited on it. One that failed, stopped or waits on you stays
 open, and a task given more work opens again; ask the lead to show one, or
