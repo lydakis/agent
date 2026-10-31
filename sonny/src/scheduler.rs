@@ -487,17 +487,25 @@ fn launch(
             f.started = Some(now);
             (f.failures, f.retry) = (0, None);
         }
-        // A fire of it the scheduler did not start runs still.
-        Ok(None) => f.again = true,
+        // A fire of it the scheduler did not start runs still, as one from
+        // before a restart: its end wakes no one, so it is looked at
+        // again after a wait that doubles, up to a minute.
+        Ok(None) => back_off(f, now, LOOK_EVERY),
         // Tried again after a wait that doubles, up to five minutes.
         Err(error) => {
             eprintln!("{}", trigger::error_json(&error));
-            f.failures = f.failures.saturating_add(1);
-            let wait = AGAIN_AFTER * 2u32.pow(f.failures.min(9) - 1);
-            f.retry = Some(now + wait.min(LOOK_EVERY * 5));
-            f.again = true;
+            back_off(f, now, LOOK_EVERY * 5);
         }
     }
+}
+
+/// A trigger whose fire did not start, due again after a wait that
+/// doubles with each try, up to `most`.
+fn back_off(f: &mut Followed, now: std::time::Instant, most: Duration) {
+    f.failures = f.failures.saturating_add(1);
+    let wait = AGAIN_AFTER * 2u32.pow(f.failures.min(9) - 1);
+    f.retry = Some(now + wait.min(most));
+    f.again = true;
 }
 
 /// `sonny scheduler`: fire every trigger of this HOME, until its HOME is
@@ -1245,6 +1253,22 @@ mod tests {
         assert_eq!(f.retry, Some(now + AGAIN_AFTER));
         launch("t00000", f, &mut fleet, now + AGAIN_AFTER, &mut failing);
         assert_eq!(f.retry, Some(now + AGAIN_AFTER * 3));
+        // A fire from before a restart holds the lock: it waits too, up
+        // to a minute, rather than being tried at every pass.
+        let f = followed.get_mut("t00001").unwrap();
+        let mut held = |_: &str, _: &Job| Ok::<Option<libc::pid_t>, String>(None);
+        let mut at = now;
+        for _ in 0..20 {
+            f.again = true;
+            launch("t00001", f, &mut fleet, at, &mut held);
+            assert!(f.again && f.retry.is_some_and(|r| r > at));
+            assert!(f.retry.unwrap() - at <= LOOK_EVERY);
+            at = f.retry.unwrap();
+        }
+        assert_eq!(f.retry, Some(at));
+        let mut ok = |_: &str, _: &Job| Ok::<Option<libc::pid_t>, String>(Some(7));
+        launch("t00001", f, &mut fleet, at, &mut ok);
+        assert_eq!((f.failures, f.retry), (0, None));
     }
 
     /// In a zone with daylight saving, as a child of this test binary, so
