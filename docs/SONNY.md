@@ -766,9 +766,14 @@ Agents do not get a tool per MCP tool. While any server is on, every agent
 Sonny opens has one tool, `exec`, with Codex's code mode contract
 ([exec.rs](../sonny/src/exec.rs)): the model writes JavaScript, each tool is
 `await tools.mcp__SERVER__TOOL(args)` and resolves to its `CallToolResult`,
-and only what the script passes to `text()` (or `image()`, saved to a file
-whose path it names) comes back, so twenty calls and the filtering between
-them cost one result. `store` and `load` keep small values for the agent's
+and only what the script passes to `text()` and `image()` comes back, so
+twenty calls and the filtering between them cost one result. `image()`
+takes a `data:` URL or an MCP `ImageContent` block (`image(r.content[0])`),
+and the model sees the picture itself, in order with the text, as Codex's
+code mode returns it: the result is the daemon's list of text and image
+parts. Like a file `read` sends, a picture is a PNG, JPEG, GIF or WebP by
+its own bytes, scaled to 1568 pixels on its longest side when larger; a
+result holds up to 20, 5 MB together, and `image()` throws past that. `store` and `load` keep small values for the agent's
 later scripts, `ALL_TOOLS` lists every tool, and `tools.tool_search` ranks
 them for a query. The description lists each server and declares its tools
 in TypeScript up to about 3,000 tokens; the rest are found from a script. A
@@ -776,7 +781,7 @@ script runs in QuickJS with no files, network or timers, at most 256 MB and
 10 minutes, four at once in the tool host and sixteen alive (more wait
 their turn), and returns
 at most 10,000 tokens, longer output keeping its start and end and saving
-the whole to a file; saved outputs and images are kept a week. A first
+the whole to a file; saved outputs are kept a week. A first
 line such as
 `// @exec: {"max_output_tokens": 1000, "timeout_ms": 60000}` sets those.
 Its time counts from the call: waiting for a place and starting servers

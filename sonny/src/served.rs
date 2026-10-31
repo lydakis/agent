@@ -784,12 +784,14 @@ async fn serve(store: PathBuf, socket: PathBuf, nudge: Arc<Notify>, serving: Ser
                             let answer = match call["name"] == EXEC {
                                 // In the host, where the servers stay up.
                                 true => script(&hub, &client, &call).await,
-                                false => answer(&client, &call, &me, &store, &socket).await,
+                                false => answer(&client, &call, &me, &store, &socket)
+                                    .await
+                                    .map(Value::String),
                             };
                             let mut asked = json!({"bot": call["bot"], "turn": call["turn"],
                                 "call_id": call["call_id"]});
                             match answer {
-                                Ok(output) => asked["output"] = json!(cut(output)),
+                                Ok(output) => asked["output"] = cut_parts(output),
                                 Err((code, detail)) => {
                                     asked["error"] = json!({"code": code, "detail": cut(detail)})
                                 }
@@ -851,9 +853,42 @@ fn cut(mut text: String) -> String {
     text
 }
 
+/// An answer of text alone or of parts, its text held to `OUTPUT_BYTES`
+/// together, as `cut` holds text alone; its pictures the script bounded.
+fn cut_parts(output: Value) -> Value {
+    let Value::Array(parts) = output else {
+        return json!(cut(output.as_str().unwrap_or_default().to_owned()));
+    };
+    let mut left = OUTPUT_BYTES;
+    let parts = parts.into_iter().filter_map(|mut part| {
+        let Some(text) = part["text"].as_str() else {
+            return Some(part);
+        };
+        if left == 0 {
+            return None;
+        }
+        let mut end = text.len().min(left);
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        left -= end;
+        let kept = match end < text.len() {
+            true => format!("{}\n[cut]", &text[..end]),
+            false => text.to_owned(),
+        };
+        part["text"] = json!(kept);
+        Some(part)
+    });
+    Value::Array(parts.collect())
+}
+
 /// An `exec` call answered here, with its script's time bounded by the
-/// call's.
-async fn script(hub: &crate::mcp::Hub, client: &Arc<Client>, call: &Value) -> Answer {
+/// call's: its text, and the pictures it showed.
+async fn script(
+    hub: &crate::mcp::Hub,
+    client: &Arc<Client>,
+    call: &Value,
+) -> Result<Value, (&'static str, String)> {
     let input = call["arguments"]["input"].as_str().unwrap_or_default();
     let bot = str_of(&call["bot"]);
     let steps = crate::exec::Steps::new(
@@ -1227,6 +1262,17 @@ mod tests {
         let long = "é".repeat(OUTPUT_BYTES);
         assert!(cut(long).len() <= OUTPUT_BYTES + 6);
         assert_eq!(cut("short".into()), "short");
+        let picture = json!({"type": "image", "media_type": "image/png", "data": "AA=="});
+        let parts = cut_parts(
+            json!([{"type": "text", "text": "x".repeat(OUTPUT_BYTES - 2)},
+            picture, {"type": "text", "text": "abcd"}, picture, {"type": "text", "text": "gone"}]),
+        );
+        assert_eq!(parts[0]["text"].as_str().unwrap().len(), OUTPUT_BYTES - 2);
+        assert_eq!(
+            (&parts[1], &parts[2]["text"], &parts[3]),
+            (&picture, &json!("ab\n[cut]"), &picture)
+        );
+        assert_eq!(parts.as_array().unwrap().len(), 4);
         assert_eq!(code("task_not_started"), "task_not_started");
         assert_eq!(code("tasks_exist"), "tasks_exist");
         assert_eq!(code("Anything Else"), "tool_failed");
