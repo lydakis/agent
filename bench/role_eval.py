@@ -600,6 +600,9 @@ def blind():
             if shared:
                 text = text.replace(os.path.join(shared, Path(build).relative_to(shared).parts[0]),
                                     os.path.join(shared, 'ARM'))
+        # C1 scores what main ended up holding: carry it under the same name.
+        if (RUNS / run_name / 'main.txt').exists():
+            text += '\n### MAIN AT THE END (scoring only)\n\n```\n' + (RUNS / run_name / 'main.txt').read_text() + '```\n'
         for arm in 'AB':
             text = text.replace(f'/src-{arm}/', '/src-ARM/')
         (dest / f'{name}.md').write_text(text)
