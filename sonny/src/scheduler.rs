@@ -130,6 +130,10 @@ pub fn ring() -> Result<(), String> {
 /// another Sonny, so the system has nothing new to tell the person about;
 /// else started when the system has let it go.
 pub fn ensure() -> Result<(), String> {
+    // Sonny's start reaches here from several threads at once (triggers,
+    // the backup, start-at-login): one writes the job, the others find it.
+    static ENSURING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _one = ENSURING.lock().unwrap_or_else(|e| e.into_inner());
     let home = PathBuf::from(std::env::var_os("HOME").ok_or("no HOME for triggers")?);
     let scheduler = Scheduler::here();
     if scheduler == Scheduler::Systemd {
@@ -376,6 +380,8 @@ struct Followed {
     /// stays due.
     failures: u32,
     retry: Option<std::time::Instant>,
+    /// A calendar time that came, whose fire has not started yet.
+    unkept: Option<i64>,
 }
 
 /// The fires the scheduler started and runs still, by process and by
@@ -406,6 +412,50 @@ impl Fleet {
         self.busy.remove(&name);
         Some(name)
     }
+}
+
+/// Whether one of the trigger's calendar times came by `now`. Kept at
+/// once when its fire runs, which skips it, as launchd and systemd skip
+/// one; else once its fire starts ([`started`]), so a scheduler that
+/// restarts before then (a full fleet, a start that failed) finds it still
+/// due.
+fn came(
+    name: &str,
+    f: &mut Followed,
+    busy: bool,
+    now: i64,
+    kept: &mut HashMap<String, (String, i64)>,
+) -> bool {
+    if !f.next.is_some_and(|next| next <= now) {
+        return false;
+    }
+    f.looked = now;
+    f.next = next_after(&f.job.calendar, now);
+    match busy {
+        true => {
+            kept.insert(name.to_owned(), (f.generation.clone(), now));
+        }
+        false => f.unkept = Some(now),
+    }
+    true
+}
+
+/// After [`launch`] at `at`: the calendar time its fire was for kept, when
+/// the fire started. Whether `kept` changed.
+fn started(
+    name: &str,
+    f: &mut Followed,
+    at: std::time::Instant,
+    kept: &mut HashMap<String, (String, i64)>,
+) -> bool {
+    if f.started != Some(at) {
+        return false;
+    }
+    let Some(came) = f.unkept.take() else {
+        return false;
+    };
+    kept.insert(name.to_owned(), (f.generation.clone(), came));
+    true
 }
 
 /// How a trigger's fire is started: its process, or none while another
@@ -557,14 +607,9 @@ pub fn run() -> i32 {
         for (name, f) in followed.iter_mut() {
             let busy = fleet.busy.contains(name);
             let mut due = std::mem::take(&mut f.again);
-            if f.next.is_some_and(|next| next <= now) {
-                // A time that comes while a fire runs is skipped, as
-                // launchd and systemd skip it.
+            if came(name, f, busy, now, &mut kept) {
+                fired |= busy;
                 due |= !busy;
-                f.looked = now;
-                f.next = next_after(&f.job.calendar, now);
-                kept.insert(name.clone(), (f.generation.clone(), now));
-                fired = true;
             }
             if let Some(path) = f.job.watch.as_ref().filter(|_| watch) {
                 let seen = look(path);
@@ -580,6 +625,7 @@ pub fn run() -> i32 {
                 launch(name, f, &mut fleet, instant, &mut |name, job| {
                     spawn(&places, name, job)
                 });
+                fired |= started(name, f, instant, &mut kept);
             }
         }
         if fired {
@@ -674,7 +720,12 @@ fn read_jobs(
             kept.insert(name.to_owned(), (generation.clone(), looked));
             new = true;
         }
-        let (seen, again, started) = match followed.remove(name) {
+        let was = followed.remove(name);
+        let unkept = was
+            .as_ref()
+            .filter(|f| f.generation == generation)
+            .and_then(|f| f.unkept);
+        let (seen, again, started) = match was {
             Some(f) if f.job.watch == job.watch => (f.seen, f.again, f.started),
             _ => {
                 let seen = job.watch.as_deref().and_then(look);
@@ -698,6 +749,7 @@ fn read_jobs(
                 started,
                 failures: 0,
                 retry: None,
+                unkept,
             },
         );
     }
@@ -1133,6 +1185,7 @@ mod tests {
                     started: None,
                     failures: 0,
                     retry: None,
+                    unkept: None,
                 };
                 (format!("t{i:05}"), f)
             })
@@ -1222,6 +1275,54 @@ mod tests {
             next_after(&set.entries, repeated - 3600 + 30 * 60),
             Some(repeated - 3600 + 30 * 60 + 86_400 + 3600)
         );
+    }
+
+    #[test]
+    fn a_calendar_time_is_kept_only_once_its_fire_starts() {
+        let mut f = Followed {
+            file: (0, 0, 0),
+            job: Job {
+                program: vec!["/A/sonny".into()],
+                environment: Vec::new(),
+                calendar: trigger::every("1m", 0).unwrap().entries,
+                watch: None,
+            },
+            generation: "g".into(),
+            looked: 0,
+            next: Some(60),
+            seen: None,
+            again: false,
+            started: None,
+            failures: 0,
+            retry: None,
+            unkept: None,
+        };
+        let mut kept = HashMap::new();
+        let mut fleet = Fleet {
+            running: HashMap::new(),
+            busy: std::collections::HashSet::new(),
+            cap: 0,
+        };
+        let at = std::time::Instant::now();
+        // Due with the fleet full: not kept, so a restart finds it due.
+        assert!(came("t", &mut f, false, 90, &mut kept));
+        launch("t", &mut f, &mut fleet, at, &mut |_, _| Ok(Some(1)));
+        assert!(!started("t", &mut f, at, &mut kept));
+        assert!(kept.is_empty() && f.again);
+        // A start that fails: still not kept.
+        fleet.cap = 8;
+        launch("t", &mut f, &mut fleet, at, &mut |_, _| Err("gone".into()));
+        assert!(!started("t", &mut f, at, &mut kept));
+        assert!(kept.is_empty());
+        // It starts: kept at the time that came.
+        let later = at + LOOK_EVERY * 5;
+        launch("t", &mut f, &mut fleet, later, &mut |_, _| Ok(Some(2)));
+        assert!(started("t", &mut f, later, &mut kept));
+        assert_eq!(kept["t"], ("g".to_owned(), 90));
+        // One that comes while its fire runs is skipped, and kept at once.
+        f.next = Some(120);
+        assert!(came("t", &mut f, true, 130, &mut kept));
+        assert_eq!(kept["t"].1, 130);
     }
 
     #[test]
