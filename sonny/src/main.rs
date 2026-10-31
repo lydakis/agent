@@ -7422,6 +7422,14 @@ impl App {
                     {
                         view.legend = !view.legend
                     }
+                    // `/sky` alone: no chat log, no counts, few names.
+                    KeyCode::Char('z')
+                        if pane.is_card()
+                            && let Some(view) =
+                                self.watch.as_mut().and_then(|w| w.sky.as_mut()) =>
+                    {
+                        view.zen = !view.zen
+                    }
                     // `/status` lists the resolved tasks, or only counts them.
                     KeyCode::Char('r')
                         if pane.is_card()
@@ -9618,7 +9626,7 @@ impl App {
                     })
                     .collect();
                 pane.set_card(lines, SKY_KEYS);
-                pane.foot = Some(view.footer(width));
+                pane.foot = (!view.zen).then(|| view.footer(width));
             } else if let Some(view) = &watch.background {
                 // Its card, with what was done or the keys the pick takes
                 // kept in view under it.
@@ -10423,7 +10431,7 @@ fn over(frame: &mut ratatui::Frame, rows: Vec<Line<'static>>, below: ratatui::la
 
 /// What the pane's title row says the keys do on `/status`.
 const STATUS_KEYS: &str = "esc close";
-const SKY_KEYS: &str = "? legend · esc close";
+const SKY_KEYS: &str = "z zen · ? legend · esc close";
 
 /// What the title row says the keys do on `/status` itself.
 const PICK_KEYS: &str = "↑↓ pick · enter open · esc close";
