@@ -445,6 +445,10 @@ struct Replay {
     /// Events not played yet went off the tape's start, so where it plays
     /// from is seated again (`drain`).
     cut: bool,
+    /// Who the tape's start made, folded into the cast as it went: kept
+    /// apart too, so the listing read once the past is in, which names
+    /// only who is here now, does not lose one deleted later on the tape.
+    folded: Vec<Value>,
 }
 
 impl Replay {
@@ -470,10 +474,16 @@ impl Replay {
             };
             match event["event"].as_str() {
                 Some("created" | "forked") => {
+                    let bot = made(name, &event["data"]);
                     self.cast.retain(|bot| bot["name"] != name);
-                    self.cast.push(made(name, &event["data"]));
+                    self.cast.push(bot.clone());
+                    self.folded.retain(|bot| bot["name"] != name);
+                    self.folded.push(bot);
                 }
-                Some("deleted") => self.cast.retain(|bot| bot["name"] != name),
+                Some("deleted") => {
+                    self.cast.retain(|bot| bot["name"] != name);
+                    self.folded.retain(|bot| bot["name"] != name);
+                }
                 _ => {}
             }
         }
@@ -488,7 +498,7 @@ impl Replay {
     /// seat them from: one pass over the cast and the tape, however many.
     fn remodel(&mut self, models: &HashMap<&str, &str>) {
         let new = |name: &Value| name.as_str().and_then(|name| models.get(name).copied());
-        for bot in &mut self.cast {
+        for bot in self.cast.iter_mut().chain(&mut self.folded) {
             if let Some(model) = new(&bot["name"]) {
                 bot["model"] = json!(model);
             }
@@ -514,6 +524,7 @@ impl Replay {
             played: 0,
             ready: false,
             cut: false,
+            folded: Vec::new(),
         }
     }
 }
@@ -728,7 +739,20 @@ impl View {
                         .filter_map(|bot| Some((bot["name"].as_str()?, bot["model"].as_str()?)))
                         .collect();
                     replay.remodel(&models);
+                    // Who the tape's let-go start made is here then, though
+                    // the listing of now may no longer name them.
+                    let listed: HashSet<&str> =
+                        bots.iter().filter_map(|bot| bot["name"].as_str()).collect();
+                    let folded: Vec<Value> = (replay.folded.iter())
+                        .filter(|bot| {
+                            !bot["name"]
+                                .as_str()
+                                .is_some_and(|name| listed.contains(name))
+                        })
+                        .cloned()
+                        .collect();
                     replay.cast = bots;
+                    replay.cast.extend(folded);
                 }
                 Feed::Tape(event) => {
                     if let Some(replay) = &mut self.replay {
@@ -4575,6 +4599,28 @@ mod tests {
             pairs
         };
         assert_eq!(view.pairs, counted(&view));
+    }
+
+    #[tokio::test]
+    async fn who_the_tape_let_go_of_stays_in_the_cast_past_the_last_listing() {
+        let (mut view, send) = view();
+        let mut replay = Replay::new(0);
+        // Made at the tape's start, deleted after it: the listing of now
+        // no longer names it.
+        replay.keep(json!({"event": "created", "bot": "shop.x", "data": {"bot_id": 4}}));
+        for at in 0..TAPE as i64 {
+            replay.keep(json!({"event": "queued", "bot": "shop.y", "written_ms": at}));
+        }
+        replay.keep(json!({"event": "deleted", "bot": "shop.x", "written_ms": TAPE}));
+        assert!(replay.folded.iter().any(|bot| bot["name"] == "shop.x"));
+        view.replay = Some(replay);
+        send.send(Feed::Roll(vec![json!({"name": "shop.y", "bot_id": 5})]))
+            .unwrap();
+        view.drain();
+        let cast: Vec<_> = (view.replay.as_ref().unwrap().cast.iter())
+            .map(|bot| bot["name"].clone())
+            .collect();
+        assert_eq!(cast, [json!("shop.y"), json!("shop.x")]);
     }
 
     #[test]

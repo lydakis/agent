@@ -17,6 +17,7 @@ mod background;
 mod banner;
 mod boot;
 mod browser;
+mod budget;
 mod cache;
 mod calls;
 mod cmux;
@@ -2038,10 +2039,10 @@ struct App {
     /// What `/status` read of each idle agent's history: its last turn
     /// then, and the question left open.
     asks_seen: HashMap<String, (i64, Seen)>,
-    /// What `/status` last read of each idle agent, and the listing it
-    /// read it at: an agent whose record has not moved since is not read
-    /// again, so a refresh costs the agents that changed, not all of them.
-    status_read: HashMap<String, (Value, Vec<Value>, Latest)>,
+    /// What `/status` last read of each agent's latest items, and the
+    /// history head it read them at: a history that has not moved is not
+    /// read again.
+    status_read: HashMap<String, (Value, Latest)>,
     sounds: sound::Sounds,
     /// The reply text the current model call has streamed.
     said: String,
@@ -7109,36 +7110,21 @@ impl App {
             {
                 continue;
             }
-            // An idle agent whose record (its history's head, its status,
-            // its turn) is as it was last time is read from what was kept.
-            let moved = |seen: &Value| {
-                ["bot_id", "head", "status", "running_turn"]
-                    .iter()
-                    .any(|field| seen[field] != bot[field])
+            let turns = self
+                .client
+                .request("turns", json!({"bot": name, "newest": true, "limit": 8}))
+                .await
+                .ok()
+                .and_then(|page| page["turns"].as_array().cloned())
+                .unwrap_or_default();
+            // Its latest items are read again only once its history moved:
+            // the same head is the same history.
+            let head = json!([bot["bot_id"], bot["head"]]);
+            let latest = match self.status_read.remove(name) {
+                Some((seen, latest)) if seen == head && !bot["head"].is_null() => latest,
+                _ => self.latest(name).await,
             };
-            let unread = match self.status_read.remove(name) {
-                Some((seen, turns, latest)) if bot["running_turn"].is_null() && !moved(&seen) => {
-                    Some((turns, latest))
-                }
-                _ => None,
-            };
-            let (turns, latest) = match unread {
-                Some(kept) => kept,
-                None => {
-                    let turns = self
-                        .client
-                        .request("turns", json!({"bot": name, "newest": true, "limit": 8}))
-                        .await
-                        .ok()
-                        .and_then(|page| page["turns"].as_array().cloned())
-                        .unwrap_or_default();
-                    (turns, self.latest(name).await)
-                }
-            };
-            kept.insert(
-                name.to_owned(),
-                (bot.clone(), turns.clone(), latest.clone()),
-            );
+            kept.insert(name.to_owned(), (head, latest.clone()));
             let turn = turns.first().cloned().unwrap_or(Value::Null);
             // A message steered into a running turn is recorded as a turn
             // of its own that never ran: the time is the one it joined. One
@@ -12180,11 +12166,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn status_lists_every_page_and_reads_again_only_the_agents_that_moved() {
+    async fn status_lists_every_page_and_reads_again_only_the_histories_that_moved() {
         use std::sync::atomic::{AtomicUsize, Ordering};
-        let turns = Arc::new(AtomicUsize::new(0));
+        let histories = Arc::new(AtomicUsize::new(0));
         let moved = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let (read, head) = (turns.clone(), moved.clone());
+        let (read, head) = (histories.clone(), moved.clone());
         let bot = |n: usize, head: i64| {
             json!({"name": format!("shop.t{n:03}"), "bot_id": n, "head": head,
                 "status": "idle", "running_turn": null})
@@ -12201,11 +12187,11 @@ mod tests {
                         let last = if head.load(Ordering::SeqCst) { 2 } else { 1 };
                         json!({"bots": [bot(256, last)], "next_after": null})
                     }
-                    "turns" => {
+                    "turns" => json!({"turns": [], "next_before": null}),
+                    "history_nodes" => {
                         read.fetch_add(1, Ordering::SeqCst);
-                        json!({"turns": [], "next_before": null})
+                        json!({"nodes": [], "next_from": null})
                     }
-                    "history_nodes" => json!({"nodes": [], "next_from": null}),
                     "history_items" => json!({"items": []}),
                     _ => json!({"error": {"code": "unexpected", "message": asked.to_string()}}),
                 },
@@ -12216,14 +12202,15 @@ mod tests {
         let (_, rows) = app.status_rows().await.unwrap();
         assert_eq!(rows.len(), 257);
         assert!(rows.iter().any(|row| row.bot == "shop.t256"));
-        assert_eq!(turns.load(Ordering::SeqCst), 257);
-        // Nothing moved: nothing is read again.
+        assert_eq!(histories.load(Ordering::SeqCst), 257);
+        // No history moved: none is read again (its turns are, as queued
+        // work moves no record).
         app.status_rows().await.unwrap();
-        assert_eq!(turns.load(Ordering::SeqCst), 257);
-        // One agent's history grew: only it is.
+        assert_eq!(histories.load(Ordering::SeqCst), 257);
+        // One agent's history grew: only its is.
         moved.store(true, Ordering::SeqCst);
         app.status_rows().await.unwrap();
-        assert_eq!(turns.load(Ordering::SeqCst), 258);
+        assert_eq!(histories.load(Ordering::SeqCst), 258);
     }
 
     #[tokio::test]
