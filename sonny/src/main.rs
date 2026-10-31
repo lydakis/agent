@@ -982,7 +982,11 @@ async fn run() -> Result<(), String> {
     // The person's agent can react to them; a side chat has its agent's
     // tools, or none.
     if options.side.is_none() {
-        app.declare = declared::declare(&bot, project.is_some());
+        app.role = match project {
+            Some(_) => served::Role::of(0),
+            None => declared::role(&app.client, &bot).await,
+        };
+        app.declare = declared::declare(&bot, app.role);
     }
     app.sounds = sound::Sounds::new(options.sound);
     let settings = settings::Settings::load();
@@ -1157,7 +1161,7 @@ pub(crate) fn made(
     workspace: &Path,
 ) -> Result<(), String> {
     let config = agent_client::config::load()?;
-    let declare = json!(declared::tools(false));
+    let declare = json!(declared::tools(served::Role::of(1)));
     let tools = agent_client::default_tools(client.providers(), model, config.web_search);
     asked["tools"] = json!(tools);
     asked["declare"] = declare.clone();
@@ -2007,6 +2011,8 @@ struct App {
     /// The tools to declare on the bot so it can react, sent once no turn
     /// runs.
     declare: Option<Value>,
+    /// What its tools let it do, by where it stands in its lead's line.
+    role: served::Role,
     /// The bot's reactions in the running turn so far, drawn when it ends.
     bot_reactions: Vec<String>,
     /// The bot's `react` calls not yet completed, by call id.
@@ -2984,6 +2990,7 @@ impl App {
             attached: Vec::new(),
             profile: Default::default(),
             declare: None,
+            role: served::Role::at(2, 2),
             bot_reactions: Vec::new(),
             react_calls: HashMap::new(),
             picked: reactions::Picked::default(),
@@ -3423,8 +3430,7 @@ impl App {
         // A bot that went without the tools Sonny gates, as its gate was
         // not Sonny's, has them with the mode the person picks.
         if declare.is_none() && gating.is_some() && self.mode.is_none() {
-            declare =
-                declared::declare(&json!({"declared": self.declared}), self.project.is_some());
+            declare = declared::declare(&json!({"declared": self.declared}), self.role);
         }
         // New tools are gated as the bot's mode gates the rest, so a tool
         // Sonny gates never runs unjudged where the mode judges.
@@ -13122,7 +13128,7 @@ mod tests {
         })
         .await;
         let mut app = app(client);
-        app.declare = declared::declare(&json!({}), false);
+        app.declare = declared::declare(&json!({}), served::Role::at(2, 2));
         app.running = Some(Running {
             turn: 1,
             started: Instant::now(),
@@ -13136,7 +13142,10 @@ mod tests {
         assert!(app.configure().await);
         let sent = asked.lock().unwrap()[0].clone();
         assert_eq!(sent["op"], "configure");
-        assert_eq!(sent["declare"], json!(declared::tools(false)));
+        assert_eq!(
+            sent["declare"],
+            json!(declared::tools(served::Role::at(2, 2)))
+        );
         assert!(app.declare.is_none());
     }
 
@@ -13361,7 +13370,7 @@ mod tests {
         app.tools = vec!["shell".into()];
         let custom = json!({"gates": [{"tag": "ci", "tools": ["shell"]}]});
         app.mode = approvals::mode(&custom);
-        app.declared = declared::declare(&custom, true).unwrap();
+        app.declared = declared::declare(&custom, served::Role::at(0, 2)).unwrap();
         app.gating = Some("ask");
         assert!(app.configure().await);
         let sent = asked.lock().unwrap()[0].clone();

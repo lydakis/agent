@@ -11,6 +11,9 @@ struct Lab {
     home: PathBuf,
     repo: PathBuf,
     agent: PathBuf,
+    /// The agent whose call the lookout runs: the lead, unless a test
+    /// says another.
+    bot: std::cell::RefCell<String>,
 }
 
 impl Lab {
@@ -42,6 +45,7 @@ impl Lab {
             repo: scratch.join("repo"),
             scratch,
             agent,
+            bot: std::cell::RefCell::new("demo.lead".into()),
         };
         for args in [
             &["init", "-q", "-b", "main"][..],
@@ -77,7 +81,7 @@ impl Lab {
             // The lab's folders are in this repository's build folder:
             // git finds no repository above them.
             .env("GIT_CEILING_DIRECTORIES", env!("CARGO_TARGET_TMPDIR"))
-            .env("AGENT_BOT", "demo.lead")
+            .env("AGENT_BOT", self.bot.borrow().as_str())
             .env("AGENT_BOT_ID", "1")
             .env("HOME", &self.home)
             .env("AGENT_BIN", &self.agent)
@@ -1061,4 +1065,72 @@ fn no_fork_comes_back_through_a_sealed_folder_a_bot_s_folder_holds() {
     assert!(!ok && err.contains("where a bot works"), "{err}");
     assert!(!lab.home.join(".agent/worktrees/demo.try").exists());
     assert!(!lab.scratch.join("run.log.fork").exists());
+}
+
+#[test]
+fn a_task_starts_its_own_helper_on_its_branch_as_deep_as_the_config_lets_it() {
+    let lab = Lab::new("helper");
+    let src = lab.repo.join("src");
+    let (ok, said) = lab.task(false, false);
+    assert!(ok, "{said}");
+    let fix = lab.home.join(".agent/worktrees/demo.fix");
+    std::fs::write(fix.join("src/lib.rs"), "fixed\n").unwrap();
+    lab.git(&fix, &["commit", "-qam", "fixed"]);
+    let listed = |bots: serde_json::Value| {
+        std::fs::write(lab.scratch.join("run.log.ls"), bots.to_string()).unwrap();
+    };
+    let lead = serde_json::json!({"name": "demo.lead", "workspace": src});
+    let task = serde_json::json!({"name": "demo.fix", "created_by": "demo.lead",
+        "workspace": fix.join("src")});
+    listed(serde_json::json!([lead, task]));
+    // The lead's task starts a helper from where it works, in its lead's
+    // project and repository, on its own branch's last commit.
+    *lab.bot.borrow_mut() = "demo.fix".into();
+    let call = serde_json::json!({"name": "review", "brief": "review it"});
+    let (ok, said) = lab.tool(&fix.join("src"), "start_task", call, false);
+    assert!(ok, "{said}");
+    let review = lab.home.join(".agent/worktrees/demo.review");
+    assert_eq!(
+        std::fs::read_to_string(review.join("src/lib.rs")).unwrap(),
+        "fixed\n"
+    );
+    assert_eq!(
+        lab.git(&review, &["branch", "--show-current"]),
+        "agent/demo.review"
+    );
+    let ran = lab.ran();
+    assert_eq!(ran[3..5], ["--bot", "demo.review"]);
+    // Its helper, two below the lead, starts none of its own.
+    let helper = serde_json::json!({"name": "demo.review", "created_by": "demo.fix",
+        "workspace": review.join("src")});
+    listed(serde_json::json!([lead, task, helper]));
+    *lab.bot.borrow_mut() = "demo.review".into();
+    let call = serde_json::json!({"name": "deeper", "brief": "b"});
+    let (ok, said) = lab.tool(&review.join("src"), "start_task", call.clone(), false);
+    assert!(!ok);
+    assert!(said.contains("task_depth (2)"), "{said}");
+    assert!(!lab.home.join(".agent/worktrees/demo.deeper").exists());
+    // Nor removes what it did not start.
+    let call = serde_json::json!({"task": "fix"});
+    let (ok, said) = lab.tool(&review.join("src"), "remove_task", call, false);
+    assert!(!ok);
+    assert!(said.contains("not a task you or yours started"), "{said}");
+    assert!(fix.exists());
+    // With no end to a line, it does.
+    std::fs::create_dir_all(lab.home.join(".agent")).unwrap();
+    std::fs::write(
+        lab.home.join(".agent/config.toml"),
+        "[sonny]\ntask_depth = 0\n",
+    )
+    .unwrap();
+    let call = serde_json::json!({"name": "deeper", "brief": "b"});
+    let (ok, said) = lab.tool(&review.join("src"), "start_task", call, false);
+    assert!(ok, "{said}");
+    assert!(lab.home.join(".agent/worktrees/demo.deeper").exists());
+    // The task removes the helper it started, from its lead's repository.
+    *lab.bot.borrow_mut() = "demo.fix".into();
+    let call = serde_json::json!({"task": "review"});
+    let (ok, said) = lab.tool(&fix.join("src"), "remove_task", call, false);
+    assert!(ok, "{said}");
+    assert!(!review.exists());
 }

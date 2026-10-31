@@ -59,6 +59,9 @@ pub struct Start {
     /// else its newest that has them.
     pub from: Option<String>,
     pub turn: Option<i64>,
+    /// The revision a new worktree starts at: the branch of the task that
+    /// starts this one, which builds on its work, else `HEAD`.
+    pub base: Option<String>,
 }
 
 /// The task a fork copies, and its files after the turn it copies.
@@ -71,10 +74,10 @@ struct Source {
     snapshot: crate::snapshot::Snapshot,
 }
 
-/// Start the task `start` asks for of the lead `lead`, whose folder is
-/// `here`, and say what started and how its work comes back.
-pub fn start(here: &Path, lead: &str, start: &Start) -> Result<String, String> {
-    let project = crate::project::lead_project(lead).unwrap_or(lead);
+/// Start the task `start` asks for in `project`, whose lead's folder is
+/// `here`, for `starter`, the lead or a task of its line, whose mode it
+/// works in, and say what started and how its work comes back.
+pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result<String, String> {
     let short = start.name.trim();
     // A lead's name is never a task's.
     if short == "lead" || short.starts_with("lead.") || crate::project::is_lead(short) {
@@ -150,7 +153,7 @@ pub fn start(here: &Path, lead: &str, start: &Start) -> Result<String, String> {
         Some(source) => forked(&agent, name, source)?,
         None if info["threads_in"] == "project" => in_place(here, name),
         None if start.own_folder => own_folder(here, name)?,
-        None => worktree(&at, name)?,
+        None => worktree(&at, name, start.base.as_deref().unwrap_or("HEAD"))?,
     };
     // A worktree's files come from commits a task can write, which may
     // make the lead's subfolder a link out of it: the task would then work
@@ -350,7 +353,7 @@ pub fn start(here: &Path, lead: &str, start: &Start) -> Result<String, String> {
     // committing to its repository and running the commands the config
     // lets out of it, or, in `full`, unconfined, as nothing would answer a
     // call that asks to leave.
-    let mode = lead_mode(&agent, lead).unwrap_or_else(crate::approvals::default);
+    let mode = lead_mode(&agent, starter).unwrap_or_else(crate::approvals::default);
     for (key, value) in crate::approvals::sandbox(mode, &place.dir) {
         let flag = format!("--{key}");
         match value {
@@ -460,6 +463,24 @@ pub fn start(here: &Path, lead: &str, start: &Start) -> Result<String, String> {
         ));
     }
     Ok(said.join("\n"))
+}
+
+/// The branch Sonny made the task `name` in the repository at `here`, on
+/// which a task it starts begins, so it builds on its work; `None` for a
+/// task Sonny made none there.
+pub fn branch_of(here: &Path, name: &str) -> Option<String> {
+    let branch = format!("agent/{name}");
+    git(
+        here,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ],
+    )
+    .ok()?;
+    Some(branch)
 }
 
 /// Whether git would take `name` for the branch `agent/NAME`.
@@ -796,10 +817,10 @@ fn lead_mode(agent: &Path, name: &str) -> Option<&'static str> {
 
 /// Whether the daemon has a task `name`: one whose start failed after it
 /// was made keeps its folder, since a retry continues it there.
-/// The tasks `lead` started that are still there, by name and status,
-/// as the daemon lists the bots of its project: none when it cannot say.
-pub fn still_there(lead: &str) -> Vec<(String, String)> {
-    let project = crate::project::lead_project(lead).unwrap_or(lead);
+/// The tasks `starter` started in `project` that are still there, by
+/// name and status, as the daemon lists the bots of the project: none when
+/// it cannot say.
+pub fn still_there(project: &str, starter: &str) -> Vec<(String, String)> {
     let Some(agent) = crate::agent_bin() else {
         return Vec::new();
     };
@@ -812,20 +833,19 @@ pub fn still_there(lead: &str) -> Vec<(String, String)> {
         return Vec::new();
     };
     match serde_json::from_slice::<Value>(&output.stdout) {
-        Ok(Value::Array(bots)) => own(&bots, lead),
+        Ok(Value::Array(bots)) => own(&bots, starter),
         _ => Vec::new(),
     }
 }
 
-/// The folders Sonny made `lead`'s tasks, from its folder `here`, whose
-/// task is no longer there, removed some other way than `remove_task`,
-/// such as by a prune of finished agents: each by name and the space it
-/// takes. Found without running anything in them: by their records, or
+/// The folders Sonny made the tasks of `project`, from its lead's folder
+/// `here`, whose task is no longer there, removed some other way than
+/// `remove_task`, such as by a prune of finished agents: each by name and
+/// the space it takes. Found without running anything in them: by their records, or
 /// for the worktrees of `here`'s repository, by its list of them. None
 /// when the agents can't be listed, so a task still there is never
 /// counted gone.
-pub fn left_behind(here: &Path, lead: &str) -> Vec<(String, Size)> {
-    let project = crate::project::lead_project(lead).unwrap_or(lead);
+pub fn left_behind(here: &Path, project: &str) -> Vec<(String, Size)> {
     let (Some(agent), Ok(home)) = (crate::agent_bin(), home_dir()) else {
         return Vec::new();
     };
@@ -1109,7 +1129,7 @@ fn own_folder(here: &Path, name: &str) -> Result<Place, String> {
 
 /// A git worktree on branch agent/NAME at the last commit, in the lead's
 /// subfolder of it. Outside git, the lead's folder, which the task shares.
-fn worktree(here: &Path, name: &str) -> Result<Place, String> {
+fn worktree(here: &Path, name: &str, base: &str) -> Result<Place, String> {
     if git(here, &["rev-parse", "--show-toplevel"]).is_err() {
         return Ok(Place {
             note: Some(format!(
@@ -1140,7 +1160,7 @@ fn worktree(here: &Path, name: &str) -> Result<Place, String> {
         let target = path.to_string_lossy();
         git(
             here,
-            &["worktree", "add", "-q", "-b", &branch, &target, "HEAD"],
+            &["worktree", "add", "-q", "-b", &branch, &target, base],
         )?;
         Undo::Worktree {
             here: here.to_owned(),
@@ -1180,6 +1200,11 @@ pub fn is_worktree(top: &Path) -> bool {
 }
 
 /// The bot `name` as the daemon lists it.
+/// The bot `name` as the daemon lists it, read with the CLI.
+pub fn record_of_bot(name: &str) -> Option<Value> {
+    record(&crate::agent_bin()?, name)
+}
+
 fn record(agent: &Path, name: &str) -> Option<Value> {
     let output = Command::new(agent)
         .args(["ls", "--name", name])
