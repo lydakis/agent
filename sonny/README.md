@@ -759,7 +759,7 @@ way `/react` does, and each note in the margin has its own `↩`.
 
   ![/sky folded at 10,000 agents](../docs/sonny/sky-10000.png)
 
-  ![/sky replaying two hours at 64 times](../docs/sonny/sky-replay.gif)
+  ![/sky replaying, the web of who had talked there from the start and the haiku up then](../docs/sonny/sky-replay.gif)
 
   ![/sky centred on the shop lead](../docs/sonny/sky-centre.png)
 
