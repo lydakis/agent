@@ -1331,6 +1331,55 @@ pub fn list(places: &Places, after: Option<&str>) -> Value {
     json!({"triggers": rows, "next_after": next})
 }
 
+/// A trigger as the sky shows it: the agent it messages, how it was
+/// asked for, and, when a clock sets it, its next two times (Unix
+/// seconds), so how near the next is can be told against the wait.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Upcoming {
+    pub name: String,
+    pub generation: String,
+    pub bot: String,
+    pub when: String,
+    pub next: Option<i64>,
+    pub then: Option<i64>,
+}
+
+/// The triggers of the daemon serving `store_id`, as of `now`: one that
+/// watches a file or a repository has no next time, nor a one-off whose
+/// time has gone.
+pub fn upcoming(places: &Places, store_id: &str, now: i64) -> Vec<Upcoming> {
+    let mut found: Vec<Upcoming> = triggers(places)
+        .into_iter()
+        .filter(|(t, _)| t.store_id == store_id)
+        .map(|(t, _)| {
+            let (next, then) = match t.at {
+                Some(at) => ((at > now).then_some(at), None),
+                None => {
+                    let entries = when_again(&t, None).entries;
+                    let from = t.not_before.map_or(now, |first| now.max(first - 1));
+                    let next = crate::scheduler::next_after(&entries, from);
+                    (
+                        next,
+                        next.and_then(|next| crate::scheduler::next_after(&entries, next)),
+                    )
+                }
+            };
+            Upcoming {
+                bot: t.bot().to_owned(),
+                name: t.name,
+                generation: t.generation,
+                when: t.when,
+                next,
+                then,
+            }
+        })
+        .collect();
+    found.sort_by(|a, b| {
+        (a.next.is_none(), a.next, &a.name).cmp(&(b.next.is_none(), b.next, &b.name))
+    });
+    found
+}
+
 /// Every trigger there now that was made on the daemon whose store is
 /// `store_id`, in name order: its row, as `list` shows it, and the agents
 /// it is for: the one it messages, the one that added it to start that
@@ -4630,6 +4679,62 @@ mod tests {
                 when.not_before
             );
         }
+    }
+
+    #[test]
+    fn the_sky_reads_each_trigger_s_next_two_times_on_its_own_store() {
+        let w = World::new("upcoming");
+        let now = clock(2026, 9, 28, 9, 7) + 30;
+        // Every 30m, made a minute ago: first at 09:36, then 10:06.
+        let every = Trigger {
+            not_before: Some(clock(2026, 9, 28, 9, 36)),
+            ..trigger()
+        };
+        let soon = Trigger {
+            name: "p.soon".into(),
+            when: "in 2h".into(),
+            at: Some(now + 7200),
+            ..trigger()
+        };
+        let gone = Trigger {
+            name: "p.gone".into(),
+            at: Some(now - 60),
+            ..soon.clone()
+        };
+        let watch = Trigger {
+            name: "p.watch".into(),
+            when: "file /a/b".into(),
+            ..trigger()
+        };
+        let other = Trigger {
+            name: "p.other".into(),
+            store_id: "ffee".into(),
+            ..trigger()
+        };
+        for t in [&every, &soon, &gone, &watch, &other] {
+            w.install(t).unwrap();
+        }
+        let found = upcoming(&w.places, "00ab", now);
+        let times: Vec<(&str, Option<i64>, Option<i64>)> = (found.iter())
+            .map(|u| (u.name.as_str(), u.next, u.then))
+            .collect();
+        assert_eq!(
+            times,
+            [
+                (
+                    "p.fix-login",
+                    Some(clock(2026, 9, 28, 9, 36)),
+                    Some(clock(2026, 9, 28, 10, 6))
+                ),
+                ("p.soon", Some(now + 7200), None),
+                ("p.gone", None, None),
+                ("p.watch", None, None),
+            ]
+        );
+        assert_eq!(
+            (found[0].bot.as_str(), found[0].when.as_str()),
+            ("p.fix-login", "every 30m")
+        );
     }
 
     #[test]

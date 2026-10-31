@@ -675,7 +675,7 @@ impl Credentials {
             })
             .max()
             .unwrap_or(0)
-            .max(open_field(text, &set.fields));
+            .max(open_field(text, &set.fields).value);
         // A whole credential across the cut, as one that ends with its own
         // start, is shown whole.
         let mut cut = text.len() - started;
@@ -692,6 +692,28 @@ impl Credentials {
             cut = end;
         }
         text.len() - cut
+    }
+    /// How many of `text`'s last bytes open a secret field whose value has
+    /// not started: a name, or a name and its separator. They are shown,
+    /// and kept so the next text is redacted as read after them.
+    pub fn opening(&self, text: &[u8]) -> usize {
+        let set = self.0.read().unwrap_or_else(|e| e.into_inner());
+        let open = open_field(text, &set.fields);
+        open.name - open.value
+    }
+    /// `text` redacted as it reads after `before`, already shown: a value
+    /// after a field's name shown earlier is still redacted.
+    pub fn redact_after(&self, before: &str, text: String) -> String {
+        if before.is_empty() {
+            return self.redact(text);
+        }
+        let mut whole = self.redact(format!("{before}{text}"));
+        if whole.starts_with(before) {
+            whole.replace_range(..before.len(), "");
+            whole
+        } else {
+            self.redact(text)
+        }
     }
 }
 
@@ -794,11 +816,20 @@ fn redact_fields(text: String, fields: &[String]) -> String {
     out
 }
 
-/// How many of `text`'s last bytes are a secret field still open at its
-/// end: a name that may be one's start, a name and separator with no value
-/// yet, or a value that has not ended. Held back so the value is redacted
-/// with its name, at most `FIELD_HOLD` bytes of it.
-fn open_field(text: &[u8], fields: &[String]) -> usize {
+/// A secret field still open at a text's end, in bytes from that end.
+#[derive(Clone, Copy, Default)]
+struct Open {
+    /// Where its name starts: a name that may be one's start, a name and
+    /// separator with no value yet, or a name and a value not ended.
+    name: usize,
+    /// Where its value starts, when one has and not ended: held back so it
+    /// is redacted whole, at most `FIELD_HOLD` bytes of it. The name before
+    /// it is not secret, so it is shown: a prompt such as `Password: `
+    /// reaches whoever is to answer it.
+    value: usize,
+}
+
+fn open_field(text: &[u8], fields: &[String]) -> Open {
     const FIELD_HOLD: usize = 4096;
     // Four bytes of a field's start, so short words go out as typed.
     const NAME_START: usize = 4;
@@ -818,10 +849,13 @@ fn open_field(text: &[u8], fields: &[String]) -> usize {
         let name = key(&tail[start..i]);
         if i == tail.len() {
             // The last word: it may be the start of a field's name.
+            // Bytes, not characters: a field's name may be any text.
             let begins = fields.iter().any(|field| {
-                (NAME_START.min(field.len())..=field.len()).any(|n| name.ends_with(&field[..n]))
+                (NAME_START.min(field.len())..=field.len())
+                    .any(|n| name.as_bytes().ends_with(&field.as_bytes()[..n]))
             });
-            return if begins { tail.len() - start } else { 0 };
+            let name = if begins { tail.len() - start } else { 0 };
+            return Open { name, value: 0 };
         }
         if !fields.iter().any(|field| name.ends_with(field.as_str())) {
             continue;
@@ -834,8 +868,9 @@ fn open_field(text: &[u8], fields: &[String]) -> usize {
         while j < tail.len() && matches!(tail[j], b' ' | b'\t') {
             j += 1;
         }
+        let name = tail.len() - start;
         if j == tail.len() {
-            return tail.len() - start;
+            return Open { name, value: 0 };
         }
         if !matches!(tail[j], b'=' | b':') {
             continue;
@@ -855,10 +890,13 @@ fn open_field(text: &[u8], fields: &[String]) -> usize {
             }
         });
         if !ended {
-            return tail.len() - start;
+            return Open {
+                name,
+                value: tail.len() - j,
+            };
         }
     }
-    0
+    Open::default()
 }
 
 /// Replace the body of each PEM block in `text` whose header names one of

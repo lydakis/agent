@@ -809,6 +809,10 @@ fn main() -> std::process::ExitCode {
             }
             return std::process::ExitCode::from(agent_client::memory::cli(rest) as u8);
         }
+        // An ask's deadline trigger runs this as its `--if`.
+        Some((verb, rest)) if verb == asks::TOOL => {
+            return std::process::ExitCode::from(asks::cli(rest) as u8);
+        }
         Some((verb, rest)) if verb == trigger::VERB => {
             return std::process::ExitCode::from(trigger::cli(rest) as u8);
         }
@@ -4169,6 +4173,7 @@ impl App {
             && !failed
             && let Some(ask) = asks::call(id, arguments)
         {
+            let ask = asks::settled(ask, output);
             let card = asks::card(&ask, self.width);
             let from = self.pending.len() + usize::from(self.any_history);
             self.commit(card.rows);
@@ -10702,8 +10707,12 @@ impl App {
             if let Some(picker) = &self.picker {
                 let at = picker.at();
                 let items: Vec<list::Item> = (picker.found().into_iter())
+                    // Each model by its name and provider, its id muted
+                    // after them, as one region's Bedrock id differs from
+                    // another's only there.
                     .map(|(model, found)| {
-                        list::Item::new(model, "")
+                        let id = model.split_once('/').map_or(model, |(_, id)| id);
+                        list::Item::new(models::named(model), id)
                             .current(model == self.model)
                             .found(&found)
                     })

@@ -56,7 +56,7 @@ fn short(key: &str) -> &str {
 }
 
 /// Every key `agent_client::config` reads.
-pub const SETTINGS: [Setting; 27] = [
+pub const SETTINGS: [Setting; 28] = [
     Setting {
         key: "model",
         about: "a new agent's model, when none is named (provider/model)",
@@ -176,6 +176,12 @@ pub const SETTINGS: [Setting; 27] = [
         about: "how often at most an agent hears of new posts in the commons threads it posted in, as 30s, 15m or 1h; 0 for as they come",
         values: &[],
         default: "1h",
+    },
+    Setting {
+        key: "sonny.ask_wait_minutes",
+        about: "minutes an unanswered question waits before its agent goes on with what it recommended, where it said it could, or is reminded; 0 waits for you always",
+        values: &[],
+        default: "60",
     },
     Setting {
         key: "sonny.default_permissions",

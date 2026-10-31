@@ -364,8 +364,8 @@ which bot, by its identity and its store, is kept in `~/.agent/sonny/t3`, so
 a thread T3 Code resumes is the same bot or none: one removed and made again
 under its name, or a bot of another store, is refused, and each prompt names
 the bot's identity, so one sent after such a swap reaches neither. T3 Code's model picker lists what the providers list, as `/model`
-does, each by the name its provider lists (else its id) beside the provider,
-as "Global Claude Opus 5.5 · bedrock", with the full id and
+does, each by the name its provider lists (else the name Sonny gives it, as
+people say it) beside the provider, as "Global Claude Opus 5.5 · bedrock", with the full id and
 `~/.agent/models`' notes, and the models only that file names, after
 "Default", the model the lead or task runs; its effort picker lists the
 family's efforts after "Default" too. A pick made before the first prompt is
@@ -504,7 +504,8 @@ way `/react` does, and each note in the margin has its own `↩`.
 
   ![/config over the composer, side_chat set to fork](../docs/sonny/config.png)
 - `/model` picks the lead's model, from every model its provider family
-  lists, and its effort (←/→), and writes them to the project's
+  lists, each by its name and provider (`Opus 5.5 · bedrock`) with its id
+  muted after them, found by either, and its effort (←/→), and writes them to the project's
   `.agents/project.toml` when the folder has one. A pick made while a turn
   runs shows in the footer and applies when the lead is idle; one that
   another client overtakes is dropped.
@@ -662,7 +663,9 @@ way `/react` does, and each note in the margin has its own `↩`.
   the tokens the project's agents spent in the last 24 hours, as their
   retained history records them: in all, as
   stacked bars over time (output, input read fresh, and input read from the
-  provider's cache), by agent and by model. `d`, `w` and `m` show the last
+  provider's cache), by agent and by model: each model by its name, its
+  provider in a muted column beside it, and one model's ids from one
+  provider (two Bedrock regions', say) on one row. `d`, `w` and `m` show the last
   day, week or month, `a` every agent in the store, by project, and `c`
   hides the cached reads, so what the provider charges most for stands out.
   A turn counts where it started. It reads again every minute.
@@ -738,6 +741,13 @@ way `/react` does, and each note in the margin has its own `↩`.
   a replay shows the one that was up at its time.
   `[sonny]` sets `sky_haikus` (0 for none), `sky_haiku_window`,
   `sky_haiku_margin` and `sky_haiku_hold`.
+  An agent with a schedule (a trigger that wakes it) carries a short tick
+  just outside its star, out from the middle (inward at the pane's edge),
+  plain once its next run is near (a tenth of the gap between runs, at
+  least a minute). When an
+  agent makes a schedule a spark flies from it to that tick and the chat
+  log says what it is and who set it (`login every 30m, by shop lead`);
+  one made elsewhere is logged as new, and `?` lists what is next up.
   `sonny sky` draws the same sky on its own, in the whole terminal,
   to keep in another one beside the work, with your theme's grays and
   `NO_COLOR` honoured, and `sonny sky --center NAME` starts on an agent
@@ -751,6 +761,8 @@ way `/react` does, and each note in the margin has its own `↩`.
   ![/sky filling a wide terminal](../docs/sonny/sky-wide.png)
 
   ![/sky with the busiest agent's haiku](../docs/sonny/sky-haiku.gif)
+
+  ![/sky with an agent scheduling another, its tick on the rim and what is next up](../docs/sonny/sky-schedules.gif)
 
   ![/sky with states and its chat log](../docs/sonny/sky-states.png)
 
@@ -862,8 +874,21 @@ way `/react` does, and each note in the margin has its own `↩`.
   Esc sets them aside for a message of your own, and Esc again goes back.
   Once you send words of your own, the conversation has moved on: the open
   questions leave the composer and the `needs you` count, and their cards'
-  options still answer them. The lead does not wait: it goes on with the
-  option it recommends when that can be undone, or ends its turn. Open
+  options still answer them. The lead does not wait on you blindly: each
+  ask says what it does until you answer, and the card's last row says
+  so. It goes on with the option it recommends at once when that can be
+  undone (`Going with 2 meanwhile; another pick undoes it.`), goes on with
+  it at a deadline when it can be undone but you should see it first
+  (`Goes with 2 at 21:30 unless you pick.`), or waits for anything that
+  goes out in your name or to other people, approves, merges, deletes or
+  cannot be undone (`Waits for your pick; a reminder at 21:30.`). The
+  deadline is a one-off automation (`/background`) the tool host sets,
+  `[sonny] ask_wait_minutes` from the ask (60 by default, 0 for none,
+  which makes every ask wait) unless the agent sets its own for work on a
+  clock. It runs nothing once you answer or write to that agent, since the
+  conversation moved on; when it runs, it is Sonny's words, never yours,
+  so it allows nothing that needs your own. Pick another option later and
+  the agent undoes what it did. Open
   questions are read from the history Sonny replays (its `ask` calls not
   yet answered or moved on from), so one asked while Sonny was closed is
   answered the same way when it opens. A yellow `?` starts it and a muted
@@ -875,6 +900,8 @@ way `/react` does, and each note in the margin has its own `↩`.
   itself.
 
   ![Two open decisions, their bars whole after the window narrowed, and the composer answering the first of two](../docs/sonny/ask-several.png)
+
+  ![Three decisions: one the lead goes ahead with meanwhile, one that goes ahead at 21:17 unless you pick, and one that waits for you with a reminder](../docs/sonny/ask-meanwhile.png)
 
   ![Typing an answer: the composer's band names the question over the words, as the sent answer will show it](../docs/sonny/ask-answering.png)
 
@@ -895,7 +922,7 @@ line's `task_depth` leaves room below, and its tasks take them only while
 they have room too, from their first turn, as the daemon counts the
 generations down (`inherit` as a count); a lead's own, which its tasks never take, is
 `new_project`. The daemon shows them to
-the model and records each call: `react`, `ask`, `plan`, `margin` and
+the model and records each call: `react`, `plan`, `margin` and
 `resolve_task` run nothing, and the rest wait for Sonny's answer. Sonny's tool host answers
 those, running each call in the calling agent's folder, so they work with
 every Sonny window closed; a call nobody answers in time ends as

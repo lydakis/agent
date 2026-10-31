@@ -22,6 +22,8 @@ const PROMPT_SHARE_BYTES: usize = 4096;
 
 const STEER_BATCH_ITEMS: usize = 32;
 const STEER_BATCH_BYTES: usize = 256 * 1024;
+/// The most a `history_nodes` page sends, well below the event limit.
+const HISTORY_PAGE_BYTES: usize = 256 * 1024;
 /// The most bytes of pictures one absorption takes in, past its first
 /// steer's: a message's pictures may be 5 MiB once decoded.
 const STEER_BATCH_PICTURE_BYTES: usize = 8 * 1024 * 1024;
@@ -1744,7 +1746,7 @@ impl Database {
     /// Stored schema version, kept in `PRAGMA user_version`. Stores created
     /// before versioning and stores from newer binaries are rejected; an older
     /// versioned store is migrated forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 72;
+    pub const SCHEMA: i32 = 73;
     /// Verbatim user prompts a compaction keeps: per-prompt text, and the
     /// total text plus `(ordinal, String)` entry metadata. Empty entries cost
     /// space too, so the retained list cannot grow with conversation length.
@@ -1837,6 +1839,8 @@ impl Database {
                 total_thinking INTEGER NOT NULL DEFAULT 0, pictured INTEGER NOT NULL DEFAULT 0,
                 pictures INTEGER NOT NULL DEFAULT 0, written_ms INTEGER);
             CREATE INDEX IF NOT EXISTS nodes_turn_seq ON nodes(turn_seq) WHERE turn_seq IS NOT NULL;
+            CREATE TABLE IF NOT EXISTS lineage(node INTEGER PRIMARY KEY REFERENCES nodes(id),
+                parent INTEGER, depth INTEGER NOT NULL, skip INTEGER, start INTEGER);
             CREATE UNIQUE INDEX IF NOT EXISTS nodes_turn ON nodes(turn) WHERE turn IS NOT NULL;
             CREATE TABLE IF NOT EXISTS notes(node INTEGER PRIMARY KEY REFERENCES nodes(id),
                 previous INTEGER REFERENCES notes(node), text TEXT NOT NULL);
@@ -2933,32 +2937,10 @@ impl Database {
         let Some(head) = head else {
             return Ok(false);
         };
-        let depths: Option<(i64, i64)> = self
-            .conn
-            .query_row(
-                "SELECT h.depth,n.depth FROM nodes h, nodes n WHERE h.id=?1 AND n.id=?2",
-                params![head, node],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?;
-        let Some((from, to)) = depths.filter(|(from, to)| to <= from) else {
+        let (Some(top), Some(below)) = (place(&self.conn, head)?, place(&self.conn, node)?) else {
             return Ok(false);
         };
-        // A node's depth is its parent's plus one, so the walk counts its
-        // steps: `depth` follows the item in a row, and reading it would
-        // page through every large result on the way.
-        Ok(self
-            .conn
-            .query_row(
-                "WITH RECURSIVE chain(id,parent,steps) AS (
-                    SELECT id,parent,?3 FROM nodes WHERE id=?1
-                    UNION ALL SELECT n.id,n.parent,c.steps-1 FROM nodes n JOIN chain c ON n.id=c.parent WHERE c.steps>0)
-                 SELECT 1 FROM chain WHERE steps=0 AND id=?2",
-                params![head, node, from - to],
-                |_| Ok(()),
-            )
-            .optional()?
-            .is_some())
+        Ok(ancestor(&self.conn, head, top.depth, below.depth)? == Some(node))
     }
     /// The bounded model context for the bot's next request: the newest
     /// turns that fit `context_bytes` and `context_items`, starting at a turn
@@ -9821,6 +9803,7 @@ impl Database {
             tx.execute("DELETE FROM stubs WHERE node=?", [id])?;
             tx.execute("DELETE FROM declined WHERE node=?", [id])?;
             tx.execute("DELETE FROM senders WHERE node=?", [id])?;
+            tx.execute("DELETE FROM lineage WHERE node=?", [id])?;
             tx.execute("DELETE FROM nodes WHERE id=?", [id])?;
             freed += 1;
             node = parent;
@@ -10019,6 +10002,7 @@ impl Database {
         min_node: Option<i64>,
         oldest_first: bool,
     ) -> Result<Value> {
+        use std::collections::HashSet;
         if !(1..=400).contains(&limit) {
             return fail_with("invalid_history_limit", "limit must be 1 to 400");
         }
@@ -10032,16 +10016,27 @@ impl Database {
         {
             return fail("item_not_in_bot_history");
         }
-        if oldest_first {
-            // Node IDs increase along every lineage, including forks. Find the
-            // first bounded page after the visible window on the read worker.
-            let ids = self.conn.prepare_cached(
-                "WITH RECURSIVE chain(id,parent) AS (
-                    SELECT id,parent FROM nodes WHERE id=?1 AND id>=?2
-                    UNION ALL SELECT n.id,n.parent FROM nodes n JOIN chain c ON n.id=c.parent WHERE n.id>=?2
-                 ) SELECT id FROM chain ORDER BY id LIMIT ?3"
-            )?.query_map(params![next, floor, limit as i64], |r| r.get::<_,i64>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
-            next = ids.last().copied();
+        if oldest_first && let Some(top) = next {
+            // Node IDs increase along every lineage, including forks, so the
+            // nodes at or past the floor are the lineage's newest stretch.
+            // Halve depths to find where it starts, then end the first page
+            // in it: each probe is one skip-pointer walk.
+            let depth = place(&self.conn, top)?
+                .ok_or_else(|| Error::new("storage_error"))?
+                .depth;
+            next = None;
+            if top >= floor {
+                let (mut low, mut high) = (1, depth);
+                while low < high {
+                    let middle = low + (high - low) / 2;
+                    if ancestor(&self.conn, top, depth, middle)?.is_some_and(|id| id >= floor) {
+                        high = middle;
+                    } else {
+                        low = middle + 1;
+                    }
+                }
+                next = ancestor(&self.conn, top, depth, (low + limit as i64 - 1).min(depth))?;
+            }
         }
         let mut nodes = Vec::with_capacity(limit);
         let mut statement = self
@@ -10066,51 +10061,97 @@ impl Database {
                 break;
             }
         }
-        // Only turn-start nodes carry a turn. Complete a page ending mid-turn by
-        // finding its nearest start, including retained nodes of a deleted source.
-        let mut ancestor = next;
-        while unassigned < nodes.len() {
-            let Some(id) = ancestor else {
-                break;
-            };
-            let (parent, turn, _): (Option<i64>, Option<i64>, Option<i64>) =
-                statement.query_row([id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
-            if let Some(turn) = turn {
-                for node in &mut nodes[unassigned..] {
-                    node["turn"] = json!(turn);
-                }
-                break;
+        // Only turn-start nodes carry a turn. A page ending mid-turn takes the
+        // turn of the nearest start above its oldest node, including retained
+        // nodes of a deleted source.
+        if unassigned < nodes.len()
+            && let Some(oldest) = nodes.last().and_then(|n| n["node"].as_i64())
+            && let Some(start) = place(&self.conn, oldest)?.and_then(|p| p.start)
+        {
+            let turn: Option<i64> = self
+                .conn
+                .prepare_cached("SELECT turn FROM nodes WHERE id=?")?
+                .query_row([start], |r| r.get(0))?;
+            for node in &mut nodes[unassigned..] {
+                node["turn"] = json!(turn);
             }
-            ancestor = parent;
         }
-        let next_newer = nodes
-            .first()
-            .and_then(|n| n["node"].as_i64())
-            .filter(|id| Some(*id) != range_head)
-            .map(|id| id + 1);
         // The folder each turn on the page ran in, so a path its messages name
         // resolves where it was written. Each folder is listed once with its
         // turns. A turn whose rows went with a deleted fork source is left out.
         let mut turns: Vec<i64> = nodes.iter().filter_map(|n| n["turn"].as_i64()).collect();
         turns.sort_unstable();
         turns.dedup();
-        let workspaces = self
+        let folders: HashMap<i64, String> = self
             .conn
             .prepare_cached(
-                "SELECT workspace, json_group_array(id) FROM turns
-                 WHERE id IN (SELECT value FROM json_each(?1)) AND workspace IS NOT NULL
-                 GROUP BY workspace ORDER BY min(id)",
+                "SELECT id,workspace FROM turns
+                 WHERE id IN (SELECT value FROM json_each(?1)) AND workspace IS NOT NULL",
             )?
-            .query_map([json!(turns).to_string()], |r| {
-                let folder: String = r.get(0)?;
-                let turns: String = r.get(1)?;
-                Ok((folder, turns))
-            })?
-            .map(|row| {
-                let (folder, turns) = row?;
-                Ok(json!({"folder": folder, "turns": serde_json::from_str::<Value>(&turns)?}))
-            })
-            .collect::<Result<Vec<Value>>>()?;
+            .query_map([json!(turns).to_string()], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        // A page stays within `HISTORY_PAGE_BYTES` as sent: one whose turns
+        // ran in many long folders ends early, from the end the next page
+        // continues at (`next_from`, or `next_newer` oldest first). Its
+        // first node always fits.
+        let mut bytes = 0;
+        let mut counted_turns = HashSet::new();
+        let mut counted_folders = HashSet::new();
+        let mut fits = 0;
+        let order: Vec<usize> = if oldest_first {
+            (0..nodes.len()).rev().collect()
+        } else {
+            (0..nodes.len()).collect()
+        };
+        for index in order {
+            let node = &nodes[index];
+            let mut size = node.to_string().len() + 1;
+            if let Some(turn) = node["turn"].as_i64()
+                && counted_turns.insert(turn)
+                && let Some(folder) = folders.get(&turn)
+            {
+                size += turn.to_string().len() + 1;
+                if counted_folders.insert(folder.as_str()) {
+                    size += json!(folder).to_string().len() + r#"{"folder":,"turns":[]},"#.len();
+                }
+            }
+            if fits > 0 && bytes + size > HISTORY_PAGE_BYTES {
+                break;
+            }
+            bytes += size;
+            fits += 1;
+        }
+        if fits < nodes.len() {
+            if oldest_first {
+                nodes.drain(..nodes.len() - fits);
+            } else {
+                next = nodes[fits]["node"].as_i64();
+                nodes.truncate(fits);
+            }
+        }
+        let next_newer = nodes
+            .first()
+            .and_then(|n| n["node"].as_i64())
+            .filter(|id| Some(*id) != range_head)
+            .map(|id| id + 1);
+        let mut kept: Vec<i64> = nodes.iter().filter_map(|n| n["turn"].as_i64()).collect();
+        kept.sort_unstable();
+        kept.dedup();
+        let mut workspaces: Vec<Value> = Vec::new();
+        let mut listed: HashMap<&str, usize> = HashMap::new();
+        for turn in kept {
+            let Some(folder) = folders.get(&turn) else {
+                continue;
+            };
+            let at = *listed.entry(folder.as_str()).or_insert_with(|| {
+                workspaces.push(json!({"folder": folder, "turns": []}));
+                workspaces.len() - 1
+            });
+            workspaces[at]["turns"]
+                .as_array_mut()
+                .expect("listed with turns")
+                .push(json!(turn));
+        }
         snapshot.commit()?;
         Ok(
             json!({"nodes":nodes,"next_from":next.filter(|id| *id >= floor),
@@ -10129,16 +10170,10 @@ impl Database {
         }
         let snapshot = self.conn.unchecked_transaction()?;
         let head = self.inspect(name)?.head;
-        let floor = *wanted.iter().min().unwrap();
-        let ids = serde_json::to_string(wanted)?;
-        let found: HashSet<i64> = self.conn.prepare_cached(
-            "WITH RECURSIVE chain(id,parent) AS (
-                SELECT id,parent FROM nodes WHERE id=?1
-                UNION ALL SELECT n.id,n.parent FROM nodes n JOIN chain c ON n.id=c.parent WHERE n.id>=?2
-             ) SELECT id FROM chain WHERE id IN (SELECT value FROM json_each(?3))"
-        )?.query_map(params![head,floor,ids], |row| row.get(0))?.collect::<rusqlite::Result<_>>()?;
-        if found != unique {
-            return fail("item_not_in_bot_history");
+        for &node in wanted {
+            if !self.in_lineage(head, node)? {
+                return fail("item_not_in_bot_history");
+            }
         }
         let mut items = Vec::new();
         let mut bytes = 0;
@@ -12521,6 +12556,60 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
              DROP TABLE pause;",
         )?;
     }
+    // 72 -> 73: each node's place in the history tree, so a history read
+    // reaches any ancestor in O(log n) steps rather than walking parents.
+    // Ids grow along every lineage, so a parent is placed before its
+    // children; the places are kept in memory until the walk is done.
+    if !conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='lineage')",
+        [],
+        |r| r.get::<_, bool>(0),
+    )? {
+        conn.execute_batch(
+            "CREATE TABLE lineage(node INTEGER PRIMARY KEY REFERENCES nodes(id),
+                parent INTEGER, depth INTEGER NOT NULL, skip INTEGER, start INTEGER);",
+        )?;
+        let mut placed: HashMap<i64, Place> = HashMap::new();
+        let mut nodes =
+            conn.prepare("SELECT id,parent,depth,turn IS NOT NULL FROM nodes ORDER BY id")?;
+        let mut insert =
+            conn.prepare("INSERT INTO lineage(node,parent,depth,skip,start) VALUES(?,?,?,?,?)")?;
+        let mut rows = nodes.query([])?;
+        while let Some(row) = rows.next()? {
+            let (id, parent, depth, starts): (i64, Option<i64>, i64, bool) =
+                (row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?);
+            let (skip, above) = match parent {
+                Some(parent) => {
+                    let above = *placed
+                        .get(&parent)
+                        .ok_or_else(|| Error::new("storage_error"))?;
+                    let skip = ancestor_by(
+                        |id| {
+                            let place =
+                                placed.get(&id).ok_or_else(|| Error::new("storage_error"))?;
+                            Ok((place.parent, place.skip))
+                        },
+                        parent,
+                        above.depth,
+                        skip_depth(depth),
+                    )?;
+                    (skip, above.start)
+                }
+                None => (None, None),
+            };
+            let start = if starts { Some(id) } else { above };
+            insert.execute(params![id, parent, depth, skip, start])?;
+            placed.insert(
+                id,
+                Place {
+                    parent,
+                    depth,
+                    skip,
+                    start,
+                },
+            );
+        }
+    }
     Ok(())
 }
 /// 53 -> 54: a turn's denial count became a window of its last decided
@@ -12936,11 +13025,17 @@ fn insert_node(
         return fail("storage_error");
     }
     let thinking = super::thinking_bytes(item) as i64;
-    let turn_seq = match (turn, parent) {
-        (None, _) => None,
-        (Some(_), None) => Some(1),
-        (Some(_), Some(parent)) => Some(previous_turn_seq(conn, parent)?.unwrap_or(0) + 1),
+    // The nearest turn start at or above the parent, and its ordinal.
+    let (start, start_seq): (Option<i64>, Option<i64>) = match parent {
+        Some(id) => conn
+            .prepare_cached(
+                "SELECT l.start,s.turn_seq FROM lineage l LEFT JOIN nodes s ON s.id=l.start
+                 WHERE l.node=?",
+            )?
+            .query_row([id], |r| Ok((r.get(0)?, r.get(1)?)))?,
+        None => (None, None),
     };
+    let turn_seq = turn.map(|_| start_seq.unwrap_or(0) + 1);
     // Surviving nodes and the durable deletion floor jointly bound every ID
     // ever committed. Allocate atomically in the insert, avoiding a separate
     // counter write for every message. Callers already hold a transaction.
@@ -12965,7 +13060,105 @@ fn insert_node(
         pictured.count,
         epoch_ms()
     ])?;
-    Ok(conn.last_insert_rowid())
+    let id = conn.last_insert_rowid();
+    let skip = match parent {
+        Some(parent) => ancestor(conn, parent, depth, skip_depth(depth + 1))?,
+        None => None,
+    };
+    conn.prepare_cached("INSERT INTO lineage(node,parent,depth,skip,start) VALUES(?,?,?,?,?)")?
+        .execute(params![
+            id,
+            parent,
+            depth + 1,
+            skip,
+            if turn.is_some() { Some(id) } else { start }
+        ])?;
+    Ok(id)
+}
+/// Where a node sits in the history tree, in a narrow row beside it so a
+/// walk never pages through the item: its parent, depth, skip pointer, and
+/// the nearest turn start at or above it.
+#[derive(Debug, Clone, Copy)]
+struct Place {
+    parent: Option<i64>,
+    depth: i64,
+    skip: Option<i64>,
+    start: Option<i64>,
+}
+fn place(conn: &Connection, node: i64) -> Result<Option<Place>> {
+    Ok(conn
+        .prepare_cached("SELECT parent,depth,skip,start FROM lineage WHERE node=?")?
+        .query_row([node], |r| {
+            Ok(Place {
+                parent: r.get(0)?,
+                depth: r.get(1)?,
+                skip: r.get(2)?,
+                start: r.get(3)?,
+            })
+        })
+        .optional()?)
+}
+/// The depth a node's skip pointer reaches, chosen as Bitcoin Core's block
+/// index chooses it (`GetSkipHeight`, shifted so a root has depth 1): any
+/// ancestor is then O(log n) steps away.
+fn skip_depth(depth: i64) -> i64 {
+    fn clear_lowest(n: i64) -> i64 {
+        n & (n - 1)
+    }
+    let height = depth - 1;
+    if height < 2 {
+        return 1;
+    }
+    1 + if height & 1 == 1 {
+        clear_lowest(clear_lowest(height - 1)) + 1
+    } else {
+        clear_lowest(height)
+    }
+}
+/// The ancestor of `node`, which sits at `depth`, at depth `target`
+/// (`node` itself at its own depth). `step` gives a node's parent and skip
+/// pointer. The walk takes a skip unless it would overshoot, or a later
+/// one would land closer (`CBlockIndex::GetAncestor`).
+fn ancestor_by(
+    mut step: impl FnMut(i64) -> Result<(Option<i64>, Option<i64>)>,
+    node: i64,
+    depth: i64,
+    target: i64,
+) -> Result<Option<i64>> {
+    if target < 1 || target > depth {
+        return Ok(None);
+    }
+    let (mut id, mut at) = (node, depth);
+    while at > target {
+        let (parent, skip) = step(id)?;
+        let jump = skip_depth(at);
+        let then = skip_depth(at - 1);
+        match skip {
+            Some(skip)
+                if jump == target || (jump > target && !(then < jump - 2 && then >= target)) =>
+            {
+                (id, at) = (skip, jump);
+            }
+            _ => {
+                let Some(parent) = parent else {
+                    return fail("storage_error");
+                };
+                (id, at) = (parent, at - 1);
+            }
+        }
+    }
+    Ok(Some(id))
+}
+fn ancestor(conn: &Connection, node: i64, depth: i64, target: i64) -> Result<Option<i64>> {
+    ancestor_by(
+        |id| {
+            let place = place(conn, id)?.ok_or_else(|| Error::new("storage_error"))?;
+            Ok((place.parent, place.skip))
+        },
+        node,
+        depth,
+        target,
+    )
 }
 
 // Last in the file: bench.query_plans audits the statements above the first
@@ -13142,6 +13335,70 @@ mod tests {
             ),
             ("é😀/\t\u{FFFD}z\u{FFFD}A\u{FFFD}".into(), false)
         );
+    }
+
+    #[test]
+    fn skip_pointers_reach_any_ancestor_in_logarithmic_steps() {
+        use std::collections::HashMap;
+        // A tree of 20,000 nodes: a long trunk with forks off it at every
+        // depth, each a little way back, placed as an insert places them.
+        let mut placed: HashMap<i64, (Option<i64>, i64, Option<i64>)> = HashMap::new();
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        let mut random = |n: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % n
+        };
+        for id in 1..=20_000_i64 {
+            let parent = (id > 1).then(|| {
+                if random(20) == 0 {
+                    (id - 1 - random(100) as i64).max(1)
+                } else {
+                    id - 1
+                }
+            });
+            let depth = parent.map_or(1, |p| placed[&p].1 + 1);
+            let skip = parent.and_then(|p| {
+                ancestor_by(
+                    |n| Ok((placed[&n].0, placed[&n].2)),
+                    p,
+                    placed[&p].1,
+                    skip_depth(depth),
+                )
+                .unwrap()
+            });
+            placed.insert(id, (parent, depth, skip));
+        }
+        let deepest = placed.values().map(|p| p.1).max().unwrap();
+        assert!(deepest > 4_000, "{deepest}");
+        let mut most = 0;
+        for _ in 0..2_000 {
+            let node = 1 + random(20_000) as i64;
+            let depth = placed[&node].1;
+            let target = 1 + random(depth as u64) as i64;
+            let mut steps = 0;
+            let found = ancestor_by(
+                |n| {
+                    steps += 1;
+                    Ok((placed[&n].0, placed[&n].2))
+                },
+                node,
+                depth,
+                target,
+            )
+            .unwrap();
+            let mut walked = node;
+            while placed[&walked].1 > target {
+                walked = placed[&walked].0.unwrap();
+            }
+            assert_eq!(found, Some(walked));
+            most = most.max(steps);
+        }
+        // Bitcoin Core's analysis bounds a walk near 2 log2 n steps.
+        assert!(most <= 4 * 15, "{most} steps");
+        assert_eq!(ancestor_by(|_| unreachable!(), 7, 3, 4).unwrap(), None);
+        assert_eq!(ancestor_by(|_| unreachable!(), 7, 3, 3).unwrap(), Some(7));
     }
 
     #[test]
