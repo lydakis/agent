@@ -719,7 +719,8 @@ way `/react` does, and each note in the margin has its own `↩`.
   clear sky either side. Under 60
   columns or 24 rows the sky becomes a list, a firefly per agent and the
   last it said or was told. `r` replays the last hour: the sky starts from
-  who was here then, all idle, and what they said and did plays over it,
+  who was here then, all idle, with the curve of every pair that had
+  talked before, as live, and what they said and did plays over it,
   eight times as fast, the chat log saying when each line happened. Space
   pauses, the left and right arrows step back and on, `[` and `]` halve
   and double the speed (up to 512 times), and Esc goes back to live; the
@@ -732,7 +733,8 @@ way `/react` does, and each note in the margin has its own `↩`.
   messages and tool calls over the last ten minutes; the title passes only
   to an agent half again as busy, once the holder has had it ten minutes,
   so it never flickers. Each new holder writes one, from a copy of itself
-  allowed no tool, eight a day at most, and every sky shows the same one.
+  allowed no tool, eight a day at most, and every sky shows the same one;
+  a replay shows the one that was up at its time.
   `[sonny]` sets `sky_haikus` (0 for none), `sky_haiku_window`,
   `sky_haiku_margin` and `sky_haiku_hold`.
   `sonny sky` draws the same sky on its own, in the whole terminal,
