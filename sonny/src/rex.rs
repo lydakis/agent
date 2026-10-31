@@ -52,6 +52,10 @@ fn heard(line: &Value) -> Heard {
     }
 }
 
+/// Where a floating block sits over its window, as fractions of it: the
+/// middle, with a tenth of the window around it.
+const FLOATING: [f64; 4] = [0.1, 0.1, 0.8, 0.8];
+
 pub struct Rex {
     bin: PathBuf,
     /// `-S HOST` when the session lives on another Rex server.
@@ -279,6 +283,31 @@ impl Backend for Rex {
         Ok(self.made(&args)?.0)
     }
 
+    /// Split beside `anchor`, then floated over its window, as Rex floats
+    /// a block only in its own window. Floating takes neither focus nor
+    /// the active window; one Rex refuses stays split.
+    fn float(
+        &self,
+        anchor: &str,
+        label: &str,
+        cwd: &Path,
+        command: &[String],
+        keep: bool,
+    ) -> Result<String, String> {
+        let block = self.split(anchor, "right", false, label, cwd, command, keep)?;
+        let float = serde_json::json!({"block_id": block, "bounds": FLOATING});
+        let float = float.to_string();
+        let _ = self.call(&[
+            "api",
+            "call",
+            "-s",
+            &self.session,
+            "session.float_block",
+            &float,
+        ]);
+        Ok(block)
+    }
+
     fn own_block(&self) -> Option<String> {
         let mine = std::env::var("REX_BLOCK").ok().filter(|b| !b.is_empty())?;
         (self.blocks().ok()?.into_iter())
@@ -471,6 +500,39 @@ if out is not None:
         let rex = super::Rex::open(dir.join("rex"), None, "web", false, None).unwrap();
         let mut layout = crate::mux::Layout::new(Box::new(rex));
         assert!(!layout.show("web.lead", "lead", &sonny).unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_command_floats_over_its_owners_window() {
+        let (bin, dir) = fake(
+            "float",
+            serde_json::json!({"01home": {"label": "graft", "blocks": [block("block:task", "graft.fix")]}}),
+        );
+        let rex = super::Rex::open(bin, None, "graft", false, None).unwrap();
+        let mut rex = crate::mux::Layout::new(Box::new(rex));
+        let login = ["gh".into(), "auth".into(), "login".into()];
+        let made = rex.split(
+            "graft.fix",
+            "login",
+            Path::new("/work"),
+            &login,
+            Some("float"),
+        );
+        let made = made.unwrap();
+        let calls = std::fs::read_to_string(dir.join("calls")).unwrap();
+        let calls: Vec<&str> = calls.lines().rev().take(2).collect();
+        // Split beside its owner, then floated, as Rex floats a block only
+        // in its own window.
+        assert!(
+            calls[1].starts_with("split -b block:task --split right")
+                && calls[1].contains("--label graft.fix/login --keep-open"),
+            "{calls:?}"
+        );
+        let float = format!(
+            r#"api call -s 01home session.float_block {{"block_id":"{made}","bounds":[0.1,0.1,0.8,0.8]}}"#
+        );
+        assert_eq!(calls[0], float);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
