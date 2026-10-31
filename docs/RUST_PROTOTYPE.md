@@ -997,10 +997,11 @@ the service takes the sessions with one queued in turn, one request each, as
 Redis and NATS serve their clients: a client that pipelines thousands of
 requests holds every other session up by one of them, not by all it sent
 first. Each session reads at most 8 requests ahead, so a few busy sessions
-never fill the queue for the rest. One waiting for an
-[observation read](#observation-reads) reads nothing more until it is
-answered, and what it read ahead stops counting against the queue, so any
-number of sessions waiting on reads leave it to the others. A session's own
+never fill the queue for the rest. What one waiting
+for an [observation read](#observation-reads) has queued stops counting
+against the queue, and so does what it reads, up to its 8, while it waits:
+any number of sessions waiting on reads leave the queue to the others, and
+each still reaches the lease renewals it sends behind its requests. A session's own
 requests keep their order. Storage queues at most 32
 operations.
 

@@ -80,7 +80,9 @@ def deepen(bench, turns, size):
             time.sleep(.2)
 
 
-def floods(bench, count):
+def floods(bench, count, flooder=0):
+    """Each flood's requests for one flooding connection; `flooder` keeps
+    the bots one creates and deletes its own."""
     bots = bench.tasks()
     return {
         'inspect': [('inspect', {'bot': bots[i % len(bots)]}) for i in range(count)],
@@ -94,9 +96,9 @@ def floods(bench, count):
         'search': [('history_search', {'bot': '*', 'query': 'Bench'})
                    for _ in range(count // 25)],
         'create_delete': [pair for i in range(count // 2) for pair in (
-            ('create', {'bot': f'flood{i}', 'workspace': str(bench.out),
+            ('create', {'bot': f'flood{flooder}-{i}', 'workspace': str(bench.out),
                         'model': 'openai/synthetic-model', 'instructions': 'x', 'tools': []}),
-            ('delete', {'bot': f'flood{i}'}))],
+            ('delete', {'bot': f'flood{flooder}-{i}'}))],
     }
 
 
@@ -137,7 +139,8 @@ def main():
         time.sleep(args.quiet_s)
         results['alone'] = probe.done()
         flooders = [Conn(bench.socket) for _ in range(args.flooders)]
-        for kind, requests in floods(bench, args.flood).items():
+        plans = [floods(bench, args.flood, index) for index in range(len(flooders))]
+        for kind in plans[0]:
             if kind not in args.kinds.split(','):
                 continue
             probe = Probe(bench.socket, bench.tasks()[0], args.gap_ms / 1000, args.probe_bots)
@@ -145,7 +148,7 @@ def main():
             replies = [None] * len(flooders)
 
             def flood(index):
-                replies[index] = flooders[index].many(requests, timeout=600)
+                replies[index] = flooders[index].many(plans[index][kind], timeout=600)
             threads = [threading.Thread(target=flood, args=(i,)) for i in range(len(flooders))]
             started = time.monotonic()
             for thread in threads:
@@ -153,7 +156,7 @@ def main():
             for thread in threads:
                 thread.join()
             elapsed = time.monotonic() - started
-            sent = len(requests) * len(flooders)
+            sent = sum(len(plan[kind]) for plan in plans)
             bad = [r for each in replies for r in each if 'error' in r]
             results[kind] = {'requests': sent, 'flood_s': round(elapsed, 2),
                              'per_s': round(sent / elapsed), 'errors': len(bad),
