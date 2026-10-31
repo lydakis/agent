@@ -764,15 +764,22 @@ impl Output {
         self.add(text);
     }
 
-    fn add(&mut self, text: &str) {
-        if self.tail.is_empty() && self.dropped == 0 && self.head.len() + text.len() <= OUTPUT_BYTES
-        {
-            self.head.push_str(text);
-            return;
-        }
-        if self.tail.is_empty() && self.head.len() > Self::HALF {
-            let cut = floor(&self.head, Self::HALF);
-            self.tail = self.head.split_off(cut);
+    fn add(&mut self, mut text: &str) {
+        if self.tail.is_empty() && self.dropped == 0 {
+            if self.head.len() + text.len() <= OUTPUT_BYTES {
+                self.head.push_str(text);
+                return;
+            }
+            // Past the cap: the head is the first half of all the output,
+            // whether the output so far fills it or this text does.
+            if self.head.len() > Self::HALF {
+                let cut = floor(&self.head, Self::HALF);
+                self.tail = self.head.split_off(cut);
+            } else {
+                let fill = floor(text, Self::HALF - self.head.len());
+                self.head.push_str(&text[..fill]);
+                text = &text[fill..];
+            }
         }
         let keep = text.len().min(2 * Self::HALF);
         let start = ceil(text, text.len() - keep);
@@ -2152,6 +2159,17 @@ text(ALL_TOOLS.map(t => t.name).join(","));"#,
         // What was kept and what was dropped add up to what was printed.
         let kept = body.len() - format!("\n…{dropped} bytes dropped…\n").len();
         assert_eq!(kept + dropped, 3000 * line.len() + 2999 + "\nlast".len());
+        // One text past the cap keeps its own start and end.
+        let mut output = Output::default();
+        output.push("before");
+        output.push(&format!("START{}END", "x".repeat(2 * OUTPUT_BYTES)));
+        let body = output.body();
+        assert!(
+            body.starts_with("before\nSTARTxx") && body.ends_with("xxEND"),
+            "{}",
+            &body[..20]
+        );
+        assert!(body.len() <= OUTPUT_BYTES + 64, "{}", body.len());
     }
 
     #[tokio::test]
