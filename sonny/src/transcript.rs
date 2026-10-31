@@ -1232,6 +1232,16 @@ pub fn relayed(text: &str, from: Option<&str>, open: bool, width: usize) -> Vec<
     };
     let head = cut(&format!("↳ {}", head.trim()), width.saturating_sub(2));
     let mut out = vec![Line::from(format!("{head} ▾"))];
+    out.extend(quote_rows(text, width, None));
+    out.into_iter().map(|line| line.dim()).collect()
+}
+
+/// Words with the words they quote: each `> ` run drawn as the reply it
+/// was, behind a bar, its shape without its colors, so it never
+/// outweighs the words that quote it; at most `cap` rows of each, the
+/// rest counted. Every row starts two columns in.
+fn quote_rows(text: &str, width: usize, cap: Option<usize>) -> Vec<Line<'static>> {
+    let mut out = Vec::new();
     let mut lines = text.lines().peekable();
     while let Some(line) = lines.next() {
         let Some(quoted) = quote_line(line) else {
@@ -1239,9 +1249,6 @@ pub fn relayed(text: &str, from: Option<&str>, open: bool, width: usize) -> Vec<
             out.extend(wrap(line, width, Span::raw("  "), Span::raw("  ")));
             continue;
         };
-        // Words it quotes, drawn as the reply they were, behind a bar:
-        // their shape without their colors, so they never outweigh the
-        // words that quote them.
         let mut words = quoted.to_string();
         while let Some(quoted) = lines.peek().and_then(|line| quote_line(line)) {
             words.push('\n');
@@ -1249,7 +1256,13 @@ pub fn relayed(text: &str, from: Option<&str>, open: bool, width: usize) -> Vec<
             lines.next();
         }
         let bar = || Line::from("  ▌ ");
-        for mut line in markdown(&mut Markdown::default(), &words, width, (bar(), bar())) {
+        let mut rows = markdown(&mut Markdown::default(), &words, width, (bar(), bar()));
+        if let Some(cap) = cap.filter(|cap| rows.len() > cap + 1) {
+            let more = rows.len() - cap;
+            rows.truncate(cap);
+            rows.push(Line::from(format!("  ▌ … +{more} lines")));
+        }
+        for mut line in rows {
             (line.style.fg, line.style.bg) = (None, None);
             for span in &mut line.spans {
                 (span.style.fg, span.style.bg) = (None, None);
@@ -1257,7 +1270,27 @@ pub fn relayed(text: &str, from: Option<&str>, open: bool, width: usize) -> Vec<
             out.push(line);
         }
     }
-    out.into_iter().map(|line| line.dim()).collect()
+    out
+}
+
+/// A message of the person's with the words it quotes, under its words
+/// on the same band, quieter than them and as short as a long paste.
+pub fn with_quotes(
+    mut prompt: Vec<Line<'static>>,
+    quotes: &str,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let band = crate::look::band();
+    let Some(end) = prompt.pop() else {
+        return prompt;
+    };
+    // A blank row of the band between its words and what they quote.
+    let quotes = quotes.strip_prefix('\n').unwrap_or(quotes);
+    for line in quote_rows(quotes, width, Some(PROMPT_LINES)) {
+        prompt.push(line.dim().bg(band));
+    }
+    prompt.push(end);
+    prompt
 }
 
 /// A line of quoted words, as Markdown marks one: `> ` before it, or a
