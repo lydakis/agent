@@ -544,7 +544,7 @@ way `/react` does, and each note in the margin has its own `↩`.
   extends = "auto"        # auto, ask or read-only
   network = false
   git = "read-only"       # "write" lets commits run without asking
-  writable = ["~/.cargo"] # folders it writes besides its own
+  writable = ["~/.cargo"] # folders it writes besides its own, whole paths
   reviewer = "model"      # model, you, or none: refused, and told to do without
   ```
 

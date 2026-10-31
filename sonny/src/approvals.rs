@@ -110,7 +110,12 @@ fn own(name: &str, row: &Permissions) -> Option<Mode> {
     {
         *network = row.network.unwrap_or(*network);
         *git = row.git.unwrap_or(*git);
-        *writable = row.writable.iter().map(|folder| home(folder)).collect();
+        // As Codex takes writable roots: only a whole path, never one read
+        // from wherever Sonny runs, where a checkout's link could point it
+        // anywhere.
+        *writable = (row.writable.iter().map(|folder| home(folder)))
+            .filter(|folder| std::path::Path::new(folder).is_absolute())
+            .collect();
     }
     mode.reviewer = row.reviewer.unwrap_or(mode.reviewer);
     Some(mode)
@@ -886,7 +891,8 @@ mod tests {
                     "night".to_owned(),
                     Permissions {
                         reviewer: Some(Reviewer::None),
-                        writable: vec![cache.clone(), "/not/there".into()],
+                        // One named from wherever Sonny runs is never taken.
+                        writable: vec![cache.clone(), "/not/there".into(), "cache".into()],
                         ..row("ask")
                     },
                 ),
