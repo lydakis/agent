@@ -316,11 +316,11 @@ class AcpTests(ModelFixture):
         self.assertEqual([c['value'] for c in option['options']],
                          ['default', 'openai/synthetic-model', 'openai/other-model', 'openai/newer-model',
                           'anthropic/claude-x'])
-        # Shown by the name the provider lists, else the model's own id,
-        # beside the provider; the full id is in the description.
+        # Shown by the name the provider lists, else the name Sonny gives
+        # it, beside the provider; the full id is in the description.
         self.assertEqual([c['name'] for c in option['options'][1:]],
-                         ['synthetic-model · openai', 'other-model · openai', 'Newer Model · openai',
-                          'claude-x · anthropic'])
+                         ['Synthetic Model · openai', 'Other Model · openai', 'Newer Model · openai',
+                          'X · anthropic'])
         self.assertEqual(option['options'][2]['description'], 'faster (openai/other-model)')
         self.assertEqual(option['options'][3]['description'], 'openai/newer-model')
         self.assertEqual((effort['id'], effort['category'], effort['currentValue']),
