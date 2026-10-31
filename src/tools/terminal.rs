@@ -24,7 +24,8 @@ use tokio::{
 pub const MAX_TERMINALS: usize = 16;
 /// How long a write waits for output by default: Codex's waits.
 const WRITE_YIELD_MS: u64 = 250;
-const POLL_YIELD_MS: u64 = 5_000;
+/// How long an empty `write_stdin` waits for its terminal by default.
+pub const POLL_YIELD_MS: u64 = 5_000;
 /// How long typed input may wait for a program that reads none.
 const INPUT_WAIT: Duration = Duration::from_secs(5);
 /// The terminal's size: wide enough that few programs wrap their lines.
@@ -592,30 +593,7 @@ impl Registry {
         kill: bool,
         sandbox: Option<Arc<Policy>>,
     ) -> Result<Outcome> {
-        let terminal = self
-            .terminals
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&handle)
-            .filter(|terminal| terminal.owner == owner)
-            .cloned();
-        let Some(terminal) = terminal else {
-            return fail_with(
-                "terminal_not_running",
-                format!(
-                    "proc:{handle} is no terminal of this agent's that still runs; wait on it for how it ended"
-                ),
-            );
-        };
-        if terminal.sandbox != sandbox {
-            terminal.kill();
-            return fail_with(
-                "terminal_sandbox_changed",
-                format!(
-                    "this agent's sandbox changed since proc:{handle} started, so it was ended; start it again"
-                ),
-            );
-        }
+        let terminal = self.typed(owner, handle, sandbox)?;
         let yield_ms = if kill {
             terminal.kill();
             MAX_YIELD_MS
@@ -628,6 +606,89 @@ impl Registry {
         terminal.settle(yield_ms).await;
         Ok(terminal.take(self, handle))
     }
+
+    /// The first `hold_ms` of a poll of `owner`'s terminal `handle`: its
+    /// output, when it ends within them, or `None` with the output left
+    /// for the poll's end, so a longer poll can park its turn meanwhile.
+    pub async fn poll_hold(
+        &self,
+        owner: i64,
+        handle: i64,
+        hold_ms: u64,
+        sandbox: Option<Arc<Policy>>,
+    ) -> Result<Option<Outcome>> {
+        let terminal = self.typed(owner, handle, sandbox)?;
+        terminal.settle(hold_ms).await;
+        let ended = *terminal.exited.borrow();
+        Ok(ended.then(|| terminal.take(self, handle)))
+    }
+
+    /// A parked poll's result: the output of `owner`'s terminal `handle`
+    /// since the last read and, once it ended, how. `ended` is the handle's
+    /// result for a terminal that has gone.
+    pub fn poll_end(&self, owner: i64, handle: i64, ended: Option<&Value>) -> Result<Outcome> {
+        let terminal = self
+            .terminals
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&handle)
+            .filter(|terminal| terminal.owner == owner)
+            .cloned();
+        if let Some(terminal) = terminal {
+            return Ok(terminal.take(self, handle));
+        }
+        match ended {
+            Some(Value::Object(end)) if end.contains_key("exit_code") => {
+                let mut output = Value::Object(end.clone());
+                output["handle"] = format!("proc:{handle}").into();
+                Ok(Outcome {
+                    failed: end.get("exit_code") != Some(&json!(0)),
+                    ..Outcome::text(output.to_string())
+                })
+            }
+            _ => not_running(handle),
+        }
+    }
+
+    /// `owner`'s running terminal `handle`, which takes input only while
+    /// it runs in its bot's current sandbox; one whose sandbox changed is
+    /// ended.
+    fn typed(
+        &self,
+        owner: i64,
+        handle: i64,
+        sandbox: Option<Arc<Policy>>,
+    ) -> Result<Arc<Terminal>> {
+        let terminal = self
+            .terminals
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&handle)
+            .filter(|terminal| terminal.owner == owner)
+            .cloned();
+        let Some(terminal) = terminal else {
+            return not_running(handle);
+        };
+        if terminal.sandbox != sandbox {
+            terminal.kill();
+            return fail_with(
+                "terminal_sandbox_changed",
+                format!(
+                    "this agent's sandbox changed since proc:{handle} started, so it was ended; start it again"
+                ),
+            );
+        }
+        Ok(terminal)
+    }
+}
+
+fn not_running<T>(handle: i64) -> Result<T> {
+    fail_with(
+        "terminal_not_running",
+        format!(
+            "proc:{handle} is no terminal of this agent's that still runs; wait on it for how it ended"
+        ),
+    )
 }
 
 #[cfg(test)]

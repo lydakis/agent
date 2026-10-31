@@ -21,7 +21,7 @@ use agent_runtime::{
         Bot, CallAnswer, ContextPrefix, ContextUsage, Database, ElisionPlan, Gated, Pulled,
         Settings, Slot, Store, Strip, TURN_VIEW_ACCOUNTING, Waiting, Window, unserved,
     },
-    tools::{Files, Outcome, Prepared, ReadSource, Registry},
+    tools::{Files, Outcome, POLL_YIELD_MS, Prepared, ReadSource, Registry},
 };
 use bytes::Bytes;
 use futures_util::{StreamExt, stream};
@@ -2151,6 +2151,27 @@ impl Turn {
                     self.store
                         .op("tool_finish", move |db| db.tool_finish(turn, &id, &outcome))
                         .await?;
+                } else if waiting.poll {
+                    // A terminal poll reads what the terminal wrote while
+                    // the turn was parked, or how it ended; a restart ended
+                    // it, so it no longer runs.
+                    let results = self
+                        .handles
+                        .take_settled(&self.store, turn, &waiting.handles)
+                        .await;
+                    let ended = results.values().next().cloned();
+                    let handle = match waiting.handles.first().map(|h| Handle::parse(h)) {
+                        Some(Ok(Handle::Process(id))) => id,
+                        _ => return fail("invalid_handle"),
+                    };
+                    let outcome = self
+                        .registry
+                        .poll_end(record.bot_id, handle, ended.as_deref())
+                        .unwrap_or_else(failure);
+                    let id = waiting.call_id.clone();
+                    self.store
+                        .op("tool_finish", move |db| db.tool_finish(turn, &id, &outcome))
+                        .await?;
                 } else if !waiting.approval {
                     // A later call's lapse can wake the wait before its
                     // handles resolve: those are reported pending, as the
@@ -3798,6 +3819,47 @@ impl Turn {
                         Ran::Lifted(_) => unreachable!("only a command moves to the background"),
                     }
                 }
+                // A poll past the bot's hold parks the turn as `wait` does,
+                // holding no slot until the terminal ends or the poll's
+                // time runs out; a steer waiting for the boundary keeps it
+                // live, as it makes a wait a poll.
+                Ok(Prepared::WriteStdin {
+                    handle,
+                    ref chars,
+                    yield_ms,
+                    kill: false,
+                }) if chars.is_empty()
+                    && !self.lift.is_armed()
+                    && yield_ms.unwrap_or(POLL_YIELD_MS) > self.settings().approval_hold_ms() =>
+                {
+                    let yield_ms = yield_ms.unwrap_or(POLL_YIELD_MS);
+                    let deadline_ms = now_ms() + yield_ms;
+                    let hold = self.registry.poll_hold(
+                        record.bot_id,
+                        handle,
+                        self.settings().approval_hold_ms(),
+                        sandbox,
+                    );
+                    match self.run_tool(hold, None, warm.as_deref_mut()).await? {
+                        Ran::Done(Ok(Some(outcome))) => outcome,
+                        Ran::Done(Ok(None)) => match self
+                            .park_poll(
+                                &call.call_id,
+                                handle,
+                                deadline_ms,
+                                &mut calls,
+                                route,
+                                summary_retry_ms,
+                            )
+                            .await?
+                        {
+                            ControlFlow::Continue(outcome) => outcome,
+                            ControlFlow::Break(stop) => return Ok(Some(stop)),
+                        },
+                        Ran::Done(Err(error)) => failure(error),
+                        Ran::Lifted(_) => unreachable!("only a command moves to the background"),
+                    }
+                }
                 Ok(Prepared::WriteStdin {
                     handle,
                     chars,
@@ -4655,6 +4717,55 @@ impl Turn {
                 &handles,
                 deadline_ms,
                 any,
+                Completion::Resume {
+                    bot: self.bot.clone(),
+                    turn: self.turn,
+                },
+            )
+            .await;
+        Ok(ControlFlow::Break(lapse.map_or(Stop::Parked, Stop::Lapses)))
+    }
+
+    /// Park the turn on a terminal poll, as `park` parks a wait on the
+    /// terminal's handle until `deadline_ms`; the poll's result is read
+    /// from the terminal when the turn resumes.
+    async fn park_poll(
+        &self,
+        call_id: &str,
+        handle: i64,
+        deadline_ms: u64,
+        calls: &mut std::vec::IntoIter<ToolCall>,
+        route: Option<&str>,
+        summary_retry_ms: Option<u64>,
+    ) -> Result<ControlFlow<Stop, Outcome>> {
+        let pending: Vec<ToolCall> = calls.collect();
+        let handles = vec![format!("proc:{handle}")];
+        let (turn, id, list) = (self.turn, call_id.to_owned(), handles.clone());
+        let route = route.map(str::to_owned);
+        let lapse = self
+            .store
+            .op("suspend", move |db| {
+                db.suspend_wait(
+                    turn,
+                    &id,
+                    &list,
+                    Some(deadline_ms),
+                    true,
+                    &pending,
+                    route.as_deref(),
+                    summary_retry_ms,
+                    true,
+                )?;
+                db.next_lapse(turn)
+            })
+            .await?;
+        self.handles
+            .attach(
+                &self.store,
+                Waiter::Turn(self.turn),
+                &handles,
+                Some(deadline_ms),
+                true,
                 Completion::Resume {
                     bot: self.bot.clone(),
                     turn: self.turn,

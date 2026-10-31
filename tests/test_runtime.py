@@ -2651,6 +2651,52 @@ class RuntimeTests(ModelFixture):
         client.close()
         self.assertLess(time.monotonic() - started, 3)
 
+    def test_a_terminal_poll_past_the_hold_parks_its_turn_off_the_active_slot(self):
+        client = self.client('echo,shell,write_stdin,wait', extra=('--max-active', '1'),
+                             settings={'approval_hold_ms': 100})
+        for bot in ('Bob', 'Eve'):
+            client.request('create', bot=bot, workspace=str(self.path),
+                           tools=['echo', 'shell', 'write_stdin', 'wait'])
+
+        def submit(bot, request_id, name, arguments):
+            prompt = 'calls:' + json.dumps([[name, arguments]])
+            return client.request('submit', bot=bot, request_id=request_id, prompt=prompt)['result']['turn']
+
+        def result(bot, turn):
+            self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+            return json.loads(poll(client, bot, turn)['result']['text'][5:])
+
+        started = result('Bob', submit('Bob', 's', 'shell', {
+            'command': 'printf ready; while [ ! -f release ]; do sleep .01; done; printf done',
+            'tty': True, 'yield_time_ms': 1000}))
+        self.assertEqual((started['output'], started['running']), ('ready', True))
+        handle = started['handle']
+        # A long poll parks its turn after the hold, waiting on the terminal.
+        turn = submit('Bob', 'p', 'write_stdin', {'handle': handle, 'yield_time_ms': 30000})
+        waiting = client.receive(lambda m: m.get('event') == 'turn_waiting' and m.get('turn') == turn)
+        self.assertEqual(waiting['data']['handles'], [handle])
+        # It holds no slot: another bot's turn runs to its end meanwhile.
+        other = submit('Eve', 'e', 'echo', {'text': 'hi'})
+        self.assertEqual(client.finished(other)['data']['status'], 'completed')
+        # The terminal's end wakes it, with what it wrote and how it ended.
+        began = time.monotonic()
+        (self.path / 'release').touch()
+        ended = result('Bob', turn)
+        self.assertLess(time.monotonic() - began, 10)
+        self.assertEqual((ended['output'], ended['exit_code'], ended['handle']), ('done', 0, handle))
+        # A poll whose time runs out reports the terminal still running.
+        handle = result('Bob', submit('Bob', 's2', 'shell', {
+            'command': 'sleep 600', 'tty': True, 'yield_time_ms': 0}))['handle']
+        turn = submit('Bob', 'p2', 'write_stdin', {'handle': handle, 'yield_time_ms': 400})
+        client.receive(lambda m: m.get('event') == 'turn_waiting' and m.get('turn') == turn)
+        lapsed = result('Bob', turn)
+        self.assertEqual((lapsed['output'], lapsed['running'], lapsed['handle']), ('', True, handle))
+        # A poll within the hold stays live.
+        turn = submit('Bob', 'p3', 'write_stdin', {'handle': handle, 'yield_time_ms': 50})
+        self.assertTrue(result('Bob', turn)['running'])
+        events = client.request('events', bot='Bob', after=0, limit=256)['result']['events']
+        self.assertFalse(any(e['event'] == 'turn_waiting' and e['turn'] == turn for e in events))
+
     def test_retention_prunes_records_and_deletes_idle_bots(self):
         client = self.client(settings={'keep_turns': 2})
         client.request('create', bot='Bob', workspace=str(self.path))

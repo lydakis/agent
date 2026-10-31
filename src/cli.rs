@@ -506,7 +506,7 @@ fn print_flags(flags: &str) {
             ),
             "--approval-hold" => (
                 "DURATION",
-                "A new bot's gated calls wait this long for a verdict before the turn parks; default 2s",
+                "A new bot's gated calls wait this long for a verdict, and its terminal reads for output, before the turn parks; default 2s",
             ),
             _ => unreachable!("flag missing help"),
         };
