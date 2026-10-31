@@ -6368,5 +6368,5 @@ faster here, and the gap widens with depth. A write costs about 7 to 11%
 more, mostly the lineage row's page in the same commit plus a skip walk of
 O(log n) point reads, and storage grows about 10 bytes a node. The newest
 page costs about 0.2 ms more, for sizing the page against its byte budget.
-Stores from before schema 72 place every node when they open, in one pass
+Stores from before schema 73 place every node when they open, in one pass
 in id order with the places held in memory.

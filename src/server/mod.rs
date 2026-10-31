@@ -594,6 +594,16 @@ enum Command {
         reason: String,
         by: Option<String>,
     },
+    /// Pauses, held and lifted, oldest first (newest first with `newest`),
+    /// as `turns` pages. A read.
+    Pauses {
+        #[serde(default)]
+        after: i64,
+        before: Option<i64>,
+        limit: Option<usize>,
+        #[serde(default)]
+        newest: bool,
+    },
     /// Lift the pause; what waited, and the turns it parked, start as
     /// capacity allows. `by` names who let the line go on, as a pause's does.
     Resume {
@@ -601,6 +611,8 @@ enum Command {
         by: Option<String>,
     },
 }
+/// The most agents a pause names as the ones it parked; it counts them all.
+const PAUSE_NAMES: usize = 64;
 /// The variable a Bedrock API key is read from, as the AWS tools name it.
 const BEDROCK_KEY: &str = "AWS_BEARER_TOKEN_BEDROCK";
 pub struct ProviderSpec {
@@ -3447,9 +3459,19 @@ impl Service {
                 let at = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map_or(0, |d| d.as_millis() as i64);
+                // Whose running turns it parks, kept with it so whoever looks
+                // can stop one before letting the line go on: the first
+                // names in order, and how many in all.
+                let mut running: Vec<String> = (self.active.iter())
+                    .filter(|(_, active)| active.running().is_some())
+                    .map(|(bot, _)| bot.clone())
+                    .collect();
+                running.sort_unstable();
+                let total = running.len();
+                running.truncate(PAUSE_NAMES);
                 let (pause, new) = store
                     .op("put_pause", move |db| {
-                        db.put_pause(&reason, by.as_deref(), at)
+                        db.put_pause(&reason, by.as_deref(), at, &running, total)
                     })
                     .await?;
                 self.paused = Some(pause.clone());
@@ -3467,11 +3489,29 @@ impl Service {
                 }
                 Ok(json!({"pause": pause, "changed": new, "parked": parked}))
             }
+            Command::Pauses {
+                after,
+                before,
+                limit,
+                newest,
+            } => {
+                store
+                    .read("pauses", move |db| {
+                        db.pauses(after, before, limit.unwrap_or(64), newest)
+                    })
+                    .await
+            }
             Command::Resume { by } => {
                 if by.as_ref().is_some_and(|b| b.is_empty() || b.len() > 128) {
                     return fail_with("invalid_by", "by must be 1 to 128 bytes");
                 }
-                let lifted = store.op("remove_pause", |db| db.remove_pause()).await?;
+                let at = now_ms() as i64;
+                let lifting = by.clone();
+                let lifted = store
+                    .op("remove_pause", move |db| {
+                        db.remove_pause(lifting.as_deref(), at)
+                    })
+                    .await?;
                 self.paused = None;
                 let changed = lifted.is_some();
                 if changed {
