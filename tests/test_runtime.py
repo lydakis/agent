@@ -1734,24 +1734,38 @@ class RuntimeTests(ModelFixture):
         client = self.client('shell')
         self.addCleanup(lambda: client.close(kill=True))
         client.request('create', bot='Bob', workspace=str(self.path), tools=['shell'])
-        turn = client.request('submit', bot='Bob', request_id='detached',
-                              prompt='detach:exec sleep 30')['result']['turn']
-        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
-        events = client.request('events', bot='Bob', after=0, limit=64)['result']['events']
-        completed = next(e for e in events if e['turn'] == turn and e['event'] == 'tool_completed')
-        pid = json.loads(node_item(client, 'Bob', completed['data']['node'])['result']['output'])['pid']
-        self.addCleanup(lambda: subprocess.run(['kill', '-9', str(pid)], capture_output=True))
-        os.kill(pid, 0)
-        client.request('pause', reason='the loop is sending mail', by='calc.a')
-        deadline = time.monotonic() + 5
-        while time.monotonic() < deadline:
+
+        def detach(command, request_id):
+            turn = client.request('submit', bot='Bob', request_id=request_id,
+                                  prompt=f'detach:{command}')['result']['turn']
+            self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+            events = client.request('events', bot='Bob', after=0, limit=64)['result']['events']
+            completed = next(e for e in events if e['turn'] == turn and e['event'] == 'tool_completed')
+            return json.loads(node_item(client, 'Bob', completed['data']['node'])['result']['output'])['pid']
+
+        def alive(pid):
             try:
                 os.kill(pid, 0)
             except ProcessLookupError:
-                break
+                return False
+            return True
+
+        running = detach('exec sleep 30', 'running')
+        # A launcher that leaves its work running in its group and exits.
+        left = self.path / 'left'
+        launcher = detach(f'sleep 30 & echo $! > {left}', 'launcher')
+        deadline = time.monotonic() + 5
+        while (alive(launcher) or not left.exists() or not left.read_text().strip()) and time.monotonic() < deadline:
             time.sleep(.05)
-        else:
-            self.fail('the detached command outlived the pause')
+        child = int(left.read_text())
+        for pid in (running, child):
+            self.addCleanup(lambda pid=pid: subprocess.run(['kill', '-9', str(pid)], capture_output=True))
+            self.assertTrue(alive(pid))
+        client.request('pause', reason='the loop is sending mail', by='calc.a')
+        deadline = time.monotonic() + 5
+        while (alive(running) or alive(child)) and time.monotonic() < deadline:
+            time.sleep(.05)
+        self.assertEqual((alive(running), alive(child)), (False, False))
 
     def test_a_pause_ends_a_command_a_steer_moved_to_the_background(self):
         self.model.slow_command = 'sleep 30'

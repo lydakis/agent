@@ -4664,14 +4664,23 @@ impl Database {
         let mut statement = self.conn.prepare_cached(&format!(
             "SELECT {PAUSE_COLUMNS} FROM pauses WHERE id>?1 AND id<?2 ORDER BY id {order} LIMIT ?3"
         ))?;
-        let mut pauses = statement
-            .query_map(
-                params![after, before.unwrap_or(i64::MAX), (limit + 1) as i64],
-                pause_row,
-            )?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        let more = pauses.len() > limit;
-        pauses.truncate(limit);
+        let rows = statement.query_map(
+            params![after, before.unwrap_or(i64::MAX), (limit + 1) as i64],
+            pause_row,
+        )?;
+        // Bounded by bytes as well as count, as `bots` pages are: a page of
+        // long reasons still fits one reply.
+        let (mut pauses, mut bytes, mut more) = (Vec::new(), 0, false);
+        for pause in rows {
+            let pause = pause?;
+            let size = crate::output::encoded_len(&pause)? + 1;
+            if pauses.len() == limit || bytes + size > crate::output::MAX_EVENT / 2 {
+                more = true;
+                break;
+            }
+            bytes += size;
+            pauses.push(pause);
+        }
         Ok(json!({"pauses": pauses, "more": more}))
     }
     pub fn store_identity(&self) -> Result<i64> {

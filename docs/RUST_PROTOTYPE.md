@@ -1046,8 +1046,9 @@ was recorded (it may have had effects) or came before it ran, and none is run
 again: the model decides what to redo, as Codex answers the calls an interrupt
 cut off. The pause ends every background command (whose handle then answers
 `daemon_paused`, saying the same), terminal, and detached command this
-daemon started (the session each leads; one started before a restart, or a
-process that left its session, is no longer the daemon's to find), and from
+daemon started (the process group each leads, with what it left running
+there after it exited; one started before a restart, or a process that left
+that group, is no longer the daemon's to find), and from
 then no turn starts: a `reject`
 submission answers `daemon_paused`, `queue` and `steer` submissions are
 recorded and wait, triggers and notes with them, and parked and paced turns
@@ -1067,8 +1068,8 @@ pause is not counted in `paced_ms`. Protocol 33 parks running turns on a
 pull; before it, they ended `interrupted`. Protocol 34 keeps every pause:
 `{"op":"pauses","after":ID?,"before":ID?,"limit":N?,"newest":BOOL?}` reads
 them, held and lifted, oldest first (`newest` turns it), at most `limit` (1
-to 256, default 64) after the pause `after` and before `before`, answering
-`{pauses, more}`; a bad page is `invalid_pause_page`. `agent pauses` prints
+to 256, default 64, and no more than half a reply's bytes) after the pause
+`after` and before `before`, answering `{pauses, more}`; a bad page is `invalid_pause_page`. `agent pauses` prints
 them. A store migrated from schema 71 keeps the pause that held, with no
 agents named as parked. A
 sandboxed bot's own socket refuses it with `not_permitted`, so a command

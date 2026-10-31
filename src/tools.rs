@@ -2364,20 +2364,36 @@ async fn detach(
     let mut child = process.spawn()?;
     let pid = child.id().ok_or(Error::new("shell_spawn_failed"))?;
     // It outlives turns and the daemon, but not the pull cord: a pull ends
-    // the session it leads, as it ends every other command an agent runs.
+    // the process group it leads, as it ends every other command an agent
+    // runs.
     let mut pulls = registry.pulls.subscribe();
+    let group = -(pid as i32);
+    // SAFETY: kill with a negative pid signals the process group setsid made
+    // this child lead; it touches no memory.
+    let signal = move |signal| unsafe { libc::kill(group, signal) } == 0;
     tokio::spawn(async move {
-        let _permit = permit;
-        tokio::select! {
-            _ = child.wait() => {}
+        let pulled = tokio::select! {
+            _ = child.wait() => false,
             Ok(()) = pulls.changed() => {
-                // SAFETY: kill with a negative pid signals the process group
-                // setsid made this child lead; it touches no memory.
-                unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+                signal(libc::SIGKILL);
                 let _ = child.wait().await;
+                true
+            }
+        };
+        drop((permit, held));
+        // What it left running in its group, as `cmd &` leaves, is still
+        // the pull's to end: looked for each second until the group is
+        // empty. The kernel keeps a group's id from new processes while any
+        // member lives, so only that last second could see it reused.
+        while !pulled && signal(0) {
+            tokio::select! {
+                Ok(()) = pulls.changed() => {
+                    signal(libc::SIGKILL);
+                    break;
+                }
+                () = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
             }
         }
-        drop(held);
     });
     Ok(Outcome::text(
         json!({"detached":true,"pid":pid}).to_string(),

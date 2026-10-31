@@ -14599,3 +14599,27 @@ fn schema_71_held_one_pause_and_forgot_it_when_lifted() {
     drop(db);
     std::fs::remove_file(path).unwrap();
 }
+
+#[test]
+fn a_page_of_pauses_fits_one_reply() {
+    let mut db = db();
+    for n in 0..256 {
+        db.put_pause(&"r".repeat(4096), Some(&"b".repeat(128)), n, &[], 0)
+            .unwrap();
+        db.remove_pause(None, n).unwrap();
+    }
+    let page = db.pauses(0, None, 256, false).unwrap();
+    let shown = page["pauses"].as_array().unwrap().len();
+    assert!((1..256).contains(&shown), "{shown}");
+    assert_eq!(page["more"], true);
+    assert!(serde_json::to_vec(&page).unwrap().len() <= agent_runtime::output::MAX_EVENT / 2);
+    let rest = db
+        .pauses(
+            page["pauses"][shown - 1]["id"].as_i64().unwrap(),
+            None,
+            256,
+            false,
+        )
+        .unwrap();
+    assert_eq!(rest["pauses"][0]["id"], shown as i64 + 1);
+}
