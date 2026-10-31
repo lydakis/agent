@@ -1,10 +1,22 @@
 //! Decisions for the person: the lead calls the `ask` tool Sonny declares
 //! on it, which the daemon records, and Sonny draws the question in the
 //! conversation where it was asked: why it is asked, each option with what
-//! picking it means, and the one the lead recommends and why. What the
-//! person types next answers it, and goes to the lead as their next
-//! message. The open questions are read from the history Sonny replays:
-//! its `ask` calls not yet answered.
+//! picking it means, the one the lead recommends and why, and what the
+//! agent does while nobody answers. What the person types next answers
+//! it, and goes to the lead as their next message. The open questions are
+//! read from the history Sonny replays: its `ask` calls not yet answered.
+//!
+//! Silence counts as a yes only where the agent says a step can be undone,
+//! as an Apache project's lazy consensus passes what is easy to revert once
+//! its stated time is up. The agent marks each ask `go_now`, `go_later` or
+//! `wait`, the card says which, and for the last two the tool host that
+//! answers the call ([`served`]) sets a one-off trigger at the deadline.
+//! Its `--if` is `sonny ask open` ([`still_open`]): once the person
+//! answered, or wrote words of their own to that agent, the conversation
+//! moved on and nothing fires. A fire is Sonny's words in a trigger's turn,
+//! never the person's, so it allows nothing that needs their own; a pick
+//! of another option later still answers the card, and the agent undoes
+//! what it did.
 use ratatui::{
     style::{Color, Style, Stylize},
     text::{Line, Span},
@@ -19,6 +31,10 @@ const OPTIONS: usize = 9;
 /// The mark a decision starts with, and the bar down its left side.
 const GLYPH: &str = "? ";
 const BAR: &str = "┃ ";
+/// The longest wait an agent may set: a week.
+const MAX_MINUTES: u64 = 7 * 24 * 60;
+/// How much of the question a fire's message quotes, in characters.
+const QUOTED: usize = 300;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Ask {
@@ -31,6 +47,42 @@ pub struct Ask {
     /// The option recommended, from 0, and why.
     pub recommended: Option<usize>,
     pub reason: String,
+    /// What the agent does while nobody answers, as Sonny took it: none
+    /// for an ask from before agents said.
+    pub unanswered: Option<Unanswered>,
+    /// When it goes ahead or is raised again, in seconds since the epoch,
+    /// as the call's result says.
+    pub deadline: Option<i64>,
+}
+
+/// What an agent does while the person has not answered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Unanswered {
+    /// Goes on with what it recommends at once: a step it can undo.
+    Now,
+    /// Goes on with it once the deadline passes with no word from them.
+    Later,
+    /// Does nothing they have not picked, and is reminded at the deadline.
+    Wait,
+}
+
+impl Unanswered {
+    fn parse(text: &str) -> Option<Self> {
+        match text {
+            "go_now" => Some(Self::Now),
+            "go_later" => Some(Self::Later),
+            "wait" => Some(Self::Wait),
+            _ => None,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Now => "go_now",
+            Self::Later => "go_later",
+            Self::Wait => "wait",
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -40,20 +92,29 @@ pub struct Choice {
     pub explanation: String,
 }
 
-/// The `ask` tool as Sonny declares it on a bot.
+/// The `ask` tool as Sonny declares it on a bot, answered by its tool
+/// host, which sets the deadline.
 pub fn tool() -> Value {
     json!({
         "name": TOOL,
         "description": "Put a decision in front of the person: a fork in the road, an architectural \
             choice, or a step that cannot be undone, where their pick changes what you build. Sonny \
             shows it in the conversation where you ask it: the question, why you ask it, each option \
-            with what happens if they pick it, and the one you recommend and why. Options without \
-            what they mean are useless to the person, so say what each one does to their goal. Ask \
-            once, one decision per call, and do not repeat it in your reply. Their answer comes as \
-            their next message, starting \"You asked:\" and your question. While you wait, go on \
-            with the option you recommend if it can be undone once they have seen it, or with work \
-            that does not depend on the answer; otherwise end your turn. A question with nothing to \
-            choose between goes in your reply instead.",
+            with what happens if they pick it, the one you recommend and why, and what you do until \
+            they answer. Options without what they mean are useless to the person, so say what each \
+            one does to their goal. Ask once, one decision per call, and do not repeat it in your \
+            reply. Their answer comes as their next message, starting \"You asked:\" and your \
+            question. Say in if_unanswered what you do until then. go_now goes on with the option \
+            you recommend at once, for a step you can undo once they have seen it. go_later goes \
+            on with it once the wait passes with no word from them, for a step you can undo but \
+            would rather they saw first. wait does nothing they have not picked: anything that goes \
+            out in their name or to other people, approves, merges, publishes, deletes, spends or \
+            cannot be undone waits, and so does an ask you are unsure of or one they said to wait \
+            on. Sonny wakes you at the deadline unless they answered or wrote to you since; that \
+            wake is Sonny's, never their answer, so it allows nothing that needs their own words. \
+            If they pick another option after you went ahead, undo what you did and follow their \
+            pick. Meanwhile do work that does not depend on the answer, or end your turn. A \
+            question with nothing to choose between goes in your reply instead.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -75,12 +136,19 @@ pub fn tool() -> Value {
                     }},
                 "recommended": {"type": "integer",
                     "description": "The number of the option you recommend, from 1."},
-                "reason": {"type": "string", "description": "Why you recommend it, in one sentence."}
+                "reason": {"type": "string", "description": "Why you recommend it, in one sentence."},
+                "if_unanswered": {"type": "string", "enum": ["go_now", "go_later", "wait"],
+                    "description": "What you do until they answer, as above."},
+                "wait_minutes": {"type": "integer", "minimum": 1, "maximum": MAX_MINUTES,
+                    "description": "How long go_later waits before you go ahead, or wait before you \
+                        are reminded, when the work runs on a clock, such as a meeting or a release; \
+                        left out, the person's setting."}
             },
-            "required": ["question", "why", "options", "recommended", "reason"],
+            "required": ["question", "why", "options", "recommended", "reason", "if_unanswered"],
             "additionalProperties": false
         },
-        "result": "Asked. Sonny shows the decision to the person, and their answer comes as their next message. Go on with the option you recommend if it can be undone, or with work that does not depend on the answer; otherwise end your turn now."
+        "answered_by": crate::served::TAG,
+        "expire_ms": 60 * 1000
     })
 }
 
@@ -127,6 +195,16 @@ pub fn call(id: &str, arguments: &Value) -> Option<Ask> {
         .as_u64()
         .and_then(|n| (n as usize).checked_sub(1))
         .filter(|at| *at < options.len());
+    // Going ahead goes ahead with a recommendation; with none it waits.
+    let unanswered = (arguments["if_unanswered"].as_str())
+        .and_then(Unanswered::parse)
+        .map(|plan| {
+            if recommended.is_some() {
+                plan
+            } else {
+                Unanswered::Wait
+            }
+        });
     (!question.is_empty()).then(|| Ask {
         id: id.to_owned(),
         question,
@@ -134,7 +212,22 @@ pub fn call(id: &str, arguments: &Value) -> Option<Ask> {
         options,
         recommended,
         reason: prose(arguments["reason"].as_str()),
+        unanswered,
+        deadline: None,
     })
+}
+
+/// `ask` as its call's result `output` says Sonny took it: what the agent
+/// does meanwhile, and the deadline Sonny set.
+pub fn settled(mut ask: Ask, output: &str) -> Ask {
+    let Ok(said) = serde_json::from_str::<Value>(output) else {
+        return ask;
+    };
+    if let Some(plan) = said["if_unanswered"].as_str().and_then(Unanswered::parse) {
+        ask.unanswered = Some(plan);
+    }
+    ask.deadline = said["deadline_s"].as_i64();
+    ask
 }
 
 /// The oldest question still open among a bot's `items`, newest first:
@@ -320,6 +413,21 @@ pub fn card(ask: &Ask, width: usize) -> Card {
             Style::new().dim(),
         ));
     }
+    // What happens while nobody answers, under the recommendation it
+    // follows, muted as the reason is, the time at the text's own weight.
+    if let Some(meanwhile) = meanwhile(ask, now()) {
+        if ask.reason.is_empty() {
+            rows.push(spacer());
+        }
+        let spans = meanwhile.into_iter().map(|(text, plain)| match plain {
+            true => Span::raw(text),
+            false => Span::raw(text).dim(),
+        });
+        let row = Line::from(spans.collect::<Vec<_>>());
+        let wrapped =
+            crate::transcript::wrap_lines(row, width, Line::from(indent()), Line::from(indent()));
+        rows.extend(wrapped.into_iter().map(|row| (row, Line::from(indent()))));
+    }
     let (rows, hangs) = rows.into_iter().unzip();
     Card {
         rows,
@@ -352,6 +460,289 @@ fn hang(row: &Line<'static>, lead: usize) -> Line<'static> {
         None => spans.push(Span::raw(" ".repeat(spaces + marker))),
     }
     Line::from(spans)
+}
+
+/// What the card says the agent does until the person answers, `now`
+/// in seconds since the epoch: words, each muted or at the text's weight.
+fn meanwhile(ask: &Ask, now: i64) -> Option<Vec<(String, bool)>> {
+    let pick = ask.recommended.map(|at| (at + 1).to_string());
+    let muted = |text: &str| (text.to_owned(), false);
+    let at = |deadline: i64| (clock(deadline, now), true);
+    Some(match (ask.unanswered?, pick, ask.deadline) {
+        (Unanswered::Now, Some(pick), _) => vec![muted(&format!(
+            "Going with {pick} meanwhile; another pick undoes it."
+        ))],
+        (Unanswered::Later, Some(pick), Some(deadline)) => vec![
+            muted(&format!("Goes with {pick} at ")),
+            at(deadline),
+            muted(" unless you pick."),
+        ],
+        (Unanswered::Wait, _, Some(deadline)) => vec![
+            muted("Waits for your pick; a reminder at "),
+            at(deadline),
+            muted("."),
+        ],
+        // No deadline: the person's setting turned them off, or Sonny
+        // could not say when.
+        _ => vec![muted("Waits for your pick.")],
+    })
+}
+
+/// `epoch` as a clock shows it: the time today, else tomorrow's or the
+/// date's, as `11-03 09:30`.
+fn clock(epoch: i64, now: i64) -> String {
+    let (at, today) = (crate::trigger::local(epoch), crate::trigger::local(now));
+    let time = format!("{:02}:{:02}", at.hour, at.minute);
+    let tomorrow = crate::trigger::local(now + 24 * 3600);
+    let day = |l: &crate::trigger::Local| (l.year, l.month, l.day);
+    if day(&at) == day(&today) {
+        time
+    } else if day(&at) == day(&tomorrow) {
+        format!("tomorrow {time}")
+    } else {
+        format!("{:02}-{:02} {time}", at.month, at.day)
+    }
+}
+
+fn now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
+}
+
+/// Sonny's answer to an `ask` call by `bot` in its turn `turn` as call
+/// `call`, run in that agent's shell: what it does until the person
+/// answers, and for `go_later` and `wait` the one-off trigger that wakes
+/// it at the deadline, `wait_minutes` or the person's setting, which at 0
+/// lets every ask wait with no deadline. The result says when, for the
+/// card and the agent.
+pub fn served(arguments: &Value, bot: &str, turn: i64, call: &str) -> Result<String, String> {
+    let ask =
+        self::call(call, arguments).ok_or("invalid_arguments: a question to ask, in question")?;
+    let asked = arguments["if_unanswered"].as_str().unwrap_or_default();
+    let plan = Unanswered::parse(asked)
+        .ok_or("invalid_arguments: if_unanswered is go_now, go_later or wait")?;
+    if plan != Unanswered::Wait && ask.recommended.is_none() {
+        return Err(
+            "invalid_arguments: going ahead needs the option you recommend, in recommended".into(),
+        );
+    }
+    let label = ask
+        .recommended
+        .map(|at| ask.options[at].label.clone())
+        .unwrap_or_default();
+    let setting = agent_client::config::load()
+        .map(|config| config.sonny.ask_wait_minutes)
+        .unwrap_or(60);
+    let minutes = match arguments["wait_minutes"].as_u64() {
+        _ if setting == 0 => 0,
+        Some(minutes) => minutes.clamp(1, MAX_MINUTES),
+        None => setting.min(MAX_MINUTES),
+    };
+    let plan = allowed(plan, minutes);
+    let deadline = (plan != Unanswered::Now && minutes > 0).then(|| deadline(minutes, now()));
+    // A deadline Sonny could not set leaves the ask waiting, and says why:
+    // the card still shows, and nothing goes ahead unseen.
+    let (plan, deadline, unset) =
+        match deadline.map(|at| set_deadline(&ask, plan, &label, at, bot, turn, call)) {
+            Some(Err(error)) => (Unanswered::Wait, None, Some(error)),
+            _ => (plan, deadline, None),
+        };
+    let when = deadline.map(|d| clock(d, now()));
+    let next = match (plan, &when, &unset) {
+        (Unanswered::Now, ..) => format!(
+            "Shown to the person. Go on now with \"{label}\", keeping it undoable; if they pick \
+             another, undo it and follow their pick."
+        ),
+        (Unanswered::Later, Some(when), _) => format!(
+            "Shown to the person. Unless they answer or write to you first, Sonny wakes you at \
+             {when} to go on with \"{label}\". Until then do work that does not depend on the \
+             answer, or end your turn."
+        ),
+        (Unanswered::Wait, Some(when), _) => format!(
+            "Shown to the person. Do nothing they have not picked. Unless they answer or write to \
+             you first, Sonny reminds you at {when}. Meanwhile do work that does not depend on the \
+             answer, or end your turn."
+        ),
+        (_, _, Some(error)) => format!(
+            "Shown to the person, but Sonny could not set its deadline ({error}), so it waits for \
+             their answer: do nothing they have not picked. Meanwhile do work that does not depend \
+             on the answer, or end your turn."
+        ),
+        _ => "Shown to the person, whose setting has every ask wait for their answer: do nothing \
+             they have not picked. Meanwhile do work that does not depend on the answer, or end \
+             your turn."
+            .to_owned(),
+    };
+    Ok(
+        json!({"if_unanswered": plan.name(), "deadline_s": deadline, "deadline": when,
+        "deadline_error": unset, "next": next})
+        .to_string(),
+    )
+}
+
+/// What the agent may do meanwhile, given the minutes its deadline waits:
+/// with deadlines off (0), every ask waits for the person, `go_now` too.
+fn allowed(plan: Unanswered, minutes: u64) -> Unanswered {
+    if minutes == 0 { Unanswered::Wait } else { plan }
+}
+
+/// The one-off trigger that wakes `bot` at `deadline` about its ask, unless
+/// `sonny ask open` finds it settled by then.
+fn set_deadline(
+    ask: &Ask,
+    plan: Unanswered,
+    label: &str,
+    deadline: i64,
+    bot: &str,
+    turn: i64,
+    call: &str,
+) -> Result<(), String> {
+    let sonny = crate::skills::sonny_path().ok_or("no path to this Sonny")?;
+    let quote = |text: &str| format!("'{}'", text.replace('\'', r"'\''"));
+    let gate = format!(
+        "{} ask open {} {turn} {}",
+        quote(&sonny.to_string_lossy()),
+        quote(bot),
+        quote(call)
+    );
+    let at = crate::trigger::local(deadline);
+    let add = json!({"add": {
+        "name": trigger_name(bot, call),
+        "at": format!("{}-{:02}-{:02} {:02}:{:02}", at.year, at.month, at.day, at.hour, at.minute),
+        "if": gate,
+        "message": fire(&ask.question, plan, label),
+    }});
+    crate::trigger::tool(&add).map(|_| ())
+}
+
+/// The whole minute `minutes` from `now`, never before it, as a one-off
+/// trigger keeps time.
+fn deadline(minutes: u64, now: i64) -> i64 {
+    let at = now + minutes as i64 * 60;
+    at + (60 - at.rem_euclid(60)) % 60
+}
+
+/// The trigger an ask's deadline is, by its agent and call: a name the
+/// person reads in `/background` beside the agent's own.
+fn trigger_name(bot: &str, call: &str) -> String {
+    let tail: String = call
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .take(8)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    let bot: String = bot
+        .chars()
+        .map(
+            |c| match c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                true => c,
+                false => '-',
+            },
+        )
+        .take(100)
+        .collect();
+    format!("{bot}.ask-{tail}")
+}
+
+/// What the deadline's fire tells the agent: Sonny's words, never the
+/// person's, so it allows nothing that needs theirs.
+fn fire(question: &str, plan: Unanswered, label: &str) -> String {
+    let first = question.lines().next().unwrap_or_default();
+    let question = crate::transcript::cut(first, QUOTED);
+    let label = crate::transcript::cut(label.lines().next().unwrap_or_default(), QUOTED);
+    let tail = "This is Sonny, not the person: it is no answer of theirs, and it allows nothing \
+        that needs their own words.";
+    match plan {
+        Unanswered::Later => format!(
+            "Nobody answered your question \"{question}\" in time, so go on now with \"{label}\", \
+             the option you recommended, as you said you would. Keep it undoable, and if they pick \
+             another later, undo it and follow their pick. {tail}"
+        ),
+        _ => format!(
+            "Your question \"{question}\" still has no answer, and you said it waits for the \
+             person, so do not go ahead with it. Go on with what does not depend on it, and say in \
+             one line what it holds up, so they see it again. {tail}"
+        ),
+    }
+}
+
+/// Whether ask call `call` is still open, read from the agent's history
+/// newest first, one entry at a time, as [`open`] reads it: answered by
+/// the person, or set aside by words of their own after it, it is
+/// settled. `None` while the entries read have not reached the call.
+#[derive(Default)]
+struct Reading {
+    /// The questions the person answered after the call, so far.
+    answers: Vec<String>,
+}
+
+impl Reading {
+    fn entry(&mut self, entry: &Value, call: &str) -> Option<bool> {
+        if crate::lookout::said_by_person(entry).is_some() {
+            let text = crate::text(&entry["item"]);
+            match answered(&text) {
+                Some(question) => self.answers.push(question.to_owned()),
+                None if moves_on(&text, entry["from"].as_str()) => return Some(false),
+                None => {}
+            }
+        }
+        let asked = crate::responses(&entry["item"])
+            .into_iter()
+            .find(|item| item["type"] == "function_call" && item["call_id"] == call)?;
+        let question = (asked["arguments"].as_str())
+            .and_then(|a| serde_json::from_str::<Value>(a).ok())
+            .and_then(|arguments| self::call("", &arguments))
+            .map(|ask| ask.question);
+        Some(question.is_some_and(|question| !self.answers.contains(&question)))
+    }
+}
+
+/// Whether the ask is still open, read from the daemon this shell reaches.
+pub async fn still_open(bot: &str, turn: i64, call: &str) -> Result<bool, String> {
+    let daemon = crate::trigger::Daemon::current()?;
+    let socket = daemon.socket()?;
+    let client = crate::trigger::connect(&socket, &daemon).await?;
+    let (mut reading, mut found) = (Reading::default(), None);
+    crate::said::walk(&client, bot, turn, |_, entry| {
+        found = reading.entry(entry, call);
+        found.is_some()
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(found == Some(true))
+}
+
+/// `sonny ask open BOT TURN CALL`, an ask's trigger's `--if`: exit 0
+/// while the ask is open, 1 once it is settled or cannot be read.
+pub fn cli(args: &[String]) -> i32 {
+    let [verb, bot, turn, call] = args else {
+        eprintln!("usage: sonny ask open BOT TURN CALL");
+        return 2;
+    };
+    let Ok(turn) = turn.parse::<i64>() else {
+        eprintln!("usage: sonny ask open BOT TURN CALL");
+        return 2;
+    };
+    if verb != "open" {
+        eprintln!("usage: sonny ask open BOT TURN CALL");
+        return 2;
+    }
+    let open =
+        crate::trigger::runtime().and_then(|runtime| runtime.block_on(still_open(bot, turn, call)));
+    match open {
+        Ok(true) => 0,
+        Ok(false) => 1,
+        Err(error) => {
+            eprintln!("{error}");
+            1
+        }
+    }
 }
 
 /// Which of the open questions `at` is, from 0, when there are several.
@@ -727,5 +1118,201 @@ mod tests {
         assert_ne!(rows[at("- Online") - 2], "┃");
         // Laid at the width it is drawn at, it reads the same.
         assert_eq!(drawn(&ask, 34, 34), rows);
+    }
+
+    fn asked(plan: &str) -> Value {
+        let mut arguments = keep_api();
+        arguments["if_unanswered"] = json!(plan);
+        arguments
+    }
+
+    #[test]
+    fn the_tool_is_answered_by_sonny_and_asks_what_happens_meanwhile() {
+        let tool = tool();
+        assert_eq!(tool["answered_by"], crate::served::TAG);
+        assert!(
+            tool.get("result").is_none(),
+            "a served tool has no fixed result"
+        );
+        let required = tool["parameters"]["required"].as_array().unwrap();
+        assert!(required.contains(&json!("if_unanswered")));
+        assert_eq!(
+            tool["parameters"]["properties"]["if_unanswered"]["enum"],
+            json!(["go_now", "go_later", "wait"])
+        );
+        // Anything outward-facing waits, and the wake is never the person.
+        let description = tool["description"].as_str().unwrap();
+        for words in [
+            "in their name",
+            "approves",
+            "never their answer",
+            "undo what you did",
+        ] {
+            assert!(description.contains(words), "{words}");
+        }
+    }
+
+    #[test]
+    fn what_the_agent_does_meanwhile_is_read_from_the_call_and_its_result() {
+        assert_eq!(call("c", &keep_api()).unwrap().unanswered, None);
+        assert_eq!(
+            call("c", &asked("go_later")).unwrap().unanswered,
+            Some(Unanswered::Later)
+        );
+        // Nothing recommended, nothing to go ahead with: it waits.
+        let mut none = asked("go_now");
+        none["recommended"] = json!(9);
+        assert_eq!(call("c", &none).unwrap().unanswered, Some(Unanswered::Wait));
+        // The result says how Sonny took it: deadlines off made it wait.
+        let ask = call("c", &asked("go_later")).unwrap();
+        let took = settled(ask.clone(), r#"{"if_unanswered":"wait","deadline_s":null}"#);
+        assert_eq!(
+            (took.unanswered, took.deadline),
+            (Some(Unanswered::Wait), None)
+        );
+        let took = settled(
+            ask.clone(),
+            r#"{"if_unanswered":"go_later","deadline_s":1800000000}"#,
+        );
+        assert_eq!(took.deadline, Some(1_800_000_000));
+        // A result from before, plain words, changes nothing.
+        assert_eq!(settled(ask.clone(), "Asked."), ask);
+    }
+
+    #[test]
+    fn the_card_says_what_happens_until_the_person_picks() {
+        let now = 1_800_000_000;
+        let words = |plan: &str, deadline: Option<i64>| {
+            let mut ask = call("c", &asked(plan)).unwrap();
+            ask.deadline = deadline;
+            let said = meanwhile(&ask, now).unwrap();
+            said.iter()
+                .map(|(text, _)| text.as_str())
+                .collect::<String>()
+        };
+        assert_eq!(
+            words("go_now", None),
+            "Going with 2 meanwhile; another pick undoes it."
+        );
+        let at = now + 3600;
+        assert_eq!(
+            words("go_later", Some(at)),
+            format!("Goes with 2 at {} unless you pick.", clock(at, now))
+        );
+        assert_eq!(
+            words("wait", Some(at)),
+            format!("Waits for your pick; a reminder at {}.", clock(at, now))
+        );
+        assert_eq!(words("go_later", None), "Waits for your pick.");
+        assert_eq!(words("wait", None), "Waits for your pick.");
+        // The time is at the text's own weight; the words around it muted.
+        let mut ask = call("c", &asked("go_later")).unwrap();
+        ask.deadline = Some(at);
+        let weights: Vec<bool> = meanwhile(&ask, now).unwrap().iter().map(|w| w.1).collect();
+        assert_eq!(weights, [false, true, false]);
+        // An ask from before agents said draws no such row.
+        assert_eq!(meanwhile(&call("c", &keep_api()).unwrap(), now), None);
+        // On the card, under the reason, barred.
+        let card = card(&settled(call("c", &asked("go_now")).unwrap(), ""), 60);
+        let shown: Vec<String> = card.rows.iter().map(|row| row.to_string()).collect();
+        assert_eq!(
+            shown[shown.len() - 2..],
+            [
+                "┃ Why 2: Nobody runs 0.3 outside this machine.",
+                "┃ Going with 2 meanwhile; another pick undoes it.",
+            ]
+        );
+        assert_eq!(card.hangs.len(), card.rows.len());
+    }
+
+    #[test]
+    fn a_clock_says_the_day_only_when_it_is_not_today() {
+        let local = crate::trigger::local(1_800_000_000);
+        // Noon that day, wherever the test runs.
+        let noon =
+            1_800_000_000 - (local.hour as i64 * 3600 + local.minute as i64 * 60) + 12 * 3600;
+        assert_eq!(clock(noon + 90 * 60, noon), "13:30");
+        assert_eq!(clock(noon + 24 * 3600, noon), "tomorrow 12:00");
+        let later = crate::trigger::local(noon + 3 * 24 * 3600);
+        assert_eq!(
+            clock(noon + 3 * 24 * 3600, noon),
+            format!("{:02}-{:02} 12:00", later.month, later.day)
+        );
+    }
+
+    #[test]
+    fn with_deadlines_off_every_ask_waits_even_one_going_now() {
+        for plan in [Unanswered::Now, Unanswered::Later, Unanswered::Wait] {
+            assert_eq!(allowed(plan, 0), Unanswered::Wait);
+            assert_eq!(allowed(plan, 60), plan);
+        }
+    }
+
+    #[test]
+    fn a_deadline_is_a_whole_minute_never_early() {
+        // 1_800_000_000 is a whole minute: an hour on is too.
+        assert_eq!(deadline(60, 1_800_000_000), 1_800_000_000 + 3600);
+        let at = deadline(1, 1_800_000_001);
+        assert_eq!(at % 60, 0);
+        assert!(at >= 1_800_000_061);
+        assert_eq!(
+            trigger_name("shop.lead", "toolu_01AbCdEfGhIjK"),
+            "shop.lead.ask-dEfGhIjK"
+        );
+        assert_eq!(trigger_name("a b", "c-1"), "a-b.ask-c1");
+    }
+
+    #[test]
+    fn a_fire_is_sonnys_words_and_says_what_to_do() {
+        let later = fire("Keep the old API?\nmore", Unanswered::Later, "Drop it");
+        assert!(later.contains("\"Keep the old API?\""));
+        assert!(later.contains("go on now with \"Drop it\""));
+        assert!(later.contains("undo it and follow their pick"));
+        assert!(later.contains("This is Sonny, not the person"));
+        let wait = fire("Tag it?", Unanswered::Wait, "");
+        assert!(wait.contains("do not go ahead with it"));
+        assert!(wait.contains("This is Sonny, not the person"));
+    }
+
+    #[test]
+    fn an_ask_stays_open_until_answered_or_the_person_moves_on() {
+        let asking = json!({"node": 1, "item": {"type": "function_call", "name": TOOL,
+            "call_id": "a1", "arguments": asked("go_later").to_string()}});
+        let person = |text: &str| {
+            json!({"node": 9, "from": null, "origin": null,
+            "item": {"role": "user", "content": [{"type": "input_text", "text": text}]}})
+        };
+        let read = |entries: &[Value]| {
+            let mut reading = Reading::default();
+            entries.iter().find_map(|entry| reading.entry(entry, "a1"))
+        };
+        assert_eq!(read(std::slice::from_ref(&asking)), Some(true));
+        // Words of their own after it: the conversation moved on.
+        assert_eq!(
+            read(&[person("Actually, hold on"), asking.clone()]),
+            Some(false)
+        );
+        // Its own answer settles it; another question's does not.
+        let ask = call("a1", &asked("go_later")).unwrap();
+        assert_eq!(
+            read(&[person(&answer(&ask, "1")), asking.clone()]),
+            Some(false)
+        );
+        assert_eq!(
+            read(&[person("You asked: Tag it?\n\nYes"), asking.clone()]),
+            Some(true)
+        );
+        // An automation's, another agent's or a reaction are not the person.
+        let automation = json!({"node": 8, "from": null, "origin": "trigger",
+            "item": {"role": "user", "content": [{"type": "input_text", "text": "look"}]}});
+        let agent = json!({"node": 7, "from": "shop.lead", "origin": null,
+            "item": {"role": "user", "content": [{"type": "input_text", "text": "carry on"}]}});
+        let thumbs = person(&crate::reactions::message("👍", None));
+        assert_eq!(
+            read(&[automation, agent, thumbs, asking.clone()]),
+            Some(true)
+        );
+        // Before the call is reached, nothing is known yet.
+        assert_eq!(read(&[person("You asked: Tag it?\n\nYes")]), None);
     }
 }

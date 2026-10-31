@@ -34,6 +34,7 @@
 //! commons_invites = 3           # least threads a day that send invites (more with the square root of the week's agents), 0 none; answers add up to as many again
 //! commons_invite_tokens = 1000000  # what an invite pays for in its thread
 //! commons_digest = "1h"         # an agent hears its commons threads at most this often, unless asked sooner; 0 at once
+//! ask_wait_minutes = 60         # how long an unanswered ask waits to go ahead or remind; 0 never
 //! task_depth = 3                # generations of tasks below a lead, 2 by default (tasks' own start none); 0 no end
 //! sky_haikus = 0                # haikus a day from the sky's busiest agent, 8 by default; 0 none
 //! sky_haiku_window = 10         # minutes of messages and tool calls that make an agent busiest
@@ -193,6 +194,10 @@ pub struct Sonny {
     /// threads, as a `digest` of the commons source: `1h`, or `0` for as
     /// they come.
     pub commons_digest: String,
+    /// How long an `ask` the person has not answered waits, in minutes,
+    /// before its agent goes on with what it recommended, where it said
+    /// it could, or is reminded of it; 0 lets every ask wait for them.
+    pub ask_wait_minutes: u64,
     /// How many generations below a lead its line goes: a lead's tasks
     /// are the first, and an agent of the last starts none; 0 for no end.
     pub task_depth: u64,
@@ -264,6 +269,7 @@ impl Default for Sonny {
             commons_invites: 3,
             commons_invite_tokens: 1_000_000,
             commons_digest: COMMONS_DIGEST.to_owned(),
+            ask_wait_minutes: 60,
             task_depth: 2,
             sky_haikus: 8,
             sky_haiku_window: 10,
@@ -658,6 +664,7 @@ fn parse(text: &str) -> Result<Config, String> {
                 "commons_invites",
                 "commons_invite_tokens",
                 "commons_digest",
+                "ask_wait_minutes",
                 "task_depth",
                 "sky_haikus",
                 "sky_haiku_window",
@@ -727,6 +734,7 @@ fn parse(text: &str) -> Result<Config, String> {
             if let Some(count) = match key.as_str() {
                 "commons_invites" => Some(&mut config.sonny.commons_invites),
                 "commons_invite_tokens" => Some(&mut config.sonny.commons_invite_tokens),
+                "ask_wait_minutes" => Some(&mut config.sonny.ask_wait_minutes),
                 "task_depth" => Some(&mut config.sonny.task_depth),
                 "sky_haikus" => Some(&mut config.sonny.sky_haikus),
                 "sky_haiku_window" => Some(&mut config.sonny.sky_haiku_window),
@@ -1198,6 +1206,10 @@ mod tests {
             (sonny.commons_invites, sonny.commons_invite_tokens),
             (0, 500)
         );
+        assert_eq!(config.sonny.ask_wait_minutes, 60);
+        let asks = parse("[sonny]\nask_wait_minutes = 0").unwrap().sonny;
+        assert_eq!(asks.ask_wait_minutes, 0);
+        assert!(parse("[sonny]\nask_wait_minutes = \"1h\"").is_err());
         assert_eq!(config.sonny.browser_confirm, BROWSER_CONFIRM);
         let browser =
             parse("[sonny]\nbrowser_confirm = [\"eval\", \"plugin:vault:credential.read\"]");

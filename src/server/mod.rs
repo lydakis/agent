@@ -1494,7 +1494,10 @@ pub async fn run(config: Configuration) -> Result<()> {
         .with_daemon(daemon)
         .with_process_budget(limits.processes)
         .with_lasting_budget(limits.lasting);
-    let hub = Hub::default();
+    // Observation reads and replay pages share all but one reader, so turns'
+    // own reads always find one.
+    let lane = lane::Lane::new(limits.readers.saturating_sub(1), deliver);
+    let hub = Hub::default().with_page_seats(lane.seats());
     let lineage = store.op("store_identity", |db| db.store_identity()).await?;
     let identity = store.instance_identity(lineage)?;
     // A pause outlives the daemon that took it.
@@ -1627,7 +1630,7 @@ pub async fn run(config: Configuration) -> Result<()> {
         jobs: JoinSet::new(),
         replays: JoinSet::new(),
         retention: JoinSet::new(),
-        lane: lane::Lane::new(limits.readers.saturating_sub(1), deliver),
+        lane,
         // Queued turns that survived a restart start as capacity allows.
         ready_hint: true,
         tokens: Arc::default(),
@@ -6752,6 +6755,122 @@ mod tests {
         };
         output.try_respond(id, Ok(result.unwrap())).unwrap();
         assert_eq!(service.unpublished.len(), 1, "only the late event waits");
+        publisher.abort();
+        drop(service);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_replay_keeps_its_seat_until_its_read_is_done() {
+        let dir = scratch("replay-seat");
+        let (store, _publications) = Store::open_with(&dir.join("state.sqlite"), 1)
+            .await
+            .unwrap();
+        let seats = Arc::new(tokio::sync::Semaphore::new(1));
+        let hub = Hub::default().with_page_seats(seats.clone());
+        // The one reader is busy, so the replay's page waits in its queue.
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        let busy = tokio::spawn({
+            let store = store.clone();
+            async move {
+                store
+                    .read("busy", move |_| {
+                        let _ = gate.recv();
+                        Ok(())
+                    })
+                    .await
+            }
+        });
+        let sub = hub.subscribe(hub::ALL, 1, Output::writer(tokio::io::sink()), 0, None);
+        let paging = tokio::spawn(replay(store.clone(), hub.clone(), hub::ALL.to_owned(), sub));
+        while seats.available_permits() > 0 {
+            tokio::task::yield_now().await;
+        }
+        paging.abort();
+        let _ = paging.await;
+        // The read it queued still runs on the reader: its seat is still held.
+        assert_eq!(seats.available_permits(), 0);
+        release.send(()).unwrap();
+        busy.await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while seats.available_permits() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the read's end frees its seat");
+    }
+
+    #[tokio::test]
+    async fn a_replay_racing_new_events_delivers_each_once_in_order() {
+        use tokio::io::AsyncBufReadExt;
+        let dir = scratch("replay-race");
+        let (store, publications) = Store::open(&dir.join("state.sqlite")).await.unwrap();
+        let mut service = admitting(&store, 1024);
+        let publisher = tokio::spawn(publish(
+            publications,
+            service.hub.clone(),
+            service.handles.clone(),
+        ));
+        let output = Output::writer(tokio::io::sink());
+        let mut made = 0;
+        let mut make = async |service: &mut Service, count: usize| {
+            for _ in 0..count {
+                let command = create(&format!("B{made}"), &dir);
+                made += 1;
+                let bound = service.admission_sends(&command, &json!(made), 1);
+                let deferred = service
+                    .dispatch(command, 1, &output, json!(made), bound)
+                    .await;
+                assert_eq!(deferred.unwrap_err().code, "deferred");
+                while !service.admissions.is_empty() {
+                    let (_, _, _, result) = service.settle().await;
+                    result.unwrap();
+                }
+            }
+        };
+        // History to page through, then a follower that pages it while
+        // more events commit and publish.
+        make(&mut service, 600).await;
+        let (near, far) = tokio::io::duplex(1 << 20);
+        let follower = Output::writer(near);
+        let sub = service
+            .hub
+            .subscribe(hub::ALL, 2, follower.clone(), 0, None);
+        let paging = tokio::spawn(replay(
+            store.clone(),
+            service.hub.clone(),
+            hub::ALL.to_owned(),
+            sub,
+        ));
+        make(&mut service, 400).await;
+        paging.await.unwrap().unwrap();
+        let last = store
+            .op("last", |db| db.cursor_since(i64::MAX))
+            .await
+            .unwrap();
+        service.hub.published_through(last).await;
+        let mut lines = tokio::io::BufReader::new(far).lines();
+        let mut cursors = Vec::new();
+        let mut live = 0;
+        while let Ok(Ok(Some(line))) =
+            tokio::time::timeout(Duration::from_secs(5), lines.next_line()).await
+        {
+            let event: Value = serde_json::from_str(&line).unwrap();
+            match event["cursor"].as_i64() {
+                _ if event["event"] == "follow_live" => live += 1,
+                Some(cursor) => cursors.push(cursor),
+                None => {}
+            }
+            if live == 1 && cursors.last() == Some(&last) {
+                break;
+            }
+        }
+        assert_eq!(live, 1);
+        assert!(last >= 1000, "{last}");
+        let expected: Vec<i64> = (1..=last).collect();
+        assert_eq!(cursors, expected, "every event once, in order");
         publisher.abort();
         drop(service);
         drop(store);

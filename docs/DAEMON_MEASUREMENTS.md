@@ -6337,6 +6337,98 @@ Several sessions reading at once get more than before in total, since
 reads now run side by side. Each reader connection keeps its own 2 MiB
 page cache and statement cache.
 
+## History reads reach any ancestor in O(log n) (#472)
+
+`history_nodes` and `history_items` used to walk a bot's lineage node by
+node: an oldest-first page ordered the whole ancestry past its floor
+before its `LIMIT`, checking `from` walked from the head to it, and a
+batch of items walked from the head to the oldest one asked for. Each
+node now has a narrow `lineage` row (parent, depth, a skip pointer chosen
+as Bitcoin Core's block index chooses `pskip`, and its turn's start),
+written by the insert that writes the node, so those reads take O(log n)
+point lookups. A page also stops at 256 KiB sent.
+
+A synthetic store of one bot with 2,000 turns of ten 2 KB nodes (20,000
+nodes, 77.5 MiB), release build, main 16a9324 against the branch, two
+alternating runs each (2026-10-31, the cloud container):
+
+| Measure | Main | Branch |
+| --- | ---: | ---: |
+| writes, µs per node (each its own commit) | 906, 956 | 1,008, 1,022 |
+| store size, MiB | 77.5 | 77.7 |
+| newest page of 400, ms | 0.75, 0.74 | 1.06, 0.89 |
+| oldest-first page after the first 10%, ms | 50.5, 48.6 | 1.4, 1.2 |
+| oldest-first page after half, ms | 28.4, 29.1 | 1.3, 1.2 |
+| page from an early node, ms | 44.8, 43.2 | 0.96, 0.86 |
+| one early item, ms | 48.0, 48.1 | 0.61, 0.95 |
+| 100 items spread over the history, ms | 46.9, 58.7 | 4.4, 6.5 |
+
+The deep reads no longer grow with the history: they are 30 to 80 times
+faster here, and the gap widens with depth. A write costs about 7 to 11%
+more, mostly the lineage row's page in the same commit plus a skip walk of
+O(log n) point reads, and storage grows about 10 bytes a node. The newest
+page costs about 0.2 ms more, for sizing the page against its byte budget.
+Stores from before schema 73 place every node when they open, in one pass
+in id order with the places held in memory.
+
+The write side under the hot-path screens, from the Perf workflow on the
+pull request (GitHub runner, base main 30845ba against head 9a49159,
+alternating rounds, medians):
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 45.728 | 46.527 | +1.7% |
+| admission | burst submit p99, ms | 6.214 | 6.152 | -1.0% |
+| completion | release to terminal p99, ms | 16.832 | 17.781 | +5.6% |
+| footprint | idle RSS, MiB | 20.059 | 20.152 | +0.5% |
+| footprint | per idle bot, KiB | 1.506 | 1.42 | -5.7% |
+| footprint | RSS after a turn each, MiB | 27.76 | 28.107 | +1.3% |
+| footprint | CPU per turn, ms | 1.592 | 1.64 | +3.0% |
+| lifecycle | CPU, s | 1.38 | 1.32 | -4.3% |
+| lifecycle | p95 turn, ms | 586.813 | 589.251 | +0.4% |
+| lifecycle | peak RSS, MiB | 26.826 | 26.877 | +0.2% |
+
+Store jobs per turn held at about 7.5 on both sides (the lineage row rides
+the node's own insert, so no job is added), and nothing passed the gate's
+15% line; per-round completion p99s on both sides ran from about 16 to
+20 ms, so its +0.9 ms is inside the noise. The extra per-write work shows in the
+single-commit microbenchmark above and not at fleet scale, where group
+commits carry it.
+
+## Replays off the writer and the subscription lock
+
+A `follow` replays its history in pages before it goes live. Each page
+used to be a job on the storage worker, read while holding the
+subscription's lock, so a client catching up from the first event put
+hundreds of reads in front of every write and every other request that
+needs the worker. Pages now come from the reader pool, sharing the
+observation lane's seats (all but one reader, across every replay at
+once), with no lock held while they read. Only the switch to live stays on
+the worker, as one job that reads at most one event: if an event landed
+since the last page it reads another page, and otherwise it marks the
+follow live, so nothing committed between the two modes is lost.
+
+`bench/fair_queuing.py` gained a `follow` flood: sessions that each follow
+`*` from the first event and wait for `follow_live`. 4-core Linux
+container, 210 bots each with 10 turns of 64 KiB prompts, 4 flooders with
+4 replays each (16 whole-store replays, 132,032 events delivered), probe
+`inspect` (a worker job) p50 / p95 / max in ms, base main 1413f05 against
+the head, two alternating runs each:
+
+| Flood | Base probe | Head probe | Flood, base / head |
+| --- | ---: | ---: | ---: |
+| none | 1.2 / 1.6 / 16.3, 1.3 / 1.7 / 3.7 | 1.1 / 1.4 / 21.1, 1.2 / 1.5 / 5.6 | |
+| 16 replays of `*` | 10.0 / 36.5 / 49.3, 1.4 / 42.9 / 49.3 | 1.2 / 14.5 / 25.7, 1.4 / 16.4 / 20.7 | 1.37, 1.41 / 1.05, 1.13 s |
+| 8,000 `history_nodes` (control) | 1.5 / 2.6 / 5.5, 1.4 / 2.8 / 4.9 | 1.4 / 2.8 / 6.6, 1.4 / 2.7 / 7.9 | 4.27, 4.05 / 4.05, 4.09 s |
+
+The probe's p95 behind the replays falls from about 40 ms to about 15 ms
+and its worst case halves, while the replays themselves finish about 20%
+sooner, since their pages now run side by side. The worker now sees one
+small job per replay, so what is left of the p95 is most likely the
+container's four cores busy encoding and sending 132,000 events beside
+the probe. The history flood, which this change
+does not touch, is the control and holds still.
+
 ## Request bytes read on credit
 
 `bench/ingress_credits.py`: 400 clients connect to one socket daemon and each

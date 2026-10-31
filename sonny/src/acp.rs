@@ -535,9 +535,11 @@ struct Listed {
 /// id such as Bedrock's `global.anthropic.…` is too long to read in the
 /// picker. The full id is in its description, after the file's note.
 fn choice(id: &str, name: Option<&str>, note: Option<&str>) -> Value {
-    let label = match id.split_once('/') {
-        Some((provider, model)) => format!("{} · {provider}", name.unwrap_or(model)),
-        None => name.unwrap_or(id).to_owned(),
+    // The provider's own name for it, else the one Sonny gives it.
+    let label = match (name, crate::models::provider(id)) {
+        (Some(name), Some(provider)) => format!("{name} · {provider}"),
+        (Some(name), None) => name.to_owned(),
+        (None, _) => crate::models::named(id),
     };
     let description = match note {
         Some(note) => format!("{note} ({id})"),
@@ -1970,7 +1972,7 @@ mod tests {
         // Unnamed, by its own id; the file's note comes before the full id.
         assert_eq!(
             choice("openai/gpt-6-sol", None, Some("faster")),
-            json!({"value": "openai/gpt-6-sol", "name": "gpt-6-sol · openai",
+            json!({"value": "openai/gpt-6-sol", "name": "GPT 6 Sol · openai",
                 "description": "faster (openai/gpt-6-sol)"})
         );
     }

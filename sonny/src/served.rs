@@ -776,6 +776,25 @@ async fn called(name: &str, arguments: &Value) -> Answer {
             }
             Ok(said.to_string())
         }
+        crate::asks::TOOL => {
+            // A deadline is a trigger, whose add runs on a runtime of its own.
+            // Its card is in the history of the bot that asked, a side chat
+            // included, so the deadline is that bot's, not its source's.
+            let (arguments, call) = (arguments.clone(), std::env::var("AGENT_CALL").ok());
+            let asker = std::env::var("AGENT_CALL_BOT").unwrap_or(caller);
+            let turn = std::env::var("AGENT_TURN")
+                .ok()
+                .and_then(|t| t.parse().ok());
+            let (Some(call), Some(turn)) = (call, turn) else {
+                return Err(("no_caller", "AGENT_CALL or AGENT_TURN is not set".into()));
+            };
+            tokio::task::spawn_blocking(move || {
+                crate::asks::served(&arguments, &asker, turn, &call)
+            })
+            .await
+            .map_err(|e| ("tool_failed", e.to_string()))?
+            .map_err(|e| ("ask_refused", e))
+        }
         TRIGGERS => {
             // A trigger's add runs on a runtime of its own.
             let arguments = arguments.clone();
@@ -1279,6 +1298,10 @@ async fn answer(client: &Client, call: &Value, me: &Path, store: &Path, socket: 
         .env("AGENT_BOT", str_of(&caller["name"]))
         .env("AGENT_BOT_ID", caller["bot_id"].to_string())
         .env("AGENT_TURN", call["turn"].to_string())
+        .env("AGENT_CALL", str_of(&call["call_id"]))
+        // The bot whose turn made the call, which a side chat's AGENT_BOT
+        // is not: an ask's deadline looks for the call in its history.
+        .env("AGENT_CALL_BOT", bot)
         .env("AGENT_STORE", store)
         .env("AGENT_SOCKET", socket)
         .env("AGENT_MODEL", model)

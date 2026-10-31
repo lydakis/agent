@@ -27,6 +27,9 @@ pub struct Asker {
 pub type Deliver = fn(u64, Output, Value, Result<Value>) -> BoxFuture<'static, bool>;
 
 pub struct Lane {
+    /// Reader seats, shared with follows' replay pages: a read holds one
+    /// while it reads, never while it delivers.
+    seats: std::sync::Arc<tokio::sync::Semaphore>,
     running: JoinSet<bool>,
     askers: HashMap<Id, Asker>,
     waiting: VecDeque<(Asker, BoxFuture<'static, Result<Value>>)>,
@@ -39,6 +42,7 @@ pub struct Lane {
 impl Lane {
     pub fn new(limit: usize, deliver: Deliver) -> Self {
         Lane {
+            seats: std::sync::Arc::new(tokio::sync::Semaphore::new(limit.max(1))),
             running: JoinSet::new(),
             askers: HashMap::new(),
             waiting: VecDeque::new(),
@@ -46,6 +50,11 @@ impl Lane {
             limit: limit.max(1),
             deliver,
         }
+    }
+
+    /// The lane's reader seats, for other observers to share.
+    pub fn seats(&self) -> std::sync::Arc<tokio::sync::Semaphore> {
+        self.seats.clone()
     }
 
     /// Run `read` for `asker` once a seat is free, and answer it; its
@@ -102,10 +111,16 @@ impl Lane {
             && let Some((asker, read)) = self.waiting.pop_front()
         {
             let (session, output, id) = (asker.session, asker.output.clone(), asker.id.clone());
-            let deliver = self.deliver;
+            let (deliver, seats) = (self.deliver, self.seats.clone());
             let task = self
                 .running
-                .spawn(async move { deliver(session, output, id, read.await).await })
+                .spawn(async move {
+                    let answer = {
+                        let _seat = seats.acquire().await.expect("seats are never closed");
+                        read.await
+                    };
+                    deliver(session, output, id, answer).await
+                })
                 .id();
             self.askers.insert(task, asker);
         }
@@ -169,6 +184,21 @@ mod tests {
         assert_eq!(answered(2), [Ok(Value::from("two"))]);
         assert!(lane.is_empty());
         assert!(lane.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_seat_another_observer_holds_is_not_the_lane_s_to_take() {
+        let mut lane = Lane::new(2, noted);
+        let seats = lane.seats();
+        // A replay page holds both seats: the lane's read waits for one.
+        let held = seats.clone().acquire_many_owned(2).await.unwrap();
+        lane.observe(asker(31), async { Ok(Value::from("read")) });
+        let early = tokio::time::timeout(Duration::from_millis(20), lane.next()).await;
+        assert!(early.is_err(), "a read took a seat a replay held");
+        drop(held);
+        let (asker, sent) = lane.next().await.unwrap();
+        assert_eq!((asker.session, sent), (31, true));
+        assert_eq!(seats.available_permits(), 2);
     }
 
     #[tokio::test]

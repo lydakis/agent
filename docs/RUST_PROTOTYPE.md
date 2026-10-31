@@ -1208,12 +1208,20 @@ have none.
 `{"folder", "turns"}`, so a client resolves a path a message names where it was
 written even after the bot moved; a turn whose rows went with a deleted fork
 source is absent. One query reads them for the whole page.
-Membership validation walks the lineage, as `history_items` does. Both operations run
-on the read worker in a consistent snapshot, avoiding the serialized writer.
+A page sends at most 256 KiB: one whose turns ran in many long folders holds
+fewer nodes than `limit`, and `next_from` (or `next_newer`, oldest first)
+continues from where it stopped. Its first node is always listed.
+Each node keeps its place in the history tree in a narrow row beside it
+(`lineage`: its parent, depth, a skip pointer chosen as Bitcoin Core's block
+index chooses one, and the start of its turn), so checking that `from` is in
+the lineage, finding where an oldest-first page starts, and naming a page's
+turn each take O(log n) steps however deep the history is, rather than a walk
+over it. Stores from before schema 73 place every node when they open. Both operations run
+on a reader connection in a consistent snapshot, avoiding the serialized writer.
 The fork can read its shared prefix after its source is deleted.
 
 `history_items` accepts `bot` and 1–400 distinct `nodes`. It validates all IDs
-against that bot's lineage with one ancestry walk and returns a prefix as
+against that bot's lineage through the same skip pointers and returns a prefix as
 `items: [{node: ID, item: VALUE}, ...]` in request order. A prompt a bot's turn
 wrote also carries `from: {bot, turn, bot_id}`, with `bot_id` the identity the bot's name
 held when it wrote it, and one a client sent with an `origin` carries that, so a
@@ -2383,8 +2391,10 @@ until the command ends or the read's time runs out, and the read's result is
 what the command wrote meanwhile. A steer waiting for the boundary keeps the
 read live. Output merges stdout and stderr, as a terminal
 does, keeps its last 64 KiB unread, counting what it drops, and is redacted
-like any other; a secret field's name, cut off at the end of a read, waits
-with its value for the next one, so the value is redacted whole. A
+like any other; a secret field's value, cut off at the end of a read, waits
+for the next one so it is redacted whole, while its name and separator are
+shown at once, so a prompt such as `Password: ` reaches the bot, and the
+next read is redacted as read after them. A
 terminal takes no process slot and no timeout: it runs until
 it exits or is killed, across turns, and `wait` on its handle reports how it
 ended, with what no write read. It takes a `--max-lasting` slot before it
