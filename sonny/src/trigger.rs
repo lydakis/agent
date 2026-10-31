@@ -572,6 +572,25 @@ pub(crate) fn local(epoch: i64) -> Local {
 
 /// The time a local wall-clock time names, when it names one.
 pub(crate) fn epoch_of(at: Local) -> Option<i64> {
+    mktime(at, -1)
+}
+
+/// Every moment a local time names, earliest first: two for a time the
+/// clock goes through twice as daylight saving ends, none for one it
+/// skips.
+pub(crate) fn epochs_of(at: Local) -> Vec<i64> {
+    let mut found: Vec<i64> = [0, 1]
+        .into_iter()
+        .filter_map(|dst| mktime(at, dst))
+        .collect();
+    found.sort_unstable();
+    found.dedup();
+    found
+}
+
+/// `at` as a moment, with daylight saving as `dst` says (-1: as the zone
+/// has it), when it names that local time.
+fn mktime(at: Local, dst: i32) -> Option<i64> {
     // SAFETY: mktime reads and normalizes the struct it is given.
     let epoch = unsafe {
         let mut tm: libc::tm = std::mem::zeroed();
@@ -580,7 +599,7 @@ pub(crate) fn epoch_of(at: Local) -> Option<i64> {
         tm.tm_mday = at.day as i32;
         tm.tm_hour = at.hour as i32;
         tm.tm_min = at.minute as i32;
-        tm.tm_isdst = -1;
+        tm.tm_isdst = dst;
         libc::mktime(&mut tm)
     };
     (epoch != -1 && local(epoch as i64) == at).then_some(epoch as i64)

@@ -989,16 +989,22 @@ pub fn next_after(entries: &[Entry], after: i64) -> Option<i64> {
             let minutes: Vec<u8> = entry.minute.map_or_else(|| (0..60).collect(), |m| vec![m]);
             'hours: for &hour in &hours {
                 for &minute in &minutes {
-                    let Some(at) = trigger::epoch_of(trigger::Local {
+                    let local = trigger::Local {
                         year,
                         month,
                         day,
                         hour,
                         minute,
-                    }) else {
-                        continue;
                     };
-                    if at >= first {
+                    // A time the clock goes through twice as daylight
+                    // saving ends: an entry with a set hour comes at the
+                    // first, as cron runs a job at a set time once; one
+                    // that comes every hour comes at both, as time goes.
+                    let mut ats = trigger::epochs_of(local);
+                    if entry.hour.is_some() {
+                        ats.truncate(1);
+                    }
+                    if let Some(at) = ats.into_iter().find(|at| *at >= first) {
                         best = Some(best.map_or(at, |b| b.min(at)));
                         // Later minutes this hour, and later hours, are later.
                         break 'hours;
@@ -1180,6 +1186,42 @@ mod tests {
         assert_eq!(f.retry, Some(now + AGAIN_AFTER));
         launch("t00000", f, &mut fleet, now + AGAIN_AFTER, &mut failing);
         assert_eq!(f.retry, Some(now + AGAIN_AFTER * 3));
+    }
+
+    /// In a zone with daylight saving, as a child of this test binary, so
+    /// its TZ is no other test's.
+    #[test]
+    fn the_hour_the_clock_repeats_comes_once_for_a_set_time_and_twice_for_every_minute() {
+        if std::env::var_os("AGENT_TEST_DST").is_none() {
+            let me = std::env::current_exe().unwrap();
+            let out = std::process::Command::new(me)
+                .args(["--exact", "scheduler::tests::the_hour_the_clock_repeats_comes_once_for_a_set_time_and_twice_for_every_minute", "--nocapture"])
+                .env("AGENT_TEST_DST", "1")
+                .env("TZ", "America/New_York")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success() && String::from_utf8_lossy(&out.stdout).contains("1 passed"),
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        }
+        // 2026-11-01 01:00 EST, the second 01:00 of that night.
+        let repeated = 1_793_512_800;
+        assert_eq!(trigger::local(repeated).hour, 1);
+        let every_minute = trigger::every("1m", repeated - 120).unwrap();
+        assert_eq!(
+            next_after(&every_minute.entries, repeated),
+            Some(repeated + 60)
+        );
+        // A set time, 01:30, came once already, at its first.
+        let set = trigger::cron("30 1 * * *").unwrap();
+        assert_eq!(
+            next_after(&set.entries, repeated - 3600 + 30 * 60),
+            Some(repeated - 3600 + 30 * 60 + 86_400 + 3600)
+        );
     }
 
     #[test]
