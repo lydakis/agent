@@ -8,12 +8,23 @@ from unittest import mock
 from bench import role_eval
 
 
+def build(tmp):
+    """A stand-in build: setup copies agent and sonny into the run."""
+    bins = Path(tmp) / 'build'
+    bins.mkdir()
+    for name in ('agent', 'sonny'):
+        (bins / name).write_text('#!/bin/sh\n')
+    return bins
+
+
 class SetupTests(unittest.TestCase):
     def test_only_the_models_key_reaches_the_run_and_none_is_written(self):
         with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
                 os.environ, {'ANTHROPIC_API_KEY': 'sk-test-anthropic', 'OPENAI_API_KEY': 'sk-test-openai'}):
             root = Path(tmp) / 'A1'
-            home, repo, env = role_eval.setup(root, '/bin', 'anthropic/claude-opus-5-5')
+            home, repo, env, bins = role_eval.setup(root, build(tmp), 'anthropic/claude-opus-5-5')
+            self.assertEqual(bins, root / 'bin')
+            self.assertTrue((bins / 'sonny').is_file())
             self.assertEqual(env['ANTHROPIC_API_KEY'], 'sk-test-anthropic')
             self.assertNotIn('OPENAI_API_KEY', env)
             self.assertIn('provider = "anthropic"', (home / '.agent/config.toml').read_text())
@@ -23,7 +34,7 @@ class SetupTests(unittest.TestCase):
 
     def test_the_chatgpt_plan_needs_no_key(self):
         with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {'OPENAI_API_KEY': 'sk-test'}):
-            _, _, env = role_eval.setup(Path(tmp) / 'A1', '/bin', 'chatgpt/gpt-6.1-sol')
+            _, _, env, _ = role_eval.setup(Path(tmp) / 'A1', build(tmp), 'chatgpt/gpt-6.1-sol')
             self.assertNotIn('OPENAI_API_KEY', env)
 
     def test_every_planted_step_is_scored(self):
