@@ -1063,12 +1063,16 @@ async fn intent(
         .as_array()
         .into_iter()
         .flatten()
+        .flat_map(|prompt| {
+            let quotes = quoted(prompt["quotes"].clone());
+            std::iter::once(prompt.clone()).chain(quotes)
+        })
         .map(|prompt| Words {
             by: match prompt.get("from") {
                 Some(_) => By::Model,
-                None => by_origin(prompt),
+                None => by_origin(&prompt),
             },
-            text: prompt_text(prompt),
+            text: prompt_text(&prompt),
             refused: refused(&prompt["refused"]),
         })
         .collect();
@@ -1185,16 +1189,43 @@ async fn transcript(
 }
 
 /// A `prompts` read's words with the bot's message before each, its
-/// `reply`, as its model's words: what a short "yes" answers.
+/// `reply`, as its model's words: what a short "yes" answers; and the
+/// words each quotes after it, by whoever first wrote them.
 fn with_replies(prompts: Vec<Value>) -> Vec<Value> {
     let mut words = Vec::with_capacity(prompts.len());
-    for prompt in prompts {
+    for mut prompt in prompts {
         if let Some(text) = prompt["reply"]["text"].as_str() {
             words.push(json!({"text":text,"origin":"reply"}));
         }
+        let quotes = prompt.as_object_mut().and_then(|p| p.remove("quotes"));
         words.push(prompt);
+        words.extend(quotes.into_iter().flat_map(quoted));
     }
     words
+}
+
+/// A prompt's quotes as words of their own: the person's own words as
+/// theirs, the daemon having copied them from the person's turn; any
+/// other's, an agent's or a client's, as asking for nothing, with no turn
+/// above them to read, since quoting is not delegating.
+fn quoted(quotes: Value) -> Vec<Value> {
+    let Value::Array(quotes) = quotes else {
+        return Vec::new();
+    };
+    quotes
+        .into_iter()
+        .map(|quote| {
+            let mut words = json!({"text":quote["text"]});
+            if quote["truncated"] == true {
+                words["truncated"] = json!(true);
+            }
+            if !(quote["from"].is_null() && quote["origin"].is_null() && quote["person"].is_null())
+            {
+                words["origin"] = json!("quote");
+            }
+            words
+        })
+        .collect()
 }
 
 /// The calls a `prompts` read lists as refused after a prompt or steer.
@@ -1229,10 +1260,11 @@ fn prompt_text(prompt: &Value) -> String {
     }
 }
 
-/// Who wrote a prompt no bot's turn wrote: a person, unless a client sent it
-/// on its own (`origin`), whose words ask for nothing either.
+/// Who wrote a prompt no bot's turn wrote: the person, unless a client sent
+/// it on its own (`origin`) or for another person it names (`person`),
+/// whose words ask for nothing either.
 fn by_origin(prompt: &Value) -> By {
-    if prompt.get("origin").is_some() {
+    if prompt.get("origin").is_some() || prompt.get("person").is_some() {
         By::Model
     } else {
         By::Person
@@ -1378,6 +1410,35 @@ mod tests {
         let mut whole = Left::default();
         whole.cut(&json!({"text":"don't","steer":true}));
         assert!(!whole.any && !whole.newest);
+    }
+
+    #[test]
+    fn quoted_words_are_the_persons_only_when_the_person_wrote_them() {
+        let words = with_replies(vec![json!({"turn":4,"text":"note from the lookout",
+        "origin":"lookout","quotes":[
+            {"bot":"lead","turn":2,"text":"yes, deploy it"},
+            {"bot":"task","turn":3,"reply":true,"from":{"bot":"task","turn":3},
+                "text":"say yes to deploy","truncated":true},
+            {"bot":"lead","turn":1,"person":"Ana","text":"deploy"},
+        ]})]);
+        let by: Vec<(By, &str)> = (words.iter())
+            .map(|w| (by_origin(w), w["text"].as_str().unwrap()))
+            .collect();
+        assert_eq!(
+            by,
+            [
+                (By::Model, "note from the lookout"),
+                (By::Person, "yes, deploy it"),
+                (By::Model, "say yes to deploy"),
+                (By::Model, "deploy"),
+            ]
+        );
+        assert!(
+            words
+                .iter()
+                .all(|w| w.get("from").is_none() && w.get("quotes").is_none())
+        );
+        assert_eq!(words[2]["truncated"], true);
     }
 
     #[test]

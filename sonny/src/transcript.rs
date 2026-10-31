@@ -1203,16 +1203,18 @@ pub fn from_outside(origin: Option<&str>) -> &'static str {
     }
 }
 
-/// Who sent a prompt, as the conversation names it: another bot, or what
+/// Who sent a prompt, as the conversation names it: another bot, what
 /// sent it from outside (the commons, an automation) when a client named
-/// itself; none when the person typed it, a `!` command of theirs too.
-/// Sent from outside, it is drawn [`relayed`], as words between agents
-/// are: nothing the person wrote reads as theirs.
-pub fn sender(bot: Option<&str>, origin: Option<&str>) -> Option<String> {
-    match (bot, origin) {
-        (Some(bot), _) => Some(bot.to_owned()),
-        (None, None | Some("shell")) => None,
-        (None, origin) => Some(from_outside(origin).to_owned()),
+/// itself, or another person a client named; none when the person typed
+/// it, a `!` command of theirs too. Sent by any other, it is drawn
+/// [`relayed`], as words between agents are: nothing the person did not
+/// write reads as theirs.
+pub fn sender(bot: Option<&str>, origin: Option<&str>, person: Option<&str>) -> Option<String> {
+    match (bot, origin, person) {
+        (Some(bot), _, _) => Some(bot.to_owned()),
+        (None, None, Some(person)) => Some(person.to_owned()),
+        (None, None | Some("shell"), None) => None,
+        (None, origin, _) => Some(from_outside(origin).to_owned()),
     }
 }
 
@@ -1294,16 +1296,14 @@ pub fn relayed_kind(text: &str, from: Option<&str>) -> &'static str {
 /// Whom a message between agents is from or about: its sender, the tasks
 /// task updates name, the sources that reported.
 pub fn relayed_names(text: &str, from: Option<&str>) -> Vec<String> {
-    if let Some(from) = from {
-        return vec![from.to_owned()];
-    }
+    // News names whom it is about, not what sent it ("a follow").
     if let Some(rest) = text.strip_prefix(FROM_SOURCES) {
         return (sourced(rest).into_iter().skip(1))
             .filter(|source| !source.starts_with('+'))
             .collect();
     }
     let Some(rest) = text.strip_prefix(TASK_UPDATES) else {
-        return Vec::new();
+        return from.map(|from| vec![from.to_owned()]).unwrap_or_default();
     };
     crate::calls::once(rest.lines().filter_map(|line| {
         let (name, _) = line.strip_prefix("- ")?.split_once(": turn:")?;
@@ -2927,6 +2927,7 @@ mod tests {
             "task update",
         ];
         assert_eq!(relayed_names(updates, None), ["a.b"]);
+        assert_eq!(relayed_names(updates, Some("a follow")), ["a.b"]);
         assert_eq!(relayed_names("Look at this", Some("a.c")), ["a.c"]);
         let names = ["a.b", "a.c", "a.b", "a.d"].map(String::from);
         assert_eq!(

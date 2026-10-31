@@ -5241,10 +5241,13 @@ impl App {
             rest = &rest[entries.len().min(rest.len())..];
             items.extend(entries.iter().flat_map(|entry| {
                 let node = entry["node"].as_i64().unwrap_or(0);
-                // Who sent a prompt, when another bot did or a client from
-                // outside (the commons, an automation).
-                let from =
-                    transcript::sender(entry["from"]["bot"].as_str(), entry["origin"].as_str());
+                // Who sent a prompt, when another bot did, a client from
+                // outside (the commons, an automation) or another person.
+                let from = transcript::sender(
+                    entry["from"]["bot"].as_str(),
+                    entry["origin"].as_str(),
+                    entry["person"].as_str(),
+                );
                 responses(&entry["item"]).into_iter().map(move |mut item| {
                     if let Some(from) = from.as_ref().filter(|_| item["role"] == "user") {
                         item["from"] = json!(from);

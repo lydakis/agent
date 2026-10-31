@@ -652,11 +652,27 @@ pub struct TurnOptions {
     /// What sent this prompt when no bot's turn did, in the submitting
     /// client's own words (an app's scheduler, say); none for a person's.
     pub origin: Option<String>,
+    /// The person who wrote this prompt, as the submitting client labels
+    /// them; none with no `from` or `origin` either is the daemon's own
+    /// person, unnamed.
+    pub person: Option<String>,
+    /// Turns whose words the store copies after this prompt's, each with
+    /// who wrote them.
+    pub quotes: Vec<QuoteRef>,
     /// The most input plus output tokens this turn may spend; none is
     /// bounded only by the bot's own budget.
     pub budget_tokens: Option<u64>,
     /// Pictures sent with the prompt, after its words in the user item.
     pub images: Vec<crate::codec::Image>,
+}
+/// A turn whose words a prompt quotes: its prompt, or with `reply` the
+/// last message with text it ended with.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct QuoteRef {
+    pub bot: String,
+    pub turn: i64,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reply: bool,
 }
 /// What a submission does when the bot is busy or the daemon is full.
 /// `Reject` answers `bot_busy` or `active_agent_limit`. `Queue` records the
@@ -1724,7 +1740,7 @@ impl Database {
                 turn INTEGER, turn_seq INTEGER, thinking INTEGER NOT NULL DEFAULT 0,
                 elided INTEGER NOT NULL DEFAULT 0, total_elided INTEGER NOT NULL DEFAULT 0,
                 total_thinking INTEGER NOT NULL DEFAULT 0, pictured INTEGER NOT NULL DEFAULT 0,
-                pictures INTEGER NOT NULL DEFAULT 0);
+                pictures INTEGER NOT NULL DEFAULT 0, written_ms INTEGER);
             CREATE INDEX IF NOT EXISTS nodes_turn_seq ON nodes(turn_seq) WHERE turn_seq IS NOT NULL;
             CREATE UNIQUE INDEX IF NOT EXISTS nodes_turn ON nodes(turn) WHERE turn IS NOT NULL;
             CREATE TABLE IF NOT EXISTS notes(node INTEGER PRIMARY KEY REFERENCES nodes(id),
@@ -1746,7 +1762,7 @@ impl Database {
             CREATE TABLE IF NOT EXISTS declined(node INTEGER PRIMARY KEY REFERENCES nodes(id),
                 item BLOB NOT NULL);
             CREATE TABLE IF NOT EXISTS senders(node INTEGER PRIMARY KEY REFERENCES nodes(id),
-                bot TEXT, bot_id INTEGER, turn INTEGER, origin TEXT);
+                bot TEXT, bot_id INTEGER, turn INTEGER, origin TEXT, person TEXT, quotes TEXT);
             CREATE TABLE IF NOT EXISTS elisions(node INTEGER PRIMARY KEY REFERENCES nodes(id),
                 previous INTEGER REFERENCES elisions(node), through INTEGER NOT NULL,
                 saved INTEGER NOT NULL);
@@ -1809,7 +1825,7 @@ impl Database {
                 delivery TEXT NOT NULL DEFAULT 'reject', expected_turn INTEGER,
                 cached_input_tokens INTEGER NOT NULL DEFAULT 0,
                 from_bot TEXT, from_turn INTEGER, from_id INTEGER, origin TEXT, reasoning TEXT, inherited_reasoning TEXT,
-                bot_model TEXT, bot_reasoning TEXT, images TEXT,
+                bot_model TEXT, bot_reasoning TEXT, images TEXT, person TEXT, quotes TEXT,
                 UNIQUE(bot,request_id));
             CREATE INDEX IF NOT EXISTS turns_bot_id ON turns(bot,id);
             CREATE INDEX IF NOT EXISTS turns_started ON turns(bot,id) WHERE started_ms IS NOT NULL;
@@ -5252,7 +5268,8 @@ impl Database {
         let prior: Option<Prior> = self
             .conn
             .query_row(
-                "SELECT id,prompt,status,workspace,model,delivery,expected_turn,prompt_node,from_bot,from_turn,origin,reasoning,budget_tokens,images
+                "SELECT id,prompt,status,workspace,model,delivery,expected_turn,prompt_node,from_bot,from_turn,origin,reasoning,budget_tokens,images,
+                    person,quotes
                  FROM turns WHERE bot=? AND request_id=?",
                 params![name, request_id],
                 |r| {
@@ -5271,6 +5288,19 @@ impl Database {
                                 _ => None,
                             },
                             origin: r.get(10)?,
+                            person: r.get(14)?,
+                            quotes: match r.get::<_, Option<String>>(15)? {
+                                // Kept with who wrote each and its words;
+                                // a retry names the same turns.
+                                Some(json) => serde_json::from_str(&json).map_err(|e| {
+                                    rusqlite::Error::FromSqlConversionFailure(
+                                        15,
+                                        rusqlite::types::Type::Text,
+                                        Box::new(e),
+                                    )
+                                })?,
+                                None => Vec::new(),
+                            },
                             budget_tokens: r.get::<_, Option<i64>>(12)?.map(|n| n as u64),
                             // Checked by their digest below.
                             images: Vec::new(),
@@ -5306,6 +5336,8 @@ impl Database {
                 expected_turn,
                 from,
                 origin,
+                person,
+                quotes,
                 budget_tokens,
                 images: _,
             } = &saved_options;
@@ -5319,6 +5351,8 @@ impl Database {
                 ("expected_turn", *expected_turn != same.expected_turn),
                 ("from", *from != same.from),
                 ("origin", *origin != same.origin),
+                ("person", *person != same.person),
+                ("quotes", *quotes != same.quotes),
                 ("budget_tokens", *budget_tokens != same.budget_tokens),
                 (
                     "images",
@@ -5381,6 +5415,7 @@ impl Database {
         if let Some(level) = &options.effort {
             bot.family()?.check_effort(level)?;
         }
+        let quotes = self.quote(&options.quotes, prompt.len())?;
         let attach = options.delivery == Delivery::Attach;
         // An attached message runs on no model of its own: it joins
         // whichever call the bot makes next.
@@ -5487,8 +5522,8 @@ impl Database {
             )?
             .query_row([], |r| r.get(0))?;
         tx.prepare_cached(
-            "INSERT INTO turns(id,bot,request_id,prompt,status,workspace,model,delivery,expected_turn,from_bot,from_turn,from_id,origin,reasoning,budget_tokens,images)
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO turns(id,bot,request_id,prompt,status,workspace,model,delivery,expected_turn,from_bot,from_turn,from_id,origin,reasoning,budget_tokens,images,person,quotes)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         )?.execute(
             // Queued work keeps the folder it was sent to even if the bot
             // moves before it starts; a steer without one joins any turn.
@@ -5497,7 +5532,7 @@ impl Database {
                 options.model, options.delivery.name(), options.expected_turn,
                 options.from.as_ref().map(|f| &f.0), options.from.as_ref().map(|f| f.1), from_id, options.origin,
                 options.effort, options.budget_tokens.map(|n| n as i64),
-                stored_images(&options.images)?],
+                stored_images(&options.images)?, options.person, quotes],
         )?;
         if moved {
             tx.prepare_cached("UPDATE bots SET workspace=? WHERE name=?")?
@@ -5527,6 +5562,8 @@ impl Database {
                     .map(|(bot, turn)| (bot.as_str(), *turn)),
                 from_id,
                 options.origin.as_deref(),
+                options.person.as_deref(),
+                quotes.as_deref(),
             );
             (if attach { "attached" } else { "queued" }, data)
         };
@@ -5762,12 +5799,14 @@ impl Database {
         };
         // Each steer's id, item with its pictures and stub, prompt size,
         // whether it was attached (which no pending count holds), and its
-        // pictures' JSON.
+        // pictures' JSON, and its quotes as the turn keeps them once
+        // its item holds their words.
         type Steer = (
             i64,
             (Vec<u8>, Pictured, Option<Vec<u8>>),
             usize,
             bool,
+            Option<String>,
             Option<String>,
         );
         let mut steers: Vec<Steer> = Vec::new();
@@ -5820,22 +5859,19 @@ impl Database {
                 bytes += size;
                 picture_bytes += pictured_size;
                 let id: i64 = row.get(0)?;
-                let (images, sender) = self
+                let (images, (after, quotes)) = self
                     .conn
                     .prepare_cached(
-                        "SELECT images,from_bot,from_turn,origin FROM turns WHERE id=?",
+                        "SELECT images,from_bot,from_turn,origin,person,quotes FROM turns WHERE id=?",
                     )?
                     .query_row([id], |r| {
-                        Ok((r.get::<_, Option<String>>(0)?, sent_by(r, 1)?))
+                        Ok((
+                            r.get::<_, Option<String>>(0)?,
+                            after_words(r, 1, bot.settings.hide_senders)?,
+                        ))
                     })?;
                 let pictures = images_from(images.as_deref())?;
-                let sender = sender.filter(|_| !bot.settings.hide_senders);
-                let prompted = prompt_item(
-                    family,
-                    &row.get::<_, String>(1)?,
-                    sender.as_deref(),
-                    &pictures,
-                )?;
+                let prompted = prompt_item(family, &row.get::<_, String>(1)?, &after, &pictures)?;
                 // Its pictures count at their weight, as the node will.
                 let weight = (prompted.0.len() as i64 - prompted.1.extra) as usize;
                 if weight + 1 > room_bytes || room_items == 0 {
@@ -5844,7 +5880,7 @@ impl Database {
                 }
                 room_bytes -= weight + 1;
                 room_items -= 1;
-                steers.push((id, prompted, size, row.get(4)?, images));
+                steers.push((id, prompted, size, row.get(4)?, images, quotes));
             }
         }
         let mut absorbed = Absorbed {
@@ -5862,10 +5898,11 @@ impl Database {
         let mut steered = Vec::with_capacity(steers.len());
         // Preserve the submitted effort for exact retries; only omitted effort
         // needs a separate execution value when the running turn overrides it.
-        for (steer, prompted, size, was_attached, images) in steers {
+        for (steer, prompted, size, was_attached, images, quotes) in steers {
             let id = prompt_node(&tx, head, &prompted, None)?;
             head = Some(id);
             keep_once(&tx, steer, images.as_deref())?;
+            keep_quotes(&tx, steer, quotes.as_deref(), id)?;
             if size >= PROMPT_SHARE_BYTES {
                 tx.execute("UPDATE turns SET status='steered',finished_ms=?1,prompt='',prompt_node=?2,
                     (workspace,model,inherited_reasoning)=(SELECT COALESCE(s.workspace,t.workspace),COALESCE(s.model,t.model),
@@ -7550,6 +7587,130 @@ impl Database {
     /// What each listed call and earlier prompt counts against `bytes` for
     /// its fields, so many short entries cannot outgrow a reply.
     pub const PROMPTS_ENTRY: usize = 64;
+    /// The most bytes a prompt's words and the words it quotes may have
+    /// together, as many as its words alone may.
+    pub const QUOTED_BYTES: usize = 256 * 1024;
+    /// The words of the turns `quotes` names, in order, each with who
+    /// wrote them, as the turn keeps them until its item holds them: a
+    /// turn's prompt with the turns that prompt quotes after it, still
+    /// each with its writer, or the reply a finished turn ended with,
+    /// which its bot wrote. `None` for no quotes. With the prompt's own
+    /// `words`, they may have `QUOTED_BYTES`.
+    fn quote(&self, quotes: &[QuoteRef], words: usize) -> Result<Option<String>> {
+        if quotes.is_empty() {
+            return Ok(None);
+        }
+        let mut copied = Vec::new();
+        let mut bytes = words;
+        for QuoteRef { bot, turn, reply } in quotes {
+            type Row = (
+                String,
+                Option<String>,
+                Option<String>,
+                Option<i64>,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+            );
+            let row: Option<Row> = self
+                .conn
+                .prepare_cached(
+                    "SELECT t.status,
+                        CASE WHEN t.prompt_node IS NULL THEN t.prompt
+                        ELSE json_extract(CAST(COALESCE(d.item,n.item) AS TEXT),'$.content[0].text') END,
+                        t.from_bot,t.from_turn,t.origin,t.person,t.quotes
+                     FROM turns t LEFT JOIN nodes n ON n.id=t.prompt_node
+                     LEFT JOIN declined d ON d.node=t.prompt_node
+                     WHERE t.id=? AND t.bot=?",
+                )?
+                .query_row(params![turn, bot], |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                    ))
+                })
+                .optional()?;
+            let Some((status, text, from, from_turn, origin, person, nested)) = row else {
+                return Err(
+                    Error::with("quote_not_found", format!("{bot} has no turn {turn}"))
+                        .facts(json!({"bot":bot,"turn":turn})),
+                );
+            };
+            let mut quote = json!({"bot":bot,"turn":turn});
+            if *reply {
+                if status == "steered" {
+                    return Err(Error::with(
+                        "quote_not_found",
+                        format!(
+                            "turn {turn} was a message into another of {bot}'s turns, which replied"
+                        ),
+                    )
+                    .facts(json!({"bot":bot,"turn":turn})));
+                }
+                if turn_status_name(&status) != "finished" {
+                    return Err(Error::with(
+                        "quote_unfinished",
+                        format!("{bot}'s turn {turn} has not ended"),
+                    )
+                    .facts(json!({"bot":bot,"turn":turn})));
+                }
+                let Some(text) = self.reply_text(*turn)? else {
+                    return Err(Error::with(
+                        "quote_not_found",
+                        format!("{bot}'s turn {turn} ended with no reply"),
+                    )
+                    .facts(json!({"bot":bot,"turn":turn})));
+                };
+                quote["reply"] = json!(true);
+                authored(&mut quote, Some((bot.clone(), *turn)), None, None);
+                bytes += text.len();
+                quote["text"] = json!(text);
+                copied.push(quote);
+            } else {
+                let text = text.unwrap_or_default();
+                authored(&mut quote, from.zip(from_turn), origin, person);
+                bytes += text.len();
+                quote["text"] = json!(text);
+                copied.push(quote);
+                for inner in quoted(&self.conn, nested.as_deref())? {
+                    bytes += inner["text"].as_str().map_or(0, str::len);
+                    copied.push(inner);
+                }
+            }
+            if bytes > Self::QUOTED_BYTES {
+                return Err(Error::with(
+                    "quote_too_large",
+                    format!(
+                        "a prompt and the words it quotes may have {} bytes together",
+                        Self::QUOTED_BYTES
+                    ),
+                )
+                .facts(json!({"limit":Self::QUOTED_BYTES})));
+            }
+        }
+        Ok(Some(serde_json::to_string(&copied)?))
+    }
+    /// The last message with text a turn streamed, whole: what it ended
+    /// with.
+    fn reply_text(&self, turn: i64) -> Result<Option<String>> {
+        let mut items = self.conn.prepare_cached(
+            "SELECT n.item FROM events e JOIN nodes n ON n.id=json_extract(e.data,'$.node')
+             WHERE e.turn=? AND e.kind='message' ORDER BY e.id DESC",
+        )?;
+        let mut rows = items.query([turn])?;
+        while let Some(r) = rows.next()? {
+            let text = assistant_text(&serde_json::from_slice(&r.get::<_, Vec<u8>>(0)?)?);
+            if !text.trim().is_empty() {
+                return Ok(Some(text));
+            }
+        }
+        Ok(None)
+    }
     /// The most of the bot's last message before a turn that a `prompts`
     /// read returns, from its end.
     pub const PROMPTS_REPLY: usize = 2048;
@@ -7579,7 +7740,7 @@ impl Database {
             .prepare_cached(
                 "SELECT t.status,COALESCE(t.workspace,b.workspace),
                     CASE WHEN t.prompt_node IS NULL THEN t.prompt ELSE json_extract(CAST(n.item AS TEXT),'$.content[0].text') END,
-                    t.from_bot,t.from_turn,t.origin
+                    t.from_bot,t.from_turn,t.origin,t.person,t.quotes
                  FROM turns t JOIN bots b ON b.name=t.bot LEFT JOIN nodes n ON n.id=t.prompt_node
                  WHERE t.id=? AND t.bot=?",
             )?
@@ -7587,19 +7748,16 @@ impl Database {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, Option<String>>(1)?,
-                    r.get::<_, Option<String>>(2)?,
-                    r.get::<_, Option<String>>(3)?,
-                    r.get::<_, Option<i64>>(4)?,
-                    r.get::<_, Option<String>>(5)?,
+                    Words::read(r, 2)?,
                 ))
             })
             .optional()?;
-        let Some((status, workspace, text, from, from_turn, origin)) = row else {
+        let Some((status, workspace, words)) = row else {
             self.inspect(name)?;
             return fail("turn_not_found");
         };
         let mut left = bytes;
-        let mut first = prompt_entry(turn, text, from, from_turn, origin, &mut left);
+        let mut first = self.prompt_entry(turn, words, &mut left)?;
         // What the bot last said before the words: what a person's short
         // answer, such as "yes", answers.
         let previous: Option<i64> = self
@@ -7622,25 +7780,18 @@ impl Database {
         let mut since = 0;
         let mut steer = self.conn.prepare_cached(
             "SELECT CASE WHEN t.prompt_node IS NULL THEN t.prompt ELSE json_extract(CAST(n.item AS TEXT),'$.content[0].text') END,
-                t.from_bot,t.from_turn,t.origin
+                t.from_bot,t.from_turn,t.origin,t.person,t.quotes
              FROM turns t LEFT JOIN nodes n ON n.id=t.prompt_node WHERE t.id=?",
         )?;
         for row in steers.query_map([turn], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))? {
             let (id, steered) = row?;
-            let (text, from, from_turn, origin) = steer.query_row([id], |r| {
-                Ok((
-                    r.get::<_, Option<String>>(0)?,
-                    r.get::<_, Option<String>>(1)?,
-                    r.get::<_, Option<i64>>(2)?,
-                    r.get::<_, Option<String>>(3)?,
-                ))
-            })?;
+            let words = steer.query_row([id], |r| Words::read(r, 0))?;
             if left < Self::PROMPTS_ENTRY {
                 prompts_more = true;
                 break;
             }
             left -= Self::PROMPTS_ENTRY;
-            let mut entry = prompt_entry(id, text, from, from_turn, origin, &mut left);
+            let mut entry = self.prompt_entry(id, words, &mut left)?;
             entry["steer"] = json!(true);
             if let Some(reply) = self.reply(turn, since, steered, &mut left)? {
                 entry["reply"] = reply;
@@ -7730,8 +7881,9 @@ impl Database {
         let mut earlier = Vec::new();
         let mut more = false;
         let mut statement = self.conn.prepare_cached(
-            "SELECT t.id,CASE WHEN t.prompt_node IS NULL THEN t.prompt ELSE json_extract(CAST(n.item AS TEXT),'$.content[0].text') END,
-                t.from_bot,t.from_turn,t.status='steered',t.origin
+            "SELECT t.id,t.status='steered',
+                CASE WHEN t.prompt_node IS NULL THEN t.prompt ELSE json_extract(CAST(n.item AS TEXT),'$.content[0].text') END,
+                t.from_bot,t.from_turn,t.origin,t.person,t.quotes
              FROM turns t LEFT JOIN nodes n ON n.id=t.prompt_node
              WHERE t.bot=? AND t.id<? AND (t.started_ms IS NOT NULL OR t.status='steered')
              ORDER BY t.id DESC",
@@ -7743,15 +7895,8 @@ impl Database {
                 break;
             }
             left -= Self::PROMPTS_ENTRY;
-            let mut entry = prompt_entry(
-                r.get(0)?,
-                r.get(1)?,
-                r.get(2)?,
-                r.get(3)?,
-                r.get(5)?,
-                &mut left,
-            );
-            if r.get::<_, bool>(4)? {
+            let mut entry = self.prompt_entry(r.get(0)?, Words::read(r, 2)?, &mut left)?;
+            if r.get::<_, bool>(1)? {
                 entry["steer"] = json!(true);
             }
             let steer = entry["steer"] == true;
@@ -7767,6 +7912,36 @@ impl Database {
             json!({"bot":name,"turn":turn,"status":turn_status_name(&status),"workspace":workspace,
             "prompts":prompts,"prompts_more":prompts_more,"calls":calls,"calls_more":calls_more,"earlier":earlier,"more":more}),
         )
+    }
+    /// One prompt of a `prompts` read, cut to the budget left: its words,
+    /// who wrote them, and the words it quotes, each with who wrote them.
+    fn prompt_entry(&self, turn: i64, words: Words, left: &mut usize) -> Result<Value> {
+        let Words {
+            text,
+            from,
+            origin,
+            person,
+            quotes,
+        } = words;
+        let mut text = text.unwrap_or_default();
+        let truncated = cut(&mut text, left);
+        let mut entry = json!({"turn":turn,"text":text});
+        if truncated {
+            entry["truncated"] = json!(true);
+        }
+        authored(&mut entry, from, origin, person);
+        let mut quotes = quoted(&self.conn, quotes.as_deref())?;
+        for quote in &mut quotes {
+            let mut text = quote["text"].as_str().unwrap_or_default().to_owned();
+            if cut(&mut text, left) {
+                quote["truncated"] = json!(true);
+            }
+            quote["text"] = json!(text);
+        }
+        if !quotes.is_empty() {
+            entry["quotes"] = json!(quotes);
+        }
+        Ok(entry)
     }
     /// The last message with text `turn` streamed between two of its events, as
     /// `{text}` with its end kept: at most `PROMPTS_REPLY` bytes, or the
@@ -9429,12 +9604,15 @@ impl Database {
         let mut nodes = Vec::with_capacity(limit);
         let mut statement = self
             .conn
-            .prepare_cached("SELECT parent,turn FROM nodes WHERE id=?")?;
+            .prepare_cached("SELECT parent,turn,written_ms FROM nodes WHERE id=?")?;
         let mut unassigned = 0;
         while let Some(id) = next.filter(|id| *id >= floor) {
-            let (parent, turn): (Option<i64>, Option<i64>) =
-                statement.query_row([id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            let (parent, turn, written): (Option<i64>, Option<i64>, Option<i64>) =
+                statement.query_row([id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
             nodes.push(json!({"node":id,"turn":null}));
+            if let Some(written) = written {
+                nodes.last_mut().expect("just pushed")["written_ms"] = json!(written);
+            }
             if let Some(turn) = turn {
                 for node in &mut nodes[unassigned..] {
                     node["turn"] = json!(turn);
@@ -9453,8 +9631,8 @@ impl Database {
             let Some(id) = ancestor else {
                 break;
             };
-            let (parent, turn): (Option<i64>, Option<i64>) =
-                statement.query_row([id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            let (parent, turn, _): (Option<i64>, Option<i64>, Option<i64>) =
+                statement.query_row([id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
             if let Some(turn) = turn {
                 for node in &mut nodes[unassigned..] {
                     node["turn"] = json!(turn);
@@ -9528,9 +9706,10 @@ impl Database {
         // A prompt another bot's turn or a named client sent says so. The
         // bound is on the item as read, its pictures left out.
         let mut query = self.conn.prepare_cached(&format!(
-            "SELECT CASE WHEN length(n.item)<=?2 THEN n.item END,s.bot,s.turn,s.bot_id,s.origin
-             FROM (SELECT id,{PICTURELESS} AS item FROM
-                (SELECT n.id,COALESCE(d.item,n.item) AS item FROM nodes n LEFT JOIN declined d ON d.node=n.id WHERE n.id=?1)) n
+            "SELECT CASE WHEN length(n.item)<=?2 THEN n.item END,s.bot,s.turn,s.bot_id,s.origin,
+                s.person,s.quotes,n.written_ms
+             FROM (SELECT id,{PICTURELESS} AS item,written_ms FROM
+                (SELECT n.id,COALESCE(d.item,n.item) AS item,n.written_ms FROM nodes n LEFT JOIN declined d ON d.node=n.id WHERE n.id=?1)) n
              LEFT JOIN senders s ON s.node=n.id"
         ))?;
         for &node in wanted {
@@ -9540,20 +9719,39 @@ impl Database {
                 Option<i64>,
                 Option<i64>,
                 Option<String>,
+                Option<String>,
+                Option<String>,
+                Option<i64>,
             );
-            let (raw, from, from_turn, bot_id, origin): Row = query
+            let (raw, from, from_turn, bot_id, origin, person, quotes, written): Row = query
                 .query_row(params![node, maximum as i64], |r| {
-                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                        r.get(7)?,
+                    ))
                 })?;
             let mut entry = match raw {
                 Some(raw) => json!({"node":node,"item":serde_json::from_slice::<Value>(&raw)?}),
                 None => json!({"node":node,"error":"item_too_large"}),
             };
+            // When it was written: none for items older than the store
+            // keeping it.
+            if let Some(written) = written {
+                entry["written_ms"] = json!(written);
+            }
             sender_fields(
                 &mut entry,
                 from.as_deref().zip(from_turn),
                 bot_id,
                 origin.as_deref(),
+                person.as_deref(),
+                quotes.as_deref(),
             );
             let mut size = serde_json::to_vec(&entry)?.len();
             // Leave room for the protocol envelope, including extra escaping
@@ -10561,27 +10759,40 @@ fn event(conn: &Connection, bot: &str, turn: Option<i64>, kind: &str, data: Valu
 /// sender to `data`, the event that puts the node on the lineage.
 fn keep_sender(tx: &Connection, turn: i64, node: i64, data: &mut Value) -> Result<()> {
     tx.prepare_cached(
-        "INSERT INTO senders(node,bot,bot_id,turn,origin)
-         SELECT ?2,t.from_bot,t.from_id,t.from_turn,t.origin
-         FROM turns t WHERE t.id=?1 AND (t.from_bot IS NOT NULL OR t.origin IS NOT NULL)
-         RETURNING bot,turn,bot_id,origin",
+        "INSERT INTO senders(node,bot,bot_id,turn,origin,person,quotes)
+         SELECT ?2,t.from_bot,t.from_id,t.from_turn,t.origin,t.person,t.quotes
+         FROM turns t WHERE t.id=?1 AND (t.from_bot IS NOT NULL OR t.origin IS NOT NULL
+            OR t.person IS NOT NULL OR t.quotes IS NOT NULL)
+         RETURNING bot,turn,bot_id,origin,person,quotes",
     )?
     .query_row(params![turn, node], |r| {
         let (from, origin): (Option<String>, Option<String>) = (r.get(0)?, r.get(3)?);
+        let (person, quotes): (Option<String>, Option<String>) = (r.get(4)?, r.get(5)?);
         let from = from.as_deref().zip(r.get::<_, Option<i64>>(1)?);
-        sender_fields(data, from, r.get(2)?, origin.as_deref());
+        sender_fields(
+            data,
+            from,
+            r.get(2)?,
+            origin.as_deref(),
+            person.as_deref(),
+            quotes.as_deref(),
+        );
         Ok(())
     })
     .optional()?;
     Ok(())
 }
-/// Who sent a prompt, as events and reads name it: another bot's turn, or
-/// what the submitting client called itself.
+/// Who sent a prompt, as events and reads name it: another bot's turn,
+/// what the submitting client called itself, or the person the client
+/// says wrote it; and the turns it quotes, each with who wrote it and,
+/// once the prompt is an item, where in the item its words are.
 fn sender_fields(
     data: &mut Value,
     from: Option<(&str, i64)>,
     bot_id: Option<i64>,
     origin: Option<&str>,
+    person: Option<&str>,
+    quotes: Option<&str>,
 ) {
     if let Some((bot, turn)) = from {
         data["from"] = json!({"bot":bot,"turn":turn,"bot_id":bot_id});
@@ -10589,21 +10800,141 @@ fn sender_fields(
     if let Some(origin) = origin {
         data["origin"] = json!(origin);
     }
+    if let Some(person) = person {
+        data["person"] = json!(person);
+    }
+    if let Some(Value::Array(mut quotes)) = quotes.and_then(|q| serde_json::from_str(q).ok()) {
+        for quote in &mut quotes {
+            if let Some(quote) = quote.as_object_mut() {
+                quote.remove("text");
+                quote.remove("node");
+            }
+        }
+        data["quotes"] = Value::Array(quotes);
+    }
 }
-/// The line a prompt carries to the model after its words when another
-/// bot's turn or a named client sent it, read from a turn's `from_bot`,
-/// `from_turn` and `origin` at `at`, so the model does not take it for a
-/// person's.
-fn sent_by(r: &rusqlite::Row, at: usize) -> rusqlite::Result<Option<String>> {
-    let (bot, turn, origin): (Option<String>, Option<i64>, Option<String>) =
-        (r.get(at)?, r.get(at + 1)?, r.get(at + 2)?);
-    Ok(match (bot, turn, origin) {
-        (Some(bot), Some(turn), _) => Some(format!(
+/// Who wrote words, as a prompt and a quote record it: another bot's
+/// turn, a client by its own name, or a person, named or not.
+fn authored(
+    entry: &mut Value,
+    from: Option<(String, i64)>,
+    origin: Option<String>,
+    person: Option<String>,
+) {
+    if let Some((bot, turn)) = from {
+        entry["from"] = json!({"bot":bot,"turn":turn});
+    } else if let Some(origin) = origin {
+        entry["origin"] = json!(origin);
+    } else if let Some(person) = person {
+        entry["person"] = json!(person);
+    }
+}
+/// Who wrote a quote, as the line before its words says it.
+fn quote_author(quote: &Value) -> String {
+    let from = &quote["from"];
+    if let (Some(bot), Some(turn)) = (from["bot"].as_str(), from["turn"].as_i64()) {
+        // A reply is its own turn's.
+        return match quote["reply"] == true && quote["bot"] == bot && quote["turn"] == turn {
+            true => format!("written by the agent {bot}"),
+            false => format!("written by the agent {bot} in turn:{bot}/{turn}"),
+        };
+    }
+    match (quote["origin"].as_str(), quote["person"].as_str()) {
+        (Some(origin), _) => format!("sent by {origin}"),
+        (None, Some(person)) => format!("written by {person}"),
+        (None, None) => "written by a person".to_owned(),
+    }
+}
+/// What a prompt's item carries after its words, read from a turn's
+/// `from_bot`, `from_turn`, `origin`, `person` and `quotes` at `at`: a line
+/// saying who sent it when another bot's turn, a named client or a named
+/// person did, so the model does not take it for its own person's; then
+/// each quote's words, after a line saying whose they are. `hide` leaves
+/// both kinds of line out. Also the quotes as the turn keeps them once
+/// its item holds their words: where in the item each is, in place of
+/// its text.
+fn after_words(
+    r: &rusqlite::Row,
+    at: usize,
+    hide: bool,
+) -> rusqlite::Result<(Vec<String>, Option<String>)> {
+    let bot: Option<String> = r.get(at)?;
+    let turn: Option<i64> = r.get(at + 1)?;
+    let origin: Option<String> = r.get(at + 2)?;
+    let person: Option<String> = r.get(at + 3)?;
+    let quotes: Option<String> = r.get(at + 4)?;
+    let line = match (bot, turn, origin, person) {
+        (Some(bot), Some(turn), _, _) => Some(format!(
             "[Written by the agent {bot} in turn:{bot}/{turn}, not by a person.]"
         )),
-        (_, _, Some(origin)) => Some(format!("[Sent by {origin}.]")),
+        (_, _, Some(origin), _) => Some(format!("[Sent by {origin}.]")),
+        (_, _, None, Some(person)) => Some(format!("[Written by {person}.]")),
         _ => None,
-    })
+    };
+    let mut parts: Vec<String> = line.filter(|_| !hide).into_iter().collect();
+    let Some(quotes) = quotes else {
+        return Ok((parts, None));
+    };
+    let bad = |e: serde_json::Error| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+    };
+    let mut quotes: Vec<Value> = serde_json::from_str(&quotes).map_err(bad)?;
+    for quote in &mut quotes {
+        if !hide {
+            let what = match quote["reply"] == true {
+                true => "the reply of turn",
+                false => "turn",
+            };
+            parts.push(format!(
+                "[Quoted from {what}:{}/{}, {}:]",
+                quote["bot"].as_str().unwrap_or_default(),
+                quote["turn"],
+                quote_author(quote)
+            ));
+        }
+        let text = match quote.as_object_mut().and_then(|q| q.remove("text")) {
+            Some(Value::String(text)) => text,
+            _ => String::new(),
+        };
+        parts.push(text);
+        // The words follow the prompt's own, which are the item's first.
+        quote["at"] = json!(parts.len());
+    }
+    Ok((parts, Some(serde_json::to_string(&quotes).map_err(bad)?)))
+}
+/// A turn's quotes with their words, which the turn keeps until its item
+/// holds them and the item keeps after.
+fn quoted(conn: &Connection, quotes: Option<&str>) -> Result<Vec<Value>> {
+    let Some(quotes) = quotes else {
+        return Ok(Vec::new());
+    };
+    let mut quotes: Vec<Value> = serde_json::from_str(quotes)?;
+    let mut item: Option<(i64, Value)> = None;
+    for quote in &mut quotes {
+        let Some(quote) = quote.as_object_mut() else {
+            continue;
+        };
+        let (Some(at), Some(node)) = (quote.remove("at"), quote.remove("node")) else {
+            continue;
+        };
+        let node = node.as_i64().unwrap_or_default();
+        if item.as_ref().is_none_or(|(read, _)| *read != node) {
+            let raw: String = conn
+                .prepare_cached(
+                    "SELECT CAST(COALESCE(d.item,n.item) AS TEXT) FROM nodes n
+                     LEFT JOIN declined d ON d.node=n.id WHERE n.id=?",
+                )?
+                .query_row([node], |r| r.get(0))?;
+            item = Some((node, serde_json::from_str(&raw)?));
+        }
+        let text = (item.as_ref())
+            .and_then(|(_, item)| {
+                item["content"][at.as_u64().unwrap_or(0) as usize]["text"].as_str()
+            })
+            .unwrap_or_default();
+        quote.insert("text".into(), json!(text));
+    }
+    Ok(quotes)
 }
 /// Put a turn's user item on the lineage and mark the bot busy with it,
 /// adding who sent it to `data`, the turn's `accepted` event.
@@ -10614,16 +10945,21 @@ fn start_locked(
     prompt: &str,
     data: &mut Value,
 ) -> Result<Option<i64>> {
-    let (images, sender) = tx
-        .prepare_cached("SELECT images,from_bot,from_turn,origin FROM turns WHERE id=?")?
+    let (images, (after, quotes)) = tx
+        .prepare_cached(
+            "SELECT images,from_bot,from_turn,origin,person,quotes FROM turns WHERE id=?",
+        )?
         .query_row([turn], |r| {
-            Ok((r.get::<_, Option<String>>(0)?, sent_by(r, 1)?))
+            Ok((
+                r.get::<_, Option<String>>(0)?,
+                after_words(r, 1, bot.settings.hide_senders)?,
+            ))
         })?;
     let pictures = images_from(images.as_deref())?;
-    let sender = sender.filter(|_| !bot.settings.hide_senders);
-    let prompted = prompt_item(bot.family()?, prompt, sender.as_deref(), &pictures)?;
+    let prompted = prompt_item(bot.family()?, prompt, &after, &pictures)?;
     let head = prompt_node(tx, bot.head, &prompted, Some(turn))?;
     keep_once(tx, turn, images.as_deref())?;
+    keep_quotes(tx, turn, quotes.as_deref(), head)?;
     data["node"] = json!(head);
     keep_sender(tx, turn, head, data)?;
     if prompt.len() >= PROMPT_SHARE_BYTES {
@@ -10681,6 +11017,19 @@ fn keep_once(tx: &Connection, turn: i64, images: Option<&str>) -> Result<()> {
     if let Some(json) = images.filter(|json| json.starts_with('[')) {
         tx.prepare_cached("UPDATE turns SET images=? WHERE id=?")?
             .execute(params![pictures_digest(json), turn])?;
+    }
+    Ok(())
+}
+/// Once a turn's prompt is a node, its quotes' words live there: the turn
+/// keeps which node and where in its item each is.
+fn keep_quotes(tx: &Connection, turn: i64, quotes: Option<&str>, node: i64) -> Result<()> {
+    if let Some(quotes) = quotes {
+        let mut quotes: Vec<Value> = serde_json::from_str(quotes)?;
+        for quote in &mut quotes {
+            quote["node"] = json!(node);
+        }
+        tx.prepare_cached("UPDATE turns SET quotes=? WHERE id=?")?
+            .execute(params![serde_json::to_string(&quotes)?, turn])?;
     }
     Ok(())
 }
@@ -11552,6 +11901,25 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
         // its output. None did.
         conn.execute_batch("ALTER TABLE answers ADD COLUMN parts TEXT;")?;
     }
+    // 66 -> 67: a prompt names the person who wrote it and the turns it
+    // quotes. No prompt did. Each item keeps when it was written; when
+    // older ones were is not known.
+    for (table, column, kind) in [
+        ("turns", "person", "TEXT"),
+        ("turns", "quotes", "TEXT"),
+        ("senders", "person", "TEXT"),
+        ("senders", "quotes", "TEXT"),
+        ("nodes", "written_ms", "INTEGER"),
+    ] {
+        if conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)
+             AND NOT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name=?2)",
+            [table, column],
+            |r| r.get::<_, bool>(0),
+        )? {
+            conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {kind};"))?;
+        }
+    }
     Ok(())
 }
 /// 53 -> 54: a turn's denial count became a window of its last decided
@@ -11673,27 +12041,27 @@ fn attach(entries: &mut [Value], after: i64, call: Value) {
         }
     }
 }
-/// One prompt of a `prompts` read, cut to the budget left.
-fn prompt_entry(
-    turn: i64,
+/// A prompt's words and who wrote them, as a `prompts` read takes them
+/// from a turn's row: its text, `from_bot`, `from_turn`, `origin`,
+/// `person` and `quotes`.
+struct Words {
     text: Option<String>,
-    from: Option<String>,
-    from_turn: Option<i64>,
+    from: Option<(String, i64)>,
     origin: Option<String>,
-    left: &mut usize,
-) -> Value {
-    let mut text = text.unwrap_or_default();
-    let truncated = cut(&mut text, left);
-    let mut entry = json!({"turn":turn,"text":text});
-    if truncated {
-        entry["truncated"] = json!(true);
+    person: Option<String>,
+    quotes: Option<String>,
+}
+impl Words {
+    fn read(r: &rusqlite::Row, at: usize) -> rusqlite::Result<Self> {
+        let from: Option<String> = r.get(at + 1)?;
+        Ok(Self {
+            text: r.get(at)?,
+            from: from.zip(r.get::<_, Option<i64>>(at + 2)?),
+            origin: r.get(at + 3)?,
+            person: r.get(at + 4)?,
+            quotes: r.get(at + 5)?,
+        })
     }
-    if let (Some(bot), Some(turn)) = (from, from_turn) {
-        entry["from"] = json!({"bot":bot,"turn":turn});
-    } else if let Some(origin) = origin {
-        entry["origin"] = json!(origin);
-    }
-    entry
 }
 fn first_line(prompt: &str, limit: usize) -> String {
     let line = prompt.lines().next().unwrap_or("").trim();
@@ -11883,16 +12251,16 @@ impl Pictured {
 fn prompt_item(
     family: Family,
     prompt: &str,
-    sender: Option<&str>,
+    after: &[String],
     images: &[crate::codec::Image],
 ) -> Result<(Vec<u8>, Pictured, Option<Vec<u8>>)> {
-    let item = family.user_item_from(prompt, sender, images)?;
+    let item = family.user_item_from(prompt, after, images)?;
     let pictured = Pictured::of(images);
     let stub = match images.len() {
         0 => None,
         count => {
             let weight = (item.len() as i64 - pictured.extra) as usize;
-            super::context::prompt_stub(family, prompt, sender, count, weight)?
+            super::context::prompt_stub(family, prompt, after, count, weight)?
         }
     };
     Ok((item, pictured, stub))
@@ -11977,8 +12345,8 @@ fn insert_node(
     // counter write for every message. Callers already hold a transaction.
     conn.prepare_cached(
         "INSERT INTO nodes(id,parent,item,total_bytes,depth,turn,turn_seq,thinking,elided,total_elided,
-            total_thinking,pictured,pictures)
-         SELECT MAX(last_id,COALESCE((SELECT MAX(id) FROM nodes),0))+1,?,?,?,?,?,?,?,?,?,?,?,?
+            total_thinking,pictured,pictures,written_ms)
+         SELECT MAX(last_id,COALESCE((SELECT MAX(id) FROM nodes),0))+1,?,?,?,?,?,?,?,?,?,?,?,?,?
          FROM node_sequence WHERE singleton=1",
     )?
     .execute(params![
@@ -11993,7 +12361,8 @@ fn insert_node(
         saved + elided,
         thought + thinking,
         pictured.extra,
-        pictured.count
+        pictured.count,
+        epoch_ms()
     ])?;
     Ok(conn.last_insert_rowid())
 }

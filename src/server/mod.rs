@@ -389,6 +389,14 @@ enum Command {
         /// What sent it when no bot's turn did, as the client names itself
         /// (a name's characters); absent for a person.
         origin: Option<String>,
+        /// The person who wrote it, as the client labels them (a name's
+        /// characters); absent with no `from` or `origin` is the daemon's
+        /// own person. Not verified.
+        person: Option<String>,
+        /// Turns whose words the daemon copies after the prompt's, each
+        /// with who wrote them: a turn's prompt, or with `reply` the reply
+        /// it ended with.
+        quotes: Option<Vec<agent_runtime::store::QuoteRef>>,
         /// The most input plus output tokens this turn may spend, beside
         /// the bot's own budget; absent leaves only that.
         budget_tokens: Option<u64>,
@@ -867,6 +875,9 @@ fn settle_step(handles: &Handles, bot: &str, turn: i64, stepped: Stepped) -> Opt
 /// The most bytes a prompt's pictures may have together, decoded: what
 /// Anthropic takes for one image, so one alone always fits.
 const IMAGES_BYTES: usize = 5 << 20;
+/// The most turns one prompt may quote; their words are bounded with its
+/// own.
+const MAX_QUOTES: usize = 64;
 /// The most pictures one prompt, or one tool result, may carry.
 const IMAGES: usize = 20;
 
@@ -2064,12 +2075,16 @@ impl Service {
                 workspace,
                 from,
                 origin,
+                person,
                 ..
             } => {
                 // What it sends reads as the caller's, never a person's or
                 // another bot's.
                 if from.as_ref().is_some_and(|author| author.bot != me.name) {
                     return refuse("send a message as another bot");
+                }
+                if person.is_some() {
+                    return refuse("send a message as a person");
                 }
                 // Named once, as the request names it, so a retry of the
                 // same request is the same request.
@@ -4027,6 +4042,8 @@ impl Service {
                 expected_turn,
                 from,
                 origin,
+                person,
+                quotes,
                 budget_tokens,
                 images,
             } => {
@@ -4045,6 +4062,29 @@ impl Service {
                         code: "invalid_origin".into(),
                         ..e
                     })?;
+                }
+                if let Some(person) = &person {
+                    if from.is_some() || origin.is_some() {
+                        return fail_with(
+                            "invalid_person",
+                            "person, from and origin are mutually exclusive",
+                        );
+                    }
+                    name("person", person).map_err(|e| Error {
+                        code: "invalid_person".into(),
+                        ..e
+                    })?;
+                }
+                let quotes = quotes.unwrap_or_default();
+                if quotes.len() > MAX_QUOTES {
+                    return fail_with(
+                        "invalid_quote",
+                        format!("a prompt may quote up to {MAX_QUOTES} turns"),
+                    );
+                }
+                if let Some(quote) = quotes.iter().find(|quote| quote.turn < 1) {
+                    return Err(Error::with("invalid_quote", "a quoted turn is 1 or more")
+                        .facts(json!({"bot":quote.bot,"turn":quote.turn})));
                 }
                 if prompt.len() > 256 * 1024 {
                     return fail_with("prompt_limit", "prompt may be up to 262144 bytes");
@@ -4101,6 +4141,8 @@ impl Service {
                     expected_turn,
                     from: from.map(|author| (author.bot, author.turn)),
                     origin,
+                    person,
+                    quotes,
                     budget_tokens,
                     images,
                 };
@@ -5335,6 +5377,8 @@ mod tests {
             expected_turn: None,
             from: None,
             origin: None,
+            person: None,
+            quotes: None,
             budget_tokens: None,
             images: None,
         }

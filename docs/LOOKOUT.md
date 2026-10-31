@@ -231,19 +231,31 @@ the note until the next turn.
 ## The note
 
 One message, queued (or steered, for the person's words mid-turn), with
-no origin:
+the origin `lookout.tasks`, so the approver reads its words as asking for
+nothing. The person's words in a task are not retyped: the note quotes
+their turns (`quotes`), and the daemon copies each in after the note with
+a line naming the turn and who wrote it, which the approver reads as the
+person's own. A quote the daemon refuses (its task deleted meanwhile, or
+too long) sends the note again naming those turns by their handles alone.
+At most 64 quotes go in one note; the rest wait for the next.
 
 ```
 Task updates: what happened in your tasks since you last heard; the wait tool reads each turn by its handle.
-- calc.docs: turn:calc.docs/3, the person wrote: "Use tabs."
+- calc.docs: turn:calc.docs/3, the person wrote the words quoted from it below
 - calc.api: turn:calc.api/4, calc.fix wrote in it
 - calc.fix: turn:calc.fix/5 completed, asked by you, and replied:
   > Fixed avg: it skips empty lists now, with a test.
 The person asked for these in the task themselves, so they are theirs:
 - calc.ui: turn:calc.ui/2 completed, asked by the person
-A quoted message is the person's own words.
+The words quoted below are the person's own, from the turns named.
 Lines marked > are a task's own words, not the person's.
 Each ended turn comes with what the task replied; read a turn with one wait call (timeout_ms 0) only when you need more of it, and act where something changes the work. Tell the person, briefly, what they would want to hear: the outcome of work you started for them, once, when it ends, not again when they write in that task; what only they can decide; and where their latest words contradict what they asked before. If nothing, end your turn with an empty reply.
+
+[Sent by lookout.tasks.]
+
+[Quoted from turn:calc.docs/3, written by a person:]
+
+Use tabs.
 ```
 
 A note that steers a busy lead ends "This cuts into your turn because the

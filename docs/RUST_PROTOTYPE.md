@@ -1124,6 +1124,10 @@ not copy bodies. `min_node` optionally bounds the oldest included ID.
 returning its nodes newest first; `next_newer` is the inclusive minimum ID for
 the next forward page, or null. This lets clients retain only range endpoints.
 Turn IDs are inherited from each node's nearest turn-start ancestor.
+Each node, here and in `history_items`, carries `written_ms`, when it joined
+the history (a queued prompt when its turn started, a steer when its turn
+absorbed it), set by the insert that writes it; nodes from before schema 66
+have none.
 `workspaces` lists each folder the page's turns ran in once, as
 `{"folder", "turns"}`, so a client resolves a path a message names where it was
 written even after the bot moved; a turn whose rows went with a deleted fork
@@ -1410,6 +1414,34 @@ agent's words for a person's: `[Written by the agent NAME in
 turn:NAME/TURN, not by a person.]` for `from`, `[Sent by ORIGIN.]` for
 `origin`, and nothing for a person's prompt. `content[0]` stays the words.
 A bot made with `hide_senders` reads the words alone.
+
+A client that speaks for a person other than the daemon's own may name
+them with `person` (a name's characters, else `invalid_person`), exclusive
+with `from` and `origin`. Like `origin` it is the client's word, kept and
+reported the same way, and read by the model as `[Written by PERSON.]`; a
+prompt with a `person` is no consent to the approver, which answers to the
+daemon's own person only. A command run from a bot's sandboxed tool cannot
+send one (it would speak as a person from inside an agent).
+
+`quotes`, a list of up to 64 `{bot, turn, reply?}`, copies other turns'
+words into the prompt: a turn's prompt, or with `reply: true` the last
+message the finished turn ended with. The daemon copies them at submit, so
+what a quote says is what that turn holds, never what the sender retyped,
+and keeps who first wrote them: a quoted prompt's own quotes come along
+with their writers. Each quote is a text part after the sender's line,
+behind a line naming it, `[Quoted from turn:BOT/TURN, written by a
+person:]` or `[Quoted from the reply of turn:BOT/TURN, written by the agent
+BOT:]` (`sent by ORIGIN`, `written by PERSON`, `written by the agent NAME
+in turn:NAME/TURN`); `hide_senders` leaves the lines out too. A turn that
+does not exist, a steer's reply, or a turn that ended without one is
+`quote_not_found`; a reply of an unfinished turn `quote_unfinished`; words
+and quotes past 256 KiB together `quote_too_large`. The CLI's `run --quote
+BOT/TURN` (repeatable; `BOT/TURN:reply` for a reply, `turn:` prefix
+optional) sends them. `prompts` and `history_items` list a prompt's
+quotes as `quotes`, each with its writer (`from`, `origin` or `person`,
+none for a person's) and, in `prompts`, its `text` within the read's
+`bytes`; the approver reads a quote of the person's own words as theirs
+and any other as asking for nothing.
 `{"op":"prompts","bot","turn","bytes"?}` reads a turn's words and calls
 as an approver judges them, within `bytes` of text (default 64 KiB, at most
 256 KiB): the turn's prompt and each steer it absorbed, in order, with

@@ -718,9 +718,12 @@ impl View {
                     let by = match from {
                         End::Person => "you".to_owned(),
                         End::Agent(by) => self.short(by),
-                        End::Rim(_) => {
-                            crate::transcript::from_outside(data["origin"].as_str()).to_owned()
-                        }
+                        End::Rim(_) => match data["person"].as_str() {
+                            Some(person) => person.to_owned(),
+                            None => {
+                                crate::transcript::from_outside(data["origin"].as_str()).to_owned()
+                            }
+                        },
                     };
                     let to = self.short(at);
                     self.agents[at].last = Some((now, format!("from {by}")));
@@ -837,8 +840,8 @@ impl View {
         }
     }
 
-    /// Who sent a prompt: another agent, a client named by its origin
-    /// (in from the rim), or the person.
+    /// Who sent a prompt: another agent, a client named by its origin or
+    /// another person a client named (in from the rim), or the person.
     fn sender(&self, data: &Value, at: usize) -> End {
         if let Some(by) = data["from"]["bot"].as_str() {
             // A name used again is someone else: from outside, then.
@@ -849,9 +852,9 @@ impl View {
                 })
                 .map_or(End::Rim(at), End::Agent);
         }
-        match data["origin"].as_str() {
-            Some(_) => End::Rim(at),
-            None => End::Person,
+        match data["origin"].is_string() || data["person"].is_string() {
+            true => End::Rim(at),
+            false => End::Person,
         }
     }
 
