@@ -78,6 +78,18 @@ struct Turn {
     reply: Option<String>,
 }
 
+impl Turn {
+    /// A trigger's run that went well: news only once its reply has words.
+    /// One that failed, was stopped, resolved its task or ended a goal is
+    /// news however it replied.
+    fn run(&self) -> bool {
+        self.status == "completed"
+            && self.by.as_deref() == Some("trigger")
+            && !self.resolved
+            && self.goal.is_none()
+    }
+}
+
 /// A message written in a task: who wrote it, and the words, only when
 /// the person did, kept to know the same words again; the note quotes
 /// them whole, `bytes` long.
@@ -280,6 +292,12 @@ pub struct Updates {
     /// Turns whose reply is being read: how each ends waits for it, so a
     /// note tells a turn's end with its reply or not yet.
     replying: HashSet<Key>,
+    /// A trigger's runs that went well, each held apart until its reply is
+    /// read, and whether it answered a note the lead had not heard yet:
+    /// one that replied nothing is no news, as cron mails a job's output
+    /// only when it printed some, and held apart, two runs never merge
+    /// into one end that neither reply could clear.
+    runs: HashMap<Key, (Turn, bool)>,
 }
 
 /// A turn whose answer a trigger passes to the lead: when it becomes news
@@ -366,6 +384,7 @@ impl Updates {
             opened: now_ms(),
             resolving: Default::default(),
             replying: HashSet::new(),
+            runs: HashMap::new(),
         }
     }
 
@@ -760,8 +779,15 @@ impl Updates {
         if !self.live {
             return;
         }
+        if let Some((mut run, answered)) = self.runs.remove(&(name.to_owned(), turn)) {
+            if text.is_empty() {
+                return;
+            }
+            run.reply = Some(quotable(text));
+            return self.put(name, run, answered);
+        }
         if text.is_empty() {
-            return self.said_nothing(name, turn);
+            return;
         }
         let reply = quotable(text);
         let news = (self.tasks.iter_mut()).find(|(task, _)| task == name);
@@ -815,6 +841,14 @@ impl Updates {
         let news = &mut self.tasks[at].1;
         let mut told = news.act.take().expect("found above");
         told.by = by;
+        if told.run() {
+            if news.empty() {
+                self.tasks.remove(at);
+            }
+            self.replying.insert(key.clone());
+            self.runs.insert(key, (told, false));
+            return;
+        }
         // The person's own completed turn is theirs, as when it was seen.
         news.merge(
             match told.by.as_deref() == Some("the person") && status == "completed" {
@@ -834,6 +868,11 @@ impl Updates {
     pub fn reply_unread(&mut self, name: &str, turn: i64) {
         self.replying.remove(&(name.to_owned(), turn));
         self.unknown.remove(&(name.to_owned(), turn));
+        if let Some((run, answered)) = self.runs.remove(&(name.to_owned(), turn))
+            && self.live
+        {
+            self.put(name, run, answered);
+        }
     }
 
     /// Who a turn's end names as having asked for it.
@@ -843,29 +882,6 @@ impl Updates {
             _ if from.as_deref() == Some(self.lead.as_str()) => Some("you".to_owned()),
             _ if from.is_none() && origin.as_deref() == Some(UNKNOWN) => None,
             _ => Some(from.or(origin).unwrap_or_else(|| "the person".into())),
-        }
-    }
-
-    /// A trigger's run that went well and replied nothing is no news, as
-    /// cron mails a job's output only when it printed some: one that
-    /// failed, was stopped, resolved its task or ended a goal still is.
-    fn said_nothing(&mut self, name: &str, turn: i64) {
-        let Some(at) = self.tasks.iter().position(|(task, _)| task == name) else {
-            return;
-        };
-        let news = &mut self.tasks[at].1;
-        if news.act.as_ref().is_some_and(|t| {
-            t.turn == turn
-                && t.count == 1
-                && t.status == "completed"
-                && t.by.as_deref() == Some("trigger")
-                && !t.resolved
-                && t.goal.is_none()
-        }) {
-            news.act = None;
-            if news.empty() {
-                self.tasks.remove(at);
-            }
         }
     }
 
@@ -906,13 +922,11 @@ impl Updates {
             return;
         }
         let by = self.by(status, from, origin);
+        let key = (name.to_owned(), turn);
         let news = self.news_of(name);
         let answered = news.act.as_ref().is_some_and(|asked| {
             asked.turn == turn && [APPROVAL, QUIET].contains(&asked.status.as_str())
         });
-        // One that failed or was stopped is news to the person too: the
-        // lead hears it with its own.
-        let theirs = by.as_deref() == Some("the person") && !answered && status == "completed";
         let turn = Turn {
             first: turn,
             turn,
@@ -924,7 +938,29 @@ impl Updates {
             goal,
             reply: None,
         };
-        news.merge(match theirs {
+        if turn.run() {
+            // Its end answers the note about it, whatever its reply.
+            if answered {
+                news.act = None;
+            }
+            if news.empty() {
+                self.tasks.retain(|(task, _)| task != name);
+            }
+            self.replying.insert(key.clone());
+            self.runs.insert(key, (turn, answered));
+            return;
+        }
+        self.put(name, turn, answered);
+    }
+
+    /// How a turn ended, news for the next note: the person's own turn
+    /// that completed is theirs, unless it answered a note the lead had
+    /// not heard; one that failed or was stopped is news to the person
+    /// too, and the lead hears it with its own.
+    fn put(&mut self, name: &str, turn: Turn, answered: bool) {
+        let theirs =
+            turn.by.as_deref() == Some("the person") && !answered && turn.status == "completed";
+        self.news_of(name).merge(match theirs {
             true => News {
                 theirs: Some(turn),
                 ..News::default()
@@ -1138,6 +1174,12 @@ impl Updates {
     /// waits on them.
     pub fn replies_dropped(&mut self) {
         self.replying.clear();
+        let runs: Vec<_> = self.runs.drain().collect();
+        for ((name, _), (run, answered)) in runs {
+            if self.live && self.task(&name) {
+                self.put(&name, run, answered);
+            }
+        }
     }
 
     /// The news for the next note, taken: every task's, those with the
@@ -1302,6 +1344,7 @@ impl Updates {
     /// it is no one's.
     pub fn forget(&mut self) {
         self.tasks.clear();
+        self.runs.clear();
         self.forwarding.clear();
         self.goaled.clear();
         self.approvals.clear();
@@ -1320,6 +1363,7 @@ impl Updates {
         let before = std::mem::replace(&mut self.subscribers, subscribers);
         let held = (self.tasks.iter().map(|(task, _)| task))
             .chain(self.forwarding.keys().map(|(task, _)| task))
+            .chain(self.runs.keys().map(|(task, _)| task))
             .chain(self.goaled.iter().map(|(task, _)| task))
             .chain(self.approvals.keys().map(|(task, _)| task))
             .chain(self.noted.iter().map(|(task, _)| task));
@@ -1345,6 +1389,7 @@ impl Updates {
 
     fn drop_news(&mut self, name: &str) {
         self.tasks.retain(|(task, _)| task != name);
+        self.runs.retain(|(task, _), _| task != name);
         self.forwarding.retain(|(task, _), _| task != name);
         self.goaled.retain(|(task, _)| task != name);
         self.approvals.retain(|(task, _), _| task != name);
@@ -1799,6 +1844,40 @@ mod tests {
         turn(&mut updates, "shop.fix", 5, trigger(), "completed");
         updates.replied("shop.fix", 5, "posted 2 items");
         assert!(text(&updates.take()).contains("posted 2 items"));
+    }
+
+    #[test]
+    fn two_quiet_runs_that_ended_before_their_replies_were_read_are_no_news() {
+        let mut updates = fleet();
+        let trigger = || json!({"origin": "trigger"});
+        turn(&mut updates, "shop.fix", 4, trigger(), "completed");
+        turn(&mut updates, "shop.fix", 5, trigger(), "completed");
+        // Both ended before either reply was read, each held apart.
+        assert!(!updates.news());
+        updates.replied("shop.fix", 5, "");
+        updates.replied("shop.fix", 4, "\n");
+        assert!(!updates.news(), "{}", text(&updates.take()));
+        // A run that failed beside them is still told, and one with words
+        // is told with them, once.
+        turn(&mut updates, "shop.fix", 6, trigger(), "failed");
+        turn(&mut updates, "shop.fix", 7, trigger(), "completed");
+        turn(&mut updates, "shop.fix", 8, trigger(), "completed");
+        updates.replied("shop.fix", 6, "");
+        updates.replied("shop.fix", 8, "");
+        updates.replied("shop.fix", 7, "posted 2 items");
+        let told = text(&updates.take());
+        assert!(told.contains("turn:shop.fix/7 completed"), "{told}");
+        assert!(told.contains("posted 2 items"), "{told}");
+        assert!(told.contains("1 earlier since turn:shop.fix/6"), "{told}");
+        // A run whose reply could not be read, or whose read was cut off,
+        // is told without it.
+        turn(&mut updates, "shop.fix", 9, trigger(), "completed");
+        updates.reply_unread("shop.fix", 9);
+        turn(&mut updates, "shop.docs", 3, trigger(), "completed");
+        updates.replies_dropped();
+        let told = text(&updates.take());
+        assert!(told.contains("turn:shop.fix/9 completed"), "{told}");
+        assert!(told.contains("turn:shop.docs/3 completed"), "{told}");
     }
 
     #[test]
