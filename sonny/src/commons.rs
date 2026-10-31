@@ -510,6 +510,11 @@ fn settle(dir: &Path, thread: &str, invited: &[(String, i64, bool)]) {
             "golden": golden, "turns": [turn]}));
     }
     keep(dir, &sent, count);
+    // A reply that came while the rest were still being sent takes its
+    // seat now, in the order the posts came.
+    for post in posts(&dir.join(format!("{thread}.jsonl"))).unwrap_or_default() {
+        answered(dir, thread, post["by"].as_str().unwrap_or_default());
+    }
 }
 
 /// Marks the invite of `bot` to `thread` answered, under the lock, with
@@ -1365,12 +1370,20 @@ mod tests {
         settle(&dir, "first", &[]);
         assert_eq!(budget(&sent(&dir), 0)["today"], 0);
         assert!(post("second").get("invite").is_some());
-        let two = [("b.y".to_owned(), 7, false), ("d.w".to_owned(), 11, false)];
-        settle(&dir, "second", &two);
         let reply = |thread: &str, by: &str| {
             let reply = json!({"reply": {"thread": thread, "text": "yes"}});
             call(&home, by, None, None, &reply).unwrap()
         };
+        // A reply while the rest are still being sent keeps its seat.
+        assert!(post("early").get("invite").is_some());
+        reply("early", "e.v");
+        settle(&dir, "early", &[("e.v".to_owned(), 3, false)]);
+        assert!(holds(&dir, "early", "e.v").is_some());
+        let (mut early, count) = load(&dir);
+        early.retain(|invite| invite["thread"] != "early");
+        assert!(keep(&dir, &early, count - 1));
+        let two = [("b.y".to_owned(), 7, false), ("d.w".to_owned(), 11, false)];
+        settle(&dir, "second", &two);
         // A reply brings no invite, and only the invited agent's answers
         // its invite: once, however often it replies.
         assert!(reply("second", "c.z").get("invite").is_none());
