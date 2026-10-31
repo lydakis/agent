@@ -276,7 +276,9 @@ pub async fn turn_with(
     let submitted = match client
         .request(
             "submit",
-            json!({"bot": name, "request_id": name, "prompt": prompt, "delivery": "queue"}),
+            // Said by the judge, not the person: clients draw it so.
+            json!({"bot": name, "request_id": name, "prompt": prompt, "delivery": "queue",
+                "origin": "judge"}),
         )
         .await
     {
