@@ -2,7 +2,7 @@
 use agent_runtime::{Error, Result, fail_with};
 
 const CONNECTION: &str = "--store --socket";
-const STARTUP: &str = "--provider --max-processes --max-lasting --max-active --max-connecting --max-pending --max-pending-bytes --max-readers --stall-timeout --idle-exit";
+const STARTUP: &str = "--provider --max-processes --max-lasting --max-active --max-connecting --max-pending --max-pending-bytes --max-input-bytes --max-readers --stall-timeout --idle-exit";
 
 struct Command {
     name: &'static str,
@@ -354,6 +354,10 @@ fn print_flags(flags: &str) {
             "--max-connecting" => ("N", "Concurrent provider startup limit; 0 is unbounded"),
             "--max-pending" => ("N", "Submissions waiting to start; 0 is unbounded"),
             "--max-pending-bytes" => ("N", "Prompt bytes waiting to start; 0 is unbounded"),
+            "--max-input-bytes" => (
+                "N",
+                "Request bytes read ahead of the service; default memory/16; 0 is unbounded",
+            ),
             "--max-readers" => ("N", "Store reader connections; default one per CPU"),
             "--max-output-tokens" => (
                 "N",

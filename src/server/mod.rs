@@ -793,6 +793,9 @@ pub struct Configuration {
     /// unbounded by default, since waiting work is durable rows.
     pub max_pending: Option<usize>,
     pub max_pending_bytes: Option<usize>,
+    /// Bytes of request lines read and not yet taken up, every session
+    /// together; a sixteenth of physical memory by default; zero unbounded.
+    pub max_input_bytes: Option<usize>,
     /// Store reader connections serving observation reads; one per
     /// logical CPU by default.
     pub max_readers: Option<usize>,
@@ -825,6 +828,7 @@ pub struct Limits {
     pub connecting: usize,
     pub pending: usize,
     pub pending_bytes: usize,
+    pub input_bytes: usize,
     /// Store reader connections; observation reads take all but one, which
     /// is kept for turns' own reads.
     pub readers: usize,
@@ -846,6 +850,9 @@ impl Limits {
             connecting: config.max_connecting.unwrap_or(0),
             pending: config.max_pending.unwrap_or(0),
             pending_bytes: config.max_pending_bytes.unwrap_or(0),
+            input_bytes: config
+                .max_input_bytes
+                .unwrap_or_else(session::default_input_bytes),
             readers: config
                 .max_readers
                 .unwrap_or_else(agent_runtime::store::default_readers)
@@ -1444,7 +1451,7 @@ pub async fn run(config: Configuration) -> Result<()> {
         ));
     }
     agent_runtime::sandbox::warm();
-    let (sender, mut inbound) = session::channel(64);
+    let (sender, mut inbound) = session::channel_with(64, limits.input_bytes);
     let sessions_next = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
     let mut daemon = agent_runtime::sandbox::Daemon {
         store: Some(std::fs::canonicalize(&config.store)?),
@@ -1496,7 +1503,7 @@ pub async fn run(config: Configuration) -> Result<()> {
         "paused":paused,
         "store":{"identity":format!("{identity:032x}"),"lineage":format!("{:016x}", lineage as u64)},
         "limits":{"processes":limits.processes,"lasting":limits.lasting,"active":limits.active,"connecting":limits.connecting,
-            "pending":limits.pending,"pending_bytes":limits.pending_bytes,
+            "pending":limits.pending,"pending_bytes":limits.pending_bytes,"input_bytes":limits.input_bytes,
             "readers":limits.readers,"connections":limits.connections,
             "idle_exit_seconds":config.idle_exit,
             "stall_timeout_seconds":stall_timeout.as_secs()},
@@ -1739,7 +1746,7 @@ pub async fn run(config: Configuration) -> Result<()> {
                     // What a companion sends is no client's activity.
                     let companion = match &message {
                         Inbound::Open(_, _, _, peer) => peer.is_some_and(|pid| service.companions.runs_pid(pid)),
-                        Inbound::Request(id, _) | Inbound::Closed(id) => companion_sessions.contains(id),
+                        Inbound::Request(id, ..) | Inbound::Closed(id) => companion_sessions.contains(id),
                     };
                     if !companion {
                         last_activity = std::time::Instant::now();
@@ -1766,7 +1773,8 @@ pub async fn run(config: Configuration) -> Result<()> {
                             service.abandon_steps(id);
                             if id == 0 && stdio_owner { break; }
                         }
-                        Inbound::Request(id, request) => {
+                        // The line's credit goes back as this request is taken up.
+                        Inbound::Request(id, request, _credit) => {
                             let Some(output) = sessions.get(&id).cloned() else { continue };
                             // A bad id is refused like a malformed line, after the
                             // admissions queued before it.
@@ -5068,6 +5076,7 @@ mod tests {
             limits: Limits {
                 pending: 0,
                 pending_bytes: 0,
+                input_bytes: 0,
                 readers: 1,
                 processes: 16,
                 lasting: 16,
@@ -5270,6 +5279,7 @@ mod tests {
             limits: Limits {
                 pending: 0,
                 pending_bytes: 0,
+                input_bytes: 0,
                 readers: 1,
                 processes: 16,
                 lasting: 16,
@@ -5488,6 +5498,7 @@ mod tests {
             limits: Limits {
                 pending: 0,
                 pending_bytes: 0,
+                input_bytes: 0,
                 readers: 1,
                 processes: 16,
                 lasting: 16,
@@ -5733,6 +5744,7 @@ mod tests {
             limits: Limits {
                 pending: 0,
                 pending_bytes: 0,
+                input_bytes: 0,
                 readers: 1,
                 processes: 16,
                 lasting: 16,

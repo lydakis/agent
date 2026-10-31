@@ -6336,3 +6336,39 @@ the rate it had, in exchange for no other session waiting behind them.
 Several sessions reading at once get more than before in total, since
 reads now run side by side. Each reader connection keeps its own 2 MiB
 page cache and statement cache.
+
+## Request bytes read on credit
+
+`bench/ingress_credits.py`: 400 clients connect to one socket daemon and each
+sends a 4 MiB request line, a padded `inspect`. With `--stall-s 5` each sends
+all of its line except the newline, and ends it five seconds later, as a slow
+client would. A probe session times a short `inspect` every 5 ms. The
+measurements are the daemon's peak resident memory (`VmHWM`) while the lines
+stall and the probe's p95 over the whole flood. The machine is a 4-core Linux
+container with 15 GiB of memory, so the default bound is a sixteenth of that,
+about 1 GiB. Base is main with #560 (2661e5b).
+
+| Daemon | Resident while stalled | Probe p95 | Flood |
+| --- | ---: | ---: | ---: |
+| base | 1,629 MiB | 6.0 ms | 10.4 s |
+| head, default bound (about 1 GiB) | 464 MiB | 3.4 ms | 11.6 s |
+| head, `--max-input-bytes 67108864` | 52 MiB | 19.0 ms | 12.3 s |
+
+On base, each stalled reader keeps its partial line, so memory grows with the
+number of clients. On head, a line that runs past 4 KiB waits for 8 MiB of
+credit before it reads further. Only as many lines as the bound covers read at
+once, and the others wait in their sockets' kernel buffers. At the default
+that is about 120 lines of 4 MiB. Under the small bound the probe's p95 rises
+to 19 ms, because the lines are read a few at a time across the whole flood.
+Every request is still answered.
+
+When the clients do not stall (1,000 clients sending 4 MiB lines at once), the
+small bound held peak memory at 57 to 58 MiB in two runs. Base peaked at 45 MiB
+in one run and 175 MiB in the other. In that test the senders, not the daemon,
+limit how much is in flight.
+
+An earlier version took credit 64 KiB at a time. In that version, 1,000 long
+lines under the 64 MiB bound each held part of the credit they needed and
+waited for the rest, so they deadlocked. That is why a line past its first
+4 KiB now waits for all of its credit at once.
+`long_lines_past_the_budget_together_all_get_in` is the regression test.
