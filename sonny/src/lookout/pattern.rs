@@ -227,24 +227,46 @@ fn one(wanted: &Value, got: &Value) -> bool {
     }
 }
 
-/// Equal as JSON, numbers by value: `5` is `5.0`.
+/// Equal as JSON, numbers by value: `5` is `5.0`, and whole numbers
+/// exactly, past what a float holds.
 fn equal(wanted: &Value, got: &Value) -> bool {
-    match (wanted.as_f64(), got.as_f64()) {
-        (Some(a), Some(b)) => a == b,
-        _ => wanted == got,
+    let (Value::Number(a), Value::Number(b)) = (wanted, got) else {
+        return wanted == got;
+    };
+    if let (Some(a), Some(b)) = (a.as_i64(), b.as_i64()) {
+        return a == b;
+    }
+    if let (Some(a), Some(b)) = (a.as_u64(), b.as_u64()) {
+        return a == b;
+    }
+    // A whole number and a fraction, or one past i64 against a negative.
+    match (a.is_f64() || b.is_f64(), a.as_f64(), b.as_f64()) {
+        (true, Some(a), Some(b)) => a == b,
+        _ => false,
     }
 }
 
-/// The fields a pattern names at its top, `$or`'s included: those an
-/// event of the source must print for it ever to match.
-pub fn fields(pattern: &Value) -> Vec<String> {
+/// The fields, at the pattern's top, that keep it from matching any event
+/// that has only the fields `had` says it has: none when such an event may
+/// match. A field the pattern lets be missing (`{"exists": false}`) never
+/// keeps it from matching, and `$or` is kept from matching only when every
+/// one of its patterns is.
+pub fn missing(pattern: &Value, had: &dyn Fn(&str) -> bool) -> Vec<String> {
     let mut out = Vec::new();
     for (field, wanted) in pattern.as_object().into_iter().flatten() {
-        match field.as_str() {
-            "$or" => (wanted.as_array().into_iter().flatten())
-                .flat_map(fields)
-                .for_each(|f| out.push(f)),
-            _ => out.push(field.clone()),
+        if field == "$or" {
+            let each: Vec<Vec<String>> = (wanted.as_array().into_iter().flatten())
+                .map(|p| missing(p, had))
+                .collect();
+            if each.iter().all(|m| !m.is_empty()) {
+                out.extend(each.into_iter().flatten());
+            }
+            continue;
+        }
+        let may_lack = (wanted.as_array().into_iter().flatten())
+            .any(|value| value.get("exists") == Some(&Value::Bool(false)));
+        if !may_lack && !had(field) {
+            out.push(field.clone());
         }
     }
     out.sort();
@@ -334,13 +356,44 @@ mod tests {
     fn or_takes_any_of_its_patterns() {
         let either = json!({"$or": [{"author": ["bo"]}, {"paths": [{"prefix": "docs/"}]}]});
         assert!(hears(either.clone()));
-        assert_eq!(fields(&either), ["author", "paths"]);
         assert!(!hears(
             json!({"$or": [{"author": ["bo"]}, {"repo": ["x"]}]})
         ));
         assert!(!hears(
             json!({"repo": ["agent"], "$or": [{"author": ["bo"]}, {"lines": [1]}]})
         ));
+    }
+
+    #[test]
+    fn whole_numbers_past_a_float_stay_apart() {
+        let big = json!({"id": 9007199254740993u64});
+        let wanted = json!({"id": [9007199254740992u64]});
+        assert!(!matches(&wanted, &big));
+        assert!(matches(&json!({"id": [9007199254740993u64]}), &big));
+        assert!(matches(
+            &json!({"id": [{"anything-but": 9007199254740992u64}]}),
+            &big
+        ));
+        assert!(matches(&json!({"n": [-3]}), &json!({"n": -3})));
+        assert!(!matches(&json!({"n": [-1]}), &json!({"n": u64::MAX})));
+        assert!(matches(&json!({"n": [5]}), &json!({"n": 5.0})));
+    }
+
+    #[test]
+    fn what_keeps_a_pattern_from_matching_the_fields_a_source_has() {
+        let had = |field: &str| ["text", "paths"].contains(&field);
+        assert!(missing(&json!({"paths": ["a"]}), &had).is_empty());
+        assert_eq!(
+            missing(&json!({"path": ["a"], "text": ["b"]}), &had),
+            ["path"]
+        );
+        // A field it lets be missing never does.
+        assert!(missing(&json!({"draft": [{"exists": false}]}), &had).is_empty());
+        // $or, only when every pattern in it is kept from matching.
+        let either = json!({"$or": [{"author": ["a"]}, {"paths": ["b"]}]});
+        assert!(missing(&either, &had).is_empty());
+        let neither = json!({"$or": [{"author": ["a"]}, {"repo": ["b"]}]});
+        assert_eq!(missing(&neither, &had), ["author", "repo"]);
     }
 
     #[test]

@@ -340,8 +340,8 @@ pub fn change(
     Ok(said)
 }
 
-/// The fields a filter names that no recent event of the subscription's
-/// sources had, where the lookout has seen one.
+/// The fields that keep a filter from hearing any event like those its
+/// sources lately printed, where the lookout has seen one.
 fn unseen(store: &Path, sub: &Sub, filter: &Value) -> Vec<String> {
     let seen: Vec<Vec<String>> = (sub.sources.iter())
         .filter_map(|source| super::sources::fields_seen(store, source))
@@ -349,16 +349,12 @@ fn unseen(store: &Path, sub: &Sub, filter: &Value) -> Vec<String> {
     if seen.is_empty() {
         return Vec::new();
     }
-    (super::pattern::fields(filter).into_iter())
-        .filter(|field| {
-            !seen.iter().flatten().any(|had| {
-                had == field
-                    || had
-                        .strip_prefix(field.as_str())
-                        .is_some_and(|r| r.starts_with('.'))
-            })
+    let had = |field: &str| {
+        seen.iter().flatten().any(|had| {
+            had == field || (had.strip_prefix(field)).is_some_and(|r| r.starts_with('.'))
         })
-        .collect()
+    };
+    super::pattern::missing(filter, &had)
 }
 
 /// A subscription as a call gives it, held to what one may say.
