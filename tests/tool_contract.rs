@@ -496,7 +496,7 @@ async fn detached_commands_are_bounded_and_reaped() {
 
 /// Whether sandboxes run here. CI sets AGENT_TEST_SANDBOX, where one that
 /// can't is a failure; elsewhere the test says why it skipped.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn sandboxes() -> bool {
     match agent_runtime::sandbox::available() {
         Ok(()) => true,
@@ -1164,7 +1164,7 @@ async fn a_terminal_takes_typed_input_and_reports_its_end() {
 }
 
 /// The daemon as the CLI starts it, protecting what its client names.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn protecting() -> agent_runtime::sandbox::Daemon {
     agent_runtime::sandbox::Daemon {
         protected: agent_client::PROTECTED.map(String::from).to_vec(),
