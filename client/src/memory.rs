@@ -156,7 +156,14 @@ fn run(
     args: &[String],
     stdin: &dyn Fn() -> Result<String, String>,
 ) -> Result<Value, String> {
-    let caller = std::env::var("AGENT_BOT_ID").ok();
+    // Bot ids are each store's own, and stores under one HOME share its
+    // memory: the store names which bot.
+    let caller = std::env::var("AGENT_BOT_ID")
+        .ok()
+        .map(|id| match std::env::var("AGENT_STORE") {
+            Ok(store) => format!("{store}#{id}"),
+            Err(_) => id,
+        });
     run_as(root, cwd, args, stdin, caller.as_deref())
 }
 
@@ -281,16 +288,16 @@ fn run_as(
                 pushed_back: counts[1].unwrap_or_default(),
             };
             let dir = scope()?;
-            let saved = save(&dir, fact.clone(), counts, &text)?;
-            noted(root, caller, &dir.join(format!("{}.md", fact.name)))?;
-            Ok(saved)
+            let path = dir.join(format!("{}.md", fact.name));
+            save(&dir, fact, counts, &text, &|now| {
+                noted(root, caller, &path, now)
+            })
         }
         ("read", Some(name), [None, None, None], None) => read(&scope()?, &name),
         ("rm", Some(name), [None, None, None], None) => {
             let dir = scope()?;
-            let removed = remove(&dir, &name)?;
-            noted(root, caller, &dir.join(format!("{name}.md")))?;
-            Ok(removed)
+            let path = dir.join(format!("{name}.md"));
+            remove(&dir, &name, &|now| noted(root, caller, &path, now))
         }
         ("index", None, [None, None, None], None) => {
             let dir = scope()?;
@@ -580,7 +587,17 @@ fn render_index(dir: &Path, facts: &[Fact]) -> String {
 
 /// Save `fact`; a count left out (`None` in `counts`) keeps the one the
 /// fact had, so an agent rewording a fact does not reset its weight.
-fn save(dir: &Path, mut fact: Fact, counts: [Option<u32>; 2], body: &str) -> Result<Value, String> {
+/// What a save or removal tells the cleanup journal ([`noted`]): the fact
+/// as the change left it, while the folder is still locked.
+type Note<'a> = &'a dyn Fn(Option<&str>) -> Result<(), String>;
+
+fn save(
+    dir: &Path,
+    mut fact: Fact,
+    counts: [Option<u32>; 2],
+    body: &str,
+    note: Note,
+) -> Result<Value, String> {
     fact.valid()?;
     if body.trim().is_empty() {
         return Err("invalid_text: a fact needs a body".into());
@@ -618,6 +635,7 @@ fn save(dir: &Path, mut fact: Fact, counts: [Option<u32>; 2], body: &str) -> Res
     if !duplicate {
         write(&path, &text)?;
     }
+    note(Some(&text))?;
     write(&dir.join(INDEX), &index)?;
     Ok(
         json!({"saved": fact.name, "path": path, "replaced": before.is_some(),
@@ -671,7 +689,7 @@ fn read(dir: &Path, name: &str) -> Result<Value, String> {
     Ok(json!({"read": name, "path": path, "text": text, "reads": count}))
 }
 
-fn remove(dir: &Path, name: &str) -> Result<Value, String> {
+fn remove(dir: &Path, name: &str, note: Note) -> Result<Value, String> {
     valid_name(name)?;
     let _lock = lock(dir)?;
     let path = dir.join(format!("{name}.md"));
@@ -684,6 +702,7 @@ fn remove(dir: &Path, name: &str) -> Result<Value, String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
         Err(e) => return Err(format!("memory_failed: {}: {e}", path.display())),
     };
+    note(None)?;
     write(&dir.join(INDEX), &index)?;
     let mut all_reads = reads(dir);
     if all_reads.remove(name).is_some() {
@@ -1005,10 +1024,11 @@ fn fact_changes(listing: &str) -> (Vec<String>, Vec<String>, Vec<String>) {
     (removed, added, changed)
 }
 
-/// Note a fact another agent saved or removed while a cleanup is open, as
-/// it now is, for [`put_back`]. The cleanup's own agent's changes are the
-/// cleanup's.
-fn noted(root: &Path, caller: Option<&str>, path: &Path) -> Result<(), String> {
+/// Note a fact another agent saved (`now` its text) or removed (none)
+/// while a cleanup is open, for [`put_back`]. The cleanup's own agent's
+/// changes are the cleanup's. Called under the fact's folder lock, so the
+/// notes are in the order the changes were made.
+fn noted(root: &Path, caller: Option<&str>, path: &Path, now: Option<&str>) -> Result<(), String> {
     let Ok(open) = std::fs::read_to_string(root.join(CLEANUP)) else {
         return Ok(());
     };
@@ -1019,8 +1039,7 @@ fn noted(root: &Path, caller: Option<&str>, path: &Path) -> Result<(), String> {
     let Ok(relative) = path.strip_prefix(root) else {
         return Ok(());
     };
-    let text = std::fs::read_to_string(path).ok();
-    let line = format!("{}\n", json!({"path": relative, "text": text}));
+    let line = format!("{}\n", json!({"path": relative, "text": now}));
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     let others = root.join(OTHERS);
@@ -1035,11 +1054,13 @@ fn noted(root: &Path, caller: Option<&str>, path: &Path) -> Result<(), String> {
 
 /// Put back over a refused cleanup's revert what other agents saved and
 /// removed while it was open, each fact as they last left it, reindex
-/// their folders and commit them: how many facts.
-fn put_back(root: &Path) -> Result<usize, String> {
+/// their folders and commit them: how many facts, and each folder whose
+/// index is now past the limit (the cleanup's removals had made room for
+/// saves the revert brings back beside). Nothing saved is dropped to fit.
+fn put_back(root: &Path) -> Result<(usize, Vec<PathBuf>), String> {
     let others = root.join(OTHERS);
     let Ok(listed) = std::fs::read_to_string(&others) else {
-        return Ok(0);
+        return Ok((0, Vec::new()));
     };
     let mut last: Vec<(PathBuf, Option<String>)> = Vec::new();
     for line in listed.lines() {
@@ -1077,9 +1098,14 @@ fn put_back(root: &Path) -> Result<usize, String> {
             dirs.push(dir.to_owned());
         }
     }
+    let mut full = Vec::new();
     for dir in &dirs {
         let _lock = lock(dir)?;
-        write(&dir.join(INDEX), &render_index(dir, &facts(dir)?))?;
+        let index = render_index(dir, &facts(dir)?);
+        if index.len() > LIMIT {
+            full.push(dir.clone());
+        }
+        write(&dir.join(INDEX), &index)?;
     }
     if !last.is_empty() {
         git(root, &["add", "-A"])?;
@@ -1088,7 +1114,7 @@ fn put_back(root: &Path) -> Result<usize, String> {
     }
     std::fs::remove_file(&others)
         .map_err(|e| format!("memory_failed: {}: {e}", others.display()))?;
-    Ok(last.len())
+    Ok((last.len(), full))
 }
 
 /// Commit the cleanup, or revert it when it removed more than a quarter of
@@ -1125,12 +1151,18 @@ fn cleanup_finish(root: &Path) -> Result<Value, String> {
     if removed.len() > limit {
         git(root, &["revert", "--no-edit", &head])?;
         private(root)?;
-        let kept = put_back(root)?;
+        let (kept, full) = put_back(root)?;
         let _ = std::fs::remove_file(&state);
-        let others = match kept {
+        let mut others = match kept {
             0 => String::new(),
             n => format!(" with the {n} facts other agents saved or removed meanwhile"),
         };
+        for dir in full {
+            others += &format!(
+                " ({} is now past {LIMIT} bytes of index: merge facts there first)",
+                dir.display()
+            );
+        }
         return Err(format!(
             "loss_guard: the cleanup removed {} of {before} facts, above {limit}; memory is back as it was at {start}{others}, and the refused cleanup is commit {head}",
             removed.len()
@@ -2141,6 +2173,49 @@ mod tests {
             "unchanged"
         );
         assert!(!root.join(OTHERS).exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_refused_cleanup_says_when_what_it_kept_overfills_the_index() {
+        let root = temp("cleanup-full");
+        let long = "d".repeat(3500);
+        let save = |caller: Option<&str>, name: &str| {
+            let line = [
+                "save",
+                name,
+                "--type",
+                "feedback",
+                "--description",
+                &long,
+                "--source",
+                "test",
+                "--user",
+                "--",
+                "text",
+            ];
+            run_as(&root, &root, &args(&line), &|| Ok("-".into()), caller).unwrap();
+        };
+        repo(&root).unwrap();
+        for name in ["a", "b", "c", "d"] {
+            save(None, name);
+        }
+        let as_7 = |line: &[&str]| run_as(&root, &root, &args(line), &|| Ok("-".into()), Some("7"));
+        as_7(&["cleanup", "start"]).unwrap();
+        for name in ["b", "c", "d"] {
+            as_7(&["rm", name, "--user"]).unwrap();
+        }
+        // Each save fits in the room the cleanup made.
+        for name in ["e", "f", "g"] {
+            save(Some("8"), name);
+        }
+        let refused = as_7(&["cleanup", "finish"]).unwrap_err();
+        assert!(refused.contains("with the 3 facts"), "{refused}");
+        assert!(refused.contains("merge facts there first"), "{refused}");
+        // Nothing saved is dropped to fit.
+        for name in ["a", "b", "c", "d", "e", "f", "g"] {
+            assert!(root.join(format!("{name}.md")).exists(), "{name}");
+        }
         std::fs::remove_dir_all(root).unwrap();
     }
 
