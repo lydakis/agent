@@ -70,6 +70,9 @@ class PlumbingTests(unittest.TestCase):
             self.assertTrue(row['visible_tests_pass'])
             self.assertTrue(row['answer'])
             self.assertTrue(row['instructions'])
+        # Day one ran first in the same daemon, so day two is not turn 1.
+        self.assertEqual(rows['learned']['day_one']['status'], 'completed', rows['learned'])
+        self.assertGreaterEqual(rows['learned']['day_one']['model_rounds'], 1)
         told = rows['memory']['instructions'][0]
         self.assertIn('api-timestamps', told)
         self.assertIn('error-codes', told)

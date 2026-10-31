@@ -696,7 +696,7 @@ the person edited, it writes that text beside theirs, in
 `~/.agent/sonny/upgrades/skills/NAME` or `upgrades/agents/NAME.md`, and
 notes it in `upgrades/pending`. Sonny also keeps whole what it last wrote
 of each, in `~/.agent/sonny/shipped`, which is what an edit started from.
-The first bot Sonny opens after that (not a side chat) is sent a note,
+The first lead Sonny opens after that (not a task or a side chat) is sent a note,
 queued after any turn it runs, naming the person's copy, Sonny's new text
 and the text the person started from, and asking it to offer the person a
 merge. The transcript shows it as one row, `↳ Sonny upgraded · lead role
@@ -720,6 +720,23 @@ MCP servers with `sonny mcp import`, and a git backup with `sonny setup
 backup`): each is offered once, then noted in
 `~/.agent/sonny/offered`, as is one setup itself offers. The row reads
 `↳ Sonny upgraded · what's new · set up mcp-import`.
+
+A change that leaves the person's state to be moved brings the move with it
+([upgrade.rs](../sonny/src/upgrade.rs)). A rewrite a script does the same
+everywhere is a migration, code that `upgrade::once` runs once and records.
+What needs judgment or reaches the person's own things is an upgrade step:
+words in `sonny/upgrades/ID.md` (a first line `Feature: ROW` naming its
+register row) and a check in code that says when it is done. The note asks
+the lead to do each step not done, to copy a file of the person's to
+`~/.agent/sonny/upgrades/before/ID` before changing it, and to ask the
+person first for anything that cannot be undone. Once the note is sent the
+step is noted in `~/.agent/sonny/tried` with the Sonny that asked (a
+fingerprint of its register), so one Sonny asks once; while the check fails,
+the next upgrade asks again and says it was asked before. The row reads
+`↳ Sonny upgraded · ID`. Every step and migration names the release it is
+deleted in, two after the one it ships in, and a test fails once Sonny's
+version reaches it; a person who skips more releases gets what a new install
+gets. The store's schema migrations are neither and stay in the daemon.
 
 A link the Agent app left there, into its bundle's
 `Contents/Resources/skills`, is replaced, never written through; a folder's

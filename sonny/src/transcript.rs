@@ -26,6 +26,8 @@ pub struct Markdown {
     /// How far the last line's wrapped rows are indented: under a list
     /// item's text, so a continuation does not read as a new item.
     hang: usize,
+    /// The last line is a quote's, so its wrapped rows keep its bar.
+    quoted: bool,
     /// A table's rows, held until it ends, so its columns can be fitted.
     table: Vec<String>,
     /// Inside display math, gathered in `picture`: what closes it,
@@ -144,6 +146,9 @@ impl Markdown {
 
     /// What the last line's wrapped rows start with, inside a reply.
     pub fn rest(&self) -> Span<'static> {
+        if self.quoted {
+            return Span::raw("  ▌ ").dim();
+        }
         Span::raw(format!("  {}", " ".repeat(self.hang)))
     }
 
@@ -215,6 +220,7 @@ impl Markdown {
     pub fn line(&mut self, text: &str) -> Option<Line<'static>> {
         let trimmed = text.trim_start();
         self.hang = 0;
+        self.quoted = false;
         // $$ display math $$, on one line or around several, and the
         // \[ display math \] many models write.
         let line = trimmed.trim_end();
@@ -331,6 +337,7 @@ impl Markdown {
             return Some(Line::from(spans));
         }
         if let Some(rest) = trimmed.strip_prefix("> ") {
+            self.quoted = true;
             let mut spans = vec![Span::raw("▌ ").dim()];
             spans.extend(inline(rest, Style::new().italic()));
             return Some(Line::from(spans));
@@ -1145,13 +1152,12 @@ pub fn prompt(text: &str, from: Option<&str>, width: usize) -> Vec<Line<'static>
     if let Some(from) = from {
         out.push(Line::from(format!("  from {from}")).dim());
     }
-    // An answer to the lead's question says which, and shows the answer.
-    let text = match crate::asks::split(text) {
-        Some((question, answer)) => {
-            out.push(crate::asks::answering(question, width));
-            answer
-        }
-        None => text,
+    // An answer to the lead's question says which over the answer, on
+    // its band, as a reply in a chat quotes what it replies to and as
+    // the composer showed it while it was written.
+    let (answering, text) = match crate::asks::split(text) {
+        Some((question, answer)) => (Some(crate::asks::answering(question, width)), answer),
+        None => (None, text),
     };
     // A long paste shows its start; the rest is in the conversation.
     let lines: Vec<&str> = text.lines().collect();
@@ -1164,6 +1170,7 @@ pub fn prompt(text: &str, from: Option<&str>, width: usize) -> Vec<Line<'static>
     // was written in: the words sit in the middle, not on an edge.
     let band = crate::look::band();
     out.push(Line::default().bg(band));
+    out.extend(answering.map(|row| row.bg(band)));
     for (i, line) in lines[..shown].iter().enumerate() {
         let lead = if i == 0 { "› " } else { "  " };
         out.extend(wrap(
@@ -1432,7 +1439,8 @@ fn news(text: &str) -> Option<Vec<String>> {
         return Some(sourced(rest));
     }
     // "- the lead role: theirs at …" is the lead role, "- set up backup: …"
-    // the backup, and a register's rows are what's new.
+    // the backup, "- do move; …" the step it asks, and a register's rows
+    // are what's new.
     if let Some(rest) = text.strip_prefix(crate::skills::UPGRADED) {
         let mut parts = vec!["Sonny upgraded".to_owned()];
         if rest.lines().any(|line| line.starts_with("| ")) {
@@ -1441,6 +1449,10 @@ fn news(text: &str) -> Option<Vec<String>> {
         parts.extend(rest.lines().filter_map(|line| {
             if let Some(step) = line.strip_prefix("- set up ") {
                 return Some(format!("set up {}", step.split_once(": ")?.0));
+            }
+            // "- do move; copy …", its words indented under it.
+            if let Some(step) = line.strip_prefix("- do ") {
+                return step.split([';', ' ']).next().map(str::to_owned);
             }
             let what = line.strip_prefix("- the ")?.split_once(": ")?.0;
             Some(format!("{what} edited"))
@@ -2949,7 +2961,11 @@ mod tests {
             .iter()
             .map(|row| row.to_string())
             .collect();
-        assert_eq!(shown, ["  answering “Ship it?”", "", "› Not yet", ""]);
+        // On the answer's band, over it, as the composer showed it.
+        assert_eq!(shown, ["", "  answering “Ship it?”", "› Not yet", ""]);
+        let rows = prompt("You asked: Ship **it**?\n\nNot yet", None, 80);
+        assert_eq!(rows[1].to_string(), "  answering “Ship it?”");
+        assert!(rows.iter().all(|row| row.style.bg.is_some()));
     }
 
     #[test]
@@ -3076,6 +3092,17 @@ mod tests {
         assert_eq!(
             text(&super::prompt(&note, None, 90)),
             ["↳ Sonny upgraded · what's new · set up backup"]
+        );
+        let note = format!(
+            "{}This upgrade needs you to do these for the person now:\n\
+             - do move-rows; copy a file of the person's to /h/before/move-rows before you change it:\n  \
+             Move their rows.\n  - the old ones too\n\
+             Do what you can undo yourself.",
+            crate::skills::UPGRADED
+        );
+        assert_eq!(
+            text(&super::prompt(&note, None, 90)),
+            ["↳ Sonny upgraded · move-rows"]
         );
     }
 

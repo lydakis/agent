@@ -177,11 +177,13 @@ and a file that no longer matches, or one Sonny never wrote, is the
 person's. When a new Sonny brings new text for a role or skill you
 edited, it sets that text beside yours in `~/.agent/sonny/upgrades`, with
 what you started from in `~/.agent/sonny/shipped` when it kept it, and
-the first bot you open after the upgrade tells you and offers to bring
+the first lead you open after the upgrade tells you and offers to bring
 Sonny's changes into your copy. A copy left the same as Sonny's new text
-is Sonny's again from the next start. That bot also tells you what is new
-since the Sonny you last heard of, from [FEATURES.md](FEATURES.md), and
-offers once each new setup step you have not done. A folder's own
+is Sonny's again from the next start. That lead also tells you what is new
+since the Sonny you last heard of, from [FEATURES.md](FEATURES.md),
+offers once each new setup step you have not done, and does what the
+upgrade asks to move your things to how Sonny works now, asking you first
+for anything that cannot be undone. A folder's own
 `.agents/agents/lead.md` or `task.md` comes first. The task settings from `.agents/project.toml` are composed after
 the lead's role, not kept in the file.
 
@@ -293,7 +295,9 @@ The place a
 project was laid out in is kept in `~/.agent/sonny/places`, so an agent's
 `run_in_pane` and `show_agent` calls go to that Herdr or cmux workspace or
 Rex session, in that multiplexer, rather than one guessed from where the
-tool host answering them runs, which is in neither. A task's window
+tool host answering them runs, which is in neither. A project whose lead is
+in no multiplexer gets none: such a call says nothing opened would be seen,
+and its agents get no layout skill. A task's window
 closes once its work is taken: its turn completed and the lead (or the task
 that started it) waited on it. One that failed, stopped or waits on you stays
 open, and a task given more work opens again; ask the lead to show one, or
@@ -691,18 +695,28 @@ way `/react` does, and each note in the margin has its own `↩`.
   and Enter puts it in the middle: its maker, what it made and whoever it
   talked to in the last hour on the first ring, two hops on the next, the
   chat log only its own; the stars glide to their places. Esc lets go of
-  the pick, then the centre. With thousands of agents the sky folds: a star
-  for every agent that needs you, failed, works or was just lit, and for the
-  leads, as many as the pane has room for; the rest are a faint dot each,
-  so a cloud's density says how big it is, and the biggest clouds carry
-  their count. Names keep a row apart, the leads of the biggest projects
-  first, a cell of clear sky either side. Under 60 columns or 24 rows the
-  sky becomes a list, a firefly per agent and the last it said or was told.
-  `sonny sky` draws the same sky on its own, in the whole terminal, to keep
-  in another one beside the work, with your theme's grays and `NO_COLOR`
-  honoured, and `sonny sky --center NAME` starts on an agent (its name,
-  label or project); `q` leaves it, and a daemon that goes is followed
-  again once it is back.
+  the pick, then the centre. With thousands of agents the sky folds: a
+  star for every agent that needs you, failed, works or was just lit, and
+  for the leads, as many as the pane has room for; the rest are a faint
+  dot each, so a cloud's density says how big it is, and the biggest
+  clouds carry their count. Names keep a row apart, the leads of the
+  biggest projects first, a cell of clear sky either side. Under 60
+  columns or 24 rows the sky becomes a list, a firefly per agent and the
+  last it said or was told. `r` replays the last hour: the sky starts from
+  who was here then, all idle, and what they said and did plays over it,
+  eight times as fast, the chat log saying when each line happened. Space
+  pauses, the left and right arrows step back and on, `[` and `]` halve
+  and double the speed (up to 512 times), and Esc goes back to live; the
+  footer is the replay's line, with a bar from where it started to now. It
+  reads as far back as the daemon keeps events, from when they carry their
+  time, and keeps the last 100,000 to step back through. `sonny sky`
+  draws the same sky on its own, in the whole terminal,
+  to keep in another one beside the work, with your theme's grays and
+  `NO_COLOR` honoured, and `sonny sky --center NAME` starts on an agent
+  (its name, label or project) and `sonny sky --replay [WHEN]` plays the
+  past back from WHEN (`2h`, `30m` or `1d` ago, or a time such as `02:10`;
+  an hour ago when not said); `q` leaves it, and a daemon that goes is
+  followed again once it is back.
 
   ![/sky in the pane](../docs/sonny/sky.gif)
 
@@ -713,6 +727,8 @@ way `/react` does, and each note in the margin has its own `↩`.
   ![/sky with each agent in its model's colour](../docs/sonny/sky-models.png)
 
   ![/sky folded at 10,000 agents](../docs/sonny/sky-10000.png)
+
+  ![/sky replaying two hours at 64 times](../docs/sonny/sky-replay.gif)
 
   ![/sky centred on the shop lead](../docs/sonny/sky-centre.png)
 
@@ -793,18 +809,29 @@ way `/react` does, and each note in the margin has its own `↩`.
   decision in the conversation where it was asked, its words read as
   Markdown with the same renderer a reply uses, and the composer's hint
   names it: what you type next answers it (an option's number picks it),
-  and goes to the lead as `You asked: QUESTION` and your answer. Esc sets
-  it aside for a message of your own, and Esc again goes back to it. The
-  lead does not wait: it goes on with the option it recommends when that
-  can be undone, or ends its turn. Open questions are read from the
-  history Sonny replays (its `ask` calls not yet answered), so one asked
-  while Sonny was closed is answered the same way when it opens. A yellow
-  `?` starts it and a muted bar runs down its left side, setting it apart
-  from the replies around it with or without color. A task
+  and goes to the lead as `You asked: QUESTION` and your answer. While you
+  type, the composer's band names the question over your words, as the
+  sent answer shows it. With several open, the composer answers one at a
+  time, the oldest first, and says which (`1 of 2`); ↑↓ with nothing typed
+  switches to another, and a click on any card's option answers that one.
+  Esc sets them aside for a message of your own, and Esc again goes back.
+  Once you send words of your own, the conversation has moved on: the open
+  questions leave the composer and the `needs you` count, and their cards'
+  options still answer them. The lead does not wait: it goes on with the
+  option it recommends when that can be undone, or ends its turn. Open
+  questions are read from the history Sonny replays (its `ask` calls not
+  yet answered or moved on from), so one asked while Sonny was closed is
+  answered the same way when it opens. A yellow `?` starts it and a muted
+  bar runs down its left side, however narrow the window gets later,
+  setting it apart from the replies around it with or without color. A task
   asks the same way: its lead hears the question in its task updates
   (`shop.wire asks you`), the task's row reads `needs you`, and a click on
   it opens the task in the pane, where an option's click answers the task
   itself.
+
+  ![Two open decisions, their bars whole after the window narrowed, and the composer answering the first of two](../docs/sonny/ask-several.png)
+
+  ![Typing an answer: the composer's band names the question over the words, as the sent answer will show it](../docs/sonny/ask-answering.png)
 
   ![A task's question: the lead's task updates say shop.wire asks you, and wire, opened from the margin's ↗, shows the decision in the pane](../docs/sonny/ask-from-task.png)
 - `/copy` puts the last reply on the clipboard; `/open` opens the last

@@ -98,9 +98,28 @@ const LOG_COLS: usize = 36;
 /// muted, three faint, so it ends where its fade does.
 const LOG_LINES: usize = 12;
 const GAP: usize = 3;
+/// How fast a replay plays at first, and the fastest it goes: eight
+/// minutes a minute, as fast as the chat log can still be read; an hour
+/// in under eight seconds at most.
+const REPLAY_SPEED: f32 = 8.0;
+const REPLAY_FASTEST: f32 = 512.0;
+/// A step of a replay skips what this much watching would show.
+const REPLAY_STEP: f64 = 10_000.0;
+/// What `r` replays: the last hour, as the talk lens draws.
+const REPLAY_BACK: i64 = 3_600_000;
 /// The least room the sky is drawn in; with less, a list.
 const SKY_COLS: usize = 60;
 const SKY_ROWS: usize = 24;
+
+/// An agent as its making tells of it, as the listing would.
+fn made(name: &str, data: &Value) -> Value {
+    json!({"name": name, "bot_id": data["bot_id"],
+        "created_by": data["created_by"], "created_by_id": data["created_by_id"],
+        "running_turn": data["running_turn"], "model": data["model"]})
+}
+
+/// The most events a replay keeps to step back through.
+const TAPE: usize = 100_000;
 
 /// A tool call: code's colour, for its moment.
 const TOOL: Color = Color::Cyan;
@@ -139,6 +158,9 @@ enum Feed {
     Live(Value),
     /// An agent's model, read again after it was configured.
     Model(String, String),
+    /// An event a replay plays when its time comes, with when it was
+    /// written.
+    Tape(Value),
     /// Caught up: from here on, what happens.
     Ready,
     Down(String),
@@ -327,9 +349,14 @@ pub struct View {
     calls: VecDeque<Instant>,
     /// Turns already sparked, so a queued prompt's start is not a second.
     sent: HashSet<(String, i64)>,
-    /// The chat log: when, what, the hue of what needs you or failed, and
-    /// the agents it is about, so a centred sky keeps only its agent's.
-    ticker: VecDeque<(Instant, String, Option<Color>, Vec<String>)>,
+    /// The chat log.
+    ticker: VecDeque<Note>,
+    /// When the event a replay plays now was written.
+    written: Option<i64>,
+    /// While a replay plays an event: now, and how long before the
+    /// replay's now it was written, not sped up, which the hour's counts
+    /// and weights go by while sparks and bursts play faster.
+    history: Option<(Instant, Duration)>,
     /// When messages were sent: an hour of it.
     recent: VecDeque<Instant>,
     /// When the view opened: breaths count from it, and the hour's counts
@@ -360,6 +387,109 @@ pub struct View {
     /// The pane is too small for the sky, so it shows the list.
     listing: bool,
     down: Option<String>,
+    /// Playing the past back instead of watching live.
+    replay: Option<Replay>,
+}
+
+/// A replay: the daemon's events from a time on, played as they happened,
+/// faster. The sky starts from who is here now, less those made since,
+/// all of them idle, and what was said and done then plays over it.
+struct Replay {
+    /// When it starts, in Unix ms.
+    from: i64,
+    /// When it has played to, in Unix ms, never past now.
+    at: f64,
+    /// Story ms a real one plays.
+    speed: f32,
+    playing: bool,
+    /// When `at` last moved.
+    tick: Instant,
+    /// Who was here when it started, as the listing says.
+    cast: Vec<Value>,
+    /// Every event from `from` on, in the store's order, and how many
+    /// have played.
+    tape: Vec<Value>,
+    played: usize,
+    /// The tape holds all the past; what comes after is live.
+    ready: bool,
+}
+
+impl Replay {
+    /// Puts an event on the tape. Past [`TAPE`] events, the oldest tenth
+    /// that has played goes and the replay starts where the rest does, as
+    /// a ring buffer keeps a recorder's last stretch: a replay left open
+    /// on a busy daemon stays bounded, and a step back reaches that far.
+    /// Who was made or removed in what goes is folded into the cast, as a
+    /// keyframe takes in the frames before it.
+    fn keep(&mut self, event: Value) {
+        self.tape.push(event);
+        let gone = TAPE / 10;
+        if self.tape.len() <= TAPE || self.played < gone {
+            return;
+        }
+        for event in self.tape.drain(..gone) {
+            let Some(name) = event["bot"].as_str() else {
+                continue;
+            };
+            match event["event"].as_str() {
+                Some("created" | "forked") => {
+                    self.cast.retain(|bot| bot["name"] != name);
+                    self.cast.push(made(name, &event["data"]));
+                }
+                Some("deleted") => self.cast.retain(|bot| bot["name"] != name),
+                _ => {}
+            }
+        }
+        self.played -= gone;
+        if let Some(first) = self.tape.first().and_then(|e| e["written_ms"].as_i64()) {
+            self.from = self.from.max(first);
+        }
+    }
+
+    /// Gives agents their new models, by name, wherever a step back would
+    /// seat them from: one pass over the cast and the tape, however many.
+    fn remodel(&mut self, models: &HashMap<&str, &str>) {
+        let new = |name: &Value| name.as_str().and_then(|name| models.get(name).copied());
+        for bot in &mut self.cast {
+            if let Some(model) = new(&bot["name"]) {
+                bot["model"] = json!(model);
+            }
+        }
+        for event in &mut self.tape {
+            if matches!(event["event"].as_str(), Some("created" | "forked"))
+                && let Some(model) = new(&event["bot"])
+            {
+                event["data"]["model"] = json!(model);
+            }
+        }
+    }
+
+    fn new(from: i64) -> Self {
+        Replay {
+            from,
+            at: from as f64,
+            speed: REPLAY_SPEED,
+            playing: true,
+            tick: Instant::now(),
+            cast: Vec::new(),
+            tape: Vec::new(),
+            played: 0,
+            ready: false,
+        }
+    }
+}
+
+/// A line of the chat log.
+struct Note {
+    at: Instant,
+    text: String,
+    /// The hue of what needs you or failed.
+    hue: Option<Color>,
+    /// The agents it is about, so a centred sky keeps only its agent's.
+    about: Vec<String>,
+    /// In a replay, when it happened, in Unix ms, which it says for its
+    /// time.
+    written: Option<i64>,
 }
 
 /// A place drawn on the way from one to another.
@@ -400,6 +530,8 @@ impl View {
             calls: VecDeque::new(),
             sent: HashSet::new(),
             ticker: VecDeque::new(),
+            written: None,
+            history: None,
             recent: VecDeque::new(),
             opened: Instant::now(),
             laid: false,
@@ -415,6 +547,7 @@ impl View {
             moved: None,
             listing: false,
             down: None,
+            replay: None,
         }
     }
 
@@ -425,17 +558,39 @@ impl View {
         self.task.abort();
     }
 
-    /// Follow again after a pause, from a fresh listing.
+    /// Follow again after a pause, from a fresh listing; a replay reads
+    /// its tape again and goes on from where it was.
     pub fn resume(&mut self) {
         if !self.task.is_finished() && !self.paused {
             return;
         }
         self.paused = false;
+        self.restart();
+    }
+
+    fn restart(&mut self) {
+        self.task.abort();
         let (send, feed) = mpsc::unbounded_channel();
         self.feed = feed;
-        self.task = tokio::spawn(follow(self.socket.clone(), send));
+        self.task = match &mut self.replay {
+            Some(replay) => {
+                replay.cast.clear();
+                replay.tape.clear();
+                replay.played = 0;
+                replay.ready = false;
+                tokio::spawn(tape(self.socket.clone(), replay.from, send))
+            }
+            None => tokio::spawn(follow(self.socket.clone(), send)),
+        };
         // Read afresh: agents removed meanwhile go, and who talked to whom
         // is read again from the turns kept.
+        self.forget();
+        self.live = false;
+        self.down = None;
+    }
+
+    /// Let go of every agent and what they did, to draw them again.
+    fn forget(&mut self) {
         self.agents.clear();
         self.index.clear();
         self.said.clear();
@@ -443,8 +598,21 @@ impl View {
         self.sent.clear();
         self.laid = false;
         self.sparks.clear();
-        self.live = false;
-        self.down = None;
+    }
+
+    /// Play the past back from `from` (Unix ms), or, with none, watch live
+    /// again. Either way the sky is read anew, and the chat log with it.
+    pub fn replay(&mut self, from: Option<i64>) {
+        self.replay = from.map(Replay::new);
+        self.ticker.clear();
+        self.recent.clear();
+        self.calls.clear();
+        self.restart();
+    }
+
+    /// Whether the past is playing back.
+    pub fn replaying(&self) -> bool {
+        self.replay.is_some()
     }
 
     /// Whether the follow ended, as when the daemon went: `resume`
@@ -458,6 +626,31 @@ impl View {
         let now = Instant::now();
         while let Ok(feed) = self.feed.try_recv() {
             match feed {
+                // A replay seats who was here once its tape is in.
+                Feed::Roll(bots) if let Some(replay) = &mut self.replay => {
+                    // The listing's model is each agent's model now, which
+                    // no event says again: an agent made in the replay
+                    // takes it too, from the roll read once the tape is in.
+                    let models: HashMap<&str, &str> = (bots.iter())
+                        .filter_map(|bot| Some((bot["name"].as_str()?, bot["model"].as_str()?)))
+                        .collect();
+                    replay.remodel(&models);
+                    replay.cast = bots;
+                }
+                Feed::Tape(event) => {
+                    if let Some(replay) = &mut self.replay {
+                        replay.keep(event);
+                    }
+                }
+                Feed::Ready if self.replay.as_ref().is_some_and(|r| !r.ready) => {
+                    self.live = true;
+                    let at = self.replay.as_ref().map_or(0.0, |r| r.at);
+                    if let Some(replay) = &mut self.replay {
+                        replay.ready = true;
+                        replay.tick = now;
+                    }
+                    self.seek(at, now);
+                }
                 Feed::Roll(bots) => {
                     let listed: HashSet<&str> =
                         bots.iter().filter_map(|bot| bot["name"].as_str()).collect();
@@ -481,6 +674,12 @@ impl View {
                     self.event(&event, now, true);
                 }
                 Feed::Model(name, model) => {
+                    // A replay seats agents again on a step back, from its
+                    // cast and its tape: they take the new model too, as
+                    // the listing gives every agent its model of now.
+                    if let Some(replay) = &mut self.replay {
+                        replay.remodel(&HashMap::from([(name.as_str(), model.as_str())]));
+                    }
                     if let Some(at) = self.agent(&name)
                         && self.agents[at].model != model
                     {
@@ -491,8 +690,111 @@ impl View {
                 Feed::Down(why) => self.down = Some(why),
             }
         }
+        self.play(now);
         self.sweep();
         self.land(now);
+    }
+
+    /// Move a replay on by the time since the last frame, at its speed,
+    /// and play what was written up to there.
+    fn play(&mut self, now: Instant) {
+        let Some(replay) = &mut self.replay else {
+            return;
+        };
+        if !replay.ready {
+            return;
+        }
+        if replay.playing {
+            let ran = now.duration_since(replay.tick).as_secs_f64() * 1000.0;
+            replay.at = (replay.at + ran * f64::from(replay.speed)).min(wall_ms() as f64);
+        }
+        replay.tick = now;
+        self.played_to(now);
+    }
+
+    /// Play every event written by the replay's `at`, each stamped as
+    /// long ago as it would have been, at this speed, had it played: so
+    /// a jump leaves trails and counts as playing would, its sparks long
+    /// landed.
+    fn played_to(&mut self, now: Instant) {
+        loop {
+            let Some(replay) = &mut self.replay else {
+                return;
+            };
+            let Some(event) = replay.tape.get(replay.played) else {
+                return;
+            };
+            let written = event["written_ms"].as_f64().unwrap_or(replay.from as f64);
+            if written > replay.at {
+                return;
+            }
+            let ago = (replay.at - written) / f64::from(replay.speed) / 1000.0;
+            let stamp = now
+                .checked_sub(Duration::from_secs_f64(ago))
+                .unwrap_or(self.opened.min(now));
+            let age = Duration::from_secs_f64((replay.at - written).max(0.0) / 1000.0);
+            let event = event.clone();
+            replay.played += 1;
+            self.written = Some(written as i64);
+            self.history = Some((now, age));
+            self.event(&event, stamp, true);
+            (self.written, self.history) = (None, None);
+        }
+    }
+
+    /// Go to `at` (Unix ms) in a replay: back means from the start again,
+    /// who was here seated anew.
+    fn seek(&mut self, at: f64, now: Instant) {
+        let Some(replay) = &mut self.replay else {
+            return;
+        };
+        let at = at.clamp(replay.from as f64, wall_ms() as f64);
+        if !replay.ready {
+            replay.at = at;
+            return;
+        }
+        if at < replay.at || replay.played == 0 {
+            replay.played = 0;
+            // Who the tape makes waits for its making; a name used again
+            // is someone else, told apart by id as `seat` tells them.
+            let mut made: HashMap<&str, Vec<Option<i64>>> = HashMap::new();
+            for event in &replay.tape {
+                if matches!(event["event"].as_str(), Some("created" | "forked"))
+                    && let Some(name) = event["bot"].as_str()
+                {
+                    made.entry(name)
+                        .or_default()
+                        .push(event["data"]["bot_id"].as_i64());
+                }
+            }
+            let cast: Vec<Value> = (replay.cast.iter())
+                .filter(|bot| {
+                    let Some(name) = bot["name"].as_str() else {
+                        return false;
+                    };
+                    let id = bot["bot_id"].as_i64();
+                    !made.get(name).is_some_and(|ids| {
+                        id.is_none() || ids.iter().any(|made| made.is_none() || *made == id)
+                    })
+                })
+                .cloned()
+                .collect();
+            replay.at = at;
+            self.forget();
+            self.ticker.clear();
+            self.recent.clear();
+            self.calls.clear();
+            for bot in &cast {
+                // All idle: what they did then plays from the tape.
+                if let Some(at) = self.seat(bot) {
+                    self.agents[at].running = None;
+                }
+            }
+        }
+        if let Some(replay) = &mut self.replay {
+            replay.at = at;
+        }
+        self.played_to(now);
     }
 
     /// Let removed agents go for good, and whatever pointed at them.
@@ -538,20 +840,31 @@ impl View {
     }
 
     fn land(&mut self, now: Instant) {
+        // Each lands when its flight ends, in that order: a replay's jump
+        // lands many at once, long ago.
         let mut landed = Vec::new();
         self.sparks.retain(|spark| {
             let done = now.duration_since(spark.born) >= FLIGHT;
             if done {
-                landed.push((spark.to, spark.color));
+                landed.push((spark.born + FLIGHT, spark.to, spark.color));
             }
             !done
         });
-        for (to, color) in landed {
+        landed.sort_by_key(|&(at, ..)| at);
+        for (when, to, color) in landed {
             if let End::Agent(at) = to {
                 let agent = &mut self.agents[at];
-                agent.lit = Some(now);
-                agent.heat = agent.warmth(now) + 1.0;
-                agent.heated = Some(now);
+                // A replay's jump can land an older message after the agent
+                // sent a newer one: it adds its heat, decayed to the newer
+                // time, and leaves that glow as it is.
+                if let Some(later) = agent.heated.filter(|&heated| heated > when) {
+                    let ago = later.duration_since(when).as_secs_f32();
+                    agent.heat += 0.5f32.powf(ago / HALF_LIFE);
+                    continue;
+                }
+                agent.lit = Some(when);
+                agent.heat = agent.warmth(when) + 1.0;
+                agent.heated = Some(when);
                 agent.flash = color;
             }
         }
@@ -638,10 +951,7 @@ impl View {
         let data = &event["data"];
         match event["event"].as_str().unwrap_or("") {
             "created" | "forked" => {
-                let record = json!({"name": name, "bot_id": data["bot_id"],
-                    "created_by": data["created_by"], "created_by_id": data["created_by_id"],
-                    "running_turn": data["running_turn"], "model": data["model"]});
-                if let Some(at) = self.seat(&record) {
+                if let Some(at) = self.seat(&made(name, data)) {
                     self.agents[at].lit = Some(now);
                 }
                 return;
@@ -725,8 +1035,9 @@ impl View {
                 if live {
                     if let End::Agent(by) = from
                         && by != at
+                        && let Some(then) = self.then(now)
                     {
-                        self.hear(now, by, at);
+                        self.hear(then, by, at);
                     }
                     self.send(from, End::Agent(at), now);
                     let by = match from {
@@ -758,7 +1069,9 @@ impl View {
                     self.agents[at].held.remove(call);
                 }
                 self.agents[at].twinkle = Some((now, TOOL, Work::of(tool)));
-                self.calls.push_back(now);
+                if let Some(then) = self.then(now) {
+                    self.calls.push_back(then);
+                }
                 if tool == crate::asks::TOOL {
                     if self.agents[at].state() != Some(State::NeedsYou) {
                         let said = format!("? {} asks you", self.short(at));
@@ -899,7 +1212,19 @@ impl View {
             born: now,
             color,
         });
-        self.recent.push_back(now);
+        if let Some(then) = self.then(now) {
+            self.recent.push_back(then);
+        }
+    }
+
+    /// When what happens at `now` happened, for the hour's counts: `now`
+    /// live; in a replay, as long before now as it was before the
+    /// replay's now, or nothing once more than the hour back.
+    fn then(&self, now: Instant) -> Option<Instant> {
+        match self.history {
+            None => Some(now),
+            Some((real, age)) => (age <= HOUR).then(|| real.checked_sub(age)).flatten(),
+        }
     }
 
     /// Told once when an agent comes to wait on the person's approval.
@@ -915,7 +1240,13 @@ impl View {
             .iter()
             .map(|&at| self.agents[at].name.clone())
             .collect();
-        self.ticker.push_back((now, text, hue, about));
+        self.ticker.push_back(Note {
+            at: now,
+            text,
+            hue,
+            about,
+            written: self.written,
+        });
         if self.ticker.len() > LOG {
             self.ticker.pop_front();
         }
@@ -1210,7 +1541,42 @@ impl View {
     /// of, or the key isn't the sky's.
     pub fn press(&mut self, code: ratatui::crossterm::event::KeyCode) -> bool {
         use ratatui::crossterm::event::KeyCode;
+        let now = Instant::now();
+        if let Some(replay) = &mut self.replay {
+            match code {
+                KeyCode::Char(' ') => {
+                    replay.playing = !replay.playing;
+                    replay.tick = now;
+                    return true;
+                }
+                KeyCode::Char('[') => {
+                    replay.speed = (replay.speed / 2.0).max(1.0);
+                    return true;
+                }
+                KeyCode::Char(']') => {
+                    replay.speed = (replay.speed * 2.0).min(REPLAY_FASTEST);
+                    return true;
+                }
+                KeyCode::Left | KeyCode::Right => {
+                    let step = REPLAY_STEP * f64::from(replay.speed);
+                    let at = match code {
+                        KeyCode::Left => replay.at - step,
+                        _ => replay.at + step,
+                    };
+                    self.seek(at, now);
+                    return true;
+                }
+                KeyCode::Esc if self.pick.is_none() && self.centre.is_none() => {
+                    self.replay(None);
+                    return true;
+                }
+                _ => {}
+            }
+        }
         match code {
+            KeyCode::Char('r') if self.replay.is_none() => {
+                self.replay(Some(wall_ms() - REPLAY_BACK))
+            }
             KeyCode::Char('?') => self.legend = !self.legend,
             KeyCode::Char('z') => self.zen = !self.zen,
             KeyCode::Char('m') => self.models = !self.models,
@@ -1284,6 +1650,7 @@ impl View {
         if shown == 0 {
             lines.push(Line::from(match (&self.down, self.live) {
                 (Some(why), _) => format!("Couldn't follow the agents: {why}"),
+                (None, false) if self.replay.is_some() => "Reading what happened…".into(),
                 _ => "No agents yet.".into(),
             }));
             return lines;
@@ -1586,7 +1953,7 @@ impl View {
         // Centred, only what the agent in the middle said or was told.
         let centre = self.centred().map(|at| &self.agents[at].name);
         let kept: Vec<_> = (self.ticker.iter())
-            .filter(|(.., about)| centre.is_none_or(|name| about.contains(name)))
+            .filter(|note| centre.is_none_or(|name| note.about.contains(name)))
             .collect();
         // Beside the sky, as many lines as its fade carries, at the foot.
         let lines_kept = if tall { room.min(LOG_LINES) } else { room };
@@ -1594,7 +1961,17 @@ impl View {
             .len()
             .min(lines_kept.saturating_sub(usize::from(self.down.is_some())));
         let entries = &kept[kept.len() - shown..];
-        for (n, (at, text, hue, _)) in entries.iter().enumerate() {
+        for (
+            n,
+            Note {
+                at,
+                text,
+                hue,
+                written,
+                ..
+            },
+        ) in entries.iter().copied().enumerate()
+        {
             let old = shown - 1 - n;
             let fresh = now.duration_since(*at).as_secs_f32();
             let weight = match (tall, old) {
@@ -1617,8 +1994,13 @@ impl View {
                 Ink::Faint => Ink::Faint.style(),
                 _ => Ink::Muted.style(),
             };
+            // A replay says when it happened, as a chat log's time does.
+            let when = match written {
+                Some(written) => format!("{} ", clock(*written)),
+                None => format!("{:>4}  ", ago(now, *at)),
+            };
             lines.push(Line::from(vec![
-                Span::styled(format!("{:>4}  ", ago(now, *at)), age),
+                Span::styled(when, age),
                 Span::styled(cut(text, cols.saturating_sub(6)), words),
             ]));
         }
@@ -1628,7 +2010,9 @@ impl View {
                 cols,
             )));
         } else if kept.is_empty() {
-            let quiet = if self.live {
+            let quiet = if self.replay.is_some() && self.live {
+                "Quiet then. What was said plays here."
+            } else if self.live {
                 "Quiet. Messages light up here as they go."
             } else {
                 "Catching up with who is here…"
@@ -1861,6 +2245,9 @@ impl View {
     /// what needs the person, who works, what failed, and how many
     /// messages a minute.
     pub fn footer(&self, width: usize) -> Line<'static> {
+        if let Some(replay) = &self.replay {
+            return replay_line(replay, width);
+        }
         let shown: Vec<&Agent> = self.agents.iter().filter(|a| !a.gone).collect();
         let count = shown.len();
         let mut spans = vec![
@@ -1922,6 +2309,41 @@ impl View {
         }
         Line::from(spans)
     }
+}
+
+/// A replay's footer: playing or paused, its speed, the time it has
+/// reached, and a bar from where it started to now.
+fn replay_line(replay: &Replay, width: usize) -> Line<'static> {
+    let mut spans = vec![Span::raw("  replay").dim()];
+    if !replay.ready {
+        spans.push(Span::raw(format!(" · reading from {}…", clock(replay.from))).dim());
+        return Line::from(spans);
+    }
+    let mark = if replay.playing { "▶" } else { "‖" };
+    spans.push(Span::raw(format!("  {mark} {}×  ", replay.speed)));
+    let now = wall_ms() as f64;
+    let caught_up = replay.at >= now - 1000.0;
+    spans.push(Span::raw(if caught_up {
+        "now".to_owned()
+    } else {
+        clock(replay.at as i64)
+    }));
+    let used: usize = spans.iter().map(|span| span.content.width()).sum();
+    let room = width.saturating_sub(used + 2 + 5);
+    if room >= 8 {
+        let span = (now - replay.from as f64).max(1.0);
+        let done = (((replay.at - replay.from as f64) / span) * (room - 1) as f64).round() as usize;
+        let done = done.min(room - 1);
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled("━".repeat(done), Ink::Muted.style()));
+        spans.push(Span::styled("●", Ink::Plain.style()));
+        spans.push(Span::styled(
+            "─".repeat(room - 1 - done),
+            Ink::Faint.style(),
+        ));
+        spans.push(Span::raw("  now").dim());
+    }
+    Line::from(spans)
 }
 
 /// The legend's rows, the ticker's room.
@@ -2006,11 +2428,57 @@ fn hue(from: End, to: End) -> Option<Color> {
     }
 }
 
-/// The wall clock in Unix ms, as the daemon stamps events.
+/// A time of day, as a replay's chat log and footer say it: `02:10`.
+fn clock(ms: i64) -> String {
+    let local = crate::trigger::local(ms.div_euclid(1000));
+    format!("{:02}:{:02}", local.hour, local.minute)
+}
+
+/// Now, in Unix ms.
 fn wall_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |since| since.as_millis() as i64)
+        .map_or(0, |d| d.as_millis() as i64)
+}
+
+/// When `--replay` starts, in Unix ms: `2h`, `30m` or `1d` ago, or the
+/// last time it was `02:10`.
+pub fn replay_from(when: &str, now: i64) -> Option<i64> {
+    if let Some((hour, minute)) = when.split_once(':') {
+        let (hour, minute): (u8, u8) = (hour.parse().ok()?, minute.parse().ok()?);
+        if hour > 23 || minute > 59 {
+            return None;
+        }
+        let today = crate::trigger::local(now.div_euclid(1000));
+        let on = |day: crate::trigger::Local| {
+            crate::trigger::epoch_of(crate::trigger::Local {
+                hour,
+                minute,
+                ..day
+            })
+        };
+        let at = on(today)? * 1000;
+        if at <= now {
+            return Some(at);
+        }
+        // Later today is yesterday's, by the calendar: a day back from
+        // noon is yesterday whatever the clocks did overnight.
+        let noon = crate::trigger::epoch_of(crate::trigger::Local {
+            hour: 12,
+            minute: 0,
+            ..today
+        })?;
+        return Some(on(crate::trigger::local(noon - 86_400))? * 1000);
+    }
+    let unit = when.find(|c: char| !c.is_ascii_digit())?;
+    let scale = match &when[unit..] {
+        "m" => 60_000,
+        "h" => 3_600_000,
+        "d" => 86_400_000,
+        _ => return None,
+    };
+    let n: i64 = when[..unit].parse().ok()?;
+    Some(now - n.checked_mul(scale)?)
 }
 
 /// How long ago, as the ticker says it.
@@ -2558,7 +3026,9 @@ const FRAME: Duration = Duration::from_millis(60);
 /// How long `sonny sky` waits before following a daemon that went again.
 const RETRY: Duration = Duration::from_secs(3);
 /// What the keys do in `sonny sky`.
-const KEYS: &str = "↑↓←→ pick · m models · z zen · ? legend · q quit";
+const KEYS: &str = "↑↓←→ pick · m models · r replay · z zen · ? legend · q quit";
+/// A replay's keys, in the title's place.
+pub const REPLAY_KEYS: &str = "space pause · ←→ step · [ ] speed · esc live";
 
 /// `sonny sky`: the same sky, the whole terminal, on its own, to keep
 /// beside the work as btop is kept: its title and the keys over it, the
@@ -2568,6 +3038,7 @@ pub fn watch(
     runtime: &tokio::runtime::Runtime,
     socket: PathBuf,
     centre: Option<String>,
+    replay: Option<i64>,
 ) -> Result<(), String> {
     use ratatui::crossterm::{
         cursor, event, execute,
@@ -2576,6 +3047,9 @@ pub fn watch(
     let _inside = runtime.enter();
     let mut view = View::open(socket);
     view.centre_on(centre);
+    if replay.is_some() {
+        view.replay(replay);
+    }
     terminal::enable_raw_mode().map_err(|e| e.to_string())?;
     // The theme's colours, so muted reads as the measured gray it is in
     // the conversation, and `NO_COLOR` is honoured here too.
@@ -2642,8 +3116,18 @@ impl ratatui::widgets::Widget for &mut View {
         }
         let width = area.width as usize;
         let mut head = vec![Span::raw(" "), Span::raw("sky").bold()];
-        let keys = crate::hint::spans(&format!("{KEYS} "));
-        let used = 4 + KEYS.width() + 1;
+        let mut keys = match self.replay {
+            Some(_) => format!("{REPLAY_KEYS} · q quit"),
+            None => KEYS.to_owned(),
+        };
+        // A narrow terminal keeps the last keys, quitting among them.
+        while 4 + keys.width() + 1 > width
+            && let Some((_, rest)) = keys.split_once(" · ")
+        {
+            keys = rest.to_owned();
+        }
+        let used = 4 + keys.width() + 1;
+        let keys = crate::hint::spans(&format!("{keys} "));
         head.push(Span::raw(" ".repeat(width.saturating_sub(used))));
         head.extend(keys);
         buf.set_line(area.x, area.y, &Line::from(head), area.width);
@@ -2755,15 +3239,8 @@ async fn follow(socket: PathBuf, send: mpsc::UnboundedSender<Feed>) {
         // A configured agent is read again: the event says only what
         // changed, and `m` colours by its model.
         if event["event"] == "configured" {
-            let model = event["changed"]
-                .as_array()
-                .is_some_and(|changed| changed.iter().any(|c| c == "model"));
-            if let (true, Some(name)) = (model, event["bot"].as_str())
-                && let Ok(bot) = client.request("inspect", json!({"bot": name})).await
-                && let Some(model) = bot["model"].as_str()
-                && send
-                    .send(Feed::Model(name.to_owned(), model.to_owned()))
-                    .is_err()
+            if let Some(model) = configured(&client, &event).await
+                && send.send(model).is_err()
             {
                 return;
             }
@@ -2774,6 +3251,112 @@ async fn follow(socket: PathBuf, send: mpsc::UnboundedSender<Feed>) {
             continue;
         }
         if send.send(Feed::Live(event)).is_err() {
+            return;
+        }
+    }
+    let _ = send.send(Feed::Down("the daemon closed the connection".into()));
+}
+
+/// A configured agent's model, read again when it changed: the event says
+/// only what changed, and `m` colours by its model.
+async fn configured(client: &Client, event: &Value) -> Option<Feed> {
+    let changed = event["changed"].as_array()?;
+    if !changed.iter().any(|c| c == "model") {
+        return None;
+    }
+    let name = event["bot"].as_str()?;
+    let bot = client.request("inspect", json!({"bot": name})).await.ok()?;
+    Some(Feed::Model(
+        name.to_owned(),
+        bot["model"].as_str()?.to_owned(),
+    ))
+}
+
+/// An event as a replay's tape keeps it: a tool's arguments only for a
+/// commons post, which is all the sky reads of them.
+fn slim(mut event: Value) -> Value {
+    // What the daemon sends unwritten, such as a deletion, happened when
+    // it came: dated so, it plays at its time and not at the start.
+    if event["written_ms"].is_null()
+        && let Some(fields) = event.as_object_mut()
+    {
+        fields.insert("written_ms".into(), json!(wall_ms()));
+    }
+    if event["event"] == "tool_started"
+        && event["data"]["name"] != "commons"
+        && let Some(data) = event["data"].as_object_mut()
+    {
+        data.remove("arguments");
+    }
+    event
+}
+
+/// An event of a replay's connection onto its tape; false once the sky
+/// or the daemon has gone.
+async fn taped(client: &Client, event: Value, send: &mpsc::UnboundedSender<Feed>) -> bool {
+    let sent = match event["event"].as_str() {
+        Some("pruned") => return true,
+        // As live: a new model is read again, for `m`.
+        Some("configured") => match configured(client, &event).await {
+            Some(model) => send.send(model),
+            None => return true,
+        },
+        Some("lagged" | "follow_lagged") => {
+            let _ = send.send(Feed::Down("fell behind the daemon".into()));
+            return false;
+        }
+        // What the sky reads of a tool's arguments is a commons post; the
+        // rest stays with the daemon, not in the tape. An unwritten event
+        // is dated as it comes.
+        _ => send.send(Feed::Tape(slim(event))),
+    };
+    sent.is_ok()
+}
+
+/// A replay's connection: every agent here now, then every event written
+/// since `from` (Unix ms), the past as one tape, then what follows live.
+async fn tape(socket: PathBuf, from: i64, send: mpsc::UnboundedSender<Feed>) {
+    let (client, mut events) = match Client::connect(&socket).await {
+        Ok(connected) => connected,
+        Err(error) => {
+            let _ = send.send(Feed::Down(error.to_string()));
+            return;
+        }
+    };
+    if !roll(&client, &send).await {
+        return;
+    }
+    if let Err(error) = client
+        .request(
+            "follow",
+            json!({"bot": "*", "since_ms": from, "kinds": LIVE}),
+        )
+        .await
+    {
+        let _ = send.send(Feed::Down(error.to_string()));
+        return;
+    }
+    while let Some(event) = events.recv().await {
+        if event["event"] != "follow_live" {
+            if !taped(&client, event, &send).await {
+                return;
+            }
+            continue;
+        }
+        // Who is here may have changed while the past was read, and a
+        // removal then is in neither the tape nor what follows: the cast is
+        // read again, as `follow` reads the roll again. What came while it
+        // was read goes on the tape before the replay starts, so an agent
+        // made then, listed already, waits for its making.
+        if !roll(&client, &send).await {
+            return;
+        }
+        while let Ok(event) = events.try_recv() {
+            if !taped(&client, event, &send).await {
+                return;
+            }
+        }
+        if send.send(Feed::Ready).is_err() {
             return;
         }
     }
@@ -3066,6 +3649,219 @@ mod tests {
         assert_eq!(view.agents[view.index["shop.login"]].goal, goal);
         assert!(view.press(KeyCode::Char('m')));
         assert!(!view.models);
+    }
+
+    #[tokio::test]
+    async fn a_replay_plays_the_past_in_its_time_and_steps_back_to_its_start() {
+        use ratatui::crossterm::event::KeyCode;
+        let (mut view, send) = view();
+        let from = wall_ms() - 3_600_000;
+        view.replay = Some(Replay::new(from));
+        send.send(Feed::Roll(vec![
+            json!({"name": "shop.lead", "running_turn": 4}),
+            json!({"name": "shop.login", "created_by": "shop.lead"}),
+            json!({"name": "shop.cart", "created_by": "shop.lead"}),
+        ]))
+        .unwrap();
+        let said = |cursor: i64, ms: i64, to: &str| {
+            json!({"cursor": cursor, "event": "accepted", "bot": to, "turn": cursor,
+                "written_ms": from + ms, "data": {"from": {"bot": "shop.lead", "turn": 1}}})
+        };
+        send.send(Feed::Tape(said(1, 1_000, "shop.login"))).unwrap();
+        // Made during the replay: not there until it is.
+        send.send(Feed::Tape(
+            json!({"cursor": 2, "event": "created", "bot": "shop.cart",
+            "written_ms": from + 60_000, "data": {"bot_id": 3, "created_by": "shop.lead"}}),
+        ))
+        .unwrap();
+        send.send(Feed::Tape(said(3, 90_000, "shop.cart"))).unwrap();
+        // Before it's all in, only the footer says so.
+        view.drain();
+        assert!(view.agents.is_empty());
+        assert!(text(&[view.footer(80)]).contains("reading from"));
+        send.send(Feed::Ready).unwrap();
+        view.drain();
+        // Who was here, all idle, and nothing yet said.
+        assert!(view.agent("shop.lead").is_some() && view.agent("shop.cart").is_none());
+        assert_eq!(view.agents[view.index["shop.lead"]].running, None);
+        assert!(view.ticker.is_empty());
+        // Eight times as fast: a second and a half plays twelve.
+        let replay = view.replay.as_mut().unwrap();
+        replay.tick -= Duration::from_millis(1500);
+        view.drain();
+        let logged: Vec<_> = view
+            .ticker
+            .iter()
+            .map(|t| (t.text.clone(), t.written))
+            .collect();
+        assert_eq!(
+            logged,
+            [("shop lead → login".to_owned(), Some(from + 1_000))]
+        );
+        // The hour's weights go by when it was said, not sped up: eleven
+        // seconds before the replay's now, not a second and a half.
+        let ago = view.said[0].0.elapsed().as_secs_f32();
+        assert!((10.0..12.5).contains(&ago), "{ago}");
+        assert!(view.agent("shop.cart").is_none());
+        // A step on, in the list a small pane shows too: a minute and
+        // twenty seconds at 8×, the cart made and messaged, its time in
+        // the log.
+        view.listing = true;
+        assert!(view.press(KeyCode::Right));
+        view.listing = false;
+        assert!(view.agent("shop.cart").is_some());
+        assert_eq!(view.ticker.len(), 2);
+        let log = text(&view.ticked(Instant::now(), 40, 12, true));
+        assert!(log.contains(&clock(from + 90_000)), "{log}");
+        // Paused, nothing moves; slower and faster halve and double.
+        assert!(view.press(KeyCode::Char(' ')));
+        let at = view.replay.as_ref().unwrap().at;
+        view.replay.as_mut().unwrap().tick -= Duration::from_secs(5);
+        view.drain();
+        assert_eq!(view.replay.as_ref().unwrap().at, at);
+        assert!(text(&[view.footer(80)]).contains("‖ 8×"));
+        view.press(KeyCode::Char(']'));
+        view.press(KeyCode::Char('['));
+        view.press(KeyCode::Char('['));
+        assert_eq!(view.replay.as_ref().unwrap().speed, 4.0);
+        // Back past the start: from the start again, who came later gone.
+        for _ in 0..8 {
+            view.press(KeyCode::Left);
+        }
+        assert_eq!(view.replay.as_ref().unwrap().at, from as f64);
+        assert!(view.agent("shop.cart").is_none());
+        assert!(view.ticker.is_empty());
+        // Esc watches live again.
+        assert!(view.press(KeyCode::Esc));
+        assert!(!view.replaying());
+    }
+
+    #[test]
+    fn a_replay_s_tape_keeps_tool_arguments_only_for_a_commons_post_and_dates_the_unwritten() {
+        let call = |name: &str| json!({"event": "tool_started", "bot": "a", "data": {"name": name, "arguments": "{}"}});
+        assert!(slim(call("shell"))["data"]["arguments"].is_null());
+        assert_eq!(slim(call("commons"))["data"]["arguments"], "{}");
+        assert_eq!(slim(call("shell"))["data"]["name"], "shell");
+        // A deletion comes unwritten: it is dated as it comes, and what is
+        // written keeps its date.
+        let before = wall_ms();
+        let gone = slim(json!({"event": "deleted", "bot": "a"}))["written_ms"].as_i64();
+        assert!(gone.is_some_and(|at| at >= before));
+        let said = json!({"event": "queued", "bot": "a", "written_ms": 5});
+        assert_eq!(slim(said)["written_ms"], 5);
+    }
+
+    #[test]
+    fn a_replay_s_tape_lets_its_oldest_played_tenth_go_past_its_bound() {
+        let mut replay = Replay::new(0);
+        for at in 0..TAPE as i64 {
+            replay.keep(json!({"event": "queued", "written_ms": at}));
+        }
+        // Nothing played yet: nothing goes.
+        replay.keep(json!({"event": "queued", "written_ms": TAPE}));
+        assert_eq!(replay.tape.len(), TAPE + 1);
+        replay.played = TAPE;
+        replay.keep(json!({"event": "queued", "written_ms": TAPE + 1}));
+        assert_eq!(replay.tape.len(), TAPE + 2 - TAPE / 10);
+        assert_eq!(replay.played, TAPE - TAPE / 10);
+        assert_eq!(replay.from, (TAPE / 10) as i64);
+        // Who was made, or removed, in what went is in the cast now.
+        let mut replay = Replay::new(0);
+        replay.cast = vec![json!({"name": "old"})];
+        replay.keep(json!({"event": "created", "bot": "new", "data": {"bot_id": 9}}));
+        replay.keep(json!({"event": "deleted", "bot": "old"}));
+        for at in 0..TAPE as i64 {
+            replay.keep(json!({"event": "queued", "written_ms": at}));
+        }
+        replay.played = TAPE;
+        replay.keep(json!({"event": "queued", "written_ms": TAPE}));
+        let cast: Vec<_> = replay
+            .cast
+            .iter()
+            .map(|bot| (bot["name"].clone(), bot["bot_id"].clone()))
+            .collect();
+        assert_eq!(cast, [(json!("new"), json!(9))]);
+    }
+
+    #[test]
+    fn a_replay_seats_an_agent_with_its_new_model_after_a_step_back() {
+        let mut replay = Replay::new(0);
+        replay.cast = vec![json!({"name": "a", "model": "m1"})];
+        replay.keep(json!({"event": "created", "bot": "b", "data": {"model": "m1"}}));
+        replay.remodel(&HashMap::from([("a", "m2"), ("b", "m3")]));
+        assert_eq!(replay.cast[0]["model"], "m2");
+        assert_eq!(replay.tape[0]["data"]["model"], "m3");
+    }
+
+    #[tokio::test]
+    async fn a_replay_keeps_who_had_a_name_before_it_was_used_again() {
+        let (mut view, send) = view();
+        let from = wall_ms() - 3_600_000;
+        view.replay = Some(Replay::new(from));
+        send.send(Feed::Roll(vec![json!({"name": "shop.a", "bot_id": 1})]))
+            .unwrap();
+        send.send(Feed::Tape(json!({"event": "deleted", "bot": "shop.a",
+            "written_ms": from + 60_000})))
+            .unwrap();
+        send.send(Feed::Tape(json!({"event": "created", "bot": "shop.a",
+            "written_ms": from + 90_000, "data": {"bot_id": 2}})))
+            .unwrap();
+        send.send(Feed::Ready).unwrap();
+        view.drain();
+        // At the start, the first one, not waiting on the second's making.
+        assert_eq!(view.agents[view.index["shop.a"]].id, Some(1));
+    }
+
+    #[tokio::test]
+    async fn a_replay_takes_the_listing_s_model_for_an_agent_it_saw_made() {
+        let (mut view, send) = view();
+        view.replay = Some(Replay::new(0));
+        send.send(Feed::Tape(
+            json!({"event": "created", "bot": "b", "written_ms": 1, "data": {"model": "m1"}}),
+        ))
+        .unwrap();
+        send.send(Feed::Roll(vec![json!({"name": "b", "model": "m2"})]))
+            .unwrap();
+        view.drain();
+        let replay = view.replay.as_ref().unwrap();
+        assert_eq!(replay.tape[0]["data"]["model"], "m2");
+    }
+
+    #[tokio::test]
+    async fn an_older_spark_landing_after_a_newer_send_keeps_the_newer_glow() {
+        let (mut view, send) = view();
+        send.send(Feed::Roll(vec![json!({"name": "a"}), json!({"name": "b"})]))
+            .unwrap();
+        view.drain();
+        let (a, b) = (view.index["a"], view.index["b"]);
+        let now = Instant::now();
+        // A jump plays a message to `a` a moment back, then `a` sending now.
+        view.sparks.push(Spark {
+            from: End::Agent(b),
+            to: End::Agent(a),
+            born: now - FLIGHT - Duration::from_millis(200),
+            color: Some(Color::Blue),
+        });
+        view.send(End::Agent(a), End::Agent(b), now);
+        let heat = view.agents[a].heat;
+        view.land(now);
+        let agent = &view.agents[a];
+        assert_eq!((agent.lit, agent.heated), (Some(now), Some(now)));
+        assert!(agent.heat > heat);
+    }
+
+    #[test]
+    fn a_replay_starts_some_time_ago_or_at_a_time_of_day() {
+        let now = wall_ms();
+        assert_eq!(replay_from("2h", now), Some(now - 7_200_000));
+        assert_eq!(replay_from("30m", now), Some(now - 1_800_000));
+        assert_eq!(replay_from("1d", now), Some(now - 86_400_000));
+        let at = replay_from("02:10", now).unwrap();
+        assert!(at <= now && now - at < 86_400_000 + 3_600_000);
+        assert_eq!(clock(at), "02:10");
+        for wrong in ["2", "2x", "25:00", "1:61", "", "h"] {
+            assert_eq!(replay_from(wrong, now), None, "{wrong}");
+        }
     }
 
     #[tokio::test]
@@ -3508,7 +4304,9 @@ mod tests {
                 Feed::Live(event) => event["cursor"].to_string(),
                 Feed::Roll(_) => "roll".into(),
                 Feed::Ready => "ready".into(),
-                Feed::Past(_) | Feed::Held(_) | Feed::Down(_) | Feed::Model(..) => continue,
+                Feed::Past(_) | Feed::Held(_) | Feed::Down(_) | Feed::Model(..) | Feed::Tape(_) => {
+                    continue;
+                }
             });
         }
         // Made, then started, once each in the store's order; then the roll
