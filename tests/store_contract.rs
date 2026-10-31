@@ -9395,6 +9395,65 @@ fn quoted_words_wait_with_their_turn_and_count_against_the_pending_bytes() {
 }
 
 #[test]
+fn one_absorption_takes_in_quoted_words_within_its_batch_bytes() {
+    let mut db = db();
+    db.create("Ann", Some("/synthetic"), binding()).unwrap();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let said = db
+        .begin(
+            "Ann",
+            "a1",
+            &"x".repeat(200 * 1024),
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    db.finish(said, None).unwrap();
+    let running = db
+        .begin(
+            "Bob",
+            "b1",
+            "go",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    // Two short steers quoting 200 KiB each: the first is always taken in,
+    // the second waits for the next batch.
+    let steer = TurnOptions {
+        delivery: Delivery::Steer,
+        quotes: vec![quote("Ann", said, false)],
+        ..TurnOptions::default()
+    };
+    for id in ["s1", "s2"] {
+        db.begin("Bob", id, "", true, &steer, allow_provider)
+            .unwrap();
+    }
+    let absorb = |db: &mut Database, through| {
+        db.absorb(
+            running,
+            through,
+            8 << 20,
+            4096,
+            ContextUsage::default(),
+            false,
+            true,
+        )
+        .unwrap()
+    };
+    let absorbed = absorb(&mut db, None);
+    assert_eq!(absorbed.outcomes.len(), 1);
+    assert!(absorbed.next_through.is_some());
+    let absorbed = absorb(&mut db, absorbed.next_through);
+    assert_eq!(absorbed.outcomes.len(), 1);
+    assert_eq!(db.pending().unwrap(), (0, 0));
+}
+
+#[test]
 fn batched_history_items_validate_the_branch_and_bound_payloads() {
     let mut db = db();
     db.create("source", Some("/synthetic"), binding()).unwrap();

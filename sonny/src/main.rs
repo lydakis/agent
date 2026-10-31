@@ -4445,7 +4445,7 @@ impl App {
             let text = match self.relayed[&node].text {
                 Some(_) => None,
                 None => match self.items(&[node]).await.first() {
-                    Some(item) => Some(text(item)),
+                    Some(item) => Some(quoting(item)),
                     None => {
                         self.notice = Some("could not read that message".into());
                         return;
@@ -4860,7 +4860,7 @@ impl App {
         }
         for (node, item) in read {
             if let Some(relayed) = self.relayed.get_mut(&node) {
-                relayed.text = Some(text(&item));
+                relayed.text = Some(quoting(&item));
             }
         }
         let clusters: Vec<usize> = self.clusters.keys().copied().collect();
@@ -5248,9 +5248,15 @@ impl App {
                     entry["origin"].as_str(),
                     entry["person"].as_str(),
                 );
+                let quotes = entry.get("quotes").cloned();
                 responses(&entry["item"]).into_iter().map(move |mut item| {
                     if let Some(from) = from.as_ref().filter(|_| item["role"] == "user") {
                         item["from"] = json!(from);
+                    }
+                    // Where its quoted words are among its parts, and who
+                    // wrote them.
+                    if let Some(quotes) = quotes.as_ref().filter(|_| item["role"] == "user") {
+                        item["quotes"] = quotes.clone();
                     }
                     (node, item)
                 })
@@ -10808,6 +10814,34 @@ fn text(item: &Value) -> String {
     }
 }
 
+/// A message's own words and, under them, the words it quotes, each
+/// after a line naming who wrote it: what reading the message in full shows.
+fn quoting(item: &Value) -> String {
+    let mut out = text(item);
+    let parts = item["content"].as_array();
+    for quote in item["quotes"].as_array().into_iter().flatten() {
+        let words = (quote["at"].as_u64())
+            .and_then(|at| parts?.get(at as usize)?["text"].as_str())
+            .unwrap_or_default();
+        let who = transcript::sender(
+            quote["from"]["bot"].as_str(),
+            quote["origin"].as_str(),
+            quote["person"].as_str(),
+        )
+        .unwrap_or_else(|| "you".into());
+        let what = match quote["reply"] == true {
+            true => "the reply of turn",
+            false => "turn",
+        };
+        let (bot, turn) = (quote["bot"].as_str().unwrap_or_default(), &quote["turn"]);
+        out.push_str(&format!("\n\n{who}, in {what}:{bot}/{turn}:"));
+        for line in words.lines() {
+            out.push_str(&format!("\n> {line}"));
+        }
+    }
+    out
+}
+
 /// Text, or the text of a list of parts, leaving out the pictures.
 fn joined(content: &Value) -> String {
     match content {
@@ -14673,6 +14707,26 @@ mod tests {
             transcript::fullness(48_500, None),
             ("48.5k".into(), " context", None)
         );
+    }
+
+    #[test]
+    fn a_message_read_in_full_shows_the_words_it_quotes_under_who_wrote_them() {
+        let item = json!({"role": "user", "content": [
+            {"type": "input_text", "text": "News from your tasks."},
+            {"type": "input_text", "text": "[Sent by lookout.tasks.]"},
+            {"type": "input_text", "text": "[Quoted from turn:calc.fix/5, written by a person:]"},
+            {"type": "input_text", "text": "yes, ship it\nand tag it"},
+            {"type": "input_text", "text": "[Quoted from the reply of turn:calc.fix/6, written by ana:]"},
+            {"type": "input_text", "text": "tagged"}],
+            "quotes": [{"bot": "calc.fix", "turn": 5, "at": 3},
+                {"bot": "calc.fix", "turn": 6, "reply": true, "person": "ana", "at": 5}]});
+        assert_eq!(
+            quoting(&item),
+            "News from your tasks.\n\nyou, in turn:calc.fix/5:\n> yes, ship it\n> and tag it\n\n\
+             ana, in the reply of turn:calc.fix/6:\n> tagged"
+        );
+        // Its own words are all a message without quotes shows.
+        assert_eq!(text(&item), "News from your tasks.");
     }
 
     #[test]

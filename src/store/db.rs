@@ -5854,13 +5854,21 @@ impl Database {
             let (mut bytes, mut picture_bytes) = (0, 0);
             while let Some(row) = rows.next()? {
                 let size = row.get::<_, i64>(2)? as usize;
+                // Its words with the words it quotes, which it takes in too.
+                let held = row.get::<_, i64>(6)? as usize;
                 if !row.get::<_, bool>(3)? {
                     break;
                 }
-                if size > STEER_BATCH_BYTES - bytes {
+                if size > STEER_BATCH_BYTES.saturating_sub(bytes) {
                     // An oversized store-level prompt must not spin forever.
                     // Protocol prompts are already capped at this same limit.
                     more = !steers.is_empty();
+                    break;
+                }
+                // Quoted words count past the first steer's, which admission
+                // bounded with its own words, as its pictures are.
+                if !steers.is_empty() && held > STEER_BATCH_BYTES.saturating_sub(bytes) {
+                    more = true;
                     break;
                 }
                 // Pictures are read only once they fit their own budget,
@@ -5871,7 +5879,7 @@ impl Database {
                     more = true;
                     break;
                 }
-                bytes += size;
+                bytes += held;
                 picture_bytes += pictured_size;
                 let id: i64 = row.get(0)?;
                 let (images, (after, quotes)) = self
@@ -5895,7 +5903,7 @@ impl Database {
                 }
                 room_bytes -= weight + 1;
                 room_items -= 1;
-                let waiting = (!row.get::<_, bool>(4)?).then_some(row.get::<_, i64>(6)? as usize);
+                let waiting = (!row.get::<_, bool>(4)?).then_some(held);
                 steers.push((id, prompted, size, waiting, images, quotes));
             }
         }
