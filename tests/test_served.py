@@ -253,7 +253,8 @@ class ServedToolTests(ModelFixture):
             time.sleep(.05)
         self.host()
         self.assertEqual(self.daemon.finished(turn)['data']['status'], 'completed')
-        self.assertEqual(json.loads(self.output('calc.lead', turn)), {'subscriptions': [], 'sources': []})
+        # The commons, on unless set off, is a source of Sonny's own.
+        self.assertEqual(json.loads(self.output('calc.lead', turn)), {'subscriptions': [], 'sources': [{'name': 'commons', 'events': 0}]})
 
     def test_an_agent_s_script_calls_an_mcp_server_the_host_keeps_up(self):
         server = Path(__file__).with_name('mcp_server.py')
@@ -421,7 +422,13 @@ class ServedToolTests(ModelFixture):
         for bot in ('calc.a', 'shop.b'):
             self.daemon.request('create', bot=bot, workspace=str(self.path), model='openai/synthetic-model',
                                 instructions='Agent.', declare=[declared('commons')])
+        # Each reply as it comes, not an hour's digest.
+        (self.path / '.agent').mkdir(exist_ok=True)
+        (self.path / '.agent/config.toml').write_text('[sonny]\ncommons_digest = "0"\n')
         self.host()
+        self.lookout()
+        # The commons source's first look, which tells none of the past.
+        self.lines_of(self.path / 'state.sqlite.sources/commons/read.json', 1)
         scripts = {}
 
         def turn(bot, arguments):
@@ -430,19 +437,26 @@ class ServedToolTests(ModelFixture):
             return json.loads(self.call(bot, 'commons', arguments))
 
         post = {'name': 'fake-home', 'title': 'Live tests want a fake HOME', 'text': 'For both binaries.'}
-        self.assertEqual(turn('calc.a', {'post': post})['posts'], 1)
+        started = turn('calc.a', {'post': post})
+        self.assertEqual((started['posts'], started['subscription']), (1, 'commons.fake-home'), started)
+        # Posting subscribes the poster to the thread.
+        subscribed = json.loads((self.path / 'state.sqlite.lookout/calc.a.json').read_text())
+        # Held by this bot, not one that takes its name later.
+        calc_a = self.daemon.request('inspect', bot='calc.a')['result']['bot_id']
+        self.assertEqual(subscribed['subscriptions'],
+                         [{'name': 'commons.fake-home', 'sources': ['commons:fake-home'], 'bot_id': calc_a}])
         replied = turn('shop.b', {'reply': {'thread': 'fake-home', 'text': 'Confirmed here too.'}})
-        self.assertEqual((replied['posts'], replied['told']), (2, ['calc.a']), replied)
+        self.assertEqual((replied['posts'], replied['told'], replied['subscription']),
+                         (2, [], 'commons.fake-home'), replied)
         thread = (self.path / '.agents/commons/fake-home.jsonl').read_text().splitlines()
         self.assertEqual([json.loads(line)['by'] for line in thread], ['calc.a', 'shop.b'])
-        # The reply joins calc.a's next model call, and starts no turn.
-        turns = self.daemon.request('turns', bot='calc.a')['result']['turns']
-        self.assertEqual([t['status'] for t in turns], ['completed', 'attached'], turns)
-        self.model.bodies = []
-        turn_id = self.daemon.request('submit', bot='calc.a', request_id='next', prompt='hello')['result']['turn']
-        self.assertEqual(self.daemon.finished(turn_id)['data']['status'], 'completed')
-        sent = b''.join(self.model.bodies)
-        self.assertIn(b'shop.b replied in the commons thread fake-home', sent)
+        # The lookout tells calc.a of the reply, and shop.b nothing of its own.
+        note = self.note_for('calc.a', 'Confirmed here too.', starts='From your sources: ')
+        self.assertIn('- commons:fake-home, from "shop.b" (for your commons.fake-home): '
+                      '"reply in fake-home, \\"Live tests want a fake HOME\\": Confirmed here too."', note)
+        for t in self.daemon.request('turns', bot='shop.b')['result']['turns']:
+            prompts = self.daemon.request('prompts', bot='shop.b', turn=t['turn'])['result']['prompts']
+            self.assertFalse(prompts and prompts[0]['text'].startswith('From your sources: '), prompts)
         listed = turn('shop.b', {})
         self.assertEqual([t['thread'] for t in listed['threads']], ['fake-home'])
 
@@ -517,13 +531,13 @@ class ServedToolTests(ModelFixture):
         [kept] = (self.path / '.agent/sonny/instructions').iterdir()
         self.assertTrue(kept.name.endswith(f'-{lead["bot_id"]}'), kept.name)
 
-    def note_for(self, bot, having, timeout=30):
+    def note_for(self, bot, having, timeout=30, starts='Task updates: '):
         """The first note the lookout gave `bot` that says `having`."""
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             for turn in self.daemon.request('turns', bot=bot)['result']['turns']:
                 text = self.daemon.request('prompts', bot=bot, turn=turn['turn'])['result']['prompts']
-                if text and text[0]['text'].startswith('Task updates: ') and having in text[0]['text']:
+                if text and text[0]['text'].startswith(starts) and having in text[0]['text']:
                     return text[0]['text']
             time.sleep(.2)
         self.fail(f'{bot} heard nothing saying {having!r}')

@@ -770,7 +770,10 @@ way `/react` does, and each note in the margin has its own `↩`.
 - `/pause REASON` stops every agent, in every project, until `/resume`:
   running turns stop where they are and continue on `/resume`, and what
   arrives meanwhile waits, across restarts too.
-  Every window says who paused and why. Agents pull the same cord with
+  Every window says who paused and why, and which agents it parked; Esc in
+  one of their windows ends that agent's turn before you resume.
+  `agent pauses` lists every pause, who pulled it and who let it go.
+  Agents pull the same cord with
   `agent pause --reason` from their shell
   ([docs/SONNY.md](../docs/SONNY.md#pause)). In `/sky` a pull is the one
   loud moment: a yellow cord drops from the top to whoever pulled it, an

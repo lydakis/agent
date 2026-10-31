@@ -2,7 +2,7 @@
 use agent_runtime::{Error, Result, fail_with};
 
 const CONNECTION: &str = "--store --socket";
-const STARTUP: &str = "--provider --max-processes --max-detached --max-active --max-connecting --max-pending --max-pending-bytes --stall-timeout --idle-exit";
+const STARTUP: &str = "--provider --max-processes --max-detached --max-active --max-connecting --max-pending --max-pending-bytes --max-readers --stall-timeout --idle-exit";
 
 struct Command {
     name: &'static str,
@@ -193,6 +193,14 @@ const COMMANDS: &[Command] = &[
         startup: false,
     },
     Command {
+        name: "pauses",
+        about: "Every pause, held or lifted: why, who pulled it and let it go, whose turns it parked",
+        usage: "pauses [--after ID] [--newest] [--limit N]",
+        flags: "--after --newest --limit --pretty --no-spawn",
+        settings: "",
+        startup: true,
+    },
+    Command {
         name: "serve",
         about: "Run the daemon in the foreground; other commands start it for you",
         usage: "serve --store PATH --provider SPEC... [OPTIONS]",
@@ -343,6 +351,7 @@ fn print_flags(flags: &str) {
             "--max-connecting" => ("N", "Concurrent provider startup limit; 0 is unbounded"),
             "--max-pending" => ("N", "Submissions waiting to start; 0 is unbounded"),
             "--max-pending-bytes" => ("N", "Prompt bytes waiting to start; 0 is unbounded"),
+            "--max-readers" => ("N", "Store reader connections; default one per CPU"),
             "--max-output-tokens" => (
                 "N",
                 "A new bot's output token cap per model call; default the model's limit",

@@ -394,6 +394,7 @@ bound; the operating system is then the only limit.
 | `--max-active` | Turns with a live task: a model call in flight or a foreground tool. Parked turns never count. | 4,096 |
 | `--max-pending` | Submissions waiting to start: queued behind a bot's own work or ready for a slot, daemon-wide. A submission that would wait past the bound answers `pending_limit` and writes nothing; one that starts at once is never refused by it. | none |
 | `--max-pending-bytes` | UTF-8 bytes of those waiting submissions: their prompts and the words they quote, which wait with them. | none |
+| `--max-readers` | Store reader connections, each on its own thread, for the reads clients ask for that decide nothing ([observation reads](#observation-reads)), which take all but one, and for turns' own reads. At least 1. | one per logical CPU |
 | `--max-connecting` | Provider requests awaiting response headers, a Bedrock Runtime call's body digest included. Established streams are not capped. Both providers hold headers until the first token, so a permit is held for the whole time to first token; a bound of N caps throughput at N calls per first-token latency. | none |
 | `--stall-timeout` | How long an established provider stream may go without a content frame before the attempt fails as `provider_stream_stalled` and is retried. Keepalives do not count. Whole seconds, `1s` to `24h`. | `2m` |
 | `--idle-exit` | How long, in whole seconds, before a socket daemon with no sessions, no live turns, and no running background commands exits. Parked turns are durable and resume on the next start; the client restarts the daemon on demand. | none |
@@ -996,8 +997,31 @@ requests from all sessions together, each session's in its own queue, and
 the service takes the sessions with one queued in turn, one request each, as
 Redis and NATS serve their clients: a client that pipelines thousands of
 requests holds every other session up by one of them, not by all it sent
-first. A session's own requests keep their order. Storage queues at most 32
-operations. HTTP client internal buffers,
+first. Each session reads at most 8 requests ahead, so a few busy sessions
+never fill the queue for the rest. What one waiting
+for an [observation read](#observation-reads) has queued stops counting
+against the queue, and so does what it reads, up to its 8, while it waits:
+any number of sessions waiting on reads leave the queue to the others, and
+each still reaches the lease renewals it sends behind its requests. A session's own
+requests keep their order. Storage queues at most 32
+operations.
+
+### Observation reads
+
+Reads that decide nothing run beside the service loop, not in it:
+`history_nodes`, `history_items`, `history_search`, `turns`, `bots`,
+`events`, `usage` and `prompts`. Each runs on one of the store's reader
+connections (`--max-readers`, one per logical CPU by default; WAL readers
+do not block each other or the writer). They take at most all but one of
+the connections, the rest waiting in the order they came, so a turn's own
+reads (its context, a compaction plan) always find one free, as Kubernetes'
+API Priority and Fairness keeps seats for each priority level. Meanwhile the loop serves every other
+session, so one client's deep history read or search across every bot
+holds up no other client's submit, interrupt or pause. The session that
+asked waits for its read's answer before its next request is taken, so its
+own requests keep their order and each session has at most one read
+running or waiting. At shutdown, reads still running get a few seconds to
+answer. A read whose task fails answers `observation_failed`. HTTP client internal buffers,
 active histories, allocator retention, and filesystem cache remain part of the
 memory accounting.
 
@@ -1034,32 +1058,46 @@ cancelled like any others at shutdown. `agent shutdown --grace DURATION` sends
 it and waits that much longer than 30 seconds.
 
 Protocol 24 also adds the pull cord: `pause` stops every agent until
-`resume`, and holds across restarts, since the store keeps it (schema 64, a
-one-row `pause` table). `{"op":"pause","reason":TEXT,"by":NAME}` needs a
+`resume`, and holds across restarts, since the store keeps it (schema 64;
+since schema 72 the `pauses` table keeps every pause, held or lifted). `{"op":"pause","reason":TEXT,"by":NAME}` needs a
 reason of 1 to 4096 bytes. `by` is who pulled it, 1 to 128 bytes, or the
 request answers `invalid_by`; on a bot's own socket it is that bot, whatever
 the request says. It parks every running turn at once,
 as a closed pool parks it (`turn_paced` with `paused: true`; status `paced`),
 to continue on `resume`. The reply it was writing is dropped and asked for
 again then. Each call the turn had not answered gets a result, `{error:
-"daemon_paused", detail, pause}`, saying the pause stopped it before its result
+"daemon_paused", detail, pause}` (`pause` is `{reason, by, at_ms}`), saying the pause stopped it before its result
 was recorded (it may have had effects) or came before it ran, and none is run
 again: the model decides what to redo, as Codex answers the calls an interrupt
 cut off. The pause ends every background command (whose handle then answers
-`daemon_paused`, saying the same) and terminal, though not a detached
-command, which no one tracks, and from then no turn starts: a `reject`
+`daemon_paused`, saying the same), terminal, and detached command this
+daemon started (the process group each leads, with what it left running
+there after it exited, and on Linux a sandboxed one's whole pid namespace;
+one started before a restart, or an unsandboxed process that left that
+group, is no longer the daemon's to find), and from
+then no turn starts: a `reject`
 submission answers `daemon_paused`, `queue` and `steer` submissions are
 recorded and wait, triggers and notes with them, and parked and paced turns
 stay parked. An `attach` is taken as usual. The answer is `{pause, changed,
-parked}`, where `pause` is `{reason, by, at_ms}` and `parked` counts the
-running turns it parked. While a pause holds,
+parked}`, where `pause` is `{id, reason, by, at_ms, parked}` and the
+reply's `parked` counts the running turns it parked. The pause's own `parked`
+is `{bots, total}`: the agents whose running turns it parked, the first 64 by
+name, and how many in all, so whoever looks can stop one before letting the
+line go on. While a pause holds,
 another changes nothing and answers the first with `changed: false`.
 `{"op":"resume","by":NAME?}` lifts it and answers `{pause, by, changed}` with
 the pause it lifted, or null when none held, and who lifted it (`by`, 1 to
-128 bytes, as `pause` takes it); what waited,
+128 bytes, as `pause` takes it). A lifted pause adds `resumed_by` and
+`resumed_ms`; what waited,
 and the turns the pause parked, start as capacity allows. Time parked by a
 pause is not counted in `paced_ms`. Protocol 33 parks running turns on a
-pull; before it, they ended `interrupted`. A
+pull; before it, they ended `interrupted`. Protocol 34 keeps every pause:
+`{"op":"pauses","after":ID?,"before":ID?,"limit":N?,"newest":BOOL?}` reads
+them, held and lifted, oldest first (`newest` turns it), at most `limit` (1
+to 256, default 64, and no more than half a reply's bytes) after the pause
+`after` and before `before`, answering `{pauses, more}`; a bad page is `invalid_pause_page`. `agent pauses` prints
+them. A store migrated from schema 71 keeps the pause that held, with no
+agents named as parked. A
 sandboxed bot's own socket refuses it with `not_permitted`, so a command
 left running in a sandbox cannot let the line go on. Each
 change is told to every session as a `paused` or `resumed` event, `{event,
@@ -1342,8 +1380,9 @@ bots whose name matches a SQLite GLOB pattern (1 to 256 bytes; case-sensitive
 like names), read from the name index's range for the pattern's literal
 prefix, and `active: true` keeps those with a turn running, read from a partial
 index of only them (`bots_running`). Filtered pages page and bound like any
-other. `bots` and `turns` run on the store's reader connection, so a listing
-never waits behind, or holds up, the writer.
+other. `bots` and `turns` run on the store's reader connections, beside the
+service loop ([observation reads](#observation-reads)), so a listing never
+waits behind, or holds up, the writer or another client.
 
 Protocol 23 adds `usage`, what bots' turns spent, also a read on the reader
 connection: one grouped statement over `turns`, so one snapshot. `name` keeps
@@ -1362,9 +1401,9 @@ features cost. With `bucket_ms` it adds `series`, one row for each bucket
 of that width from `since_ms` that has turns, at its `at_ms`; it needs a
 `since_ms` and fewer than 1024 buckets to now (`invalid_usage_window`). Usage
 is read from `turns`, so a deleted bot's turns, and the judge's own copies once
-deleted, no longer count. Its cost grows with the turns it matches, so it is
-answered off the dispatch path, like `provider_models`, and other requests go
-on while it reads; it holds only the reader connection. As an observation, not
+deleted, no longer count. Its cost grows with the turns it matches; like every
+observation read it is answered beside the service loop, and other sessions'
+requests go on while it reads. As an observation, not
 a screen: the same statement in Python's SQLite over a synthetic store of 164k
 turns took about 0.3 s for every bot's month and 0.07 s for one project's day.
 Sonny's `/usage` draws it, reading again once a minute while it is open.

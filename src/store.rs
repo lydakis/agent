@@ -56,6 +56,14 @@ fn owner_only(path: &Path) -> Result<()> {
     }
     Ok(())
 }
+
+/// Reads queued for the reader connections, at least twice their number.
+const READ_JOBS: usize = 32;
+
+/// Reader connections by default: one per logical CPU.
+pub fn default_readers() -> usize {
+    std::thread::available_parallelism().map_or(4, |n| n.get())
+}
 /// Most jobs one commit carries: one full queue. Under load the worker runs
 /// everything already queued, up to this many, inside one transaction and
 /// syncs once for all of them; idle, a group is one job and nothing waits
@@ -397,6 +405,13 @@ impl Store {
     /// the next group; the stream is bounded, so a publisher that stops
     /// reading eventually holds the worker, never memory.
     pub async fn open(path: &Path) -> Result<(Self, mpsc::Receiver<Publication>)> {
+        Self::open_with(path, default_readers()).await
+    }
+    /// `open` with `readers` reader connections (at least one).
+    pub async fn open_with(
+        path: &Path,
+        readers: usize,
+    ) -> Result<(Self, mpsc::Receiver<Publication>)> {
         let path = path.to_path_buf();
         let (sender, mut receiver) = mpsc::channel::<Box<dyn Job>>(GROUP_JOBS);
         let counters = std::sync::Arc::<Counters>::default();
@@ -565,35 +580,51 @@ impl Store {
         let store_path = opened
             .await
             .map_err(|_| Error::new("storage_worker_failed"))??;
-        // A second connection on its own thread for reads that carry bytes
-        // rather than decide anything: streaming a context window out of
-        // the store must not hold every other bot's commit behind it. It
-        // opens after the worker, so the file, its WAL, and the current
-        // schema exist, and it sees a job's writes once that job is answered.
-        let (reader, mut reads) = mpsc::channel::<ReadJob>(32);
-        let (ready, opened) = oneshot::channel();
-        let reader_path = store_path.clone();
-        std::thread::Builder::new()
-            .name("agent-storage-reader".into())
-            .spawn(move || {
-                let db = Connection::open(&reader_path)
-                    .map_err(Error::from)
-                    .and_then(Database::reader);
-                match db {
-                    Ok(db) => {
-                        let _ = ready.send(Ok(()));
-                        while let Some(job) = reads.blocking_recv() {
-                            job(&db);
+        // Reader connections, each on its own thread, for reads that carry
+        // bytes rather than decide anything: streaming a context window out
+        // of the store must not hold every other bot's commit behind it, and
+        // one deep history read must not hold the others. WAL readers do not
+        // block each other or the writer. They open after the worker, so the
+        // file, its WAL, and the current schema exist, and each sees a job's
+        // writes once that job is answered. They share one queue, each taking
+        // the next job when it is free.
+        let readers = readers.max(1);
+        let (reader, reads) = mpsc::channel::<ReadJob>(READ_JOBS.max(2 * readers));
+        let reads = std::sync::Arc::new(std::sync::Mutex::new(reads));
+        let mut opening = Vec::with_capacity(readers);
+        for index in 0..readers {
+            let (ready, opened) = oneshot::channel();
+            let (reader_path, reads) = (store_path.clone(), reads.clone());
+            std::thread::Builder::new()
+                .name(format!("agent-storage-reader-{index}"))
+                .spawn(move || {
+                    let db = Connection::open(&reader_path)
+                        .map_err(Error::from)
+                        .and_then(Database::reader);
+                    match db {
+                        Ok(db) => {
+                            let _ = ready.send(Ok(()));
+                            // The lock is held only while waiting for a job,
+                            // never while running one.
+                            while let Some(job) = {
+                                let mut reads = reads.lock().unwrap_or_else(|e| e.into_inner());
+                                reads.blocking_recv()
+                            } {
+                                job(&db);
+                            }
+                        }
+                        Err(error) => {
+                            let _ = ready.send(Err(error));
                         }
                     }
-                    Err(error) => {
-                        let _ = ready.send(Err(error));
-                    }
-                }
-            })?;
-        opened
-            .await
-            .map_err(|_| Error::new("storage_worker_failed"))??;
+                })?;
+            opening.push(opened);
+        }
+        for opened in opening {
+            opened
+                .await
+                .map_err(|_| Error::new("storage_worker_failed"))??;
+        }
         Ok((
             Self {
                 sender,

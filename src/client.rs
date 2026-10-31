@@ -338,7 +338,8 @@ fn parse(args: &[String]) -> Result<Options> {
                     | "--max-active"
                     | "--max-connecting"
                     | "--max-pending"
-                    | "--max-pending-bytes" => {
+                    | "--max-pending-bytes"
+                    | "--max-readers" => {
                         value.parse::<usize>().map_err(|_| {
                             Error::with("usage", format!("{flag} needs an integer"))
                         })?;
@@ -746,6 +747,7 @@ fn check_daemon(options: &Options, ready: &Value) -> Result<()> {
             "--max-connecting" => "connecting",
             "--max-pending" => "pending",
             "--max-pending-bytes" => "pending_bytes",
+            "--max-readers" => "readers",
             "--stall-timeout" => "stall_timeout_seconds",
             "--idle-exit" => "idle_exit_seconds",
             _ => continue,
@@ -1262,6 +1264,16 @@ pub fn main(args: Vec<String>) -> Result<i32> {
             let mut connection = ensure_daemon(&options)?;
             let resumed = connection.request("resume", json!({"by": by}))?;
             print_json(&resumed, options.pretty)?;
+            Ok(0)
+        }
+        "pauses" => {
+            let mut connection = ensure_existing_daemon(&options)?;
+            let page = connection.request(
+                "pauses",
+                json!({"after": options.after, "limit": options.limit.unwrap_or(64).min(256),
+                    "newest": options.newest}),
+            )?;
+            print_json(&page, options.pretty)?;
             Ok(0)
         }
         "shutdown" => {
