@@ -16,8 +16,14 @@ pub fn available() -> bool {
     ["node", "bun"].into_iter().any(on_path)
 }
 
+/// How long a script may take: five seconds, so a picture that will not
+/// come never holds a reply up. Tests share busy runners, where node's
+/// cold start alone can take that (#418), and check what is drawn, not
+/// how fast.
+const LIMIT: Duration = Duration::from_secs(if cfg!(test) { 60 } else { 5 });
+
 /// What `script` writes to stdout, or the first line it wrote to stderr.
-/// At most five seconds.
+/// At most [`LIMIT`].
 pub fn run(script: String, what: &str) -> Result<String, String> {
     let runtime = ["node", "bun"]
         .into_iter()
@@ -46,7 +52,7 @@ pub fn run(script: String, what: &str) -> Result<String, String> {
         let _ = stderr.read_to_end(&mut bytes);
         bytes
     });
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + LIMIT;
     let status = loop {
         if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
             break status;
@@ -54,7 +60,7 @@ pub fn run(script: String, what: &str) -> Result<String, String> {
         if Instant::now() > deadline {
             let _ = child.kill();
             let _ = child.wait();
-            return Err(format!("{what} took longer than 5s"));
+            return Err(format!("{what} took longer than {}s", LIMIT.as_secs()));
         }
         std::thread::sleep(Duration::from_millis(10));
     };

@@ -121,6 +121,33 @@ pub fn band() -> Color {
     }
 }
 
+/// How faint structure reads against the background: below muted text's
+/// 4.5:1 on purpose, as the context that marks and names already repeat.
+const FAINT: f32 = 2.2;
+
+/// Structure that isn't text, as the sky's lines and trails: the theme's
+/// foreground taken toward its background until it reads at about 2.2:1,
+/// measured as muted is, since plain dim vanishes in some themes. Plain dim
+/// where the theme's colors are not known, or with `NO_COLOR`.
+pub fn faint() -> Option<Color> {
+    if no_color() {
+        return None;
+    }
+    let theme = crate::term::theme();
+    let (r, g, b) = faded(theme.foreground?, theme.background?);
+    Some(Color::Rgb(r, g, b))
+}
+
+fn faded(foreground: Rgb, background: Rgb) -> Rgb {
+    let mut weight = 1.0;
+    while weight > 0.05
+        && contrast(blend(foreground, background, weight - 0.02), background) >= FAINT
+    {
+        weight -= 0.02;
+    }
+    blend(foreground, background, weight)
+}
+
 /// `weight` of `a` over `b`.
 pub fn blend(a: Rgb, b: Rgb, weight: f32) -> Rgb {
     let mix = |a: u8, b: u8| (f32::from(a) * weight + f32::from(b) * (1.0 - weight)).round() as u8;
@@ -163,6 +190,21 @@ mod tests {
                 "{gray:?} on {background:?}"
             );
             assert!(muted < text, "{gray:?} on {background:?}");
+        }
+    }
+
+    #[test]
+    fn faint_structure_reads_at_its_floor_in_every_theme() {
+        // Flexoki Dark, Catppuccin Latte, Solarized Dark.
+        for (foreground, background) in [
+            ((0xce, 0xcd, 0xc3), (0x10, 0x0f, 0x0f)),
+            ((0x4c, 0x4f, 0x69), (0xef, 0xf1, 0xf5)),
+            ((0x83, 0x94, 0x96), (0x00, 0x2b, 0x36)),
+        ] {
+            let gray = faded(foreground, background);
+            let ratio = contrast(gray, background);
+            assert!((FAINT..FAINT + 0.4).contains(&ratio), "{gray:?}: {ratio}");
+            assert!(ratio < contrast(muted(foreground, background), background));
         }
     }
 

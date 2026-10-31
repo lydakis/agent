@@ -1128,34 +1128,50 @@ async fn create(client: &Client, options: &Options, bot: &str) -> Result<(), Str
         agent_client::policy::instructions(&workspace, None, &memory).map_err(|e| e.to_string())?;
     let info = agent_client::project::read(&workspace)?;
     let instructions = project::as_task(&workspace, &info, &composed.text)?;
-    let declare = json!(declared::tools(false));
-    let config = agent_client::config::load()?;
-    let tools = agent_client::default_tools(client.providers(), &model, config.web_search);
     let mut asked = json!({"bot": bot, "workspace": workspace, "model": model,
-        "instructions": instructions, "tools": tools, "declare": declare,
-        "compaction_instructions": agent_client::policy::DEFAULT_COMPACTION_INSTRUCTIONS,
-        "request_id": unique("tui-create")});
+        "instructions": instructions, "request_id": unique("tui-create")});
+    made(client, &mut asked, &model, &workspace)?;
+    client
+        .request("create", asked)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// What every agent Sonny makes starts with, whoever asks for it: the
+/// person's `--new` or a trigger's `--start`. Its tools and Sonny's, gated
+/// and sandboxed as the first mode (`auto`) confines them, and the
+/// person's settings for its model. One way in, so no kind of agent gets
+/// another policy by being made elsewhere (#404).
+pub(crate) fn made(
+    client: &Client,
+    asked: &mut Value,
+    model: &str,
+    workspace: &Path,
+) -> Result<(), String> {
+    let config = agent_client::config::load()?;
+    let declare = json!(declared::tools(false));
+    let tools = agent_client::default_tools(client.providers(), model, config.web_search);
+    asked["tools"] = json!(tools);
+    asked["declare"] = declare.clone();
+    asked["compaction_instructions"] = json!(agent_client::policy::DEFAULT_COMPACTION_INSTRUCTIONS);
     // Confined from the start, as the mode it is made with confines it.
-    let mut settings = approvals::sandbox(approvals::MODES[0].0, &workspace);
-    if let Some(ttl) = agent_client::policy::cache_ttl(&model) {
+    let mut settings = approvals::sandbox(approvals::MODES[0].0, workspace);
+    if let Some(ttl) = agent_client::policy::cache_ttl(model) {
         settings.insert("cache_ttl".into(), json!(ttl));
     }
     if config.hide_senders {
         settings.insert("hide_senders".into(), json!(true));
     }
     asked["settings"] = Value::Object(settings);
-    if let Some(fallback) = config.fallbacks.get(&model) {
+    if let Some(fallback) = config.fallbacks.get(model) {
         asked["fallback"] = json!(fallback);
     }
     let tools: Vec<String> = tools.into_iter().map(String::from).collect();
     let tools = approvals::gateable(&tools, &declare);
-    if let Value::Object(fields) = &mut asked {
+    if let Value::Object(fields) = asked {
         fields.extend(approvals::gate(approvals::MODES[0].0, &tools));
     }
-    client
-        .request("create", asked)
-        .await
-        .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -2430,17 +2446,22 @@ impl Fleet {
     /// afresh: at start, and after a reconnect whose missed events are not
     /// replayed. One that stopped meanwhile is marked idle, quietly.
     async fn reconcile(&mut self) {
-        let Ok(page) = self
-            .client
-            .request(
-                "bots",
-                json!({"name": format!("{}.*", self.project), "limit": 256}),
-            )
-            .await
-        else {
-            return;
-        };
-        let bots = page["bots"].as_array().cloned().unwrap_or_default();
+        // Every page of them: a project past one page still finds a task
+        // running that sorts after it.
+        let mut bots = Vec::new();
+        let mut after = Value::Null;
+        loop {
+            let asked =
+                json!({"name": format!("{}.*", self.project), "limit": 256, "after": after});
+            let Ok(page) = self.client.request("bots", asked).await else {
+                return;
+            };
+            bots.extend(page["bots"].as_array().cloned().unwrap_or_default());
+            after = page["next_after"].clone();
+            if after.is_null() {
+                break;
+            }
+        }
         // A project inside this one has a lead, and a home, of its own: its
         // lead opens there and its tasks are its own.
         let names = bots.iter().filter_map(|bot| bot["name"].as_str());
@@ -7422,6 +7443,14 @@ impl App {
                     {
                         view.legend = !view.legend
                     }
+                    // `/sky` alone: no chat log, no counts, few names.
+                    KeyCode::Char('z')
+                        if pane.is_card()
+                            && let Some(view) =
+                                self.watch.as_mut().and_then(|w| w.sky.as_mut()) =>
+                    {
+                        view.zen = !view.zen
+                    }
                     // `/status` lists the resolved tasks, or only counts them.
                     KeyCode::Char('r')
                         if pane.is_card()
@@ -9618,7 +9647,7 @@ impl App {
                     })
                     .collect();
                 pane.set_card(lines, SKY_KEYS);
-                pane.foot = Some(view.footer(width));
+                pane.foot = (!view.zen).then(|| view.footer(width));
             } else if let Some(view) = &watch.background {
                 // Its card, with what was done or the keys the pick takes
                 // kept in view under it.
@@ -10423,7 +10452,7 @@ fn over(frame: &mut ratatui::Frame, rows: Vec<Line<'static>>, below: ratatui::la
 
 /// What the pane's title row says the keys do on `/status`.
 const STATUS_KEYS: &str = "esc close";
-const SKY_KEYS: &str = "? legend · esc close";
+const SKY_KEYS: &str = "z zen · ? legend · esc close";
 
 /// What the title row says the keys do on `/status` itself.
 const PICK_KEYS: &str = "↑↓ pick · enter open · esc close";
