@@ -114,9 +114,9 @@ use std::{
 use transcript::Markdown;
 use unicode_width::UnicodeWidthStr;
 
-/// Rows kept at the bottom: the reply's unfinished line, the status, a gap,
-/// the composer and the footer.
-const VIEWPORT: u16 = 5;
+/// Rows kept at the bottom: the reply's unfinished line, the status, the
+/// composer between a row of its band above and below, and the footer.
+const VIEWPORT: u16 = 6;
 /// The most rows a long prompt's composer grows to; it shows its end.
 const COMPOSER_ROWS: usize = 8;
 /// An agent in a folder: what a profile shown in the footer was read for.
@@ -1199,15 +1199,13 @@ fn remote_without_display(var: &dyn Fn(&str) -> Option<std::ffi::OsString>) -> b
             .any(|key| set(key))
 }
 
-/// The viewport's rows, top to bottom: the reply's open line, the status,
-/// a gap, the composer (as many rows as are left) and the footer.
-/// The live area is `live` rows: the reply's open line, wrapped.
 /// The composer's edge: the band the person's messages sit on, from the
-/// row above it down, the conversation's width, as Codex draws its
-/// composer and the user's messages on one shade: what was written and
-/// what is being written read as one thing, and the composer's limits
-/// show in any theme. Without colour (`NO_COLOR`) a muted rule above it.
-fn edge(frame: &mut ratatui::Frame, gap: Rect, composer: Rect) {
+/// row above it to the row below, the conversation's width, as Codex
+/// draws its composer and the user's messages on one shade: what was
+/// written and what is being written read as one thing, the words in the
+/// middle of it, and the composer's limits show in any theme. Without
+/// colour (`NO_COLOR`) a muted rule above it.
+fn edge(frame: &mut ratatui::Frame, gap: Rect, composer: Rect, pad: Rect) {
     let width = composer.width.min(PROSE as u16);
     if look::no_color() {
         let rule = Line::from("─".repeat(width as usize)).dim();
@@ -1216,7 +1214,7 @@ fn edge(frame: &mut ratatui::Frame, gap: Rect, composer: Rect) {
     }
     let band = Rect {
         y: gap.y,
-        height: composer.bottom().saturating_sub(gap.y),
+        height: pad.bottom().saturating_sub(gap.y),
         width,
         ..composer
     };
@@ -1225,12 +1223,16 @@ fn edge(frame: &mut ratatui::Frame, gap: Rect, composer: Rect) {
         .set_style(band, Style::default().bg(look::band()));
 }
 
-fn areas(area: ratatui::layout::Rect, live: u16) -> [ratatui::layout::Rect; 5] {
+/// The viewport's rows, top to bottom: the reply's open line (`live`
+/// rows, wrapped), the status, a row of the composer's band, the composer
+/// (as many rows as are left), its band's row under it, and the footer.
+fn areas(area: ratatui::layout::Rect, live: u16) -> [ratatui::layout::Rect; 6] {
     Layout::vertical([
         Constraint::Length(live.max(1)),
         Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Min(1),
+        Constraint::Length(1),
         Constraint::Length(1),
     ])
     .areas(area)
@@ -9567,7 +9569,7 @@ impl App {
             };
             self.screen.render(history, frame.buffer_mut(), file);
             linked.extend(self.screen.link_cells(frame.buffer_mut()));
-            let [live, status, gap, composer, footer] = areas(view, live_rows);
+            let [live, status, gap, composer, pad, footer] = areas(view, live_rows);
             frame.render_widget(Paragraph::new(open_rows.clone()), live);
             frame.render_widget(Paragraph::new(self.status_line()), status);
             let menu = self.menu();
@@ -9576,12 +9578,8 @@ impl App {
                 let items: Vec<list::Item> = (menu.iter())
                     .map(|(name, about)| list::Item::new(*name, *about))
                     .collect();
-                let [_, _, _, composer_row, _] = areas(view, live_rows);
-                over(
-                    frame,
-                    list::lines(&items, pick, width, composer_row.y as usize),
-                    composer_row,
-                );
+                // Over the rows above the composer's band.
+                over(frame, list::lines(&items, pick, width, gap.y as usize), gap);
             }
             if let Some(query) = &self.finding {
                 let line = Line::from(vec![Span::raw("find ").dim(), Span::raw(query.clone())]);
@@ -9747,7 +9745,7 @@ impl App {
                 frame.render_widget(Paragraph::new(keys), footer);
                 return;
             }
-            edge(frame, gap, composer);
+            edge(frame, gap, composer, pad);
             frame.render_widget(Paragraph::new(composer_rows), composer);
             composer_at = first_row.map(|first| (composer, first, width.min(PROSE)));
             // Keys in the pane: no cursor where they do not go.
@@ -9757,7 +9755,9 @@ impl App {
                     composer.y + (cursor_row as u16).min(composer.height.saturating_sub(1)),
                 ));
             }
-            let (line, counter) = self.footer(width);
+            // Under the composer's band and no wider: one column, its
+            // right edge where the band's is.
+            let (line, counter) = self.footer(width.min(PROSE));
             frame.render_widget(Paragraph::new(line), footer);
             counter_at = counter.map(|at| (footer.y, footer.x + at.start..footer.x + at.end));
         };
@@ -12393,19 +12393,19 @@ mod tests {
             app.daemon(turn_event("tool_completed", 1, json!({"call_id": id})))
                 .await;
         }
-        assert_eq!(drawn(&mut app), ["› merged, thanks", "   👀 👍 "]);
+        assert_eq!(drawn(&mut app), ["", "› merged, thanks", "", "   👀 👍 "]);
         app.daemon(react(1, "c3", json!({"emoji": "👀", "remove": true})))
             .await;
         app.daemon(turn_event("tool_completed", 1, json!({"call_id": "c3"})))
             .await;
-        assert_eq!(drawn(&mut app), ["› merged, thanks", "   👍 "]);
+        assert_eq!(drawn(&mut app), ["", "› merged, thanks", "", "   👍 "]);
         app.daemon(turn_event(
             "turn_finished",
             1,
             json!({"status": "completed"}),
         ))
         .await;
-        assert_eq!(drawn(&mut app), ["› merged, thanks", "   👍 "]);
+        assert_eq!(drawn(&mut app), ["", "› merged, thanks", "", "   👍 "]);
         // One that answers too: under its own message, not the reply.
         app.daemon(turn_event("accepted", 2, json!({"node": 5})))
             .await;
@@ -12430,9 +12430,13 @@ mod tests {
         ))
         .await;
         let rows = drawn(&mut app);
-        assert_eq!(rows[2..5], ["", "› and the notes?", "   🎉 "]);
-        assert!(rows[6].starts_with("─ Worked"), "{rows:?}");
-        assert_eq!(rows[7..], ["", "• Updated."]);
+        assert_eq!(
+            rows[4..9],
+            ["", "", "› and the notes?", "", "   🎉 "],
+            "{rows:?}"
+        );
+        assert!(rows[10].starts_with("─ Worked"), "{rows:?}");
+        assert_eq!(rows[11..], ["", "• Updated."]);
         // Once that message is no longer in the conversation, a reaction
         // to it draws no row of its own.
         app.seen_node = 0;
@@ -12487,7 +12491,7 @@ mod tests {
         ))
         .await;
         let rows = drawn(&mut app);
-        assert_eq!(rows[..2], ["› ship it", "   👀 👍 "], "{rows:?}");
+        assert_eq!(rows[..4], ["", "› ship it", "", "   👀 👍 "], "{rows:?}");
         assert!(!rows.iter().any(|row| row.contains("reacted")), "{rows:?}");
     }
 
@@ -12499,19 +12503,22 @@ mod tests {
         app.commit(vec![Line::from("• Shipped.")]);
         app.picked.set(5, "calc.lead", "👀", false);
         app.place_picked(5);
-        assert_eq!(drawn(&mut app)[..2], ["› ship it", "   👀 calc.lead "]);
+        assert_eq!(
+            drawn(&mut app)[..4],
+            ["", "› ship it", "", "   👀 calc.lead "]
+        );
         // The bot's own go first, the lead's under them.
         app.bot_reactions = vec!["👍".into()];
         app.draw_bot_reactions();
         assert_eq!(
-            drawn(&mut app)[..3],
-            ["› ship it", "   👍 ", "   👀 calc.lead "]
+            drawn(&mut app)[..5],
+            ["", "› ship it", "", "   👍 ", "   👀 calc.lead "]
         );
         // Taken off, its row goes; no row ever says so.
         app.picked.set(5, "calc.lead", "👀", true);
         app.place_picked(5);
         let rows = drawn(&mut app);
-        assert_eq!(rows[..2], ["› ship it", "   👍 "], "{rows:?}");
+        assert_eq!(rows[..4], ["", "› ship it", "", "   👍 "], "{rows:?}");
         assert!(
             !rows.iter().any(|row| row.contains("calc.lead")),
             "{rows:?}"
@@ -12557,10 +12564,14 @@ mod tests {
         assert_eq!(
             drawn(&mut app),
             [
+                "",
                 "› merged, thanks",
+                "",
                 "   👍 ",
                 "",
+                "",
                 "› and the notes?",
+                "",
                 "   🎉 ",
                 "",
                 "• Updated.",
@@ -12768,7 +12779,7 @@ mod tests {
         app.reactions.toggle(1, "🎉").unwrap();
         app.history().await;
         let rows: Vec<String> = app.pending.iter().map(|l| l.to_string()).collect();
-        assert_eq!(rows, ["• Merged it.", "   🎉 ", "", "› what next?"]);
+        assert_eq!(rows, ["• Merged it.", "   🎉 ", "", "", "› what next?", ""]);
         assert_eq!(app.replies, [(1, "Merged it.".to_owned())]);
     }
 
@@ -12928,7 +12939,7 @@ mod tests {
         );
         // The person's own words are drawn as ever.
         app.land(7, "thanks", None, false);
-        assert_eq!(drawn(&mut app).last().unwrap(), "› thanks");
+        assert_eq!(drawn(&mut app).iter().rev().nth(1).unwrap(), "› thanks");
         // A message a page drawn again put in a newer cluster opens there,
         // not in the cluster its rows were let go from.
         app.next_group = 9;

@@ -51,16 +51,22 @@ impl Look {
     }
 
     pub fn finish(self, buffer: &mut Buffer) {
-        if self != Look::Drawn {
-            buffer.content.iter_mut().for_each(|cell| self.cell(cell));
-        }
+        buffer.content.iter_mut().for_each(|cell| self.cell(cell));
     }
 
     pub fn cell(self, cell: &mut Cell) {
+        // A hue on a muted row (the footer's branch, an agent's name) is a
+        // short mark meant to read: dim over it falls under 3:1 in many
+        // themes, so the hue is drawn as it is and the words round it
+        // stay muted.
+        let dim = cell.modifier.contains(Modifier::DIM);
+        let hued = !matches!(cell.fg, Color::Reset | Color::Rgb(..))
+            && !cell.symbol().contains(crate::image::PLACEHOLDER);
         match self {
+            Look::Drawn | Look::Muted(_) if dim && hued => cell.modifier.remove(Modifier::DIM),
             Look::Drawn => {}
             Look::Muted((r, g, b)) => {
-                if cell.modifier.contains(Modifier::DIM) && cell.fg == Color::Reset {
+                if dim && cell.fg == Color::Reset {
                     cell.fg = Color::Rgb(r, g, b);
                     cell.modifier.remove(Modifier::DIM);
                 }
@@ -161,17 +167,27 @@ mod tests {
     }
 
     #[test]
-    fn dim_default_text_becomes_the_gray_and_colored_text_stays() {
-        let mut buffer = Buffer::empty(ratatui::layout::Rect::new(0, 0, 3, 1));
-        buffer[(0, 0)].set_symbol("a").modifier = Modifier::DIM;
-        buffer[(1, 0)].set_symbol("b").set_fg(Color::Green).modifier = Modifier::DIM;
-        buffer[(2, 0)].set_symbol("c").set_bg(Color::Yellow);
+    fn dim_default_text_becomes_the_gray_and_a_hue_on_it_reads() {
+        let fresh = || {
+            let mut buffer = Buffer::empty(ratatui::layout::Rect::new(0, 0, 3, 1));
+            buffer[(0, 0)].set_symbol("a").modifier = Modifier::DIM;
+            buffer[(1, 0)].set_symbol("b").set_fg(Color::Green).modifier = Modifier::DIM;
+            buffer[(2, 0)].set_symbol("c").set_bg(Color::Yellow);
+            buffer
+        };
+        let mut buffer = fresh();
         Look::Muted((1, 2, 3)).finish(&mut buffer);
         assert_eq!(buffer[(0, 0)].fg, Color::Rgb(1, 2, 3));
         assert!(!buffer[(0, 0)].modifier.contains(Modifier::DIM));
         assert_eq!(buffer[(1, 0)].fg, Color::Green);
-        assert!(buffer[(1, 0)].modifier.contains(Modifier::DIM));
+        assert!(!buffer[(1, 0)].modifier.contains(Modifier::DIM));
+        // Where the theme's colors are not known, the hue too.
+        let mut buffer = fresh();
+        Look::Drawn.finish(&mut buffer);
+        assert!(buffer[(0, 0)].modifier.contains(Modifier::DIM));
+        assert!(!buffer[(1, 0)].modifier.contains(Modifier::DIM));
 
+        let mut buffer = fresh();
         Look::Plain.finish(&mut buffer);
         assert_eq!(buffer[(1, 0)].fg, Color::Reset);
         assert_eq!(buffer[(2, 0)].symbol(), "c");

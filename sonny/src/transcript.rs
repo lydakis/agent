@@ -1160,7 +1160,10 @@ pub fn prompt(text: &str, from: Option<&str>, width: usize) -> Vec<Line<'static>
     } else {
         lines.len()
     };
+    // On its band with a row of it above and below, as the composer it
+    // was written in: the words sit in the middle, not on an edge.
     let band = crate::look::band();
+    out.push(Line::default().bg(band));
     for (i, line) in lines[..shown].iter().enumerate() {
         let lead = if i == 0 { "› " } else { "  " };
         out.extend(wrap(
@@ -1177,6 +1180,7 @@ pub fn prompt(text: &str, from: Option<&str>, width: usize) -> Vec<Line<'static>
                 .bg(band),
         );
     }
+    out.push(Line::default().bg(band));
     out
 }
 
@@ -2835,7 +2839,7 @@ mod tests {
             .iter()
             .map(|row| row.to_string())
             .collect();
-        assert_eq!(shown, ["  answering “Ship it?”", "› Not yet"]);
+        assert_eq!(shown, ["  answering “Ship it?”", "", "› Not yet", ""]);
     }
 
     #[test]
