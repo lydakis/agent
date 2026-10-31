@@ -195,6 +195,14 @@ pub struct Request {
 }
 /// A client's refusal of an answered call, which the model reads as the
 /// call's error.
+/// A declared call's answer: text, or parts in the order the model reads
+/// them, text and pictures, as a provider's own tool results take them.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ToolOutput {
+    Text(String),
+    Parts(Vec<agent_runtime::codec::Part>),
+}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ToolError {
@@ -381,6 +389,14 @@ enum Command {
         /// What sent it when no bot's turn did, as the client names itself
         /// (a name's characters); absent for a person.
         origin: Option<String>,
+        /// The person who wrote it, as the client labels them (a name's
+        /// characters); absent with no `from` or `origin` is the daemon's
+        /// own person. Not verified.
+        person: Option<String>,
+        /// Turns whose words the daemon copies after the prompt's, each
+        /// with who wrote them: a turn's prompt, or with `reply` the reply
+        /// it ended with.
+        quotes: Option<Vec<agent_runtime::store::QuoteRef>>,
         /// The most input plus output tokens this turn may spend, beside
         /// the bot's own budget; absent leaves only that.
         budget_tokens: Option<u64>,
@@ -478,7 +494,7 @@ enum Command {
         bot: String,
         turn: i64,
         call_id: String,
-        output: Option<String>,
+        output: Option<ToolOutput>,
         error: Option<ToolError>,
     },
     /// Put one step of a declared call this client answers to the bot's
@@ -859,17 +875,21 @@ fn settle_step(handles: &Handles, bot: &str, turn: i64, stepped: Stepped) -> Opt
 /// The most bytes a prompt's pictures may have together, decoded: what
 /// Anthropic takes for one image, so one alone always fits.
 const IMAGES_BYTES: usize = 5 << 20;
-/// The most pictures one prompt may carry.
+/// The most turns one prompt may quote; their words are bounded with its
+/// own.
+const MAX_QUOTES: usize = agent_runtime::store::Database::QUOTES;
+/// The most pictures one prompt, or one tool result, may carry.
 const IMAGES: usize = 20;
 
 /// Pictures a provider takes: a media type both families know, base64 of
 /// an image of that type, and within [`IMAGES`] and [`IMAGES_BYTES`].
-fn check_images(images: &[agent_runtime::codec::Image]) -> Result<()> {
+/// `carrier` names what carries them, a prompt or a tool result.
+fn check_images(images: &[&agent_runtime::codec::Image], carrier: &str) -> Result<()> {
     use base64::Engine;
     if images.len() > IMAGES {
         return fail_with(
             "image_limit",
-            format!("a prompt may carry up to {IMAGES} images"),
+            format!("{carrier} may carry up to {IMAGES} images"),
         );
     }
     let mut bytes = 0;
@@ -901,10 +921,24 @@ fn check_images(images: &[agent_runtime::codec::Image]) -> Result<()> {
     if bytes > IMAGES_BYTES {
         return fail_with(
             "image_limit",
-            format!("a prompt's images may be up to {IMAGES_BYTES} bytes together, decoded"),
+            format!("{carrier}'s images may be up to {IMAGES_BYTES} bytes together, decoded"),
         );
     }
     Ok(())
+}
+/// [`check_images`] off the runtime thread, since decoding grows with the
+/// pictures: `held` comes back once the pictures `images` finds in it pass.
+async fn images_checked<T: Send + 'static>(
+    held: T,
+    images: fn(&T) -> Vec<&agent_runtime::codec::Image>,
+    carrier: &'static str,
+) -> Result<T> {
+    if images(&held).is_empty() {
+        return Ok(held);
+    }
+    tokio::task::spawn_blocking(move || check_images(&images(&held), carrier).map(|()| held))
+        .await
+        .unwrap_or_else(|join| std::panic::resume_unwind(join.into_panic()))
 }
 fn workspace(path: &str) -> Result<String> {
     if !Path::new(path).is_absolute() || !Path::new(path).is_dir() {
@@ -2041,12 +2075,16 @@ impl Service {
                 workspace,
                 from,
                 origin,
+                person,
                 ..
             } => {
                 // What it sends reads as the caller's, never a person's or
                 // another bot's.
                 if from.as_ref().is_some_and(|author| author.bot != me.name) {
                     return refuse("send a message as another bot");
+                }
+                if person.is_some() {
+                    return refuse("send a message as a person");
                 }
                 // Named once, as the request names it, so a retry of the
                 // same request is the same request.
@@ -3507,14 +3545,60 @@ impl Service {
                 output,
                 error,
             } => {
+                use agent_runtime::codec::Part;
                 let outcome = match (output, error) {
-                    (Some(output), None) if output.len() > ANSWER_BYTES => {
+                    (Some(ToolOutput::Text(output)), None) if output.len() > ANSWER_BYTES => {
                         return fail_with(
                             "tool_output_limit",
                             format!("output may be up to {ANSWER_BYTES} bytes"),
                         );
                     }
-                    (Some(output), None) => Outcome::text(self.registry.redact_text(output)),
+                    (Some(ToolOutput::Text(output)), None) => {
+                        Outcome::text(self.registry.redact_text(output))
+                    }
+                    (Some(ToolOutput::Parts(parts)), None) => {
+                        let words: usize = parts
+                            .iter()
+                            .map(|part| match part {
+                                Part::Text { text } => text.len(),
+                                Part::Image(_) => 0,
+                            })
+                            .sum();
+                        if words > ANSWER_BYTES {
+                            return fail_with(
+                                "tool_output_limit",
+                                format!("output's text may be up to {ANSWER_BYTES} bytes"),
+                            );
+                        }
+                        let parts = images_checked(
+                            parts,
+                            |parts| parts.iter().filter_map(Part::image).collect(),
+                            "a tool result",
+                        )
+                        .await?;
+                        let mut parts: Vec<Part> = parts
+                            .into_iter()
+                            .map(|part| match part {
+                                Part::Text { text } => Part::Text {
+                                    text: self.registry.redact_text(text),
+                                },
+                                image => image,
+                            })
+                            .collect();
+                        // Words before the first picture are the output.
+                        let output = match parts.first_mut() {
+                            Some(Part::Text { text }) => {
+                                let text = std::mem::take(text);
+                                parts.remove(0);
+                                text
+                            }
+                            _ => String::new(),
+                        };
+                        Outcome {
+                            parts,
+                            ..Outcome::text(output)
+                        }
+                    }
                     (None, Some(ToolError { code, detail })) => {
                         let coded = !code.is_empty()
                             && code.len() <= 64
@@ -3537,7 +3621,8 @@ impl Service {
                         Outcome {
                             output: json!({"error":code,"detail":detail}).to_string(),
                             artifacts: Vec::new(),
-                            images: Vec::new(),
+                            files: Vec::new(),
+                            parts: Vec::new(),
                             note: None,
                             failed: true,
                         }
@@ -3958,12 +4043,18 @@ impl Service {
                 expected_turn,
                 from,
                 origin,
+                person,
+                quotes,
                 budget_tokens,
                 images,
             } => {
                 name("request_id", &request_id)?;
-                let images = images.unwrap_or_default();
-                check_images(&images)?;
+                let images = images_checked(
+                    images.unwrap_or_default(),
+                    |images| images.iter().collect(),
+                    "a prompt",
+                )
+                .await?;
                 if origin.is_some() && from.is_some() {
                     return fail_with("invalid_origin", "from and origin are mutually exclusive");
                 }
@@ -3972,6 +4063,29 @@ impl Service {
                         code: "invalid_origin".into(),
                         ..e
                     })?;
+                }
+                if let Some(person) = &person {
+                    if from.is_some() || origin.is_some() {
+                        return fail_with(
+                            "invalid_person",
+                            "person, from and origin are mutually exclusive",
+                        );
+                    }
+                    name("person", person).map_err(|e| Error {
+                        code: "invalid_person".into(),
+                        ..e
+                    })?;
+                }
+                let quotes = quotes.unwrap_or_default();
+                if quotes.len() > MAX_QUOTES {
+                    return fail_with(
+                        "invalid_quote",
+                        format!("a prompt may quote up to {MAX_QUOTES} turns"),
+                    );
+                }
+                if let Some(quote) = quotes.iter().find(|quote| quote.turn < 1) {
+                    return Err(Error::with("invalid_quote", "a quoted turn is 1 or more")
+                        .facts(json!({"bot":quote.bot,"turn":quote.turn})));
                 }
                 if prompt.len() > 256 * 1024 {
                     return fail_with("prompt_limit", "prompt may be up to 262144 bytes");
@@ -4028,6 +4142,8 @@ impl Service {
                     expected_turn,
                     from: from.map(|author| (author.bot, author.turn)),
                     origin,
+                    person,
+                    quotes,
                     budget_tokens,
                     images,
                 };
@@ -5262,6 +5378,8 @@ mod tests {
             expected_turn: None,
             from: None,
             origin: None,
+            person: None,
+            quotes: None,
             budget_tokens: None,
             images: None,
         }
@@ -6952,7 +7070,7 @@ mod tests {
         let (done, running) = store
             .call(move |db| {
                 let done = db.process_start(turn, "shell-1")?;
-                db.process_finish(done, &json!({"exit_code":0}), &[])?;
+                db.process_finish(done, &json!({"exit_code":0}), &[], &[])?;
                 Ok((done, db.process_start(turn, "shell-2")?))
             })
             .await

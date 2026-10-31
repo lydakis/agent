@@ -24,7 +24,7 @@ A lead hears of its tasks' turns from Sonny's task updates and lookout, not
 from triggers.
 
 Sonny's agents add and change triggers with the `triggers` tool, which
-Sonny's lookout answers outside the agent's sandbox, since a trigger is a
+Sonny's tool host answers outside the agent's sandbox, since a trigger is a
 job of the system's scheduler: `add` (the fields below, as `every`, `cron`, `start {name,
 model, effort}`, `reply_to`, `if`, `runs`, `turn_budget_tokens`, `replace`
 and `message`), `remove`, `fire` or `show` NAME, or nothing to list them.
@@ -37,7 +37,7 @@ the agent the fire messaged, with a note it reads in its next model call,
 as a fire that sent nothing is told (`[trigger NAME · TIME · turn N it sent
 BOT failed: WHY]`). A fire with `reply_to` passes the failure on with its
 answer instead.
-It waits for a verdict wherever the agent's other calls do (`/approvals`),
+It waits for a verdict wherever the agent's other calls do (`/permissions`),
 since a trigger runs as the person and its `if` command outside any
 sandbox. For people, scripts and other harnesses, Sonny writes
 `~/.agent/trigger` each time it starts, a script that runs it as
@@ -320,7 +320,7 @@ shell command (`cargo test`, `make lint`, `test -z "$(git status --short)"`)
 that exits 0 once done; the lookout runs it in the agent's folder, as the
 person and outside any sandbox like a trigger's `if`, though without the
 provider keys an agent's shell goes without, so `set` waits for a verdict wherever the
-agent's other calls do (`/approvals`). Each goal is
+agent's other calls do (`/permissions`). Each goal is
 `STORE.lookout/goals/BOT.json`; setting the same goal again changes
 nothing.
 
@@ -386,7 +386,7 @@ one line per fact, and is held to 16 KiB so reading it at the start of
 every task stays cheap. The daemon knows nothing of memory.
 
 Sonny's agents read and save memory with the `memory` tool, which Sonny's
-lookout answers outside the agent's sandbox, so a sandboxed agent still
+tool host answers outside the agent's sandbox, so a sandboxed agent still
 saves to `~/.agents/memory`: `read` NAME, `save {name, type,
 description, source, text}`, `remove`, `index`, `check`, `changed` or `cleanup`, scoped by `user`
 or `project`, or nothing to show both indexes. It waits for no verdict.
@@ -447,10 +447,11 @@ looks back a day; a refused cleanup leaves it, so its night is read again): the 
 daemon: every message written since then that carries no other agent's or
 named client's mark, steers included, newest first and at most
 56 KiB, within what a served tool may answer, each with its agent, turn, and the memory project of the folder
-that turn ran in. History keeps no times, so a message is dated by its
-turn: the one that started a turn is as old as the turn's start, and one
-sent into it later came while it ran, so a long turn's opening message
-from before then is left out. The person's reactions to a bot's replies
+that turn ran in. Each message is dated by when it was written (the
+daemon's `written_ms`), so a line sent into a long turn before then is
+left out. A message from before the daemon kept that time is dated by
+its turn: the one that started a turn is as old as the turn's start, and
+one sent into it later came while it ran. The person's reactions to a bot's replies
 are in it too, each with `reacted_to`, the first line of the reply it
 answers (the bot is told only the emoji when it was its last reply). A
 reaction counts once, and not at all once the person took it off, as the
@@ -680,6 +681,35 @@ A link the Agent app left there, into its bundle's
 own skill of the same name wins over any of them. Agents already running
 keep the index they were created with.
 
+## Tool host
+
+The tools Sonny gives its agents (`start_task`, `memory`, `goal`,
+`triggers`, `subscriptions`, the commons, `exec` and the rest whose
+`answered_by` is `sonny`) wait in the daemon until Sonny answers them
+([served.rs](../sonny/src/served.rs)). The tool host answers them:
+`sonny tool-host --store STORE --socket SOCKET`, the daemon's companion
+`sonny-tool-host` ([tool_host.rs](../sonny/src/tool_host.rs)), which Sonny
+and `sonny acp` add beside the lookout, so the calls are answered with
+every window closed, by the build that declared them. It is the lookout's
+sibling, not part of it, as Codex keeps its code-mode host apart from the
+session: a tool that runs long, crashes or holds memory, as an MCP server
+or a browser can, never holds up the news a lead hears, and either can be
+replaced without the other.
+
+Each call that starts, or waited from before the host did, runs as
+`sonny tool NAME` in the calling agent's folder, with the environment its
+shell would have; `exec` runs in the host itself, where the MCP servers
+stay up (next section). A turn that ends stops the calls it still has
+running. The host holds `STORE.tool-host.lock`, so a second one prints
+`{"event":"already_serving"}` and exits, unless another build started the
+running one, which it then stops and replaces (`STORE.tool-host.sonny`
+says which build runs). It follows the daemon's `tool_started` and
+`turn_finished` events from `STORE.tool-host.cursor`, the first time from
+the lookout's cursor rather than the whole log, and exits once the daemon
+has been gone 30 seconds. On starting, it brings every agent Sonny declared
+tools on up to this build's tools. `/status` says "tools not answered"
+when no tool host runs.
+
 ## MCP servers
 
 The person's MCP servers live in `~/.agent/config.toml`, under Codex's key
@@ -737,17 +767,22 @@ Agents do not get a tool per MCP tool. While any server is on, every agent
 Sonny opens has one tool, `exec`, with Codex's code mode contract
 ([exec.rs](../sonny/src/exec.rs)): the model writes JavaScript, each tool is
 `await tools.mcp__SERVER__TOOL(args)` and resolves to its `CallToolResult`,
-and only what the script passes to `text()` (or `image()`, saved to a file
-whose path it names) comes back, so twenty calls and the filtering between
-them cost one result. `store` and `load` keep small values for the agent's
+and only what the script passes to `text()` and `image()` comes back, so
+twenty calls and the filtering between them cost one result. `image()`
+takes a `data:` URL or an MCP `ImageContent` block (`image(r.content[0])`),
+and the model sees the picture itself, in order with the text, as Codex's
+code mode returns it: the result is the daemon's list of text and image
+parts. Like a file `read` sends, a picture is a PNG, JPEG, GIF or WebP by
+its own bytes, scaled to 1568 pixels on its longest side when larger; a
+result holds up to 20, 5 MB together, and `image()` throws past that. `store` and `load` keep small values for the agent's
 later scripts, `ALL_TOOLS` lists every tool, and `tools.tool_search` ranks
 them for a query. The description lists each server and declares its tools
 in TypeScript up to about 3,000 tokens; the rest are found from a script. A
 script runs in QuickJS with no files, network or timers, at most 256 MB and
-10 minutes, four at once in the lookout and sixteen alive (more wait
+10 minutes, four at once in the tool host and sixteen alive (more wait
 their turn), and returns
 at most 10,000 tokens, longer output keeping its start and end and saving
-the whole to a file; saved outputs and images are kept a week. A first
+the whole to a file; saved outputs are kept a week. A first
 line such as
 `// @exec: {"max_output_tokens": 1000, "timeout_ms": 60000}` sets those.
 Its time counts from the call: waiting for a place and starting servers
@@ -758,13 +793,13 @@ result over 16 MB is refused, as rmcp refuses such a message. Two tools
 whose identifiers would be the same (`my-server` and `my_server`'s
 `search`) are neither on `tools`, the description saying why.
 
-The lookout runs the scripts and keeps the servers
+The tool host runs the scripts and keeps the servers
 ([mcp.rs](../sonny/src/mcp.rs)): one connection per server for every agent,
 started by the first call and stopped after ten idle minutes, with each
 server's tool list kept in `~/.agent/sonny/mcp`, readable by the person
 alone and keyed by a digest of its config rather than the config's
 secrets, so agents are told of its tools without starting it. A server's
-stderr is kept by its last twenty lines, each cut at 1 KB, for when it fails. Servers run as the person, beside the lookout and
+stderr is kept by its last twenty lines, each cut at 1 KB, for when it fails. Servers run as the person, beside the tool host and
 outside every agent's sandbox, as Codex starts its own: a sandboxed task
 reaches them only through `exec`. A turn that ends, as one the person
 interrupts, stops its script and the calls it has in flight.

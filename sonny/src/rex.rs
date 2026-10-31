@@ -5,7 +5,7 @@
 //! labels need not be unique. Checked against rex 0.0.1792787366 (API rev 7)
 //! for `ls`, `new`, `split`, `block ls` and `block close`; `run`'s output is
 //! read the way `split`'s is.
-use crate::mux::{Backend, Block, Place, Places};
+use crate::mux::{Backend, Block, Heard, Place, Places, Stream, Watch};
 use serde_json::Value;
 use std::{
     collections::HashMap,
@@ -29,6 +29,29 @@ pub fn find() -> Option<PathBuf> {
     on_path.or_else(|| Path::new(MAC_APP).is_file().then(|| PathBuf::from(MAC_APP)))
 }
 
+/// What a line of `rex events -s SESSION --json` says. A session's event
+/// comes wrapped in a `session_event`; a terminal's, once more, in a
+/// `block_event`, which moves no block, as focus, ownership and clients
+/// coming and going (each CLI call is one) don't. A block renamed says
+/// only `session_view_changed`. The stream goes on once its session is
+/// gone, so `session_destroyed` ends it.
+fn heard(line: &Value) -> Heard {
+    if line["type"] == "session_destroyed" {
+        return Heard::Over;
+    }
+    match line["payload"]["event"]["type"].as_str() {
+        Some(
+            "block_event"
+            | "block_owner_changed"
+            | "active_window_changed"
+            | "client_connected"
+            | "client_disconnected"
+            | "client_connection_changed",
+        ) => Heard::Same,
+        _ => Heard::Changed,
+    }
+}
+
 pub struct Rex {
     bin: PathBuf,
     /// `-S HOST` when the session lives on another Rex server.
@@ -46,13 +69,14 @@ impl Rex {
     fn call(&self, args: &[&str]) -> Result<Value, String> {
         // Every call names its session: the shell's own Rex variables may
         // name another (a daemon's), and rex would look a bare ID up there.
-        let out = Command::new(&self.bin)
-            .env_remove("REX_SESSION")
-            .env_remove("REX_BLOCK")
-            .args(&self.host)
-            .args(args)
-            .output()
-            .map_err(|e| format!("rex: {e}"))?;
+        let out = crate::mux::output(
+            Command::new(&self.bin)
+                .env_remove("REX_SESSION")
+                .env_remove("REX_BLOCK")
+                .args(&self.host)
+                .args(args),
+        )
+        .map_err(|e| format!("rex: {e}"))?;
         if !out.status.success() {
             return Err(format!(
                 "rex {}: {}",
@@ -111,9 +135,9 @@ impl Rex {
         let kept = kept.and_then(|kept| sessions.iter().find(|(id, _)| id == kept));
         let lead = format!("{label}.lead");
         let leads = || {
-            sessions
-                .iter()
-                .find(|(id, _)| rex.blocks_in(id).iter().any(|b| b.label == lead))
+            sessions.iter().find(|(id, _)| {
+                (rex.blocks_in(id).unwrap_or_default().iter()).any(|b| b.label == lead)
+            })
         };
         (rex.session, rex.name) = match current {
             Some((id, now)) => {
@@ -135,11 +159,9 @@ impl Rex {
         Ok(rex)
     }
 
-    fn blocks_in(&self, session: &str) -> Vec<Block> {
-        let Ok(ls) = self.call(&["block", "ls", "-s", session, "--json"]) else {
-            return Vec::new();
-        };
-        ls["blocks"]
+    fn blocks_in(&self, session: &str) -> Result<Vec<Block>, String> {
+        let ls = self.call(&["block", "ls", "-s", session, "--json"])?;
+        Ok(ls["blocks"]
             .as_array()
             .into_iter()
             .flatten()
@@ -150,7 +172,7 @@ impl Rex {
                     window: b["window_id"].as_str().unwrap_or("").to_owned(),
                 })
             })
-            .collect()
+            .collect())
     }
 
     /// The new block's ID from `split`'s, `run`'s or `window new`'s reply.
@@ -177,7 +199,7 @@ impl Backend for Rex {
         self.made
     }
 
-    fn blocks(&self) -> Vec<Block> {
+    fn blocks(&self) -> Result<Vec<Block>, String> {
         self.blocks_in(&self.session)
     }
 
@@ -259,8 +281,7 @@ impl Backend for Rex {
 
     fn own_block(&self) -> Option<String> {
         let mine = std::env::var("REX_BLOCK").ok().filter(|b| !b.is_empty())?;
-        self.blocks()
-            .into_iter()
+        (self.blocks().ok()?.into_iter())
             .find(|b| b.id == mine || b.id.ends_with(&mine))
             .map(|b| b.id)
     }
@@ -272,13 +293,22 @@ impl Backend for Rex {
         }
     }
 
+    fn watch(&self) -> Option<Watch> {
+        let mut command = Command::new(&self.bin);
+        (command.env_remove("REX_SESSION").env_remove("REX_BLOCK"))
+            .args(&self.host)
+            .args(["events", "-s", &self.session, "--json"]);
+        Some(Watch {
+            from: Stream::Command(command),
+            heard: Box::new(heard),
+        })
+    }
+
     /// Where each block sits, by label: its tab, counted from 1, and in a
     /// split, its side of its neighbour (`right of`, `below`, … a label).
-    fn places(&self) -> Places {
+    fn places(&self) -> Result<Places, String> {
         let mut places = HashMap::new();
-        let Ok(ls) = self.call(&["window", "ls", "-s", &self.session, "--json"]) else {
-            return places;
-        };
+        let ls = self.call(&["window", "ls", "-s", &self.session, "--json"])?;
         for (tab, window) in ls["windows"].as_array().into_iter().flatten().enumerate() {
             for layer in window["layers"].as_array().into_iter().flatten() {
                 let labels: HashMap<&str, &str> = layer["blocks"]
@@ -298,7 +328,7 @@ impl Backend for Rex {
                 }
             }
         }
-        places
+        Ok(places)
     }
 }
 
@@ -339,6 +369,23 @@ fn sides_of(node: &Value, sides: &mut HashMap<String, (&'static str, String)>) {
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn rex_news_of_a_terminal_or_focus_moves_no_block() {
+        use crate::mux::Heard;
+        let event = |kind: &str| {
+            serde_json::json!({"type": "session_event", "payload": {
+                "session_id": "session:01", "event": {"type": kind, "payload": {}}}})
+        };
+        assert_eq!(super::heard(&event("block_event")), Heard::Same);
+        assert_eq!(super::heard(&event("active_window_changed")), Heard::Same);
+        assert_eq!(super::heard(&event("client_connected")), Heard::Same);
+        for kind in ["window_created", "block_closed", "session_view_changed"] {
+            assert_eq!(super::heard(&event(kind)), Heard::Changed);
+        }
+        let gone = serde_json::json!({"type": "session_destroyed", "payload": {"session_id": "session:01"}});
+        assert_eq!(super::heard(&gone), Heard::Over);
+    }
 
     /// A stand-in rex, over a JSON file of sessions and their blocks, that
     /// logs each call it gets.

@@ -48,12 +48,13 @@ pub async fn said(
             let Some(first) = turns.keys().min().copied() else {
                 continue;
             };
-            // History has no times, so a message is dated by its turn: a
-            // turn's first entry is what started it, written when the turn
-            // started, and what the person sent into it later came while it
-            // ran. Newest first, and a turn's entries together, its oldest
-            // message is held until an older entry shows it came later or
-            // the turn ends, when it counts only if the turn started since.
+            // A message is dated by when it was written. One from before
+            // the daemon kept that is dated by its turn: a turn's first
+            // entry is what started it, written when the turn started, and
+            // what the person sent into it later came while it ran. Newest
+            // first, and a turn's entries together, its oldest message is
+            // held until an older entry shows it came later or the turn
+            // ends, when it counts only if the turn started since.
             let opened = |turn: i64| {
                 (turns.get(&turn).and_then(|t| t.started_ms)).is_none_or(|ms| ms >= since_ms)
             };
@@ -84,12 +85,21 @@ pub async fn said(
                     admit(&mut said, &mut answers, node, message);
                 }
                 let project = turns.get(&turn).and_then(|t| t.project.clone());
+                let written = entry["written_ms"].as_i64();
                 let later = match crate::lookout::said_by_person(entry) {
                     Some(node) => {
                         let text = cut(crate::text(&entry["item"]));
                         let message =
                             json!({"bot": name, "turn": turn, "text": text, "project": project});
-                        held.replace((turn, node, message))
+                        match written {
+                            Some(ms) => {
+                                if ms >= since_ms {
+                                    admit(&mut said, &mut answers, node, message);
+                                }
+                                held.take()
+                            }
+                            None => held.replace((turn, node, message)),
+                        }
                     }
                     None => held.take(),
                 };
@@ -97,6 +107,7 @@ pub async fn said(
                     admit(&mut said, &mut answers, node, message);
                 }
                 if let Some((node, quote, emoji)) = reaction(entry)
+                    && written.is_none_or(|ms| ms >= since_ms)
                     // One no reply holds now was taken off: it takes no room.
                     && (on.as_ref()).is_none_or(|on| on.before(i64::MAX, &emoji))
                 {
@@ -389,7 +400,11 @@ pub async fn walk(
 /// feedback on that reply: its node, the first line of the reply when the
 /// reaction quotes it, and the emoji.
 fn reaction(entry: &Value) -> Option<(i64, Option<String>, String)> {
-    if !(entry["from"].is_null() && entry["origin"].is_null() && entry["item"]["role"] == "user") {
+    if !(entry["from"].is_null()
+        && entry["origin"].is_null()
+        && entry["person"].is_null()
+        && entry["item"]["role"] == "user")
+    {
         return None;
     }
     let text = crate::text(&entry["item"]);

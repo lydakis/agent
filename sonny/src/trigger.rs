@@ -3172,7 +3172,7 @@ async fn start(client: &Client, trigger: &Trigger) -> Result<i64, String> {
 }
 
 /// Give the agent a `--start` trigger made before its agents had Sonny's
-/// tools those tools, as [`start`] gives them now; the lookout keeps them
+/// tools those tools, as [`start`] gives them now; the tool host keeps them
 /// up to date from then on. One that has any declared tools is left as it
 /// is, and a failure leaves it to the next fire. One made before `--start`
 /// confined its agents as `--new` does is confined too: it was never given
@@ -3192,7 +3192,7 @@ async fn adopt(client: &Client, name: &str, id: i64) {
         let _ = client.request("configure", Value::Object(fields)).await;
     }
     if unconfined(&record)
-        && let Some(fields) = crate::approvals::regate(&record, crate::approvals::MODES[0].0)
+        && let Some(fields) = crate::approvals::regate(&record, crate::approvals::default())
     {
         let mut asked = Value::Object(fields);
         asked["bot"] = json!(name);

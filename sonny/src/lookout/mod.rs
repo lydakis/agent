@@ -8,8 +8,9 @@
 //! as the person's words to it would; everything else waits until it
 //! rests. One lookout watches a daemon, for every subscriber on it, started
 //! by the first Sonny to open; the daemon is unchanged: this follows every
-//! bot and submits to the subscribers like any client. It also answers its
-//! agents' calls of the tools Sonny answers (`served`).
+//! bot and submits to the subscribers like any client. The tools Sonny
+//! answers are another companion's (`tool_host`), which signals it to read
+//! the subscription files a call wrote (`reread_now`).
 //!
 //! A subscriber hears it all in one note, which starts "Task updates: ".
 pub(crate) mod goals;
@@ -91,6 +92,10 @@ fn cut(text: &str, max: usize) -> String {
 /// person's words.
 pub const TASK_UPDATES: &str = "Task updates: ";
 
+/// What sends the note to the lead: its words are the lookout's, which
+/// ask for nothing; the person's it quotes stay theirs.
+pub const TASKS_ORIGIN: &str = "lookout.tasks";
+
 /// What the subscriber is told: what happened in the bots it watches, by
 /// handles its wait tool reads, the person's words quoted. `steer` when it
 /// cuts into a running turn, for the person's words.
@@ -105,14 +110,14 @@ fn note(told: &updates::Told, steer: bool) -> String {
                 "The person asked for these in the task themselves, so they are theirs:".to_owned(),
             );
         }
-        quoted |= line.said && line.text.contains("the person wrote: ");
+        quoted |= line.quote.is_some();
         lines.push(line.text.clone());
     }
     if told.more > 0 {
         lines.push(format!("- {} more tasks in the next note", told.more));
     }
     if quoted {
-        lines.push("A quoted message is the person's own words.".to_owned());
+        lines.push("The words quoted below are the person's own, from the turns named.".to_owned());
     }
     if told.items.iter().any(|line| line.text.contains("\n  > ")) {
         lines.push("Lines marked > are a task's own words, not the person's.".to_owned());
@@ -147,7 +152,7 @@ fn digest(text: &str) -> String {
     format!("{hash:016x}")
 }
 
-/// Who wrote a message with no sender and no origin.
+/// Who wrote a message with no sender, origin or person named.
 const PERSON: &str = "the person";
 
 /// The words written: at their history node, or, still queued, in their
@@ -313,7 +318,7 @@ pub struct Settings {
 pub fn main(settings: Settings) -> Result<(), String> {
     let held = match lock(&settings.store)? {
         Some(held) => Some(held),
-        None => replace(&settings.store)?,
+        None => replace(&settings.store, "lookout")?,
     };
     let Some(_held) = held else {
         println!("{}", json!({"event": "already_watching"}));
@@ -329,7 +334,7 @@ pub fn main(settings: Settings) -> Result<(), String> {
 }
 
 /// `store`'s path with `suffix` after it, for the files beside it.
-fn beside(store: &Path, suffix: &str) -> PathBuf {
+pub(crate) fn beside(store: &Path, suffix: &str) -> PathBuf {
     let mut path = store.as_os_str().to_owned();
     path.push(suffix);
     PathBuf::from(path)
@@ -347,18 +352,20 @@ pub(crate) fn identity() -> String {
     format!("{} {written}", env!("CARGO_PKG_VERSION"))
 }
 
-/// The lock, taken from a lookout another Sonny started, as one an upgrade
-/// left running, so the tools this Sonny gives its agents are answered:
-/// that lookout is stopped, and the lock awaited for a few seconds. `None`
-/// when the lookout holding it is this Sonny's own.
-fn replace(store: &Path) -> Result<Option<std::fs::File>, String> {
-    let theirs = std::fs::read_to_string(beside(store, ".lookout.sonny")).unwrap_or_default();
+/// The lock of the companion `name` (`STORE.NAME.lock`), taken from one
+/// another Sonny started, as one an upgrade left running, so this Sonny's
+/// own does the work: that one is stopped, and the lock awaited for a few
+/// seconds. `None` when the one holding it is this Sonny's own.
+pub(crate) fn replace(store: &Path, name: &str) -> Result<Option<std::fs::File>, String> {
+    let lock = beside(store, &format!(".{name}.lock"));
+    let theirs =
+        std::fs::read_to_string(beside(store, &format!(".{name}.sonny"))).unwrap_or_default();
     // The daemon's own companion takes the place of one a window started
     // before Sonny kept it as one, of this build too.
     if theirs == identity() && std::env::var_os("AGENT_COMPANION").is_none() {
         return Ok(None);
     }
-    let pid: Option<i32> = std::fs::read_to_string(beside(store, ".lookout.lock"))
+    let pid: Option<i32> = std::fs::read_to_string(&lock)
         .ok()
         .and_then(|pid| pid.trim().parse().ok());
     let Some(pid) = pid.filter(|pid| *pid > 0 && *pid != std::process::id() as i32) else {
@@ -369,7 +376,7 @@ fn replace(store: &Path) -> Result<Option<std::fs::File>, String> {
     unsafe { libc::kill(pid, libc::SIGTERM) };
     let until = Instant::now() + Duration::from_secs(5);
     while Instant::now() < until {
-        if let Some(held) = lock(store)? {
+        if let Some(held) = hold(&lock)? {
             return Ok(Some(held));
         }
         std::thread::sleep(Duration::from_millis(100));
@@ -380,15 +387,19 @@ fn replace(store: &Path) -> Result<Option<std::fs::File>, String> {
 /// The store's lookout lock, held while this process lives: `None` when
 /// another lookout holds it.
 fn lock(store: &std::path::Path) -> Result<Option<std::fs::File>, String> {
+    hold(&beside(store, ".lookout.lock"))
+}
+
+/// The lock file at `path`, held while this process lives, with its pid
+/// written in: `None` when another process holds it.
+pub(crate) fn hold(path: &Path) -> Result<Option<std::fs::File>, String> {
     use std::os::fd::AsRawFd;
-    let mut path = store.as_os_str().to_owned();
-    path.push(".lookout.lock");
     let file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
-        .open(&path)
-        .map_err(|e| format!("{}: {e}", std::path::Path::new(&path).display()))?;
+        .open(path)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
     // SAFETY: flock on a descriptor `file` owns and keeps open; the lock is
     // released when the process exits. Tried twice, since `running` holds
     // it for an instant.
@@ -407,10 +418,7 @@ fn lock(store: &std::path::Path) -> Result<Option<std::fs::File>, String> {
     let error = std::io::Error::last_os_error();
     match error.raw_os_error() == Some(libc::EWOULDBLOCK) {
         true => Ok(None),
-        false => Err(format!(
-            "{}: {error}",
-            std::path::Path::new(&path).display()
-        )),
+        false => Err(format!("{}: {error}", path.display())),
     }
 }
 
@@ -441,19 +449,18 @@ async fn serve(settings: Settings) -> Result<(), String> {
         taken: HashMap::new(),
         watchers: HashMap::new(),
         started: true,
+        rewriting: HashSet::new(),
     };
     println!(
         "{}",
         json!({"event": "watching", "pid": std::process::id()})
     );
-    let served = crate::served::Server::start(service.store.clone(), service.socket.clone());
     // Asked to give way, as by another build's lookout: what it still
-    // serves stops first, since that one serves it again.
+    // runs stops first, since that one runs it again.
     if let Ok(mut term) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
     {
         tokio::spawn(async move {
             term.recv().await;
-            crate::served::stop();
             sources::stop();
             goals::stop();
             std::process::exit(0);
@@ -464,9 +471,7 @@ async fn serve(settings: Settings) -> Result<(), String> {
     loop {
         if let Ok((client, events)) = Client::connect(&service.socket).await {
             gone = None;
-            service
-                .watch(client, events, &served, &mut from_sources)
-                .await;
+            service.watch(client, events, &mut from_sources).await;
         }
         // A daemon restarting is back within moments; one shut down is not,
         // and the client that starts the next daemon starts its lookout.
@@ -547,6 +552,9 @@ struct Service {
     /// Not connected yet since it started: its stream starts again where
     /// the last lookout's would.
     started: bool,
+    /// The `subscriptions` and `goal` calls under way, by bot, turn and
+    /// ID, whose end means the files the lookout reads changed.
+    rewriting: HashSet<(String, i64, String)>,
 }
 
 /// Every bot that one of `made` made, and what those made, as the daemon
@@ -631,6 +639,7 @@ pub(crate) fn said_by_person(entry: &Value) -> Option<i64> {
         .any(|said| said["role"] == "user" && !crate::text(&said).trim().is_empty());
     (entry["from"].is_null()
         && entry["origin"].is_null()
+        && entry["person"].is_null()
         && words
         && !crate::reactions::is_reaction(&crate::text(item)))
     .then(|| entry["node"].as_i64())
@@ -677,7 +686,6 @@ impl Service {
         &mut self,
         client: Arc<Client>,
         mut events: agent_client::Events,
-        served: &crate::served::Server,
         from_sources: &mut tokio::sync::mpsc::Receiver<sources::Event>,
     ) {
         let bots = all_bots(&client).await;
@@ -699,11 +707,6 @@ impl Service {
         self.subscribers = subs::all(&self.store).into_iter().collect();
         for bot in &bots {
             self.seat(&client, bot).await;
-        }
-        // Once a lookout: a connection dropped and made again changes no
-        // bot's tools.
-        if self.started {
-            tokio::spawn(refresh_tools(client.clone(), bots.clone()));
         }
         self.resubscribe(true);
         let listed: HashSet<String> = (bots.iter())
@@ -806,13 +809,15 @@ impl Service {
                         self.configured(&client, &event).await;
                         continue;
                     }
-                    served.event(&event);
                     streaming |= event["event"] == "follow_live";
                     self.snapshot(&event, streaming);
-                    // A `subscriptions` call this lookout answered counts
-                    // from the next event on, not from the next tick.
-                    if served.subscribed() {
+                    // A `subscriptions` or `goal` call the tool host
+                    // answered counts from the next event on: its end is in
+                    // the stream before any event that follows it.
+                    if self.rewrote(&event) {
                         reread = Some(Instant::now());
+                        self.goals.reread();
+                        self.runner.reload();
                         self.reread(&client).await;
                     }
                     let cursor = event["cursor"].as_i64();
@@ -977,9 +982,8 @@ impl Service {
                 _ = tick.tick() => {
                     let now = Instant::now();
                     self.save_cursor();
-                    // What `subscriptions` calls wrote since: at once for
-                    // one this lookout answered, else now and then.
-                    if served.subscribed() || reread.is_none_or(|at| now >= at + REREAD) {
+                    // What the person or a script wrote since, now and then.
+                    if reread.is_none_or(|at| now >= at + REREAD) {
                         reread = Some(now);
                         self.goals.reread();
                         self.runner.reload();
@@ -1216,6 +1220,39 @@ impl Service {
                 false
             }
             Err(()) => true,
+        }
+    }
+
+    /// Whether `event` ends a call of Sonny's that wrote files the lookout
+    /// reads, a `subscriptions` or `goal` call, which the tool host
+    /// answers. A turn that ends forgets the calls it left under way.
+    fn rewrote(&mut self, event: &Value) -> bool {
+        let (Some(bot), Some(turn)) = (event["bot"].as_str(), event["turn"].as_i64()) else {
+            return false;
+        };
+        let data = &event["data"];
+        let call = || {
+            (
+                bot.to_owned(),
+                turn,
+                data["call_id"].as_str().unwrap_or("").to_owned(),
+            )
+        };
+        match event["event"].as_str() {
+            Some("tool_started")
+                if data["answered_by"] == crate::served::TAG
+                    && (data["name"] == crate::served::SUBSCRIPTIONS
+                        || data["name"] == crate::served::GOAL) =>
+            {
+                self.rewriting.insert(call());
+                false
+            }
+            Some("tool_completed") => self.rewriting.remove(&call()),
+            Some("turn_finished") => {
+                self.rewriting.retain(|(b, t, _)| b != bot || *t != turn);
+                false
+            }
+            _ => false,
         }
     }
 
@@ -1474,8 +1511,13 @@ const STATUS_BYTES: u64 = 1 << 20;
 /// have it. The lock is tried shared and let go at once; a lookout
 /// starting meanwhile tries again (`lock`).
 pub fn running(store: &std::path::Path) -> bool {
+    held(&beside(store, ".lookout.lock"))
+}
+
+/// Whether a process holds the lock file at `path`.
+pub(crate) fn held(path: &Path) -> bool {
     use std::os::fd::AsRawFd;
-    let Ok(file) = std::fs::File::open(beside(store, ".lookout.lock")) else {
+    let Ok(file) = std::fs::File::open(path) else {
         return false;
     };
     // SAFETY: flock on a descriptor `file` owns; closing it lets go.
@@ -1534,51 +1576,8 @@ pub fn subscribe_lead(store: &Path, lead: &str, project: &str) -> Result<bool, S
     subs::ensure(store, lead, subs::Sub::lead(lead, project))
 }
 
-/// Bring every agent Sonny declared on up to this build's tools, as
-/// opening its window would, so one no one opens after an upgrade, such
-/// as a task out of sight, gets a tool added since. A busy one is tried
-/// again each minute, for an hour.
-async fn refresh_tools(client: Arc<Client>, bots: Vec<Value>) {
-    let mut left = bots;
-    for _ in 0..60 {
-        let mut busy = Vec::new();
-        for bot in left {
-            let Ok(mut record) = client
-                .request(
-                    "inspect",
-                    json!({"bot": bot["name"], "bot_id": bot["bot_id"]}),
-                )
-                .await
-            else {
-                continue;
-            };
-            record["name"] = bot["name"].clone();
-            record["bot_id"] = bot["bot_id"].clone();
-            let Some(fields) = crate::declared::refresh(&record) else {
-                continue;
-            };
-            match client.request("configure", Value::Object(fields)).await {
-                Ok(_) => println!(
-                    "{}",
-                    json!({"event": "tools_refreshed", "bot": bot["name"]})
-                ),
-                Err(error) if error.code == "bot_busy" => busy.push(bot),
-                Err(error) => println!(
-                    "{}",
-                    json!({"event": "tools_refresh_failed", "bot": bot["name"], "error": error.code})
-                ),
-            }
-        }
-        if busy.is_empty() {
-            return;
-        }
-        left = busy;
-        tokio::time::sleep(Duration::from_secs(60)).await;
-    }
-}
-
 /// Every bot the daemon lists, page by page.
-async fn all_bots(client: &Client) -> Vec<Value> {
+pub(crate) async fn all_bots(client: &Client) -> Vec<Value> {
     let mut bots = Vec::new();
     let mut after = Value::Null;
     loop {
@@ -1816,10 +1815,11 @@ impl Lookout {
         {
             return None;
         }
-        match (data["from"]["bot"].as_str(), data["origin"].as_str()) {
+        let by = (data["origin"].as_str()).or(data["person"].as_str());
+        match (data["from"]["bot"].as_str(), by) {
             (Some(bot), _) if bot == self.lead => None,
             (Some(bot), _) => Some(bot.to_owned()),
-            (None, Some(origin)) => Some(origin.to_owned()),
+            (None, Some(by)) => Some(by.to_owned()),
             (None, None) => Some(PERSON.to_owned()),
         }
     }
@@ -2092,8 +2092,15 @@ impl Lookout {
         let key: Vec<String> = told.items.iter().map(|line| line.key.clone()).collect();
         let request_id = format!("lookout-{}", digest(&key.join(",")));
         let delivery = if steer { "steer" } else { "queue" };
-        let asked = json!({"bot": self.lead, "bot_id": self.updates.lead_id(), "prompt": prompt,
-            "request_id": request_id, "delivery": delivery});
+        let quotes: Vec<Value> = (told.items.iter())
+            .filter_map(|line| line.quote.as_ref())
+            .map(|(task, turn)| json!({"bot": task, "turn": turn}))
+            .collect();
+        let mut asked = json!({"bot": self.lead, "bot_id": self.updates.lead_id(), "prompt": prompt,
+            "request_id": request_id, "delivery": delivery, "origin": TASKS_ORIGIN});
+        if !quotes.is_empty() {
+            asked["quotes"] = json!(quotes);
+        }
         self.sending = Some((told, key, delivery));
         self.send(client, woken, asked, Answer::Noted);
     }
@@ -2170,7 +2177,12 @@ impl Lookout {
                         self.updates.sent(told);
                     }
                     Err(code) => {
-                        self.updates.unsent(told);
+                        // Words it could not quote, gone with their task
+                        // or too long, are named by their turns instead.
+                        match code.starts_with("quote_") {
+                            true => self.updates.unquoted(told),
+                            false => self.updates.unsent(told),
+                        }
                         self.write(
                             &json!({"at_ms": epoch_ms(), "lead": self.lead, "wake_failed": code}),
                         );
@@ -2454,10 +2466,12 @@ mod tests {
 
     fn line(task: &str, turn: i64, theirs: bool, said: bool) -> updates::Line {
         updates::Line {
-            said,
+            quote: said.then(|| (task.to_owned(), turn)),
             theirs,
             text: match said {
-                true => format!("- {task}: turn:{task}/{turn}, the person wrote: \"tabs\""),
+                true => format!(
+                    "- {task}: turn:{task}/{turn}, the person wrote the words quoted from it below"
+                ),
                 false => format!("- {task}: turn:{task}/{turn} completed"),
             },
             key: String::new(),
@@ -2477,12 +2491,12 @@ mod tests {
         assert_eq!(
             note(&told, true),
             "Task updates: what happened in your tasks since you last heard; the wait tool reads each turn by its handle.\n\
-             - calc.fix: turn:calc.fix/12, the person wrote: \"tabs\"\n\
+             - calc.fix: turn:calc.fix/12, the person wrote the words quoted from it below\n\
              - calc.docs: turn:calc.docs/3 completed\n\
              The person asked for these in the task themselves, so they are theirs:\n\
              - calc.ui: turn:calc.ui/2 completed\n\
              - 1 more tasks in the next note\n\
-             A quoted message is the person's own words.\n\
+             The words quoted below are the person's own, from the turns named.\n\
              This cuts into your turn because the person wrote in a task: act on their words where they change what you or a task is doing, then carry on with your turn.\n\
              \n\
              Memory changed"
@@ -2555,15 +2569,18 @@ mod tests {
         assert_eq!(
             texts,
             [
-                "- calc.fix: turn:calc.fix/5, the person wrote: \"use tabs please\"",
-                "- calc.fix: turn:calc.fix/7, the person wrote: \"and spaces in yaml\"",
+                "- calc.fix: turn:calc.fix/5, the person wrote the words quoted from it below",
+                "- calc.fix: turn:calc.fix/7, the person wrote the words quoted from it below",
                 "- calc.fix: turn:calc.fix/6, calc.docs wrote in it",
             ]
         );
-        assert!(told.items.iter().all(|l| l.said));
+        // The daemon copies the person's words from their turns, which
+        // keeps them the person's; the note is the lookout's.
+        let quotes: Vec<_> = told.items.iter().filter_map(|l| l.quote.clone()).collect();
+        assert_eq!(quotes, [("calc.fix".into(), 5), ("calc.fix".into(), 7)]);
         let note = note(&told, false);
-        assert!(!note.contains("ignore the person"));
-        assert!(note.contains("A quoted message is the person's own words."));
+        assert!(!note.contains("ignore the person") && !note.contains("tabs"));
+        assert!(note.contains("The words quoted below are the person's own"));
     }
 
     #[test]
@@ -2609,7 +2626,10 @@ mod tests {
         lookout.heard(&said(5, PERSON, "use tabs"));
         let told = lookout.updates.take();
         let steered = note(&told, true);
-        assert!(steered.contains("use tabs"), "{steered}");
+        assert!(
+            steered.contains("turn:calc.fix/5, the person wrote the words quoted"),
+            "{steered}"
+        );
         assert!(!steered.contains("turn:calc.fix/4"), "{steered}");
         lookout.updates.sent(told);
         assert!(lookout.updates.news());
@@ -2955,6 +2975,7 @@ mod tests {
             taken: HashMap::new(),
             watchers: HashMap::new(),
             started: false,
+            rewriting: HashSet::new(),
             goals: goals::Goals::new(Path::new("/nonexistent"), Path::new("")),
             fires: HashMap::new(),
         }
@@ -3267,6 +3288,48 @@ mod tests {
             told.iter().any(|line| line.contains("turn:calc.fix/2")),
             "{told:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_subscriptions_call_s_end_rereads_before_the_events_after_it() {
+        let mut service = service(PathBuf::from("/nonexistent"), &[]);
+        let event = |kind: &str, call: &str, data: Value| {
+            let mut data = data;
+            data["call_id"] = json!(call);
+            json!({"event": kind, "bot": "reviewer", "turn": 2, "data": data})
+        };
+        let started = |name: &str, call: &str| {
+            event(
+                "tool_started",
+                call,
+                json!({"name": name, "answered_by": "sonny"}),
+            )
+        };
+        assert!(!service.rewrote(&started("subscriptions", "a")));
+        assert!(!service.rewrote(&started("memory", "b")));
+        assert!(!service.rewrote(&event("tool_started", "c", json!({"name": "goal"}))));
+        assert!(!service.rewrote(&event("tool_completed", "b", json!({}))));
+        assert!(service.rewrote(&event("tool_completed", "a", json!({}))));
+        assert!(!service.rewrote(&event("tool_completed", "a", json!({}))));
+        // A turn that ends forgets a call it never ended.
+        assert!(!service.rewrote(&started("goal", "d")));
+        assert!(!service.rewrote(&event("turn_finished", "", json!({}))));
+        assert!(service.rewriting.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_note_is_the_lookout_s_and_quotes_the_person_s_words() {
+        let (client, mut got) = submits().await;
+        let mut lookout = seated("idle");
+        lookout.heard(&said(5, PERSON, "yes, ship it"));
+        lookout.heard(&said(6, "calc.docs", "ship it"));
+        lookout.since = Some(Instant::now() - SETTLE);
+        let (woken, _woke) = tokio::sync::mpsc::channel(4);
+        lookout.wake(&client, &woken);
+        let submit = got.recv().await.unwrap();
+        assert_eq!(submit["origin"], TASKS_ORIGIN);
+        assert_eq!(submit["quotes"], json!([{"bot": "calc.fix", "turn": 5}]));
+        assert!(!submit["prompt"].as_str().unwrap().contains("ship it"));
     }
 
     #[tokio::test]

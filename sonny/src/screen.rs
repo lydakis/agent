@@ -80,6 +80,8 @@ pub enum Tag {
     /// The last row of the words streamed as this item of the running
     /// turn, until their message names its node.
     Streamed(u64),
+    /// The welcome's line Sonny's eyes are on, for a blink drawn over it.
+    Eyes,
 }
 
 /// Buttons on a row: the columns each takes, and what it does.
@@ -346,6 +348,14 @@ impl Screen {
     /// of what was tagged.
     pub fn tags(&self) -> impl Iterator<Item = Tag> + '_ {
         self.rows.iter().filter_map(|row| row.tag)
+    }
+
+    /// The screen row the row tagged `tag` was drawn on last, if it was.
+    pub fn drawn_at(&self, tag: Tag) -> Option<u16> {
+        let at = self.shown_at(self.tagged(tag)?)?;
+        (self.top..self.top + self.drawn)
+            .contains(&at)
+            .then(|| self.area.y + (at - self.top) as u16)
     }
 
     /// Whether a row is tagged `tag`.

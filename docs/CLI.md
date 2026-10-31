@@ -181,9 +181,10 @@ identity is `bot_not_found`.
   `--note-turns`, `--compact-at`, `--compact-keep`, `--compact-tokens`, `--keep-turns`,
   `--approval-hold`, `--max-output-tokens`, `--keep-warm`, `--cache-ttl`,
   `--sandbox`, `--writable` (repeatable, made absolute from the current
-  folder), `--network`, `--hide-senders` and `--unsandboxed` (repeatable: a
-  command's first words, such as `mcpx`); they are not daemon options, and an existing bot
-  keeps its own (see [bot settings](RUST_PROTOTYPE.md#bot-settings)).
+  folder), `--network`, `--hide-senders`, `--unsandboxed` (repeatable: a
+  command's first words, such as `mcpx`) and `--outputs` (made absolute; a new
+  bot gets `outputs` beside the store without it); they are not daemon options,
+  and an existing bot keeps its own (see [bot settings](RUST_PROTOTYPE.md#bot-settings)).
 
 The lightweight command registry in `src/cli.rs` supplies help and option scope
 for both client commands and `serve`. Keep that registry, the implementation,
@@ -354,6 +355,15 @@ turn with a level sees it in its shell as `AGENT_EFFORT`, and a new bot that tak
 from `AGENT_MODEL` takes its level from `AGENT_EFFORT`, so a peer started
 on its creator's model thinks as hard as its creator; a bot given
 `--model` or a profile's model gets only its own `--effort`.
+`run --quote BOT/TURN` copies that turn's prompt after this prompt, with a
+line saying who wrote it; `BOT/TURN:reply` copies the reply the finished
+turn ended with. It repeats, up to 64, the quotes a quoted prompt brings
+counted. The daemon copies the words, so the model reads what was written
+and by whom, never the sender's retelling; a turn without those words is
+refused (`quote_not_found`, `quote_unfinished`, `quote_too_large`). Sonny's
+approver takes a quote of the person's words as consent only when the
+person sent the quoting prompt: an agent could otherwise quote an old
+"yes" for a new ask.
 `run --instructions` and `--instructions-file` set a new bot's instructions,
 with the CLI's built-in text as the default; the daemon has none. `run
 --tools LIST` chooses a new bot's tools from those the daemon registers,

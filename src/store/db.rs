@@ -227,6 +227,12 @@ pub struct Settings {
     /// Whether a workspace-write sandbox reaches the network.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub network: bool,
+    /// The folder a tool output cut for the model is written to whole,
+    /// one file per stream, in place of the store's copy: an absolute
+    /// path, used only while the bot's sandbox cannot write it. None keeps
+    /// every output in the store.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outputs: Option<String>,
     /// Whether a prompt another bot or a named client sent reaches the
     /// model without the line saying so after its words.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -418,6 +424,13 @@ impl Settings {
         {
             return refuse("writable folders are absolute paths");
         }
+        if self
+            .outputs
+            .as_ref()
+            .is_some_and(|path| !std::path::Path::new(path).is_absolute() || path.len() > 4096)
+        {
+            return refuse("outputs is an absolute path");
+        }
         Ok(())
     }
     /// Every setting as it applies, defaults included, for clients; a
@@ -434,6 +447,7 @@ impl Settings {
             "cache_ttl":self.cache_ttl,
             "speed":self.speed().map_or("standard", crate::provider::Speed::name),
             "sandbox":self.sandbox,"writable":self.writable,"network":self.network,
+            "outputs":self.outputs,
             "hide_senders":self.hide_senders,"unsandboxed":self.unsandboxed})
     }
     fn stored(&self) -> Result<Option<String>> {
@@ -652,11 +666,27 @@ pub struct TurnOptions {
     /// What sent this prompt when no bot's turn did, in the submitting
     /// client's own words (an app's scheduler, say); none for a person's.
     pub origin: Option<String>,
+    /// The person who wrote this prompt, as the submitting client labels
+    /// them; none with no `from` or `origin` either is the daemon's own
+    /// person, unnamed.
+    pub person: Option<String>,
+    /// Turns whose words the store copies after this prompt's, each with
+    /// who wrote them.
+    pub quotes: Vec<QuoteRef>,
     /// The most input plus output tokens this turn may spend; none is
     /// bounded only by the bot's own budget.
     pub budget_tokens: Option<u64>,
     /// Pictures sent with the prompt, after its words in the user item.
     pub images: Vec<crate::codec::Image>,
+}
+/// A turn whose words a prompt quotes: its prompt, or with `reply` the
+/// last message with text it ended with.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct QuoteRef {
+    pub bot: String,
+    pub turn: i64,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reply: bool,
 }
 /// What a submission does when the bot is busy or the daemon is full.
 /// `Reject` answers `bot_busy` or `active_agent_limit`. `Queue` records the
@@ -862,7 +892,8 @@ pub fn unserved(detail: String) -> Outcome {
     Outcome {
         output: json!({"error":"tool_unserved","detail":detail}).to_string(),
         artifacts: Vec::new(),
-        images: Vec::new(),
+        files: Vec::new(),
+        parts: Vec::new(),
         note: None,
         failed: true,
     }
@@ -1378,7 +1409,7 @@ pub struct Database {
     /// Bounds on submissions waiting to start, turns and prompt bytes; zero
     /// is unbounded. Daemon configuration, set once after open.
     pending_limits: (usize, usize),
-    /// Queued and ready turns and their prompt bytes. Counted from the rows
+    /// Queued and ready turns and their prompt and quoted bytes. Counted from the rows
     /// at open and kept by the one writer at each transition, so admission
     /// and `stats` cost nothing on the store.
     pending: (i64, i64),
@@ -1411,6 +1442,9 @@ pub struct Database {
     /// The `steps` the current group removed, put back if it does not
     /// commit, as the rows they name are.
     steps_gone: Vec<(i64, i64)>,
+    /// Files of outputs whose records the current group removed, removed
+    /// once it commits: a group that does not keeps both.
+    files_gone: Vec<String>,
 }
 
 /// The columns of the turn view, from `turns t JOIN bots b ON b.name=t.bot`.
@@ -1634,7 +1668,7 @@ impl Database {
     /// Stored schema version, kept in `PRAGMA user_version`. Stores created
     /// before versioning and stores from newer binaries are rejected; an older
     /// versioned store is migrated forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 64;
+    pub const SCHEMA: i32 = 68;
     /// Verbatim user prompts a compaction keeps: per-prompt text, and the
     /// total text plus `(ordinal, String)` entry metadata. Empty entries cost
     /// space too, so the retained list cannot grow with conversation length.
@@ -1669,6 +1703,7 @@ impl Database {
             steps: HashMap::new(),
             stepped: Vec::new(),
             steps_gone: Vec::new(),
+            files_gone: Vec::new(),
         })
     }
 
@@ -1724,7 +1759,7 @@ impl Database {
                 turn INTEGER, turn_seq INTEGER, thinking INTEGER NOT NULL DEFAULT 0,
                 elided INTEGER NOT NULL DEFAULT 0, total_elided INTEGER NOT NULL DEFAULT 0,
                 total_thinking INTEGER NOT NULL DEFAULT 0, pictured INTEGER NOT NULL DEFAULT 0,
-                pictures INTEGER NOT NULL DEFAULT 0);
+                pictures INTEGER NOT NULL DEFAULT 0, written_ms INTEGER);
             CREATE INDEX IF NOT EXISTS nodes_turn_seq ON nodes(turn_seq) WHERE turn_seq IS NOT NULL;
             CREATE UNIQUE INDEX IF NOT EXISTS nodes_turn ON nodes(turn) WHERE turn IS NOT NULL;
             CREATE TABLE IF NOT EXISTS notes(node INTEGER PRIMARY KEY REFERENCES nodes(id),
@@ -1738,12 +1773,15 @@ impl Database {
             CREATE INDEX IF NOT EXISTS compactions_previous ON compactions(previous);
             CREATE INDEX IF NOT EXISTS compactions_cut ON compactions(cut);
             CREATE INDEX IF NOT EXISTS compactions_pinned ON compactions(pinned) WHERE pinned IS NOT NULL;
+            CREATE TABLE IF NOT EXISTS pins(compaction INTEGER NOT NULL REFERENCES compactions(node),
+                node INTEGER NOT NULL REFERENCES nodes(id), PRIMARY KEY(compaction,node)) WITHOUT ROWID;
+            CREATE INDEX IF NOT EXISTS pins_node ON pins(node);
             CREATE TABLE IF NOT EXISTS stubs(node INTEGER PRIMARY KEY REFERENCES nodes(id),
                 item BLOB NOT NULL);
             CREATE TABLE IF NOT EXISTS declined(node INTEGER PRIMARY KEY REFERENCES nodes(id),
                 item BLOB NOT NULL);
             CREATE TABLE IF NOT EXISTS senders(node INTEGER PRIMARY KEY REFERENCES nodes(id),
-                bot TEXT, bot_id INTEGER, turn INTEGER, origin TEXT);
+                bot TEXT, bot_id INTEGER, turn INTEGER, origin TEXT, person TEXT, quotes TEXT);
             CREATE TABLE IF NOT EXISTS elisions(node INTEGER PRIMARY KEY REFERENCES nodes(id),
                 previous INTEGER REFERENCES elisions(node), through INTEGER NOT NULL,
                 saved INTEGER NOT NULL);
@@ -1806,7 +1844,7 @@ impl Database {
                 delivery TEXT NOT NULL DEFAULT 'reject', expected_turn INTEGER,
                 cached_input_tokens INTEGER NOT NULL DEFAULT 0,
                 from_bot TEXT, from_turn INTEGER, from_id INTEGER, origin TEXT, reasoning TEXT, inherited_reasoning TEXT,
-                bot_model TEXT, bot_reasoning TEXT, images TEXT,
+                bot_model TEXT, bot_reasoning TEXT, images TEXT, person TEXT, quotes TEXT,
                 UNIQUE(bot,request_id));
             CREATE INDEX IF NOT EXISTS turns_bot_id ON turns(bot,id);
             CREATE INDEX IF NOT EXISTS turns_started ON turns(bot,id) WHERE started_ms IS NOT NULL;
@@ -1835,7 +1873,8 @@ impl Database {
             CREATE INDEX IF NOT EXISTS approval_tags_tag ON approval_tags(tag,approval,turn);
             CREATE TABLE IF NOT EXISTS answers(id INTEGER PRIMARY KEY AUTOINCREMENT, turn INTEGER NOT NULL REFERENCES turns(id),
                 call_id TEXT NOT NULL, tag TEXT NOT NULL, name TEXT NOT NULL, arguments TEXT NOT NULL,
-                expires_ms INTEGER NOT NULL, output TEXT, failed INTEGER NOT NULL DEFAULT 0, paused_ms INTEGER);
+                expires_ms INTEGER NOT NULL, output TEXT, failed INTEGER NOT NULL DEFAULT 0, paused_ms INTEGER,
+                parts TEXT);
             CREATE UNIQUE INDEX IF NOT EXISTS answers_call ON answers(turn,call_id);
             CREATE INDEX IF NOT EXISTS answers_waiting ON answers(tag,id) WHERE output IS NULL;
             CREATE INDEX IF NOT EXISTS answers_paused ON answers(turn) WHERE paused_ms IS NOT NULL;
@@ -1843,7 +1882,7 @@ impl Database {
                 call_id TEXT NOT NULL, status TEXT NOT NULL, result TEXT, delivered INTEGER);
             CREATE INDEX IF NOT EXISTS processes_turn ON processes(turn);
             CREATE TABLE IF NOT EXISTS artifacts(turn INTEGER NOT NULL REFERENCES turns(id), call_id TEXT NOT NULL,
-                stream TEXT NOT NULL, data BLOB NOT NULL, raw_bytes INTEGER NOT NULL DEFAULT 0,
+                stream TEXT NOT NULL, data BLOB NOT NULL, raw_bytes INTEGER NOT NULL DEFAULT 0, file TEXT,
                 PRIMARY KEY(turn,call_id,stream));
             CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY AUTOINCREMENT, bot TEXT NOT NULL REFERENCES bots(name),
                 turn INTEGER, kind TEXT NOT NULL, data TEXT NOT NULL);
@@ -1895,6 +1934,7 @@ impl Database {
             steps: HashMap::new(),
             stepped: Vec::new(),
             steps_gone: Vec::new(),
+            files_gone: Vec::new(),
         };
         // A deletion interrupted between pieces finishes now: the bot was
         // already refusing work, and nothing else may see it half gone.
@@ -1940,8 +1980,8 @@ impl Database {
             .prepare_cached("SELECT COUNT(*) FROM approvals")?
             .query_row([], |r| r.get(0))?;
         for statement in [
-            "SELECT COUNT(*),COALESCE(SUM(length(CAST(prompt AS BLOB))),0) FROM turns WHERE status='queued'",
-            "SELECT COUNT(*),COALESCE(SUM(length(CAST(prompt AS BLOB))),0) FROM turns WHERE status='ready'",
+            "SELECT COUNT(*),COALESCE(SUM(length(CAST(prompt AS BLOB))+COALESCE(length(CAST(quotes AS BLOB)),0)),0) FROM turns WHERE status='queued'",
+            "SELECT COUNT(*),COALESCE(SUM(length(CAST(prompt AS BLOB))+COALESCE(length(CAST(quotes AS BLOB)),0)),0) FROM turns WHERE status='ready'",
         ] {
             let (turns, bytes): (i64, i64) = self
                 .conn
@@ -1974,8 +2014,12 @@ impl Database {
     /// methods it calls release their own savepoints into this one.
     pub fn atomic<T>(&mut self, work: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
         self.conn.execute_batch("SAVEPOINT atomic")?;
-        let (served, stepped, gone) =
-            (self.served.len(), self.stepped.len(), self.steps_gone.len());
+        let (served, stepped, gone, files) = (
+            self.served.len(),
+            self.stepped.len(),
+            self.steps_gone.len(),
+            self.files_gone.len(),
+        );
         let done = work(self);
         if done.is_ok() {
             self.conn.execute_batch("RELEASE atomic")?;
@@ -1985,6 +2029,7 @@ impl Database {
                 .execute_batch("ROLLBACK TO atomic; RELEASE atomic")?;
             self.served.truncate(served);
             self.stepped.truncate(stepped);
+            self.files_gone.truncate(files);
             self.restore_steps(gone);
             self.recount_pending()?;
         }
@@ -2003,7 +2048,16 @@ impl Database {
         self.conn.prepare_cached("COMMIT")?.execute([])?;
         self.live_before.clear();
         self.steps_gone.clear();
+        artifact::remove(&std::mem::take(&mut self.files_gone));
         Ok(())
+    }
+    /// Remove the files of outputs whose records just went: once the group
+    /// commits, or now when there is none.
+    fn forget_files(&mut self, files: Vec<String>) {
+        match self.in_group() {
+            true => self.files_gone.extend(files),
+            false => artifact::remove(&files),
+        }
     }
     /// Put back the steps removed since the group had `kept` removals.
     fn restore_steps(&mut self, kept: usize) {
@@ -2028,6 +2082,7 @@ impl Database {
         self.outcomes.clear();
         self.served.clear();
         self.stepped.clear();
+        self.files_gone.clear();
         self.restore_steps(0);
         self.pending_stale = true;
         for (turn, before) in self.live_before.drain() {
@@ -3045,8 +3100,34 @@ impl Database {
             .pinned
             .filter(|&(.., at_start, _)| at_start && state.start.is_some())
             .map(|(id, size, seq, depth, _, pictured)| (id, size, seq, depth, pictured));
+        // And the messages sent to the turn before the cut, each whole after
+        // the prompt, in order; under the floor, one with a stub goes as it.
+        let pins: Vec<(i64, i64, Pictured)> = match (pinned, &state.compaction) {
+            (Some(_), Some((version, ..))) => self
+                .conn
+                .prepare_cached(
+                    "SELECT n.id,n.total_bytes-COALESCE(p.total_bytes,0),n.pictured,n.pictures,n.elided
+                     FROM pins x JOIN nodes n ON n.id=x.node LEFT JOIN nodes p ON p.id=n.parent
+                     WHERE x.compaction=? ORDER BY n.id",
+                )?
+                .query_map([version], |r| {
+                    let (id, size, elided): (i64, i64, i64) = (r.get(0)?, r.get(1)?, r.get(4)?);
+                    Ok(match elided > 0 && id <= state.elided {
+                        true => (id, size - elided, Pictured::default()),
+                        false => (id, size, Pictured {
+                            count: r.get(3)?,
+                            extra: r.get(2)?,
+                        }),
+                    })
+                })?
+                .collect::<rusqlite::Result<_>>()?,
+            _ => Vec::new(),
+        };
+        let pins_bytes: i64 = pins.iter().map(|(_, size, _)| size + 1).sum();
         let lead = |index: usize| match pinned {
-            Some((_, size, ..)) if index == saved_start => (size + 1, 1),
+            Some((_, size, ..)) if index == saved_start => {
+                (size + 1 + pins_bytes, 1 + pins.len() as i64)
+            }
             _ => (0, 0),
         };
         let fits = |index: usize, bytes_limit: i64, items_limit: i64| {
@@ -3093,6 +3174,10 @@ impl Database {
         let start = &rows[chosen];
         let window = &rows[..=chosen];
         let pinned = pinned.filter(|_| chosen == saved_start);
+        let pins = match pinned {
+            Some(_) => pins,
+            None => Vec::new(),
+        };
         let compaction = match state.compaction {
             Some((version, summary, prompts, from, to)) => Some(CompactionView {
                 version,
@@ -3115,15 +3200,34 @@ impl Database {
             ),
             None => Default::default(),
         };
+        for (id, size, pictures) in &pins {
+            ids.push(*id);
+            sizes.push(clamp(*size));
+            thinking.push(0);
+            pictured.push(signed(pictures.extra));
+        }
         ids.extend(window.iter().rev().map(|r| r.id));
         sizes.extend(sent[..=chosen].iter().rev().map(|&b| clamp(b)));
         thinking.extend(window.iter().rev().map(|r| clamp(r.thinking)));
         pictured.extend(window.iter().rev().map(|r| signed(r.pictured)));
-        // The view since the summary includes the prompt it keeps in full.
+        // The view since the summary includes the prompt it keeps in full,
+        // and the messages kept beside it.
         let mut unsummarized = state.unsummarized;
         if let Some((_, size, ..)) = state.pinned {
             unsummarized.bytes += size as usize;
             unsummarized.items += 1;
+            if let Some(version) = compaction.as_ref().map(|c| c.version) {
+                let (bytes, items): (i64, i64) = self
+                    .conn
+                    .prepare_cached(
+                        "SELECT COALESCE(SUM(n.total_bytes-COALESCE(p.total_bytes,0)),0),COUNT(*)
+                         FROM pins x JOIN nodes n ON n.id=x.node LEFT JOIN nodes p ON p.id=n.parent
+                         WHERE x.compaction=?",
+                    )?
+                    .query_row([version], |r| Ok((r.get(0)?, r.get(1)?)))?;
+                unsummarized.bytes += bytes as usize;
+                unsummarized.items += items as usize;
+            }
         }
         Ok(Some(Window {
             family: Family::parse(&state.family).ok_or(Error::new("store_family_unsupported"))?,
@@ -3131,17 +3235,25 @@ impl Database {
             sizes,
             thinking,
             pictured,
-            item_bytes: through[chosen] + pinned.map_or(0, |(_, size, ..)| size),
+            item_bytes: through[chosen]
+                + pinned.map_or(0, |(_, size, ..)| size)
+                + pins.iter().map(|(_, size, _)| size).sum::<i64>(),
             unsummarized,
             omitted_items: pinned.map_or(start.depth, |(.., depth, _)| depth) - 1,
             omitted_turns: pinned.map_or(start.turn_seq.unwrap_or(1), |(_, _, seq, ..)| seq) - 1,
-            omitted_in_turn: pinned.map_or(0, |(.., depth, _)| start.depth - 1 - depth),
+            omitted_in_turn: pinned.map_or(0, |(.., depth, _)| {
+                start.depth - 1 - depth - pins.len() as i64
+            }),
             history: state.history,
             note: state.note,
             compaction,
             elided: state.elided,
             pictures: window.iter().map(|r| r.pictures).sum::<i64>()
-                + pinned.map_or(0, |(.., pictures)| pictures.count),
+                + pinned.map_or(0, |(.., pictures)| pictures.count)
+                + pins
+                    .iter()
+                    .map(|(.., pictures)| pictures.count)
+                    .sum::<i64>(),
         }))
     }
     /// Where to move the bot's elision floor so the newest `keep_bytes` of
@@ -3248,12 +3360,46 @@ impl Database {
                 break;
             }
         }
+        // A cut's prompt and the messages kept beside it go ahead of the
+        // tail, older than all of it, so a floor anywhere in the tail takes
+        // their pictures too: when only they are past the bound, the floor
+        // goes through the tail's oldest row.
+        let lead: Vec<Row> = match keep_pictures {
+            Some(_) => self
+                .conn
+                .prepare_cached(
+                    "WITH lead(node) AS (
+                        SELECT c.pinned FROM bots b JOIN compactions c ON c.node=b.compaction
+                        WHERE b.name=?1 AND c.cut=b.context_start AND c.pinned IS NOT NULL
+                        UNION ALL SELECT x.node FROM bots b JOIN compactions c ON c.node=b.compaction
+                        JOIN pins x ON x.compaction=c.node
+                        WHERE b.name=?1 AND c.cut=b.context_start AND c.pinned IS NOT NULL)
+                     SELECT n.id,0,n.elided,
+                        CASE WHEN n.id<=?2 AND n.elided>0 THEN 0 ELSE n.pictures END,
+                        CASE WHEN n.id<=?2 AND n.elided>0 THEN 0 ELSE n.pictured END
+                     FROM lead JOIN nodes n ON n.id=lead.node",
+                )?
+                .query_map(params![name, elided], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+                })?
+                .collect::<rusqlite::Result<_>>()?,
+            None => Vec::new(),
+        };
+        if edge == rows.len() {
+            for &(.., pictures, pictured) in &lead {
+                count += pictures;
+                extra += pictured.max(0);
+            }
+            if count > keep_count || extra > keep_extra {
+                edge = rows.len() - 1;
+            }
+        }
         let floor = edge.max(answered);
         let Some(&(through, ..)) = rows.get(floor) else {
             return Ok(None);
         };
         let (mut results, mut saved_bytes) = (0, 0);
-        for row in &rows[floor..] {
+        for row in rows[floor..].iter().chain(&lead) {
             if let &(id, _, saves, ..) = row
                 && id > elided
                 && saves > 0
@@ -3966,63 +4112,60 @@ impl Database {
             )?,
             None => (None, None),
         };
+        let old_pins = match bot.compaction {
+            Some(id) if old_pinned.is_some() => self.pins(id)?,
+            _ => Vec::new(),
+        };
         let before = self.compaction_context_usage(
             &bot,
             old_cut,
-            old_pinned,
+            old_pinned.map(|prompt| (prompt, &old_pins[..])),
             old.as_ref(),
             note_turns,
             input_limit,
         )?;
-        let after = self.compaction_context_usage(
-            &bot,
-            Some(plan.cut),
-            plan.pinned,
-            Some(&candidate),
-            note_turns,
-            input_limit,
-        )?;
-        if after.bytes >= before.bytes || after.items > before.items {
-            return fail_with(
-                "compaction_not_smaller",
-                "the summary, retained prompts and omission listing did not reduce the context view",
-            );
-        }
-        // Catch-up may leave an oversized backlog, but it must not install a
-        // pinned prefix that makes even the active turn impossible to send.
-        // Optional previews yield during request fitting. Exclude them from
-        // this minimum check, also avoiding another omitted-turn traversal.
-        if !after.fits(input_limit)
-            && let Some(turn) = bot.running_turn
-        {
-            // The least the active turn can be cut to: its prompt ahead of
-            // its newest round, or, before its first result, all of it.
-            let prompt: i64 =
-                self.conn
-                    .query_row("SELECT id FROM nodes WHERE turn=?", [turn], |r| r.get(0))?;
-            let head = bot.head.ok_or(Error::new("storage_error"))?;
-            let (start, pinned) = match self.newest_round(head, prompt)? {
-                Some(round) => (round, Some(prompt)),
-                None => match plan.pinned {
-                    Some(pinned) => (plan.cut, Some(pinned)),
-                    None => (prompt, None),
-                },
-            };
-            let minimum = self.compaction_context_usage(
+        // A cut inside the turn keeps, beside its prompt, the messages sent
+        // to the turn before the cut, whole and in order, so none of them
+        // reads older than the prompt. Those the room cannot take go oldest
+        // first: a later one may overrule them, never the other way round.
+        let mut pins = match (plan.pinned, old_cut) {
+            (Some(prompt), Some(old_cut)) if old_pinned == Some(prompt) => {
+                let mut pins = old_pins.clone();
+                pins.extend(self.turn_messages(plan.cut, old_cut - 1)?);
+                pins
+            }
+            (Some(prompt), _) => self.turn_messages(plan.cut, prompt)?,
+            (None, _) => Vec::new(),
+        };
+        let after = loop {
+            let after = self.compaction_context_usage(
                 &bot,
-                Some(start),
-                pinned,
+                Some(plan.cut),
+                plan.pinned.map(|prompt| (prompt, &pins[..])),
                 Some(&candidate),
-                0,
+                note_turns,
                 input_limit,
             )?;
-            if !minimum.fits(input_limit) {
-                return fail_with(
-                    "compaction_context_limit",
-                    "the new pinned prefix leaves insufficient room for the active turn",
-                );
+            let smaller = after.bytes < before.bytes && after.items <= before.items;
+            let fits = smaller
+                && self.active_turn_fits(&bot, plan, &pins, &candidate, after, input_limit)?;
+            if fits || pins.is_empty() {
+                if !smaller {
+                    return fail_with(
+                        "compaction_not_smaller",
+                        "the summary, retained prompts and omission listing did not reduce the context view",
+                    );
+                }
+                if !fits {
+                    return fail_with(
+                        "compaction_context_limit",
+                        "the new pinned prefix leaves insufficient room for the active turn",
+                    );
+                }
+                break after;
             }
-        }
+            pins.remove(0);
+        };
         let tx = self.conn.savepoint()?;
         let previous = if bot.compaction == bot.head {
             // Another step before the model answers at this head, since the
@@ -4063,11 +4206,16 @@ impl Database {
             )?;
             bot.compaction
         };
+        tx.execute("DELETE FROM pins WHERE compaction=?", [bot.head])?;
+        for pin in &pins {
+            tx.prepare_cached("INSERT INTO pins(compaction,node) VALUES (?,?)")?
+                .execute(params![bot.head, pin])?;
+        }
         tx.execute(
             "UPDATE bots SET compaction=?,context_start=? WHERE name=?",
             params![bot.head, plan.cut, name],
         )?;
-        let data = json!({"version":bot.head,"cut":plan.cut,"pinned":plan.pinned,"previous":previous,"covered_turns":[covered_from, plan.covered.1],
+        let data = json!({"version":bot.head,"cut":plan.cut,"pinned":plan.pinned,"pinned_messages":pins,"previous":previous,"covered_turns":[covered_from, plan.covered.1],
             "span_turns":[plan.covered.0, plan.covered.1],
             "items":plan.ids.len(),"bytes":plan.sizes.iter().map(|s| *s as u64).sum::<u64>(),
             "summary_bytes":summary.len(),"prompt_bytes":plan.prompts.iter().map(|(_, p)| p.len()).sum::<usize>(),
@@ -4093,14 +4241,96 @@ impl Database {
         tx.commit()?;
         Ok(entry(cursor, name, bot.running_turn, "compacted", data))
     }
+    /// Whether the active turn, cut to the least it can be, still fits
+    /// beside a new compaction's pinned prefix. Catch-up may leave an
+    /// oversized backlog, but it must not install a prefix that makes even
+    /// the active turn impossible to send. Optional previews yield during
+    /// request fitting, so they are left out here, which also avoids another
+    /// omitted-turn traversal.
+    fn active_turn_fits(
+        &self,
+        bot: &Bot,
+        plan: &CompactionPlan,
+        pins: &[i64],
+        candidate: &CompactionView,
+        after: super::ContextUsage,
+        input_limit: super::ContextUsage,
+    ) -> Result<bool> {
+        let Some(turn) = bot.running_turn else {
+            return Ok(true);
+        };
+        if after.fits(input_limit) {
+            return Ok(true);
+        }
+        // The least the active turn can be cut to: its prompt and the
+        // messages kept beside it ahead of its newest round, or, before its
+        // first result, all of it.
+        let prompt: i64 =
+            self.conn
+                .query_row("SELECT id FROM nodes WHERE turn=?", [turn], |r| r.get(0))?;
+        let head = bot.head.ok_or(Error::new("storage_error"))?;
+        let (start, pinned, pins) = match self.newest_round(head, prompt)? {
+            Some(round) => {
+                let kept = match plan.pinned {
+                    Some(pinned) if pinned == prompt => pins.to_vec(),
+                    _ => Vec::new(),
+                };
+                (round, Some(prompt), kept)
+            }
+            None => match plan.pinned {
+                Some(pinned) => (plan.cut, Some(pinned), pins.to_vec()),
+                None => (prompt, None, Vec::new()),
+            },
+        };
+        let minimum = self.compaction_context_usage(
+            bot,
+            Some(start),
+            pinned.map(|prompt| (prompt, &pins[..])),
+            Some(candidate),
+            0,
+            input_limit,
+        )?;
+        Ok(minimum.fits(input_limit))
+    }
+    /// The messages someone sent the bot between `bound` and `cut`, both
+    /// left out, oldest first: the nodes along the cut's lineage that are
+    /// neither the model's output nor a tool result. Read when a cut inside
+    /// a turn is made, over the span it covers.
+    fn turn_messages(&self, cut: i64, bound: i64) -> Result<Vec<i64>> {
+        let mut statement = self.conn.prepare_cached(
+            "WITH RECURSIVE chain(id,parent) AS (
+                SELECT id,parent FROM nodes WHERE id=(SELECT parent FROM nodes WHERE id=?1) AND id>?2
+                UNION ALL SELECT n.id,n.parent FROM nodes n JOIN chain c ON n.id=c.parent WHERE n.id>?2)
+             SELECT c.id,n.item FROM chain c JOIN nodes n ON n.id=c.id ORDER BY c.id",
+        )?;
+        let mut rows = statement.query(params![cut, bound])?;
+        let mut messages = Vec::new();
+        while let Some(row) = rows.next()? {
+            let item = row.get_ref(1)?;
+            let item = item.as_blob().map_err(|_| Error::new("storage_error"))?;
+            if super::context::is_message(item) {
+                messages.push(row.get(0)?);
+            }
+        }
+        Ok(messages)
+    }
+    /// The messages a compaction version keeps beside its pinned prompt,
+    /// oldest first.
+    fn pins(&self, compaction: i64) -> Result<Vec<i64>> {
+        Ok(self
+            .conn
+            .prepare_cached("SELECT node FROM pins WHERE compaction=? ORDER BY node")?
+            .query_map([compaction], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?)
+    }
     /// The view a compaction leaves: `view` ahead of the items from `cut`,
     /// or, for a cut inside a turn, ahead of that turn's `pinned` prompt and
-    /// then the items from the cut.
+    /// the messages kept beside it, `pins`, then the items from the cut.
     fn compaction_context_usage(
         &self,
         bot: &Bot,
         cut: Option<i64>,
-        pinned: Option<i64>,
+        pinned: Option<(i64, &[i64])>,
         view: Option<&CompactionView>,
         note_turns: usize,
         input_limit: super::ContextUsage,
@@ -4116,7 +4346,7 @@ impl Database {
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )?;
         let mut in_turn = 0;
-        if let Some(prompt) = pinned {
+        if let Some((prompt, pins)) = pinned {
             // Under the floor, a prompt with a stub goes as it.
             let (size, seq, depth): (i64, i64, i64) = self.conn.query_row(
                 "SELECT n.total_bytes-COALESCE(p.total_bytes,0)
@@ -4132,6 +4362,18 @@ impl Database {
             in_turn = omitted - depth;
             omitted = depth - 1;
             turns = seq - 1;
+            // The messages kept beside it, each as the prompt goes.
+            let mut sized = self.conn.prepare_cached(
+                "SELECT n.total_bytes-COALESCE(p.total_bytes,0)
+                    -CASE WHEN n.id<=COALESCE(e.through,0) AND n.elided>0 THEN n.elided ELSE 0 END
+                 FROM nodes n LEFT JOIN nodes p ON p.id=n.parent
+                 LEFT JOIN elisions e ON e.node=?2 WHERE n.id=?1",
+            )?;
+            for pin in pins {
+                bytes += sized.query_row(params![pin, bot.elision], |r| r.get::<_, i64>(0))?;
+                items += 1;
+                in_turn -= 1;
+            }
         }
         let note: Option<(i64, String)> = self
             .conn
@@ -4141,7 +4383,7 @@ impl Database {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
-        let listed = match pinned.or(cut) {
+        let listed = match pinned.map(|(prompt, _)| prompt).or(cut) {
             Some(start) if note_turns > 0 && omitted > 0 => {
                 self.omitted_turns(start, note_turns)?
             }
@@ -4381,7 +4623,8 @@ impl Database {
     }
     /// Bytes and items in the active turn alone. Older turns can be removed
     /// from the context window; the current turn cannot, though a compaction
-    /// cut inside it leaves only its prompt and what follows the cut. The
+    /// cut inside it leaves only its prompt, the messages kept beside it, and
+    /// what follows the cut. The
     /// indexed first node, cut, and head supply cumulative totals without
     /// walking the turn.
     pub fn turn_usage(&self, name: &str, turn: i64) -> Result<(Family, usize, usize)> {
@@ -4395,7 +4638,12 @@ impl Database {
                             ELSE cp.total_bytes-MIN(cp.total_elided,COALESCE(e.saved,0))
                                 -s.total_bytes+COALESCE(p.total_bytes,0)
                                 +CASE WHEN s.id<=COALESCE(e.through,0) AND s.elided>0 THEN s.elided ELSE 0 END END,
-                    h.depth-CASE WHEN c.node IS NULL THEN COALESCE(p.depth,0) ELSE cp.depth-1 END
+                    h.depth-CASE WHEN c.node IS NULL THEN COALESCE(p.depth,0) ELSE cp.depth-1 END,
+                    (SELECT COALESCE(SUM(n.total_bytes-q.total_bytes
+                        -CASE WHEN n.id<=COALESCE(e.through,0) AND n.elided>0 THEN n.elided ELSE 0 END),0)
+                     FROM pins x JOIN nodes n ON n.id=x.node JOIN nodes q ON q.id=n.parent
+                     WHERE x.compaction=c.node),
+                    (SELECT COUNT(*) FROM pins WHERE compaction=c.node)
              FROM bots b JOIN nodes h ON h.id=b.head JOIN nodes s ON s.turn=?2
              LEFT JOIN nodes p ON p.id=s.parent LEFT JOIN elisions e ON e.node=b.elision
              LEFT JOIN compactions c ON c.node=b.compaction AND c.pinned=s.id
@@ -4403,7 +4651,11 @@ impl Database {
              WHERE b.name=?1 AND b.running_turn=?2",
             )?
             .query_row(params![name, turn], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                Ok((
+                    r.get(0)?,
+                    r.get::<_, i64>(1)? + r.get::<_, i64>(3)?,
+                    r.get::<_, i64>(2)? + r.get::<_, i64>(4)?,
+                ))
             })
             .optional()?;
         let Some((family, bytes, items)) = row else {
@@ -4466,7 +4718,8 @@ impl Database {
         let (omitted, turns, in_turn, history, note) = self
             .conn
             .prepare_cached(
-                "SELECT s.depth-1,s.turn_seq-1,COALESCE(cut.depth-1-s.depth,0),
+                "SELECT s.depth-1,s.turn_seq-1,
+                    COALESCE(cut.depth-1-s.depth-(SELECT COUNT(*) FROM pins WHERE compaction=c.node),0),
                     instr(','||b.tools||',',',history,')>0,n.node,n.text
              FROM bots b JOIN nodes s ON s.turn=?2 LEFT JOIN notes n ON n.node=b.note
              LEFT JOIN compactions c ON c.node=b.compaction AND c.pinned=s.id
@@ -4968,7 +5221,8 @@ impl Database {
     pub fn set_pending_limits(&mut self, turns: usize, bytes: usize) {
         self.pending_limits = (turns, bytes);
     }
-    /// Queued and ready turns and their prompt bytes.
+    /// Queued and ready turns and their bytes: their prompts and the words
+    /// they quote, which wait with them until they start.
     pub fn pending(&self) -> Result<(i64, i64)> {
         Ok(self.pending)
     }
@@ -5050,7 +5304,8 @@ impl Database {
         let prior: Option<Prior> = self
             .conn
             .query_row(
-                "SELECT id,prompt,status,workspace,model,delivery,expected_turn,prompt_node,from_bot,from_turn,origin,reasoning,budget_tokens,images
+                "SELECT id,prompt,status,workspace,model,delivery,expected_turn,prompt_node,from_bot,from_turn,origin,reasoning,budget_tokens,images,
+                    person,quotes
                  FROM turns WHERE bot=? AND request_id=?",
                 params![name, request_id],
                 |r| {
@@ -5069,6 +5324,27 @@ impl Database {
                                 _ => None,
                             },
                             origin: r.get(10)?,
+                            person: r.get(14)?,
+                            quotes: match r.get::<_, Option<String>>(15)? {
+                                // Kept with who wrote each and its words,
+                                // and those they brought; a retry names the
+                                // same turns as the request did.
+                                Some(json) => serde_json::from_str::<Vec<Value>>(&json)
+                                    .and_then(|kept| {
+                                        (kept.into_iter())
+                                            .filter(|quote| quote["nested"] != true)
+                                            .map(serde_json::from_value)
+                                            .collect()
+                                    })
+                                    .map_err(|e| {
+                                        rusqlite::Error::FromSqlConversionFailure(
+                                            15,
+                                            rusqlite::types::Type::Text,
+                                            Box::new(e),
+                                        )
+                                    })?,
+                                None => Vec::new(),
+                            },
                             budget_tokens: r.get::<_, Option<i64>>(12)?.map(|n| n as u64),
                             // Checked by their digest below.
                             images: Vec::new(),
@@ -5104,6 +5380,8 @@ impl Database {
                 expected_turn,
                 from,
                 origin,
+                person,
+                quotes,
                 budget_tokens,
                 images: _,
             } = &saved_options;
@@ -5117,6 +5395,8 @@ impl Database {
                 ("expected_turn", *expected_turn != same.expected_turn),
                 ("from", *from != same.from),
                 ("origin", *origin != same.origin),
+                ("person", *person != same.person),
+                ("quotes", *quotes != same.quotes),
                 ("budget_tokens", *budget_tokens != same.budget_tokens),
                 (
                     "images",
@@ -5179,6 +5459,7 @@ impl Database {
         if let Some(level) = &options.effort {
             bot.family()?.check_effort(level)?;
         }
+        let quotes = self.quote(&options.quotes, prompt.len())?;
         let attach = options.delivery == Delivery::Attach;
         // An attached message runs on no model of its own: it joins
         // whichever call the bot makes next.
@@ -5257,6 +5538,7 @@ impl Database {
         // Work that would wait counts against the pending bounds; a refusal
         // writes nothing, like the active-turn bound. An attached message
         // is no work: it waits for whatever the bot does next.
+        let waiting = prompt.len() + quotes.as_ref().map_or(0, String::len);
         if status != "running" && !attach {
             let (limit_turns, limit_bytes) = self.pending_limits;
             if limit_turns > 0 || limit_bytes > 0 {
@@ -5267,11 +5549,11 @@ impl Database {
                         format!("{turns} submissions are waiting; the bound is {limit_turns}"),
                     );
                 }
-                if limit_bytes > 0 && bytes + prompt.len() as i64 > limit_bytes as i64 {
+                if limit_bytes > 0 && bytes + waiting as i64 > limit_bytes as i64 {
                     return fail_with(
                         "pending_limit",
                         format!(
-                            "{bytes} prompt bytes are waiting; this one would pass the bound of {limit_bytes}"
+                            "{bytes} prompt and quoted bytes are waiting; this one would pass the bound of {limit_bytes}"
                         ),
                     );
                 }
@@ -5285,8 +5567,8 @@ impl Database {
             )?
             .query_row([], |r| r.get(0))?;
         tx.prepare_cached(
-            "INSERT INTO turns(id,bot,request_id,prompt,status,workspace,model,delivery,expected_turn,from_bot,from_turn,from_id,origin,reasoning,budget_tokens,images)
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO turns(id,bot,request_id,prompt,status,workspace,model,delivery,expected_turn,from_bot,from_turn,from_id,origin,reasoning,budget_tokens,images,person,quotes)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         )?.execute(
             // Queued work keeps the folder it was sent to even if the bot
             // moves before it starts; a steer without one joins any turn.
@@ -5295,7 +5577,7 @@ impl Database {
                 options.model, options.delivery.name(), options.expected_turn,
                 options.from.as_ref().map(|f| &f.0), options.from.as_ref().map(|f| f.1), from_id, options.origin,
                 options.effort, options.budget_tokens.map(|n| n as i64),
-                stored_images(&options.images)?],
+                stored_images(&options.images)?, options.person, quotes],
         )?;
         if moved {
             tx.prepare_cached("UPDATE bots SET workspace=? WHERE name=?")?
@@ -5325,6 +5607,8 @@ impl Database {
                     .map(|(bot, turn)| (bot.as_str(), *turn)),
                 from_id,
                 options.origin.as_deref(),
+                options.person.as_deref(),
+                quotes.as_deref(),
             );
             (if attach { "attached" } else { "queued" }, data)
         };
@@ -5332,7 +5616,7 @@ impl Database {
         tx.commit()?;
         if status != "running" && !attach {
             self.pending.0 += 1;
-            self.pending.1 += prompt.len() as i64;
+            self.pending.1 += waiting as i64;
         }
         let joins = options.delivery == Delivery::Steer
             && status == "queued"
@@ -5360,7 +5644,8 @@ impl Database {
         turn: i64,
         validate: impl FnOnce(&Bot, Option<&str>) -> Result<()>,
     ) -> Result<(Value, bool)> {
-        // Bot, request, prompt, status, folder, model, strict, effort.
+        // Bot, request, prompt, status, folder, model, strict, effort,
+        // waiting bytes.
         type Queued = (
             String,
             String,
@@ -5370,11 +5655,13 @@ impl Database {
             Option<String>,
             bool,
             Option<String>,
+            i64,
         );
-        let (name, request_id, prompt, status, workspace, model, strict, reasoning): Queued = self
+        let (name, request_id, prompt, status, workspace, model, strict, reasoning, waiting): Queued = self
             .conn
             .query_row(
-                "SELECT bot,request_id,prompt,status,workspace,model,expected_turn IS NOT NULL,reasoning FROM turns WHERE id=?",
+                "SELECT bot,request_id,prompt,status,workspace,model,expected_turn IS NOT NULL,reasoning,
+                    length(CAST(prompt AS BLOB))+COALESCE(length(CAST(quotes AS BLOB)),0) FROM turns WHERE id=?",
                 [turn],
                 |r| {
                     Ok((
@@ -5386,6 +5673,7 @@ impl Database {
                         r.get(5)?,
                         r.get(6)?,
                         r.get(7)?,
+                        r.get(8)?,
                     ))
                 },
             )
@@ -5421,7 +5709,7 @@ impl Database {
         start_locked(&tx, &bot, turn, &prompt, &mut data)?;
         let cursor = event(&tx, &name, Some(turn), "accepted", data.clone())?;
         tx.commit()?;
-        self.pending_left(prompt.len());
+        self.pending_left(waiting as usize);
         let steers = self.steers_waiting(&name)?;
         Ok((entry(cursor, &name, Some(turn), "accepted", data), steers))
     }
@@ -5455,7 +5743,7 @@ impl Database {
         let (name, status, prompt_bytes): (String, String, i64) = self
             .conn
             .query_row(
-                "SELECT bot,status,length(CAST(prompt AS BLOB)) FROM turns WHERE id=?",
+                "SELECT bot,status,length(CAST(prompt AS BLOB))+COALESCE(length(CAST(quotes AS BLOB)),0) FROM turns WHERE id=?",
                 [turn],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
@@ -5559,13 +5847,15 @@ impl Database {
             )
         };
         // Each steer's id, item with its pictures and stub, prompt size,
-        // whether it was attached (which no pending count holds), and its
-        // pictures' JSON.
+        // the bytes the pending count holds for it (none when it was
+        // attached), its pictures' JSON, and its quotes as the turn keeps
+        // them once its item holds their words.
         type Steer = (
             i64,
             (Vec<u8>, Pictured, Option<Vec<u8>>),
             usize,
-            bool,
+            Option<usize>,
+            Option<String>,
             Option<String>,
         );
         let mut steers: Vec<Steer> = Vec::new();
@@ -5579,7 +5869,8 @@ impl Database {
                     (s.workspace IS NULL OR s.workspace=COALESCE(t.workspace,b.workspace))
                     AND (s.model IS NULL OR s.model=COALESCE(t.model,b.provider||'/'||b.model))
                     AND (s.reasoning IS NULL OR s.reasoning IS COALESCE(t.reasoning,b.reasoning)),
-                    s.status='attached',length(s.images)
+                    s.status='attached',length(s.images),
+                    length(CAST(s.prompt AS BLOB))+COALESCE(length(CAST(s.quotes AS BLOB)),0)
                  FROM (SELECT id FROM turns WHERE bot=?1 AND status='queued' AND delivery='steer'
                          AND id<=?4 AND (expected_turn IS NULL OR expected_turn=?2)
                        UNION ALL SELECT id FROM turns WHERE ?5 AND bot=?1 AND status='attached'
@@ -5598,13 +5889,21 @@ impl Database {
             let (mut bytes, mut picture_bytes) = (0, 0);
             while let Some(row) = rows.next()? {
                 let size = row.get::<_, i64>(2)? as usize;
+                // Its words with the words it quotes, which it takes in too.
+                let held = row.get::<_, i64>(6)? as usize;
                 if !row.get::<_, bool>(3)? {
                     break;
                 }
-                if size > STEER_BATCH_BYTES - bytes {
+                if size > STEER_BATCH_BYTES.saturating_sub(bytes) {
                     // An oversized store-level prompt must not spin forever.
                     // Protocol prompts are already capped at this same limit.
                     more = !steers.is_empty();
+                    break;
+                }
+                // Quoted words count past the first steer's, which admission
+                // bounded with its own words, as its pictures are.
+                if !steers.is_empty() && held > STEER_BATCH_BYTES.saturating_sub(bytes) {
+                    more = true;
                     break;
                 }
                 // Pictures are read only once they fit their own budget,
@@ -5615,25 +5914,22 @@ impl Database {
                     more = true;
                     break;
                 }
-                bytes += size;
+                bytes += held;
                 picture_bytes += pictured_size;
                 let id: i64 = row.get(0)?;
-                let (images, sender) = self
+                let (images, (after, quotes)) = self
                     .conn
                     .prepare_cached(
-                        "SELECT images,from_bot,from_turn,origin FROM turns WHERE id=?",
+                        "SELECT images,from_bot,from_turn,origin,person,quotes FROM turns WHERE id=?",
                     )?
                     .query_row([id], |r| {
-                        Ok((r.get::<_, Option<String>>(0)?, sent_by(r, 1)?))
+                        Ok((
+                            r.get::<_, Option<String>>(0)?,
+                            after_words(r, 1, bot.settings.hide_senders)?,
+                        ))
                     })?;
                 let pictures = images_from(images.as_deref())?;
-                let sender = sender.filter(|_| !bot.settings.hide_senders);
-                let prompted = prompt_item(
-                    family,
-                    &row.get::<_, String>(1)?,
-                    sender.as_deref(),
-                    &pictures,
-                )?;
+                let prompted = prompt_item(family, &row.get::<_, String>(1)?, &after, &pictures)?;
                 // Its pictures count at their weight, as the node will.
                 let weight = (prompted.0.len() as i64 - prompted.1.extra) as usize;
                 if weight + 1 > room_bytes || room_items == 0 {
@@ -5642,7 +5938,8 @@ impl Database {
                 }
                 room_bytes -= weight + 1;
                 room_items -= 1;
-                steers.push((id, prompted, size, row.get(4)?, images));
+                let waiting = (!row.get::<_, bool>(4)?).then_some(held);
+                steers.push((id, prompted, size, waiting, images, quotes));
             }
         }
         let mut absorbed = Absorbed {
@@ -5660,10 +5957,11 @@ impl Database {
         let mut steered = Vec::with_capacity(steers.len());
         // Preserve the submitted effort for exact retries; only omitted effort
         // needs a separate execution value when the running turn overrides it.
-        for (steer, prompted, size, was_attached, images) in steers {
+        for (steer, prompted, size, waiting, images, quotes) in steers {
             let id = prompt_node(&tx, head, &prompted, None)?;
             head = Some(id);
             keep_once(&tx, steer, images.as_deref())?;
+            keep_quotes(&tx, steer, quotes.as_deref(), id)?;
             if size >= PROMPT_SHARE_BYTES {
                 tx.execute("UPDATE turns SET status='steered',finished_ms=?1,prompt='',prompt_node=?2,
                     (workspace,model,inherited_reasoning)=(SELECT COALESCE(s.workspace,t.workspace),COALESCE(s.model,t.model),
@@ -5696,7 +5994,7 @@ impl Database {
             absorbed
                 .entries
                 .push(entry(cursor, &bot.name, Some(turn), "steered", data));
-            steered.push((steer, (!was_attached).then_some(size)));
+            steered.push((steer, waiting));
         }
         // Steers go in only at a round boundary and hold no calls.
         tx.execute(
@@ -5997,7 +6295,7 @@ impl Database {
             .optional()?
             .unwrap_or(false);
         let item =
-            family.tool_result_item_with(call_id, custom, &outcome.output, &outcome.images)?;
+            family.tool_result_item_with(call_id, custom, &outcome.output, &outcome.parts)?;
         // Verdicts are for the round as planned: after a failure the gated
         // calls still to run are announced again, in this same commit.
         // Unless one of them lapsed while this call ran: a new request would
@@ -6016,6 +6314,17 @@ impl Database {
         for (stream, data) in &outcome.artifacts {
             artifact::put(&tx, turn, call_id, stream, data)?;
         }
+        for (stream, file) in &outcome.files {
+            artifact::put_file(&tx, turn, call_id, stream, file)?;
+        }
+        // A parked answer's pictures were kept for the result, which now
+        // holds them: stored once.
+        if !outcome.parts.is_empty() {
+            tx.prepare_cached(
+                "UPDATE answers SET parts=NULL WHERE turn=? AND call_id=? AND parts IS NOT NULL",
+            )?
+            .execute(params![turn, call_id])?;
+        }
         // The stub names the result's node, so it is made for the id the
         // insert takes, and its savings go in with the node. Written with
         // the result, eliding it later reads no output. A bot without the
@@ -6024,12 +6333,13 @@ impl Database {
         // Pictures count at their weight, so a stub saves only what the
         // result weighs over it.
         let next = next_node(&tx)?;
-        let pictured = Pictured::of(&outcome.images);
+        let pictured = Pictured::of_all(outcome.images());
         let weight = (item.len() as i64 - pictured.extra) as usize;
-        let stub = if !outcome.images.is_empty() {
-            super::context::picture_stub(family, call_id, &outcome.output, weight)?
+        let words = outcome.words();
+        let stub = if pictured.count > 0 {
+            super::context::picture_stub(family, call_id, custom, &words, weight)?
         } else if bot.tools.iter().any(|tool| tool == "read") {
-            super::context::stub(family, call_id, custom, &outcome.output, next, weight)?
+            super::context::stub(family, call_id, custom, &words, next, weight)?
         } else {
             None
         };
@@ -6060,7 +6370,9 @@ impl Database {
                 params![head, bot.name],
             )?;
         }
-        let artifacts: Vec<&str> = outcome.artifacts.iter().map(|(s, _)| *s).collect();
+        let artifacts: Vec<&str> = (outcome.artifacts.iter().map(|(s, _)| *s))
+            .chain(outcome.files.iter().map(|(s, _)| *s))
+            .collect();
         let mut data = json!({"call_id":call_id,"node":head,"artifacts":artifacts,
             "note":outcome.note.as_ref().map(|_| head)});
         if outcome.failed {
@@ -6353,24 +6665,43 @@ impl Database {
         {
             return Ok(CallAnswer::Given(given));
         }
-        let (tag, expires_ms, output, failed, paused): (String, i64, Option<String>, bool, bool) =
-            self.conn
-                .prepare_cached(
-                    "SELECT tag,expires_ms,output,failed,paused_ms IS NOT NULL FROM answers
-                     WHERE turn=? AND call_id=?",
-                )?
-                .query_row(params![turn, call_id], |r| {
-                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
-                })
-                .optional()?
-                .ok_or(Error::new("invalid_tool_state"))?;
+        #[allow(clippy::type_complexity)]
+        let (tag, expires_ms, output, failed, paused, parts): (
+            String,
+            i64,
+            Option<String>,
+            bool,
+            bool,
+            Option<String>,
+        ) = self
+            .conn
+            .prepare_cached(
+                "SELECT tag,expires_ms,output,failed,paused_ms IS NOT NULL,parts FROM answers
+                 WHERE turn=? AND call_id=?",
+            )?
+            .query_row(params![turn, call_id], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            })
+            .optional()?
+            .ok_or(Error::new("invalid_tool_state"))?;
         // A step waiting on a gate stops the call's time.
         let expires_ms = (!paused).then_some(expires_ms.max(0) as u64);
         Ok(match output {
             Some(output) => CallAnswer::Given(Outcome {
                 output,
                 artifacts: Vec::new(),
-                images: Vec::new(),
+                files: Vec::new(),
+                parts: parts
+                    .map(|json| serde_json::from_str(&json))
+                    .transpose()?
+                    .unwrap_or_default(),
                 note: None,
                 failed,
             }),
@@ -6541,9 +6872,15 @@ impl Database {
             "waiting" => {
                 self.conn
                     .prepare_cached(
-                        "UPDATE answers SET output=?,failed=? WHERE turn=? AND call_id=?",
+                        "UPDATE answers SET output=?,failed=?,parts=? WHERE turn=? AND call_id=?",
                     )?
-                    .execute(params![outcome.output, outcome.failed, turn, call_id])?;
+                    .execute(params![
+                        outcome.output,
+                        outcome.failed,
+                        stored_parts(&outcome.parts)?,
+                        turn,
+                        call_id
+                    ])?;
                 let resume = self
                     .waiting(turn)?
                     .is_some_and(|w| w.answer.is_some() && w.call_id == call_id);
@@ -7315,6 +7652,153 @@ impl Database {
     /// What each listed call and earlier prompt counts against `bytes` for
     /// its fields, so many short entries cannot outgrow a reply.
     pub const PROMPTS_ENTRY: usize = 64;
+    /// The most bytes a prompt's words and the words it quotes may have
+    /// together, as many as its words alone may.
+    pub const QUOTED_BYTES: usize = 256 * 1024;
+    /// The most quotes a prompt may hold, those its quoted prompts bring
+    /// counted too: each is a part of the item, with a line naming it.
+    pub const QUOTES: usize = 64;
+    /// What each quote counts against `QUOTED_BYTES` beyond its words: the
+    /// line naming it and its record.
+    const QUOTE_BYTES: usize = 256;
+    /// The words of the turns `quotes` names, in order, each with who
+    /// wrote them, as the turn keeps them until its item holds them: a
+    /// turn's prompt with the turns that prompt quotes after it, still
+    /// each with its writer, or the reply a finished turn ended with,
+    /// which its bot wrote. `None` for no quotes. With the prompt's own
+    /// `words`, they may have `QUOTED_BYTES`.
+    fn quote(&self, quotes: &[QuoteRef], words: usize) -> Result<Option<String>> {
+        if quotes.is_empty() {
+            return Ok(None);
+        }
+        let mut copied = Vec::new();
+        let mut bytes = words;
+        for QuoteRef { bot, turn, reply } in quotes {
+            type Row = (
+                String,
+                Option<String>,
+                Option<String>,
+                Option<i64>,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+            );
+            let row: Option<Row> = self
+                .conn
+                .prepare_cached(
+                    "SELECT t.status,
+                        CASE WHEN t.prompt_node IS NULL THEN t.prompt
+                        ELSE json_extract(CAST(COALESCE(d.item,n.item) AS TEXT),'$.content[0].text') END,
+                        t.from_bot,t.from_turn,t.origin,t.person,t.quotes
+                     FROM turns t LEFT JOIN nodes n ON n.id=t.prompt_node
+                     LEFT JOIN declined d ON d.node=t.prompt_node
+                     WHERE t.id=? AND t.bot=?",
+                )?
+                .query_row(params![turn, bot], |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                    ))
+                })
+                .optional()?;
+            let Some((status, text, from, from_turn, origin, person, nested)) = row else {
+                return Err(
+                    Error::with("quote_not_found", format!("{bot} has no turn {turn}"))
+                        .facts(json!({"bot":bot,"turn":turn})),
+                );
+            };
+            let mut quote = json!({"bot":bot,"turn":turn});
+            if *reply {
+                if status == "steered" {
+                    return Err(Error::with(
+                        "quote_not_found",
+                        format!(
+                            "turn {turn} was a message into another of {bot}'s turns, which replied"
+                        ),
+                    )
+                    .facts(json!({"bot":bot,"turn":turn})));
+                }
+                if turn_status_name(&status) != "finished" {
+                    return Err(Error::with(
+                        "quote_unfinished",
+                        format!("{bot}'s turn {turn} has not ended"),
+                    )
+                    .facts(json!({"bot":bot,"turn":turn})));
+                }
+                let Some(text) = self.reply_text(*turn)? else {
+                    return Err(Error::with(
+                        "quote_not_found",
+                        format!(
+                            "{bot}'s turn {turn} has no reply to quote: it ended without one, \
+                             or its messages' events were pruned"
+                        ),
+                    )
+                    .facts(json!({"bot":bot,"turn":turn})));
+                };
+                quote["reply"] = json!(true);
+                authored(&mut quote, Some((bot.clone(), *turn)), None, None);
+                bytes += text.len() + Self::QUOTE_BYTES;
+                quote["text"] = json!(text);
+                copied.push(quote);
+            } else {
+                let text = text.unwrap_or_default();
+                authored(&mut quote, from.zip(from_turn), origin, person);
+                bytes += text.len() + Self::QUOTE_BYTES;
+                quote["text"] = json!(text);
+                copied.push(quote);
+                // What it quotes comes along, marked so a retry still names
+                // only the turns the request named.
+                // Past the bound by a character, so longer words are refused.
+                for mut inner in quoted(&self.conn, nested.as_deref(), Self::QUOTED_BYTES + 4)? {
+                    bytes += inner["text"].as_str().map_or(0, str::len) + Self::QUOTE_BYTES;
+                    inner["nested"] = json!(true);
+                    copied.push(inner);
+                }
+            }
+            if copied.len() > Self::QUOTES {
+                return Err(Error::with(
+                    "quote_too_large",
+                    format!(
+                        "a prompt may hold {} quotes, those its quoted prompts quote counted",
+                        Self::QUOTES
+                    ),
+                )
+                .facts(json!({"limit":Self::QUOTES})));
+            }
+            if bytes > Self::QUOTED_BYTES {
+                return Err(Error::with(
+                    "quote_too_large",
+                    format!(
+                        "a prompt and the words it quotes may have {} bytes together",
+                        Self::QUOTED_BYTES
+                    ),
+                )
+                .facts(json!({"limit":Self::QUOTED_BYTES})));
+            }
+        }
+        Ok(Some(serde_json::to_string(&copied)?))
+    }
+    /// The last message with text a turn streamed, whole: what it ended
+    /// with.
+    fn reply_text(&self, turn: i64) -> Result<Option<String>> {
+        let mut items = self.conn.prepare_cached(
+            "SELECT n.item FROM events e JOIN nodes n ON n.id=json_extract(e.data,'$.node')
+             WHERE e.turn=? AND e.kind='message' ORDER BY e.id DESC",
+        )?;
+        let mut rows = items.query([turn])?;
+        while let Some(r) = rows.next()? {
+            let text = assistant_text(&serde_json::from_slice(&r.get::<_, Vec<u8>>(0)?)?);
+            if !text.trim().is_empty() {
+                return Ok(Some(text));
+            }
+        }
+        Ok(None)
+    }
     /// The most of the bot's last message before a turn that a `prompts`
     /// read returns, from its end.
     pub const PROMPTS_REPLY: usize = 2048;
@@ -7344,7 +7828,7 @@ impl Database {
             .prepare_cached(
                 "SELECT t.status,COALESCE(t.workspace,b.workspace),
                     CASE WHEN t.prompt_node IS NULL THEN t.prompt ELSE json_extract(CAST(n.item AS TEXT),'$.content[0].text') END,
-                    t.from_bot,t.from_turn,t.origin
+                    t.from_bot,t.from_turn,t.origin,t.person,t.quotes
                  FROM turns t JOIN bots b ON b.name=t.bot LEFT JOIN nodes n ON n.id=t.prompt_node
                  WHERE t.id=? AND t.bot=?",
             )?
@@ -7352,19 +7836,16 @@ impl Database {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, Option<String>>(1)?,
-                    r.get::<_, Option<String>>(2)?,
-                    r.get::<_, Option<String>>(3)?,
-                    r.get::<_, Option<i64>>(4)?,
-                    r.get::<_, Option<String>>(5)?,
+                    Words::read(r, 2)?,
                 ))
             })
             .optional()?;
-        let Some((status, workspace, text, from, from_turn, origin)) = row else {
+        let Some((status, workspace, words)) = row else {
             self.inspect(name)?;
             return fail("turn_not_found");
         };
         let mut left = bytes;
-        let mut first = prompt_entry(turn, text, from, from_turn, origin, &mut left);
+        let mut first = self.prompt_entry(turn, words, &mut left)?;
         // What the bot last said before the words: what a person's short
         // answer, such as "yes", answers.
         let previous: Option<i64> = self
@@ -7387,25 +7868,18 @@ impl Database {
         let mut since = 0;
         let mut steer = self.conn.prepare_cached(
             "SELECT CASE WHEN t.prompt_node IS NULL THEN t.prompt ELSE json_extract(CAST(n.item AS TEXT),'$.content[0].text') END,
-                t.from_bot,t.from_turn,t.origin
+                t.from_bot,t.from_turn,t.origin,t.person,t.quotes
              FROM turns t LEFT JOIN nodes n ON n.id=t.prompt_node WHERE t.id=?",
         )?;
         for row in steers.query_map([turn], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))? {
             let (id, steered) = row?;
-            let (text, from, from_turn, origin) = steer.query_row([id], |r| {
-                Ok((
-                    r.get::<_, Option<String>>(0)?,
-                    r.get::<_, Option<String>>(1)?,
-                    r.get::<_, Option<i64>>(2)?,
-                    r.get::<_, Option<String>>(3)?,
-                ))
-            })?;
+            let words = steer.query_row([id], |r| Words::read(r, 0))?;
             if left < Self::PROMPTS_ENTRY {
                 prompts_more = true;
                 break;
             }
             left -= Self::PROMPTS_ENTRY;
-            let mut entry = prompt_entry(id, text, from, from_turn, origin, &mut left);
+            let mut entry = self.prompt_entry(id, words, &mut left)?;
             entry["steer"] = json!(true);
             if let Some(reply) = self.reply(turn, since, steered, &mut left)? {
                 entry["reply"] = reply;
@@ -7495,8 +7969,9 @@ impl Database {
         let mut earlier = Vec::new();
         let mut more = false;
         let mut statement = self.conn.prepare_cached(
-            "SELECT t.id,CASE WHEN t.prompt_node IS NULL THEN t.prompt ELSE json_extract(CAST(n.item AS TEXT),'$.content[0].text') END,
-                t.from_bot,t.from_turn,t.status='steered',t.origin
+            "SELECT t.id,t.status='steered',
+                CASE WHEN t.prompt_node IS NULL THEN t.prompt ELSE json_extract(CAST(n.item AS TEXT),'$.content[0].text') END,
+                t.from_bot,t.from_turn,t.origin,t.person,t.quotes
              FROM turns t LEFT JOIN nodes n ON n.id=t.prompt_node
              WHERE t.bot=? AND t.id<? AND (t.started_ms IS NOT NULL OR t.status='steered')
              ORDER BY t.id DESC",
@@ -7508,15 +7983,8 @@ impl Database {
                 break;
             }
             left -= Self::PROMPTS_ENTRY;
-            let mut entry = prompt_entry(
-                r.get(0)?,
-                r.get(1)?,
-                r.get(2)?,
-                r.get(3)?,
-                r.get(5)?,
-                &mut left,
-            );
-            if r.get::<_, bool>(4)? {
+            let mut entry = self.prompt_entry(r.get(0)?, Words::read(r, 2)?, &mut left)?;
+            if r.get::<_, bool>(1)? {
                 entry["steer"] = json!(true);
             }
             let steer = entry["steer"] == true;
@@ -7532,6 +8000,50 @@ impl Database {
             json!({"bot":name,"turn":turn,"status":turn_status_name(&status),"workspace":workspace,
             "prompts":prompts,"prompts_more":prompts_more,"calls":calls,"calls_more":calls_more,"earlier":earlier,"more":more}),
         )
+    }
+    /// One prompt of a `prompts` read, cut to the budget left: its words,
+    /// who wrote them, and the words it quotes, each with who wrote them.
+    fn prompt_entry(&self, turn: i64, words: Words, left: &mut usize) -> Result<Value> {
+        let Words {
+            text,
+            from,
+            origin,
+            person,
+            quotes,
+        } = words;
+        let mut text = text.unwrap_or_default();
+        let truncated = cut(&mut text, left);
+        let mut entry = json!({"turn":turn,"text":text});
+        if truncated {
+            entry["truncated"] = json!(true);
+        }
+        authored(&mut entry, from, origin, person);
+        // A character past the budget, so words that go on read as cut.
+        let mut quotes = quoted(&self.conn, quotes.as_deref(), *left + 4)?;
+        // Each quote's record counts like an entry's; those past the
+        // budget are left out, and the entry says its words were cut.
+        let mut kept = 0;
+        for quote in &mut quotes {
+            if *left < Self::PROMPTS_ENTRY {
+                break;
+            }
+            *left -= Self::PROMPTS_ENTRY;
+            let mut text = quote["text"].as_str().unwrap_or_default().to_owned();
+            if cut(&mut text, left) {
+                quote["truncated"] = json!(true);
+            }
+            quote["text"] = json!(text);
+            kept += 1;
+        }
+        if kept < quotes.len() {
+            quotes.truncate(kept);
+            entry["quotes_more"] = json!(true);
+            entry["truncated"] = json!(true);
+        }
+        if !quotes.is_empty() {
+            entry["quotes"] = json!(quotes);
+        }
+        Ok(entry)
     }
     /// The last message with text `turn` streamed between two of its events, as
     /// `{text}` with its end kept: at most `PROMPTS_REPLY` bytes, or the
@@ -8350,6 +8862,7 @@ impl Database {
         id: i64,
         result: &Value,
         artifacts: &[(&str, Vec<u8>)],
+        files: &[(&str, String)],
     ) -> Result<()> {
         let tx = self.conn.savepoint()?;
         if tx.execute(
@@ -8359,13 +8872,16 @@ impl Database {
         {
             return fail("invalid_process_state");
         }
-        if !artifacts.is_empty() {
+        if !artifacts.is_empty() || !files.is_empty() {
             let (turn, call_id): (i64, String) =
                 tx.query_row("SELECT turn,call_id FROM processes WHERE id=?", [id], |r| {
                     Ok((r.get(0)?, r.get(1)?))
                 })?;
             for (stream, data) in artifacts {
                 artifact::put(&tx, turn, &call_id, stream, data)?;
+            }
+            for (stream, file) in files {
+                artifact::put_file(&tx, turn, &call_id, stream, file)?;
             }
         }
         tx.commit()?;
@@ -8912,7 +9428,9 @@ impl Database {
             .collect::<rusqlite::Result<_>>()?;
         if !turns.is_empty() {
             let mut events = 0;
+            let mut files = Vec::new();
             for turn in &turns {
+                files.extend(artifact::files(&tx, *turn)?);
                 for table in ["artifacts", "processes", "tools"] {
                     tx.prepare_cached(&format!("DELETE FROM {table} WHERE turn=?"))?
                         .execute([turn])?;
@@ -8925,6 +9443,7 @@ impl Database {
             }
             out["events"] = json!(events);
             tx.commit()?;
+            self.forget_files(files);
             return Ok(out);
         }
         // Then the turn rows and what remains keyed by the bot alone.
@@ -8966,6 +9485,7 @@ impl Database {
                 tx.query_row("SELECT parent FROM nodes WHERE id=?", [id], |r| r.get(0))?;
             tx.execute("UPDATE bots SET head=? WHERE name=?", params![parent, name])?;
             tx.execute("DELETE FROM notes WHERE node=?", [id])?;
+            tx.execute("DELETE FROM pins WHERE compaction=?", [id])?;
             tx.execute("DELETE FROM compactions WHERE node=?", [id])?;
             tx.execute("DELETE FROM elisions WHERE node=?", [id])?;
             tx.execute("DELETE FROM stubs WHERE node=?", [id])?;
@@ -9111,9 +9631,11 @@ impl Database {
             .collect::<rusqlite::Result<_>>()?;
         let mut events = 0;
         let mut cursor: Option<i64> = None;
+        let mut files = Vec::new();
         for turn in &turns {
             // Background commands may outlive their launching turn; their
             // running row is required when the result commits and waiters wake.
+            files.extend(artifact::files(&tx, *turn)?);
             tx.prepare_cached("DELETE FROM artifacts WHERE turn=?")?
                 .execute([turn])?;
             tx.prepare_cached("DELETE FROM processes WHERE turn=? AND status!='running'")?
@@ -9150,6 +9672,7 @@ impl Database {
                 r.get(0)
             })?;
         tx.commit()?;
+        self.forget_files(files);
         let next_after = match limit {
             Some(limit) if turns.len() == limit => turns.last().copied(),
             _ => None,
@@ -9193,12 +9716,15 @@ impl Database {
         let mut nodes = Vec::with_capacity(limit);
         let mut statement = self
             .conn
-            .prepare_cached("SELECT parent,turn FROM nodes WHERE id=?")?;
+            .prepare_cached("SELECT parent,turn,written_ms FROM nodes WHERE id=?")?;
         let mut unassigned = 0;
         while let Some(id) = next.filter(|id| *id >= floor) {
-            let (parent, turn): (Option<i64>, Option<i64>) =
-                statement.query_row([id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            let (parent, turn, written): (Option<i64>, Option<i64>, Option<i64>) =
+                statement.query_row([id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
             nodes.push(json!({"node":id,"turn":null}));
+            if let Some(written) = written {
+                nodes.last_mut().expect("just pushed")["written_ms"] = json!(written);
+            }
             if let Some(turn) = turn {
                 for node in &mut nodes[unassigned..] {
                     node["turn"] = json!(turn);
@@ -9217,8 +9743,8 @@ impl Database {
             let Some(id) = ancestor else {
                 break;
             };
-            let (parent, turn): (Option<i64>, Option<i64>) =
-                statement.query_row([id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            let (parent, turn, _): (Option<i64>, Option<i64>, Option<i64>) =
+                statement.query_row([id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
             if let Some(turn) = turn {
                 for node in &mut nodes[unassigned..] {
                     node["turn"] = json!(turn);
@@ -9292,9 +9818,10 @@ impl Database {
         // A prompt another bot's turn or a named client sent says so. The
         // bound is on the item as read, its pictures left out.
         let mut query = self.conn.prepare_cached(&format!(
-            "SELECT CASE WHEN length(n.item)<=?2 THEN n.item END,s.bot,s.turn,s.bot_id,s.origin
-             FROM (SELECT id,{PICTURELESS} AS item FROM
-                (SELECT n.id,COALESCE(d.item,n.item) AS item FROM nodes n LEFT JOIN declined d ON d.node=n.id WHERE n.id=?1)) n
+            "SELECT CASE WHEN length(n.item)<=?2 THEN n.item END,s.bot,s.turn,s.bot_id,s.origin,
+                s.person,s.quotes,n.written_ms
+             FROM (SELECT id,{PICTURELESS} AS item,written_ms FROM
+                (SELECT n.id,COALESCE(d.item,n.item) AS item,n.written_ms FROM nodes n LEFT JOIN declined d ON d.node=n.id WHERE n.id=?1)) n
              LEFT JOIN senders s ON s.node=n.id"
         ))?;
         for &node in wanted {
@@ -9304,20 +9831,39 @@ impl Database {
                 Option<i64>,
                 Option<i64>,
                 Option<String>,
+                Option<String>,
+                Option<String>,
+                Option<i64>,
             );
-            let (raw, from, from_turn, bot_id, origin): Row = query
+            let (raw, from, from_turn, bot_id, origin, person, quotes, written): Row = query
                 .query_row(params![node, maximum as i64], |r| {
-                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                        r.get(7)?,
+                    ))
                 })?;
             let mut entry = match raw {
                 Some(raw) => json!({"node":node,"item":serde_json::from_slice::<Value>(&raw)?}),
                 None => json!({"node":node,"error":"item_too_large"}),
             };
+            // When it was written: none for items older than the store
+            // keeping it.
+            if let Some(written) = written {
+                entry["written_ms"] = json!(written);
+            }
             sender_fields(
                 &mut entry,
                 from.as_deref().zip(from_turn),
                 bot_id,
                 origin.as_deref(),
+                person.as_deref(),
+                quotes.as_deref(),
             );
             let mut size = serde_json::to_vec(&entry)?.len();
             // Leave room for the protocol envelope, including extra escaping
@@ -10325,27 +10871,40 @@ fn event(conn: &Connection, bot: &str, turn: Option<i64>, kind: &str, data: Valu
 /// sender to `data`, the event that puts the node on the lineage.
 fn keep_sender(tx: &Connection, turn: i64, node: i64, data: &mut Value) -> Result<()> {
     tx.prepare_cached(
-        "INSERT INTO senders(node,bot,bot_id,turn,origin)
-         SELECT ?2,t.from_bot,t.from_id,t.from_turn,t.origin
-         FROM turns t WHERE t.id=?1 AND (t.from_bot IS NOT NULL OR t.origin IS NOT NULL)
-         RETURNING bot,turn,bot_id,origin",
+        "INSERT INTO senders(node,bot,bot_id,turn,origin,person,quotes)
+         SELECT ?2,t.from_bot,t.from_id,t.from_turn,t.origin,t.person,t.quotes
+         FROM turns t WHERE t.id=?1 AND (t.from_bot IS NOT NULL OR t.origin IS NOT NULL
+            OR t.person IS NOT NULL OR t.quotes IS NOT NULL)
+         RETURNING bot,turn,bot_id,origin,person,quotes",
     )?
     .query_row(params![turn, node], |r| {
         let (from, origin): (Option<String>, Option<String>) = (r.get(0)?, r.get(3)?);
+        let (person, quotes): (Option<String>, Option<String>) = (r.get(4)?, r.get(5)?);
         let from = from.as_deref().zip(r.get::<_, Option<i64>>(1)?);
-        sender_fields(data, from, r.get(2)?, origin.as_deref());
+        sender_fields(
+            data,
+            from,
+            r.get(2)?,
+            origin.as_deref(),
+            person.as_deref(),
+            quotes.as_deref(),
+        );
         Ok(())
     })
     .optional()?;
     Ok(())
 }
-/// Who sent a prompt, as events and reads name it: another bot's turn, or
-/// what the submitting client called itself.
+/// Who sent a prompt, as events and reads name it: another bot's turn,
+/// what the submitting client called itself, or the person the client
+/// says wrote it; and the turns it quotes, each with who wrote it and,
+/// once the prompt is an item, where in the item its words are.
 fn sender_fields(
     data: &mut Value,
     from: Option<(&str, i64)>,
     bot_id: Option<i64>,
     origin: Option<&str>,
+    person: Option<&str>,
+    quotes: Option<&str>,
 ) {
     if let Some((bot, turn)) = from {
         data["from"] = json!({"bot":bot,"turn":turn,"bot_id":bot_id});
@@ -10353,21 +10912,160 @@ fn sender_fields(
     if let Some(origin) = origin {
         data["origin"] = json!(origin);
     }
+    if let Some(person) = person {
+        data["person"] = json!(person);
+    }
+    if let Some(Value::Array(mut quotes)) = quotes.and_then(|q| serde_json::from_str(q).ok()) {
+        for quote in &mut quotes {
+            if let Some(quote) = quote.as_object_mut() {
+                quote.remove("text");
+                quote.remove("node");
+            }
+        }
+        data["quotes"] = Value::Array(quotes);
+    }
 }
-/// The line a prompt carries to the model after its words when another
-/// bot's turn or a named client sent it, read from a turn's `from_bot`,
-/// `from_turn` and `origin` at `at`, so the model does not take it for a
-/// person's.
-fn sent_by(r: &rusqlite::Row, at: usize) -> rusqlite::Result<Option<String>> {
-    let (bot, turn, origin): (Option<String>, Option<i64>, Option<String>) =
-        (r.get(at)?, r.get(at + 1)?, r.get(at + 2)?);
-    Ok(match (bot, turn, origin) {
-        (Some(bot), Some(turn), _) => Some(format!(
+/// Who wrote words, as a prompt and a quote record it: another bot's
+/// turn, a client by its own name, or a person, named or not.
+fn authored(
+    entry: &mut Value,
+    from: Option<(String, i64)>,
+    origin: Option<String>,
+    person: Option<String>,
+) {
+    if let Some((bot, turn)) = from {
+        entry["from"] = json!({"bot":bot,"turn":turn});
+    } else if let Some(origin) = origin {
+        entry["origin"] = json!(origin);
+    } else if let Some(person) = person {
+        entry["person"] = json!(person);
+    }
+}
+/// Who wrote a quote, as the line before its words says it.
+fn quote_author(quote: &Value) -> String {
+    let from = &quote["from"];
+    if let (Some(bot), Some(turn)) = (from["bot"].as_str(), from["turn"].as_i64()) {
+        // A reply is its own turn's.
+        return match quote["reply"] == true && quote["bot"] == bot && quote["turn"] == turn {
+            true => format!("written by the agent {bot}"),
+            false => format!("written by the agent {bot} in turn:{bot}/{turn}"),
+        };
+    }
+    match (quote["origin"].as_str(), quote["person"].as_str()) {
+        (Some(origin), _) => format!("sent by {origin}"),
+        (None, Some(person)) => format!("written by {person}"),
+        (None, None) => "written by a person".to_owned(),
+    }
+}
+/// What a prompt's item carries after its words, read from a turn's
+/// `from_bot`, `from_turn`, `origin`, `person` and `quotes` at `at`: a line
+/// saying who sent it when another bot's turn, a named client or a named
+/// person did, so the model does not take it for its own person's; then
+/// each quote's words, after a line saying whose they are. `hide` leaves
+/// both kinds of line out. Also the quotes as the turn keeps them once
+/// its item holds their words: where in the item each is, in place of
+/// its text.
+fn after_words(
+    r: &rusqlite::Row,
+    at: usize,
+    hide: bool,
+) -> rusqlite::Result<(Vec<String>, Option<String>)> {
+    let bot: Option<String> = r.get(at)?;
+    let turn: Option<i64> = r.get(at + 1)?;
+    let origin: Option<String> = r.get(at + 2)?;
+    let person: Option<String> = r.get(at + 3)?;
+    let quotes: Option<String> = r.get(at + 4)?;
+    let line = match (bot, turn, origin, person) {
+        (Some(bot), Some(turn), _, _) => Some(format!(
             "[Written by the agent {bot} in turn:{bot}/{turn}, not by a person.]"
         )),
-        (_, _, Some(origin)) => Some(format!("[Sent by {origin}.]")),
+        (_, _, Some(origin), _) => Some(format!("[Sent by {origin}.]")),
+        (_, _, None, Some(person)) => Some(format!("[Written by {person}.]")),
         _ => None,
-    })
+    };
+    let mut parts: Vec<String> = line.filter(|_| !hide).into_iter().collect();
+    let Some(quotes) = quotes else {
+        return Ok((parts, None));
+    };
+    let bad = |e: serde_json::Error| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+    };
+    let mut quotes: Vec<Value> = serde_json::from_str(&quotes).map_err(bad)?;
+    for quote in &mut quotes {
+        if !hide {
+            let what = match quote["reply"] == true {
+                true => "the reply of turn",
+                false => "turn",
+            };
+            parts.push(format!(
+                "[Quoted from {what}:{}/{}, {}:]",
+                quote["bot"].as_str().unwrap_or_default(),
+                quote["turn"],
+                quote_author(quote)
+            ));
+        }
+        let text = match quote.as_object_mut().and_then(|q| q.remove("text")) {
+            Some(Value::String(text)) => text,
+            _ => String::new(),
+        };
+        parts.push(text);
+        // The words follow the prompt's own, which are the item's first.
+        quote["at"] = json!(parts.len());
+    }
+    Ok((parts, Some(serde_json::to_string(&quotes).map_err(bad)?)))
+}
+/// A turn's quotes with their words, which the turn keeps until its item
+/// holds them and the item keeps after: at most `cap` bytes of each, cut
+/// at a whole character, read in SQL from the parts quoted, so a picture
+/// beside them is never copied or parsed here.
+fn quoted(conn: &Connection, quotes: Option<&str>, cap: usize) -> Result<Vec<Value>> {
+    let Some(quotes) = quotes else {
+        return Ok(Vec::new());
+    };
+    let mut quotes: Vec<Value> = serde_json::from_str(quotes)?;
+    // Where each quote's words are: its item's node and the part.
+    let at = |quote: &Value| Some((quote["node"].as_i64()?, quote["at"].as_u64()?));
+    let mut parts: HashMap<i64, Vec<u64>> = HashMap::new();
+    for (node, part) in quotes.iter().filter_map(at) {
+        parts.entry(node).or_default().push(part);
+    }
+    let mut texts = HashMap::new();
+    let mut read = conn.prepare_cached(
+        "SELECT c.key, substr(CAST(json_extract(c.value,'$.text') AS BLOB),1,?2) FROM nodes n
+         LEFT JOIN declined d ON d.node=n.id,
+         json_each(CAST(COALESCE(d.item,n.item) AS TEXT),'$.content') c
+         WHERE n.id=?1 AND c.key IN (SELECT value FROM json_each(?3))",
+    )?;
+    for (node, wanted) in &parts {
+        let mut rows = read.query(params![node, cap as i64, json!(wanted).to_string()])?;
+        while let Some(r) = rows.next()? {
+            // Bytes, not text, which SQLite would end at a NUL; cut to
+            // the last whole character.
+            if let Some(bytes) = r.get::<_, Option<Vec<u8>>>(1)? {
+                let text = match String::from_utf8(bytes) {
+                    Ok(text) => text,
+                    Err(cut) => {
+                        let whole = cut.utf8_error().valid_up_to();
+                        String::from_utf8_lossy(&cut.into_bytes()[..whole]).into_owned()
+                    }
+                };
+                texts.insert((*node, r.get::<_, i64>(0)? as u64), text);
+            }
+        }
+    }
+    for quote in &mut quotes {
+        let Some(place) = at(quote) else {
+            continue;
+        };
+        let text = texts.get(&place).cloned().unwrap_or_default();
+        let quote = quote
+            .as_object_mut()
+            .expect("a quote with a place is an object");
+        quote.remove("at");
+        quote.remove("node");
+        quote.insert("text".into(), json!(text));
+    }
+    Ok(quotes)
 }
 /// Put a turn's user item on the lineage and mark the bot busy with it,
 /// adding who sent it to `data`, the turn's `accepted` event.
@@ -10378,16 +11076,21 @@ fn start_locked(
     prompt: &str,
     data: &mut Value,
 ) -> Result<Option<i64>> {
-    let (images, sender) = tx
-        .prepare_cached("SELECT images,from_bot,from_turn,origin FROM turns WHERE id=?")?
+    let (images, (after, quotes)) = tx
+        .prepare_cached(
+            "SELECT images,from_bot,from_turn,origin,person,quotes FROM turns WHERE id=?",
+        )?
         .query_row([turn], |r| {
-            Ok((r.get::<_, Option<String>>(0)?, sent_by(r, 1)?))
+            Ok((
+                r.get::<_, Option<String>>(0)?,
+                after_words(r, 1, bot.settings.hide_senders)?,
+            ))
         })?;
     let pictures = images_from(images.as_deref())?;
-    let sender = sender.filter(|_| !bot.settings.hide_senders);
-    let prompted = prompt_item(bot.family()?, prompt, sender.as_deref(), &pictures)?;
+    let prompted = prompt_item(bot.family()?, prompt, &after, &pictures)?;
     let head = prompt_node(tx, bot.head, &prompted, Some(turn))?;
     keep_once(tx, turn, images.as_deref())?;
+    keep_quotes(tx, turn, quotes.as_deref(), head)?;
     data["node"] = json!(head);
     keep_sender(tx, turn, head, data)?;
     if prompt.len() >= PROMPT_SHARE_BYTES {
@@ -10419,6 +11122,12 @@ fn images_from(json: Option<&str>) -> rusqlite::Result<Vec<crate::codec::Image>>
 }
 /// The `images` column for a turn's pictures: their JSON, or nothing for
 /// none.
+/// An answer's parts as the answers table keeps them: JSON, or null for none.
+fn stored_parts(parts: &[crate::codec::Part]) -> Result<Option<String>> {
+    Ok((!parts.is_empty())
+        .then(|| serde_json::to_string(parts))
+        .transpose()?)
+}
 fn stored_images(images: &[crate::codec::Image]) -> Result<Option<String>> {
     Ok((!images.is_empty())
         .then(|| serde_json::to_string(images))
@@ -10439,6 +11148,19 @@ fn keep_once(tx: &Connection, turn: i64, images: Option<&str>) -> Result<()> {
     if let Some(json) = images.filter(|json| json.starts_with('[')) {
         tx.prepare_cached("UPDATE turns SET images=? WHERE id=?")?
             .execute(params![pictures_digest(json), turn])?;
+    }
+    Ok(())
+}
+/// Once a turn's prompt is a node, its quotes' words live there: the turn
+/// keeps which node and where in its item each is.
+fn keep_quotes(tx: &Connection, turn: i64, quotes: Option<&str>, node: i64) -> Result<()> {
+    if let Some(quotes) = quotes {
+        let mut quotes: Vec<Value> = serde_json::from_str(quotes)?;
+        for quote in &mut quotes {
+            quote["node"] = json!(node);
+        }
+        tx.prepare_cached("UPDATE turns SET quotes=? WHERE id=?")?
+            .execute(params![serde_json::to_string(&quotes)?, turn])?;
     }
     Ok(())
 }
@@ -10477,7 +11199,7 @@ THEN CASE WHEN json_extract(CAST(item AS TEXT),'$.role')='user' AND json_type(CA
                 '$.omitted_bytes',length(json_extract(b.value,'$.source.data')))
             ELSE json(b.value) END END)
         FROM json_each(CAST(item AS TEXT),'$.content') AS b)) AS BLOB)
-    WHEN json_extract(CAST(item AS TEXT),'$.type')='function_call_output' AND json_type(CAST(item AS TEXT),'$.output')='array'
+    WHEN json_extract(CAST(item AS TEXT),'$.type') IN ('function_call_output','custom_tool_call_output') AND json_type(CAST(item AS TEXT),'$.output')='array'
     THEN CAST(json_set(CAST(item AS TEXT),'$.output',(SELECT json_group_array(CASE
         WHEN json_extract(p.value,'$.type')='input_image' AND json_extract(p.value,'$.image_url') LIKE 'data:%'
         THEN json_set(p.value,'$.image_url',substr(json_extract(p.value,'$.image_url'),1,instr(json_extract(p.value,'$.image_url'),',')),
@@ -11298,6 +12020,46 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
         }
     }
     // 63 -> 64: the daemon's pause, in a table the schema creates; none held.
+    // 64 -> 65: the messages a cut inside a turn keeps beside its prompt, in
+    // a table the schema creates; earlier cuts kept the prompt alone.
+    if conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='answers')
+         AND NOT EXISTS(SELECT 1 FROM pragma_table_info('answers') WHERE name='parts')",
+        [],
+        |r| r.get::<_, bool>(0),
+    )? {
+        // 65 -> 66: a client's answer may come with pictures, in parts after
+        // its output. None did.
+        conn.execute_batch("ALTER TABLE answers ADD COLUMN parts TEXT;")?;
+    }
+    // 66 -> 67: a prompt names the person who wrote it and the turns it
+    // quotes. No prompt did. Each item keeps when it was written; when
+    // older ones were is not known.
+    for (table, column, kind) in [
+        ("turns", "person", "TEXT"),
+        ("turns", "quotes", "TEXT"),
+        ("senders", "person", "TEXT"),
+        ("senders", "quotes", "TEXT"),
+        ("nodes", "written_ms", "INTEGER"),
+    ] {
+        if conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)
+             AND NOT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name=?2)",
+            [table, column],
+            |r| r.get::<_, bool>(0),
+        )? {
+            conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {kind};"))?;
+        }
+    }
+    if !conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('artifacts') WHERE name='file')",
+        [],
+        |r| r.get::<_, bool>(0),
+    )? {
+        // 67 -> 68: a retained output may be a file in the bot's outputs
+        // folder rather than the store's copy. Every earlier one is a copy.
+        conn.execute_batch("ALTER TABLE artifacts ADD COLUMN file TEXT;")?;
+    }
     Ok(())
 }
 /// 53 -> 54: a turn's denial count became a window of its last decided
@@ -11419,27 +12181,27 @@ fn attach(entries: &mut [Value], after: i64, call: Value) {
         }
     }
 }
-/// One prompt of a `prompts` read, cut to the budget left.
-fn prompt_entry(
-    turn: i64,
+/// A prompt's words and who wrote them, as a `prompts` read takes them
+/// from a turn's row: its text, `from_bot`, `from_turn`, `origin`,
+/// `person` and `quotes`.
+struct Words {
     text: Option<String>,
-    from: Option<String>,
-    from_turn: Option<i64>,
+    from: Option<(String, i64)>,
     origin: Option<String>,
-    left: &mut usize,
-) -> Value {
-    let mut text = text.unwrap_or_default();
-    let truncated = cut(&mut text, left);
-    let mut entry = json!({"turn":turn,"text":text});
-    if truncated {
-        entry["truncated"] = json!(true);
+    person: Option<String>,
+    quotes: Option<String>,
+}
+impl Words {
+    fn read(r: &rusqlite::Row, at: usize) -> rusqlite::Result<Self> {
+        let from: Option<String> = r.get(at + 1)?;
+        Ok(Self {
+            text: r.get(at)?,
+            from: from.zip(r.get::<_, Option<i64>>(at + 2)?),
+            origin: r.get(at + 3)?,
+            person: r.get(at + 4)?,
+            quotes: r.get(at + 5)?,
+        })
     }
-    if let (Some(bot), Some(turn)) = (from, from_turn) {
-        entry["from"] = json!({"bot":bot,"turn":turn});
-    } else if let Some(origin) = origin {
-        entry["origin"] = json!(origin);
-    }
-    entry
 }
 fn first_line(prompt: &str, limit: usize) -> String {
     let line = prompt.lines().next().unwrap_or("").trim();
@@ -11617,22 +12379,28 @@ impl Pictured {
             extra: crate::codec::pictured(images),
         }
     }
+    fn of_all<'a>(images: impl Iterator<Item = &'a crate::codec::Image>) -> Self {
+        images.fold(Self { count: 0, extra: 0 }, |sum, image| Self {
+            count: sum.count + 1,
+            extra: sum.extra + crate::codec::pictured(std::slice::from_ref(image)),
+        })
+    }
 }
 /// A prompt's user item, its pictures, and, when it has any, the stub it
 /// goes as below the elision floor.
 fn prompt_item(
     family: Family,
     prompt: &str,
-    sender: Option<&str>,
+    after: &[String],
     images: &[crate::codec::Image],
 ) -> Result<(Vec<u8>, Pictured, Option<Vec<u8>>)> {
-    let item = family.user_item_from(prompt, sender, images)?;
+    let item = family.user_item_from(prompt, after, images)?;
     let pictured = Pictured::of(images);
     let stub = match images.len() {
         0 => None,
         count => {
             let weight = (item.len() as i64 - pictured.extra) as usize;
-            super::context::prompt_stub(family, prompt, sender, count, weight)?
+            super::context::prompt_stub(family, prompt, after, count, weight)?
         }
     };
     Ok((item, pictured, stub))
@@ -11717,8 +12485,8 @@ fn insert_node(
     // counter write for every message. Callers already hold a transaction.
     conn.prepare_cached(
         "INSERT INTO nodes(id,parent,item,total_bytes,depth,turn,turn_seq,thinking,elided,total_elided,
-            total_thinking,pictured,pictures)
-         SELECT MAX(last_id,COALESCE((SELECT MAX(id) FROM nodes),0))+1,?,?,?,?,?,?,?,?,?,?,?,?
+            total_thinking,pictured,pictures,written_ms)
+         SELECT MAX(last_id,COALESCE((SELECT MAX(id) FROM nodes),0))+1,?,?,?,?,?,?,?,?,?,?,?,?,?
          FROM node_sequence WHERE singleton=1",
     )?
     .execute(params![
@@ -11733,7 +12501,8 @@ fn insert_node(
         saved + elided,
         thought + thinking,
         pictured.extra,
-        pictured.count
+        pictured.count,
+        epoch_ms()
     ])?;
     Ok(conn.last_insert_rowid())
 }

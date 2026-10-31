@@ -1,5 +1,5 @@
 //! The MCP servers in `[sonny.mcp_servers]`, which agents reach through
-//! their scripts: the lookout keeps one connection per server for every
+//! their scripts: the tool host keeps one connection per server for every
 //! agent, started by the first call and stopped after ten idle minutes, as
 //! Codex and Pi keep theirs beside the agent loop rather than in its
 //! sandbox. Each server's tools are kept on disk once listed, so they are
@@ -30,7 +30,7 @@ const STDERR_LINES: usize = 20;
 const STDERR_LINE: usize = 1024;
 /// The bytes a tool's result may hold, as rmcp bounds each message it
 /// reads over stdio and in an HTTP server's event stream: a result held in
-/// the lookout is outside every script's memory cap.
+/// the tool host is outside every script's memory cap.
 pub const RESULT_BYTES: usize = 16 << 20;
 
 pub type Servers = BTreeMap<String, McpServer>;

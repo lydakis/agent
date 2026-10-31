@@ -6033,3 +6033,96 @@ difference of about a third of a KiB across runs of the same size, within
 what earlier screens moved by (#447 measured 1.40 and 1.45). The benches
 run standard bots, so the new path costs one match per call; a fast
 Anthropic bot's key is one short string built per call.
+
+## Messages sent to a turn stay whole after a cut (#479)
+
+Building a window after a cut inside a turn now reads the messages the cut
+keeps beside its prompt (`pins`, by its compaction, indexed) and their
+total since the summary, and a turn's usage adds their bytes. A window with
+no cut inside a turn, which is every bench's, runs neither read. The Perf
+workflow's matched screen, base main 7ae53d8 against the PR head 82161f4,
+on the GitHub runner (2026-10-31):
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 39.948 | 40.457 | +1.3% |
+| admission | burst submit p99, ms | 6.266 | 6.188 | -1.2% |
+| completion | release to terminal p99, ms | 13.804 | 13.78 | -0.2% |
+| footprint | idle RSS, MiB | 19.102 | 19.236 | +0.7% |
+| footprint | per idle bot, KiB | 1.472 | 1.46 | -0.8% |
+| footprint | RSS after a turn each, MiB | 27.438 | 27.547 | +0.4% |
+| footprint | CPU per turn, ms | 1.271 | 1.287 | +1.2% |
+| lifecycle | CPU, s | 1.15 | 1.135 | -1.3% |
+| lifecycle | p95 turn, ms | 578.239 | 578.803 | +0.1% |
+| lifecycle | peak RSS, MiB | 24.805 | 25.504 | +2.8% |
+
+Store jobs per turn did not change (about 7.5 on both), and nothing passed
+the gate's 15% in the direction that costs. The later head that counts the
+kept pictures toward a request's picture bound adds one indexed read to
+picture elision only, which runs when a request carries too many pictures,
+never in these benches.
+
+## A person's words and quoted turns (#477)
+
+A submit can now name the person who wrote it (`person`) and quote other
+turns (`quotes`), and each history item records when it was written
+(`nodes.written_ms`). A turn without quotes pays one empty check at begin;
+a quoted turn copies at most 64 prompts or replies, bounded at 256 KiB, in
+the same store job that starts it. Every node insert writes one more
+integer. The Perf workflow's matched screen, base main dac04eb against the
+PR head f4955a5, on the GitHub runner (2026-10-31):
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 30.915 | 30.551 | -1.2% |
+| admission | burst submit p99, ms | 4.322 | 4.11 | -4.9% |
+| completion | release to terminal p99, ms | 9.368 | 9.46 | +1.0% |
+| footprint | idle RSS, MiB | 19.252 | 19.135 | -0.6% |
+| footprint | per idle bot, KiB | 1.368 | 1.608 | +17.5% |
+| footprint | RSS after a turn each, MiB | 29.414 | 29.174 | -0.8% |
+| footprint | CPU per turn, ms | 0.89 | 0.899 | +1.1% |
+| lifecycle | CPU, s | 0.835 | 0.905 | +8.4% |
+| lifecycle | p95 turn, ms | 673.778 | 827.412 | +22.8% |
+| lifecycle | peak RSS, MiB | 25.828 | 25.709 | -0.5% |
+
+Store jobs per turn did not change (about 7.5 on both). Two timings warned,
+and both came from too few runs on a busy runner: the lifecycle bench runs
+once per round, and its base p95 here (674 ms) was itself far off the 580 ms
+earlier screens measured. Run again alternately on a 4-core Linux box, four
+rounds each, lifecycle p95 turn was 578 to 584 ms on the base and 581 to
+589 ms on the head, CPU 0.93 to 1.00 s against 0.94 to 1.03 s. Per idle bot
+over six runs each was 1.28 to 1.44 KiB on the base and 1.42 to 1.75 KiB on
+the head, a median gap of about 60 bytes, inside the spread earlier screens
+moved by (#467 measured 1.64 and 1.35 for one daemon). Idle bots write no
+nodes and carry no new state, so nothing in this change adds to them.
+
+## Cut outputs as files in a bot's outputs folder (#485)
+
+A tool call whose output is cut for the model now asks, when its bot has
+an `outputs` folder, whether its sandbox may write that folder, and writes
+each cut stream there, synced, on a blocking thread, in place of the
+store's LZ4 copy. A call with no cut stream, or a bot with no folder, pays
+one check of an empty list. Retention and deletion read a turn's file
+names before its rows go. The Perf workflow's matched screen, base main
+678876e against the PR head bc36668, on the GitHub runner (2026-10-31):
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 40.431 | 39.977 | -1.1% |
+| admission | burst submit p99, ms | 6.342 | 6.098 | -3.9% |
+| completion | release to terminal p99, ms | 13.964 | 13.472 | -3.5% |
+| footprint | idle RSS, MiB | 18.641 | 19.195 | +3.0% |
+| footprint | per idle bot, KiB | 1.476 | 1.46 | -1.1% |
+| footprint | RSS after a turn each, MiB | 28.119 | 27.91 | -0.7% |
+| footprint | CPU per turn, ms | 1.272 | 1.278 | +0.5% |
+| lifecycle | CPU, s | 1.155 | 1.175 | +1.7% |
+| lifecycle | p95 turn, ms | 579.309 | 577.968 | -0.2% |
+| lifecycle | peak RSS, MiB | 25.453 | 25.283 | -0.7% |
+
+Nothing passed the gate's 15% in the direction that costs; idle RSS moved
+by half a MiB, inside what earlier screens of unchanged idle code moved
+by (#479 measured 19.10 and 19.24). The benches' outputs are short, so
+none is cut: the screen shows the path every call takes, and a cut call
+adds a file write and two syncs on a blocking thread, not the runtime's.
+The later head that syncs each file and removes pruned files after the
+group commits changes only cut calls and retention.

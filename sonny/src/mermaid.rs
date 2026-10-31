@@ -1,10 +1,11 @@
 //! Mermaid diagrams as SVG, through Pele (vendor/pele.global.js, MIT),
-//! run by the machine's `node` or `bun`. Pele themes its SVG with CSS
+//! run by Sonny's own QuickJS. Pele themes its SVG with CSS
 //! variables, which resvg does not read, so the colours are written in
 //! here, for the terminal's light or dark background.
 use std::collections::HashMap;
 
-const PELE: &str = include_str!("../vendor/pele.global.js");
+static PELE: crate::js::Engine =
+    crate::js::Engine::new("Mermaid", include_str!("../vendor/pele.global.js"));
 
 /// Pele's own variables, for each background.
 const LIGHT: [(&str, &str); 8] = [
@@ -31,11 +32,7 @@ const DARK: [(&str, &str); 8] = [
 /// The diagram as an SVG resvg can draw, or why not.
 pub fn svg(source: &str) -> Result<String, String> {
     let source = serde_json::to_string(source).map_err(|e| e.to_string())?;
-    let script = format!(
-        "{PELE}\ntry {{ process.stdout.write(pele.render({source}).svg) }} \
-         catch (e) {{ process.stderr.write(String(e && e.message || e)); process.exit(1) }}\n"
-    );
-    let svg = crate::js::run(script, "Mermaid")?;
+    let svg = PELE.eval(format!("pele.render({source}).svg"))?;
     let theme = if crate::term::light() { LIGHT } else { DARK };
     Ok(resolve(&svg, &theme))
 }
@@ -156,10 +153,7 @@ mod tests {
     }
 
     #[test]
-    fn a_flowchart_draws_when_node_is_here() {
-        if !crate::js::available() {
-            return;
-        }
+    fn a_flowchart_draws() {
         let out = svg("flowchart LR\n  A[Sonny] --> B[daemon]").unwrap();
         assert!(out.starts_with("<svg") && !out.contains("var("), "{out}");
         crate::image::render(&out, 80).unwrap();

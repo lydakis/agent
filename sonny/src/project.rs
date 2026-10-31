@@ -883,7 +883,7 @@ async fn make(
     let (instructions, _) = folder(dir, role)?;
     // Gated and confined from the start, as a new lead's mode makes it,
     // whoever opens it first.
-    let mode = crate::approvals::MODES[0].0;
+    let mode = crate::approvals::default();
     let tools: Vec<String> = match &role.tools {
         Some(tools) => tools.clone(),
         // The tools the client will give it; one the gate names that the
@@ -896,11 +896,14 @@ async fn make(
                 .collect()
         }
     };
-    let declare = json!(crate::declared::tools(true));
+    let declare = json!(crate::declared::tools(crate::served::Role::of(0)));
     let gate = crate::approvals::gate(mode, &crate::approvals::gateable(&tools, &declare));
     let mut settings = crate::approvals::sandbox(mode, dir);
     if agent_client::config::load()?.hide_senders {
         settings.insert("hide_senders".into(), json!(true));
+    }
+    if let Some(outputs) = crate::outputs() {
+        settings.insert("outputs".into(), json!(outputs));
     }
     let policy = json!({
         "instructions": instructions,

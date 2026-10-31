@@ -4,7 +4,8 @@ use agent_runtime::{
     provider::{ToolCall, Usage},
     store::{
         Answered, Binding, Bot, CacheTtl, CompactionPlan, ContextUsage, Database, Decision,
-        Delivery, Fork, Gate, Gated, Planning, Settings, Strip, TurnBudget, TurnOptions, Wake,
+        Delivery, Fork, Gate, Gated, Planning, QuoteRef, Settings, Strip, TurnBudget, TurnOptions,
+        Wake,
     },
     tools::{Declared, Outcome},
 };
@@ -84,9 +85,10 @@ fn result(output: &str) -> Outcome {
     Outcome {
         output: output.into(),
         artifacts: Vec::new(),
-        images: Vec::new(),
+        parts: Vec::new(),
         note: None,
         failed: false,
+        files: Vec::new(),
     }
 }
 
@@ -160,6 +162,8 @@ fn historical_fork_and_exact_resume_preserve_independent_lineage() {
         expected_turn: None,
         from: None,
         origin: None,
+        person: None,
+        quotes: Vec::new(),
         budget_tokens: None,
         images: Vec::new(),
     };
@@ -1111,6 +1115,7 @@ fn a_failure_after_a_later_call_lapsed_keeps_its_request() {
     std::thread::sleep(std::time::Duration::from_millis(60));
     let failed = Outcome {
         failed: true,
+        files: Vec::new(),
         ..result("{}")
     };
     db.tool_finish(turn, "r1", &failed).unwrap();
@@ -1410,6 +1415,7 @@ fn a_call_announced_again_is_found_by_a_listing_already_past_it() {
     ));
     let failed = Outcome {
         failed: true,
+        files: Vec::new(),
         ..result("{}")
     };
     db.tool_finish(turn, "s1", &failed).unwrap();
@@ -2326,6 +2332,430 @@ fn history_items_name_who_sent_each_prompt_after_its_turns_are_gone() {
     assert_eq!(senders(&db, "Branch"), expected);
 }
 
+/// A turn's prompt, or with `reply` the reply it ended with, to quote.
+fn quote(bot: &str, turn: i64, reply: bool) -> QuoteRef {
+    QuoteRef {
+        bot: bot.into(),
+        turn,
+        reply,
+    }
+}
+
+#[test]
+fn a_quote_copies_a_turns_words_with_who_wrote_them() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    db.create("Carol", Some("/synthetic"), binding()).unwrap();
+    // The daemon's own person asks Bob for something, and Bob replies.
+    let asked = db
+        .begin(
+            "Bob",
+            "p1",
+            "ship it",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    db.append(asked, vec![assistant("shipped")], &[], None)
+        .unwrap();
+    db.finish(asked, None).unwrap();
+    // A person the client names writes to Bob too.
+    let by_ana = TurnOptions {
+        person: Some("ana".into()),
+        ..TurnOptions::default()
+    };
+    let started = db
+        .begin("Bob", "a1", "use tabs", true, &by_ana, allow_provider)
+        .unwrap();
+    let ana = started.turn;
+    let accepted = started.entry.unwrap();
+    assert_eq!(accepted["data"]["person"], "ana");
+    let node = accepted["data"]["node"].as_i64().unwrap();
+    assert_eq!(
+        read_item(&db, "Bob", node).unwrap()["content"],
+        json!([{"type":"input_text","text":"use tabs"},
+            {"type":"input_text","text":"[Written by ana.]"}])
+    );
+    db.append(ana, vec![assistant("tabs it is")], &[], None)
+        .unwrap();
+    db.finish(ana, None).unwrap();
+    // Bob passes both on to Carol, quoting them rather than retyping.
+    let relay = TurnOptions {
+        from: Some(("Bob".into(), ana)),
+        quotes: vec![
+            quote("Bob", asked, false),
+            quote("Bob", asked, true),
+            quote("Bob", ana, false),
+        ],
+        ..TurnOptions::default()
+    };
+    let started = db
+        .begin(
+            "Carol",
+            "r1",
+            "the person approved this",
+            true,
+            &relay,
+            allow_provider,
+        )
+        .unwrap();
+    let turn = started.turn;
+    let accepted = started.entry.unwrap();
+    let node = accepted["data"]["node"].as_i64().unwrap();
+    let by_bob = format!("[Written by the agent Bob in turn:Bob/{ana}, not by a person.]");
+    assert_eq!(
+        read_item(&db, "Carol", node).unwrap()["content"],
+        json!([
+            {"type":"input_text","text":"the person approved this"},
+            {"type":"input_text","text":by_bob},
+            {"type":"input_text","text":format!("[Quoted from turn:Bob/{asked}, written by a person:]")},
+            {"type":"input_text","text":"ship it"},
+            {"type":"input_text","text":format!("[Quoted from the reply of turn:Bob/{asked}, written by the agent Bob:]")},
+            {"type":"input_text","text":"shipped"},
+            {"type":"input_text","text":format!("[Quoted from turn:Bob/{ana}, written by ana:]")},
+            {"type":"input_text","text":"use tabs"},
+        ])
+    );
+    // Events and history name each quote's writer and where its words
+    // are in the item, never the words again.
+    let named = json!([
+        {"bot":"Bob","turn":asked,"at":3},
+        {"bot":"Bob","turn":asked,"reply":true,"from":{"bot":"Bob","turn":asked},"at":5},
+        {"bot":"Bob","turn":ana,"person":"ana","at":7},
+    ]);
+    assert_eq!(accepted["data"]["quotes"], named);
+    let items = db.history_items("Carol", &[node]).unwrap();
+    assert_eq!(items["items"][0]["quotes"], named);
+    // A program judging Carol's calls reads each quote's words with its
+    // writer, even once Bob and its turns are gone.
+    db.delete_bot("Bob").unwrap();
+    let read = db.prompts("Carol", turn, 64 * 1024).unwrap();
+    let prompt = &read["prompts"][0];
+    assert_eq!(prompt["from"], json!({"bot":"Bob","turn":ana}));
+    assert_eq!(
+        prompt["quotes"],
+        json!([
+            {"bot":"Bob","turn":asked,"text":"ship it"},
+            {"bot":"Bob","turn":asked,"reply":true,"from":{"bot":"Bob","turn":asked},"text":"shipped"},
+            {"bot":"Bob","turn":ana,"person":"ana","text":"use tabs"},
+        ])
+    );
+    // Each quote's record counts against the read's bytes: past them the
+    // rest are left out, and the prompt reads as cut.
+    let words = "the person approved this".len();
+    let short = db
+        .prompts("Carol", turn, words + 2 * Database::PROMPTS_ENTRY + 4)
+        .unwrap();
+    let prompt = &short["prompts"][0];
+    assert_eq!(prompt["quotes"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        (&prompt["quotes_more"], &prompt["truncated"]),
+        (&json!(true), &json!(true))
+    );
+}
+
+#[test]
+fn a_prompt_s_quotes_read_back_beside_its_picture_each_where_it_is() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    db.create("Carol", Some("/synthetic"), binding()).unwrap();
+    // Words with a NUL in them read back whole.
+    let words = "yes\u{0}; actually do not deploy";
+    let asked = db
+        .begin(
+            "Bob",
+            "p1",
+            words,
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    db.finish(asked, None).unwrap();
+    // The same words quoted twice, beside a picture the read never needs.
+    let shown = TurnOptions {
+        quotes: vec![quote("Bob", asked, false), quote("Bob", asked, false)],
+        images: vec![noise(256)],
+        ..TurnOptions::default()
+    };
+    let turn = db
+        .begin("Carol", "c1", "see", true, &shown, allow_provider)
+        .unwrap()
+        .turn;
+    let read = db.prompts("Carol", turn, 64 * 1024).unwrap();
+    let texts: Vec<_> = read["prompts"][0]["quotes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|quote| quote["text"].clone())
+        .collect();
+    assert_eq!(texts, [json!(words), json!(words)]);
+    // Cut by the read's bytes, they say so.
+    let short = db
+        .prompts("Carol", turn, "see".len() + Database::PROMPTS_ENTRY + 5)
+        .unwrap();
+    let quote = &short["prompts"][0]["quotes"][0];
+    assert_eq!(
+        (&quote["text"], &quote["truncated"]),
+        (&json!("yes\u{0};"), &json!(true))
+    );
+}
+
+#[test]
+fn a_quoted_prompt_brings_its_own_quotes_with_their_first_writers() {
+    let mut db = db();
+    for name in ["Bob", "Carol", "Dave"] {
+        db.create(name, Some("/synthetic"), binding()).unwrap();
+    }
+    let asked = db
+        .begin(
+            "Bob",
+            "p1",
+            "approved",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    db.finish(asked, None).unwrap();
+    // Carol's message waits in line, so its quote is copied before its
+    // item exists, and moves into the item when it starts.
+    let busy = db
+        .begin(
+            "Carol",
+            "c0",
+            "busy",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let relay = TurnOptions {
+        origin: Some("lookout".into()),
+        quotes: vec![quote("Bob", asked, false)],
+        delivery: Delivery::Queue,
+        ..TurnOptions::default()
+    };
+    let queued = db
+        .begin(
+            "Carol",
+            "c1",
+            "from your tasks",
+            true,
+            &relay,
+            allow_provider,
+        )
+        .unwrap();
+    assert_eq!(
+        queued.entry.unwrap()["data"]["quotes"],
+        json!([{"bot":"Bob","turn":asked}])
+    );
+    db.finish(busy, None).unwrap();
+    let (accepted, _) = db.start(queued.turn, allow_provider).unwrap();
+    assert_eq!(
+        accepted["data"]["quotes"],
+        json!([{"bot":"Bob","turn":asked,"at":3}])
+    );
+    let carol = queued.turn;
+    let pass_on = TurnOptions {
+        quotes: vec![quote("Carol", carol, false)],
+        ..TurnOptions::default()
+    };
+    let started = db
+        .begin("Dave", "d1", "see this", true, &pass_on, allow_provider)
+        .unwrap();
+    let node = started.entry.unwrap()["data"]["node"].as_i64().unwrap();
+    assert_eq!(
+        read_item(&db, "Dave", node).unwrap()["content"],
+        json!([
+            {"type":"input_text","text":"see this"},
+            {"type":"input_text","text":format!("[Quoted from turn:Carol/{carol}, sent by lookout:]")},
+            {"type":"input_text","text":"from your tasks"},
+            {"type":"input_text","text":format!("[Quoted from turn:Bob/{asked}, written by a person:]")},
+            {"type":"input_text","text":"approved"},
+        ])
+    );
+    // A retry names the turns the request named, not those they brought.
+    let again = db
+        .begin("Dave", "d1", "see this", true, &pass_on, allow_provider)
+        .unwrap();
+    assert_eq!(again.turn, started.turn);
+    // Quotes they bring count against the prompt's quotes: each is a part
+    // of its own.
+    let many = TurnOptions {
+        quotes: vec![quote("Dave", started.turn, false); 30],
+        ..TurnOptions::default()
+    };
+    let error = db
+        .begin("Bob", "p2", "all of it", true, &many, allow_provider)
+        .unwrap_err();
+    assert_eq!(error.code, "quote_too_large");
+}
+
+#[test]
+fn a_quote_names_a_turn_that_has_the_words() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    db.create("Carol", Some("/synthetic"), binding()).unwrap();
+    let running = db
+        .begin(
+            "Bob",
+            "p1",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let steer = db
+        .begin(
+            "Bob",
+            "p2",
+            "and more",
+            true,
+            &TurnOptions {
+                delivery: Delivery::Steer,
+                ..TurnOptions::default()
+            },
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let send = |db: &mut Database, id: &str, quotes: Vec<QuoteRef>, prompt: &str| {
+        let options = TurnOptions {
+            quotes,
+            delivery: Delivery::Queue,
+            ..TurnOptions::default()
+        };
+        db.begin("Carol", id, prompt, true, &options, allow_provider)
+            .map(|started| started.turn)
+            .map_err(|error| error.code)
+    };
+    assert_eq!(
+        send(&mut db, "q1", vec![quote("Bob", running + 99, false)], "x"),
+        Err("quote_not_found".into())
+    );
+    assert_eq!(
+        send(&mut db, "q2", vec![quote("Carol", running, false)], "x"),
+        Err("quote_not_found".into())
+    );
+    // A running turn's words are there; the reply it ends with is not yet.
+    assert!(send(&mut db, "q3", vec![quote("Bob", running, false)], "x").is_ok());
+    assert_eq!(
+        send(&mut db, "q4", vec![quote("Bob", running, true)], "x"),
+        Err("quote_unfinished".into())
+    );
+    db.absorb(
+        running,
+        None,
+        8 << 20,
+        4096,
+        ContextUsage::default(),
+        false,
+        true,
+    )
+    .unwrap();
+    db.finish(running, None).unwrap();
+    // A steer replied in the turn it joined; a turn that said nothing
+    // has no reply.
+    assert_eq!(
+        send(&mut db, "q5", vec![quote("Bob", steer, true)], "x"),
+        Err("quote_not_found".into())
+    );
+    assert_eq!(
+        send(&mut db, "q6", vec![quote("Bob", running, true)], "x"),
+        Err("quote_not_found".into())
+    );
+    assert!(send(&mut db, "q7", vec![quote("Bob", steer, false)], "x").is_ok());
+    // The prompt and its quotes are bounded together, as a prompt alone.
+    let words = "w".repeat(Database::QUOTED_BYTES - 3);
+    assert_eq!(
+        send(&mut db, "q8", vec![quote("Bob", running, false)], &words),
+        Err("quote_too_large".into())
+    );
+    // A retry names the same turns, or it is another request.
+    let first = send(&mut db, "q9", vec![quote("Bob", running, false)], "x").unwrap();
+    assert_eq!(
+        send(&mut db, "q9", vec![quote("Bob", running, false)], "x"),
+        Ok(first)
+    );
+    assert_eq!(
+        send(&mut db, "q9", vec![quote("Bob", steer, false)], "x"),
+        Err("idempotency_conflict".into())
+    );
+}
+
+#[test]
+fn a_bot_that_hides_senders_reads_quoted_words_without_their_lines() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let mut quiet = binding();
+    quiet.settings.hide_senders = true;
+    db.create("Carol", Some("/synthetic"), quiet).unwrap();
+    let asked = db
+        .begin(
+            "Bob",
+            "p1",
+            "ship it",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let options = TurnOptions {
+        person: Some("ana".into()),
+        quotes: vec![quote("Bob", asked, false)],
+        ..TurnOptions::default()
+    };
+    let started = db
+        .begin("Carol", "c1", "see this", true, &options, allow_provider)
+        .unwrap();
+    let data = &started.entry.unwrap()["data"];
+    assert_eq!(data["quotes"], json!([{"bot":"Bob","turn":asked,"at":1}]));
+    let node = data["node"].as_i64().unwrap();
+    assert_eq!(
+        read_item(&db, "Carol", node).unwrap()["content"],
+        json!([{"type":"input_text","text":"see this"},
+            {"type":"input_text","text":"ship it"}])
+    );
+}
+
+#[test]
+fn schema_64_had_no_people_and_no_quotes() {
+    let path = std::env::temp_dir().join(format!("agent-schema64-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            "ALTER TABLE turns DROP COLUMN person; ALTER TABLE turns DROP COLUMN quotes;
+             ALTER TABLE senders DROP COLUMN person; ALTER TABLE senders DROP COLUMN quotes;
+             ALTER TABLE nodes DROP COLUMN written_ms; PRAGMA user_version=64;",
+        )
+        .unwrap();
+    drop(Database::initialize(Connection::open(&path).unwrap()).unwrap());
+    let conn = Connection::open(&path).unwrap();
+    let columns: i64 = conn
+        .query_row(
+            "SELECT (SELECT count(*) FROM pragma_table_info('turns') WHERE name IN ('person','quotes'))
+                  + (SELECT count(*) FROM pragma_table_info('senders') WHERE name IN ('person','quotes'))
+                  + (SELECT count(*) FROM pragma_table_info('nodes') WHERE name='written_ms')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(columns, 5);
+    drop(conn);
+    std::fs::remove_file(path).unwrap();
+}
+
 #[test]
 fn a_bot_that_hides_senders_reads_only_the_words() {
     let mut db = db();
@@ -2489,6 +2919,7 @@ fn prompts_name_who_wrote_each_and_what_the_turn_ran() {
     db.tool_start(turn, &round[0]).unwrap();
     let failed = Outcome {
         failed: true,
+        files: Vec::new(),
         ..result("exit 1")
     };
     let (_, completed) = db.tool_finish(turn, "c1", &failed).unwrap();
@@ -3225,7 +3656,7 @@ fn a_bot_keeps_its_settings_and_a_fork_copies_them() {
         serde_json::to_value(&bob).unwrap()["settings"],
         json!({"context_bytes":4096,"context_items":4096,"note_turns":48,"compact_at":75,
             "compact_keep":25,"compact_tokens":null,"keep_turns":1,"max_rounds":null,"approval_hold_ms":2000,"max_output_tokens":null,
-            "keep_warm":0,"cache_ttl":"1h","speed":"fast","sandbox":null,"writable":[],"network":false,"hide_senders":false,"unsandboxed":[]})
+            "keep_warm":0,"cache_ttl":"1h","speed":"fast","sandbox":null,"writable":[],"network":false,"outputs":null,"hide_senders":false,"unsandboxed":[]})
     );
     // Retention follows the bot's own setting.
     for n in 1..=3 {
@@ -3498,6 +3929,89 @@ fn waiting_calls_page_past_held_answers_and_an_answer_out_of_time_is_refused() {
 }
 
 #[test]
+fn a_parked_answer_s_pictures_are_stored_once_its_result_is() {
+    let path =
+        std::env::temp_dir().join(format!("agent-parked-parts-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    let start = Declared {
+        name: "start".into(),
+        description: "Start.".into(),
+        parameters: json!({"type":"object"}),
+        result: "ok".into(),
+        answered_by: Some("sonny".into()),
+        expire_ms: None,
+        grammar: None,
+        steps: false,
+        inherit: true,
+    };
+    db.create(
+        "Lead",
+        Some("/synthetic"),
+        Binding {
+            declared: Some(std::slice::from_ref(&start)),
+            ..binding()
+        },
+    )
+    .unwrap();
+    let turn = db
+        .begin(
+            "Lead",
+            "request",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let call = ToolCall {
+        name: "start".into(),
+        call_id: "c1".into(),
+        arguments: "{}".into(),
+        custom: false,
+    };
+    db.append(turn, vec![], std::slice::from_ref(&call), None)
+        .unwrap();
+    db.tool_start(turn, &call).unwrap();
+    assert!(
+        db.suspend_answer(turn, "c1", &[], 0, None, None)
+            .unwrap()
+            .is_some()
+    );
+    let pictured = Outcome {
+        parts: vec![agent_runtime::codec::Part::Image(
+            agent_runtime::codec::Image {
+                media_type: "image/png".into(),
+                data: "A".repeat(4096),
+            },
+        )],
+        ..result("a page")
+    };
+    db.answer_call("Lead", turn, "c1", pictured.clone(), 0)
+        .unwrap();
+    let kept = |path: &std::path::Path| -> Option<String> {
+        Connection::open(path)
+            .unwrap()
+            .query_row("SELECT parts FROM answers WHERE call_id='c1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap()
+    };
+    assert!(kept(&path).is_some());
+    db.resume(turn).unwrap();
+    let agent_runtime::store::CallAnswer::Given(answer) = db.answer_take(turn, "c1", 0).unwrap()
+    else {
+        panic!("the parked answer was not taken");
+    };
+    assert_eq!(answer.parts, pictured.parts);
+    db.tool_finish(turn, "c1", &answer).unwrap();
+    assert_eq!(kept(&path), None);
+    drop(db);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn schema_52_bots_declare_no_tools() {
     let path = std::env::temp_dir().join(format!("agent-declared-{}.sqlite", std::process::id()));
     let _ = std::fs::remove_file(&path);
@@ -3642,9 +4156,10 @@ fn artifacts_are_scoped_to_the_owning_bot_and_lineage_checks_use_depth() {
             ("stdout", b"full output".to_vec()),
             ("stderr", "\"\né🙂".repeat(100_000).into_bytes()),
         ],
-        images: Vec::new(),
+        parts: Vec::new(),
         note: None,
         failed: false,
+        files: Vec::new(),
     };
     let (_, entry) = db.tool_finish(turn, "c1", &outcome).unwrap();
     assert_eq!(entry["data"]["artifacts"][0], "stdout");
@@ -4029,6 +4544,8 @@ fn turn_options_are_recorded_and_part_of_idempotency() {
         expected_turn: None,
         from: None,
         origin: None,
+        person: None,
+        quotes: Vec::new(),
         budget_tokens: None,
         images: Vec::new(),
     };
@@ -4159,6 +4676,8 @@ fn a_bot_without_a_default_workspace_needs_one_per_submission() {
         expected_turn: None,
         from: None,
         origin: None,
+        person: None,
+        quotes: Vec::new(),
         budget_tokens: None,
         images: Vec::new(),
     };
@@ -4993,6 +5512,8 @@ fn forks_start_at_any_answered_message_and_default_to_the_head() {
                 expected_turn: None,
                 from: None,
                 origin: None,
+                person: None,
+                quotes: Vec::new(),
                 budget_tokens: None,
                 images: Vec::new(),
             },
@@ -5363,6 +5884,7 @@ fn a_fork_waits_on_its_own_commands_and_reads_only_delivered_output() {
         process,
         &json!({"stdout":"large"}),
         &[("stdout", b"synthetic output".to_vec())],
+        &[],
     )
     .unwrap();
     // Its stored output is Bob's, and a branch's only once delivered there.
@@ -6399,7 +6921,7 @@ fn completion_retention_passes_turns_whose_processes_still_run() {
     assert_eq!(db.prune_except("Bob", 1, None).unwrap()["events"], 0);
     assert_eq!(db.running_processes().unwrap(), piece as i64);
     // A process that ends makes its turn prunable again.
-    db.process_finish(processes[0], &json!({"stdout":"done"}), &[])
+    db.process_finish(processes[0], &json!({"stdout":"done"}), &[], &[])
         .unwrap();
     db.prune_except("Bob", 1, None).unwrap();
     assert!(db.process_result(processes[0]).unwrap().is_none());
@@ -6625,6 +7147,7 @@ fn retention_keeps_running_processes_until_their_results_commit() {
         process,
         &json!({"stdout":"done"}),
         &[("stdout", b"full output".to_vec())],
+        &[],
     )
     .unwrap();
     assert_eq!(
@@ -8824,6 +9347,168 @@ fn pending_counters_follow_every_transition_and_bound_admission() {
 }
 
 #[test]
+fn quoted_words_wait_with_their_turn_and_count_against_the_pending_bytes() {
+    let path = std::env::temp_dir().join(format!(
+        "agent-pending-quotes-{}.sqlite",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let quoting = |delivery| TurnOptions {
+        delivery,
+        quotes: vec![quote("Ann", 1, false)],
+        ..TurnOptions::default()
+    };
+    let words = "x".repeat(4096);
+    let waiting = {
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        db.create("Ann", Some("/synthetic"), binding()).unwrap();
+        db.create("Bob", Some("/synthetic"), binding()).unwrap();
+        let said = db
+            .begin(
+                "Ann",
+                "a1",
+                &words,
+                true,
+                &TurnOptions::default(),
+                allow_provider,
+            )
+            .unwrap()
+            .turn;
+        assert_eq!(said, 1);
+        db.finish(said, None).unwrap();
+        let running = db
+            .begin(
+                "Bob",
+                "b1",
+                "go",
+                true,
+                &TurnOptions::default(),
+                allow_provider,
+            )
+            .unwrap()
+            .turn;
+        // An empty prompt quoting 4 KiB waits with those 4 KiB.
+        db.begin(
+            "Bob",
+            "b2",
+            "",
+            true,
+            &quoting(Delivery::Queue),
+            allow_provider,
+        )
+        .unwrap();
+        let (turns, bytes) = db.pending().unwrap();
+        assert_eq!(turns, 1);
+        assert!(bytes as usize > words.len(), "{bytes}");
+        // The bound counts them too.
+        db.set_pending_limits(0, bytes as usize + 1024);
+        assert_eq!(
+            db.begin(
+                "Bob",
+                "b3",
+                "",
+                true,
+                &quoting(Delivery::Queue),
+                allow_provider
+            )
+            .unwrap_err()
+            .code,
+            "pending_limit"
+        );
+        db.set_pending_limits(0, 0);
+        // A steer quoting them leaves the count when it is taken in.
+        db.begin(
+            "Bob",
+            "b4",
+            "",
+            true,
+            &quoting(Delivery::Steer),
+            allow_provider,
+        )
+        .unwrap();
+        assert_eq!(db.pending().unwrap(), (2, 2 * bytes));
+        db.absorb(
+            running,
+            None,
+            8 << 20,
+            4096,
+            ContextUsage::default(),
+            false,
+            true,
+        )
+        .unwrap();
+        assert_eq!(db.pending().unwrap(), (1, bytes));
+        bytes
+    };
+    // Recounted at open: the waiting turn still holds its quoted words.
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    assert_eq!(db.pending().unwrap(), (1, waiting));
+    let (_, turn) = db.next_ready().unwrap().unwrap();
+    db.start(turn, |_, _| Ok(())).unwrap();
+    assert_eq!(db.pending().unwrap(), (0, 0));
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn one_absorption_takes_in_quoted_words_within_its_batch_bytes() {
+    let mut db = db();
+    db.create("Ann", Some("/synthetic"), binding()).unwrap();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let said = db
+        .begin(
+            "Ann",
+            "a1",
+            &"x".repeat(200 * 1024),
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    db.finish(said, None).unwrap();
+    let running = db
+        .begin(
+            "Bob",
+            "b1",
+            "go",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    // Two short steers quoting 200 KiB each: the first is always taken in,
+    // the second waits for the next batch.
+    let steer = TurnOptions {
+        delivery: Delivery::Steer,
+        quotes: vec![quote("Ann", said, false)],
+        ..TurnOptions::default()
+    };
+    for id in ["s1", "s2"] {
+        db.begin("Bob", id, "", true, &steer, allow_provider)
+            .unwrap();
+    }
+    let absorb = |db: &mut Database, through| {
+        db.absorb(
+            running,
+            through,
+            8 << 20,
+            4096,
+            ContextUsage::default(),
+            false,
+            true,
+        )
+        .unwrap()
+    };
+    let absorbed = absorb(&mut db, None);
+    assert_eq!(absorbed.outcomes.len(), 1);
+    assert!(absorbed.next_through.is_some());
+    let absorbed = absorb(&mut db, absorbed.next_through);
+    assert_eq!(absorbed.outcomes.len(), 1);
+    assert_eq!(db.pending().unwrap(), (0, 0));
+}
+
+#[test]
 fn batched_history_items_validate_the_branch_and_bound_payloads() {
     let mut db = db();
     db.create("source", Some("/synthetic"), binding()).unwrap();
@@ -9004,9 +9689,10 @@ fn carry_forward_notes_are_versioned_by_result_node_and_forks_bind_by_checkpoint
         let outcome = Outcome {
             output: "{}".into(),
             artifacts: Vec::new(),
-            images: Vec::new(),
+            parts: Vec::new(),
             note: Some(text.to_owned()),
             failed: false,
+            files: Vec::new(),
         };
         let (_, entry) = db.tool_finish(turn, &call.call_id, &outcome).unwrap();
         let version = entry["data"]["note"].as_i64().unwrap();
@@ -10166,7 +10852,7 @@ fn pictures_count_at_their_weight_and_go_whole() {
     .unwrap();
     db.tool_start(turn, &call).unwrap();
     let read = Outcome {
-        images: vec![photo.clone()],
+        parts: vec![agent_runtime::codec::Part::Image(photo.clone())],
         ..result("photo.png: a PNG image, 600×600; it follows")
     };
     db.tool_finish(turn, "c1", &read).unwrap();
@@ -10213,7 +10899,7 @@ fn pictures_count_at_their_weight_and_go_whole() {
         items[2]["output"]
             .as_str()
             .unwrap()
-            .starts_with("[tool result's picture elided")
+            .starts_with("[tool result's pictures elided")
     );
 }
 
@@ -10575,6 +11261,108 @@ fn a_bot_without_read_stores_no_stubs() {
     assert!(db.elision_plan("Bob", 1, 1).unwrap().is_none());
     drop(db);
     std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn a_result_s_text_parts_elide_together() {
+    // A short output then a long text part: the stub counts and quotes
+    // the whole text, as a read of the result returns it.
+    let path = std::env::temp_dir().join(format!("agent-parts-stub-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let turn = db
+        .begin(
+            "Bob",
+            "r1",
+            "task",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let call = ToolCall {
+        custom: false,
+        name: "shell".into(),
+        call_id: "c0".into(),
+        arguments: "{}".into(),
+    };
+    let item = json!({"type":"function_call","call_id":"c0","name":"shell","arguments":"{}"});
+    db.append(
+        turn,
+        vec![serde_json::to_vec(&item).unwrap().into()],
+        std::slice::from_ref(&call),
+        None,
+    )
+    .unwrap();
+    db.tool_start(turn, &call).unwrap();
+    let long = format!("{}the end", lines(0, 400));
+    let outcome = Outcome {
+        parts: vec![agent_runtime::codec::Part::Text { text: long.clone() }],
+        ..result("intro")
+    };
+    db.tool_finish(turn, "c0", &outcome).unwrap();
+    let stub: Vec<u8> = Connection::open(&path)
+        .unwrap()
+        .query_row("SELECT item FROM stubs", [], |r| r.get(0))
+        .unwrap();
+    let stub: Value = serde_json::from_slice(&stub).unwrap();
+    let text = stub["output"].as_str().unwrap();
+    let whole = format!("intro\n{long}");
+    assert!(text.contains(&format!("{} bytes", whole.len())), "{text}");
+    assert!(text.ends_with("the end"), "{text}");
+    drop(db);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn a_custom_tool_s_pictures_are_read_without_their_bytes() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let turn = db
+        .begin(
+            "Bob",
+            "r1",
+            "task",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let call = ToolCall {
+        custom: true,
+        name: "shot".into(),
+        call_id: "c0".into(),
+        arguments: "page".into(),
+    };
+    let item = json!({"type":"custom_tool_call","call_id":"c0","name":"shot","input":"page"});
+    db.append(
+        turn,
+        vec![serde_json::to_vec(&item).unwrap().into()],
+        std::slice::from_ref(&call),
+        None,
+    )
+    .unwrap();
+    db.tool_start(turn, &call).unwrap();
+    let data = "A".repeat(4096);
+    let outcome = Outcome {
+        parts: vec![agent_runtime::codec::Part::Image(
+            agent_runtime::codec::Image {
+                media_type: "image/png".into(),
+                data: data.clone(),
+            },
+        )],
+        ..result("a page")
+    };
+    let (_, entry) = db.tool_finish(turn, "c0", &outcome).unwrap();
+    let read = read_item(&db, "Bob", entry["data"]["node"].as_i64().unwrap()).unwrap();
+    assert_eq!(read["type"], "custom_tool_call_output");
+    assert_eq!(
+        read["output"][1],
+        json!({"type":"input_image","image_url":"data:image/png;base64,","omitted_bytes":data.len()})
+    );
 }
 
 #[test]
@@ -12789,7 +13577,7 @@ fn an_expired_fork_still_running_a_command_holds_back_no_other() {
         db.expired(i64::MAX, 1).unwrap(),
         vec![("idle".to_owned(), idle.bot_id)]
     );
-    db.process_finish(process, &json!({}), &[]).unwrap();
+    db.process_finish(process, &json!({}), &[], &[]).unwrap();
     assert_eq!(db.expired(i64::MAX, 16).unwrap().len(), 2);
 }
 
@@ -12962,6 +13750,82 @@ fn a_pinned_prompt_under_the_floor_counts_as_its_stub() {
     );
     let (_, bytes, _) = db.turn_usage("Bob", turn).unwrap();
     assert_eq!(bytes as i64, window.item_bytes);
+}
+
+#[test]
+fn a_cut_s_kept_pictures_count_toward_the_picture_bound() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    converse(&mut db, "Bob", 1);
+    let look = |delivery| TurnOptions {
+        delivery,
+        images: vec![noise(40); 20],
+        ..TurnOptions::default()
+    };
+    let turn = db
+        .begin(
+            "Bob",
+            "r2",
+            "long task",
+            true,
+            &look(Delivery::default()),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let prompt = db.inspect("Bob").unwrap().head.unwrap();
+    exchange(&mut db, turn, "c0", &lines(0, 50));
+    db.window("Bob", i64::MAX, i64::MAX).unwrap().unwrap();
+    db.begin(
+        "Bob",
+        "s",
+        "this too",
+        true,
+        &look(Delivery::Steer),
+        allow_provider,
+    )
+    .unwrap();
+    db.absorb(
+        turn,
+        None,
+        8 << 20,
+        4096,
+        ContextUsage::default(),
+        false,
+        true,
+    )
+    .unwrap();
+    let steer = db.inspect("Bob").unwrap().head.unwrap();
+    for n in 1..6 {
+        exchange(&mut db, turn, &format!("c{n}"), &lines(n, 50));
+    }
+    let plan = compaction_plan(&db, "Bob", 1, 64 << 10, 256)
+        .unwrap()
+        .unwrap();
+    assert_eq!(plan.pinned, Some(prompt));
+    let limit = ContextUsage {
+        bytes: 64 << 10,
+        items: 256,
+    };
+    db.compact("Bob", &plan, "summary", None, 0, limit, Value::Null)
+        .unwrap();
+    let window = db.window("Bob", 64 << 10, 256).unwrap().unwrap();
+    assert_eq!(&window.ids[..2], &[prompt, steer]);
+    assert_eq!(window.pictures, 40);
+    // The tail has none; the prompt's and the steer's are past the bound,
+    // and any floor in the tail takes them.
+    let plan = db
+        .picture_elision_plan("Bob", 30, i64::MAX)
+        .unwrap()
+        .unwrap();
+    db.elide("Bob", &plan).unwrap();
+    let window = db.window("Bob", 64 << 10, 256).unwrap().unwrap();
+    assert_eq!(window.pictures, 0);
+    assert!(
+        db.picture_elision_plan("Bob", 30, i64::MAX)
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[test]
@@ -13185,4 +14049,42 @@ fn a_waiting_step_ended_in_a_group_that_fails_is_told_of_once_one_commits() {
         .unwrap();
     db.commit_group().unwrap();
     assert_eq!(stepped(&mut db), [approval]);
+}
+
+#[test]
+fn each_item_says_when_it_joined_the_history() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let before = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let turn = db
+        .begin(
+            "Bob",
+            "r1",
+            "hello",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    db.append(turn, vec![assistant("hi")], &[], None).unwrap();
+    db.finish(turn, None).unwrap();
+    let page = db.history_nodes("Bob", None, 400, None, false).unwrap();
+    let nodes: Vec<i64> = (page["nodes"].as_array().unwrap().iter())
+        .map(|n| n["node"].as_i64().unwrap())
+        .collect();
+    let items = db.history_items("Bob", &nodes).unwrap();
+    for (listed, read) in page["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .zip(items["items"].as_array().unwrap())
+    {
+        let written = listed["written_ms"].as_i64().unwrap();
+        assert!(written >= before, "{listed}");
+        assert_eq!(read["written_ms"], written);
+    }
 }

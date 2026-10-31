@@ -690,6 +690,14 @@ fn saw(dir: &Path, thread: &str, bot: &str) -> u64 {
     count
 }
 
+/// How many agents other than `author` have read `thread` or posted in
+/// it: who a post there reaches. None for a thread nobody has seen.
+pub fn audience(home: &Path, thread: &str, author: &str) -> usize {
+    let seen = json_file(&dir(home).join(SEEN));
+    (seen.get(thread).and_then(Value::as_object))
+        .map_or(0, |by| by.keys().filter(|bot| *bot != author).count())
+}
+
 /// A thread as the tool shows it, read by no one yet.
 fn thread(dir: &Path, name: &str) -> Result<Value, String> {
     valid_name(name)?;
@@ -1320,6 +1328,11 @@ mod tests {
             call(home, "c.z", None, None, &json!({})).unwrap()["threads"][0]["reads"],
             1
         );
+        // Who a post there reaches: everyone who posted or read, but the
+        // poster.
+        assert_eq!(audience(home, "flaky-lookout", "a.x"), 2);
+        assert_eq!(audience(home, "flaky-lookout", "d.w"), 3);
+        assert_eq!(audience(home, "nobody-here", "a.x"), 0);
     }
 
     #[test]

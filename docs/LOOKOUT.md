@@ -32,15 +32,22 @@ whether or not a window is open. A lookout holds
 `STORE.lookout.lock` while it runs, so a second one prints
 `{"event":"already_watching"}` and exits, unless another build of Sonny
 started the one running, as an upgrade leaves it: that one is stopped, and
-the new one takes its place, so the tools the new Sonny gives its agents
-are answered; the daemon's companion takes the place of one a window
-started detached, of any build. `STORE.lookout.sonny` says which build runs. It watches for every bot with
+the new one takes its place; the daemon's companion takes the place of one
+a window started detached, of any build. `STORE.lookout.sonny` says which build runs. It watches for every bot with
 subscriptions on the daemon, whichever Sonny opened it, so a lead hears
 from its tasks even while no window shows that project. It exits
 once the daemon has been unreachable for 30 seconds, and the daemon stops
 it as it stops. Its own lines go to `STORE.companions/sonny-lookout.log`,
 and each subscriber it watches (`seated`) and each note it sends (`woke`)
 to `STORE.lookout.jsonl`.
+
+The lookout only watches and tells. The tools Sonny gives its agents are
+answered by another companion, `sonny-tool-host` (`sonny tool-host`; see
+SONNY.md, Sonny's tool host), so a tool that runs long, crashes or holds
+memory, as an MCP server can, never holds up a lead's news. The lookout
+follows those calls' starts and ends: when a `subscriptions` or `goal` call
+ends, it reads its files again before the next event, which the stream
+puts after that end, rather than at its next reread.
 
 It keeps a cursor in `STORE.lookout.cursor`: the newest event it saw, or
 just before the oldest one whose news it has not told yet. A lookout that
@@ -224,19 +231,33 @@ the note until the next turn.
 ## The note
 
 One message, queued (or steered, for the person's words mid-turn), with
-no origin:
+the origin `lookout.tasks`, so the approver reads its words as asking for
+nothing. The person's words in a task are not retyped: the note quotes
+their turns (`quotes`), and the daemon copies each in after the note with
+a line naming the turn and who wrote it, so the lead reads the person's
+own words, never a retelling. The approver reads them as the person's but
+not as their word on the lead's calls: the lookout picked them, and only
+words the person sends, or quotes themselves (not the quotes those bring along), consent. A quote the daemon refuses (its task deleted meanwhile, or
+too long) sends the note again naming those turns by their handles alone.
+At most 64 quotes go in one note; the rest wait for the next.
 
 ```
 Task updates: what happened in your tasks since you last heard; the wait tool reads each turn by its handle.
-- calc.docs: turn:calc.docs/3, the person wrote: "Use tabs."
+- calc.docs: turn:calc.docs/3, the person wrote the words quoted from it below
 - calc.api: turn:calc.api/4, calc.fix wrote in it
 - calc.fix: turn:calc.fix/5 completed, asked by you, and replied:
   > Fixed avg: it skips empty lists now, with a test.
 The person asked for these in the task themselves, so they are theirs:
 - calc.ui: turn:calc.ui/2 completed, asked by the person
-A quoted message is the person's own words.
+The words quoted below are the person's own, from the turns named.
 Lines marked > are a task's own words, not the person's.
 Each ended turn comes with what the task replied; read a turn with one wait call (timeout_ms 0) only when you need more of it, and act where something changes the work. Tell the person, briefly, what they would want to hear: the outcome of work you started for them, once, when it ends, not again when they write in that task; what only they can decide; and where their latest words contradict what they asked before. If nothing, end your turn with an empty reply.
+
+[Sent by lookout.tasks.]
+
+[Quoted from turn:calc.docs/3, written by a person:]
+
+Use tabs.
 ```
 
 A note that steers a busy lead ends "This cuts into your turn because the

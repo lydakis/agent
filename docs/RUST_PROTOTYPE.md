@@ -360,6 +360,22 @@ read inherited outputs, but cannot read later source turns or unrelated branches
 A stream the call never retained answers `artifact_not_found`, a turn outside
 the reader's lineage `turn_not_found`, and a turn whose records retention has
 removed `artifact_pruned` (see Retention).
+
+<a id="retained-outputs"></a>A bot with an `outputs` folder keeps each such
+stream there whole instead, as `TURN-CALL_ID-STREAM`, and its result lists
+those paths as `files` beside `artifacts`, so any command or tool reads them.
+The store keeps one row per stream naming the file and none of its bytes
+(schema 68), and `artifact` and `read artifact=` read the file. Each file is
+made new (0600, never through a link) and synced with its folder before the
+store records it, off the runtime thread, and only while
+the bot's sandbox cannot write the folder, checked after the folder is made: a
+command that could write there could put a link for the daemon to follow. An unconfined bot's
+commands can already write whatever the daemon can. A stream whose file cannot
+be written stays in the store, and a turn stopped while its files are written
+removes them. Retention and deletion remove a turn's files once removing its
+records commits; a file removed by hand reads `artifact_not_found`. A daemon
+that dies between writing a file and recording its call leaves the file, which
+no record names.
 Line pages are assembled on the storage worker; only the bounded page crosses
 into the async runtime. Byte-oriented protocol pages continue to use SQL slicing.
 
@@ -375,7 +391,7 @@ bound; the operating system is then the only limit.
 | `--max-detached` | Detached shell commands still running, daemon-wide; exited ones are reaped and stop counting. Zero is unbounded. | 16 |
 | `--max-active` | Turns with a live task: a model call in flight or a foreground tool. Parked turns never count. | 4,096 |
 | `--max-pending` | Submissions waiting to start: queued behind a bot's own work or ready for a slot, daemon-wide. A submission that would wait past the bound answers `pending_limit` and writes nothing; one that starts at once is never refused by it. | none |
-| `--max-pending-bytes` | UTF-8 prompt bytes of those waiting submissions. | none |
+| `--max-pending-bytes` | UTF-8 bytes of those waiting submissions: their prompts and the words they quote, which wait with them. | none |
 | `--max-connecting` | Provider requests awaiting response headers, a Bedrock Runtime call's body digest included. Established streams are not capped. Both providers hold headers until the first token, so a permit is held for the whole time to first token; a bound of N caps throughput at N calls per first-token latency. | none |
 | `--stall-timeout` | How long an established provider stream may go without a content frame before the attempt fails as `provider_stream_stalled` and is retried. Keepalives do not count. Whole seconds, `1s` to `24h`. | `2m` |
 | `--idle-exit` | How long, in whole seconds, before a socket daemon with no sessions, no live turns, and no running background commands exits. Parked turns are durable and resume on the next start; the client restarts the daemon on demand. | none |
@@ -417,6 +433,7 @@ keep-warm when it sets any of them.
 | `writable` (`--writable`, repeatable) | Absolute folders a `workspace-write` bot may write besides its own; each must exist and is stored by its real path. At most 64, 32 KiB as JSON. | none |
 | `network` (`--network`) | A `workspace-write` bot's commands may use the network. | off |
 | `hide_senders` (`--hide-senders`) | Its model reads what other bots and clients send it without the line naming the sender (see [fleet controllers](#fleet-controllers)); `senders = "hidden"` in `~/.agent/config.toml` sets it on the bots the CLI and Sonny make. | off |
+| `outputs` (`--outputs`) | An absolute folder that holds each tool output stream cut for the model whole, one file per stream, in place of the store's copy (see [retained outputs](#retained-outputs)). The daemon makes it, owner-only, and writes there only while the bot's sandbox cannot write it; otherwise the stream stays in the store. `agent run --new` and Sonny name `outputs` beside the store unless told otherwise. | none |
 | `unsandboxed` (`--unsandboxed`, repeatable) | Commands a sandboxed bot runs outside its sandbox without asking, each by its first words, such as `mcpx` or `docker compose` (see [sandbox](#sandbox)). At most 64, each at most 1 KiB. | none |
 
 Provider requests multiplex over HTTP/2, and one connection carries at most
@@ -1124,6 +1141,10 @@ not copy bodies. `min_node` optionally bounds the oldest included ID.
 returning its nodes newest first; `next_newer` is the inclusive minimum ID for
 the next forward page, or null. This lets clients retain only range endpoints.
 Turn IDs are inherited from each node's nearest turn-start ancestor.
+Each node, here and in `history_items`, carries `written_ms`, when it joined
+the history (a queued prompt when its turn started, a steer when its turn
+absorbed it), set by the insert that writes it; nodes from before schema 67
+have none.
 `workspaces` lists each folder the page's turns ran in once, as
 `{"folder", "turns"}`, so a client resolves a path a message names where it was
 written even after the bot moved; a turn whose rows went with a deleted fork
@@ -1205,7 +1226,7 @@ does not, and each is one op:
   outside: open sessions, active turns against the bound, parked turns,
   running processes against the process bound and how many of them are
   still in line for a slot (`queued_processes`), turns queued or ready to
-  start (`queued_turns`) with their prompt bytes (`pending_bytes`) and the
+  start (`queued_turns`) with their prompt and quoted bytes (`pending_bytes`) and the
   bounds on both (`pending_limit`, `pending_bytes_limit`), daemon-wide in-flight
   requests per shared HTTP client shard (`transport.in_flight_by_shard`),
   and every provider's model pools with their learned allowance and current
@@ -1410,6 +1431,39 @@ agent's words for a person's: `[Written by the agent NAME in
 turn:NAME/TURN, not by a person.]` for `from`, `[Sent by ORIGIN.]` for
 `origin`, and nothing for a person's prompt. `content[0]` stays the words.
 A bot made with `hide_senders` reads the words alone.
+
+A client that speaks for a person other than the daemon's own may name
+them with `person` (a name's characters, else `invalid_person`), exclusive
+with `from` and `origin`. Like `origin` it is the client's word, kept and
+reported the same way, and read by the model as `[Written by PERSON.]`; a
+prompt with a `person` is no consent to the approver, which answers to the
+daemon's own person only. A command run from a bot's sandboxed tool cannot
+send one (it would speak as a person from inside an agent).
+
+`quotes`, a list of `{bot, turn, reply?}`, copies other turns'
+words into the prompt: a turn's prompt, or with `reply: true` the last
+message the finished turn ended with. The daemon copies them at submit, so
+what a quote says is what that turn holds, never what the sender retyped,
+and keeps who first wrote them: a quoted prompt's own quotes come along
+with their writers. Each quote is a text part after the sender's line,
+behind a line naming it, `[Quoted from turn:BOT/TURN, written by a
+person:]` or `[Quoted from the reply of turn:BOT/TURN, written by the agent
+BOT:]` (`sent by ORIGIN`, `written by PERSON`, `written by the agent NAME
+in turn:NAME/TURN`); `hide_senders` leaves the lines out too. A turn that
+does not exist, a steer's reply, or a turn with no reply left (it ended
+without one, or pruning took its message events) is `quote_not_found`; a
+reply of an unfinished turn `quote_unfinished`; more than 64 quotes, those
+quoted prompts bring counted (marked `nested` in the record, which a retry
+leaves out), or words and quotes past 256 KiB together, each quote's line
+counted at 256 bytes, `quote_too_large`. The CLI's `run --quote
+BOT/TURN` (repeatable; `BOT/TURN:reply` for a reply, `turn:` prefix
+optional) sends them. `prompts` and `history_items` list a prompt's
+quotes as `quotes`, each with its writer (`from`, `origin` or `person`,
+none for a person's) and, in `prompts`, its `text` within the read's
+`bytes`, each record counted as an entry; quotes past them are left out,
+and their prompt says `quotes_more` and `truncated`; Sonny's approver reads a quote of the person's own words as
+consent only in a prompt the person sent, and any other as asking for
+nothing.
 `{"op":"prompts","bot","turn","bytes"?}` reads a turn's words and calls
 as an approver judges them, within `bytes` of text (default 64 KiB, at most
 256 KiB): the turn's prompt and each steer it absorbed, in order, with
@@ -2210,7 +2264,8 @@ it as `queued_processes`, a subset of `running_processes`, which counts every
 accepted command whose result is not yet recorded. stdout and stderr are each
 retained up to 1 MiB; beyond 64 KiB the model receives a head and tail with the
 omission stated and the full stream is stored as an artifact retrievable through
-the `artifact` operation. Output is redacted before it is stored or sent,
+the `artifact` operation, or written to the bot's `outputs` folder (see
+[retained outputs](#retained-outputs)). Output is redacted before it is stored or sent,
 artifacts included, as every tool's result is: each credential the daemon
 holds, wherever it appears; the value printed after a field name ending in
 one the daemon was started with (`--redact-field`, any case, with or without
@@ -2332,9 +2387,10 @@ gives a sandboxed command no way to it.
 Creating a sandboxed bot checks that sandboxes run here and refuses with
 `sandbox_unavailable` otherwise: on Linux, a system bubblewrap
 (`/usr/bin/bwrap`, `/bin/bwrap`, `/usr/local/bin/bwrap` or
-`/run/current-system/sw/bin/bwrap`, never one found on `PATH`, which could
-lie in a folder a bot may write) must make the user, pid and network
-namespaces; on
+`/run/current-system/sw/bin/bwrap`, or the one a package build fixed with
+`AGENT_BWRAP`, as the Homebrew formula does for its own; never one found on
+`PATH`, which could lie in a folder a bot may write) must make the user, pid
+and network namespaces; on
 macOS, `/usr/bin/sandbox-exec` must exist. A sandboxed bot never runs
 unconfined for want of one. A `writable` folder that doesn't exist is
 `path_not_found`.
@@ -2434,7 +2490,14 @@ reads, or with `"error":{"code","detail"?}` in place of `output`, a refusal
 the model reads as `{"error":CODE,"detail":DETAIL}` (a code is 1 to 64
 lowercase letters, digits or `_`; output and detail each up to 64 KiB,
 redacted as command output is; anything else is `invalid_tool_result` or
-`tool_output_limit`). The first answer counts: another is
+`tool_output_limit`). `output` may instead be a list of parts the model
+reads in that order, as providers' own tool results and MCP's take them:
+`{"type":"text","text"}` and `{"type":"image","media_type","data"}`. Its
+text is up to 64 KiB together, redacted the same way, and its pictures
+are a prompt's: up to 20 of PNG, JPEG, GIF or WebP, 5 MiB together once
+decoded, else `invalid_image` or `image_limit`. A picture counts at its
+token cost, and a result with pictures elides to its text as a read
+picture does. The client scales a picture; the daemon sends it as given. The first answer counts: another is
 `call_already_answered`, one for a call that ended or ran out of time is
 `no_pending_call` or, once its turn ended, `stale_turn`. There is no lease: a tag is the client's
 to serve.
@@ -3166,26 +3229,35 @@ next output, or with a steer absorbed after that exchange, so no call is
 separated from its result on either side and a steer at the boundary goes
 verbatim.
 
-The turn's prompt stays in view whole. The compaction records it as the
-version's `pinned` node, and while the window starts at that cut, the
+The turn's prompt stays in view whole, and so does every message sent to
+the turn before the cut: a steer or an attached message. The compaction
+records the prompt as the version's `pinned` node and those messages as
+its `pinned_messages`, and while the window starts at that cut, the
 request carries the prompt as its first item after the pinned context,
-then the items from the cut. The summary header says `covering turns A to
+then those messages in the order they came, then the items from the cut.
+So a correction sent mid-turn never reads older than the prompt it
+corrects, as it would if only the summary told of it. They count against
+the room the prompt does; when the active turn would not fit beside them,
+the oldest go into the summary first, since a later message may overrule
+an earlier one but not the other way round. The summary header says `covering turns A to
 B and the start of turn C`, or `covering the start of turn C`, and its
 list of verbatim user messages leaves out turn C's prompt, which follows
 in full; the list keeps it for when a later compaction covers the whole
 turn. The context note counts the messages it leaves out of turn C
 separately from earlier turns. A second cut in the same turn summarizes
-from the first, merging the previous summary, and keeps the same prompt.
+from the first, merging the previous summary, and keeps the same prompt
+and messages, with those sent since the first cut after them.
 Once the turn has ended, a later cut at a turn's prompt covers it whole.
 The turn keeps running for its clients throughout: events, steers,
 approvals, and its checkpoint are unchanged; only what the next request
 carries differs. Admission for steers, notes, and `history` results counts
 the turn from its prompt and cut, as the window does. A historical fork
 binds the version at or before its checkpoint and restores its cut, so a
-fork from inside a split turn sees that prompt and the tail from the cut.
-Steers absorbed before the cut are summarized with the rounds around them,
-as a covered turn's steers are. Schema 30 adds the `pinned` column; every
-earlier cut is a turn's prompt, so none has one.
+fork from inside a split turn sees that prompt, the messages that version
+kept, and the tail from the cut. A turn covered whole has its steers
+summarized with its rounds. Schema 30 adds the `pinned` column; every
+earlier cut is a turn's prompt, so none has one. Schema 65 adds the `pins`
+table of kept messages; cuts made before it keep the prompt alone.
 
 A round can take the turn past its budget before compaction is due, for
 example one large result after several small ones, or a turn that fits
