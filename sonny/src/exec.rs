@@ -657,10 +657,12 @@ async fn run(
     ))
 }
 
-/// Marks where an `image()` call's picture goes in the output, around its
-/// number: a character of the private use area, taken out of the text a
-/// script prints, so no output can name a picture.
-const MARK: char = '\u{E000}';
+/// Mark where an `image()` call's picture goes in the output, opening and
+/// closing its number: characters of the private use area, taken out of
+/// the text a script prints, so no output can name a picture. Two of them,
+/// so a mark the output's budget cut in half leaves the others whole.
+const OPEN: char = '\u{E000}';
+const CLOSE: char = '\u{E001}';
 
 /// The most pictures one result holds, and their bytes together, as the
 /// daemon takes them: a prompt's.
@@ -686,27 +688,31 @@ fn parts(text: String, pictures: Vec<Picture>) -> Value {
     let mut parts = Vec::new();
     let mut words = String::new();
     let said = |words: &mut String, parts: &mut Vec<Value>| {
+        words.retain(|c| c != CLOSE);
         let kept = words.trim_matches('\n');
         if !kept.is_empty() {
             parts.push(json!({"type": "text", "text": kept}));
         }
         words.clear();
     };
-    for (at, piece) in text.split(MARK).enumerate() {
-        // Every other piece sits between two marks: a picture's number.
-        let picture = (at % 2 == 1)
-            .then(|| piece.parse::<usize>().ok())
-            .flatten()
+    let mut rest = text.as_str();
+    while let Some(open) = rest.find(OPEN) {
+        words.push_str(&rest[..open]);
+        rest = &rest[open + OPEN.len_utf8()..];
+        // A whole mark is digits closed before the next mark opens; any
+        // other is half of one the budget cut, and is dropped.
+        let close = rest.find(CLOSE).filter(|&at| !rest[..at].contains(OPEN));
+        let picture = close
+            .and_then(|at| rest[..at].parse::<usize>().ok())
             .and_then(|n| pictures.get(n));
-        match picture {
-            Some(picture) => {
-                said(&mut words, &mut parts);
-                parts.push(json!({"type": "image", "media_type": picture.media_type,
-                    "data": picture.data}));
-            }
-            None => words.push_str(piece),
+        if let (Some(picture), Some(at)) = (picture, close) {
+            said(&mut words, &mut parts);
+            parts.push(json!({"type": "image", "media_type": picture.media_type,
+                "data": picture.data}));
+            rest = &rest[at + CLOSE.len_utf8()..];
         }
     }
+    words.push_str(rest);
     said(&mut words, &mut parts);
     Value::Array(parts)
 }
@@ -1226,7 +1232,7 @@ impl Run {
         globals.set(
             "__text",
             Function::new(ctx.clone(), move |text: String| {
-                said.lock().unwrap().push(&text.replace(MARK, ""))
+                said.lock().unwrap().push(&text.replace([OPEN, CLOSE], ""))
             })?,
         )?;
         let call = Caller {
@@ -1273,7 +1279,7 @@ impl Run {
                             PICTURE_BYTES >> 20
                         ));
                     }
-                    let mark = format!("{MARK}{}{MARK}", pictures.len());
+                    let mark = format!("{OPEN}{}{CLOSE}", pictures.len());
                     pictures.push(picture);
                     said.lock().unwrap().push(&mark);
                     Ok("shown".to_owned())
@@ -2372,7 +2378,7 @@ text(ALL_TOOLS.map(t => t.name).join(","));"#,
             &hub,
             &dir,
             &format!(
-                "text('before \\u{{E000}}0\\u{{E000}}'); image({{type: 'image', data: '{pixel}', mimeType: 'image/png'}}); text('between'); image('data:image/png;base64,{pixel}'); text('after');"
+                "text('before \\u{{E000}}0\\u{{E001}}'); image({{type: 'image', data: '{pixel}', mimeType: 'image/png'}}); text('between'); image('data:image/png;base64,{pixel}'); text('after');"
             ),
         )
         .await;
@@ -2417,6 +2423,23 @@ text(ALL_TOOLS.map(t => t.name).join(","));"#,
         );
         assert!(long.len() < 700, "{}", long.len());
         hub.stop().await;
+    }
+
+    #[test]
+    fn a_mark_the_budget_cut_leaves_the_pictures_after_it() {
+        let picture = |n: u8| Picture {
+            media_type: "image/png",
+            data: n.to_string(),
+            bytes: 1,
+        };
+        let text = format!("a\n{OPEN}0\n…cut…\n{CLOSE}\nb\n{OPEN}1{CLOSE}\nc");
+        let shown = parts(text, vec![picture(0), picture(1)]);
+        assert_eq!(
+            shown,
+            json!([{"type": "text", "text": "a\n0\n…cut…\n\nb"},
+                {"type": "image", "media_type": "image/png", "data": "1"},
+                {"type": "text", "text": "c"}])
+        );
     }
 
     #[test]
