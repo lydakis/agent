@@ -1259,7 +1259,17 @@ fn subscribe_all(home: &Path, store: &Path, bots: &HashMap<String, Option<i64>>)
         else {
             continue;
         };
-        for post in posts(&file).unwrap_or_default() {
+        // A thread it cannot read leaves the migration to run again once
+        // it can, rather than done without the thread's posters.
+        let posts = match posts(&file) {
+            Ok(posts) => posts,
+            Err(error) => {
+                eprintln!("sonny: {POSTERS} waits on {error}");
+                all = false;
+                continue;
+            }
+        };
+        for post in posts {
             let ours = |by: &&str| match (bots.get(*by), post["by_id"].as_i64()) {
                 (Some(Some(id)), Some(by_id)) => *id == by_id,
                 (Some(_), _) => true,
@@ -1655,6 +1665,22 @@ mod tests {
         crate::lookout::subs::remove(&store, "b.y", "commons.t").unwrap();
         subscribe_posters(&home, &store, &bots);
         assert!(names("b.y").is_empty());
+        // A thread it cannot read keeps the migration to do.
+        let other = home.join("other.sqlite");
+        let torn = dir(&home).join("torn.jsonl");
+        std::fs::write(&torn, "{\"by\": \"a.x\", \"text\": \"x\"}\n{torn").unwrap();
+        subscribe_posters(&home, &other, &bots);
+        let mut record = other.as_os_str().to_owned();
+        record.push(".migrated");
+        assert!(!crate::upgrade::lines(Path::new(&record)).contains(&POSTERS.to_owned()));
+        std::fs::write(&torn, "{\"by\": \"a.x\", \"text\": \"x\"}\n").unwrap();
+        subscribe_posters(&home, &other, &bots);
+        assert!(crate::upgrade::lines(Path::new(&record)).contains(&POSTERS.to_owned()));
+        let mut other_names: Vec<String> = (crate::lookout::subs::read(&other, "a.x").into_iter())
+            .map(|sub| sub.name)
+            .collect();
+        other_names.sort();
+        assert_eq!(other_names, ["commons.t", "commons.torn"]);
         let _ = std::fs::remove_dir_all(&home);
     }
 
