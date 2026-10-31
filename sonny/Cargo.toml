@@ -12,7 +12,7 @@ publish = false
 [dependencies]
 agent-client = { path = "../client" }
 # Already built for the runtime; encodes program status titles (OSC 7501).
-base64 = "0.22"
+base64 = "0.23"
 # Splits the browser tool's command lines as a shell would, running none.
 shell-words = "1"
 # Reads the browser tool's URLs as the browser does (WHATWG), already

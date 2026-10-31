@@ -33,7 +33,7 @@ version = "0.7.0"
 dependencies = [
  "agent-client",
  "aws-lc-rs",
- "base64 0.22.1",
+ "base64 0.23.1",
  "bytes",
  "dhat",
  "futures-util",
@@ -2999,7 +2999,7 @@ name = "sonny"
 version = "0.7.0"
 dependencies = [
  "agent-client",
- "base64 0.22.1",
+ "base64 0.23.1",
  "image",
  "libc",
  "open",
