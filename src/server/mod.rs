@@ -592,8 +592,12 @@ enum Command {
         reason: String,
         by: Option<String>,
     },
-    /// Lift the pause; what waited starts as capacity allows.
-    Resume,
+    /// Lift the pause; what waited starts as capacity allows. `by` names
+    /// who let the line go on, as a pause's does.
+    Resume {
+        #[serde(default)]
+        by: Option<String>,
+    },
 }
 /// The variable a Bedrock API key is read from, as the AWS tools name it.
 const BEDROCK_KEY: &str = "AWS_BEARER_TOKEN_BEDROCK";
@@ -1968,7 +1972,7 @@ impl Service {
             Command::Shutdown { .. } => return refuse("stop the daemon"),
             // Any agent may pull the cord; letting the line go on is the
             // person's, from outside any sandbox.
-            Command::Resume => return refuse("resume a pause"),
+            Command::Resume { .. } => return refuse("resume a pause"),
             // A companion runs as the daemon does, outside any sandbox.
             Command::Companions { .. } => return refuse("manage the daemon's companions"),
             _ => {}
@@ -3408,17 +3412,18 @@ impl Service {
                 }
                 Ok(json!({"pause": pause, "changed": new, "interrupted": interrupted}))
             }
-            Command::Resume => {
+            Command::Resume { by } => {
                 let lifted = store.op("remove_pause", |db| db.remove_pause()).await?;
                 self.paused = None;
                 let changed = lifted.is_some();
                 if changed {
                     // What waited starts as capacity allows.
                     self.ready_hint = true;
-                    self.notices
-                        .push(json!({"event": "resumed", "pause": lifted, "durable": false}));
+                    self.notices.push(
+                        json!({"event": "resumed", "pause": lifted, "by": by, "durable": false}),
+                    );
                 }
-                Ok(json!({"pause": lifted, "changed": changed}))
+                Ok(json!({"pause": lifted, "by": by, "changed": changed}))
             }
             Command::Companions { add, remove } => match (add, remove) {
                 (Some(_), Some(_)) => {
