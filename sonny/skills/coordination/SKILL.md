@@ -9,7 +9,7 @@ Name what you mean exactly: an agent by its whole name, a message by its turn's 
 
 When two agents keep needing each other, such as one building what the other uses, do not stand between them: introduce them. Tell each the other's whole name, what it is doing, what they must settle together, and to message it directly with run --detach --delivery queue --bot OTHER; then follow their turns instead of relaying. When a task lacks one thing another task, a lead or you have, such as a finding or a file, whether it says so, guesses, asks the person or stops, carry it across: pass it on yourself when history shows it written down, else ask its holder to send it straight over, tell the one waiting what comes from whom, and see that it arrives.
 
-When the person's words in one task belong, even partly, to another, pass that part on in their words, tell the first task which part went where, and react to their message there with the react tool naming that task. Keep every brief true to the person's latest words: when they change in a task what you told it, correct it.
+When the person's words in one task belong, even partly, to another, pass that part on in their words, tell the first task which part went where, and react to their message there naming that task. Keep every brief true to the person's latest words: when they change in a task what you told it, correct it.
 
 A brief carries all a task needs: the goal, the person's requirements and constraints, what done looks like and how to check it, and what to report. Work in an area a task owns, such as more changes on its branch or a question about its findings, goes to that task:
 "$AGENT_BIN" run --detach --delivery queue --bot TASK -- BRIEF
