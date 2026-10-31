@@ -16,12 +16,12 @@ Sonny's tools and the tasks are all real. Every permission asked is allowed, the
 and `mail`, release fixed events at each step. They include news that bears
 on the work and news that doesn't. The person's words at each step are in
 `STEPS`. A step settles once no agent has a turn running and the lead has
-been quiet for a minute. Sonny loads a trigger into the user's own launchd or systemd whatever
-HOME made it, under a label tagged with that HOME (#453), so a run's triggers
-never touch the user's own; each run still removes its triggers when it
-ends, and one an eval that stops early leaves loaded unloads itself at its
-next fire, once the run's HOME is gone (`launchctl list | grep
-me.lydakis.agent.trigger` on a Mac lists them).
+been quiet for a minute. A run's triggers live under its own HOME, fired by
+that HOME's own scheduler, one job in the user's launchd or systemd under a
+label tagged with that HOME (#453), so they never touch the user's own; each
+run still removes its triggers when it ends, and the scheduler of a run that
+stopped early lets its job go once the run's HOME is gone (`launchctl list |
+grep me.lydakis.agent.scheduler` on a Mac lists them).
 
 Output goes under `.local/role-eval/<model>/`. Each run writes `acp.jsonl`,
 `transcript.md` (what the person saw), `usage.json`, `bots.txt`, `git.txt`
