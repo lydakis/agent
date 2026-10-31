@@ -1920,8 +1920,10 @@ struct App {
     /// The lead's open questions for the person, oldest first: its `ask`
     /// calls not yet answered, nor set aside.
     asks: Vec<asks::Ask>,
-    /// Which of them what is typed answers.
-    focus: usize,
+    /// Which of them what is typed answers, by id, so it stays on that
+    /// question as others close or the conversation is drawn again; the
+    /// oldest when none was picked or the one picked is gone.
+    focus: Option<String>,
     /// Questions the conversation went on past, the person writing a
     /// message of their own after them: out of the composer and the
     /// count, their options still answering them.
@@ -2860,7 +2862,7 @@ impl App {
             calls: HashMap::new(),
             approvals: Vec::new(),
             asks: Vec::new(),
-            focus: 0,
+            focus: None,
             aside: Vec::new(),
             sent_answers: Vec::new(),
             reactions_key: record["bot_id"].as_i64().map(|id| {
@@ -5267,7 +5269,6 @@ impl App {
             self.answering = None;
             self.asks.clear();
             self.aside.clear();
-            self.focus = 0;
             self.sent_answers.clear();
         }
         self.seen_node = nodes.last().copied().unwrap_or(self.seen_node);
@@ -9086,37 +9087,28 @@ impl App {
     /// The open question what is typed answers, unless Esc set them
     /// aside for a message of the person's own.
     fn asking(&self) -> Option<&asks::Ask> {
-        (!self.chatting)
-            .then(|| self.asks.get(self.focus))
-            .flatten()
+        (!self.chatting).then(|| self.asks.get(self.at())).flatten()
+    }
+
+    /// Where the question in focus is among those open, from 0.
+    fn at(&self) -> usize {
+        let picked = self.focus.as_ref();
+        (self.asks.iter())
+            .position(|ask| Some(&ask.id) == picked)
+            .unwrap_or(0)
     }
 
     /// `ask` answered from here: closed now, its answer kept until it
     /// lands so landing closes no other asked the same.
     fn close_ask(&mut self, ask: &asks::Ask) {
-        let held = self.focused();
         self.asks.retain(|open| open.id != ask.id);
         self.aside.retain(|open| open.id != ask.id);
         self.sent_answers.push(ask.question.clone());
-        self.settle_asks(held);
+        self.settle_asks();
     }
 
-    /// The id of the question in focus, for the focus to stay on it
-    /// while others before it close.
-    fn focused(&self) -> Option<String> {
-        self.asks.get(self.focus).map(|ask| ask.id.clone())
-    }
-
-    /// The focus on the question it was on, `held`, wherever that is
-    /// now; that one gone, on the one after it, or the oldest once it
-    /// was the last; none open, typing writes again.
-    fn settle_asks(&mut self, held: Option<String>) {
-        if let Some(at) = held.and_then(|id| self.asks.iter().position(|ask| ask.id == id)) {
-            self.focus = at;
-        }
-        if self.focus >= self.asks.len() {
-            self.focus = 0;
-        }
+    /// None open, typing writes again.
+    fn settle_asks(&mut self) {
         if self.asks.is_empty() {
             self.chatting = false;
         }
@@ -9133,24 +9125,24 @@ impl App {
             self.sent_answers.remove(at);
             return;
         }
-        let held = self.focused();
         if asks::moves_on(message, from) {
             self.aside.append(&mut self.asks);
         } else if !asks::close(&mut self.asks, message) {
             asks::close(&mut self.aside, message);
         }
-        self.settle_asks(held);
+        self.settle_asks();
     }
 
     /// The composer's focus on the next open question, or the one
     /// before: Up and Down with nothing typed step through them, as a
     /// list's rows.
     fn step_ask(&mut self, down: bool) {
-        let count = self.asks.len();
-        self.focus = match down {
-            true => (self.focus + 1) % count,
-            false => (self.focus + count - 1) % count,
+        let (count, at) = (self.asks.len(), self.at());
+        let to = match down {
+            true => (at + 1) % count,
+            false => (at + count - 1) % count,
         };
+        self.focus = self.asks.get(to).map(|ask| ask.id.clone());
     }
 
     /// The bot's reactions so far to the person's message, right under
@@ -10140,7 +10132,7 @@ impl App {
             self.finding.is_some(),
         ];
         (!open.contains(&true))
-            .then(|| asks::answering_typed(ask, self.focus, self.asks.len(), width))
+            .then(|| asks::answering_typed(ask, self.at(), self.asks.len(), width))
     }
 
     /// The composer's rows: the prompt wrapped to the width, the way it
@@ -10180,7 +10172,7 @@ impl App {
             let hint = match self.running {
                 _ if let Some(ask) = answering => asks::hint(
                     ask,
-                    self.focus,
+                    self.at(),
                     self.asks.len(),
                     width.saturating_sub(prompt::LEAD),
                 ),
@@ -11806,11 +11798,44 @@ mod tests {
             ask("c6", "Bump?"),
             ask("c7", "Notes?"),
         ];
-        app.focus = 1;
+        app.focus = Some("c6".into());
         app.answered("You asked: Tag it?\n\nKeep it", None);
         assert_eq!(app.asking().map(|a| a.id.as_str()), Some("c6"));
         app.press("answer/0/c7").await;
         assert_eq!(app.asking().map(|a| a.id.as_str()), Some("c6"));
+    }
+
+    #[tokio::test]
+    async fn the_question_picked_stays_picked_when_the_conversation_is_drawn_again() {
+        let asked = |id: &str, question: &str| {
+            json!({"type": "function_call", "name": "ask", "call_id": id,
+                "arguments": json!({"question": question}).to_string()})
+        };
+        let items = json!({
+            "1": asked("a1", "Tag it?"),
+            "2": {"type": "function_call_output", "call_id": "a1", "output": "Asked."},
+            "3": asked("a2", "Bump?"),
+            "4": {"type": "function_call_output", "call_id": "a2", "output": "Asked."},
+        });
+        let client = daemon_answering(move |asked| match asked["op"].as_str() {
+            Some("history_nodes") => {
+                json!({"nodes": (1..=4).rev().map(|node| json!({"node": node}))
+                .collect::<Vec<_>>(), "next_from": null})
+            }
+            _ => json!({"items": asked["nodes"].as_array().into_iter().flatten()
+                .map(|node| json!({"node": node, "item": items[node.to_string()]}))
+                .collect::<Vec<_>>()}),
+        })
+        .await;
+        let mut app = app(client);
+        app.history().await;
+        app.step_ask(true);
+        assert_eq!(app.asking().map(|a| a.id.as_str()), Some("a2"));
+        // A repaint (the theme switched) draws it all from the start.
+        app.seen_node = 0;
+        app.history().await;
+        assert_eq!(app.asks.len(), 2);
+        assert_eq!(app.asking().map(|a| a.id.as_str()), Some("a2"));
     }
 
     #[tokio::test]
