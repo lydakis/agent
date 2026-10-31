@@ -27,7 +27,8 @@ STRUCTURAL_SCANS = {'SCAN CONSTANT ROW', 'SCAN c', 'SCAN chain', 'SCAN sqlite_ma
 
 
 def statements(source):
-    constants = dict(re.findall(r'const (COLUMNS|READING_ITEM|TURN_VIEW|PICTURELESS|REPLY_NODE): &str = "([^"]*)";', source, re.S))
+    constants = {name: value.replace('\\"', '"') for name, value in re.findall(
+        r'const (COLUMNS|READING_ITEM|TURN_VIEW|PICTURELESS|REPLY_NODE): &str = "((?:[^"\\]|\\.)*)";', source, re.S)}
     literals = re.findall(r'r?#?"((?:[^"\\]|\\.)*)"#?', source, re.S)
     for literal in literals:
         text = re.sub(r'\s+', ' ', literal.replace('\\n', ' ')).strip()
