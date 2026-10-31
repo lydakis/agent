@@ -7810,7 +7810,7 @@ impl App {
                         self.close_pane(true)
                     }
                     KeyCode::Esc => {}
-                    // `/sky`'s own keys: its legend, zen, the lenses on Tab,
+                    // `/sky`'s own keys: its legend, zen, the models' colours,
                     // a star picked and centred on; Esc lets go of the pick
                     // and the centre before it closes the pane.
                     _ if pane.is_card()
@@ -10969,7 +10969,7 @@ fn over(frame: &mut ratatui::Frame, rows: Vec<Line<'static>>, below: ratatui::la
 
 /// What the pane's title row says the keys do on `/status`.
 const STATUS_KEYS: &str = "esc close";
-const SKY_KEYS: &str = "tab lens · ↑↓←→ pick · z zen · ? legend · esc close";
+const SKY_KEYS: &str = "↑↓←→ pick · m models · z zen · ? legend · esc close";
 
 /// What the title row says the keys do on `/status` itself.
 const PICK_KEYS: &str = "↑↓ pick · enter open · esc close";

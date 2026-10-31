@@ -5,9 +5,10 @@
 //! from the middle, another agent's across, a lookout's or automation's in
 //! from the rim), a commons post ripples out, a tool call twinkles, and
 //! whoever is lit fades like a firefly. It is a calm window, kept open to
-//! watch: lines and trails are faint, a working star breathes, and only
-//! what a glance can act on has a hue, yellow `?` for what needs you and
-//! red `✗` for what failed, with cyan for a tool call's moment. Beside it,
+//! watch: every pair that has talked keeps a faint curve, as in 0.7.0, an
+//! agent at rest is a dot, a working star breathes, and only what a glance
+//! can act on has a hue, yellow `?` for what needs you and red `✗` for
+//! what failed, with cyan for a tool call's moment. Beside it,
 //! where there is room, the chat log of who talked to whom, newest at the
 //! bottom, fading as it rises. Where the sky has no room, under about 60
 //! columns or 24 rows, the same agents are a list, each with a firefly.
@@ -56,7 +57,7 @@ const FLIGHT: Duration = Duration::from_millis(1100);
 const CROWD: usize = 12;
 /// The most sparks drawn at once.
 const SPARKS: usize = 12;
-/// How long stars take to glide to new places, when the lens or the centre
+/// How long stars take to glide to new places, when the centre
 /// changes.
 const GLIDE: Duration = Duration::from_millis(330);
 /// How long a commons post's ripple spreads.
@@ -76,8 +77,9 @@ const FLASH_GROWTH: f32 = std::f32::consts::SQRT_2;
 /// The biggest, about two dozen at once, as wide as 0.7.0's commons
 /// ripple spread.
 const FLASH_MAX: f32 = 24.0;
-/// How long a pair that talked keeps a trail.
-const TRAIL: Duration = Duration::from_secs(60);
+/// The pairs that talked, newest kept, each a curve: the web of who
+/// works with whom, as in 0.7.0.
+const TALKS: usize = 96;
 /// What was said and called, kept an hour for the counts.
 const HOUR: Duration = Duration::from_secs(3600);
 /// A working star's breath, in seconds: about thirteen a minute, the
@@ -108,6 +110,23 @@ const WORKING: Color = Color::Reset;
 const NEEDS: Color = Color::Yellow;
 /// A failed call.
 const FAILED: Color = Color::Red;
+/// A message, coloured where 0.7.0 coloured it, in the visual system's
+/// hues: blue between agents, magenta to or from the person.
+const AGENTS: Color = Color::Blue;
+const YOU: Color = Color::Magenta;
+/// The models' colours on `m`, an exception to one meaning per hue as the
+/// usage chart's are: telling models apart needs a fill each. Hues the
+/// sky's messages and tools don't take first, then the bright twins.
+const MODEL_HUES: [Color; 8] = [
+    Color::Green,
+    Color::Yellow,
+    Color::LightGreen,
+    Color::LightYellow,
+    Color::LightBlue,
+    Color::LightMagenta,
+    Color::LightCyan,
+    Color::LightRed,
+];
 
 /// What the follow brings the view.
 enum Feed {
@@ -193,42 +212,13 @@ impl State {
     }
 }
 
-/// A way of looking at the same agents and events, swapped with Tab: the
-/// colours and marks hold in each, only the grouping and the lines change.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Lens {
-    /// Who made whom, and who talked in the last minute.
-    #[default]
-    Live,
-    /// Who made whom, and who talked in the last hour, the busier a pair
-    /// the denser its trail: where patterns show.
-    Talk,
-    /// Each model in a lead's place, the agents it runs round it.
-    Models,
-}
-
-impl Lens {
-    fn next(self) -> Lens {
-        match self {
-            Lens::Live => Lens::Talk,
-            Lens::Talk => Lens::Models,
-            Lens::Models => Lens::Live,
-        }
-    }
-
-    fn name(self) -> &'static str {
-        match self {
-            Lens::Live => "live",
-            Lens::Talk => "talk",
-            Lens::Models => "models",
-        }
-    }
-}
-
 struct Spark {
     from: End,
     to: End,
     born: Instant,
+    /// Blue between agents, magenta with the person; from outside, the
+    /// text's.
+    color: Option<Color>,
 }
 
 #[derive(Default)]
@@ -249,6 +239,8 @@ struct Agent {
     /// one, and it halves as a glow does.
     heat: f32,
     heated: Option<Instant>,
+    /// The burst's colour: the message's.
+    flash: Option<Color>,
     /// It asked the person something, not yet answered.
     asking: bool,
     /// Its calls that wait for the person's approval.
@@ -274,7 +266,7 @@ struct Agent {
 }
 
 impl Agent {
-    /// Its model as the models lens groups it.
+    /// Its model, as `m` colours it.
     fn model_or_unknown(&self) -> &str {
         match self.model.as_str() {
             "" => "unknown",
@@ -329,6 +321,8 @@ pub struct View {
     sparks: Vec<Spark>,
     /// Who told whom, and when, agent to agent: an hour of it.
     said: VecDeque<(Instant, usize, usize)>,
+    /// Who has told whom, past turns and live, the last told at the back.
+    talks: VecDeque<(usize, usize)>,
     /// When tools were called: an hour of it.
     calls: VecDeque<Instant>,
     /// Turns already sparked, so a queued prompt's start is not a second.
@@ -352,7 +346,8 @@ pub struct View {
     /// Only the sky: no chat log, no counts, no names but what needs the
     /// person or failed.
     pub zen: bool,
-    pub lens: Lens,
+    /// Each agent in its model's colour, on `m`.
+    pub models: bool,
     /// The agent in the middle in the person's place, by name: its own,
     /// or the label or project it was asked for by.
     centre: Option<String>,
@@ -360,8 +355,6 @@ pub struct View {
     pick: Option<String>,
     /// Where the person is: the middle, or a ring of a centred sky.
     person: Glide,
-    /// The models' names and where each sits, in the models lens.
-    groups: Vec<(String, (f32, f32))>,
     /// When the stars last set off for new places.
     moved: Option<Instant>,
     /// The pane is too small for the sky, so it shows the list.
@@ -403,6 +396,7 @@ impl View {
             index: HashMap::new(),
             sparks: Vec::new(),
             said: VecDeque::new(),
+            talks: VecDeque::new(),
             calls: VecDeque::new(),
             sent: HashSet::new(),
             ticker: VecDeque::new(),
@@ -414,11 +408,10 @@ impl View {
             paused: false,
             legend: false,
             zen: false,
-            lens: Lens::Live,
+            models: false,
             centre: None,
             pick: None,
             person: Glide::default(),
-            groups: Vec::new(),
             moved: None,
             listing: false,
             down: None,
@@ -446,6 +439,7 @@ impl View {
         self.agents.clear();
         self.index.clear();
         self.said.clear();
+        self.talks.clear();
         self.sent.clear();
         self.laid = false;
         self.sparks.clear();
@@ -491,7 +485,6 @@ impl View {
                         && self.agents[at].model != model
                     {
                         self.agents[at].model = model;
-                        self.laid = self.laid && self.lens != Lens::Models;
                     }
                 }
                 Feed::Ready => self.live = true,
@@ -535,6 +528,9 @@ impl View {
         self.said = (self.said.iter())
             .filter_map(|&(when, a, b)| Some((when, moved[a]?, moved[b]?)))
             .collect();
+        self.talks = (self.talks.iter())
+            .filter_map(|&(a, b)| Some((moved[a]?, moved[b]?)))
+            .collect();
         self.index = (self.agents.iter().enumerate())
             .map(|(at, agent)| (agent.name.clone(), at))
             .collect();
@@ -546,16 +542,17 @@ impl View {
         self.sparks.retain(|spark| {
             let done = now.duration_since(spark.born) >= FLIGHT;
             if done {
-                landed.push(spark.to);
+                landed.push((spark.to, spark.color));
             }
             !done
         });
-        for to in landed {
+        for (to, color) in landed {
             if let End::Agent(at) = to {
                 let agent = &mut self.agents[at];
                 agent.lit = Some(now);
                 agent.heat = agent.warmth(now) + 1.0;
                 agent.heated = Some(now);
+                agent.flash = color;
             }
         }
         let old = |at: &Instant| now.duration_since(*at) > HOUR;
@@ -610,7 +607,6 @@ impl View {
         let model = bot["model"].as_str().unwrap_or_default();
         if agent.model != model {
             agent.model = model.to_owned();
-            self.laid = self.laid && self.lens != Lens::Models;
         }
         Some(at)
     }
@@ -706,15 +702,31 @@ impl View {
                         self.sent.clear();
                     }
                 }
+                if let End::Agent(by) = from
+                    && by != at
+                {
+                    self.talks.retain(|pair| *pair != (by, at));
+                    self.talks.push_back((by, at));
+                    if self.talks.len() > TALKS {
+                        self.talks.pop_front();
+                    }
+                    // A past turn of the last hour counts toward its pair's
+                    // weight, at the time the daemon wrote it.
+                    if !live
+                        && let Some(written) = event["written_ms"].as_i64()
+                        && let Some(ago) = wall_ms().checked_sub(written)
+                        && let Some(when) =
+                            now.checked_sub(Duration::from_millis(ago.max(0) as u64))
+                        && now.duration_since(when) <= HOUR
+                    {
+                        self.hear(when, by, at);
+                    }
+                }
                 if live {
                     if let End::Agent(by) = from
                         && by != at
                     {
-                        // A new pair moves the rings of a centred sky.
-                        let new = !(self.said.iter())
-                            .any(|&(_, a, b)| (a, b) == (by, at) || (a, b) == (at, by));
-                        self.laid = self.laid && !(new && self.centre.is_some());
-                        self.said.push_back((now, by, at));
+                        self.hear(now, by, at);
                     }
                     self.send(from, End::Agent(at), now);
                     let by = match from {
@@ -834,6 +846,7 @@ impl View {
                         from: End::Agent(at),
                         to: End::Person,
                         born: now,
+                        color: Some(YOU),
                     });
                 }
                 self.agents[at].sender = None;
@@ -860,16 +873,31 @@ impl View {
         }
     }
 
-    /// A spark has no hue: its motion is what is seen, and where it starts
+    /// Remembers that `by` talked to `at` for the hour's weights. A pair new
+    /// to the hour moves the rings of a centred sky, past turns as live ones.
+    fn hear(&mut self, when: Instant, by: usize, at: usize) {
+        let new = !(self.said.iter()).any(|&(_, a, b)| (a, b) == (by, at) || (a, b) == (at, by));
+        self.laid = self.laid && !(new && self.centre.is_some());
+        self.said.push_back((when, by, at));
+    }
+
+    /// A spark takes the hue of who is talking (see [`hue`]); where it starts
     /// and lands says who.
     fn send(&mut self, from: End, to: End, now: Instant) {
+        // The sender bursts as the receiver will, in the message's colour.
+        let color = hue(from, to);
         if let End::Agent(at) = from {
-            self.agents[at].lit = Some(now);
+            let agent = &mut self.agents[at];
+            agent.lit = Some(now);
+            agent.heat = agent.warmth(now) + 1.0;
+            agent.heated = Some(now);
+            agent.flash = color;
         }
         self.sparks.push(Spark {
             from,
             to,
             born: now,
+            color,
         });
         self.recent.push_back(now);
     }
@@ -908,7 +936,7 @@ impl View {
     }
 
     /// Lay the agents out. The list always follows the tree of who made
-    /// whom; the sky follows the lens, or rings by hops round a centred
+    /// whom; the sky follows it too, or rings by hops round a centred
     /// agent. Stars already placed glide to their new places, so the eye
     /// keeps its bearings (Yee et al. 2001).
     fn lay(&mut self, now: Instant) {
@@ -944,10 +972,9 @@ impl View {
         for &root in &roots {
             self.agents[root].root = true;
         }
-        self.groups.clear();
         let mut person = (0.0, 0.0);
-        let places = match (self.centred(), self.lens) {
-            (Some(centre), _) => {
+        let places = match self.centred() {
+            Some(centre) => {
                 // The person is a node too, next to the leads they made.
                 let you = count;
                 let mut near: Vec<Vec<usize>> = vec![Vec::new(); count + 1];
@@ -996,28 +1023,7 @@ impl View {
                 }
                 places
             }
-            (None, Lens::Models) => {
-                let mut models: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
-                for (at, agent) in self.agents.iter().enumerate().filter(|(_, a)| !a.gone) {
-                    models.entry(agent.model_or_unknown()).or_default().push(at);
-                }
-                let names: Vec<String> = models.keys().map(|m| (*m).to_owned()).collect();
-                let mut kids: Vec<Vec<usize>> = vec![Vec::new(); count + names.len()];
-                for (n, agents) in models.into_values().enumerate() {
-                    let mut agents = agents;
-                    agents.sort_by_key(|&at| self.agents[at].name.clone());
-                    kids[count + n] = agents;
-                }
-                let groups: Vec<usize> = (count..count + names.len()).collect();
-                let (places, _) = radial(&groups, &kids, count + names.len());
-                for (n, name) in names.into_iter().enumerate() {
-                    if let Some((at, _)) = places[count + n] {
-                        self.groups.push((name, at));
-                    }
-                }
-                places
-            }
-            (None, _) => tree,
+            None => tree,
         };
         let first = self.moved.is_none() && self.agents.iter().all(|a| a.goal.is_none());
         for (at, agent) in self.agents.iter_mut().enumerate() {
@@ -1198,8 +1204,8 @@ impl View {
         }
     }
 
-    /// A key the sky takes: Tab the next lens, the arrows pick a star,
-    /// Enter centres on it, `?` the legend, `z` zen. Esc lets go of the
+    /// A key the sky takes: the arrows pick a star, Enter centres on it,
+    /// `?` the legend, `z` zen, `m` the models' colours. Esc lets go of the
     /// pick, then of the centre; false when there was nothing to let go
     /// of, or the key isn't the sky's.
     pub fn press(&mut self, code: ratatui::crossterm::event::KeyCode) -> bool {
@@ -1207,10 +1213,7 @@ impl View {
         match code {
             KeyCode::Char('?') => self.legend = !self.legend,
             KeyCode::Char('z') => self.zen = !self.zen,
-            KeyCode::Tab => {
-                self.lens = self.lens.next();
-                self.laid = false;
-            }
+            KeyCode::Char('m') => self.models = !self.models,
             KeyCode::Up if self.listing => self.step_list(false),
             KeyCode::Down if self.listing => self.step_list(true),
             KeyCode::Left | KeyCode::Right if self.listing => {}
@@ -1325,59 +1328,42 @@ impl View {
         // The person: the place and the word say who. In the middle, or
         // on a ring when an agent is centred.
         sky.text_at(self.person.at, "you", Style::default().bold());
-        // Who made whom: dotted lines, faint, as all that says how things
-        // stand rather than what happens. In the models lens none: each
-        // model's agents sit together round its muted name, and lines from
-        // a name to every agent were a hairball.
-        if self.lens != Lens::Models || centre.is_some() {
-            for (at, agent) in self.agents.iter().enumerate().filter(|(_, a)| !a.gone) {
-                if let Some(by) = self.maker(at)
-                    && !agent.root
-                    && shown[at]
-                {
-                    sky.line(self.agents[by].at, agent.at, Ink::Faint, 3);
-                }
+        // Who made whom: dotted lines, dim, as all that says how things
+        // stand rather than what happens.
+        for (at, agent) in self.agents.iter().enumerate().filter(|(_, a)| !a.gone) {
+            if let Some(by) = self.maker(at)
+                && !agent.root
+                && shown[at]
+            {
+                sky.line(self.agents[by].at, agent.at, Ink::Muted, 3);
             }
         }
-        // Who talked: a faint trail for each pair. Live, the last minute,
-        // its dots thinning out as it ages; in the talk lens the last hour,
-        // denser the more the pair talked, the busiest reaching muted.
-        let span = match self.lens {
-            Lens::Talk => HOUR,
-            _ => TRAIL,
-        };
-        let mut trails: HashMap<(usize, usize), (Instant, usize)> = HashMap::new();
+        // Who talked: a curve for each pair that has, past turns and live,
+        // as in 0.7.0; told both ways, two, as each bends its own way. The
+        // more a pair talked this hour the heavier its curve: denser, and
+        // plain for the busiest, so where the work is shows.
+        let mut hour: HashMap<(usize, usize), usize> = HashMap::new();
         for &(when, by, to) in self.said.iter().rev() {
-            if now.duration_since(when) > span {
+            if now.duration_since(when) > HOUR {
                 break;
             }
-            trails
-                .entry((by.min(to), by.max(to)))
-                .or_insert((when, 0))
-                .1 += 1;
+            *hour.entry((by.min(to), by.max(to))).or_default() += 1;
         }
-        let busiest = trails.values().map(|&(_, n)| n).max().unwrap_or(1);
-        for ((a, b), (when, n)) in trails {
-            if self.agents[a].gone || self.agents[b].gone {
+        let busiest = hour.values().copied().max().unwrap_or(1);
+        for &(by, to) in &self.talks {
+            if !(shown[by] && shown[to]) || self.agents[by].gone || self.agents[to].gone {
                 continue;
             }
-            let (ink, gap) = match self.lens {
-                Lens::Talk => {
-                    // Gaps from 10 dots for one message down to 2.
-                    let share = n as f32 / busiest as f32;
-                    let ink = if share > 0.6 && n >= 4 {
-                        Ink::Muted
-                    } else {
-                        Ink::Faint
-                    };
-                    (ink, 2 + (8.0 * (1.0 - share.sqrt())) as usize)
-                }
-                _ => {
-                    let age = now.duration_since(when).as_secs_f32() / TRAIL.as_secs_f32();
-                    (Ink::Faint, 4 + (age * 8.0) as usize)
-                }
+            let n = hour.get(&(by.min(to), by.max(to))).copied().unwrap_or(0);
+            let share = n as f32 / busiest as f32;
+            // Every 4th dot for a pair quiet this hour, down to every 2nd.
+            let gap = 4 - (2.0 * share.sqrt()).round() as usize;
+            let ink = if share > 0.6 && n >= 4 {
+                Ink::Plain
+            } else {
+                Ink::Muted
             };
-            let (a, b) = (self.agents[a].at, self.agents[b].at);
+            let (a, b) = (self.agents[by].at, self.agents[to].at);
             sky.curve(a, bend(a, b), b, ink, gap);
         }
         // Ripples and flashes, then sparks, then the stars over them.
@@ -1397,7 +1383,11 @@ impl View {
                 0.5f32.powf(now.duration_since(at).as_secs_f32() / HALF_LIFE)
             });
             if glow > 0.08 {
-                let ink = if glow > 0.4 { Ink::Muted } else { Ink::Faint };
+                let ink = match agent.flash {
+                    Some(color) => Ink::Color(color, glow > 0.4),
+                    None if glow > 0.4 => Ink::Bright,
+                    None => Ink::Plain,
+                };
                 let doublings = agent.heat.max(1.0).log2();
                 let burst = (FLASH * FLASH_GROWTH.powf(doublings)).min(FLASH_MAX);
                 sky.circle(agent.at, burst * (0.25 + 0.75 * glow), ink);
@@ -1417,14 +1407,19 @@ impl View {
                     break;
                 }
                 let at = bezier(a, control, b, ease(back));
+                let ink = match spark.color {
+                    Some(color) => Ink::Color(color, step < 3),
+                    None if step < 3 => Ink::Bright,
+                    None => Ink::Plain,
+                };
                 match step {
-                    0 => sky.blob(at, Ink::Bright),
-                    1 | 2 => sky.dot(at, Ink::Bright),
-                    _ => sky.dot(at, Ink::Muted),
+                    0 => sky.blob(at, ink),
+                    _ => sky.dot(at, ink),
                 }
             }
         }
         let shade = Shade::now();
+        let hues: HashMap<String, Color> = self.hues().into_iter().collect();
         // The folded: a faint dot each, so a cloud's density says its size,
         // and a count on each arm.
         let mut folded: HashMap<usize, (usize, (f32, f32))> = HashMap::new();
@@ -1444,14 +1439,24 @@ impl View {
                 sky.twinkle(agent.at, work, Ink::Color(color, true));
             }
             // What needs the person or failed, still in its colour; a
-            // working star breathes; an idle one rests, muted.
-            let ink = match agent.state() {
-                Some(State::NeedsYou) => Ink::Color(NEEDS, true),
-                Some(State::Failed) => Ink::Color(FAILED, true),
-                Some(State::Working) => shade.breathe(agent.breath(now, self.opened)),
-                None => Ink::Muted,
+            // working star breathes. As in 0.7.0, those are blobs, and so
+            // is one a message lights; one at rest is a single dot.
+            // On `m`, each in its model's colour instead, bold while it
+            // works.
+            let hue = (self.models)
+                .then(|| hues.get(agent.model_or_unknown()).copied())
+                .flatten();
+            let (ink, big) = match (hue, agent.state()) {
+                (Some(hue), state) => {
+                    let big = state.is_some() || agent.glow(now) > 0.4;
+                    (Ink::Color(hue, big), big)
+                }
+                (None, Some(State::Working)) => {
+                    (shade.breathe(agent.breath(now, self.opened)), true)
+                }
+                (None, _) => (Ink::Plain, agent.glow(now) > 0.4),
             };
-            sky.star(agent.at, ink);
+            sky.star(agent.at, ink, big);
         }
         // Names: leads always, others while working or lit, nearest the
         // middle first, never over each other. In zen, only what needs the
@@ -1525,11 +1530,6 @@ impl View {
                 _ => name_style(agent.state(), agent.glow(now)),
             };
             placed += usize::from(sky.label(agent.at, mark, &short(&agent.name), style));
-        }
-        if self.lens == Lens::Models && centre.is_none() && !self.zen {
-            for (model, at) in &self.groups {
-                sky.label(*at, None, model, Ink::Muted.style());
-            }
         }
         for (arm, n) in unnamed {
             let mark = Some(("?", Style::default().fg(NEEDS).bold()));
@@ -1655,20 +1655,27 @@ impl View {
             Line::from(spans)
         };
         lines.extend([
-            row(Span::raw("⠛").dim(), vec![says("   an agent, at rest")]),
+            row(Span::raw("⠂"), vec![says("   an agent, at rest")]),
             row(Span::raw("⠛").bold(), vec![says("   working: it breathes")]),
             row(
-                Span::raw("⠛").fg(NEEDS),
-                vec![Span::raw("   ? needs you").fg(NEEDS)],
+                Span::raw("?").fg(NEEDS),
+                vec![says("   by a name: it needs you")],
             ),
             row(
-                Span::raw("⠛").fg(FAILED),
-                vec![Span::raw("   ✗ failed").fg(FAILED)],
+                Span::raw("✗").fg(FAILED),
+                vec![says("   by a name: it failed")],
             ),
-            row(Span::raw("⠶").bold(), vec![says("   a message on its way")]),
             row(
-                Span::styled("○", Ink::Muted.style()),
-                vec![says("   it lands: the busier, the bigger")],
+                Span::raw("⠶").fg(AGENTS).bold(),
+                vec![says("   a message between agents")],
+            ),
+            row(
+                Span::raw("⠶").fg(YOU).bold(),
+                vec![says("   to or from you")],
+            ),
+            row(
+                Span::raw("○").fg(AGENTS),
+                vec![says("   a burst: the busier, the bigger")],
             ),
             row(
                 Span::raw("⠤⠤").fg(TOOL),
@@ -1693,7 +1700,7 @@ impl View {
                 vec![says("   a commons post, by its reach")],
             ),
             row(
-                Span::styled("⠁⠈", Ink::Faint.style()),
+                Span::styled("⠁⠈", Ink::Muted.style()),
                 vec![says("  who made whom, who talked")],
             ),
             Line::default(),
@@ -1741,6 +1748,26 @@ impl View {
         }
         lines.truncate(rows);
         lines
+    }
+
+    /// Each model's colour on `m`: the most agents' first, then by name,
+    /// a hue each while they last; the rest share the text's.
+    fn hues(&self) -> Vec<(String, Color)> {
+        let mut models: HashMap<&str, usize> = HashMap::new();
+        for agent in self.agents.iter().filter(|a| !a.gone) {
+            *models.entry(agent.model_or_unknown()).or_default() += 1;
+        }
+        let mut models: Vec<(&str, usize)> = models.into_iter().collect();
+        models.sort_by_key(|&(model, n)| (std::cmp::Reverse(n), model));
+        (models.into_iter())
+            .map(|(model, _)| model.to_owned())
+            .zip(
+                MODEL_HUES
+                    .iter()
+                    .copied()
+                    .chain(std::iter::repeat(Color::Reset)),
+            )
+            .collect()
     }
 
     fn end(&self, end: End) -> (f32, f32) {
@@ -1843,7 +1870,24 @@ impl View {
             ))
             .dim(),
         ];
-        for state in [State::NeedsYou, State::Working, State::Failed] {
+        // On `m`, which colour is which model, as many as fit.
+        if self.models {
+            for (model, hue) in self.hues() {
+                let key = format!(" ⠛ {model}");
+                let used: usize = spans.iter().map(|span| span.content.width()).sum();
+                if used + 3 + key.width() > width {
+                    break;
+                }
+                spans.push(Span::raw(" ·").dim());
+                spans.push(Span::raw(" ⠛").fg(hue));
+                spans.push(Span::raw(format!(" {model}")).dim());
+            }
+        }
+        let states = match self.models {
+            true => &[][..],
+            false => &[State::NeedsYou, State::Working, State::Failed][..],
+        };
+        for &state in states {
             let n = shown.iter().filter(|a| a.state() == Some(state)).count();
             if n > 0 || state == State::Working {
                 let (mark, color, word) = state.mark();
@@ -1857,13 +1901,8 @@ impl View {
                 spans.push(Span::raw(format!(" {n} {word}")).dim());
             }
         }
-        // The lens, when not the live one, and who is in the middle.
+        // Who is in the middle.
         let mut seen = String::new();
-        match self.lens {
-            Lens::Live => {}
-            Lens::Talk => seen.push_str(" · talk lens: the last hour"),
-            lens => seen.push_str(&format!(" · {} lens", lens.name())),
-        }
         if let Some(at) = self.centred() {
             seen.push_str(&format!(" · around {}", self.short(at)));
         }
@@ -1918,11 +1957,13 @@ fn legend(list: bool) -> Vec<Line<'static>> {
     }
     lines.extend([
         Line::from(vec![
-            Span::raw("⠶").bold(),
-            says(" a message on its way  "),
+            mark("⠶", AGENTS),
+            says(" between agents  "),
+            mark("⠶", YOU),
+            says(" with you  "),
             Span::styled("◯", Ink::Muted.style()),
             says(" a commons post  "),
-            Span::styled("⠁⠈⠁", Ink::Faint.style()),
+            Span::styled("⠁⠈⠁", Ink::Muted.style()),
             says(" who made whom, who talked"),
         ]),
         Line::from(vec![
@@ -1953,6 +1994,23 @@ fn name_style(state: Option<State>, glow: f32) -> Style {
         None if glow > 0.08 => Style::default(),
         None => Style::default().add_modifier(Modifier::DIM),
     }
+}
+
+/// A message's colour: magenta to or from the person, blue between agents,
+/// none from outside (a lookout's or an automation's).
+fn hue(from: End, to: End) -> Option<Color> {
+    match (from, to) {
+        (End::Person, _) | (_, End::Person) => Some(YOU),
+        (End::Agent(_), End::Agent(_)) => Some(AGENTS),
+        _ => None,
+    }
+}
+
+/// The wall clock in Unix ms, as the daemon stamps events.
+fn wall_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_millis() as i64)
 }
 
 /// How long ago, as the ticker says it.
@@ -2243,15 +2301,13 @@ impl Sky {
         (w / 2.0 + x * across, h / 2.0 + y * down)
     }
 
-    /// How many dots the unit disc's radius takes across and down: an
-    /// ellipse that fills the canvas, two dots in from its edges, never
-    /// more than twice as wide as high, so a wide pane's sky has no empty
-    /// sides and a ring still reads as one.
+    /// How many dots the unit disc's radius takes across and down: a
+    /// circle, as in 0.7.0, two dots in from the canvas's nearer edges, so
+    /// curves bend evenly and a centred sky's rings are rings.
     fn scale(&self) -> (f32, f32) {
         let (w, h) = (self.cols as f32 * 2.0, self.rows as f32 * 4.0);
-        let down = (h / 2.0 - 2.0).max(1.0);
-        let across = (w / 2.0 - 2.0).clamp(1.0, 2.0 * down);
-        (across, down)
+        let radius = (w.min(h) / 2.0 - 2.0).max(1.0);
+        (radius, radius)
     }
 
     fn plot(&mut self, x: f32, y: f32, ink: Ink) {
@@ -2292,8 +2348,12 @@ impl Sky {
         }
     }
 
-    fn star(&mut self, at: (f32, f32), ink: Ink) {
-        self.blob(at, ink);
+    /// An agent: a blob, or at rest a dot; names keep off either.
+    fn star(&mut self, at: (f32, f32), ink: Ink, big: bool) {
+        match big {
+            true => self.blob(at, ink),
+            false => self.dot(at, ink),
+        }
         let (row, cols) = self.covers(at);
         for col in cols.filter(|_| row < self.rows) {
             self.stars[row * self.cols + col] = true;
@@ -2450,6 +2510,15 @@ impl Sky {
         for (cell, ch) in cells.zip(words.chars()) {
             self.text[cell] = Some((ch, style));
         }
+        // A cell of clear sky either side, as a map's names mask the lines
+        // under their edges, so a dense web never runs into the words.
+        let sides = [
+            start.checked_sub(1),
+            Some(start + count).filter(|&c| c < self.cols),
+        ];
+        for col in sides.into_iter().flatten() {
+            self.dots[row * self.cols + col] = 0;
+        }
         true
     }
 
@@ -2489,7 +2558,7 @@ const FRAME: Duration = Duration::from_millis(60);
 /// How long `sonny sky` waits before following a daemon that went again.
 const RETRY: Duration = Duration::from_secs(3);
 /// What the keys do in `sonny sky`.
-const KEYS: &str = "tab lens · ↑↓←→ pick · z zen · ? legend · q quit";
+const KEYS: &str = "↑↓←→ pick · m models · z zen · ? legend · q quit";
 
 /// `sonny sky`: the same sky, the whole terminal, on its own, to keep
 /// beside the work as btop is kept: its title and the keys over it, the
@@ -2684,7 +2753,7 @@ async fn follow(socket: PathBuf, send: mpsc::UnboundedSender<Feed>) {
             _ => {}
         }
         // A configured agent is read again: the event says only what
-        // changed, and the models lens needs its model.
+        // changed, and `m` colours by its model.
         if event["event"] == "configured" {
             let model = event["changed"]
                 .as_array()
@@ -2896,6 +2965,7 @@ mod tests {
                 from: End::Person,
                 to: End::Agent(0),
                 born: at - FLIGHT,
+                color: None,
             });
             view.land(at);
         };
@@ -2978,16 +3048,24 @@ mod tests {
         assert!(view.press(KeyCode::Enter));
         assert_eq!(view.centre.as_deref(), Some(picked.as_str()));
         assert!(view.pick.is_none());
-        // The models lens groups by model, its names muted on the sky.
+        // `m` colours each agent by its model where it stands, the
+        // footer saying which colour is which.
         view.centre_on(None);
-        assert!(view.press(KeyCode::Tab));
-        assert!(view.press(KeyCode::Tab));
-        assert_eq!(view.lens, Lens::Models);
         view.card(120, 40);
-        view.moved = None;
-        let sky = text(&view.card(120, 40));
-        assert!(sky.contains("m1") && sky.contains("m2"), "{sky}");
-        assert_eq!(view.groups.len(), 2);
+        let goal = view.agents[view.index["shop.login"]].goal;
+        assert!(view.press(KeyCode::Char('m')));
+        assert!(view.models);
+        let hues = view.hues();
+        assert_eq!(hues.len(), 2);
+        let footer = view.footer(120).to_string();
+        assert!(
+            footer.contains("⠛ m1") && footer.contains("⠛ m2"),
+            "{footer}"
+        );
+        view.card(120, 40);
+        assert_eq!(view.agents[view.index["shop.login"]].goal, goal);
+        assert!(view.press(KeyCode::Char('m')));
+        assert!(!view.models);
     }
 
     #[tokio::test]
@@ -3153,7 +3231,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn past_turns_spark_nothing_and_leave_no_trail() {
+    async fn past_turns_spark_nothing_but_keep_who_talked() {
         let (mut view, send) = view();
         send.send(Feed::Roll(vec![json!({"name": "a"}), json!({"name": "b"})]))
             .unwrap();
@@ -3162,11 +3240,69 @@ mod tests {
         ))
         .unwrap();
         view.drain();
-        // The past keeps no trails: they say what happens now.
+        // The past sparks nothing and counts nothing, but who talked to
+        // whom keeps its curve, as in 0.7.0.
         assert!(view.sparks.is_empty());
         assert!(view.said.is_empty());
+        assert_eq!(view.talks, [(view.index["a"], view.index["b"])]);
         assert!(view.ticker.is_empty());
         assert!(view.agents.iter().all(|a| a.running.is_none()));
+    }
+
+    #[tokio::test]
+    async fn the_legend_beside_the_sky_fits_its_column() {
+        let (mut view, send) = view();
+        send.send(Feed::Roll(vec![json!({"name": "a"})])).unwrap();
+        view.drain();
+        for line in view.key(Instant::now(), 40) {
+            let width: usize = line.spans.iter().map(|span| span.content.width()).sum();
+            assert!(width <= LOG_COLS, "{line}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_past_turn_of_the_last_hour_weighs_on_its_pair() {
+        let (mut view, send) = view();
+        send.send(Feed::Roll(vec![
+            json!({"name": "a"}),
+            json!({"name": "b"}),
+            json!({"name": "c"}),
+        ]))
+        .unwrap();
+        let minutes = |n: i64| wall_ms() - n * 60_000;
+        send.send(Feed::Past(
+            json!({"event": "accepted", "bot": "b", "turn": 1,
+            "written_ms": minutes(10), "data": {"from": {"bot": "a"}}}),
+        ))
+        .unwrap();
+        send.send(Feed::Past(
+            json!({"event": "accepted", "bot": "c", "turn": 1,
+            "written_ms": minutes(90), "data": {"from": {"bot": "a"}}}),
+        ))
+        .unwrap();
+        view.drain();
+        // Both keep their curve; only the one this hour counts.
+        let (a, b, c) = (view.index["a"], view.index["b"], view.index["c"]);
+        assert_eq!(view.talks, [(a, b), (a, c)]);
+        assert_eq!(
+            view.said
+                .iter()
+                .map(|&(_, by, to)| (by, to))
+                .collect::<Vec<_>>(),
+            [(a, b)]
+        );
+        let ago = view.said[0].0.elapsed().as_secs();
+        assert!((595..=605).contains(&ago), "{ago}");
+        // On a centred sky, a past pair new to the hour lays the rings again.
+        view.centre = Some("a".to_owned());
+        view.laid = true;
+        send.send(Feed::Past(
+            json!({"event": "accepted", "bot": "c", "turn": 2,
+            "written_ms": minutes(5), "data": {"from": {"bot": "a"}}}),
+        ))
+        .unwrap();
+        view.drain();
+        assert!(!view.laid);
     }
 
     #[tokio::test]
