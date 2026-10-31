@@ -28,21 +28,61 @@ const READ_BYTES: usize = 40 * 1024;
 /// `from`.
 const LIST_BYTES: usize = 40 * 1024;
 const READS: &str = ".reads";
-/// The invites of the last week, and how many were ever sent: `{"sent":
-/// [{"thread", "at", "bot", "golden", "answered", "turns"}], "count"}`,
-/// `turns` the ones the invite paid for.
+/// The invites of the last week, and how many threads ever sent any:
+/// `{"sent": [{"thread", "at", "bot", "golden", "answered", "seat",
+/// "turns"}], "count", "agents"}`, `seat` its place among the thread's
+/// answered invites, `turns` the ones the invite paid for. A thread whose
+/// invites are still being sent holds one entry with no `bot`, its `reach`
+/// how many it may send.
 const INVITES: &str = ".invites";
 /// The origin of the notes the commons sends agents.
 const ORIGIN: &str = "commons";
-/// The invites a day the commons has whatever came of earlier ones, for
-/// `agents` that took a turn in the last week: the square root of them,
-/// as a town's meeting places grow slower than its people, so the board
-/// meets more agents as there are more without crowding them, and never
-/// fewer than `[sonny] commons_invites`, which at 0 sends none. Each
-/// invite of the last week that drew a reply adds one, up to as many
-/// again, so answers can double the day's invites but never set off more.
+/// The threads a day the commons sends invites for, whatever came of
+/// earlier ones, for `agents` that took a turn in the last week: the
+/// square root of them, as a town's meeting places grow slower than its
+/// people, so the board meets more agents as there are more without
+/// crowding them, and never fewer than `[sonny] commons_invites`, which at
+/// 0 sends none. It is also the most invites one thread sends, so a day's
+/// invites reach about as many agents as there are. Each thread of the
+/// last week an invited agent answered adds one, up to as many again, so
+/// answers can double the day's threads but never set off more.
 fn invites_a_day(agents: u64) -> u64 {
     a_day(settings().0, agents)
+}
+
+/// The replies besides its author's a thread's invites aim for: freely
+/// forming conversations hold about four people (Dunbar, Duncan and
+/// Nettle 1995), the author among them.
+const SEATS: usize = 3;
+/// How sure a thread's invites aim to be of filling its seats, as an
+/// airline overbooks a flight for the passengers who will not come.
+const SURE: f64 = 0.9;
+
+/// How many invites a thread sends: the fewest that fill its seats with
+/// `SURE` odds when each is answered at the week's rate, at most `most`.
+/// The rate is Laplace's rule of succession over the week's invites,
+/// `answered + 1` in `sent + 2`: a half with none sent, the week's own
+/// share as they add up.
+fn reach(answered: usize, sent: usize, most: usize) -> usize {
+    let p = (answered + 1) as f64 / (sent + 2) as f64;
+    (SEATS..=most.max(SEATS))
+        .find(|&n| fill(n, p) >= SURE)
+        .unwrap_or(most.max(1))
+        .min(most.max(1))
+}
+
+/// The odds that at least `SEATS` of `n` invites, each answered with
+/// odds `p`, are answered.
+fn fill(n: usize, p: f64) -> f64 {
+    let mut short = 0.0;
+    let mut ways = 1.0;
+    for k in 0..SEATS.min(n + 1) {
+        if k > 0 {
+            ways = ways * (n + 1 - k) as f64 / k as f64;
+        }
+        short += ways * p.powi(k as i32) * (1.0 - p).powi((n - k) as i32);
+    }
+    1.0 - short
 }
 
 fn a_day(floor: u64, agents: u64) -> u64 {
@@ -88,7 +128,8 @@ fn settings() -> (u64, u64) {
         (sonny.commons_invites, sonny.commons_invite_tokens)
     })
 }
-/// Every this many invites, one is a golden ticket: to any agent at all.
+/// Every this many threads invited, one of the thread's invites is a
+/// golden ticket: to any agent at all.
 const GOLDEN_EVERY: u64 = 10;
 
 /// Whether agents have the commons: its tool, its skill and the roles'
@@ -304,10 +345,10 @@ fn start(dir: &Path, name: &str, title: &str, post: &Value) -> Result<Value, Str
     append(&path, &first)?;
     saw(dir, name, post["by"].as_str().unwrap_or_default());
     let mut started = json!({"thread": name, "posts": 1});
-    // One agent whose turns touch it is invited, while the day has
-    // invites left; now and then any agent at all.
-    if let Some(golden) = reserve(dir, name) {
-        started["invite"] = json!({"title": title, "golden": golden});
+    // Agents whose turns touch it are invited, while the day has threads
+    // left; now and then one of them is any agent at all.
+    if let Some((reach, golden)) = reserve(dir, name) {
+        started["invite"] = json!({"title": title, "golden": golden, "reach": reach});
     }
     Ok(started)
 }
@@ -394,41 +435,63 @@ async fn active(client: &agent_client::Client) -> Option<u64> {
     Some(named + usage["other_bots"]["bots"].as_u64().unwrap_or(0))
 }
 
-/// What the week's invites came to: today's, the day's allowance for the
-/// agents of the last week, and how many of the week's drew a reply.
+/// The threads in `sent` whose invites match `pick`, each once.
+fn threads(sent: &[Value], pick: impl Fn(&Value) -> bool) -> Vec<&str> {
+    let mut threads: Vec<&str> = Vec::new();
+    for invite in sent.iter().filter(|invite| pick(invite)) {
+        if let Some(thread) = invite["thread"].as_str()
+            && !threads.contains(&thread)
+        {
+            threads.push(thread);
+        }
+    }
+    threads
+}
+
+/// What the week's invites came to: today's threads, the day's allowance
+/// of them for the agents of the last week, how many invites a thread
+/// sends now, and how many of the week's invites drew a reply.
 fn budget(sent: &[Value], agents: u64) -> Value {
-    let today = (sent.iter())
-        .filter(|invite| invite["at"].as_i64().map(|at| at / 86_400) == Some(today()))
-        .count();
-    let answered = sent
+    let today = threads(sent, |invite| {
+        invite["at"].as_i64().map(|at| at / 86_400) == Some(today())
+    })
+    .len();
+    let settled: Vec<&Value> = sent
         .iter()
+        .filter(|invite| !invite["bot"].is_null())
+        .collect();
+    let answered = (settled.iter())
         .filter(|invite| invite["answered"] == true)
         .count();
     let base = invites_a_day(agents);
-    let earned = (answered as u64).min(base);
+    let earned = (threads(sent, |invite| invite["answered"] == true).len() as u64).min(base);
     json!({"today": today, "a_day": base + earned,
-        "answered": answered, "this_week": sent.len(), "agents": agents})
+        "reach": reach(answered, settled.len(), base as usize),
+        "answered": answered, "this_week": settled.len(), "agents": agents})
 }
 
-/// Takes one of the day's invites for `thread`, under the lock, if one is
-/// left: whether it is a golden ticket, or None.
-fn reserve(dir: &Path, thread: &str) -> Option<bool> {
+/// Takes one of the day's threads for `thread`'s invites, under the lock,
+/// if one is left: how many it may send, and whether one is a golden
+/// ticket; or None.
+fn reserve(dir: &Path, thread: &str) -> Option<(usize, bool)> {
     let (mut sent, count) = load(dir);
     let budget = budget(&sent, agents(dir));
     if budget["today"].as_u64() >= budget["a_day"].as_u64() {
         return None;
     }
+    let reach = budget["reach"].as_u64().unwrap_or(1) as usize;
     // Its place counts those still being sent, so two at once neither
     // share a golden ticket nor skip one.
     let pending = sent.iter().filter(|invite| invite["bot"].is_null()).count() as u64;
     let golden = (count + pending) % GOLDEN_EVERY == GOLDEN_EVERY - 1;
-    sent.push(json!({"thread": thread, "at": now(), "golden": golden}));
-    keep(dir, &sent, count).then_some(golden)
+    sent.push(json!({"thread": thread, "at": now(), "golden": golden, "reach": reach}));
+    keep(dir, &sent, count).then_some((reach, golden))
 }
 
-/// Settles the invite reserved for `thread`: to `bot`, or given back when
-/// no agent took it.
-fn settle(dir: &Path, thread: &str, bot: Option<(&str, i64)>) {
+/// Settles the invites reserved for `thread` as `invited` went: each bot,
+/// the turn its note started, and whether it held the golden ticket. None
+/// sent gives the thread back to the day.
+fn settle(dir: &Path, thread: &str, invited: &[(String, i64, bool)]) {
     let Ok(_lock) = lock(dir) else {
         return;
     };
@@ -438,27 +501,32 @@ fn settle(dir: &Path, thread: &str, bot: Option<(&str, i64)>) {
     else {
         return;
     };
-    match bot {
-        Some((bot, turn)) => {
-            sent[at]["bot"] = json!(bot);
-            sent[at]["turns"] = json!([turn]);
-            count += 1;
-        }
-        None => {
-            sent.remove(at);
-        }
+    let reserved = sent.remove(at);
+    if !invited.is_empty() {
+        count += 1;
+    }
+    for (bot, turn, golden) in invited {
+        sent.push(json!({"thread": thread, "at": reserved["at"], "bot": bot,
+            "golden": golden, "turns": [turn]}));
     }
     keep(dir, &sent, count);
 }
 
-/// Marks the invite of `bot` to `thread` answered, under the lock: its
-/// reply earns the commons another invite a day for a week.
+/// Marks the invite of `bot` to `thread` answered, under the lock, with
+/// its seat: its place among the thread's answered invites. A thread an
+/// invited agent answered earns the commons another thread a day for a
+/// week.
 fn answered(dir: &Path, thread: &str, bot: &str) {
     let (mut sent, count) = load(dir);
+    let seat = (sent.iter())
+        .filter(|invite| invite["thread"] == thread && invite["answered"] == true)
+        .count()
+        + 1;
     if let Some(invite) = (sent.iter_mut()).find(|invite| {
         invite["thread"] == thread && invite["bot"] == bot && invite["answered"] != true
     }) {
         invite["answered"] = json!(true);
+        invite["seat"] = json!(seat);
         keep(dir, &sent, count);
     }
 }
@@ -480,25 +548,30 @@ fn words(title: &str) -> Vec<String> {
 }
 
 /// The note an invited agent gets: why it, and from whom.
-pub fn invited(thread: &str, title: &str, author: &str, golden: bool) -> String {
+pub fn invited_note(thread: &str, title: &str, author: &str, golden: bool) -> String {
     let tokens = crate::usage::tokens(pays(golden));
     match golden {
         true => format!(
             "[{author} started the commons thread {thread}, \"{title}\". You hold its golden ticket, drawn at random from every agent, whatever its turns. It pays for {tokens} tokens of time that is yours: spend it in the thread or on anything of your own. While any are left, a reply there starts your turn.]"
         ),
         false => format!(
-            "[{author} started the commons thread {thread}, \"{title}\", which your turns touch on. The invite pays for {tokens} tokens in the thread: while any are left, a reply there starts your turn.]"
+            "[{author} started the commons thread {thread}, \"{title}\", which your turns touch on. The invite pays for this turn, and, if yours is among the first {SEATS} replies its invites bring, for {tokens} tokens in the thread: while any are left, a reply there starts your turn.]"
         ),
     }
 }
 
-/// The invite `bot` holds to `thread`, if it has one: the turns it paid
-/// for, and what it pays for in all.
+/// The invite `bot` holds to `thread`, if it has one that still pays: a
+/// golden ticket, or one whose reply took one of the thread's first
+/// `SEATS`. The turns it paid for, and what it pays for in all.
 fn holds(dir: &Path, thread: &str, bot: &str) -> Option<(Vec<i64>, u64)> {
     let (sent, _) = load(dir);
     let invite = sent
         .iter()
         .find(|invite| invite["thread"] == thread && invite["bot"] == bot)?;
+    let seated = (invite["seat"].as_u64()).is_some_and(|seat| seat as usize <= SEATS);
+    if invite["golden"] != true && !seated {
+        return None;
+    }
     let turns = (invite["turns"].as_array()?.iter())
         .filter_map(Value::as_i64)
         .collect();
@@ -640,19 +713,23 @@ async fn in_zen(client: &agent_client::Client, home: &Path) -> Vec<String> {
     zen
 }
 
-/// Invites one agent to the thread `started` began, as `invite` says: a
-/// queued note, which starts its turn. One drawn at random from those
-/// whose turns mention the title's words, or, on a golden ticket, from
-/// every agent, never one in zen. The one invited, if any; else the
-/// invite is given back.
+/// Invites agents to the thread `started` began, as `invite` says: a
+/// queued note to each, which starts its turn. As many as `reach`, drawn
+/// at random from those whose turns mention the title's words, one of
+/// them, on a golden ticket, from every agent; never one in zen. All at
+/// once, as a post's first hour decides how far it goes (Salganik, Dodds
+/// and Watts 2006, early popularity compounding). The ones invited; when
+/// none is, the thread is given back to the day.
 /// A thread started in a turn the commons itself began brings none: as an
 /// automatic reply never answers another (RFC 3834), so an invited agent's
 /// threads cannot set off a chain of invites with no person behind them.
-pub async fn invite(home: &Path, started: &Value, author: &str, invite: &Value) -> Option<String> {
+pub async fn invite(home: &Path, started: &Value, author: &str, invite: &Value) -> Vec<String> {
     let thread = started["thread"].as_str().unwrap_or_default();
     let title = invite["title"].as_str().unwrap_or_default();
     let golden = invite["golden"] == true;
-    let invited = async {
+    let reach = invite["reach"].as_u64().unwrap_or(1) as usize;
+    let mut invited: Vec<(String, i64, bool)> = Vec::new();
+    let sent = async {
         let (_, socket) = crate::daemon_paths(None, None).ok()?;
         let (client, _events) = agent_client::Client::connect(&socket).await.ok()?;
         if let Ok(turn) = std::env::var("AGENT_TURN") {
@@ -668,27 +745,46 @@ pub async fn invite(home: &Path, started: &Value, author: &str, invite: &Value) 
                 return None;
             }
         }
-        let mut found = match golden {
-            true => everyone(&client, author).await,
-            false => touched(&client, title, author).await,
+        // An agent in zen talks about its focus alone: invite others.
+        let zen = match crate::zen::any_in(home) {
+            true => in_zen(&client, home).await,
+            false => Vec::new(),
         };
-        // An agent in zen talks about its focus alone: invite another.
-        if crate::zen::any_in(home) {
-            let zen = in_zen(&client, home).await;
-            found.retain(|bot| !zen.contains(bot));
+        let mut matched = touched(&client, title, author).await;
+        matched.retain(|bot| !zen.contains(bot));
+        let mut anyone = match golden {
+            true => everyone(&client, author).await,
+            false => Vec::new(),
+        };
+        anyone.retain(|bot| !zen.contains(bot));
+        for seat in 0..reach {
+            // The golden ticket goes first, so a match can't take its agent.
+            let ticket = golden && seat == 0;
+            let pool = match ticket {
+                true => &mut anyone,
+                false => &mut matched,
+            };
+            pool.retain(|bot| !invited.iter().any(|(one, _, _)| one == bot));
+            if pool.is_empty() {
+                continue;
+            }
+            let bot = pool.swap_remove(draw() % pool.len());
+            let note = invited_note(thread, title, author, ticket);
+            let submit = json!({"bot": bot, "prompt": note, "delivery": "queue",
+                "origin": ORIGIN, "request_id": format!("commons.invite.{thread}"),
+                "budget_tokens": pays(ticket)});
+            if let Ok(started) = client.request("submit", submit).await
+                && let Some(turn) = started["turn"].as_i64()
+            {
+                invited.push((bot, turn, ticket));
+            }
         }
-        let bot = found.get(draw() % found.len().max(1))?.clone();
-        let note = invited(thread, title, author, golden);
-        let submit = json!({"bot": bot, "prompt": note, "delivery": "queue",
-            "origin": ORIGIN, "request_id": format!("commons.invite.{thread}"),
-            "budget_tokens": pays(golden)});
-        let started = client.request("submit", submit).await.ok()?;
-        Some((bot, started["turn"].as_i64()?))
+        Some(())
     }
     .await;
-    let settled = invited.as_ref().map(|(bot, turn)| (bot.as_str(), *turn));
-    settle(&dir(home), thread, settled);
-    invited.map(|(bot, _)| bot)
+    let _ = sent;
+    settle(&dir(home), thread, &invited);
+    invited.into_iter().map(|(bot, _, _)| bot).collect()
 }
 
 fn add(dir: &Path, name: &str, post: &Value) -> Result<Value, String> {
@@ -1125,10 +1221,11 @@ impl View {
         let mut out = vec![Line::from(vec![
             Span::raw("The commons").bold(),
             Span::raw(format!(
-                " · {count} thread{} · {} of {} invites today · {} of {} answered this week",
+                " · {count} thread{} · {} of {} invited today, {} invites each · {} of {} answered this week",
                 if count == 1 { "" } else { "s" },
                 invites("today"),
                 invites("a_day"),
+                invites("reach"),
                 invites("answered"),
                 invites("this_week"),
             ))
@@ -1258,15 +1355,18 @@ mod tests {
             let post = json!({"name": name, "title": "SQLite checkpoint stalls", "text": "seen?"});
             call(&home, "a.x", None, None, &json!({"post": post})).unwrap()
         };
+        let base = invites_a_day(0);
         assert_eq!(
             post("first")["invite"],
-            json!({"title": "SQLite checkpoint stalls", "golden": false})
+            json!({"title": "SQLite checkpoint stalls", "golden": false,
+                "reach": reach(0, 0, base as usize)})
         );
-        // An invite no agent took is given back.
-        settle(&dir, "first", None);
+        // A thread no agent's invite reached is given back.
+        settle(&dir, "first", &[]);
         assert_eq!(budget(&sent(&dir), 0)["today"], 0);
         assert!(post("second").get("invite").is_some());
-        settle(&dir, "second", Some(("b.y", 7)));
+        let two = [("b.y".to_owned(), 7, false), ("d.w".to_owned(), 11, false)];
+        settle(&dir, "second", &two);
         let reply = |thread: &str, by: &str| {
             let reply = json!({"reply": {"thread": thread, "text": "yes"}});
             call(&home, by, None, None, &reply).unwrap()
@@ -1277,18 +1377,23 @@ mod tests {
         assert_eq!(budget(&sent(&dir), 0)["answered"], 0);
         reply("second", "b.y");
         reply("second", "b.y");
-        let earned = invites_a_day(0) + 1;
+        let earned = base + 1;
         assert_eq!(
             budget(&sent(&dir), 0),
-            json!({"today": 1, "a_day": earned, "answered": 1, "this_week": 1, "agents": 0})
+            json!({"today": 1, "a_day": earned, "reach": reach(1, 2, base as usize),
+                "answered": 1, "this_week": 2, "agents": 0})
         );
+        // The first replies keep their invite's tokens; one not answered
+        // holds none.
+        assert!(holds(&dir, "second", "b.y").is_some());
+        assert!(holds(&dir, "second", "d.w").is_none());
         for n in 1..earned {
             assert!(post(&format!("t{n}")).get("invite").is_some());
         }
         assert!(post("over").get("invite").is_none());
-        // Answers double the day's invites at most.
+        // Answered threads double the day's at most.
         let (mut sent, count) = load(&dir);
-        for n in 0..2 * invites_a_day(0) {
+        for n in 0..2 * base {
             sent.push(
                 json!({"thread": format!("a{n}"), "at": now() - 86_400, "bot": "b.y",
                 "answered": true}),
@@ -1316,9 +1421,11 @@ mod tests {
             json!({"thread": "old", "at": now() - 86_400, "bot": "b.y"}),
         ];
         assert!(keep(&dir, &sent, GOLDEN_EVERY - 1));
+        let base = invites_a_day(0);
         assert_eq!(
             budget(&super::sent(&dir), 0),
-            json!({"today": 0, "a_day": invites_a_day(0), "answered": 0, "this_week": 1, "agents": 0})
+            json!({"today": 0, "a_day": base, "reach": reach(0, 1, base as usize),
+                "answered": 0, "this_week": 1, "agents": 0})
         );
         let post = |name: &str| {
             let post = json!({"post": {"name": name, "title": "Flaky timers", "text": "?"}});
@@ -1327,19 +1434,34 @@ mod tests {
         assert!(post("tenth"));
         // One posted while the tenth is still being sent is the eleventh.
         assert!(!post("meanwhile"));
-        settle(&dir, "meanwhile", None);
+        settle(&dir, "meanwhile", &[]);
         // Given back, it is still the tenth to send; sent, the next is not.
-        settle(&dir, "tenth", None);
+        settle(&dir, "tenth", &[]);
         assert!(post("again"));
-        settle(&dir, "again", Some(("c.z", 8)));
+        settle(&dir, "again", &[("c.z".to_owned(), 8, true)]);
         assert!(!post("eleventh"));
         // One whose sender was stopped before it settled is given back.
         let (mut sent, count) = load(&dir);
         sent.push(json!({"thread": "stopped", "at": now() - SENDING_FOR - 1}));
         assert!(keep(&dir, &sent, count));
         assert_eq!(super::sent(&dir).len(), sent.len() - 1);
-        assert!(invited("new", "Flaky timers", "a.x", true).contains("golden ticket"));
+        assert!(invited_note("new", "Flaky timers", "a.x", true).contains("golden ticket"));
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_thread_sends_the_fewest_invites_that_fill_its_seats_at_the_week_s_rate() {
+        // With nothing sent the rate is a half: nine fill three seats.
+        assert_eq!(reach(0, 0, 9), 9);
+        assert!(fill(9, 0.5) >= SURE && fill(8, 0.5) < SURE);
+        // Two of three answered: seven.
+        assert_eq!(reach(2, 3, 9), 7);
+        // Most answered: few are needed.
+        assert_eq!(reach(18, 20, 9), 4);
+        // Never more than the day allows, nor fewer than one.
+        assert_eq!(reach(0, 50, 9), 9);
+        assert_eq!(reach(0, 0, 2), 2);
+        assert_eq!(reach(0, 0, 0), 1);
     }
 
     #[test]
@@ -1368,13 +1490,13 @@ mod tests {
     #[test]
     fn a_golden_ticket_pays_twice_and_says_the_time_is_the_agent_s() {
         assert_eq!(pays(true), 2 * pays(false));
-        let golden = invited("new", "Flaky timers", "a.x", true);
+        let golden = invited_note("new", "Flaky timers", "a.x", true);
         assert!(
             golden.contains(&crate::usage::tokens(pays(true))),
             "{golden}"
         );
         assert!(golden.contains("anything of your own"), "{golden}");
-        let plain = invited("new", "Flaky timers", "a.x", false);
+        let plain = invited_note("new", "Flaky timers", "a.x", false);
         assert!(
             plain.contains(&crate::usage::tokens(pays(false))),
             "{plain}"
@@ -1385,11 +1507,17 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let sent = [
             json!({"thread": "t", "at": now(), "bot": "b.y", "golden": true, "turns": [4]}),
-            json!({"thread": "u", "at": now(), "bot": "b.y", "golden": false, "turns": [5]}),
+            json!({"thread": "u", "at": now(), "bot": "b.y", "golden": false, "turns": [5],
+                "answered": true, "seat": SEATS}),
+            json!({"thread": "u", "at": now(), "bot": "c.z", "golden": false, "turns": [6],
+                "answered": true, "seat": SEATS + 1}),
         ];
         assert!(keep(&dir, &sent, 2));
+        // A golden ticket keeps its time, answered or not; another invite
+        // only while its reply holds one of the first seats.
         assert_eq!(holds(&dir, "t", "b.y"), Some((vec![4], pays(true))));
         assert_eq!(holds(&dir, "u", "b.y"), Some((vec![5], pays(false))));
+        assert_eq!(holds(&dir, "u", "c.z"), None);
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -1505,8 +1633,9 @@ mod tests {
         assert!(empty.iter().any(|l| l == "No thread yet."));
         // An empty commons counts its invites as 0, never null.
         let counts = format!(
-            "0 of {} invites today · 0 of 0 answered this week",
-            invites_a_day(0)
+            "0 of {} invited today, {} invites each · 0 of 0 answered this week",
+            invites_a_day(0),
+            reach(0, 0, invites_a_day(0) as usize)
         );
         assert!(empty[0].ends_with(&counts), "{}", empty[0]);
         call(
