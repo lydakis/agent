@@ -1508,6 +1508,21 @@ impl View {
         }
     }
 
+    /// The agents who pulled and resumed the cord, while it is drawn.
+    fn cord_ends(&self) -> [Option<usize>; 2] {
+        let end = |by: &Option<String>| match self.cord_end(by) {
+            End::Agent(at) => Some(at),
+            _ => None,
+        };
+        match &self.cord {
+            None => [None, None],
+            Some(cord) => [
+                end(&cord.by),
+                cord.lifted.as_ref().and_then(|(by, _)| end(by)),
+            ],
+        }
+    }
+
     /// Where one who pulled or resumed is: their star, or the person's
     /// place for the person or an agent not on the sky.
     fn cord_end(&self, by: &Option<String>) -> End {
@@ -2042,7 +2057,10 @@ impl View {
         // faint cloud on their arm (Furnas' degree of interest). What
         // needs the person or failed always draws.
         let room = (sky_cols * sky_rows / 24).max(8);
-        let shown = self.shown(now, room, &[picked, centre]);
+        // Who pulled or resumed the cord keeps a star, for it to hang from
+        // and ring out of.
+        let ends = self.cord_ends();
+        let shown = self.shown(now, room, &[picked, centre, ends[0], ends[1]]);
         let cord = self.cord_frame(&sky, now);
         let puller = cord.as_ref().and_then(|cord| cord.puller);
         let resumer = cord.as_ref().and_then(|cord| cord.resumer);
@@ -3827,7 +3845,9 @@ fn slim(mut event: Value) -> Value {
 /// or the daemon has gone.
 async fn taped(client: &Client, event: Value, send: &mpsc::UnboundedSender<Feed>) -> bool {
     let sent = match event["event"].as_str() {
-        Some("pruned") => return true,
+        // A pause's notices tell of now, not of the past a replay plays,
+        // and are no events to seek through: a replay leaves the cord out.
+        Some("pruned" | "paused" | "resumed") => return true,
         // As live: a new model is read again, for `m`.
         Some("configured") => match configured(client, &event).await {
             Some(model) => send.send(model),
@@ -4030,6 +4050,32 @@ mod tests {
         assert_eq!(frame.rope.unwrap().ink, Ink::Color(NEEDS, false));
         let search = view.agents[view.agent("shop.search").unwrap()].at;
         assert!(View::stilled(Some(&frame), &sky, search));
+    }
+
+    #[tokio::test]
+    async fn sonny_sky_keeps_a_star_for_whoever_pulled_or_resumed_a_crowded_sky() {
+        let (mut view, send) = view();
+        let mut bots = vec![json!({"name": "shop.lead"})];
+        for n in 0..40 {
+            bots.push(json!({"name": format!("shop.a{n}"), "created_by": "shop.lead"}));
+        }
+        send.send(Feed::Roll(bots)).unwrap();
+        send.send(Feed::Ready).unwrap();
+        let pause = json!({"reason": "look", "by": "shop.a17", "at_ms": wall_ms()});
+        send.send(Feed::Live(json!({"event": "paused", "pause": pause})))
+            .unwrap();
+        send.send(Feed::Live(
+            json!({"event": "resumed", "pause": pause, "by": "shop.a29"}),
+        ))
+        .unwrap();
+        view.drain();
+        let ends = view.cord_ends();
+        let (a17, a29) = (view.agent("shop.a17"), view.agent("shop.a29"));
+        assert_eq!(ends, [a17, a29]);
+        // Idle, both would fold into the cloud; the cord keeps them stars.
+        let shown = view.shown(Instant::now(), 8, &ends);
+        assert!(shown[a17.unwrap()] && shown[a29.unwrap()]);
+        assert!(shown.iter().filter(|&&star| star).count() <= 10);
     }
 
     #[tokio::test]
