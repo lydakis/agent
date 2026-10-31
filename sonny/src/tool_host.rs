@@ -6,6 +6,7 @@
 
 use agent_client::Client;
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -154,6 +155,21 @@ fn save(store: &Path, cursor: i64) {
 /// as a task out of sight, gets a tool added since. A busy one is tried
 /// again each minute, for an hour.
 async fn refresh_tools(client: Arc<Client>, bots: Vec<Value>) {
+    // Where each stands in its lead's line, from the listing.
+    let limit = crate::served::depth_limit();
+    let by_id: HashMap<i64, &Value> = (bots.iter())
+        .filter_map(|bot| Some((bot["bot_id"].as_i64()?, bot)))
+        .collect();
+    let depths: HashMap<i64, u64> = (bots.iter())
+        .filter_map(|bot| {
+            let (depth, _) = crate::declared::line_by(bot, limit, |at| {
+                by_id
+                    .get(&at["created_by_id"].as_i64()?)
+                    .map(|&by| by.clone())
+            });
+            Some((bot["bot_id"].as_i64()?, depth))
+        })
+        .collect();
     let mut left = bots;
     for _ in 0..60 {
         let mut busy = Vec::new();
@@ -169,7 +185,10 @@ async fn refresh_tools(client: Arc<Client>, bots: Vec<Value>) {
             };
             record["name"] = bot["name"].clone();
             record["bot_id"] = bot["bot_id"].clone();
-            let Some(fields) = crate::declared::refresh(&record) else {
+            let depth = (bot["bot_id"].as_i64())
+                .and_then(|id| depths.get(&id).copied())
+                .unwrap_or(1);
+            let Some(fields) = crate::declared::refresh(&record, depth) else {
                 continue;
             };
             match client.request("configure", Value::Object(fields)).await {

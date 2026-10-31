@@ -3,8 +3,8 @@
 //! labelled with each bot's name. Every call goes through the `herdr` CLI,
 //! which prints the socket API's JSON reply; ids are kept because labels
 //! need not be unique. Written against herdr 0.9.5's CLI and API schema.
-use crate::mux::{Backend, Block, Place, Places};
-use serde_json::Value;
+use crate::mux::{Backend, Block, Heard, Place, Places, Stream, Watch};
+use serde_json::{Value, json};
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
@@ -270,6 +270,32 @@ fn run(bin: &Path, args: &[&str], limit: Duration) -> bool {
     }
 }
 
+/// The events that may move, label or end a pane: `pane.updated` says a
+/// pane was renamed, among others.
+const CHANGES: [&str; 10] = [
+    "tab.created",
+    "tab.closed",
+    "tab.moved",
+    "pane.created",
+    "pane.closed",
+    "pane.updated",
+    "pane.moved",
+    "pane.exited",
+    "layout.updated",
+    "workspace.closed",
+];
+
+/// What a line of an `events.subscribe` stream says: the reply that it
+/// started, an event, or an error, as when it fell behind (`events_lost`),
+/// after which Herdr closes it.
+fn heard(line: &Value) -> Heard {
+    match (line.get("error"), line.get("result")) {
+        (Some(_), _) => Heard::Over,
+        (None, Some(_)) => Heard::Same,
+        (None, None) => Heard::Changed,
+    }
+}
+
 pub struct Herdr {
     bin: PathBuf,
     workspace: String,
@@ -427,11 +453,9 @@ impl Backend for Herdr {
         self.made
     }
 
-    fn blocks(&self) -> Vec<Block> {
-        let Ok(listed) = self.call(&["pane", "list", "--workspace", &self.workspace]) else {
-            return Vec::new();
-        };
-        listed["panes"]
+    fn blocks(&self) -> Result<Vec<Block>, String> {
+        let listed = self.call(&["pane", "list", "--workspace", &self.workspace])?;
+        Ok(listed["panes"]
             .as_array()
             .into_iter()
             .flatten()
@@ -442,7 +466,7 @@ impl Backend for Herdr {
                     window: p["tab_id"].as_str().unwrap_or("").to_owned(),
                 })
             })
-            .collect()
+            .collect())
     }
 
     fn close_block(&self, block: &str) {
@@ -539,16 +563,27 @@ impl Backend for Herdr {
         }
     }
 
+    /// Herdr's CLI has no stream; its socket does, and Herdr names it in
+    /// every pane it runs, as in the one Sonny runs in.
+    fn watch(&self) -> Option<Watch> {
+        let socket = std::env::var_os("HERDR_SOCKET_PATH").filter(|s| !s.is_empty())?;
+        let ask = json!({
+            "id": "sonny-layout",
+            "method": "events.subscribe",
+            "params": {"subscriptions": CHANGES.map(|kind| json!({"type": kind}))},
+        });
+        Some(Watch {
+            from: Stream::Socket(socket.into(), ask.to_string()),
+            heard: Box::new(heard),
+        })
+    }
+
     /// Where each pane sits, by label: its tab's number, and beside the
     /// tab's first other pane, which side of it.
-    fn places(&self) -> Places {
+    fn places(&self) -> Result<Places, String> {
         let mut places = HashMap::new();
-        let numbers: HashMap<String, usize> = self
-            .call(&["tab", "list", "--workspace", &self.workspace])
-            .ok()
-            .and_then(|tabs| tabs["tabs"].as_array().cloned())
-            .into_iter()
-            .flatten()
+        let tabs = self.call(&["tab", "list", "--workspace", &self.workspace])?;
+        let numbers: HashMap<String, usize> = (tabs["tabs"].as_array().into_iter().flatten())
             .filter_map(|t| {
                 Some((
                     t["tab_id"].as_str()?.to_owned(),
@@ -556,7 +591,7 @@ impl Backend for Herdr {
                 ))
             })
             .collect();
-        let blocks = self.blocks();
+        let blocks = self.blocks()?;
         let mut tabs: Vec<&str> = Vec::new();
         for block in &blocks {
             if !tabs.contains(&block.window.as_str()) {
@@ -568,14 +603,14 @@ impl Backend for Herdr {
             let panes: Vec<&Block> = blocks.iter().filter(|b| b.window == *tab).collect();
             let rects: HashMap<String, Value> = match panes.len() {
                 1 => HashMap::new(),
-                _ => self
-                    .call(&["pane", "layout", "--pane", &panes[0].id])
-                    .ok()
-                    .and_then(|l| l["layout"]["panes"].as_array().cloned())
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|p| Some((p["pane_id"].as_str()?.to_owned(), p["rect"].clone())))
-                    .collect(),
+                _ => {
+                    let layout = self.call(&["pane", "layout", "--pane", &panes[0].id])?;
+                    (layout["layout"]["panes"].as_array().into_iter().flatten())
+                        .filter_map(|p| {
+                            Some((p["pane_id"].as_str()?.to_owned(), p["rect"].clone()))
+                        })
+                        .collect()
+                }
             };
             for pane in &panes {
                 let side = panes
@@ -588,7 +623,7 @@ impl Backend for Herdr {
                 places.insert(pane.label.clone(), (number, side));
             }
         }
-        places
+        Ok(places)
     }
 }
 
@@ -611,6 +646,16 @@ fn side_of(rect: &Value, other: &Value) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn herdr_news_starts_with_a_reply_and_ends_on_an_error() {
+        let started = json!({"id": "sonny-layout", "result": {"type": "subscription_started"}});
+        let event = json!({"event": "tab_created", "data": {}});
+        let lost = json!({"id": "sonny-layout", "error": {"code": "events_lost"}});
+        assert_eq!(heard(&started), Heard::Same);
+        assert_eq!(heard(&event), Heard::Changed);
+        assert_eq!(heard(&lost), Heard::Over);
+    }
     use crate::mux::{Layout, Placement};
     use serde_json::json;
 
@@ -865,7 +910,7 @@ if out is not None:
         let bin = find().expect("herdr on the PATH");
         let herdr = Herdr::open(bin, "sonnycheck", None, None).unwrap();
         let workspace = herdr.workspace.clone();
-        let lead = herdr.blocks()[0].id.clone();
+        let lead = herdr.blocks().unwrap()[0].id.clone();
         herdr.rename_block(&lead, "sonnycheck.lead");
         let mut layout = Layout::new(Box::new(herdr));
         let sleep = ["sh".to_owned(), "-c".into(), "echo task; sleep 60".into()];
@@ -922,7 +967,12 @@ if out is not None:
             "below"
         );
         layout.close("sonnycheck.fix");
-        let left: Vec<String> = check.blocks().into_iter().map(|b| b.label).collect();
+        let left: Vec<String> = check
+            .blocks()
+            .unwrap()
+            .into_iter()
+            .map(|b| b.label)
+            .collect();
         println!("after closing the task: {left:?}");
         assert!(!left.iter().any(|l| l.starts_with("sonnycheck.fix")));
         let _ = check.call(&["workspace", "close", &workspace]);

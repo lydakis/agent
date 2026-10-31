@@ -887,6 +887,9 @@ impl ReadSource {
 pub struct Outcome {
     pub output: String,
     pub artifacts: Vec<(&'static str, Vec<u8>)>,
+    /// Retained streams written whole to a file in the bot's outputs
+    /// folder, in place of a copy in the store: each one's path.
+    pub files: Vec<(&'static str, String)>,
     /// What follows the output, in order: an image file read's picture, or
     /// the pictures, and the words between them, a client answered with.
     pub parts: Vec<crate::codec::Part>,
@@ -919,6 +922,7 @@ impl Outcome {
         Self {
             output,
             artifacts: Vec::new(),
+            files: Vec::new(),
             parts: Vec::new(),
             note: None,
             failed: false,
@@ -1670,6 +1674,7 @@ impl Registry {
         Outcome {
             output: output.to_string(),
             artifacts,
+            files: Vec::new(),
             parts: Vec::new(),
             note: None,
             failed: !success,
@@ -1719,6 +1724,7 @@ impl Registry {
         Outcome {
             output: output.to_string(),
             artifacts,
+            files: Vec::new(),
             parts: Vec::new(),
             note: None,
             failed: !success,

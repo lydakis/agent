@@ -227,6 +227,12 @@ pub struct Settings {
     /// Whether a workspace-write sandbox reaches the network.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub network: bool,
+    /// The folder a tool output cut for the model is written to whole,
+    /// one file per stream, in place of the store's copy: an absolute
+    /// path, used only while the bot's sandbox cannot write it. None keeps
+    /// every output in the store.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outputs: Option<String>,
     /// Whether a prompt another bot or a named client sent reaches the
     /// model without the line saying so after its words.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -418,6 +424,13 @@ impl Settings {
         {
             return refuse("writable folders are absolute paths");
         }
+        if self
+            .outputs
+            .as_ref()
+            .is_some_and(|path| !std::path::Path::new(path).is_absolute() || path.len() > 4096)
+        {
+            return refuse("outputs is an absolute path");
+        }
         Ok(())
     }
     /// Every setting as it applies, defaults included, for clients; a
@@ -434,6 +447,7 @@ impl Settings {
             "cache_ttl":self.cache_ttl,
             "speed":self.speed().map_or("standard", crate::provider::Speed::name),
             "sandbox":self.sandbox,"writable":self.writable,"network":self.network,
+            "outputs":self.outputs,
             "hide_senders":self.hide_senders,"unsandboxed":self.unsandboxed})
     }
     fn stored(&self) -> Result<Option<String>> {
@@ -878,6 +892,7 @@ pub fn unserved(detail: String) -> Outcome {
     Outcome {
         output: json!({"error":"tool_unserved","detail":detail}).to_string(),
         artifacts: Vec::new(),
+        files: Vec::new(),
         parts: Vec::new(),
         note: None,
         failed: true,
@@ -1427,6 +1442,9 @@ pub struct Database {
     /// The `steps` the current group removed, put back if it does not
     /// commit, as the rows they name are.
     steps_gone: Vec<(i64, i64)>,
+    /// Files of outputs whose records the current group removed, removed
+    /// once it commits: a group that does not keeps both.
+    files_gone: Vec<String>,
 }
 
 /// The columns of the turn view, from `turns t JOIN bots b ON b.name=t.bot`.
@@ -1650,7 +1668,7 @@ impl Database {
     /// Stored schema version, kept in `PRAGMA user_version`. Stores created
     /// before versioning and stores from newer binaries are rejected; an older
     /// versioned store is migrated forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 67;
+    pub const SCHEMA: i32 = 68;
     /// Verbatim user prompts a compaction keeps: per-prompt text, and the
     /// total text plus `(ordinal, String)` entry metadata. Empty entries cost
     /// space too, so the retained list cannot grow with conversation length.
@@ -1685,6 +1703,7 @@ impl Database {
             steps: HashMap::new(),
             stepped: Vec::new(),
             steps_gone: Vec::new(),
+            files_gone: Vec::new(),
         })
     }
 
@@ -1863,7 +1882,7 @@ impl Database {
                 call_id TEXT NOT NULL, status TEXT NOT NULL, result TEXT, delivered INTEGER);
             CREATE INDEX IF NOT EXISTS processes_turn ON processes(turn);
             CREATE TABLE IF NOT EXISTS artifacts(turn INTEGER NOT NULL REFERENCES turns(id), call_id TEXT NOT NULL,
-                stream TEXT NOT NULL, data BLOB NOT NULL, raw_bytes INTEGER NOT NULL DEFAULT 0,
+                stream TEXT NOT NULL, data BLOB NOT NULL, raw_bytes INTEGER NOT NULL DEFAULT 0, file TEXT,
                 PRIMARY KEY(turn,call_id,stream));
             CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY AUTOINCREMENT, bot TEXT NOT NULL REFERENCES bots(name),
                 turn INTEGER, kind TEXT NOT NULL, data TEXT NOT NULL);
@@ -1915,6 +1934,7 @@ impl Database {
             steps: HashMap::new(),
             stepped: Vec::new(),
             steps_gone: Vec::new(),
+            files_gone: Vec::new(),
         };
         // A deletion interrupted between pieces finishes now: the bot was
         // already refusing work, and nothing else may see it half gone.
@@ -1994,8 +2014,12 @@ impl Database {
     /// methods it calls release their own savepoints into this one.
     pub fn atomic<T>(&mut self, work: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
         self.conn.execute_batch("SAVEPOINT atomic")?;
-        let (served, stepped, gone) =
-            (self.served.len(), self.stepped.len(), self.steps_gone.len());
+        let (served, stepped, gone, files) = (
+            self.served.len(),
+            self.stepped.len(),
+            self.steps_gone.len(),
+            self.files_gone.len(),
+        );
         let done = work(self);
         if done.is_ok() {
             self.conn.execute_batch("RELEASE atomic")?;
@@ -2005,6 +2029,7 @@ impl Database {
                 .execute_batch("ROLLBACK TO atomic; RELEASE atomic")?;
             self.served.truncate(served);
             self.stepped.truncate(stepped);
+            self.files_gone.truncate(files);
             self.restore_steps(gone);
             self.recount_pending()?;
         }
@@ -2023,7 +2048,16 @@ impl Database {
         self.conn.prepare_cached("COMMIT")?.execute([])?;
         self.live_before.clear();
         self.steps_gone.clear();
+        artifact::remove(&std::mem::take(&mut self.files_gone));
         Ok(())
+    }
+    /// Remove the files of outputs whose records just went: once the group
+    /// commits, or now when there is none.
+    fn forget_files(&mut self, files: Vec<String>) {
+        match self.in_group() {
+            true => self.files_gone.extend(files),
+            false => artifact::remove(&files),
+        }
     }
     /// Put back the steps removed since the group had `kept` removals.
     fn restore_steps(&mut self, kept: usize) {
@@ -2048,6 +2082,7 @@ impl Database {
         self.outcomes.clear();
         self.served.clear();
         self.stepped.clear();
+        self.files_gone.clear();
         self.restore_steps(0);
         self.pending_stale = true;
         for (turn, before) in self.live_before.drain() {
@@ -6279,6 +6314,9 @@ impl Database {
         for (stream, data) in &outcome.artifacts {
             artifact::put(&tx, turn, call_id, stream, data)?;
         }
+        for (stream, file) in &outcome.files {
+            artifact::put_file(&tx, turn, call_id, stream, file)?;
+        }
         // A parked answer's pictures were kept for the result, which now
         // holds them: stored once.
         if !outcome.parts.is_empty() {
@@ -6332,7 +6370,9 @@ impl Database {
                 params![head, bot.name],
             )?;
         }
-        let artifacts: Vec<&str> = outcome.artifacts.iter().map(|(s, _)| *s).collect();
+        let artifacts: Vec<&str> = (outcome.artifacts.iter().map(|(s, _)| *s))
+            .chain(outcome.files.iter().map(|(s, _)| *s))
+            .collect();
         let mut data = json!({"call_id":call_id,"node":head,"artifacts":artifacts,
             "note":outcome.note.as_ref().map(|_| head)});
         if outcome.failed {
@@ -6657,6 +6697,7 @@ impl Database {
             Some(output) => CallAnswer::Given(Outcome {
                 output,
                 artifacts: Vec::new(),
+                files: Vec::new(),
                 parts: parts
                     .map(|json| serde_json::from_str(&json))
                     .transpose()?
@@ -8821,6 +8862,7 @@ impl Database {
         id: i64,
         result: &Value,
         artifacts: &[(&str, Vec<u8>)],
+        files: &[(&str, String)],
     ) -> Result<()> {
         let tx = self.conn.savepoint()?;
         if tx.execute(
@@ -8830,13 +8872,16 @@ impl Database {
         {
             return fail("invalid_process_state");
         }
-        if !artifacts.is_empty() {
+        if !artifacts.is_empty() || !files.is_empty() {
             let (turn, call_id): (i64, String) =
                 tx.query_row("SELECT turn,call_id FROM processes WHERE id=?", [id], |r| {
                     Ok((r.get(0)?, r.get(1)?))
                 })?;
             for (stream, data) in artifacts {
                 artifact::put(&tx, turn, &call_id, stream, data)?;
+            }
+            for (stream, file) in files {
+                artifact::put_file(&tx, turn, &call_id, stream, file)?;
             }
         }
         tx.commit()?;
@@ -9383,7 +9428,9 @@ impl Database {
             .collect::<rusqlite::Result<_>>()?;
         if !turns.is_empty() {
             let mut events = 0;
+            let mut files = Vec::new();
             for turn in &turns {
+                files.extend(artifact::files(&tx, *turn)?);
                 for table in ["artifacts", "processes", "tools"] {
                     tx.prepare_cached(&format!("DELETE FROM {table} WHERE turn=?"))?
                         .execute([turn])?;
@@ -9396,6 +9443,7 @@ impl Database {
             }
             out["events"] = json!(events);
             tx.commit()?;
+            self.forget_files(files);
             return Ok(out);
         }
         // Then the turn rows and what remains keyed by the bot alone.
@@ -9583,9 +9631,11 @@ impl Database {
             .collect::<rusqlite::Result<_>>()?;
         let mut events = 0;
         let mut cursor: Option<i64> = None;
+        let mut files = Vec::new();
         for turn in &turns {
             // Background commands may outlive their launching turn; their
             // running row is required when the result commits and waiters wake.
+            files.extend(artifact::files(&tx, *turn)?);
             tx.prepare_cached("DELETE FROM artifacts WHERE turn=?")?
                 .execute([turn])?;
             tx.prepare_cached("DELETE FROM processes WHERE turn=? AND status!='running'")?
@@ -9622,6 +9672,7 @@ impl Database {
                 r.get(0)
             })?;
         tx.commit()?;
+        self.forget_files(files);
         let next_after = match limit {
             Some(limit) if turns.len() == limit => turns.last().copied(),
             _ => None,
@@ -11999,6 +12050,15 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
         )? {
             conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {kind};"))?;
         }
+    }
+    if !conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('artifacts') WHERE name='file')",
+        [],
+        |r| r.get::<_, bool>(0),
+    )? {
+        // 67 -> 68: a retained output may be a file in the bot's outputs
+        // folder rather than the store's copy. Every earlier one is a copy.
+        conn.execute_batch("ALTER TABLE artifacts ADD COLUMN file TEXT;")?;
     }
     Ok(())
 }

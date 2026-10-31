@@ -3621,6 +3621,7 @@ impl Service {
                         Outcome {
                             output: json!({"error":code,"detail":detail}).to_string(),
                             artifacts: Vec::new(),
+                            files: Vec::new(),
                             parts: Vec::new(),
                             note: None,
                             failed: true,
@@ -7069,7 +7070,7 @@ mod tests {
         let (done, running) = store
             .call(move |db| {
                 let done = db.process_start(turn, "shell-1")?;
-                db.process_finish(done, &json!({"exit_code":0}), &[])?;
+                db.process_finish(done, &json!({"exit_code":0}), &[], &[])?;
                 Ok((done, db.process_start(turn, "shell-2")?))
             })
             .await

@@ -33,6 +33,7 @@
 //! commons = false               # agents go without the commons, on by default
 //! commons_invites = 3           # invites a day a new thread can send, 0 none; answers add up to as many again
 //! commons_invite_tokens = 1000000  # what an invite pays for in its thread
+//! task_depth = 3                # generations of tasks below a lead, 2 by default (tasks' own start none); 0 no end
 //! unsandboxed = ["mcpx"]        # commands run outside agents' sandboxes
 //! default_permissions = "strict"   # the /permissions row a new lead starts in, auto by default
 //!
@@ -178,6 +179,9 @@ pub struct Sonny {
     pub commons_invites: u64,
     /// The tokens an invite pays for in its thread.
     pub commons_invite_tokens: u64,
+    /// How many generations below a lead its line goes: a lead's tasks
+    /// are the first, and an agent of the last starts none; 0 for no end.
+    pub task_depth: u64,
     /// What the lookout runs for news from outside, by name.
     pub sources: Vec<Source>,
 }
@@ -198,6 +202,7 @@ impl Default for Sonny {
             commons: true,
             commons_invites: 3,
             commons_invite_tokens: 1_000_000,
+            task_depth: 2,
             chime: true,
             verbose: false,
             start_at_boot: false,
@@ -578,6 +583,7 @@ fn parse(text: &str) -> Result<Config, String> {
                 "commons",
                 "commons_invites",
                 "commons_invite_tokens",
+                "task_depth",
                 "unsandboxed",
                 "default_permissions",
             ],
@@ -640,6 +646,7 @@ fn parse(text: &str) -> Result<Config, String> {
             if let Some(count) = match key.as_str() {
                 "commons_invites" => Some(&mut config.sonny.commons_invites),
                 "commons_invite_tokens" => Some(&mut config.sonny.commons_invite_tokens),
+                "task_depth" => Some(&mut config.sonny.task_depth),
                 _ => None,
             } {
                 *count = (value.as_integer())
@@ -1057,6 +1064,12 @@ mod tests {
         );
         assert!(parse("[sonny]\ncommons_invites = -1").is_err());
         assert!(parse("[sonny]\ncommons_invites = \"3\"").is_err());
+        assert_eq!(config.sonny.task_depth, 2);
+        assert_eq!(
+            parse("[sonny]\ntask_depth = 0").unwrap().sonny.task_depth,
+            0
+        );
+        assert!(parse("[sonny]\ntask_depth = -1").is_err());
         assert_eq!(
             parse("[sonny]\nsuggest = \"no\"").unwrap_err(),
             "sonny.suggest must be true or false"

@@ -150,7 +150,9 @@ A lead's transcript starts with a welcome, as Claude Code's does: Sonny,
 the robot the client is named for, as a portrait drawn in half blocks,
 beside the folder, the lead's model and a few commands. A new lead opens
 on it; a long conversation shows it above its first message, once scrolling
-up has reached it. A side chat has none.
+up has reached it. A side chat has none. Until you type or scroll, Sonny
+blinks or glances every 8 to 16 seconds, a different gesture each time;
+each redraws six cells.
 
 Sonny's two roles are normal profiles the person can read and edit in
 `~/.agents/agents`, beside their own: `lead.md`
@@ -744,6 +746,18 @@ way `/react` does, and each note in the margin has its own `↩`.
   its full path. The `remove_task` tool (`task`, `discard`) removes a task
   that is done and its worktree, refusing while the worktree has
   uncommitted changes. Its branch is kept unless it is merged.
+- **Tasks that start their own:** any agent with room below it in its
+  lead's line has `start_task` and `remove_task` too, for help inside its
+  own brief, such as a review or a watch on something; separate work still
+  goes to its lead. `[sonny] task_depth` (in `/config`) says how many
+  generations of tasks a line has: 2 by default, so the lead's tasks start
+  helpers and those helpers start none; 1 keeps starting to the lead; 0
+  has no end. A task's helper is started from the lead's folder, in its
+  project, in the repository the task works in, on the last commit of the
+  task's branch, so it builds on the task's work; the lead hears it as one
+  of its line. A
+  start deeper than the setting allows is refused (`task_depth_reached`),
+  and a task removes only agents of its own line.
 - **Forking a task with its files:** after each turn a task completes, the
   lookout keeps its worktree's files as a commit beside the repository's
   history (`refs/agent/snapshots/STORE/BOT_ID/TURN`, through an index of its
@@ -788,8 +802,10 @@ Sonny declares its tools on the agents it opens and the leads it makes,
 which agents they make inherit: `react`, `ask`, `plan` (the plan the
 person sees, as a checklist), `margin` (notes beside the conversation),
 `resolve_task`, `subscriptions`, `show_agent` and
-`run_in_pane`; a lead's own, which its tasks don't take, are `start_task`,
-`remove_task` and `new_project`. The daemon shows them to
+`run_in_pane`; `start_task` and `remove_task` go to every agent the
+line's `task_depth` leaves room below, and its tasks take them only while
+they have room too; a lead's own, which its tasks never take, is
+`new_project`. The daemon shows them to
 the model and records each call: `react`, `ask`, `plan`, `margin` and
 `resolve_task` run nothing, and the rest wait for Sonny's answer. Sonny's tool host answers
 those, running each call in the calling agent's folder, so they work with
