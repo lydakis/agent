@@ -686,9 +686,10 @@ async fn a_sandboxed_command_writes_only_its_roots() {
 }
 
 /// The daemon's socket is out of reach from inside a sandbox, network on
-/// or off, as Codex keeps its own, and so is every other Unix socket, even
-/// one in its folder: the command makes none. It reaches the daemon only
-/// by the connections handed it, each to its bot's own socket.
+/// or off. Every other Unix socket it reaches with the network on, as
+/// Codex's full network does, and none with it off: the command makes
+/// none. It reaches the daemon only by its bot's own socket, in the
+/// daemon's socket's place or by the connections handed it.
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn a_sandboxed_command_cannot_reach_the_daemon_socket() {
@@ -701,7 +702,8 @@ async fn a_sandboxed_command_cannot_reach_the_daemon_socket() {
         .join(format!("agent-socket-{}", std::process::id()));
     std::fs::create_dir_all(&base).unwrap();
     let socket = base.join("agent.sock");
-    let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let daemon_listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    daemon_listener.set_nonblocking(true).unwrap();
     let mine = base.join("mine.sock");
     let _mine = std::os::unix::net::UnixListener::bind(&mine).unwrap();
     let tools = Registry::new("shell").unwrap();
@@ -755,6 +757,7 @@ async fn a_sandboxed_command_cannot_reach_the_daemon_socket() {
         }
     };
     assert_eq!(run(None, to(&socket)).await, 0);
+    assert!(daemon_listener.accept().is_ok());
     assert_eq!(run(None, "python3 pair.py SOCK_DGRAM".into()).await, 0);
     assert!(datagram.recv(&mut [0u8; 1]).is_ok());
     for network in [false, true] {
@@ -776,18 +779,24 @@ async fn a_sandboxed_command_cannot_reach_the_daemon_socket() {
             0,
             "network {network}"
         );
-        assert_ne!(
-            run(Some(policy.clone()), to(&mine)).await,
-            0,
+        // Any other socket with the network on, as Codex's full network;
+        // with it off, none.
+        assert_eq!(
+            run(Some(policy.clone()), to(&mine)).await == 0,
+            network,
             "network {network}"
         );
         // A pair of sockets is the command's own, but a pair of datagram
-        // sockets, which would send to any socket's path, it doesn't make.
+        // sockets, which would send to any socket's path, it makes only
+        // with the network on.
         let pair = |kind: &str| format!("python3 pair.py {kind}");
         assert_eq!(run(Some(policy.clone()), pair("SOCK_STREAM")).await, 0);
         assert_eq!(run(Some(policy.clone()), pair("SOCK_SEQPACKET")).await, 0);
-        assert_ne!(run(Some(policy.clone()), pair("SOCK_DGRAM")).await, 0);
-        assert!(datagram.recv(&mut [0u8; 1]).is_err());
+        assert_eq!(
+            run(Some(policy.clone()), pair("SOCK_DGRAM")).await == 0,
+            network
+        );
+        assert_eq!(datagram.recv(&mut [0u8; 1]).is_ok(), network);
         // With the bot's own socket, laid out as the daemon lays them out,
         // the command is handed connections to that one, and only those.
         let folder = base.join(format!("agent.sock.d-{network}"));
@@ -799,12 +808,14 @@ async fn a_sandboxed_command_cannot_reach_the_daemon_socket() {
             capability: Some(own),
             ..policy
         };
-        assert_ne!(
-            run(Some(policy.clone()), to(&socket)).await,
-            0,
+        // By the daemon's socket's name it reaches its own, with the
+        // network on.
+        assert_eq!(
+            run(Some(policy.clone()), to(&socket)).await == 0,
+            network,
             "network {network}"
         );
-        assert!(listener.accept().is_err());
+        assert_eq!(listener.accept().is_ok(), network);
         assert_eq!(
             run(Some(policy.clone()), handed.into()).await,
             0,
@@ -827,12 +838,14 @@ async fn a_sandboxed_command_cannot_reach_the_daemon_socket() {
         let naming = policy.with_sockets(&[mine.display().to_string()]);
         assert_eq!(run(Some(naming), to(&mine)).await, 0, "network {network}");
     }
+    assert!(daemon_listener.accept().is_err());
     std::fs::remove_dir_all(base).unwrap();
 }
 
-/// On macOS a sandboxed command reaches only the Unix sockets its settings
-/// name, network on or off: not the daemon's, even inside its folder, nor
-/// one in its folder, which could be a hard link to any socket.
+/// On macOS a sandboxed command reaches every Unix socket with the network
+/// on, as Codex's full network does, and listens on its own; with it off,
+/// only those its settings name. Never the daemon's, even inside its
+/// folder, nor by a hard link to it there.
 #[cfg(target_os = "macos")]
 #[tokio::test]
 async fn a_sandboxed_command_reaches_only_the_sockets_it_names() {
@@ -857,6 +870,21 @@ async fn a_sandboxed_command_reaches_only_the_sockets_it_names() {
     ];
     let _listeners: Vec<_> = paths.iter().map(|path| listen(path)).collect();
     let tools = Registry::new("shell").unwrap();
+    let runs = |policy: Policy, command: String| {
+        let tools = tools.clone();
+        let workspace = workspace.clone();
+        async move {
+            let prepared = tools
+                .prepare("shell", &json!({"command": command}).to_string())
+                .unwrap();
+            let output = tools
+                .execute(prepared, &workspace, &[], Some(std::sync::Arc::new(policy)))
+                .await
+                .unwrap()
+                .output;
+            serde_json::from_str::<Value>(&output).unwrap()["exit_code"] == 0
+        }
+    };
     let reaches = |policy: Policy, path: std::path::PathBuf| {
         let tools = tools.clone();
         let workspace = workspace.clone();
@@ -904,9 +932,26 @@ async fn a_sandboxed_command_reaches_only_the_sockets_it_names() {
         ];
         assert_eq!(
             reached,
-            [false, false, false, true, true],
+            [false, network, network, true, true],
             "network {network}"
         );
+        // A hard link to the daemon's socket in its folder is not made, or
+        // reaches nothing.
+        let linked = workspace.join(format!("linked-{network}.sock"));
+        let link = format!(
+            "ln {} {} && python3 -c 'import socket; socket.socket(socket.AF_UNIX).connect(\"{}\")'",
+            socket.display(),
+            linked.display(),
+            linked.display()
+        );
+        assert!(!runs(policy.clone(), link).await, "network {network}");
+        // Its own server it runs with the network on.
+        let listens = format!(
+            "python3 -c 'import socket, os; p = \"{0}\"; s = socket.socket(socket.AF_UNIX); \
+             s.bind(p); s.listen(); socket.socket(socket.AF_UNIX).connect(p); os.unlink(p)'",
+            workspace.join(format!("serve-{network}.sock")).display()
+        );
+        assert_eq!(runs(policy.clone(), listens).await, network);
     }
     std::fs::remove_dir_all(base).unwrap();
 }
