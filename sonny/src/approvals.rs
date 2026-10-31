@@ -1200,18 +1200,20 @@ mod tests {
         // the verdict too.
         let panes = json!({"tools": ["shell", "read"], "declared": crate::declared::tools(crate::served::Role::at(0, 2)),
             "gates": [{"tag": "auto", "tools": ["shell"]}]});
-        assert_eq!(
-            regate(&panes, "auto").unwrap()["approve"],
-            json!([
-                "shell",
-                "start_task",
-                "remove_task",
-                "new_project",
-                "subscriptions",
-                "run_in_pane",
-                "triggers",
-                "goal"
-            ])
-        );
+        let mut waiting = json!([
+            "shell",
+            "start_task",
+            "remove_task",
+            "new_project",
+            "subscriptions",
+            "run_in_pane",
+            "triggers",
+            "goal"
+        ]);
+        // The browser, there when agent-browser is, reaches outside.
+        if crate::browser::tool().is_some() {
+            waiting.as_array_mut().unwrap().push(json!("browser"));
+        }
+        assert_eq!(regate(&panes, "auto").unwrap()["approve"], waiting);
     }
 }

@@ -36,6 +36,7 @@
 //! task_depth = 3                # generations of tasks below a lead, 2 by default (tasks' own start none); 0 no end
 //! unsandboxed = ["mcpx"]        # commands run outside agents' sandboxes
 //! default_permissions = "strict"   # the /permissions row a new lead starts in, auto by default
+//! browser_confirm = ["eval"]    # agent-browser actions the agent's gate approves; eval, download, upload and state by default
 //!
 //! [sonny.permissions.strict]    # a /permissions row of the person's own, as Codex's profiles
 //! description = "Offline, commits ask"
@@ -185,7 +186,15 @@ pub struct Sonny {
     pub task_depth: u64,
     /// What the lookout runs for news from outside, by name.
     pub sources: Vec<Source>,
+    /// The agent-browser action categories that the `browser` tool puts
+    /// to the agent's gate before they run.
+    pub browser_confirm: Vec<String>,
 }
+
+/// The agent-browser action categories its `browser` tool confirms unless
+/// the config says otherwise: agent-browser's own destructive ones, and
+/// saved state, which carries sign-ins.
+pub const BROWSER_CONFIRM: [&str; 4] = ["eval", "download", "upload", "state"];
 
 impl Default for Sonny {
     fn default() -> Self {
@@ -209,6 +218,7 @@ impl Default for Sonny {
             start_at_boot: false,
             margin_opens: MarginOpens::default(),
             sources: Vec::new(),
+            browser_confirm: BROWSER_CONFIRM.map(str::to_owned).to_vec(),
         }
     }
 }
@@ -590,6 +600,7 @@ fn parse(text: &str) -> Result<Config, String> {
                 "task_depth",
                 "unsandboxed",
                 "default_permissions",
+                "browser_confirm",
             ],
             _ => return Err(format!("unknown table [{name}]")),
         };
@@ -656,6 +667,25 @@ fn parse(text: &str) -> Result<Config, String> {
                 *count = (value.as_integer())
                     .and_then(|n| u64::try_from(n).ok())
                     .ok_or_else(|| format!("{name}.{key} must be a whole number, 0 or more"))?;
+                continue;
+            }
+            if (name.as_str(), key.as_str()) == ("sonny", "browser_confirm") {
+                let invalid =
+                    || format!("{name}.{key} must be a list of agent-browser action categories");
+                let categories = value.as_array().ok_or_else(invalid)?;
+                config.sonny.browser_confirm = categories
+                    .iter()
+                    .map(|category| match category.as_str() {
+                        Some(category)
+                            if !category.is_empty()
+                                && (category.bytes())
+                                    .all(|b| b.is_ascii_alphanumeric() || b":_-.".contains(&b)) =>
+                        {
+                            Ok(category.to_owned())
+                        }
+                        _ => Err(invalid()),
+                    })
+                    .collect::<Result<_, _>>()?;
                 continue;
             }
             if (name.as_str(), key.as_str()) == ("sonny", "unsandboxed") {
@@ -1073,6 +1103,22 @@ mod tests {
             (sonny.commons_invites, sonny.commons_invite_tokens),
             (0, 500)
         );
+        assert_eq!(config.sonny.browser_confirm, BROWSER_CONFIRM);
+        let browser =
+            parse("[sonny]\nbrowser_confirm = [\"eval\", \"plugin:vault:credential.read\"]");
+        assert_eq!(
+            browser.unwrap().sonny.browser_confirm,
+            ["eval", "plugin:vault:credential.read"]
+        );
+        assert!(
+            parse("[sonny]\nbrowser_confirm = []")
+                .unwrap()
+                .sonny
+                .browser_confirm
+                .is_empty()
+        );
+        assert!(parse("[sonny]\nbrowser_confirm = [\"eval,upload\"]").is_err());
+        assert!(parse("[sonny]\nbrowser_confirm = \"eval\"").is_err());
         assert!(parse("[sonny]\ncommons_invites = -1").is_err());
         assert!(parse("[sonny]\ncommons_invites = \"3\"").is_err());
         assert_eq!(config.sonny.task_depth, 2);
