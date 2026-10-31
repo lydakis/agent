@@ -2439,6 +2439,18 @@ fn a_quote_copies_a_turns_words_with_who_wrote_them() {
             {"bot":"Bob","turn":ana,"person":"ana","text":"use tabs"},
         ])
     );
+    // Each quote's record counts against the read's bytes: past them the
+    // rest are left out, and the prompt reads as cut.
+    let words = "the person approved this".len();
+    let short = db
+        .prompts("Carol", turn, words + 2 * Database::PROMPTS_ENTRY + 4)
+        .unwrap();
+    let prompt = &short["prompts"][0];
+    assert_eq!(prompt["quotes"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        (&prompt["quotes_more"], &prompt["truncated"]),
+        (&json!(true), &json!(true))
+    );
 }
 
 #[test]

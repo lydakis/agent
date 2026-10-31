@@ -7961,12 +7961,25 @@ impl Database {
         }
         authored(&mut entry, from, origin, person);
         let mut quotes = quoted(&self.conn, quotes.as_deref())?;
+        // Each quote's record counts like an entry's; those past the
+        // budget are left out, and the entry says its words were cut.
+        let mut kept = 0;
         for quote in &mut quotes {
+            if *left < Self::PROMPTS_ENTRY {
+                break;
+            }
+            *left -= Self::PROMPTS_ENTRY;
             let mut text = quote["text"].as_str().unwrap_or_default().to_owned();
             if cut(&mut text, left) {
                 quote["truncated"] = json!(true);
             }
             quote["text"] = json!(text);
+            kept += 1;
+        }
+        if kept < quotes.len() {
+            quotes.truncate(kept);
+            entry["quotes_more"] = json!(true);
+            entry["truncated"] = json!(true);
         }
         if !quotes.is_empty() {
             entry["quotes"] = json!(quotes);

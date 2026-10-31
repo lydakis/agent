@@ -1443,7 +1443,8 @@ BOT/TURN` (repeatable; `BOT/TURN:reply` for a reply, `turn:` prefix
 optional) sends them. `prompts` and `history_items` list a prompt's
 quotes as `quotes`, each with its writer (`from`, `origin` or `person`,
 none for a person's) and, in `prompts`, its `text` within the read's
-`bytes`; Sonny's approver reads a quote of the person's own words as
+`bytes`, each record counted as an entry; quotes past them are left out,
+and their prompt says `quotes_more` and `truncated`; Sonny's approver reads a quote of the person's own words as
 consent only in a prompt the person sent, and any other as asking for
 nothing.
 `{"op":"prompts","bot","turn","bytes"?}` reads a turn's words and calls
