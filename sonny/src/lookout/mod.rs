@@ -754,8 +754,10 @@ impl Service {
             return;
         }
         // Goal checks a dropped connection left under way answer the old
-        // channel, never this one: none is under way here yet.
-        let (checked, mut settled) = tokio::sync::mpsc::channel(64);
+        // channel, never this one: none is under way here yet. Unbounded,
+        // as a goal's turn waits on its one settlement, which a full
+        // channel would drop: it holds a few per agent with a goal at most.
+        let (checked, mut settled) = tokio::sync::mpsc::unbounded_channel();
         for lookout in self.lookouts.values_mut() {
             // Reads a dropped connection left under way answer the old
             // channel, never this one.
@@ -936,10 +938,15 @@ impl Service {
                 Some(key) = taken.recv() => {
                     self.telling.remove(&key);
                 }
-                Some(goals::Settled { bot, turn, outcome }) = settled.recv() => {
-                    self.goals.settled(&bot, turn);
+                Some(settled) = settled.recv() => {
+                    let checking = self.goals.settled(&settled, &client, &checked);
+                    let goals::Settled { bot, turn, outcome, .. } = settled;
+                    let now = Instant::now();
                     for lookout in self.lookouts.values_mut() {
                         lookout.updates.goal_settled(&bot, turn, outcome.as_deref());
+                        if let Some(later) = checking {
+                            lookout.updates.goal_checking(&bot, later, now);
+                        }
                     }
                 }
                 // What sources say is news once the stream is live; until

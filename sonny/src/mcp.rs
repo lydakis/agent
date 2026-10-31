@@ -23,8 +23,15 @@ pub const IDLE: Duration = Duration::from_secs(600);
 /// unless its config says otherwise.
 const START: Duration = Duration::from_secs(30);
 const CALL: Duration = Duration::from_secs(60);
-/// The last lines a stdio server wrote to stderr, for when it fails.
+/// The last lines a stdio server wrote to stderr, for when it fails, and
+/// the bytes of each kept: a server that writes megabytes with no newline
+/// costs no more than one that writes a line.
 const STDERR_LINES: usize = 20;
+const STDERR_LINE: usize = 1024;
+/// The bytes a tool's result may hold, as rmcp bounds each message it
+/// reads over stdio and in an HTTP server's event stream: a result held in
+/// the lookout is outside every script's memory cap.
+pub const RESULT_BYTES: usize = 16 << 20;
 
 pub type Servers = BTreeMap<String, McpServer>;
 
@@ -155,7 +162,7 @@ impl Hub {
 
     /// Call `tool` of `server`, starting it if need be: its whole
     /// `CallToolResult`, or why there is none.
-    pub async fn call(&self, server: &str, tool: &str, arguments: Value) -> Result<Value, String> {
+    pub async fn call(&self, server: &str, tool: &str, arguments: Value) -> Result<Called, String> {
         let slot = self.slot(server)?;
         if !allowed(&slot.config, tool) {
             return Err(format!("{server} has no tool {tool}"));
@@ -188,7 +195,20 @@ impl Hub {
                 }
                 Err(format!("{server}.{tool}: {error}"))
             }
-            Ok(Ok(result)) => serde_json::to_value(result).map_err(|e| e.to_string()),
+            Ok(Ok(result)) => {
+                let json = serde_json::to_string(&result).map_err(|e| e.to_string())?;
+                if json.len() > RESULT_BYTES {
+                    return Err(format!(
+                        "{server}.{tool} returned {} MB, more than the {} MB a result may hold",
+                        json.len() >> 20,
+                        RESULT_BYTES >> 20
+                    ));
+                }
+                Ok(Called {
+                    json,
+                    is_error: result.is_error == Some(true),
+                })
+            }
         }
     }
 
@@ -261,6 +281,13 @@ impl Hub {
             "instructions": instructions, "error": error});
         let _ = write(&file, &kept.to_string());
     }
+}
+
+/// What a call returned: its `CallToolResult` as JSON, and whether that
+/// says the call failed.
+pub struct Called {
+    pub json: String,
+    pub is_error: bool,
 }
 
 /// Lowers a server's count of calls in flight however the call ends.
@@ -338,17 +365,34 @@ fn seconds(value: Option<f64>) -> Option<Duration> {
     value.map(Duration::from_secs_f64)
 }
 
-/// What a listing was made with, so a changed config lists again.
+/// What a listing was made with, so a changed config lists again: a
+/// digest, since the config holds the server's env and headers, secrets
+/// among them.
 fn fingerprint(config: &McpServer) -> String {
-    format!("{config:?}")
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(format!("{config:?}"));
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+/// `text` as `file`, which only the person may read: a server's tools and
+/// instructions are its own.
 fn write(file: &Path, text: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
     if let Some(dir) = file.parent() {
-        std::fs::create_dir_all(dir)?;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)?;
     }
     let staged = file.with_extension(format!("json.{}", std::process::id()));
-    std::fs::write(&staged, text)?;
+    let mut out = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&staged)?;
+    out.write_all(text.as_bytes())?;
     std::fs::rename(&staged, file)
 }
 
@@ -380,21 +424,15 @@ async fn connect(config: &McpServer) -> Result<Live, String> {
                 .stderr(std::process::Stdio::piped())
                 .spawn()
                 .map_err(|e| format!("{command}: {e}"))?;
-            let group = transport.id();
+            let group = Group::of(transport.id());
             let tail = Arc::new(Mutex::new(VecDeque::new()));
             if let Some(stderr) = stderr {
                 tokio::spawn(collect(stderr, Arc::clone(&tail)));
             }
-            if let Some(group) = group {
-                GROUPS.lock().unwrap().push(group);
-            }
             match client_info().serve(transport).await {
                 Ok(client) => (client, group, tail),
                 Err(error) => {
-                    if let Some(group) = group {
-                        GROUPS.lock().unwrap().retain(|g| *g != group);
-                        kill(group);
-                    }
+                    drop(group);
                     // Its last words, if it said why.
                     tokio::time::sleep(Duration::from_millis(50)).await;
                     let said: Vec<String> = tail.lock().unwrap().iter().cloned().collect();
@@ -424,7 +462,7 @@ async fn connect(config: &McpServer) -> Result<Live, String> {
                 .serve(transport)
                 .await
                 .map_err(|e| e.to_string())?;
-            (client, None, Arc::default())
+            (client, Group(None), Arc::default())
         }
         (None, None) => return Err("no command or url".into()),
     };
@@ -440,7 +478,7 @@ async fn connect(config: &McpServer) -> Result<Live, String> {
                 client,
                 tools: Vec::new(),
                 instructions: None,
-                group,
+                group: group.keep(),
             };
             live.stop().await;
             return Err(format!("listing its tools: {error}"));
@@ -454,8 +492,36 @@ async fn connect(config: &McpServer) -> Result<Live, String> {
         client,
         tools,
         instructions,
-        group,
+        group: group.keep(),
     })
+}
+
+/// A stdio server's process group while it starts, stopped if it never
+/// does: when it fails, and when its start is given up, as a script whose
+/// time runs out gives it up.
+struct Group(Option<u32>);
+
+impl Group {
+    fn of(group: Option<u32>) -> Group {
+        if let Some(group) = group {
+            GROUPS.lock().unwrap().push(group);
+        }
+        Group(group)
+    }
+
+    /// Started: the group is the server's, stopped with it.
+    fn keep(mut self) -> Option<u32> {
+        self.0.take()
+    }
+}
+
+impl Drop for Group {
+    fn drop(&mut self) {
+        if let Some(group) = self.0.take() {
+            GROUPS.lock().unwrap().retain(|g| *g != group);
+            kill(group);
+        }
+    }
 }
 
 /// `~/x` as the home folder's `x`.
@@ -466,15 +532,46 @@ fn home_relative(path: &Path) -> PathBuf {
     }
 }
 
-async fn collect(stderr: tokio::process::ChildStderr, tail: Arc<Mutex<VecDeque<String>>>) {
-    use tokio::io::AsyncBufReadExt;
-    let mut lines = tokio::io::BufReader::new(stderr).lines();
-    while let Ok(Some(line)) = lines.next_line().await {
+/// The last `STDERR_LINES` lines a server writes, each cut at
+/// `STDERR_LINE` bytes as it is read.
+async fn collect(
+    mut stderr: impl tokio::io::AsyncRead + Unpin,
+    tail: Arc<Mutex<VecDeque<String>>>,
+) {
+    use tokio::io::AsyncReadExt;
+    let mut chunk = [0u8; 8192];
+    let mut line = Vec::new();
+    let mut cut = false;
+    let end = |line: &mut Vec<u8>, cut: &mut bool| {
+        let mut text = String::from_utf8_lossy(line)
+            .trim_end_matches('\r')
+            .to_owned();
+        if std::mem::take(cut) {
+            text.push('…');
+        }
+        line.clear();
         let mut tail = tail.lock().unwrap();
         if tail.len() == STDERR_LINES {
             tail.pop_front();
         }
-        tail.push_back(line);
+        tail.push_back(text);
+    };
+    while let Ok(read @ 1..) = stderr.read(&mut chunk).await {
+        for piece in chunk[..read].split_inclusive(|byte| *byte == b'\n') {
+            let (body, ended) = match piece.strip_suffix(b"\n") {
+                Some(body) => (body, true),
+                None => (piece, false),
+            };
+            let room = STDERR_LINE.saturating_sub(line.len());
+            cut |= body.len() > room;
+            line.extend_from_slice(&body[..body.len().min(room)]);
+            if ended {
+                end(&mut line, &mut cut);
+            }
+        }
+    }
+    if !line.is_empty() {
+        end(&mut line, &mut cut);
     }
 }
 
@@ -746,5 +843,70 @@ fn line(server: &Value) -> String {
             "{name}  {transport}  {}",
             server["error"].as_str().unwrap_or("failed")
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn a_listing_is_kept_for_the_person_alone_without_the_config_s_secrets() {
+        let dir = std::env::temp_dir().join(format!("sonny-mcp-kept-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let config = McpServer {
+            command: Some("server".into()),
+            env: [("TOKEN".to_owned(), "hunter2-secret".to_owned())].into(),
+            http_headers: [("X-Key".to_owned(), "header-secret".to_owned())].into(),
+            enabled: true,
+            ..McpServer::default()
+        };
+        let hub = Hub::new(Some(dir.join("mcp")));
+        let slot = Slot {
+            name: "s".into(),
+            config: config.clone(),
+            live: tokio::sync::Mutex::default(),
+            used: Mutex::new(Instant::now()),
+            busy: AtomicUsize::new(0),
+        };
+        hub.keep(&slot, &[json!({"name": "t"})], &None, None);
+        let file = dir.join("mcp/s.json");
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert!(!text.contains("secret"), "{text}");
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!((mode(&file), mode(&dir.join("mcp"))), (0o600, 0o700));
+        assert_eq!(kept(&dir.join("mcp"), "s", &config).unwrap().tools.len(), 1);
+        // Another secret is another config, listed again.
+        let changed = McpServer {
+            env: [("TOKEN".to_owned(), "other".to_owned())].into(),
+            ..config
+        };
+        assert_eq!(kept(&dir.join("mcp"), "s", &changed), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_server_s_stderr_is_kept_by_its_last_lines_each_cut() {
+        let mut written = vec![b'x'; 5 << 20];
+        written.extend_from_slice(b"\r\n");
+        for n in 0..30 {
+            written.extend_from_slice(format!("line {n}\n").as_bytes());
+        }
+        written.extend_from_slice(&[b'y'; 3000]);
+        let tail = Arc::new(Mutex::new(VecDeque::new()));
+        collect(&written[..], Arc::clone(&tail)).await;
+        let tail: Vec<String> = tail.lock().unwrap().iter().cloned().collect();
+        assert_eq!(tail.len(), STDERR_LINES);
+        assert_eq!(tail[0], "line 11");
+        assert_eq!(
+            tail[STDERR_LINES - 1],
+            format!("{}…", "y".repeat(STDERR_LINE))
+        );
+        let mut long = vec![b'z'; 3 * STDERR_LINE];
+        long.push(b'\n');
+        let one = Arc::new(Mutex::new(VecDeque::new()));
+        collect(&long[..], Arc::clone(&one)).await;
+        assert_eq!(one.lock().unwrap()[0].len(), STDERR_LINE + '…'.len_utf8());
     }
 }
