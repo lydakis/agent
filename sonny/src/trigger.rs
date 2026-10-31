@@ -740,7 +740,7 @@ pub(crate) fn local(epoch: i64) -> Local {
 }
 
 /// The time a local wall-clock time names, when it names one.
-fn epoch_of(at: Local) -> Option<i64> {
+pub(crate) fn epoch_of(at: Local) -> Option<i64> {
     // SAFETY: mktime reads and normalizes the struct it is given.
     let epoch = unsafe {
         let mut tm: libc::tm = std::mem::zeroed();
