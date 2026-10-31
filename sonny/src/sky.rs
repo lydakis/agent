@@ -417,8 +417,9 @@ pub struct View {
     runtime: tokio::runtime::Handle,
 }
 
-/// A haiku as its copy sends it back: who wrote it, and its lines.
-type Poem = (String, Vec<String>);
+/// A haiku as its copy sends it back: who wrote it, since when it held
+/// the title as its claim says, and its lines.
+type Poem = (String, i64, Vec<String>);
 
 /// A haiku on the sky: who wrote it, its lines, when it starts to show,
 /// and since when its writer held the title, until it passed.
@@ -763,13 +764,21 @@ impl View {
     /// Take the haikus written and let an hour-old one go; then, live,
     /// pass the busiest title by its rule, and have a new holder write.
     fn reign(&mut self, now: Instant) {
-        while let Ok((by, lines)) = self.poems.1.try_recv() {
-            let ((), kept) = haiku::Kept::update(&self.socket, |kept| {
-                (kept.by, kept.lines) = (by.clone(), lines.clone());
-                kept.at_ms = wall_ms();
+        while let Ok((by, since, lines)) = self.poems.1.try_recv() {
+            // Only for the claim it was written for: one a newer claim
+            // took over while it was written is let go.
+            let (current, kept) = haiku::Kept::update(&self.socket, |kept| {
+                let current = kept.by == by && kept.since_ms == since;
+                if current {
+                    kept.lines = lines.clone();
+                    kept.at_ms = wall_ms();
+                }
+                current
             });
             self.kept = kept;
-            self.recite(by, lines, now);
+            if current {
+                self.recite(by, lines, now);
+            }
         }
         if (self.verse.as_ref())
             .is_some_and(|verse| now.saturating_duration_since(verse.from) > HOUR)
@@ -828,7 +837,7 @@ impl View {
             let (socket, send) = (self.socket.clone(), self.poems.0.clone());
             self.runtime.spawn(async move {
                 if let Some(lines) = haiku::write(socket, name.clone()).await {
-                    let _ = send.send((name, lines));
+                    let _ = send.send((name, since, lines));
                 }
             });
         }
@@ -4554,7 +4563,16 @@ mod tests {
             "the pull request waits for me",
             "morning merges in",
         ];
-        let poem = ("shop.lead".to_owned(), lines.map(str::to_owned).to_vec());
+        // The claim it was written for.
+        let since = wall_ms() - 60_000;
+        haiku::Kept::update(&view.socket, |kept| {
+            (kept.by, kept.since_ms) = ("shop.lead".into(), since);
+        });
+        let poem = (
+            "shop.lead".to_owned(),
+            since,
+            lines.map(str::to_owned).to_vec(),
+        );
         view.poems.0.send(poem).unwrap();
         view.drain();
         // Just in: its first word, faint, and nothing signed yet.
@@ -4572,9 +4590,20 @@ mod tests {
             assert!(shown.contains(line), "{shown}");
         }
         assert!(shown.contains("— shop lead, busiest for 1m"), "{shown}");
+        // One written for a claim since taken over is let go.
+        let stale = (
+            "shop.lead".to_owned(),
+            since - 1,
+            vec!["x".into(), "y".into(), "z".into()],
+        );
+        view.poems.0.send(stale).unwrap();
+        view.drain();
+        assert!(view.fading.is_none());
+        assert_eq!(haiku::Kept::load(&view.socket).lines, lines);
         // The next fades the last out first.
         let poem = (
             "shop.lead".to_owned(),
+            since,
             vec!["a".into(), "b".into(), "c".into()],
         );
         view.poems.0.send(poem).unwrap();
