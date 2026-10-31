@@ -539,12 +539,8 @@ pub fn served(arguments: &Value, bot: &str, turn: i64, call: &str) -> Result<Str
         Some(minutes) => minutes.clamp(1, MAX_MINUTES),
         None => setting.min(MAX_MINUTES),
     };
-    let (plan, deadline) = match plan {
-        Unanswered::Now => (plan, None),
-        // With deadlines off, nothing goes ahead unseen.
-        _ if minutes == 0 => (Unanswered::Wait, None),
-        _ => (plan, Some(deadline(minutes, now()))),
-    };
+    let plan = allowed(plan, minutes);
+    let deadline = (plan != Unanswered::Now && minutes > 0).then(|| deadline(minutes, now()));
     // A deadline Sonny could not set leaves the ask waiting, and says why:
     // the card still shows, and nothing goes ahead unseen.
     let (plan, deadline, unset) =
@@ -583,6 +579,12 @@ pub fn served(arguments: &Value, bot: &str, turn: i64, call: &str) -> Result<Str
         "deadline_error": unset, "next": next})
         .to_string(),
     )
+}
+
+/// What the agent may do meanwhile, given the minutes its deadline waits:
+/// with deadlines off (0), every ask waits for the person, `go_now` too.
+fn allowed(plan: Unanswered, minutes: u64) -> Unanswered {
+    if minutes == 0 { Unanswered::Wait } else { plan }
 }
 
 /// The one-off trigger that wakes `bot` at `deadline` about its ask, unless
@@ -1236,6 +1238,14 @@ mod tests {
             clock(noon + 3 * 24 * 3600, noon),
             format!("{:02}-{:02} 12:00", later.month, later.day)
         );
+    }
+
+    #[test]
+    fn with_deadlines_off_every_ask_waits_even_one_going_now() {
+        for plan in [Unanswered::Now, Unanswered::Later, Unanswered::Wait] {
+            assert_eq!(allowed(plan, 0), Unanswered::Wait);
+            assert_eq!(allowed(plan, 60), plan);
+        }
     }
 
     #[test]
