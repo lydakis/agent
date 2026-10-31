@@ -6,10 +6,15 @@
 //! says how, in its multiplexer's CLI.
 use std::{
     collections::HashMap,
-    io::Read,
+    io::{BufRead, BufReader, Read, Write},
+    os::unix::net::UnixStream,
     path::{Path, PathBuf},
-    process::{Command, Output, Stdio},
-    sync::{Arc, Mutex, mpsc},
+    process::{Child, Command, Output, Stdio},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc,
+    },
     time::{Duration, Instant},
 };
 
@@ -80,6 +85,7 @@ fn output_within(command: &mut Command, limit: Duration) -> std::io::Result<Outp
 }
 
 /// A block as its multiplexer lists it.
+#[derive(Clone)]
 pub struct Block {
     pub id: String,
     pub label: String,
@@ -110,8 +116,9 @@ pub trait Backend: Send {
     fn here(&self) -> bool;
     /// Whether that home was made just now, with a shell nobody asked for.
     fn made(&self) -> bool;
-    /// The home's blocks, in the multiplexer's order.
-    fn blocks(&self) -> Vec<Block>;
+    /// The home's blocks, in the multiplexer's order, or why they could
+    /// not be read.
+    fn blocks(&self) -> Result<Vec<Block>, String>;
     fn close_block(&self, block: &str);
     fn rename_block(&self, block: &str, label: &str);
     fn rename_window(&self, window: &str, name: &str);
@@ -142,9 +149,88 @@ pub trait Backend: Send {
     ) -> Result<String, String>;
     /// The block Sonny itself runs in, when in this home.
     fn own_block(&self) -> Option<String>;
-    fn places(&self) -> Places;
+    fn places(&self) -> Result<Places, String>;
     /// The home, to find again.
     fn place(&self) -> Place;
+    /// Where the multiplexer says what changes in the home, when it can.
+    fn watch(&self) -> Option<Watch> {
+        None
+    }
+}
+
+/// A multiplexer's news of what changes in a home, one JSON object a line,
+/// so that the blocks listed once are listed again only once one changed.
+/// The host's events say that something changed, not what: the home is
+/// read again whole, as Herdr's and cmux's event docs ask of a client
+/// that keeps their state.
+pub struct Watch {
+    pub from: Stream,
+    /// What a line says.
+    pub heard: Box<dyn Fn(&serde_json::Value) -> Heard + Send>,
+}
+
+pub enum Stream {
+    /// A command that prints the news until it is stopped.
+    Command(Command),
+    /// A socket that sends the news once asked, by the line given.
+    Socket(PathBuf, String),
+}
+
+#[derive(Debug, PartialEq)]
+pub enum Heard {
+    /// Something in the home may have changed.
+    Changed,
+    /// Nothing that moves a block, said by a stream that is up.
+    Same,
+    /// The stream will say no more.
+    Over,
+}
+
+/// What a home's watch has heard: whether it is up, and how many times the
+/// home changed, which what was read before is checked against.
+#[derive(Default)]
+struct News {
+    up: AtomicBool,
+    changes: AtomicU64,
+}
+
+impl News {
+    fn changes(&self) -> u64 {
+        self.changes.load(Ordering::Acquire)
+    }
+
+    fn changed(&self) {
+        self.changes.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+/// What a watch holds open, closed with its layout.
+enum Watching {
+    Command(Child),
+    Socket(UnixStream),
+}
+
+impl Watching {
+    fn close(self) {
+        match self {
+            Self::Command(mut child) => {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            Self::Socket(socket) => {
+                let _ = socket.shutdown(std::net::Shutdown::Both);
+            }
+        }
+    }
+}
+
+/// The watch's stream, opened on its own thread so that a host slow to
+/// take it holds up no work. Once the layout is gone, one opened after
+/// is closed at once.
+#[derive(Default)]
+struct Following {
+    gone: bool,
+    stream: Option<Watching>,
 }
 
 /// A project's home, as its lead's Sonny last found it in the person's
@@ -222,26 +308,155 @@ pub struct Layout {
     /// The blocks a home made just now came with, closed once something
     /// is placed in it.
     spare: Vec<String>,
+    /// The home's blocks and places as last read, with the changes the
+    /// watch had heard of by then.
+    listed: Option<(u64, Vec<Block>)>,
+    placed: Option<(u64, Places)>,
+    news: Arc<News>,
+    following: Arc<Mutex<Following>>,
+}
+
+impl Drop for Layout {
+    fn drop(&mut self) {
+        let mut following = self.following.lock().unwrap_or_else(|e| e.into_inner());
+        following.gone = true;
+        if let Some(stream) = following.stream.take() {
+            stream.close();
+        }
+    }
 }
 
 impl Layout {
     pub fn new(backend: Box<dyn Backend>) -> Self {
         let spare = match backend.made() {
-            true => backend.blocks().into_iter().map(|b| b.id).collect(),
+            true => (backend.blocks().unwrap_or_default().into_iter())
+                .map(|b| b.id)
+                .collect(),
             false => Vec::new(),
         };
         Self {
             backend,
             blocks: HashMap::new(),
             spare,
+            listed: None,
+            placed: None,
+            news: Arc::default(),
+            following: Arc::default(),
         }
+    }
+
+    /// Follow the home's news, when its multiplexer gives it: from then
+    /// on, what was read is read again only once the news says the home
+    /// changed. The first line heard says the stream is up; until then,
+    /// and once it ends, the home is read again for each batch of work.
+    pub fn watch(&mut self) {
+        let Some(Watch { from, heard }) = self.backend.watch() else {
+            return;
+        };
+        let news = self.news.clone();
+        let following = self.following.clone();
+        std::thread::spawn(move || {
+            let (stream, lines): (_, Box<dyn BufRead + Send>) = match from {
+                Stream::Command(mut command) => {
+                    let Ok(mut child) = command
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::null())
+                        .spawn()
+                    else {
+                        return;
+                    };
+                    let Some(out) = child.stdout.take() else {
+                        return;
+                    };
+                    (Watching::Command(child), Box::new(BufReader::new(out)))
+                }
+                Stream::Socket(path, ask) => {
+                    let Ok(mut socket) = UnixStream::connect(&path) else {
+                        return;
+                    };
+                    let Ok(kept) = socket.try_clone() else {
+                        return;
+                    };
+                    if writeln!(socket, "{ask}").is_err() {
+                        return;
+                    }
+                    (Watching::Socket(kept), Box::new(BufReader::new(socket)))
+                }
+            };
+            {
+                let mut following = following.lock().unwrap_or_else(|e| e.into_inner());
+                if following.gone {
+                    stream.close();
+                    return;
+                }
+                following.stream = Some(stream);
+            }
+            for line in lines.lines() {
+                let Ok(line) = line else { break };
+                let said = serde_json::from_str(&line).map_or(Heard::Changed, |line| heard(&line));
+                if said == Heard::Over {
+                    break;
+                }
+                // Up just now: what was read before it may have missed a
+                // change, so it is read again.
+                if !news.up.swap(true, Ordering::AcqRel) || said == Heard::Changed {
+                    news.changed();
+                }
+            }
+            news.up.store(false, Ordering::Release);
+            news.changed();
+        });
+    }
+
+    /// Ready for a batch of work: with no news followed, what was read
+    /// before may be out of date, so it is read again when next asked.
+    pub fn fresh(&mut self) {
+        if !self.news.up.load(Ordering::Acquire) {
+            self.listed = None;
+            self.placed = None;
+        }
+    }
+
+    /// The home's blocks, as last read unless the home changed since. A
+    /// read that failed is none, and tried again when next asked.
+    fn listed(&mut self) -> Vec<Block> {
+        let now = self.news.changes();
+        if let Some((at, blocks)) = &self.listed
+            && *at == now
+        {
+            return blocks.clone();
+        }
+        let Ok(blocks) = self.backend.blocks() else {
+            return Vec::new();
+        };
+        self.listed = Some((now, blocks.clone()));
+        blocks
+    }
+
+    /// What Sonny itself changes is read again after.
+    fn forget(&mut self) {
+        self.listed = None;
+        self.placed = None;
+    }
+
+    /// A close or rename is not confirmed by its multiplexer, so the
+    /// home is read again after rather than guessed.
+    fn close_block(&mut self, block: &str) {
+        self.backend.close_block(block);
+        self.forget();
+    }
+
+    fn rename_block(&mut self, block: &str, label: &str) {
+        self.backend.rename_block(block, label);
+        self.forget();
     }
 
     /// Close the shell a home made just now came with, now that it holds
     /// something of its own.
     fn tidy(&mut self) {
         for block in std::mem::take(&mut self.spare) {
-            self.backend.close_block(&block);
+            self.close_block(&block);
         }
     }
 
@@ -266,7 +481,7 @@ impl Layout {
     /// task has a block already. Returns whether one was opened. The
     /// person's focus stays where it is.
     pub fn show(&mut self, bot: &str, name: &str, command: &[String]) -> Result<bool, String> {
-        let listed = self.backend.blocks();
+        let listed = self.listed();
         if let Some(block) = self.blocks.get(bot)
             && listed.iter().any(|b| &b.id == block)
         {
@@ -287,9 +502,9 @@ impl Layout {
         command: &[String],
         placement: &Placement,
     ) -> Result<(), String> {
-        let listed = self.backend.blocks();
+        let listed = self.listed();
         for old in listed.iter().filter(|b| b.label == bot) {
-            self.backend.close_block(&old.id);
+            self.close_block(&old.id);
         }
         let cwd = Path::new("/");
         let block = match placement {
@@ -303,15 +518,16 @@ impl Layout {
                 (self.backend).split(&anchor, side, false, bot, cwd, command, false)?
             }
         };
+        self.forget();
         self.blocks.insert(bot.to_owned(), block);
         self.tidy();
         Ok(())
     }
 
     /// Each window and the labels of its blocks, in the multiplexer's order.
-    pub fn windows(&self) -> Vec<(String, Vec<String>)> {
+    pub fn windows(&mut self) -> Vec<(String, Vec<String>)> {
         let mut windows: Vec<(String, Vec<String>)> = Vec::new();
-        for block in self.backend.blocks() {
+        for block in self.listed() {
             match windows
                 .iter_mut()
                 .find(|(window, _)| *window == block.window)
@@ -323,8 +539,20 @@ impl Layout {
         windows
     }
 
-    pub fn places(&self) -> Places {
-        self.backend.places()
+    /// Where each block sits, as last read unless the home changed since.
+    /// A read that failed is nowhere, and tried again when next asked.
+    pub fn places(&mut self) -> Places {
+        let now = self.news.changes();
+        if let Some((at, places)) = &self.placed
+            && *at == now
+        {
+            return places.clone();
+        }
+        let Ok(places) = self.backend.places() else {
+            return Places::new();
+        };
+        self.placed = Some((now, places.clone()));
+        places
     }
 
     pub fn rename_window(&self, window: &str, name: &str) {
@@ -335,7 +563,7 @@ impl Layout {
     /// after the bot.
     pub fn adopt_own(&mut self, bot: &str) {
         let mine = self.backend.own_block();
-        let listed = self.backend.blocks();
+        let listed = self.listed();
         let own = listed
             .iter()
             .find(|b| mine.as_ref().is_some_and(|mine| &b.id == mine))
@@ -343,10 +571,11 @@ impl Layout {
         let Some(own) = own else {
             return;
         };
-        if own.label != bot {
-            self.backend.rename_block(&own.id, bot);
+        let own = own.id.clone();
+        if !listed.iter().any(|b| b.id == own && b.label == bot) {
+            self.rename_block(&own, bot);
         }
-        self.blocks.insert(bot.to_owned(), own.id.clone());
+        self.blocks.insert(bot.to_owned(), own);
     }
 
     /// Close every other block labelled with the bot's name, as one Sonny
@@ -356,12 +585,11 @@ impl Layout {
             return;
         };
         for other in self
-            .backend
-            .blocks()
+            .listed()
             .into_iter()
             .filter(|b| b.label == bot && b.id != mine)
         {
-            self.backend.close_block(&other.id);
+            self.close_block(&other.id);
         }
     }
 
@@ -380,9 +608,9 @@ impl Layout {
         side: Option<&str>,
     ) -> Result<String, String> {
         let label = format!("{owner}/{name}");
-        let listed = self.backend.blocks();
+        let listed = self.listed();
         for old in listed.iter().filter(|b| b.label == label) {
-            self.backend.close_block(&old.id);
+            self.close_block(&old.id);
         }
         let anchor = listed.iter().find(|b| b.label == owner);
         let block = match anchor.zip(side) {
@@ -391,6 +619,7 @@ impl Layout {
             }
             None => self.backend.window(&label, name, cwd, command, true),
         }?;
+        self.forget();
         self.tidy();
         Ok(block)
     }
@@ -400,10 +629,10 @@ impl Layout {
     pub fn close(&mut self, bot: &str) {
         let known = self.blocks.remove(bot);
         let owned = format!("{bot}/");
-        for block in self.backend.blocks().into_iter().filter(|b| {
+        for block in self.listed().into_iter().filter(|b| {
             b.label == bot || b.label.starts_with(&owned) || Some(&b.id) == known.as_ref()
         }) {
-            self.backend.close_block(&block.id);
+            self.close_block(&block.id);
         }
     }
 }
@@ -422,7 +651,8 @@ enum Work {
 /// A [`Layout`] worked on a thread of its own, so that no multiplexer
 /// call holds up Sonny's screen: jobs run in the order they are sent,
 /// a naming of the windows that another follows is skipped, and where
-/// each block sits is kept to be read at once.
+/// each block sits is kept to be read at once. It follows the home's
+/// news, so what nothing changed is not read again.
 pub struct Worker {
     work: mpsc::Sender<Work>,
     home: String,
@@ -438,8 +668,10 @@ impl Worker {
         let (home, here) = (layout.home(), layout.here());
         std::thread::spawn(move || {
             let mut layout = layout;
+            layout.watch();
             while let Ok(first) = queue.recv() {
                 let batch: Vec<Work> = std::iter::once(first).chain(queue.try_iter()).collect();
+                layout.fresh();
                 let last_names = batch.iter().rposition(|w| matches!(w, Work::Names(_)));
                 let read = batch.iter().any(|w| matches!(w, Work::Places));
                 for (n, work) in batch.into_iter().enumerate() {
@@ -644,6 +876,11 @@ mod tests {
         blocks: RefCell<Vec<Block>>,
         own: Option<String>,
         made: bool,
+        /// How many times the blocks were listed.
+        lists: Arc<std::sync::atomic::AtomicUsize>,
+        /// While set, the blocks cannot be read.
+        down: Arc<AtomicBool>,
+        news: RefCell<Option<Watch>>,
     }
 
     impl Fake {
@@ -668,14 +905,18 @@ mod tests {
         fn made(&self) -> bool {
             self.made
         }
-        fn blocks(&self) -> Vec<Block> {
-            (self.blocks.borrow().iter())
+        fn blocks(&self) -> Result<Vec<Block>, String> {
+            self.lists.fetch_add(1, Ordering::SeqCst);
+            if self.down.load(Ordering::SeqCst) {
+                return Err("down".into());
+            }
+            Ok((self.blocks.borrow().iter())
                 .map(|b| Block {
                     id: b.id.clone(),
                     label: b.label.clone(),
                     window: b.window.clone(),
                 })
-                .collect()
+                .collect())
         }
         fn close_block(&self, block: &str) {
             self.blocks.borrow_mut().retain(|b| b.id != block);
@@ -720,13 +961,16 @@ mod tests {
         fn own_block(&self) -> Option<String> {
             self.own.clone()
         }
-        fn places(&self) -> Places {
-            Places::new()
+        fn places(&self) -> Result<Places, String> {
+            Ok(Places::new())
         }
         fn place(&self) -> Place {
             Place::Herdr {
                 workspace: "w1".into(),
             }
+        }
+        fn watch(&self) -> Option<Watch> {
+            self.news.borrow_mut().take()
         }
     }
 
@@ -745,6 +989,99 @@ mod tests {
         let error = super::output_within(hung.arg("30"), std::time::Duration::from_millis(200));
         assert_eq!(error.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    /// Wait until `news` has heard of `changes` changes.
+    fn hear(news: &News, changes: u64) {
+        let started = Instant::now();
+        while news.changes() < changes {
+            assert!(started.elapsed() < Duration::from_secs(5), "never heard");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn with_no_news_the_home_is_read_once_a_batch() {
+        let fake = Fake::default();
+        let lists = fake.lists.clone();
+        fake.add("shop.fix", "w1");
+        let mut layout = Layout::new(Box::new(fake));
+        layout.windows();
+        layout.windows();
+        assert_eq!(lists.load(Ordering::SeqCst), 1);
+        layout.fresh();
+        layout.windows();
+        assert_eq!(lists.load(Ordering::SeqCst), 2);
+        // What Sonny opens itself, it reads again.
+        layout.show("shop.new", "new", &[]).unwrap();
+        assert_eq!(lists.load(Ordering::SeqCst), 2);
+        let windows = layout.windows();
+        assert_eq!((lists.load(Ordering::SeqCst), windows.len()), (3, 2));
+    }
+
+    #[test]
+    fn with_news_the_home_is_read_again_only_once_it_changed() {
+        let dir = std::env::temp_dir().join(format!("sonny-news-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("news.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let fake = Fake::default();
+        let lists = fake.lists.clone();
+        let down = fake.down.clone();
+        fake.add("shop.fix", "w1");
+        *fake.news.borrow_mut() = Some(Watch {
+            from: Stream::Socket(path, "{\"ask\":1}".into()),
+            heard: Box::new(|line| match line["said"].as_str() {
+                Some("changed") => Heard::Changed,
+                Some("over") => Heard::Over,
+                _ => Heard::Same,
+            }),
+        });
+        let mut layout = Layout::new(Box::new(fake));
+        let news = layout.news.clone();
+        layout.watch();
+        let (socket, _) = listener.accept().unwrap();
+        let mut asked = String::new();
+        BufReader::new(socket.try_clone().unwrap())
+            .read_line(&mut asked)
+            .unwrap();
+        assert_eq!(asked, "{\"ask\":1}\n");
+        let say = |said: &str| writeln!(&socket, "{{\"said\":\"{said}\"}}").unwrap();
+        // Up: read again once, then not, batch after batch.
+        say("started");
+        hear(&news, 1);
+        layout.windows();
+        layout.fresh();
+        layout.places();
+        layout.windows();
+        assert_eq!(lists.load(Ordering::SeqCst), 1);
+        // What does not move a block changes nothing.
+        say("focus");
+        say("changed");
+        hear(&news, 2);
+        layout.windows();
+        assert_eq!(lists.load(Ordering::SeqCst), 2);
+        // A read that failed is not kept: it is tried again until it is
+        // read.
+        say("changed");
+        hear(&news, 3);
+        down.store(true, Ordering::SeqCst);
+        assert!(layout.windows().is_empty());
+        layout.windows();
+        down.store(false, Ordering::SeqCst);
+        assert_eq!(layout.windows().len(), 1);
+        layout.windows();
+        assert_eq!(lists.load(Ordering::SeqCst), 5);
+        // Once the news ends, each batch reads the home again.
+        say("over");
+        hear(&news, 4);
+        assert!(!news.up.load(Ordering::SeqCst));
+        layout.windows();
+        layout.fresh();
+        layout.windows();
+        assert_eq!(lists.load(Ordering::SeqCst), 7);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -800,7 +1137,7 @@ mod tests {
         assert_ne!(Place::file(socket, "shop"), Place::file(socket, "shop.web"));
     }
 
-    fn labels(layout: &Layout) -> Vec<(String, Vec<String>)> {
+    fn labels(layout: &mut Layout) -> Vec<(String, Vec<String>)> {
         layout.windows()
     }
 
@@ -830,7 +1167,7 @@ mod tests {
             .split("shop.lead", "server", Path::new("/w"), &sonny, None)
             .unwrap();
         assert_eq!(
-            labels(&layout),
+            labels(&mut layout),
             [
                 (
                     "home".into(),
@@ -845,7 +1182,7 @@ mod tests {
         );
         layout.close("shop.fix");
         assert_eq!(
-            labels(&layout),
+            labels(&mut layout),
             [
                 ("home".into(), vec!["shop.lead".into()]),
                 ("server".into(), vec!["shop.lead/server".into()]),
@@ -863,7 +1200,10 @@ mod tests {
         let mut layout = Layout::new(Box::new(fake));
         let sonny = ["sonny".to_owned()];
         assert!(layout.show("web.lead", "lead", &sonny).unwrap());
-        assert_eq!(labels(&layout), [("lead".into(), vec!["web.lead".into()])]);
+        assert_eq!(
+            labels(&mut layout),
+            [("lead".into(), vec!["web.lead".into()])]
+        );
         // The lead's Sonny is there already: left alone.
         assert!(!layout.show("web.lead", "lead", &sonny).unwrap());
     }
@@ -892,7 +1232,7 @@ mod tests {
             .unwrap();
         layout.close("shop.fix");
         assert_eq!(
-            labels(&layout),
+            labels(&mut layout),
             [(
                 "work".into(),
                 vec![
