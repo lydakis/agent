@@ -389,9 +389,20 @@ read, its marks kept and dim: `**bold**` bold, `` `code` `` in code's colour,
 a `#` line as a heading, a `>` quote in italics, a link's label underlined;
 what is sent is the text as typed.
 
-Up on the composer's first row and Down on its last walk the prompts you
-sent before, as in a shell, and past the newest your draft comes back. They
-are kept in `~/.agent/sonny/history.jsonl`, this window's own first.
+Up and Down also bring back what you sent before, as a shell's history
+and Codex's and Claude Code's do: Up on the composer's first row goes back
+a prompt, Down on its last row comes forward, and past the newest what you
+were writing comes back. A prompt of several rows opens at its top going
+back and at its end coming forward, so the next press keeps going; in
+between, the arrows move through its rows. Every window keeps its prompts in
+`~/.agent/sonny/history.jsonl` (only you can read it), and recalls its own
+first, newest first, then those any window sent before it opened. Edit a
+prompt brought back and it is yours to send, or Up starts again from it.
+A prompt this window sent comes back with its pictures (the newest as many
+as one message may carry; older ones let theirs go), and the draft with its
+own; one from the file comes back as text alone.
+
+![Up brings back a two-row prompt with the cursor at its top, Up again the one before, and Down twice returns the draft](../docs/sonny/prompt-history.png)
 
 Alt-T boosts the next message: the turn it starts runs at a higher effort
 (`xhigh`, or `high` where the model has no `xhigh`), Alt-T again at `max`
