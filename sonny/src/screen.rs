@@ -97,6 +97,10 @@ pub enum Mark {
     /// The first row of a message, whatever its lead: a reply that opens
     /// with a heading has no bullet to say so.
     Opens,
+    /// The lead the row's rows past its first start with when it is
+    /// wrapped narrower than it was written, as [`Screen::push_hanging`]
+    /// gives one: a bar down a card's side goes on down its rows.
+    Hangs(Line<'static>),
 }
 
 /// A row on the screen: one of the conversation's rows, or the part of
@@ -148,6 +152,7 @@ impl Row {
             Mark::Link(url) => self.link = Some(url),
             Mark::Buttons(buttons) => self.buttons = buttons,
             Mark::Opens => self.opens = true,
+            Mark::Hangs(rest) => self.rest = Some(rest),
         }
     }
 }

@@ -1918,8 +1918,14 @@ struct App {
     /// Calls waiting on the person, as `approvals` lists them.
     approvals: Vec<Value>,
     /// The lead's open questions for the person, oldest first: its `ask`
-    /// calls not yet answered.
+    /// calls not yet answered, nor set aside.
     asks: Vec<asks::Ask>,
+    /// Which of them what is typed answers.
+    focus: usize,
+    /// Questions the conversation went on past, the person writing a
+    /// message of their own after them: out of the composer and the
+    /// count, their options still answering them.
+    aside: Vec<asks::Ask>,
     /// Questions this window answered and closed, until their answers
     /// land, so landing does not close another asked the same.
     sent_answers: Vec<String>,
@@ -2854,6 +2860,8 @@ impl App {
             calls: HashMap::new(),
             approvals: Vec::new(),
             asks: Vec::new(),
+            focus: 0,
+            aside: Vec::new(),
             sent_answers: Vec::new(),
             reactions_key: record["bot_id"].as_i64().map(|id| {
                 let store =
@@ -3913,14 +3921,20 @@ impl App {
             && !failed
             && let Some(ask) = asks::call(id, arguments)
         {
-            let (lines, options) = asks::lines(&ask, self.width);
+            let card = asks::card(&ask, self.width);
             let from = self.pending.len() + usize::from(self.any_history);
-            self.commit(lines);
+            self.commit(card.rows);
             self.marks
-                .extend(options.into_iter().enumerate().map(|(at, row)| {
+                .extend(card.options.into_iter().enumerate().map(|(at, row)| {
                     let button = format!("{}answer/{at}/{id}", screen::BUTTON);
                     (from + row, screen::Mark::Link(button))
                 }));
+            // Drawn narrower later, as when the margin opens, its bar
+            // goes on down every row.
+            self.marks.extend(
+                (card.hangs.into_iter().enumerate())
+                    .map(|(row, hang)| (from + row, screen::Mark::Hangs(hang))),
+            );
             return;
         }
         // A plan said in a row of how far it has got: the newest shows
@@ -4370,7 +4384,11 @@ impl App {
             .and_then(|rest| rest.split_once('/'))
             .and_then(|(at, id)| Some((at.parse::<usize>().ok()?, id)))
         {
-            let Some(ask) = self.asks.iter().find(|ask| ask.id == id).cloned() else {
+            // One set aside is still answered by its options.
+            let Some(ask) = (self.asks.iter().chain(&self.aside))
+                .find(|ask| ask.id == id)
+                .cloned()
+            else {
                 self.notice = Some("that question was answered already".into());
                 return;
             };
@@ -4378,11 +4396,7 @@ impl App {
             match self.send(answer, None, false, false, &[]).await {
                 Ok(()) => {
                     self.notice = None;
-                    self.asks.retain(|open| open.id != ask.id);
-                    self.sent_answers.push(ask.question);
-                    if self.asks.is_empty() {
-                        self.chatting = false;
-                    }
+                    self.close_ask(&ask);
                 }
                 Err(error) => self.notice = Some(error),
             }
@@ -5252,6 +5266,8 @@ impl App {
             self.react_calls.clear();
             self.answering = None;
             self.asks.clear();
+            self.aside.clear();
+            self.focus = 0;
             self.sent_answers.clear();
         }
         self.seen_node = nodes.last().copied().unwrap_or(self.seen_node);
@@ -5381,7 +5397,7 @@ impl App {
                         // were drawn live.
                         self.draw_bot_reactions();
                         if !older {
-                            asks::close(&mut self.asks, &text(&item));
+                            self.answered(&text(&item), item["from"].as_str());
                         }
                         self.land(node, &text(&item), item["from"].as_str(), older);
                     }
@@ -5480,13 +5496,8 @@ impl App {
                             self.resolve(&arguments, id, turns.get(&node).copied(), false)
                                 .await;
                         }
-                        if name == asks::TOOL
-                            && !failed
-                            && !reactions::refused(&item)
-                            && let Some(ask) = asks::call(id, &arguments)
-                            && !self.asks.iter().any(|open| open.id == ask.id)
-                        {
-                            self.asks.push(ask);
+                        if name == asks::TOOL && !failed && !reactions::refused(&item) {
+                            self.asked(id, &arguments);
                         }
                     }
                     _ => {}
@@ -5892,7 +5903,7 @@ impl App {
                     && !quiet_message(&text(item))
                 {
                     self.land(node, &text(item), item["from"].as_str(), false);
-                    self.answered(&text(item));
+                    self.answered(&text(item), item["from"].as_str());
                 }
             }
             "steered" => {
@@ -5909,7 +5920,7 @@ impl App {
                     // message before this one.
                     self.draw_bot_reactions();
                     self.land(node, &text(item), item["from"].as_str(), false);
-                    self.answered(&text(item));
+                    self.answered(&text(item), item["from"].as_str());
                 }
             }
             "queued" => self.notice = Some(format!("queued behind turn {}", data["behind"])),
@@ -8477,6 +8488,14 @@ impl App {
                     KeyCode::Right => self.input.right(),
                     KeyCode::Home => self.input.home(),
                     KeyCode::End => self.input.end(),
+                    // With nothing typed, the open questions are a list.
+                    KeyCode::Up | KeyCode::Down
+                        if self.input.is_empty()
+                            && self.asking().is_some()
+                            && self.asks.len() > 1 =>
+                    {
+                        self.step_ask(key.code == KeyCode::Down)
+                    }
                     KeyCode::Up => {
                         self.input.up(self.prose());
                     }
@@ -8861,9 +8880,7 @@ impl App {
         }
         // What is typed answers the lead's first open question, and goes
         // with it; the question closes once the daemon has the answer.
-        let answering = (!self.chatting)
-            .then(|| self.asks.first().cloned())
-            .flatten();
+        let answering = self.asking().cloned();
         let prompt = match &answering {
             Some(ask) => asks::answer(ask, &prompt),
             None => prompt,
@@ -8902,11 +8919,7 @@ impl App {
                 self.notice = None;
                 self.pictures.clear();
                 if let Some(ask) = answering {
-                    self.asks.retain(|open| open.id != ask.id);
-                    self.sent_answers.push(ask.question);
-                    if self.asks.is_empty() {
-                        self.chatting = false;
-                    }
+                    self.close_ask(&ask);
                 }
             }
             Err(error) => self.notice = Some(error),
@@ -9049,18 +9062,49 @@ impl App {
         }
     }
 
-    /// The question an `ask` call put, open until it is answered.
+    /// The question an `ask` call put, open until it is answered or the
+    /// conversation goes on past it. One newly asked takes no focus from
+    /// the one being answered, as Codex's questions take none.
     fn asked(&mut self, id: &str, arguments: &Value) {
         if let Some(ask) = asks::call(id, arguments)
-            && !self.asks.iter().any(|open| open.id == ask.id)
+            && !(self.asks.iter().chain(&self.aside)).any(|open| open.id == ask.id)
         {
             self.asks.push(ask);
         }
     }
 
+    /// The open question what is typed answers, unless Esc set them
+    /// aside for a message of the person's own.
+    fn asking(&self) -> Option<&asks::Ask> {
+        (!self.chatting)
+            .then(|| self.asks.get(self.focus))
+            .flatten()
+    }
+
+    /// `ask` answered from here: closed now, its answer kept until it
+    /// lands so landing closes no other asked the same.
+    fn close_ask(&mut self, ask: &asks::Ask) {
+        self.asks.retain(|open| open.id != ask.id);
+        self.aside.retain(|open| open.id != ask.id);
+        self.sent_answers.push(ask.question.clone());
+        self.settle_asks();
+    }
+
+    /// The focus on a question still open, the oldest once the one it
+    /// was on is gone from the end; none open, typing writes again.
+    fn settle_asks(&mut self) {
+        if self.focus >= self.asks.len() {
+            self.focus = 0;
+        }
+        if self.asks.is_empty() {
+            self.chatting = false;
+        }
+    }
+
     /// The question a message answered, from this window or another,
-    /// closed.
-    fn answered(&mut self, message: &str) {
+    /// closed; or, the person's own words that answer none, every
+    /// question open set aside, as the conversation went on past them.
+    fn answered(&mut self, message: &str, from: Option<&str>) {
         // An answer sent from here closed its question when it was sent.
         if let Some(question) = asks::answered(message)
             && let Some(at) = self.sent_answers.iter().position(|q| q == question)
@@ -9068,10 +9112,23 @@ impl App {
             self.sent_answers.remove(at);
             return;
         }
-        asks::close(&mut self.asks, message);
-        if self.asks.is_empty() {
-            self.chatting = false;
+        if asks::moves_on(message, from) {
+            self.aside.append(&mut self.asks);
+        } else if !asks::close(&mut self.asks, message) {
+            asks::close(&mut self.aside, message);
         }
+        self.settle_asks();
+    }
+
+    /// The composer's focus on the next open question, or the one
+    /// before: Up and Down with nothing typed step through them, as a
+    /// list's rows.
+    fn step_ask(&mut self, down: bool) {
+        let count = self.asks.len();
+        self.focus = match down {
+            true => (self.focus + 1) % count,
+            false => (self.focus + count - 1) % count,
+        };
     }
 
     /// The bot's reactions so far to the person's message, right under
@@ -9581,7 +9638,12 @@ impl App {
         let (composer_rows, (cursor_row, cursor_col)) = self.composer(width.min(PROSE));
         // A short pane keeps the rows around the cursor, where typing goes on.
         let room = (terminal.size()?.height as usize).saturating_sub(VIEWPORT as usize - 1);
-        let (composer_rows, cursor_row) = window(composer_rows, cursor_row, room.max(1));
+        // What is typed to answer a question has the question over it,
+        // as a reply in a chat has what it replies to.
+        let heading = self.answering_over(width.min(PROSE)).filter(|_| room > 1);
+        let text_room = room - usize::from(heading.is_some());
+        let (mut composer_rows, mut cursor_row) =
+            window(composer_rows, cursor_row, text_room.max(1));
         // The first of the text's rows shown, for the mouse to find its spot.
         let first_row = match &self.composing {
             Some((_, (_, first, _))) => Some(*first),
@@ -9590,6 +9652,10 @@ impl App {
                 self.input.cursor(&layout).0 - cursor_row
             }),
         };
+        if let Some(heading) = &heading {
+            composer_rows.insert(0, heading.clone());
+            cursor_row += 1;
+        }
         let mut composer_at = None;
         let mut counter_at = None;
         // The reply's open line, wrapped as it will be written: it grows
@@ -9989,7 +10055,16 @@ impl App {
             }
             edge(frame, gap, composer, pad);
             frame.render_widget(Paragraph::new(composer_rows), composer);
-            composer_at = first_row.map(|first| (composer, first, width.min(PROSE)));
+            // The mouse finds the text under the row over it.
+            let text = match heading {
+                Some(_) => Rect {
+                    y: composer.y + 1,
+                    height: composer.height.saturating_sub(1),
+                    ..composer
+                },
+                None => composer,
+            };
+            composer_at = first_row.map(|first| (text, first, width.min(PROSE)));
             // Keys in the pane: no cursor where they do not go.
             if !self.pane_keys {
                 frame.set_cursor_position((
@@ -10033,14 +10108,27 @@ impl App {
         Ok(())
     }
 
+    /// The row over what is typed while it answers a question: which,
+    /// and which of those open.
+    fn answering_over(&self, width: usize) -> Option<Line<'static>> {
+        let ask = self.asking().filter(|_| !self.input.is_empty())?;
+        let open = [
+            self.picker.is_some(),
+            self.config.is_some(),
+            self.finding.is_some(),
+        ];
+        (!open.contains(&true))
+            .then(|| asks::answering_typed(ask, self.focus, self.asks.len(), width))
+    }
+
     /// The composer's rows: the prompt wrapped to the width, the way it
     /// will read once sent, and only the rows around the cursor when it
     /// is long; or the hint. Also the cursor's row among those and its
     /// column. A list or picker open over the composer keeps it to the
     /// cursor's row.
     fn composer(&self, width: usize) -> (Vec<Line<'static>>, (usize, usize)) {
-        // What is sent answers the lead's first open question.
-        let answering = (!self.chatting).then(|| self.asks.first()).flatten();
+        // What is sent answers the open question in focus.
+        let answering = self.asking();
         // The guess at the next message, for Tab to take.
         if let Some(guess) = self.suggested() {
             let room = width.saturating_sub(prompt::LEAD + TAB.width());
@@ -10061,20 +10149,30 @@ impl App {
                 Some(project) => lead_title(project, &self.bot),
                 None => self.bot.clone(),
             };
+            // What Enter does, muted, then its keys in the one grammar.
+            let said = |words: &str, keys: &str| {
+                let mut spans = vec![Span::raw(format!("{words} · ")).dim()];
+                spans.extend(hint::spans(keys));
+                spans
+            };
             let hint = match self.running {
-                _ if let Some(ask) = answering => {
-                    asks::hint(ask, self.asks.len() - 1, width.saturating_sub(prompt::LEAD))
-                }
-                _ if self.react_to.is_some() => "An emoji for that reply · esc cancel".into(),
-                _ if !self.asks.is_empty() => "A message of your own · esc answer".into(),
-                Some(_) => format!("Steer {name}"),
-                None => format!("Message {name}"),
+                _ if let Some(ask) = answering => asks::hint(
+                    ask,
+                    self.focus,
+                    self.asks.len(),
+                    width.saturating_sub(prompt::LEAD),
+                ),
+                _ if self.react_to.is_some() => said("An emoji for that reply", "esc cancel"),
+                _ if !self.asks.is_empty() => said("A message of your own", "esc answer"),
+                Some(_) => vec![Span::raw(format!("Steer {name}")).dim()],
+                None => vec![Span::raw(format!("Message {name}")).dim()],
             };
             let lead = match answering {
                 Some(_) => Span::raw("? ").bold().fg(Color::Yellow),
                 None => Span::raw("› ").bold(),
             };
-            let mut spans = vec![lead, Span::raw(hint).dim()];
+            let mut spans = vec![lead];
+            spans.extend(hint);
             // Where the keys are, while nothing else is asked.
             if answering.is_none()
                 && self.asks.is_empty()
@@ -11634,7 +11732,7 @@ mod tests {
         app.input.set("2");
         app.submit().await;
         // Its answer landing leaves the other question asked the same open.
-        app.answered("You asked: Keep the old API?\n\nDrop it");
+        app.answered("You asked: Keep the old API?\n\nDrop it", None);
         // Esc sets the rest aside: the next message is the person's own.
         app.chatting = true;
         app.input.set("how is it going?");
@@ -11650,6 +11748,35 @@ mod tests {
             app.asks,
             [ask("c2", "Tag it?"), ask("c3", "Keep the old API?")]
         );
+        // Down picks the next to answer; what is typed then answers it,
+        // named over the words as the sent answer will be.
+        app.chatting = false;
+        app.step_ask(true);
+        assert_eq!(app.asking().map(|a| a.id.as_str()), Some("c3"));
+        app.input.set("1");
+        assert_eq!(
+            app.answering_over(80).unwrap().to_string(),
+            "  answering “Keep the old API?” (2 of 2)"
+        );
+        app.step_ask(true);
+        assert_eq!(app.asking().map(|a| a.id.as_str()), Some("c2"));
+        // The person's own words landing move on past them: out of the
+        // composer and the count, their options still answering them.
+        app.answered("how is it going?", None);
+        assert!(app.asks.is_empty() && app.asking().is_none());
+        assert_eq!(app.aside.len(), 2);
+        app.input.clear();
+        app.press("answer/0/c2").await;
+        assert_eq!(
+            sent.lock().unwrap().last().unwrap(),
+            "You asked: Tag it?\n\nKeep it"
+        );
+        assert_eq!(app.aside, [ask("c3", "Keep the old API?")]);
+        // Another agent's words, or a reaction, move nothing on.
+        app.asks = vec![ask("c4", "Ship it?")];
+        app.answered("Done: tests pass", Some("tally.halves"));
+        app.answered(&reactions::message("👍", None), None);
+        assert_eq!(app.asks.len(), 1);
     }
 
     #[tokio::test]
@@ -11699,7 +11826,7 @@ mod tests {
         assert_eq!(rows[at + 4], "┃    Brew gets it tonight.");
         assert_eq!(rows[at + 8], "┃ Why 1: Nothing else is due.");
         // Its answer landing, sent from here or another window, closes it.
-        app.answered("You asked: Tag 0.4.1?\n\nYes");
+        app.answered("You asked: Tag 0.4.1?\n\nYes", None);
         assert!(app.asks.is_empty());
         // Live, a question is pinned once the daemon took the call.
         let arguments = json!({"question": "Merge?"}).to_string();
