@@ -82,6 +82,7 @@ mod tool_host;
 mod transcript;
 mod tree;
 mod trigger;
+mod upgrade;
 mod usage;
 mod user_shell;
 mod zen;
@@ -1109,9 +1110,10 @@ async fn run() -> Result<(), String> {
     app.project = project;
     // Sonny's welcome heads a lead's conversation, though not a side chat.
     app.welcome = options.side.is_none();
-    // The first bot opened since an upgrade tells the person what it left
-    // beside their edits; a side chat leaves it to its agent.
-    if options.side.is_none() {
+    // The first lead opened since an upgrade tells the person what changed
+    // and does what the upgrade asks; a task works in its own worktree and
+    // sandbox, and a side chat leaves it to its agent.
+    if options.side.is_none() && project::is_lead(&name) {
         app.upgrades = skills::upgraded();
     }
     if let Some(set) = setup::just_set() {

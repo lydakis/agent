@@ -28,6 +28,14 @@ correctness, and performance; earlier Agent revisions impose no requirements.
   once at open and the rest of the code knows only the current format. Keep
   migrations small and tested; reject what cannot be converted clearly rather
   than resetting it silently.
+- Sonny's own one-off upgrade work (outside the store's schema) lives in
+  [sonny/src/upgrade.rs](sonny/src/upgrade.rs) and names the release it
+  retires at, two after the one it ships in; a test fails once Sonny reaches
+  it, and the work is deleted then. A mechanical rewrite of files Sonny
+  writes is a migration in code, run by `upgrade::once`. What needs judgment
+  or reaches the person's own things (config they wrote, skills they edited,
+  hosts this machine knows) is a step the folder's lead does from
+  `sonny/upgrades/ID.md`, with a check in code for done.
 - Update current callers, tests, and docs together.
 - Current-format durability, resumption, and fork correctness still matter.
 - Model/provider coverage is a product requirement, including older models.

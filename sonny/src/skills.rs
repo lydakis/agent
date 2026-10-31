@@ -32,7 +32,12 @@ pub fn install_own() {
     let automation = include_str!("../skills/automation/SKILL.md");
     install("automation", &agent_client::policy::with_cli(automation));
     if let Some(home) = std::env::var_os("HOME") {
-        queue_news(&PathBuf::from(home), FEATURES, &crate::setup::STEPS);
+        queue_news(
+            &PathBuf::from(home),
+            FEATURES,
+            &crate::setup::STEPS,
+            crate::upgrade::STEPS,
+        );
     }
     let (Some(home), Some(sonny)) = (std::env::var_os("HOME"), sonny_path()) else {
         return;
@@ -484,8 +489,23 @@ fn offered(home: &Path) -> PathBuf {
 }
 
 fn offered_in(home: &Path) -> Vec<String> {
-    let text = std::fs::read_to_string(offered(home)).unwrap_or_default();
-    text.lines().map(str::to_owned).collect()
+    crate::upgrade::lines(&offered(home))
+}
+
+/// The upgrade steps a bot was asked to do, a line `ID KEY` each, KEY
+/// naming the Sonny that asked, so none is asked twice of one Sonny.
+fn tried(home: &Path) -> PathBuf {
+    home.join(".agent/sonny/tried")
+}
+
+/// Which Sonny asks: its register, which every feature's change edits.
+fn asker(features: &str) -> String {
+    crate::project::fingerprint(features)
+}
+
+/// Where a step copies a file of the person's before changing it.
+fn before(home: &Path, id: &str) -> PathBuf {
+    upgrades(home).join("before").join(id)
 }
 
 /// Whether setup or a bot has offered `id` before.
@@ -502,25 +522,19 @@ pub fn note_offered(id: &str) {
 }
 
 fn note_offered_in(home: &Path, ids: &[String]) {
-    let mut all = offered_in(home);
-    let before = all.len();
-    all.extend(
-        ids.iter()
-            .filter(|id| !all.contains(id))
-            .cloned()
-            .collect::<Vec<_>>(),
-    );
-    if all.len() > before {
-        let text: String = all.iter().map(|id| format!("{id}\n")).collect();
-        let _ = std::fs::create_dir_all(home.join(".agent/sonny"));
-        let _ = agent_client::files::replace_mode(&offered(home), text.as_bytes(), 0o644);
-    }
+    crate::upgrade::add(&offered(home), ids);
 }
 
-/// What the next bot tells of beside the skills: a register changed since
-/// the person last heard of it, and each setup step neither done nor
-/// offered. The first register a person has is heard of without a word.
-fn queue_news(home: &Path, features: &str, steps: &[crate::setup::Step]) {
+/// What the next lead tells of beside the skills: a register changed since
+/// the person last heard of it, each setup step neither done nor offered,
+/// and each upgrade step not done that this Sonny has not asked for. The
+/// first register a person has is heard of without a word.
+fn queue_news(
+    home: &Path,
+    features: &str,
+    offers: &[crate::setup::Step],
+    steps: &[crate::upgrade::Step],
+) {
     keep(&home.join(".agent/sonny"), &[("FEATURES.md", features)]);
     match std::fs::read_to_string(heard(home)) {
         Err(_) => {
@@ -530,9 +544,16 @@ fn queue_news(home: &Path, features: &str, steps: &[crate::setup::Step]) {
         Ok(_) => {}
     }
     let offered = offered_in(home);
-    for step in steps {
+    for step in offers {
         if !offered.iter().any(|id| id == step.id) && !(step.done)() {
             queue_unclaimed(home, &format!("setup {}", step.id));
+        }
+    }
+    let tried = crate::upgrade::lines(&tried(home));
+    let asker = asker(features);
+    for step in steps {
+        if !tried.contains(&format!("{} {asker}", step.id)) && !(step.done)() {
+            queue_unclaimed(home, &format!("do {}", step.id));
         }
     }
 }
@@ -574,6 +595,8 @@ pub struct Upgrades {
     features: Option<String>,
     /// The setup steps it offers.
     offering: Vec<String>,
+    /// The upgrade steps it asks for, each as `tried` keeps it.
+    asking: Vec<String>,
 }
 
 /// What no bot was told of yet: the skills and roles Sonny set its new
@@ -584,10 +607,15 @@ pub fn upgraded() -> Option<Upgrades> {
 }
 
 fn upgraded_in(home: &Path) -> Option<Upgrades> {
-    upgraded_with(home, FEATURES, &crate::setup::STEPS)
+    upgraded_with(home, FEATURES, &crate::setup::STEPS, crate::upgrade::STEPS)
 }
 
-fn upgraded_with(home: &Path, features: &str, steps: &[crate::setup::Step]) -> Option<Upgrades> {
+fn upgraded_with(
+    home: &Path,
+    features: &str,
+    offers: &[crate::setup::Step],
+    steps: &[crate::upgrade::Step],
+) -> Option<Upgrades> {
     let me = std::process::id().to_string();
     // A claim left by a Sonny that stopped before telling goes back.
     for entry in std::fs::read_dir(claims(home))
@@ -616,7 +644,11 @@ fn upgraded_with(home: &Path, features: &str, steps: &[crate::setup::Step]) -> O
     let mut news = None;
     let mut setups = Vec::new();
     let mut offering = Vec::new();
+    let mut doing = Vec::new();
+    let mut asking = Vec::new();
     let offered = offered_in(home);
+    let tried = crate::upgrade::lines(&tried(home));
+    let asker = asker(features);
     for line in &taken {
         if line == "features" {
             let before = std::fs::read_to_string(heard(home)).unwrap_or_default();
@@ -625,8 +657,30 @@ fn upgraded_with(home: &Path, features: &str, steps: &[crate::setup::Step]) -> O
             news = Some(rows);
             continue;
         }
+        if let Some(id) = line.strip_prefix("do ") {
+            // Done since, or retired.
+            let Some(step) = steps.iter().find(|s| s.id == id).filter(|s| !(s.done)()) else {
+                continue;
+            };
+            let again = match tried.iter().any(|t| t.split(' ').next() == Some(id)) {
+                true => " (asked after an earlier upgrade; Sonny's check still finds it not done)",
+                false => "",
+            };
+            let body: String = (step.body().lines())
+                .map(|line| match line.is_empty() {
+                    true => "\n".to_owned(),
+                    false => format!("  {line}\n"),
+                })
+                .collect();
+            doing.push(format!(
+                "- do {id}{again}; copy a file of the person's to {} before you change it:\n{body}",
+                before(home, id).display()
+            ));
+            asking.push(format!("{id} {asker}"));
+            continue;
+        }
         if let Some(id) = line.strip_prefix("setup ") {
-            let step = steps.iter().find(|step| step.id == id);
+            let step = offers.iter().find(|step| step.id == id);
             // Offered by setup since, or done.
             if let Some(step) = step.filter(|s| !offered.iter().any(|o| o == id) && !(s.done)()) {
                 setups.push(format!(
@@ -680,6 +734,17 @@ fn upgraded_with(home: &Path, features: &str, steps: &[crate::setup::Step]) -> O
             register(home).display()
         ));
     }
+    if !doing.is_empty() {
+        parts.push(format!(
+            "This upgrade needs you to do these for the person now, as release notes ask \
+             whoever upgrades:\n{}Do what you can undo yourself; ask the person first for \
+             anything that cannot be undone, such as deleting their data, sending a message, \
+             pushing to a remote or spending money. Tell them in a line what you did. Sonny \
+             checks each itself, and asks again after a later upgrade if it is not done, so \
+             say what stopped you.",
+            doing.concat()
+        ));
+    }
     if !setups.is_empty() {
         parts.push(format!(
             "Sonny offers setup the person has not done:\n{}\nOffer each once: do it with \
@@ -704,11 +769,16 @@ fn upgraded_with(home: &Path, features: &str, steps: &[crate::setup::Step]) -> O
         claim,
         key: format!(
             "sonny-upgrade-{}",
-            crate::project::fingerprint(&format!("{note:?}{key}{}", setups.join("")))
+            crate::project::fingerprint(&format!(
+                "{note:?}{key}{}{}",
+                setups.join(""),
+                asking.join("")
+            ))
         ),
         note: note.unwrap_or_default(),
         features: news.map(|_| features.to_owned()),
         offering,
+        asking,
     })
 }
 
@@ -748,6 +818,7 @@ impl Upgrades {
             keep(&shipped(&self.home), &[("FEATURES.md", features)]);
         }
         note_offered_in(&self.home, &self.offering);
+        crate::upgrade::add(&tried(&self.home), &self.asking);
         let _ = std::fs::remove_dir_all(&self.claim);
     }
 
@@ -1038,9 +1109,9 @@ mod tests {
         let two = "# F\n| Feature | Status |\n|---|---|\n| Tasks | shipped |\n| Leads | shipped |\n| Backup | experimental |\n";
         // The first register is heard of without a word; the step not done
         // is offered.
-        queue_news(&home, one, &steps);
+        queue_news(&home, one, &steps, &[]);
         assert_eq!(std::fs::read_to_string(register(&home)).unwrap(), one);
-        let upgrades = upgraded_with(&home, one, &steps).unwrap();
+        let upgrades = upgraded_with(&home, one, &steps, &[]).unwrap();
         let note = upgrades.note();
         assert!(note.starts_with(UPGRADED), "{note}");
         assert!(!note.contains("features changed"), "{note}");
@@ -1051,15 +1122,15 @@ mod tests {
         assert!(!note.contains("set up done"), "{note}");
         // Claimed and not told yet, a Sonny starting meanwhile does not
         // queue it again.
-        queue_news(&home, one, &steps);
-        assert!(upgraded_with(&home, one, &steps).is_none());
+        queue_news(&home, one, &steps, &[]);
+        assert!(upgraded_with(&home, one, &steps, &[]).is_none());
         upgrades.told();
         // Offered once: the same Sonny starting again has nothing.
-        queue_news(&home, one, &steps);
-        assert!(upgraded_with(&home, one, &steps).is_none());
+        queue_news(&home, one, &steps, &[]);
+        assert!(upgraded_with(&home, one, &steps, &[]).is_none());
         // The next Sonny's register: its new and changed rows.
-        queue_news(&home, two, &steps);
-        let upgrades = upgraded_with(&home, two, &steps).unwrap();
+        queue_news(&home, two, &steps, &[]);
+        let upgrades = upgraded_with(&home, two, &steps, &[]).unwrap();
         let note = upgrades.note();
         assert!(
             note.contains("| Leads | shipped |\n| Backup | experimental |"),
@@ -1069,18 +1140,80 @@ mod tests {
         assert!(!note.contains("set up backup"), "{note}");
         // Not told, it waits; told, it is heard.
         upgrades.back();
-        let upgrades = upgraded_with(&home, two, &steps).unwrap();
+        let upgrades = upgraded_with(&home, two, &steps, &[]).unwrap();
         upgrades.told();
         assert_eq!(std::fs::read_to_string(heard(&home)).unwrap(), two);
-        queue_news(&home, two, &steps);
-        assert!(upgraded_with(&home, two, &steps).is_none());
+        queue_news(&home, two, &steps, &[]);
+        assert!(upgraded_with(&home, two, &steps, &[]).is_none());
         // A step setup offered itself is not offered again.
         let _ = std::fs::remove_file(offered(&home));
-        queue_news(&home, two, &steps);
+        queue_news(&home, two, &steps, &[]);
         note_offered_in(&home, &["backup".into()]);
-        let upgrades = upgraded_with(&home, two, &steps).unwrap();
+        let upgrades = upgraded_with(&home, two, &steps, &[]).unwrap();
         assert_eq!(upgrades.note(), "");
         upgrades.told();
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn an_upgrade_asks_the_lead_for_a_step_until_its_check_passes() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static DONE: AtomicBool = AtomicBool::new(false);
+        let home = std::env::temp_dir().join(format!("sonny-steps-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let steps = [crate::upgrade::Step {
+            id: "move",
+            text: "Feature: Tasks\nMove the person's rows.\n\n- the old ones too",
+            done: || DONE.load(Ordering::SeqCst),
+            retire: "9.0.0",
+        }];
+        let one = "# F\n| Tasks | shipped |\n";
+        let two = "# F\n| Tasks | shipped, changed |\n";
+        queue_news(&home, one, &[], &steps);
+        let upgrades = upgraded_with(&home, one, &[], &steps).unwrap();
+        let note = upgrades.note();
+        assert!(
+            note.contains("This upgrade needs you to do these"),
+            "{note}"
+        );
+        let copy = home.join(".agent/sonny/upgrades/before/move");
+        assert!(
+            note.contains(&format!(
+                "- do move; copy a file of the person's to {} before you change it:\n  \
+                 Move the person's rows.\n\n  - the old ones too\n",
+                copy.display()
+            )),
+            "{note}"
+        );
+        assert!(!note.contains("earlier upgrade"), "{note}");
+        upgrades.told();
+        // Asked once of this Sonny, whatever came of it.
+        queue_news(&home, one, &[], &steps);
+        assert!(upgraded_with(&home, one, &[], &steps).is_none());
+        // Not done, the next Sonny asks again, and says so.
+        queue_news(&home, two, &[], &steps);
+        let upgrades = upgraded_with(&home, two, &[], &steps).unwrap();
+        assert!(
+            upgrades
+                .note()
+                .contains("- do move (asked after an earlier upgrade")
+        );
+        // Done before it was told: it is left out.
+        DONE.store(true, Ordering::SeqCst);
+        let upgrades = {
+            upgrades.back();
+            upgraded_with(&home, two, &[], &steps).unwrap()
+        };
+        assert!(
+            !upgrades.note().contains("- do move"),
+            "{}",
+            upgrades.note()
+        );
+        upgrades.told();
+        // Done, no Sonny asks for it again.
+        queue_news(&home, "# F\n| Tasks | removed |\n", &[], &steps);
+        let _ = upgraded_with(&home, "# F\n| Tasks | removed |\n", &[], &steps)
+            .map(|upgrades| assert!(!upgrades.note().contains("- do move")));
         let _ = std::fs::remove_dir_all(&home);
     }
 
