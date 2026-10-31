@@ -589,9 +589,11 @@ impl Turn {
                         .map(|_| ())
                 })
                 .await;
-            // Parked: nothing more to commit, and the service keeps a
-            // wake-up that holds until `resume`. A park that could not be
-            // written ends the turn as the pull used to.
+            // Parked, by the pull or by the turn's own park that committed
+            // as the pull cancelled it: nothing more to commit, and the
+            // service keeps a wake-up that holds until `resume`, where the
+            // park's own rules decide. A park that could not be written
+            // ends the turn as the pull used to.
             if parked.is_ok() {
                 result = Ok(Round::Paced(0));
             }

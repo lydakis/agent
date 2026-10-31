@@ -8611,7 +8611,8 @@ impl Database {
     /// parked as a closed pool parks it, at a model-call boundary: each call
     /// it had not answered gets a result saying the pause stopped it, or
     /// came before it ran, and none is run again. The reply it was writing
-    /// is asked for again when it continues.
+    /// is asked for again when it continues. A turn whose own park committed
+    /// as the pull cancelled its task stays as it parked; `None` says so.
     pub fn suspend_pulled(
         &mut self,
         turn: i64,
@@ -8619,11 +8620,23 @@ impl Database {
         paced_ms: u64,
         summary_ms: u64,
         route: Option<&str>,
-    ) -> Result<Vec<Value>> {
+    ) -> Result<Option<Vec<Value>>> {
         let bot = self.active(turn)?;
-        if bot.status != "running" {
-            return fail("invalid_tool_state");
+        match bot.status.as_str() {
+            "running" => {}
+            "waiting" | "paced" => {
+                self.note_pacing(turn, retries, paced_ms, summary_ms)?;
+                return Ok(None);
+            }
+            _ => return fail("invalid_tool_state"),
         }
+        let unanswered: Vec<String> = self
+            .conn
+            .prepare(
+                "SELECT call_id FROM tools WHERE turn=? AND status IN ('planned','executing')",
+            )?
+            .query_map([turn], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
         let pause = self.pause()?;
         let waiting = Waiting {
             turn,
@@ -8651,7 +8664,7 @@ impl Database {
         flush(&tx, turn, self.live.get(&turn))?;
         let (head, mut entries) = close_unanswered(&tx, &bot, turn, bot.head, |executing| {
             let detail = if executing {
-                "the pause stopped this call before its result was recorded. It may have had effects and is not run again: check the current state before retrying"
+                "the pause stopped this call before its result was recorded; it may have had effects. It is not run again"
             } else {
                 "the pause came before this call ran; it did not run"
             };
@@ -8666,12 +8679,33 @@ impl Database {
                 "UPDATE bots SET head=?1,closed=?1,open_calls=0 WHERE name=?2",
                 params![head, bot.name],
             )?;
-            // What waited on those calls went with them.
-            tx.execute(
-                "DELETE FROM approvals WHERE turn=? AND call_id IN
-                    (SELECT call_id FROM tools WHERE turn=? AND status='completed')",
-                params![turn, turn],
-            )?;
+        }
+        // What waited on those calls went with them: their requests, what a
+        // client was to answer, and each step a call asked about, denied as
+        // an answered call's are.
+        let (mut requests, mut steps) = (0, Vec::new());
+        for call_id in &unanswered {
+            let asked: Vec<(i64, String, String)> = tx
+                .prepare_cached(
+                    "DELETE FROM approvals WHERE turn=? AND step_of=? RETURNING id,call_id,name",
+                )?
+                .query_map(params![turn, call_id], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                })?
+                .collect::<rusqlite::Result<_>>()?;
+            for (approval, id, name) in asked {
+                let data = json!({"call_id":id,"step_of":call_id,"name":name,"decision":"deny",
+                    "reason":"the pause stopped the call","approvals":[]});
+                event(&tx, &bot.name, Some(turn), "step_decided", data)?;
+                steps.push(approval);
+            }
+            requests += tx
+                .prepare_cached(
+                    "DELETE FROM approvals WHERE turn=? AND call_id=? AND step_of IS NULL",
+                )?
+                .execute(params![turn, call_id])? as i64;
+            tx.prepare_cached("DELETE FROM answers WHERE turn=? AND call_id=?")?
+                .execute(params![turn, call_id])?;
         }
         tx.execute(
             "UPDATE turns SET status='paced',waiting=?,retries=retries+?,paced_ms=paced_ms+?,
@@ -8689,8 +8723,12 @@ impl Database {
         let cursor = event(&tx, &bot.name, Some(turn), "turn_paced", data.clone())?;
         tx.commit()?;
         self.forget_live(turn);
+        self.approvals -= requests + steps.len() as i64;
+        for approval in steps {
+            self.unstep(approval, true);
+        }
         entries.push(entry(cursor, &bot.name, Some(turn), "turn_paced", data));
-        Ok(entries)
+        Ok(Some(entries))
     }
     /// Every parked turn, on handles or on a pool, for re-registration after
     /// a restart.

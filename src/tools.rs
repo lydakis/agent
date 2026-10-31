@@ -1994,7 +1994,7 @@ impl Registry {
 fn stopped_by_pause() -> Error {
     Error::with(
         "daemon_paused",
-        "the pause stopped this command before it finished. It may have had effects and is not run again: check the current state before retrying",
+        "the pause stopped this command before it finished; it may have had effects. It is not run again",
     )
 }
 
