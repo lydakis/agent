@@ -23,6 +23,9 @@ const LIMIT: Duration = Duration::from_secs(if cfg!(test) { 60 } else { 5 });
 /// What one engine may hold: MathJax with a large formula stays well
 /// under a tenth of this.
 const MEMORY: usize = 256 << 20;
+/// The deepest a script may recurse before it throws. The engine's thread
+/// has twice this, so the native frames around it never overflow first,
+/// which would end Sonny instead of the picture.
 const STACK: usize = 8 << 20;
 
 type Job = (String, Sender<Result<String, String>>);
@@ -53,6 +56,7 @@ impl Engine {
             let (what, bundle, limit) = (self.what, self.bundle, self.limit);
             std::thread::Builder::new()
                 .name(format!("sonny-js-{}", what.to_lowercase()))
+                .stack_size(2 * STACK)
                 .spawn(move || serve(what, bundle, limit, jobs))
                 .expect("a thread for drawing");
             Mutex::new(send)
@@ -144,6 +148,13 @@ mod tests {
         );
         assert_eq!(ENGINE.eval("draw('c')".into()), Ok("c1".into()));
         assert!(ENGINE.eval("draw(".into()).is_err());
+        // Recursion with no end throws, never overflows the thread.
+        let deep = ENGINE.eval("(function down(n) { return down(n + 1) + 'x'; })(0)".into());
+        assert!(
+            deep.as_ref().is_err_and(|e| e.contains("stack")),
+            "{deep:?}"
+        );
+        assert_eq!(ENGINE.eval("draw('e')".into()), Ok("e1".into()));
     }
 
     #[test]

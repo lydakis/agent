@@ -1,7 +1,8 @@
 //! LaTeX in a reply. Inline `$…$` becomes Unicode text (x², α, ∑, a/b),
 //! which stays selectable and wraps with the line. Display math (`$$…$$`,
 //! a ```math fence) is drawn by MathJax (vendor/mathjax.js, Apache-2.0,
-//! built from vendor/mathjax-entry.js) in Sonny's own QuickJS, as an SVG.
+//! built from vendor/mathjax-entry.js with mathjax-full 3.2.2 and
+//! `esbuild --bundle --minify`, 0.24.2) in Sonny's own QuickJS, as an SVG.
 
 static MATHJAX: crate::js::Engine =
     crate::js::Engine::new("LaTeX", include_str!("../vendor/mathjax.js"));
