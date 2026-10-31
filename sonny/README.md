@@ -398,6 +398,8 @@ between, the arrows move through its rows. Every window keeps its prompts in
 `~/.agent/sonny/history.jsonl` (only you can read it), and recalls its own
 first, newest first, then those any window sent before it opened. Edit a
 prompt brought back and it is yours to send, or Up starts again from it.
+A prompt this window sent comes back with its pictures, and the draft with
+its own; one from the file comes back as text alone.
 
 ![Up brings back a two-row prompt with the cursor at its top, Up again the one before, and Down twice returns the draft](../docs/sonny/prompt-history.png)
 

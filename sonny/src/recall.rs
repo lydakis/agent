@@ -11,6 +11,10 @@
 //! last, and past the newest what was being written comes back. A
 //! recalled prompt once edited is a draft of its own, so Up goes back
 //! from it, newest first again.
+//!
+//! What a prompt was sent with (its pictures) comes back with this
+//! window's own prompts, and the draft's with the draft; the file keeps
+//! text alone, so a prompt from it comes back with nothing attached.
 use serde_json::json;
 use std::{
     io::{Read, Seek, SeekFrom, Write},
@@ -22,29 +26,31 @@ use std::{
 const MOST_BYTES: u64 = 4 << 20;
 
 #[derive(Default)]
-pub struct Recall {
+pub struct Recall<A> {
     file: Option<PathBuf>,
     /// When this window opened, in milliseconds: the file's prompts from
     /// before then are walked after this window's own.
     opened: i64,
-    /// This window's prompts, oldest first.
-    mine: Vec<String>,
+    /// This window's prompts, oldest first, with what each was sent with.
+    mine: Vec<(String, A)>,
     /// The file's, oldest first, read the first time Up is pressed.
     before: Option<Vec<String>>,
-    walk: Option<Walk>,
+    walk: Option<Walk<A>>,
 }
 
 /// Where Up and Down have got to.
-struct Walk {
+struct Walk<A> {
     /// How far back, 1 the newest.
     back: usize,
     /// What was being written when Up first went back.
     draft: String,
+    /// What the draft had attached.
+    attached: A,
     /// What the composer was given.
     shown: String,
 }
 
-impl Recall {
+impl<A: Clone + Default + PartialEq> Recall<A> {
     /// The prompts kept under `HOME`.
     pub fn load() -> Self {
         match std::env::var_os("HOME").filter(|h| !h.is_empty()) {
@@ -66,21 +72,27 @@ impl Recall {
         self.walk.as_ref().is_some_and(|walk| walk.shown == text)
     }
 
-    /// Notes `prompt` sent, and ends any walk.
-    pub fn sent(&mut self, prompt: &str) {
+    /// Notes `prompt` sent with `attached`, and ends any walk.
+    pub fn sent(&mut self, prompt: &str, attached: A) {
         self.walk = None;
-        if prompt.is_empty() || self.mine.last().is_some_and(|last| last == prompt) {
+        if prompt.is_empty()
+            || self
+                .mine
+                .last()
+                .is_some_and(|last| last.0 == prompt && last.1 == attached)
+        {
             return;
         }
-        self.mine.push(prompt.to_owned());
+        self.mine.push((prompt.to_owned(), attached));
         if let Some(file) = &self.file {
             let _ = append(file, prompt, now_ms());
         }
     }
 
     /// The prompt before the one shown, for the composer now holding
-    /// `current`; none when there is none older.
-    pub fn older(&mut self, current: &str) -> Option<String> {
+    /// `current` with `attached`, which becomes what that prompt was sent
+    /// with; none when there is none older.
+    pub fn older(&mut self, current: &str, attached: &mut A) -> Option<String> {
         if !self.showing(current) {
             self.walk = None;
         }
@@ -92,31 +104,37 @@ impl Recall {
         }
         let back = self.walk.as_ref().map_or(0, |walk| walk.back);
         // The same prompt twice in a row is shown once.
-        let to = (back + 1..=self.len()).find(|&to| self.nth(to) != current)?;
-        let text = self.nth(to).to_owned();
-        let draft = match self.walk.take() {
-            Some(walk) => walk.draft,
-            None => current.to_owned(),
+        let to = (back + 1..=self.len()).find(|&to| self.nth(to).0 != current)?;
+        let (text, with) = self.nth(to);
+        let (text, with) = (text.to_owned(), with.cloned().unwrap_or_default());
+        let (draft, draft_attached) = match self.walk.take() {
+            Some(walk) => (walk.draft, walk.attached),
+            None => (current.to_owned(), std::mem::take(attached)),
         };
+        *attached = with;
         self.walk = Some(Walk {
             back: to,
             draft,
+            attached: draft_attached,
             shown: text.clone(),
         });
         Some(text)
     }
 
     /// The prompt after the one shown, or past the newest the draft Up
-    /// set aside; none when the composer holds no recalled prompt.
-    pub fn newer(&mut self, current: &str) -> Option<String> {
+    /// set aside, `attached` becoming what it has; none when the composer
+    /// holds no recalled prompt.
+    pub fn newer(&mut self, current: &str, attached: &mut A) -> Option<String> {
         if !self.showing(current) {
             self.walk = None;
             return None;
         }
         let walk = self.walk.take()?;
-        match (1..walk.back).rev().find(|&to| self.nth(to) != current) {
+        match (1..walk.back).rev().find(|&to| self.nth(to).0 != current) {
             Some(to) => {
-                let text = self.nth(to).to_owned();
+                let (text, with) = self.nth(to);
+                let text = text.to_owned();
+                *attached = with.cloned().unwrap_or_default();
                 self.walk = Some(Walk {
                     back: to,
                     shown: text.clone(),
@@ -124,7 +142,10 @@ impl Recall {
                 });
                 Some(text)
             }
-            None => Some(walk.draft),
+            None => {
+                *attached = walk.attached;
+                Some(walk.draft)
+            }
         }
     }
 
@@ -132,23 +153,30 @@ impl Recall {
         self.mine.len() + self.before.as_ref().map_or(0, Vec::len)
     }
 
-    /// The prompt `back` from now, 1 the newest.
-    fn nth(&self, back: usize) -> &str {
+    /// The prompt `back` from now, 1 the newest, with what it was sent
+    /// with when this window sent it.
+    fn nth(&self, back: usize) -> (&str, Option<&A>) {
         let mine = self.mine.len();
         if back <= mine {
-            return &self.mine[mine - back];
+            let (text, with) = &self.mine[mine - back];
+            return (text, Some(with));
         }
         let before = self.before.as_deref().unwrap_or_default();
-        &before[before.len() + mine - back]
+        (&before[before.len() + mine - back], None)
     }
 }
 
-/// The file's prompts sent before `opened`, oldest first. A line half
-/// written by another window is skipped.
+/// The file's prompts sent before `opened`, oldest first, read under
+/// the lock so a window trimming it meanwhile is not caught halfway.
 fn read(file: &Path, opened: i64) -> Vec<String> {
-    let Ok(text) = std::fs::read_to_string(file) else {
+    let mut text = String::new();
+    let read = std::fs::File::open(file).and_then(|mut handle| {
+        handle.lock_shared()?;
+        handle.read_to_string(&mut text)
+    });
+    if read.is_err() {
         return Vec::new();
-    };
+    }
     text.lines()
         .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
         .filter(|entry| entry["at"].as_i64().is_some_and(|at| at < opened))
@@ -195,12 +223,12 @@ fn now_ms() -> i64 {
 mod tests {
     use super::*;
 
-    fn walk(recall: &mut Recall, keys: &str, mut text: String) -> Vec<String> {
+    fn walk(recall: &mut Recall<()>, keys: &str, mut text: String) -> Vec<String> {
         keys.chars()
             .map(|key| {
                 let next = match key {
-                    '↑' => recall.older(&text),
-                    _ => recall.newer(&text),
+                    '↑' => recall.older(&text, &mut ()),
+                    _ => recall.newer(&text, &mut ()),
                 };
                 if let Some(next) = next {
                     text = next;
@@ -214,7 +242,7 @@ mod tests {
     fn up_goes_back_and_down_comes_forward_to_the_draft() {
         let mut recall = Recall::default();
         for prompt in ["one", "two", "two", "three"] {
-            recall.sent(prompt);
+            recall.sent(prompt, ());
         }
         assert_eq!(
             walk(&mut recall, "↑↑↑↑↓↓↓↓", "half typed".into()),
@@ -238,18 +266,47 @@ mod tests {
     fn an_edited_recall_is_a_draft_of_its_own() {
         let mut recall = Recall::default();
         for prompt in ["one", "two", "three"] {
-            recall.sent(prompt);
+            recall.sent(prompt, ());
         }
         assert_eq!(walk(&mut recall, "↑↑", String::new()), ["three", "two"]);
         assert!(recall.showing("two"));
         // Down does nothing for an edited one; Up starts again from it.
-        assert_eq!(recall.newer("two!"), None);
+        assert_eq!(recall.newer("two!", &mut ()), None);
         assert_eq!(walk(&mut recall, "↑↓", "two!".into()), ["three", "two!"]);
         // Sending ends the walk.
-        recall.older("");
-        recall.sent("three");
+        recall.older("", &mut ());
+        recall.sent("three", ());
         assert!(!recall.showing("three"));
         assert_eq!(walk(&mut recall, "↑", String::new()), ["three"]);
+    }
+
+    #[test]
+    fn what_a_prompt_was_sent_with_comes_back_with_it() {
+        let dir = std::env::temp_dir().join(format!("sonny-recall-with-{}", std::process::id()));
+        let file = dir.join("history.jsonl");
+        let _ = std::fs::remove_dir_all(&dir);
+        append(&file, "from the file [Image #1]", 0).unwrap();
+        let mut recall = Recall::kept(&file);
+        recall.sent("look [Image #1]", vec!["sent picture"]);
+        let mut attached = vec!["draft picture"];
+        assert_eq!(
+            recall.older("draft [Image #1]", &mut attached).as_deref(),
+            Some("look [Image #1]")
+        );
+        assert_eq!(attached, ["sent picture"]);
+        assert_eq!(
+            recall.older("look [Image #1]", &mut attached).as_deref(),
+            Some("from the file [Image #1]")
+        );
+        assert!(attached.is_empty(), "the file keeps text alone");
+        recall.newer("from the file [Image #1]", &mut attached);
+        assert_eq!(attached, ["sent picture"]);
+        assert_eq!(
+            recall.newer("look [Image #1]", &mut attached).as_deref(),
+            Some("draft [Image #1]")
+        );
+        assert_eq!(attached, ["draft picture"]);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -261,8 +318,8 @@ mod tests {
         append(&file, "older still", 0).unwrap();
         let mut other = Recall::kept(&file);
         let mut recall = Recall::kept(&file);
-        other.sent("another window, after this one opened");
-        recall.sent("mine");
+        other.sent("another window, after this one opened", ());
+        recall.sent("mine", ());
         std::fs::write(
             &file,
             format!("{}half a li", std::fs::read_to_string(&file).unwrap()),

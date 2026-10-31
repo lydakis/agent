@@ -1967,7 +1967,7 @@ struct App {
     window: Option<u64>,
     input: prompt::Prompt,
     /// The prompts sent before, which Up and Down bring back.
-    recall: recall::Recall,
+    recall: recall::Recall<Vec<Option<attach::Picture>>>,
     /// Lines waiting to be written into the conversation, and what marks
     /// the rows of some, by their place among them.
     pending: Vec<Line<'static>>,
@@ -8953,7 +8953,7 @@ impl App {
                     // and what was being written.
                     KeyCode::Up => {
                         if !self.input.up(self.prose())
-                            && let Some(text) = self.recall.older(&self.input)
+                            && let Some(text) = self.recall.older(&self.input, &mut self.pictures)
                         {
                             self.input.set(&text);
                             // One of several rows starts at its top, so Up
@@ -8965,7 +8965,7 @@ impl App {
                     }
                     KeyCode::Down => {
                         if !self.input.down(self.prose())
-                            && let Some(text) = self.recall.newer(&self.input)
+                            && let Some(text) = self.recall.newer(&self.input, &mut self.pictures)
                         {
                             self.input.set(&text);
                         }
@@ -9044,7 +9044,19 @@ impl App {
         if prompt.is_empty() {
             return;
         }
-        self.recall.sent(&prompt);
+        // With the pictures it shows, by their numbers.
+        let attached = (self.pictures.iter().enumerate())
+            .map(|(at, picture)| {
+                picture
+                    .clone()
+                    .filter(|_| prompt.contains(&attach::placeholder(at + 1)))
+            })
+            .collect::<Vec<_>>();
+        let attached = match attached.iter().any(Option::is_some) {
+            true => attached,
+            false => Vec::new(),
+        };
+        self.recall.sent(&prompt, attached);
         // A command run, so the menu ranks it first next time.
         let word = prompt.split_whitespace().next().unwrap_or_default();
         if COMMANDS.iter().any(|(name, _)| *name == word) {
@@ -15672,8 +15684,8 @@ mod tests {
     #[tokio::test]
     async fn up_and_down_past_the_rows_walk_the_prompts_sent() {
         let mut app = app(daemon_answering(|_| json!({})).await);
-        app.recall.sent("/status");
-        app.recall.sent("first line\nsecond line");
+        app.recall.sent("/status", Vec::new());
+        app.recall.sent("first line\nsecond line", Vec::new());
         let key = |code| Event::Key(event::KeyEvent::new(code, KeyModifiers::NONE));
         // A draft of two rows: Up moves through it before going back.
         app.input.set("draft\nmore");
