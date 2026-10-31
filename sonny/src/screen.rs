@@ -94,6 +94,9 @@ pub enum Mark {
     /// Links on parts of the row's first line, by the columns they take:
     /// several buttons on one row.
     Buttons(Buttons),
+    /// The first row of a message, whatever its lead: a reply that opens
+    /// with a heading has no bullet to say so.
+    Opens,
 }
 
 /// A row on the screen: one of the conversation's rows, or the part of
@@ -123,6 +126,8 @@ struct Row {
     link: Option<String>,
     tag: Option<Tag>,
     buttons: Buttons,
+    /// It is a message's first row.
+    opens: bool,
 }
 
 impl Row {
@@ -133,6 +138,7 @@ impl Row {
             link: None,
             tag: None,
             buttons: Vec::new(),
+            opens: false,
         }
     }
 
@@ -141,6 +147,7 @@ impl Row {
             Mark::Tag(tag) => self.tag = Some(tag),
             Mark::Link(url) => self.link = Some(url),
             Mark::Buttons(buttons) => self.buttons = buttons,
+            Mark::Opens => self.opens = true,
         }
     }
 }
@@ -627,6 +634,7 @@ impl Screen {
             link: None,
             tag: None,
             buttons: Vec::new(),
+            opens: false,
         });
         self.swap(0, rows.collect());
         self.pages.splice(0..1, pages);
@@ -793,6 +801,7 @@ impl Screen {
                     link: None,
                     tag: None,
                     buttons: Vec::new(),
+                    opens: false,
                 }),
             );
             self.shown.splice(
@@ -1427,6 +1436,9 @@ impl Screen {
             .partition_point(|&first| first <= at)
             .checked_sub(1)?;
         let opens = |row: &Row| {
+            if row.opens {
+                return true;
+            }
             let lead: String = (row.line.spans.iter())
                 .flat_map(|span| span.content.chars())
                 .take(2)
@@ -2059,6 +2071,26 @@ mod tests {
         screen.mouse(mouse(MouseEventKind::Moved, 3, 6));
         let buf = draw(&mut screen);
         assert!(row(&buf, 6).starts_with("↩ thanks"), "{:?}", row(&buf, 6));
+    }
+
+    #[test]
+    fn a_reply_that_opens_with_a_heading_shows_its_mark_on_its_own_first_row() {
+        let mut screen = Screen::default();
+        screen.push(vec![Line::from("• Ran cargo test"), Line::default()]);
+        screen.push_marked(
+            vec![
+                Line::from("  ## Fixed"),
+                Line::default(),
+                Line::from("  It rounds."),
+            ],
+            vec![(0, Mark::Opens), (2, Mark::Tag(Tag::End(5)))],
+        );
+        let area = Rect::new(0, 0, 30, 5);
+        screen.mouse(mouse(MouseEventKind::Moved, 4, 4));
+        let mut buf = Buffer::empty(area);
+        screen.render(area, &mut buf, |_| None);
+        assert!(row(&buf, 2).starts_with("↩ ## Fixed"), "{:?}", row(&buf, 2));
+        assert!(row(&buf, 0).starts_with("• Ran"));
     }
 
     #[test]

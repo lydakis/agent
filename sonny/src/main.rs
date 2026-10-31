@@ -4674,7 +4674,9 @@ impl App {
     /// The bot's words at `node`, as replayed: their last row tagged,
     /// and the person's reactions to them right under it.
     fn commit_said(&mut self, node: i64, lines: Vec<Line<'static>>) {
+        let count = lines.len();
         self.commit(lines);
+        self.mark_first(count);
         self.mark_last(screen::Mark::Tag(screen::Tag::End(node)));
         if let Some(row) = self.reacted_row(node) {
             self.commit_after(vec![row], false);
@@ -4735,6 +4737,14 @@ impl App {
     }
 
     /// `mark` on the last row written so far, waiting or drawn.
+    /// The first of the last `count` lines waiting marked as a message's
+    /// first row.
+    fn mark_first(&mut self, count: usize) {
+        if count > 0 && self.pending.len() >= count {
+            (self.marks).push((self.pending.len() - count, screen::Mark::Opens));
+        }
+    }
+
     fn mark_last(&mut self, mark: screen::Mark) {
         match self.pending.len() {
             0 => {
@@ -5584,6 +5594,9 @@ impl App {
         if live.gap && !live.spilled {
             self.pending.push(Line::default());
         }
+        if !live.spilled {
+            self.marks.push((self.pending.len(), screen::Mark::Opens));
+        }
         self.rows_drawn += live.rows.len();
         self.pending.extend(match words {
             Words::Step => transcript::quiet(live.rows),
@@ -5616,6 +5629,9 @@ impl App {
         if live.spilled || live.rows.len() > (self.height / 2).max(4) {
             if live.gap && !live.spilled {
                 self.pending.push(Line::default());
+            }
+            if !live.spilled {
+                self.marks.push((self.pending.len(), screen::Mark::Opens));
             }
             live.spilled = true;
             self.rows_drawn += live.rows.len();

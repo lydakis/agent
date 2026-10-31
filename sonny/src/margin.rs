@@ -205,6 +205,16 @@ impl Kept {
 }
 
 /// `body` written into a kept note's `json`.
+/// A note's words as a reply quotes them: its text, a file's path, or
+/// what another bot's note showed when last read.
+fn said(body: &Body) -> String {
+    match body {
+        Body::Markdown(text) | Body::Read { text, .. } => text.clone(),
+        Body::File(path) => path.clone(),
+        Body::From { shown, .. } => shown.as_deref().map(said).unwrap_or_default(),
+    }
+}
+
 fn body_json(body: &Body, json: &mut Value) {
     match body {
         Body::Markdown(text) => json["markdown"] = json!(text),
@@ -611,12 +621,11 @@ impl Margin {
     /// agent wrote it out, or the file it shows.
     pub fn quoted(&self, id: &str) -> Option<String> {
         let note = self.note(id)?;
-        let said = match &note.body {
-            Body::Markdown(text) | Body::Read { text, .. } => text.clone(),
-            Body::File(path) => path.clone(),
-            _ => String::new(),
-        };
-        Some(format!("✎ {}\n{said}", note.title).trim_end().to_owned())
+        Some(
+            format!("✎ {}\n{}", note.title, said(&note.body))
+                .trim_end()
+                .to_owned(),
+        )
     }
 
     /// Whether it holds no note and no plan.
@@ -1498,6 +1507,8 @@ mod tests {
         assert!(rows(&mut margin).contains("fn flow() {}"));
         margin.resolved("flow", "Request flow", read("page.html", "<p>hi</p>"), None);
         assert!(rows(&mut margin).contains("<p>hi</p>"));
+        // A reply to it quotes what it shows, as one to a note of its own.
+        assert!(margin.quoted("flow").unwrap().ends_with("\n<p>hi</p>"));
         // A file not read yet, here anew, leaves what was kept of it.
         let mut anew = Reference::default();
         anew.read(
