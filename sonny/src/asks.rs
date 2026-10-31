@@ -545,39 +545,33 @@ pub fn served(arguments: &Value, bot: &str, turn: i64, call: &str) -> Result<Str
         _ if minutes == 0 => (Unanswered::Wait, None),
         _ => (plan, Some(deadline(minutes, now()))),
     };
-    if let Some(deadline) = deadline {
-        let sonny = crate::skills::sonny_path().ok_or("no path to this Sonny")?;
-        let quote = |text: &str| format!("'{}'", text.replace('\'', r"'\''"));
-        let gate = format!(
-            "{} ask open {} {turn} {}",
-            quote(&sonny.to_string_lossy()),
-            quote(bot),
-            quote(call)
-        );
-        let at = crate::trigger::local(deadline);
-        let add = json!({"add": {
-            "name": trigger_name(bot, call),
-            "at": format!("{}-{:02}-{:02} {:02}:{:02}", at.year, at.month, at.day, at.hour, at.minute),
-            "if": gate,
-            "message": fire(&ask.question, plan, &label),
-        }});
-        crate::trigger::tool(&add)?;
-    }
+    // A deadline Sonny could not set leaves the ask waiting, and says why:
+    // the card still shows, and nothing goes ahead unseen.
+    let (plan, deadline, unset) =
+        match deadline.map(|at| set_deadline(&ask, plan, &label, at, bot, turn, call)) {
+            Some(Err(error)) => (Unanswered::Wait, None, Some(error)),
+            _ => (plan, deadline, None),
+        };
     let when = deadline.map(|d| clock(d, now()));
-    let next = match (plan, &when) {
-        (Unanswered::Now, _) => format!(
+    let next = match (plan, &when, &unset) {
+        (Unanswered::Now, ..) => format!(
             "Shown to the person. Go on now with \"{label}\", keeping it undoable; if they pick \
              another, undo it and follow their pick."
         ),
-        (Unanswered::Later, Some(when)) => format!(
+        (Unanswered::Later, Some(when), _) => format!(
             "Shown to the person. Unless they answer or write to you first, Sonny wakes you at \
              {when} to go on with \"{label}\". Until then do work that does not depend on the \
              answer, or end your turn."
         ),
-        (Unanswered::Wait, Some(when)) => format!(
+        (Unanswered::Wait, Some(when), _) => format!(
             "Shown to the person. Do nothing they have not picked. Unless they answer or write to \
              you first, Sonny reminds you at {when}. Meanwhile do work that does not depend on the \
              answer, or end your turn."
+        ),
+        (_, _, Some(error)) => format!(
+            "Shown to the person, but Sonny could not set its deadline ({error}), so it waits for \
+             their answer: do nothing they have not picked. Meanwhile do work that does not depend \
+             on the answer, or end your turn."
         ),
         _ => "Shown to the person, whose setting has every ask wait for their answer: do nothing \
              they have not picked. Meanwhile do work that does not depend on the answer, or end \
@@ -586,9 +580,38 @@ pub fn served(arguments: &Value, bot: &str, turn: i64, call: &str) -> Result<Str
     };
     Ok(
         json!({"if_unanswered": plan.name(), "deadline_s": deadline, "deadline": when,
-        "next": next})
+        "deadline_error": unset, "next": next})
         .to_string(),
     )
+}
+
+/// The one-off trigger that wakes `bot` at `deadline` about its ask, unless
+/// `sonny ask open` finds it settled by then.
+fn set_deadline(
+    ask: &Ask,
+    plan: Unanswered,
+    label: &str,
+    deadline: i64,
+    bot: &str,
+    turn: i64,
+    call: &str,
+) -> Result<(), String> {
+    let sonny = crate::skills::sonny_path().ok_or("no path to this Sonny")?;
+    let quote = |text: &str| format!("'{}'", text.replace('\'', r"'\''"));
+    let gate = format!(
+        "{} ask open {} {turn} {}",
+        quote(&sonny.to_string_lossy()),
+        quote(bot),
+        quote(call)
+    );
+    let at = crate::trigger::local(deadline);
+    let add = json!({"add": {
+        "name": trigger_name(bot, call),
+        "at": format!("{}-{:02}-{:02} {:02}:{:02}", at.year, at.month, at.day, at.hour, at.minute),
+        "if": gate,
+        "message": fire(&ask.question, plan, label),
+    }});
+    crate::trigger::tool(&add).map(|_| ())
 }
 
 /// The whole minute `minutes` from `now`, never before it, as a one-off

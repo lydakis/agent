@@ -886,6 +886,8 @@ way `/react` does, and each note in the margin has its own `↩`.
 
   ![Two open decisions, their bars whole after the window narrowed, and the composer answering the first of two](../docs/sonny/ask-several.png)
 
+  ![Three decisions: one the lead goes ahead with meanwhile, one that goes ahead at 21:17 unless you pick, and one that waits for you with a reminder](../docs/sonny/ask-meanwhile.png)
+
   ![Typing an answer: the composer's band names the question over the words, as the sent answer will show it](../docs/sonny/ask-answering.png)
 
   ![A task's question: the lead's task updates say shop.wire asks you, and wire, opened from the margin's ↗, shows the decision in the pane](../docs/sonny/ask-from-task.png)
