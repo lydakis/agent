@@ -25,7 +25,8 @@ use std::{
 };
 
 /// How big the file grows before its older half goes: some ten
-/// thousand prompts of a few lines.
+/// thousand prompts of a few lines. A window keeps as many bytes of its
+/// own prompts' words, so neither grows with a long conversation.
 const MOST_BYTES: u64 = 4 << 20;
 
 #[derive(Default)]
@@ -96,14 +97,21 @@ impl<A: Clone + Default + PartialEq> Recall<A> {
             return;
         }
         self.mine.push((prompt.to_owned(), attached, bytes));
-        let mut held = 0;
-        for (_, attached, bytes) in self.mine.iter_mut().rev() {
+        let (mut held, mut words) = (0, 0);
+        let mut from = 0;
+        for (at, (text, attached, bytes)) in self.mine.iter_mut().enumerate().rev() {
             held += *bytes;
             if held > self.keep {
                 *attached = A::default();
                 *bytes = 0;
             }
+            words += text.len() as u64;
+            if words > MOST_BYTES && from == 0 {
+                from = at + 1;
+            }
         }
+        // The oldest go past the words' budget; the newest always stays.
+        self.mine.drain(..from.min(self.mine.len() - 1));
         if let Some(file) = &self.file {
             let _ = append(file, prompt, now_ms());
         }
@@ -369,6 +377,27 @@ mod tests {
             Some("look [Image #1]".into())
         );
         assert_eq!(attached, ["second"]);
+    }
+
+    #[test]
+    fn a_window_keeps_its_newest_words_up_to_the_files_size() {
+        let mut recall = Recall::default();
+        let long = "x".repeat(1 << 20);
+        for at in 0..6 {
+            recall.sent(&format!("{at} {long}"), (), 0);
+        }
+        let kept: Vec<_> = recall.mine.iter().map(|(text, ..)| &text[..1]).collect();
+        assert_eq!(
+            kept,
+            ["3", "4", "5"],
+            "the newest within {MOST_BYTES} bytes"
+        );
+        recall.sent(&"y".repeat(5 << 20), (), 0);
+        assert_eq!(
+            recall.mine.len(),
+            1,
+            "one longer than the budget stays alone"
+        );
     }
 
     #[test]
