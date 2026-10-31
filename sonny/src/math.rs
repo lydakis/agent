@@ -1,19 +1,16 @@
 //! LaTeX in a reply. Inline `$…$` becomes Unicode text (x², α, ∑, a/b),
 //! which stays selectable and wraps with the line. Display math (`$$…$$`,
 //! a ```math fence) is drawn by MathJax (vendor/mathjax.js, Apache-2.0,
-//! built from vendor/mathjax-entry.js) under node or bun, as an SVG.
+//! built from vendor/mathjax-entry.js) in Sonny's own QuickJS, as an SVG.
 
-const MATHJAX: &str = include_str!("../vendor/mathjax.js");
+static MATHJAX: crate::js::Engine =
+    crate::js::Engine::new("LaTeX", include_str!("../vendor/mathjax.js"));
 
 /// Display math as an SVG resvg can draw: sized in pixels for the
 /// terminal's cells and coloured for its background.
 pub fn svg(tex: &str) -> Result<String, String> {
     let tex = serde_json::to_string(tex).map_err(|e| e.to_string())?;
-    let script = format!(
-        "{MATHJAX}\ntry {{ process.stdout.write(tex2svg({tex}, true)) }} \
-         catch (e) {{ process.stderr.write(String(e && e.message || e)); process.exit(1) }}\n"
-    );
-    let svg = crate::js::run(script, "LaTeX")?;
+    let svg = MATHJAX.eval(format!("tex2svg({tex}, true)"))?;
     // MathJax reports a TeX error inside the picture, in red: say it instead.
     if let Some(at) = svg.find("data-mjx-error=\"") {
         let rest = &svg[at + "data-mjx-error=\"".len()..];
@@ -392,10 +389,7 @@ mod tests {
     use super::unicode;
 
     #[test]
-    fn display_math_draws_when_node_is_here() {
-        if !crate::js::available() {
-            return;
-        }
+    fn display_math_draws() {
         let svg = super::svg(r"\int_0^1 x^2\,dx = \frac{1}{3}").unwrap();
         assert!(
             !svg.contains("currentColor") && !svg.contains("ex\""),
