@@ -3498,6 +3498,89 @@ fn waiting_calls_page_past_held_answers_and_an_answer_out_of_time_is_refused() {
 }
 
 #[test]
+fn a_parked_answer_s_pictures_are_stored_once_its_result_is() {
+    let path =
+        std::env::temp_dir().join(format!("agent-parked-parts-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    let start = Declared {
+        name: "start".into(),
+        description: "Start.".into(),
+        parameters: json!({"type":"object"}),
+        result: "ok".into(),
+        answered_by: Some("sonny".into()),
+        expire_ms: None,
+        grammar: None,
+        steps: false,
+        inherit: true,
+    };
+    db.create(
+        "Lead",
+        Some("/synthetic"),
+        Binding {
+            declared: Some(std::slice::from_ref(&start)),
+            ..binding()
+        },
+    )
+    .unwrap();
+    let turn = db
+        .begin(
+            "Lead",
+            "request",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let call = ToolCall {
+        name: "start".into(),
+        call_id: "c1".into(),
+        arguments: "{}".into(),
+        custom: false,
+    };
+    db.append(turn, vec![], std::slice::from_ref(&call), None)
+        .unwrap();
+    db.tool_start(turn, &call).unwrap();
+    assert!(
+        db.suspend_answer(turn, "c1", &[], 0, None, None)
+            .unwrap()
+            .is_some()
+    );
+    let pictured = Outcome {
+        parts: vec![agent_runtime::codec::Part::Image(
+            agent_runtime::codec::Image {
+                media_type: "image/png".into(),
+                data: "A".repeat(4096),
+            },
+        )],
+        ..result("a page")
+    };
+    db.answer_call("Lead", turn, "c1", pictured.clone(), 0)
+        .unwrap();
+    let kept = |path: &std::path::Path| -> Option<String> {
+        Connection::open(path)
+            .unwrap()
+            .query_row("SELECT parts FROM answers WHERE call_id='c1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap()
+    };
+    assert!(kept(&path).is_some());
+    db.resume(turn).unwrap();
+    let agent_runtime::store::CallAnswer::Given(answer) = db.answer_take(turn, "c1", 0).unwrap()
+    else {
+        panic!("the parked answer was not taken");
+    };
+    assert_eq!(answer.parts, pictured.parts);
+    db.tool_finish(turn, "c1", &answer).unwrap();
+    assert_eq!(kept(&path), None);
+    drop(db);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn schema_52_bots_declare_no_tools() {
     let path = std::env::temp_dir().join(format!("agent-declared-{}.sqlite", std::process::id()));
     let _ = std::fs::remove_file(&path);

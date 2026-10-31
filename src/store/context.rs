@@ -379,11 +379,10 @@ pub fn stub(
 
 /// What a request sends in place of a result that carried pictures (an
 /// image file read, a client's answer) below the bot's elision floor: its
-/// text, without the pictures, which calling the tool again would show.
-/// `custom` keeps the result's kind for its call. Any saving
-/// makes one, so that a request can always leave older pictures out (see
-/// [`prompt_stub`]); `None` when it would weigh as much as `weight`, what the
-/// result weighs with its pictures at their token cost.
+/// text, without the pictures; `custom` keeps the result's kind for its
+/// call. Any saving makes one, so that a request can always leave older
+/// pictures out (see [`prompt_stub`]); `None` when it would weigh as much as
+/// `weight`, what the result weighs with its pictures at their token cost.
 pub fn picture_stub(
     family: Family,
     call_id: &str,
@@ -391,9 +390,7 @@ pub fn picture_stub(
     output: &str,
     weight: usize,
 ) -> Result<Option<Vec<u8>>> {
-    let text = format!(
-        "[tool result's pictures elided from this request; call the tool again to see them. Its text:]\n{output}"
-    );
+    let text = format!("[tool result's pictures elided from this request. Its text:]\n{output}");
     let stub = family.tool_result_item(call_id, custom, &text)?;
     Ok((stub.len() < weight).then_some(stub))
 }

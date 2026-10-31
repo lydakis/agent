@@ -6017,6 +6017,14 @@ impl Database {
         for (stream, data) in &outcome.artifacts {
             artifact::put(&tx, turn, call_id, stream, data)?;
         }
+        // A parked answer's pictures were kept for the result, which now
+        // holds them: stored once.
+        if !outcome.parts.is_empty() {
+            tx.prepare_cached(
+                "UPDATE answers SET parts=NULL WHERE turn=? AND call_id=? AND parts IS NOT NULL",
+            )?
+            .execute(params![turn, call_id])?;
+        }
         // The stub names the result's node, so it is made for the id the
         // insert takes, and its savings go in with the node. Written with
         // the result, eliding it later reads no output. A bot without the
