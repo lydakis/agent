@@ -154,7 +154,7 @@ pub const SETTINGS: [Setting; 21] = [
     },
     Setting {
         key: "sonny.commons_invites",
-        about: "invites a day new commons threads send, 0 for none; each answered one adds one, up to as many again",
+        about: "least invites a day new commons threads send, the square root of the week's agents if more, 0 for none; each answered one adds one, up to as many again",
         values: &[],
         default: "3",
     },

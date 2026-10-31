@@ -736,6 +736,9 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                 .and_then(|id| id.parse().ok());
             // The model its turn runs, as the host set it for the call.
             let model = std::env::var("AGENT_MODEL").ok();
+            if arguments["post"].is_object() {
+                crate::commons::recount(&home).await;
+            }
             let mut said =
                 crate::commons::call(&home, &caller, caller_id, model.as_deref(), arguments)
                     .map_err(|e| ("commons_refused", e))?;
