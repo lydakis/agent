@@ -16,13 +16,23 @@ CLI makes each bot with `run --new --agents`, so its instructions are what
 the composer gives today, memory indexes included
 ([CLIENT.md](CLIENT.md#layers)).
 
-There are two conditions:
+There are three conditions:
 
 - **`none`**: no facts and no `memory` skill. This is the control.
 - **`memory`**: three facts are saved through Sonny's
   `~/.agent/memory` script, and Sonny's `memory` skill is installed, both
   from this checkout so they match. A
   new agent's instructions then carry the person's index and the project's.
+- **`learned`**: day one, then day two (added 2026-10-31, from the
+  day-six review's ask that a fresh lead on day two apply what day one
+  learned). The skill is installed and nothing is saved. On day one, a
+  new agent in the project's main checkout hears the fact from the person
+  in passing, with nothing to change (`LEARN` in the script). On day two,
+  a fresh agent in the same HOME gets the task in its worktree. Only what
+  the first agent chose to save carries the fact over. `stale` has no
+  `learned` run, since its fact is wrong on purpose. Each row records
+  `day_one`: its status, its time and the facts it saved, with their text;
+  the summary counts `day_one_saved`.
 
 There are three scenarios. Each pairs a fact the code does not show with a
 task that needs it:
@@ -69,8 +79,9 @@ cargo build --release --locked -p agent-runtime -p sonny
 - **Login.** The daemons read the plan login `agent login chatgpt` saved,
   from `AGENT_CHATGPT_LOGIN` or `~/.agent/chatgpt.json`. The 2026-10-10 run
   below predates it and used Codex's login.
-- **Run size.** 18 bots start at once: 2 conditions × 3 scenarios × 3
-  trials (`--trials`). Each bot's turn is capped at 400,000 tokens
+- **Run size.** 24 task bots start at once: 3 conditions × 3 scenarios × 3
+  trials (`--trials`), less `learned` × `stale`; the 6 `learned` ones
+  each have a day-one bot first. Each bot's turn is capped at 400,000 tokens
   (`--turn-budget-tokens`) and 20 minutes (`--timeout`).
 - **Output.** The summary prints per condition and scenario. Every bot's
   record goes to `--out`. Its folder, worktree and memory stay in a new

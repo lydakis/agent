@@ -13,6 +13,11 @@ Conditions:
 - `memory`: the facts below saved with the app's `~/.agent/memory` script
   and the app's `memory` skill installed, both from this checkout, so a new agent's instructions
   carry both memory indexes (the person's and the project's).
+- `learned`: day one, then day two. The skill is installed and nothing is
+  saved; on day one an agent in the project hears the fact from the person
+  in passing (`LEARN`), with nothing to change. On day two a fresh agent,
+  in the same HOME, gets the task. Whatever carries the fact over is what
+  the first agent chose to save. `stale` has no day one: its fact is wrong.
 
 Scenarios, each a fact the code does not show and a task that needs it:
 
@@ -58,7 +63,7 @@ from bench.targets import clean_env, file_hash  # noqa: E402
 ROOT = Path(__file__).resolve().parents[1]
 BUILD = 'cargo build --release --locked -p agent-runtime -p sonny'
 PROJECT = 'shop'
-CONDITIONS = ('none', 'memory')
+CONDITIONS = ('none', 'memory', 'learned')
 # The key variable each built-in provider reads.
 KEYS = {'openai': 'OPENAI_API_KEY', 'anthropic': 'ANTHROPIC_API_KEY', 'openrouter': 'OPENROUTER_API_KEY'}
 
@@ -147,6 +152,17 @@ FACTS = {
         'turn:lead/3',
         'Prices are rounded with `round_price()` in `shop/money.py`, which rounds half to even. '
         'Use it for any new price calculation.'),
+}
+
+# Day one of `learned`: the person mentions the fact while the agent has
+# nothing to do with it yet, as a person does.
+LEARN = {
+    'decision': 'Heads up, nothing to change today: we agreed with the mobile team that timestamps in API '
+                'output are UTC ISO-8601 with whole seconds and a trailing Z, like 2026-09-30T12:00:00Z, '
+                'never +00:00, because the mobile client only parses that form.',
+    'preference': 'Something about how I work, nothing to change today: I search logs by code, so I want '
+                  'every error message to start with a bracketed upper-case code, like '
+                  '[E_NOT_FOUND] order 7 does not exist.',
 }
 
 SCENARIOS = {
@@ -293,16 +309,17 @@ def provider_keys(specs):
 
 
 def home(root, condition, app):
-    """A HOME of the bot's own: the memory script, and for `memory` the
-    skill and the facts, saved through the script."""
+    """A HOME of the bot's own: the memory script; for `memory` and
+    `learned` the skill; for `memory` the facts, saved through the script."""
     home = root / 'home'
     (home / '.agent').mkdir(parents=True)
     script = home / '.agent/memory'
     quoted = "'" + str(app).replace("'", "'\\''") + "'"
     script.write_text(f'#!/bin/sh\nexec {quoted} memory "$@"\n')
     script.chmod(0o755)
-    if condition == 'memory':
+    if condition in ('memory', 'learned'):
         shutil.copytree(ROOT / 'sonny/skills/memory', home / '.agents/skills/memory')
+    if condition == 'memory':
         for name, (scope, kind, description, source, text) in FACTS.items():
             where = ['--user'] if scope == 'user' else ['--project', PROJECT]
             subprocess.run([str(script), 'save', name, '--type', kind, '--description', description,
@@ -353,34 +370,53 @@ def answer(found):
     return ''.join(texts)[:2000]
 
 
-def run_bot(binary, app, model, env, out_dir, condition, scenario, trial, budget, timeout):
-    """One task in its own HOME and daemon, scored."""
-    root = Path(tempfile.mkdtemp(prefix=f'{condition}-{scenario}-{trial}-', dir=out_dir))
-    worktree = project(root)
-    bot_home = home(root, condition, app)
-    before = memory_files(bot_home)
-    bot_env = {**env, 'HOME': str(bot_home)}
-    name = f'{scenario}-{trial}'
-    agent = [str(binary)]
+def one_turn(agent, env, name, workspace, model, budget, timeout, message):
+    """A new bot's first turn: what it streamed, an error, its turn's view
+    and the wall time."""
     started = time.monotonic()
     try:
-        run = subprocess.run([*agent, 'run', '--new', '--agents', '--bot', name, '--workspace', str(worktree),
-                              '--model', model, '--turn-budget-tokens', str(budget), '--', SCENARIOS[scenario]],
-                             cwd=worktree, env=bot_env, capture_output=True, text=True, timeout=timeout)
+        run = subprocess.run([*agent, 'run', '--new', '--agents', '--bot', name, '--workspace', str(workspace),
+                              '--model', model, '--turn-budget-tokens', str(budget), '--', message],
+                             cwd=workspace, env=env, capture_output=True, text=True, timeout=timeout)
         stream, error = run.stdout, run.stderr[-2000:]
     except subprocess.TimeoutExpired as expired:
         # What streamed before the timeout, bytes on some Pythons.
         out = expired.stdout or ''
         stream, error = out.decode() if isinstance(out, bytes) else out, 'timeout'
-        subprocess.run([*agent, 'interrupt', '--bot', name], env=bot_env, capture_output=True, timeout=30)
+        subprocess.run([*agent, 'interrupt', '--bot', name], env=env, capture_output=True, timeout=30)
     wall = round(time.monotonic() - started, 1)
     # A finished turn returns at once; an interrupted one once it settles.
-    view = subprocess.run([*agent, 'wait', '--timeout', '60s', f'turn:{name}/1'], env=bot_env,
+    view = subprocess.run([*agent, 'wait', '--timeout', '60s', f'turn:{name}/1'], env=env,
                           capture_output=True, text=True, timeout=90)
     try:
         turn = json.loads(view.stdout)['results'][f'turn:{name}/1']
     except (ValueError, KeyError, TypeError):
         turn = {'error': view.stderr[-500:]}
+    return stream, error, turn, wall
+
+
+def run_bot(binary, app, model, env, out_dir, condition, scenario, trial, budget, timeout):
+    """One task in its own HOME and daemon, scored. For `learned`, a day
+    one first: another new agent in the project hears the fact."""
+    root = Path(tempfile.mkdtemp(prefix=f'{condition}-{scenario}-{trial}-', dir=out_dir))
+    worktree = project(root)
+    bot_home = home(root, condition, app)
+    bot_env = {**env, 'HOME': str(bot_home)}
+    agent = [str(binary)]
+    day_one = None
+    if condition == 'learned':
+        empty = memory_files(bot_home)
+        stream, error, turn, wall = one_turn(agent, bot_env, f'day1-{scenario}-{trial}', root / PROJECT,
+                                             model, budget, timeout, LEARN[scenario])
+        saved = memory_files(bot_home)
+        day_one = {'status': turn.get('status'), 'error': turn.get('error') or (error if not stream else None),
+                   'output_tokens': turn.get('output_tokens'), 'wall_s': wall,
+                   'memory_saved': {k: v for k, v in saved.items() if empty.get(k) != v},
+                   'answer': answer(events(stream))}
+    before = memory_files(bot_home)
+    name = f'{scenario}-{trial}'
+    stream, error, turn, wall = one_turn(agent, bot_env, name, worktree, model, budget, timeout,
+                                         SCENARIOS[scenario])
     subprocess.run([*agent, 'shutdown'], env=bot_env, capture_output=True, timeout=60)
     found = events(stream)
     commands = shell_commands(found)
@@ -399,6 +435,7 @@ def run_bot(binary, app, model, env, out_dir, condition, scenario, trial, budget
         # Whether the agent fixed the wrong fact is read from its text.
         **({'fact_changed': after.get(stale) != before[stale], 'fact_after': after.get(stale)}
            if condition == 'memory' and scenario == 'stale' else {}),
+        **({'day_one': day_one} if day_one else {}),
         'answer': answer(found),
         'dir': str(root),
     }
@@ -419,7 +456,9 @@ def summarize(rows):
                                                  total('output_tokens')],
                         'memory_commands': [len(r['memory_commands']) for r in block],
                         **({'fact_changed': sum(r['fact_changed'] for r in block)}
-                           if 'fact_changed' in block[0] else {})})
+                           if 'fact_changed' in block[0] else {}),
+                        **({'day_one_saved': sum(bool(r['day_one']['memory_saved']) for r in block)}
+                           if 'day_one' in block[0] else {})})
     return summary
 
 
@@ -480,7 +519,9 @@ def main():
     if ROOT in out_dir.resolve().parents:
         parser.error(f'{out_dir} is inside {ROOT}: set TMPDIR elsewhere')
     observed = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
-    jobs = [(c, s, t) for c in args.conditions for s in args.scenarios for t in range(args.trials)]
+    # `stale`'s fact is wrong, so nobody tells it on a day one.
+    jobs = [(c, s, t) for c in args.conditions for s in args.scenarios for t in range(args.trials)
+            if c != 'learned' or s in LEARN]
     with concurrent.futures.ThreadPoolExecutor(len(jobs)) as pool:
         rows = list(pool.map(lambda job: run_bot(args.binary.resolve(), app, args.model, env, out_dir, *job,
                                                  args.turn_budget_tokens, args.timeout), jobs))
