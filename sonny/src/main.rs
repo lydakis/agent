@@ -6677,7 +6677,11 @@ impl App {
             }
             "turn_paced" => {
                 if let Some(running) = &mut self.running {
-                    running.phase = "Rate limited".into();
+                    running.phase = match data["paused"] == true {
+                        true => "Paused",
+                        false => "Rate limited",
+                    }
+                    .into();
                 }
             }
             "turn_resumed" => {
@@ -9328,8 +9332,8 @@ impl App {
                     .await
                 {
                     Ok(said) if said["changed"] == true => format!(
-                        "every agent is paused; {} running stopped",
-                        said["interrupted"]
+                        "every agent is paused; {} running wait for /resume",
+                        said["parked"]
                     ),
                     Ok(_) => "already paused".into(),
                     Err(error) => format!("pause: {error}"),
@@ -11975,7 +11979,7 @@ mod tests {
     async fn a_pause_shows_who_pulled_it_until_resume() {
         let client = daemon_answering(|asked| match asked["op"].as_str() {
             Some("pause") => json!({"pause": {"reason": asked["reason"], "by": null, "at_ms": 1},
-                "changed": true, "interrupted": 2}),
+                "changed": true, "parked": 2}),
             Some("resume") => json!({"pause": {"reason": "rows", "by": null}, "changed": true}),
             _ => json!({}),
         })
@@ -11996,7 +12000,7 @@ mod tests {
         app.submit().await;
         assert_eq!(
             app.notice.as_deref(),
-            Some("every agent is paused; 2 running stopped")
+            Some("every agent is paused; 2 running wait for /resume")
         );
         // Every window hears of it, whoever pulled it.
         let pause = json!({"reason": "the migration deletes rows", "by": "calc.a", "at_ms": 1});

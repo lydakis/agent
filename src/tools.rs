@@ -1956,7 +1956,7 @@ impl Registry {
                 // The cord pulled: dropped the same way, its handle saying
                 // why.
                 Ok(()) = pulls.changed() => {
-                    let _ = done.send(Err(Error::new("daemon_paused")));
+                    let _ = done.send(Err(stopped_by_pause()));
                 }
             }
         });
@@ -1972,7 +1972,7 @@ impl Registry {
         async move {
             tokio::select! {
                 result = run => result,
-                Ok(()) = pulls.changed() => Err(Error::new("daemon_paused")),
+                Ok(()) = pulls.changed() => Err(stopped_by_pause()),
             }
         }
     }
@@ -1988,6 +1988,14 @@ impl Registry {
     pub fn end_background(&self) {
         self.stopping.send_replace(true);
     }
+}
+
+/// How a command the pull cord ended answers: it is not run again.
+fn stopped_by_pause() -> Error {
+    Error::with(
+        "daemon_paused",
+        "the pause stopped this command before it finished. It may have had effects and is not run again: check the current state before retrying",
+    )
 }
 
 /// Number lines from a 1-based offset within the page budget. A single line

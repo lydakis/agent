@@ -335,7 +335,8 @@ A turn reads the same wherever a client meets it. Its view is `bot`,
 `retries`, `paced_ms`, `started_ms` and `finished_ms`, all from the turn's row.
 `waiting_on` is what a parked turn waits for, as its `turn_waiting` or
 `turn_paced` event said (`call_id` and `approval` or `handles`, or
-`resume_at_ms`), and null otherwise. A `wait` result is the view, plus the
+`resume_at_ms`, null with `paused: true` for a turn the pull cord parked), and
+null otherwise. A `wait` result is the view, plus the
 outcome once finished; an `interrupt` reply is the view plus
 `interrupt_requested`; a `turns` item is the view plus the fields below.
 `submit` answers with the view's identity and status, without a second read.
@@ -1035,18 +1036,27 @@ Protocol 24 also adds the pull cord: `pause` stops every agent until
 `resume`, and holds across restarts, since the store keeps it (schema 64, a
 one-row `pause` table). `{"op":"pause","reason":TEXT,"by":NAME}` needs a
 reason of 1 to 4096 bytes. `by` is who pulled it; on a bot's own socket it is
-that bot, whatever the request says. It ends every running turn as
-`interrupted` with `daemon_paused`, ends every background command (whose
-handle then answers `daemon_paused`) and terminal, though not a detached
+that bot, whatever the request says. It parks every running turn at once,
+as a closed pool parks it (`turn_paced` with `paused: true`; status `paced`),
+to continue on `resume`. The reply it was writing is dropped and asked for
+again then. Each call the turn had not answered gets a result, `{error:
+"daemon_paused", detail, pause}`, saying the pause stopped it before its result
+was recorded (it may have had effects) or came before it ran, and none is run
+again: the model decides what to redo, as Codex answers the calls an interrupt
+cut off. The pause ends every background command (whose handle then answers
+`daemon_paused`, saying the same) and terminal, though not a detached
 command, which no one tracks, and from then no turn starts: a `reject`
 submission answers `daemon_paused`, `queue` and `steer` submissions are
 recorded and wait, triggers and notes with them, and parked and paced turns
 stay parked. An `attach` is taken as usual. The answer is `{pause, changed,
-interrupted}`, where `pause` is `{reason, by, at_ms}`. While a pause holds,
+parked}`, where `pause` is `{reason, by, at_ms}` and `parked` counts the
+running turns it parked. While a pause holds,
 another changes nothing and answers the first with `changed: false`.
 `{"op":"resume","by":NAME?}` lifts it and answers `{pause, by, changed}` with
-the pause it lifted, or null when none held, and who lifted it; what waited
-starts as capacity allows. A
+the pause it lifted, or null when none held, and who lifted it; what waited,
+and the turns the pause parked, start as capacity allows. Time parked by a
+pause is not counted in `paced_ms`. Protocol 32 parks running turns on a
+pull; before it, they ended `interrupted`. A
 sandboxed bot's own socket refuses it with `not_permitted`, so a command
 left running in a sandbox cannot let the line go on. Each
 change is told to every session as a `paused` or `resumed` event, `{event,
@@ -1398,7 +1408,8 @@ the refused call's `name` and argument preview as `tool_started` would),
 `approval_requested` (a round's gated calls, see [tool approval](#tool-approval)),
 `turn_waiting` and `turn_resumed` (a parked turn's handles, or the call whose
 verdict it waits for, and its wake-up), `turn_paced` (a turn parked at its model-call boundary because its
-provider's pool is closed by a rate limit, with `resume_at_ms`; it resumes
+provider's pool is closed by a rate limit, with `resume_at_ms`, or because the
+pull cord stopped it, with `resume_at_ms` null and `paused: true`; it resumes
 through `turn_resumed` like a parked wait), `steered` (a steer's item joining
 the running turn: `steer` names the steer's turn, `node` its item, `from`
 or `origin` its sender as on `accepted`, and `attached: true` when it was sent

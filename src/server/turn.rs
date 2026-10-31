@@ -522,9 +522,14 @@ impl Turn {
         let mut landed = None;
         // Cancelling mid-job loses nothing: a job the worker has taken runs
         // to its commit, and the worker publishes whatever committed.
+        // The pull cord parks the turn rather than ending it.
+        let mut pulled = false;
         let mut result = tokio::select! {
             biased;
-            code = interrupt => fail(code),
+            code = interrupt => {
+                pulled = code == PAUSED;
+                fail(code)
+            }
             result = self.rounds(&mut accounting, &mut landed) => result,
         };
         // The rounds future is gone, so cancellation cannot discard this flush.
@@ -575,6 +580,22 @@ impl Turn {
                     .map(|_| ())
                 })
                 .await
+        } else if pulled {
+            let route = accounting.route.get().cloned();
+            let parked = self
+                .store
+                .op("suspend_pulled", move |db| {
+                    db.suspend_pulled(turn, retries, paced_ms, summary_ms, route.as_deref())
+                        .map(|_| ())
+                })
+                .await;
+            // Parked: nothing more to commit, and the service keeps a
+            // wake-up that holds until `resume`. A park that could not be
+            // written ends the turn as the pull used to.
+            if parked.is_ok() {
+                result = Ok(Round::Paced(0));
+            }
+            Ok(())
         } else if retries > 0 || paced_ms > 0 || summary_ms > 0 {
             self.store
                 .op("note_pacing", move |db| {
@@ -589,8 +610,10 @@ impl Turn {
         }
         // An interrupt may arrive while the non-cancellable flush is pending.
         // Honor it before retiring a parked task whose receiver is still live.
+        // A pull leaves a park as it is: the pause holds its wake-up.
         if result.is_ok()
             && let Some(code) = *cancelled.borrow()
+            && code != PAUSED
         {
             result = fail(code);
         }

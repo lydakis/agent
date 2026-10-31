@@ -585,15 +585,16 @@ enum Command {
         grace_ms: u64,
     },
     /// Stop every agent until `resume`, across restarts: each running turn
-    /// ends with `daemon_paused`, no turn starts, and queued work waits.
+    /// parks at once, its unanswered calls answered `daemon_paused`, and
+    /// continues on `resume`; no turn starts, and queued work waits.
     /// `by` names who pulled it; a bot's own socket is that bot. While a
     /// pause holds, another changes nothing.
     Pause {
         reason: String,
         by: Option<String>,
     },
-    /// Lift the pause; what waited starts as capacity allows. `by` names
-    /// who let the line go on, as a pause's does.
+    /// Lift the pause; what waited, and the turns it parked, start as
+    /// capacity allows. `by` names who let the line go on, as a pause's does.
     Resume {
         #[serde(default)]
         by: Option<String>,
@@ -3398,11 +3399,11 @@ impl Service {
                     })
                     .await?;
                 self.paused = Some(pause.clone());
-                // The line stops: every running turn ends now. Parked and
-                // queued turns hold no slot and wait.
-                let mut interrupted = 0;
+                // The line stops: every running turn parks now, to continue
+                // on `resume`. Parked and queued turns hold no slot and wait.
+                let mut parked = 0;
                 if new {
-                    interrupted = (self.active.values())
+                    parked = (self.active.values())
                         .filter(|active| active.cancel(turn::PAUSED))
                         .count();
                     // And what they started that runs on without them.
@@ -3410,7 +3411,7 @@ impl Service {
                     self.notices
                         .push(json!({"event": "paused", "pause": pause, "durable": false}));
                 }
-                Ok(json!({"pause": pause, "changed": new, "interrupted": interrupted}))
+                Ok(json!({"pause": pause, "changed": new, "parked": parked}))
             }
             Command::Resume { by } => {
                 let lifted = store.op("remove_pause", |db| db.remove_pause()).await?;
