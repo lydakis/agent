@@ -3372,12 +3372,10 @@ impl App {
                 mode,
                 &approvals::gateable(&self.tools, declared),
             ));
-            // An agent's sandbox goes with its row, a lead's or a task's;
-            // a side chat keeps its agent's.
-            if !SIDE.load(std::sync::atomic::Ordering::Relaxed) {
-                let workspace = std::path::Path::new(&self.workspace);
-                fields.extend(approvals::sandbox(mode, workspace));
-            }
+            // An agent's sandbox goes with its row, a lead's, a task's or
+            // a side chat's, which the daemon holds within its agent's.
+            let workspace = std::path::Path::new(&self.workspace);
+            fields.extend(approvals::sandbox(mode, workspace));
         }
         match self.client.request("configure", asked).await {
             Ok(_) => {
