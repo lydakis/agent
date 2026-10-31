@@ -211,7 +211,7 @@ struct Options {
     new: bool,
     model: Option<String>,
     workspace: Option<String>,
-    /// Lay the project's tasks out in Rex or Herdr, whichever Sonny runs in.
+    /// Lay the project's tasks out in Rex, Herdr or cmux, whichever Sonny runs in.
     layout: bool,
     /// The Rex server the project's session lives on, when not this one.
     rex_host: Option<String>,
@@ -232,7 +232,7 @@ fn usage() -> String {
      \x20      [--agent NAME [--new [--workspace DIR]] | --lead NAME | --new-lead [NAME]]\n\
      With no --agent, the folder's lead you last wrote to, its first made with --model the\n\
      first time; --lead opens another of the folder's leads, --new-lead makes one. Its\n\
-     tasks open beside it in Rex or Herdr, each in a git worktree of its own. Type /status\n\
+     tasks open beside it in Rex, Herdr or cmux, each in a git worktree of its own. Type /status\n\
      for the project's agents, /lead for the folder's leads.\n\
      Agents start tasks, put windows and panes where the person looks, make projects\n\
      and follow agents in the lookout with tools Sonny gives them, which its tool host answers.\n\
@@ -253,7 +253,7 @@ fn usage() -> String {
 /// asked. A task gets a window of its own unless told otherwise; `split`
 /// puts it beside the caller's block, or `beside` another bot's. Another
 /// project's lead gets its project's own home instead (a Rex session, a
-/// Herdr workspace), running that lead's Sonny, unless it is there already.
+/// Herdr or cmux workspace), running that lead's Sonny, unless it is there already.
 async fn show(
     caller: &str,
     bot: &str,
@@ -988,8 +988,8 @@ async fn run() -> Result<(), String> {
         app.model = model.clone();
         app.turn_model = Some(model.clone());
     }
-    // Tasks are laid out in Rex when the person is in it (or names the
-    // Rex server to use); elsewhere they run out of sight, in /status.
+    // Tasks are laid out in the multiplexer the person runs Sonny in (or
+    // the Rex server named); elsewhere they run out of sight, in /status.
     if let Some(project) = &project
         && options.layout
     {
@@ -2244,7 +2244,7 @@ struct App {
     suggestion: Option<String>,
 }
 
-/// The lead's tasks, laid out in the project's Rex session: a window for
+/// The lead's tasks, laid out in the project's home in a multiplexer: a window for
 /// each task while it works, opened as its turn starts. It follows every
 /// bot on its own connection, so the lead's own view is not disturbed.
 struct Fleet {
@@ -2264,7 +2264,7 @@ struct Fleet {
     leads: std::collections::HashSet<String>,
     /// How a task's window runs Sonny on it, without the bot's name.
     command: Vec<String>,
-    /// Said once in the status row when Rex is set up.
+    /// Said once in the status row when tasks open where this pane is not.
     note: Option<String>,
     /// What each bot is doing, as its window says.
     doing: HashMap<String, &'static str>,
