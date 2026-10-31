@@ -14751,7 +14751,7 @@ mod tests {
 
     #[tokio::test]
     async fn words_attached_to_a_call_hang_under_what_it_carried() {
-        let note = "[mira replied in the commons thread t42, where you posted.]";
+        let note = "[trigger nightly · 15:02 · not sent to tally.lead: busy]";
         let client = daemon_answering(move |asked| {
             let node = asked["nodes"][0].as_i64().unwrap_or(0);
             match asked["op"].as_str() {
@@ -14767,15 +14767,15 @@ mod tests {
         let mine = drawn(&mut app).len();
         // Read with the person's message: right under it, a clip for an
         // arrow, and no message the bot answers.
-        app.land(4, (note, ""), (Some("the commons"), false, true), false);
+        app.land(4, (note, ""), (Some("an automation"), false, true), false);
         let rows = drawn(&mut app);
-        assert_eq!(rows[mine..], ["  📎 From the commons ▸"], "{rows:?}");
+        assert_eq!(rows[mine..], ["  📎 From an automation ▸"], "{rows:?}");
         assert_eq!(app.answering.as_ref().map(|(_, _, node)| *node), Some(3));
         // Another joins it; a message between agents does not.
         app.land(5, (note, ""), (Some("calc.add"), false, true), false);
         assert_eq!(
             drawn(&mut app)[mine..],
-            ["  📎 2 attached notes · the commons, calc.add ▸"]
+            ["  📎 2 attached notes · an automation, calc.add ▸"]
         );
         app.land(
             6,
@@ -14786,7 +14786,7 @@ mod tests {
         assert_eq!(
             drawn(&mut app)[mine..],
             [
-                "  📎 2 attached notes · the commons, calc.add ▸",
+                "  📎 2 attached notes · an automation, calc.add ▸",
                 "",
                 "↳ From calc.add ▸"
             ]
@@ -14799,9 +14799,9 @@ mod tests {
         assert_eq!(
             open[mine..mine + 4],
             [
-                "  📎 2 attached notes · the commons, calc.add ▾",
-                "    📎 From the commons ▾",
-                "      [mira replied in the commons thread t42, where you posted.]",
+                "  📎 2 attached notes · an automation, calc.add ▾",
+                "    📎 From an automation ▾",
+                "      [trigger nightly · 15:02 · not sent to tally.lead: busy]",
                 "    📎 From calc.add ▸",
             ]
         );
