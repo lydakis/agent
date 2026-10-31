@@ -2756,6 +2756,128 @@ fn schema_64_had_no_people_and_no_quotes() {
     std::fs::remove_file(path).unwrap();
 }
 
+/// A turn of Bob's that says "Shall I deploy?" and then streams what says
+/// nothing a person reads: reasoning, and content that is not parts.
+fn ask_and_finish(db: &mut Database, key: &str) -> (i64, i64) {
+    let turn = db
+        .begin(
+            "Bob",
+            key,
+            "go",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let quiet = |item: Value| Bytes::from(serde_json::to_vec(&item).unwrap());
+    let entries = db
+        .append(
+            turn,
+            vec![
+                assistant("Looking."),
+                assistant("Shall I deploy?"),
+                quiet(json!({"type":"reasoning","id":"rs_1","summary":[]})),
+                quiet(json!({"type":"message","role":"assistant","content":"plain"})),
+                assistant(" \n"),
+            ],
+            &[],
+            None,
+        )
+        .unwrap();
+    db.finish(turn, None).unwrap();
+    (turn, entries[1]["data"]["node"].as_i64().unwrap())
+}
+
+#[test]
+fn a_finished_turns_reply_outlives_retention() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    db.create("Carol", Some("/synthetic"), binding()).unwrap();
+    let (asked, _) = ask_and_finish(&mut db, "r1");
+    let answered = db
+        .begin(
+            "Bob",
+            "r2",
+            "yes",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    db.append(answered, vec![assistant("Deployed.")], &[], None)
+        .unwrap();
+    db.finish(answered, None).unwrap();
+    assert!(db.prune("Bob", 1).unwrap()["events"].as_i64().unwrap() > 0);
+    // Its outcome is gone, as retention promises.
+    assert_eq!(
+        db.turn_outcome("Bob", asked).unwrap_err().code,
+        "turn_result_pruned"
+    );
+    // The words a person's "yes" answered are still read with it.
+    assert_eq!(
+        db.prompts("Bob", answered, 64 * 1024).unwrap()["prompts"][0]["reply"]["text"],
+        "Shall I deploy?"
+    );
+    // And the reply can still be quoted.
+    let options = TurnOptions {
+        quotes: vec![quote("Bob", asked, true)],
+        ..TurnOptions::default()
+    };
+    let quoting = db
+        .begin("Carol", "c1", "see this", true, &options, allow_provider)
+        .unwrap()
+        .turn;
+    assert_eq!(
+        db.prompts("Carol", quoting, 64 * 1024).unwrap()["prompts"][0]["quotes"][0]["text"],
+        "Shall I deploy?"
+    );
+}
+
+#[test]
+fn schema_69_finds_each_finished_turns_reply() {
+    let path = std::env::temp_dir().join(format!(
+        "agent-schema69-reply-{}.sqlite",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let (asked, node, silent) = {
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        db.create("Bob", Some("/synthetic"), binding()).unwrap();
+        let (asked, node) = ask_and_finish(&mut db, "r1");
+        let silent = db
+            .begin(
+                "Bob",
+                "r2",
+                "hush",
+                true,
+                &TurnOptions::default(),
+                allow_provider,
+            )
+            .unwrap()
+            .turn;
+        db.finish(silent, None).unwrap();
+        (asked, node, silent)
+    };
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch("ALTER TABLE turns DROP COLUMN reply_node; PRAGMA user_version=69;")
+        .unwrap();
+    drop(Database::initialize(Connection::open(&path).unwrap()).unwrap());
+    let conn = Connection::open(&path).unwrap();
+    let reply = |turn: i64| -> Option<i64> {
+        conn.query_row("SELECT reply_node FROM turns WHERE id=?", [turn], |r| {
+            r.get(0)
+        })
+        .unwrap()
+    };
+    assert_eq!(reply(asked), Some(node));
+    assert_eq!(reply(silent), None);
+    drop(conn);
+    std::fs::remove_file(path).unwrap();
+}
+
 #[test]
 fn events_keep_when_they_were_written_and_a_time_finds_its_cursor() {
     let path = std::env::temp_dir().join(format!("agent-written-{}.sqlite", std::process::id()));
@@ -2865,7 +2987,7 @@ fn an_event_is_never_written_before_the_one_before_it() {
 
 #[test]
 fn schema_68_events_had_no_times() {
-    let path = std::env::temp_dir().join(format!("agent-schema68-{}.sqlite", std::process::id()));
+    let path = std::env::temp_dir().join(format!("agent-schema69-{}.sqlite", std::process::id()));
     let _ = std::fs::remove_file(&path);
     let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
     db.create("Bob", Some("/synthetic"), binding()).unwrap();

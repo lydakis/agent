@@ -6157,6 +6157,37 @@ the same p95 at 578 ms on unchanged turn code). Every event insert reads
 the newest row through the primary key, an index seek on a page the
 insert just touched, so the per-turn CPU did not move.
 
+## A finished turn keeps its reply (#503)
+
+A turn's finish now also sets `turns.reply_node` in the write that marks it
+finished: one subquery over the turn's message events, newest first through
+the `(turn,kind,id)` index, that stops at the first node with text, which is
+nearly always the last one. Quoting a reply and the `prompts` read of the turn
+before now join one row by key instead of scanning and parsing events.
+Measured with SQLite 3.45 by itself, the subquery took about 3.5 µs for a
+typical turn and 0.47 ms for a turn of 200 large calls with no text; the
+schema step fills 50,000 finished turns of 10 messages in 0.23 s. The Perf
+workflow's matched screen, base main cd2813f against the PR head 62ed32a
+(the later head changes only how the plan audit reads the statement), on the
+GitHub runner (2026-10-31):
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 25.666 | 26.197 | +2.1% |
+| admission | burst submit p99, ms | 3.823 | 3.735 | -2.3% |
+| completion | release to terminal p99, ms | 7.909 | 7.871 | -0.5% |
+| footprint | idle RSS, MiB | 19.707 | 19.475 | -1.2% |
+| footprint | per idle bot, KiB | 1.462 | 1.53 | +4.7% |
+| footprint | RSS after a turn each, MiB | 30.332 | 29.686 | -2.1% |
+| footprint | CPU per turn, ms | 0.754 | 0.753 | -0.1% |
+| lifecycle | CPU, s | 0.65 | 0.665 | +2.3% |
+| lifecycle | p95 turn, ms | 574.506 | 574.659 | +0.0% |
+| lifecycle | peak RSS, MiB | 25.727 | 25.377 | -1.4% |
+
+Store jobs per turn did not change (about 7.5 on both), the head's 32
+finishes in each completion burst ran 3 ms in all, and nothing passed the
+gate's 15% in the direction that costs.
+
 ## Cut output files owned until recorded (#505)
 
 `Outcome.files` became `Files`, an `Option<Arc>` that removes its files
