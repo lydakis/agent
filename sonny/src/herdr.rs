@@ -206,7 +206,7 @@ impl Presence {
             .map_or(0, |d| d.as_millis() as u64);
         let last = self
             .seq
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
                 Some(now.max(last + 1))
             })
             .unwrap_or_default();

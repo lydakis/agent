@@ -91,12 +91,12 @@ impl Provider {
             Ok(text) => text.len(),
             Err(error) => 64 + error.code.len() + error.detail.as_ref().map_or(0, String::len),
         };
-        let room =
-            self.transport
-                .listed
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |kept| {
-                    (kept + held <= KEPT).then_some(kept + held)
-                });
+        let room = self
+            .transport
+            .listed
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |kept| {
+                (kept + held <= KEPT).then_some(kept + held)
+            });
         if room.is_ok() {
             *kept = Some((Instant::now(), listed.clone(), held));
         }
