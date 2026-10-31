@@ -115,9 +115,10 @@ use std::{
 use transcript::Markdown;
 use unicode_width::UnicodeWidthStr;
 
-/// Rows kept at the bottom: the reply's unfinished line, the status, the
-/// composer between a row of its band above and below, and the footer.
-const VIEWPORT: u16 = 6;
+/// Rows kept at the bottom: the reply's unfinished line, the status, a
+/// blank row, the composer between a row of its band above and below, and
+/// the footer.
+const VIEWPORT: u16 = 7;
 /// The most rows a long prompt's composer grows to; it shows its end.
 const COMPOSER_ROWS: usize = 8;
 /// An agent in a folder: what a profile shown in the footer was read for.
@@ -900,7 +901,7 @@ async fn run() -> Result<(), String> {
         }
     };
     trigger::restamp_at_start(client.identity(), client.store());
-    // A lead made just now starts in the first approval mode.
+    // A lead made just now starts in the row new leads start in.
     let mut fresh = false;
     // A lead moved elsewhere, and the folder it comes back to.
     let mut moving = None;
@@ -1081,8 +1082,8 @@ async fn run() -> Result<(), String> {
         app.notice = Some(set);
     }
     if fresh {
-        app.gating = Some(approvals::MODES[0].0);
-    } else if app.mode == Some("auto")
+        app.gating = Some(approvals::default());
+    } else if approvals::reviews(app.mode)
         && let Err(error) = serve_auto(&app.client, &app.model).await
     {
         app.notice = Some(error);
@@ -1146,7 +1147,7 @@ async fn create(client: &Client, options: &Options, bot: &str) -> Result<(), Str
 
 /// What every agent Sonny makes starts with, whoever asks for it: the
 /// person's `--new` or a trigger's `--start`. Its tools and Sonny's, gated
-/// and sandboxed as the first mode (`auto`) confines them, and the
+/// and sandboxed as the default row confines them, and the
 /// person's settings for its model. One way in, so no kind of agent gets
 /// another policy by being made elsewhere (#404).
 pub(crate) fn made(
@@ -1161,8 +1162,9 @@ pub(crate) fn made(
     asked["tools"] = json!(tools);
     asked["declare"] = declare.clone();
     asked["compaction_instructions"] = json!(agent_client::policy::DEFAULT_COMPACTION_INSTRUCTIONS);
-    // Confined from the start, as the mode it is made with confines it.
-    let mut settings = approvals::sandbox(approvals::MODES[0].0, workspace);
+    // Confined from the start, as the row it is made in confines it.
+    let mode = approvals::default();
+    let mut settings = approvals::sandbox(mode, workspace);
     if let Some(ttl) = agent_client::policy::cache_ttl(model) {
         settings.insert("cache_ttl".into(), json!(ttl));
     }
@@ -1176,7 +1178,7 @@ pub(crate) fn made(
     let tools: Vec<String> = tools.into_iter().map(String::from).collect();
     let tools = approvals::gateable(&tools, &declare);
     if let Value::Object(fields) = asked {
-        fields.extend(approvals::gate(approvals::MODES[0].0, &tools));
+        fields.extend(approvals::gate(mode, &tools));
     }
     Ok(())
 }
@@ -1245,18 +1247,22 @@ fn edge(frame: &mut ratatui::Frame, gap: Rect, composer: Rect, pad: Rect) {
 }
 
 /// The viewport's rows, top to bottom: the reply's open line (`live`
-/// rows, wrapped), the status, a row of the composer's band, the composer
-/// (as many rows as are left), its band's row under it, and the footer.
+/// rows, wrapped), the status, a blank row that keeps the status off the
+/// band, as one blank row parts any two things, a row of the composer's
+/// band, the composer (as many rows as are left), its band's row under
+/// it, and the footer.
 fn areas(area: ratatui::layout::Rect, live: u16) -> [ratatui::layout::Rect; 6] {
-    Layout::vertical([
+    let [live, status, _, gap, composer, pad, footer] = Layout::vertical([
         Constraint::Length(live.max(1)),
+        Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Min(1),
         Constraint::Length(1),
         Constraint::Length(1),
     ])
-    .areas(area)
+    .areas(area);
+    [live, status, gap, composer, pad, footer]
 }
 
 /// At most `keep` of `rows`, as near the end as still shows `row`; and
@@ -1704,11 +1710,11 @@ struct Running {
     effort: Option<String>,
 }
 
-/// The lists of a setting's values `/approvals` and `/fast` open over
+/// The lists of a setting's values `/permissions` and `/fast` open over
 /// the composer.
 #[derive(Clone, Copy, PartialEq)]
 enum Choice {
-    Approvals,
+    Permissions,
     Speed,
 }
 
@@ -1765,7 +1771,10 @@ const COMMANDS: [(&str, &str); 27] = [
         "/compact",
         "Summarize the lead's conversation before its next call",
     ),
-    ("/approvals", "Choose whether calls wait for a review"),
+    (
+        "/permissions",
+        "Choose what agents may do, and who approves the rest",
+    ),
     ("/retry", "Allow one retry of a call the reviewer denied"),
     (
         "/instructions",
@@ -2156,15 +2165,17 @@ struct App {
     cache: Option<&'static str>,
     /// `/fast`: the speed picked, set once no turn runs.
     pace: Option<&'static str>,
-    /// The bot's tools, which an approval mode gates.
+    /// The bot's tools, which its permissions row gates.
     tools: Vec<String>,
     /// The tools its client declared, of which a mode gates Sonny's that
     /// can drop work or run outside the sandbox.
     declared: Value,
-    /// Its approval mode, when it is one of Sonny's.
+    /// Its permissions row, when it is one of Sonny's.
     mode: Option<&'static str>,
-    /// `/approvals` or `/fast`, open over the composer: the row picked.
+    /// `/permissions` or `/fast`, open over the composer: the row picked.
     choosing: Option<(Choice, usize)>,
+    /// The rows `/permissions` lists, as the config had them when it opened.
+    rows: Vec<approvals::Mode>,
     /// Calls the approver serving `auto` is reviewing in this turn.
     reviewing: std::collections::HashSet<String>,
     /// Calls it denied while Sonny watched, newest last: what `/retry`
@@ -3048,6 +3059,7 @@ impl App {
             declared: record["declared"].clone(),
             mode: approvals::mode(record),
             choosing: None,
+            rows: Vec::new(),
             reviewing: std::collections::HashSet::new(),
             denials: Vec::new(),
             approving: None,
@@ -3443,11 +3455,10 @@ impl App {
                 mode,
                 &approvals::gateable(&self.tools, declared),
             ));
-            // A lead's sandbox goes with its mode.
-            if self.project.is_some() {
-                let workspace = std::path::Path::new(&self.workspace);
-                fields.extend(approvals::sandbox(mode, workspace));
-            }
+            // An agent's sandbox goes with its row, a lead's, a task's or
+            // a side chat's, which the daemon holds within its agent's.
+            let workspace = std::path::Path::new(&self.workspace);
+            fields.extend(approvals::sandbox(mode, workspace));
         }
         match self.client.request("configure", asked).await {
             Ok(_) => {
@@ -3483,7 +3494,7 @@ impl App {
                 }
                 if let Some(mode) = gating {
                     self.mode = Some(mode);
-                    if mode == "auto"
+                    if approvals::reviews(Some(mode))
                         && let Err(error) = serve_auto(&self.client, &self.model).await
                     {
                         self.notice = Some(error);
@@ -3507,7 +3518,7 @@ impl App {
         true
     }
 
-    /// Give the mode picked with `/approvals` to every agent the lead made,
+    /// Give the row picked with `/permissions` to every agent the lead made,
     /// and those they made: the person's pick overrides the gate each was
     /// made with. One that is busy is tried again a little later.
     async fn spread(&mut self) {
@@ -3555,7 +3566,7 @@ impl App {
                 Err(error) if error.code == "bot_busy" => busy = true,
                 Err(error) => {
                     let name = bot["name"].as_str().unwrap_or_default();
-                    self.notice = Some(format!("{name}'s approvals: {error}"));
+                    self.notice = Some(format!("{name}'s permissions: {error}"));
                 }
             }
         }
@@ -3965,7 +3976,7 @@ impl App {
             if let Err(error) = start_companions(&self.client).await {
                 self.notice = Some(error);
             }
-            if self.mode == Some("auto")
+            if approvals::reviews(self.mode)
                 && let Err(error) = serve_auto(&self.client, &self.model).await
             {
                 self.notice = Some(error);
@@ -5916,7 +5927,7 @@ impl App {
                     dropped.push("model");
                 }
                 if changed("gates") && self.gating.take().is_some() {
-                    dropped.push("approvals");
+                    dropped.push("permissions");
                 }
                 if changed("instructions") && self.instruct.take().is_some() {
                     dropped.push("instructions");
@@ -7178,7 +7189,9 @@ impl App {
         }
     }
 
-    async fn answer(&mut self, decision: &str) {
+    /// Answers the call waiting first; one allowed is recorded under it,
+    /// with the command `kept` from now on when it is always allowed.
+    async fn answer(&mut self, decision: &str, kept: Option<&str>) {
         let call = self.approvals.remove(0);
         let answered = self
             .client
@@ -7189,8 +7202,20 @@ impl App {
                     "by": "tui"}),
             )
             .await;
-        if let Err(error) = answered {
-            self.notice = Some(error.to_string());
+        match answered {
+            Err(error) => self.notice = Some(error.to_string()),
+            Ok(_) if decision == "allow" => {
+                let name = call["name"].as_str().unwrap_or("tool");
+                let lines = transcript::allowed(
+                    name,
+                    &call["arguments"],
+                    kept,
+                    &self.workspace,
+                    self.width,
+                );
+                self.commit(lines);
+            }
+            Ok(_) => {}
         }
         // A round with more calls waiting than one listing holds shows
         // the rest once these are answered.
@@ -7199,6 +7224,25 @@ impl App {
         }
         if self.approvals.is_empty() {
             status_report("working", &self.bot);
+        }
+    }
+
+    /// Allows the waiting command, and every command it starts with from
+    /// now, outside every agent's sandbox, as Codex's "don't ask again"
+    /// keeps a prefix rule: `[sonny] unsandboxed` holds it, and the lead
+    /// and the agents it made take it at once.
+    async fn always(&mut self, prefix: &str) {
+        if let Err(error) = approvals::allow_always(prefix) {
+            self.notice = Some(format!("couldn't keep {prefix}: {error}"));
+            return;
+        }
+        self.answer("allow", Some(prefix)).await;
+        // A row the person picked that waits for the turn to end is the
+        // one set, with the command let out.
+        if let Some(mode) = self.gating.or(self.mode) {
+            self.gating = Some(mode);
+            self.spread = Some((mode, Instant::now()));
+            self.configure().await;
         }
     }
 
@@ -8347,7 +8391,7 @@ impl App {
                 && key.kind != KeyEventKind::Release
             {
                 let count = match choice {
-                    Choice::Approvals => approvals::MODES.len(),
+                    Choice::Permissions => self.rows.len(),
                     Choice::Speed => self.speed_rows().len(),
                 };
                 // Another client may have moved the bot to a provider
@@ -8359,17 +8403,16 @@ impl App {
                     KeyCode::Enter => {
                         self.choosing = None;
                         match choice {
-                            Choice::Approvals => {
-                                let mode = approvals::MODES[pick].0;
-                                // The agents the lead made take it too, even
-                                // when the lead has it already.
+                            Choice::Permissions => {
+                                let mode = self.rows[pick].name;
+                                // Set again even when it is the row the agent
+                                // has, as the config may have changed it since;
+                                // the agents the lead made take it too.
                                 self.spread = Some((mode, Instant::now()));
-                                if self.mode != Some(mode) {
-                                    self.gating = Some(mode);
-                                    self.configure().await;
-                                    if self.gating.is_some() {
-                                        self.notice = Some("applies when idle".into());
-                                    }
+                                self.gating = Some(mode);
+                                self.configure().await;
+                                if self.gating.is_some() {
+                                    self.notice = Some("applies when idle".into());
                                 }
                             }
                             Choice::Speed => self.pace_at(self.speed_rows()[pick].0).await,
@@ -8523,8 +8566,19 @@ impl App {
                             self.notice =
                                 Some("only part of this call could be read; n denies it".into());
                         } else {
-                            self.answer(if c == 'y' { "allow" } else { "deny" }).await;
+                            self.answer(if c == 'y' { "allow" } else { "deny" }, None)
+                                .await;
                         }
+                    }
+                    KeyCode::Char('a')
+                        if !ctrl
+                            && !alt
+                            && self.paused.is_none()
+                            && self.input.is_empty()
+                            && let Some(prefix) =
+                                self.approvals.first().and_then(approvals::always) =>
+                    {
+                        self.always(&prefix).await;
                     }
                     KeyCode::Char('a') if ctrl => self.input.home(),
                     KeyCode::Char('e') if ctrl => self.input.end(),
@@ -8853,14 +8907,15 @@ impl App {
             }
             return;
         }
-        if prompt == "/approvals" {
+        if prompt == "/permissions" {
             self.input.clear();
             let current = self.gating.or(self.mode);
+            // Read now, so a row just added to the config is there.
+            self.rows = approvals::modes();
             self.choosing = Some((
-                Choice::Approvals,
-                approvals::MODES
-                    .iter()
-                    .position(|(mode, _)| Some(*mode) == current)
+                Choice::Permissions,
+                (self.rows.iter())
+                    .position(|mode| Some(mode.name) == current)
                     .unwrap_or(0),
             ));
             return;
@@ -9595,7 +9650,7 @@ impl App {
     }
 
     /// The call waiting on the person, written out whole above the
-    /// status row before `y` can allow it: the row shows only its start.
+    /// status row before `y` can allow it: the row shows only the keys.
     fn show_asked(&mut self) {
         let Some(call) = self.approvals.first() else {
             self.asked = None;
@@ -9631,6 +9686,9 @@ impl App {
             let why = reason.split(". ").next().unwrap_or(reason);
             lines.push(Line::from(format!("  {why}")).dim());
         }
+        // What the agent said before the call reads before it, a step as
+        // the call's start would make it.
+        self.end_live(Words::Step);
         self.commit(lines);
     }
 
@@ -10001,9 +10059,10 @@ impl App {
                 return;
             }
             if let Some((_, pick)) = self.choosing {
-                let items: Vec<list::Item> = (approvals::MODES.iter())
-                    .map(|(mode, about)| {
-                        list::Item::new(*mode, *about).current(Some(*mode) == self.mode)
+                let items: Vec<list::Item> = (self.rows.iter())
+                    .map(|mode| {
+                        list::Item::new(&mode.label, &mode.about)
+                            .current(Some(mode.name) == self.mode)
                     })
                     .collect();
                 over(
@@ -10013,7 +10072,7 @@ impl App {
                 );
                 let line = Line::from(vec![
                     Span::raw("› ").bold(),
-                    Span::raw("approvals for this agent and those it makes").dim(),
+                    Span::raw("permissions for this agent and those it makes").dim(),
                 ]);
                 frame.render_widget(Paragraph::new(line), composer);
                 let keys = Line::from(hint::spans("  ↑↓ pick · enter choose · esc close"));
@@ -10249,22 +10308,19 @@ impl App {
             return Line::from(line);
         }
         if let Some(call) = self.approvals.first() {
-            let name = call["name"].as_str().unwrap_or("tool");
-            let what = call["arguments"]["command"]
-                .as_str()
-                .or_else(|| call["arguments"]["path"].as_str())
-                .map(first_line)
-                .unwrap_or_default();
-            // The keys first, so a narrow pane still shows how to answer.
-            return Line::from(vec![
+            // Only the keys: the call is written out whole right above,
+            // under the same ⏸, so the row does not say it again.
+            let mut line = vec![
                 Span::raw("⏸ ").fg(Color::Yellow),
-                Span::raw(format!("Allow {name}? ")).bold(),
                 Span::raw("y"),
-                Span::raw(" allow · ").dim(),
-                Span::raw("n"),
-                Span::raw(" deny  ").dim(),
-                Span::raw(what),
-            ]);
+                Span::raw(" allow once · ").dim(),
+            ];
+            if let Some(prefix) = approvals::always(call) {
+                line.push(Span::raw("a"));
+                line.push(Span::raw(format!(" always allow {prefix} · ")).dim());
+            }
+            line.extend([Span::raw("n"), Span::raw(" deny").dim()]);
+            return Line::from(line);
         }
         if let Some(running) = &self.running {
             let mut spans = vec![Span::raw("• ").dim()];
@@ -10397,11 +10453,23 @@ impl App {
             }
             left.push_str(" when idle");
         }
+        // A permissions row picked shows from when it applies.
         if let Some(mode) = self.gating {
-            left.push_str(&format!(" · {mode} approvals when idle"));
+            let row = approvals::footer(mode).unwrap_or_else(|| mode.to_owned());
+            left.push_str(&format!(" · {row} when idle"));
         }
         if let Some(speed) = self.pace {
             left.push_str(&format!(" · {speed} speed when idle"));
+        }
+        // The row it runs in, last, unless it is the one new leads start
+        // in: full access in the text's own weight, not muted, as nothing
+        // holds it back; no hue, as yellow is for what needs the person.
+        let row = match self.gating {
+            Some(_) => None,
+            None => self.mode.and_then(approvals::footer),
+        };
+        if let Some(row) = &row {
+            left.push_str(&format!(" · {row}"));
         }
         // The context, not what the bot ever spent: how full the next
         // round is.
@@ -10472,6 +10540,11 @@ impl App {
         // The branch in green, as shells show it; the agent's name in the
         // agents' color.
         let at = left.width() + place.width() + branch.width() + fill;
+        let warned = (row.as_deref() == Some("full access")).then(|| {
+            let tail = " · full access";
+            left.truncate(left.len() - tail.len());
+            tail
+        });
         // An armed boost in the text's own weight, not muted: what the
         // next message will take, said without a hue.
         let mut spans = match (self.boost.as_ref()).and_then(|boost| {
@@ -10485,6 +10558,10 @@ impl App {
             ],
             None => vec![Span::raw(left)],
         };
+        if let Some(tail) = warned {
+            spans.push(Span::raw(" · "));
+            spans.push(Span::raw(&tail[" · ".len()..]).not_dim());
+        }
         spans.push(Span::raw(place));
         if let Some(name) = branch.strip_prefix(" on ") {
             spans.push(Span::raw(" on "));
@@ -11268,7 +11345,7 @@ mod tests {
         app.daemon(json!({"event": "resumed", "pause": pause, "durable": false}))
             .await;
         assert!(app.paused.is_none());
-        assert!(shown(&app).starts_with("⏸ Allow shell? "));
+        assert_eq!(shown(&app), "⏸ y allow once · n deny");
     }
 
     #[tokio::test]
@@ -11930,6 +12007,22 @@ mod tests {
         app.input.set("/retry");
         app.submit().await;
         assert_eq!(app.notice.as_deref(), Some("no recent reviewer denials"));
+    }
+
+    #[test]
+    fn a_call_the_person_allows_is_recorded_under_it() {
+        let shell = json!({"command": "cargo test --release"});
+        let once = transcript::allowed("shell", &shell, None, "/w", 80);
+        assert_eq!(once.len(), 1);
+        assert_eq!(
+            once[0].to_string(),
+            "✓ Request allowed for cargo test --release"
+        );
+        let kept = transcript::allowed("shell", &shell, Some("cargo test"), "/w", 80);
+        assert_eq!(
+            kept[1].to_string(),
+            "  └ cargo test runs outside the sandbox from now on"
+        );
     }
 
     #[test]
@@ -14198,6 +14291,18 @@ mod tests {
         app.place = place::Place {
             branch: Some("agent/fix-cart".into()),
         };
+        // The row new leads start in goes unsaid; another is named, last.
+        app.mode = Some("full");
+        let full = app.footer(100).0;
+        assert!(
+            full.to_string().contains("opus · full access · /work"),
+            "{full}"
+        );
+        let warned = full.spans.iter().find(|span| span.content == "full access");
+        let warned = warned.map(|span| span.style);
+        assert_eq!(warned.and_then(|style| style.fg), None);
+        assert!(warned.is_some_and(|style| style.sub_modifier.contains(Modifier::DIM)));
+        app.mode = Some("auto");
         let wide = app.footer_line(100).to_string();
         assert!(
             wide.contains("opus · /work/.agent/worktrees/fix-cart/packages/shop on agent/fix-cart"),

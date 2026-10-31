@@ -37,7 +37,7 @@ the agent the fire messaged, with a note it reads in its next model call,
 as a fire that sent nothing is told (`[trigger NAME · TIME · turn N it sent
 BOT failed: WHY]`). A fire with `reply_to` passes the failure on with its
 answer instead.
-It waits for a verdict wherever the agent's other calls do (`/approvals`),
+It waits for a verdict wherever the agent's other calls do (`/permissions`),
 since a trigger runs as the person and its `if` command outside any
 sandbox. For people, scripts and other harnesses, Sonny writes
 `~/.agent/trigger` each time it starts, a script that runs it as
@@ -320,7 +320,7 @@ shell command (`cargo test`, `make lint`, `test -z "$(git status --short)"`)
 that exits 0 once done; the lookout runs it in the agent's folder, as the
 person and outside any sandbox like a trigger's `if`, though without the
 provider keys an agent's shell goes without, so `set` waits for a verdict wherever the
-agent's other calls do (`/approvals`). Each goal is
+agent's other calls do (`/permissions`). Each goal is
 `STORE.lookout/goals/BOT.json`; setting the same goal again changes
 nothing.
 

@@ -29,6 +29,19 @@ each setting is; what to set is the person's call.
   `sonny mcp add|remove|list|import`.
 - `[sonny.sources.NAME]` in the config: news from outside for the lookout,
   a `command` run `every` so often.
+- `[sonny.permissions.NAME]` in the config: a `/permissions` row of the
+  person's own, as Codex's permission profiles: the row it `extends`
+  (`auto`, the default, `ask` or `read-only`), then what it changes:
+  `network` (`true` or `false`), `git` (`"write"`, commits run without
+  asking, or `"read-only"`, they ask), `writable` (more folders, `~` for
+  home), `reviewer` (`"model"`, `"you"`, or `"none"`, which refuses what
+  leaves the sandbox and tells the agent to do without), and a
+  `description` for the list. Codex's own stricter workspace is
+  `network = false` and `git = "read-only"`. `/permissions` lists it the
+  next time it opens; `sonny.default_permissions` names it for new leads.
+- `sonny.unsandboxed` in the config: commands, by their first words, every
+  agent runs outside its sandbox without asking (`["mcpx", "cargo test"]`);
+  "always allow" on an approval prompt adds one.
 
 ## ~/.agent/config.toml
 
