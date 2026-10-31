@@ -419,7 +419,12 @@ pub fn unsandboxed() -> Vec<String> {
 /// line). Only a plain command offers one: a pipe, a list, a redirection
 /// or an expansion runs more than its first words say.
 pub fn always(call: &Value) -> Option<String> {
-    if call["name"] != "shell" || call["arguments"]["sandbox_permissions"] != "require_escalated" {
+    // A call read only in part may hide more past what was read, so it is
+    // denied or nothing, as `y` is off for it.
+    if call["name"] != "shell"
+        || call["arguments"]["sandbox_permissions"] != "require_escalated"
+        || call["incomplete"] == true
+    {
         return None;
     }
     let command = call["arguments"]["command"].as_str()?.trim();
@@ -934,6 +939,10 @@ mod tests {
             always(&call("docker compose up")).as_deref(),
             Some("docker compose")
         );
+        // Read only in part: what was not read may hide more.
+        let mut cut = call("cargo test -p sonny");
+        cut["incomplete"] = json!(true);
+        assert_eq!(always(&cut), None);
         assert_eq!(always(&call("mcpx --list")).as_deref(), Some("mcpx"));
         assert_eq!(
             always(&call("./build.sh fast")).as_deref(),
