@@ -259,12 +259,15 @@ fn mode_in(record: &Value, modes: &[Mode]) -> Option<&'static str> {
                 let fits = sandbox == Some("workspace-write")
                     && network == *reaches
                     && (*git || !committing)
-                    && (!repository || *git == committing)
                     && (folders.iter())
                         .all(|folder| own.iter().chain(&there).any(|mine| mine == folder));
+                // A repository made since the row was set leaves a row that
+                // commits without its git folder: it still fits, after one
+                // that matches as it is.
                 let exact = there
                     .iter()
-                    .all(|folder| folders.contains(&folder.as_str()));
+                    .all(|folder| folders.contains(&folder.as_str()))
+                    && (!repository || *git == committing);
                 fits.then_some((exact, there.len()))
             }
         }
@@ -903,6 +906,37 @@ mod tests {
         // by a reviewer is auto's again.
         assert_eq!(mode_in(&night, &modes[..4]), None);
         assert_eq!(mode_in(&strict, &modes[..4]), Some("auto"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_row_stays_the_bot_s_when_its_folder_becomes_a_repository() {
+        let dir = std::env::temp_dir().join(format!("sonny-later-repo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = std::fs::canonicalize(&dir).unwrap();
+        let sonny = agent_client::config::Sonny {
+            permissions: std::collections::BTreeMap::from([(
+                "offline".to_owned(),
+                Permissions {
+                    description: None,
+                    extends: "auto".into(),
+                    network: Some(false),
+                    git: None,
+                    writable: Vec::new(),
+                    reviewer: None,
+                },
+            )]),
+            ..Default::default()
+        };
+        let modes = modes_of(&sonny);
+        let offline = modes.iter().find(|mode| mode.name == "offline").unwrap();
+        let record = json!({"gates": [{"tag": "auto", "tools": ["shell"]}], "workspace": dir,
+            "settings": fields(offline, &dir, &[])});
+        assert_eq!(mode_in(&record, &modes), Some("offline"));
+        // A repository made there since: still offline, not widened to auto.
+        crate::task::git(&dir, &["init", "-q"]).unwrap();
+        assert_eq!(mode_in(&record, &modes), Some("offline"));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

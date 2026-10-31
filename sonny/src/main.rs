@@ -7156,7 +7156,9 @@ impl App {
             return;
         }
         self.answer("allow", Some(prefix)).await;
-        if let Some(mode) = self.mode {
+        // A row the person picked that waits for the turn to end is the
+        // one set, with the command let out.
+        if let Some(mode) = self.gating.or(self.mode) {
             self.gating = Some(mode);
             self.spread = Some((mode, Instant::now()));
             self.configure().await;
@@ -8311,15 +8313,14 @@ impl App {
                         match choice {
                             Choice::Permissions => {
                                 let mode = self.rows[pick].name;
-                                // The agents the lead made take it too, even
-                                // when the lead has it already.
+                                // Set again even when it is the row the agent
+                                // has, as the config may have changed it since;
+                                // the agents the lead made take it too.
                                 self.spread = Some((mode, Instant::now()));
-                                if self.mode != Some(mode) {
-                                    self.gating = Some(mode);
-                                    self.configure().await;
-                                    if self.gating.is_some() {
-                                        self.notice = Some("applies when idle".into());
-                                    }
+                                self.gating = Some(mode);
+                                self.configure().await;
+                                if self.gating.is_some() {
+                                    self.notice = Some("applies when idle".into());
                                 }
                             }
                             Choice::Speed => self.pace_at(self.speed_rows()[pick].0).await,
