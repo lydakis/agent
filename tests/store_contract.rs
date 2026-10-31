@@ -88,6 +88,7 @@ fn result(output: &str) -> Outcome {
         parts: Vec::new(),
         note: None,
         failed: false,
+        files: Vec::new(),
     }
 }
 
@@ -1114,6 +1115,7 @@ fn a_failure_after_a_later_call_lapsed_keeps_its_request() {
     std::thread::sleep(std::time::Duration::from_millis(60));
     let failed = Outcome {
         failed: true,
+        files: Vec::new(),
         ..result("{}")
     };
     db.tool_finish(turn, "r1", &failed).unwrap();
@@ -1413,6 +1415,7 @@ fn a_call_announced_again_is_found_by_a_listing_already_past_it() {
     ));
     let failed = Outcome {
         failed: true,
+        files: Vec::new(),
         ..result("{}")
     };
     db.tool_finish(turn, "s1", &failed).unwrap();
@@ -2861,15 +2864,15 @@ fn an_event_is_never_written_before_the_one_before_it() {
 }
 
 #[test]
-fn schema_67_events_had_no_times() {
-    let path = std::env::temp_dir().join(format!("agent-schema67-{}.sqlite", std::process::id()));
+fn schema_68_events_had_no_times() {
+    let path = std::env::temp_dir().join(format!("agent-schema68-{}.sqlite", std::process::id()));
     let _ = std::fs::remove_file(&path);
     let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
     db.create("Bob", Some("/synthetic"), binding()).unwrap();
     drop(db);
     Connection::open(&path)
         .unwrap()
-        .execute_batch("ALTER TABLE events DROP COLUMN written_ms; PRAGMA user_version=67;")
+        .execute_batch("ALTER TABLE events DROP COLUMN written_ms; PRAGMA user_version=68;")
         .unwrap();
     let db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
     let page = db.events("Bob", 0, 256).unwrap();
@@ -3048,6 +3051,7 @@ fn prompts_name_who_wrote_each_and_what_the_turn_ran() {
     db.tool_start(turn, &round[0]).unwrap();
     let failed = Outcome {
         failed: true,
+        files: Vec::new(),
         ..result("exit 1")
     };
     let (_, completed) = db.tool_finish(turn, "c1", &failed).unwrap();
@@ -3784,7 +3788,7 @@ fn a_bot_keeps_its_settings_and_a_fork_copies_them() {
         serde_json::to_value(&bob).unwrap()["settings"],
         json!({"context_bytes":4096,"context_items":4096,"note_turns":48,"compact_at":75,
             "compact_keep":25,"compact_tokens":null,"keep_turns":1,"max_rounds":null,"approval_hold_ms":2000,"max_output_tokens":null,
-            "keep_warm":0,"cache_ttl":"1h","speed":"fast","sandbox":null,"writable":[],"network":false,"hide_senders":false,"unsandboxed":[]})
+            "keep_warm":0,"cache_ttl":"1h","speed":"fast","sandbox":null,"writable":[],"network":false,"outputs":null,"hide_senders":false,"unsandboxed":[]})
     );
     // Retention follows the bot's own setting.
     for n in 1..=3 {
@@ -4287,6 +4291,7 @@ fn artifacts_are_scoped_to_the_owning_bot_and_lineage_checks_use_depth() {
         parts: Vec::new(),
         note: None,
         failed: false,
+        files: Vec::new(),
     };
     let (_, entry) = db.tool_finish(turn, "c1", &outcome).unwrap();
     assert_eq!(entry["data"]["artifacts"][0], "stdout");
@@ -6011,6 +6016,7 @@ fn a_fork_waits_on_its_own_commands_and_reads_only_delivered_output() {
         process,
         &json!({"stdout":"large"}),
         &[("stdout", b"synthetic output".to_vec())],
+        &[],
     )
     .unwrap();
     // Its stored output is Bob's, and a branch's only once delivered there.
@@ -7047,7 +7053,7 @@ fn completion_retention_passes_turns_whose_processes_still_run() {
     assert_eq!(db.prune_except("Bob", 1, None).unwrap()["events"], 0);
     assert_eq!(db.running_processes().unwrap(), piece as i64);
     // A process that ends makes its turn prunable again.
-    db.process_finish(processes[0], &json!({"stdout":"done"}), &[])
+    db.process_finish(processes[0], &json!({"stdout":"done"}), &[], &[])
         .unwrap();
     db.prune_except("Bob", 1, None).unwrap();
     assert!(db.process_result(processes[0]).unwrap().is_none());
@@ -7273,6 +7279,7 @@ fn retention_keeps_running_processes_until_their_results_commit() {
         process,
         &json!({"stdout":"done"}),
         &[("stdout", b"full output".to_vec())],
+        &[],
     )
     .unwrap();
     assert_eq!(
@@ -9817,6 +9824,7 @@ fn carry_forward_notes_are_versioned_by_result_node_and_forks_bind_by_checkpoint
             parts: Vec::new(),
             note: Some(text.to_owned()),
             failed: false,
+            files: Vec::new(),
         };
         let (_, entry) = db.tool_finish(turn, &call.call_id, &outcome).unwrap();
         let version = entry["data"]["note"].as_i64().unwrap();
@@ -13701,7 +13709,7 @@ fn an_expired_fork_still_running_a_command_holds_back_no_other() {
         db.expired(i64::MAX, 1).unwrap(),
         vec![("idle".to_owned(), idle.bot_id)]
     );
-    db.process_finish(process, &json!({}), &[]).unwrap();
+    db.process_finish(process, &json!({}), &[], &[]).unwrap();
     assert_eq!(db.expired(i64::MAX, 16).unwrap().len(), 2);
 }
 

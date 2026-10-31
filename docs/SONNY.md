@@ -447,10 +447,11 @@ looks back a day; a refused cleanup leaves it, so its night is read again): the 
 daemon: every message written since then that carries no other agent's or
 named client's mark, steers included, newest first and at most
 56 KiB, within what a served tool may answer, each with its agent, turn, and the memory project of the folder
-that turn ran in. History keeps no times, so a message is dated by its
-turn: the one that started a turn is as old as the turn's start, and one
-sent into it later came while it ran, so a long turn's opening message
-from before then is left out. The person's reactions to a bot's replies
+that turn ran in. Each message is dated by when it was written (the
+daemon's `written_ms`), so a line sent into a long turn before then is
+left out. A message from before the daemon kept that time is dated by
+its turn: the one that started a turn is as old as the turn's start, and
+one sent into it later came while it ran. The person's reactions to a bot's replies
 are in it too, each with `reacted_to`, the first line of the reply it
 answers (the bot is told only the emoji when it was its last reply). A
 reaction counts once, and not at all once the person took it off, as the

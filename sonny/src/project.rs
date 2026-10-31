@@ -896,11 +896,14 @@ async fn make(
                 .collect()
         }
     };
-    let declare = json!(crate::declared::tools(true));
+    let declare = json!(crate::declared::tools(crate::served::Role::of(0)));
     let gate = crate::approvals::gate(mode, &crate::approvals::gateable(&tools, &declare));
     let mut settings = crate::approvals::sandbox(mode, dir);
     if agent_client::config::load()?.hide_senders {
         settings.insert("hide_senders".into(), json!(true));
+    }
+    if let Some(outputs) = crate::outputs() {
+        settings.insert("outputs".into(), json!(outputs));
     }
     let policy = json!({
         "instructions": instructions,

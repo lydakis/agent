@@ -11,7 +11,7 @@
 //! cmux shows what Sonny is doing without any of this: the program status
 //! Sonny writes to its terminal (OSC 7501) is the workspace's status row,
 //! and its notifications (OSC 777) ring the pane they came from.
-use crate::mux::{Backend, Block, Place, Places};
+use crate::mux::{Backend, Block, Heard, Place, Places, Stream, Watch};
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
@@ -196,6 +196,15 @@ impl Resume {
     }
 }
 
+/// What a line of `cmux events` says: an event, or its stream's `ack` or
+/// `heartbeat`.
+fn heard(line: &Value) -> Heard {
+    match line["type"].as_str() {
+        Some("event") => Heard::Changed,
+        _ => Heard::Same,
+    }
+}
+
 pub struct Cmux {
     bin: PathBuf,
     workspace: String,
@@ -272,14 +281,13 @@ impl Cmux {
     }
 
     /// This workspace, as `system.tree` has it.
-    fn tree(&self) -> Option<Value> {
-        let tree = self
-            .call(
-                "system.tree",
-                json!({"all_windows": true, "workspace_id": self.workspace}),
-            )
-            .ok()?;
-        workspaces_of(&tree).find(|w| w["id"] == self.workspace.as_str())
+    fn tree(&self) -> Result<Value, String> {
+        let tree = self.call(
+            "system.tree",
+            json!({"all_windows": true, "workspace_id": self.workspace}),
+        )?;
+        (workspaces_of(&tree).find(|w| w["id"] == self.workspace.as_str()))
+            .ok_or_else(|| format!("cmux: no workspace {}", self.workspace))
     }
 
     /// The pane a task's tab goes in: the lead's, else this tab's, else the
@@ -319,17 +327,15 @@ impl Backend for Cmux {
 
     /// Each tab, pane by pane: its title is its label, and its pane stands
     /// for its window.
-    fn blocks(&self) -> Vec<Block> {
-        let Some(workspace) = self.tree() else {
-            return Vec::new();
-        };
-        surfaces(&workspace)
+    fn blocks(&self) -> Result<Vec<Block>, String> {
+        let workspace = self.tree()?;
+        Ok(surfaces(&workspace)
             .map(|(pane, surface, title)| Block {
                 id: surface.to_owned(),
                 label: title.to_owned(),
                 window: pane.to_owned(),
             })
-            .collect()
+            .collect())
     }
 
     fn close_block(&self, block: &str) {
@@ -365,7 +371,7 @@ impl Backend for Cmux {
             "initial_input": Self::input(command, keep),
             "focus": false,
         });
-        if let Some(pane) = self.home_pane(&self.blocks()) {
+        if let Some(pane) = self.home_pane(&self.blocks().unwrap_or_default()) {
             params["pane_id"] = pane.into();
         }
         if keep {
@@ -431,13 +437,26 @@ impl Backend for Cmux {
         }
     }
 
+    /// cmux's heartbeats keep the stream from outliving Sonny: the first
+    /// one written after it is gone ends the command.
+    fn watch(&self) -> Option<Watch> {
+        let mut command = Command::new(&self.bin);
+        for name in PLACE_VARS {
+            command.env_remove(name);
+        }
+        command.args(["events", "--category", "workspace"]);
+        command.args(["--category", "pane", "--category", "surface"]);
+        Some(Watch {
+            from: Stream::Command(command),
+            heard: Box::new(heard),
+        })
+    }
+
     /// Where each tab sits, by label: its number in its pane, and when the
     /// workspace is split, which side of the first other pane its pane is.
-    fn places(&self) -> Places {
+    fn places(&self) -> Result<Places, String> {
         let mut places = HashMap::new();
-        let Some(workspace) = self.tree() else {
-            return places;
-        };
+        let workspace = self.tree()?;
         let panes: Vec<&Value> = workspace["panes"]
             .as_array()
             .into_iter()
@@ -445,14 +464,12 @@ impl Backend for Cmux {
             .collect();
         let frames: HashMap<String, Value> = match panes.len() {
             0 | 1 => HashMap::new(),
-            _ => self
-                .call("pane.list", json!({"workspace_id": self.workspace}))
-                .ok()
-                .and_then(|listed| listed["panes"].as_array().cloned())
-                .into_iter()
-                .flatten()
-                .filter_map(|p| Some((p["id"].as_str()?.to_owned(), p["pixel_frame"].clone())))
-                .collect(),
+            _ => {
+                let listed = self.call("pane.list", json!({"workspace_id": self.workspace}))?;
+                (listed["panes"].as_array().into_iter().flatten())
+                    .filter_map(|p| Some((p["id"].as_str()?.to_owned(), p["pixel_frame"].clone())))
+                    .collect()
+            }
         };
         let label = |pane: &Value| {
             let selected = pane["selected_surface_id"].clone();
@@ -482,7 +499,7 @@ impl Backend for Cmux {
                 }
             }
         }
-        places
+        Ok(places)
     }
 }
 
@@ -504,6 +521,14 @@ fn side_of(frame: &Value, other: &Value) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cmux_news_is_its_events_not_its_heartbeats() {
+        assert_eq!(heard(&json!({"type": "ack", "version": 1})), Heard::Same);
+        assert_eq!(heard(&json!({"type": "heartbeat"})), Heard::Same);
+        let closed = json!({"type": "event", "name": "surface.closed", "category": "surface"});
+        assert_eq!(heard(&closed), Heard::Changed);
+    }
     use crate::mux::Layout;
 
     /// A stand-in cmux over a JSON file of workspaces, panes and tabs, that
@@ -760,7 +785,10 @@ print(json.dumps(out))
             "places",
             json!({"n": 10, "workspaces": [{"id": "ws-1", "title": "shop", "panes": [lead, right]}]}),
         );
-        let places = Cmux::open(bin, "shop", None, None).unwrap().places();
+        let places = Cmux::open(bin, "shop", None, None)
+            .unwrap()
+            .places()
+            .unwrap();
         let side = |s: &str, of: &str| Some((s.to_owned(), of.to_owned()));
         assert_eq!(
             places["shop.lead"],
