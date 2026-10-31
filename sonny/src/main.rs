@@ -12509,21 +12509,23 @@ mod tests {
             (4, 1, say("assistant", "Rounding now, and the tests pass.")),
             (5, 2, say("user", "The release build broke.")),
             (6, 2, say("assistant", "Noted what shop.fix said.")),
-            (
-                7,
-                2,
-                json!({"type": "function_call", "name": "ask", "call_id": "a1",
-                "arguments": ask.to_string()}),
-            ),
-            (
-                8,
-                2,
-                json!({"type": "function_call_output", "call_id": "a1", "output": "Asked."}),
-            ),
             (9, 3, say("user", news)),
             (10, 3, say("assistant", "calc.neg is done.")),
             (11, 4, say("user", "Push it")),
             (12, 4, say("assistant", "Pushed as 4f2c1a0.")),
+            // Asked last: the person's own words after it would set it
+            // aside, the conversation having moved on past it.
+            (
+                13,
+                4,
+                json!({"type": "function_call", "name": "ask", "call_id": "a1",
+                "arguments": ask.to_string()}),
+            ),
+            (
+                14,
+                4,
+                json!({"type": "function_call_output", "call_id": "a1", "output": "Asked."}),
+            ),
         ];
         daemon_answering(move |asked| match asked["op"].as_str() {
             Some("history_nodes") => json!({"nodes": items.iter().rev()
