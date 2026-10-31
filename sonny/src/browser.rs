@@ -728,8 +728,8 @@ fn session(store: &str, bot: &str) -> String {
         )
         .collect();
     // Two names that read alike here (`a.b` and `a_b`) are two agents, and
-    // one name in two stores, two daemons' agents, so each ends in a hash
-    // of its store and name, FNV-1a so the same agent keeps its session,
+    // one name in two stores, or made again, other agents, so each ends in
+    // a hash of whose it is (`store`: its store and ID) and its name, FNV-1a so the same agent keeps its session,
     // after the start of its name, read in a session list.
     let hash = (store.bytes().chain([0]).chain(bot.bytes()))
         .fold(0xcbf29ce484222325u64, |hash, byte| {
@@ -1080,8 +1080,14 @@ pub async fn answer(
         Ok(config) => confirmed(&config.sonny.browser_confirm),
         Err(_) => confirmed(&agent_client::config::BROWSER_CONFIRM.map(str::to_owned)),
     };
+    // A bot made again under a deleted one's name is another agent, with
+    // an ID of its own, so it gets no browser of the old one's.
     let session = session(
-        client.store().unwrap_or_default(),
+        &format!(
+            "{}\0{}",
+            client.store().unwrap_or_default(),
+            record["bot_id"]
+        ),
         call["bot"].as_str().unwrap_or_default(),
     );
     // One call at a time in a session, through its confirmations:
