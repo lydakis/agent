@@ -1423,7 +1423,7 @@ prompt with a `person` is no consent to the approver, which answers to the
 daemon's own person only. A command run from a bot's sandboxed tool cannot
 send one (it would speak as a person from inside an agent).
 
-`quotes`, a list of up to 64 `{bot, turn, reply?}`, copies other turns'
+`quotes`, a list of `{bot, turn, reply?}`, copies other turns'
 words into the prompt: a turn's prompt, or with `reply: true` the last
 message the finished turn ended with. The daemon copies them at submit, so
 what a quote says is what that turn holds, never what the sender retyped,
@@ -1433,15 +1433,19 @@ behind a line naming it, `[Quoted from turn:BOT/TURN, written by a
 person:]` or `[Quoted from the reply of turn:BOT/TURN, written by the agent
 BOT:]` (`sent by ORIGIN`, `written by PERSON`, `written by the agent NAME
 in turn:NAME/TURN`); `hide_senders` leaves the lines out too. A turn that
-does not exist, a steer's reply, or a turn that ended without one is
-`quote_not_found`; a reply of an unfinished turn `quote_unfinished`; words
-and quotes past 256 KiB together `quote_too_large`. The CLI's `run --quote
+does not exist, a steer's reply, or a turn with no reply left (it ended
+without one, or pruning took its message events) is `quote_not_found`; a
+reply of an unfinished turn `quote_unfinished`; more than 64 quotes, those
+quoted prompts bring counted (marked `nested` in the record, which a retry
+leaves out), or words and quotes past 256 KiB together, each quote's line
+counted at 256 bytes, `quote_too_large`. The CLI's `run --quote
 BOT/TURN` (repeatable; `BOT/TURN:reply` for a reply, `turn:` prefix
 optional) sends them. `prompts` and `history_items` list a prompt's
 quotes as `quotes`, each with its writer (`from`, `origin` or `person`,
 none for a person's) and, in `prompts`, its `text` within the read's
-`bytes`; the approver reads a quote of the person's own words as theirs
-and any other as asking for nothing.
+`bytes`; Sonny's approver reads a quote of the person's own words as
+consent only in a prompt the person sent, and any other as asking for
+nothing.
 `{"op":"prompts","bot","turn","bytes"?}` reads a turn's words and calls
 as an approver judges them, within `bytes` of text (default 64 KiB, at most
 256 KiB): the turn's prompt and each steer it absorbed, in order, with

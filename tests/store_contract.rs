@@ -2517,6 +2517,21 @@ fn a_quoted_prompt_brings_its_own_quotes_with_their_first_writers() {
             {"type":"input_text","text":"approved"},
         ])
     );
+    // A retry names the turns the request named, not those they brought.
+    let again = db
+        .begin("Dave", "d1", "see this", true, &pass_on, allow_provider)
+        .unwrap();
+    assert_eq!(again.turn, started.turn);
+    // Quotes they bring count against the prompt's quotes: each is a part
+    // of its own.
+    let many = TurnOptions {
+        quotes: vec![quote("Dave", started.turn, false); 30],
+        ..TurnOptions::default()
+    };
+    let error = db
+        .begin("Bob", "p2", "all of it", true, &many, allow_provider)
+        .unwrap_err();
+    assert_eq!(error.code, "quote_too_large");
 }
 
 #[test]

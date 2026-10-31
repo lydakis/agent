@@ -5290,15 +5290,23 @@ impl Database {
                             origin: r.get(10)?,
                             person: r.get(14)?,
                             quotes: match r.get::<_, Option<String>>(15)? {
-                                // Kept with who wrote each and its words;
-                                // a retry names the same turns.
-                                Some(json) => serde_json::from_str(&json).map_err(|e| {
-                                    rusqlite::Error::FromSqlConversionFailure(
-                                        15,
-                                        rusqlite::types::Type::Text,
-                                        Box::new(e),
-                                    )
-                                })?,
+                                // Kept with who wrote each and its words,
+                                // and those they brought; a retry names the
+                                // same turns as the request did.
+                                Some(json) => serde_json::from_str::<Vec<Value>>(&json)
+                                    .and_then(|kept| {
+                                        (kept.into_iter())
+                                            .filter(|quote| quote["nested"] != true)
+                                            .map(serde_json::from_value)
+                                            .collect()
+                                    })
+                                    .map_err(|e| {
+                                        rusqlite::Error::FromSqlConversionFailure(
+                                            15,
+                                            rusqlite::types::Type::Text,
+                                            Box::new(e),
+                                        )
+                                    })?,
                                 None => Vec::new(),
                             },
                             budget_tokens: r.get::<_, Option<i64>>(12)?.map(|n| n as u64),
@@ -7590,6 +7598,12 @@ impl Database {
     /// The most bytes a prompt's words and the words it quotes may have
     /// together, as many as its words alone may.
     pub const QUOTED_BYTES: usize = 256 * 1024;
+    /// The most quotes a prompt may hold, those its quoted prompts bring
+    /// counted too: each is a part of the item, with a line naming it.
+    pub const QUOTES: usize = 64;
+    /// What each quote counts against `QUOTED_BYTES` beyond its words: the
+    /// line naming it and its record.
+    const QUOTE_BYTES: usize = 256;
     /// The words of the turns `quotes` names, in order, each with who
     /// wrote them, as the turn keeps them until its item holds them: a
     /// turn's prompt with the turns that prompt quotes after it, still
@@ -7662,25 +7676,41 @@ impl Database {
                 let Some(text) = self.reply_text(*turn)? else {
                     return Err(Error::with(
                         "quote_not_found",
-                        format!("{bot}'s turn {turn} ended with no reply"),
+                        format!(
+                            "{bot}'s turn {turn} has no reply to quote: it ended without one, \
+                             or its messages' events were pruned"
+                        ),
                     )
                     .facts(json!({"bot":bot,"turn":turn})));
                 };
                 quote["reply"] = json!(true);
                 authored(&mut quote, Some((bot.clone(), *turn)), None, None);
-                bytes += text.len();
+                bytes += text.len() + Self::QUOTE_BYTES;
                 quote["text"] = json!(text);
                 copied.push(quote);
             } else {
                 let text = text.unwrap_or_default();
                 authored(&mut quote, from.zip(from_turn), origin, person);
-                bytes += text.len();
+                bytes += text.len() + Self::QUOTE_BYTES;
                 quote["text"] = json!(text);
                 copied.push(quote);
-                for inner in quoted(&self.conn, nested.as_deref())? {
-                    bytes += inner["text"].as_str().map_or(0, str::len);
+                // What it quotes comes along, marked so a retry still names
+                // only the turns the request named.
+                for mut inner in quoted(&self.conn, nested.as_deref())? {
+                    bytes += inner["text"].as_str().map_or(0, str::len) + Self::QUOTE_BYTES;
+                    inner["nested"] = json!(true);
                     copied.push(inner);
                 }
+            }
+            if copied.len() > Self::QUOTES {
+                return Err(Error::with(
+                    "quote_too_large",
+                    format!(
+                        "a prompt may hold {} quotes, those its quoted prompts quote counted",
+                        Self::QUOTES
+                    ),
+                )
+                .facts(json!({"limit":Self::QUOTES})));
             }
             if bytes > Self::QUOTED_BYTES {
                 return Err(Error::with(

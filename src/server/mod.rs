@@ -877,7 +877,7 @@ fn settle_step(handles: &Handles, bot: &str, turn: i64, stepped: Stepped) -> Opt
 const IMAGES_BYTES: usize = 5 << 20;
 /// The most turns one prompt may quote; their words are bounded with its
 /// own.
-const MAX_QUOTES: usize = 64;
+const MAX_QUOTES: usize = agent_runtime::store::Database::QUOTES;
 /// The most pictures one prompt, or one tool result, may carry.
 const IMAGES: usize = 20;
 

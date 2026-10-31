@@ -469,8 +469,10 @@ impl Updates {
                             }
                         }
                     }
-                } else if let Some(origin) = data["origin"].as_str() {
-                    self.origin.insert(key(turn), origin.to_owned());
+                } else if let Some(by) = data["origin"].as_str().or(data["person"].as_str()) {
+                    // A client, or another person a client named: not the
+                    // person's own turn.
+                    self.origin.insert(key(turn), by.to_owned());
                 }
                 // A trigger's fire with --reply-to ends its request ID
                 // `.to.ID`: the bot the turn's answer goes to.
@@ -1526,6 +1528,24 @@ mod tests {
             &ev(bot, Some(turn), "turn_finished", json!({"status": status})),
             now,
         );
+    }
+
+    #[test]
+    fn a_turn_another_person_asked_for_is_theirs_not_the_person_s() {
+        let mut updates = fleet();
+        turn(
+            &mut updates,
+            "shop.fix",
+            4,
+            json!({"person": "ana"}),
+            "completed",
+        );
+        let told = updates.take();
+        assert_eq!(
+            text(&told),
+            "- shop.fix: turn:shop.fix/4 completed, asked by ana"
+        );
+        assert!(told.items.iter().all(|line| !line.theirs));
     }
 
     #[test]
