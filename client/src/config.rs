@@ -35,6 +35,10 @@
 //! commons_invite_tokens = 1000000  # what an invite pays for in its thread
 //! commons_digest = "1h"         # an agent hears its commons threads at most this often, unless asked sooner; 0 at once
 //! task_depth = 3                # generations of tasks below a lead, 2 by default (tasks' own start none); 0 no end
+//! sky_haikus = 0                # haikus a day from the sky's busiest agent, 8 by default; 0 none
+//! sky_haiku_window = 10         # minutes of messages and tool calls that make an agent busiest
+//! sky_haiku_margin = 50         # how much busier, in percent, a challenger must be to take the title
+//! sky_haiku_hold = 10           # minutes the title is held before it can pass
 //! tool_processes = 8            # processes Sonny runs for agents at once (tool calls, goal checks) in each of its companions; 0, the default, twice the CPUs
 //! unsandboxed = ["mcpx"]        # commands run outside agents' sandboxes
 //! default_permissions = "strict"   # the /permissions row a new lead starts in, auto by default
@@ -192,6 +196,16 @@ pub struct Sonny {
     /// How many generations below a lead its line goes: a lead's tasks
     /// are the first, and an agent of the last starts none; 0 for no end.
     pub task_depth: u64,
+    /// The haikus a day the sky's busiest agent writes, each time the
+    /// title passes; 0 for none.
+    pub sky_haikus: u64,
+    /// The minutes of messages and tool calls that make an agent busiest.
+    pub sky_haiku_window: u64,
+    /// How much busier, in percent, a challenger must be to take the
+    /// title, and the minutes it is held before it can pass: a
+    /// thermostat's margin and hold, so it does not flicker.
+    pub sky_haiku_margin: u64,
+    pub sky_haiku_hold: u64,
     /// The processes each of Sonny's companions runs for agents at once:
     /// tool calls the tool host answers, goal checks. 0 for twice the
     /// CPUs.
@@ -251,6 +265,10 @@ impl Default for Sonny {
             commons_invite_tokens: 1_000_000,
             commons_digest: COMMONS_DIGEST.to_owned(),
             task_depth: 2,
+            sky_haikus: 8,
+            sky_haiku_window: 10,
+            sky_haiku_margin: 50,
+            sky_haiku_hold: 10,
             tool_processes: 0,
             chime: true,
             verbose: false,
@@ -641,6 +659,10 @@ fn parse(text: &str) -> Result<Config, String> {
                 "commons_invite_tokens",
                 "commons_digest",
                 "task_depth",
+                "sky_haikus",
+                "sky_haiku_window",
+                "sky_haiku_margin",
+                "sky_haiku_hold",
                 "tool_processes",
                 "unsandboxed",
                 "default_permissions",
@@ -706,6 +728,10 @@ fn parse(text: &str) -> Result<Config, String> {
                 "commons_invites" => Some(&mut config.sonny.commons_invites),
                 "commons_invite_tokens" => Some(&mut config.sonny.commons_invite_tokens),
                 "task_depth" => Some(&mut config.sonny.task_depth),
+                "sky_haikus" => Some(&mut config.sonny.sky_haikus),
+                "sky_haiku_window" => Some(&mut config.sonny.sky_haiku_window),
+                "sky_haiku_margin" => Some(&mut config.sonny.sky_haiku_margin),
+                "sky_haiku_hold" => Some(&mut config.sonny.sky_haiku_hold),
                 "tool_processes" => Some(&mut config.sonny.tool_processes),
                 _ => None,
             } {
@@ -1121,7 +1147,14 @@ fn replace(path: &Path, text: &str) -> Result<(), String> {
         |e: &dyn std::fmt::Display| format!("config_unwritable: {}: {e}", path.display());
     parse(text).map_err(|reason| format!("config_invalid: {}: {reason}", path.display()))?;
     if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| unwritable(&e))?;
+        use std::os::unix::fs::DirBuilderExt;
+        // `~/.agent` is its owner's alone when a client makes it, as when
+        // the daemon does; one that exists keeps its mode.
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+            .map_err(|e| unwritable(&e))?;
     }
     let staged = path.with_extension(format!("toml.{}", std::process::id()));
     std::fs::write(&staged, text)
@@ -1183,6 +1216,15 @@ mod tests {
         assert!(parse("[sonny]\nbrowser_confirm = \"eval\"").is_err());
         assert!(parse("[sonny]\ncommons_invites = -1").is_err());
         assert!(parse("[sonny]\ncommons_invites = \"3\"").is_err());
+        let sky = (config.sonny.sky_haikus, config.sonny.sky_haiku_window);
+        assert_eq!(sky, (8, 10));
+        let sky = (config.sonny.sky_haiku_margin, config.sonny.sky_haiku_hold);
+        assert_eq!(sky, (50, 10));
+        assert_eq!(
+            parse("[sonny]\nsky_haikus = 0").unwrap().sonny.sky_haikus,
+            0
+        );
+        assert!(parse("[sonny]\nsky_haiku_margin = 1.5").is_err());
         assert_eq!(config.sonny.task_depth, 2);
         assert_eq!(
             parse("[sonny]\ntask_depth = 0").unwrap().sonny.task_depth,

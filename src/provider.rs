@@ -2909,11 +2909,19 @@ mod tests {
     /// Serve one SSE response: text deltas `gap` apart with a ping and a
     /// comment keepalive between them, then only keepalives, forever.
     async fn pinging(deltas: usize, gap: Duration) -> String {
-        use tokio::io::AsyncWriteExt;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
+            // A server answers once it has the request: a reply that comes
+            // before the request is written is refused by the client.
+            let mut request = Vec::new();
+            let mut buffer = [0; 4096];
+            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = socket.read(&mut buffer).await.unwrap();
+                request.extend_from_slice(&buffer[..n]);
+            }
             let frame = |data: &str| format!("data: {data}\n\n");
             let mut out = String::from(
                 "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n",

@@ -6,6 +6,7 @@ use crate::{Error, Result};
 use rusqlite::Connection;
 use std::{
     fs::{File, OpenOptions},
+    os::unix::fs::{DirBuilderExt, OpenOptionsExt},
     path::Path,
 };
 use tokio::sync::{mpsc, oneshot};
@@ -17,12 +18,44 @@ pub use context::{ContextPrefix, ContextUsage, pinned_item, thinking_bytes, with
 pub use db::{
     Absorbed, Answered, Binding, Bot, CacheTtl, CallAnswer, CatchUp, CompactionPlan,
     CompactionView, CopiedCall, DENIAL_WINDOW, Database, Decision, Delivery, ElisionPlan,
-    FOLDERS_JSON, Fork, Gate, Gated, MAX_GATES, ParkedFallback, Planning, Publication, QuoteRef,
-    Served, Settings, Started, Step, Stepped, Strip, TURN_VIEW_ACCOUNTING, TurnBudget, TurnContext,
-    TurnOptions, Waiting, Wake, Window, cache_hit, merge_gates, unserved,
+    FOLDERS_JSON, Fork, Gate, Gated, MAX_GATES, ParkedFallback, Planning, Publication, Pulled,
+    QuoteRef, Served, Settings, Started, Step, Stepped, Strip, TURN_VIEW_ACCOUNTING, TurnBudget,
+    TurnContext, TurnOptions, Waiting, Wake, Window, cache_hit, merge_gates, unserved,
 };
 
 type ReadJob = Box<dyn FnOnce(&Database) + Send>;
+
+/// The store's main file readable and writable by its owner alone, made so
+/// when it is new, before SQLite first opens it: SQLite gives the `-wal`
+/// and `-shm` it makes beside the main file that file's mode, so one mode
+/// set here covers all three. A store or sidecar an earlier daemon left
+/// looser is tightened; they hold every conversation in the clear.
+fn owner_only(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+    {
+        Ok(_) => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error.into()),
+    }
+    for suffix in ["", "-wal", "-shm"] {
+        let mut sidecar = path.as_os_str().to_os_string();
+        sidecar.push(suffix);
+        match std::fs::metadata(&sidecar) {
+            Ok(found) if found.permissions().mode() & 0o077 != 0 => {
+                std::fs::set_permissions(&sidecar, std::fs::Permissions::from_mode(0o600))?
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
 /// Most jobs one commit carries: one full queue. Under load the worker runs
 /// everything already queued, up to this many, inside one transaction and
 /// syncs once for all of them; idle, a group is one job and nothing waits
@@ -375,7 +408,12 @@ impl Store {
             .spawn(move || {
                 let opened: Result<(Database, File, std::path::PathBuf)> = (|| {
                     if let Some(parent) = path.parent() {
-                        std::fs::create_dir_all(parent)?;
+                        // A folder made here is the daemon's user's alone;
+                        // one that exists keeps the mode its maker gave it.
+                        std::fs::DirBuilder::new()
+                            .recursive(true)
+                            .mode(0o700)
+                            .create(parent)?;
                     }
                     // Resolve existing files and parent-directory aliases without
                     // opening an extra handle to SQLite's own lock target.
@@ -403,6 +441,7 @@ impl Store {
                         .truncate(false)
                         .read(true)
                         .write(true)
+                        .mode(0o600)
                         .open(lock_path)?;
                     lock.try_lock()
                         .map_err(|_| Error::new("store_already_owned"))?;
@@ -418,6 +457,7 @@ impl Store {
                         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                         Err(error) => return Err(error.into()),
                     }
+                    owner_only(&path)?;
                     let db = Database::initialize(Connection::open(&path)?)?;
                     Ok((db, lock, path))
                 })();
@@ -1110,6 +1150,63 @@ mod tests {
             error.detail.as_deref(),
             Some("sqlite_primary=1 sqlite_extended=1")
         );
+    }
+
+    fn mode(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::symlink_metadata(path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777
+    }
+    fn beside(path: &Path, suffix: &str) -> std::path::PathBuf {
+        let mut sidecar = path.as_os_str().to_os_string();
+        sidecar.push(suffix);
+        sidecar.into()
+    }
+
+    #[tokio::test]
+    async fn a_new_store_and_its_folders_are_their_owner_s_alone() {
+        let root = scratch_path("owner-only").parent().unwrap().to_path_buf();
+        let _ = std::fs::remove_dir_all(&root);
+        let path = root.join("made").join("state.sqlite");
+        let (store, _publications) = Store::open(&path).await.unwrap();
+        store
+            .call(|db| Ok(db.connection().execute_batch("CREATE TABLE t(x INTEGER)")?))
+            .await
+            .unwrap();
+        assert_eq!(mode(&root), 0o700);
+        assert_eq!(mode(path.parent().unwrap()), 0o700);
+        for suffix in ["", "-wal", "-shm", ".owner-lock"] {
+            assert_eq!(mode(&beside(&path, suffix)), 0o600, "{suffix}");
+        }
+        drop(store);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn an_existing_folder_keeps_its_mode_and_a_loose_store_is_tightened() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = scratch_path("tightened");
+        let folder = path.parent().unwrap();
+        let _ = std::fs::remove_dir_all(folder);
+        std::fs::create_dir_all(folder).unwrap();
+        std::fs::set_permissions(folder, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // An earlier daemon's store, made with the umask.
+        std::fs::File::create(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let (store, _publications) = Store::open(&path).await.unwrap();
+        store
+            .call(|db| Ok(db.connection().execute_batch("CREATE TABLE t(x INTEGER)")?))
+            .await
+            .unwrap();
+        assert_eq!(mode(folder), 0o755);
+        for suffix in ["", "-wal", "-shm"] {
+            assert_eq!(mode(&beside(&path, suffix)), 0o600, "{suffix}");
+        }
+        drop(store);
+        let _ = std::fs::remove_dir_all(folder);
     }
 
     #[tokio::test]

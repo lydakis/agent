@@ -29,6 +29,7 @@ mod embed;
 mod exec;
 mod footer;
 mod fuzzy;
+mod haiku;
 mod herdr;
 mod highlight;
 mod hint;
@@ -6677,7 +6678,11 @@ impl App {
             }
             "turn_paced" => {
                 if let Some(running) = &mut self.running {
-                    running.phase = "Rate limited".into();
+                    running.phase = match data["paused"] == true {
+                        true => "Paused",
+                        false => "Rate limited",
+                    }
+                    .into();
                 }
             }
             "turn_resumed" => {
@@ -9328,8 +9333,8 @@ impl App {
                     .await
                 {
                     Ok(said) if said["changed"] == true => format!(
-                        "every agent is paused; {} running stopped",
-                        said["interrupted"]
+                        "every agent is paused; {} running wait for /resume",
+                        said["parked"]
                     ),
                     Ok(_) => "already paused".into(),
                     Err(error) => format!("pause: {error}"),
@@ -11165,10 +11170,24 @@ impl App {
                 0 => 0,
                 n => format!("  ? {n} needs you").width(),
             };
-            let room = width.saturating_sub(4 + needs + "zen · ".len());
+            // An armed boost too, quieter than the full footer's: an arrow
+            // for each step above the agent's own effort, so ↑ then ↑↑.
+            let boost = (self.boost.as_ref()).map(|boost| {
+                let model = self.turn_model.as_deref().unwrap_or(&self.model);
+                let levels = boosts(self.client.providers(), model, self.effort.as_deref());
+                let steps = levels
+                    .iter()
+                    .position(|level| level == boost)
+                    .map_or(1, |at| at + 1);
+                format!(" {}", "↑".repeat(steps))
+            });
+            let marked = boost.as_ref().map_or(0, |boost| boost.width());
+            let room = width.saturating_sub(4 + needs + marked + "zen · ".len());
             let focus = format!("zen · {}", transcript::cut(&first_line(focus), room));
             items.retain(|item| item.slot == Slot::Needs);
-            items.push(Item::new(Slot::Place, vec![vec![Span::raw(focus).dim()]]));
+            let mut place = vec![Span::raw(focus).dim()];
+            place.extend(boost.map(Span::raw));
+            items.push(Item::new(Slot::Place, vec![place]));
             return footer::lay(items, width);
         }
         // The margin's glance says these while it is in view.
@@ -11975,7 +11994,7 @@ mod tests {
     async fn a_pause_shows_who_pulled_it_until_resume() {
         let client = daemon_answering(|asked| match asked["op"].as_str() {
             Some("pause") => json!({"pause": {"reason": asked["reason"], "by": null, "at_ms": 1},
-                "changed": true, "interrupted": 2}),
+                "changed": true, "parked": 2}),
             Some("resume") => json!({"pause": {"reason": "rows", "by": null}, "changed": true}),
             _ => json!({}),
         })
@@ -11996,7 +12015,7 @@ mod tests {
         app.submit().await;
         assert_eq!(
             app.notice.as_deref(),
-            Some("every agent is paused; 2 running stopped")
+            Some("every agent is paused; 2 running wait for /resume")
         );
         // Every window hears of it, whoever pulled it.
         let pause = json!({"reason": "the migration deletes rows", "by": "calc.a", "at_ms": 1});
@@ -12985,7 +13004,9 @@ mod tests {
     async fn zen_goes_to_the_agent_as_typed_and_alone_leaves() {
         let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen = asked.clone();
-        let client = daemon_answering(move |asked| {
+        let providers = json!({"anthropic": {"family": "anthropic",
+            "efforts": ["low", "medium", "high", "xhigh", "max"]}});
+        let client = daemon_serving(providers, move |asked| {
             seen.lock().unwrap().push(asked.clone());
             match asked["op"].as_str() {
                 Some("submit") => json!({"turn": 1}),
@@ -12994,6 +13015,7 @@ mod tests {
         })
         .await;
         let mut app = app(client);
+        app.model = "anthropic/opus".into();
         app.bot = "zen-test.lead".into();
         app.reactions_key = Some("0000-9".into());
         app.input.set("/zen");
@@ -13016,6 +13038,21 @@ mod tests {
             "{footer}"
         );
         assert!(!footer.contains("zen-test.lead"), "{footer}");
+        // An armed boost shows in zen as an arrow a step, in the text's
+        // weight, and a long focus gives way to it.
+        app.boost = Some("xhigh".into());
+        let footer = app.footer_line(100).to_string();
+        assert!(
+            footer.starts_with("  zen · the receipts' currency ↑") && !footer.contains("xhigh"),
+            "{footer}"
+        );
+        app.boost = Some("max".into());
+        let line = app.footer_line(30);
+        assert!(line.to_string().trim_end().ends_with(" ↑↑"), "{line}");
+        assert!(line.width() <= 30, "{line}");
+        let mark = (line.spans.iter()).find(|span| span.content.contains('↑'));
+        assert!(mark.is_some_and(|span| span.style == Style::default()));
+        app.boost = None;
         app.repaint = false;
         app.input.set("/zen");
         app.submit().await;

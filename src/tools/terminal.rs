@@ -281,7 +281,10 @@ impl Registry {
             // the master reads its end once the command's do.
             drop(process);
             let group = child.id().ok_or(Error::new("shell_spawn_failed"))? as i32;
-            Ok::<_, Error>((child, AsyncFd::new(master)?, group, held))
+            // SAFETY: the OwnedFd is open, and it keeps the one descriptor
+            // until the AsyncFd that owns it drops.
+            let master = unsafe { AsyncFd::register(master) }.map_err(std::io::Error::from)?;
+            Ok::<_, Error>((child, master, group, held))
         };
         let (mut child, master, group, held) = match started.await {
             Ok(started) => started,

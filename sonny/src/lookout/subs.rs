@@ -276,12 +276,14 @@ fn plain(name: &str, max: usize) -> bool {
 /// The lock every edit holds while it reads and writes.
 fn held(store: &Path) -> Result<std::fs::File, String> {
     use std::os::fd::AsRawFd;
-    std::fs::create_dir_all(dir(store)).map_err(|e| e.to_string())?;
+    use std::os::unix::fs::OpenOptionsExt;
+    super::make_dir(&dir(store)).map_err(|e| e.to_string())?;
     let path = dir(store).join(".lock");
     let file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
+        .mode(0o600)
         .open(&path)
         .map_err(|e| format!("{}: {e}", path.display()))?;
     // SAFETY: flock on a descriptor `file` owns and keeps open; the lock goes
@@ -306,12 +308,11 @@ fn write(store: &Path, subscriber: &str, subs: &[Sub]) -> Result<(), String> {
             _ => Ok(()),
         };
     }
-    std::fs::create_dir_all(dir(store)).map_err(|e| e.to_string())?;
+    super::make_dir(&dir(store)).map_err(|e| e.to_string())?;
     let body = json!({"subscriptions": subs.iter().map(Sub::to_json).collect::<Vec<_>>()});
     // Written whole, then moved in, so the lookout never reads half a file.
     let partial = path.with_extension(format!("json.{}.partial", std::process::id()));
-    std::fs::write(&partial, format!("{body:#}\n")).map_err(|e| e.to_string())?;
-    std::fs::rename(&partial, &path).map_err(|e| e.to_string())
+    super::write_moved(&partial, &path, &format!("{body:#}\n")).map_err(|e| e.to_string())
 }
 
 /// Remove the subscriber's subscription by that name: whether it had one.
@@ -534,6 +535,13 @@ mod tests {
         // No event seen yet: nothing to warn of.
         let added = add(crs.clone()).unwrap();
         assert_eq!(added["subscriptions"][0]["filter"], filter);
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode(&super::dir(&store)), 0o700);
+            assert_eq!(mode(&super::dir(&store).join(".lock")), 0o600);
+            assert_eq!(mode(&file(&store, "shop.lead")), 0o600);
+        }
         assert!(added.get("unseen").is_none(), "{added}");
         let sub = &read(&store, "shop.lead")[0];
         assert_eq!(sub.filter.as_ref(), Some(&filter));

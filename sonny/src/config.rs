@@ -56,7 +56,7 @@ fn short(key: &str) -> &str {
 }
 
 /// Every key `agent_client::config` reads.
-pub const SETTINGS: [Setting; 23] = [
+pub const SETTINGS: [Setting; 27] = [
     Setting {
         key: "model",
         about: "a new agent's model, when none is named (provider/model)",
@@ -188,6 +188,30 @@ pub const SETTINGS: [Setting; 23] = [
         about: "how many generations of tasks a lead's line has: 2 lets its tasks start their own, which start none; 0 for no end",
         values: &[],
         default: "2",
+    },
+    Setting {
+        key: "sonny.sky_haikus",
+        about: "haikus a day from the agent the sky finds busiest, each written by a copy of it that calls no tool when the title passes; 0 for none",
+        values: &[],
+        default: "8",
+    },
+    Setting {
+        key: "sonny.sky_haiku_window",
+        about: "the minutes of messages and tool calls that make an agent the sky's busiest",
+        values: &[],
+        default: "10",
+    },
+    Setting {
+        key: "sonny.sky_haiku_margin",
+        about: "how much busier, in percent, an agent must be than the busiest to take the title, so it does not flicker",
+        values: &[],
+        default: "50",
+    },
+    Setting {
+        key: "sonny.sky_haiku_hold",
+        about: "the minutes the busiest keeps the title before another can take it",
+        values: &[],
+        default: "10",
     },
     Setting {
         key: "sonny.tool_processes",

@@ -1580,15 +1580,21 @@ class RuntimeTests(ModelFixture):
         turn = client.request('submit', bot='Bob', request_id='running', prompt='gate')['result']['turn']
         self.model.requests.get(timeout=3)
         self.assertEqual(client.request('pause', reason=' ')['error'], 'usage')
+        # Who pulled it is told to every session, so it is bounded.
+        self.assertEqual(client.request('pause', reason='why', by='x' * 129)['error'], 'invalid_by')
+        self.assertIsNone(client.request('stats')['result']['paused'])
         paused = client.request('pause', reason='the migration is deleting rows', by='calc.a')['result']
-        self.assertEqual((paused['changed'], paused['interrupted']), (True, 1))
+        self.assertEqual((paused['changed'], paused['parked']), (True, 1))
         self.assertEqual(paused['pause']['reason'], 'the migration is deleting rows')
         self.assertEqual(paused['pause']['by'], 'calc.a')
         heard = client.receive(lambda e: e.get('event') == 'paused')
         self.assertEqual(heard['pause'], paused['pause'])
-        # The running turn ends now, as interrupted by the pause.
-        ended = client.finished(turn)['data']
-        self.assertEqual((ended['status'], ended['error']), ('interrupted', 'daemon_paused'))
+        # The running turn parks now, to go on when the pause lifts.
+        parked = client.receive(lambda e: e.get('event') == 'turn_paced' and e.get('turn') == turn)
+        self.assertEqual(parked['data'], {'resume_at_ms': None, 'paused': True})
+        running = f'turn:Bob/{turn}'
+        view = client.request('wait', handles=[running], timeout_ms=0)['result']['results'][running]
+        self.assertEqual((view['status'], view['waiting_on']), ('paced', {'resume_at_ms': None, 'paused': True}))
         # A second pull changes nothing: the first pause holds.
         again = client.request('pause', reason='another', by='shop.b')['result']
         self.assertEqual((again['changed'], again['pause']), (False, paused['pause']))
@@ -1607,17 +1613,60 @@ class RuntimeTests(ModelFixture):
         time.sleep(.3)
         self.assertTrue(self.model.requests.empty())
         handle = f"turn:Alice/{held['turn']}"
-        # Resume lifts it, says so, and what waited runs.
+        # Resume lifts it, says so, what waited runs, and the parked turn
+        # goes on from where it stopped.
         self.model.release_headers.set()
+        # Who resumed is bounded the same way, and the pause holds.
+        self.assertEqual(restarted.request('resume', by='x' * 129)['error'], 'invalid_by')
+        self.assertEqual(restarted.request('resume', by='')['error'], 'invalid_by')
+        self.assertEqual(restarted.request('stats')['result']['paused'], paused['pause'])
         resumed = restarted.request('resume', by='shop.b')['result']
         self.assertEqual((resumed['changed'], resumed['pause'], resumed['by']), (True, paused['pause'], 'shop.b'))
         # Every session hears who let the line go on.
         heard = restarted.receive(lambda e: e.get('event') == 'resumed')
         self.assertEqual((heard['pause'], heard['by']), (paused['pause'], 'shop.b'))
-        waited = restarted.request('wait', handles=[handle], timeout_ms=5000)['result']
+        waited = restarted.request('wait', handles=[handle, running], timeout_ms=5000)['result']
         self.assertEqual(waited['results'][handle]['status'], 'completed')
+        self.assertEqual(waited['results'][running]['status'], 'completed')
+        # The pause is not counted as time spent paced by a rate limit.
+        self.assertLess(waited['results'][running]['paced_ms'], 300)
         self.assertEqual(restarted.request('resume')['result'], {'pause': None, 'by': None, 'changed': False})
         self.assertIsNone(restarted.request('stats')['result']['paused'])
+
+    def test_a_pause_stops_a_running_command_and_the_turn_goes_on_without_rerunning_it(self):
+        marker = self.path / 'ran'
+        self.model.slow_command = f'echo x >> {marker}; sleep 30'
+        client = self.client('echo,shell')
+        self.addCleanup(lambda: client.close(kill=True))
+        client.request('create', bot='Alice', workspace=str(self.path))
+        turn = client.request('submit', bot='Alice', request_id='a', prompt='sayslow:the review')['result']['turn']
+        client.receive(lambda m: m.get('event') == 'tool_started' and m.get('turn') == turn)
+        deadline = time.monotonic() + 5
+        while not marker.exists() and time.monotonic() < deadline:
+            time.sleep(.05)
+        paused = client.request('pause', reason='the loop is sending mail', by='calc.a')['result']
+        self.assertEqual(paused['parked'], 1)
+        # The command's call gets its result: the pause stopped it.
+        done = client.receive(lambda m: m.get('event') == 'tool_completed' and m.get('turn') == turn)
+        self.assertEqual(done['data']['call_id'], 'slow-1')
+        parked = client.receive(lambda e: e.get('event') == 'turn_paced' and e.get('turn') == turn)
+        self.assertTrue(parked['data']['paused'])
+        deadline = time.monotonic() + 5
+        while client.request('stats')['result']['running_processes'] and time.monotonic() < deadline:
+            time.sleep(.05)
+        self.assertEqual(client.request('stats')['result']['running_processes'], 0)
+        while not self.model.requests.empty():
+            self.model.requests.get_nowait()
+        client.request('resume')
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        # The model reads why, and the command did not run again.
+        request = self.model.requests.get(timeout=3)
+        output = json.loads(next(i for i in request['input'] if i.get('type') == 'function_call_output'
+                                 and i['call_id'] == 'slow-1')['output'])
+        self.assertEqual(output['error'], 'daemon_paused')
+        self.assertIn('not run again', output['detail'])
+        self.assertEqual(output['pause']['reason'], 'the loop is sending mail')
+        self.assertEqual(marker.read_text(), 'x\n')
 
     def test_a_pause_ends_the_background_commands_agents_started(self):
         self.model.background_timeout_ms = 30000

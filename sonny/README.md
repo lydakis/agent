@@ -394,7 +394,8 @@ what is sent is the text as typed.
 Alt-T boosts the next message: the turn it starts runs at a higher effort
 (`xhigh`, or `high` where the model has no `xhigh`), Alt-T again at `max`
 where the model takes it, and again back to the agent's own. The footer
-shows `↑xhigh` beside the effort until a message takes it; a message that
+shows `↑xhigh` beside the effort until a message takes it (in zen, quieter, an
+arrow a step after the focus: `↑`, then `↑↑`); a message that
 steers a running turn leaves it for the next. The agent's own effort never
 changes, as `/model` changes it.
 
@@ -725,8 +726,17 @@ way `/react` does, and each note in the margin has its own `↩`.
   and double the speed (up to 512 times), and Esc goes back to live; the
   footer is the replay's line, with a bar from where it started to now. It
   reads as far back as the daemon keeps events, from when they carry their
-  time, and keeps the last 100,000 to step back through. `sonny sky`
-  draws the same sky on its own, in the whole terminal,
+  time, and keeps the last 100,000 to step back through. Now and then the
+  busiest agent writes a haiku about what it has been doing, and it
+  streams in a word at a time atop the chat log (top right in zen), signed
+  with its name and how long it has been busiest. Busiest is the most
+  messages and tool calls over the last ten minutes; the title passes only
+  to an agent half again as busy, once the holder has had it ten minutes,
+  so it never flickers. Each new holder writes one, from a copy of itself
+  allowed no tool, eight a day at most, and every sky shows the same one.
+  `[sonny]` sets `sky_haikus` (0 for none), `sky_haiku_window`,
+  `sky_haiku_margin` and `sky_haiku_hold`.
+  `sonny sky` draws the same sky on its own, in the whole terminal,
   to keep in another one beside the work, with your theme's grays and
   `NO_COLOR` honoured, and `sonny sky --center NAME` starts on an agent
   (its name, label or project) and `sonny sky --replay [WHEN]` plays the
@@ -737,6 +747,8 @@ way `/react` does, and each note in the margin has its own `↩`.
   ![/sky in the pane](../docs/sonny/sky.gif)
 
   ![/sky filling a wide terminal](../docs/sonny/sky-wide.png)
+
+  ![/sky with the busiest agent's haiku](../docs/sonny/sky-haiku.gif)
 
   ![/sky with states and its chat log](../docs/sonny/sky-states.png)
 
@@ -754,7 +766,8 @@ way `/react` does, and each note in the margin has its own `↩`.
 
   ![/sky with its legend](../docs/sonny/sky-legend.png)
 - `/pause REASON` stops every agent, in every project, until `/resume`:
-  running turns end and what arrives meanwhile waits, across restarts too.
+  running turns stop where they are and continue on `/resume`, and what
+  arrives meanwhile waits, across restarts too.
   Every window says who paused and why. Agents pull the same cord with
   `agent pause --reason` from their shell
   ([docs/SONNY.md](../docs/SONNY.md#pause)). In `/sky` a pull is the one

@@ -67,12 +67,14 @@ vulnerability, whether or not the code's own documentation agrees.
   `127.0.0.1` in the CLI process for the minutes the sign-in takes.
 - Anyone who can connect to the daemon's own socket has full control of
   every bot: the daemon checks no peer identity and no token on it, by
-  design. The socket's mode is whatever the umask gives a new file, under
-  `~/.agent`, which the daemon makes with the umask too. With the usual
-  `022` only the owner can connect; with a looser umask or a shared group
-  on `$HOME`, keep `~/.agent` to yourself. When the store's path is too
-  long for a socket address, the socket moves to a folder under `/tmp`
-  that is made `0700` and refused unless the caller owns it alone.
+  design. The daemon binds the socket `0600`, whatever the umask, by
+  setting the umask around the bind, so there is no instant in which the
+  name exists with a looser mode. `~/.agent` is made `0700` when the
+  daemon or the CLI makes it; one that already exists keeps the mode its
+  maker gave it, so on a shared `$HOME` check it yourself. When the
+  store's path is too long for a socket address, the socket moves to a
+  folder under `/tmp` that is made `0700` and refused unless the caller
+  owns it alone.
 - A sandboxed bot's commands never reach the daemon's own socket. Each
   such bot gets a socket of its own (`SOCKET.d/BOT_ID`, in a folder made
   `0700`) that answers as that bot and refuses what would widen its
@@ -195,10 +197,15 @@ vulnerability, whether or not the code's own documentation agrees.
 ### Durable state
 
 - The store, `~/.agent/state.sqlite`, holds every bot's history, prompts,
-  pictures, tool output, artifacts and approvals in the clear. It, its
-  WAL, and the companions' and lookout's logs beside it take the umask,
-  `0644` under the usual one. There is no encryption at rest. Tool output
-  spilled to files goes in folders made `0700`, as `0600` files.
+  pictures, tool output, artifacts and approvals in the clear. The daemon
+  makes it `0600` before SQLite first opens it, so the `-wal` and `-shm`
+  SQLite makes beside it take that mode too, and tightens a store or
+  sidecar an earlier daemon left looser. The daemon's log, the
+  companions' folder and logs, and what the lookout keeps beside the
+  store (its log, cursor, lock and marker, the sources', subscriptions'
+  and goals' folders) are made `0600` and `0700` the same way. There is
+  no encryption at rest. Tool output spilled to files goes in folders
+  made `0700`, as `0600` files.
 - `rm`, `prune` and `--keep-turns` delete rows; SQLite's free pages and
   WAL are not scrubbed. Compaction keeps the original history.
 - A resume never silently makes a fresh bot. A fork is a new identity; a
@@ -313,6 +320,6 @@ is built.
 - `web_fetch` reaches the daemon host's own networks.
 - Nothing in the store is encrypted at rest, and nothing on the daemon's
   own socket authenticates beyond the socket's file permissions, which
-  follow the umask.
+  the daemon sets to its owner alone.
 - Multi-daemon operation, moving bots between machines and remote socket
   access are not implemented ([docs/MULTI_DAEMON.md](docs/MULTI_DAEMON.md)).

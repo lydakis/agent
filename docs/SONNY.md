@@ -687,9 +687,11 @@ stay, and `/commons` still shows them.
 ## Pause
 
 `/pause REASON` stops every agent of every project at once, through the
-daemon's `pause` ([protocol](RUST_PROTOTYPE.md)): running turns end, nothing
-new starts, and what arrives meanwhile, triggers and lookout notes too, waits
-in the store, also across restarts. `/resume` lets it all go on. While it
+daemon's `pause` ([protocol](RUST_PROTOTYPE.md)): running turns stop where
+they are and say "Paused", a command they were running is stopped and not run
+again, nothing new starts, and what arrives meanwhile, triggers and lookout notes too, waits
+in the store, also across restarts. `/resume` lets it all go on, the stopped turns continuing from where they
+were. While it
 holds, every window says above the footer who paused and why. Agents pull the
 same cord from their shell with `"$AGENT_BIN" pause --reason WHY`, and get no
 tool for it: `task.md` and `lead.md` say to, when they see agents doing harm

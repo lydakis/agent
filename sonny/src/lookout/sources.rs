@@ -397,7 +397,7 @@ async fn run(source: Source, every: Duration, dir: PathBuf, shape: PathBuf, sent
     let mut seen = Seen::default();
     let mut shape = Shape::read(shape);
     loop {
-        let _ = std::fs::create_dir_all(&dir);
+        let _ = super::make_dir(&dir);
         let ran = once(&source, &dir, &sent, &mut seen, &mut shape).await;
         shape.flush();
         match ran {
@@ -766,12 +766,10 @@ impl Shape {
         let Some(dir) = self.file.parent() else {
             return;
         };
-        let _ = std::fs::create_dir_all(dir);
+        let _ = super::make_dir(dir);
         // Written whole, then moved in, so a reader never reads half a file.
         let partial = self.file.with_extension("json.partial");
-        if std::fs::write(&partial, format!("{:#}\n", self.to_json())).is_ok() {
-            let _ = std::fs::rename(&partial, &self.file);
-        }
+        let _ = super::write_moved(&partial, &self.file, &format!("{:#}\n", self.to_json()));
     }
 }
 
