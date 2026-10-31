@@ -1,0 +1,29 @@
+# Dependabot version updates. Security updates and alerts are repository
+# settings, not this file; this adds the weekly version pull requests.
+# Cargo dependencies are grouped into one pull request a week so a run of
+# patch bumps does not become a run of Perf screens; a major bump of a
+# dependency gets its own. The pinned action SHAs in workflows are bumped
+# with their version comments.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    groups:
+      cargo-minor-and-patch:
+        update-types: [minor, patch]
+    commit-message:
+      prefix: "deps"
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: "ci"
