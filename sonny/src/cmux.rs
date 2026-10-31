@@ -60,10 +60,7 @@ fn rpc(bin: &Path, method: &str, params: &Value) -> Result<Value, String> {
     for name in PLACE_VARS {
         command.env_remove(name);
     }
-    let out = command
-        .args(["rpc", method, &params.to_string()])
-        .stdin(Stdio::null())
-        .output()
+    let out = crate::mux::output(command.args(["rpc", method, &params.to_string()]))
         .map_err(|e| format!("cmux: {e}"))?;
     if !out.status.success() {
         // cmux says why, among others that its socket would not take this

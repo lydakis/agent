@@ -6,8 +6,78 @@
 //! says how, in its multiplexer's CLI.
 use std::{
     collections::HashMap,
+    io::Read,
     path::{Path, PathBuf},
+    process::{Command, Output, Stdio},
+    sync::mpsc,
+    time::{Duration, Instant},
 };
+
+/// How long a multiplexer's CLI may take to answer: one whose server has
+/// stopped answering is given up on, rather than holding Sonny's screen.
+const ANSWER: Duration = Duration::from_secs(10);
+
+/// `command`'s output, as `Command::output` gives it, unless the command
+/// takes longer than [`ANSWER`]: then it is stopped, and that is the error.
+pub fn output(command: &mut Command) -> std::io::Result<Output> {
+    output_within(command, ANSWER)
+}
+
+fn output_within(command: &mut Command, limit: Duration) -> std::io::Result<Output> {
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    // Each pipe read to its end on a thread of its own, so a full one
+    // never holds the other up.
+    fn read(pipe: Option<impl Read + Send + 'static>) -> mpsc::Receiver<Vec<u8>> {
+        let (sent, read) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut bytes);
+            }
+            let _ = sent.send(bytes);
+        });
+        read
+    }
+    let (stdout, stderr) = (read(child.stdout.take()), read(child.stderr.take()));
+    let deadline = Instant::now() + limit;
+    let read = |pipe: &mpsc::Receiver<Vec<u8>>| {
+        pipe.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .ok()
+    };
+    let answered = 'answered: {
+        let (Some(stdout), Some(stderr)) = (read(&stdout), read(&stderr)) else {
+            break 'answered None;
+        };
+        // Its output closed, the command has all but exited.
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    break 'answered Some(Output {
+                        status,
+                        stdout,
+                        stderr,
+                    });
+                }
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(1))
+                }
+                _ => break 'answered None,
+            }
+        }
+    };
+    answered.ok_or_else(|| {
+        let _ = child.kill();
+        let _ = child.wait();
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("no answer in {limit:?}"),
+        )
+    })
+}
 
 /// A block as its multiplexer lists it.
 pub struct Block {
@@ -566,6 +636,23 @@ mod tests {
                 workspace: "w1".into(),
             }
         }
+    }
+
+    #[test]
+    fn a_multiplexer_that_does_not_answer_is_given_up_on() {
+        let answered =
+            super::output(std::process::Command::new("sh").args(["-c", "echo hi; echo oh >&2"]))
+                .unwrap();
+        assert!(answered.status.success());
+        assert_eq!(
+            (&answered.stdout[..], &answered.stderr[..]),
+            (&b"hi\n"[..], &b"oh\n"[..])
+        );
+        let started = std::time::Instant::now();
+        let mut hung = std::process::Command::new("sleep");
+        let error = super::output_within(hung.arg("30"), std::time::Duration::from_millis(200));
+        assert_eq!(error.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
     }
 
     #[test]

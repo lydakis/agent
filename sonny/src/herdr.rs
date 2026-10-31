@@ -39,17 +39,18 @@ pub fn pane() -> Option<String> {
 /// reaches.
 pub fn has_lead(bin: &Path, project: &str) -> bool {
     let lead = format!("{project}.lead");
-    Command::new(bin)
-        .env_remove("HERDR_PANE_ID")
-        .args(["pane", "list"])
-        .output()
-        .ok()
-        .filter(|out| out.status.success())
-        .and_then(|out| serde_json::from_slice::<Value>(&out.stdout).ok())
-        .is_some_and(|reply| {
-            (reply["result"]["panes"].as_array().into_iter().flatten())
-                .any(|p| p["label"] == lead.as_str())
-        })
+    crate::mux::output(
+        Command::new(bin)
+            .env_remove("HERDR_PANE_ID")
+            .args(["pane", "list"]),
+    )
+    .ok()
+    .filter(|out| out.status.success())
+    .and_then(|out| serde_json::from_slice::<Value>(&out.stdout).ok())
+    .is_some_and(|reply| {
+        (reply["result"]["panes"].as_array().into_iter().flatten())
+            .any(|p| p["label"] == lead.as_str())
+    })
 }
 
 /// Sonny as an agent that supports Herdr (herdr.dev/docs/add-herdr-support),
@@ -299,13 +300,14 @@ impl Herdr {
     /// The reply's `result`. Every call names what it acts on: the shell's
     /// own Herdr variables may name another pane (a daemon's).
     fn call(&self, args: &[&str]) -> Result<Value, String> {
-        let out = Command::new(&self.bin)
-            .env_remove("HERDR_PANE_ID")
-            .env_remove("HERDR_TAB_ID")
-            .env_remove("HERDR_WORKSPACE_ID")
-            .args(args)
-            .output()
-            .map_err(|e| format!("herdr: {e}"))?;
+        let out = crate::mux::output(
+            Command::new(&self.bin)
+                .env_remove("HERDR_PANE_ID")
+                .env_remove("HERDR_TAB_ID")
+                .env_remove("HERDR_WORKSPACE_ID")
+                .args(args),
+        )
+        .map_err(|e| format!("herdr: {e}"))?;
         let what = args[..args.len().min(2)].join(" ");
         if !out.status.success() {
             let said = String::from_utf8_lossy(&out.stderr);
@@ -499,8 +501,10 @@ impl Backend for Herdr {
         };
         let cwd = cwd.to_string_lossy();
         let mut args = vec!["pane", "split", anchor, "--direction", direction];
+        // The ratio is the first pane's share, and a swap leaves the
+        // shares where they are: swapped, the new pane is the first.
         if small {
-            args.extend(["--ratio", "0.65"]);
+            args.extend(["--ratio", if swap { "0.35" } else { "0.65" }]);
         }
         if keep {
             args.extend(["--cwd", &cwd]);
@@ -778,6 +782,37 @@ if out is not None:
 
         layout.close("graft.fix");
         assert_eq!(labels(&dir), ["graft.lead", "graft.docs"]);
+    }
+
+    #[test]
+    fn a_small_split_above_or_left_is_small_once_swapped() {
+        let (bin, dir) = fake(
+            "small",
+            json!({
+                "n": 10,
+                "workspaces": [{"workspace_id": "w1", "label": "shop"}],
+                "panes": [
+                    {"pane_id": "w1:p1", "workspace_id": "w1", "tab_id": "w1:t1", "label": "shop.lead"},
+                ],
+            }),
+        );
+        let herdr = Herdr::open(bin, "shop", None, None).unwrap();
+        let mut layout = Layout::new(Box::new(herdr));
+        let serve = ["serve".to_owned()];
+        layout
+            .split(
+                "shop.lead",
+                "server",
+                Path::new("/work"),
+                &serve,
+                Some("above"),
+            )
+            .unwrap();
+        let calls = calls(&dir);
+        let split = calls.iter().find(|c| c[..2] == ["pane", "split"]).unwrap();
+        // Herdr gives the first pane the ratio; the new one is swapped there.
+        assert_eq!(split[3..7], ["--direction", "down", "--ratio", "0.35"]);
+        assert!(calls.iter().any(|c| c[..2] == ["pane", "swap"]));
     }
 
     #[test]
