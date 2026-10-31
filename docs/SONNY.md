@@ -725,12 +725,21 @@ at most 10,000 tokens, longer output keeping its start and end and saving
 the whole to a file; saved outputs and images are kept a week. A first
 line such as
 `// @exec: {"max_output_tokens": 1000, "timeout_ms": 60000}` sets those.
+Its time counts from the call: waiting for a place and starting servers
+to list their tools spend it. What lives outside its 256 MB is bounded as
+it runs: its output past 1 MB keeps its first half and its latest, as
+Codex keeps a command's; eight of its calls are in flight at once, and a
+result over 16 MB is refused, as rmcp refuses such a message. Two tools
+whose identifiers would be the same (`my-server` and `my_server`'s
+`search`) are neither on `tools`, the description saying why.
 
 The lookout runs the scripts and keeps the servers
 ([mcp.rs](../sonny/src/mcp.rs)): one connection per server for every agent,
 started by the first call and stopped after ten idle minutes, with each
-server's tool list kept in `~/.agent/sonny/mcp` so agents are told of its
-tools without starting it. Servers run as the person, beside the lookout and
+server's tool list kept in `~/.agent/sonny/mcp`, readable by the person
+alone and keyed by a digest of its config rather than the config's
+secrets, so agents are told of its tools without starting it. A server's
+stderr is kept by its last twenty lines, each cut at 1 KB, for when it fails. Servers run as the person, beside the lookout and
 outside every agent's sandbox, as Codex starts its own: a sandboxed task
 reaches them only through `exec`. A turn that ends, as one the person
 interrupts, stops its script and the calls it has in flight.

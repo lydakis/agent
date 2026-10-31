@@ -339,8 +339,10 @@ project's). Sonny calls these tools by the credential T3 Code scopes to the
 lead's thread, which no program Sonny starts inherits. Sonny takes the person's words out of the instructions T3 Code
 wraps a prompt in, which name tools Sonny's agents do not have, so T3 Code's
 Plan mode does not reach them; plan with the lead instead. What thread is
-which bot is kept in `~/.agent/sonny/t3`, so a thread T3 Code resumes is the
-same bot. T3 Code's model picker lists what the providers list, as `/model`
+which bot, by its identity and its store, is kept in `~/.agent/sonny/t3`, so
+a thread T3 Code resumes is the same bot or none: one removed and made again
+under its name, or a bot of another store, is refused, and each prompt names
+the bot's identity, so one sent after such a swap reaches neither. T3 Code's model picker lists what the providers list, as `/model`
 does, each by the name its provider lists (else its id) beside the provider,
 as "Global Claude Opus 5.5 · bedrock", with the full id and
 `~/.agent/models`' notes, and the models only that file names, after

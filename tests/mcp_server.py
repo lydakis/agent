@@ -1,7 +1,7 @@
 """A stand-in stdio MCP server for Sonny's tests: `echo`, `add` (with
 structured output), `fail` (a tool error) and `slow`. Each start appends
-its pid to $MCP_STARTS when that is set; calls are answered at once,
-each on a thread of its own."""
+its pid to $MCP_STARTS when that is set, and waits $MCP_START_MS before it
+answers; calls are answered at once, each on a thread of its own."""
 import json
 import os
 import sys
@@ -11,6 +11,8 @@ import time
 if os.environ.get('MCP_STARTS'):
     with open(os.environ['MCP_STARTS'], 'a') as f:
         f.write(f'{os.getpid()}\n')
+
+time.sleep(int(os.environ.get('MCP_START_MS', '0')) / 1000)
 
 TOOLS = [
     {'name': 'echo', 'description': 'Echo text back.',
