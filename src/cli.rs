@@ -21,7 +21,7 @@ const COMMANDS: &[Command] = &[
         about: "Send a prompt to a bot, or make one with --new; prints the turn as it runs",
         usage: "run [OPTIONS] [--] PROMPT...",
         flags: "--bot --new --fork --allow --expires --detach --delivery --turn --model --workspace --effort --turn-budget-tokens --image --agents --profile --request-id --bot-id --pretty --no-spawn",
-        settings: "--tools --instructions --instructions-file --budget-tokens --compaction-instructions --compaction-instructions-file --compaction-model --no-compaction --fallback --approval --approve --context-bytes --context-items --note-turns --compact-at --compact-keep --compact-tokens --max-rounds --keep-turns --approval-hold --max-output-tokens --keep-warm --cache-ttl --sandbox --writable --network --hide-senders --unsandboxed",
+        settings: "--tools --instructions --instructions-file --budget-tokens --compaction-instructions --compaction-instructions-file --compaction-model --no-compaction --fallback --approval --approve --context-bytes --context-items --note-turns --compact-at --compact-keep --compact-tokens --max-rounds --keep-turns --approval-hold --max-output-tokens --keep-warm --cache-ttl --speed --sandbox --writable --network --hide-senders --unsandboxed",
         startup: true,
     },
     Command {
@@ -354,6 +354,10 @@ fn print_flags(flags: &str) {
             "--cache-ttl" => (
                 "5m|1h",
                 "A new bot's Anthropic prompt-cache lifetime; 1h bills writes at 2x input and sends no refresh; default 5m",
+            ),
+            "--speed" => (
+                "standard|fast|ultrafast",
+                "A new bot's speed tier, where its provider serves it, at a higher price per token; default standard",
             ),
             "--idle-exit" => ("DURATION", "Exit after this long idle; 0 disables"),
             "--shell-exclude" => (

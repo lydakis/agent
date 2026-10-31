@@ -283,6 +283,9 @@ enum Command {
         /// Its prompt-cache lifetime, as `create`'s settings name it.
         cache_ttl: Option<agent_runtime::store::CacheTtl>,
         unsandboxed: Option<Vec<String>>,
+        /// The tier its calls are served at, as `create`'s settings name
+        /// it; `standard` goes back to none.
+        speed: Option<agent_runtime::provider::Speed>,
     },
     /// Summarize a bot's context with its compaction instructions before
     /// its next model call: a running turn's next round boundary, or an
@@ -1311,12 +1314,13 @@ pub async fn run(config: Configuration) -> Result<()> {
             provider = provider.with_socket()?;
         }
         let provider = provider.with_stall_timeout(stall_timeout)?;
-        let searches = provider.searches();
+        let (searches, speeds) = (provider.searches(), provider.speeds());
         if providers.insert(spec.name.clone(), provider).is_some() {
             return fail_with("duplicate_provider", spec.name.as_str());
         }
         let mut binding = json!({"family":spec.family.name(),"url":spec.url,
             "transport":spec.transport(),"efforts":spec.family.efforts(),
+            "speeds":speeds,
             "web_search":searches});
         if let Some(Value::Object(auth)) = auth {
             binding.as_object_mut().expect("object").extend(auth);
@@ -3066,6 +3070,7 @@ impl Service {
                 network,
                 cache_ttl,
                 unsandboxed,
+                speed,
             } => {
                 if effort.is_some() && model.is_none() {
                     return fail_with("invalid_effort", "effort goes with model");
@@ -3142,7 +3147,10 @@ impl Service {
                         if served.family() != family {
                             return fail_with("provider_family_mismatch", reference.clone());
                         }
-                        turn::shaped(served, &record.settings)?;
+                        // The speed it will have, on the provider it moves to.
+                        let mut settings = record.settings.clone();
+                        settings.speed = speed.or(settings.speed);
+                        turn::shaped(served, &settings)?;
                         if let Some(level) = &effort {
                             family.check_effort(level)?;
                         }
@@ -3150,6 +3158,22 @@ impl Service {
                     }
                     None => None,
                 };
+                // A speed its own provider must serve.
+                if let (Some(speed), None) = (speed, &model) {
+                    let record = store
+                        .op("inspect", {
+                            let bot = bot.clone();
+                            move |db| db.inspect(&bot)
+                        })
+                        .await?;
+                    let served = self
+                        .providers
+                        .get(&record.provider)
+                        .ok_or(Error::with("provider_unavailable", record.provider.clone()))?;
+                    let mut settings = record.settings.clone();
+                    settings.speed = Some(speed);
+                    turn::shaped(served, &settings)?;
+                }
                 let answer = store
                     .op("configure", move |db| {
                         let id = db.identity(&bot, bot_id)?;
@@ -3192,6 +3216,11 @@ impl Service {
                             && db.set_cache_ttl(&bot, Some(id), ttl)?
                         {
                             changed.push("cache_ttl");
+                        }
+                        if let Some(speed) = speed
+                            && db.set_speed(&bot, Some(id), speed)?
+                        {
+                            changed.push("speed");
                         }
 
                         Ok(json!({"bot":bot,"bot_id":id,"changed":changed}))

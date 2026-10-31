@@ -212,6 +212,10 @@ pub struct Settings {
     /// Anthropic prompt-cache lifetime.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_ttl: Option<CacheTtl>,
+    /// The tier its own model's calls are served at; none is standard.
+    /// Calls on another model, a summarizer or a fallback, go at standard.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speed: Option<crate::provider::Speed>,
     /// How its shell, write and edit calls are confined, by Codex's
     /// sandbox modes; none runs them unconfined.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -335,6 +339,11 @@ impl Settings {
     pub fn cache_hour(&self) -> bool {
         self.cache_ttl == Some(CacheTtl::Hour)
     }
+    /// The tier faster than standard it chose, if any.
+    pub fn speed(&self) -> Option<crate::provider::Speed> {
+        self.speed
+            .filter(|speed| *speed != crate::provider::Speed::Standard)
+    }
     /// Refuses a value outside its range, naming the setting and the range.
     pub fn validate(&self) -> Result<()> {
         let refuse = |detail: &str| fail_with("invalid_setting", detail);
@@ -423,6 +432,7 @@ impl Settings {
             // Null when never set (five minutes), so a client's default can
             // tell it from five minutes someone chose.
             "cache_ttl":self.cache_ttl,
+            "speed":self.speed().map_or("standard", crate::provider::Speed::name),
             "sandbox":self.sandbox,"writable":self.writable,"network":self.network,
             "hide_senders":self.hide_senders,"unsandboxed":self.unsandboxed})
     }
@@ -2494,6 +2504,24 @@ impl Database {
             None => settings,
         };
         settings.validate()?;
+        let stored = settings.stored()?;
+        let changed = self.conn.execute(
+            "UPDATE bots SET settings=? WHERE id=? AND settings IS NOT ?",
+            params![stored, id, stored],
+        )?;
+        Ok(changed == 1)
+    }
+    /// The tier the bot's calls are served at; whether that changed it.
+    /// Standard is stored as none, as a bot that never chose one has.
+    pub fn set_speed(
+        &mut self,
+        name: &str,
+        bot_id: Option<i64>,
+        speed: crate::provider::Speed,
+    ) -> Result<bool> {
+        let id = self.identity(name, bot_id)?;
+        let mut settings = self.inspect(name)?.settings;
+        settings.speed = Some(speed).filter(|speed| *speed != crate::provider::Speed::Standard);
         let stored = settings.stored()?;
         let changed = self.conn.execute(
             "UPDATE bots SET settings=? WHERE id=? AND settings IS NOT ?",

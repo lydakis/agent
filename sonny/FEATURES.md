@@ -98,6 +98,7 @@ per feature; group small things into the row they belong to.
 | Key hints in one grammar (key, then what it does, muted); `?` with nothing typed shows every key | shipped | added 10-30 #427 | As Codex's `key_hint` and both peers' `?` sheet: keys only the README taught are on screen | ? |
 | One list over the composer (slash menu, `/model`, `/approvals`, `/retry`, `/react`): up to 8 rows, the pick reversed, `•` what is in effect | shipped | added 10-30 #427 | As Codex's one popup: every list reads and moves the same | ? |
 | One vocabulary: slash descriptions as imperatives; automation, follow, reviewer, `no reply`, `Edited`, `/retry`, `sonny --agent` | shipped | added 10-30 #438 | One word per idea, the same word everywhere the person reads, as Codex and Claude Code word their commands; the agents' tool names follow after an eval | ? |
+| `/fast`: pick how fast the agent is served from the list `/approvals` uses: standard, then each faster tier its provider serves (fast, Claude's fast mode or OpenAI's priority tier; ultrafast where served), each with what it costs; the footer names the speed | experimental | added 10-30 #467 | As Codex's and Claude Code's `/fast`: a speed for this agent until changed, listing only what its provider serves, so a Bedrock Claude agent says it has none | ? |
 | Messages to a busy agent: Enter steers, Tab queues for after the turn | shipped | Tab queues 10-30 #400 | As Codex does: the person knows whether it should wait, so no judge guesses | ? |
 
 ## Side pane
