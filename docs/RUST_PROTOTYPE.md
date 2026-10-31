@@ -3166,26 +3166,35 @@ next output, or with a steer absorbed after that exchange, so no call is
 separated from its result on either side and a steer at the boundary goes
 verbatim.
 
-The turn's prompt stays in view whole. The compaction records it as the
-version's `pinned` node, and while the window starts at that cut, the
+The turn's prompt stays in view whole, and so does every message sent to
+the turn before the cut: a steer or an attached message. The compaction
+records the prompt as the version's `pinned` node and those messages as
+its `pinned_messages`, and while the window starts at that cut, the
 request carries the prompt as its first item after the pinned context,
-then the items from the cut. The summary header says `covering turns A to
+then those messages in the order they came, then the items from the cut.
+So a correction sent mid-turn never reads older than the prompt it
+corrects, as it would if only the summary told of it. They count against
+the room the prompt does; when the active turn would not fit beside them,
+the oldest go into the summary first, since a later message may overrule
+an earlier one but not the other way round. The summary header says `covering turns A to
 B and the start of turn C`, or `covering the start of turn C`, and its
 list of verbatim user messages leaves out turn C's prompt, which follows
 in full; the list keeps it for when a later compaction covers the whole
 turn. The context note counts the messages it leaves out of turn C
 separately from earlier turns. A second cut in the same turn summarizes
-from the first, merging the previous summary, and keeps the same prompt.
+from the first, merging the previous summary, and keeps the same prompt
+and messages, with those sent since the first cut after them.
 Once the turn has ended, a later cut at a turn's prompt covers it whole.
 The turn keeps running for its clients throughout: events, steers,
 approvals, and its checkpoint are unchanged; only what the next request
 carries differs. Admission for steers, notes, and `history` results counts
 the turn from its prompt and cut, as the window does. A historical fork
 binds the version at or before its checkpoint and restores its cut, so a
-fork from inside a split turn sees that prompt and the tail from the cut.
-Steers absorbed before the cut are summarized with the rounds around them,
-as a covered turn's steers are. Schema 30 adds the `pinned` column; every
-earlier cut is a turn's prompt, so none has one.
+fork from inside a split turn sees that prompt, the messages that version
+kept, and the tail from the cut. A turn covered whole has its steers
+summarized with its rounds. Schema 30 adds the `pinned` column; every
+earlier cut is a turn's prompt, so none has one. Schema 65 adds the `pins`
+table of kept messages; cuts made before it keep the prompt alone.
 
 A round can take the turn past its budget before compaction is due, for
 example one large result after several small ones, or a turn that fits
