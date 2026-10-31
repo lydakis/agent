@@ -399,6 +399,8 @@ between, the arrows move through its rows. Every window keeps its prompts in
 first, newest first, then those any window sent before it opened. Edit a
 prompt brought back and it is yours to send, or Up starts again from it.
 
+![Up brings back a two-row prompt with the cursor at its top, Up again the one before, and Down twice returns the draft](../docs/sonny/prompt-history.png)
+
 Alt-T boosts the next message: the turn it starts runs at a higher effort
 (`xhigh`, or `high` where the model has no `xhigh`), Alt-T again at `max`
 where the model takes it, and again back to the agent's own. The footer
