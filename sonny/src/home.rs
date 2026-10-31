@@ -18,8 +18,8 @@ use std::{
 };
 
 /// The job the backup had of its own before Sonny's scheduler ran it,
-/// which Sonny's start lets go of.
-const OLD_LABEL: &str = "me.lydakis.agent.backup";
+/// which Sonny's start lets go of once.
+pub(crate) const OLD_LABEL: &str = "me.lydakis.agent.backup";
 /// How often the scheduler runs a sync.
 pub const EVERY_SECONDS: u32 = 600;
 /// Names never copied, at any depth: a repository's own, and what memory
@@ -89,16 +89,24 @@ pub fn done(places: &Places) -> bool {
     origin(&places.repo, None).is_some()
 }
 
-/// Whether the scheduler runs a sync now: `~/agent-home` is there and the
-/// last sync, which a sync never set up records too, is ten minutes old.
-/// Read without running git, as the scheduler asks every minute.
+/// Whether the scheduler runs a sync now: backup is set up here and the
+/// last sync is ten minutes old. Read without running git, as the
+/// scheduler asks every minute.
 pub fn due(places: &Places, now_ms: u128) -> bool {
-    places.repo.join(".git").exists()
+    timed(places)
         && last(places)
             .and_then(|last| last["at_ms"].as_u64())
-            .is_none_or(|at| {
+            .is_some_and(|at| {
                 now_ms.saturating_sub(u128::from(at)) >= u128::from(EVERY_SECONDS) * 1000
             })
+}
+
+/// Whether the scheduler keeps the backup: `~/agent-home` is a repository
+/// and a sync ran, as setup runs the first after restoring. A clone put
+/// there by hand is not set up: a sync from it would push this machine's
+/// home over the one it holds, before setup restored it.
+fn timed(places: &Places) -> bool {
+    places.repo.join(".git").exists() && last(places).is_some()
 }
 
 /// What the last sync did, with whether backup is set up.
@@ -564,8 +572,7 @@ pub fn at_start() {
         return;
     };
     std::thread::spawn(move || {
-        crate::scheduler::retire_old(OLD_LABEL);
-        if places.repo.join(".git").exists()
+        if timed(&places)
             && let Err(error) = crate::scheduler::ring()
         {
             eprintln!("{}", error_json(&error));
@@ -879,7 +886,7 @@ mod tests {
         let places = places(&root);
         assert!(!due(&places, 1_000_000), "no repository, no sync");
         std::fs::create_dir_all(places.repo.join(".git")).unwrap();
-        assert!(due(&places, 1_000_000), "never synced");
+        assert!(!due(&places, 1_000_000), "a clone setup never synced from");
         write(&places.state, "{\"at_ms\": 1000000}");
         assert!(!due(&places, 1_000_000 + 599_999));
         assert!(due(&places, 1_000_000 + 600_000));

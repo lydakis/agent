@@ -14,7 +14,7 @@
 //! running), when the path it watches changes, and while its queue of
 //! asks holds one. One fire of a trigger at a time, also across a restart
 //! of the scheduler: a fire holds a lock on its own file in
-//! `~/.agent/triggers/.locks` while it runs.
+//! `~/.agent/triggers/.scheduler` while it runs.
 //!
 //! A write to its doorbell (`~/.agent/triggers/.ring`, a FIFO) has it look
 //! again at once: Sonny rings it when a definition or a queue changes, and
@@ -153,6 +153,16 @@ pub fn ensure() -> Result<(), String> {
     }
     trigger::replace_mode(&file, text.as_bytes(), 0o644)?;
     start(scheduler, &file, &label)
+}
+
+/// Whether the job is there and runs another Sonny than this one.
+fn stale() -> bool {
+    let (Some(home), Some(sonny)) = (std::env::var_os("HOME"), crate::skills::sonny_path()) else {
+        return false;
+    };
+    let scheduler = Scheduler::here();
+    std::fs::read_to_string(job_file(scheduler, Path::new(&home)))
+        .is_ok_and(|text| !text.contains(&program(scheduler, &sonny)))
 }
 
 /// Start a job the system has, else load it from its file.
@@ -300,11 +310,19 @@ pub(crate) fn retire_old(label: &str) {
     }
 }
 
-/// At Sonny's start: the scheduler running, when any trigger is there.
+/// At Sonny's start: the job runs this Sonny, when it ran one from
+/// elsewhere (an install that keeps each version in its own folder), even
+/// while the old one still answers its doorbell; and the scheduler
+/// running, when any trigger is there.
 pub fn at_start() {
     let Ok(places) = Places::home() else {
         return;
     };
+    if stale()
+        && let Err(error) = ensure()
+    {
+        eprintln!("{}", trigger::error_json(&error));
+    }
     let any = std::fs::read_dir(&places.jobs)
         .into_iter()
         .flatten()
@@ -447,12 +465,12 @@ pub fn run() -> i32 {
             syncing = run_own(me, &["home", "sync", "--job"]);
         }
         let now_folder = modified(&places.jobs);
+        let mut fired = false;
         if rang || every_minute || now_folder != folder {
             folder = now_folder;
-            read_jobs(&places, &mut followed, &kept);
+            fired = read_jobs(&places, &mut followed, &mut kept);
         }
         let now = trigger::now();
-        let mut fired = false;
         let mut names: Vec<String> = followed.keys().cloned().collect();
         names.sort();
         for name in names {
@@ -531,12 +549,16 @@ pub fn run() -> i32 {
 /// Read the definitions again: a new one is followed from the time kept
 /// for it, else from when it was written; a changed one is read again,
 /// keeping where it looked when it is the same trigger; a removed one is
-/// let go.
+/// let go. A trigger new since the scheduler last kept its times fires
+/// once for a write to its watched path after its definition was written,
+/// as a job the system watched from the moment it was added would have.
+/// Whether `kept` has a trigger new to it, to be written.
 fn read_jobs(
     places: &Places,
     followed: &mut HashMap<String, Followed>,
-    kept: &HashMap<String, (String, i64)>,
-) {
+    kept: &mut HashMap<String, (String, i64)>,
+) -> bool {
+    let mut new = false;
     use std::os::unix::fs::MetadataExt;
     let mut there = std::collections::HashSet::new();
     for entry in std::fs::read_dir(&places.jobs)
@@ -564,6 +586,10 @@ fn read_jobs(
             followed.remove(name);
             continue;
         };
+        let known = followed
+            .get(name)
+            .is_some_and(|f| f.generation == generation)
+            || kept.get(name).is_some_and(|(kept, _)| *kept == generation);
         let looked = match followed.get(name) {
             Some(f) if f.generation == generation => f.looked,
             _ => match kept.get(name) {
@@ -571,9 +597,20 @@ fn read_jobs(
                 _ => meta.mtime(),
             },
         };
+        if !known {
+            kept.insert(name.to_owned(), (generation.clone(), looked));
+            new = true;
+        }
         let (seen, again, started) = match followed.remove(name) {
             Some(f) if f.job.watch == job.watch => (f.seen, f.again, f.started),
-            _ => (job.watch.as_deref().and_then(look), false, None),
+            _ => {
+                let seen = job.watch.as_deref().and_then(look);
+                // Changed (written, or its metadata) after the definition.
+                let after = |(_, _, m, mn, c, cn, _): (u64, u64, i64, i64, i64, i64, u64)| {
+                    (m, mn).max((c, cn)) > (meta.mtime(), meta.mtime_nsec())
+                };
+                (seen, !known && seen.is_some_and(after), None)
+            }
         };
         followed.insert(
             name.to_owned(),
@@ -590,6 +627,7 @@ fn read_jobs(
         );
     }
     followed.retain(|name, _| there.contains(name));
+    new
 }
 
 /// Whether a trigger's queue holds an ask, or one a fire took and was cut
@@ -708,7 +746,7 @@ fn orphaned() -> bool {
 /// its generation, kept across restarts of the scheduler: a time missed
 /// while none ran comes once when one runs.
 fn read_looked(places: &Places) -> HashMap<String, (String, i64)> {
-    std::fs::read(places.state.join(".looked"))
+    std::fs::read(places.looked())
         .ok()
         .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
         .and_then(|value| {
@@ -737,7 +775,7 @@ fn write_looked(places: &Places, kept: &HashMap<String, (String, i64)>) {
         })
         .collect();
     let written = trigger::replace_mode(
-        &places.state.join(".looked"),
+        &places.looked(),
         serde_json::Value::Object(value).to_string().as_bytes(),
         0o600,
     );
@@ -849,8 +887,9 @@ impl Doorbell {
     }
 }
 
-/// The first calendar time after `after`, within a year and a day; none for
-/// no entries. A field an entry leaves out is any value, as launchd reads
+/// The first calendar time after `after`, within eight years and a day,
+/// which holds a 29 February past a century that has none; none for no
+/// entries. A field an entry leaves out is any value, as launchd reads
 /// it; weekday 0 and 7 are Sunday.
 pub fn next_after(entries: &[Entry], after: i64) -> Option<i64> {
     if entries.is_empty() {
@@ -859,7 +898,7 @@ pub fn next_after(entries: &[Entry], after: i64) -> Option<i64> {
     let first = after - after.rem_euclid(60) + 60;
     let start = trigger::local(first);
     let day0 = days_from_civil(start.year, start.month, start.day);
-    for offset in 0..=367 {
+    for offset in 0..=(8 * 366 + 1) {
         let (year, month, day) = civil_from_days(day0 + offset);
         // 1970-01-01 was a Thursday.
         let weekday = (day0 + offset + 4).rem_euclid(7) as u8;
@@ -984,6 +1023,66 @@ mod tests {
             Some(clock(2026, 12, 25, 7, 30))
         );
         assert_eq!(next_after(&[], 0), None);
+        // Sparse, beyond a year: the next 29 February.
+        let leap = trigger::cron("0 0 29 2 *").unwrap();
+        assert_eq!(
+            next_after(&leap.entries, clock(2026, 10, 31, 12, 0)),
+            Some(clock(2028, 2, 29, 0, 0))
+        );
+    }
+
+    #[test]
+    fn a_write_between_adding_and_the_first_read_fires_once() {
+        let root =
+            std::env::temp_dir().join(format!("agent-scheduler-watch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let places = Places::under(&root);
+        std::fs::create_dir_all(&places.jobs).unwrap();
+        let watched = root.join("notes.md");
+        std::fs::write(&watched, "before\n").unwrap();
+        let program: Vec<String> = [
+            "/A/sonny",
+            "--trigger-fire",
+            "--name",
+            "w",
+            "--bot",
+            "w",
+            "--bot-id",
+            "1",
+            "--generation",
+            "g1",
+            "--when",
+            "file",
+            "--store",
+            "/s",
+            "--store-id",
+            "x",
+            "--",
+            "hi",
+        ]
+        .map(String::from)
+        .to_vec();
+        let text = serde_json::json!({"program": program, "watch": watched}).to_string();
+        let define = || std::fs::write(places.job("w"), &text).unwrap();
+        let (mut followed, mut kept) = (HashMap::new(), HashMap::new());
+        // Written before the trigger was added: nothing to fire for.
+        std::thread::sleep(Duration::from_millis(20));
+        define();
+        assert!(read_jobs(&places, &mut followed, &mut kept));
+        assert!(!followed["w"].again);
+        assert_eq!(kept["w"].0, "g1");
+        // Written after it was added, before the scheduler first read it.
+        followed.clear();
+        kept.clear();
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(&watched, "after\n").unwrap();
+        assert!(read_jobs(&places, &mut followed, &mut kept));
+        assert!(followed["w"].again);
+        // One it kept already, as after the scheduler restarts: no fire.
+        followed.clear();
+        assert!(!read_jobs(&places, &mut followed, &mut kept));
+        assert!(!followed["w"].again);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

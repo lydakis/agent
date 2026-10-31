@@ -155,8 +155,14 @@ impl Places {
     pub(crate) fn scheduling(&self) -> PathBuf {
         self.locks().join("scheduler")
     }
+    /// Up to when the scheduler looked at each trigger's calendar.
+    pub(crate) fn looked(&self) -> PathBuf {
+        self.locks().join("looked")
+    }
+    /// The scheduler's own folder, which [`finish`] leaves, so neither a
+    /// lock nor a write of its own under way is taken from it.
     fn locks(&self) -> PathBuf {
-        self.state.join(".locks")
+        self.state.join(".scheduler")
     }
 }
 
@@ -1949,8 +1955,9 @@ fn stored(file: &Path) -> bool {
 }
 
 /// The scheduler's own files in the triggers' folder, which [`finish`]
-/// leaves: its doorbell and what it keeps across its restarts.
-pub(crate) const SCHEDULER_FILES: [&str; 3] = [".ring", ".looked", ".locks"];
+/// leaves: its doorbell, and the folder of its locks and what it keeps
+/// across its restarts, where its writes are.
+pub(crate) const SCHEDULER_FILES: [&str; 2] = [".ring", ".scheduler"];
 
 /// At Sonny's start, under the lock, finish what was cut short: a write
 /// that died before its rename, whose temporary nothing else would remove,
@@ -2245,10 +2252,17 @@ pub fn at_start() {
     };
     std::thread::spawn(move || {
         finish(&places);
-        if let Some(home) = std::env::var_os("HOME") {
-            let scheduler = Scheduler::here();
-            let let_go = |dir: &Path, label: &str| crate::scheduler::let_go(scheduler, dir, label);
-            migrate(&places, Path::new(&home), scheduler, &ring, &let_go);
+        if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+            let record = home.join(".agent/sonny/migrated");
+            crate::upgrade::once(&record, "scheduler-job", || {
+                let scheduler = Scheduler::here();
+                let let_go =
+                    |dir: &Path, label: &str| crate::scheduler::let_go(scheduler, dir, label);
+                let moved = migrate(&places, &home, scheduler, &ring, &let_go);
+                crate::scheduler::retire_old(crate::boot::OLD_LABEL);
+                crate::scheduler::retire_old(crate::home::OLD_LABEL);
+                moved
+            });
         }
         refresh(&places, &sonny);
         crate::scheduler::at_start();
@@ -2263,13 +2277,15 @@ pub fn at_start() {
 /// HOMEs share, and another HOME's trigger is that HOME's to move, at its
 /// own Sonny's start. One that cannot be read is left as it is. `let_go`
 /// asks the system to let go of an old job, given its folder and label.
+/// Whether every one this HOME's start could move moved: one that failed is
+/// tried again at the next start.
 pub fn migrate(
     places: &Places,
     home: &Path,
     scheduler: Scheduler,
     ring: Ring,
     let_go: &dyn Fn(&Path, &str),
-) {
+) -> bool {
     let dir = scheduler.jobs(home);
     let tag = home_tag(home.as_os_str());
     let suffix = scheduler.suffix();
@@ -2289,16 +2305,20 @@ pub fn migrate(
             Some((format!("{LABEL}{rest}"), name.to_owned()))
         })
         .collect();
-    let mut moved = false;
+    let (mut moved, mut all) = (false, true);
     for (label, name) in old {
         match migrated(places, home, scheduler, &dir, &label, &name, let_go) {
             Ok(done) => moved |= done,
-            Err(error) => eprintln!("{}", error_json(&error)),
+            Err(error) => {
+                all = false;
+                eprintln!("{}", error_json(&error));
+            }
         }
     }
     if moved && let Err(error) = ring() {
         eprintln!("{}", error_json(&error));
     }
+    all
 }
 
 /// Whether a label, past [`LABEL`], starts with a HOME's tag.
@@ -5688,13 +5708,13 @@ mod tests {
         let let_go = std::cell::RefCell::new(Vec::new());
         let record =
             |at: &Path, label: &str| let_go.borrow_mut().push((at.to_owned(), label.to_owned()));
-        migrate(
+        assert!(migrate(
             &w.places,
             &home,
             Scheduler::Launchd,
             &|| w.fake.ring(),
             &record,
-        );
+        ));
         assert!(!old.exists() && !untagged.exists());
         assert_eq!(std::fs::read_to_string(&elsewhere).unwrap(), other);
         assert!(tagged_other.exists() && !w.places.job("theirs").exists());
@@ -5719,13 +5739,13 @@ mod tests {
         assert!(w.places.asks(&s.name).is_dir());
         assert_eq!(w.rows().len(), 2);
         // Once: nothing is left to move.
-        migrate(
+        assert!(migrate(
             &w.places,
             &home,
             Scheduler::Launchd,
             &|| w.fake.ring(),
             &record,
-        );
+        ));
         assert_eq!(w.fake.rings.get(), 1);
         assert_eq!(let_go.borrow().len(), 2);
     }
@@ -5764,13 +5784,13 @@ mod tests {
             ),
         )
         .unwrap();
-        migrate(
+        assert!(migrate(
             &w.places,
             &home,
             Scheduler::Systemd,
             &|| w.fake.ring(),
             &|_, _| {},
-        );
+        ));
         assert!(!old.exists() && !older.exists());
         assert_eq!(w.plist("kept"), before);
         assert_eq!(read_job(&w.plist(&s.name)).unwrap().0, s);

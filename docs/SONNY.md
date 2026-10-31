@@ -274,24 +274,28 @@ launchd keeps one domain per user and systemd one user manager, whatever
 HOME is, so a test's or an eval's HOME has a job of its own beside the
 user's, and never reaches the user's triggers. The first trigger, the
 backup's setup (`/home`) and `start_at_boot` write the job when it is not
-there, or when it runs a Sonny that is no longer there; a ring that finds no
-scheduler running starts it.
+there, or when it runs another Sonny than this one (Sonny's start checks,
+for an install that keeps each version in a folder of its own); a ring
+that finds no scheduler running starts it.
 
 The job runs `sonny scheduler`. It reads the definitions in
 `~/.agent/triggers/jobs` when that folder changes, and runs a trigger's
 fire when one of its calendar times comes (once for any number missed while
 the machine slept or the scheduler was not running: it keeps when it last
-looked at each trigger in `~/.agent/triggers/.looked`), when the path it
-watches changes, and while its queue holds an ask. One fire of a trigger
+looked at each trigger in `~/.agent/triggers/.scheduler/looked`), when the path it
+watches changes (a write after the trigger was added and before the
+scheduler first read it included), and while its queue holds an ask. One fire of a trigger
 runs at a time, also across a restart of the scheduler: a fire holds a lock
-on its own file in `~/.agent/triggers/.locks` while it runs, which a daemon
+on its own file in `~/.agent/triggers/.scheduler` while it runs, which a daemon
 it starts does not inherit. A ring of its doorbell, the FIFO `~/.agent/triggers/.ring`, has it
 look again at once, and so does a fire that ends; else it sleeps until the
 next calendar time, and at most a minute, and looks at watched paths every
 two seconds. A lock of its own there keeps one scheduler per HOME. It also
 runs what Sonny once gave the system jobs of their own for: the daemon at
 its start when `start_at_boot` is on, and the backup's sync every ten
-minutes while `~/agent-home` is a repository. When Sonny is upgraded in
+minutes once setup ran its first (a clone put in `~/agent-home` by hand
+is not set up: a sync from it would push this machine's home over the one
+it holds). When Sonny is upgraded in
 place it runs the new Sonny in its stead; when its HOME is gone (a test's
 HOME deleted with its scheduler running) it lets its own job go and ends.
 A fire whose HOME is gone sends nothing.
@@ -307,7 +311,8 @@ LaunchAgents do; for triggers to fire while you are logged out,
 `systemd/private` in `XDG_RUNTIME_DIR`, or in `/run/user/UID` when that is
 unset), `add` refuses with `triggers_unsupported`.
 
-Sonny's start moves what an earlier Sonny gave the system: each trigger
+Sonny's start moves what an earlier Sonny gave the system, once (an
+`upgrade::once` migration, retired at 0.10.0): each trigger
 that was a LaunchAgent or a user service of its own
 (`me.lydakis.agent.trigger.TAG.NAME`, or `me.lydakis.agent.trigger.NAME`
 from before tags, when it runs with this HOME) becomes its definition, at

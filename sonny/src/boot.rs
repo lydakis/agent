@@ -10,7 +10,7 @@ use std::path::Path;
 
 /// The job each setting had of its own before the scheduler ran it, which
 /// Sonny's start lets go of.
-const OLD_LABEL: &str = "me.lydakis.agent.boot";
+pub(crate) const OLD_LABEL: &str = "me.lydakis.agent.boot";
 
 /// Whether the setting is on, as config.toml says now.
 pub fn on() -> bool {
@@ -60,7 +60,6 @@ pub fn apply(on: bool) -> Result<String, String> {
 /// and the scheduler running while the setting is on.
 pub fn at_start() {
     std::thread::spawn(|| {
-        crate::scheduler::retire_old(OLD_LABEL);
         if on()
             && let Err(error) = crate::scheduler::ring()
         {
