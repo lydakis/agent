@@ -625,6 +625,16 @@ impl View {
             match feed {
                 // A replay seats who was here once its tape is in.
                 Feed::Roll(bots) if let Some(replay) = &mut self.replay => {
+                    // The listing's model is each agent's model now, which
+                    // no event says again: an agent made in the replay
+                    // takes it too, from the roll read once the tape is in.
+                    for bot in &bots {
+                        if let (Some(name), Some(model)) =
+                            (bot["name"].as_str(), bot["model"].as_str())
+                        {
+                            replay.remodel(name, model);
+                        }
+                    }
                     replay.cast = bots;
                 }
                 Feed::Tape(event) => {
@@ -3770,6 +3780,21 @@ mod tests {
         replay.remodel("b", "m3");
         assert_eq!(replay.cast[0]["model"], "m2");
         assert_eq!(replay.tape[0]["data"]["model"], "m3");
+    }
+
+    #[tokio::test]
+    async fn a_replay_takes_the_listing_s_model_for_an_agent_it_saw_made() {
+        let (mut view, send) = view();
+        view.replay = Some(Replay::new(0));
+        send.send(Feed::Tape(
+            json!({"event": "created", "bot": "b", "written_ms": 1, "data": {"model": "m1"}}),
+        ))
+        .unwrap();
+        send.send(Feed::Roll(vec![json!({"name": "b", "model": "m2"})]))
+            .unwrap();
+        view.drain();
+        let replay = view.replay.as_ref().unwrap();
+        assert_eq!(replay.tape[0]["data"]["model"], "m2");
     }
 
     #[tokio::test]
