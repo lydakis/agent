@@ -473,7 +473,8 @@ impl Finished {
 }
 
 /// The provider as a bot's settings shape its calls: its output bound,
-/// cache lifetime and keep-warm. The bot's defaults borrow it unchanged.
+/// cache lifetime, keep-warm and speed. The bot's defaults borrow it
+/// unchanged.
 pub fn shaped<'p>(
     provider: &'p Provider,
     settings: &Settings,
@@ -482,6 +483,22 @@ pub fn shaped<'p>(
         settings.max_output_tokens,
         settings.keep_warm(),
         settings.cache_hour(),
+        settings.speed(),
+    )
+}
+
+/// The provider as the bot's settings shape a call on another model than
+/// its own, a summarizer or a fallback: at standard speed, which every
+/// model takes.
+fn shaped_other<'p>(
+    provider: &'p Provider,
+    settings: &Settings,
+) -> Result<std::borrow::Cow<'p, Provider>> {
+    provider.shaped(
+        settings.max_output_tokens,
+        settings.keep_warm(),
+        settings.cache_hour(),
+        None,
     )
 }
 
@@ -1210,7 +1227,10 @@ impl Turn {
         }
         let reference = summarizer(record);
         let (name, model) = split_model(&reference).ok()?;
-        let provider = shaped(self.providers.get(name)?, self.settings()).ok()?;
+        let provider = match record.compaction_model {
+            None => shaped(self.providers.get(name)?, self.settings()).ok()?,
+            Some(_) => shaped_other(self.providers.get(name)?, self.settings()).ok()?,
+        };
         let output = provider.output_byte_estimate(model)? / 4;
         let input = view
             + tools.get().len()
@@ -1389,7 +1409,11 @@ impl Turn {
         // another since.
         let summarizer = match self.providers.get(name) {
             Some(provider) if provider.family() == record.family()? => {
-                shaped(provider, self.settings())?
+                match record.compaction_model {
+                    // The bot's own model, whose cache a summary reads.
+                    None => shaped(provider, self.settings())?,
+                    Some(_) => shaped_other(provider, self.settings())?,
+                }
             }
             found => {
                 let (error, detail) = match found {
@@ -2761,7 +2785,7 @@ impl Turn {
             return Ok(None);
         }
         Ok(Some(Fallback {
-            provider: Arc::new(shaped(known, self.settings())?.into_owned()),
+            provider: Arc::new(shaped_other(known, self.settings())?.into_owned()),
             name: name.to_owned(),
             model: model.to_owned(),
             credit: None,
