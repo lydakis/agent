@@ -860,7 +860,8 @@ impl Service {
                     {
                         self.in_flight.retain(|(bot, _), _| bot != name);
                         self.records.remove(name);
-                        if self.lookouts.remove(name).is_some() {
+                        if let Some(lookout) = self.lookouts.remove(name) {
+                            lookout.unheld();
                             self.index();
                         }
                     }
@@ -1341,8 +1342,10 @@ impl Service {
         };
         // Another bot took the name while no one watched: what was held
         // for the last one is no one's.
-        if (self.lookouts.get(lead)).is_some_and(|had| replaced(&had.record, record)) {
-            self.lookouts.remove(lead);
+        if (self.lookouts.get(lead)).is_some_and(|had| replaced(&had.record, record))
+            && let Some(had) = self.lookouts.remove(lead)
+        {
+            had.unheld();
         }
         if self.lookouts.contains_key(lead) {
             return true;
@@ -1400,8 +1403,15 @@ impl Service {
     /// bots are listed afresh.
     fn resubscribe(&mut self, all: bool) {
         let subscribers = &self.subscribers;
-        self.lookouts
-            .retain(|name, _| subscribers.contains_key(name));
+        // One no longer subscribed to anything drops what waited for it,
+        // so subscribing again does not bring it back.
+        self.lookouts.retain(|name, lookout| {
+            let kept = subscribers.contains_key(name);
+            if !kept {
+                lookout.unheld();
+            }
+            kept
+        });
         for (name, lookout) in self.lookouts.iter_mut() {
             lookout.updates.subscribed(others(name, subscribers));
             let subs = subscribers.get(name).cloned().unwrap_or_default();
@@ -2354,6 +2364,14 @@ impl Lookout {
         let _ = agent_client::files::replace_mode(path, body.to_string().as_bytes(), 0o600);
     }
 
+    /// The subscriber is gone or subscribed to nothing: what waited for it
+    /// is no one's.
+    fn unheld(&self) {
+        if let Some(path) = &self.held {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
     /// What a lookout of this subscriber kept untold before, read back once
     /// it is watched again; one kept for another bot of its name is dropped.
     fn restore(&mut self, path: PathBuf) {
@@ -3227,10 +3245,15 @@ mod tests {
                 .others
                 .contains_key("calc.lead")
         );
-        // A lead is no different: without its file, nothing is watched for it.
+        // A lead is no different: without its file, nothing is watched for
+        // it, and what waited for it goes.
+        let held = std::env::temp_dir().join(format!("sonny-unheld-{}.json", std::process::id()));
+        std::fs::write(&held, "{}").unwrap();
+        service.lookouts.get_mut("calc.lead").unwrap().held = Some(held.clone());
         service.subscribers.clear();
         service.resubscribe(true);
         assert!(service.lookouts.is_empty());
+        assert!(!held.exists());
     }
 
     #[test]
