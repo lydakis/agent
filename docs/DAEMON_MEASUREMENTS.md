@@ -6154,6 +6154,6 @@ GitHub runner (2026-10-31):
 | lifecycle | p95 turn, ms | 574.506 | 574.659 | +0.0% |
 | lifecycle | peak RSS, MiB | 25.727 | 25.377 | -1.4% |
 
-Store jobs per turn did not change (about 7.5 on both), the completion
-burst's finish jobs ran 3 ms per 32 on both, and nothing passed the gate's
-15% in the direction that costs.
+Store jobs per turn did not change (about 7.5 on both), the head's 32
+finishes in each completion burst ran 3 ms in all, and nothing passed the
+gate's 15% in the direction that costs.
