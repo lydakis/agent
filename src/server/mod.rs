@@ -578,9 +578,10 @@ enum Command {
         #[serde(default)]
         active: bool,
     },
-    /// Stop the daemon. With `grace_ms`, running turns first get up to that
-    /// long to finish while nothing new starts; whatever still runs is then
-    /// cancelled with `daemon_shutdown`.
+    /// Stop the daemon. With `grace_ms`, it first drains for up to that
+    /// long: nothing starts, and each running turn parks at its next
+    /// boundary. Whatever still runs at exit parks, its unanswered calls
+    /// answered `daemon_shutdown`; the next start continues it.
     Shutdown {
         #[serde(default)]
         grace_ms: u64,
@@ -1117,9 +1118,10 @@ struct Service {
     wakes: Wakes,
     /// The newest steer each parked turn has been woken for.
     steer_wakes: HashMap<i64, i64>,
-    /// Shutting down with a grace period: running turns go on, no turn
-    /// starts, and accepted submissions wait durably for the next start.
-    draining: bool,
+    /// Shutting down with a grace period: no turn starts, each running turn
+    /// parks at its next boundary, and accepted submissions wait durably
+    /// for the next start. Every turn task reads it.
+    draining: Arc<std::sync::atomic::AtomicBool>,
     /// The pause that holds, as the store keeps it: no turn starts and
     /// accepted submissions wait for `resume`.
     paused: Option<Value>,
@@ -1629,7 +1631,7 @@ pub async fn run(config: Configuration) -> Result<()> {
         tokens: Arc::default(),
         wakes,
         steer_wakes,
-        draining: false,
+        draining: Arc::default(),
         paused,
         notices: Vec::new(),
         admissions: std::collections::VecDeque::with_capacity(ADMISSION_WINDOW),
@@ -1657,7 +1659,7 @@ pub async fn run(config: Configuration) -> Result<()> {
     // the stdio owner's output is what failed.
     let served: Result<()> = async {
         loop {
-            if service.draining && service.active.is_empty() {
+            if service.draining() && service.active.is_empty() {
                 break;
             }
             // Computed before the select so its arms borrow the service freely.
@@ -1704,7 +1706,7 @@ pub async fn run(config: Configuration) -> Result<()> {
                 }
                 // Idle bots whose time ran out are deleted, here and not on a
                 // client's request, so a client that stopped leaves none.
-                _ = tokio::time::sleep_until(expiry.unwrap_or_else(tokio::time::Instant::now)), if expiry.is_some() && !service.draining => {
+                _ = tokio::time::sleep_until(expiry.unwrap_or_else(tokio::time::Instant::now)), if expiry.is_some() && !service.draining() => {
                     service.expire().await?;
                 }
                 // A parked turn's time comes due (a pool reopens, a gate lapses,
@@ -1863,7 +1865,7 @@ pub async fn run(config: Configuration) -> Result<()> {
                                 // A later shutdown can only bring the deadline closer.
                                 let until = tokio::time::Instant::now() + Duration::from_millis(grace_ms);
                                 drain_until = Some(drain_until.map_or(until, |current| current.min(until)));
-                                service.draining = true;
+                                service.draining.store(true, std::sync::atomic::Ordering::Relaxed);
                                 if grace_ms == 0 || service.active.is_empty() {
                                     // The socket writer is a task on this runtime. Give
                                     // it time to acknowledge shutdown before exiting.
@@ -1898,8 +1900,13 @@ pub async fn run(config: Configuration) -> Result<()> {
     answer_observed(&mut service, &mut sessions, stdio_owner).await;
     // Release every slot as it is cancelled: a turn interrupted earlier keeps
     // its first cause, and its dropped sender still stops a finish retry.
+    // A planned stop parks each running turn for the next start; a fatal
+    // error ends it, as a crash would, so a failing daemon never brings a
+    // turn back on its own.
+    let planned = served.is_ok();
+    let cause = if planned { turn::SHUTDOWN } else { turn::DIED };
     for active in std::mem::take(&mut service.active).into_values() {
-        active.cancel(turn::SHUTDOWN);
+        active.cancel(cause);
     }
     // A completion that could not commit leaves its turn for the next start
     // to end as interrupted; the rest still drain, and the exit reports it.
@@ -1936,6 +1943,11 @@ pub async fn run(config: Configuration) -> Result<()> {
         let _ = publisher.await;
     }
     drop(firehose_hub);
+    // After a planned stop a wait still open gets its answer, the turns it
+    // waits on shown as they stand: parked ones go on only at the next start.
+    if planned {
+        handles.expire_requests();
+    }
     let mut reads = handles.shutdown();
     // Socket writers need runtime time to flush terminal events and wait
     // results. Drain concurrently under one deadline, so slow clients cannot
@@ -2225,6 +2237,9 @@ impl Service {
             None => Ok(()),
         }
     }
+    fn draining(&self) -> bool {
+        self.draining.load(std::sync::atomic::Ordering::Relaxed)
+    }
     fn has_capacity(&self) -> bool {
         self.held().is_none()
             && (self.limit_active == 0 || self.active.len() + self.reserved < self.limit_active)
@@ -2233,7 +2248,7 @@ impl Service {
     /// Why no turn may start, if none may: the daemon is shutting down or
     /// paused.
     fn held(&self) -> Option<&'static str> {
-        if self.draining {
+        if self.draining() {
             Some("daemon_draining")
         } else if self.paused.is_some() {
             Some(turn::PAUSED)
@@ -2823,6 +2838,7 @@ impl Service {
             tokens: self.tokens.clone(),
             read_results: Default::default(),
             side: Default::default(),
+            stopping: self.draining.clone(),
         };
         self.jobs.spawn(async move {
             let (bot, id) = (task.bot.clone(), task.turn);
@@ -3593,7 +3609,7 @@ impl Service {
                     "store": store.stats(),
                     "tokens": self.tokens.snapshot(),
                     "handles": {"waiters": waiters, "retained": retained},
-                    "draining": self.draining,
+                    "draining": self.draining(),
                     "paused": self.paused,
                 }))
             }
@@ -4517,7 +4533,8 @@ fn delivered(hub: &Hub, events: &Unpublished) -> bool {
 }
 
 /// Answer the admissions still queued at shutdown and start their turns, so
-/// shutdown ends those turns like any other running turn. A stdio owner that
+/// shutdown parks those turns like any other running turn (or, on a fatal
+/// error, ends them). A stdio owner that
 /// cannot take a reply within its timeout gets no more: the rest settle
 /// without waiting on it again.
 async fn answer_queued(
@@ -5102,7 +5119,7 @@ mod tests {
             tokens: Arc::default(),
             wakes: Wakes::default(),
             steer_wakes: HashMap::new(),
-            draining: false,
+            draining: Arc::default(),
             paused: None,
             notices: Vec::new(),
             admissions: std::collections::VecDeque::new(),
@@ -5304,7 +5321,7 @@ mod tests {
             tokens: Arc::default(),
             wakes: Wakes::default(),
             steer_wakes: HashMap::new(),
-            draining: false,
+            draining: Arc::default(),
             paused: None,
             notices: Vec::new(),
             admissions: std::collections::VecDeque::new(),
@@ -5526,7 +5543,7 @@ mod tests {
             tokens: Arc::default(),
             wakes: Wakes::default(),
             steer_wakes: HashMap::new(),
-            draining: false,
+            draining: Arc::default(),
             paused: None,
             notices: Vec::new(),
             admissions: std::collections::VecDeque::new(),
@@ -5756,7 +5773,7 @@ mod tests {
             tokens: Arc::default(),
             wakes: Wakes::default(),
             steer_wakes: HashMap::new(),
-            draining: false,
+            draining: Arc::default(),
             paused: None,
             notices: Vec::new(),
             admissions: std::collections::VecDeque::new(),

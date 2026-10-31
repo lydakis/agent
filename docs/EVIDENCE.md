@@ -306,10 +306,11 @@ Reconnects, retention, overload, compaction and recovery.
   and shell turns in 712 ms with their processes gone. Restart is ready in
   25.6 and 29.0 ms on stores of 1 and 9.6 GB, and in 154 ms with 10,000 bots.
   [Record](DAEMON_MEASUREMENTS.md#mass-interrupt).
-- **Shutdown.** A graceful drain lets running turns finish for a set time.
+- **Shutdown.** A graceful drain starts nothing and parks running turns at
+  their next boundary, within a set time; the next start continues them.
   Admissions still waiting on their commit when a `shutdown` request or
-  SIGTERM arrives are answered, and their turns end `interrupted` with
-  `daemon_shutdown`. Behavior and tests only, not measured. Harbor trials end
+  SIGTERM arrives are answered, and their turns park and continue at the next
+  start. Behavior and tests only, not measured. Harbor trials end
   at their timeout within about half a second.
 - **Compaction.** Long conversations of many turns are compacted with the
   original history kept. On luna, the evaluation's final file and every

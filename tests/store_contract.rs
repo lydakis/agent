@@ -4,8 +4,8 @@ use agent_runtime::{
     provider::{ToolCall, Usage},
     store::{
         Answered, Binding, Bot, CacheTtl, CompactionPlan, ContextUsage, Database, Decision,
-        Delivery, Fork, Gate, Gated, Planning, QuoteRef, Settings, Strip, TurnBudget, TurnOptions,
-        Wake,
+        Delivery, Fork, Gate, Gated, Halt, Planning, QuoteRef, Settings, Strip, TurnBudget,
+        TurnOptions, Wake,
     },
     tools::{Declared, Inherit, Outcome},
 };
@@ -9564,6 +9564,59 @@ fn a_store_from_before_skip_pointers_places_every_node() {
         .unwrap();
     let db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
     assert_eq!((lineage(), pages(&db)), before);
+    drop(db);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn a_turn_parked_by_a_stop_continues_and_one_a_pull_parked_before_74_keeps_its_pause() {
+    let path = std::env::temp_dir().join(format!("agent-halt-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let turn = db
+        .begin(
+            "Bob",
+            "first",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    db.suspend_halted(turn, Halt::Shutdown, 0, 0, 0, None)
+        .unwrap();
+    // A stop leaves no deadline: the next start wakes it at once.
+    let parked = db.waiting_turns().unwrap();
+    assert_eq!(
+        (parked.len(), parked[0].halt, parked[0].deadline_ms),
+        (1, Some(Halt::Shutdown), None)
+    );
+    assert_eq!(
+        db.turn_view("Bob", turn).unwrap()["waiting_on"],
+        json!({"resume_at_ms":null,"stopped":true})
+    );
+    drop(db);
+    // As schema 73 wrote a pull's park.
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            "UPDATE turns SET waiting=json_set(json_remove(waiting,'$.halt'),'$.pulled',json('true'));
+             PRAGMA user_version=73;",
+        )
+        .unwrap();
+    let db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    assert_eq!(db.waiting_turns().unwrap()[0].halt, Some(Halt::Pause));
+    assert_eq!(
+        db.turn_view("Bob", turn).unwrap()["waiting_on"],
+        json!({"resume_at_ms":null,"paused":true})
+    );
+    let raw: String = Connection::open(&path)
+        .unwrap()
+        .query_row("SELECT waiting FROM turns WHERE id=?", [turn], |r| r.get(0))
+        .unwrap();
+    assert!(!raw.contains("pulled"), "{raw}");
     drop(db);
     std::fs::remove_file(path).unwrap();
 }

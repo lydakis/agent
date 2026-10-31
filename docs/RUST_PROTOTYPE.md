@@ -1041,21 +1041,43 @@ start a second daemon for the same socket: they refuse a newer one, and
 replace an older one once its running turns end (docs/CLI.md).
 
 `agent shutdown` returns once the daemon process has exited, so a caller may
-copy or reopen the store: the daemon answers the request first, then cancels
-active turns, commits their records and closes the database. The `ready` line
+copy or reopen the store: the daemon answers the request first, then parks
+running turns, commits their records and closes the database. The `ready` line
 carries the daemon's `pid` for this. The command fails with
 `daemon_shutdown_timeout` after 30 seconds.
 
 `shutdown` takes an optional `grace_ms`, up to 86,400,000. With it the daemon
-answers, then drains: running turns go on for up to that long and no turn
-starts. A `reject` submission answers `daemon_draining`; `queue` and `steer`
+answers, then drains: no turn starts, and each running turn starts no further
+model call or tool call. A turn whose model is answering finishes when that
+answer ends it; otherwise it parks at its next boundary, once the model's
+answer and every call already running have committed. Calls the answer made
+that had not started are answered `daemon_shutdown`, saying they did not run.
+A `reject` submission answers `daemon_draining`; `queue` and `steer`
 submissions are recorded as usual, and queued work starts on the next daemon
 start. Parked and paced turns stay parked, as on any shutdown. `stats` reports
 `draining: true`. The daemon exits when no turn is running or the deadline
 passes, whichever comes first. A later `shutdown` can only bring the deadline
-closer; SIGTERM and SIGINT still exit at once. Turns still running at exit are
-cancelled like any others at shutdown. `agent shutdown --grace DURATION` sends
+closer; SIGTERM and SIGINT still exit at once. `agent shutdown --grace DURATION` sends
 it and waits that much longer than 30 seconds.
+
+Whatever still runs when the daemon exits (the deadline passed, no grace was
+given, or a signal came) parks as a pull parks it, and the next start
+continues it, as capacity allows and with no `resume`: `turn_paced` says
+`{"resume_at_ms": null, "stopped": true}`, and so does the turn view's
+`waiting_on`. The reply it was writing is dropped and asked for again then.
+Each call it had not answered gets `{error: "daemon_shutdown", detail}`,
+saying the stop cut it off before its result was recorded (it may have had
+effects) or came before it ran, and none is run again. The time the daemon
+was down is not counted in `paced_ms`. A client's `wait` still open is
+answered as its deadline would answer it, the parked turn reported pending
+as it stands. Background commands and terminals end with the daemon as
+before. Only a planned stop parks: a daemon that exits on a fatal error ends
+its running turns `interrupted` with `process_interrupted`, as a crash would,
+and leaves its waits unanswered. A park says which halt held it in the
+turn's `waiting` record (`halt`: `pause` or `shutdown`); schema 74 moves a
+pull's park from its own flag to that. Protocol 36 parks turns on a stop; before it, they ended
+`interrupted` with `daemon_shutdown`. A daemon older than 36 still ends them
+that way when an upgrade replaces it.
 
 Protocol 24 also adds the pull cord: `pause` stops every agent until
 `resume`, and holds across restarts, since the store keeps it (schema 64;
@@ -1890,10 +1912,13 @@ named bot, and no external request or tool is automatically repeated. Existing
 queued work remains eligible to start. Explicitly stopped turns stay stopped.
 
 An interrupted turn's `turn_finished` error names the cause, so a client can
-decide whether to resubmit: `cancelled` for a client's `interrupt`,
-`daemon_shutdown` when the daemon shut down around it (`shutdown` or a
-signal), and `process_interrupted` when the daemon died with it running and the
-next open ended it. The daemon never continues such a turn on its own.
+decide whether to resubmit: `cancelled` for a client's `interrupt`
+and `process_interrupted` when the daemon died with it running and the next
+open ended it, or stopped on a fatal error, such as a store that refuses
+writes, and ended it on the way out. The daemon never continues such a turn on its own. A turn the
+daemon was asked to stop around (`shutdown` or a signal) is not interrupted:
+it parks as a pause parks it, each call still open answered `daemon_shutdown`,
+and continues at the next start; the time down is not pacing.
 
 `inspect` reports the identity's state and changes nothing; no operation
 automatically continues an interrupted network request. A new submission is an

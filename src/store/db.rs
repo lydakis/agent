@@ -836,10 +836,11 @@ pub struct Waiting {
     /// pool resumes there.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback: Option<ParkedFallback>,
-    /// Parked by the pull cord, not a closed pool: it waits for `resume`,
-    /// and the pause is not charged as pacing.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub pulled: bool,
+    /// Parked by the pull cord, until `resume`, or by the daemon stopping,
+    /// until the next start, not by a closed pool: that time is not charged
+    /// as pacing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub halt: Option<Halt>,
 }
 /// A declined request's fallback model, as `provider/model`, and the credit
 /// its retry redeems.
@@ -865,7 +866,7 @@ pub struct CopiedCall {
 impl Waiting {
     fn paced_elapsed_ms(&self) -> i64 {
         self.paced_since_ms
-            .filter(|_| !self.pulled)
+            .filter(|_| self.halt.is_none())
             .map_or(0, |since| epoch_ms().saturating_sub(since).max(0))
     }
 }
@@ -1063,9 +1064,18 @@ impl ApprovalPage {
         Ok(true)
     }
 }
-/// What a pull did to a running turn.
+/// What parks a running turn that its own rounds did not: the pull cord,
+/// which holds it until `resume`, or the daemon stopping, which leaves it
+/// for the next start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Halt {
+    Pause,
+    Shutdown,
+}
+/// What a pull or a stop did to a running turn.
 #[derive(Debug)]
-pub enum Pulled {
+pub enum Halted {
     /// Parked it, with these entries.
     Parked(Vec<Value>),
     /// Found it parked already, by its own park that committed as the pull
@@ -1507,7 +1517,7 @@ const TURN_VIEW: &str = "t.id,t.bot,b.id,t.request_id,t.status,t.input_tokens,
     t.finished_ms,json_extract(t.waiting,'$.call_id'),json_extract(t.waiting,'$.approval'),
     json_extract(t.waiting,'$.handles'),json_extract(t.waiting,'$.any'),
     json_extract(t.waiting,'$.deadline_ms'),json_extract(t.waiting,'$.answer'),
-    json_extract(t.waiting,'$.pulled')";
+    json_extract(t.waiting,'$.halt')";
 /// Columns `TURN_VIEW` takes, for queries that select more after it.
 const TURN_VIEW_COLUMNS: usize = 20;
 
@@ -1552,10 +1562,11 @@ fn turn_view(r: &rusqlite::Row) -> rusqlite::Result<Value> {
             json!({"call_id":call_id,"handles":handles,"deadline_ms":deadline_ms,
                 "any":r.get::<_, Option<i64>>(16)? == Some(1)})
         }
-        "paced" if r.get::<_, Option<i64>>(19)? == Some(1) => {
-            json!({"resume_at_ms":null,"paused":true})
-        }
-        "paced" => json!({"resume_at_ms":deadline_ms}),
+        "paced" => match r.get::<_, Option<String>>(19)?.as_deref() {
+            Some("pause") => json!({"resume_at_ms":null,"paused":true}),
+            Some("shutdown") => json!({"resume_at_ms":null,"stopped":true}),
+            _ => json!({"resume_at_ms":deadline_ms}),
+        },
         _ => Value::Null,
     };
     Ok(json!({"bot":bot,"bot_id":r.get::<_, i64>(2)?,"turn":turn,
@@ -1741,7 +1752,7 @@ impl Database {
     /// Stored schema version, kept in `PRAGMA user_version`. Stores created
     /// before versioning and stores from newer binaries are rejected; an older
     /// versioned store is migrated forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 73;
+    pub const SCHEMA: i32 = 74;
     /// Verbatim user prompts a compaction keeps: per-prompt text, and the
     /// total text plus `(ordinal, String)` entry metadata. Empty entries cost
     /// space too, so the retained list cannot grow with conversation length.
@@ -6754,7 +6765,7 @@ impl Database {
             copied: None,
             summary_retry_ms,
             fallback: None,
-            pulled: false,
+            halt: None,
         };
         let tx = self.conn.savepoint()?;
         flush(&tx, turn, self.live.get(&turn))?;
@@ -6897,7 +6908,7 @@ impl Database {
             copied: None,
             summary_retry_ms,
             fallback: None,
-            pulled: false,
+            halt: None,
         };
         let tx = self.conn.savepoint()?;
         flush(&tx, turn, self.live.get(&turn))?;
@@ -8587,7 +8598,7 @@ impl Database {
             copied: None,
             summary_retry_ms,
             fallback: None,
-            pulled: false,
+            halt: None,
         };
         let tx = self.conn.savepoint()?;
         // A verdict for a later call of the round waits in the store.
@@ -8644,7 +8655,7 @@ impl Database {
             copied,
             summary_retry_ms,
             fallback,
-            pulled: false,
+            halt: None,
         };
         let tx = self.conn.savepoint()?;
         flush(&tx, turn, self.live.get(&turn))?;
@@ -8666,21 +8677,24 @@ impl Database {
         self.forget_live(turn);
         Ok(entry(cursor, &bot.name, Some(turn), "turn_paced", data))
     }
-    /// Park a running turn the pull cord stopped, until `resume`. It is
-    /// parked as a closed pool parks it, at a model-call boundary: each call
-    /// it had not answered gets a result saying the pause stopped it, or
-    /// came before it ran, and none is run again. The reply it was writing
+    /// Park a running turn the pull cord stopped, until `resume`, or one the
+    /// daemon stopping cut off, until the next start. It is parked as a
+    /// closed pool parks it, at a model-call boundary: each call it had not
+    /// answered gets a result saying the pause or the stop cut it off, or
+    /// came before it ran, and none is run again, as Codex answers the
+    /// calls an interrupt cut off. The reply it was writing
     /// is asked for again when it continues. A turn whose own park committed
     /// as the pull cancelled its task stays as it parked: its park comes
     /// back, with its next lapse, for the task to register its wake-ups.
-    pub fn suspend_pulled(
+    pub fn suspend_halted(
         &mut self,
         turn: i64,
+        stop: Halt,
         retries: u64,
         paced_ms: u64,
         summary_ms: u64,
         route: Option<&str>,
-    ) -> Result<Pulled> {
+    ) -> Result<Halted> {
         let bot = self.active(turn)?;
         match bot.status.as_str() {
             "running" => {}
@@ -8689,7 +8703,7 @@ impl Database {
                 let waiting = self
                     .waiting(turn)?
                     .ok_or(Error::new("invalid_tool_state"))?;
-                return Ok(Pulled::Already(Box::new(waiting), self.next_lapse(turn)?));
+                return Ok(Halted::Already(Box::new(waiting), self.next_lapse(turn)?));
             }
             _ => return fail("invalid_tool_state"),
         }
@@ -8701,9 +8715,13 @@ impl Database {
             .query_map([turn], |r| r.get(0))?
             .collect::<rusqlite::Result<_>>()?;
         // Why, who and when; not whose turns it parked.
-        let pause = self
-            .pause()?
-            .map(|p| json!({"reason":p["reason"],"by":p["by"],"at_ms":p["at_ms"]}));
+        let pause = match stop {
+            Halt::Pause => self
+                .pause()?
+                .map(|p| json!({"reason":p["reason"],"by":p["by"],"at_ms":p["at_ms"]})),
+            Halt::Shutdown => None,
+        };
+        // No deadline: the pause's `resume`, or the next start, wakes it.
         let waiting = Waiting {
             turn,
             bot: bot.name.clone(),
@@ -8724,20 +8742,23 @@ impl Database {
             copied: None,
             summary_retry_ms: None,
             fallback: None,
-            pulled: true,
+            halt: Some(stop),
         };
         let tx = self.conn.savepoint()?;
         flush(&tx, turn, self.live.get(&turn))?;
         let (head, mut entries) = close_unanswered(&tx, &bot, turn, bot.head, |executing| {
-            let detail = if executing {
-                "the pause stopped this call before its result was recorded; it may have had effects. It is not run again"
-            } else {
-                "the pause came before this call ran; it did not run"
+            let result = match (stop, executing) {
+                (Halt::Pause, true) => json!({"error":"daemon_paused","detail":
+                    "the pause stopped this call before its result was recorded; it may have had effects. It is not run again",
+                    "pause":pause}),
+                (Halt::Pause, false) => json!({"error":"daemon_paused","detail":
+                    "the pause came before this call ran; it did not run","pause":pause}),
+                (Halt::Shutdown, true) => json!({"error":"daemon_shutdown","detail":
+                    "the daemon stopped this call before its result was recorded; it may have had effects. It is not run again"}),
+                (Halt::Shutdown, false) => json!({"error":"daemon_shutdown","detail":
+                    "the daemon stopped before this call ran; it did not run"}),
             };
-            (
-                json!({"error":"daemon_paused","detail":detail,"pause":pause}),
-                false,
-            )
+            (result, false)
         })?;
         if head != bot.head {
             // Every call of the round is answered, so the round is closed.
@@ -8760,8 +8781,12 @@ impl Database {
                 })?
                 .collect::<rusqlite::Result<_>>()?;
             for (approval, id, name) in asked {
+                let reason = match stop {
+                    Halt::Pause => "the pause stopped the call",
+                    Halt::Shutdown => "the daemon stopped the call",
+                };
                 let data = json!({"call_id":id,"step_of":call_id,"name":name,"decision":"deny",
-                    "reason":"the pause stopped the call","approvals":[]});
+                    "reason":reason,"approvals":[]});
                 event(&tx, &bot.name, Some(turn), "step_decided", data)?;
                 steps.push(approval);
             }
@@ -8785,7 +8810,10 @@ impl Database {
             ],
         )?;
         tx.execute("UPDATE bots SET status='paced' WHERE name=?", [&bot.name])?;
-        let data = json!({"resume_at_ms":null,"paused":true});
+        let data = match stop {
+            Halt::Pause => json!({"resume_at_ms":null,"paused":true}),
+            Halt::Shutdown => json!({"resume_at_ms":null,"stopped":true}),
+        };
         let cursor = event(&tx, &bot.name, Some(turn), "turn_paced", data.clone())?;
         tx.commit()?;
         self.forget_live(turn);
@@ -8794,7 +8822,7 @@ impl Database {
             self.unstep(approval, true);
         }
         entries.push(entry(cursor, &bot.name, Some(turn), "turn_paced", data));
-        Ok(Pulled::Parked(entries))
+        Ok(Halted::Parked(entries))
     }
     /// Every parked turn, on handles or on a pool, for re-registration after
     /// a restart.
@@ -12573,6 +12601,15 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
                 },
             );
         }
+    }
+    // 73 -> 74: a turn the pull cord parked says so as its halt, beside the
+    // daemon stopping, rather than with a flag of its own.
+    if from < 74 {
+        conn.execute(
+            "UPDATE turns SET waiting=json_set(json_remove(waiting,'$.pulled'),'$.halt','pause')
+             WHERE json_extract(waiting,'$.pulled')=1",
+            [],
+        )?;
     }
     Ok(())
 }
