@@ -4913,6 +4913,8 @@ impl Outputs {
     /// that can't be built counts as one that may.
     fn exposed(&self) -> bool {
         use std::os::unix::fs::DirBuilderExt;
+        let found = |path: &std::path::Path| std::fs::symlink_metadata(path).is_ok();
+        let existing = self.folder.ancestors().find(|path| found(path));
         if std::fs::DirBuilder::new()
             .recursive(true)
             .mode(0o700)
@@ -4921,6 +4923,21 @@ impl Outputs {
             || !std::fs::symlink_metadata(&self.folder).is_ok_and(|found| found.is_dir())
         {
             return true;
+        }
+        // Folders it made last only once the folders that name them are
+        // synced; the folder itself is synced with what is written in it.
+        if existing != Some(self.folder.as_path()) {
+            for parent in self.folder.ancestors().skip(1) {
+                if std::fs::File::open(parent)
+                    .and_then(|folder| folder.sync_all())
+                    .is_err()
+                {
+                    return true;
+                }
+                if Some(parent) == existing {
+                    break;
+                }
+            }
         }
         match Policy::new(
             self.settings.sandbox,
