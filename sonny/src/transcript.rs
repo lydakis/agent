@@ -1726,6 +1726,30 @@ pub fn denied(
     lines
 }
 
+/// A call the person allowed, as Codex records the decision: what it was,
+/// and the command `kept` from now on when they always allow it. A denial
+/// is [`denied`]'s, once the call ends.
+pub fn allowed(
+    name: &str,
+    arguments: &Value,
+    kept: Option<&str>,
+    workspace: &str,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let what = action(name, arguments, workspace);
+    let mut lines = vec![Line::from(vec![
+        Span::raw("✓ ").fg(Color::Green),
+        Span::raw("Request "),
+        Span::raw("allowed").bold(),
+        Span::raw(" for "),
+        Span::raw(cut(&what, width.saturating_sub(23).max(8))).dim(),
+    ])];
+    if let Some(kept) = kept {
+        lines.push(Line::from(format!("  └ {kept} runs outside the sandbox from now on")).dim());
+    }
+    lines
+}
+
 /// What a tool call did: one header line, then a short look at its result.
 pub fn tool(
     name: &str,

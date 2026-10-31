@@ -519,12 +519,16 @@ way `/react` does, and each note in the margin has its own `↩`.
   the status row says `Reviewing approval request` (Sonny keeps
   `sonny approver` as the daemon's companion when nothing serves it), and
   a denied call is drawn as `✗ Request denied for …` with the reviewer's
-  reason, in either view. The footer names the row unless it is the one new
-  leads start in, full access in yellow.
+  reason, in either view; one you allow is drawn as `✓ Request allowed
+  for …`, as Codex records each decision. The status row above the
+  composer shows only the keys, since the call is written out whole right
+  above it. The footer names the row unless it is the one new leads start
+  in, full access in the text's own weight rather than muted (no hue:
+  yellow is for what needs you).
 
   ![/permissions: Sonny's four rows, then one of the config's](../docs/sonny/permissions.png)
 
-  ![The footer naming full access in yellow](../docs/sonny/permissions-full-footer.png)
+  ![The footer naming full access](../docs/sonny/permissions-full-footer.png)
 
   Rows of your own follow Sonny's, as Codex's permission profiles do, from
   `~/.agent/config.toml`:
@@ -558,6 +562,8 @@ way `/react` does, and each note in the margin has its own `↩`.
   agents take it at once.
 
   ![An approval prompt offering to always allow cargo test](../docs/sonny/permissions-always.png)
+
+  ![The call allowed, and cargo test outside the sandbox from now on](../docs/sonny/permissions-allowed.png)
 - `/retry` lists the calls the reviewer denied while Sonny watched, with
   the reason for each. Enter writes the call out whole, and a second
   Enter sends your approval of that exact call as your own message, so

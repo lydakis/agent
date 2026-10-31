@@ -114,9 +114,10 @@ use std::{
 use transcript::Markdown;
 use unicode_width::UnicodeWidthStr;
 
-/// Rows kept at the bottom: the reply's unfinished line, the status, the
-/// composer between a row of its band above and below, and the footer.
-const VIEWPORT: u16 = 6;
+/// Rows kept at the bottom: the reply's unfinished line, the status, a
+/// blank row, the composer between a row of its band above and below, and
+/// the footer.
+const VIEWPORT: u16 = 7;
 /// The most rows a long prompt's composer grows to; it shows its end.
 const COMPOSER_ROWS: usize = 8;
 /// An agent in a folder: what a profile shown in the footer was read for.
@@ -1225,18 +1226,22 @@ fn edge(frame: &mut ratatui::Frame, gap: Rect, composer: Rect, pad: Rect) {
 }
 
 /// The viewport's rows, top to bottom: the reply's open line (`live`
-/// rows, wrapped), the status, a row of the composer's band, the composer
-/// (as many rows as are left), its band's row under it, and the footer.
+/// rows, wrapped), the status, a blank row that keeps the status off the
+/// band, as one blank row parts any two things, a row of the composer's
+/// band, the composer (as many rows as are left), its band's row under
+/// it, and the footer.
 fn areas(area: ratatui::layout::Rect, live: u16) -> [ratatui::layout::Rect; 6] {
-    Layout::vertical([
+    let [live, status, _, gap, composer, pad, footer] = Layout::vertical([
         Constraint::Length(live.max(1)),
+        Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Min(1),
         Constraint::Length(1),
         Constraint::Length(1),
     ])
-    .areas(area)
+    .areas(area);
+    [live, status, gap, composer, pad, footer]
 }
 
 /// At most `keep` of `rows`, as near the end as still shows `row`; and
@@ -7082,7 +7087,9 @@ impl App {
         }
     }
 
-    async fn answer(&mut self, decision: &str) {
+    /// Answers the call waiting first; one allowed is recorded under it,
+    /// with the command `kept` from now on when it is always allowed.
+    async fn answer(&mut self, decision: &str, kept: Option<&str>) {
         let call = self.approvals.remove(0);
         let answered = self
             .client
@@ -7093,8 +7100,20 @@ impl App {
                     "by": "tui"}),
             )
             .await;
-        if let Err(error) = answered {
-            self.notice = Some(error.to_string());
+        match answered {
+            Err(error) => self.notice = Some(error.to_string()),
+            Ok(_) if decision == "allow" => {
+                let name = call["name"].as_str().unwrap_or("tool");
+                let lines = transcript::allowed(
+                    name,
+                    &call["arguments"],
+                    kept,
+                    &self.workspace,
+                    self.width,
+                );
+                self.commit(lines);
+            }
+            Ok(_) => {}
         }
         // A round with more calls waiting than one listing holds shows
         // the rest once these are answered.
@@ -7115,8 +7134,7 @@ impl App {
             self.notice = Some(format!("couldn't keep {prefix}: {error}"));
             return;
         }
-        self.answer("allow").await;
-        self.notice = Some(format!("{prefix} runs outside the sandbox from now on"));
+        self.answer("allow", Some(prefix)).await;
         if let Some(mode) = self.mode {
             self.gating = Some(mode);
             self.spread = Some((mode, Instant::now()));
@@ -8426,7 +8444,8 @@ impl App {
                             self.notice =
                                 Some("only part of this call could be read; n denies it".into());
                         } else {
-                            self.answer(if c == 'y' { "allow" } else { "deny" }).await;
+                            self.answer(if c == 'y' { "allow" } else { "deny" }, None)
+                                .await;
                         }
                     }
                     KeyCode::Char('a')
@@ -9509,7 +9528,7 @@ impl App {
     }
 
     /// The call waiting on the person, written out whole above the
-    /// status row before `y` can allow it: the row shows only its start.
+    /// status row before `y` can allow it: the row shows only the keys.
     fn show_asked(&mut self) {
         let Some(call) = self.approvals.first() else {
             self.asked = None;
@@ -9545,6 +9564,9 @@ impl App {
             let why = reason.split(". ").next().unwrap_or(reason);
             lines.push(Line::from(format!("  {why}")).dim());
         }
+        // What the agent said before the call reads before it, a step as
+        // the call's start would make it.
+        self.end_live(Words::Step);
         self.commit(lines);
     }
 
@@ -10164,16 +10186,10 @@ impl App {
             return Line::from(line);
         }
         if let Some(call) = self.approvals.first() {
-            let name = call["name"].as_str().unwrap_or("tool");
-            let what = call["arguments"]["command"]
-                .as_str()
-                .or_else(|| call["arguments"]["path"].as_str())
-                .map(first_line)
-                .unwrap_or_default();
-            // The keys first, so a narrow pane still shows how to answer.
+            // Only the keys: the call is written out whole right above,
+            // under the same ⏸, so the row does not say it again.
             let mut line = vec![
                 Span::raw("⏸ ").fg(Color::Yellow),
-                Span::raw(format!("Allow {name}? ")).bold(),
                 Span::raw("y"),
                 Span::raw(" allow once · ").dim(),
             ];
@@ -10181,7 +10197,7 @@ impl App {
                 line.push(Span::raw("a"));
                 line.push(Span::raw(format!(" always allow {prefix} · ")).dim());
             }
-            line.extend([Span::raw("n"), Span::raw(" deny  ").dim(), Span::raw(what)]);
+            line.extend([Span::raw("n"), Span::raw(" deny").dim()]);
             return Line::from(line);
         }
         if let Some(running) = &self.running {
@@ -10324,7 +10340,8 @@ impl App {
             left.push_str(&format!(" · {speed} speed when idle"));
         }
         // The row it runs in, last, unless it is the one new leads start
-        // in: full access in the warning colour, as nothing holds it back.
+        // in: full access in the text's own weight, not muted, as nothing
+        // holds it back; no hue, as yellow is for what needs the person.
         let row = match self.gating {
             Some(_) => None,
             None => self.mode.and_then(approvals::footer),
@@ -10421,7 +10438,7 @@ impl App {
         };
         if let Some(tail) = warned {
             spans.push(Span::raw(" · "));
-            spans.push(Span::raw(&tail[" · ".len()..]).fg(Color::Yellow).not_dim());
+            spans.push(Span::raw(&tail[" · ".len()..]).not_dim());
         }
         spans.push(Span::raw(place));
         if let Some(name) = branch.strip_prefix(" on ") {
@@ -11206,7 +11223,7 @@ mod tests {
         app.daemon(json!({"event": "resumed", "pause": pause, "durable": false}))
             .await;
         assert!(app.paused.is_none());
-        assert!(shown(&app).starts_with("⏸ Allow shell? "));
+        assert_eq!(shown(&app), "⏸ y allow once · n deny");
     }
 
     #[tokio::test]
@@ -11868,6 +11885,22 @@ mod tests {
         app.input.set("/retry");
         app.submit().await;
         assert_eq!(app.notice.as_deref(), Some("no recent reviewer denials"));
+    }
+
+    #[test]
+    fn a_call_the_person_allows_is_recorded_under_it() {
+        let shell = json!({"command": "cargo test --release"});
+        let once = transcript::allowed("shell", &shell, None, "/w", 80);
+        assert_eq!(once.len(), 1);
+        assert_eq!(
+            once[0].to_string(),
+            "✓ Request allowed for cargo test --release"
+        );
+        let kept = transcript::allowed("shell", &shell, Some("cargo test"), "/w", 80);
+        assert_eq!(
+            kept[1].to_string(),
+            "  └ cargo test runs outside the sandbox from now on"
+        );
     }
 
     #[test]
@@ -14144,7 +14177,9 @@ mod tests {
             "{full}"
         );
         let warned = full.spans.iter().find(|span| span.content == "full access");
-        assert_eq!(warned.and_then(|span| span.style.fg), Some(Color::Yellow));
+        let warned = warned.map(|span| span.style);
+        assert_eq!(warned.and_then(|style| style.fg), None);
+        assert!(warned.is_some_and(|style| style.sub_modifier.contains(Modifier::DIM)));
         app.mode = Some("auto");
         let wide = app.footer_line(100).to_string();
         assert!(
