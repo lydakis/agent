@@ -82,6 +82,10 @@ it keeps these, and says in its PR how:
   sonny/src/project.rs, checked by a test). Text added there cuts as much
   elsewhere: merge or drop a sentence, or leave to memory what the person
   can teach. Raise a budget only with George's say.
+- Sonny's skills and roles (sonny/skills, sonny/agents) teach how working
+  with agents goes and name nothing of the person's world: no service, host
+  or web address. Teach the door (memory, their skills, MCP, lookout)
+  instead; `sonny/tests/shipped_text_names_no_service.rs` checks names.
 - George explicitly selected a custom Rust core as a performance engineering
   project. Keep Pi and Codex as measured baselines, not an adoption gate. Reuse
   standard transport, storage, and profiling components. Record equivalent-workload

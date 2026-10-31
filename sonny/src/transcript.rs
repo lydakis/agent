@@ -1210,16 +1210,18 @@ pub fn from_outside(origin: Option<&str>) -> &'static str {
     }
 }
 
-/// Who sent a prompt, as the conversation names it: another bot, or what
+/// Who sent a prompt, as the conversation names it: another bot, what
 /// sent it from outside (the commons, an automation) when a client named
-/// itself; none when the person typed it, a `!` command of theirs too.
-/// Sent from outside, it is drawn [`relayed`], as words between agents
-/// are: nothing the person wrote reads as theirs.
-pub fn sender(bot: Option<&str>, origin: Option<&str>) -> Option<String> {
-    match (bot, origin) {
-        (Some(bot), _) => Some(bot.to_owned()),
-        (None, None | Some("shell")) => None,
-        (None, origin) => Some(from_outside(origin).to_owned()),
+/// itself, or another person a client named; none when the person typed
+/// it, a `!` command of theirs too. Sent by any other, it is drawn
+/// [`relayed`], as words between agents are: nothing the person did not
+/// write reads as theirs.
+pub fn sender(bot: Option<&str>, origin: Option<&str>, person: Option<&str>) -> Option<String> {
+    match (bot, origin, person) {
+        (Some(bot), _, _) => Some(bot.to_owned()),
+        (None, None, Some(person)) => Some(person.to_owned()),
+        (None, None | Some("shell"), None) => None,
+        (None, origin, _) => Some(from_outside(origin).to_owned()),
     }
 }
 
@@ -1237,15 +1239,71 @@ pub fn relayed(text: &str, from: Option<&str>, open: bool, width: usize) -> Vec<
     };
     let head = cut(&format!("↳ {}", head.trim()), width.saturating_sub(2));
     let mut out = vec![Line::from(format!("{head} ▾"))];
-    for line in text.lines() {
-        out.extend(wrap(
-            Line::from(line.to_string()),
-            width,
-            Span::raw("  "),
-            Span::raw("  "),
-        ));
-    }
+    out.extend(quote_rows(text, width, None));
     out.into_iter().map(|line| line.dim()).collect()
+}
+
+/// Words with the words they quote: each `> ` run drawn as the reply it
+/// was, behind a bar, its shape without its colors, so it never
+/// outweighs the words that quote it; at most `cap` rows of each, the
+/// rest counted. Every row starts two columns in.
+fn quote_rows(text: &str, width: usize, cap: Option<usize>) -> Vec<Line<'static>> {
+    let mut out = Vec::new();
+    let mut lines = text.lines().peekable();
+    while let Some(line) = lines.next() {
+        let Some(quoted) = quote_line(line) else {
+            let line = Line::from(line.to_string());
+            out.extend(wrap(line, width, Span::raw("  "), Span::raw("  ")));
+            continue;
+        };
+        let mut words = quoted.to_string();
+        while let Some(quoted) = lines.peek().and_then(|line| quote_line(line)) {
+            words.push('\n');
+            words.push_str(quoted);
+            lines.next();
+        }
+        let bar = || Line::from("  ▌ ");
+        let mut rows = markdown(&mut Markdown::default(), &words, width, (bar(), bar()));
+        if let Some(cap) = cap.filter(|cap| rows.len() > cap + 1) {
+            let more = rows.len() - cap;
+            rows.truncate(cap);
+            rows.push(Line::from(format!("  ▌ … +{more} lines")));
+        }
+        for mut line in rows {
+            (line.style.fg, line.style.bg) = (None, None);
+            for span in &mut line.spans {
+                (span.style.fg, span.style.bg) = (None, None);
+            }
+            out.push(line);
+        }
+    }
+    out
+}
+
+/// A message of the person's with the words it quotes, under its words
+/// on the same band, quieter than them and as short as a long paste.
+pub fn with_quotes(
+    mut prompt: Vec<Line<'static>>,
+    quotes: &str,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let band = crate::look::band();
+    let Some(end) = prompt.pop() else {
+        return prompt;
+    };
+    // A blank row of the band between its words and what they quote.
+    let quotes = quotes.strip_prefix('\n').unwrap_or(quotes);
+    for line in quote_rows(quotes, width, Some(PROMPT_LINES)) {
+        prompt.push(line.dim().bg(band));
+    }
+    prompt.push(end);
+    prompt
+}
+
+/// A line of quoted words, as Markdown marks one: `> ` before it, or a
+/// lone `>` for a blank line between them.
+fn quote_line(line: &str) -> Option<&str> {
+    line.strip_prefix("> ").or((line == ">").then_some(""))
 }
 
 /// What the shut row of words between agents says: who sent them, not
@@ -1301,16 +1359,14 @@ pub fn relayed_kind(text: &str, from: Option<&str>) -> &'static str {
 /// Whom a message between agents is from or about: its sender, the tasks
 /// task updates name, the sources that reported.
 pub fn relayed_names(text: &str, from: Option<&str>) -> Vec<String> {
-    if let Some(from) = from {
-        return vec![from.to_owned()];
-    }
+    // News names whom it is about, not what sent it ("a follow").
     if let Some(rest) = text.strip_prefix(FROM_SOURCES) {
         return (sourced(rest).into_iter().skip(1))
             .filter(|source| !source.starts_with('+'))
             .collect();
     }
     let Some(rest) = text.strip_prefix(TASK_UPDATES) else {
-        return Vec::new();
+        return from.map(|from| vec![from.to_owned()]).unwrap_or_default();
     };
     crate::calls::once(rest.lines().filter_map(|line| {
         let (name, _) = line.strip_prefix("- ")?.split_once(": turn:")?;
@@ -1730,6 +1786,30 @@ pub fn denied(
         }
     }
     lines.extend(rows.into_iter().map(|line| line.dim()));
+    lines
+}
+
+/// A call the person allowed, as Codex records the decision: what it was,
+/// and the command `kept` from now on when they always allow it. A denial
+/// is [`denied`]'s, once the call ends.
+pub fn allowed(
+    name: &str,
+    arguments: &Value,
+    kept: Option<&str>,
+    workspace: &str,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let what = action(name, arguments, workspace);
+    let mut lines = vec![Line::from(vec![
+        Span::raw("✓ ").fg(Color::Green),
+        Span::raw("Request "),
+        Span::raw("allowed").bold(),
+        Span::raw(" for "),
+        Span::raw(cut(&what, width.saturating_sub(23).max(8))).dim(),
+    ])];
+    if let Some(kept) = kept {
+        lines.push(Line::from(format!("  └ {kept} runs outside the sandbox from now on")).dim());
+    }
     lines
 }
 
@@ -2726,6 +2806,36 @@ mod tests {
     }
 
     #[test]
+    fn words_a_message_quotes_draw_as_their_reply_did_behind_a_quiet_bar() {
+        let message = "Can this land?\n\ncalc.fix replied:\n> Fixed **it**:\n>\n> ```rust\n> let x = 1;\n> ```";
+        let rows = relayed(message, Some("ana"), true, 80);
+        assert_eq!(
+            text(&rows),
+            [
+                "↳ From ana ▾",
+                "  Can this land?",
+                "  ",
+                "  calc.fix replied:",
+                "  ▌ Fixed it:",
+                "  ▌ ",
+                "  ▌   let x = 1;",
+            ]
+        );
+        // Its shape stays, its colors go: all of it as quiet as the rest.
+        let spans = rows.iter().flat_map(|row| &row.spans);
+        assert!(
+            spans
+                .clone()
+                .any(|s| s.content == "it" && s.style.add_modifier.contains(Modifier::BOLD))
+        );
+        assert!(spans.clone().all(|s| s.style.fg.is_none()));
+        assert!(
+            rows.iter()
+                .all(|row| row.style.add_modifier.contains(Modifier::DIM))
+        );
+    }
+
+    #[test]
     fn a_line_of_pictures_is_read_as_markdown_and_html_write_them() {
         let picture = |alt: &str, src: &str| Picture {
             alt: alt.into(),
@@ -2914,6 +3024,7 @@ mod tests {
             "task update",
         ];
         assert_eq!(relayed_names(updates, None), ["a.b"]);
+        assert_eq!(relayed_names(updates, Some("a follow")), ["a.b"]);
         assert_eq!(relayed_names("Look at this", Some("a.c")), ["a.c"]);
         let names = ["a.b", "a.c", "a.b", "a.d"].map(String::from);
         assert_eq!(

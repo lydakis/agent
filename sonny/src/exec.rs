@@ -75,7 +75,7 @@ const DESCRIPTION: &str = r#"Run JavaScript code to orchestrate/compose MCP tool
 - Global helpers:
 - `exit()`: Immediately ends the current script successfully (like an early return from the top level).
 - `text(value: string | number | boolean | undefined | null)`: Appends a text item. Non-string values are stringified with `JSON.stringify(...)` when possible.
-- `image(imageUrlOrItem: string | { image_url: string } | ImageContent)`: Saves an image to a file and appends its path. `image_url` should be a base64-encoded `data:` URL. To forward an MCP tool image, pass an individual `ImageContent` block from `result.content`, for example `image(result.content[0])`.
+- `image(imageUrlOrItem: string | { image_url: string } | ImageContent)`: Appends an image item, which you see in order with the text. `image_url` should be a base64-encoded `data:` URL of a PNG, JPEG, GIF or WebP. To forward an MCP tool image, pass an individual `ImageContent` block from `result.content`, for example `image(result.content[0])`. A result holds up to 20 images, 5 MB together; one larger than 1568 pixels on its longest side is scaled down.
 - `store(key: string, value: any)`: stores a serializable value under a string key for later `exec` calls by the same agent.
 - `load(key: string)`: returns the stored value for a string key, or `undefined` if it is missing.
 - `ALL_TOOLS`: metadata for the enabled nested tools as `{ name, description }` entries.
@@ -473,7 +473,7 @@ pub fn parse(input: &str) -> Result<Script, String> {
     Ok(script)
 }
 
-/// Where a script's images, stored values and whole outputs are kept.
+/// Where a script's stored values and whole outputs are kept.
 fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".agent/sonny/exec"))
 }
@@ -525,10 +525,15 @@ impl Steps {
         }
     }
 
-    /// Put the call of `tool` to the agent's gate: none, an allow, or why
-    /// it may not run. An allow a gate gave names the step, to say how it
-    /// ended once it ran.
-    async fn ask(&self, tool: &str, arguments: Value) -> Result<Option<String>, String> {
+    /// Put the call of `tool`, which the agent knows as `called`, to the
+    /// agent's gate: none, an allow, or why it may not run. An allow a gate
+    /// gave names the step, to say how it ended once it ran.
+    pub async fn ask(
+        &self,
+        tool: &str,
+        called: &str,
+        arguments: Value,
+    ) -> Result<Option<String>, String> {
         let step = format!(
             "{}.{}",
             self.run,
@@ -542,16 +547,16 @@ impl Steps {
                 .is_some_and(|approvals| !approvals.is_empty())
                 .then_some(step)),
             Ok(reply) => Err(format!(
-                "tools.{tool} was not approved: {}",
+                "{called} was not approved: {}",
                 reply["reason"].as_str().unwrap_or("denied")
             )),
-            Err(error) => Err(format!("tools.{tool} could not be approved: {error}")),
+            Err(error) => Err(format!("{called} could not be approved: {error}")),
         }
     }
 
     /// Tell the agent how an allowed step ended, so its judge counts it
     /// among the calls done. Its turn may be gone by then: nothing to tell.
-    async fn ran(&self, step: String, failed: bool) {
+    pub async fn ran(&self, step: String, failed: bool) {
         let ran = json!({"bot": self.bot, "turn": self.turn, "call_id": self.call_id,
             "step": step, "failed": failed});
         let _ = self.client.request("step_result", ran).await;
@@ -567,7 +572,7 @@ pub async fn answer(
     input: &str,
     left: Duration,
     steps: Option<Steps>,
-) -> Result<String, String> {
+) -> Result<Value, String> {
     let servers = agent_client::config::load()?.sonny.mcp_servers;
     hub.configure(&servers).await;
     run(hub, home_dir().as_deref(), bot, input, left, steps).await
@@ -582,7 +587,7 @@ async fn run(
     input: &str,
     left: Duration,
     steps: Option<Steps>,
-) -> Result<String, String> {
+) -> Result<Value, String> {
     let script = parse(input)?;
     let started = Instant::now();
     // One deadline from here: waiting for a place and listing the servers'
@@ -604,14 +609,14 @@ async fn run(
         Ok(readied) => readied?,
         Err(_) => {
             let ended = Ended::Terminated("it ran out of time before it started".into());
-            return Ok(said(
+            return Ok(Value::String(said(
                 &ended,
                 started,
                 &BTreeMap::new(),
                 String::new(),
                 budget,
                 dir,
-            ));
+            )));
         }
     };
     let run = Run {
@@ -621,8 +626,8 @@ async fn run(
         failed: Arc::new(failed),
         listed: Value::Array(listed).to_string(),
         store: dir.map(|dir| dir.join("store").join(format!("{bot}.json"))),
-        images: dir.map(|dir| dir.join("images")),
         said: Arc::default(),
+        pictures: Arc::default(),
         calls: Arc::default(),
         stopped: Arc::default(),
         steps: steps.map(Arc::new),
@@ -630,7 +635,11 @@ async fn run(
     };
     let stopped = Arc::clone(&run.stopped);
     let _stop = Stop(Arc::clone(&stopped));
-    let (output, calls) = (Arc::clone(&run.said), Arc::clone(&run.calls));
+    let (output, calls, pictures) = (
+        Arc::clone(&run.said),
+        Arc::clone(&run.calls),
+        Arc::clone(&run.pictures),
+    );
     let clock = Arc::clone(&run.clock);
     let ended = tokio::task::spawn_blocking(move || {
         // Its places are held until the script's runtime is gone, so an
@@ -646,7 +655,71 @@ async fn run(
     .map_err(|e| e.to_string())??;
     let calls = calls.lock().unwrap().clone();
     let body = std::mem::take(&mut *output.lock().unwrap()).body();
-    Ok(said(&ended, started, &calls, body, budget, dir))
+    let pictures = std::mem::take(&mut *pictures.lock().unwrap());
+    Ok(parts(
+        said(&ended, started, &calls, body, budget, dir),
+        pictures,
+    ))
+}
+
+/// Mark where an `image()` call's picture goes in the output, opening and
+/// closing its number: characters of the private use area, taken out of
+/// the text a script prints, so no output can name a picture. Two of them,
+/// so a mark the output's budget cut in half leaves the others whole.
+const OPEN: char = '\u{E000}';
+const CLOSE: char = '\u{E001}';
+
+/// The most pictures one result holds, and their bytes together, as the
+/// daemon takes them: a prompt's.
+pub const PICTURES: usize = 20;
+pub const PICTURE_BYTES: usize = crate::attach::MOST_BYTES;
+
+/// A picture a script passed to `image()`, as the daemon takes it.
+struct Picture {
+    media_type: &'static str,
+    /// Base64.
+    data: String,
+    /// Decoded.
+    bytes: usize,
+}
+
+/// What `exec` answers: its text alone, or, once the script showed
+/// pictures, its text and pictures in the order it gave them. A picture
+/// whose mark the output's budget cut is left out with it.
+fn parts(text: String, pictures: Vec<Picture>) -> Value {
+    if pictures.is_empty() {
+        return Value::String(text);
+    }
+    let mut parts = Vec::new();
+    let mut words = String::new();
+    let said = |words: &mut String, parts: &mut Vec<Value>| {
+        words.retain(|c| c != CLOSE);
+        let kept = words.trim_matches('\n');
+        if !kept.is_empty() {
+            parts.push(json!({"type": "text", "text": kept}));
+        }
+        words.clear();
+    };
+    let mut rest = text.as_str();
+    while let Some(open) = rest.find(OPEN) {
+        words.push_str(&rest[..open]);
+        rest = &rest[open + OPEN.len_utf8()..];
+        // A whole mark is digits closed before the next mark opens; any
+        // other is half of one the budget cut, and is dropped.
+        let close = rest.find(CLOSE).filter(|&at| !rest[..at].contains(OPEN));
+        let picture = close
+            .and_then(|at| rest[..at].parse::<usize>().ok())
+            .and_then(|n| pictures.get(n));
+        if let (Some(picture), Some(at)) = (picture, close) {
+            said(&mut words, &mut parts);
+            parts.push(json!({"type": "image", "media_type": picture.media_type,
+                "data": picture.data}));
+            rest = &rest[at + CLOSE.len_utf8()..];
+        }
+    }
+    words.push_str(rest);
+    said(&mut words, &mut parts);
+    Value::Array(parts)
 }
 
 /// The servers' tools, each by the identifier a script calls it by, as
@@ -868,11 +941,11 @@ fn budgeted(body: String, tokens: usize, dir: Option<&Path>) -> String {
 }
 
 /// A name no other file of this lookout's takes.
-/// How long the outputs and images scripts save are kept.
+/// How long the outputs scripts save are kept.
 const KEPT: Duration = Duration::from_secs(7 * 24 * 3600);
 
 /// `dir`, made, with what was saved there over `KEPT` ago removed, so
-/// saved outputs and images hold a week's worth rather than ever more.
+/// saved outputs hold a week's worth rather than ever more.
 fn fresh(dir: &Path) -> Result<&Path, String> {
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     for entry in std::fs::read_dir(dir).map_err(|e| e.to_string())?.flatten() {
@@ -910,8 +983,8 @@ struct Run {
     failed: Arc<Vec<String>>,
     listed: String,
     store: Option<PathBuf>,
-    images: Option<PathBuf>,
     said: Arc<Mutex<Output>>,
+    pictures: Arc<Mutex<Vec<Picture>>>,
     calls: Arc<Mutex<BTreeMap<String, usize>>>,
     stopped: Arc<AtomicBool>,
     steps: Option<Arc<Steps>>,
@@ -1078,7 +1151,7 @@ const PRELUDE: &str = r#"(() => {
     },
   });
   globalThis.text = (value) => { host.text(show(value)); };
-  globalThis.image = (item) => { host.text(said(host.image(JSON.stringify(item)))); };
+  globalThis.image = (item) => { said(host.image(JSON.stringify(item))); };
   globalThis.store = (key, value) => { said(host.store(String(key), JSON.stringify(value) ?? "null")); };
   globalThis.load = (key) => { const kept = host.load(String(key)); return kept == null ? undefined : JSON.parse(kept); };
   globalThis.exit = () => { throw EXIT; };
@@ -1164,7 +1237,7 @@ impl Run {
         globals.set(
             "__text",
             Function::new(ctx.clone(), move |text: String| {
-                said.lock().unwrap().push(&text)
+                said.lock().unwrap().push(&text.replace([OPEN, CLOSE], ""))
             })?,
         )?;
         let call = Caller {
@@ -1198,16 +1271,24 @@ impl Run {
                 }),
             )?,
         )?;
-        let images = self.images.clone();
+        let (said, pictures) = (Arc::clone(&self.said), Arc::clone(&self.pictures));
         globals.set(
             "__image",
             Function::new(ctx.clone(), move |item: String| {
-                said_of(
-                    images
-                        .as_deref()
-                        .ok_or("no HOME".into())
-                        .and_then(|dir| image(dir, &item)),
-                )
+                said_of(image(&item).and_then(|picture| {
+                    let mut pictures = pictures.lock().unwrap();
+                    let bytes: usize = pictures.iter().map(|p| p.bytes).sum();
+                    if pictures.len() == PICTURES || bytes + picture.bytes > PICTURE_BYTES {
+                        return Err(format!(
+                            "image() refused: a result holds up to {PICTURES} images, {} MB together",
+                            PICTURE_BYTES >> 20
+                        ));
+                    }
+                    let mark = format!("{OPEN}{}{CLOSE}", pictures.len());
+                    pictures.push(picture);
+                    said.lock().unwrap().push(&mark);
+                    Ok("shown".to_owned())
+                }))
             })?,
         )?;
         let store = self.store.clone();
@@ -1293,7 +1374,10 @@ impl Caller {
             };
             let stopped = self.clock.stop();
             let asking = Arc::clone(&steps);
-            let approval = Abort(self.host.spawn(async move { asking.ask(&id, asked).await }));
+            let approval = Abort(
+                self.host
+                    .spawn(async move { asking.ask(&id, &format!("tools.{id}"), asked).await }),
+            );
             let approved = approval.await;
             // Whatever the verdict, the script runs on from here, its time
             // starting again once it has a place, as a new script's does.
@@ -1414,8 +1498,8 @@ fn search(nested: &BTreeMap<String, Nested>, arguments: &str) -> Value {
     json!({"ok": {"tools": tools}})
 }
 
-/// `image()`: the image saved under `dir`, as the line naming it.
-fn image(dir: &Path, item: &str) -> Result<String, String> {
+/// `image()`: the picture an item holds, scaled as `read` scales one.
+fn image(item: &str) -> Result<Picture, String> {
     use base64::Engine;
     let item: Value = serde_json::from_str(item).map_err(|e| e.to_string())?;
     let (data, mime) = match &item {
@@ -1432,17 +1516,94 @@ fn image(dir: &Path, item: &str) -> Result<String, String> {
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(data.trim())
         .map_err(|e| format!("image data is not base64: {e}"))?;
-    let extension = match mime.as_str() {
-        "image/png" => "png",
-        "image/jpeg" | "image/jpg" => "jpg",
-        "image/gif" => "gif",
-        "image/webp" => "webp",
-        "image/svg+xml" => "svg",
-        _ => "img",
+    let (media_type, bytes) = fitted(&bytes).map_err(|e| format!("{mime} image: {e}"))?;
+    Ok(Picture {
+        media_type,
+        bytes: bytes.len(),
+        data: base64::engine::general_purpose::STANDARD.encode(bytes),
+    })
+}
+
+/// The picture file `bytes` hold, as a part of a tool's answer, fitted as
+/// a script's picture is.
+pub fn picture(bytes: &[u8]) -> Result<Value, String> {
+    use base64::Engine;
+    let (media_type, bytes) = fitted(bytes)?;
+    Ok(json!({"type": "image", "media_type": media_type,
+        "data": base64::engine::general_purpose::STANDARD.encode(bytes)}))
+}
+
+/// The longest side a picture is sent at, and the most bytes it is sent
+/// with as it is, as the daemon's `read` sends an image file
+/// (`src/tools/picture.rs`).
+const LONGEST: u32 = 1568;
+const AS_IS_BYTES: usize = 1 << 20;
+/// The most pixels a picture may have to be scaled: decoding takes four
+/// bytes a pixel.
+const MOST_PIXELS: u64 = 64 << 20;
+
+/// A picture of one of the four kinds providers take, by its own bytes
+/// rather than the type it claims, as it is when small enough, else scaled
+/// to [`LONGEST`]: a PNG, or a JPEG for a photograph or a PNG still too
+/// large.
+fn fitted(bytes: &[u8]) -> Result<(&'static str, Vec<u8>), String> {
+    use image::{ImageFormat, imageops::FilterType};
+    let (format, media_type) = match bytes {
+        [0x89, b'P', b'N', b'G', ..] => (ImageFormat::Png, "image/png"),
+        [0xff, 0xd8, 0xff, ..] => (ImageFormat::Jpeg, "image/jpeg"),
+        [b'G', b'I', b'F', b'8', ..] => (ImageFormat::Gif, "image/gif"),
+        [
+            b'R',
+            b'I',
+            b'F',
+            b'F',
+            _,
+            _,
+            _,
+            _,
+            b'W',
+            b'E',
+            b'B',
+            b'P',
+            ..,
+        ] => (ImageFormat::WebP, "image/webp"),
+        _ => return Err("not a PNG, JPEG, GIF or WebP".into()),
     };
-    let file = fresh(dir)?.join(format!("{}.{extension}", stamp()));
-    std::fs::write(&file, bytes).map_err(|e| e.to_string())?;
-    Ok(format!("[image saved to {}]", file.display()))
+    let unreadable = |e: image::ImageError| format!("cannot be read: {e}");
+    let reader = || image::ImageReader::with_format(std::io::Cursor::new(bytes), format);
+    let (width, height) = reader().into_dimensions().map_err(unreadable)?;
+    if width.max(height) <= LONGEST && bytes.len() <= AS_IS_BYTES {
+        return Ok((media_type, bytes.to_vec()));
+    }
+    if u64::from(width) * u64::from(height) > MOST_PIXELS {
+        return Err(format!("{width}×{height} is too large to scale"));
+    }
+    let mut limits = image::Limits::default();
+    limits.max_alloc = Some(4 * MOST_PIXELS);
+    let mut reader = reader();
+    reader.limits(limits);
+    let picture = reader.decode().map_err(unreadable)?;
+    let scaled = match width.max(height) > LONGEST {
+        true => picture.resize(LONGEST, LONGEST, FilterType::CatmullRom),
+        false => picture,
+    };
+    let mut data = Vec::new();
+    if format != ImageFormat::Jpeg {
+        scaled
+            .write_to(&mut std::io::Cursor::new(&mut data), ImageFormat::Png)
+            .map_err(unreadable)?;
+        if data.len() <= AS_IS_BYTES {
+            return Ok(("image/png", data));
+        }
+        data.clear();
+    }
+    image::DynamicImage::ImageRgb8(scaled.to_rgb8())
+        .write_with_encoder(image::codecs::jpeg::JpegEncoder::new_with_quality(
+            &mut std::io::Cursor::new(&mut data),
+            85,
+        ))
+        .map_err(unreadable)?;
+    Ok(("image/jpeg", data))
 }
 
 fn str_of(value: &Value) -> &str {
@@ -1605,6 +1766,13 @@ mod tests {
     }
 
     async fn ran(hub: &Hub, dir: &Path, input: &str) -> String {
+        match shown(hub, dir, input).await {
+            Value::String(text) => text,
+            parts => panic!("pictures in {parts}"),
+        }
+    }
+
+    async fn shown(hub: &Hub, dir: &Path, input: &str) -> Value {
         run(
             hub,
             Some(dir),
@@ -1714,7 +1882,10 @@ text("done");"#;
             Some(asker),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .to_owned();
         assert!(said.starts_with("Script completed"), "{said}");
         assert!(
             said.ends_with(
@@ -1764,7 +1935,10 @@ text("done");"#;
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .to_owned();
         assert!(said.ends_with("Output:\nhi\ntrue\ndone"), "{said}");
     }
 
@@ -1800,7 +1974,7 @@ text("done");"#;
         assert!(said.ends_with("Output:\nmeanwhile"), "{said}");
         assert!(waiting.iter().all(|script| !script.is_finished()));
         for script in waiting {
-            let said = script.await.unwrap().unwrap();
+            let said = script.await.unwrap().unwrap().as_str().unwrap().to_owned();
             assert!(said.ends_with("Output:\napproved"), "{said}");
         }
     }
@@ -1841,7 +2015,7 @@ text("done");"#;
         assert_eq!(ALIVE.available_permits(), 0);
         go.add_permits(LIVE);
         for script in waiting {
-            let said = script.await.unwrap().unwrap();
+            let said = script.await.unwrap().unwrap().as_str().unwrap().to_owned();
             assert!(said.ends_with("Output:\napproved"), "{said}");
         }
     }
@@ -1891,7 +2065,10 @@ await Promise.all([
             Some(asker),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .to_owned();
         assert!(
             said.starts_with("Script terminated: it ran out of time"),
             "{said}"
@@ -2198,7 +2375,7 @@ text(ALL_TOOLS.map(t => t.name).join(","));"#,
     }
 
     #[tokio::test]
-    async fn helpers_keep_values_find_tools_save_images_and_cut_long_output() {
+    async fn helpers_keep_values_find_tools_show_images_and_cut_long_output() {
         let dir = scratch("helpers");
         let hub = hub(&dir).await;
         ran(&hub, &dir, "store('seen', {n: 1});").await;
@@ -2212,20 +2389,44 @@ text(ALL_TOOLS.map(t => t.name).join(","));"#,
         let found = ran(&hub, &dir, "const r = await tools.tool_search({query: 'add numbers', limit: 1}); text(r.tools[0].name); text(r.tools[0].description.includes('declare const tools'));").await;
         assert!(found.ends_with("Output:\nmcp__test__add\ntrue"), "{found}");
         let pixel = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgYGD4DwABBAEAwS2OUAAAAABJRU5ErkJggg==";
-        let shown = ran(
+        // Words and pictures in the order the script gave them; a mark
+        // the script prints itself names none.
+        let parts = shown(
             &hub,
             &dir,
-            &format!("image({{type: 'image', data: '{pixel}', mimeType: 'image/png'}});"),
+            &format!(
+                "text('before \\u{{E000}}0\\u{{E001}}'); image({{type: 'image', data: '{pixel}', mimeType: 'image/png'}}); text('between'); image('data:image/png;base64,{pixel}'); text('after');"
+            ),
         )
         .await;
-        let path = shown
-            .split("[image saved to ")
-            .nth(1)
-            .unwrap()
-            .trim_end_matches(']');
+        let kinds: Vec<&str> = (parts.as_array().unwrap().iter())
+            .map(|part| part["type"].as_str().unwrap())
+            .collect();
+        assert_eq!(kinds, ["text", "image", "text", "image", "text"], "{parts}");
         assert!(
-            path.ends_with(".png") && Path::new(path).is_file(),
-            "{shown}"
+            parts[0]["text"]
+                .as_str()
+                .unwrap()
+                .ends_with("Output:\nbefore 0"),
+            "{parts}"
+        );
+        assert_eq!(
+            parts[1],
+            json!({"type": "image", "media_type": "image/png", "data": pixel})
+        );
+        assert_eq!(
+            (parts[2]["text"].as_str(), parts[4]["text"].as_str()),
+            (Some("between"), Some("after"))
+        );
+        let refused = ran(
+            &hub,
+            &dir,
+            "image({type: 'image', data: 'PHN2Zz4=', mimeType: 'image/svg+xml'});",
+        )
+        .await;
+        assert!(
+            refused.contains("not a PNG, JPEG, GIF or WebP"),
+            "{refused}"
         );
         let long = ran(
             &hub,
@@ -2242,7 +2443,47 @@ text(ALL_TOOLS.map(t => t.name).join(","));"#,
     }
 
     #[test]
-    fn saved_outputs_and_images_are_kept_a_week() {
+    fn a_mark_the_budget_cut_leaves_the_pictures_after_it() {
+        let picture = |n: u8| Picture {
+            media_type: "image/png",
+            data: n.to_string(),
+            bytes: 1,
+        };
+        let text = format!("a\n{OPEN}0\n…cut…\n{CLOSE}\nb\n{OPEN}1{CLOSE}\nc");
+        let shown = parts(text, vec![picture(0), picture(1)]);
+        assert_eq!(
+            shown,
+            json!([{"type": "text", "text": "a\n0\n…cut…\n\nb"},
+                {"type": "image", "media_type": "image/png", "data": "1"},
+                {"type": "text", "text": "c"}])
+        );
+    }
+
+    #[test]
+    fn a_large_picture_is_scaled_as_read_scales_one() {
+        let png = |width, height| {
+            let mut data = Vec::new();
+            image::DynamicImage::new_rgb8(width, height)
+                .write_to(
+                    &mut std::io::Cursor::new(&mut data),
+                    image::ImageFormat::Png,
+                )
+                .unwrap();
+            data
+        };
+        let small = png(40, 30);
+        assert_eq!(fitted(&small).unwrap(), ("image/png", small));
+        let (media_type, data) = fitted(&png(3000, 2000)).unwrap();
+        let scaled = image::load_from_memory(&data).unwrap();
+        assert_eq!(
+            (media_type, scaled.width(), scaled.height()),
+            ("image/png", 1568, 1045)
+        );
+        assert!(fitted(b"<svg/>").is_err());
+    }
+
+    #[test]
+    fn saved_outputs_are_kept_a_week() {
         let dir = scratch("kept").join("output");
         std::fs::create_dir_all(&dir).unwrap();
         let (old, new) = (dir.join("old.txt"), dir.join("new.txt"));

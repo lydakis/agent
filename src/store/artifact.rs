@@ -39,6 +39,11 @@ fn encode(raw: &[u8]) -> Option<Vec<u8>> {
     (out.len() < raw.len() - raw.len() / 8).then_some(out)
 }
 
+/// The most a retained stream holds: `ARTIFACT_BYTES` of output made
+/// valid UTF-8, each invalid byte at most three. Past `ARTIFACT_BYTES`
+/// the store keeps a stream as it is, never encoded.
+const RETAINED_BYTES: usize = 3 * ARTIFACT_BYTES;
+
 pub(super) fn put(db: &Connection, turn: i64, call: &str, stream: &str, raw: &[u8]) -> Result<()> {
     let encoded = encode(raw);
     db.prepare("INSERT INTO artifacts(turn,call_id,stream,data,raw_bytes) VALUES (?,?,?,?,?)")?
@@ -54,6 +59,73 @@ pub(super) fn put(db: &Connection, turn: i64, call: &str, stream: &str, raw: &[u
             }
         ])?;
     Ok(())
+}
+
+/// A retained output written whole to `file`, which stands in for the
+/// store's copy: the row keeps no data, only where it is.
+pub(super) fn put_file(
+    db: &Connection,
+    turn: i64,
+    call: &str,
+    stream: &str,
+    file: &str,
+) -> Result<()> {
+    db.prepare(
+        "INSERT INTO artifacts(turn,call_id,stream,data,raw_bytes,file) VALUES (?,?,?,x'',0,?)",
+    )?
+    .execute(params![turn, call, stream, file])?;
+    Ok(())
+}
+
+/// The files that hold `turn`'s retained outputs, for removal with it.
+pub(super) fn files(db: &Connection, turn: i64) -> Result<Vec<String>> {
+    Ok(db
+        .prepare_cached("SELECT file FROM artifacts WHERE turn=? AND file IS NOT NULL")?
+        .query_map([turn], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?)
+}
+
+/// Remove the files of outputs whose records are gone, once that is
+/// durable. A file someone already removed is gone either way; one a link
+/// replaced loses only the link, never what it points to.
+pub(super) fn remove(files: &[String]) {
+    for file in files {
+        let _ = std::fs::remove_file(file);
+    }
+}
+
+/// A page of a retained output's file, as a stored copy is paged; none
+/// when the file is gone or is no longer a file. Links are not followed,
+/// and opening never waits on a pipe put in its place.
+fn read_file(file: &str, offset: u64, limit: usize) -> Result<Option<(u64, Vec<u8>)>> {
+    use std::io::{Read, Seek, SeekFrom};
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut opened = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(file)
+    {
+        Ok(opened) => opened,
+        Err(_) => return Ok(None),
+    };
+    let found = opened.metadata()?;
+    if !found.is_file() {
+        return Ok(None);
+    }
+    let total = found.len();
+    // One that is larger was not written here.
+    if total > RETAINED_BYTES as u64 {
+        return fail("storage_error");
+    }
+    if offset > total {
+        return Err(past_end(total));
+    }
+    opened.seek(SeekFrom::Start(offset))?;
+    let mut bytes = Vec::new();
+    opened
+        .take(limit.min((total - offset) as usize) as u64)
+        .read_to_end(&mut bytes)?;
+    Ok(Some((total, bytes)))
 }
 
 fn past_end(size: u64) -> Error {
@@ -75,10 +147,11 @@ pub(super) fn read(
     if offset > i64::MAX as u64 - 1 {
         return fail("invalid_artifact_page");
     }
-    let row: Option<(i64, i64, Option<Vec<u8>>)> = db
+    type Row = (i64, i64, Option<Vec<u8>>, Option<String>);
+    let row: Option<Row> = db
         .prepare(
             "SELECT raw_bytes,length(data),CASE WHEN raw_bytes=0 THEN substr(data,?4,?5)
-         ELSE substr(data,1,?6) END FROM artifacts WHERE turn=?1 AND call_id=?2 AND stream=?3",
+         ELSE substr(data,1,?6) END,file FROM artifacts WHERE turn=?1 AND call_id=?2 AND stream=?3",
         )?
         .query_row(
             params![
@@ -89,12 +162,15 @@ pub(super) fn read(
                 limit.min(i64::MAX as usize) as i64,
                 DIRECTORY as i64
             ],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )
         .optional()?;
-    let Some((raw_size, stored_size, bytes)) = row else {
+    let Some((raw_size, stored_size, bytes, file)) = row else {
         return Ok(None);
     };
+    if let Some(file) = file {
+        return read_file(&file, offset, limit);
+    }
     let bytes = bytes.unwrap_or_default();
     if raw_size == 0 {
         let total = u64::try_from(stored_size).map_err(|_| Error::new("storage_error"))?;
@@ -183,7 +259,7 @@ mod tests {
     #[test]
     fn arbitrary_bytes_pages_and_corruption() {
         let db = Connection::open_in_memory().unwrap();
-        db.execute_batch("CREATE TABLE artifacts(turn INTEGER,call_id TEXT,stream TEXT,data BLOB,raw_bytes INTEGER)").unwrap();
+        db.execute_batch("CREATE TABLE artifacts(turn INTEGER,call_id TEXT,stream TEXT,data BLOB,raw_bytes INTEGER,file TEXT)").unwrap();
         let mut state = 7u64;
         let mut mixed = vec![0; ARTIFACT_BYTES];
         for b in &mut mixed[BLOCK..2 * BLOCK] {

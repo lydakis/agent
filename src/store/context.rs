@@ -378,21 +378,20 @@ pub fn stub(
 }
 
 /// What a request sends in place of a result that carried pictures (an
-/// image file read) below the bot's elision floor: its text, without the
-/// pictures, which the file holds if the model needs them again. Any saving
-/// makes one, so that a request can always leave older pictures out (see
-/// [`prompt_stub`]); `None` when it would weigh as much as `weight`, what the
-/// result weighs with its pictures at their token cost.
+/// image file read, a client's answer) below the bot's elision floor: its
+/// text, without the pictures; `custom` keeps the result's kind for its
+/// call. Any saving makes one, so that a request can always leave older
+/// pictures out (see [`prompt_stub`]); `None` when it would weigh as much as
+/// `weight`, what the result weighs with its pictures at their token cost.
 pub fn picture_stub(
     family: Family,
     call_id: &str,
+    custom: bool,
     output: &str,
     weight: usize,
 ) -> Result<Option<Vec<u8>>> {
-    let text = format!(
-        "[tool result's picture elided from this request; read the file again to see it. Its text:]\n{output}"
-    );
-    let stub = family.tool_result_item(call_id, false, &text)?;
+    let text = format!("[tool result's pictures elided from this request. Its text:]\n{output}");
+    let stub = family.tool_result_item(call_id, custom, &text)?;
     Ok((stub.len() < weight).then_some(stub))
 }
 
@@ -404,14 +403,14 @@ pub fn picture_stub(
 pub fn prompt_stub(
     family: Family,
     prompt: &str,
-    sender: Option<&str>,
+    after: &[String],
     pictures: usize,
     weight: usize,
 ) -> Result<Option<Vec<u8>>> {
     let text = format!(
         "{prompt}\n[{pictures} picture(s) sent with this message, elided from this request]"
     );
-    let stub = family.user_item_from(&text, sender, &[])?;
+    let stub = family.user_item_from(&text, after, &[])?;
     Ok((stub.len() < weight).then_some(stub))
 }
 
@@ -425,8 +424,8 @@ pub fn tool_result(item: &[u8]) -> Option<(Family, String, String)> {
         call_id: String,
         output: Text,
     }
-    /// A result's text: the text alone, or the text part of a list of
-    /// parts that also holds pictures.
+    /// A result's text: the text alone, or the text parts of a list of
+    /// parts that also holds pictures, a line each.
     #[derive(serde::Deserialize)]
     #[serde(untagged)]
     enum Text {
@@ -441,7 +440,11 @@ pub fn tool_result(item: &[u8]) -> Option<(Family, String, String)> {
         fn text(self) -> String {
             match self {
                 Text::Alone(text) => text,
-                Text::Parts(parts) => parts.into_iter().filter_map(|p| p.text).collect(),
+                Text::Parts(parts) => parts
+                    .into_iter()
+                    .filter_map(|p| p.text)
+                    .collect::<Vec<_>>()
+                    .join("\n"),
             }
         }
     }
@@ -693,10 +696,10 @@ mod tests {
 
     #[test]
     fn a_result_with_a_picture_reads_as_its_text_and_elides_to_it() {
-        let images = [crate::codec::Image {
+        let images = [crate::codec::Part::Image(crate::codec::Image {
             media_type: "image/png".into(),
             data: "A".repeat(4096),
-        }];
+        })];
         for family in [Family::Responses, Family::Anthropic] {
             let item = family
                 .tool_result_item_with("c1", false, "a.png: a PNG image", &images)
@@ -705,16 +708,25 @@ mod tests {
             let (read, call_id, text) = tool_result(&item).unwrap();
             assert_eq!((read, call_id.as_str()), (family, "c1"));
             assert_eq!(text, "a.png: a PNG image");
-            let stub = picture_stub(family, "c1", &text, item.len())
+            let stub = picture_stub(family, "c1", false, &text, item.len())
                 .unwrap()
                 .unwrap();
             let (_, _, stubbed) = tool_result(&stub).unwrap();
             assert!(
-                stubbed.starts_with("[tool result's picture elided"),
+                stubbed.starts_with("[tool result's pictures elided"),
                 "{stubbed}"
             );
             assert!(stubbed.ends_with("a.png: a PNG image"));
         }
+        // A custom tool's result elides to a custom tool's result.
+        let item = Family::Responses
+            .tool_result_item_with("c1", true, "shot", &images)
+            .unwrap();
+        let stub = picture_stub(Family::Responses, "c1", true, "shot", item.len())
+            .unwrap()
+            .unwrap();
+        let stub: serde_json::Value = serde_json::from_slice(&stub).unwrap();
+        assert_eq!(stub["type"], "custom_tool_call_output");
     }
 
     #[test]

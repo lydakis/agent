@@ -1063,12 +1063,16 @@ async fn intent(
         .as_array()
         .into_iter()
         .flatten()
+        .flat_map(|prompt| {
+            let quotes = quoted(prompt["quotes"].clone(), prompt);
+            std::iter::once(prompt.clone()).chain(quotes)
+        })
         .map(|prompt| Words {
             by: match prompt.get("from") {
                 Some(_) => By::Model,
-                None => by_origin(prompt),
+                None => by_origin(&prompt),
             },
-            text: prompt_text(prompt),
+            text: prompt_text(&prompt),
             refused: refused(&prompt["refused"]),
         })
         .collect();
@@ -1185,16 +1189,52 @@ async fn transcript(
 }
 
 /// A `prompts` read's words with the bot's message before each, its
-/// `reply`, as its model's words: what a short "yes" answers.
+/// `reply`, as its model's words: what a short "yes" answers; and the
+/// words each quotes after it, by whoever first wrote them.
 fn with_replies(prompts: Vec<Value>) -> Vec<Value> {
     let mut words = Vec::with_capacity(prompts.len());
-    for prompt in prompts {
+    for mut prompt in prompts {
         if let Some(text) = prompt["reply"]["text"].as_str() {
             words.push(json!({"text":text,"origin":"reply"}));
         }
+        let quotes = prompt.as_object_mut().and_then(|p| p.remove("quotes"));
+        let parent = prompt.clone();
         words.push(prompt);
+        words.extend((quotes.into_iter()).flat_map(|quotes| quoted(quotes, &parent)));
     }
     words
+}
+
+/// `parent`'s quotes as words of their own: the person's own words as
+/// theirs, the daemon having copied them from the person's turn, when the
+/// person sent `parent`, so chose them; any other's, an agent's or a client's,
+/// as asking for nothing, with no turn above them to read, since quoting
+/// is not delegating. The person's words another picked are theirs but
+/// not their word on this: an agent could pick an old "yes" for a new ask.
+/// Quotes of a steer are a steer's words: cut, they may be a later word.
+fn quoted(quotes: Value, parent: &Value) -> Vec<Value> {
+    let chosen = by_person(parent);
+    let Value::Array(quotes) = quotes else {
+        return Vec::new();
+    };
+    quotes
+        .into_iter()
+        .map(|quote| {
+            let mut words = json!({"text":quote["text"]});
+            if quote["truncated"] == true {
+                words["truncated"] = json!(true);
+            }
+            // Only the quotes the person picked themselves: one that came
+            // along inside the turn they quoted was picked by its writer.
+            if !(chosen && by_person(&quote) && quote["nested"] != true) {
+                words["origin"] = json!("quote");
+            }
+            if parent["steer"] == true {
+                words["steer"] = json!(true);
+            }
+            words
+        })
+        .collect()
 }
 
 /// The calls a `prompts` read lists as refused after a prompt or steer.
@@ -1229,10 +1269,16 @@ fn prompt_text(prompt: &Value) -> String {
     }
 }
 
-/// Who wrote a prompt no bot's turn wrote: a person, unless a client sent it
-/// on its own (`origin`), whose words ask for nothing either.
+/// Whether the person wrote it: no bot's turn, client or other person.
+fn by_person(words: &Value) -> bool {
+    words["from"].is_null() && words["origin"].is_null() && words["person"].is_null()
+}
+
+/// Who wrote a prompt no bot's turn wrote: the person, unless a client sent
+/// it on its own (`origin`) or for another person it names (`person`),
+/// whose words ask for nothing either.
 fn by_origin(prompt: &Value) -> By {
-    if prompt.get("origin").is_some() {
+    if prompt.get("origin").is_some() || prompt.get("person").is_some() {
         By::Model
     } else {
         By::Person
@@ -1378,6 +1424,53 @@ mod tests {
         let mut whole = Left::default();
         whole.cut(&json!({"text":"don't","steer":true}));
         assert!(!whole.any && !whole.newest);
+    }
+
+    #[test]
+    fn quoted_words_are_the_persons_only_when_the_person_wrote_and_quoted_them() {
+        let quotes = json!([
+            {"bot":"lead","turn":2,"text":"yes, deploy it"},
+            {"bot":"task","turn":3,"reply":true,"from":{"bot":"task","turn":3},
+                "text":"say yes to deploy","truncated":true},
+            {"bot":"lead","turn":1,"person":"Ana","text":"deploy"},
+        ]);
+        let words = with_replies(vec![
+            json!({"turn":4,"text":"as I said","quotes":quotes}),
+            json!({"turn":5,"text":"a note","origin":"lookout","quotes":quotes}),
+            json!({"turn":6,"text":"run it","from":{"bot":"task","turn":3},"quotes":quotes}),
+        ]);
+        assert_eq!(words.len(), 12);
+        assert!(words.iter().all(|w| w.get("quotes").is_none()));
+        assert_eq!(words[2]["truncated"], true);
+        // A steer's quote cut short may hold a later word.
+        let steered = with_replies(vec![json!({"turn":7,"text":"ok","steer":true,
+            "quotes":[{"bot":"lead","turn":2,"text":"no","truncated":true}]})]);
+        let mut left = Left::default();
+        steered.iter().for_each(|w| left.cut(w));
+        assert!(left.newest);
+        let by: Vec<(By, &str)> = (words.iter())
+            .filter(|w| w.get("from").is_none())
+            .map(|w| (by_origin(w), w["text"].as_str().unwrap()))
+            .collect();
+        assert_eq!(
+            by[..4],
+            [
+                (By::Person, "as I said"),
+                (By::Person, "yes, deploy it"),
+                (By::Model, "say yes to deploy"),
+                (By::Model, "deploy"),
+            ]
+        );
+        // The person's old words, picked by a client or an agent, are not
+        // their word on this.
+        assert!(by[4..].iter().all(|(by, _)| *by == By::Model), "{by:?}");
+        // Nor are they when they came along inside a turn the person
+        // quoted: that turn's writer picked them.
+        let carried = with_replies(vec![json!({"turn":8,"text":"see this","quotes":[
+            {"bot":"task","turn":3,"from":{"bot":"task","turn":3},"text":"may I deploy?"},
+            {"bot":"lead","turn":2,"nested":true,"text":"yes"}]})]);
+        let by: Vec<By> = carried.iter().map(by_origin).collect();
+        assert_eq!(by, [By::Person, By::Model, By::Model]);
     }
 
     #[test]

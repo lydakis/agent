@@ -20,15 +20,15 @@ const COMMANDS: &[Command] = &[
         name: "run",
         about: "Send a prompt to a bot, or make one with --new; prints the turn as it runs",
         usage: "run [OPTIONS] [--] PROMPT...",
-        flags: "--bot --new --fork --allow --expires --detach --delivery --turn --model --workspace --effort --turn-budget-tokens --image --agents --profile --request-id --bot-id --pretty --no-spawn",
-        settings: "--tools --instructions --instructions-file --budget-tokens --compaction-instructions --compaction-instructions-file --compaction-model --no-compaction --fallback --approval --approve --context-bytes --context-items --note-turns --compact-at --compact-keep --compact-tokens --max-rounds --keep-turns --approval-hold --max-output-tokens --keep-warm --cache-ttl --speed --sandbox --writable --network --hide-senders --unsandboxed",
+        flags: "--bot --new --fork --allow --expires --detach --delivery --turn --model --workspace --effort --turn-budget-tokens --image --quote --agents --profile --request-id --bot-id --pretty --no-spawn",
+        settings: "--tools --instructions --instructions-file --budget-tokens --compaction-instructions --compaction-instructions-file --compaction-model --no-compaction --fallback --approval --approve --context-bytes --context-items --note-turns --compact-at --compact-keep --compact-tokens --max-rounds --keep-turns --approval-hold --max-output-tokens --keep-warm --cache-ttl --speed --sandbox --writable --network --hide-senders --unsandboxed --unix-socket --outputs",
         startup: true,
     },
     Command {
         name: "follow",
         about: "Stream a bot's events, or every bot's with --all",
-        usage: "follow (--bot NAME | --all) [--after CURSOR]",
-        flags: "--bot --all --after --pretty",
+        usage: "follow (--bot NAME | --all) [--after CURSOR | --since DURATION]",
+        flags: "--bot --all --after --since --pretty",
         settings: "",
         startup: false,
     },
@@ -310,6 +310,10 @@ fn print_flags(flags: &str) {
                 "PATH",
                 "Send this PNG, JPEG, GIF or WebP with the prompt; repeat for more",
             ),
+            "--quote" => (
+                "BOT/TURN",
+                "Copy that turn's prompt after this prompt, with who wrote it; BOT/TURN:reply copies the reply it ended with; repeat for more",
+            ),
             "--pretty" => ("", "Render human-readable output"),
             "--no-spawn" => ("", "Require an already running daemon"),
             "--keep-turns" => (
@@ -430,6 +434,10 @@ fn print_flags(flags: &str) {
                 "Another folder a workspace-write bot may change; repeat for more",
             ),
             "--network" => ("", "A workspace-write bot's commands may use the network"),
+            "--outputs" => (
+                "PATH",
+                "Where a new bot's tool outputs cut for the model are written whole, one file per stream; default the outputs folder beside the store",
+            ),
             "--hide-senders" => (
                 "",
                 "A new bot's model reads what other bots and clients send it with no line naming the sender",
@@ -437,6 +445,10 @@ fn print_flags(flags: &str) {
             "--unsandboxed" => (
                 "COMMAND",
                 "A command, by its first words, a sandboxed bot runs outside its sandbox without asking; repeat for more",
+            ),
+            "--unix-socket" => (
+                "PATH",
+                "A Unix socket, or a folder of them, the only ones a sandboxed bot's commands reach; repeat for more",
             ),
             "--fallback" => (
                 "PROVIDER/MODEL",
@@ -465,7 +477,7 @@ fn print_flags(flags: &str) {
             "--limit" => ("N", "List at most N"),
             "--since" => (
                 "DURATION",
-                "Only turns started this long ago or since; default: all",
+                "From this long ago: for usage, only turns started since (default: all); for follow, events written since",
             ),
             "--bucket" => (
                 "DURATION",
@@ -609,8 +621,10 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
                 flag,
                 "--provider"
                     | "--image"
+                    | "--quote"
                     | "--writable"
                     | "--unsandboxed"
+                    | "--unix-socket"
                     | "--env"
                     | "--shell-exclude"
                     | "--redact-field"
@@ -708,6 +722,7 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
     let has = |f: &str| flags.iter().any(|seen| seen == f);
     for (a, b) in [
         ("--all", "--bot"),
+        ("--after", "--since"),
         ("--fork", "--new"),
         ("--fork", "--turn"),
         ("--fork", "--bot-id"),
@@ -768,6 +783,7 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
             "--network",
             "--hide-senders",
             "--unsandboxed",
+            "--unix-socket",
             "--approval",
             "--approve",
         ]

@@ -37,7 +37,8 @@ cargo install --locked --path .
 That puts `agent` in `~/.cargo/bin`. With [Homebrew](https://brew.sh),
 `brew install lydakis/agent/agent` builds the same from a release's source;
 `brew install lydakis/agent/sonny` adds [Sonny](#sonny), the terminal
-client, and pulls in `agent` and `ripgrep` with it. If Homebrew refuses the tap as
+client, and pulls in `agent`, `ripgrep` and
+[agent-browser](https://github.com/vercel-labs/agent-browser) with it. If Homebrew refuses the tap as
 untrusted, run `brew trust lydakis/agent` first.
 
 On Linux without Homebrew (which does not run on ARM Linux), install Sonny
@@ -49,9 +50,11 @@ curl -fsSL https://raw.githubusercontent.com/lydakis/agent/main/install.sh | sh
 ```
 
 It unpacks `sonny-VERSION-linux-ARCH.tar.gz` (x86_64 or aarch64) under
-`~/.local/opt` and links `~/.local/bin/sonny`; `PREFIX` installs elsewhere
-and `SONNY_VERSION` picks a release. [install.sh](install.sh) is short
-enough to read first.
+`~/.local/opt`, links `~/.local/bin/sonny`, and installs bubblewrap (the
+sandbox) and ripgrep with the system's package manager when they are
+missing; `PREFIX` installs elsewhere, `SONNY_VERSION` picks a release and
+`SONNY_PACKAGES=0` leaves the system's packages alone. [install.sh](install.sh)
+is short enough to read first.
 
 ## Quickstart
 

@@ -432,7 +432,8 @@ def run(arm, n, bins, model, spec=None):
         if acp:
             acp.close()
         # A trigger is loaded in the user's own scheduler whatever HOME made
-        # it (#453): take the run's out before its HOME goes.
+        # it, under that HOME's own label (#453): take the run's out before
+        # its HOME goes, rather than leave each to unload itself at its fire.
         listed = subprocess.run([str(sonny), 'trigger', 'ls'], env=env, capture_output=True, text=True)
         for t in json.loads(listed.stdout or '{}').get('triggers', []):
             subprocess.run([str(sonny), 'trigger', 'rm', t['name']], env=env, capture_output=True)

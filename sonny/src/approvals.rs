@@ -1,65 +1,358 @@
-//! `/approvals`: whether the lead's tool calls wait for a verdict, and
-//! whose. Sonny's names for the CLI's modes: `auto` is a judge model,
-//! `ask` is the person here (the CLI's `manual`), `full` runs everything.
-//! Agents the lead makes keep the gate it had when it made them, until
-//! the person picks a mode: it overrides what every one was made with.
-use agent_client::approver::{AUTO_UNGATED, UNGATED};
+//! `/permissions`: what the lead and the agents it makes may do in their
+//! sandboxes, and who approves anything more, as Codex's `/permissions`
+//! rows pair a sandbox with a reviewer. Four rows are Sonny's own; the
+//! person's `[sonny.permissions.NAME]` rows follow them. Agents the lead
+//! makes keep the row it had when it made them, until the person picks
+//! one: it overrides what every one was made with.
+use agent_client::approver::AUTO_UNGATED;
+use agent_client::config::{Permissions, Reviewer};
 use serde_json::{Map, Value, json};
 
-/// New leads start in the first.
-pub const MODES: [(&str, &str); 3] = [
-    ("auto", "a reviewer model decides each call"),
-    ("ask", "you answer each call here"),
-    ("full", "every call runs"),
-];
+/// One `/permissions` row.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Mode {
+    /// Its id, as the config and the footer name it.
+    pub name: &'static str,
+    /// What the list calls it.
+    pub label: String,
+    pub about: String,
+    pub sandbox: Sandbox,
+    /// Who approves a call that leaves the sandbox.
+    pub reviewer: Reviewer,
+}
 
-/// The lead's mode, from its record's gates; `None` for a gate Sonny
-/// did not set.
-pub fn mode(record: &Value) -> Option<&'static str> {
-    let gates = record["gates"].as_array().map(Vec::as_slice).unwrap_or(&[]);
-    match gates {
-        [] => Some("full"),
-        [gate] if gate["tag"] == "auto" => Some("auto"),
-        [gate] if gate["tag"] == "manual" => Some("ask"),
+/// Where an agent's commands, writes and edits run.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Sandbox {
+    /// Its folder, temp and `writable` written; the network reached when
+    /// `network`, and its repositories committed to when `git`, their
+    /// hooks and config kept read-only; only the Unix sockets
+    /// `unix_sockets` names reached.
+    Workspace {
+        network: bool,
+        git: bool,
+        writable: Vec<String>,
+        unix_sockets: Vec<String>,
+    },
+    /// Everything read, nothing written, no network.
+    ReadOnly,
+    /// None, as under Codex's full access.
+    Full,
+}
+
+/// The row a new lead starts in when the config names none.
+const DEFAULT: &str = "auto";
+
+/// Sonny's own row `name`: the first three sandboxed, as Codex's
+/// `workspace-write` with the network and the folder's repository
+/// loosened (the person's pick, 10-28), and Codex's `read-only`.
+fn builtin(name: &str) -> Option<Mode> {
+    let workspace = Sandbox::Workspace {
+        network: true,
+        git: true,
+        writable: Vec::new(),
+        unix_sockets: Vec::new(),
+    };
+    let (name, label, about, sandbox, reviewer) = match name {
+        "auto" => (
+            "auto",
+            "Auto",
+            "Works in its folder; a reviewer model approves anything more",
+            workspace,
+            Reviewer::Model,
+        ),
+        "ask" => (
+            "ask",
+            "Ask me",
+            "Works in its folder; you approve anything more",
+            workspace,
+            Reviewer::You,
+        ),
+        "read-only" => (
+            "read-only",
+            "Read only",
+            "Reads anything, changes nothing; you approve anything more",
+            Sandbox::ReadOnly,
+            Reviewer::You,
+        ),
+        "full" => (
+            "full",
+            "Full access",
+            "No sandbox and no reviews; agents can do anything you can",
+            Sandbox::Full,
+            Reviewer::None,
+        ),
+        _ => return None,
+    };
+    Some(Mode {
+        name,
+        label: label.into(),
+        about: about.into(),
+        sandbox,
+        reviewer,
+    })
+}
+
+/// A row of the person's config: the row it extends, with what it changes.
+fn own(name: &str, row: &Permissions) -> Option<Mode> {
+    let mut mode = builtin(&row.extends)?;
+    mode.name = intern(name);
+    mode.about = (row.description.clone())
+        .unwrap_or_else(|| format!("Like {}, as ~/.agent/config.toml changes it", mode.label));
+    // Its name, written as the list writes Sonny's: a capital first.
+    let mut chars = name.chars();
+    mode.label = chars
+        .next()
+        .map(|first| first.to_uppercase().chain(chars).collect())
+        .unwrap_or_default();
+    if let Sandbox::Workspace {
+        network,
+        git,
+        writable,
+        unix_sockets,
+    } = &mut mode.sandbox
+    {
+        *network = row.network.unwrap_or(*network);
+        *git = row.git.unwrap_or(*git);
+        // As Codex takes writable roots: only a whole path, never one read
+        // from wherever Sonny runs, where a checkout's link could point it
+        // anywhere.
+        *writable = (row.writable.iter().map(|folder| home(folder)))
+            .filter(|folder| std::path::Path::new(folder).is_absolute())
+            .collect();
+        *unix_sockets = (row.unix_sockets.iter().map(|path| home(path)))
+            .filter(|path| std::path::Path::new(path).is_absolute())
+            .collect();
+    }
+    mode.reviewer = row.reviewer.unwrap_or(mode.reviewer);
+    Some(mode)
+}
+
+/// `folder` with a leading `~` for the person's home.
+fn home(folder: &str) -> String {
+    match (folder.strip_prefix("~/"), std::env::var("HOME")) {
+        (Some(rest), Ok(home)) => format!("{home}/{rest}"),
+        _ if folder == "~" => std::env::var("HOME").unwrap_or_else(|_| folder.to_owned()),
+        _ => folder.to_owned(),
+    }
+}
+
+/// A row's name for as long as Sonny runs, as the built-in ones are: each
+/// name kept once.
+fn intern(name: &str) -> &'static str {
+    static NAMES: std::sync::Mutex<Vec<&'static str>> = std::sync::Mutex::new(Vec::new());
+    let mut names = NAMES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(kept) = names.iter().find(|kept| **kept == name) {
+        return kept;
+    }
+    let kept: &'static str = Box::leak(name.to_owned().into_boxed_str());
+    names.push(kept);
+    kept
+}
+
+/// Every row `/permissions` lists: Sonny's four, then the config's; only
+/// Sonny's when the config can't be read, which Sonny reports on start.
+pub fn modes() -> Vec<Mode> {
+    let config = agent_client::config::load().unwrap_or_default();
+    modes_of(&config.sonny)
+}
+
+fn modes_of(sonny: &agent_client::config::Sonny) -> Vec<Mode> {
+    let builtins = agent_client::config::PERMISSIONS
+        .iter()
+        .filter_map(|name| builtin(name));
+    let own = (sonny.permissions.iter()).filter_map(|(name, row)| own(name, row));
+    builtins.chain(own).collect()
+}
+
+/// The row `name`, of Sonny's or the config's.
+pub fn find(name: &str) -> Option<Mode> {
+    builtin(name).or_else(|| modes().into_iter().find(|mode| mode.name == name))
+}
+
+/// The row a new lead starts in: the config's `default_permissions`, else
+/// `auto`.
+pub fn default() -> &'static str {
+    agent_client::config::load()
+        .ok()
+        .and_then(|config| config.sonny.default_permissions)
+        .map_or(DEFAULT, |name| intern(&name))
+}
+
+/// Whether a reviewer model approves for the row `name`, so Sonny keeps
+/// one serving.
+pub fn reviews(name: Option<&str>) -> bool {
+    name.and_then(find)
+        .is_some_and(|mode| mode.reviewer == Reviewer::Model)
+}
+
+/// What the footer says of the row `name`: nothing for the row new leads
+/// start in, read when Sonny started; its name in the list otherwise.
+pub fn footer(name: &str) -> Option<String> {
+    static START: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+    if name == *START.get_or_init(default) {
+        return None;
+    }
+    Some(match builtin(name) {
+        Some(mode) => mode.label.to_lowercase(),
+        None => name.to_owned(),
+    })
+}
+
+/// The mark the footer leads the row `name` with, as Claude Code marks
+/// its modes: `⏵⏵` runs that never stop to ask, `⏸` the approvals that
+/// stop it, `⊘` writes refused. A row of the person's own has none.
+pub fn mark(name: &str) -> Option<&'static str> {
+    match name {
+        "full" => Some("⏵⏵"),
+        "ask" => Some("⏸"),
+        "read-only" => Some("⊘"),
         _ => None,
     }
 }
 
-/// A mode to set again, for a bot whose `auto` gate is older than the one
-/// `gate` makes: one that lapses, so a doubted call is denied rather than
-/// waiting for the person, or one that still judges reads. A bot another
-/// bot made is set again too, as the person's `/approvals` would.
+/// Who approves for a bot, from its record's gates: `None` for a gate
+/// Sonny did not set.
+fn reviewer(record: &Value) -> Option<Reviewer> {
+    let gates = record["gates"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+    match gates {
+        [] => Some(Reviewer::None),
+        [gate] if gate["tag"] == "auto" => Some(Reviewer::Model),
+        [gate] if gate["tag"] == "manual" => Some(Reviewer::You),
+        _ => None,
+    }
+}
+
+/// The lead's row, from its record's gates and sandbox; `None` for a gate
+/// Sonny did not set. Of the rows that fit, the one that says most about
+/// it: one that names its folders over one that leaves them out, and of
+/// rows alike, the first. A bot no row fits, such as one made
+/// before Sonny confined leads, or in a row since taken out of the config,
+/// takes Sonny's row for whoever approves it, so its sandbox is set again;
+/// one no one approves for, still confined, is left as no row of Sonny's.
+pub fn mode(record: &Value) -> Option<&'static str> {
+    mode_in(record, &modes())
+}
+
+/// [`mode`], of `modes`.
+fn mode_in(record: &Value, modes: &[Mode]) -> Option<&'static str> {
+    let reviewer = reviewer(record)?;
+    let settings = &record["settings"];
+    let sandbox = settings["sandbox"].as_str();
+    let writable: Vec<&str> = (settings["writable"].as_array().into_iter().flatten())
+        .filter_map(Value::as_str)
+        .collect();
+    let committing = writable.iter().any(|path| path.ends_with(".git"));
+    // Whether its folder is in a repository, so a row that writes it
+    // would have given it its git folder: looked for by name, as no
+    // command needs to run for it.
+    let repository = (record["workspace"].as_str()).is_some_and(|dir| {
+        std::path::Path::new(dir)
+            .ancestors()
+            .any(|dir| dir.join(".git").exists())
+    });
+    let network = settings["network"].as_bool().unwrap_or(false);
+    let reached = list(settings, "unix_sockets");
+    // Its own folders, past its repositories' git folders.
+    let folders: Vec<&str> = (writable.iter().copied())
+        .filter(|path| !path.ends_with(".git"))
+        .collect();
+    // How well a row fits: whether its folders there now are the bot's,
+    // then how many there are.
+    let fit = |mode: &Mode| -> Option<(bool, usize)> {
+        if mode.reviewer != reviewer {
+            return None;
+        }
+        match &mode.sandbox {
+            Sandbox::Full => {
+                (!matches!(sandbox, Some("workspace-write" | "read-only"))).then_some((true, 0))
+            }
+            Sandbox::ReadOnly => (sandbox == Some("read-only")).then_some((true, 0)),
+            Sandbox::Workspace {
+                network: reaches,
+                git,
+                writable: own,
+                unix_sockets,
+            } => {
+                // Every folder the bot writes is one of the row's, as
+                // written or by its real path. A row folder that is not
+                // there yet was left out, and one made since still fits,
+                // so a row is never lost, and widened, because a cache
+                // folder appeared.
+                let there = real(own);
+                let fits = sandbox == Some("workspace-write")
+                    && network == *reaches
+                    && (*git || !committing)
+                    && reached == sockets(unix_sockets)
+                    && (folders.iter())
+                        .all(|folder| own.iter().chain(&there).any(|mine| mine == folder));
+                // A repository made since the row was set leaves a row that
+                // commits without its git folder: it still fits, after one
+                // that matches as it is.
+                let exact = there
+                    .iter()
+                    .all(|folder| folders.contains(&folder.as_str()))
+                    && (!repository || *git == committing);
+                fits.then_some((exact, there.len()))
+            }
+        }
+    };
+    let mut best: Option<((bool, usize), &'static str)> = None;
+    for mode in modes {
+        if let Some(score) = fit(mode)
+            && best.is_none_or(|(most, _)| score > most)
+        {
+            best = Some((score, mode.name));
+        }
+    }
+    if let Some((_, name)) = best {
+        return Some(name);
+    }
+    match reviewer {
+        Reviewer::Model => Some("auto"),
+        Reviewer::You if sandbox == Some("read-only") => Some("read-only"),
+        Reviewer::You => Some("ask"),
+        Reviewer::None if matches!(sandbox, Some("workspace-write" | "read-only")) => None,
+        Reviewer::None => Some("full"),
+    }
+}
+
+/// A row to set again, for a bot whose gate is older than the one `gate`
+/// makes: an `auto` one that lapses, so a doubted call is denied rather
+/// than waiting for the person, or one that still holds reads back. A bot
+/// another bot made is set again too, as the person's `/permissions` would.
 pub fn refresh(record: &Value) -> Option<&'static str> {
     let gate = &record["gates"][0];
     let old = gate["expire_ms"].is_u64()
         || gate["tools"]
             .as_array()
             .is_some_and(|tools| tools.iter().any(|t| t == "read"));
-    (mode(record) == Some("auto") && old).then_some("auto")
+    mode(record).filter(|_| old)
 }
 
-/// The `create` or `configure` fields for a mode: every tool the bot has
-/// but those that touch only its own records waits for the verdict, and in
-/// `auto` reads run unjudged too. `full` is no gate, which `create` takes
-/// as no fields.
-pub fn gate(mode: &str, tools: &[String]) -> Map<String, Value> {
-    let ungated: &[&str] = if mode == "auto" {
-        &AUTO_UNGATED
-    } else {
-        &UNGATED
-    };
+/// The `create` or `configure` fields for the row `name`: every tool the
+/// bot has but those that touch only its own records or only read waits
+/// for whoever approves, unless no one does. Reads run unjudged, as
+/// Codex's sandboxes let reads through: what leaves the sandbox is a
+/// write, a command or a call out. No gate is `create`'s no fields.
+pub fn gate(name: &str, tools: &[String]) -> Map<String, Value> {
+    let reviewer = find(name).map_or(Reviewer::None, |mode| mode.reviewer);
     let approve: Vec<&String> = tools
         .iter()
-        .filter(|tool| !ungated.contains(&tool.as_str()))
+        .filter(|tool| !AUTO_UNGATED.contains(&tool.as_str()))
         .collect();
-    let fields = match mode {
-        // Nothing left to gate, such as a bot that only reads in `auto`:
-        // a gate needs a tool, so the bot is ungated.
+    let fields = match reviewer {
+        // Nothing left to gate, such as a bot that only reads: a gate
+        // needs a tool, so the bot is ungated.
         _ if approve.is_empty() => json!({"approve": []}),
-        // No expiry: a call the judge doubts waits for the person here.
-        "auto" => json!({"approve": approve, "approver": "auto"}),
-        "ask" => json!({"approve": approve, "approver": "manual"}),
-        _ => json!({"approve": []}),
+        // No expiry: a call the reviewer doubts waits for the person here.
+        Reviewer::Model => json!({"approve": approve, "approver": "auto"}),
+        Reviewer::You => json!({"approve": approve, "approver": "manual"}),
+        // No one: a call that leaves the sandbox is refused, and the agent
+        // is told to do without it, as under Codex's `never`.
+        Reviewer::None => json!({"approve": []}),
     };
     match fields {
         Value::Object(fields) => fields,
@@ -68,30 +361,49 @@ pub fn gate(mode: &str, tools: &[String]) -> Map<String, Value> {
 }
 
 /// The sandbox fields, as `configure` takes them and `create`'s settings
-/// hold them, for an agent working in `workspace`: Codex's
-/// `workspace-write`, reaching the network, with the folder's repository
-/// writable too so a commit runs without asking (its hooks and config stay
-/// read-only), as is each repository inside it, given as a folder of its
-/// own so the daemon keeps its hooks and config too, and the commands the
-/// person's config lets out of it
-/// (`[sonny] unsandboxed`). In `full` mode an agent runs unconfined, as
-/// under Codex's full access, where nothing would answer a call that asks
-/// to leave the sandbox.
-pub fn sandbox(mode: &str, workspace: &std::path::Path) -> Map<String, Value> {
-    sandbox_with(mode, workspace, &unsandboxed())
+/// hold them, for an agent in the row `name` working in `workspace`, with
+/// the commands the person's config lets out of it (`[sonny]
+/// unsandboxed`). A row's repositories are the folder's own and each
+/// inside it, given as folders of their own so the daemon keeps their
+/// hooks and config read-only; a row's other folders are those that are
+/// there, by their real paths. A row no longer in the config is the
+/// default's.
+pub fn sandbox(name: &str, workspace: &std::path::Path) -> Map<String, Value> {
+    sandbox_with(name, workspace, &unsandboxed())
 }
 
 /// [`sandbox`]'s fields, with `unsandboxed` the commands let out of it.
 fn sandbox_with(
-    mode: &str,
+    name: &str,
     workspace: &std::path::Path,
     unsandboxed: &[String],
 ) -> Map<String, Value> {
-    let fields = match mode {
-        "full" => json!({"sandbox": "danger-full-access"}),
-        _ => {
-            let mut writable: Vec<String> = repository(workspace).into_iter().collect();
-            writable.extend(repositories(workspace));
+    let mode = find(name)
+        .or_else(|| find(default()))
+        .or_else(|| builtin(DEFAULT));
+    match mode {
+        Some(mode) => fields(&mode, workspace, unsandboxed),
+        None => confined(json!({"sandbox": "danger-full-access"})),
+    }
+}
+
+/// The sandbox fields of `mode` in `workspace`.
+fn fields(mode: &Mode, workspace: &std::path::Path, unsandboxed: &[String]) -> Map<String, Value> {
+    let mut fields = match &mode.sandbox {
+        Sandbox::Full => return confined(json!({"sandbox": "danger-full-access"})),
+        Sandbox::ReadOnly => json!({"sandbox": "read-only"}),
+        Sandbox::Workspace {
+            network,
+            git,
+            writable: own,
+            unix_sockets,
+        } => {
+            let mut writable: Vec<String> = Vec::new();
+            if *git {
+                writable.extend(repository(workspace));
+                writable.extend(repositories(workspace));
+            }
+            writable.extend(real(own));
             // As many as the daemon takes, the shallowest kept.
             writable.truncate(MAX_WRITABLE);
             while serde_json::to_string(&writable).map_or(0, |json| json.len()) > MAX_WRITABLE_JSON
@@ -99,17 +411,59 @@ fn sandbox_with(
                 writable.pop();
             }
             let mut fields =
-                json!({"sandbox": "workspace-write", "writable": writable, "network": true});
-            if !unsandboxed.is_empty() {
-                fields["unsandboxed"] = json!(unsandboxed);
+                json!({"sandbox": "workspace-write", "writable": writable, "network": network});
+            let unix_sockets = sockets(unix_sockets);
+            if !unix_sockets.is_empty() {
+                fields["unix_sockets"] = json!(unix_sockets);
             }
             fields
         }
     };
+    if !unsandboxed.is_empty() {
+        fields["unsandboxed"] = json!(unsandboxed);
+    }
+    confined(fields)
+}
+
+fn confined(fields: Value) -> Map<String, Value> {
     match fields {
         Value::Object(fields) => fields,
         _ => Map::new(),
     }
+}
+
+/// `paths` as the daemon keeps a bot's Unix sockets: by their real paths,
+/// as [`agent_client::files::real`] gives them, since a socket comes and
+/// goes with its program, sorted, and each once.
+fn sockets(paths: &[String]) -> Vec<String> {
+    let mut paths: Vec<String> = (paths.iter())
+        .map(|path| {
+            (agent_client::files::real(std::path::Path::new(path)))
+                .and_then(|real| real.to_str().map(str::to_owned))
+                .unwrap_or_else(|| path.clone())
+        })
+        .collect();
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+/// The strings of `value`'s list `key`, none when it has none.
+fn list(value: &Value, key: &str) -> Vec<String> {
+    (value[key].as_array().into_iter().flatten())
+        .filter_map(Value::as_str)
+        .map(str::to_owned)
+        .collect()
+}
+
+/// `folders` as the daemon keeps them, by their real paths, leaving out
+/// those that aren't there.
+fn real(folders: &[String]) -> Vec<String> {
+    (folders.iter())
+        .filter_map(|folder| std::fs::canonicalize(folder).ok())
+        .filter(|path| path.is_dir())
+        .filter_map(|path| path.to_str().map(str::to_owned))
+        .collect()
 }
 
 /// The commands the person's config lets agents run outside their
@@ -119,6 +473,83 @@ pub fn unsandboxed() -> Vec<String> {
         .map(|config| config.sonny.unsandboxed)
         .unwrap_or_default()
 }
+
+/// The command prefix the person may let out of every sandbox when they
+/// allow `call` for good: the program and, when it reads as one, its
+/// subcommand, as Codex suggests a prefix rule (`cargo test`, not the whole
+/// line). Only a plain command offers one: a pipe, a list, a redirection
+/// or an expansion runs more than its first words say.
+pub fn always(call: &Value) -> Option<String> {
+    // A call read only in part may hide more past what was read, so it is
+    // denied or nothing, as `y` is off for it.
+    if call["name"] != "shell"
+        || call["arguments"]["sandbox_permissions"] != "require_escalated"
+        || call["incomplete"] == true
+    {
+        return None;
+    }
+    let command = call["arguments"]["command"].as_str()?.trim();
+    if command.is_empty()
+        || command.contains([
+            '|', '&', ';', '<', '>', '$', '`', '(', ')', '\n', '\'', '"', '\\', '*', '?',
+        ])
+    {
+        return None;
+    }
+    let words: Vec<&str> = command.split_whitespace().collect();
+    let program = *words.first()?;
+    // A program named from the folder it runs in, `./build.sh`, is another
+    // one in every other folder, which the prefix would let out too.
+    if program.contains('=') || (program.contains('/') && !program.starts_with(['/', '~'])) {
+        return None;
+    }
+    let subcommand = (words.get(1)).filter(|word| {
+        word.chars().next().is_some_and(|c| c.is_ascii_lowercase())
+            && word
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    });
+    Some(match subcommand {
+        Some(subcommand) => format!("{program} {subcommand}"),
+        None => program.to_owned(),
+    })
+}
+
+/// Adds `prefix` to `[sonny] unsandboxed` in the person's config, so every
+/// agent's sandbox lets it out from the next time Sonny sets it.
+pub fn allow_always(prefix: &str) -> Result<(), String> {
+    let path = agent_client::config::path().ok_or("no config file to keep it in")?;
+    let commands = agent_client::config::read(&path)?.sonny.unsandboxed;
+    let Some(commands) = adding(commands, prefix)? else {
+        return Ok(());
+    };
+    let value = toml::Value::Array(commands.into_iter().map(toml::Value::String).collect());
+    agent_client::config::write(&path, &[("sonny.unsandboxed", Some(value))])
+}
+
+/// `commands` with `prefix` added, None when it is there already, or why
+/// not when the daemon's bound on them would refuse every sandbox Sonny
+/// sets after: at most 64 commands, each of at most 1 KiB.
+fn adding(mut commands: Vec<String>, prefix: &str) -> Result<Option<Vec<String>>, String> {
+    if commands.iter().any(|command| command == prefix) {
+        return Ok(None);
+    }
+    if prefix.len() > MAX_COMMAND {
+        return Err("it is longer than a command let out may be".into());
+    }
+    if commands.len() >= MAX_UNSANDBOXED {
+        return Err(format!(
+            "[sonny] unsandboxed holds the most commands it may, {MAX_UNSANDBOXED}"
+        ));
+    }
+    commands.push(prefix.to_owned());
+    Ok(Some(commands))
+}
+
+/// The most commands a sandbox lets out, and the longest, as the daemon
+/// bounds them.
+const MAX_UNSANDBOXED: usize = 64;
+const MAX_COMMAND: usize = 1024;
 
 /// The git folder of the repository `dir` is in, which its linked
 /// worktrees share, by its real path as the daemon keeps it. Only one
@@ -197,12 +628,27 @@ fn repositories(dir: &std::path::Path) -> Vec<String> {
 pub fn sandboxed_as(record: &Value, fields: &Map<String, Value>) -> bool {
     let fields = Value::Object(fields.clone());
     let settings = &record["settings"];
-    let list = |value: &Value, key: &str| value[key].as_array().cloned().unwrap_or_default();
     settings["sandbox"] == fields["sandbox"]
         && list(settings, "writable") == list(&fields, "writable")
         && list(settings, "unsandboxed") == list(&fields, "unsandboxed")
+        && list(settings, "unix_sockets") == list(&fields, "unix_sockets")
         && settings["network"].as_bool().unwrap_or(false)
             == fields["network"].as_bool().unwrap_or(false)
+}
+
+/// Whether the bot `record` describes may run Sonny's tool `tool`: any
+/// tool not in `served::GATED`, and one of those, which act outside the
+/// agent's sandbox, only once a gate has judged it or for an agent with
+/// no sandbox. A confined row no one reviews refuses them, as the daemon
+/// refuses its other ways out of the sandbox.
+pub fn may_run(record: &Value, tool: &str) -> bool {
+    let confined = matches!(
+        record["settings"]["sandbox"].as_str(),
+        Some("workspace-write" | "read-only")
+    );
+    let judged = (record["gates"].as_array().into_iter().flatten())
+        .any(|gate| (gate["tools"].as_array().into_iter().flatten()).any(|gated| gated == tool));
+    !crate::served::GATED.contains(&tool) || judged || !confined
 }
 
 /// What a bot's gate may hold back: its own `tools`, and of the tools its
@@ -304,14 +750,19 @@ mod tests {
         crate::task::git(&dir, &["init", "-q"]).unwrap();
         let git = dir.join(".git").display().to_string();
         let confined = json!({"sandbox": "workspace-write", "writable": [git], "network": true});
-        for (mode, _) in MODES {
+        for mode in ["auto", "ask"] {
             let fields = sandbox_with(mode, &dir, &[]);
-            if mode == "full" {
-                continue;
-            }
             assert_eq!(Value::Object(fields.clone()), confined);
             assert!(sandboxed_as(&json!({"settings": fields}), &fields));
         }
+        // Read only writes nothing, its repository included, and reaches
+        // no network; the commands let out of every sandbox leave it too.
+        let reading = sandbox_with("read-only", &dir, &["mcpx".to_owned()]);
+        assert_eq!(
+            Value::Object(reading.clone()),
+            json!({"sandbox": "read-only", "unsandboxed": ["mcpx"]})
+        );
+        assert!(sandboxed_as(&json!({"settings": reading}), &reading));
         assert_eq!(Value::Object(sandbox_with("auto", &dir, &[])), confined);
         let full = sandbox_with("full", &dir, &[]);
         assert_eq!(
@@ -417,16 +868,26 @@ mod tests {
         let tools: Vec<String> = ["shell", "read", "wait", "history"]
             .map(String::from)
             .to_vec();
-        for (name, _) in MODES {
+        let plain = std::env::temp_dir().join(format!("sonny-rows-{}", std::process::id()));
+        std::fs::create_dir_all(&plain).unwrap();
+        for name in agent_client::config::PERMISSIONS {
             let fields = gate(name, &tools);
             let gates = match fields.get("approver") {
                 Some(tag) => json!([{"tag": tag, "tools": fields["approve"]}]),
                 None => json!([]),
             };
-            assert_eq!(mode(&json!({"gates": gates})), Some(name));
+            let settings = sandbox_with(name, &plain, &[]);
+            let record = json!({"gates": gates, "settings": settings, "workspace": plain});
+            assert_eq!(mode(&record), Some(name));
         }
+        std::fs::remove_dir_all(&plain).unwrap();
+        // Reads run unjudged in every row, as Codex's sandboxes read.
         assert_eq!(gate("auto", &tools)["approve"], json!(["shell"]));
-        assert_eq!(gate("ask", &tools)["approve"], json!(["shell", "read"]));
+        assert_eq!(gate("ask", &tools)["approve"], json!(["shell"]));
+        assert_eq!(gate("read-only", &tools)["approver"], json!("manual"));
+        // Made before rows had sandboxes of their own: by who approves.
+        let manual = json!([{"tag": "manual", "tools": ["shell"]}]);
+        assert_eq!(mode(&json!({"gates": manual})), Some("ask"));
         // A bot with nothing left to gate is ungated, not refused.
         let reader: Vec<String> = ["read", "wait"].map(String::from).to_vec();
         assert_eq!(Value::Object(gate("auto", &reader)), json!({"approve": []}));
@@ -444,8 +905,256 @@ mod tests {
         // So is one that still judges reads.
         let reads = json!({"gates": [{"tag": "auto", "tools": ["shell", "read"]}]});
         assert_eq!(refresh(&reads), Some("auto"));
+        let asked = json!({"gates": [{"tag": "manual", "tools": ["shell", "read"]}]});
+        assert_eq!(refresh(&asked), Some("ask"));
         assert_eq!(mode(&json!({"gates": null})), Some("full"));
         assert_eq!(mode(&json!({"gates": [{"tag": "ci"}]})), None);
+    }
+
+    #[test]
+    fn the_person_s_own_rows_follow_sonny_s_and_are_read_back() {
+        let dir = std::env::temp_dir().join(format!("sonny-own-rows-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("cache")).unwrap();
+        let dir = std::fs::canonicalize(&dir).unwrap();
+        crate::task::git(&dir, &["init", "-q"]).unwrap();
+        let cache = dir.join("cache").display().to_string();
+        let later = dir.join("later").display().to_string();
+        let row = |extends: &str| Permissions {
+            description: None,
+            extends: extends.into(),
+            network: None,
+            git: None,
+            writable: Vec::new(),
+            unix_sockets: Vec::new(),
+            reviewer: None,
+        };
+        let sonny = agent_client::config::Sonny {
+            permissions: std::collections::BTreeMap::from([
+                (
+                    "strict".to_owned(),
+                    Permissions {
+                        description: Some("Offline, commits ask".into()),
+                        network: Some(false),
+                        git: Some(false),
+                        writable: vec![later.clone()],
+                        ..row("auto")
+                    },
+                ),
+                (
+                    "night".to_owned(),
+                    Permissions {
+                        reviewer: Some(Reviewer::None),
+                        // One named from wherever Sonny runs is never taken.
+                        writable: vec![cache.clone(), "/not/there".into(), "cache".into()],
+                        ..row("ask")
+                    },
+                ),
+            ]),
+            ..Default::default()
+        };
+        let modes = modes_of(&sonny);
+        let names: Vec<&str> = modes.iter().map(|mode| mode.name).collect();
+        assert_eq!(
+            names,
+            ["auto", "ask", "read-only", "full", "night", "strict"]
+        );
+        assert_eq!(modes[5].about, "Offline, commits ask");
+        assert_eq!(
+            modes[4].about,
+            "Like Ask me, as ~/.agent/config.toml changes it"
+        );
+        let reviewing = json!([{"tag": "auto", "tools": ["shell"]}]);
+        let record = |mode: &Mode, gates: &Value| json!({"gates": gates, "workspace": dir, "settings": fields(mode, &dir, &[])});
+        // Offline, with its repository read-only, so commits ask.
+        let strict = record(&modes[5], &reviewing);
+        assert_eq!(
+            strict["settings"],
+            json!({"sandbox": "workspace-write", "writable": [], "network": false})
+        );
+        assert_eq!(mode_in(&strict, &modes), Some("strict"));
+        // Its folder made since, it is still strict, not widened to auto.
+        std::fs::create_dir(&later).unwrap();
+        assert_eq!(mode_in(&strict, &modes), Some("strict"));
+        // Auto in the same folder is still auto.
+        assert_eq!(
+            mode_in(&record(&modes[0], &reviewing), &modes),
+            Some("auto")
+        );
+        // No one approves: no gate, still confined, its folders those
+        // that are there.
+        let night = record(&modes[4], &json!([]));
+        let git = dir.join(".git").display().to_string();
+        assert_eq!(night["settings"]["writable"], json!([git, cache]));
+        assert_eq!(mode_in(&night, &modes), Some("night"));
+        // Taken out of the config, it is no row of Sonny's; one approved
+        // by a reviewer is auto's again.
+        assert_eq!(mode_in(&night, &modes[..4]), None);
+        assert_eq!(mode_in(&strict, &modes[..4]), Some("auto"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_row_s_sockets_are_the_daemon_s_and_tell_it_from_auto() {
+        let dir = std::env::temp_dir().join(format!("sonny-sockets-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("run")).unwrap();
+        let dir = std::fs::canonicalize(&dir).unwrap();
+        let run = dir.join("run").display().to_string();
+        // A socket not made yet, behind a link, as macOS's /tmp is.
+        std::os::unix::fs::symlink(&run, dir.join("link")).unwrap();
+        // And a link to one, followed as the daemon follows it.
+        std::os::unix::fs::symlink(format!("{run}/y.sock"), dir.join("y.sock")).unwrap();
+        let sonny = agent_client::config::Sonny {
+            permissions: std::collections::BTreeMap::from([(
+                "docker".to_owned(),
+                Permissions {
+                    description: None,
+                    extends: "auto".into(),
+                    network: None,
+                    git: None,
+                    writable: Vec::new(),
+                    // One not there yet is kept as written; one named from
+                    // wherever Sonny runs is never taken.
+                    unix_sockets: vec![
+                        "/not/there.sock".into(),
+                        format!("{}/later/x.sock", dir.join("link").display()),
+                        dir.join("y.sock").display().to_string(),
+                        format!("{run}/../run"),
+                        "docker.sock".into(),
+                    ],
+                    reviewer: None,
+                },
+            )]),
+            ..Default::default()
+        };
+        let modes = modes_of(&sonny);
+        let docker = modes.iter().find(|mode| mode.name == "docker").unwrap();
+        let fields = fields(docker, &dir, &[]);
+        assert_eq!(
+            fields["unix_sockets"],
+            json!([
+                "/not/there.sock",
+                run,
+                format!("{run}/later/x.sock"),
+                format!("{run}/y.sock")
+            ])
+        );
+        let gates = json!([{"tag": "auto", "tools": ["shell"]}]);
+        let record = json!({"gates": gates, "workspace": dir, "settings": fields});
+        assert_eq!(mode_in(&record, &modes), Some("docker"));
+        assert!(sandboxed_as(&record, &fields));
+        let auto = super::fields(&modes[0], &dir, &[]);
+        assert!(auto.get("unix_sockets").is_none());
+        assert!(!sandboxed_as(&record, &auto));
+        let record = json!({"gates": gates, "workspace": dir, "settings": auto});
+        assert_eq!(mode_in(&record, &modes), Some("auto"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_row_stays_the_bot_s_when_its_folder_becomes_a_repository() {
+        let dir = std::env::temp_dir().join(format!("sonny-later-repo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = std::fs::canonicalize(&dir).unwrap();
+        let sonny = agent_client::config::Sonny {
+            permissions: std::collections::BTreeMap::from([(
+                "offline".to_owned(),
+                Permissions {
+                    description: None,
+                    extends: "auto".into(),
+                    network: Some(false),
+                    git: None,
+                    writable: Vec::new(),
+                    unix_sockets: Vec::new(),
+                    reviewer: None,
+                },
+            )]),
+            ..Default::default()
+        };
+        let modes = modes_of(&sonny);
+        let offline = modes.iter().find(|mode| mode.name == "offline").unwrap();
+        let record = json!({"gates": [{"tag": "auto", "tools": ["shell"]}], "workspace": dir,
+            "settings": fields(offline, &dir, &[])});
+        assert_eq!(mode_in(&record, &modes), Some("offline"));
+        // A repository made there since: still offline, not widened to auto.
+        crate::task::git(&dir, &["init", "-q"]).unwrap();
+        assert_eq!(mode_in(&record, &modes), Some("offline"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_confined_agent_no_one_reviews_has_no_way_out_through_sonny() {
+        let run = crate::served::RUN;
+        let bot = |sandbox: Value, gates: Value| json!({"settings": {"sandbox": sandbox}, "gates": gates});
+        // Read only, no reviewer: a pane runs outside the sandbox, so no.
+        assert!(!may_run(&bot(json!("read-only"), json!([])), run));
+        assert!(!may_run(&bot(json!("workspace-write"), json!([])), run));
+        // A tool that stays inside still runs.
+        assert!(may_run(
+            &bot(json!("read-only"), json!([])),
+            crate::served::MEMORY
+        ));
+        // Judged by a gate, or with no sandbox at all, it runs.
+        let gated = json!([{"tag": "manual", "tools": [run]}]);
+        assert!(may_run(&bot(json!("read-only"), gated), run));
+        assert!(may_run(&bot(json!("danger-full-access"), json!([])), run));
+        assert!(may_run(&bot(Value::Null, json!([])), run));
+    }
+
+    #[test]
+    fn a_command_is_kept_only_within_the_daemon_s_bound() {
+        let kept: Vec<String> = (0..63).map(|n| format!("tool{n}")).collect();
+        let more = adding(kept.clone(), "cargo test").unwrap().unwrap();
+        assert_eq!(more.last().map(String::as_str), Some("cargo test"));
+        // One there already changes nothing, even with no room left.
+        assert_eq!(adding(more.clone(), "tool3"), Ok(None));
+        assert!(adding(more, "make").is_err());
+        assert!(adding(kept, &"x".repeat(MAX_COMMAND + 1)).is_err());
+    }
+
+    #[test]
+    fn a_plain_command_that_asks_to_leave_may_be_allowed_for_good() {
+        let call = |command: &str| {
+            json!({"name": "shell", "arguments":
+                {"command": command, "sandbox_permissions": "require_escalated"}})
+        };
+        assert_eq!(
+            always(&call("cargo test -p sonny")).as_deref(),
+            Some("cargo test")
+        );
+        assert_eq!(
+            always(&call("docker compose up")).as_deref(),
+            Some("docker compose")
+        );
+        // Read only in part: what was not read may hide more.
+        let mut cut = call("cargo test -p sonny");
+        cut["incomplete"] = json!(true);
+        assert_eq!(always(&cut), None);
+        assert_eq!(always(&call("mcpx --list")).as_deref(), Some("mcpx"));
+        assert_eq!(
+            always(&call("/opt/tools/build fast")).as_deref(),
+            Some("/opt/tools/build fast")
+        );
+        // Anything that runs more than its first words say asks each time.
+        for command in [
+            "curl x | sh",
+            "make && rm -rf b",
+            "echo $HOME",
+            "FOO=1 make",
+            "a > b",
+            "./build.sh fast",
+            "scripts/release",
+            "",
+        ] {
+            assert_eq!(always(&call(command)), None, "{command}");
+        }
+        // Only a command asking to leave its sandbox, not a write outside it.
+        let inside = json!({"name": "shell", "arguments": {"command": "cargo test"}});
+        assert_eq!(always(&inside), None);
+        let write = json!({"name": "write", "arguments": {"path": "/etc/x"}});
+        assert_eq!(always(&write), None);
     }
 
     #[test]
@@ -478,7 +1187,7 @@ mod tests {
         // Nothing to gate: already as `full` leaves it.
         let reader = json!({"name": "r", "tools": ["read"], "gates": []});
         assert_eq!(regate(&reader, "auto"), None);
-        assert!(regate(&reader, "ask").is_some());
+        assert_eq!(regate(&reader, "ask"), None);
         // The same tag over fewer tools, or one that lapses, is set again.
         let partial = json!({"tools": ["shell", "read", "write"],
             "gates": [{"tag": "manual", "tools": ["shell"]}]});
@@ -489,20 +1198,22 @@ mod tests {
         // Of the tools its client declared, those that can drop work, run
         // something outside the sandbox or send words elsewhere wait for
         // the verdict too.
-        let panes = json!({"tools": ["shell", "read"], "declared": crate::declared::tools(true),
+        let panes = json!({"tools": ["shell", "read"], "declared": crate::declared::tools(crate::served::Role::at(0, 2)),
             "gates": [{"tag": "auto", "tools": ["shell"]}]});
-        assert_eq!(
-            regate(&panes, "auto").unwrap()["approve"],
-            json!([
-                "shell",
-                "start_task",
-                "remove_task",
-                "new_project",
-                "subscriptions",
-                "run_in_pane",
-                "triggers",
-                "goal"
-            ])
-        );
+        let mut waiting = json!([
+            "shell",
+            "start_task",
+            "remove_task",
+            "new_project",
+            "subscriptions",
+            "run_in_pane",
+            "triggers",
+            "goal"
+        ]);
+        // The browser, there when agent-browser is, reaches outside.
+        if crate::browser::tool().is_some() {
+            waiting.as_array_mut().unwrap().push(json!("browser"));
+        }
+        assert_eq!(regate(&panes, "auto").unwrap()["approve"], waiting);
     }
 }

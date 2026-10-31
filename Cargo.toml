@@ -36,6 +36,11 @@ tokio-tungstenite = { version = "0.30", default-features = false, features = ["h
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# The seccomp filter bubblewrap loads (`--seccomp`), compiled as Codex's
+# Linux sandbox and Firecracker compile theirs.
+[target.'cfg(target_os = "linux")'.dependencies]
+seccompiler = "0.5"
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

@@ -144,13 +144,16 @@ fn admission_bound(command: &Command, id: &Value, deliveries: usize) -> Bound {
                     }
             }),
             output::encoded_len(&(bot, created_by)),
-            // The workspace and the writable folders, canonical, which the
-            // reply's settings repeat; a bot a sandboxed bot makes can take
-            // its creator's.
+            // The workspace, the writable folders and the Unix sockets,
+            // canonical, which the reply's settings repeat; a bot a
+            // sandboxed bot makes can take its creator's.
             usize::from(workspace.is_some()) * PATH_JSON
                 + match created_by {
-                    Some(_) => FOLDERS_JSON,
-                    None => (settings.writable.len() * PATH_JSON).min(FOLDERS_JSON),
+                    Some(_) => 2 * FOLDERS_JSON,
+                    None => {
+                        (settings.writable.len() * PATH_JSON).min(FOLDERS_JSON)
+                            + (settings.unix_sockets.len() * PATH_JSON).min(FOLDERS_JSON)
+                    }
                 },
             // Both the bot and its event carry its gates, most of them
             // inherited from its creator, so the command does not show
@@ -195,6 +198,14 @@ pub struct Request {
 }
 /// A client's refusal of an answered call, which the model reads as the
 /// call's error.
+/// A declared call's answer: text, or parts in the order the model reads
+/// them, text and pictures, as a provider's own tool results take them.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ToolOutput {
+    Text(String),
+    Parts(Vec<agent_runtime::codec::Part>),
+}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ToolError {
@@ -275,14 +286,16 @@ enum Command {
         /// removes them.
         declare: Option<Vec<Declared>>,
         /// Its command sandbox, replacing the one it has, as `create`'s
-        /// settings name it: with `writable`, `network` and `unsandboxed`,
-        /// which otherwise go back to none, off and none.
+        /// settings name it: with `writable`, `network`, `unsandboxed` and
+        /// `unix_sockets`, which otherwise go back to none, off, none and
+        /// none.
         sandbox: Option<agent_runtime::sandbox::Mode>,
         writable: Option<Vec<String>>,
         network: Option<bool>,
         /// Its prompt-cache lifetime, as `create`'s settings name it.
         cache_ttl: Option<agent_runtime::store::CacheTtl>,
         unsandboxed: Option<Vec<String>>,
+        unix_sockets: Option<Vec<String>>,
         /// The tier its calls are served at, as `create`'s settings name
         /// it; `standard` goes back to none.
         speed: Option<agent_runtime::provider::Speed>,
@@ -381,6 +394,14 @@ enum Command {
         /// What sent it when no bot's turn did, as the client names itself
         /// (a name's characters); absent for a person.
         origin: Option<String>,
+        /// The person who wrote it, as the client labels them (a name's
+        /// characters); absent with no `from` or `origin` is the daemon's
+        /// own person. Not verified.
+        person: Option<String>,
+        /// Turns whose words the daemon copies after the prompt's, each
+        /// with who wrote them: a turn's prompt, or with `reply` the reply
+        /// it ended with.
+        quotes: Option<Vec<agent_runtime::store::QuoteRef>>,
         /// The most input plus output tokens this turn may spend, beside
         /// the bot's own budget; absent leaves only that.
         budget_tokens: Option<u64>,
@@ -438,6 +459,9 @@ enum Command {
         bot: String,
         #[serde(default)]
         after: i64,
+        /// Start instead from the first event written at or after this Unix
+        /// ms; exclusive with `after`.
+        since_ms: Option<i64>,
         /// Only events of these kinds, when given; notices about the
         /// stream itself (`follow_live`, `pruned`) always come.
         kinds: Option<Vec<String>>,
@@ -478,7 +502,7 @@ enum Command {
         bot: String,
         turn: i64,
         call_id: String,
-        output: Option<String>,
+        output: Option<ToolOutput>,
         error: Option<ToolError>,
     },
     /// Put one step of a declared call this client answers to the bot's
@@ -859,17 +883,21 @@ fn settle_step(handles: &Handles, bot: &str, turn: i64, stepped: Stepped) -> Opt
 /// The most bytes a prompt's pictures may have together, decoded: what
 /// Anthropic takes for one image, so one alone always fits.
 const IMAGES_BYTES: usize = 5 << 20;
-/// The most pictures one prompt may carry.
+/// The most turns one prompt may quote; their words are bounded with its
+/// own.
+const MAX_QUOTES: usize = agent_runtime::store::Database::QUOTES;
+/// The most pictures one prompt, or one tool result, may carry.
 const IMAGES: usize = 20;
 
 /// Pictures a provider takes: a media type both families know, base64 of
 /// an image of that type, and within [`IMAGES`] and [`IMAGES_BYTES`].
-fn check_images(images: &[agent_runtime::codec::Image]) -> Result<()> {
+/// `carrier` names what carries them, a prompt or a tool result.
+fn check_images(images: &[&agent_runtime::codec::Image], carrier: &str) -> Result<()> {
     use base64::Engine;
     if images.len() > IMAGES {
         return fail_with(
             "image_limit",
-            format!("a prompt may carry up to {IMAGES} images"),
+            format!("{carrier} may carry up to {IMAGES} images"),
         );
     }
     let mut bytes = 0;
@@ -901,10 +929,24 @@ fn check_images(images: &[agent_runtime::codec::Image]) -> Result<()> {
     if bytes > IMAGES_BYTES {
         return fail_with(
             "image_limit",
-            format!("a prompt's images may be up to {IMAGES_BYTES} bytes together, decoded"),
+            format!("{carrier}'s images may be up to {IMAGES_BYTES} bytes together, decoded"),
         );
     }
     Ok(())
+}
+/// [`check_images`] off the runtime thread, since decoding grows with the
+/// pictures: `held` comes back once the pictures `images` finds in it pass.
+async fn images_checked<T: Send + 'static>(
+    held: T,
+    images: fn(&T) -> Vec<&agent_runtime::codec::Image>,
+    carrier: &'static str,
+) -> Result<T> {
+    if images(&held).is_empty() {
+        return Ok(held);
+    }
+    tokio::task::spawn_blocking(move || check_images(&images(&held), carrier).map(|()| held))
+        .await
+        .unwrap_or_else(|join| std::panic::resume_unwind(join.into_panic()))
 }
 fn workspace(path: &str) -> Result<String> {
     if !Path::new(path).is_absolute() || !Path::new(path).is_dir() {
@@ -936,6 +978,17 @@ fn confine(settings: &mut Settings) -> Result<()> {
     }
     settings.writable.sort();
     settings.writable.dedup();
+    // By its real path, as Seatbelt matches it: a socket comes and goes
+    // with its program, so what of it is there, and the rest as written.
+    for path in &mut settings.unix_sockets {
+        if let Some(real) = agent_client::files::real(std::path::Path::new(&*path))
+            .and_then(|real| real.to_str().map(str::to_owned))
+        {
+            *path = real;
+        }
+    }
+    settings.unix_sockets.sort();
+    settings.unix_sockets.dedup();
     Ok(())
 }
 /// A field given as `null` deserializes to `Some(None)`, apart from one
@@ -1940,11 +1993,12 @@ impl Service {
             Ok(())
         };
         // A tool a client answers is one the caller may pass on: one it has,
-        // may call, and gives the bots it makes, answered by the same client
-        // and gated as a whole unless the caller's is gated by its steps.
-        // Another could get a client to act for it.
+        // may call, and gives the bots it makes, answered by the same client,
+        // gated as a whole unless the caller's is gated by its steps, and
+        // passed down no further than the caller's goes. Another could get
+        // a client to act for it.
         let callable = |own: &agent_runtime::tools::Declared| {
-            own.inherit
+            own.inherit.passes()
                 && me
                     .allowed
                     .as_ref()
@@ -1957,6 +2011,7 @@ impl Service {
                         && own.name == tool.name
                         && own.answered_by == tool.answered_by
                         && (own.steps || !tool.steps)
+                        && tool.inherit.within(own.inherit.passed())
                 })
         };
         // The folders a request would give a bot, each of which the caller
@@ -1977,15 +2032,19 @@ impl Service {
                     return refuse("declare a tool a client answers that it can't pass on");
                 }
                 // Without its own list, a bot takes the tools its creator
-                // passes on: none a client answers that the caller may not call.
-                if declare.is_none() && me.declared.iter().any(|own| own.inherit && !passes(own)) {
-                    *declare = Some(
-                        me.declared
-                            .iter()
-                            .filter(|own| own.inherit && passes(own))
-                            .cloned()
-                            .collect(),
-                    );
+                // passes on, a generation fewer: none a client answers that
+                // the caller may not call.
+                if declare.is_none() {
+                    let passed: Vec<_> = (me.declared.iter())
+                        .filter(|own| own.inherit.passes())
+                        .map(|own| agent_runtime::tools::Declared {
+                            inherit: own.inherit.passed(),
+                            ..own.clone()
+                        })
+                        .collect();
+                    if passed.iter().any(|tool| !passes(tool)) {
+                        *declare = Some(passed.into_iter().filter(|tool| passes(tool)).collect());
+                    }
                 }
                 folders.extend(workspace.clone());
                 folders.extend(settings.writable.iter().cloned());
@@ -2041,12 +2100,16 @@ impl Service {
                 workspace,
                 from,
                 origin,
+                person,
                 ..
             } => {
                 // What it sends reads as the caller's, never a person's or
                 // another bot's.
                 if from.as_ref().is_some_and(|author| author.bot != me.name) {
                     return refuse("send a message as another bot");
+                }
+                if person.is_some() {
+                    return refuse("send a message as a person");
                 }
                 // Named once, as the request names it, so a retry of the
                 // same request is the same request.
@@ -3070,6 +3133,7 @@ impl Service {
                 network,
                 cache_ttl,
                 unsandboxed,
+                unix_sockets,
                 speed,
             } => {
                 if effort.is_some() && model.is_none() {
@@ -3082,6 +3146,7 @@ impl Service {
                             writable: writable.unwrap_or_default(),
                             network: network.unwrap_or(false),
                             unsandboxed: unsandboxed.unwrap_or_default(),
+                            unix_sockets: unix_sockets.unwrap_or_default(),
                             ..Settings::default()
                         };
                         settings.validate()?;
@@ -3094,10 +3159,14 @@ impl Service {
                         .map_err(|_| Error::new("sandbox_unavailable"))??;
                         Some(settings)
                     }
-                    None if writable.is_some() || network.is_some() || unsandboxed.is_some() => {
+                    None if writable.is_some()
+                        || network.is_some()
+                        || unsandboxed.is_some()
+                        || unix_sockets.is_some() =>
+                    {
                         return fail_with(
                             "invalid_setting",
-                            "writable, network and unsandboxed go with sandbox",
+                            "writable, network, unsandboxed and unix_sockets go with sandbox",
                         );
                     }
                     None => None,
@@ -3507,14 +3576,60 @@ impl Service {
                 output,
                 error,
             } => {
+                use agent_runtime::codec::Part;
                 let outcome = match (output, error) {
-                    (Some(output), None) if output.len() > ANSWER_BYTES => {
+                    (Some(ToolOutput::Text(output)), None) if output.len() > ANSWER_BYTES => {
                         return fail_with(
                             "tool_output_limit",
                             format!("output may be up to {ANSWER_BYTES} bytes"),
                         );
                     }
-                    (Some(output), None) => Outcome::text(self.registry.redact_text(output)),
+                    (Some(ToolOutput::Text(output)), None) => {
+                        Outcome::text(self.registry.redact_text(output))
+                    }
+                    (Some(ToolOutput::Parts(parts)), None) => {
+                        let words: usize = parts
+                            .iter()
+                            .map(|part| match part {
+                                Part::Text { text } => text.len(),
+                                Part::Image(_) => 0,
+                            })
+                            .sum();
+                        if words > ANSWER_BYTES {
+                            return fail_with(
+                                "tool_output_limit",
+                                format!("output's text may be up to {ANSWER_BYTES} bytes"),
+                            );
+                        }
+                        let parts = images_checked(
+                            parts,
+                            |parts| parts.iter().filter_map(Part::image).collect(),
+                            "a tool result",
+                        )
+                        .await?;
+                        let mut parts: Vec<Part> = parts
+                            .into_iter()
+                            .map(|part| match part {
+                                Part::Text { text } => Part::Text {
+                                    text: self.registry.redact_text(text),
+                                },
+                                image => image,
+                            })
+                            .collect();
+                        // Words before the first picture are the output.
+                        let output = match parts.first_mut() {
+                            Some(Part::Text { text }) => {
+                                let text = std::mem::take(text);
+                                parts.remove(0);
+                                text
+                            }
+                            _ => String::new(),
+                        };
+                        Outcome {
+                            parts,
+                            ..Outcome::text(output)
+                        }
+                    }
                     (None, Some(ToolError { code, detail })) => {
                         let coded = !code.is_empty()
                             && code.len() <= 64
@@ -3537,7 +3652,8 @@ impl Service {
                         Outcome {
                             output: json!({"error":code,"detail":detail}).to_string(),
                             artifacts: Vec::new(),
-                            images: Vec::new(),
+                            files: Default::default(),
+                            parts: Vec::new(),
                             note: None,
                             failed: true,
                         }
@@ -3914,9 +4030,17 @@ impl Service {
                     })
                     .await
             }
-            Command::Follow { bot, after, kinds } => {
+            Command::Follow {
+                bot,
+                after,
+                since_ms,
+                kinds,
+            } => {
                 if after < 0 {
                     return fail_with("invalid_event_page", "after must be 0 or more");
+                }
+                if since_ms.is_some() && after != 0 {
+                    return fail_with("invalid_event_page", "after and since_ms are exclusive");
                 }
                 if kinds.as_ref().is_some_and(|kinds| {
                     kinds.is_empty() || kinds.iter().any(|kind| name("kind", kind).is_err())
@@ -3931,6 +4055,14 @@ impl Service {
                     let check = bot.clone();
                     store.op("inspect", move |db| db.inspect(&check)).await?;
                 }
+                let after = match since_ms {
+                    Some(since_ms) => {
+                        store
+                            .op("cursor_since", move |db| db.cursor_since(since_ms))
+                            .await?
+                    }
+                    None => after,
+                };
                 let wanted = kinds.clone().map(|kinds| kinds.into_iter().collect());
                 let sub = self
                     .hub
@@ -3958,12 +4090,18 @@ impl Service {
                 expected_turn,
                 from,
                 origin,
+                person,
+                quotes,
                 budget_tokens,
                 images,
             } => {
                 name("request_id", &request_id)?;
-                let images = images.unwrap_or_default();
-                check_images(&images)?;
+                let images = images_checked(
+                    images.unwrap_or_default(),
+                    |images| images.iter().collect(),
+                    "a prompt",
+                )
+                .await?;
                 if origin.is_some() && from.is_some() {
                     return fail_with("invalid_origin", "from and origin are mutually exclusive");
                 }
@@ -3972,6 +4110,29 @@ impl Service {
                         code: "invalid_origin".into(),
                         ..e
                     })?;
+                }
+                if let Some(person) = &person {
+                    if from.is_some() || origin.is_some() {
+                        return fail_with(
+                            "invalid_person",
+                            "person, from and origin are mutually exclusive",
+                        );
+                    }
+                    name("person", person).map_err(|e| Error {
+                        code: "invalid_person".into(),
+                        ..e
+                    })?;
+                }
+                let quotes = quotes.unwrap_or_default();
+                if quotes.len() > MAX_QUOTES {
+                    return fail_with(
+                        "invalid_quote",
+                        format!("a prompt may quote up to {MAX_QUOTES} turns"),
+                    );
+                }
+                if let Some(quote) = quotes.iter().find(|quote| quote.turn < 1) {
+                    return Err(Error::with("invalid_quote", "a quoted turn is 1 or more")
+                        .facts(json!({"bot":quote.bot,"turn":quote.turn})));
                 }
                 if prompt.len() > 256 * 1024 {
                     return fail_with("prompt_limit", "prompt may be up to 262144 bytes");
@@ -4028,6 +4189,8 @@ impl Service {
                     expected_turn,
                     from: from.map(|author| (author.bot, author.turn)),
                     origin,
+                    person,
+                    quotes,
                     budget_tokens,
                     images,
                 };
@@ -5262,6 +5425,8 @@ mod tests {
             expected_turn: None,
             from: None,
             origin: None,
+            person: None,
+            quotes: None,
             budget_tokens: None,
             images: None,
         }
@@ -6536,6 +6701,16 @@ mod tests {
             *compaction_instructions = Some(awkward);
             *compaction_model = Some("openai/synthetic".into());
         }
+        // Its sockets as many as it may name, each escaped in JSON, where a
+        // sandbox can run.
+        if agent_runtime::sandbox::available().is_ok()
+            && let Command::Create { settings, .. } = &mut create
+        {
+            settings.sandbox = Some(agent_runtime::sandbox::Mode::ReadOnly);
+            settings.unix_sockets = (0..64)
+                .map(|i| format!("/{i}{}", "\u{1}".repeat(80)))
+                .collect();
+        }
         // A creator carrying every gate a bot may, each at its limits, which
         // the command creating its child does not show.
         let tools = ["echo".to_owned()];
@@ -6603,6 +6778,10 @@ mod tests {
             assert_eq!(deferred.unwrap_err().code, "deferred");
             let (_, _, _, result) = service.settle().await;
             let reply = json!({"id": id, "result": result.unwrap()});
+            if reply["result"]["name"] == "Bot" && agent_runtime::sandbox::available().is_ok() {
+                let sockets = &reply["result"]["settings"]["unix_sockets"];
+                assert_eq!(sockets.as_array().map(Vec::len), Some(64));
+            }
             let event = loop {
                 // The gated creators' own events come first.
                 if let Publication::Event(entry) = publications.recv().await.unwrap()
@@ -6952,7 +7131,7 @@ mod tests {
         let (done, running) = store
             .call(move |db| {
                 let done = db.process_start(turn, "shell-1")?;
-                db.process_finish(done, &json!({"exit_code":0}), &[])?;
+                db.process_finish(done, &json!({"exit_code":0}), &[], &[])?;
                 Ok((done, db.process_start(turn, "shell-2")?))
             })
             .await

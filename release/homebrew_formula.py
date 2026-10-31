@@ -20,7 +20,10 @@ def archive_name(version: str) -> str:
 FORMULAS = {
     "agent": (
         "Small daemon that hosts many durable AI agents",
-        "",
+        # Its default sandbox on Linux runs commands in bubblewrap, which it
+        # never looks up on PATH: the build fixes where this one is.
+        '  on_linux do\n    depends_on "bubblewrap"\n  end\n',
+        '    ENV["AGENT_BWRAP"] = (Formula["bubblewrap"].opt_bin/"bwrap").to_s if OS.linux?\n'
         '    system "cargo", "install", *std_cargo_args\n',
         '    assert_equal "agent-runtime #{version}", shell_output("#{bin}/agent --version").strip\n',
     ),
@@ -28,8 +31,8 @@ FORMULAS = {
         "Terminal coordinator for a daemon that hosts many durable AI agents",
         # Sonny starts this daemon when none runs, by its `opt` path, which
         # outlasts the versions upgrades remove. Its bots search code with
-        # `rg`, as other harnesses' agents do.
-        '  depends_on "lydakis/agent/agent"\n  depends_on "ripgrep"\n',
+        # `rg`, as other harnesses' agents do, and browse with agent-browser.
+        '  depends_on "agent-browser"\n  depends_on "lydakis/agent/agent"\n  depends_on "ripgrep"\n',
         '    system "cargo", "install", *std_cargo_args(path: "sonny")\n',
         '    assert_equal "sonny #{version}", shell_output("#{bin}/sonny --version").strip\n',
     ),

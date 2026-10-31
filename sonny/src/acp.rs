@@ -2,7 +2,7 @@
 //! Code, which runs it as a provider ("Local command"), a process for each
 //! thread. A thread in a folder is that folder's lead, as `sonny` there
 //! finds or makes it, set up the same way: its rules and skills, its tools,
-//! its approval mode, and the lookout. Each task the lead starts opens as a
+//! its permissions row, and the lookout. Each task the lead starts opens as a
 //! thread through T3 Code's tools, the lead thread's child while the
 //! person's prompt runs, and that thread is the task's.
 //!
@@ -1560,7 +1560,7 @@ async fn services(
         lookout::subscribe_lead(&agent.options.store, bot, project)?;
     }
     crate::start_companions(client).await?;
-    if approvals::mode(&record) == Some("auto") {
+    if approvals::reviews(approvals::mode(&record)) {
         let model = format!(
             "{}/{}",
             record["provider"].as_str().unwrap_or(""),
@@ -1573,7 +1573,7 @@ async fn services(
 
 /// Set up the lead a thread is, as `sonny` sets up the lead it opens: the
 /// tools Sonny gives it, its folder's rules and skills as they are today,
-/// the approval mode a new lead starts in, the lookout watching its tasks,
+/// the permissions row a new lead starts in, the lookout watching its tasks,
 /// and a judge for its calls.
 async fn setup_lead(
     agent: &Agent,
@@ -1597,12 +1597,12 @@ async fn setup_lead(
     {
         asked["instructions"] = json!(text);
     }
-    let declare = declared::declare(&record, true);
+    let declare = declared::declare(&record, crate::served::Role::of(0));
     if let Some(declare) = &declare {
         asked["declare"] = declare.clone();
     }
     let mode = approvals::mode(&record);
-    let mut gating = lead.new.then_some(approvals::MODES[0].0);
+    let mut gating = lead.new.then(approvals::default);
     if gating.is_none()
         && let Some(mode) = mode.filter(|mode| *mode != "full")
         && !approvals::sandboxed_as(&record, &approvals::sandbox(mode, Path::new(&workspace)))
@@ -1646,7 +1646,7 @@ async fn setup_lead(
     }
     lookout::subscribe_lead(&agent.options.store, &lead.bot, &lead.project)?;
     crate::start_companions(client).await?;
-    if gating.or(mode) == Some("auto") {
+    if approvals::reviews(gating.or(mode)) {
         let model = format!(
             "{}/{}",
             record["provider"].as_str().unwrap_or(""),

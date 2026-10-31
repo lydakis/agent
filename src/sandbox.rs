@@ -11,6 +11,7 @@
 //! unless the bot's client turned it on.
 
 use crate::{Result, fail_with};
+use agent_client::files::real;
 use serde::{Deserialize, Serialize};
 use std::path::{Component, Path, PathBuf};
 
@@ -67,6 +68,14 @@ pub struct Policy {
     pub capability: Option<PathBuf>,
     /// The agent binary a confined write runs in ([`WRITE`]).
     pub helper: Option<PathBuf>,
+    /// The folders, or sockets, whose Unix sockets its commands reach,
+    /// those its settings name. No other, as Claude Code's sandbox and
+    /// Codex's managed network keep them: a socket may be a program's that
+    /// runs as the person, Docker's or a browser's, which runs what a
+    /// command asks of it outside the sandbox. Not even those in its own
+    /// folders: a hard link there to any socket, which needs no right to
+    /// the socket, would reach that one by a name in them.
+    pub sockets: Vec<PathBuf>,
 }
 
 impl Policy {
@@ -110,7 +119,15 @@ impl Policy {
             socket: daemon.socket.clone(),
             capability: None,
             helper: daemon.helper.clone(),
+            sockets: Vec::new(),
         }))
+    }
+
+    /// This policy, its commands also reaching the Unix sockets at or under
+    /// `paths`, absolute paths its settings name.
+    pub fn with_sockets(mut self, paths: &[String]) -> Policy {
+        self.sockets.extend(paths.iter().map(PathBuf::from));
+        self
     }
 
     /// Whether a command in this sandbox may write `path`, an absolute
@@ -622,49 +639,6 @@ fn depth(path: &Path) -> usize {
     path.components().count()
 }
 
-/// `path` with what exists of it resolved to its real path and the rest
-/// appended; `None` when the rest climbs out with `..`, which can't be
-/// known without making it. A symlink whose target is missing is followed
-/// to that target, as a write through it would be.
-fn real(path: &Path) -> Option<PathBuf> {
-    real_within(path, 40)
-}
-
-fn real_within(path: &Path, links: u32) -> Option<PathBuf> {
-    let mut existing = path.to_owned();
-    let mut rest = Vec::new();
-    loop {
-        let found = std::fs::canonicalize(&existing).ok().or_else(|| {
-            // canonicalize fails on a dangling link as on a missing name.
-            let link = std::fs::read_link(&existing).ok()?;
-            let mut target = existing.parent()?.join(link);
-            for part in rest.iter().rev() {
-                target.push(part);
-            }
-            rest.clear();
-            real_within(&target, links.checked_sub(1)?)
-        });
-        if let Some(mut resolved) = found {
-            for part in rest.iter().rev() {
-                resolved.push(part);
-            }
-            return Some(resolved);
-        }
-        if std::fs::symlink_metadata(&existing).is_ok_and(|found| found.file_type().is_symlink()) {
-            return None;
-        }
-        let name = existing.file_name()?.to_owned();
-        if !matches!(
-            Path::new(&name).components().next(),
-            Some(Component::Normal(_))
-        ) {
-            return None;
-        }
-        rest.push(name);
-        existing = existing.parent()?.to_owned();
-    }
-}
-
 /// Whether this machine can run sandboxed commands, or why not: refused when
 /// a bot asks for a sandbox, rather than running it unconfined.
 pub fn available() -> Result<()> {
@@ -733,11 +707,17 @@ mod linux {
         "/run/current-system/sw/bin/bwrap",
     ];
 
+    /// The bubblewrap a package build depends on, fixed when the daemon is
+    /// built (`AGENT_BWRAP`), as Flatpak's `--with-system-bubblewrap`:
+    /// Homebrew on Linux installs it under its own prefix.
+    const BUILT_WITH: Option<&str> = option_env!("AGENT_BWRAP");
+
+    fn places() -> impl Iterator<Item = &'static str> {
+        BUILT_WITH.into_iter().chain(BWRAP)
+    }
+
     fn bwrap() -> Option<PathBuf> {
-        BWRAP
-            .iter()
-            .map(PathBuf::from)
-            .find(|found| found.is_file())
+        places().map(PathBuf::from).find(|found| found.is_file())
     }
 
     /// The bubblewrap that sandboxes run in, checked once: a daemon
@@ -758,7 +738,7 @@ mod linux {
             return Err(format!(
                 "bubblewrap (bwrap) is not in {}; install it, for example with \
                      `apt install bubblewrap` or `dnf install bubblewrap`",
-                BWRAP.join(", ")
+                places().collect::<Vec<_>>().join(", ")
             ));
         };
         let output = std::process::Command::new(&bwrap)
@@ -858,13 +838,204 @@ mod linux {
         rest: &[&str],
         detached: bool,
     ) -> Result<tokio::process::Command> {
+        use std::os::fd::AsRawFd;
         let mut command = tokio::process::Command::new(checked()?);
+        let filter = loaded(&filter(policy)?)?;
         command
             .args(args(policy, detached))
-            .arg("--")
-            .arg(program)
-            .args(rest);
+            .arg("--seccomp")
+            .arg(filter.as_raw_fd().to_string());
+        let mut kept = vec![filter];
+        if let Some(handing) = (policy.capability.as_deref().map(handing).transpose()?).flatten() {
+            command.env(
+                agent_client::socket::HANDED,
+                handing.as_raw_fd().to_string(),
+            );
+            kept.push(handing);
+        }
+        command.arg("--").arg(program).args(rest);
+        // SAFETY: fcntl is async-signal-safe; it only lets the descriptors
+        // through exec, into bubblewrap and the command.
+        unsafe {
+            command.pre_exec(move || {
+                for fd in &kept {
+                    if libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, 0) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                Ok(())
+            });
+        }
         Ok(command)
+    }
+
+    /// The seccomp filter bubblewrap loads, as Codex's Linux sandbox and
+    /// Claude Code's build theirs: what no path rule can hold. A command
+    /// makes no Unix socket, since bubblewrap's read-only root still lets
+    /// one connect to any it sees, the daemon's, Docker's or a desktop
+    /// session's bus that runs anything asked; one that names some is
+    /// let make them all, since seccomp can't tell them apart by path, as
+    /// Claude Code's `allowAllUnixSockets`. A pair (socketpair) it still
+    /// makes, which reaches nothing. io_uring, which makes sockets past
+    /// seccomp, it never sets up. Any other architecture's calls, which
+    /// number them otherwise, end the command.
+    pub(super) fn filter(policy: &Policy) -> Result<Vec<u8>> {
+        use seccompiler::{
+            BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition,
+            SeccompFilter, SeccompRule, TargetArch,
+        };
+        let invalid = |error: &dyn std::fmt::Display| {
+            Error::with("sandbox_unavailable", format!("seccomp filter: {error}"))
+        };
+        let arch = TargetArch::try_from(std::env::consts::ARCH).map_err(|e| invalid(&e))?;
+        let unix = SeccompRule::new(vec![
+            SeccompCondition::new(
+                0,
+                SeccompCmpArgLen::Dword,
+                SeccompCmpOp::Eq,
+                libc::AF_UNIX as u64,
+            )
+            .map_err(|e| invalid(&e))?,
+        ])
+        .map_err(|e| invalid(&e))?;
+        // A pair of datagram sockets, which Linux makes of a raw one too,
+        // sends to any socket's path, not only to its other end.
+        let datagrams = [libc::SOCK_DGRAM, libc::SOCK_RAW].map(|kind| {
+            SeccompRule::new(vec![
+                SeccompCondition::new(
+                    0,
+                    SeccompCmpArgLen::Dword,
+                    SeccompCmpOp::Eq,
+                    libc::AF_UNIX as u64,
+                )?,
+                SeccompCondition::new(
+                    1,
+                    SeccompCmpArgLen::Dword,
+                    SeccompCmpOp::MaskedEq(0xf),
+                    kind as u64,
+                )?,
+            ])
+        });
+        let datagrams = (datagrams.into_iter())
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| invalid(&e))?;
+        let mut rules = std::collections::BTreeMap::new();
+        rules.insert(libc::SYS_io_uring_setup, Vec::new());
+        if policy.sockets.is_empty() {
+            rules.insert(libc::SYS_socket, vec![unix.clone()]);
+            rules.insert(libc::SYS_socketpair, datagrams.clone());
+        }
+        // x86_64's x32 calls share its architecture, numbered past this bit.
+        if arch == TargetArch::x86_64 {
+            const X32: i64 = 0x4000_0000;
+            rules.insert(X32 | libc::SYS_io_uring_setup, Vec::new());
+            if policy.sockets.is_empty() {
+                rules.insert(X32 | libc::SYS_socket, vec![unix]);
+                rules.insert(X32 | libc::SYS_socketpair, datagrams);
+            }
+        }
+        let filter = SeccompFilter::new(
+            rules,
+            SeccompAction::Allow,
+            SeccompAction::Errno(libc::EPERM as u32),
+            arch,
+        )
+        .map_err(|e| invalid(&e))?;
+        let program: BpfProgram = filter.try_into().map_err(|e| invalid(&e))?;
+        Ok((program.iter())
+            .flat_map(|instruction| {
+                let mut bytes = Vec::with_capacity(8);
+                bytes.extend(instruction.code.to_ne_bytes());
+                bytes.push(instruction.jt);
+                bytes.push(instruction.jf);
+                bytes.extend(instruction.k.to_ne_bytes());
+                bytes
+            })
+            .collect())
+    }
+
+    /// `program` behind a pipe's read end, for bubblewrap's `--seccomp`.
+    fn loaded(program: &[u8]) -> Result<std::os::fd::OwnedFd> {
+        use std::io::Write;
+        let (read, write) = std::io::pipe()?;
+        // A filter is far smaller than a pipe holds, so this never waits.
+        std::fs::File::from(std::os::fd::OwnedFd::from(write)).write_all(program)?;
+        Ok(read.into())
+    }
+
+    /// The descriptor a command asks the daemon for connections on, as
+    /// [`agent_client::socket::handed`] does: each request is answered
+    /// with a connection the daemon opens to the bot's own socket, `own`,
+    /// for as long as any process of the command holds it. Without a
+    /// runtime to answer on, none.
+    fn handing(own: &Path) -> Result<Option<std::os::fd::OwnedFd>> {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return Ok(None);
+        };
+        let mut pair = [0; 2];
+        // SAFETY: socketpair writes two descriptors into `pair`.
+        if unsafe {
+            libc::socketpair(
+                libc::AF_UNIX,
+                libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+                0,
+                pair.as_mut_ptr(),
+            )
+        } < 0
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        // SAFETY: both are new and owned here alone.
+        let (ours, theirs) =
+            unsafe { (OwnedFd::from_raw_fd(pair[0]), OwnedFd::from_raw_fd(pair[1])) };
+        // The command's end blocks; each asker waits on it as it chooses.
+        // SAFETY: fcntl on a descriptor owned here.
+        unsafe {
+            let flags = libc::fcntl(theirs.as_raw_fd(), libc::F_GETFL);
+            libc::fcntl(theirs.as_raw_fd(), libc::F_SETFL, flags & !libc::O_NONBLOCK);
+        }
+        let ours = tokio::io::unix::AsyncFd::new(ours)?;
+        let own = own.to_owned();
+        runtime.spawn(async move {
+            let mut byte = [0u8; 1];
+            loop {
+                let Ok(mut ready) = ours.readable().await else {
+                    return;
+                };
+                // SAFETY: the byte outlives the call.
+                let read = unsafe {
+                    libc::recv(
+                        ours.get_ref().as_raw_fd(),
+                        byte.as_mut_ptr().cast(),
+                        1,
+                        libc::MSG_DONTWAIT,
+                    )
+                };
+                match read {
+                    // Every process of the command has let it go.
+                    0 => return,
+                    n if n < 0 => {
+                        match std::io::Error::last_os_error().kind() {
+                            std::io::ErrorKind::WouldBlock => ready.clear_ready(),
+                            std::io::ErrorKind::Interrupted => {}
+                            _ => return,
+                        }
+                        continue;
+                    }
+                    _ => {}
+                }
+                // Handed blocking, as a connection made in the command
+                // would be: the description is shared, and its flags with it.
+                let stream = (tokio::net::UnixStream::connect(&own).await)
+                    .and_then(tokio::net::UnixStream::into_std)
+                    .and_then(|stream| stream.set_nonblocking(false).map(|()| stream))
+                    .ok();
+                let fd = ours.get_ref().as_raw_fd();
+                let _ = agent_client::socket::hand(fd, stream.as_ref().map(|s| s.as_raw_fd()));
+            }
+        });
+        Ok(Some(theirs))
     }
 }
 
@@ -1126,6 +1297,21 @@ pub fn seatbelt(policy: &Policy) -> (String, Vec<(String, PathBuf)>) {
         sections.push(format!(
             "(allow network-outbound)\n(allow network-inbound)\n{SEATBELT_NETWORK}{SEATBELT_TLS_TRUST}"
         ));
+    }
+    // Unix sockets only those its settings name.
+    if policy.network {
+        sections.push("(deny network-outbound (remote unix-socket))".to_owned());
+    }
+    if !policy.sockets.is_empty() {
+        let mut rules = vec!["(allow system-socket (socket-domain AF_UNIX))".to_owned()];
+        for path in &policy.sockets {
+            let key = param(path);
+            rules.push(format!(
+                "(allow network-bind (local unix-socket (subpath (param \"{key}\"))))\n\
+                 (allow network-outbound (remote unix-socket (subpath (param \"{key}\"))))"
+            ));
+        }
+        sections.push(rules.join("\n"));
     }
     // Never the daemon's socket itself: the bot's own instead, which
     // answers as that bot and only as far as a sandboxed bot may go.
@@ -1498,6 +1684,63 @@ mod tests {
     }
 
     #[test]
+    fn unix_sockets_are_reached_only_as_named() {
+        let base =
+            std::env::temp_dir().join(format!("agent-sandbox-sockets-{}", std::process::id()));
+        std::fs::create_dir_all(base.join("cache")).unwrap();
+        let base = std::fs::canonicalize(&base).unwrap();
+        let cache = base.join("cache");
+        let policy = |network| {
+            Policy::new(
+                Some(Mode::WorkspaceWrite),
+                Some(&base),
+                &[cache.to_str().unwrap().to_owned()],
+                network,
+                &protecting(),
+            )
+            .unwrap()
+            .unwrap()
+        };
+        assert!(policy(true).sockets.is_empty());
+        let networked = policy(true).with_sockets(&["/tmp/ssh-agent.sock".to_owned()]);
+        assert_eq!(networked.sockets, [PathBuf::from("/tmp/ssh-agent.sock")]);
+        let (profile, params) = seatbelt(&networked);
+        let key = |path: &Path| {
+            params
+                .iter()
+                .find(|(_, p)| p == path)
+                .map(|(k, _)| k.clone())
+                .unwrap()
+        };
+        // The network on, every other socket stays out of reach, Docker's,
+        // those of what runs as the person, and those in its own folders.
+        let denied = profile
+            .find("(deny network-outbound (remote unix-socket))")
+            .unwrap();
+        let allowed = format!(
+            "(allow network-outbound (remote unix-socket (subpath (param \"{}\"))))",
+            key(Path::new("/tmp/ssh-agent.sock"))
+        );
+        assert!(profile.find(&allowed).unwrap() > denied, "{allowed}");
+        assert!(profile.find("(allow network-outbound)\n").unwrap() < denied);
+        for path in [&base, &cache] {
+            let own = format!("(remote unix-socket (subpath (param \"{}\")))", key(path));
+            assert!(!profile.contains(&own), "{own}");
+        }
+        // The network off, none but those either.
+        let (profile, _) = seatbelt(&policy(false));
+        assert!(!profile.contains("(deny network-outbound (remote unix-socket))"));
+        assert!(!profile.contains("(local unix-socket"));
+        // Read-only, it reaches only those it names.
+        let read_only = Policy::new(Some(Mode::ReadOnly), Some(&base), &[], false, &protecting())
+            .unwrap()
+            .unwrap();
+        assert!(read_only.sockets.is_empty());
+        assert!(!seatbelt(&read_only).0.contains("(local unix-socket"));
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
     fn many_nested_roots_still_fit_one_invocation() {
         // 64 nested roots with long names, about the settings' limit: each
         // rule names only its own, so the profile and its parameters grow
@@ -1523,6 +1766,7 @@ mod tests {
             socket: Some(path.join("agent.sock")),
             capability: None,
             helper: None,
+            sockets: Vec::new(),
         };
         let (profile, params) = seatbelt(&policy);
         let size = profile.len()
