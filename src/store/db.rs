@@ -3308,12 +3308,46 @@ impl Database {
                 break;
             }
         }
+        // A cut's prompt and the messages kept beside it go ahead of the
+        // tail, older than all of it, so a floor anywhere in the tail takes
+        // their pictures too: when only they are past the bound, the floor
+        // goes through the tail's oldest row.
+        let lead: Vec<Row> = match keep_pictures {
+            Some(_) => self
+                .conn
+                .prepare_cached(
+                    "WITH lead(node) AS (
+                        SELECT c.pinned FROM bots b JOIN compactions c ON c.node=b.compaction
+                        WHERE b.name=?1 AND c.cut=b.context_start AND c.pinned IS NOT NULL
+                        UNION ALL SELECT x.node FROM bots b JOIN compactions c ON c.node=b.compaction
+                        JOIN pins x ON x.compaction=c.node
+                        WHERE b.name=?1 AND c.cut=b.context_start AND c.pinned IS NOT NULL)
+                     SELECT n.id,0,n.elided,
+                        CASE WHEN n.id<=?2 AND n.elided>0 THEN 0 ELSE n.pictures END,
+                        CASE WHEN n.id<=?2 AND n.elided>0 THEN 0 ELSE n.pictured END
+                     FROM lead JOIN nodes n ON n.id=lead.node",
+                )?
+                .query_map(params![name, elided], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+                })?
+                .collect::<rusqlite::Result<_>>()?,
+            None => Vec::new(),
+        };
+        if edge == rows.len() {
+            for &(.., pictures, pictured) in &lead {
+                count += pictures;
+                extra += pictured.max(0);
+            }
+            if count > keep_count || extra > keep_extra {
+                edge = rows.len() - 1;
+            }
+        }
         let floor = edge.max(answered);
         let Some(&(through, ..)) = rows.get(floor) else {
             return Ok(None);
         };
         let (mut results, mut saved_bytes) = (0, 0);
-        for row in &rows[floor..] {
+        for row in rows[floor..].iter().chain(&lead) {
             if let &(id, _, saves, ..) = row
                 && id > elided
                 && saves > 0
