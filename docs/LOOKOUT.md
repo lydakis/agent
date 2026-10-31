@@ -32,15 +32,22 @@ whether or not a window is open. A lookout holds
 `STORE.lookout.lock` while it runs, so a second one prints
 `{"event":"already_watching"}` and exits, unless another build of Sonny
 started the one running, as an upgrade leaves it: that one is stopped, and
-the new one takes its place, so the tools the new Sonny gives its agents
-are answered; the daemon's companion takes the place of one a window
-started detached, of any build. `STORE.lookout.sonny` says which build runs. It watches for every bot with
+the new one takes its place; the daemon's companion takes the place of one
+a window started detached, of any build. `STORE.lookout.sonny` says which build runs. It watches for every bot with
 subscriptions on the daemon, whichever Sonny opened it, so a lead hears
 from its tasks even while no window shows that project. It exits
 once the daemon has been unreachable for 30 seconds, and the daemon stops
 it as it stops. Its own lines go to `STORE.companions/sonny-lookout.log`,
 and each subscriber it watches (`seated`) and each note it sends (`woke`)
 to `STORE.lookout.jsonl`.
+
+The lookout only watches and tells. The tools Sonny gives its agents are
+answered by another companion, `sonny-tool-host` (`sonny tool-host`; see
+SONNY.md, Sonny's tool host), so a tool that runs long, crashes or holds
+memory, as an MCP server can, never holds up a lead's news. The lookout
+follows those calls' starts and ends: when a `subscriptions` or `goal` call
+ends, it reads its files again before the next event, which the stream
+puts after that end, rather than at its next reread.
 
 It keeps a cursor in `STORE.lookout.cursor`: the newest event it saw, or
 just before the oldest one whose news it has not told yet. A lookout that
