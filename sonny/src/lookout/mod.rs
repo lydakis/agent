@@ -1994,10 +1994,12 @@ impl Lookout {
     /// Who wrote a turn, as the note names them; `None` for the
     /// subscriber, whose words are no news to it.
     fn author(&self, data: &Value) -> Option<String> {
-        // A lookout's own note to a lead another subscriber watches, or a
-        // goal's next turn, whose end alone is news.
+        // A lookout's own note to a lead another subscriber watches, a
+        // goal's next turn, or a trigger's fire: how the turn ends alone is
+        // news (a trigger's run that went well and said nothing is none).
         if (data["request_id"].as_str())
             .is_some_and(|id| id.starts_with("lookout-") || id.starts_with(goals::REQUEST))
+            || (data["origin"] == "trigger" && data["from"]["bot"].is_null())
         {
             return None;
         }
@@ -2984,6 +2986,18 @@ mod tests {
             ..said(8, PERSON, "tabs")
         });
         assert!(!busy.urgent && busy.wake_due(now).is_none());
+    }
+
+    #[test]
+    fn a_trigger_s_words_are_no_news_only_how_its_turn_ends() {
+        let mut lookout = seated("idle");
+        let fire = json!({"origin": "trigger", "request_id": "trigger_7_1"});
+        lookout.event(&ev("calc.fix", 4, "accepted", fire.clone()));
+        lookout.event(&ev("calc.fix", 5, "queued", fire));
+        assert!(lookout.due.is_empty());
+        // The person's words still are.
+        lookout.event(&ev("calc.fix", 6, "accepted", json!({})));
+        assert_eq!(lookout.due.len(), 1);
     }
 
     #[test]
