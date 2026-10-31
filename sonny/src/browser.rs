@@ -717,7 +717,7 @@ fn checked(line: &str, reach: &Reach) -> Result<Checked, String> {
 /// What a session of the agent `bot` is called: agent-browser's session
 /// names take letters, digits, `-` and `_`, in few enough of them that its
 /// socket's path stays shorter than a socket's may be.
-fn session(bot: &str) -> String {
+fn session(store: &str, bot: &str) -> String {
     let mut name: String = bot
         .chars()
         .map(
@@ -727,12 +727,14 @@ fn session(bot: &str) -> String {
             },
         )
         .collect();
-    // Two names that read alike here (`a.b` and `a_b`) are two agents, so
-    // each ends in a hash of its own, FNV-1a so the same agent keeps its
-    // session, after the start of its name, read in a session list.
-    let hash = (bot.bytes()).fold(0xcbf29ce484222325u64, |hash, byte| {
-        (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
-    });
+    // Two names that read alike here (`a.b` and `a_b`) are two agents, and
+    // one name in two stores, two daemons' agents, so each ends in a hash
+    // of its store and name, FNV-1a so the same agent keeps its session,
+    // after the start of its name, read in a session list.
+    let hash = (store.bytes().chain([0]).chain(bot.bytes()))
+        .fold(0xcbf29ce484222325u64, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
+        });
     name.truncate(7);
     name = format!("{name}-{hash:016x}");
     format!("sonny-{name}")
@@ -1076,7 +1078,10 @@ pub async fn answer(
         Ok(config) => confirmed(&config.sonny.browser_confirm),
         Err(_) => confirmed(&agent_client::config::BROWSER_CONFIRM.map(str::to_owned)),
     };
-    let session = session(call["bot"].as_str().unwrap_or_default());
+    let session = session(
+        client.store().unwrap_or_default(),
+        call["bot"].as_str().unwrap_or_default(),
+    );
     // One call at a time in a session, through its confirmations:
     // agent-browser holds one pending action a session and confirms it
     // whatever ID it is given, so another call's would be confirmed too.
@@ -1526,14 +1531,16 @@ mod tests {
 
     #[test]
     fn each_agent_has_its_own_session() {
-        assert!(session("lead-agent").starts_with("sonny-lead-ag-"));
-        assert!(session("a/b c").starts_with("sonny-a_b_c-"));
+        assert!(session("s1", "lead-agent").starts_with("sonny-lead-ag-"));
+        assert!(session("s1", "a/b c").starts_with("sonny-a_b_c-"));
         // Names that read alike here are still two agents' sessions.
-        assert_ne!(session("a.b.lead"), session("a_b.lead"));
-        let long = session("a-task-with-a-very-long-name-indeed");
+        assert_ne!(session("s1", "a.b.lead"), session("s1", "a_b.lead"));
+        let long = session("s1", "a-task-with-a-very-long-name-indeed");
         assert_eq!(long.len(), 30, "{long}");
-        assert_ne!(long, session("a-task-with-a-very-long-name-too"));
-        assert_eq!(long, session("a-task-with-a-very-long-name-indeed"));
+        assert_ne!(long, session("s1", "a-task-with-a-very-long-name-too"));
+        assert_eq!(long, session("s1", "a-task-with-a-very-long-name-indeed"));
+        // One name in another daemon's store is another agent.
+        assert_ne!(session("s1", "calc.lead"), session("s2", "calc.lead"));
     }
 
     #[test]
