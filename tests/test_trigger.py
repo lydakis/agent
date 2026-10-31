@@ -366,6 +366,10 @@ class TriggerFireTests(ModelFixture):
         declared = lambda: [t['name'] for t in connection.request('inspect', bot='p.review')['result'].get('declared', [])]
         try:
             self.assertIn('memory', declared())
+            # Gated and sandboxed as `sonny --new` makes one (#404).
+            made = connection.request('inspect', bot='p.review')['result']
+            self.assertEqual(made['settings']['sandbox'], 'workspace-write', made['settings'])
+            self.assertEqual([g['tag'] for g in made['gates']], ['auto'], made['gates'])
             self.settle('p.review')
             # One a trigger made before it had them takes them at its next fire.
             connection.request('configure', bot='p.review', bot_id=review, declare=[])

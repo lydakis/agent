@@ -417,9 +417,9 @@ impl Agent {
         // A thread comes back as the bot it was, or not at all.
         let bound = match resumed {
             Some(id) => match t3::recall(id) {
-                Some(bot) => {
+                Some(pinned) => {
                     session
-                        .bind(self, Some(bot), false, &project::Pick::Last)
+                        .bind(self, Some(pinned), false, &project::Pick::Last)
                         .await
                 }
                 None => Err(format!("Sonny does not know thread {id}")),
@@ -499,6 +499,9 @@ struct State {
 
 struct Bound {
     bot: String,
+    /// Its identity, which every prompt names: one sent after the bot was
+    /// removed and another made under its name reaches neither.
+    bot_id: Option<i64>,
     client: Arc<Client>,
     /// The lead's project, for a lead's thread.
     project: Option<String>,
@@ -547,10 +550,11 @@ impl Session {
     /// Make this thread `bot`'s, or its folder's lead's, and follow it.
     /// `claimed`: a task that waited for this thread, whose first turn
     /// runs already. With no bot, `pick` picks which of the folder's leads.
+    /// A bot pinned to its identity and store is that one or none.
     async fn bind(
         self: &Arc<Self>,
         agent: &Arc<Agent>,
-        bot: Option<String>,
+        bot: Option<t3::Pinned>,
         claimed: bool,
         pick: &project::Pick,
     ) -> Result<(), String> {
@@ -561,18 +565,31 @@ impl Session {
         // makes: T3 Code puts its last pick to every thread it opens, and
         // the folder's lead that is there already, every other thread's
         // too, keeps its own.
-        let (bot, project, moving, made) = match bot {
-            Some(bot) => {
+        let (bot, expected, project, moving, made) = match bot {
+            Some(t3::Pinned { bot, bot_id, store }) => {
+                if let Some(store) = store
+                    && client.store() != Some(store.as_str())
+                {
+                    return Err(format!(
+                        "this thread was {bot} of another store than this daemon's"
+                    ));
+                }
+                if bot_id.is_some() {
+                    client
+                        .request("inspect", json!({"bot": bot, "bot_id": bot_id}))
+                        .await
+                        .map_err(|e| format!("this thread's {bot} is gone: {e}"))?;
+                }
                 let project = project::lead_project(&bot).map(str::to_owned);
                 services(agent, &client, &bot, project.as_deref()).await?;
-                (bot, project, None, false)
+                (bot, bot_id, project, None, false)
             }
             None => {
                 let picked = self.state.lock().await.picked.clone();
                 let lead = project::open(&client, &self.cwd, picked.as_deref(), pick).await?;
                 let moving = lead.moving.as_ref().map(|dir| dir.display().to_string());
                 setup_lead(agent, &self.id, &client, &lead, moving.as_deref()).await?;
-                (lead.bot, Some(lead.project), moving, lead.new)
+                (lead.bot, None, Some(lead.project), moving, lead.new)
             }
         };
         client
@@ -597,9 +614,10 @@ impl Session {
         })
         .await;
         let record = client
-            .request("inspect", json!({"bot": bot}))
+            .request("inspect", json!({"bot": bot, "bot_id": expected}))
             .await
             .map_err(|e| e.to_string())?;
+        let bot_id = record["bot_id"].as_i64();
         let workspace = record["workspace"].as_str().unwrap_or_default().to_owned();
         let running = record["running_turn"].as_i64();
         let model = format!(
@@ -617,7 +635,12 @@ impl Session {
                 }
             }
         }
-        t3::remember(&self.id, &bot);
+        let pinned = t3::Pinned {
+            bot: bot.clone(),
+            bot_id,
+            store: client.store().map(str::to_owned),
+        };
+        t3::remember(&self.id, &pinned);
         {
             let mut state = self.state.lock().await;
             state.running = running;
@@ -633,6 +656,7 @@ impl Session {
             }
             state.bound = Some(Bound {
                 bot,
+                bot_id,
                 client,
                 project,
                 workspace,
@@ -861,6 +885,7 @@ impl Session {
             let pick = chosen
                 .clone()
                 .unwrap_or_else(|| project::Pick::Thread(text.clone()));
+            let claimed = claimed.map(t3::Pinned::named);
             if let Err(error) = self.bind(agent, claimed, task, &pick).await {
                 self.state.lock().await.prompt = None;
                 return Err((FAILED, error));
@@ -910,7 +935,8 @@ impl Session {
             return Err((FAILED, "the thread has no bot".into()));
         };
         let steer = state.running.is_some();
-        let mut asked = json!({"bot": bound.bot, "request_id": crate::unique("acp"), "prompt": text,
+        let mut asked = json!({"bot": bound.bot, "bot_id": bound.bot_id,
+            "request_id": crate::unique("acp"), "prompt": text,
             "delivery": if steer { "steer" } else { "reject" },
             "images": if images.is_empty() { Value::Null } else { json!(images) }});
         if !steer && let Some(dir) = &bound.moving {

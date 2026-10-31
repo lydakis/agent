@@ -127,25 +127,38 @@ fn write(store: &Path, goal: &Goal) -> Result<(), String> {
         })
 }
 
-/// Where a goal whose check passed is noted, by the turn that met it:
-/// `STORE.lookout/goals/met/BOT.json`, so the roster and `/status` can
-/// tell a task that did what was asked from one that only stopped.
-fn met_file(store: &Path, bot: &str) -> PathBuf {
-    dir(store).join("met").join(format!("{bot}.json"))
+/// Where how a goal ended is noted, by the turn that ended it:
+/// `STORE.lookout/goals/ended/BOT.json`. The roster and `/status` read it
+/// to tell a task that did what was asked from one that only stopped, and
+/// a lookout that restarts before the lead heard the turn reads how it
+/// ended from it, since the goal itself is gone, as a Kubernetes Job keeps
+/// its terminal condition after its pods go.
+fn ended_file(store: &Path, bot: &str) -> PathBuf {
+    dir(store).join("ended").join(format!("{bot}.json"))
 }
 
-/// Note that `turn` met the goal, written whole and moved in.
-fn met(store: &Path, goal: &Goal, turn: i64) {
-    let path = met_file(store, &goal.bot);
-    let Some(dir) = path.parent() else {
-        return;
-    };
-    let _ = std::fs::create_dir_all(dir);
-    let partial = dir.join(format!(".{}.{}.partial", goal.bot, std::process::id()));
-    let text = json!({"turn": turn, "check": goal.check}).to_string();
-    if std::fs::write(&partial, text).is_err() || std::fs::rename(&partial, &path).is_err() {
-        let _ = std::fs::remove_file(&partial);
+/// How `goal` ended at `turn`, written whole and moved in before the goal
+/// goes, then the goal ends.
+fn ended(store: &Path, goal: &Goal, turn: i64, outcome: &str, met: bool) {
+    let path = ended_file(store, &goal.bot);
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+        let partial = dir.join(format!(".{}.{}.partial", goal.bot, std::process::id()));
+        let text = json!({"turn": turn, "bot_id": goal.bot_id, "check": goal.check, "met": met,
+            "outcome": outcome})
+        .to_string();
+        if std::fs::write(&partial, text).is_err() || std::fs::rename(&partial, &path).is_err() {
+            let _ = std::fs::remove_file(&partial);
+        }
     }
+    end(store, goal);
+}
+
+/// What the ended note says of `bot`'s `turn`, when that turn ended its goal.
+fn ending(store: &Path, bot: &str, turn: i64) -> Option<Value> {
+    let text = std::fs::read_to_string(ended_file(store, bot)).ok()?;
+    let noted: Value = serde_json::from_str(&text).ok()?;
+    (noted["turn"].as_i64() == Some(turn)).then_some(noted)
 }
 
 /// How a task whose turn `turn` completed stands with its goal: `checking`
@@ -155,9 +168,8 @@ pub fn standing(store: &Path, bot: &str, turn: Option<i64>) -> Option<&'static s
     if read(store, bot).is_some() {
         return Some(crate::started::CHECKING);
     }
-    let text = std::fs::read_to_string(met_file(store, bot)).ok()?;
-    let noted: Value = serde_json::from_str(&text).ok()?;
-    (turn.is_some() && noted["turn"].as_i64() == turn).then_some(crate::started::CHECKED)
+    let noted = ending(store, bot, turn?)?;
+    (noted["met"] == true).then_some(crate::started::CHECKED)
 }
 
 /// The goal ends: its file goes, unless it was set again since.
@@ -336,6 +348,8 @@ pub struct Settled {
     pub bot: String,
     pub turn: i64,
     pub outcome: Option<String>,
+    /// The turn the agent works again in, when it does.
+    pub continued: Option<i64>,
 }
 
 /// The lookout's goals, and what it follows of each agent's turns.
@@ -347,9 +361,12 @@ pub struct Goals {
     called: HashSet<String>,
     /// Agents whose running turn the goal started.
     continued: HashSet<String>,
-    /// Agents whose goal's check runs: a turn that ends meanwhile is
-    /// plain news, and the check's own turn is checked in its place.
+    /// Agents whose goal's check runs.
     checking: HashMap<String, Check>,
+    /// The newest turn of each agent that completed while its check ran,
+    /// held until that check settles, as a work queue keeps an item added
+    /// again while it is processed and processes it once more after.
+    later: HashMap<String, Later>,
     /// Turns in a row the goal started that called no tool.
     /// Keyed by the goal's `set_ms` and the last turn counted, so a turn
     /// replayed after a reconnect is not counted again.
@@ -367,6 +384,18 @@ struct Check {
     turn: i64,
     /// The goal checked: one set since is checked afresh.
     set_ms: u64,
+    /// The idle count from before this turn and any that wait for it
+    /// counted, which a replay counts again.
+    idle: Option<(u64, i64, u32)>,
+}
+
+/// A turn that completed while its goal's check ran.
+struct Later {
+    turn: i64,
+    at: Option<i64>,
+    goal: Goal,
+    idle: u32,
+    before: Option<(u64, i64, u32)>,
 }
 
 impl Goals {
@@ -378,35 +407,77 @@ impl Goals {
             called: HashSet::new(),
             continued: HashSet::new(),
             checking: HashMap::new(),
+            later: HashMap::new(),
             idle: HashMap::new(),
             worked: HashMap::new(),
         }
     }
 
-    /// The check of `bot`'s `turn` said how its goal stands.
-    pub fn settled(&mut self, bot: &str, turn: i64) {
-        if self
-            .checking
-            .get(bot)
-            .is_some_and(|check| check.turn == turn)
-        {
-            self.checking.remove(bot);
+    /// The check of `bot`'s `turn` said how its goal stands. A turn that
+    /// completed meanwhile is checked now, unless the agent works again
+    /// after it, whose turn is checked when it ends: after a restart the
+    /// turn the check went on in may be one that already ended, which no
+    /// one would check again. Else it is plain news. Returns the turn whose
+    /// check starts now.
+    pub fn settled(
+        &mut self,
+        settled: &Settled,
+        client: &std::sync::Arc<Client>,
+        done: &tokio::sync::mpsc::UnboundedSender<Settled>,
+    ) -> Option<i64> {
+        if !(self.checking.get(&settled.bot)).is_some_and(|check| check.turn == settled.turn) {
+            return None;
         }
+        self.checking.remove(&settled.bot);
+        let later = self.later.remove(&settled.bot)?;
+        let goes_on = settled.outcome.is_none()
+            && settled.continued.is_none_or(|turn| turn <= later.turn)
+            && read(&self.store, &settled.bot).is_some_and(|now| now.set_ms == later.goal.set_ms);
+        if goes_on {
+            let turn = later.turn;
+            self.check(
+                later.goal,
+                turn,
+                later.idle,
+                later.at,
+                later.before,
+                client,
+                done,
+            );
+            return Some(turn);
+        }
+        let _ = done.send(Settled {
+            bot: settled.bot.clone(),
+            turn: later.turn,
+            outcome: Some(String::new()),
+            continued: None,
+        });
+        None
     }
 
     /// Checks under way answer a connection since dropped, never the next:
-    /// they stop, and the replay runs them again.
+    /// they stop, and the replay runs them again, counting idle turns again
+    /// from where they stood before the first of them.
     pub fn reconnected(&mut self) {
-        for (_, check) in self.checking.drain() {
+        for (bot, check) in self.checking.drain() {
             check.pursuit.abort();
+            match check.idle {
+                Some(idle) => self.idle.insert(bot, idle),
+                None => self.idle.remove(&bot),
+            };
         }
+        self.later.clear();
     }
 
-    /// The end of the oldest turn whose check is under way: what the
-    /// lookout keeps for the next one is from before it, so a restart, or
-    /// one with no subscriber to hold the turn, runs its check again.
+    /// The end of the oldest turn whose check is under way or waits for
+    /// one: what the lookout keeps for the next one is from before it, so
+    /// a restart, or one with no subscriber to hold the turn, runs its
+    /// check again.
     pub fn floor(&self) -> Option<i64> {
-        self.checking.values().filter_map(|check| check.at).min()
+        (self.checking.values().map(|check| check.at))
+            .chain(self.later.values().map(|later| later.at))
+            .flatten()
+            .min()
     }
 
     pub fn reread(&mut self) {
@@ -424,7 +495,7 @@ impl Goals {
         bot_id: Option<i64>,
         live: bool,
         client: &std::sync::Arc<Client>,
-        done: &tokio::sync::mpsc::Sender<Settled>,
+        done: &tokio::sync::mpsc::UnboundedSender<Settled>,
     ) -> Option<(String, i64)> {
         let bot = event["bot"].as_str()?;
         let data = &event["data"];
@@ -458,10 +529,11 @@ impl Goals {
                 if let Some(check) = self.checking.remove(bot) {
                     check.pursuit.abort();
                 }
+                self.later.remove(bot);
                 if let Some(goal) = self.goals.remove(bot) {
                     end(&self.store, &goal);
                 }
-                let _ = std::fs::remove_file(met_file(&self.store, bot));
+                let _ = std::fs::remove_file(ended_file(&self.store, bot));
                 None
             }
             "turn_finished" => {
@@ -477,7 +549,9 @@ impl Goals {
                     Some(goal) => self.goals.insert(bot.to_owned(), goal),
                     None => self.goals.remove(bot),
                 };
-                let mut goal = self.goals.get(bot)?.clone();
+                let Some(mut goal) = self.goals.get(bot).cloned() else {
+                    return self.told_before(bot, turn, bot_id, done);
+                };
                 if let Some(worked) = worked {
                     goal.workspace = worked;
                 }
@@ -488,20 +562,28 @@ impl Goals {
                     self.goals.remove(bot);
                     return None;
                 }
-                match self.checking.get(bot) {
-                    Some(check) if check.set_ms == goal.set_ms => return None,
-                    // The goal it checks was set again: its turn is plain
-                    // news, and this one is checked for the new goal.
-                    Some(_) => {
-                        let check = self.checking.remove(bot)?;
-                        check.pursuit.abort();
-                        let _ = done.try_send(Settled {
+                // A set again goal's check answers for a goal that is
+                // gone: its turn is plain news, and this one is checked for
+                // the new goal.
+                if let Some(check) = self.checking.get(bot)
+                    && check.set_ms != goal.set_ms
+                {
+                    let check = self.checking.remove(bot)?;
+                    check.pursuit.abort();
+                    let _ = done.send(Settled {
+                        bot: bot.to_owned(),
+                        turn: check.turn,
+                        outcome: Some(String::new()),
+                        continued: None,
+                    });
+                    if let Some(later) = self.later.remove(bot) {
+                        let _ = done.send(Settled {
                             bot: bot.to_owned(),
-                            turn: check.turn,
+                            turn: later.turn,
                             outcome: Some(String::new()),
+                            continued: None,
                         });
                     }
-                    None => {}
                 }
                 // An interrupted or failed turn pauses it: the next turn
                 // that completes is checked. A steer's is part of another.
@@ -517,37 +599,104 @@ impl Goals {
                     },
                     false => 0,
                 };
-                self.idle.insert(bot.to_owned(), (goal.set_ms, turn, idle));
-                let (client, done, store, socket) = (
-                    client.clone(),
-                    done.clone(),
-                    self.store.clone(),
-                    self.socket.clone(),
-                );
-                let held = (bot.to_owned(), turn);
-                let set_ms = goal.set_ms;
-                let bot = bot.to_owned();
-                let checking = bot.clone();
-                let pursuit = tokio::spawn(async move {
-                    let outcome = pursue(&client, &store, &socket, &goal, turn, idle).await;
-                    let _ = done.send(Settled { bot, turn, outcome }).await;
-                });
-                let check = Check {
-                    pursuit: pursuit.abort_handle(),
-                    at: event["cursor"].as_i64(),
-                    turn,
-                    set_ms,
-                };
-                self.checking.insert(checking, check);
-                Some(held)
+                let before = self.idle.insert(bot.to_owned(), (goal.set_ms, turn, idle));
+                let at = event["cursor"].as_i64();
+                // One under way: this turn waits for it, and one that
+                // waited before it is plain news.
+                if self.checking.contains_key(bot) {
+                    let later = Later {
+                        turn,
+                        at,
+                        goal,
+                        idle,
+                        before,
+                    };
+                    if let Some(older) = self.later.insert(bot.to_owned(), later) {
+                        let _ = done.send(Settled {
+                            bot: bot.to_owned(),
+                            turn: older.turn,
+                            outcome: Some(String::new()),
+                            continued: None,
+                        });
+                    }
+                    return Some((bot.to_owned(), turn));
+                }
+                self.check(goal, turn, idle, at, before, client, done);
+                Some((bot.to_owned(), turn))
             }
             _ => None,
         }
     }
+
+    /// Run `goal`'s check for `turn`, whose end is at `at`. `before` is
+    /// the idle count from before `turn` counted.
+    #[allow(clippy::too_many_arguments)]
+    fn check(
+        &mut self,
+        goal: Goal,
+        turn: i64,
+        idle: u32,
+        at: Option<i64>,
+        before: Option<(u64, i64, u32)>,
+        client: &std::sync::Arc<Client>,
+        done: &tokio::sync::mpsc::UnboundedSender<Settled>,
+    ) {
+        let (client, done, store, socket) = (
+            client.clone(),
+            done.clone(),
+            self.store.clone(),
+            self.socket.clone(),
+        );
+        let set_ms = goal.set_ms;
+        let bot = goal.bot.clone();
+        let pursuit = tokio::spawn(async move {
+            let (outcome, continued) = pursue(&client, &store, &socket, &goal, turn, idle).await;
+            let bot = goal.bot;
+            let settled = Settled {
+                bot,
+                turn,
+                outcome,
+                continued,
+            };
+            let _ = done.send(settled);
+        });
+        let check = Check {
+            pursuit: pursuit.abort_handle(),
+            at,
+            turn,
+            set_ms,
+            idle: before,
+        };
+        self.checking.insert(bot, check);
+    }
+
+    /// A turn of an agent with no goal now: when it is the one that ended
+    /// its goal, which a restart reads again before the lead heard how, it
+    /// is told so again.
+    fn told_before(
+        &mut self,
+        bot: &str,
+        turn: i64,
+        bot_id: Option<i64>,
+        done: &tokio::sync::mpsc::UnboundedSender<Settled>,
+    ) -> Option<(String, i64)> {
+        let noted = ending(&self.store, bot, turn)?;
+        if bot_id.is_some_and(|id| noted["bot_id"].as_i64() != Some(id)) {
+            return None;
+        }
+        let outcome = noted["outcome"].as_str()?.to_owned();
+        let _ = done.send(Settled {
+            bot: bot.to_owned(),
+            turn,
+            outcome: Some(outcome),
+            continued: None,
+        });
+        Some((bot.to_owned(), turn))
+    }
 }
 
-/// After a turn of an agent with a goal: whether it works again, or how
-/// the goal ended.
+/// After a turn of an agent with a goal: how the goal ended, else `None`
+/// with the turn it works again in.
 async fn pursue(
     client: &Client,
     store: &Path,
@@ -555,13 +704,13 @@ async fn pursue(
     goal: &Goal,
     turn: i64,
     idle: u32,
-) -> Option<String> {
+) -> (Option<String>, Option<i64>) {
     // What the lead hears is the lookout's own words only: the reason an
     // agent gives and the check it may have set are its text, which the
     // lead reads in the turn itself.
     if goal.blocked.is_some() {
-        end(store, goal);
-        return Some(GAVE_UP.to_owned());
+        ended(store, goal, turn, GAVE_UP, false);
+        return (Some(GAVE_UP.to_owned()), None);
     }
     let check = format!("`{}`", goal.check);
     let (code, output) = run(goal, store, socket).await;
@@ -570,16 +719,18 @@ async fn pursue(
     match read(store, &goal.bot) {
         Some(now) if now.set_ms == goal.set_ms => {
             if now.blocked.is_some() {
-                end(store, &now);
-                return Some(GAVE_UP.to_owned());
+                ended(store, &now, turn, GAVE_UP, false);
+                return (Some(GAVE_UP.to_owned()), None);
             }
         }
-        _ => return Some(String::new()),
+        _ => return (Some(String::new()), None),
     }
+    let over = |outcome: String, met: bool| {
+        ended(store, goal, turn, &outcome, met);
+        (Some(outcome), None)
+    };
     if code == Some(0) {
-        met(store, goal, turn);
-        end(store, goal);
-        return Some(", and met its goal: its check exits 0".to_owned());
+        return over(", and met its goal: its check exits 0".to_owned(), true);
     }
     let exits = match code {
         Some(code) => format!("exits {code}"),
@@ -591,18 +742,22 @@ async fn pursue(
             .and_then(|r| r["tokens_used"].as_u64())
             .unwrap_or(0);
         if used.saturating_sub(goal.tokens_at_set) >= budget {
-            end(store, goal);
-            return Some(format!(
-                ", and stopped at its goal's budget of {budget} tokens: its check still {exits}"
-            ));
+            return over(
+                format!(
+                    ", and stopped at its goal's budget of {budget} tokens: its check still {exits}"
+                ),
+                false,
+            );
         }
     }
     if idle >= IDLE_TURNS {
-        end(store, goal);
-        return Some(format!(
-            ", and stopped pursuing its goal: {IDLE_TURNS} turns in a row it started called no tool, \
-             and its check still {exits}"
-        ));
+        return over(
+            format!(
+                ", and stopped pursuing its goal: {IDLE_TURNS} turns in a row it started called no tool, \
+                 and its check still {exits}"
+            ),
+            false,
+        );
     }
     let prompt = format!(
         "Your goal is not met yet: {check} {exits}.\n```\n{output}\n```\nKeep working until {}. When no way \
@@ -611,12 +766,22 @@ async fn pursue(
     );
     let asked = json!({"bot": goal.bot, "bot_id": goal.bot_id, "prompt": prompt, "delivery": "queue",
         "origin": "goal", "request_id": format!("{REQUEST}{}-{turn}", goal.bot)});
+    // The turn it goes on in: after a restart, the one this turn's own
+    // request ID made before, which may have ended already. One made
+    // before from other output than the check printed now is that turn
+    // too, which the daemon names.
     match client.request("submit", asked).await {
-        Ok(_) => None,
-        Err(error) => Some(format!(
-            ", and could not go on with its goal: {}",
-            error.code
-        )),
+        Ok(made) => (None, made["turn"].as_i64()),
+        Err(error) if error.code == "idempotency_conflict" => {
+            (None, error.facts.as_ref().and_then(|f| f["turn"].as_i64()))
+        }
+        Err(error) => (
+            Some(format!(
+                ", and could not go on with its goal: {}",
+                error.code
+            )),
+            None,
+        ),
     }
 }
 
@@ -782,15 +947,90 @@ mod tests {
         assert_eq!(standing(&store, "p.fix", Some(4)), None);
         write(&store, &set).unwrap();
         assert_eq!(standing(&store, "p.fix", Some(4)), Some("checking"));
-        met(&store, &set, 4);
-        end(&store, &set);
+        ended(
+            &store,
+            &set,
+            4,
+            ", and met its goal: its check exits 0",
+            true,
+        );
         assert_eq!(standing(&store, "p.fix", Some(4)), Some("checked"));
+        // How it ended is kept for that turn, for a lookout that restarts
+        // before the lead heard.
+        assert_eq!(
+            ending(&store, "p.fix", 4).unwrap()["outcome"],
+            ", and met its goal: its check exits 0"
+        );
+        assert_eq!(ending(&store, "p.fix", 5), None);
         // A later turn is plain news, and so is a goal set again.
         assert_eq!(standing(&store, "p.fix", Some(5)), None);
         write(&store, &set).unwrap();
         assert_eq!(standing(&store, "p.fix", Some(4)), Some("checking"));
         // The goals list never takes the note for a goal.
         assert_eq!(all(&store).len(), 1);
+        // One that ended any other way was never met.
+        end(&store, &set);
+        ended(&store, &set, 6, GAVE_UP, false);
+        assert_eq!(standing(&store, "p.fix", Some(6)), None);
+        assert_eq!(ending(&store, "p.fix", 6).unwrap()["outcome"], GAVE_UP);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_replay_after_a_drop_counts_idle_turns_from_before_the_check_it_runs_again() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let dir = scratch("replay");
+        let store = dir.join("state.sqlite");
+        let mut set = goal(&store, "p.fix");
+        set.check = "sleep 30".into();
+        write(&store, &set).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let socket = dir.join("agent.sock");
+            let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+            tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (read, mut write) = stream.into_split();
+                let ready = json!({"event": "ready", "protocol": agent_client::PROTOCOL});
+                write.write_all(format!("{ready}\n").as_bytes()).await.unwrap();
+                let mut lines = BufReader::new(read).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    let asked: Value = serde_json::from_str(&line).unwrap();
+                    let answer = json!({"id": asked["id"], "result": {}});
+                    write.write_all(format!("{answer}\n").as_bytes()).await.unwrap();
+                }
+            });
+            let client = Client::connect(&socket).await.unwrap().0;
+            let (done, _settled) = tokio::sync::mpsc::unbounded_channel();
+            let mut goals = Goals::new(&store, &socket);
+            let turn = |goals: &mut Goals, turn: i64, tool: bool| {
+                let ev = |event: &str, data: Value| {
+                    json!({"bot": "p.fix", "turn": turn, "event": event, "data": data, "cursor": turn})
+                };
+                let asked = json!({"request_id": format!("{REQUEST}p.fix-{turn}")});
+                goals.event(&ev("accepted", asked), None, true, &client, &done);
+                if tool {
+                    goals.event(&ev("tool_started", json!({})), None, true, &client, &done);
+                }
+                let finished = ev("turn_finished", json!({"status": "completed"}));
+                goals.event(&finished, None, true, &client, &done)
+            };
+            // Goal turns with no call, a call, and no call, while the first
+            // one's check runs.
+            assert_eq!(turn(&mut goals, 1, false), Some(("p.fix".into(), 1)));
+            turn(&mut goals, 2, true);
+            turn(&mut goals, 3, false);
+            assert_eq!(goals.idle["p.fix"], (1, 3, 1));
+            // The connection drops, and the replay starts from turn 1: it
+            // is one idle turn, not one more after turn 3.
+            goals.reconnected();
+            turn(&mut goals, 1, false);
+            assert_eq!(goals.idle["p.fix"], (1, 1, 1));
+            goals.reconnected();
+        });
         let _ = std::fs::remove_dir_all(&dir);
     }
 

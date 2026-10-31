@@ -49,6 +49,13 @@ const RUNNING_GAP: Duration = Duration::from_millis(50);
 /// The output a script returns, in tokens of about four bytes, unless its
 /// options line says otherwise.
 const OUTPUT_TOKENS: usize = 10_000;
+/// The bytes of output a script keeps while it runs, outside its memory
+/// cap: past them, its first and last halves, as Codex keeps a command's.
+const OUTPUT_BYTES: usize = 1 << 20;
+/// A script's tool calls in flight at once; the rest wait their turn, so
+/// the results held outside its memory cap are at most these many of
+/// `RESULT_BYTES`.
+const CALLS: usize = 8;
 /// The bytes of tool declarations the description holds, about 3,000
 /// tokens as Pi's code mode allows; the rest are found from the script.
 const DECLARATIONS: usize = 12_000;
@@ -61,7 +68,7 @@ const DESCRIPTION: &str = r#"Run JavaScript code to orchestrate/compose MCP tool
 - Accepts raw JavaScript source text, not JSON, quoted strings, or markdown code fences.
 - Only what the script passes to `text()` and `image()` is returned to you.
 - You may optionally start the tool input with a first-line pragma like `// @exec: {"max_output_tokens": 1000, "timeout_ms": 60000}`.
-- `max_output_tokens` sets the token budget for `exec` results. Defaults to 10000 tokens; longer output keeps its start and end, and the whole of it is saved to a file the result names.
+- `max_output_tokens` sets the token budget for `exec` results. Defaults to 10000 tokens; longer output keeps its start and end, and the whole of it, up to 1 MB, is saved to a file the result names.
 - `timeout_ms` ends the script after that many milliseconds. Defaults to 600000, the most it may run.
 - When the JS code is fully evaluated, its context ends and unawaited promises are silently discarded.
 
@@ -136,6 +143,11 @@ fn description(servers: &Servers, known: &BTreeMap<String, Known>) -> String {
     let mut sections = vec![DESCRIPTION.to_owned(), TYPES.to_owned()];
     let mut left = DECLARATIONS;
     let mut omitted = 0;
+    let collided = collisions(
+        known
+            .iter()
+            .map(|(name, known)| (name.as_str(), &known.tools[..])),
+    );
     for (name, config) in servers {
         let known = &known[name];
         let mut section = format!("## {name}");
@@ -152,6 +164,10 @@ fn description(servers: &Servers, known: &BTreeMap<String, Known>) -> String {
         }
         sections.push(section);
         for tool in &known.tools {
+            let id = identifier(name, tool["name"].as_str().unwrap_or_default());
+            if collided.contains_key(&id) {
+                continue;
+            }
             let declared = declaration(name, tool);
             if declared.len() > left {
                 omitted += 1;
@@ -164,7 +180,32 @@ fn description(servers: &Servers, known: &BTreeMap<String, Known>) -> String {
     if omitted > 0 {
         sections.push(format!("{omitted} more tools are in `ALL_TOOLS`."));
     }
+    sections.extend(collided.values().cloned());
     sections.join("\n\n")
+}
+
+/// The identifiers two or more tools of `listings` would share, each with
+/// why neither is on `tools`: one would silently take the other's place.
+fn collisions<'a>(
+    listings: impl Iterator<Item = (&'a str, &'a [Value])>,
+) -> BTreeMap<String, String> {
+    let mut named: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (server, tools) in listings {
+        for tool in tools {
+            let name = tool["name"].as_str().unwrap_or_default();
+            (named.entry(identifier(server, name)).or_default()).push(format!("{server}'s {name}"));
+        }
+    }
+    (named.into_iter())
+        .filter(|(_, tools)| tools.len() > 1)
+        .map(|(id, tools)| {
+            let why = format!(
+                "`{id}` would name {}, so none of them is on `tools`: rename a server or turn a tool off.",
+                tools.join(" and ")
+            );
+            (id, why)
+        })
+        .collect()
 }
 
 /// A tool as the script calls it: `mcp__SERVER__TOOL`, made an identifier.
@@ -543,42 +584,36 @@ async fn run(
     steps: Option<Steps>,
 ) -> Result<String, String> {
     let script = parse(input)?;
-    let waiting = Instant::now();
-    let alive = ALIVE.acquire().await.map_err(|e| e.to_string())?;
-    let running = RUNNING.acquire().await.map_err(|e| e.to_string())?;
-    let left = left.saturating_sub(waiting.elapsed());
-    let mut nested: BTreeMap<String, Nested> = BTreeMap::new();
-    let mut listed = Vec::new();
-    let mut failed = Vec::new();
-    for (server, config) in hub.servers() {
-        match hub.tools(&server).await {
-            Ok(tools) => {
-                for tool in &tools {
-                    let name = tool["name"].as_str().unwrap_or_default();
-                    let id = identifier(&server, name);
-                    let description = declaration(&server, tool);
-                    listed.push(json!({"name": id, "description": description}));
-                    let asks = config.approval_mode(name).asks(&tool["annotations"]);
-                    nested.insert(
-                        id,
-                        Nested {
-                            server: server.clone(),
-                            tool: name.to_owned(),
-                            description,
-                            asks,
-                        },
-                    );
-                }
-            }
-            Err(error) => failed.push(error),
-        }
-    }
+    let started = Instant::now();
+    // One deadline from here: waiting for a place and listing the servers'
+    // tools spend the script's time as its JavaScript does.
     let timeout = script
         .timeout_ms
         .map_or(TIMEOUT, Duration::from_millis)
         .min(TIMEOUT)
         .min(left);
+    let deadline = started + timeout;
+    let readied = tokio::time::timeout_at(deadline.into(), async {
+        let alive = ALIVE.acquire().await.map_err(|e| e.to_string())?;
+        let running = RUNNING.acquire().await.map_err(|e| e.to_string())?;
+        Ok::<_, String>((alive, running, discover(hub).await))
+    })
+    .await;
     let budget = script.max_output_tokens.unwrap_or(OUTPUT_TOKENS);
+    let (alive, running, (nested, listed, failed)) = match readied {
+        Ok(readied) => readied?,
+        Err(_) => {
+            let ended = Ended::Terminated("it ran out of time before it started".into());
+            return Ok(said(
+                &ended,
+                started,
+                &BTreeMap::new(),
+                String::new(),
+                budget,
+                dir,
+            ));
+        }
+    };
     let run = Run {
         hub: hub.clone(),
         lookout: tokio::runtime::Handle::current(),
@@ -591,12 +626,11 @@ async fn run(
         calls: Arc::default(),
         stopped: Arc::default(),
         steps: steps.map(Arc::new),
-        clock: Clock::new(Instant::now() + timeout, running),
+        clock: Clock::new(deadline, running),
     };
     let stopped = Arc::clone(&run.stopped);
     let _stop = Stop(Arc::clone(&stopped));
-    let started = Instant::now();
-    let (said, calls) = (Arc::clone(&run.said), Arc::clone(&run.calls));
+    let (output, calls) = (Arc::clone(&run.said), Arc::clone(&run.calls));
     let clock = Arc::clone(&run.clock);
     let ended = tokio::task::spawn_blocking(move || {
         // Its places are held until the script's runtime is gone, so an
@@ -610,7 +644,78 @@ async fn run(
     })
     .await
     .map_err(|e| e.to_string())??;
-    let status = match &ended {
+    let calls = calls.lock().unwrap().clone();
+    let body = std::mem::take(&mut *output.lock().unwrap()).body();
+    Ok(said(&ended, started, &calls, body, budget, dir))
+}
+
+/// The servers' tools, each by the identifier a script calls it by, as
+/// `ALL_TOOLS` lists them, and why any server's are missing: its own
+/// failure, or tools whose identifiers collide.
+async fn discover(hub: &Hub) -> (BTreeMap<String, Nested>, Vec<Value>, Vec<String>) {
+    let servers = hub.servers();
+    let mut listing = tokio::task::JoinSet::new();
+    for server in servers.keys() {
+        let (hub, server) = (hub.clone(), server.clone());
+        listing.spawn(async move {
+            let tools = hub.tools(&server).await;
+            (server, tools)
+        });
+    }
+    let mut lists = BTreeMap::new();
+    let mut failed = Vec::new();
+    while let Some(Ok((server, tools))) = listing.join_next().await {
+        match tools {
+            Ok(tools) => {
+                lists.insert(server, tools);
+            }
+            Err(error) => failed.push(error),
+        }
+    }
+    let collided = collisions(
+        lists
+            .iter()
+            .map(|(server, tools)| (server.as_str(), &tools[..])),
+    );
+    failed.extend(collided.values().cloned());
+    let mut nested = BTreeMap::new();
+    let mut listed = Vec::new();
+    for (server, tools) in &lists {
+        let config = &servers[server];
+        for tool in tools {
+            let name = tool["name"].as_str().unwrap_or_default();
+            let id = identifier(server, name);
+            if collided.contains_key(&id) {
+                continue;
+            }
+            let description = declaration(server, tool);
+            listed.push(json!({"name": id, "description": description}));
+            let asks = config.approval_mode(name).asks(&tool["annotations"]);
+            nested.insert(
+                id,
+                Nested {
+                    server: server.clone(),
+                    tool: name.to_owned(),
+                    description,
+                    asks,
+                },
+            );
+        }
+    }
+    (nested, listed, failed)
+}
+
+/// What `exec` answers: how the script ended, its time and calls, then
+/// what it printed within `budget`.
+fn said(
+    ended: &Ended,
+    started: Instant,
+    calls: &BTreeMap<String, usize>,
+    mut body: String,
+    budget: usize,
+    dir: Option<&Path>,
+) -> String {
+    let status = match ended {
         Ended::Completed => "Script completed".to_owned(),
         Ended::Failed(_) => "Script failed".to_owned(),
         Ended::Terminated(why) => format!("Script terminated: {why}"),
@@ -619,7 +724,6 @@ async fn run(
         "{status}\nWall time {:.1} seconds\n",
         started.elapsed().as_secs_f64()
     );
-    let calls = calls.lock().unwrap().clone();
     if !calls.is_empty() {
         let each: Vec<String> = calls
             .iter()
@@ -628,14 +732,96 @@ async fn run(
         head.push_str(&format!("MCP calls: {}\n", each.join(", ")));
     }
     head.push_str("Output:\n");
-    let mut body = said.lock().unwrap().join("\n");
-    if let Ended::Failed(error) = &ended {
+    if let Ended::Failed(error) = ended {
         if !body.is_empty() {
             body.push('\n');
         }
         body.push_str(&format!("Script error:\n{error}"));
     }
-    Ok(head + &budgeted(body, budget, dir))
+    head + &budgeted(body, budget, dir)
+}
+
+/// What a script printed, a line for each `text()`, kept within
+/// `OUTPUT_BYTES` as it runs: past them, its first half and its latest.
+#[derive(Default)]
+struct Output {
+    head: String,
+    /// The latest output once the head is full, up to twice the half
+    /// kept, so that it is cut once per half rather than on every line.
+    tail: String,
+    dropped: usize,
+    lines: usize,
+}
+
+impl Output {
+    const HALF: usize = OUTPUT_BYTES / 2;
+
+    fn push(&mut self, text: &str) {
+        if self.lines > 0 {
+            self.add("\n");
+        }
+        self.lines += 1;
+        self.add(text);
+    }
+
+    fn add(&mut self, mut text: &str) {
+        if self.tail.is_empty() && self.dropped == 0 {
+            if self.head.len() + text.len() <= OUTPUT_BYTES {
+                self.head.push_str(text);
+                return;
+            }
+            // Past the cap: the head is the first half of all the output,
+            // whether the output so far fills it or this text does.
+            if self.head.len() > Self::HALF {
+                let cut = floor(&self.head, Self::HALF);
+                self.tail = self.head.split_off(cut);
+            } else {
+                let fill = floor(text, Self::HALF - self.head.len());
+                self.head.push_str(&text[..fill]);
+                text = &text[fill..];
+            }
+        }
+        let keep = text.len().min(2 * Self::HALF);
+        let start = ceil(text, text.len() - keep);
+        self.dropped += start;
+        self.tail.push_str(&text[start..]);
+        if self.tail.len() > 2 * Self::HALF {
+            let cut = ceil(&self.tail, self.tail.len() - Self::HALF);
+            self.dropped += cut;
+            self.tail.drain(..cut);
+        }
+    }
+
+    /// All that was kept, the bytes dropped between its halves named.
+    fn body(self) -> String {
+        let mut tail = self.tail;
+        let mut dropped = self.dropped;
+        if tail.len() > Self::HALF {
+            let cut = ceil(&tail, tail.len() - Self::HALF);
+            dropped += cut;
+            tail.drain(..cut);
+        }
+        match dropped {
+            0 => self.head + &tail,
+            dropped => format!("{}\n…{dropped} bytes dropped…\n{tail}", self.head),
+        }
+    }
+}
+
+/// The last char boundary of `text` at or before `at`.
+fn floor(text: &str, mut at: usize) -> usize {
+    while !text.is_char_boundary(at) {
+        at -= 1;
+    }
+    at
+}
+
+/// The first char boundary of `text` at or after `at`.
+fn ceil(text: &str, mut at: usize) -> usize {
+    while !text.is_char_boundary(at) {
+        at += 1;
+    }
+    at
 }
 
 /// Sets the script's stop flag when the answer is dropped or done.
@@ -725,7 +911,7 @@ struct Run {
     listed: String,
     store: Option<PathBuf>,
     images: Option<PathBuf>,
-    said: Arc<Mutex<Vec<String>>>,
+    said: Arc<Mutex<Output>>,
     calls: Arc<Mutex<BTreeMap<String, usize>>>,
     stopped: Arc<AtomicBool>,
     steps: Option<Arc<Steps>>,
@@ -978,7 +1164,7 @@ impl Run {
         globals.set(
             "__text",
             Function::new(ctx.clone(), move |text: String| {
-                said.lock().unwrap().push(text)
+                said.lock().unwrap().push(&text)
             })?,
         )?;
         let call = Caller {
@@ -989,6 +1175,7 @@ impl Run {
             calls: Arc::clone(&self.calls),
             steps: self.steps.clone(),
             clock: Arc::clone(&self.clock),
+            at_once: Arc::new(tokio::sync::Semaphore::new(CALLS)),
         };
         globals.set(
             "__call",
@@ -996,7 +1183,7 @@ impl Run {
                 ctx.clone(),
                 Async(move |id: String, arguments: String| {
                     let call = call.clone();
-                    async move { rquickjs::Result::Ok(call.call(id, arguments).await.to_string()) }
+                    async move { rquickjs::Result::Ok(call.call(id, arguments).await) }
                 }),
             )?,
         )?;
@@ -1073,21 +1260,29 @@ struct Caller {
     calls: Arc<Mutex<BTreeMap<String, usize>>>,
     steps: Option<Arc<Steps>>,
     clock: Arc<Clock>,
+    /// Places for the script's calls in flight.
+    at_once: Arc<tokio::sync::Semaphore>,
 }
 
 impl Caller {
-    async fn call(&self, id: String, arguments: String) -> Value {
+    /// Call the tool `id` names: `{"ok": CallToolResult}` or `{"error"}`,
+    /// as JSON for the script.
+    async fn call(&self, id: String, arguments: String) -> String {
+        match self.called(id, arguments).await {
+            Ok(called) => format!("{{\"ok\":{}}}", called.json),
+            Err(error) => json!({"error": error}).to_string(),
+        }
+    }
+
+    async fn called(&self, id: String, arguments: String) -> Result<crate::mcp::Called, String> {
         let Some(nested) = self.nested.get(&id).cloned() else {
             let mut error = format!("tools.{id} is not a tool; ALL_TOOLS lists them");
             if !self.failed.is_empty() {
                 error.push_str(&format!(" ({})", self.failed.join("; ")));
             }
-            return json!({"error": error});
+            return Err(error);
         };
-        let arguments: Value = match serde_json::from_str(&arguments) {
-            Ok(arguments) => arguments,
-            Err(e) => return json!({"error": e.to_string()}),
-        };
+        let arguments: Value = serde_json::from_str(&arguments).map_err(|e| e.to_string())?;
         // Put to the agent's gate first, with the script's time stopped,
         // on the lookout's runtime, where its connection lives.
         let mut allowed = None;
@@ -1107,15 +1302,12 @@ impl Caller {
             // starting again once it has a place, as a new script's does.
             let placed = self.clock.take_place().await;
             drop(stopped);
-            if let Err(error) = placed {
-                return json!({"error": error});
-            }
-            match approved {
-                Ok(Ok(step)) => allowed = step.map(|step| (steps, step)),
-                Ok(Err(error)) => return json!({"error": error}),
-                Err(e) => return json!({"error": e.to_string()}),
-            }
+            placed?;
+            allowed = (approved.map_err(|e| e.to_string())??).map(|step| (steps, step));
         }
+        // A place among the script's calls in flight, held until its
+        // result is the script's.
+        let _place = self.at_once.acquire().await.map_err(|e| e.to_string())?;
         *self
             .calls
             .lock()
@@ -1127,13 +1319,12 @@ impl Caller {
             self.lookout
                 .spawn(async move { hub.call(&nested.server, &nested.tool, arguments).await }),
         );
-        let result = match call.await {
-            Ok(Ok(result)) => json!({"ok": result}),
-            Ok(Err(error)) => json!({"error": error}),
-            Err(e) => json!({"error": e.to_string()}),
-        };
+        let result = call
+            .await
+            .map_err(|e| e.to_string())
+            .and_then(|called| called);
         if let Some((steps, step)) = allowed {
-            let failed = result.get("ok").is_none_or(|ok| ok["isError"] == true);
+            let failed = !matches!(&result, Ok(called) if !called.is_error);
             self.lookout
                 .spawn(async move { steps.ran(step, failed).await });
         }
@@ -1840,6 +2031,145 @@ text(ALL_TOOLS.map(t => t.name).join(","));"#,
         let after = ran(&hub, &dir, "text('next');").await;
         assert!(after.ends_with("next") && started.elapsed() < Duration::from_secs(5));
         hub.stop().await;
+    }
+
+    #[tokio::test]
+    async fn waiting_and_listing_spend_the_script_s_time() {
+        let dir = scratch("deadline");
+        let server = McpServer {
+            command: Some("python3".into()),
+            args: vec![concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/mcp_server.py").into()],
+            env: [("MCP_START_MS".to_owned(), "5000".to_owned())].into(),
+            enabled: true,
+            ..McpServer::default()
+        };
+        let hub = Hub::new(Some(dir.join("mcp")));
+        hub.configure(&[("sleepy".to_owned(), server)].into()).await;
+        let started = Instant::now();
+        let said = ran(&hub, &dir, "// @exec: {\"timeout_ms\": 300}\ntext('ran');").await;
+        assert!(
+            said.starts_with("Script terminated: it ran out of time before it started"),
+            "{said}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(2), "{said}");
+        hub.stop().await;
+    }
+
+    #[tokio::test]
+    async fn tools_whose_identifiers_collide_are_refused_not_replaced() {
+        let dir = scratch("collide");
+        let server = McpServer {
+            command: Some("python3".into()),
+            args: vec![concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/mcp_server.py").into()],
+            enabled: true,
+            ..McpServer::default()
+        };
+        let hub = Hub::new(Some(dir.join("mcp")));
+        let servers: Servers = [
+            ("my-server".to_owned(), server.clone()),
+            ("my_server".to_owned(), server),
+        ]
+        .into();
+        hub.configure(&servers).await;
+        let said = ran(
+            &hub,
+            &dir,
+            "text(ALL_TOOLS.length);\ntry { await tools.mcp__my_server__echo({text: 'hi'}); } catch (e) { text(e.message); }",
+        )
+        .await;
+        assert!(said.contains("Output:\n0\n"), "{said}");
+        assert!(
+            said.contains(
+                "`mcp__my_server__echo` would name my-server's echo and my_server's echo"
+            ),
+            "{said}"
+        );
+        let known: BTreeMap<String, Known> = ["my-server", "my_server"]
+            .into_iter()
+            .map(|name| {
+                let tools = vec![json!({"name": "echo", "inputSchema": {"type": "object"}})];
+                (
+                    name.to_owned(),
+                    Known {
+                        tools,
+                        ..Known::default()
+                    },
+                )
+            })
+            .collect();
+        let described = description(&servers, &known);
+        assert!(
+            !described.contains("### `mcp__my_server__echo`"),
+            "{described}"
+        );
+        assert!(described.contains("would name my-server's echo and my_server's echo"));
+        hub.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_script_s_calls_in_flight_and_output_are_bounded_as_it_runs() {
+        let dir = scratch("bounded");
+        let hub = hub(&dir).await;
+        // Twice as many calls as may be in flight take two of their times.
+        let started = Instant::now();
+        let fanned = ran(
+            &hub,
+            &dir,
+            &format!(
+                "await Promise.all(Array.from({{length: {}}}, () => tools.mcp__test__slow({{ms: 300}}))); text('all');",
+                2 * CALLS
+            ),
+        )
+        .await;
+        assert!(fanned.ends_with("all"), "{fanned}");
+        assert!(started.elapsed() >= Duration::from_millis(600), "{fanned}");
+        // Megabytes printed keep their start and end, whatever the budget.
+        let printed = ran(
+            &hub,
+            &dir,
+            "// @exec: {\"max_output_tokens\": 100000000}\nfor (let i = 0; i < 4000; i++) text(String(i).padEnd(1000, '.'));",
+        )
+        .await;
+        assert!(printed.len() < OUTPUT_BYTES + 200, "{}", printed.len());
+        assert!(printed.contains("Output:\n0...."));
+        assert!(printed.contains("bytes dropped"));
+        assert!(printed.ends_with(&format!("3999{}", ".".repeat(996))));
+        hub.stop().await;
+    }
+
+    #[test]
+    fn output_keeps_its_first_and_latest_halves() {
+        let mut output = Output::default();
+        output.push("first");
+        assert_eq!(std::mem::take(&mut output).body(), "first");
+        let line = "é".repeat(1000);
+        for _ in 0..3000 {
+            output.push(&line);
+        }
+        output.push("last");
+        let body = output.body();
+        assert!(body.len() <= OUTPUT_BYTES + 64, "{}", body.len());
+        assert!(body.starts_with('é') && body.ends_with("\nlast"));
+        let dropped: usize = body
+            .split('…')
+            .nth(1)
+            .and_then(|said| said.split(' ').next())
+            .and_then(|n| n.parse().ok())
+            .unwrap();
+        // What was kept and what was dropped add up to what was printed.
+        let kept = body.len() - format!("\n…{dropped} bytes dropped…\n").len();
+        assert_eq!(kept + dropped, 3000 * line.len() + 2999 + "\nlast".len());
+        // One text past the cap keeps its own start and end.
+        let mut output = Output::default();
+        output.push("before");
+        output.push(&format!("START{}END", "x".repeat(2 * OUTPUT_BYTES)));
+        let body = output.body();
+        assert!(
+            body.starts_with("before\nSTARTxx") && body.ends_with("xxEND"),
+            "{}",
+            &body[..20]
+        );
+        assert!(body.len() <= OUTPUT_BYTES + 64, "{}", body.len());
     }
 
     #[tokio::test]

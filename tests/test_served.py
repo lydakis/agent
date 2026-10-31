@@ -24,6 +24,15 @@ def declared(name, inherit=True):
     return tool
 
 
+def running(pid):
+    """Whether `pid` runs: not gone and not a zombie. It can go between any
+    two looks at /proc, so a stat that vanishes means gone."""
+    try:
+        return Path(f'/proc/{pid}/stat').read_text().rsplit(')', 1)[1].split()[0] != 'Z'
+    except FileNotFoundError:
+        return False
+
+
 @unittest.skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'set AGENT_TEST_RUNTIME=1 after a Rust release build')
 class ServedToolTests(ModelFixture):
     def setUp(self):
@@ -142,8 +151,7 @@ class ServedToolTests(ModelFixture):
         self.daemon.request('interrupt', bot='calc.lead', turn=turn)
         self.assertEqual(self.daemon.finished(turn)['data']['status'], 'interrupted')
         deadline = time.monotonic() + 10
-        stat = Path(f'/proc/{setup_pid}/stat')
-        while stat.exists() and stat.read_text().split()[2] != 'Z':
+        while running(setup_pid):
             self.assertLess(time.monotonic(), deadline, 'the setup still runs')
             time.sleep(.05)
         time.sleep(1)
@@ -177,8 +185,7 @@ class ServedToolTests(ModelFixture):
         self.lookout()
         old.wait(timeout=10)
         deadline = time.monotonic() + 10
-        stat = Path(f'/proc/{first}/stat')
-        while stat.exists() and stat.read_text().split()[2] != 'Z':
+        while running(first):
             self.assertLess(time.monotonic(), deadline, 'the first setup still runs')
             time.sleep(.05)
         self.assertEqual(self.daemon.finished(turn)['data']['status'], 'completed')
@@ -505,6 +512,55 @@ class ServedToolTests(ModelFixture):
         old.wait(timeout=10)
         self.lookout()
         self.assertEqual(len(self.lines_of(runs, 2)), 2)
+
+    def goal_down(self, **goal):
+        """calc.fix and its lead with no lookout running, `goal` on disk as
+        the goal tool writes it, and the cursor a lookout that went down
+        just now left: what happens next is news to the one that starts."""
+        old = self.goal_watch()
+        old.kill()
+        old.wait(timeout=10)
+        fix = self.daemon.request('inspect', bot='calc.fix')['result']
+        folder = self.path / 'state.sqlite.lookout/goals'
+        folder.mkdir(parents=True, exist_ok=True)
+        if 'check' in goal:
+            (folder / 'calc.fix.json').write_text(json.dumps(dict(
+                bot='calc.fix', bot_id=fix['bot_id'], done_when='it ran twice', workspace=str(self.path),
+                set_by='calc.lead', set_ms=1, timeout_s=60, **goal)))
+        at = max(e['cursor'] for bot in ('calc.lead', 'calc.fix')
+                 for e in self.daemon.request('events', bot=bot, after=0, limit=256)['result']['events'])
+        (self.path / 'state.sqlite.lookout.cursor').write_text(f'{at} {at}')
+        return fix
+
+    def test_two_goal_turns_that_ended_while_the_lookout_was_down_are_both_checked(self):
+        runs = self.path / 'runs'
+        self.goal_down(check=f'echo . >> {runs}; test $(wc -l < {runs}) -ge 2')
+        first = self.daemon.request('submit', bot='calc.fix', request_id='work', prompt='Work.')['result']['turn']
+        self.assertEqual(self.daemon.finished(first)['data']['status'], 'completed')
+        # The turn the first check goes on in, made before the lookout went
+        # down: its request ID is the one the check asks for again.
+        second = self.daemon.request('submit', bot='calc.fix', request_id=f'goal-calc.fix-{first}', prompt='More.',
+                                     origin='goal')['result']['turn']
+        self.assertEqual(self.daemon.finished(second)['data']['status'], 'completed')
+        self.lookout()
+        note = self.note_for('calc.lead', 'its goal')
+        self.assertIn(f'- calc.fix: turn:calc.fix/{second} completed, asked by goal, and met its goal:', note)
+        self.assertEqual(len(self.lines_of(runs, 2)), 2)
+
+    def test_how_a_goal_ended_reaches_the_lead_after_a_restart(self):
+        fix = self.goal_down()
+        turn = self.daemon.request('submit', bot='calc.fix', request_id='work', prompt='Work.')['result']['turn']
+        self.assertEqual(self.daemon.finished(turn)['data']['status'], 'completed')
+        # The goal ended with that turn, and the lookout went down before
+        # its lead heard.
+        ended = self.path / 'state.sqlite.lookout/goals/ended'
+        ended.mkdir(parents=True)
+        (ended / 'calc.fix.json').write_text(json.dumps(dict(
+            turn=turn, bot_id=fix['bot_id'], check='false', met=False,
+            outcome=', and gave up its goal, saying why in that turn')))
+        self.lookout()
+        note = self.note_for('calc.lead', 'its goal')
+        self.assertIn(f'- calc.fix: turn:calc.fix/{turn} completed, asked by the person, and gave up its goal', note)
 
     @unittest.skipIf(sys.platform == 'darwin', 'launchd keeps triggers on a Mac')
     def test_a_trigger_with_no_systemd_running_is_refused_and_says_why(self):

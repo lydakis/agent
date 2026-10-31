@@ -3154,30 +3154,18 @@ async fn start(client: &Client, trigger: &Trigger) -> Result<i64, String> {
         .as_ref()
         .ok_or("invalid_trigger: --start has no folder")?;
     let instructions = crate::project::plain(dir)?;
-    let config = agent_client::config::load()?;
-    let mut settings =
-        agent_client::policy::cache_ttl(model).map_or(json!({}), |ttl| json!({"cache_ttl": ttl}));
-    if config.hide_senders {
-        settings["hide_senders"] = json!(true);
-    }
-    let made = client
-        .request(
-            "create",
-            json!({"bot": name, "workspace": dir, "model": model, "effort": effort,
-                "instructions": instructions,
-                "compaction_instructions": agent_client::policy::DEFAULT_COMPACTION_INSTRUCTIONS,
-                "tools": agent_client::default_tools(client.providers(), model, config.web_search),
-                // The memory tool, and `exec` while MCP servers are on, so
-                // an agent no one opens reaches the person's chat, mail
-                // and the like as one they open does.
-                "declare": crate::declared::tools(false),
-                "created_by": by.as_ref().map(|(bot, _)| bot),
-                "created_by_id": by.as_ref().map(|(_, id)| id),
-                "settings": settings,
-                "request_id": format!("trigger-{}", trigger.generation)}),
-        )
-        .await
-        .map_err(coded)?;
+    let mut asked = json!({"bot": name, "workspace": dir, "model": model, "effort": effort,
+        "instructions": instructions,
+        "created_by": by.as_ref().map(|(bot, _)| bot),
+        "created_by_id": by.as_ref().map(|(_, id)| id),
+        "request_id": format!("trigger-{}", trigger.generation)});
+    // As the person's `--new` makes one: Sonny's tools (the memory tool,
+    // and `exec` while MCP servers are on, so an agent no one opens reaches
+    // the person's chat, mail and the like as one they open does), gated
+    // and sandboxed as `auto` confines them. A call the judge doubts waits
+    // in `/approvals` for the person, as any agent's does.
+    crate::made(client, &mut asked, model, dir)?;
+    let made = client.request("create", asked).await.map_err(coded)?;
     made["bot_id"]
         .as_i64()
         .ok_or_else(|| "create: no bot id".into())
@@ -3186,7 +3174,10 @@ async fn start(client: &Client, trigger: &Trigger) -> Result<i64, String> {
 /// Give the agent a `--start` trigger made before its agents had Sonny's
 /// tools those tools, as [`start`] gives them now; the lookout keeps them
 /// up to date from then on. One that has any declared tools is left as it
-/// is, and a failure leaves it to the next fire.
+/// is, and a failure leaves it to the next fire. One made before `--start`
+/// confined its agents as `--new` does is confined too: it was never given
+/// a sandbox, which every mode Sonny sets names, so one the person put in
+/// `full` stays there.
 async fn adopt(client: &Client, name: &str, id: i64) {
     let Ok(mut record) = client
         .request("inspect", json!({"bot": name, "bot_id": id}))
@@ -3197,8 +3188,23 @@ async fn adopt(client: &Client, name: &str, id: i64) {
     record["name"] = json!(name);
     record["bot_id"] = json!(id);
     if let Some(fields) = crate::declared::adopt(&record) {
+        record["declared"] = fields["declare"].clone();
         let _ = client.request("configure", Value::Object(fields)).await;
     }
+    if unconfined(&record)
+        && let Some(fields) = crate::approvals::regate(&record, crate::approvals::MODES[0].0)
+    {
+        let mut asked = Value::Object(fields);
+        asked["bot"] = json!(name);
+        asked["bot_id"] = json!(id);
+        let _ = client.request("configure", asked).await;
+    }
+}
+
+/// Whether an agent was made with no sandbox and no gate, as `--start`
+/// made them before #404: no mode Sonny sets leaves the sandbox unnamed.
+fn unconfined(record: &Value) -> bool {
+    record["settings"]["sandbox"].is_null() && crate::approvals::mode(record) == Some("full")
 }
 
 /// What came of a fire whose agent could not be made. Pinned by id, an
@@ -4457,6 +4463,18 @@ mod tests {
                 .unwrap_err()
                 .starts_with("trigger_not_found")
         );
+    }
+
+    #[test]
+    fn only_an_agent_no_mode_was_ever_set_on_is_confined_when_its_trigger_fires() {
+        // As `--start` made them before: no sandbox, no gate.
+        assert!(unconfined(&json!({"settings": {}, "gates": []})));
+        // The person put it in `full`, which names its sandbox.
+        let full = json!({"settings": {"sandbox": "danger-full-access"}, "gates": []});
+        assert!(!unconfined(&full));
+        let auto = json!({"settings": {"sandbox": "workspace-write"},
+            "gates": [{"tag": "auto", "tools": ["shell"]}]});
+        assert!(!unconfined(&auto));
     }
 
     #[test]
