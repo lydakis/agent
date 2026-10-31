@@ -25,6 +25,7 @@ mod declared;
 mod diff;
 mod embed;
 mod exec;
+mod fuzzy;
 mod herdr;
 mod highlight;
 mod hint;
@@ -1805,6 +1806,25 @@ const COMMANDS: [(&str, &str); 27] = [
     ("/quit", "Quit; the agents keep working"),
 ];
 
+/// The slash menu's keys, while it is open: Enter runs the pick, or on
+/// part of a [`WHOLE`] command's name fills it in for a second Enter.
+fn menu_keys(menu: &[(&str, &str, Vec<usize>)], pick: usize, typed: &str) -> Option<&'static str> {
+    let picked = menu.get(pick.min(menu.len().checked_sub(1)?))?.0;
+    Some(match (typed == picked, WHOLE.contains(&picked)) {
+        (true, _) => "  ↑↓ pick · enter run · esc close",
+        (false, true) => "  ↑↓ pick · enter complete, again run · esc close",
+        (false, false) => "  ↑↓ pick · tab complete · enter run · esc close",
+    })
+}
+
+/// The commands that act at once and cannot be taken back, as an MCP
+/// tool's `destructiveHint` marks one: `/compact` summarizes the
+/// conversation away. (`/retry` opens a list to approve from, and `/pause`
+/// asks why first.) Enter runs one only once its whole name is typed; on
+/// part of it, Enter fills the name in, as Tab does, and a second Enter
+/// runs it.
+const WHOLE: [&str; 1] = ["/compact"];
+
 /// What an agent's last few items say, for `/status`.
 /// What an idle agent's history says, read once per turn it ended: the
 /// question it has open, and whether its last turn resolved it.
@@ -1976,6 +1996,8 @@ struct App {
     pictures: Vec<Option<attach::Picture>>,
     /// The person's reactions to this bot's replies.
     reactions: reactions::Reactions,
+    /// The slash commands the person ran, for the menu to rank.
+    picks: fuzzy::Picks,
     /// The bot's latest replies, by node, with their first lines: what
     /// `/react` offers, newest last.
     replies: Vec<(i64, String)>,
@@ -2894,6 +2916,7 @@ impl App {
             queued: Vec::new(),
             pictures: Vec::new(),
             reactions: reactions::Reactions::default(),
+            picks: fuzzy::Picks::default(),
             replies: Vec::new(),
             quoting: false,
             reacting: None,
@@ -3011,6 +3034,7 @@ impl App {
         let _ = terminal.autoresize();
         self.width = terminal.size().map(|s| s.width as usize).unwrap_or(80);
         self.reactions = reactions::Reactions::load(self.reactions_key.as_deref());
+        self.picks = fuzzy::Picks::load("commands");
         self.margin = margin::Margin::load(self.reactions_key.as_deref());
         self.picked = reactions::Picked::load(self.reactions_key.as_deref());
         self.history().await;
@@ -7126,15 +7150,22 @@ impl App {
     }
 
     /// The slash commands the input could be, while it is one word that
-    /// starts with `/`.
-    fn menu(&self) -> Vec<(&'static str, &'static str)> {
+    /// starts with `/`, best first, with where the letters typed are in
+    /// each: the person's own picks rank first among equal matches.
+    fn menu(&self) -> Vec<(&'static str, &'static str, Vec<usize>)> {
         if !self.input.starts_with('/') || self.input.contains(char::is_whitespace) {
             return Vec::new();
         }
-        COMMANDS
-            .into_iter()
-            .filter(|(name, _)| name.starts_with(&*self.input))
-            .collect()
+        let names = COMMANDS.iter().map(|(name, _)| &name[1..]);
+        fuzzy::rank(names, &self.input[1..], |name| {
+            self.picks.weight_now(&format!("/{name}"))
+        })
+        .into_iter()
+        .map(|(at, found)| {
+            let (name, about) = COMMANDS[at];
+            (name, about, found.at.iter().map(|at| at + 1).collect())
+        })
+        .collect()
     }
 
     /// What the full screen takes before the rest: the mouse, a copy of
@@ -8379,9 +8410,12 @@ impl App {
                         .modifiers
                         .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
                 {
+                    let whole = &*self.input == picked;
                     self.input.set(picked);
                     self.pick = 0;
-                    self.submit().await;
+                    if whole || !WHOLE.contains(&picked) {
+                        self.submit().await;
+                    }
                     return;
                 }
                 KeyCode::Esc => {
@@ -8563,6 +8597,11 @@ impl App {
         let prompt = self.input.trim().to_owned();
         if prompt.is_empty() {
             return;
+        }
+        // A command run, so the menu ranks it first next time.
+        let word = prompt.split_whitespace().next().unwrap_or_default();
+        if COMMANDS.iter().any(|(name, _)| *name == word) {
+            self.picks.pick_now(word);
         }
         if let Some(command) = prompt.strip_prefix('!') {
             let command = command.trim();
@@ -9805,7 +9844,7 @@ impl App {
             if !menu.is_empty() {
                 let pick = self.pick.min(menu.len() - 1);
                 let items: Vec<list::Item> = (menu.iter())
-                    .map(|(name, about)| list::Item::new(*name, *about))
+                    .map(|(name, about, found)| list::Item::new(*name, *about).found(found))
                     .collect();
                 // Over the rows above the composer's band.
                 over(frame, list::lines(&items, pick, width, gap.y as usize), gap);
@@ -9952,10 +9991,13 @@ impl App {
                 return;
             }
             if let Some(picker) = &self.picker {
-                let shown = picker.shown();
                 let at = picker.at();
-                let items: Vec<list::Item> = (shown.iter())
-                    .map(|model| list::Item::new(*model, "").current(*model == self.model))
+                let items: Vec<list::Item> = (picker.found().into_iter())
+                    .map(|(model, found)| {
+                        list::Item::new(model, "")
+                            .current(model == self.model)
+                            .found(&found)
+                    })
                     .collect();
                 let room = composer.y as usize;
                 let mut rows = list::lines(&items, at, width, room);
@@ -10006,7 +10048,12 @@ impl App {
             }
             // Under the composer's band and no wider: one column, its
             // right edge where the band's is.
-            let (line, counter) = self.footer(width.min(PROSE));
+            // The menu's keys while it is open, as every list over the
+            // composer has them, saying what Enter does with the pick.
+            let (line, counter) = match menu_keys(&menu, self.pick, &self.input) {
+                Some(keys) => (Line::from(hint::spans(keys)), None),
+                None => self.footer(width.min(PROSE)),
+            };
             frame.render_widget(Paragraph::new(line), footer);
             counter_at = counter.map(|at| (footer.y, footer.x + at.start..footer.x + at.end));
         };
@@ -14281,6 +14328,61 @@ mod tests {
         app.input.set("/mo");
         app.key(Event::Key(ctrl_h)).await;
         assert_eq!(&*app.input, "/m", "with the command menu open too");
+    }
+
+    #[tokio::test]
+    async fn enter_on_part_of_compact_fills_it_in_and_what_was_run_ranks_first() {
+        let asked = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen = asked.clone();
+        let mut app = app(daemon_answering(move |request| {
+            let op = request["op"].as_str().unwrap_or_default();
+            seen.lock().unwrap().push(op.to_owned());
+            json!({})
+        })
+        .await);
+        let enter = || Event::Key(event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let compacted = || asked.lock().unwrap().iter().any(|op| op == "compact");
+        let first = |app: &App| {
+            app.menu()
+                .iter()
+                .map(|(name, ..)| *name)
+                .take(4)
+                .collect::<Vec<_>>()
+        };
+        app.input.set("/co");
+        assert_eq!(first(&app), ["/compact", "/commons", "/config", "/copy"]);
+        let keys = |app: &App| menu_keys(&app.menu(), app.pick, &app.input);
+        assert_eq!(
+            keys(&app),
+            Some("  ↑↓ pick · enter complete, again run · esc close")
+        );
+        // Part of /compact's name: Enter fills it in, and runs nothing.
+        app.key(enter()).await;
+        assert_eq!(&*app.input, "/compact");
+        assert!(!compacted());
+        assert_eq!(keys(&app), Some("  ↑↓ pick · enter run · esc close"));
+        // Its whole name: Enter runs it.
+        app.key(enter()).await;
+        assert!(app.input.is_empty());
+        assert!(compacted());
+        // Any other command runs on part of its name, and what was run
+        // more ranks first among the names that start the same.
+        for _ in 0..2 {
+            app.input.set("/cop");
+            app.key(enter()).await;
+            assert_eq!(app.notice.as_deref(), Some("no reply yet"));
+        }
+        app.input.set("/co");
+        assert_eq!(first(&app)[0], "/copy");
+        assert_eq!(
+            keys(&app),
+            Some("  ↑↓ pick · tab complete · enter run · esc close")
+        );
+        // Its letters in order find a command.
+        app.input.set("/cms");
+        assert_eq!(first(&app), ["/commons"]);
+        let found = &app.menu()[0].2;
+        assert_eq!(found, &[1, 3, 7], "where in /commons the letters are");
     }
 
     #[tokio::test]

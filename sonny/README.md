@@ -1001,11 +1001,27 @@ what it does muted, `·` between them (`↑↓ pick · enter open · esc
 close`). Every list over the composer (the slash menu, `/model`,
 `/approvals`, `/retry`, a reply to react to) is one list: up to 8 rows
 under a blank one, the pick in reverse video, `•` before what is in
-effect.
+effect, and its keys where the footer was.
 
 ![? with nothing typed: every key beside the conversation](../docs/sonny/shortcuts.png)
 
-![The slash menu: 8 commands under a blank row, each described as an imperative; the footer says ? 1 needs you](../docs/sonny/slash-menu.png)
+Every list you narrow by typing (the slash menu, `/model`, `sonny setup`'s
+pickers) finds rows one way: the letters typed, in order, the first of
+them starting the name or a word in it, so `/cms` finds `/commons` and
+`g6l` finds `gpt-6-luna`; the letters found are bold. The whole name
+ranks first, then names it starts, then a word in a name it starts, then
+the letters. Among equal matches in the slash menu, the commands you run
+more often and more lately come first (each run counts half as much a
+week on, kept in `~/.agent/sonny/picks.json`), so once you use `/commons`
+more than `/compact`, `/co` and Enter opens `/commons`.
+
+Enter runs the command marked, even on part of its name, except
+`/compact`, which can't be taken back: on part of its name Enter fills it
+in, and a second Enter runs it. The key line says which Enter will do.
+
+![/co with /compact marked: the keys read enter complete, again run; Enter put /compact in the composer and the keys now read enter run](../docs/sonny/slash-compact-whole.png)
+
+![/co after /commons was run: /commons ranks first; /cms finds /commons with c, m and s in bold](../docs/sonny/slash-ranked-fuzzy.png)
 
 The pane's place, when nothing else is open there, is the margin. Its
 first row is a glance at what runs for the agent: a red `✗` for what
