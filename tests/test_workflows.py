@@ -21,11 +21,10 @@ from tests.test_runtime import PROTECTING, ModelFixture
 ROOT = Path(__file__).resolve().parent.parent
 
 # Sonny's rows as the daemon gets them (sonny/src/approvals.rs `builtin`
-# and `OWN_UNSANDBOXED`): Auto and Ask me differ only in who answers what
-# leaves the sandbox.
-OWN = ['sonny zen']
-AUTO = {'sandbox': 'workspace-write', 'network': True, 'unsandboxed': OWN}
-READ_ONLY = {'sandbox': 'read-only', 'unsandboxed': OWN}
+# and `sandbox`, which adds Sonny's zen folder to what a row writes): Auto
+# and Ask me differ only in who answers what leaves the sandbox.
+AUTO = {'sandbox': 'workspace-write', 'network': True}
+READ_ONLY = {'sandbox': 'read-only'}
 FULL = {}
 
 
@@ -76,6 +75,8 @@ class WorkflowTests(ModelFixture):
             's.connect(os.path.expanduser("~/.mcpx/mcpx.sock"))\n'
             'print(s.recv(16).decode())\n')
         (bin / 'mcpx').chmod(0o755)
+        self.zen = self.home / '.agent/sonny/zen'
+        self.zen.mkdir(parents=True)
         env = {**clean_env(), 'HOME': str(self.home), 'PATH': f'{bin}:{os.environ["PATH"]}'}
         self.daemon = SocketClient(self.binary, self.path / 'state.sqlite', self.url, 'shell',
                                    extra=PROTECTING, env=env)
@@ -84,6 +85,8 @@ class WorkflowTests(ModelFixture):
 
     def agent(self, settings, gated=True):
         name = f'bot{len(self.daemon.request("bots")["result"]["bots"])}'
+        if settings.get('sandbox') == 'workspace-write':
+            settings = {**settings, 'writable': [*settings.get('writable', []), str(self.zen)]}
         gate = {'approve': ['shell'], 'approver': 'manual'} if gated else {}
         self.daemon.request('create', bot=name, workspace=str(self.work), tools=['shell'],
                             settings=settings, **gate)
@@ -126,10 +129,12 @@ class WorkflowTests(ModelFixture):
             asked, output = self.runs(bot, 'agent ls')
             self.assertFalse(asked, settings)
             self.assertIn(bot, output['stdout'], settings)
-            # It keeps its focus with Sonny's CLI, which writes Sonny's state.
-            asked, _ = self.runs(bot, 'sonny zen the tests')
-            self.assertFalse(asked, settings)
-        self.assertEqual(len(list((self.home / '.agent/sonny/zen').iterdir())), 3)
+            # It keeps its focus with Sonny's CLI, in Sonny's zen folder,
+            # which every row but Read only writes.
+            asked, output = self.run_(bot, 'sonny zen the tests')
+            self.assertEqual((asked, output.get('exit_code') == 0), (False, settings is not READ_ONLY),
+                             (settings, output))
+        self.assertEqual(len(list(self.zen.iterdir())), 2)
 
     def test_mcpx_docker_and_ssh_agent_sockets_are_reached_with_the_network_on(self):
         # Auto and Ask me reach the network, so every socket, as Codex's
@@ -148,7 +153,7 @@ class WorkflowTests(ModelFixture):
         self.assertTrue(asked)
         # "Always allow mcpx" adds it to the commands that leave every
         # sandbox; it never asks again.
-        self.daemon.request('configure', bot=bot, sandbox='read-only', unsandboxed=[*OWN, 'mcpx'])
+        self.daemon.request('configure', bot=bot, sandbox='read-only', unsandboxed=['mcpx'])
         asked, output = self.runs(bot, 'mcpx')
         self.assertEqual((asked, output['stdout'].strip()), (False, 'pong'))
 
@@ -180,7 +185,7 @@ class WorkflowTests(ModelFixture):
         self.assertTrue(asked)
         self.assertTrue(Path(f'{cache}-x').exists())
         # Allowed always, the same command runs without asking.
-        self.daemon.request('configure', bot=bot, sandbox='workspace-write', unsandboxed=[*OWN, 'touch'])
+        self.daemon.request('configure', bot=bot, sandbox='workspace-write', unsandboxed=['touch'])
         asked, _ = self.runs(bot, f'touch {cache}-y')
         self.assertFalse(asked)
         self.assertTrue(Path(f'{cache}-y').exists())

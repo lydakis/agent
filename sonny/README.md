@@ -584,8 +584,9 @@ way `/react` does, and each note in the margin has its own `↩`.
   named from the folder it runs in (`./build.sh`) is never offered.
 
   An agent that reaches the network reaches every Unix socket too, as
-  Codex's full network does, so MCPX, Docker and ssh-agent just work, and
-  `sonny zen` always runs outside, as it writes only Sonny's state. One
+  Codex's full network does, so MCPX, Docker and ssh-agent just work; and
+  every row that writes writes Sonny's zen folder too, so `sonny zen`
+  works from an agent's shell. One
   kept off the network reaches none, since a program listening on a socket
   runs what it is asked outside the sandbox, as Docker's does: its row's
   `unix_sockets` names those it may reach, each a socket or a folder of
