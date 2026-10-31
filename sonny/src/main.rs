@@ -7118,13 +7118,17 @@ impl App {
                 .and_then(|page| page["turns"].as_array().cloned())
                 .unwrap_or_default();
             // Its latest items are read again only once its history moved:
-            // the same head is the same history.
+            // the same head is the same history. A failed read is kept
+            // for none, so the next refresh tries again.
             let head = json!([bot["bot_id"], bot["head"]]);
             let latest = match self.status_read.remove(name) {
-                Some((seen, latest)) if seen == head && !bot["head"].is_null() => latest,
-                _ => self.latest(name).await,
+                Some((seen, latest)) if seen == head && !bot["head"].is_null() => Some(latest),
+                _ => self.read_latest(name).await,
             };
-            kept.insert(name.to_owned(), (head, latest.clone()));
+            if let Some(latest) = &latest {
+                kept.insert(name.to_owned(), (head, latest.clone()));
+            }
+            let latest = latest.unwrap_or_default();
             let turn = turns.first().cloned().unwrap_or(Value::Null);
             // A message steered into a running turn is recorded as a turn
             // of its own that never ran: the time is the one it joined. One
@@ -7336,27 +7340,30 @@ impl App {
     /// An agent's latest step, as a line; the pull request its latest
     /// reply links; and the question it asked the person, when that is
     /// still open. Its last few items say: asking ends a turn.
+    #[cfg(test)]
     async fn latest(&self, bot: &str) -> Latest {
-        let Ok(page) = self
+        self.read_latest(bot).await.unwrap_or_default()
+    }
+
+    /// `bot`'s latest step, question and pull request; none when a read
+    /// failed, which an empty history is not.
+    async fn read_latest(&self, bot: &str) -> Option<Latest> {
+        let page = self
             .client
             .request("history_nodes", json!({"bot": bot, "limit": 4}))
             .await
-        else {
-            return Latest::default();
-        };
+            .ok()?;
         let nodes: Vec<i64> = page["nodes"]
             .as_array()
             .into_iter()
             .flatten()
             .filter_map(|n| n["node"].as_i64())
             .collect();
-        let Ok(read) = self
+        let read = self
             .client
             .request("history_items", json!({"bot": bot, "nodes": nodes}))
             .await
-        else {
-            return Latest::default();
-        };
+            .ok()?;
         // Newest first, as the nodes were asked for.
         let entries = read["items"].as_array().cloned().unwrap_or_default();
         let items: Vec<Value> = entries.iter().map(|entry| entry["item"].clone()).collect();
@@ -7385,11 +7392,11 @@ impl App {
                     })
             })
             .collect();
-        Latest {
+        Some(Latest {
             ask: asks::open(&flat),
             pr,
             step: Self::step(items),
-        }
+        })
     }
 
     /// The newest of `items` that reads as a step, as a line.
@@ -12171,6 +12178,7 @@ mod tests {
         let histories = Arc::new(AtomicUsize::new(0));
         let moved = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (read, head) = (histories.clone(), moved.clone());
+        let failed = std::sync::atomic::AtomicBool::new(false);
         let bot = |n: usize, head: i64| {
             json!({"name": format!("shop.t{n:03}"), "bot_id": n, "head": head,
                 "status": "idle", "running_turn": null})
@@ -12192,6 +12200,12 @@ mod tests {
                         read.fetch_add(1, Ordering::SeqCst);
                         json!({"nodes": [], "next_from": null})
                     }
+                    // The first agent's first read fails.
+                    "history_items"
+                        if asked["bot"] == "shop.t000" && !failed.swap(true, Ordering::SeqCst) =>
+                    {
+                        json!({"error": "storage_error", "detail": "a failed read"})
+                    }
                     "history_items" => json!({"items": []}),
                     _ => json!({"error": {"code": "unexpected", "message": asked.to_string()}}),
                 },
@@ -12203,14 +12217,16 @@ mod tests {
         assert_eq!(rows.len(), 257);
         assert!(rows.iter().any(|row| row.bot == "shop.t256"));
         assert_eq!(histories.load(Ordering::SeqCst), 257);
-        // No history moved: none is read again (its turns are, as queued
-        // work moves no record).
+        // No history moved: only the one whose read failed is read again
+        // (and every agent's turns, as queued work moves no record).
         app.status_rows().await.unwrap();
-        assert_eq!(histories.load(Ordering::SeqCst), 257);
+        assert_eq!(histories.load(Ordering::SeqCst), 258);
+        app.status_rows().await.unwrap();
+        assert_eq!(histories.load(Ordering::SeqCst), 258);
         // One agent's history grew: only its is.
         moved.store(true, Ordering::SeqCst);
         app.status_rows().await.unwrap();
-        assert_eq!(histories.load(Ordering::SeqCst), 258);
+        assert_eq!(histories.load(Ordering::SeqCst), 259);
     }
 
     #[tokio::test]

@@ -11,9 +11,9 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 pub struct Budget {
     all: Arc<Semaphore>,
-    /// Each agent's share while it holds or waits for a place; gone once
-    /// it holds none.
-    shares: Mutex<HashMap<String, Arc<Semaphore>>>,
+    /// Each agent's share while it holds or waits for a place, with how
+    /// many hold or wait; gone once none does.
+    shares: Mutex<HashMap<String, (Arc<Semaphore>, usize)>>,
     share: usize,
 }
 
@@ -21,17 +21,24 @@ pub struct Budget {
 pub struct Permit {
     _all: OwnedSemaphorePermit,
     _share: OwnedSemaphorePermit,
+    _claim: Claim,
+}
+
+/// One holder of, or waiter on, an agent's share. Dropped, whether its
+/// place came or its wait was given up, it leaves no unused share behind.
+struct Claim {
     owner: String,
     budget: &'static Budget,
 }
 
-impl Drop for Permit {
+impl Drop for Claim {
     fn drop(&mut self) {
         let mut shares = self.budget.shares.lock().unwrap_or_else(|e| e.into_inner());
-        // The map holds the share once and this permit once (its place
-        // comes back after this runs): nobody else holds or waits on it.
-        if (shares.get(&self.owner)).is_some_and(|share| Arc::strong_count(share) <= 2) {
-            shares.remove(&self.owner);
+        if let Some((_, users)) = shares.get_mut(&self.owner) {
+            *users -= 1;
+            if *users == 0 {
+                shares.remove(&self.owner);
+            }
         }
     }
 }
@@ -47,13 +54,19 @@ impl Budget {
     }
 
     /// Wait for a place for `owner`: its share first, so an agent waiting
-    /// on its own share holds none of the others'.
+    /// on its own share holds none of the others'. Cancel-safe.
     pub async fn admit(&'static self, owner: &str) -> Permit {
-        let share = {
+        let (share, claim) = {
             let mut shares = self.shares.lock().unwrap_or_else(|e| e.into_inner());
-            (shares.entry(owner.to_owned()))
-                .or_insert_with(|| Arc::new(Semaphore::new(self.share)))
-                .clone()
+            let (share, users) = shares
+                .entry(owner.to_owned())
+                .or_insert_with(|| (Arc::new(Semaphore::new(self.share)), 0));
+            *users += 1;
+            let claim = Claim {
+                owner: owner.to_owned(),
+                budget: self,
+            };
+            (share.clone(), claim)
         };
         let share = share.acquire_owned().await.expect("never closed");
         let all = self
@@ -65,8 +78,7 @@ impl Budget {
         Permit {
             _all: all,
             _share: share,
-            owner: owner.to_owned(),
-            budget: self,
+            _claim: claim,
         }
     }
 }
@@ -122,5 +134,16 @@ mod tests {
         drop(held);
         drop(second.await);
         assert!(budget.shares.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_agent_that_stops_waiting_leaves_no_share_behind() {
+        let budget = leaked(2);
+        let _a = budget.admit("a").await;
+        let _b = budget.admit("b").await;
+        // The budget is full: `c` waits, then gives up.
+        let gave_up = tokio::time::timeout(Duration::from_millis(20), budget.admit("c")).await;
+        assert!(gave_up.is_err());
+        assert!(!budget.shares.lock().unwrap().contains_key("c"));
     }
 }
