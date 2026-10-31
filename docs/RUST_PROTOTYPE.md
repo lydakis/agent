@@ -375,7 +375,7 @@ bound; the operating system is then the only limit.
 | `--max-detached` | Detached shell commands still running, daemon-wide; exited ones are reaped and stop counting. Zero is unbounded. | 16 |
 | `--max-active` | Turns with a live task: a model call in flight or a foreground tool. Parked turns never count. | 4,096 |
 | `--max-pending` | Submissions waiting to start: queued behind a bot's own work or ready for a slot, daemon-wide. A submission that would wait past the bound answers `pending_limit` and writes nothing; one that starts at once is never refused by it. | none |
-| `--max-pending-bytes` | UTF-8 prompt bytes of those waiting submissions. | none |
+| `--max-pending-bytes` | UTF-8 bytes of those waiting submissions: their prompts and the words they quote, which wait with them. | none |
 | `--max-connecting` | Provider requests awaiting response headers, a Bedrock Runtime call's body digest included. Established streams are not capped. Both providers hold headers until the first token, so a permit is held for the whole time to first token; a bound of N caps throughput at N calls per first-token latency. | none |
 | `--stall-timeout` | How long an established provider stream may go without a content frame before the attempt fails as `provider_stream_stalled` and is retried. Keepalives do not count. Whole seconds, `1s` to `24h`. | `2m` |
 | `--idle-exit` | How long, in whole seconds, before a socket daemon with no sessions, no live turns, and no running background commands exits. Parked turns are durable and resume on the next start; the client restarts the daemon on demand. | none |
@@ -1209,7 +1209,7 @@ does not, and each is one op:
   outside: open sessions, active turns against the bound, parked turns,
   running processes against the process bound and how many of them are
   still in line for a slot (`queued_processes`), turns queued or ready to
-  start (`queued_turns`) with their prompt bytes (`pending_bytes`) and the
+  start (`queued_turns`) with their prompt and quoted bytes (`pending_bytes`) and the
   bounds on both (`pending_limit`, `pending_bytes_limit`), daemon-wide in-flight
   requests per shared HTTP client shard (`transport.in_flight_by_shard`),
   and every provider's model pools with their learned allowance and current

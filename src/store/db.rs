@@ -1394,7 +1394,7 @@ pub struct Database {
     /// Bounds on submissions waiting to start, turns and prompt bytes; zero
     /// is unbounded. Daemon configuration, set once after open.
     pending_limits: (usize, usize),
-    /// Queued and ready turns and their prompt bytes. Counted from the rows
+    /// Queued and ready turns and their prompt and quoted bytes. Counted from the rows
     /// at open and kept by the one writer at each transition, so admission
     /// and `stats` cost nothing on the store.
     pending: (i64, i64),
@@ -1960,8 +1960,8 @@ impl Database {
             .prepare_cached("SELECT COUNT(*) FROM approvals")?
             .query_row([], |r| r.get(0))?;
         for statement in [
-            "SELECT COUNT(*),COALESCE(SUM(length(CAST(prompt AS BLOB))),0) FROM turns WHERE status='queued'",
-            "SELECT COUNT(*),COALESCE(SUM(length(CAST(prompt AS BLOB))),0) FROM turns WHERE status='ready'",
+            "SELECT COUNT(*),COALESCE(SUM(length(CAST(prompt AS BLOB))+COALESCE(length(CAST(quotes AS BLOB)),0)),0) FROM turns WHERE status='queued'",
+            "SELECT COUNT(*),COALESCE(SUM(length(CAST(prompt AS BLOB))+COALESCE(length(CAST(quotes AS BLOB)),0)),0) FROM turns WHERE status='ready'",
         ] {
             let (turns, bytes): (i64, i64) = self
                 .conn
@@ -5186,7 +5186,8 @@ impl Database {
     pub fn set_pending_limits(&mut self, turns: usize, bytes: usize) {
         self.pending_limits = (turns, bytes);
     }
-    /// Queued and ready turns and their prompt bytes.
+    /// Queued and ready turns and their bytes: their prompts and the words
+    /// they quote, which wait with them until they start.
     pub fn pending(&self) -> Result<(i64, i64)> {
         Ok(self.pending)
     }
@@ -5502,6 +5503,7 @@ impl Database {
         // Work that would wait counts against the pending bounds; a refusal
         // writes nothing, like the active-turn bound. An attached message
         // is no work: it waits for whatever the bot does next.
+        let waiting = prompt.len() + quotes.as_ref().map_or(0, String::len);
         if status != "running" && !attach {
             let (limit_turns, limit_bytes) = self.pending_limits;
             if limit_turns > 0 || limit_bytes > 0 {
@@ -5512,11 +5514,11 @@ impl Database {
                         format!("{turns} submissions are waiting; the bound is {limit_turns}"),
                     );
                 }
-                if limit_bytes > 0 && bytes + prompt.len() as i64 > limit_bytes as i64 {
+                if limit_bytes > 0 && bytes + waiting as i64 > limit_bytes as i64 {
                     return fail_with(
                         "pending_limit",
                         format!(
-                            "{bytes} prompt bytes are waiting; this one would pass the bound of {limit_bytes}"
+                            "{bytes} prompt and quoted bytes are waiting; this one would pass the bound of {limit_bytes}"
                         ),
                     );
                 }
@@ -5579,7 +5581,7 @@ impl Database {
         tx.commit()?;
         if status != "running" && !attach {
             self.pending.0 += 1;
-            self.pending.1 += prompt.len() as i64;
+            self.pending.1 += waiting as i64;
         }
         let joins = options.delivery == Delivery::Steer
             && status == "queued"
@@ -5607,7 +5609,8 @@ impl Database {
         turn: i64,
         validate: impl FnOnce(&Bot, Option<&str>) -> Result<()>,
     ) -> Result<(Value, bool)> {
-        // Bot, request, prompt, status, folder, model, strict, effort.
+        // Bot, request, prompt, status, folder, model, strict, effort,
+        // waiting bytes.
         type Queued = (
             String,
             String,
@@ -5617,11 +5620,13 @@ impl Database {
             Option<String>,
             bool,
             Option<String>,
+            i64,
         );
-        let (name, request_id, prompt, status, workspace, model, strict, reasoning): Queued = self
+        let (name, request_id, prompt, status, workspace, model, strict, reasoning, waiting): Queued = self
             .conn
             .query_row(
-                "SELECT bot,request_id,prompt,status,workspace,model,expected_turn IS NOT NULL,reasoning FROM turns WHERE id=?",
+                "SELECT bot,request_id,prompt,status,workspace,model,expected_turn IS NOT NULL,reasoning,
+                    length(CAST(prompt AS BLOB))+COALESCE(length(CAST(quotes AS BLOB)),0) FROM turns WHERE id=?",
                 [turn],
                 |r| {
                     Ok((
@@ -5633,6 +5638,7 @@ impl Database {
                         r.get(5)?,
                         r.get(6)?,
                         r.get(7)?,
+                        r.get(8)?,
                     ))
                 },
             )
@@ -5668,7 +5674,7 @@ impl Database {
         start_locked(&tx, &bot, turn, &prompt, &mut data)?;
         let cursor = event(&tx, &name, Some(turn), "accepted", data.clone())?;
         tx.commit()?;
-        self.pending_left(prompt.len());
+        self.pending_left(waiting as usize);
         let steers = self.steers_waiting(&name)?;
         Ok((entry(cursor, &name, Some(turn), "accepted", data), steers))
     }
@@ -5702,7 +5708,7 @@ impl Database {
         let (name, status, prompt_bytes): (String, String, i64) = self
             .conn
             .query_row(
-                "SELECT bot,status,length(CAST(prompt AS BLOB)) FROM turns WHERE id=?",
+                "SELECT bot,status,length(CAST(prompt AS BLOB))+COALESCE(length(CAST(quotes AS BLOB)),0) FROM turns WHERE id=?",
                 [turn],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
@@ -5806,14 +5812,14 @@ impl Database {
             )
         };
         // Each steer's id, item with its pictures and stub, prompt size,
-        // whether it was attached (which no pending count holds), and its
-        // pictures' JSON, and its quotes as the turn keeps them once
-        // its item holds their words.
+        // the bytes the pending count holds for it (none when it was
+        // attached), its pictures' JSON, and its quotes as the turn keeps
+        // them once its item holds their words.
         type Steer = (
             i64,
             (Vec<u8>, Pictured, Option<Vec<u8>>),
             usize,
-            bool,
+            Option<usize>,
             Option<String>,
             Option<String>,
         );
@@ -5828,7 +5834,8 @@ impl Database {
                     (s.workspace IS NULL OR s.workspace=COALESCE(t.workspace,b.workspace))
                     AND (s.model IS NULL OR s.model=COALESCE(t.model,b.provider||'/'||b.model))
                     AND (s.reasoning IS NULL OR s.reasoning IS COALESCE(t.reasoning,b.reasoning)),
-                    s.status='attached',length(s.images)
+                    s.status='attached',length(s.images),
+                    length(CAST(s.prompt AS BLOB))+COALESCE(length(CAST(s.quotes AS BLOB)),0)
                  FROM (SELECT id FROM turns WHERE bot=?1 AND status='queued' AND delivery='steer'
                          AND id<=?4 AND (expected_turn IS NULL OR expected_turn=?2)
                        UNION ALL SELECT id FROM turns WHERE ?5 AND bot=?1 AND status='attached'
@@ -5888,7 +5895,8 @@ impl Database {
                 }
                 room_bytes -= weight + 1;
                 room_items -= 1;
-                steers.push((id, prompted, size, row.get(4)?, images, quotes));
+                let waiting = (!row.get::<_, bool>(4)?).then_some(row.get::<_, i64>(6)? as usize);
+                steers.push((id, prompted, size, waiting, images, quotes));
             }
         }
         let mut absorbed = Absorbed {
@@ -5906,7 +5914,7 @@ impl Database {
         let mut steered = Vec::with_capacity(steers.len());
         // Preserve the submitted effort for exact retries; only omitted effort
         // needs a separate execution value when the running turn overrides it.
-        for (steer, prompted, size, was_attached, images, quotes) in steers {
+        for (steer, prompted, size, waiting, images, quotes) in steers {
             let id = prompt_node(&tx, head, &prompted, None)?;
             head = Some(id);
             keep_once(&tx, steer, images.as_deref())?;
@@ -5943,7 +5951,7 @@ impl Database {
             absorbed
                 .entries
                 .push(entry(cursor, &bot.name, Some(turn), "steered", data));
-            steered.push((steer, (!was_attached).then_some(size)));
+            steered.push((steer, waiting));
         }
         // Steers go in only at a round boundary and hold no calls.
         tx.execute(

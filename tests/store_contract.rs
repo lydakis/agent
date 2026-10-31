@@ -9292,6 +9292,109 @@ fn pending_counters_follow_every_transition_and_bound_admission() {
 }
 
 #[test]
+fn quoted_words_wait_with_their_turn_and_count_against_the_pending_bytes() {
+    let path = std::env::temp_dir().join(format!(
+        "agent-pending-quotes-{}.sqlite",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let quoting = |delivery| TurnOptions {
+        delivery,
+        quotes: vec![quote("Ann", 1, false)],
+        ..TurnOptions::default()
+    };
+    let words = "x".repeat(4096);
+    let waiting = {
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        db.create("Ann", Some("/synthetic"), binding()).unwrap();
+        db.create("Bob", Some("/synthetic"), binding()).unwrap();
+        let said = db
+            .begin(
+                "Ann",
+                "a1",
+                &words,
+                true,
+                &TurnOptions::default(),
+                allow_provider,
+            )
+            .unwrap()
+            .turn;
+        assert_eq!(said, 1);
+        db.finish(said, None).unwrap();
+        let running = db
+            .begin(
+                "Bob",
+                "b1",
+                "go",
+                true,
+                &TurnOptions::default(),
+                allow_provider,
+            )
+            .unwrap()
+            .turn;
+        // An empty prompt quoting 4 KiB waits with those 4 KiB.
+        db.begin(
+            "Bob",
+            "b2",
+            "",
+            true,
+            &quoting(Delivery::Queue),
+            allow_provider,
+        )
+        .unwrap();
+        let (turns, bytes) = db.pending().unwrap();
+        assert_eq!(turns, 1);
+        assert!(bytes as usize > words.len(), "{bytes}");
+        // The bound counts them too.
+        db.set_pending_limits(0, bytes as usize + 1024);
+        assert_eq!(
+            db.begin(
+                "Bob",
+                "b3",
+                "",
+                true,
+                &quoting(Delivery::Queue),
+                allow_provider
+            )
+            .unwrap_err()
+            .code,
+            "pending_limit"
+        );
+        db.set_pending_limits(0, 0);
+        // A steer quoting them leaves the count when it is taken in.
+        db.begin(
+            "Bob",
+            "b4",
+            "",
+            true,
+            &quoting(Delivery::Steer),
+            allow_provider,
+        )
+        .unwrap();
+        assert_eq!(db.pending().unwrap(), (2, 2 * bytes));
+        db.absorb(
+            running,
+            None,
+            8 << 20,
+            4096,
+            ContextUsage::default(),
+            false,
+            true,
+        )
+        .unwrap();
+        assert_eq!(db.pending().unwrap(), (1, bytes));
+        bytes
+    };
+    // Recounted at open: the waiting turn still holds its quoted words.
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    assert_eq!(db.pending().unwrap(), (1, waiting));
+    let (_, turn) = db.next_ready().unwrap().unwrap();
+    db.start(turn, |_, _| Ok(())).unwrap();
+    assert_eq!(db.pending().unwrap(), (0, 0));
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn batched_history_items_validate_the_branch_and_bound_payloads() {
     let mut db = db();
     db.create("source", Some("/synthetic"), binding()).unwrap();
