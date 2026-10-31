@@ -178,7 +178,7 @@ pub const SETTINGS: [Setting; 22] = [
     },
     Setting {
         key: "sonny.tool_processes",
-        about: "processes Sonny runs for agents at once (tool calls, goal checks), each agent at most half; 0 for twice the CPUs",
+        about: "processes each of Sonny's companions runs for agents at once (the tool host's tool calls, the lookout's goal checks), each agent at most half; 0 for twice the CPUs",
         values: &[],
         default: "0",
     },
