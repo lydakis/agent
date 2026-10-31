@@ -6027,10 +6027,11 @@ impl Database {
         let next = next_node(&tx)?;
         let pictured = Pictured::of_all(outcome.images());
         let weight = (item.len() as i64 - pictured.extra) as usize;
+        let words = outcome.words();
         let stub = if pictured.count > 0 {
-            super::context::picture_stub(family, call_id, custom, &outcome.words(), weight)?
+            super::context::picture_stub(family, call_id, custom, &words, weight)?
         } else if bot.tools.iter().any(|tool| tool == "read") {
-            super::context::stub(family, call_id, custom, &outcome.output, next, weight)?
+            super::context::stub(family, call_id, custom, &words, next, weight)?
         } else {
             None
         };

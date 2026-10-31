@@ -10578,6 +10578,59 @@ fn a_bot_without_read_stores_no_stubs() {
 }
 
 #[test]
+fn a_result_s_text_parts_elide_together() {
+    // A short output then a long text part: the stub counts and quotes
+    // the whole text, as a read of the result returns it.
+    let path = std::env::temp_dir().join(format!("agent-parts-stub-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let turn = db
+        .begin(
+            "Bob",
+            "r1",
+            "task",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let call = ToolCall {
+        custom: false,
+        name: "shell".into(),
+        call_id: "c0".into(),
+        arguments: "{}".into(),
+    };
+    let item = json!({"type":"function_call","call_id":"c0","name":"shell","arguments":"{}"});
+    db.append(
+        turn,
+        vec![serde_json::to_vec(&item).unwrap().into()],
+        std::slice::from_ref(&call),
+        None,
+    )
+    .unwrap();
+    db.tool_start(turn, &call).unwrap();
+    let long = format!("{}the end", lines(0, 400));
+    let outcome = Outcome {
+        parts: vec![agent_runtime::codec::Part::Text { text: long.clone() }],
+        ..result("intro")
+    };
+    db.tool_finish(turn, "c0", &outcome).unwrap();
+    let stub: Vec<u8> = Connection::open(&path)
+        .unwrap()
+        .query_row("SELECT item FROM stubs", [], |r| r.get(0))
+        .unwrap();
+    let stub: Value = serde_json::from_slice(&stub).unwrap();
+    let text = stub["output"].as_str().unwrap();
+    let whole = format!("intro\n{long}");
+    assert!(text.contains(&format!("{} bytes", whole.len())), "{text}");
+    assert!(text.ends_with("the end"), "{text}");
+    drop(db);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn schema_29_adds_elision_without_rewriting_stored_results() {
     let path = std::env::temp_dir().join(format!("agent-stubs-{}.sqlite", std::process::id()));
     let _ = std::fs::remove_file(&path);
