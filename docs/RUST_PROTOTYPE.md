@@ -1035,8 +1035,9 @@ it and waits that much longer than 30 seconds.
 Protocol 24 also adds the pull cord: `pause` stops every agent until
 `resume`, and holds across restarts, since the store keeps it (schema 64, a
 one-row `pause` table). `{"op":"pause","reason":TEXT,"by":NAME}` needs a
-reason of 1 to 4096 bytes. `by` is who pulled it; on a bot's own socket it is
-that bot, whatever the request says. It parks every running turn at once,
+reason of 1 to 4096 bytes. `by` is who pulled it, 1 to 128 bytes, or the
+request answers `invalid_by`; on a bot's own socket it is that bot, whatever
+the request says. It parks every running turn at once,
 as a closed pool parks it (`turn_paced` with `paused: true`; status `paced`),
 to continue on `resume`. The reply it was writing is dropped and asked for
 again then. Each call the turn had not answered gets a result, `{error:
@@ -1053,7 +1054,8 @@ parked}`, where `pause` is `{reason, by, at_ms}` and `parked` counts the
 running turns it parked. While a pause holds,
 another changes nothing and answers the first with `changed: false`.
 `{"op":"resume","by":NAME?}` lifts it and answers `{pause, by, changed}` with
-the pause it lifted, or null when none held, and who lifted it; what waited,
+the pause it lifted, or null when none held, and who lifted it (`by`, 1 to
+128 bytes, as `pause` takes it); what waited,
 and the turns the pause parked, start as capacity allows. Time parked by a
 pause is not counted in `paced_ms`. Protocol 32 parks running turns on a
 pull; before it, they ended `interrupted`. A

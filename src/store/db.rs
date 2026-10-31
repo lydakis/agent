@@ -1061,6 +1061,15 @@ impl ApprovalPage {
         Ok(true)
     }
 }
+/// What a pull did to a running turn.
+#[derive(Debug)]
+pub enum Pulled {
+    /// Parked it, with these entries.
+    Parked(Vec<Value>),
+    /// Found it parked already, by its own park that committed as the pull
+    /// cancelled its task, with that park's next lapse.
+    Already(Box<Waiting>, Option<u64>),
+}
 /// What a wake-up for a parked turn finds.
 #[derive(Debug, PartialEq)]
 pub enum Wake {
@@ -8612,7 +8621,8 @@ impl Database {
     /// it had not answered gets a result saying the pause stopped it, or
     /// came before it ran, and none is run again. The reply it was writing
     /// is asked for again when it continues. A turn whose own park committed
-    /// as the pull cancelled its task stays as it parked; `None` says so.
+    /// as the pull cancelled its task stays as it parked: its park comes
+    /// back, with its next lapse, for the task to register its wake-ups.
     pub fn suspend_pulled(
         &mut self,
         turn: i64,
@@ -8620,13 +8630,16 @@ impl Database {
         paced_ms: u64,
         summary_ms: u64,
         route: Option<&str>,
-    ) -> Result<Option<Vec<Value>>> {
+    ) -> Result<Pulled> {
         let bot = self.active(turn)?;
         match bot.status.as_str() {
             "running" => {}
             "waiting" | "paced" => {
                 self.note_pacing(turn, retries, paced_ms, summary_ms)?;
-                return Ok(None);
+                let waiting = self
+                    .waiting(turn)?
+                    .ok_or(Error::new("invalid_tool_state"))?;
+                return Ok(Pulled::Already(Box::new(waiting), self.next_lapse(turn)?));
             }
             _ => return fail("invalid_tool_state"),
         }
@@ -8728,7 +8741,7 @@ impl Database {
             self.unstep(approval, true);
         }
         entries.push(entry(cursor, &bot.name, Some(turn), "turn_paced", data));
-        Ok(Some(entries))
+        Ok(Pulled::Parked(entries))
     }
     /// Every parked turn, on handles or on a pool, for re-registration after
     /// a restart.

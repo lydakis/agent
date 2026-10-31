@@ -18,8 +18,8 @@ use agent_runtime::{
     provider::{Chain, Delta, Items, Provider, Report, Request as ModelRequest, ToolCall},
     sandbox::Policy,
     store::{
-        Bot, CallAnswer, ContextPrefix, ContextUsage, Database, ElisionPlan, Gated, Settings, Slot,
-        Store, Strip, TURN_VIEW_ACCOUNTING, Waiting, Window, unserved,
+        Bot, CallAnswer, ContextPrefix, ContextUsage, Database, ElisionPlan, Gated, Pulled,
+        Settings, Slot, Store, Strip, TURN_VIEW_ACCOUNTING, Waiting, Window, unserved,
     },
     tools::{Files, Outcome, Prepared, ReadSource, Registry},
 };
@@ -586,16 +586,19 @@ impl Turn {
                 .store
                 .op("suspend_pulled", move |db| {
                     db.suspend_pulled(turn, retries, paced_ms, summary_ms, route.as_deref())
-                        .map(|_| ())
                 })
                 .await;
-            // Parked, by the pull or by the turn's own park that committed
-            // as the pull cancelled it: nothing more to commit, and the
-            // service keeps a wake-up that holds until `resume`, where the
-            // park's own rules decide. A park that could not be written
-            // ends the turn as the pull used to.
-            if parked.is_ok() {
-                result = Ok(Round::Paced(0));
+            // Parked: nothing more to commit, and the service keeps a
+            // wake-up that holds until `resume`. A park of the turn's own
+            // that committed as the pull cancelled it keeps its wake-ups,
+            // registered here as the rounds would have. A park that could
+            // not be written ends the turn as the pull used to.
+            match parked {
+                Ok(Pulled::Parked(_)) => result = Ok(Round::Paced(0)),
+                Ok(Pulled::Already(waiting, lapse)) => {
+                    result = Ok(self.rejoin(*waiting, lapse).await);
+                }
+                Err(_) => {}
             }
             Ok(())
         } else if retries > 0 || paced_ms > 0 || summary_ms > 0 {
@@ -633,6 +636,37 @@ impl Turn {
         // The task wrapper commits completion before releasing the active slot.
         // Until then, the store keeps the bot durably busy.
         Exit::Finished(error)
+    }
+
+    /// Register the wake-ups of a park that committed as its task was
+    /// cancelled, as a restart registers a parked turn's: a pool's time, a
+    /// verdict or answer looked at again, or a wait's handles and its round's
+    /// next lapse.
+    async fn rejoin(&self, waiting: Waiting, lapse: Option<u64>) -> Round {
+        if waiting.paced_since_ms.is_some() {
+            return Round::Lapses(waiting.deadline_ms.unwrap_or(0));
+        }
+        if waiting.approval || waiting.answer.is_some() {
+            self.handles.wake(self.bot.clone(), self.turn);
+            return match waiting.deadline_ms.filter(|&at| at > now_ms()) {
+                Some(at) => Round::Lapses(at),
+                None => Round::Parked,
+            };
+        }
+        self.handles
+            .attach(
+                &self.store,
+                Waiter::Turn(self.turn),
+                &waiting.handles,
+                waiting.deadline_ms,
+                waiting.any,
+                Completion::Resume {
+                    bot: self.bot.clone(),
+                    turn: self.turn,
+                },
+            )
+            .await;
+        lapse.map_or(Round::Parked, Round::Lapses)
     }
 
     /// Prepare metadata and the encoded prefix once per model round. Retries

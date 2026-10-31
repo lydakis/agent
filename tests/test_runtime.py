@@ -1580,6 +1580,9 @@ class RuntimeTests(ModelFixture):
         turn = client.request('submit', bot='Bob', request_id='running', prompt='gate')['result']['turn']
         self.model.requests.get(timeout=3)
         self.assertEqual(client.request('pause', reason=' ')['error'], 'usage')
+        # Who pulled it is told to every session, so it is bounded.
+        self.assertEqual(client.request('pause', reason='why', by='x' * 129)['error'], 'invalid_by')
+        self.assertIsNone(client.request('stats')['result']['paused'])
         paused = client.request('pause', reason='the migration is deleting rows', by='calc.a')['result']
         self.assertEqual((paused['changed'], paused['parked']), (True, 1))
         self.assertEqual(paused['pause']['reason'], 'the migration is deleting rows')
@@ -1613,6 +1616,10 @@ class RuntimeTests(ModelFixture):
         # Resume lifts it, says so, what waited runs, and the parked turn
         # goes on from where it stopped.
         self.model.release_headers.set()
+        # Who resumed is bounded the same way, and the pause holds.
+        self.assertEqual(restarted.request('resume', by='x' * 129)['error'], 'invalid_by')
+        self.assertEqual(restarted.request('resume', by='')['error'], 'invalid_by')
+        self.assertEqual(restarted.request('stats')['result']['paused'], paused['pause'])
         resumed = restarted.request('resume', by='shop.b')['result']
         self.assertEqual((resumed['changed'], resumed['pause'], resumed['by']), (True, paused['pause'], 'shop.b'))
         # Every session hears who let the line go on.

@@ -3398,6 +3398,10 @@ impl Service {
                 if reason.is_empty() || reason.len() > 4096 {
                     return fail_with("usage", "a pause's reason is 1 to 4096 bytes");
                 }
+                // Told to every session, so bounded as a verdict's `by` is.
+                if by.as_ref().is_some_and(|b| b.is_empty() || b.len() > 128) {
+                    return fail_with("invalid_by", "by must be 1 to 128 bytes");
+                }
                 let at = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map_or(0, |d| d.as_millis() as i64);
@@ -3422,6 +3426,9 @@ impl Service {
                 Ok(json!({"pause": pause, "changed": new, "parked": parked}))
             }
             Command::Resume { by } => {
+                if by.as_ref().is_some_and(|b| b.is_empty() || b.len() > 128) {
+                    return fail_with("invalid_by", "by must be 1 to 128 bytes");
+                }
                 let lifted = store.op("remove_pause", |db| db.remove_pause()).await?;
                 self.paused = None;
                 let changed = lifted.is_some();
