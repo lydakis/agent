@@ -3248,6 +3248,28 @@ fn slim(mut event: Value) -> Value {
     event
 }
 
+/// An event of a replay's connection onto its tape; false once the sky
+/// or the daemon has gone.
+async fn taped(client: &Client, event: Value, send: &mpsc::UnboundedSender<Feed>) -> bool {
+    let sent = match event["event"].as_str() {
+        Some("pruned") => return true,
+        // As live: a new model is read again, for `m`.
+        Some("configured") => match configured(client, &event).await {
+            Some(model) => send.send(model),
+            None => return true,
+        },
+        Some("lagged" | "follow_lagged") => {
+            let _ = send.send(Feed::Down("fell behind the daemon".into()));
+            return false;
+        }
+        // What the sky reads of a tool's arguments is a commons post; the
+        // rest stays with the daemon, not in the tape. An unwritten event
+        // is dated as it comes.
+        _ => send.send(Feed::Tape(slim(event))),
+    };
+    sent.is_ok()
+}
+
 /// A replay's connection: every agent here now, then every event written
 /// since `from` (Unix ms), the past as one tape, then what follows live.
 async fn tape(socket: PathBuf, from: i64, send: mpsc::UnboundedSender<Feed>) {
@@ -3272,30 +3294,26 @@ async fn tape(socket: PathBuf, from: i64, send: mpsc::UnboundedSender<Feed>) {
         return;
     }
     while let Some(event) = events.recv().await {
-        let sent = match event["event"].as_str() {
-            // Who is here may have changed while the past was read, and a
-            // removal then is in neither the tape nor what follows: the cast
-            // is read again, as `follow` reads the roll again.
-            Some("follow_live") => match roll(&client, &send).await {
-                true => send.send(Feed::Ready),
-                false => return,
-            },
-            Some("pruned") => continue,
-            // As live: a new model is read again, for `m`.
-            Some("configured") => match configured(&client, &event).await {
-                Some(model) => send.send(model),
-                None => continue,
-            },
-            Some("lagged" | "follow_lagged") => {
-                let _ = send.send(Feed::Down("fell behind the daemon".into()));
+        if event["event"] != "follow_live" {
+            if !taped(&client, event, &send).await {
                 return;
             }
-            // What the sky reads of a tool's arguments is a commons post;
-            // the rest stays with the daemon, not in the tape. An unwritten
-            // event is dated as it comes.
-            _ => send.send(Feed::Tape(slim(event))),
-        };
-        if sent.is_err() {
+            continue;
+        }
+        // Who is here may have changed while the past was read, and a
+        // removal then is in neither the tape nor what follows: the cast is
+        // read again, as `follow` reads the roll again. What came while it
+        // was read goes on the tape before the replay starts, so an agent
+        // made then, listed already, waits for its making.
+        if !roll(&client, &send).await {
+            return;
+        }
+        while let Ok(event) = events.try_recv() {
+            if !taped(&client, event, &send).await {
+                return;
+            }
+        }
+        if send.send(Feed::Ready).is_err() {
             return;
         }
     }
