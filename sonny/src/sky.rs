@@ -64,15 +64,15 @@ const TICKER: usize = 5;
 const SKY_COLS: usize = 60;
 const SKY_ROWS: usize = 24;
 
-/// Agent to agent.
-const TALK: Color = Color::Magenta;
+/// Agent to agent: agents' colour, as their names.
+const TALK: Color = Color::Blue;
+/// To or from the person: theirs, as the `›` on their messages.
+const YOU: Color = Color::Magenta;
 /// A tool call: code's colour.
 const TOOL: Color = Color::Cyan;
 /// The state table's: working, needs you.
 const WORKING: Color = Color::Cyan;
 const NEEDS: Color = Color::Yellow;
-/// A commons post.
-const BOARD: Color = Color::Green;
 /// A failed call.
 const FAILED: Color = Color::Red;
 
@@ -627,12 +627,12 @@ impl View {
                 }
                 // The answer to the person flies back to the middle.
                 if live && agent.sender == Some(End::Person) && data["status"] == "completed" {
-                    agent.lit = Some((now, None));
+                    agent.lit = Some((now, Some(YOU)));
                     self.sparks.push(Spark {
                         from: End::Agent(at),
                         to: End::Person,
                         born: now,
-                        color: None,
+                        color: Some(YOU),
                     });
                 }
                 self.agents[at].sender = None;
@@ -662,7 +662,7 @@ impl View {
     fn send(&mut self, from: End, to: End, now: Instant) {
         let color = match from {
             End::Agent(_) => Some(TALK),
-            End::Person => None,
+            End::Person => Some(YOU),
             End::Rim(_) => Some(Color::Reset),
         };
         if let End::Agent(at) = from {
@@ -833,15 +833,16 @@ impl View {
         let sky_rows = rows.saturating_sub(TICKER + 3).clamp(8, cols / 2 + 1);
         let mut sky = Sky::new(cols, sky_rows);
         // The person in the middle.
-        sky.text_at((0.0, 0.0), "you", Style::default().bold());
-        // Who made whom: dotted lines; who talked: dotted curves. In the
-        // text's own colour at full weight, as dim braille all but
-        // vanishes in some themes; hues are kept for what happens now.
+        sky.text_at((0.0, 0.0), "you", Style::default().fg(YOU).bold());
+        // Who made whom: dotted lines; who talked: dotted curves. Muted,
+        // as everything that says how it got here: the measured gray
+        // that still reads in every theme, where plain dim would vanish;
+        // hues are kept for what happens now.
         for (at, agent) in self.agents.iter().enumerate().filter(|(_, a)| !a.gone) {
             if let Some(by) = self.maker(at)
                 && !agent.root
             {
-                sky.line(self.agents[by].at, agent.at, Ink::Plain, 3);
+                sky.line(self.agents[by].at, agent.at, Ink::Faint, 3);
             }
         }
         for &(by, to) in &self.talks {
@@ -849,14 +850,16 @@ impl View {
                 continue;
             }
             let (a, b) = (self.agents[by].at, self.agents[to].at);
-            sky.curve(a, bend(a, b), b, Ink::Plain, 4);
+            sky.curve(a, bend(a, b), b, Ink::Faint, 4);
         }
         // Ripples, then sparks, then the stars over them.
         for agent in self.agents.iter().filter(|a| !a.gone) {
             if let Some(at) = agent.ripple {
                 let t = now.duration_since(at).as_secs_f32() / RIPPLE.as_secs_f32();
                 if t < 1.0 {
-                    sky.ring(agent.at, 0.04 + 0.26 * t, Ink::Color(BOARD, t < 0.6));
+                    // No hue of its own: the ring says it.
+                    let ink = if t < 0.6 { Ink::Bright } else { Ink::Plain };
+                    sky.ring(agent.at, 0.04 + 0.26 * t, ink);
                 }
             }
         }
@@ -941,11 +944,7 @@ impl View {
                 }
                 _ => None,
             };
-            let style = match agent.state() {
-                Some(State::Working | State::NeedsYou) => Style::default().bold(),
-                Some(State::Failed) => Style::default(),
-                None => Style::default().add_modifier(Modifier::DIM),
-            };
+            let style = name_style(agent.state(), agent.glow(now));
             sky.label(agent.at, mark, &short(&agent.name), style);
         }
         lines.extend(sky.lines());
@@ -1035,13 +1034,7 @@ impl View {
                 }
                 None => Span::raw(" "),
             };
-            let name = short(&agent.name);
-            let name = match agent.state() {
-                Some(State::Working | State::NeedsYou) => Span::raw(name).bold(),
-                Some(State::Failed) => Span::raw(name),
-                None if glow > 0.08 => Span::raw(name),
-                None => Span::raw(name).dim(),
-            };
+            let name = Span::styled(short(&agent.name), name_style(agent.state(), glow));
             let indent = "  ".repeat(depth.min(4));
             let used = 4 + indent.width() + name.content.width();
             let mut spans = vec![
@@ -1137,10 +1130,12 @@ fn legend(list: bool) -> Vec<Line<'static>> {
     }
     lines.extend([
         Line::from(vec![
-            Span::raw("•").bold(),
-            says(" a message: yours, or from outside  "),
+            mark("•", YOU).bold(),
+            says(" to or from you  "),
             mark("•", TALK),
-            says(" agent to agent"),
+            says(" agent to agent  "),
+            Span::raw("•").bold(),
+            says(" from outside"),
         ]),
         Line::from(vec![
             mark("⠤⠤", TOOL),
@@ -1155,7 +1150,7 @@ fn legend(list: bool) -> Vec<Line<'static>> {
             says(" a call failed"),
         ]),
         Line::from(vec![
-            mark("◯", BOARD),
+            Span::raw("◯"),
             says(" a commons post  "),
             Span::raw("⠁⠈⠁"),
             says(" who made whom, who talked"),
@@ -1163,6 +1158,19 @@ fn legend(list: bool) -> Vec<Line<'static>> {
         Line::from(says("A star glows as its agent talks, then fades.")),
     ]);
     lines
+}
+
+/// A name: bold while it works or needs the person, muted while it is
+/// quiet. In the text's own colour: here every label is an agent's name,
+/// so agents' blue would say nothing a name doesn't, and the sky's hues
+/// are kept for what happens.
+fn name_style(state: Option<State>, glow: f32) -> Style {
+    match state {
+        Some(State::Working | State::NeedsYou) => Style::default().bold(),
+        Some(State::Failed) => Style::default(),
+        None if glow > 0.08 => Style::default(),
+        None => Style::default().add_modifier(Modifier::DIM),
+    }
 }
 
 /// How long ago, as the ticker says it.
@@ -1251,6 +1259,7 @@ fn ease(t: f32) -> f32 {
 /// takes the cell's colour only when it is at least as strong.
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Ink {
+    Faint,
     Plain,
     Bright,
     Color(Color, bool),
@@ -1259,10 +1268,11 @@ enum Ink {
 impl Ink {
     fn rank(self) -> u8 {
         match self {
-            Ink::Plain => 0,
-            Ink::Color(_, false) => 1,
-            Ink::Bright => 2,
-            Ink::Color(_, true) => 3,
+            Ink::Faint => 0,
+            Ink::Plain => 1,
+            Ink::Color(_, false) => 2,
+            Ink::Bright => 3,
+            Ink::Color(_, true) => 4,
         }
     }
     fn fade(self) -> Ink {
@@ -1274,6 +1284,7 @@ impl Ink {
     }
     fn style(self) -> Style {
         match self {
+            Ink::Faint => Style::default().add_modifier(Modifier::DIM),
             Ink::Plain => Style::default(),
             Ink::Bright => Style::default().bold(),
             Ink::Color(color, true) => Style::default().fg(color).bold(),
@@ -1492,6 +1503,9 @@ pub fn watch(runtime: &tokio::runtime::Runtime, socket: PathBuf) -> Result<(), S
     let _inside = runtime.enter();
     let mut view = View::open(socket);
     terminal::enable_raw_mode().map_err(|e| e.to_string())?;
+    // The theme's colours, so muted reads as the measured gray it is in
+    // the conversation, and `NO_COLOR` is honoured here too.
+    crate::term::detect();
     let _ = execute!(std::io::stdout(), EnterAlternateScreen, cursor::Hide);
     let backend = ratatui::backend::CrosstermBackend::new(std::io::stdout());
     let drawn = ratatui::Terminal::new(backend)
@@ -1511,7 +1525,10 @@ pub fn watch(runtime: &tokio::runtime::Runtime, socket: PathBuf) -> Result<(), S
                     (true, Some(_)) => {}
                 }
                 terminal
-                    .draw(|frame| frame.render_widget(&mut view, frame.area()))
+                    .draw(|frame| {
+                        frame.render_widget(&mut view, frame.area());
+                        crate::look::Look::now().finish(frame.buffer_mut());
+                    })
                     .map_err(|e| e.to_string())?;
                 if !event::poll(FRAME).map_err(|e| e.to_string())? {
                     continue;
@@ -1825,6 +1842,9 @@ mod tests {
         assert_eq!(view.sparks.len(), 2);
         assert_eq!(view.sparks[0].from, End::Agent(view.index["shop.lead"]));
         assert_eq!(view.sparks[1].from, End::Person);
+        // Between agents in agents' blue; to or from the person in theirs.
+        assert_eq!(view.sparks[0].color, Some(Color::Blue));
+        assert_eq!(view.sparks[1].color, Some(Color::Magenta));
         assert_eq!(view.talks.len(), 1);
         let shown = text(&view.card(60, 40));
         assert!(shown.contains("shop lead → login"), "{shown}");

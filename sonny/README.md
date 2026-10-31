@@ -587,15 +587,20 @@ way `/react` does, and each note in the margin has its own `↩`.
   across, a follow's or an automation's in from the rim), a commons post
   ripples out, a tool call twinkles in a shape for its kind (a shell's
   streak across, a file's up and down, the web's corners, any other tool's
-  star), and whoever was lit fades. Dotted lines join who made whom and who
-  talked to whom; the last messages are listed under the sky. Each agent
+  star), and whoever was lit fades. Its colours are the rest of Sonny's:
+  what goes to or from you is magenta, as the `›` on your messages; what
+  goes between agents is blue, agents' colour; a follow's or an
+  automation's is the text's own, bold. Dotted lines join who made whom and
+  who talked to whom, muted, as everything that says how it got here; the
+  last messages are listed under the sky. Each agent
   shows the state table's mark and colour: working cyan `●`, needs you
   yellow `?` (an ask, or an approval waiting), failed red `✗`; the footer
   counts them the same way. Under 60 columns or 24 rows the sky becomes a
   list, a firefly per agent and the last it said or was told. `?` swaps the
   ticker for a legend of every mark, colour and shape.
   `sonny sky` draws the same sky on its own, in the whole terminal, to keep
-  in another one beside the work; `q` leaves it, and a daemon that goes is
+  in another one beside the work, with the same muted gray from your theme
+  and `NO_COLOR` honoured; `q` leaves it, and a daemon that goes is
   followed again once it is back.
 
   ![/sky in the pane](../docs/sonny/sky.gif)
