@@ -454,6 +454,9 @@ enum Command {
         bot: String,
         #[serde(default)]
         after: i64,
+        /// Start instead from the first event written at or after this Unix
+        /// ms; exclusive with `after`.
+        since_ms: Option<i64>,
         /// Only events of these kinds, when given; notices about the
         /// stream itself (`follow_live`, `pruned`) always come.
         kinds: Option<Vec<String>>,
@@ -3998,9 +4001,17 @@ impl Service {
                     })
                     .await
             }
-            Command::Follow { bot, after, kinds } => {
+            Command::Follow {
+                bot,
+                after,
+                since_ms,
+                kinds,
+            } => {
                 if after < 0 {
                     return fail_with("invalid_event_page", "after must be 0 or more");
+                }
+                if since_ms.is_some() && after != 0 {
+                    return fail_with("invalid_event_page", "after and since_ms are exclusive");
                 }
                 if kinds.as_ref().is_some_and(|kinds| {
                     kinds.is_empty() || kinds.iter().any(|kind| name("kind", kind).is_err())
@@ -4015,6 +4026,14 @@ impl Service {
                     let check = bot.clone();
                     store.op("inspect", move |db| db.inspect(&check)).await?;
                 }
+                let after = match since_ms {
+                    Some(since_ms) => {
+                        store
+                            .op("cursor_since", move |db| db.cursor_since(since_ms))
+                            .await?
+                    }
+                    None => after,
+                };
                 let wanted = kinds.clone().map(|kinds| kinds.into_iter().collect());
                 let sub = self
                     .hub

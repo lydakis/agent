@@ -222,6 +222,33 @@ class DaemonTests(ModelFixture):
         refused = ends.request('follow', bot='*', after=0, kinds=[])
         self.assertEqual(refused['error'], 'invalid_follow_kinds')
 
+    def test_a_follow_from_a_time_replays_what_was_written_since(self):
+        client = SocketClient(self.binary, self.path/'state.db', self.url, 'echo')
+        self.addCleanup(client.close)
+        client.request('create', bot='Alice', workspace=str(self.path))
+        first = client.request('submit', bot='Alice', request_id='a', prompt='hi')['result']['turn']
+        client.finished(first)
+        everything = Connection(client.socket_path)
+        self.addCleanup(everything.close)
+        everything.request('follow', bot='Alice', after=0)
+        everything.receive(lambda e: e.get('event') == 'follow_live')
+        times = [e['written_ms'] for e in everything.durable]
+        self.assertEqual(times, sorted(times))
+        # Every event from the second turn's first on, and none before it.
+        time.sleep(0.01)
+        second = client.request('submit', bot='Alice', request_id='b', prompt='hi')['result']['turn']
+        client.finished(second)
+        later = client.request('events', bot='Alice', after=0, limit=256)['result']['events']
+        since = next(e['written_ms'] for e in later if e['turn'] == second)
+        recent = Connection(client.socket_path)
+        self.addCleanup(recent.close)
+        recent.request('follow', bot='Alice', since_ms=since)
+        recent.receive(lambda e: e.get('event') == 'follow_live')
+        self.assertEqual([e['cursor'] for e in recent.durable],
+                         [e['cursor'] for e in later if e['written_ms'] >= since])
+        refused = recent.request('follow', bot='Alice', after=1, since_ms=since)
+        self.assertEqual(refused['error'], 'invalid_event_page')
+
     def test_configure_changes_a_bot_and_tells_its_followers(self):
         client = SocketClient(self.binary, self.path/'state.db', self.url, 'echo')
         self.addCleanup(client.close)

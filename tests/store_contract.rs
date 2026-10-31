@@ -2754,6 +2754,109 @@ fn schema_64_had_no_people_and_no_quotes() {
 }
 
 #[test]
+fn events_keep_when_they_were_written_and_a_time_finds_its_cursor() {
+    let path = std::env::temp_dir().join(format!("agent-written-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    // An empty store starts a follow from the beginning, whatever the time.
+    assert_eq!(db.cursor_since(0).unwrap(), 0);
+    assert_eq!(db.cursor_since(i64::MAX).unwrap(), 0);
+    let before = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    for n in 0..6 {
+        let request = format!("r{n}");
+        let turn = db
+            .begin(
+                "Bob",
+                &request,
+                "hello",
+                true,
+                &TurnOptions::default(),
+                allow_provider,
+            )
+            .unwrap()
+            .turn;
+        db.append(turn, vec![assistant("hi")], &[], None).unwrap();
+        db.finish(turn, None).unwrap();
+    }
+    let page = db.events("Bob", 0, 256).unwrap();
+    let events = page["events"].as_array().unwrap();
+    assert!(events.len() > 12, "{page}");
+    for event in events {
+        assert!(event["written_ms"].as_i64().unwrap() >= before, "{event}");
+    }
+    let cursors: Vec<i64> = events
+        .iter()
+        .map(|e| e["cursor"].as_i64().unwrap())
+        .collect();
+    drop(db);
+    // Times as an older store has them: the first events none, the rest
+    // ten ms apart, with a gap in the cursors where a bot was deleted.
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch(&format!(
+        "UPDATE events SET written_ms=NULL WHERE id<{old};
+         UPDATE events SET written_ms=id*10 WHERE id>={old};
+         DELETE FROM events WHERE id IN ({a},{b});",
+        old = cursors[3],
+        a = cursors[7],
+        b = cursors[8],
+    ))
+    .unwrap();
+    drop(conn);
+    let db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    let kept: Vec<(i64, Option<i64>)> = cursors
+        .iter()
+        .filter(|&&c| c != cursors[7] && c != cursors[8])
+        .map(|&c| (c, (c >= cursors[3]).then_some(c * 10)))
+        .collect();
+    let last = *cursors.last().unwrap();
+    for since in (0..=last * 10 + 20).step_by(5) {
+        let first = kept
+            .iter()
+            .find(|(_, written)| written.is_some_and(|w| w >= since))
+            .map_or(last, |(cursor, _)| cursor - 1);
+        // Any cursor between the event before and the first is the same
+        // start: a follow from it replays the same events.
+        let got = db.cursor_since(since).unwrap();
+        let skipped = |c: &i64| (got.min(first) + 1..=got.max(first)).contains(c);
+        assert!(
+            !kept.iter().any(|(c, _)| skipped(c)),
+            "since {since}: {got}, not {first}"
+        );
+    }
+    drop(db);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn schema_67_events_had_no_times() {
+    let path = std::env::temp_dir().join(format!("agent-schema67-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    drop(db);
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch("ALTER TABLE events DROP COLUMN written_ms; PRAGMA user_version=67;")
+        .unwrap();
+    let db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    let page = db.events("Bob", 0, 256).unwrap();
+    let created = &page["events"][0];
+    assert_eq!(created["event"], "created");
+    assert!(created.get("written_ms").is_none(), "{created}");
+    // An event with no time counts as older than any time asked for.
+    assert_eq!(
+        db.cursor_since(0).unwrap(),
+        created["cursor"].as_i64().unwrap()
+    );
+    drop(db);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn a_bot_that_hides_senders_reads_only_the_words() {
     let mut db = db();
     db.create("Bob", Some("/synthetic"), binding()).unwrap();
