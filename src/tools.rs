@@ -2377,7 +2377,7 @@ async fn detach(
             _ = child.wait() => false,
             Ok(()) = pulls.changed() => {
                 if sandboxed {
-                    end_namespace(pid);
+                    end_namespace(pid).await;
                 }
                 signal(libc::SIGKILL);
                 let _ = child.wait().await;
@@ -2409,8 +2409,9 @@ async fn detach(
 /// of its own and, for a detached command, does not take it down when it
 /// dies; killing that init ends every process in the namespace.
 #[cfg(target_os = "linux")]
-fn end_namespace(pid: u32) {
-    let children = std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children"));
+async fn end_namespace(pid: u32) {
+    // Read off the runtime thread, as every file is.
+    let children = tokio::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children")).await;
     for init in
         (children.unwrap_or_default().split_whitespace()).filter_map(|c| c.parse::<i32>().ok())
     {
@@ -2420,7 +2421,7 @@ fn end_namespace(pid: u32) {
 }
 /// sandbox-exec runs the command in its own place: its group is the command's.
 #[cfg(all(unix, not(target_os = "linux")))]
-fn end_namespace(_: u32) {}
+async fn end_namespace(_: u32) {}
 
 #[cfg(not(unix))]
 async fn detach(
