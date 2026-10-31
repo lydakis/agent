@@ -4,10 +4,10 @@
 use std::path::{Path, PathBuf};
 
 /// What every agent of Sonny's leans on: the lead's and tasks' roles (and
-/// the superlead's, which a project opts into), the
-/// memory, plan, commons and automation skills, the nightly cleanup's, and
-/// `~/.agent/memory` and `~/.agent/trigger`, which run this Sonny. Written
-/// at each start, so they lead to this copy.
+/// the superlead's, which a project opts into), the memory, plan, zen,
+/// commons and automation skills, the nightly cleanup's, agent-browser's
+/// own when it is installed, and `~/.agent/memory` and `~/.agent/trigger`,
+/// which run this Sonny. Written at each start, so they lead to this copy.
 pub fn install_own() {
     for (name, text) in crate::project::builtins() {
         install_role(name, &text);
@@ -18,6 +18,7 @@ pub fn install_own() {
         include_str!("../skills/memory-cleanup/SKILL.md"),
     );
     install("plan", include_str!("../skills/plan/SKILL.md"));
+    install("zen", crate::zen::SKILL);
     // `[sonny] commons = false`: agents go without it.
     if crate::commons::on() {
         install("commons", include_str!("../skills/commons/SKILL.md"));
@@ -26,6 +27,7 @@ pub fn install_own() {
     }
     install("sonny-setup", crate::setup::SKILL);
     install("sonny-config", &crate::config::skill());
+    install_browser();
     // A job reaches the daemon the way every agent Sonny runs does.
     let automation = include_str!("../skills/automation/SKILL.md");
     install("automation", &agent_client::policy::with_cli(automation));
@@ -51,6 +53,43 @@ pub fn install_own() {
         text.starts_with("#!/bin/sh\n# usage: project add") && text.ends_with(" project \"$@\"\n")
     }) {
         let _ = std::fs::remove_file(&project);
+    }
+}
+
+/// agent-browser's own skill, as the installed binary serves it, so it
+/// matches that version: Sonny ships the tool, not words about it. Asking
+/// starts a process, so a skill already written is refreshed off the start;
+/// with agent-browser gone, Sonny's copy goes too.
+fn install_browser() {
+    const NAME: &str = "agent-browser";
+    if !crate::setup::on_path(NAME) {
+        remove(NAME);
+        return;
+    }
+    let refresh = || {
+        let served = std::process::Command::new(NAME)
+            .args(["skills", "get", NAME])
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output();
+        if let Ok(served) = served
+            && served.status.success()
+            && let Ok(text) = String::from_utf8(served.stdout)
+            && text.starts_with("---\n")
+        {
+            install(NAME, &text);
+        }
+    };
+    let written = std::env::var_os("HOME").is_some_and(|home| {
+        PathBuf::from(home)
+            .join(".agents/skills")
+            .join(NAME)
+            .exists()
+    });
+    if written {
+        std::thread::spawn(refresh);
+    } else {
+        refresh();
     }
 }
 

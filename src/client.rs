@@ -1652,12 +1652,35 @@ fn ways_past_busy(bot: &str, error: Error) -> Error {
     error
 }
 
+/// The Unix ms `--since` ago names, when given.
+fn since_ms(options: &Options) -> Result<Option<u64>> {
+    let Some(ago) = options.since_ms else {
+        return Ok(None);
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| Error::new("clock_before_epoch"))?
+        .as_millis() as u64;
+    Ok(Some(now.saturating_sub(ago)))
+}
+
+/// Where a follow starts: after `--after`'s cursor, or from the first event
+/// written `--since` ago or later.
+fn follow_from(options: &Options) -> Result<Value> {
+    Ok(match since_ms(options)? {
+        Some(since_ms) => json!({"since_ms":since_ms}),
+        None => json!({"after":options.after}),
+    })
+}
+
 fn follow(options: &Options) -> Result<i32> {
     if options.all {
         // Every bot's events from a store-wide cursor, then live, until the
         // connection ends: the fleet controller's view.
         let mut connection = Connection::connect(&options.socket)?;
-        connection.request("follow", json!({"bot":"*","after":options.after}))?;
+        let mut request = follow_from(options)?;
+        request["bot"] = json!("*");
+        connection.request("follow", request)?;
         let mut renderer = Renderer::new(options.pretty, None, &options.target);
         loop {
             let event = connection.next_event()?;
@@ -1672,9 +1695,13 @@ fn follow(options: &Options) -> Result<i32> {
     // Choose the turn before subscribing. If it finishes during attachment,
     // replay still delivers its terminal event; a later idle snapshot cannot
     // make us abandon events queued while waiting for an RPC response.
+    // A time to follow from is taken first, so a turn ending after the
+    // snapshot ends after it too, and its end is replayed.
+    let mut request = follow_from(options)?;
+    request["bot"] = json!(bot);
     let state = connection.request("inspect", json!({"bot":bot}))?;
     let turn = state["running_turn"].as_i64();
-    connection.request("follow", json!({"bot":bot,"after":options.after}))?;
+    connection.request("follow", request)?;
     let mut renderer = Renderer::new(options.pretty, turn, &options.target);
     loop {
         let event = connection.next_event()?;
@@ -2072,14 +2099,7 @@ fn inspect(options: &Options) -> Result<i32> {
 /// What the bots' turns spent, from `--since` ago: in all, by bot, by
 /// model, and every `--bucket`.
 fn usage(options: &Options) -> Result<i32> {
-    let since_ms = match options.since_ms {
-        Some(ago) => (std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|_| Error::new("clock_before_epoch"))?
-            .as_millis() as u64)
-            .saturating_sub(ago),
-        None => 0,
-    };
+    let since_ms = since_ms(options)?.unwrap_or(0);
     let mut connection = ensure_existing_daemon(options)?;
     let usage = connection.request(
         "usage",

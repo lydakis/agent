@@ -736,6 +736,11 @@ pub async fn model(client: &Client) -> Result<String, String> {
         }
         false
     });
+    if let Err(error) = chrome()
+        && error != "setup cancelled"
+    {
+        println!("{DIM}Chrome not downloaded: {error}{RESET}");
+    }
     summary(&model, &file, &brought, backed);
     Ok(model)
 }
@@ -770,6 +775,53 @@ fn backup() -> Result<bool, String> {
         }
     }
     done.map(|()| true)
+}
+
+/// A Chrome for agent-browser to drive, offered when it finds none; an
+/// answer other than yes skips it.
+fn chrome() -> Result<(), String> {
+    if has_chrome() != Some(false) {
+        return Ok(());
+    }
+    println!(
+        "\nAgents browse with agent-browser, which finds no Chrome here. It can download\nChrome for Testing for them, kept apart from any browser of yours."
+    );
+    let answer = line("Download it now? [Y/n] ")?;
+    if !matches!(answer.to_ascii_lowercase().as_str(), "" | "y" | "yes") {
+        return Ok(());
+    }
+    let ran = std::process::Command::new("agent-browser")
+        .arg("install")
+        .status()
+        .map_err(|e| e.to_string())?;
+    match ran.success() {
+        true => Ok(()),
+        false => Err(format!("`agent-browser install` {ran}")),
+    }
+}
+
+/// Whether agent-browser finds a Chrome, by its own check; `None` when it
+/// is not installed or does not say.
+fn has_chrome() -> Option<bool> {
+    if !on_path("agent-browser") {
+        return None;
+    }
+    let report = std::process::Command::new("agent-browser")
+        .args(["doctor", "--offline", "--quick", "--json"])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    chrome_found(&serde_json::from_slice(&report.stdout).ok()?)
+}
+
+/// What `agent-browser doctor --json` says of Chrome.
+fn chrome_found(report: &Value) -> Option<bool> {
+    let check = report["checks"]
+        .as_array()?
+        .iter()
+        .find(|check| check["id"] == "chrome.installed")?;
+    Some(check["status"] == "pass")
 }
 
 /// What a refusal to list asks of the person, where Sonny knows.
@@ -845,7 +897,7 @@ pub fn just_set() -> Option<String> {
 }
 
 /// Whether `name` is a file in a `PATH` folder.
-fn on_path(name: &str) -> bool {
+pub fn on_path(name: &str) -> bool {
     std::env::var_os("PATH")
         .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join(name).is_file()))
 }
@@ -887,6 +939,18 @@ fn missing_tools() -> Vec<String> {
             "ripgrep, which agents search with: {}",
             install("ripgrep")
         ));
+    }
+    // Not in distributions' packages: Homebrew's, or npm's.
+    if !on_path("agent-browser") {
+        let command = match on_path("brew") {
+            true => "brew install agent-browser",
+            false => "npm install -g agent-browser",
+        };
+        missing.push(format!(
+            "agent-browser, which agents browse with: `{command}`"
+        ));
+    } else if has_chrome() == Some(false) {
+        missing.push("Chrome, which agent-browser drives: `agent-browser install`".into());
     }
     missing
 }
@@ -1166,6 +1230,19 @@ fn masked(prompt: &str, out: &mut dyn Write) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_browser_s_doctor_says_whether_it_finds_chrome() {
+        let report = |status: &str| {
+            json!({"checks": [
+                {"id": "env.version", "status": "pass"},
+                {"id": "chrome.installed", "status": status},
+            ]})
+        };
+        assert_eq!(chrome_found(&report("pass")), Some(true));
+        assert_eq!(chrome_found(&report("fail")), Some(false));
+        assert_eq!(chrome_found(&json!({"checks": []})), None);
+    }
 
     #[test]
     fn a_listing_reads_as_provider_models_and_refusals() {

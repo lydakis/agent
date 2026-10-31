@@ -1663,12 +1663,29 @@ fn conflict(name: &str, field: &str) -> Error {
 fn entry(cursor: i64, bot: &str, turn: Option<i64>, kind: &str, data: Value) -> Value {
     json!({"cursor":cursor,"bot":bot,"turn":turn,"event":kind,"data":data})
 }
+/// A stored event as read back: its entry with `written_ms`, the Unix ms
+/// it joined the store, when it has one (events from before the column
+/// existed have none).
+fn stored_entry(
+    cursor: i64,
+    bot: &str,
+    turn: Option<i64>,
+    kind: &str,
+    data: Value,
+    written_ms: Option<i64>,
+) -> Value {
+    let mut event = entry(cursor, bot, turn, kind, data);
+    if let Some(written_ms) = written_ms {
+        event["written_ms"] = json!(written_ms);
+    }
+    event
+}
 
 impl Database {
     /// Stored schema version, kept in `PRAGMA user_version`. Stores created
     /// before versioning and stores from newer binaries are rejected; an older
     /// versioned store is migrated forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 68;
+    pub const SCHEMA: i32 = 69;
     /// Verbatim user prompts a compaction keeps: per-prompt text, and the
     /// total text plus `(ordinal, String)` entry metadata. Empty entries cost
     /// space too, so the retained list cannot grow with conversation length.
@@ -1885,7 +1902,7 @@ impl Database {
                 stream TEXT NOT NULL, data BLOB NOT NULL, raw_bytes INTEGER NOT NULL DEFAULT 0, file TEXT,
                 PRIMARY KEY(turn,call_id,stream));
             CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY AUTOINCREMENT, bot TEXT NOT NULL REFERENCES bots(name),
-                turn INTEGER, kind TEXT NOT NULL, data TEXT NOT NULL);
+                turn INTEGER, kind TEXT NOT NULL, data TEXT NOT NULL, written_ms INTEGER);
             CREATE TABLE IF NOT EXISTS event_retention(singleton INTEGER PRIMARY KEY CHECK(singleton=1),
                 pruned_cursor INTEGER NOT NULL);
             INSERT OR IGNORE INTO event_retention VALUES (1,0);
@@ -2119,19 +2136,20 @@ impl Database {
     ) -> Result<()> {
         loop {
             let mut statement = self.conn.prepare_cached(
-                "SELECT id,bot,turn,kind,data FROM events WHERE id>? ORDER BY id LIMIT 256",
+                "SELECT id,bot,turn,kind,data,written_ms FROM events WHERE id>? ORDER BY id LIMIT 256",
             )?;
             let mut rows = statement.query([*watermark])?;
             let mut delivered = 0;
             while let Some(row) = rows.next()? {
                 let cursor: i64 = row.get(0)?;
                 let data: Value = serde_json::from_str(&row.get::<_, String>(4)?)?;
-                let event = entry(
+                let event = stored_entry(
                     cursor,
                     &row.get::<_, String>(1)?,
                     row.get(2)?,
                     &row.get::<_, String>(3)?,
                     data,
+                    row.get(5)?,
                 );
                 *watermark = cursor;
                 delivered += 1;
@@ -9228,6 +9246,40 @@ impl Database {
             Some(entry(cursor, name, None, "forked", data)),
         ))
     }
+    /// The cursor just before the first event written at or after `since_ms`:
+    /// where a follow from that time starts. Cursors and times rise together
+    /// (an event is never written before the one before it), so it is found
+    /// by halving the cursor range, a few point reads however many events
+    /// there are; events with no time count as older.
+    pub fn cursor_since(&self, since_ms: i64) -> Result<i64> {
+        let mut at = self.conn.prepare_cached(
+            "SELECT id,COALESCE(written_ms,-1) FROM events WHERE id>=? ORDER BY id LIMIT 1",
+        )?;
+        let (mut low, mut high): (i64, i64) = self.conn.query_row(
+            // Each bound its own subquery: SQLite reads a lone MIN or MAX
+            // from the end of the key, but scans for both in one.
+            "SELECT COALESCE((SELECT MIN(id) FROM events),1),
+                    COALESCE((SELECT MAX(id) FROM events),0)+1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        // The first cursor written at or after `since_ms` is in low..=high,
+        // high meaning none yet.
+        while low < high {
+            let middle = low + (high - low) / 2;
+            match at
+                .query_row([middle], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))
+                .optional()?
+            {
+                // Nothing in middle..high: the first is before it, or none.
+                Some((id, _)) if id >= high => high = middle,
+                Some((id, written)) if written >= since_ms => high = id,
+                Some((id, _)) => low = id + 1,
+                None => high = middle,
+            }
+        }
+        Ok(low - 1)
+    }
     pub fn events(&self, name: &str, after: i64, limit: usize) -> Result<Value> {
         self.inspect(name)?;
         self.event_page(Some(name), after, limit)
@@ -9245,8 +9297,8 @@ impl Database {
             );
         }
         let mut stmt = self.conn.prepare_cached(match name {
-            Some(_) => "SELECT id,turn,kind,data,bot FROM events WHERE bot=?1 AND id>?2 ORDER BY id LIMIT ?3",
-            None => "SELECT id,turn,kind,data,bot FROM events WHERE ?1 IS NULL AND id>?2 ORDER BY id LIMIT ?3",
+            Some(_) => "SELECT id,turn,kind,data,bot,written_ms FROM events WHERE bot=?1 AND id>?2 ORDER BY id LIMIT ?3",
+            None => "SELECT id,turn,kind,data,bot,written_ms FROM events WHERE ?1 IS NULL AND id>?2 ORDER BY id LIMIT ?3",
         })?;
         let mut rows = stmt.query(params![name, after, limit as i64])?;
         let mut events = Vec::new();
@@ -9258,12 +9310,13 @@ impl Database {
             let next: i64 = row.get(0)?;
             let data: String = row.get(3)?;
             let bot: String = row.get(4)?;
-            let item = entry(
+            let item = stored_entry(
                 next,
                 &bot,
                 row.get::<_, Option<i64>>(1)?,
                 &row.get::<_, String>(2)?,
                 serde_json::from_str::<Value>(&data)?,
+                row.get(5)?,
             );
             let size = crate::output::encoded_len(&item)? + 1;
             if bytes + size > byte_limit {
@@ -10856,9 +10909,16 @@ fn flush(tx: &Connection, turn: i64, live: Option<&Live>) -> Result<()> {
     }
     Ok(())
 }
+/// Store an event, written now or, should the clock have gone back, when
+/// the event before it was: times rise with cursors, as a log's time index
+/// keeps them (Kafka's), so a follow from a time skips nothing.
 fn event(conn: &Connection, bot: &str, turn: Option<i64>, kind: &str, data: Value) -> Result<i64> {
-    conn.prepare_cached("INSERT INTO events(bot,turn,kind,data) VALUES (?,?,?,?)")?
-        .execute(params![bot, turn, kind, data.to_string()])?;
+    conn.prepare_cached(
+        "INSERT INTO events(bot,turn,kind,data,written_ms) VALUES (?1,?2,?3,?4,
+            MAX(?5,COALESCE((SELECT written_ms FROM events
+                WHERE id=(SELECT MAX(id) FROM events)),?5)))",
+    )?
+    .execute(params![bot, turn, kind, data.to_string(), epoch_ms()])?;
     Ok(conn.last_insert_rowid())
 }
 /// Append an item. Stored history has no lifetime cap; the per-request
@@ -12060,6 +12120,16 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
         // 67 -> 68: a retained output may be a file in the bot's outputs
         // folder rather than the store's copy. Every earlier one is a copy.
         conn.execute_batch("ALTER TABLE artifacts ADD COLUMN file TEXT;")?;
+    }
+    // 68 -> 69: an event keeps when it joined the store; when older ones
+    // did is not known.
+    if conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='events')
+         AND NOT EXISTS(SELECT 1 FROM pragma_table_info('events') WHERE name='written_ms')",
+        [],
+        |r| r.get::<_, bool>(0),
+    )? {
+        conn.execute_batch("ALTER TABLE events ADD COLUMN written_ms INTEGER;")?;
     }
     Ok(())
 }
