@@ -1249,8 +1249,22 @@ pub fn subscribe_posters(home: &Path, store: &Path, bots: &HashMap<String, Optio
 /// each was.
 fn subscribe_all(home: &Path, store: &Path, bots: &HashMap<String, Option<i64>>) -> bool {
     let mut all = true;
-    let entries = std::fs::read_dir(dir(home)).into_iter().flatten().flatten();
+    // No commons yet is nothing to do; one it cannot list is left to do.
+    let entries = match std::fs::read_dir(dir(home)) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return true,
+        Err(e) => {
+            eprintln!("sonny: {POSTERS} waits on the commons: {e}");
+            return false;
+        }
+    };
     for entry in entries {
+        let Ok(entry) =
+            entry.inspect_err(|e| eprintln!("sonny: {POSTERS} waits on the commons: {e}"))
+        else {
+            all = false;
+            continue;
+        };
         let file = entry.path();
         let Some(thread) = (file.extension().is_some_and(|e| e == "jsonl"))
             .then(|| file.file_stem())
@@ -1665,7 +1679,12 @@ mod tests {
         crate::lookout::subs::remove(&store, "b.y", "commons.t").unwrap();
         subscribe_posters(&home, &store, &bots);
         assert!(names("b.y").is_empty());
-        // A thread it cannot read keeps the migration to do.
+        // A commons it cannot list, or a thread it cannot read, keeps the
+        // migration to do; no commons at all is done.
+        assert!(subscribe_all(&home.join("nowhere"), &store, &bots));
+        let file = home.join("not-a-folder");
+        std::fs::write(&file, "").unwrap();
+        assert!(!subscribe_all(&file, &store, &bots));
         let other = home.join("other.sqlite");
         let torn = dir(&home).join("torn.jsonl");
         std::fs::write(&torn, "{\"by\": \"a.x\", \"text\": \"x\"}\n{torn").unwrap();
