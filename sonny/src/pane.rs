@@ -107,7 +107,7 @@ const MAIN: &str = " ↗";
 const AGENT_KEYS: &str = "ctrl+g main view · ctrl+\\ chat";
 /// The same, for one laid out in a multiplexer, whose tab its name and
 /// Ctrl+T go to.
-const LAID_OUT_KEYS: &str = "ctrl+g main view · ctrl+t its tab · ctrl+\\ chat";
+const LAID_OUT_KEYS: &str = "ctrl+g main view · ctrl+\\ chat · ctrl+t its tab";
 
 /// Ctrl+G, which opens the agent in the pane in the main view, as its
 /// title's button does: no Sonny key takes it.
@@ -470,14 +470,15 @@ impl Pane {
         if area.height == 0 {
             return None;
         }
-        let keys = match focused {
+        let mut keys = match focused {
             true if !self.back.is_empty() => format!("  ← back · {} ", self.keys),
             true => format!("  {} ", self.keys),
             false => format!("  {switch} "),
         };
         let mut style = Style::new();
-        // A file's name is a link to it.
-        if self.link.is_some() {
+        // A file's name is a link to it, as a laid out agent's is to its
+        // tab.
+        if self.link.is_some() || self.tab {
             style = style.add_modifier(Modifier::UNDERLINED);
         }
         if !focused {
@@ -500,6 +501,22 @@ impl Pane {
             head.push(Span::raw(" "));
             head.push(arrow("›", !self.forward.is_empty()));
             head.push(Span::raw(" "));
+        }
+        // A name keeps its room: the last keys go first, as the footer's
+        // least urgent do.
+        if self.head.is_none() {
+            let button = if self.agent.is_some() {
+                MAIN.width()
+            } else {
+                0
+            };
+            let name =
+                head.iter().map(|s| s.content.width()).sum::<usize>() + self.title.width() + button;
+            while name + keys.width() > area.width as usize
+                && let Some((kept, _)) = keys.trim_end().rsplit_once(" · ")
+            {
+                keys = format!("{kept} ");
+            }
         }
         // Keys in their one grammar while they go here, else dim.
         let key_spans = match focused {
@@ -822,7 +839,7 @@ mod tests {
         let head = rows(&mut pane, 72, 3).remove(0);
         assert!(head.starts_with(" shop.fix ↗ "), "{head}");
         assert!(
-            head.ends_with("ctrl+g main view · ctrl+t its tab · ctrl+\\ chat"),
+            head.ends_with("ctrl+g main view · ctrl+\\ chat · ctrl+t its tab"),
             "{head}"
         );
         let name = " shop.fix".width() as u16;
@@ -836,6 +853,13 @@ mod tests {
             pane.head_button(name + 1).as_deref(),
             Some("sonny:main/shop.fix")
         );
+        // Narrower, the keys go from the last before the name is cut.
+        let head = rows(&mut pane, 48, 3).remove(0);
+        assert!(head.starts_with(" shop.fix ↗ "), "{head}");
+        assert!(head.ends_with("ctrl+g main view · ctrl+\\ chat"), "{head}");
+        let head = rows(&mut pane, 32, 3).remove(0);
+        assert!(head.starts_with(" shop.fix ↗ "), "{head}");
+        assert!(head.ends_with("ctrl+g main view"), "{head}");
         // Not laid out: the name is only a name.
         pane.as_agent("shop.fix", false);
         rows(&mut pane, 72, 3);
