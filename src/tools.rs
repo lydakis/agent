@@ -2360,12 +2360,13 @@ async fn detach(
         })?)
     };
     // What the sandbox holds in place stays held while the command runs.
+    let sandboxed = sandbox.is_some();
     let held = crate::sandbox::hold_for(sandbox.as_deref()).await;
     let mut child = process.spawn()?;
     let pid = child.id().ok_or(Error::new("shell_spawn_failed"))?;
     // It outlives turns and the daemon, but not the pull cord: a pull ends
-    // the process group it leads, as it ends every other command an agent
-    // runs.
+    // the process group it leads, and a sandbox's namespace, as it ends
+    // every other command an agent runs.
     let mut pulls = registry.pulls.subscribe();
     let group = -(pid as i32);
     // SAFETY: kill with a negative pid signals the process group setsid made
@@ -2375,6 +2376,9 @@ async fn detach(
         let pulled = tokio::select! {
             _ = child.wait() => false,
             Ok(()) = pulls.changed() => {
+                if sandboxed {
+                    end_namespace(pid);
+                }
                 signal(libc::SIGKILL);
                 let _ = child.wait().await;
                 true
@@ -2399,6 +2403,24 @@ async fn detach(
         json!({"detached":true,"pid":pid}).to_string(),
     ))
 }
+
+/// End the pid namespace a sandboxed detached command runs in. bubblewrap,
+/// the process `pid`, starts the namespace's init as its child in a session
+/// of its own and, for a detached command, does not take it down when it
+/// dies; killing that init ends every process in the namespace.
+#[cfg(target_os = "linux")]
+fn end_namespace(pid: u32) {
+    let children = std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children"));
+    for init in
+        (children.unwrap_or_default().split_whitespace()).filter_map(|c| c.parse::<i32>().ok())
+    {
+        // SAFETY: kill only signals the process; it touches no memory.
+        unsafe { libc::kill(init, libc::SIGKILL) };
+    }
+}
+/// sandbox-exec runs the command in its own place: its group is the command's.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn end_namespace(_: u32) {}
 
 #[cfg(not(unix))]
 async fn detach(

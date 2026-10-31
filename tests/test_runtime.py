@@ -9,7 +9,9 @@ import queue
 import re
 import signal
 import sqlite3
+import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -1766,6 +1768,27 @@ class RuntimeTests(ModelFixture):
         while (alive(running) or alive(child)) and time.monotonic() < deadline:
             time.sleep(.05)
         self.assertEqual((alive(running), alive(child)), (False, False))
+
+    @unittest.skipUnless(shutil.which('bwrap') or sys.platform == 'darwin', 'sandboxes need bubblewrap')
+    def test_a_pause_ends_a_sandboxed_detached_command(self):
+        client = self.client('shell')
+        self.addCleanup(lambda: client.close(kill=True))
+        client.request('create', bot='Bob', workspace=str(self.path), tools=['shell'],
+                       settings={'sandbox': 'workspace-write'})
+        ticks = self.path / 'ticks'
+        turn = client.request('submit', bot='Bob', request_id='loop',
+                              prompt=f'detach:while :; do echo x >> {ticks}; sleep .05; done')['result']['turn']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        deadline = time.monotonic() + 5
+        while (not ticks.exists() or ticks.stat().st_size < 4) and time.monotonic() < deadline:
+            time.sleep(.05)
+        self.assertGreaterEqual(ticks.stat().st_size, 4)
+        client.request('pause', reason='the loop is sending mail', by='calc.a')
+        time.sleep(.5)
+        before = ticks.stat().st_size
+        time.sleep(.5)
+        # Nothing in the sandbox runs on: the loop stopped writing.
+        self.assertEqual(ticks.stat().st_size, before)
 
     def test_a_pause_ends_a_command_a_steer_moved_to_the_background(self):
         self.model.slow_command = 'sleep 30'

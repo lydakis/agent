@@ -1047,8 +1047,9 @@ again: the model decides what to redo, as Codex answers the calls an interrupt
 cut off. The pause ends every background command (whose handle then answers
 `daemon_paused`, saying the same), terminal, and detached command this
 daemon started (the process group each leads, with what it left running
-there after it exited; one started before a restart, or a process that left
-that group, is no longer the daemon's to find), and from
+there after it exited, and on Linux a sandboxed one's whole pid namespace;
+one started before a restart, or an unsandboxed process that left that
+group, is no longer the daemon's to find), and from
 then no turn starts: a `reject`
 submission answers `daemon_paused`, `queue` and `steer` submissions are
 recorded and wait, triggers and notes with them, and parked and paced turns
