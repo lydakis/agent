@@ -27,6 +27,10 @@ const WRITE_YIELD_MS: u64 = 250;
 const POLL_YIELD_MS: u64 = 5_000;
 /// How long typed input may wait for a program that reads none.
 const INPUT_WAIT: Duration = Duration::from_secs(5);
+/// How long a start waits for a terminal it pruned to give up its slot,
+/// when no other is free: a killed session is normally gone in
+/// milliseconds; one stuck in the kernel is not waited for longer.
+const PRUNE_WAIT: Duration = Duration::from_secs(2);
 /// The terminal's size: wide enough that few programs wrap their lines.
 const COLUMNS: u16 = 120;
 const ROWS: u16 = 40;
@@ -390,9 +394,17 @@ impl Registry {
     ) -> Result<Outcome> {
         let started = async {
             // The bot's least recently used terminal past its share ends
-            // first, so its permit is free for this one.
-            self.prune(owner).await;
-            let permit = self.lasting()?;
+            // first. Only when every lasting slot is taken does the start
+            // wait for that one's to free, a moment after its kill.
+            let pruned = self.prune(owner);
+            let permit = match (self.lasting(), pruned) {
+                (Ok(permit), _) => permit,
+                (Err(_), Some(mut exited)) => {
+                    let _ = tokio::time::timeout(PRUNE_WAIT, exited.wait_for(|e| *e)).await;
+                    self.lasting()?
+                }
+                (Err(error), None) => return Err(error),
+            };
             let held = crate::sandbox::hold_for(sandbox.as_deref()).await;
             let (master, slave) = open()?;
             let mut process = sh(
@@ -566,18 +578,15 @@ impl Registry {
     }
 
     /// End `owner`'s least recently used terminal when it already runs its
-    /// share, and wait a moment for it to go, so its permit is free.
-    async fn prune(&self, owner: i64) {
+    /// share, returning what says when it has gone.
+    fn prune(&self, owner: i64) -> Option<watch::Receiver<bool>> {
         let pruned = least_used(
             &self.terminals.lock().unwrap_or_else(|e| e.into_inner()),
             owner,
             MAX_TERMINALS,
-        );
-        if let Some(pruned) = pruned {
-            pruned.kill();
-            let mut exited = pruned.exited.clone();
-            let _ = tokio::time::timeout(Duration::from_secs(2), exited.wait_for(|e| *e)).await;
-        }
+        )?;
+        pruned.kill();
+        Some(pruned.exited.clone())
     }
 
     /// End every terminal, as the daemon stops; each reports its end on
