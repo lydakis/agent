@@ -144,13 +144,16 @@ fn admission_bound(command: &Command, id: &Value, deliveries: usize) -> Bound {
                     }
             }),
             output::encoded_len(&(bot, created_by)),
-            // The workspace and the writable folders, canonical, which the
-            // reply's settings repeat; a bot a sandboxed bot makes can take
-            // its creator's.
+            // The workspace, the writable folders and the Unix sockets,
+            // canonical, which the reply's settings repeat; a bot a
+            // sandboxed bot makes can take its creator's.
             usize::from(workspace.is_some()) * PATH_JSON
                 + match created_by {
-                    Some(_) => FOLDERS_JSON,
-                    None => (settings.writable.len() * PATH_JSON).min(FOLDERS_JSON),
+                    Some(_) => 2 * FOLDERS_JSON,
+                    None => {
+                        (settings.writable.len() * PATH_JSON).min(FOLDERS_JSON)
+                            + (settings.unix_sockets.len() * PATH_JSON).min(FOLDERS_JSON)
+                    }
                 },
             // Both the bot and its event carry its gates, most of them
             // inherited from its creator, so the command does not show
@@ -283,14 +286,16 @@ enum Command {
         /// removes them.
         declare: Option<Vec<Declared>>,
         /// Its command sandbox, replacing the one it has, as `create`'s
-        /// settings name it: with `writable`, `network` and `unsandboxed`,
-        /// which otherwise go back to none, off and none.
+        /// settings name it: with `writable`, `network`, `unsandboxed` and
+        /// `unix_sockets`, which otherwise go back to none, off, none and
+        /// none.
         sandbox: Option<agent_runtime::sandbox::Mode>,
         writable: Option<Vec<String>>,
         network: Option<bool>,
         /// Its prompt-cache lifetime, as `create`'s settings name it.
         cache_ttl: Option<agent_runtime::store::CacheTtl>,
         unsandboxed: Option<Vec<String>>,
+        unix_sockets: Option<Vec<String>>,
         /// The tier its calls are served at, as `create`'s settings name
         /// it; `standard` goes back to none.
         speed: Option<agent_runtime::provider::Speed>,
@@ -454,6 +459,9 @@ enum Command {
         bot: String,
         #[serde(default)]
         after: i64,
+        /// Start instead from the first event written at or after this Unix
+        /// ms; exclusive with `after`.
+        since_ms: Option<i64>,
         /// Only events of these kinds, when given; notices about the
         /// stream itself (`follow_live`, `pruned`) always come.
         kinds: Option<Vec<String>>,
@@ -970,6 +978,17 @@ fn confine(settings: &mut Settings) -> Result<()> {
     }
     settings.writable.sort();
     settings.writable.dedup();
+    // By its real path, as Seatbelt matches it: a socket comes and goes
+    // with its program, so what of it is there, and the rest as written.
+    for path in &mut settings.unix_sockets {
+        if let Some(real) = agent_client::files::real(std::path::Path::new(&*path))
+            .and_then(|real| real.to_str().map(str::to_owned))
+        {
+            *path = real;
+        }
+    }
+    settings.unix_sockets.sort();
+    settings.unix_sockets.dedup();
     Ok(())
 }
 /// A field given as `null` deserializes to `Some(None)`, apart from one
@@ -1974,11 +1993,12 @@ impl Service {
             Ok(())
         };
         // A tool a client answers is one the caller may pass on: one it has,
-        // may call, and gives the bots it makes, answered by the same client
-        // and gated as a whole unless the caller's is gated by its steps.
-        // Another could get a client to act for it.
+        // may call, and gives the bots it makes, answered by the same client,
+        // gated as a whole unless the caller's is gated by its steps, and
+        // passed down no further than the caller's goes. Another could get
+        // a client to act for it.
         let callable = |own: &agent_runtime::tools::Declared| {
-            own.inherit
+            own.inherit.passes()
                 && me
                     .allowed
                     .as_ref()
@@ -1991,6 +2011,7 @@ impl Service {
                         && own.name == tool.name
                         && own.answered_by == tool.answered_by
                         && (own.steps || !tool.steps)
+                        && tool.inherit.within(own.inherit.passed())
                 })
         };
         // The folders a request would give a bot, each of which the caller
@@ -2011,15 +2032,19 @@ impl Service {
                     return refuse("declare a tool a client answers that it can't pass on");
                 }
                 // Without its own list, a bot takes the tools its creator
-                // passes on: none a client answers that the caller may not call.
-                if declare.is_none() && me.declared.iter().any(|own| own.inherit && !passes(own)) {
-                    *declare = Some(
-                        me.declared
-                            .iter()
-                            .filter(|own| own.inherit && passes(own))
-                            .cloned()
-                            .collect(),
-                    );
+                // passes on, a generation fewer: none a client answers that
+                // the caller may not call.
+                if declare.is_none() {
+                    let passed: Vec<_> = (me.declared.iter())
+                        .filter(|own| own.inherit.passes())
+                        .map(|own| agent_runtime::tools::Declared {
+                            inherit: own.inherit.passed(),
+                            ..own.clone()
+                        })
+                        .collect();
+                    if passed.iter().any(|tool| !passes(tool)) {
+                        *declare = Some(passed.into_iter().filter(|tool| passes(tool)).collect());
+                    }
                 }
                 folders.extend(workspace.clone());
                 folders.extend(settings.writable.iter().cloned());
@@ -3108,6 +3133,7 @@ impl Service {
                 network,
                 cache_ttl,
                 unsandboxed,
+                unix_sockets,
                 speed,
             } => {
                 if effort.is_some() && model.is_none() {
@@ -3120,6 +3146,7 @@ impl Service {
                             writable: writable.unwrap_or_default(),
                             network: network.unwrap_or(false),
                             unsandboxed: unsandboxed.unwrap_or_default(),
+                            unix_sockets: unix_sockets.unwrap_or_default(),
                             ..Settings::default()
                         };
                         settings.validate()?;
@@ -3132,10 +3159,14 @@ impl Service {
                         .map_err(|_| Error::new("sandbox_unavailable"))??;
                         Some(settings)
                     }
-                    None if writable.is_some() || network.is_some() || unsandboxed.is_some() => {
+                    None if writable.is_some()
+                        || network.is_some()
+                        || unsandboxed.is_some()
+                        || unix_sockets.is_some() =>
+                    {
                         return fail_with(
                             "invalid_setting",
-                            "writable, network and unsandboxed go with sandbox",
+                            "writable, network, unsandboxed and unix_sockets go with sandbox",
                         );
                     }
                     None => None,
@@ -3621,6 +3652,7 @@ impl Service {
                         Outcome {
                             output: json!({"error":code,"detail":detail}).to_string(),
                             artifacts: Vec::new(),
+                            files: Default::default(),
                             parts: Vec::new(),
                             note: None,
                             failed: true,
@@ -3998,9 +4030,17 @@ impl Service {
                     })
                     .await
             }
-            Command::Follow { bot, after, kinds } => {
+            Command::Follow {
+                bot,
+                after,
+                since_ms,
+                kinds,
+            } => {
                 if after < 0 {
                     return fail_with("invalid_event_page", "after must be 0 or more");
+                }
+                if since_ms.is_some() && after != 0 {
+                    return fail_with("invalid_event_page", "after and since_ms are exclusive");
                 }
                 if kinds.as_ref().is_some_and(|kinds| {
                     kinds.is_empty() || kinds.iter().any(|kind| name("kind", kind).is_err())
@@ -4015,6 +4055,14 @@ impl Service {
                     let check = bot.clone();
                     store.op("inspect", move |db| db.inspect(&check)).await?;
                 }
+                let after = match since_ms {
+                    Some(since_ms) => {
+                        store
+                            .op("cursor_since", move |db| db.cursor_since(since_ms))
+                            .await?
+                    }
+                    None => after,
+                };
                 let wanted = kinds.clone().map(|kinds| kinds.into_iter().collect());
                 let sub = self
                     .hub
@@ -6653,6 +6701,16 @@ mod tests {
             *compaction_instructions = Some(awkward);
             *compaction_model = Some("openai/synthetic".into());
         }
+        // Its sockets as many as it may name, each escaped in JSON, where a
+        // sandbox can run.
+        if agent_runtime::sandbox::available().is_ok()
+            && let Command::Create { settings, .. } = &mut create
+        {
+            settings.sandbox = Some(agent_runtime::sandbox::Mode::ReadOnly);
+            settings.unix_sockets = (0..64)
+                .map(|i| format!("/{i}{}", "\u{1}".repeat(80)))
+                .collect();
+        }
         // A creator carrying every gate a bot may, each at its limits, which
         // the command creating its child does not show.
         let tools = ["echo".to_owned()];
@@ -6720,6 +6778,10 @@ mod tests {
             assert_eq!(deferred.unwrap_err().code, "deferred");
             let (_, _, _, result) = service.settle().await;
             let reply = json!({"id": id, "result": result.unwrap()});
+            if reply["result"]["name"] == "Bot" && agent_runtime::sandbox::available().is_ok() {
+                let sockets = &reply["result"]["settings"]["unix_sockets"];
+                assert_eq!(sockets.as_array().map(Vec::len), Some(64));
+            }
             let event = loop {
                 // The gated creators' own events come first.
                 if let Publication::Event(entry) = publications.recv().await.unwrap()
@@ -7069,7 +7131,7 @@ mod tests {
         let (done, running) = store
             .call(move |db| {
                 let done = db.process_start(turn, "shell-1")?;
-                db.process_finish(done, &json!({"exit_code":0}), &[])?;
+                db.process_finish(done, &json!({"exit_code":0}), &[], &[])?;
                 Ok((done, db.process_start(turn, "shell-2")?))
             })
             .await

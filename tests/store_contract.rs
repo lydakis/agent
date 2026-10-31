@@ -7,7 +7,7 @@ use agent_runtime::{
         Delivery, Fork, Gate, Gated, Planning, QuoteRef, Settings, Strip, TurnBudget, TurnOptions,
         Wake,
     },
-    tools::{Declared, Outcome},
+    tools::{Declared, Inherit, Outcome},
 };
 use bytes::Bytes;
 use rusqlite::Connection;
@@ -88,6 +88,7 @@ fn result(output: &str) -> Outcome {
         parts: Vec::new(),
         note: None,
         failed: false,
+        files: Default::default(),
     }
 }
 
@@ -1114,6 +1115,7 @@ fn a_failure_after_a_later_call_lapsed_keeps_its_request() {
     std::thread::sleep(std::time::Duration::from_millis(60));
     let failed = Outcome {
         failed: true,
+        files: Default::default(),
         ..result("{}")
     };
     db.tool_finish(turn, "r1", &failed).unwrap();
@@ -1413,6 +1415,7 @@ fn a_call_announced_again_is_found_by_a_listing_already_past_it() {
     ));
     let failed = Outcome {
         failed: true,
+        files: Default::default(),
         ..result("{}")
     };
     db.tool_finish(turn, "s1", &failed).unwrap();
@@ -2753,6 +2756,260 @@ fn schema_64_had_no_people_and_no_quotes() {
     std::fs::remove_file(path).unwrap();
 }
 
+/// A turn of Bob's that says "Shall I deploy?" and then streams what says
+/// nothing a person reads: reasoning, and content that is not parts.
+fn ask_and_finish(db: &mut Database, key: &str) -> (i64, i64) {
+    let turn = db
+        .begin(
+            "Bob",
+            key,
+            "go",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let quiet = |item: Value| Bytes::from(serde_json::to_vec(&item).unwrap());
+    let entries = db
+        .append(
+            turn,
+            vec![
+                assistant("Looking."),
+                assistant("Shall I deploy?"),
+                quiet(json!({"type":"reasoning","id":"rs_1","summary":[]})),
+                quiet(json!({"type":"message","role":"assistant","content":"plain"})),
+                assistant(" \n"),
+            ],
+            &[],
+            None,
+        )
+        .unwrap();
+    db.finish(turn, None).unwrap();
+    (turn, entries[1]["data"]["node"].as_i64().unwrap())
+}
+
+#[test]
+fn a_finished_turns_reply_outlives_retention() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    db.create("Carol", Some("/synthetic"), binding()).unwrap();
+    let (asked, _) = ask_and_finish(&mut db, "r1");
+    let answered = db
+        .begin(
+            "Bob",
+            "r2",
+            "yes",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    db.append(answered, vec![assistant("Deployed.")], &[], None)
+        .unwrap();
+    db.finish(answered, None).unwrap();
+    assert!(db.prune("Bob", 1).unwrap()["events"].as_i64().unwrap() > 0);
+    // Its outcome is gone, as retention promises.
+    assert_eq!(
+        db.turn_outcome("Bob", asked).unwrap_err().code,
+        "turn_result_pruned"
+    );
+    // The words a person's "yes" answered are still read with it.
+    assert_eq!(
+        db.prompts("Bob", answered, 64 * 1024).unwrap()["prompts"][0]["reply"]["text"],
+        "Shall I deploy?"
+    );
+    // And the reply can still be quoted.
+    let options = TurnOptions {
+        quotes: vec![quote("Bob", asked, true)],
+        ..TurnOptions::default()
+    };
+    let quoting = db
+        .begin("Carol", "c1", "see this", true, &options, allow_provider)
+        .unwrap()
+        .turn;
+    assert_eq!(
+        db.prompts("Carol", quoting, 64 * 1024).unwrap()["prompts"][0]["quotes"][0]["text"],
+        "Shall I deploy?"
+    );
+}
+
+#[test]
+fn schema_69_finds_each_finished_turns_reply() {
+    let path = std::env::temp_dir().join(format!(
+        "agent-schema69-reply-{}.sqlite",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let (asked, node, silent) = {
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        db.create("Bob", Some("/synthetic"), binding()).unwrap();
+        let (asked, node) = ask_and_finish(&mut db, "r1");
+        let silent = db
+            .begin(
+                "Bob",
+                "r2",
+                "hush",
+                true,
+                &TurnOptions::default(),
+                allow_provider,
+            )
+            .unwrap()
+            .turn;
+        db.finish(silent, None).unwrap();
+        (asked, node, silent)
+    };
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch("ALTER TABLE turns DROP COLUMN reply_node; PRAGMA user_version=69;")
+        .unwrap();
+    drop(Database::initialize(Connection::open(&path).unwrap()).unwrap());
+    let conn = Connection::open(&path).unwrap();
+    let reply = |turn: i64| -> Option<i64> {
+        conn.query_row("SELECT reply_node FROM turns WHERE id=?", [turn], |r| {
+            r.get(0)
+        })
+        .unwrap()
+    };
+    assert_eq!(reply(asked), Some(node));
+    assert_eq!(reply(silent), None);
+    drop(conn);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn events_keep_when_they_were_written_and_a_time_finds_its_cursor() {
+    let path = std::env::temp_dir().join(format!("agent-written-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    // An empty store starts a follow from the beginning, whatever the time.
+    assert_eq!(db.cursor_since(0).unwrap(), 0);
+    assert_eq!(db.cursor_since(i64::MAX).unwrap(), 0);
+    let before = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    for n in 0..6 {
+        let request = format!("r{n}");
+        let turn = db
+            .begin(
+                "Bob",
+                &request,
+                "hello",
+                true,
+                &TurnOptions::default(),
+                allow_provider,
+            )
+            .unwrap()
+            .turn;
+        db.append(turn, vec![assistant("hi")], &[], None).unwrap();
+        db.finish(turn, None).unwrap();
+    }
+    let page = db.events("Bob", 0, 256).unwrap();
+    let events = page["events"].as_array().unwrap();
+    assert!(events.len() > 12, "{page}");
+    for event in events {
+        assert!(event["written_ms"].as_i64().unwrap() >= before, "{event}");
+    }
+    let cursors: Vec<i64> = events
+        .iter()
+        .map(|e| e["cursor"].as_i64().unwrap())
+        .collect();
+    drop(db);
+    // Times as an older store has them: the first events none, the rest
+    // ten ms apart, with a gap in the cursors where a bot was deleted.
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch(&format!(
+        "UPDATE events SET written_ms=NULL WHERE id<{old};
+         UPDATE events SET written_ms=id*10 WHERE id>={old};
+         DELETE FROM events WHERE id IN ({a},{b});",
+        old = cursors[3],
+        a = cursors[7],
+        b = cursors[8],
+    ))
+    .unwrap();
+    drop(conn);
+    let db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    let kept: Vec<(i64, Option<i64>)> = cursors
+        .iter()
+        .filter(|&&c| c != cursors[7] && c != cursors[8])
+        .map(|&c| (c, (c >= cursors[3]).then_some(c * 10)))
+        .collect();
+    let last = *cursors.last().unwrap();
+    for since in (0..=last * 10 + 20).step_by(5) {
+        let first = kept
+            .iter()
+            .find(|(_, written)| written.is_some_and(|w| w >= since))
+            .map_or(last, |(cursor, _)| cursor - 1);
+        // Any cursor between the event before and the first is the same
+        // start: a follow from it replays the same events.
+        let got = db.cursor_since(since).unwrap();
+        let skipped = |c: &i64| (got.min(first) + 1..=got.max(first)).contains(c);
+        assert!(
+            !kept.iter().any(|(c, _)| skipped(c)),
+            "since {since}: {got}, not {first}"
+        );
+    }
+    drop(db);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn an_event_is_never_written_before_the_one_before_it() {
+    let path = std::env::temp_dir().join(format!("agent-clock-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    drop(db);
+    // The last event written an hour ahead, as before the clock went back.
+    let ahead = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+        + 3_600_000;
+    Connection::open(&path)
+        .unwrap()
+        .execute("UPDATE events SET written_ms=?", [ahead])
+        .unwrap();
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    db.create("Carol", Some("/synthetic"), binding()).unwrap();
+    let page = db.events_after(0, 256).unwrap();
+    let times: Vec<i64> = (page["events"].as_array().unwrap().iter())
+        .map(|e| e["written_ms"].as_i64().unwrap())
+        .collect();
+    assert_eq!(times, [ahead, ahead], "{page}");
+    assert_eq!(db.cursor_since(ahead).unwrap(), 0);
+    drop(db);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn schema_68_events_had_no_times() {
+    let path = std::env::temp_dir().join(format!("agent-schema69-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    drop(db);
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch("ALTER TABLE events DROP COLUMN written_ms; PRAGMA user_version=68;")
+        .unwrap();
+    let db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    let page = db.events("Bob", 0, 256).unwrap();
+    let created = &page["events"][0];
+    assert_eq!(created["event"], "created");
+    assert!(created.get("written_ms").is_none(), "{created}");
+    // An event with no time counts as older than any time asked for.
+    assert_eq!(
+        db.cursor_since(0).unwrap(),
+        created["cursor"].as_i64().unwrap()
+    );
+    drop(db);
+    std::fs::remove_file(path).unwrap();
+}
+
 #[test]
 fn a_bot_that_hides_senders_reads_only_the_words() {
     let mut db = db();
@@ -2916,6 +3173,7 @@ fn prompts_name_who_wrote_each_and_what_the_turn_ran() {
     db.tool_start(turn, &round[0]).unwrap();
     let failed = Outcome {
         failed: true,
+        files: Default::default(),
         ..result("exit 1")
     };
     let (_, completed) = db.tool_finish(turn, "c1", &failed).unwrap();
@@ -3652,7 +3910,8 @@ fn a_bot_keeps_its_settings_and_a_fork_copies_them() {
         serde_json::to_value(&bob).unwrap()["settings"],
         json!({"context_bytes":4096,"context_items":4096,"note_turns":48,"compact_at":75,
             "compact_keep":25,"compact_tokens":null,"keep_turns":1,"max_rounds":null,"approval_hold_ms":2000,"max_output_tokens":null,
-            "keep_warm":0,"cache_ttl":"1h","speed":"fast","sandbox":null,"writable":[],"network":false,"hide_senders":false,"unsandboxed":[]})
+            "keep_warm":0,"cache_ttl":"1h","speed":"fast","sandbox":null,"writable":[],"network":false,"outputs":null,"hide_senders":false,"unsandboxed":[],
+            "unix_sockets":[]})
     );
     // Retention follows the bot's own setting.
     for n in 1..=3 {
@@ -3750,7 +4009,7 @@ fn declared_tools_pass_to_created_bots_and_forks_and_a_forks_allow_narrows_them(
         description: "React to a message.".into(),
         parameters: json!({"type":"object","properties":{"emoji":{"type":"string"}}}),
         result: "ok".into(),
-        inherit: true,
+        inherit: Inherit::All,
         answered_by: None,
         expire_ms: None,
         grammar: None,
@@ -3762,7 +4021,7 @@ fn declared_tools_pass_to_created_bots_and_forks_and_a_forks_allow_narrows_them(
         description: "Resolve a task.".into(),
         parameters: json!({"type":"object"}),
         result: "ok".into(),
-        inherit: false,
+        inherit: Inherit::Generations(0),
         answered_by: None,
         expire_ms: None,
         grammar: None,
@@ -3854,6 +4113,71 @@ fn declared_tools_pass_to_created_bots_and_forks_and_a_forks_allow_narrows_them(
 }
 
 #[test]
+fn a_tool_declared_for_some_generations_goes_that_far_down_and_no_further() {
+    let mut db = db();
+    let start = Declared {
+        name: "start".into(),
+        description: "Start a task.".into(),
+        parameters: json!({"type":"object"}),
+        result: "ok".into(),
+        inherit: Inherit::Generations(2),
+        answered_by: None,
+        expire_ms: None,
+        grammar: None,
+        steps: false,
+    };
+    let (lead, _) = db
+        .create(
+            "Lead",
+            Some("/synthetic"),
+            Binding {
+                declared: Some(std::slice::from_ref(&start)),
+                ..binding()
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(&lead).unwrap()["declared"][0]["inherit"],
+        2
+    );
+    let made = |db: &mut Database, name: &str, by: &str, by_id: i64| {
+        let mut b = binding();
+        b.created_by = Some(by);
+        b.created_by_id = Some(by_id);
+        db.create(name, Some("/synthetic"), b).unwrap().0
+    };
+    // Each generation passes it on one fewer, the last as its own.
+    let task = made(&mut db, "Task", "Lead", lead.bot_id);
+    assert_eq!(task.declared[0].inherit, Inherit::Generations(1));
+    let helper = made(&mut db, "Helper", "Task", task.bot_id);
+    assert_eq!(helper.declared[0].inherit, Inherit::Generations(0));
+    assert_eq!(
+        serde_json::to_value(&helper).unwrap()["declared"][0]["inherit"],
+        false
+    );
+    assert!(
+        made(&mut db, "Deeper", "Helper", helper.bot_id)
+            .declared
+            .is_empty()
+    );
+    // A fork is a copy, not a generation: it keeps what its source has.
+    converse(&mut db, "Task", 1);
+    let copy = db.fork("Task", "Copy", Fork::default()).unwrap().0;
+    assert_eq!(copy.declared[0].inherit, Inherit::Generations(1));
+    // On the wire it is true, false or a count, and nothing else.
+    let read = |inherit: Value| {
+        serde_json::from_value::<Declared>(json!({"name":"t","description":"d",
+            "parameters":{"type":"object"},"inherit":inherit}))
+        .map(|tool| tool.inherit)
+    };
+    assert_eq!(read(json!(true)).unwrap(), Inherit::All);
+    assert_eq!(read(json!(false)).unwrap(), Inherit::Generations(0));
+    assert_eq!(read(json!(0)).unwrap(), Inherit::Generations(0));
+    assert_eq!(read(json!(3)).unwrap(), Inherit::Generations(3));
+    assert!(read(json!(-1)).is_err() && read(json!("all")).is_err());
+}
+
+#[test]
 fn waiting_calls_page_past_held_answers_and_an_answer_out_of_time_is_refused() {
     let mut db = db();
     let start = Declared {
@@ -3865,7 +4189,7 @@ fn waiting_calls_page_past_held_answers_and_an_answer_out_of_time_is_refused() {
         expire_ms: None,
         grammar: None,
         steps: false,
-        inherit: true,
+        inherit: Inherit::All,
     };
     db.create(
         "Lead",
@@ -3939,7 +4263,7 @@ fn a_parked_answer_s_pictures_are_stored_once_its_result_is() {
         expire_ms: None,
         grammar: None,
         steps: false,
-        inherit: true,
+        inherit: Inherit::All,
     };
     db.create(
         "Lead",
@@ -4155,6 +4479,7 @@ fn artifacts_are_scoped_to_the_owning_bot_and_lineage_checks_use_depth() {
         parts: Vec::new(),
         note: None,
         failed: false,
+        files: Default::default(),
     };
     let (_, entry) = db.tool_finish(turn, "c1", &outcome).unwrap();
     assert_eq!(entry["data"]["artifacts"][0], "stdout");
@@ -5879,6 +6204,7 @@ fn a_fork_waits_on_its_own_commands_and_reads_only_delivered_output() {
         process,
         &json!({"stdout":"large"}),
         &[("stdout", b"synthetic output".to_vec())],
+        &[],
     )
     .unwrap();
     // Its stored output is Bob's, and a branch's only once delivered there.
@@ -6915,7 +7241,7 @@ fn completion_retention_passes_turns_whose_processes_still_run() {
     assert_eq!(db.prune_except("Bob", 1, None).unwrap()["events"], 0);
     assert_eq!(db.running_processes().unwrap(), piece as i64);
     // A process that ends makes its turn prunable again.
-    db.process_finish(processes[0], &json!({"stdout":"done"}), &[])
+    db.process_finish(processes[0], &json!({"stdout":"done"}), &[], &[])
         .unwrap();
     db.prune_except("Bob", 1, None).unwrap();
     assert!(db.process_result(processes[0]).unwrap().is_none());
@@ -7141,6 +7467,7 @@ fn retention_keeps_running_processes_until_their_results_commit() {
         process,
         &json!({"stdout":"done"}),
         &[("stdout", b"full output".to_vec())],
+        &[],
     )
     .unwrap();
     assert_eq!(
@@ -9685,6 +10012,7 @@ fn carry_forward_notes_are_versioned_by_result_node_and_forks_bind_by_checkpoint
             parts: Vec::new(),
             note: Some(text.to_owned()),
             failed: false,
+            files: Default::default(),
         };
         let (_, entry) = db.tool_finish(turn, &call.call_id, &outcome).unwrap();
         let version = entry["data"]["note"].as_i64().unwrap();
@@ -13569,7 +13897,7 @@ fn an_expired_fork_still_running_a_command_holds_back_no_other() {
         db.expired(i64::MAX, 1).unwrap(),
         vec![("idle".to_owned(), idle.bot_id)]
     );
-    db.process_finish(process, &json!({}), &[]).unwrap();
+    db.process_finish(process, &json!({}), &[], &[]).unwrap();
     assert_eq!(db.expired(i64::MAX, 16).unwrap().len(), 2);
 }
 
@@ -13971,7 +14299,7 @@ fn a_waiting_step_ended_in_a_group_that_fails_is_told_of_once_one_commits() {
         expire_ms: None,
         grammar: None,
         steps: true,
-        inherit: true,
+        inherit: Inherit::All,
     };
     let gate = Gate {
         tag: "manual".into(),

@@ -80,13 +80,17 @@ impl Picker {
         }
     }
 
-    /// The models the filter leaves, in order.
+    /// The models the filter leaves, best first.
     pub fn shown(&self) -> Vec<&str> {
-        let filter = self.filter.to_lowercase();
-        self.models
-            .iter()
-            .filter(|m| m.to_lowercase().contains(&filter))
-            .map(String::as_str)
+        self.found().into_iter().map(|(model, _)| model).collect()
+    }
+
+    /// The models the filter leaves, best first, with where its letters
+    /// are in each.
+    pub fn found(&self) -> Vec<(&str, Vec<usize>)> {
+        let models = self.models.iter().map(String::as_str);
+        (crate::fuzzy::rank(models, &self.filter, |_| 0.0).into_iter())
+            .map(|(at, found)| (self.models[at].as_str(), found.at))
             .collect()
     }
 
@@ -285,6 +289,10 @@ mod tests {
         picker.narrow("LUNA".into());
         assert_eq!(picker.shown().len(), 2);
         assert_eq!(picker.at(), 0);
+        // The letters in order find a model, as fzf's do.
+        picker.narrow("g6l".into());
+        assert_eq!(picker.shown(), ["chatgpt/gpt-6-luna", "openai/gpt-6-luna"]);
+        assert_eq!(picker.found()[0].1, [8, 12, 14]);
         picker.narrow("nothing".into());
         assert_eq!(picker.chosen(), None);
     }

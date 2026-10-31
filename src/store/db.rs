@@ -227,6 +227,12 @@ pub struct Settings {
     /// Whether a workspace-write sandbox reaches the network.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub network: bool,
+    /// The folder a tool output cut for the model is written to whole,
+    /// one file per stream, in place of the store's copy: an absolute
+    /// path, used only while the bot's sandbox cannot write it. None keeps
+    /// every output in the store.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outputs: Option<String>,
     /// Whether a prompt another bot or a named client sent reaches the
     /// model without the line saying so after its words.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -240,6 +246,11 @@ pub struct Settings {
     /// ([`crate::sandbox::unsandboxed`]).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unsandboxed: Vec<String>,
+    /// Unix sockets, or folders of them, the only ones a sandbox's commands
+    /// reach, each an absolute path
+    /// ([`crate::sandbox::Policy::sockets`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unix_sockets: Vec<String>,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, Serialize)]
 pub enum CacheTtl {
@@ -249,8 +260,8 @@ pub enum CacheTtl {
     Hour,
 }
 const MIN_CONTEXT_BYTES: usize = 1024;
-/// The most a bot's `writable` folders take as JSON, by their real paths,
-/// so a reply that repeats them has a bound.
+/// The most a bot's `writable` folders, and its `unix_sockets`, each take
+/// as JSON, by their real paths, so a reply that repeats them has a bound.
 pub const FOLDERS_JSON: usize = 32 << 10;
 const MIN_COMPACT_TOKENS: u64 = 1024;
 /// Where a model with a `window`-token context compacts unless the bot
@@ -325,9 +336,12 @@ impl Settings {
             self.writable = creator.writable.clone();
             self.network = creator.network;
             self.unsandboxed = creator.unsandboxed.clone();
+            self.unix_sockets = creator.unix_sockets.clone();
         }
         self.unsandboxed
             .retain(|prefix| creator.unsandboxed.contains(prefix));
+        self.unix_sockets
+            .retain(|path| creator.unix_sockets.contains(path));
         self.sandbox = Mode::stricter(self.sandbox, creator.sandbox);
         if self.sandbox != Some(Mode::WorkspaceWrite) {
             self.writable.clear();
@@ -398,6 +412,16 @@ impl Settings {
         if !sandboxed && !self.unsandboxed.is_empty() {
             return refuse("unsandboxed goes with sandbox read-only or workspace-write");
         }
+        if !sandboxed && !self.unix_sockets.is_empty() {
+            return refuse("unix_sockets goes with sandbox read-only or workspace-write");
+        }
+        if self.unix_sockets.len() > 64
+            || crate::output::encoded_len(&self.unix_sockets).unwrap_or(usize::MAX) > FOLDERS_JSON
+            || (self.unix_sockets.iter())
+                .any(|path| !std::path::Path::new(path).is_absolute() || path.len() > 4096)
+        {
+            return refuse("unix_sockets names at most 64 absolute paths, 32 KiB in all");
+        }
         if self.unsandboxed.len() > 64
             || self
                 .unsandboxed
@@ -418,6 +442,13 @@ impl Settings {
         {
             return refuse("writable folders are absolute paths");
         }
+        if self
+            .outputs
+            .as_ref()
+            .is_some_and(|path| !std::path::Path::new(path).is_absolute() || path.len() > 4096)
+        {
+            return refuse("outputs is an absolute path");
+        }
         Ok(())
     }
     /// Every setting as it applies, defaults included, for clients; a
@@ -434,7 +465,9 @@ impl Settings {
             "cache_ttl":self.cache_ttl,
             "speed":self.speed().map_or("standard", crate::provider::Speed::name),
             "sandbox":self.sandbox,"writable":self.writable,"network":self.network,
-            "hide_senders":self.hide_senders,"unsandboxed":self.unsandboxed})
+            "outputs":self.outputs,
+            "hide_senders":self.hide_senders,"unsandboxed":self.unsandboxed,
+            "unix_sockets":self.unix_sockets})
     }
     fn stored(&self) -> Result<Option<String>> {
         Ok((*self != Self::default())
@@ -878,6 +911,7 @@ pub fn unserved(detail: String) -> Outcome {
     Outcome {
         output: json!({"error":"tool_unserved","detail":detail}).to_string(),
         artifacts: Vec::new(),
+        files: Default::default(),
         parts: Vec::new(),
         note: None,
         failed: true,
@@ -1427,6 +1461,9 @@ pub struct Database {
     /// The `steps` the current group removed, put back if it does not
     /// commit, as the rows they name are.
     steps_gone: Vec<(i64, i64)>,
+    /// Files of outputs whose records the current group removed, removed
+    /// once it commits: a group that does not keeps both.
+    files_gone: Vec<String>,
 }
 
 /// The columns of the turn view, from `turns t JOIN bots b ON b.name=t.bot`.
@@ -1645,12 +1682,29 @@ fn conflict(name: &str, field: &str) -> Error {
 fn entry(cursor: i64, bot: &str, turn: Option<i64>, kind: &str, data: Value) -> Value {
     json!({"cursor":cursor,"bot":bot,"turn":turn,"event":kind,"data":data})
 }
+/// A stored event as read back: its entry with `written_ms`, the Unix ms
+/// it joined the store, when it has one (events from before the column
+/// existed have none).
+fn stored_entry(
+    cursor: i64,
+    bot: &str,
+    turn: Option<i64>,
+    kind: &str,
+    data: Value,
+    written_ms: Option<i64>,
+) -> Value {
+    let mut event = entry(cursor, bot, turn, kind, data);
+    if let Some(written_ms) = written_ms {
+        event["written_ms"] = json!(written_ms);
+    }
+    event
+}
 
 impl Database {
     /// Stored schema version, kept in `PRAGMA user_version`. Stores created
     /// before versioning and stores from newer binaries are rejected; an older
     /// versioned store is migrated forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 67;
+    pub const SCHEMA: i32 = 70;
     /// Verbatim user prompts a compaction keeps: per-prompt text, and the
     /// total text plus `(ordinal, String)` entry metadata. Empty entries cost
     /// space too, so the retained list cannot grow with conversation length.
@@ -1685,6 +1739,7 @@ impl Database {
             steps: HashMap::new(),
             stepped: Vec::new(),
             steps_gone: Vec::new(),
+            files_gone: Vec::new(),
         })
     }
 
@@ -1825,7 +1880,7 @@ impl Database {
                 delivery TEXT NOT NULL DEFAULT 'reject', expected_turn INTEGER,
                 cached_input_tokens INTEGER NOT NULL DEFAULT 0,
                 from_bot TEXT, from_turn INTEGER, from_id INTEGER, origin TEXT, reasoning TEXT, inherited_reasoning TEXT,
-                bot_model TEXT, bot_reasoning TEXT, images TEXT, person TEXT, quotes TEXT,
+                bot_model TEXT, bot_reasoning TEXT, images TEXT, person TEXT, quotes TEXT, reply_node INTEGER,
                 UNIQUE(bot,request_id));
             CREATE INDEX IF NOT EXISTS turns_bot_id ON turns(bot,id);
             CREATE INDEX IF NOT EXISTS turns_started ON turns(bot,id) WHERE started_ms IS NOT NULL;
@@ -1863,10 +1918,10 @@ impl Database {
                 call_id TEXT NOT NULL, status TEXT NOT NULL, result TEXT, delivered INTEGER);
             CREATE INDEX IF NOT EXISTS processes_turn ON processes(turn);
             CREATE TABLE IF NOT EXISTS artifacts(turn INTEGER NOT NULL REFERENCES turns(id), call_id TEXT NOT NULL,
-                stream TEXT NOT NULL, data BLOB NOT NULL, raw_bytes INTEGER NOT NULL DEFAULT 0,
+                stream TEXT NOT NULL, data BLOB NOT NULL, raw_bytes INTEGER NOT NULL DEFAULT 0, file TEXT,
                 PRIMARY KEY(turn,call_id,stream));
             CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY AUTOINCREMENT, bot TEXT NOT NULL REFERENCES bots(name),
-                turn INTEGER, kind TEXT NOT NULL, data TEXT NOT NULL);
+                turn INTEGER, kind TEXT NOT NULL, data TEXT NOT NULL, written_ms INTEGER);
             CREATE TABLE IF NOT EXISTS event_retention(singleton INTEGER PRIMARY KEY CHECK(singleton=1),
                 pruned_cursor INTEGER NOT NULL);
             INSERT OR IGNORE INTO event_retention VALUES (1,0);
@@ -1915,6 +1970,7 @@ impl Database {
             steps: HashMap::new(),
             stepped: Vec::new(),
             steps_gone: Vec::new(),
+            files_gone: Vec::new(),
         };
         // A deletion interrupted between pieces finishes now: the bot was
         // already refusing work, and nothing else may see it half gone.
@@ -1994,8 +2050,12 @@ impl Database {
     /// methods it calls release their own savepoints into this one.
     pub fn atomic<T>(&mut self, work: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
         self.conn.execute_batch("SAVEPOINT atomic")?;
-        let (served, stepped, gone) =
-            (self.served.len(), self.stepped.len(), self.steps_gone.len());
+        let (served, stepped, gone, files) = (
+            self.served.len(),
+            self.stepped.len(),
+            self.steps_gone.len(),
+            self.files_gone.len(),
+        );
         let done = work(self);
         if done.is_ok() {
             self.conn.execute_batch("RELEASE atomic")?;
@@ -2005,6 +2065,7 @@ impl Database {
                 .execute_batch("ROLLBACK TO atomic; RELEASE atomic")?;
             self.served.truncate(served);
             self.stepped.truncate(stepped);
+            self.files_gone.truncate(files);
             self.restore_steps(gone);
             self.recount_pending()?;
         }
@@ -2023,7 +2084,16 @@ impl Database {
         self.conn.prepare_cached("COMMIT")?.execute([])?;
         self.live_before.clear();
         self.steps_gone.clear();
+        artifact::remove(&std::mem::take(&mut self.files_gone));
         Ok(())
+    }
+    /// Remove the files of outputs whose records just went: once the group
+    /// commits, or now when there is none.
+    fn forget_files(&mut self, files: Vec<String>) {
+        match self.in_group() {
+            true => self.files_gone.extend(files),
+            false => artifact::remove(&files),
+        }
     }
     /// Put back the steps removed since the group had `kept` removals.
     fn restore_steps(&mut self, kept: usize) {
@@ -2048,6 +2118,7 @@ impl Database {
         self.outcomes.clear();
         self.served.clear();
         self.stepped.clear();
+        self.files_gone.clear();
         self.restore_steps(0);
         self.pending_stale = true;
         for (turn, before) in self.live_before.drain() {
@@ -2084,19 +2155,20 @@ impl Database {
     ) -> Result<()> {
         loop {
             let mut statement = self.conn.prepare_cached(
-                "SELECT id,bot,turn,kind,data FROM events WHERE id>? ORDER BY id LIMIT 256",
+                "SELECT id,bot,turn,kind,data,written_ms FROM events WHERE id>? ORDER BY id LIMIT 256",
             )?;
             let mut rows = statement.query([*watermark])?;
             let mut delivered = 0;
             while let Some(row) = rows.next()? {
                 let cursor: i64 = row.get(0)?;
                 let data: Value = serde_json::from_str(&row.get::<_, String>(4)?)?;
-                let event = entry(
+                let event = stored_entry(
                     cursor,
                     &row.get::<_, String>(1)?,
                     row.get(2)?,
                     &row.get::<_, String>(3)?,
                     data,
+                    row.get(5)?,
                 );
                 *watermark = cursor;
                 delivered += 1;
@@ -2362,7 +2434,7 @@ impl Database {
     }
     /// The tools the creating bot's client declared, which a bot it
     /// creates takes unless its own client declares others: all but those
-    /// declared as the creator's own.
+    /// declared as the creator's own, each passed on one generation fewer.
     fn creator_declared(conn: &Connection, creator: Option<i64>) -> Result<Option<String>> {
         let Some(id) = creator else {
             return Ok(None);
@@ -2373,7 +2445,10 @@ impl Database {
             return Ok(None);
         };
         let mut declared: Vec<Declared> = serde_json::from_str(&stored)?;
-        declared.retain(|tool| tool.inherit);
+        declared.retain(|tool| tool.inherit.passes());
+        for tool in &mut declared {
+            tool.inherit = tool.inherit.passed();
+        }
         stored_declared(&declared)
     }
     /// The bot holding identity `id`, whatever it is named.
@@ -2503,6 +2578,7 @@ impl Database {
             writable: sandbox.writable,
             network: sandbox.network,
             unsandboxed: sandbox.unsandboxed,
+            unix_sockets: sandbox.unix_sockets,
             ..bot.settings
         };
         let creator = match bot.created_by_id {
@@ -6279,6 +6355,9 @@ impl Database {
         for (stream, data) in &outcome.artifacts {
             artifact::put(&tx, turn, call_id, stream, data)?;
         }
+        for (stream, file) in outcome.files.iter() {
+            artifact::put_file(&tx, turn, call_id, stream, file)?;
+        }
         // A parked answer's pictures were kept for the result, which now
         // holds them: stored once.
         if !outcome.parts.is_empty() {
@@ -6332,7 +6411,9 @@ impl Database {
                 params![head, bot.name],
             )?;
         }
-        let artifacts: Vec<&str> = outcome.artifacts.iter().map(|(s, _)| *s).collect();
+        let artifacts: Vec<&str> = (outcome.artifacts.iter().map(|(s, _)| *s))
+            .chain(outcome.files.iter().map(|(s, _)| *s))
+            .collect();
         let mut data = json!({"call_id":call_id,"node":head,"artifacts":artifacts,
             "note":outcome.note.as_ref().map(|_| head)});
         if outcome.failed {
@@ -6344,6 +6425,7 @@ impl Database {
             false => None,
         };
         tx.commit()?;
+        outcome.files.recorded();
         if let Some(served) = served {
             self.served.push(served);
             if let Some(live) = self.live_changed(turn) {
@@ -6657,6 +6739,7 @@ impl Database {
             Some(output) => CallAnswer::Given(Outcome {
                 output,
                 artifacts: Vec::new(),
+                files: Default::default(),
                 parts: parts
                     .map(|json| serde_json::from_str(&json))
                     .transpose()?
@@ -7692,10 +7775,7 @@ impl Database {
                 let Some(text) = self.reply_text(*turn)? else {
                     return Err(Error::with(
                         "quote_not_found",
-                        format!(
-                            "{bot}'s turn {turn} has no reply to quote: it ended without one, \
-                             or its messages' events were pruned"
-                        ),
+                        format!("{bot}'s turn {turn} has no reply to quote: it ended without one"),
                     )
                     .facts(json!({"bot":bot,"turn":turn})));
                 };
@@ -7742,21 +7822,20 @@ impl Database {
         }
         Ok(Some(serde_json::to_string(&copied)?))
     }
-    /// The last message with text a turn streamed, whole: what it ended
-    /// with.
+    /// The last message with text a finished turn streamed, whole: what it
+    /// ended with.
     fn reply_text(&self, turn: i64) -> Result<Option<String>> {
-        let mut items = self.conn.prepare_cached(
-            "SELECT n.item FROM events e JOIN nodes n ON n.id=json_extract(e.data,'$.node')
-             WHERE e.turn=? AND e.kind='message' ORDER BY e.id DESC",
-        )?;
-        let mut rows = items.query([turn])?;
-        while let Some(r) = rows.next()? {
-            let text = assistant_text(&serde_json::from_slice(&r.get::<_, Vec<u8>>(0)?)?);
-            if !text.trim().is_empty() {
-                return Ok(Some(text));
-            }
+        let item: Option<Vec<u8>> = self
+            .conn
+            .prepare_cached(
+                "SELECT n.item FROM turns t JOIN nodes n ON n.id=t.reply_node WHERE t.id=?",
+            )?
+            .query_row([turn], |r| r.get(0))
+            .optional()?;
+        match item {
+            Some(item) => Ok(Some(assistant_text(&serde_json::from_slice(&item)?))),
+            None => Ok(None),
         }
-        Ok(None)
     }
     /// The most of the bot's last message before a turn that a `prompts`
     /// read returns, from its end.
@@ -7807,17 +7886,23 @@ impl Database {
         let mut first = self.prompt_entry(turn, words, &mut left)?;
         // What the bot last said before the words: what a person's short
         // answer, such as "yes", answers.
-        let previous: Option<i64> = self
+        // A finished turn keeps it past retention; one still going, which
+        // retention leaves alone, is read from its events.
+        let previous: Option<(i64, bool)> = self
             .conn
             .prepare_cached(
-                "SELECT id FROM turns WHERE bot=? AND id<? AND started_ms IS NOT NULL ORDER BY id DESC LIMIT 1",
+                "SELECT id,finished_ms IS NOT NULL FROM turns
+                 WHERE bot=? AND id<? AND started_ms IS NOT NULL ORDER BY id DESC LIMIT 1",
             )?
-            .query_row(params![name, turn], |r| r.get(0))
+            .query_row(params![name, turn], |r| Ok((r.get(0)?, r.get(1)?)))
             .optional()?;
-        if let Some(previous) = previous
-            && let Some(reply) = self.reply(previous, 0, i64::MAX, &mut left)?
-        {
-            first["reply"] = reply;
+        let said = match previous {
+            Some((previous, true)) => self.reply_text(previous)?,
+            Some((previous, false)) => self.said(previous, 0, i64::MAX)?,
+            None => None,
+        };
+        if let Some(said) = said {
+            first["reply"] = Self::reply(&said, &mut left);
         }
         let mut prompts = vec![first];
         let mut prompts_more = false;
@@ -7840,8 +7925,8 @@ impl Database {
             left -= Self::PROMPTS_ENTRY;
             let mut entry = self.prompt_entry(id, words, &mut left)?;
             entry["steer"] = json!(true);
-            if let Some(reply) = self.reply(turn, since, steered, &mut left)? {
-                entry["reply"] = reply;
+            if let Some(said) = self.said(turn, since, steered)? {
+                entry["reply"] = Self::reply(&said, &mut left);
             }
             since = steered;
             prompts.push(entry);
@@ -8007,24 +8092,27 @@ impl Database {
     /// The last message with text `turn` streamed between two of its events, as
     /// `{text}` with its end kept: at most `PROMPTS_REPLY` bytes, or the
     /// budget left, starting at a whole word when cut (`truncated`).
-    fn reply(&self, turn: i64, after: i64, before: i64, left: &mut usize) -> Result<Option<Value>> {
-        // The newest item with text: calls and reasoning stream as
-        // messages too, and say nothing a person answers.
+    /// The newest text a turn streamed between two events: calls and
+    /// reasoning stream as messages too, and say nothing a person answers.
+    fn said(&self, turn: i64, after: i64, before: i64) -> Result<Option<String>> {
         let mut items = self.conn.prepare_cached(
             "SELECT n.item FROM events e JOIN nodes n ON n.id=json_extract(e.data,'$.node')
              WHERE e.turn=? AND e.kind='message' AND e.id>? AND e.id<? ORDER BY e.id DESC",
         )?;
         let mut rows = items.query(params![turn, after, before])?;
-        let mut text = String::new();
-        while text.trim().is_empty() {
-            let Some(r) = rows.next()? else {
-                return Ok(None);
-            };
-            text = assistant_text(&serde_json::from_slice(&r.get::<_, Vec<u8>>(0)?)?);
+        while let Some(r) = rows.next()? {
+            let text = assistant_text(&serde_json::from_slice(&r.get::<_, Vec<u8>>(0)?)?);
+            if !text.trim().is_empty() {
+                return Ok(Some(text));
+            }
         }
+        Ok(None)
+    }
+    /// What a `prompts` read shows of the text: its end, within the budget.
+    fn reply(text: &str, left: &mut usize) -> Value {
         // Redacted whole before its end is kept: a private key whose
         // opening line is cut away would no longer read as one.
-        let text = agent_client::approver::Redactor::default().redact(&text);
+        let text = agent_client::approver::Redactor::default().redact(text);
         let limit = Self::PROMPTS_REPLY.min(*left);
         let mut start = text.len().saturating_sub(limit);
         while !text.is_char_boundary(start) {
@@ -8043,7 +8131,7 @@ impl Database {
         if truncated {
             reply["truncated"] = json!(true);
         }
-        Ok(Some(reply))
+        reply
     }
     /// The calls a turn was refused, and the steps of its running calls,
     /// that did not then run as they were, each `{name, arguments}` with its
@@ -8286,10 +8374,13 @@ impl Database {
         } else {
             "completed"
         };
-        tx.execute(
-            "UPDATE turns SET status=?,finished_ms=? WHERE id=?",
-            params![status, epoch_ms(), turn],
-        )?;
+        // The message it ended on is kept on the row, so a quote of the
+        // reply, and a `prompts` read of the turn after, find it once
+        // retention has dropped the turn's events.
+        tx.prepare_cached(&format!(
+            "UPDATE turns SET status=?1,finished_ms=?2,reply_node={REPLY_NODE} WHERE id=?3"
+        ))?
+        .execute(params![status, epoch_ms(), turn])?;
         // A request a safety classifier declined, and the bot's fallback
         // too: what it added since the model last answered goes to later
         // requests as notes in its place, since Anthropic says to remove it
@@ -8821,6 +8912,7 @@ impl Database {
         id: i64,
         result: &Value,
         artifacts: &[(&str, Vec<u8>)],
+        files: &[(&str, String)],
     ) -> Result<()> {
         let tx = self.conn.savepoint()?;
         if tx.execute(
@@ -8830,13 +8922,16 @@ impl Database {
         {
             return fail("invalid_process_state");
         }
-        if !artifacts.is_empty() {
+        if !artifacts.is_empty() || !files.is_empty() {
             let (turn, call_id): (i64, String) =
                 tx.query_row("SELECT turn,call_id FROM processes WHERE id=?", [id], |r| {
                     Ok((r.get(0)?, r.get(1)?))
                 })?;
             for (stream, data) in artifacts {
                 artifact::put(&tx, turn, &call_id, stream, data)?;
+            }
+            for (stream, file) in files {
+                artifact::put_file(&tx, turn, &call_id, stream, file)?;
             }
         }
         tx.commit()?;
@@ -9182,6 +9277,40 @@ impl Database {
             Some(entry(cursor, name, None, "forked", data)),
         ))
     }
+    /// The cursor just before the first event written at or after `since_ms`:
+    /// where a follow from that time starts. Cursors and times rise together
+    /// (an event is never written before the one before it), so it is found
+    /// by halving the cursor range, a few point reads however many events
+    /// there are; events with no time count as older.
+    pub fn cursor_since(&self, since_ms: i64) -> Result<i64> {
+        let mut at = self.conn.prepare_cached(
+            "SELECT id,COALESCE(written_ms,-1) FROM events WHERE id>=? ORDER BY id LIMIT 1",
+        )?;
+        let (mut low, mut high): (i64, i64) = self.conn.query_row(
+            // Each bound its own subquery: SQLite reads a lone MIN or MAX
+            // from the end of the key, but scans for both in one.
+            "SELECT COALESCE((SELECT MIN(id) FROM events),1),
+                    COALESCE((SELECT MAX(id) FROM events),0)+1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        // The first cursor written at or after `since_ms` is in low..=high,
+        // high meaning none yet.
+        while low < high {
+            let middle = low + (high - low) / 2;
+            match at
+                .query_row([middle], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))
+                .optional()?
+            {
+                // Nothing in middle..high: the first is before it, or none.
+                Some((id, _)) if id >= high => high = middle,
+                Some((id, written)) if written >= since_ms => high = id,
+                Some((id, _)) => low = id + 1,
+                None => high = middle,
+            }
+        }
+        Ok(low - 1)
+    }
     pub fn events(&self, name: &str, after: i64, limit: usize) -> Result<Value> {
         self.inspect(name)?;
         self.event_page(Some(name), after, limit)
@@ -9199,8 +9328,8 @@ impl Database {
             );
         }
         let mut stmt = self.conn.prepare_cached(match name {
-            Some(_) => "SELECT id,turn,kind,data,bot FROM events WHERE bot=?1 AND id>?2 ORDER BY id LIMIT ?3",
-            None => "SELECT id,turn,kind,data,bot FROM events WHERE ?1 IS NULL AND id>?2 ORDER BY id LIMIT ?3",
+            Some(_) => "SELECT id,turn,kind,data,bot,written_ms FROM events WHERE bot=?1 AND id>?2 ORDER BY id LIMIT ?3",
+            None => "SELECT id,turn,kind,data,bot,written_ms FROM events WHERE ?1 IS NULL AND id>?2 ORDER BY id LIMIT ?3",
         })?;
         let mut rows = stmt.query(params![name, after, limit as i64])?;
         let mut events = Vec::new();
@@ -9212,12 +9341,13 @@ impl Database {
             let next: i64 = row.get(0)?;
             let data: String = row.get(3)?;
             let bot: String = row.get(4)?;
-            let item = entry(
+            let item = stored_entry(
                 next,
                 &bot,
                 row.get::<_, Option<i64>>(1)?,
                 &row.get::<_, String>(2)?,
                 serde_json::from_str::<Value>(&data)?,
+                row.get(5)?,
             );
             let size = crate::output::encoded_len(&item)? + 1;
             if bytes + size > byte_limit {
@@ -9383,7 +9513,9 @@ impl Database {
             .collect::<rusqlite::Result<_>>()?;
         if !turns.is_empty() {
             let mut events = 0;
+            let mut files = Vec::new();
             for turn in &turns {
+                files.extend(artifact::files(&tx, *turn)?);
                 for table in ["artifacts", "processes", "tools"] {
                     tx.prepare_cached(&format!("DELETE FROM {table} WHERE turn=?"))?
                         .execute([turn])?;
@@ -9396,6 +9528,7 @@ impl Database {
             }
             out["events"] = json!(events);
             tx.commit()?;
+            self.forget_files(files);
             return Ok(out);
         }
         // Then the turn rows and what remains keyed by the bot alone.
@@ -9583,9 +9716,11 @@ impl Database {
             .collect::<rusqlite::Result<_>>()?;
         let mut events = 0;
         let mut cursor: Option<i64> = None;
+        let mut files = Vec::new();
         for turn in &turns {
             // Background commands may outlive their launching turn; their
             // running row is required when the result commits and waiters wake.
+            files.extend(artifact::files(&tx, *turn)?);
             tx.prepare_cached("DELETE FROM artifacts WHERE turn=?")?
                 .execute([turn])?;
             tx.prepare_cached("DELETE FROM processes WHERE turn=? AND status!='running'")?
@@ -9622,6 +9757,7 @@ impl Database {
                 r.get(0)
             })?;
         tx.commit()?;
+        self.forget_files(files);
         let next_after = match limit {
             Some(limit) if turns.len() == limit => turns.last().copied(),
             _ => None,
@@ -10256,6 +10392,19 @@ impl Database {
     }
 }
 
+/// The node of the newest message with text that a turn streamed, as a
+/// subquery, in its parentheses, of a statement on `turns`: the text `assistant_text` reads, so
+/// calls and reasoning, which stream as messages too, are passed over. A
+/// turn's last message is nearly always its reply, so the search reads one
+/// node, through the events index, once per turn.
+const REPLY_NODE: &str = "(SELECT n.id FROM events e JOIN nodes n ON n.id=json_extract(e.data,'$.node')
+    WHERE e.turn=turns.id AND e.kind='message'
+    AND EXISTS(SELECT 1 FROM json_each(CAST(n.item AS TEXT),'$.content') c
+        WHERE CASE c.type WHEN 'object' THEN json_extract(c.value,'$.type') IN ('output_text','text')
+            AND json_type(c.value,'$.text')='text'
+            AND trim(json_extract(c.value,'$.text'),' '||char(9,10,13))!='' END)
+    ORDER BY e.id DESC LIMIT 1)";
+
 /// Text of an assistant item in either family encoding; other content is skipped.
 fn assistant_text(item: &Value) -> String {
     let mut text = String::new();
@@ -10804,9 +10953,16 @@ fn flush(tx: &Connection, turn: i64, live: Option<&Live>) -> Result<()> {
     }
     Ok(())
 }
+/// Store an event, written now or, should the clock have gone back, when
+/// the event before it was: times rise with cursors, as a log's time index
+/// keeps them (Kafka's), so a follow from a time skips nothing.
 fn event(conn: &Connection, bot: &str, turn: Option<i64>, kind: &str, data: Value) -> Result<i64> {
-    conn.prepare_cached("INSERT INTO events(bot,turn,kind,data) VALUES (?,?,?,?)")?
-        .execute(params![bot, turn, kind, data.to_string()])?;
+    conn.prepare_cached(
+        "INSERT INTO events(bot,turn,kind,data,written_ms) VALUES (?1,?2,?3,?4,
+            MAX(?5,COALESCE((SELECT written_ms FROM events
+                WHERE id=(SELECT MAX(id) FROM events)),?5)))",
+    )?
+    .execute(params![bot, turn, kind, data.to_string(), epoch_ms()])?;
     Ok(conn.last_insert_rowid())
 }
 /// Append an item. Stored history has no lifetime cap; the per-request
@@ -11999,6 +12155,40 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
         )? {
             conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {kind};"))?;
         }
+    }
+    if !conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('artifacts') WHERE name='file')",
+        [],
+        |r| r.get::<_, bool>(0),
+    )? {
+        // 67 -> 68: a retained output may be a file in the bot's outputs
+        // folder rather than the store's copy. Every earlier one is a copy.
+        conn.execute_batch("ALTER TABLE artifacts ADD COLUMN file TEXT;")?;
+    }
+    // 68 -> 69: an event keeps when it joined the store; when older ones
+    // did is not known.
+    if conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='events')
+         AND NOT EXISTS(SELECT 1 FROM pragma_table_info('events') WHERE name='written_ms')",
+        [],
+        |r| r.get::<_, bool>(0),
+    )? {
+        conn.execute_batch("ALTER TABLE events ADD COLUMN written_ms INTEGER;")?;
+    }
+    // 69 -> 70: a finished turn keeps the message it ended on, found from
+    // the events retention has left. Nodes are freed only with their bot's
+    // turns, so the column needs no reference to check.
+    if conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='turns')
+         AND NOT EXISTS(SELECT 1 FROM pragma_table_info('turns') WHERE name='reply_node')",
+        [],
+        |r| r.get::<_, bool>(0),
+    )? {
+        conn.execute_batch(&format!(
+            "ALTER TABLE turns ADD COLUMN reply_node INTEGER;
+             UPDATE turns SET reply_node={REPLY_NODE}
+             WHERE started_ms IS NOT NULL AND finished_ms IS NOT NULL;"
+        ))?;
     }
     Ok(())
 }

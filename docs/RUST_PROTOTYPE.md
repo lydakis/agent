@@ -360,6 +360,22 @@ read inherited outputs, but cannot read later source turns or unrelated branches
 A stream the call never retained answers `artifact_not_found`, a turn outside
 the reader's lineage `turn_not_found`, and a turn whose records retention has
 removed `artifact_pruned` (see Retention).
+
+<a id="retained-outputs"></a>A bot with an `outputs` folder keeps each such
+stream there whole instead, as `TURN-CALL_ID-STREAM`, and its result lists
+those paths as `files` beside `artifacts`, so any command or tool reads them.
+The store keeps one row per stream naming the file and none of its bytes
+(schema 68), and `artifact` and `read artifact=` read the file. Each file is
+made new (0600, never through a link) and synced with its folder before the
+store records it, off the runtime thread, and only while
+the bot's sandbox cannot write the folder, checked after the folder is made: a
+command that could write there could put a link for the daemon to follow. An unconfined bot's
+commands can already write whatever the daemon can. A stream whose file cannot
+be written stays in the store, and a turn stopped while its files are written
+removes them. Retention and deletion remove a turn's files once removing its
+records commits; a file removed by hand reads `artifact_not_found`. A daemon
+that dies between writing a file and recording its call leaves the file, which
+no record names.
 Line pages are assembled on the storage worker; only the bounded page crosses
 into the async runtime. Byte-oriented protocol pages continue to use SQL slicing.
 
@@ -417,7 +433,9 @@ keep-warm when it sets any of them.
 | `writable` (`--writable`, repeatable) | Absolute folders a `workspace-write` bot may write besides its own; each must exist and is stored by its real path. At most 64, 32 KiB as JSON. | none |
 | `network` (`--network`) | A `workspace-write` bot's commands may use the network. | off |
 | `hide_senders` (`--hide-senders`) | Its model reads what other bots and clients send it without the line naming the sender (see [fleet controllers](#fleet-controllers)); `senders = "hidden"` in `~/.agent/config.toml` sets it on the bots the CLI and Sonny make. | off |
+| `outputs` (`--outputs`) | An absolute folder that holds each tool output stream cut for the model whole, one file per stream, in place of the store's copy (see [retained outputs](#retained-outputs)). The daemon makes it, owner-only, and writes there only while the bot's sandbox cannot write it; otherwise the stream stays in the store. `agent run --new` and Sonny name `outputs` beside the store unless told otherwise. | none |
 | `unsandboxed` (`--unsandboxed`, repeatable) | Commands a sandboxed bot runs outside its sandbox without asking, each by its first words, such as `mcpx` or `docker compose` (see [sandbox](#sandbox)). At most 64, each at most 1 KiB. | none |
+| `unix_sockets` (`--unix-socket`, repeatable) | Absolute Unix sockets, or folders of them, the only ones a sandboxed bot's commands reach, such as a Docker or SSH agent socket (see [sandbox](#sandbox)). Each is stored by its real path while it exists. At most 64. | none |
 
 Provider requests multiplex over HTTP/2, and one connection carries at most
 the 100 streams the provider advertises; the HTTP layer queues the rest, so a
@@ -1058,7 +1076,11 @@ is `invalid_json` with a null `id`; JSON of the wrong shape is
 `invalid_request`, answered with its `id` when that parses, and its detail
 names the unknown or ill-typed field.
 Notifications carry `event`; durable ones carry `cursor`, `bot`, `turn`, and
-`data`, in exactly the shape `events` replays them. Durable events reach
+`data`, in exactly the shape `events` replays them, and `written_ms`, the Unix
+ms the event joined the store, set by the insert that writes it and never
+earlier than the event before it (should the clock go back, events keep the
+last time until it catches up, as a log's time index does); events from
+before schema 69 have none. Durable events reach
 followers in commit order: the storage worker itself hands each group's
 committed events, and the outcomes of turns its jobs ended, to one publisher
 before taking the next group. Tasks never publish durable events, so a
@@ -1091,6 +1113,7 @@ own path from the turn. Example requests:
 {"id":29,"op":"compact","bot":"Bob","bot_id":1}
 {"id":15,"op":"delete","bot":"Bob","bot_id":1}
 {"id":16,"op":"follow","bot":"*","after":0}
+{"id":32,"op":"follow","bot":"*","since_ms":1793000000000,"kinds":["accepted","message"]}
 {"id":17,"op":"wait","handles":["turn:Bob/1","turn:Alice/3"],"any":true,"timeout_ms":60000}
 {"id":18,"op":"stats"}
 {"id":19,"op":"provider_models"}
@@ -1271,9 +1294,9 @@ since its history is kept in that family's encoding
 `approve: []` alone removes them, including the gates a bot took from the
 bot that made it: whoever configures a bot decides, as a person overriding
 one does, and bots it already made keep theirs. The gate is checked before
-anything is written. `sandbox`, with `writable`, `network` and `unsandboxed`
-(as `create`'s settings name them), replaces the bot's sandbox, and those left
-out go back to none, off and none; a bot another bot made keeps no weaker a sandbox than its
+anything is written. `sandbox`, with `writable`, `network`, `unsandboxed` and
+`unix_sockets` (as `create`'s settings name them), replaces the bot's sandbox,
+and those left out go back to none, off, none and none; a bot another bot made keeps no weaker a sandbox than its
 creator's, as when it was made, and a bot's own socket may not configure
 at all. `cache_ttl` (`5m` or `1h`, as `create`'s settings name it) sets the
 bot's prompt-cache lifetime from its next model call, and `speed`
@@ -1343,6 +1366,13 @@ symlinks, and unrelated files are never removed on startup; a refused stale
 socket can be recovered. Normal shutdown removes only the socket inode the
 service created. Do not replace ownership-lock files while a service runs.
 
+`follow` takes the cursor as `after`, or as `since_ms` (a Unix ms; giving
+both is `invalid_event_page`): it then starts from the first event written at
+or after that time, so a client can replay the last hour without knowing its
+cursors. Cursors and times rise together, so the daemon finds that cursor by
+halving the cursor range, a few point reads however many events are kept;
+events with no time count as older. It is the `usage` op's word for a start
+time, and `agent follow --since 1h` sends it.
 `follow` replays durable events after the cursor as notifications, emits
 `follow_live` with the cursor reached, and then delivers live events. The
 switch happens inside a storage job, so no committed event falls between the
@@ -1433,8 +1463,8 @@ behind a line naming it, `[Quoted from turn:BOT/TURN, written by a
 person:]` or `[Quoted from the reply of turn:BOT/TURN, written by the agent
 BOT:]` (`sent by ORIGIN`, `written by PERSON`, `written by the agent NAME
 in turn:NAME/TURN`); `hide_senders` leaves the lines out too. A turn that
-does not exist, a steer's reply, or a turn with no reply left (it ended
-without one, or pruning took its message events) is `quote_not_found`; a
+does not exist, a steer's reply, or a turn that ended without a reply
+(or whose events were pruned before schema 70) is `quote_not_found`; a
 reply of an unfinished turn `quote_unfinished`; more than 64 quotes, those
 quoted prompts bring counted (marked `nested` in the record, which a retry
 leaves out), or words and quotes past 256 KiB together, each quote's line
@@ -2143,7 +2173,11 @@ deleted once idle:
   removes those results after completion. The
   transcript and the turn rows themselves stay, so the context window, the
   `history` tool, `history_items`, forks, and accounting are unaffected; what shrinks
-  is replay and artifact retrieval. New `wait` calls for an expired
+  is replay and artifact retrieval. A finished turn's row names the message
+  with text it ended on, set in the write that finishes it, so a quote of its
+  reply and the `reply` a `prompts` read of the next turn carries are
+  unaffected too, and read it by key rather than searching events. Schema 70
+  adds it, found for finished turns from the events retention had left. New `wait` calls for an expired
   turn outcome return the turn's view with `error: turn_result_pruned`; they
   never report an empty success.
   On a pruning notice, `agent run` and `agent follow` reconcile their selected
@@ -2247,7 +2281,8 @@ it as `queued_processes`, a subset of `running_processes`, which counts every
 accepted command whose result is not yet recorded. stdout and stderr are each
 retained up to 1 MiB; beyond 64 KiB the model receives a head and tail with the
 omission stated and the full stream is stored as an artifact retrievable through
-the `artifact` operation. Output is redacted before it is stored or sent,
+the `artifact` operation, or written to the bot's `outputs` folder (see
+[retained outputs](#retained-outputs)). Output is redacted before it is stored or sent,
 artifacts included, as every tool's result is: each credential the daemon
 holds, wherever it appears; the value printed after a field name ending in
 one the daemon was started with (`--redact-field`, any case, with or without
@@ -2333,16 +2368,38 @@ files wherever they are made. Network is
 off unless `network` is set. `danger-full-access`, or no `sandbox`, runs
 unconfined.
 
+A Unix socket is a way out of any sandbox: a program listening on one runs
+what it is asked outside, as a browser's daemon launches a browser or Docker
+runs a container. So, as Claude Code's sandbox and Codex's managed network
+block them by default, a sandboxed bot's commands reach only the Unix
+sockets its `unix_sockets` names. Not even those in its own folders: a hard
+link there to any socket, which needs no right to the socket, would reach
+it, and a named folder the bot may write lets one in the same way. On macOS
+Seatbelt holds them to those paths, network on or off. On Linux, where a
+read-only mount doesn't stop `connect`, a seccomp filter bubblewrap loads
+refuses every Unix socket a command would make, as Codex's Linux sandbox
+does; a filter can't see the path, so a bot whose `unix_sockets` names any
+reaches them all, as Claude Code's `allowAllUnixSockets` does. Socket pairs
+stay allowed, but not of datagrams, which send to any socket's path. The filter also refuses `io_uring`, whose calls it can't see,
+and ends a command that makes system calls of another architecture.
+
 A sandboxed bot's commands reach the daemon through the bot's own socket,
 never the daemon's: so `agent` and the clients built on it work in its shell,
 as that bot and only as far as a sandboxed bot may go. The daemon opens the
 socket, `SOCKET.d/BOT_ID` beside its own, the first time one of the bot's
-commands runs, and closes it when the bot is deleted. On Linux it is bound over the
-daemon's socket in the sandbox, and the folder of the bots' sockets is
-hidden; on macOS Seatbelt denies the daemon's socket and that folder and
-allows the bot's own, network on or off. Either way the command's
-`AGENT_SOCKET` names it, and no command reaches another bot's. A request on
-it:
+commands runs, and closes it when the bot is deleted. On macOS Seatbelt
+denies the daemon's socket and that folder and allows the bot's own,
+network on or off. On Linux, where the command makes no Unix socket, the
+daemon hands it connections, as a broker does: `AGENT_SOCKET_FD` names a
+descriptor the command inherits, and each byte written to it is answered
+with a connection to the bot's own socket, passed over it, or none when
+that socket is gone. Like make's jobserver descriptors, it reaches only
+the processes that keep it: a launcher that closes what it didn't open,
+as Python's `subprocess` does, passes it on (`pass_fds`), or the client
+says which descriptor went missing. The bot's socket is also bound over the daemon's in
+the sandbox, and the folder of the bots' sockets is hidden. Either way the
+command's `AGENT_SOCKET` names it, the clients connect as it says, and no
+command reaches another bot's. A request on it:
 
 | Request | On a bot's own socket |
 |---|---|
@@ -2562,6 +2619,15 @@ waiting`), an answer to the call ends them (the waiting request gets
 drops them all. Schema 63 adds the steps' and paused calls' columns. Protocol 24
 also adds `history_search`, the history tool's query for clients (see
 `history_nodes` above).
+
+Protocol version 29 lets `inherit` be a count of generations as well as
+`true` or `false`: a tool declared with `"inherit": 2` goes to the bots
+its bot creates with `"inherit": 1`, to theirs with `false`, and no
+further, as a packet's hop count runs down. `false` is no generation and
+`true`, still the default and still left out, every one. A fork is a copy,
+not a generation, and keeps the count its source has. A client bounding
+how deep its agents delegate gives its tool for starting them that count,
+so each bot's tools are right from its first turn.
 
 ### Tool approval
 

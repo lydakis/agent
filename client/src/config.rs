@@ -31,10 +31,12 @@
 //! margin_opens = "never"         # "always", the default, or "unless-closed"
 //! suggest = false               # no guess at the next message, on by default
 //! commons = false               # agents go without the commons, on by default
-//! commons_invites = 3           # invites a day a new thread can send, 0 none; answers add up to as many again
+//! commons_invites = 3           # least invites a day new threads send (more with the square root of the week's agents), 0 none; answers add up to as many again
 //! commons_invite_tokens = 1000000  # what an invite pays for in its thread
+//! task_depth = 3                # generations of tasks below a lead, 2 by default (tasks' own start none); 0 no end
 //! unsandboxed = ["mcpx"]        # commands run outside agents' sandboxes
 //! default_permissions = "strict"   # the /permissions row a new lead starts in, auto by default
+//! browser_confirm = ["eval"]    # agent-browser actions the agent's gate approves; eval, download, upload and state by default
 //!
 //! [sonny.permissions.strict]    # a /permissions row of the person's own, as Codex's profiles
 //! description = "Offline, commits ask"
@@ -42,6 +44,7 @@
 //! network = false               # whether commands reach the network
 //! git = "read-only"             # "write" lets commits run without asking
 //! writable = ["~/.cargo"]       # folders it writes besides its own
+//! unix_sockets = ["~/.colima"]  # the only sockets, or their folders, its commands reach
 //! reviewer = "model"            # who approves anything more: model, you or none
 //!
 //! [sonny.mcp_servers.linear]    # an MCP server Sonny's agents reach
@@ -173,14 +176,26 @@ pub struct Sonny {
     /// Whether agents have the commons: its tool, skill and the roles'
     /// lines about it.
     pub commons: bool,
-    /// The invites a day new commons threads send before answers earn
-    /// more: each answered one adds one, up to as many again.
+    /// The least invites a day new commons threads send before answers
+    /// earn more, the square root of the week's agents when that is more:
+    /// each answered one adds one, up to as many again.
     pub commons_invites: u64,
     /// The tokens an invite pays for in its thread.
     pub commons_invite_tokens: u64,
+    /// How many generations below a lead its line goes: a lead's tasks
+    /// are the first, and an agent of the last starts none; 0 for no end.
+    pub task_depth: u64,
     /// What the lookout runs for news from outside, by name.
     pub sources: Vec<Source>,
+    /// The agent-browser action categories that the `browser` tool puts
+    /// to the agent's gate before they run.
+    pub browser_confirm: Vec<String>,
 }
+
+/// The agent-browser action categories its `browser` tool confirms unless
+/// the config says otherwise: agent-browser's own destructive ones, and
+/// saved state, which carries sign-ins.
+pub const BROWSER_CONFIRM: [&str; 4] = ["eval", "download", "upload", "state"];
 
 impl Default for Sonny {
     fn default() -> Self {
@@ -198,11 +213,13 @@ impl Default for Sonny {
             commons: true,
             commons_invites: 3,
             commons_invite_tokens: 1_000_000,
+            task_depth: 2,
             chime: true,
             verbose: false,
             start_at_boot: false,
             margin_opens: MarginOpens::default(),
             sources: Vec::new(),
+            browser_confirm: BROWSER_CONFIRM.map(str::to_owned).to_vec(),
         }
     }
 }
@@ -247,6 +264,9 @@ pub struct Permissions {
     pub git: Option<bool>,
     /// Folders, `~` for home, it writes besides its own.
     pub writable: Vec<String>,
+    /// Unix sockets, or folders of them, `~` for home, the only ones its
+    /// commands reach.
+    pub unix_sockets: Vec<String>,
     /// Who approves what leaves the sandbox.
     pub reviewer: Option<Reviewer>,
 }
@@ -578,8 +598,10 @@ fn parse(text: &str) -> Result<Config, String> {
                 "commons",
                 "commons_invites",
                 "commons_invite_tokens",
+                "task_depth",
                 "unsandboxed",
                 "default_permissions",
+                "browser_confirm",
             ],
             _ => return Err(format!("unknown table [{name}]")),
         };
@@ -640,11 +662,31 @@ fn parse(text: &str) -> Result<Config, String> {
             if let Some(count) = match key.as_str() {
                 "commons_invites" => Some(&mut config.sonny.commons_invites),
                 "commons_invite_tokens" => Some(&mut config.sonny.commons_invite_tokens),
+                "task_depth" => Some(&mut config.sonny.task_depth),
                 _ => None,
             } {
                 *count = (value.as_integer())
                     .and_then(|n| u64::try_from(n).ok())
                     .ok_or_else(|| format!("{name}.{key} must be a whole number, 0 or more"))?;
+                continue;
+            }
+            if (name.as_str(), key.as_str()) == ("sonny", "browser_confirm") {
+                let invalid =
+                    || format!("{name}.{key} must be a list of agent-browser action categories");
+                let categories = value.as_array().ok_or_else(invalid)?;
+                config.sonny.browser_confirm = categories
+                    .iter()
+                    .map(|category| match category.as_str() {
+                        Some(category)
+                            if !category.is_empty()
+                                && (category.bytes())
+                                    .all(|b| b.is_ascii_alphanumeric() || b":_-.".contains(&b)) =>
+                        {
+                            Ok(category.to_owned())
+                        }
+                        _ => Err(invalid()),
+                    })
+                    .collect::<Result<_, _>>()?;
                 continue;
             }
             if (name.as_str(), key.as_str()) == ("sonny", "unsandboxed") {
@@ -731,6 +773,7 @@ fn permissions(value: &toml::Value) -> Result<BTreeMap<String, Permissions>, Str
             network: None,
             git: None,
             writable: Vec::new(),
+            unix_sockets: Vec::new(),
             reviewer: None,
         };
         for (field, value) in fields {
@@ -764,14 +807,18 @@ fn permissions(value: &toml::Value) -> Result<BTreeMap<String, Permissions>, Str
                         }
                     })
                 }
-                "writable" => {
-                    let invalid = || format!("{} must be a list of folders", key(field));
-                    parsed.writable = (value.as_array().ok_or_else(invalid)?.iter())
-                        .map(|folder| match folder.as_str() {
-                            Some(folder) if !folder.trim().is_empty() => Ok(folder.to_owned()),
+                "writable" | "unix_sockets" => {
+                    let invalid = || format!("{} must be a list of paths", key(field));
+                    let paths = (value.as_array().ok_or_else(invalid)?.iter())
+                        .map(|path| match path.as_str() {
+                            Some(path) if !path.trim().is_empty() => Ok(path.to_owned()),
                             _ => Err(invalid()),
                         })
                         .collect::<Result<_, _>>()?;
+                    match field.as_str() {
+                        "writable" => parsed.writable = paths,
+                        _ => parsed.unix_sockets = paths,
+                    }
                 }
                 "reviewer" => {
                     parsed.reviewer = Some(match string(&key(field), value)?.as_str() {
@@ -789,11 +836,13 @@ fn permissions(value: &toml::Value) -> Result<BTreeMap<String, Permissions>, Str
                 _ => return Err(format!("unknown key {}", key(field))),
             }
         }
-        // A read-only sandbox has nothing to write and no network to reach.
+        // A read-only sandbox has nothing to write and no network or socket to
+        // reach.
         if parsed.extends == "read-only"
             && (parsed.network == Some(true)
                 || parsed.git == Some(true)
-                || !parsed.writable.is_empty())
+                || !parsed.writable.is_empty()
+                || !parsed.unix_sockets.is_empty())
         {
             return Err(format!(
                 "sonny.permissions.{name}: a read-only row writes nothing and reaches no network"
@@ -1055,8 +1104,30 @@ mod tests {
             (sonny.commons_invites, sonny.commons_invite_tokens),
             (0, 500)
         );
+        assert_eq!(config.sonny.browser_confirm, BROWSER_CONFIRM);
+        let browser =
+            parse("[sonny]\nbrowser_confirm = [\"eval\", \"plugin:vault:credential.read\"]");
+        assert_eq!(
+            browser.unwrap().sonny.browser_confirm,
+            ["eval", "plugin:vault:credential.read"]
+        );
+        assert!(
+            parse("[sonny]\nbrowser_confirm = []")
+                .unwrap()
+                .sonny
+                .browser_confirm
+                .is_empty()
+        );
+        assert!(parse("[sonny]\nbrowser_confirm = [\"eval,upload\"]").is_err());
+        assert!(parse("[sonny]\nbrowser_confirm = \"eval\"").is_err());
         assert!(parse("[sonny]\ncommons_invites = -1").is_err());
         assert!(parse("[sonny]\ncommons_invites = \"3\"").is_err());
+        assert_eq!(config.sonny.task_depth, 2);
+        assert_eq!(
+            parse("[sonny]\ntask_depth = 0").unwrap().sonny.task_depth,
+            0
+        );
+        assert!(parse("[sonny]\ntask_depth = -1").is_err());
         assert_eq!(
             parse("[sonny]\nsuggest = \"no\"").unwrap_err(),
             "sonny.suggest must be true or false"
@@ -1125,7 +1196,7 @@ mod tests {
     #[test]
     fn permissions_rows_extend_sonny_s_own() {
         let config = parse(
-            "[sonny]\ndefault_permissions = \"strict\"\n\n[sonny.permissions.strict]\ndescription = \"Offline\"\nnetwork = false\ngit = \"read-only\"\nwritable = [\"~/.cargo\"]\n\n[sonny.permissions.night]\nextends = \"ask\"\nreviewer = \"none\"\n",
+            "[sonny]\ndefault_permissions = \"strict\"\n\n[sonny.permissions.strict]\ndescription = \"Offline\"\nnetwork = false\ngit = \"read-only\"\nwritable = [\"~/.cargo\"]\nunix_sockets = [\"~/.docker/run\"]\n\n[sonny.permissions.night]\nextends = \"ask\"\nreviewer = \"none\"\n",
         )
         .unwrap();
         assert_eq!(config.sonny.default_permissions.as_deref(), Some("strict"));
@@ -1135,6 +1206,7 @@ mod tests {
             ("auto", Some(false), Some(false))
         );
         assert_eq!(strict.writable, ["~/.cargo"]);
+        assert_eq!(strict.unix_sockets, ["~/.docker/run"]);
         assert_eq!(strict.reviewer, None);
         let night = &config.sonny.permissions["night"];
         assert_eq!(

@@ -243,9 +243,10 @@ class ApprovalTests(ModelFixture):
         daemon = SocketClient(self.binary, self.path / 'state.sqlite', self.url, 'echo,shell',
                               settings={'sandbox': 'workspace-write'})
         self.addCleanup(daemon.close)
-        # Bob's own tool a client answers, gated as a whole, which it passes on.
+        # Bob's own tool a client answers, gated as a whole, which it passes on
+        # two generations down.
         run = {'name': 'run', 'description': 'Run.', 'parameters': {'type': 'object'}, 'answered_by': 'client'}
-        daemon.request('create', bot='Bob', workspace=str(self.path), declare=[run])
+        daemon.request('create', bot='Bob', workspace=str(self.path), declare=[dict(run, inherit=2)])
         daemon.request('create', bot='Alice', workspace=str(outside), settings={})
         # Another sandboxed bot, whose own socket is open once it has run a
         # command.
@@ -278,15 +279,22 @@ class ApprovalTests(ModelFixture):
             dict(op='fork', source='Src', bot='Twin', request_id='twin'),
             dict(op='delete', bot='Src'),
             dict(op='fork', source='Src', bot='Twin', request_id='twin'),
-            dict(child, bot='Runner', workspace=str(self.path / 'kid'), declare=[run]),
+            dict(child, bot='Runner', workspace=str(self.path / 'kid'), declare=[dict(run, inherit=1)]),
+            dict(child, bot='Deeper', workspace=str(self.path / 'kid'), declare=[dict(run, inherit=2)]),
+            dict(child, bot='Endless', workspace=str(self.path / 'kid'), declare=[run]),
             dict(child, bot='Stepper', workspace=str(self.path / 'kid'), declare=[dict(run, steps=True)]),
             dict(op='resume'),
         ]
         (self.path / 'requests.json').write_text(json.dumps(requests))
         (self.path / 'probe.py').write_text(
             'import json, os, socket, sys\n'
+            'def connect(path):\n'
+            '    if path == os.environ["AGENT_SOCKET"] and "AGENT_SOCKET_FD" in os.environ:\n'
+            '        asked = socket.socket(fileno=int(os.environ["AGENT_SOCKET_FD"])); asked.send(b"?")\n'
+            '        return socket.socket(fileno=socket.recv_fds(asked, 1, 1)[1][0])\n'
+            '    s = socket.socket(socket.AF_UNIX); s.connect(path); return s\n'
             'def ask(path, requests):\n'
-            '    s = socket.socket(socket.AF_UNIX); s.connect(path); f = s.makefile("rw")\n'
+            '    s = connect(path); f = s.makefile("rw")\n'
             '    f.readline()\n'
             '    out = []\n'
             '    for i, request in enumerate(requests):\n'
@@ -308,7 +316,8 @@ class ApprovalTests(ModelFixture):
                               prompt=f'shell:python3 probe.py {daemon.socket_path} {carl}')['result']['turn']
         self.assertEqual(daemon.finished(turn)['data']['status'], 'completed')
         probed = json.loads(self.tool_output(daemon, 'shell-1')[1]['stdout'])
-        # On Linux its own socket is in the daemon's socket's place.
+        # On Linux its own socket is in the daemon's socket's place, reached
+        # by the connections the daemon hands it, as it makes no socket.
         if sys.platform == 'linux':
             self.assertEqual(probed['own'], str(daemon.socket_path))
         # No bot can put its own listener in place of another's.
@@ -316,11 +325,14 @@ class ApprovalTests(ModelFixture):
         # Nor reach another bot's, which would answer as that bot.
         self.assertFalse(probed['borrowed'])
         (bots, configure, answer, shutdown, kid, out, liar, delete_alice, delete_kid, copy,
-         ask, hand, tooled, away, again, src, twin, delete_src, twin_again, runner, stepper, resume) = probed['answers']
+         ask, hand, tooled, away, again, src, twin, delete_src, twin_again, runner, deeper, endless, stepper,
+         resume) = probed['answers']
         self.assertIn('Bob', [bot['name'] for bot in bots['result']['bots']])
-        # Passed on as it has it, not as a tool whose steps alone are gated.
+        # Passed on as it has it, not as a tool whose steps alone are gated,
+        # and no further down than it goes.
         self.assertIn('result', runner)
-        for refused in (configure, answer, shutdown, out, liar, delete_alice, copy, hand, tooled, away, stepper, resume):
+        for refused in (configure, answer, shutdown, out, liar, delete_alice, copy, hand, tooled, away, deeper,
+                        endless, stepper, resume):
             self.assertEqual(refused['error'], 'not_permitted', refused)
         # What it makes is its own and no less sandboxed.
         self.assertEqual((kid['result']['created_by'], kid['result']['settings']['sandbox']),
@@ -349,15 +361,18 @@ class ApprovalTests(ModelFixture):
         self.addCleanup(shutil.rmtree, outside)
         client = self.client('shell', settings={'sandbox': 'workspace-write'})
         client.request('create', bot='Bob', workspace=str(self.path))
-        calls = [['shell', {'command': 'sleep .6; touch a'}],
-                 ['shell', {'command': f'sleep .6; touch b; touch {outside}/x'}],
+        # Each command marks that it runs, then finishes only if it sees the
+        # other's mark within 10 s: run one after the other, neither would.
+        def meets(mine, theirs):
+            return (f'touch {mine}.on; i=0; until [ -e {theirs}.on ] || [ $i -ge 200 ]; do sleep .05; i=$((i+1)); done; '
+                    f'[ -e {theirs}.on ] && touch {mine}')
+        calls = [['shell', {'command': meets('a', 'b')}],
+                 ['shell', {'command': f'{meets("b", "a")}; touch {outside}/x'}],
                  ['shell', {'command': f'touch {outside}/escaped', 'sandbox_permissions': 'require_escalated'}]]
-        started = time.monotonic()
         turn = client.request('submit', bot='Bob', request_id='t',
                               prompt='calls:' + json.dumps(calls))['result']['turn']
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
         # The two confined commands ran at once, each in the sandbox.
-        self.assertLess(time.monotonic() - started, 1.1)
         self.assertTrue((self.path / 'a').exists() and (self.path / 'b').exists())
         self.assertNotEqual(self.tool_output(client, 'shell-2')[1]['exit_code'], 0)
         # The one that asks to leave it still runs alone, and is refused.

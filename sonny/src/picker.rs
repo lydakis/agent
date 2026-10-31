@@ -1,7 +1,7 @@
 //! A list picked with the arrow keys, drawn in place under the lines
 //! before it, as Codex and Claude Code ask their first-run questions:
-//! Enter takes the marked row, typing narrows the rows, Esc or Ctrl+C
-//! cancels. Once picked, the list folds into one line naming the pick.
+//! Enter takes the marked row, typing narrows the rows as every list
+//! does ([`crate::fuzzy`]), Esc or Ctrl+C cancels. Once picked, the list folds into one line naming the pick.
 use ratatui::crossterm::{
     event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     terminal::{disable_raw_mode, enable_raw_mode},
@@ -56,6 +56,7 @@ pub fn pick(title: &str, rows: &[Row], marked: usize, typed: bool) -> Result<Pic
         filter: String::new(),
         marked,
         top: 0,
+        typed,
     };
     enable_raw_mode().map_err(|e| e.to_string())?;
     let mut drawn = 0;
@@ -93,6 +94,7 @@ pub fn pick_many(title: &str, rows: &[Row], mut ticked: Vec<bool>) -> Result<Vec
         filter: String::new(),
         marked: 0,
         top: 0,
+        typed: false,
     };
     let shown = |ticked: &[bool]| -> Vec<Row> {
         (rows.iter().zip(ticked))
@@ -158,17 +160,25 @@ struct List {
     marked: usize,
     /// The first of those shown that is drawn.
     top: usize,
+    /// What is typed can be the answer, so only rows that hold it as typed
+    /// are shown: a new name is not taken for a row that only has its
+    /// letters scattered in order.
+    typed: bool,
 }
 
 impl List {
+    /// The rows the filter leaves, best first, by their label or detail.
     fn shown(&self, rows: &[Row]) -> Vec<usize> {
-        let filter = self.filter.to_lowercase();
-        (0..rows.len())
-            .filter(|&index| {
-                let row = &rows[index];
-                row.label.to_lowercase().contains(&filter)
-                    || row.detail.to_lowercase().contains(&filter)
-            })
+        use crate::fuzzy::{Tier, better, find, order};
+        let found = (rows.iter()).map(|row| {
+            better(
+                find(&row.label, &self.filter),
+                find(&row.detail, &self.filter),
+            )
+        });
+        (order(found, |_| 0.0).into_iter())
+            .filter(|(_, found)| !self.typed || found.tier != Tier::Letters || found.together())
+            .map(|(index, _)| index)
             .collect()
     }
 
@@ -347,6 +357,7 @@ mod tests {
             filter: String::new(),
             marked: 0,
             top: 0,
+            typed: false,
         };
         assert_eq!(list.key(KeyCode::Down, none, &rows, false), None);
         assert_eq!(list.key(KeyCode::Down, none, &rows, false), None);
