@@ -25,6 +25,7 @@ pub fn install_own() {
         remove("commons");
     }
     install("sonny-setup", crate::setup::SKILL);
+    install("sonny-config", &crate::config::skill());
     // A job reaches the daemon the way every agent Sonny runs does.
     let automation = include_str!("../skills/automation/SKILL.md");
     install("automation", &agent_client::policy::with_cli(automation));

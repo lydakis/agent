@@ -1588,10 +1588,14 @@ pub fn on_store(places: &Places, store_id: &str) -> Vec<(Value, Vec<String>)> {
                 row["missed"] = json!(true);
             }
             let mut bots = vec![t.bot().to_owned()];
+            // Whose it is, as an ended one's row says too: its failures
+            // are told to them.
             if let Target::Start {
-                by: Some((by, _)), ..
+                by: Some((by, by_id)),
+                ..
             } = &t.target
             {
+                (row["by"], row["by_id"]) = (json!(by), json!(by_id));
                 bots.push(by.clone());
             }
             if let Some((to, _)) = &t.reply_to {
@@ -3033,10 +3037,11 @@ fn write_row(places: &Places, trigger: &Trigger, last: &Value, kept: &Kept) -> R
     // agent that added it to start its own.
     row["store_id"] = json!(trigger.store_id);
     if let Target::Start {
-        by: Some((by, _)), ..
+        by: Some((by, by_id)),
+        ..
     } = &trigger.target
     {
-        row["by"] = json!(by);
+        (row["by"], row["by_id"]) = (json!(by), json!(by_id));
     }
     row["head"] = json!(kept.seen.head);
     row["seen_at"] = json!(kept.seen.at);
@@ -3388,6 +3393,78 @@ async fn missed(client: &Client, trigger: &Trigger, (bot, id): (&str, i64), outc
                 "delivery": "attach", "origin": "trigger"}),
         )
         .await;
+}
+
+/// The generation of the trigger whose fire sent a turn with `request_id`:
+/// a fire's own, not the answer it passes on (`reply.`), a missed fire's
+/// note (`missed.`), nor one whose answer goes to `--reply-to` (`.to.`),
+/// which that answer tells of.
+pub fn fire_generation(request_id: &str) -> Option<&str> {
+    let (generation, rest) = request_id.strip_prefix("trigger_")?.split_once('_')?;
+    let own = !rest.contains(".to.")
+        && !["reply.", "missed.", "failed."]
+            .iter()
+            .any(|note| rest.starts_with(note));
+    own.then_some(generation)
+}
+
+/// A fire's turn on `bot` that failed (`error`), told to the agent that
+/// added the trigger to start `bot`, else to `bot` itself, as a fire that
+/// sent nothing is told: the note it reads in its next model call, without
+/// starting a turn. The trigger's row, which the daemon at `store_id`
+/// keeps, names it. Its request id is the turn's own, so it is told once.
+pub async fn tell_failed(
+    client: &Client,
+    store_id: &str,
+    generation: &str,
+    (bot, bot_id, turn): (&str, Option<i64>, i64),
+    error: &str,
+) -> agent_client::Result<()> {
+    let places = Places::home().ok();
+    let (to, to_id, prompt) = failed_note(
+        places.as_ref(),
+        store_id,
+        generation,
+        (bot, bot_id, turn),
+        error,
+    );
+    let mut submit = json!({"bot": to,
+        "request_id": format!("trigger_{generation}_failed.{bot}.{turn}"),
+        "prompt": prompt, "delivery": "attach", "origin": "trigger"});
+    // By its id too, as every delivery of a trigger's: a name used again
+    // is not who it was for.
+    if let Some(id) = to_id {
+        submit["bot_id"] = json!(id);
+    }
+    client.request("submit", submit).await.map(drop)
+}
+
+/// Who is told of a fire's failed turn, by name and id when known, and the
+/// note: the agent that made the trigger, else the one the fire sent.
+fn failed_note(
+    places: Option<&Places>,
+    store_id: &str,
+    generation: &str,
+    (bot, bot_id, turn): (&str, Option<i64>, i64),
+    error: &str,
+) -> (String, Option<i64>, String) {
+    let row = places.and_then(|places| {
+        on_store(places, store_id)
+            .into_iter()
+            .map(|(row, _)| row)
+            .find(|row| row["generation"] == generation)
+    });
+    let name = (row.as_ref()).and_then(|row| row["name"].as_str());
+    let (to, to_id) = match (row.as_ref()).and_then(|row| Some((row["by"].as_str()?, row))) {
+        Some((by, row)) => (by, row["by_id"].as_i64()),
+        None => (bot, bot_id),
+    };
+    let prompt = format!(
+        "[trigger {} · {} · turn {turn} it sent {bot} failed: {error}]",
+        name.unwrap_or("(ended)"),
+        stamp(now())
+    );
+    (to.to_owned(), to_id, prompt)
 }
 
 /// A fire's request id, which says its trigger sent it (`sent_by`). A fire
@@ -3872,6 +3949,89 @@ pub(crate) async fn connect(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_failed_fires_turn_is_a_note_for_its_agent() {
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = asked.clone();
+        let client = crate::tests::daemon_answering(move |request| {
+            seen.lock().unwrap().push(request.clone());
+            json!({})
+        })
+        .await;
+        tell_failed(
+            &client,
+            "no-such-store",
+            "1-2",
+            ("calc.lead", Some(5), 4),
+            "provider_error",
+        )
+        .await
+        .unwrap();
+        let submit = asked.lock().unwrap()[0].clone();
+        assert_eq!(submit["bot"], "calc.lead");
+        assert_eq!(submit["bot_id"], 5);
+        assert_eq!(submit["delivery"], "attach");
+        assert_eq!(submit["origin"], "trigger");
+        assert_eq!(submit["request_id"], "trigger_1-2_failed.calc.lead.4");
+        let prompt = submit["prompt"].as_str().unwrap();
+        assert!(prompt.starts_with("[trigger (ended) · "), "{prompt}");
+        assert!(prompt.ends_with(" · turn 4 it sent calc.lead failed: provider_error]"));
+    }
+
+    #[test]
+    fn a_failed_fires_turn_is_told_to_whoever_made_its_installed_trigger() {
+        let w = World::new("failed-note");
+        let started = Trigger {
+            name: "p.digest".into(),
+            target: Target::Start {
+                name: "p.digest".into(),
+                model: "openai/gpt".into(),
+                effort: None,
+                by: Some(("p.lead".into(), 7)),
+            },
+            ..trigger()
+        };
+        w.install(&started).unwrap();
+        let (to, to_id, prompt) = failed_note(
+            Some(&w.places),
+            &started.store_id,
+            &started.generation,
+            ("p.digest", Some(12), 3),
+            "provider_error",
+        );
+        assert_eq!((to.as_str(), to_id), ("p.lead", Some(7)));
+        assert!(prompt.starts_with("[trigger p.digest · "), "{prompt}");
+        // One no agent made, or no longer found: the agent the fire sent.
+        let (to, to_id, prompt) = failed_note(
+            Some(&w.places),
+            &started.store_id,
+            "9-9",
+            ("p.fix-login", Some(12), 3),
+            "provider_error",
+        );
+        assert_eq!((to.as_str(), to_id), ("p.fix-login", Some(12)));
+        assert!(prompt.starts_with("[trigger (ended) · "), "{prompt}");
+    }
+
+    #[test]
+    fn a_fires_own_turn_names_its_trigger_by_generation() {
+        assert_eq!(
+            fire_generation("trigger_123-456_7.1700.42.0"),
+            Some("123-456")
+        );
+        assert_eq!(fire_generation("trigger_123-456_7.every"), Some("123-456"));
+        // Not the fire's own: its answer passed on, notes, `--reply-to`'s.
+        for id in [
+            "trigger_123-456_reply.9.4",
+            "trigger_123-456_missed.7.1.2.3",
+            "trigger_123-456_failed.calc.lead.4",
+            "trigger_123-456_7.1700.42.0.to.9",
+            "tui-123",
+        ] {
+            assert_eq!(fire_generation(id), None, "{id}");
+        }
+    }
     use std::cell::RefCell;
 
     /// A time on a known local clock.
@@ -4465,6 +4625,7 @@ mod tests {
             ]
         );
         assert_eq!(found[1].0["when"], "every 30m");
+        assert_eq!(found[0].0["by"], "p.lead");
     }
 
     #[test]

@@ -6,6 +6,10 @@
 //!
 //! The full screen selects text with the mouse, as Codex's composer does:
 //! typing replaces the selection, and the deletions take it out.
+use ratatui::{
+    style::{Color, Modifier, Style},
+    text::Span,
+};
 use std::ops::{Deref, Range};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -451,9 +455,335 @@ fn words(line: &str) -> impl Iterator<Item = &str> {
     })
 }
 
+/// How the composer draws what is typed: Markdown's marks kept and dim,
+/// what they mark styled as the conversation draws it (bold, italic,
+/// struck, `code` in code's colour, a `#` line as a heading), so the
+/// person sees what they will send and sends the plain text they typed.
+/// Each styled piece as a byte range; the rest is plain. A slash command
+/// and a `!` command are not Markdown.
+pub fn marks(text: &str) -> Vec<(Range<usize>, Style)> {
+    let mut marked = Vec::new();
+    if text.starts_with('/') || text.starts_with('!') {
+        return marked;
+    }
+    let mut start = 0;
+    for line in text.split('\n') {
+        let (lead, base) = opening(line);
+        if lead > 0 {
+            marked.push((start..start + lead, dim()));
+        }
+        inline(line, lead, start, base, &mut marked);
+        start += line.len() + 1;
+    }
+    marked
+}
+
+/// A line's block mark, as the conversation draws it, and the style of
+/// what follows: a heading's `#`s (bold), a quote's `>` (italic), a
+/// list's `-`, `*`, `+` or number; none, plain.
+fn opening(line: &str) -> (usize, Style) {
+    let hashes = line.len() - line.trim_start_matches('#').len();
+    if (1..=6).contains(&hashes) && line[hashes..].starts_with(' ') {
+        return (hashes + 1, Style::new().add_modifier(Modifier::BOLD));
+    }
+    let indent = line.len() - line.trim_start().len();
+    let rest = &line[indent..];
+    if rest.starts_with("> ") {
+        return (indent + 2, Style::new().add_modifier(Modifier::ITALIC));
+    }
+    if ["- ", "* ", "+ "]
+        .iter()
+        .any(|bullet| rest.starts_with(bullet))
+    {
+        return (indent + 2, Style::new());
+    }
+    let digits = rest.len() - rest.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+    match (1..=3).contains(&digits) && rest[digits..].starts_with(". ") {
+        true => (indent + digits + 2, Style::new()),
+        false => (0, Style::new()),
+    }
+}
+
+fn dim() -> Style {
+    Style::new().add_modifier(Modifier::DIM)
+}
+
+/// A link starting at `at` in `line`, as `transcript::inline` takes one:
+/// its label's length and the link's.
+fn link(line: &str, at: usize, next: &mut Next) -> Option<(usize, usize)> {
+    if !line[at..].starts_with('[') {
+        return None;
+    }
+    let close = next.find(line, "](", at + 1)?;
+    let end = next.find(line, ")", close + 2)? + 1;
+    // No `[` in the label, no space in the URL, neither empty.
+    let bracket = next.find(line, "[", at + 1).unwrap_or(usize::MAX);
+    let space = next.find(line, " ", close + 2).unwrap_or(usize::MAX);
+    (close > at + 1 && end > close + 3 && bracket > close && space >= end)
+        .then_some((close - at - 1, end - at))
+}
+
+/// Where each mark is next found on a line, from where a search starts:
+/// searches from later and later on one line read it once, not once per
+/// mark that opens on it.
+#[derive(Default)]
+struct Next(Vec<(&'static str, Option<usize>)>);
+
+impl Next {
+    fn find(&mut self, line: &str, needle: &'static str, from: usize) -> Option<usize> {
+        let known = self.0.iter_mut().find(|(n, _)| *n == needle);
+        match known.as_deref() {
+            // Not on the rest of the line: nor on any later part of it.
+            Some((_, None)) => return None,
+            Some((_, Some(found))) if *found >= from => return Some(*found),
+            _ => {}
+        }
+        let found = (line.get(from..)?.find(needle)).map(|i| from + i);
+        match known {
+            Some(entry) => entry.1 = found,
+            None => self.0.push((needle, found)),
+        }
+        found
+    }
+}
+
+/// The inline marks of `line` from `from`, at `offset` in the text, over
+/// `base`: as `transcript::inline` reads them, a mark closed on its line.
+fn inline(
+    line: &str,
+    from: usize,
+    offset: usize,
+    base: Style,
+    marked: &mut Vec<(Range<usize>, Style)>,
+) {
+    let pairs: [(&str, Style, bool); 6] = [
+        ("`", base.fg(Color::Cyan), false),
+        ("**", base.add_modifier(Modifier::BOLD), true),
+        ("__", base.add_modifier(Modifier::BOLD), true),
+        ("~~", base.add_modifier(Modifier::CROSSED_OUT), true),
+        ("*", base.add_modifier(Modifier::ITALIC), true),
+        ("_", base.add_modifier(Modifier::ITALIC), true),
+    ];
+    let mut at = from;
+    let mut plain = from;
+    let mut next = Next::default();
+    while at < line.len() {
+        let rest = &line[at..];
+        let found = pairs.iter().find_map(|(mark, style, nested)| {
+            let after = rest.strip_prefix(mark)?;
+            // `_` and `*` mark emphasis only around a word, not in
+            // snake_case or 2*3*4.
+            if matches!(*mark, "*" | "_")
+                && (after.starts_with(' ')
+                    || line[..at].chars().last().is_some_and(char::is_alphanumeric))
+            {
+                return None;
+            }
+            let end = next.find(line, mark, at + mark.len())? - (at + mark.len());
+            (end > 0).then_some((mark.len(), end, *style, *nested))
+        });
+        // A link, `[label](url)`: its label underlined, the rest dim.
+        if found.is_none()
+            && let Some((label, end)) = link(line, at, &mut next)
+        {
+            if plain < at && base != Style::new() {
+                marked.push((offset + plain..offset + at, base));
+            }
+            marked.push((offset + at..offset + at + 1, dim()));
+            inline(
+                &line[..at + 1 + label],
+                at + 1,
+                offset,
+                base.underlined(),
+                marked,
+            );
+            marked.push((offset + at + 1 + label..offset + at + end, dim()));
+            at += end;
+            plain = at;
+            continue;
+        }
+        let Some((mark, end, style, nested)) = found else {
+            at += rest.chars().next().map_or(1, char::len_utf8);
+            continue;
+        };
+        if plain < at && base != Style::new() {
+            marked.push((offset + plain..offset + at, base));
+        }
+        let (inner, close) = (at + mark, at + mark + end);
+        marked.push((offset + at..offset + inner, dim()));
+        match nested {
+            true => inline(&line[..close], inner, offset, style, marked),
+            false => marked.push((offset + inner..offset + close, style)),
+        }
+        marked.push((offset + close..offset + close + mark, dim()));
+        at = close + mark;
+        plain = at;
+    }
+    if plain < line.len() && base != Style::new() {
+        marked.push((offset + plain..offset + line.len(), base));
+    }
+}
+
+/// The text `range` of `text` as spans, styled where `marked` says, and
+/// reversed where it is `selected`.
+pub fn spans(
+    text: &str,
+    range: Range<usize>,
+    marked: &[(Range<usize>, Style)],
+    selected: Option<&Range<usize>>,
+) -> Vec<Span<'static>> {
+    // The marks on this row alone, in their order: a later one is laid
+    // over an earlier.
+    let marked: Vec<_> = (marked.iter())
+        .filter(|(piece, _)| piece.start < range.end && range.start < piece.end)
+        .collect();
+    let mut cuts = vec![range.start, range.end];
+    for (piece, _) in &marked {
+        cuts.extend([piece.start, piece.end]);
+    }
+    if let Some(selected) = selected {
+        cuts.extend([selected.start, selected.end]);
+    }
+    cuts.retain(|cut| range.contains(cut) || *cut == range.end);
+    cuts.sort_unstable();
+    cuts.dedup();
+    (cuts.windows(2))
+        .map(|cut| {
+            let (from, to) = (cut[0], cut[1]);
+            let mut style = (marked.iter())
+                .filter(|(piece, _)| piece.start <= from && to <= piece.end)
+                .map(|(_, style)| *style)
+                .next_back()
+                .unwrap_or_default();
+            if selected.is_some_and(|s| s.start <= from && to <= s.end) {
+                style = style.add_modifier(Modifier::REVERSED);
+            }
+            Span::styled(text[from..to].to_owned(), style)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Each styled piece of `text` as (its text, bold, italic, dim, cyan).
+    fn styled(text: &str) -> Vec<(&str, bool, bool, bool, bool)> {
+        marks(text)
+            .into_iter()
+            .map(|(range, style)| {
+                let has = |m| style.add_modifier.contains(m);
+                (
+                    &text[range],
+                    has(Modifier::BOLD),
+                    has(Modifier::ITALIC),
+                    has(Modifier::DIM),
+                    style.fg == Some(Color::Cyan),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn markdown_marks_stay_dim_and_what_they_mark_is_styled() {
+        assert_eq!(
+            styled("a **b** `c`"),
+            [
+                ("**", false, false, true, false),
+                ("b", true, false, false, false),
+                ("**", false, false, true, false),
+                ("`", false, false, true, false),
+                ("c", false, false, false, true),
+                ("`", false, false, true, false),
+            ]
+        );
+        // A heading: its marks dim, the rest bold, emphasis inside it too.
+        assert_eq!(
+            styled("## Hi *there*"),
+            [
+                ("## ", false, false, true, false),
+                ("Hi ", true, false, false, false),
+                ("*", false, false, true, false),
+                ("there", true, true, false, false),
+                ("*", false, false, true, false),
+            ]
+        );
+        // Not yet closed, snake_case, 2*3*4, code's insides, a command.
+        assert!(styled("**bold so far").is_empty());
+        assert!(styled("snake_case_name and 2*3*4").is_empty());
+        assert_eq!(styled("`a*b*c`")[1], ("a*b*c", false, false, false, true));
+        assert!(styled("/model **x**").is_empty());
+        assert!(styled("!ls `x`").is_empty());
+        // Each line on its own: a mark never closes on the next.
+        assert!(styled("a *b\nc* d").is_empty());
+        // A list's mark and a quote's are dim, a quote italic; a link's
+        // label underlined.
+        assert_eq!(
+            styled("- a\n  12. b\n> c"),
+            [
+                ("- ", false, false, true, false),
+                ("  12. ", false, false, true, false),
+                ("> ", false, false, true, false),
+                ("c", false, true, false, false),
+            ]
+        );
+        let link = marks("see [the docs](https://x.io) now");
+        let pieces: Vec<(&str, bool, bool)> = (link.iter())
+            .map(|(range, style)| {
+                let has = |m| style.add_modifier.contains(m);
+                (
+                    &"see [the docs](https://x.io) now"[range.clone()],
+                    has(Modifier::UNDERLINED),
+                    has(Modifier::DIM),
+                )
+            })
+            .collect();
+        assert_eq!(
+            pieces,
+            [
+                ("[", false, true),
+                ("the docs", true, false),
+                ("](https://x.io)", false, true),
+            ]
+        );
+        assert!(styled("a [b] (c) and [](x) and [d](e f) and [g]()").is_empty());
+        assert_eq!(styled("[a [b](c) d")[1].0, "b");
+        // A long line of marks that never close is read once, not once per
+        // mark: a paste of them stays quick to draw.
+        let long = format!("`*{}", "[x] (y) ".repeat(40_000));
+        let started = std::time::Instant::now();
+        assert!(marks(&long).is_empty());
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn a_row_is_cut_where_its_styles_and_the_selection_change() {
+        let text = "a **b** c";
+        let marked = marks(text);
+        let spans = spans(text, 0..text.len(), &marked, Some(&(5..9)));
+        let shown: Vec<(&str, bool)> = (spans.iter())
+            .map(|s| {
+                (
+                    s.content.as_ref(),
+                    s.style.add_modifier.contains(Modifier::REVERSED),
+                )
+            })
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                ("a ", false),
+                ("**", false),
+                ("b", false),
+                ("**", true),
+                (" c", true)
+            ]
+        );
+        // A row that starts inside a marked word keeps its style.
+        let spans = super::spans(text, 5..9, &marked, None);
+        assert_eq!(spans[0].content, "**");
+        assert!(spans[0].style.add_modifier.contains(Modifier::DIM));
+    }
 
     fn typed(text: &str) -> Prompt {
         let mut prompt = Prompt::default();
