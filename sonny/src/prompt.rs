@@ -468,22 +468,54 @@ pub fn marks(text: &str) -> Vec<(Range<usize>, Style)> {
     }
     let mut start = 0;
     for line in text.split('\n') {
-        let hashes = line.len() - line.trim_start_matches('#').len();
-        match (1..=6).contains(&hashes) && line[hashes..].starts_with(' ') {
-            true => {
-                let heading = Style::new().add_modifier(Modifier::BOLD);
-                marked.push((start..start + hashes + 1, dim()));
-                inline(line, hashes + 1, start, heading, &mut marked);
-            }
-            false => inline(line, 0, start, Style::new(), &mut marked),
+        let (lead, base) = opening(line);
+        if lead > 0 {
+            marked.push((start..start + lead, dim()));
         }
+        inline(line, lead, start, base, &mut marked);
         start += line.len() + 1;
     }
     marked
 }
 
+/// A line's block mark, as the conversation draws it, and the style of
+/// what follows: a heading's `#`s (bold), a quote's `>` (italic), a
+/// list's `-`, `*`, `+` or number; none, plain.
+fn opening(line: &str) -> (usize, Style) {
+    let hashes = line.len() - line.trim_start_matches('#').len();
+    if (1..=6).contains(&hashes) && line[hashes..].starts_with(' ') {
+        return (hashes + 1, Style::new().add_modifier(Modifier::BOLD));
+    }
+    let indent = line.len() - line.trim_start().len();
+    let rest = &line[indent..];
+    if rest.starts_with("> ") {
+        return (indent + 2, Style::new().add_modifier(Modifier::ITALIC));
+    }
+    if ["- ", "* ", "+ "]
+        .iter()
+        .any(|bullet| rest.starts_with(bullet))
+    {
+        return (indent + 2, Style::new());
+    }
+    let digits = rest.len() - rest.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+    match (1..=3).contains(&digits) && rest[digits..].starts_with(". ") {
+        true => (indent + digits + 2, Style::new()),
+        false => (0, Style::new()),
+    }
+}
+
 fn dim() -> Style {
     Style::new().add_modifier(Modifier::DIM)
+}
+
+/// A link at the start of `rest`, as `transcript::inline` takes one: its
+/// label's length and where the link ends.
+fn link(rest: &str) -> Option<(usize, usize)> {
+    let close = rest.strip_prefix('[')?.find("](")? + 1;
+    let end = rest[close + 2..].find(')')? + close + 3;
+    let (label, url) = (&rest[1..close], &rest[close + 2..end - 1]);
+    (!label.is_empty() && !label.contains('[') && !url.is_empty() && !url.contains(' '))
+        .then_some((label.len(), end))
 }
 
 /// The inline marks of `line` from `from`, at `offset` in the text, over
@@ -520,6 +552,26 @@ fn inline(
             let end = after.find(mark)?;
             (end > 0).then_some((mark.len(), end, *style, *nested))
         });
+        // A link, `[label](url)`: its label underlined, the rest dim.
+        if found.is_none()
+            && let Some((label, end)) = link(rest)
+        {
+            if plain < at && base != Style::new() {
+                marked.push((offset + plain..offset + at, base));
+            }
+            marked.push((offset + at..offset + at + 1, dim()));
+            inline(
+                &line[..at + 1 + label],
+                at + 1,
+                offset,
+                base.underlined(),
+                marked,
+            );
+            marked.push((offset + at + 1 + label..offset + at + end, dim()));
+            at += end;
+            plain = at;
+            continue;
+        }
         let Some((mark, end, style, nested)) = found else {
             at += rest.chars().next().map_or(1, char::len_utf8);
             continue;
@@ -634,6 +686,37 @@ mod tests {
         assert!(styled("!ls `x`").is_empty());
         // Each line on its own: a mark never closes on the next.
         assert!(styled("a *b\nc* d").is_empty());
+        // A list's mark and a quote's are dim, a quote italic; a link's
+        // label underlined.
+        assert_eq!(
+            styled("- a\n  12. b\n> c"),
+            [
+                ("- ", false, false, true, false),
+                ("  12. ", false, false, true, false),
+                ("> ", false, false, true, false),
+                ("c", false, true, false, false),
+            ]
+        );
+        let link = marks("see [the docs](https://x.io) now");
+        let pieces: Vec<(&str, bool, bool)> = (link.iter())
+            .map(|(range, style)| {
+                let has = |m| style.add_modifier.contains(m);
+                (
+                    &"see [the docs](https://x.io) now"[range.clone()],
+                    has(Modifier::UNDERLINED),
+                    has(Modifier::DIM),
+                )
+            })
+            .collect();
+        assert_eq!(
+            pieces,
+            [
+                ("[", false, true),
+                ("the docs", true, false),
+                ("](https://x.io)", false, true),
+            ]
+        );
+        assert!(styled("a [b] (c) and [](x) and [d](e f)").is_empty());
     }
 
     #[test]

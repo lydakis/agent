@@ -7435,11 +7435,8 @@ impl App {
             ("tab", "with nothing typed, keys to the pane"),
             ("ctrl+\\", "keys to the pane and back"),
             ("ctrl+[ ctrl+]", "hide the pane, show it again"),
-            ("ctrl+g", "the agent in the pane to the main view"),
-            (
-                "alt+t",
-                "think harder for the next message; again for the most",
-            ),
+            ("ctrl+g", "open the pane's agent in the main view"),
+            ("alt+t", "boost the next message; again for more"),
             ("ctrl+v", "paste a picture"),
             ("ctrl+c", "copy the selection, clear, or quit"),
             ("ctrl+l", "draw the screen again"),
@@ -10068,7 +10065,20 @@ impl App {
         // The branch in green, as shells show it; the agent's name in the
         // agents' color.
         let at = left.width() + place.width() + branch.width() + fill;
-        let mut spans = vec![Span::raw(left), Span::raw(place)];
+        // An armed boost in the text's own weight, not muted: what the
+        // next message will take, said without a hue.
+        let mut spans = match (self.boost.as_ref()).and_then(|boost| {
+            let armed = format!(" ↑{boost}");
+            Some((left.find(&armed)?, armed.len()))
+        }) {
+            Some((from, len)) => vec![
+                Span::raw(left[..from].to_owned()),
+                Span::raw(left[from..from + len].to_owned()).not_dim(),
+                Span::raw(left[from + len..].to_owned()),
+            ],
+            None => vec![Span::raw(left)],
+        };
+        spans.push(Span::raw(place));
         if let Some(name) = branch.strip_prefix(" on ") {
             spans.push(Span::raw(" on "));
             spans.push(Span::raw(name.to_owned()).fg(Color::Green));
