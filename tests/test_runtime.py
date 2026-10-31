@@ -1609,12 +1609,14 @@ class RuntimeTests(ModelFixture):
         handle = f"turn:Alice/{held['turn']}"
         # Resume lifts it, says so, and what waited runs.
         self.model.release_headers.set()
-        resumed = restarted.request('resume')['result']
-        self.assertEqual((resumed['changed'], resumed['pause']), (True, paused['pause']))
-        restarted.receive(lambda e: e.get('event') == 'resumed')
+        resumed = restarted.request('resume', by='shop.b')['result']
+        self.assertEqual((resumed['changed'], resumed['pause'], resumed['by']), (True, paused['pause'], 'shop.b'))
+        # Every session hears who let the line go on.
+        heard = restarted.receive(lambda e: e.get('event') == 'resumed')
+        self.assertEqual((heard['pause'], heard['by']), (paused['pause'], 'shop.b'))
         waited = restarted.request('wait', handles=[handle], timeout_ms=5000)['result']
         self.assertEqual(waited['results'][handle]['status'], 'completed')
-        self.assertEqual(restarted.request('resume')['result'], {'pause': None, 'changed': False})
+        self.assertEqual(restarted.request('resume')['result'], {'pause': None, 'by': None, 'changed': False})
         self.assertIsNone(restarted.request('stats')['result']['paused'])
 
     def test_a_pause_ends_the_background_commands_agents_started(self):

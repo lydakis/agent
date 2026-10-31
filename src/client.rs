@@ -1246,9 +1246,11 @@ pub fn main(args: Vec<String>) -> Result<i32> {
             print_json(&paused, options.pretty)?;
             Ok(0)
         }
+        // Let go as that agent, too, from an agent's own shell.
         "resume" => {
+            let by = std::env::var("AGENT_BOT").ok().filter(|b| !b.is_empty());
             let mut connection = ensure_daemon(&options)?;
-            let resumed = connection.request("resume", json!({}))?;
+            let resumed = connection.request("resume", json!({"by": by}))?;
             print_json(&resumed, options.pretty)?;
             Ok(0)
         }

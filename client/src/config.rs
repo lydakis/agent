@@ -31,7 +31,7 @@
 //! margin_opens = "never"         # "always", the default, or "unless-closed"
 //! suggest = false               # no guess at the next message, on by default
 //! commons = false               # agents go without the commons, on by default
-//! commons_invites = 3           # least invites a day new threads send (more with the square root of the week's agents), 0 none; answers add up to as many again
+//! commons_invites = 3           # least threads a day that send invites (more with the square root of the week's agents), 0 none; answers add up to as many again
 //! commons_invite_tokens = 1000000  # what an invite pays for in its thread
 //! task_depth = 3                # generations of tasks below a lead, 2 by default (tasks' own start none); 0 no end
 //! sky_haikus = 0                # haikus a day from the sky's busiest agent, 8 by default; 0 none
@@ -180,9 +180,9 @@ pub struct Sonny {
     /// Whether agents have the commons: its tool, skill and the roles'
     /// lines about it.
     pub commons: bool,
-    /// The least invites a day new commons threads send before answers
+    /// The least commons threads a day that send invites before answers
     /// earn more, the square root of the week's agents when that is more:
-    /// each answered one adds one, up to as many again.
+    /// each answered thread adds one, up to as many again.
     pub commons_invites: u64,
     /// The tokens an invite pays for in its thread.
     pub commons_invite_tokens: u64,

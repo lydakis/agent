@@ -268,9 +268,9 @@ async fn show(
     split: Option<String>,
     beside: Option<String>,
 ) -> Result<Value, String> {
-    if let Some(side) = split.as_deref().filter(|side| !mux::SIDES.contains(side)) {
+    if let Some(side) = split.as_deref().filter(|side| !mux::SPLITS.contains(side)) {
         return Err(format!(
-            "{side:?} is not a side: right, left, above or below"
+            "{side:?} is not a side: right, left, above, below or float"
         ));
     }
     let (socket, project) = agents_project(caller).await?;
@@ -366,9 +366,9 @@ async fn run_in_pane(
     if name.is_empty() || name.contains('/') {
         return Err("a name without /".into());
     }
-    if let Some(side) = split.as_deref().filter(|side| !mux::SIDES.contains(side)) {
+    if let Some(side) = split.as_deref().filter(|side| !mux::SPLITS.contains(side)) {
         return Err(format!(
-            "{side:?} is not a side: right, left, above or below"
+            "{side:?} is not a side: right, left, above, below or float"
         ));
     }
     if !cwd.is_absolute() || !cwd.is_dir() {

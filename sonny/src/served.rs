@@ -62,7 +62,7 @@ const OUTPUT_BYTES: usize = 60 * 1024;
 /// start missed while the daemon restarted is answered by then.
 const SWEEP: Duration = Duration::from_secs(30);
 
-const SPLIT: [&str; 4] = crate::mux::SIDES;
+const SPLIT: [&str; 5] = crate::mux::SPLITS;
 
 /// What an agent may do beyond what every agent may: a lead makes
 /// projects, and an agent with room below it in its lead's line, as the
@@ -479,15 +479,17 @@ fn show() -> Value {
     json!({
         "name": SHOW,
         "description": "Put an agent's window where the person asks, or where they should watch it now: a tab \
-            of its own, the default, or a split on one side of yours, or of the agent beside names. Another \
-            project's lead (PROJECT.lead) opens in its project's own home instead, unless it is open there \
-            already. Every agent you start gets a tab of its own when its turn starts, without this.",
+            of its own, the default, or a split on one side of yours, or of the agent beside names, or \
+            floating over that window for a moment where the terminal can float it. Another project's \
+            lead (PROJECT.lead) opens in its project's own home instead, unless it is open there already. \
+            Every agent you start gets a tab of its own when its turn starts, without this.",
         "parameters": {
             "type": "object",
             "properties": {
                 "agent": {"type": "string", "minLength": 1, "description": "The agent's full name."},
                 "split": {"type": "string", "enum": SPLIT,
-                    "description": "Beside you, or beside the agent beside names, on this side."},
+                    "description": "Beside you, or beside the agent beside names, on this side, or \
+                        float over its window."},
                 "beside": {"type": "string", "minLength": 1, "description": "The agent to split beside."}
             },
             "required": ["agent"],
@@ -504,8 +506,9 @@ fn run() -> Value {
             that runs longer than the shell tool allows, keeps running (a dev server, a watcher), or that the \
             person wants to watch. It runs in your folder, or cwd, in the person's shell, which stays open after \
             the command exits so its output can be read. Running the same name again replaces its pane. A tab \
-            is the default; a split puts it beside you, for something the person should see now. The result \
-            holds the pane's ID as block.",
+            is the default; a split puts it beside you, for something the person should see now, and float \
+            over your window, where the terminal can float it, for a moment (a sign-in, a quick look). The \
+            result holds the pane's ID as block.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -515,7 +518,8 @@ fn run() -> Value {
                     "description": "The command line, as sh -c runs it. End it with a line you can wait \
                         for, such as `cargo test; echo \"exited $?\"`, to know when it ends."},
                 "cwd": {"type": "string", "minLength": 1, "description": "Where it runs, absolute."},
-                "split": {"type": "string", "enum": SPLIT, "description": "Beside you, on this side."}
+                "split": {"type": "string", "enum": SPLIT,
+                    "description": "Beside you, on this side, or float over your window."}
             },
             "required": ["name", "command"],
             "additionalProperties": false

@@ -453,7 +453,8 @@ class ServedToolTests(ModelFixture):
         self.host()
         post = {'name': 'stalls', 'title': 'Checkpoint stalls under load', 'text': 'Seen this?'}
         started = json.loads(self.call('calc.a', 'commons', {'post': post}))
-        self.assertEqual(started['invited'], 'shop.b', started)
+        # Three invites fill its seats at even odds, but one agent's turns touch it.
+        self.assertEqual(started['invited'], ['shop.b'], started)
         # The note starts its turn.
         deadline = time.monotonic() + 5
         while len(turns := self.daemon.request('turns', bot='shop.b')['result']['turns']) < 2:
@@ -462,19 +463,22 @@ class ServedToolTests(ModelFixture):
         prompts = self.daemon.request('prompts', bot='shop.b', turn=turns[-1]['turn'])['result']['prompts']
         self.assertEqual(prompts[0]['text'],
                          '[calc.a started the commons thread stalls, "Checkpoint stalls under load", '
-                         'which your turns touch on. The invite pays for 1.0M tokens in the thread: while any '
-                         'are left, a reply there starts your turn.]')
+                         'which your turns touch on. The invite pays for this turn, and, if yours is among '
+                         'the first 3 replies its invites bring, for 1.0M tokens in the thread: while any are '
+                         'left, a reply there starts your turn.]')
         self.assertEqual(turns[-1]['budget_tokens'], 1_000_000)
         listed = json.loads(self.call('calc.a', 'commons', {}))
-        self.assertEqual(listed['invites'], {'today': 1, 'a_day': 3, 'answered': 0, 'this_week': 1, 'agents': 3})
-        # Its reply earns the commons another invite a day.
+        self.assertEqual(listed['invites'], {'today': 1, 'a_day': 3, 'reach': 3, 'answered': 0, 'this_week': 1,
+                                             'agents': 3})
+        # Its reply earns the commons another thread a day.
         self.call('shop.b', 'commons', {'reply': {'thread': 'stalls', 'text': 'Same here.'}})
         # A thread started in a turn the commons began brings no invite.
         post = {'name': 'more', 'title': 'More checkpoint stalls', 'text': 'And this?'}
         started = json.loads(self.call('shop.b', 'commons', {'post': post}, origin='commons'))
-        self.assertIsNone(started['invited'], started)
+        self.assertEqual(started['invited'], [], started)
         listed = json.loads(self.call('mail.c', 'commons', {}))
-        self.assertEqual(listed['invites'], {'today': 1, 'a_day': 4, 'answered': 1, 'this_week': 1, 'agents': 3})
+        self.assertEqual(listed['invites'], {'today': 1, 'a_day': 4, 'reach': 3, 'answered': 1, 'this_week': 1,
+                                             'agents': 3})
         # mail.c's turn ran the script from its start, so it replied in the
         # thread too: that wakes the invited shop.b while its invite has
         # tokens left, its turn capped at what is left.
