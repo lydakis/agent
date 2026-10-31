@@ -60,6 +60,18 @@ const RIPPLE: Duration = Duration::from_millis(1400);
 const TWINKLE: Duration = Duration::from_millis(350);
 /// How fast a lit agent fades: its glow halves this often.
 const HALF_LIFE: f32 = 0.9;
+/// A landing flash's radius in braille dots, whatever the pane, as the
+/// star it rings is: one message's ring stands off its two-dot star by
+/// more than twice the star's width, so it reads as a halo round it, not
+/// a fatter star.
+const FLASH: f32 = 6.0;
+/// The ring's area grows as the heat does, as a map's circles grow with
+/// what they count: each doubling of heat, √2 wider, one even step after
+/// another (6, 8.5, 12, 17 dots).
+const FLASH_GROWTH: f32 = std::f32::consts::SQRT_2;
+/// The biggest, eight messages at once, stays a mark round one star,
+/// under a commons ripple.
+const FLASH_MAX: f32 = 17.0;
 /// How long a pair that talked keeps a trail.
 const TRAIL: Duration = Duration::from_secs(60);
 /// What was said and called, kept an hour for the counts.
@@ -341,6 +353,8 @@ pub struct View {
     groups: Vec<(String, (f32, f32))>,
     /// When the stars last set off for new places.
     moved: Option<Instant>,
+    /// The pane is too small for the sky, so it shows the list.
+    listing: bool,
     down: Option<String>,
 }
 
@@ -395,6 +409,7 @@ impl View {
             person: Glide::default(),
             groups: Vec::new(),
             moved: None,
+            listing: false,
             down: None,
         }
     }
@@ -532,7 +547,13 @@ impl View {
             self.calls.pop_front();
         }
         while self.said.front().is_some_and(|(at, ..)| old(at)) {
-            self.said.pop_front();
+            if let Some((_, a, b)) = self.said.pop_front()
+                && self.centre.is_some()
+                && !(self.said.iter()).any(|&(_, x, y)| (x, y) == (a, b) || (x, y) == (b, a))
+            {
+                // A pair gone quiet moves the rings of a centred sky.
+                self.laid = false;
+            }
         }
     }
 
@@ -604,7 +625,7 @@ impl View {
             "created" | "forked" => {
                 let record = json!({"name": name, "bot_id": data["bot_id"],
                     "created_by": data["created_by"], "created_by_id": data["created_by_id"],
-                    "running_turn": data["running_turn"]});
+                    "running_turn": data["running_turn"], "model": data["model"]});
                 if let Some(at) = self.seat(&record) {
                     self.agents[at].lit = Some(now);
                 }
@@ -670,6 +691,10 @@ impl View {
                     if let End::Agent(by) = from
                         && by != at
                     {
+                        // A new pair moves the rings of a centred sky.
+                        let new = !(self.said.iter())
+                            .any(|&(_, a, b)| (a, b) == (by, at) || (a, b) == (at, by));
+                        self.laid = self.laid && !(new && self.centre.is_some());
                         self.said.push_back((now, by, at));
                     }
                     self.send(from, End::Agent(at), now);
@@ -1108,6 +1133,9 @@ impl View {
                 self.lens = self.lens.next();
                 self.laid = false;
             }
+            KeyCode::Up if self.listing => self.step_list(false),
+            KeyCode::Down if self.listing => self.step_list(true),
+            KeyCode::Left | KeyCode::Right if self.listing => {}
             KeyCode::Up => self.step((0.0, -1.0)),
             KeyCode::Down => self.step((0.0, 1.0)),
             KeyCode::Left => self.step((-1.0, 0.0)),
@@ -1121,6 +1149,26 @@ impl View {
             _ => return false,
         }
         true
+    }
+
+    /// Pick the next agent down the list, or up it.
+    fn step_list(&mut self, down: bool) {
+        let listed: Vec<usize> = (self.order.iter())
+            .map(|&(at, _)| at)
+            .filter(|&at| !self.agents[at].gone)
+            .collect();
+        let here = (self.pick.as_deref())
+            .and_then(|name| self.agent(name))
+            .and_then(|at| listed.iter().position(|&listed| listed == at));
+        let next = match (here, down) {
+            (None, true) => 0,
+            (None, false) => listed.len().saturating_sub(1),
+            (Some(here), true) => (here + 1).min(listed.len().saturating_sub(1)),
+            (Some(here), false) => here.saturating_sub(1),
+        };
+        if let Some(&at) = listed.get(next) {
+            self.pick = Some(self.agents[at].name.clone());
+        }
     }
 
     /// Pick the star nearest the picked one, or the middle, that way.
@@ -1160,7 +1208,8 @@ impl View {
             return lines;
         }
         // The list's rows say what the ticker would, agent by agent.
-        if cols < SKY_COLS || rows < SKY_ROWS {
+        self.listing = cols < SKY_COLS || rows < SKY_ROWS;
+        if self.listing {
             let under = match (self.zen, self.legend) {
                 (true, _) => 0,
                 (false, true) => LEGEND,
@@ -1259,13 +1308,16 @@ impl View {
             // fades: the more it is messaged, the bigger, bounded.
             let warmth = agent.warmth(now);
             if warmth > 0.25 {
-                let ink = if warmth >= 1.0 {
+                let ink = if warmth >= 0.5 {
                     Ink::Muted
                 } else {
                     Ink::Faint
                 };
-                let radius = (0.015 + 0.03 * (1.0 + warmth).ln()).min(0.08);
-                sky.ring(agent.at, radius, ink);
+                // Cooling, it fades where it is rather than closing on
+                // the star.
+                let doublings = warmth.max(1.0).log2();
+                let dots = (FLASH * FLASH_GROWTH.powf(doublings)).min(FLASH_MAX);
+                sky.circle(agent.at, dots, ink);
             }
         }
         for spark in &self.sparks {
@@ -1575,9 +1627,13 @@ impl View {
     /// fit, what needs the person, what failed, works or is lit come
     /// first, the leads after them.
     fn list(&self, now: Instant, cols: usize, rows: usize) -> Vec<Line<'static>> {
+        let picked = self.pick.as_deref().and_then(|name| self.agent(name));
         let rank = |at: usize| {
             let agent = &self.agents[at];
             let lit = agent.glow(now) > 0.08;
+            if Some(at) == picked {
+                return -1;
+            }
             match agent.state() {
                 Some(State::NeedsYou) => 0,
                 Some(State::Failed) => 1,
@@ -1609,7 +1665,12 @@ impl View {
                 }
                 None => Span::raw(" "),
             };
-            let name = Span::styled(short(&agent.name), name_style(agent.state(), glow));
+            let style = match Some(at) == picked {
+                // The pick reversed, as in the sky.
+                true => Style::default().reversed(),
+                false => name_style(agent.state(), glow),
+            };
+            let name = Span::styled(short(&agent.name), style);
             let indent = "  ".repeat(depth.min(4));
             let used = 4 + indent.width() + name.content.width();
             let mut spans = vec![
@@ -2113,10 +2174,14 @@ impl Sky {
     }
 
     fn ring(&mut self, at: (f32, f32), radius: f32, ink: Ink) {
-        let (x, y) = self.spot(at);
         // Round, whatever the ellipse: a ring is a mark, not a place.
         let (across, down) = self.scale();
-        let r = radius * across.min(down);
+        self.circle(at, radius * across.min(down), ink);
+    }
+
+    /// A ring of `r` braille dots round a point.
+    fn circle(&mut self, at: (f32, f32), r: f32, ink: Ink) {
+        let (x, y) = self.spot(at);
         let steps = (r * 6.0).clamp(8.0, 160.0) as usize;
         for step in 0..steps {
             let a = TAU * step as f32 / steps as f32;
@@ -2736,6 +2801,59 @@ mod tests {
         let sky = text(&view.card(120, 40));
         assert!(sky.contains("m1") && sky.contains("m2"), "{sky}");
         assert_eq!(view.groups.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_centred_sky_follows_who_talks_and_a_small_pane_picks_in_its_list() {
+        use ratatui::crossterm::event::KeyCode;
+        let (mut view, send) = view();
+        send.send(Feed::Roll(vec![
+            json!({"name": "shop.lead"}),
+            json!({"name": "shop.login", "created_by": "shop.lead"}),
+            json!({"name": "shop.cart", "created_by": "shop.login"}),
+        ]))
+        .unwrap();
+        view.drain();
+        view.centre_on(Some("shop.lead".into()));
+        view.card(120, 40);
+        let radius = |view: &View, name: &str| {
+            let at = view.agents[view.index[name]].at;
+            at.0.hypot(at.1)
+        };
+        view.moved = None;
+        view.glide(Instant::now());
+        assert!(radius(&view, "shop.cart") > radius(&view, "shop.login") + 0.1);
+        // Two hops out until it talks to the centre: then one.
+        let from = json!({"bot": "shop.cart", "turn": 1});
+        send.send(Feed::Live(
+            json!({"cursor": 1, "event": "accepted", "bot": "shop.lead", "turn": 2, "data": {"from": from}}),
+        ))
+        .unwrap();
+        view.drain();
+        view.card(120, 40);
+        view.moved = None;
+        view.glide(Instant::now());
+        assert!((radius(&view, "shop.cart") - radius(&view, "shop.login")).abs() < 0.01);
+        // One made while the sky is open comes with its model.
+        send.send(Feed::Live(
+            json!({"cursor": 2, "event": "created", "bot": "shop.new",
+            "data": {"bot_id": 9, "created_by": "shop.lead", "model": "m3"}}),
+        ))
+        .unwrap();
+        view.drain();
+        assert_eq!(view.agents[view.index["shop.new"]].model, "m3");
+        // Too small for the sky, the arrows walk the list, which keeps
+        // the pick in view.
+        view.centre_on(None);
+        view.card(40, 12);
+        assert!(view.press(KeyCode::Down));
+        let first = view.pick.clone().expect("a row picked");
+        assert!(view.press(KeyCode::Down));
+        assert_ne!(view.pick.as_ref(), Some(&first));
+        assert!(view.press(KeyCode::Up));
+        assert_eq!(view.pick.as_ref(), Some(&first));
+        let listed = text(&view.card(40, 12));
+        assert!(listed.contains(&short(&first)), "{listed}");
     }
 
     #[tokio::test]
