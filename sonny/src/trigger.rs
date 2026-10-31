@@ -2684,7 +2684,9 @@ pub fn at_start() {
     };
     std::thread::spawn(move || {
         finish(&places, &schedule);
-        relabel(&places, &schedule);
+        if let Some(home) = std::env::var_os("HOME") {
+            relabel(&places, &home.to_string_lossy(), &schedule);
+        }
         refresh(&places, &sonny, &schedule);
     });
 }
@@ -2693,7 +2695,10 @@ pub fn at_start() {
 /// takes its tag: launchd lets go of the old label and loads the job again
 /// under the new one, from its definition moved to the new file. One that
 /// will not load under it goes back as it was, for the next start to try.
-pub fn relabel(places: &Places, launchd: Loader) {
+/// Only a trigger made from `home` moves: systemd's unit folder can be one
+/// that several HOMEs share, and another HOME's trigger is that HOME's to
+/// move, at its own Sonny's start.
+pub fn relabel(places: &Places, home: &str, launchd: Loader) {
     let suffix = places.scheduler.suffix();
     let untagged: Vec<String> = std::fs::read_dir(&places.jobs)
         .into_iter()
@@ -2704,8 +2709,25 @@ pub fn relabel(places: &Places, launchd: Loader) {
         .filter(|rest| !tagged(rest) && valid_name(rest).is_ok())
         .collect();
     for name in untagged {
-        if let Err(error) = relabeled(places, &name, launchd) {
+        if let Err(error) = relabeled(places, &name, home, launchd) {
             eprintln!("{}", error_json(&error));
+        }
+    }
+}
+
+/// Whether a definition runs its fires with `home` as HOME, or names none
+/// (the scheduler's own, the user's).
+fn made_from(text: &str, home: &str) -> bool {
+    match is_plist(text) {
+        true => {
+            !text.contains("<key>HOME</key>")
+                || text.contains(&format!("<key>HOME</key><string>{}</string>", escape(home)))
+        }
+        false => {
+            let set = |line: &str| {
+                line.starts_with("Environment=\"HOME=") || line.starts_with("Environment=HOME=")
+            };
+            !text.lines().any(set) || text.contains(&unit_environment(&[("HOME", home.to_owned())]))
         }
     }
 }
@@ -2720,7 +2742,7 @@ fn tagged(rest: &str) -> bool {
 }
 
 /// Under the lock, move one untagged trigger to its tagged label.
-fn relabeled(places: &Places, name: &str, launchd: Loader) -> Result<(), String> {
+fn relabeled(places: &Places, name: &str, home: &str, launchd: Loader) -> Result<(), String> {
     let _lock = Lock::take(places)?;
     let old = places
         .jobs
@@ -2731,8 +2753,9 @@ fn relabeled(places: &Places, name: &str, launchd: Loader) -> Result<(), String>
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(format!("{}: {e}", old.display())),
     };
-    // Only a trigger's definition moves; anything else is left as it is.
-    if read_job(&text).is_none() {
+    // Only a trigger's definition, made from this HOME, moves; anything
+    // else is left as it is.
+    if read_job(&text).is_none() || !made_from(&text, home) {
         return Ok(());
     }
     let new = places.job(name);
@@ -6224,12 +6247,12 @@ mod tests {
         assert!(w.rows().is_empty());
         // One that will not load under its tag stays as it was.
         w.fake.refuse_load.set(true);
-        relabel(&w.places, &|c| w.fake.call(c));
+        relabel(&w.places, "/H", &|c| w.fake.call(c));
         w.fake.refuse_load.set(false);
         assert!(old.exists() && !w.places.job(&s.name).exists());
         assert_eq!(std::fs::read_to_string(&old).unwrap(), text);
         // The next start moves it.
-        relabel(&w.places, &|c| w.fake.call(c));
+        relabel(&w.places, "/H", &|c| w.fake.call(c));
         assert!(!old.exists());
         assert_eq!(w.state(&s.name), (true, true, false));
         assert!(!w.fake.loaded.borrow().contains(&was));
@@ -6241,7 +6264,7 @@ mod tests {
         assert_eq!(w.rows().len(), 1);
         // Once: a tagged one is left as it is.
         let unloads = w.fake.unloads.get();
-        relabel(&w.places, &|c| w.fake.call(c));
+        relabel(&w.places, "/H", &|c| w.fake.call(c));
         assert_eq!(w.fake.unloads.get(), unloads);
     }
 
@@ -6259,7 +6282,24 @@ mod tests {
         .unwrap();
         w.fake.loaded.borrow_mut().remove(&label);
         w.fake.loaded.borrow_mut().insert(was.clone());
-        relabel(&w.places, &|c| w.fake.call(c));
+        // Another HOME's trigger in a unit folder they share is its own to move.
+        let theirs = Trigger {
+            name: "theirs".into(),
+            ..s.clone()
+        };
+        let elsewhere = w.places.jobs.join(format!("{LABEL}theirs.service"));
+        let other = unit(
+            Path::new("/A/agent-app"),
+            &theirs,
+            &fired(),
+            Path::new("/q"),
+            &[("HOME", "/elsewhere".into())],
+        );
+        std::fs::write(&elsewhere, &other).unwrap();
+        assert!(made_from(&other, "/elsewhere") && !made_from(&other, "/H"));
+        relabel(&w.places, "/H", &|c| w.fake.call(c));
+        assert_eq!(std::fs::read_to_string(&elsewhere).unwrap(), other);
+        assert!(!w.places.job("theirs").exists());
         assert_eq!(
             std::fs::read_to_string(w.places.job(&s.name)).unwrap(),
             text

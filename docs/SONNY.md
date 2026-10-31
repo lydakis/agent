@@ -267,8 +267,9 @@ whatever HOME is, so a test's or an eval's HOME would add its jobs beside
 the user's own. A trigger's label therefore carries `TAG`, eight hex digits
 of a hash of its HOME's path (64-bit FNV-1a, folded to 32 bits, a trailing
 `/` left out): each HOME has labels of its own, and its `add`, `rm` and
-`ls` never reach another's. Sonny's start moves a trigger made before
-labels had the tag to its tagged label, once: launchd lets go of the old
+`ls` never reach another's. Sonny's start moves a trigger made from its
+HOME before labels had the tag to its tagged label, once (another HOME's,
+in a systemd unit folder they share, waits for that HOME's Sonny): launchd lets go of the old
 label and loads the job under the new one, from its definition moved to
 the new file; one that will not load goes back as it was, for the next
 start. A fire whose HOME is gone (a test's HOME deleted with its job still
