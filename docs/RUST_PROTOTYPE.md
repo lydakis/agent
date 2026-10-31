@@ -365,7 +365,7 @@ removed `artifact_pruned` (see Retention).
 stream there whole instead, as `TURN-CALL_ID-STREAM`, and its result lists
 those paths as `files` beside `artifacts`, so any command or tool reads them.
 The store keeps one row per stream naming the file and none of its bytes
-(schema 67), and `artifact` and `read artifact=` read the file. Each file is
+(schema 68), and `artifact` and `read artifact=` read the file. Each file is
 made new (0600, never through a link) and synced with its folder before the
 store records it, off the runtime thread, and only while
 the bot's sandbox cannot write the folder, checked after the folder is made: a
@@ -391,7 +391,7 @@ bound; the operating system is then the only limit.
 | `--max-detached` | Detached shell commands still running, daemon-wide; exited ones are reaped and stop counting. Zero is unbounded. | 16 |
 | `--max-active` | Turns with a live task: a model call in flight or a foreground tool. Parked turns never count. | 4,096 |
 | `--max-pending` | Submissions waiting to start: queued behind a bot's own work or ready for a slot, daemon-wide. A submission that would wait past the bound answers `pending_limit` and writes nothing; one that starts at once is never refused by it. | none |
-| `--max-pending-bytes` | UTF-8 prompt bytes of those waiting submissions. | none |
+| `--max-pending-bytes` | UTF-8 bytes of those waiting submissions: their prompts and the words they quote, which wait with them. | none |
 | `--max-connecting` | Provider requests awaiting response headers, a Bedrock Runtime call's body digest included. Established streams are not capped. Both providers hold headers until the first token, so a permit is held for the whole time to first token; a bound of N caps throughput at N calls per first-token latency. | none |
 | `--stall-timeout` | How long an established provider stream may go without a content frame before the attempt fails as `provider_stream_stalled` and is retried. Keepalives do not count. Whole seconds, `1s` to `24h`. | `2m` |
 | `--idle-exit` | How long, in whole seconds, before a socket daemon with no sessions, no live turns, and no running background commands exits. Parked turns are durable and resume on the next start; the client restarts the daemon on demand. | none |
@@ -1141,6 +1141,10 @@ not copy bodies. `min_node` optionally bounds the oldest included ID.
 returning its nodes newest first; `next_newer` is the inclusive minimum ID for
 the next forward page, or null. This lets clients retain only range endpoints.
 Turn IDs are inherited from each node's nearest turn-start ancestor.
+Each node, here and in `history_items`, carries `written_ms`, when it joined
+the history (a queued prompt when its turn started, a steer when its turn
+absorbed it), set by the insert that writes it; nodes from before schema 67
+have none.
 `workspaces` lists each folder the page's turns ran in once, as
 `{"folder", "turns"}`, so a client resolves a path a message names where it was
 written even after the bot moved; a turn whose rows went with a deleted fork
@@ -1222,7 +1226,7 @@ does not, and each is one op:
   outside: open sessions, active turns against the bound, parked turns,
   running processes against the process bound and how many of them are
   still in line for a slot (`queued_processes`), turns queued or ready to
-  start (`queued_turns`) with their prompt bytes (`pending_bytes`) and the
+  start (`queued_turns`) with their prompt and quoted bytes (`pending_bytes`) and the
   bounds on both (`pending_limit`, `pending_bytes_limit`), daemon-wide in-flight
   requests per shared HTTP client shard (`transport.in_flight_by_shard`),
   and every provider's model pools with their learned allowance and current
@@ -1427,6 +1431,39 @@ agent's words for a person's: `[Written by the agent NAME in
 turn:NAME/TURN, not by a person.]` for `from`, `[Sent by ORIGIN.]` for
 `origin`, and nothing for a person's prompt. `content[0]` stays the words.
 A bot made with `hide_senders` reads the words alone.
+
+A client that speaks for a person other than the daemon's own may name
+them with `person` (a name's characters, else `invalid_person`), exclusive
+with `from` and `origin`. Like `origin` it is the client's word, kept and
+reported the same way, and read by the model as `[Written by PERSON.]`; a
+prompt with a `person` is no consent to the approver, which answers to the
+daemon's own person only. A command run from a bot's sandboxed tool cannot
+send one (it would speak as a person from inside an agent).
+
+`quotes`, a list of `{bot, turn, reply?}`, copies other turns'
+words into the prompt: a turn's prompt, or with `reply: true` the last
+message the finished turn ended with. The daemon copies them at submit, so
+what a quote says is what that turn holds, never what the sender retyped,
+and keeps who first wrote them: a quoted prompt's own quotes come along
+with their writers. Each quote is a text part after the sender's line,
+behind a line naming it, `[Quoted from turn:BOT/TURN, written by a
+person:]` or `[Quoted from the reply of turn:BOT/TURN, written by the agent
+BOT:]` (`sent by ORIGIN`, `written by PERSON`, `written by the agent NAME
+in turn:NAME/TURN`); `hide_senders` leaves the lines out too. A turn that
+does not exist, a steer's reply, or a turn with no reply left (it ended
+without one, or pruning took its message events) is `quote_not_found`; a
+reply of an unfinished turn `quote_unfinished`; more than 64 quotes, those
+quoted prompts bring counted (marked `nested` in the record, which a retry
+leaves out), or words and quotes past 256 KiB together, each quote's line
+counted at 256 bytes, `quote_too_large`. The CLI's `run --quote
+BOT/TURN` (repeatable; `BOT/TURN:reply` for a reply, `turn:` prefix
+optional) sends them. `prompts` and `history_items` list a prompt's
+quotes as `quotes`, each with its writer (`from`, `origin` or `person`,
+none for a person's) and, in `prompts`, its `text` within the read's
+`bytes`, each record counted as an entry; quotes past them are left out,
+and their prompt says `quotes_more` and `truncated`; Sonny's approver reads a quote of the person's own words as
+consent only in a prompt the person sent, and any other as asking for
+nothing.
 `{"op":"prompts","bot","turn","bytes"?}` reads a turn's words and calls
 as an approver judges them, within `bytes` of text (default 64 KiB, at most
 256 KiB): the turn's prompt and each steer it absorbed, in order, with
