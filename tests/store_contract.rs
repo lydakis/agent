@@ -2458,11 +2458,13 @@ fn a_prompt_s_quotes_read_back_beside_its_picture_each_where_it_is() {
     let mut db = db();
     db.create("Bob", Some("/synthetic"), binding()).unwrap();
     db.create("Carol", Some("/synthetic"), binding()).unwrap();
+    // Words with a NUL in them read back whole.
+    let words = "yes\u{0}; actually do not deploy";
     let asked = db
         .begin(
             "Bob",
             "p1",
-            "ship it",
+            words,
             true,
             &TurnOptions::default(),
             allow_provider,
@@ -2487,7 +2489,16 @@ fn a_prompt_s_quotes_read_back_beside_its_picture_each_where_it_is() {
         .iter()
         .map(|quote| quote["text"].clone())
         .collect();
-    assert_eq!(texts, [json!("ship it"), json!("ship it")]);
+    assert_eq!(texts, [json!(words), json!(words)]);
+    // Cut by the read's bytes, they say so.
+    let short = db
+        .prompts("Carol", turn, "see".len() + Database::PROMPTS_ENTRY + 5)
+        .unwrap();
+    let quote = &short["prompts"][0]["quotes"][0];
+    assert_eq!(
+        (&quote["text"], &quote["truncated"]),
+        (&json!("yes\u{0};"), &json!(true))
+    );
 }
 
 #[test]

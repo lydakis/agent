@@ -7712,7 +7712,8 @@ impl Database {
                 copied.push(quote);
                 // What it quotes comes along, marked so a retry still names
                 // only the turns the request named.
-                for mut inner in quoted(&self.conn, nested.as_deref(), Self::QUOTED_BYTES + 1)? {
+                // Past the bound by a character, so longer words are refused.
+                for mut inner in quoted(&self.conn, nested.as_deref(), Self::QUOTED_BYTES + 4)? {
                     bytes += inner["text"].as_str().map_or(0, str::len) + Self::QUOTE_BYTES;
                     inner["nested"] = json!(true);
                     copied.push(inner);
@@ -7976,7 +7977,8 @@ impl Database {
             entry["truncated"] = json!(true);
         }
         authored(&mut entry, from, origin, person);
-        let mut quotes = quoted(&self.conn, quotes.as_deref(), *left)?;
+        // A character past the budget, so words that go on read as cut.
+        let mut quotes = quoted(&self.conn, quotes.as_deref(), *left + 4)?;
         // Each quote's record counts like an entry's; those past the
         // budget are left out, and the entry says its words were cut.
         let mut kept = 0;
@@ -10962,9 +10964,9 @@ fn after_words(
     Ok((parts, Some(serde_json::to_string(&quotes).map_err(bad)?)))
 }
 /// A turn's quotes with their words, which the turn keeps until its item
-/// holds them and the item keeps after: at most `cap` characters of each,
-/// read in SQL from the parts quoted, so a picture beside them is never
-/// copied or parsed here.
+/// holds them and the item keeps after: at most `cap` bytes of each, cut
+/// at a whole character, read in SQL from the parts quoted, so a picture
+/// beside them is never copied or parsed here.
 fn quoted(conn: &Connection, quotes: Option<&str>, cap: usize) -> Result<Vec<Value>> {
     let Some(quotes) = quotes else {
         return Ok(Vec::new());
@@ -10978,7 +10980,7 @@ fn quoted(conn: &Connection, quotes: Option<&str>, cap: usize) -> Result<Vec<Val
     }
     let mut texts = HashMap::new();
     let mut read = conn.prepare_cached(
-        "SELECT c.key, substr(json_extract(c.value,'$.text'),1,?2) FROM nodes n
+        "SELECT c.key, substr(CAST(json_extract(c.value,'$.text') AS BLOB),1,?2) FROM nodes n
          LEFT JOIN declined d ON d.node=n.id,
          json_each(CAST(COALESCE(d.item,n.item) AS TEXT),'$.content') c
          WHERE n.id=?1 AND c.key IN (SELECT value FROM json_each(?3))",
@@ -10986,7 +10988,16 @@ fn quoted(conn: &Connection, quotes: Option<&str>, cap: usize) -> Result<Vec<Val
     for (node, wanted) in &parts {
         let mut rows = read.query(params![node, cap as i64, json!(wanted).to_string()])?;
         while let Some(r) = rows.next()? {
-            if let Some(text) = r.get::<_, Option<String>>(1)? {
+            // Bytes, not text, which SQLite would end at a NUL; cut to
+            // the last whole character.
+            if let Some(bytes) = r.get::<_, Option<Vec<u8>>>(1)? {
+                let text = match String::from_utf8(bytes) {
+                    Ok(text) => text,
+                    Err(cut) => {
+                        let whole = cut.utf8_error().valid_up_to();
+                        String::from_utf8_lossy(&cut.into_bytes()[..whole]).into_owned()
+                    }
+                };
                 texts.insert((*node, r.get::<_, i64>(0)? as u64), text);
             }
         }
