@@ -382,15 +382,17 @@ text and per-delta delays are identical to the Responses and Gateway fixtures.
 model calls, connected to external HTTPS hosts, and ran IDE-detection (`ps`),
 `rg`, and git probes. With them, every remaining request is:
 
-- One `HEAD /api/hello` per process: a connection warm-up the CLI fires when no
-  proxy is configured. The fixture answers `200` with an empty body and counts it
-  in `preconnect_requests`. It is excluded from `requests`/`completed_requests`
-  but its connection is included in `connections_used`, so Claude Code uses about
-  two connections per agent.
-- Three short-lived `git` processes per CLI process at startup (remote and
-  settings-tracking probes), which find no repository in the empty workspace.
-  They remain in the target tree and its CPU. Inside a repository the CLI ran
-  seven per process, including `status` and `log`.
+- One `HEAD /api/hello` per process on 2.1.267: a connection warm-up the CLI
+  fired when no proxy was configured. The fixture answers `200` with an empty
+  body and counts it in `preconnect_requests`. It is excluded from
+  `requests`/`completed_requests` but its connection is included in
+  `connections_used`, so 2.1.267 used about two connections per agent. 2.1.316
+  no longer sends it (retraced 2026-10-31): one loopback connection per agent.
+- Short-lived `git` processes per CLI process at startup, which find no
+  repository in the empty workspace: three on 2.1.267 (remote and
+  settings-tracking probes), one `ls-files` settings probe on 2.1.316. They
+  remain in the target tree and its CPU. Inside a repository 2.1.267 ran seven
+  per process, including `status` and `log`.
 
 No external connection and no read of the enclosing repository was observed
 with these settings. Any other request fails

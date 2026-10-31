@@ -63,7 +63,7 @@ try {
   const configDir = `${dirs.config}/opencode`;
   await mkdir(`${configDir}/node_modules`, { recursive: true });
   // opencode compares package names only; the version mirrors the targets.py pin.
-  const dependency = { '@opencode-ai/plugin': '1.18.32' };
+  const dependency = { '@opencode-ai/plugin': '1.19.5' };
   await writeFile(`${configDir}/package.json`, JSON.stringify({ dependencies: dependency }));
   await writeFile(`${configDir}/package-lock.json`, JSON.stringify({
     lockfileVersion: 3, packages: { '': { dependencies: dependency } },
