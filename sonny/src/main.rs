@@ -59,6 +59,7 @@ mod reactions;
 mod resolved;
 mod rex;
 mod said;
+mod scheduler;
 mod screen;
 mod seed;
 mod served;
@@ -806,9 +807,13 @@ fn main() -> std::process::ExitCode {
         Some((verb, rest)) if verb == trigger::VERB => {
             return std::process::ExitCode::from(trigger::cli(rest) as u8);
         }
-        // launchd or systemd runs this for a trigger's fire.
+        // Sonny's scheduler runs this for a trigger's fire.
         Some((flag, rest)) if flag == trigger::FIRE_FLAG => {
             return std::process::ExitCode::from(trigger::fire_cli(rest) as u8);
+        }
+        // Unlisted: the one job Sonny gives the system, which fires triggers.
+        Some((verb, [])) if verb == scheduler::VERB => {
+            return std::process::ExitCode::from(scheduler::run() as u8);
         }
         Some((lookout, rest)) if lookout == "lookout" => lookout::run(rest),
         Some((verb, rest)) if verb == tool_host::NAME => tool_host::run(rest),

@@ -128,9 +128,10 @@ none, as `agent models --discover` does.
 `sonny setup backup URL` keeps the person's home off the machine, for one
 that may be rebuilt or lost: memory, skills and profiles (`~/.agents`) and
 `~/.agent/config.toml` are copied into a clone of URL, a private git
-repository, at `~/agent-home`, committed and pushed every ten minutes by a
-LaunchAgent or a systemd user timer (`me.lydakis.agent.backup`), which runs
-`sonny home sync`. Keys in `~/.agent/env`, logins and the daemon's store
+repository, at `~/agent-home`, committed and pushed every ten minutes by
+Sonny's scheduler, the one background job Sonny keeps
+([docs/SONNY.md](../docs/SONNY.md#the-scheduler)), which runs `sonny home
+sync`. Keys in `~/.agent/env`, logins and the daemon's store
 stay out, and so does a `config.toml` that holds a secret itself (an MCP
 server's `http_headers`, or a key named like a token), which the sync names
 and leaves behind while memory still goes. Memory's own git history stays
@@ -147,14 +148,15 @@ machine keeps its own.
 
 `[sonny] start_at_boot = true` (in `/config`) starts the daemon when the
 machine does, for a box whose agents should keep working after a restart
-with nobody opening Sonny. Sonny keeps a job that runs `sonny boot`, which
-starts the daemon as a trigger's fire does, with the login shell's
-environment: a LaunchAgent run at login on a Mac, or a systemd user
-service wanted by `default.target` elsewhere, which starts at boot once
-the user lingers (Sonny runs `loginctl enable-linger`, and says when that
-needs `sudo`). The daemon brings back the companions it keeps, the lookout
-and the tool host among them. Turning it off removes the job and leaves a running daemon
-running.
+with nobody opening Sonny. Sonny's scheduler, which the system starts at
+login on a Mac (a LaunchAgent) and with the user manager elsewhere (a
+systemd user service wanted by `default.target`, which starts at boot once
+the user lingers: Sonny runs `loginctl enable-linger`, and says when that
+needs `sudo`), runs `sonny boot` when it starts, which starts the daemon as
+a trigger's fire does, with the login shell's environment. The daemon
+brings back the companions it keeps, the lookout and the tool host among
+them. Turning it off leaves the scheduler for triggers, and a running
+daemon running.
 
 A lead's transcript starts with a welcome, as Claude Code's does: Sonny,
 the robot the client is named for, as a portrait drawn in half blocks,
@@ -883,9 +885,8 @@ every Sonny window closed; a call nobody answers in time ends as
 verdict wherever the agent's other calls do (`/permissions`): a start runs
 the folder's setup script, a new project makes a lead, a removal can drop
 work, a subscription sends other bots' words to the subscriber's judge,
-a pane runs a command outside the agent's sandbox, and a trigger is a
-job of the system's scheduler (a LaunchAgent, or a systemd user service)
-that runs as you. An agent whose
+a pane runs a command outside the agent's sandbox, and a trigger runs as
+you, from Sonny's scheduler, outside any sandbox. An agent whose
 gate Sonny did not set, as another client's, goes without these until the
 person picks a row in `/permissions`. An agent of Sonny's reaches Sonny only through these tools: none
 of them has a command form. Sonny draws the calls, live and from history,
@@ -914,9 +915,8 @@ At each start Sonny writes what every agent leans on: the
 in `~/.agents/skills` (replacing links the Agent app left there), and
 `~/.agent/memory` and `~/.agent/trigger`, scripts that run this Sonny as
 `sonny memory ...` (facts saved for later agents, in `~/.agents/memory`)
-and `sonny trigger ...` (jobs that wake an agent, kept by launchd on a Mac
-and systemd's user manager on Linux), which other harnesses, scripts and
-those schedulers run too; Sonny's own agents use the
+and `sonny trigger ...` (jobs that wake an agent, which Sonny's scheduler
+runs), which other harnesses and scripts run too; Sonny's own agents use the
 `memory` and `triggers` tools instead, which the tool host answers outside
 their sandbox. A skill Sonny wrote is rewritten when Sonny's
 text changes, until you edit it: from then on it is yours, and Sonny leaves
