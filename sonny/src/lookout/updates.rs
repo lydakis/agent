@@ -872,6 +872,15 @@ impl Updates {
         }
     }
 
+    /// The check of a turn that waited behind another check starts: the
+    /// turn waits as long again from now, so time spent behind the other
+    /// does not run out its hold.
+    pub fn goal_checking(&mut self, name: &str, turn: i64, now: Instant) {
+        if let Some(forward) = self.forwarding.get_mut(&(name.to_owned(), turn)) {
+            forward.at = now + GOAL_HOLD;
+        }
+    }
+
     /// Whether a turn waits for its goal's check: the replay after a
     /// restart starts before it, so the check runs again.
     pub fn goal_pending(&self) -> bool {
@@ -1837,9 +1846,19 @@ mod tests {
         // A check that never says lets the turn go once it could have run
         // its longest.
         updates.goal_turn("shop.docs", 3);
-        turn(&mut updates, "shop.docs", 3, goal, "completed");
+        turn(&mut updates, "shop.docs", 3, goal.clone(), "completed");
         updates.expire(Instant::now() + GOAL_HOLD);
         assert!(text(&updates.take()).starts_with("- shop.docs: turn:shop.docs/3 completed"));
+        // One whose check waited behind another's holds from when its own
+        // check started.
+        updates.goal_turn("shop.docs", 4);
+        turn(&mut updates, "shop.docs", 4, goal, "completed");
+        let started = Instant::now() + GOAL_HOLD / 2;
+        updates.goal_checking("shop.docs", 4, started);
+        updates.expire(Instant::now() + GOAL_HOLD + Duration::from_secs(1));
+        assert!(updates.take().items.is_empty());
+        updates.expire(started + GOAL_HOLD);
+        assert!(text(&updates.take()).starts_with("- shop.docs: turn:shop.docs/4 completed"));
     }
 
     #[test]

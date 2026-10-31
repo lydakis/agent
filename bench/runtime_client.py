@@ -45,12 +45,13 @@ def poll(client, bot, turn):
 
 class Client:
     def __init__(self, binary, path, url, tools="echo", model="synthetic-model", key_env=None, env=None,
-                 provider="openai", family="responses", extra=(), settings=None, command=None):
+                 provider="openai", family="responses", extra=(), settings=None, command=None,
+                 stderr=subprocess.DEVNULL):
         # `command` runs another engine's adapter that speaks the same JSON lines.
         command = command or [str(binary), *serve_args(path, url, key_env, provider, family, extra)]
         self.process = subprocess.Popen(command,
                                         stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                        stderr=subprocess.DEVNULL, text=True, env=env or clean_env(),
+                                        stderr=stderr, text=True, env=env or clean_env(),
                                         start_new_session=True)
         self.queue = queue.Queue()
         self.saved = []
