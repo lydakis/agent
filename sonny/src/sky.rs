@@ -66,17 +66,16 @@ const TWINKLE: Duration = Duration::from_millis(350);
 /// How fast a lit agent fades: its glow halves this often.
 const HALF_LIFE: f32 = 0.9;
 /// A landing flash's radius in braille dots, whatever the pane, as the
-/// star it rings is: one message's ring stands off its two-dot star by
-/// more than twice the star's width, so it reads as a halo round it, not
-/// a fatter star.
-const FLASH: f32 = 6.0;
+/// star it rings is: one message bursts as far as it did in 0.7.0, then
+/// shrinks into its star.
+const FLASH: f32 = 5.0;
 /// The ring's area grows as the heat does, as a map's circles grow with
-/// what they count: each doubling of heat, √2 wider, one even step after
-/// another (6, 8.5, 12, 17 dots).
+/// what they count: each doubling of messages √2 wider (5, 7, 10, 14 dots
+/// for 1, 2, 4, 8 at once).
 const FLASH_GROWTH: f32 = std::f32::consts::SQRT_2;
-/// The biggest, eight messages at once, stays a mark round one star,
-/// under a commons ripple.
-const FLASH_MAX: f32 = 17.0;
+/// The biggest, about two dozen at once, as wide as 0.7.0's commons
+/// ripple spread.
+const FLASH_MAX: f32 = 24.0;
 /// How long a pair that talked keeps a trail.
 const TRAIL: Duration = Duration::from_secs(60);
 /// What was said and called, kept an hour for the counts.
@@ -93,6 +92,9 @@ const TICKER: usize = 5;
 const LOG: usize = 64;
 /// The chat log's column beside the sky, and the gap before it.
 const LOG_COLS: usize = 36;
+/// The most lines the chat log beside the sky shows: three plain, six
+/// muted, three faint, so it ends where its fade does.
+const LOG_LINES: usize = 12;
 const GAP: usize = 3;
 /// The least room the sky is drawn in; with less, a list.
 const SKY_COLS: usize = 60;
@@ -1388,20 +1390,17 @@ impl View {
                     sky.ring(agent.at, 0.03 + (reach - 0.03) * t, ink);
                 }
             }
-            // A message landing flashes round its star and shrinks as it
-            // fades: the more it is messaged, the bigger, bounded.
-            let warmth = agent.warmth(now);
-            if warmth > 0.25 {
-                let ink = if warmth >= 0.5 {
-                    Ink::Muted
-                } else {
-                    Ink::Faint
-                };
-                // Cooling, it fades where it is rather than closing on
-                // the star.
-                let doublings = warmth.max(1.0).log2();
-                let dots = (FLASH * FLASH_GROWTH.powf(doublings)).min(FLASH_MAX);
-                sky.circle(agent.at, dots, ink);
+            // A message landing bursts round its star, then shrinks into it
+            // as it fades, as in 0.7.0; how big it bursts is how hot the
+            // agent is.
+            let glow = agent.heated.map_or(0.0, |at| {
+                0.5f32.powf(now.duration_since(at).as_secs_f32() / HALF_LIFE)
+            });
+            if glow > 0.08 {
+                let ink = if glow > 0.4 { Ink::Muted } else { Ink::Faint };
+                let doublings = agent.heat.max(1.0).log2();
+                let burst = (FLASH * FLASH_GROWTH.powf(doublings)).min(FLASH_MAX);
+                sky.circle(agent.at, burst * (0.25 + 0.75 * glow), ink);
             }
         }
         // The newest dozen in flight: more is a blur, not news.
@@ -1589,9 +1588,11 @@ impl View {
         let kept: Vec<_> = (self.ticker.iter())
             .filter(|(.., about)| centre.is_none_or(|name| about.contains(name)))
             .collect();
+        // Beside the sky, as many lines as its fade carries, at the foot.
+        let lines_kept = if tall { room.min(LOG_LINES) } else { room };
         let shown = kept
             .len()
-            .min(room.saturating_sub(usize::from(self.down.is_some())));
+            .min(lines_kept.saturating_sub(usize::from(self.down.is_some())));
         let entries = &kept[kept.len() - shown..];
         for (n, (at, text, hue, _)) in entries.iter().enumerate() {
             let old = shown - 1 - n;
@@ -1600,7 +1601,7 @@ impl View {
                 _ if fresh < 0.3 => Ink::Faint,
                 _ if fresh < 0.6 => Ink::Muted,
                 (false, _) | (true, 0..=2) => Ink::Plain,
-                (true, 3..=11) => Ink::Muted,
+                (true, 3..=8) => Ink::Muted,
                 (true, _) => Ink::Faint,
             };
             let words = match (hue, weight) {
