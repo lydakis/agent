@@ -2157,7 +2157,7 @@ impl Lookout {
             self.updates.unsent(told);
             return;
         }
-        let prompt = note(&told, steer);
+        let prompt = crate::stamp::now(&note(&told, steer));
         let key: Vec<String> = told.items.iter().map(|line| line.key.clone()).collect();
         let request_id = format!("lookout-{}", digest(&key.join(",")));
         let delivery = if steer { "steer" } else { "queue" };
@@ -2405,7 +2405,7 @@ impl Lookout {
             .count()
             .max(1);
         let sent: Vec<sources::Heard> = self.heard.drain(..take).collect();
-        let prompt = sources::note(&sent, self.heard.len());
+        let prompt = crate::stamp::now(&sources::note(&sent, self.heard.len()));
         let key: Vec<String> = (sent.iter())
             .map(|heard| {
                 let event = &heard.event;
