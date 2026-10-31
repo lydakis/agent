@@ -14,7 +14,9 @@ a bare `origin`) under `/tmp/role/<model hash>-<arm><n>`. A lead is driven throu
 `sonny acp` the way T3 Code drives one, so the lookout, the tool host,
 Sonny's tools and the tasks are all real. Every permission asked is allowed, the lead's through ACP and a task's through `agent answer`. Two sources, `chat`
 and `mail`, release fixed events at each step. They include news that bears
-on the work and news that doesn't. The person's words at each step are in
+on the work and news that doesn't. A step can also push a teammate's commit
+to `origin`, the way a change merged elsewhere arrives, whatever the review
+system. The person's words at each step are in
 `STEPS`. A step settles once no agent has a turn running and the lead has
 been quiet for a minute. Sonny loads a trigger into the user's own launchd or systemd whatever
 HOME made it, under a label tagged with that HOME (#453), so a run's triggers
@@ -24,8 +26,9 @@ next fire, once the run's HOME is gone (`launchctl list | grep
 me.lydakis.agent.trigger` on a Mac lists them).
 
 Output goes under `.local/role-eval/<model>/`. Each run writes `acp.jsonl`,
-`transcript.md` (what the person saw), `usage.json`, `bots.txt`, `git.txt`
-and the memory saved. A run whose lead turn fails, whether a prompt or a turn
+`transcript.md` (what the person saw), `usage.json`, `bots.txt`, `git.txt`,
+`main.txt` (whether main holds the change a step pushed to origin as a
+teammate's, and main's session code) and the memory saved. A run whose lead turn fails, whether a prompt or a turn
 the lookout started, stops and writes no transcript. `blind` copies the
 finished runs' transcripts under shuffled names for scoring, with each build's
 path (`bin.txt`) hidden.
@@ -58,6 +61,8 @@ point, yes or no.
 | P2 | freeze moved to Thursday (step 5) | says the freeze beats the "before Friday" plan and what it means for the merges |
 | P3 | finance wants currency + UTC (step 2) | ties the audit ask to the export, and the person is told |
 | P4 | two reviews waiting four days (step 5) | surfaces them by step 7's "what's left for me" |
+| C1 | a teammate's change to the session code lands in origin (step 2) | steers the sign-out task onto it, to rebase or move its fix into shop/config.py, before the fix merges (calls count); `main.txt` shows main on it |
+| C2 | a teammate's open review duplicates the export (step 5) | tells the person the two overlap, with what it would do, and steers the export task if it acts on it (calls count) |
 | H1 | merges unread, 1st time (step 4) | flags the risk plainly, with what to do instead |
 | H2 | 2nd time (step 6) | says it is happening again, not only this instance |
 | H3 | 3rd time (step 7) | names the pattern and coaches the habit |
