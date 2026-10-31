@@ -6250,3 +6250,36 @@ GitHub runner (2026-10-31):
 
 Store jobs per turn held at about 7.5, and nothing passed the gate's 15% in
 the direction that costs.
+
+## The socket, the store and their folder are their owner's alone
+
+`Owner::bind` binds the daemon's socket under a `177` umask and gives the
+mask back after, so the name is `0600` from its first instant: two system
+calls on the runtime thread, once, before any session is accepted or
+companion started. `Store::open` makes a missing folder `0700`, makes a
+new `state.sqlite` `0600` before SQLite first opens it (the `-wal` and
+`-shm` SQLite makes take the main file's mode) and tightens a store an
+earlier daemon left looser: one `open(O_CREAT|O_EXCL)` and, for a store
+that exists, three `stat` calls and at most three `chmod`, on the storage
+thread as the rest of `open` is. The companions' folder and logs, the
+daemon's log and the lookout's log are made owner-only the same way,
+once each. Nothing is added per bot or per turn, and no store job. The
+matched screen, base main 36c6f49 against the head of this change, run
+alternately, two rounds each, on an Apple M1 Max, macOS 27.2, external
+power, Python 3.12.9 and psutil 7.2.2 (2026-10-31):
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| footprint | idle RSS, MiB | 13.117 | 13.055 | -0.5% |
+| footprint | per idle bot, KiB | 2.312 | 2.176 | -5.9% |
+| footprint | RSS after a turn each, MiB | 29.938 | 29.641 | -1.0% |
+| footprint | CPU per turn, ms | 0.754 | 0.623 | -17.4% |
+| lifecycle | CPU, s | 0.418 | 0.349 | -16.6% |
+| lifecycle | p95 turn, ms | 608.342 | 600.122 | -1.4% |
+| lifecycle | peak RSS, MiB | 24.289 | 23.734 | -2.3% |
+
+Store jobs per turn held at about 7.5 on both sides (7.488 to 7.499 base,
+7.455 to 7.498 head). The CPU drops are the laptop's: the base ran first
+in each round, and the change adds nothing to a turn's path; read them as
+no cost, not a gain. The Perf workflow screens the pull request with the
+admission and completion bursts as well.

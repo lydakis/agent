@@ -754,7 +754,8 @@ way `/react` does, and each note in the margin has its own `↩`.
 
   ![/sky with its legend](../docs/sonny/sky-legend.png)
 - `/pause REASON` stops every agent, in every project, until `/resume`:
-  running turns end and what arrives meanwhile waits, across restarts too.
+  running turns stop where they are and continue on `/resume`, and what
+  arrives meanwhile waits, across restarts too.
   Every window says who paused and why. Agents pull the same cord with
   `agent pause --reason` from their shell
   ([docs/SONNY.md](../docs/SONNY.md#pause)). In `/sky` a pull is the one

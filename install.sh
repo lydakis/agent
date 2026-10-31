@@ -14,8 +14,8 @@
 #
 # It also installs, with the system's package manager (through sudo when
 # not root), what Sonny's own features need and the release cannot carry:
-# bubblewrap, which the daemon's default sandbox runs commands in, and
-# ripgrep, which its agents search code with.
+# bubblewrap, the sandbox Sonny's agents run their commands in by default,
+# and ripgrep, which they search code with.
 #
 #   SONNY_VERSION  a release such as 0.4.1 (default: the latest)
 #   PREFIX         where to install (default: ~/.local)

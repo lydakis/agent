@@ -1068,7 +1068,14 @@ fn replace(path: &Path, text: &str) -> Result<(), String> {
         |e: &dyn std::fmt::Display| format!("config_unwritable: {}: {e}", path.display());
     parse(text).map_err(|reason| format!("config_invalid: {}: {reason}", path.display()))?;
     if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| unwritable(&e))?;
+        use std::os::unix::fs::DirBuilderExt;
+        // `~/.agent` is its owner's alone when a client makes it, as when
+        // the daemon does; one that exists keeps its mode.
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+            .map_err(|e| unwritable(&e))?;
     }
     let staged = path.with_extension(format!("toml.{}", std::process::id()));
     std::fs::write(&staged, text)

@@ -1624,9 +1624,13 @@ pub(crate) async fn all_bots(client: &Client) -> Vec<Value> {
 
 fn append(path: &std::path::Path, line: &Value) {
     use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    // Owner-only when new, as the store it sits beside: it carries what
+    // bots said.
     if let Ok(mut file) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
+        .mode(0o600)
         .open(path)
     {
         let _ = writeln!(file, "{line}");
@@ -3454,6 +3458,13 @@ mod tests {
             &log,
             &json!({"at_ms": now, "lead": "calc.lead", "seated": true}),
         );
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&log).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
         append(
             &log,
             &json!({"at_ms": now, "lead": "calc.lead", "woke": []}),

@@ -477,6 +477,27 @@ class DaemonTests(ModelFixture):
         self.addCleanup(reopened.close)
         self.assertIn('result', reopened.request('inspect', bot='Bob'))
 
+    def test_a_fresh_daemon_keeps_its_socket_and_store_to_its_owner(self):
+        # Whoever connects has every bot, and the store holds every
+        # conversation in the clear: the daemon sets the modes itself,
+        # whatever umask it was started with.
+        mode = lambda path: os.stat(path).st_mode & 0o777
+        given = mode(self.path)
+        folder = self.path/'fresh'
+        loose = os.umask(0o000)
+        try:
+            client = SocketClient(self.binary, folder/'state.db', self.url, 'echo')
+        finally:
+            os.umask(loose)
+        self.addCleanup(client.close)
+        client.control.request('create', bot='first', workspace=str(self.path))
+        self.assertEqual(mode(client.socket_path), 0o600)
+        self.assertEqual(mode(folder), 0o700)
+        for name in ('state.db', 'state.db-wal', 'state.db-shm', 'state.db.owner-lock'):
+            self.assertEqual(mode(folder/name), 0o600, name)
+        # The folder the daemon was given keeps the mode its maker gave it.
+        self.assertEqual(mode(self.path), given)
+
     def test_socket_collision_preserves_live_owner_and_regular_files(self):
         client = SocketClient(self.binary, self.path/'first.db', self.url, 'echo')
         self.addCleanup(client.close)
