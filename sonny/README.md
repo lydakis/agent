@@ -365,7 +365,8 @@ keyboard protocol, which Sonny asks for as Codex does (Kitty, Ghostty,
 WezTerm, iTerm2, Herdr and others); elsewhere it reads as Enter, and Alt-Enter
 or Ctrl-J still start a line. Markdown shows in the composer as it will
 read, its marks kept and dim: `**bold**` bold, `` `code` `` in code's colour,
-a `#` line as a heading; what is sent is the text as typed.
+a `#` line as a heading, a `>` quote in italics, a link's label underlined;
+what is sent is the text as typed.
 
 Alt-T boosts the next message: the turn it starts runs at a higher effort
 (`xhigh`, or `high` where the model has no `xhigh`), Alt-T again at `max`
