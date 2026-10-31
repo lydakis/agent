@@ -403,7 +403,9 @@ pub struct View {
     copies: HashMap<String, (String, Option<i64>)>,
     /// Who is busiest, by the rule, and the haiku each holder writes.
     title: haiku::Title,
-    kept: haiku::Kept,
+    /// The haiku shown last, by its writer and when it was written: one
+    /// in the file that is not it is new here.
+    shown: (String, i64),
     verse: Option<Verse>,
     /// The haiku before, fading out, since when.
     fading: Option<(Verse, Instant)>,
@@ -606,7 +608,7 @@ impl View {
             replay: None,
             copies: HashMap::new(),
             title: haiku::Title::new(haiku::Rule::load(), now),
-            kept,
+            shown: (kept.by.clone(), kept.at_ms),
             verse,
             fading: None,
             poems: mpsc::unbounded_channel(),
@@ -775,8 +777,9 @@ impl View {
                 }
                 current
             });
-            self.kept = kept;
+            // Else what took it over shows as the file is next read.
             if current {
+                self.shown = (by.clone(), kept.at_ms);
                 self.recite(by, lines, now);
             }
         }
@@ -806,7 +809,7 @@ impl View {
         // A haiku another sky wrote shows here too, and its writer holds
         // the title here as there.
         let kept = haiku::Kept::load(&self.socket);
-        let new = (kept.by != self.kept.by || kept.at_ms != self.kept.at_ms)
+        let new = (kept.by != self.shown.0 || kept.at_ms != self.shown.1)
             && kept.lines.len() == 3
             && wall_ms() - kept.at_ms < HOUR.as_millis() as i64;
         if new {
@@ -815,8 +818,8 @@ impl View {
                 let since = now.checked_sub(Duration::from_millis(held)).unwrap_or(now);
                 self.title.holder = Some((kept.by.clone(), since));
             }
-            self.recite(kept.by.clone(), kept.lines.clone(), now);
-            self.kept = kept;
+            self.shown = (kept.by.clone(), kept.at_ms);
+            self.recite(kept.by, kept.lines, now);
         }
         let (index, agents) = (&self.index, &self.agents);
         let gone = |name: &str| index.get(name).is_none_or(|&at| agents[at].gone);
@@ -830,9 +833,8 @@ impl View {
         }
         let since = wall_ms();
         let rule = self.title.rule;
-        let (claimed, kept) =
+        let (claimed, _) =
             haiku::Kept::update(&self.socket, |kept| kept.claim(&rule, &name, since, since));
-        self.kept = kept;
         if claimed {
             let (socket, send) = (self.socket.clone(), self.poems.0.clone());
             self.runtime.spawn(async move {
@@ -4600,6 +4602,22 @@ mod tests {
         view.drain();
         assert!(view.fading.is_none());
         assert_eq!(haiku::Kept::load(&view.socket).lines, lines);
+        // Nor does letting one go hide what another sky wrote meanwhile.
+        haiku::Kept::update(&view.socket, |kept| {
+            kept.lines = vec!["d".into(), "e".into(), "f".into()];
+            kept.at_ms = wall_ms() + 1;
+        });
+        let stale = (
+            "shop.lead".to_owned(),
+            since - 1,
+            vec!["x".into(), "y".into(), "z".into()],
+        );
+        view.poems.0.send(stale).unwrap();
+        view.weighed = None;
+        view.drain();
+        assert_eq!(view.verse.as_ref().unwrap().lines, ["d", "e", "f"]);
+        view.fading = None;
+        view.verse.as_mut().unwrap().from -= Duration::from_secs(10);
         // The next fades the last out first.
         let poem = (
             "shop.lead".to_owned(),
@@ -4608,8 +4626,7 @@ mod tests {
         );
         view.poems.0.send(poem).unwrap();
         view.drain();
-        assert!(text(&view.card(150, 40)).contains("morning merges in"));
-        assert!(view.fading.is_some());
+        assert_eq!(view.fading.as_ref().unwrap().0.lines, ["d", "e", "f"]);
         // Zen keeps it, over the sky.
         view.verse.as_mut().unwrap().from -= Duration::from_secs(10);
         view.zen = true;
