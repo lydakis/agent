@@ -648,12 +648,70 @@ def settled_closes(root):
 # reading `tools/settle` does not count as running it; `make` may take
 # options and variables before its target. A group or loop that ran a step
 # filters it when its end is piped or redirected.
-STEP_RUN = re.compile(
-    r"""^[\s('"{]*(?:(?:do|then|else|if|elif|while|until|!)\s+)*"""
-    r"""(?:(?:(?:env|command|exec|time|nice|nohup|stdbuf)(?:\s+-\S+)*|timeout(?:\s+-\S+)*\s+\S+"""
-    r"""|\w+=\S*)\s+)*"""
-    r"""(?:(?:python3?|bash|sh)(?:\s+-\w+)*\s+['"]?)?"""
-    r"""(?:make(?:\s+(?:-C\s+\S+|-\S+|\w+=\S*))*\s+(?:check|bench)\b|(?:[\w.~/-]*/)?tools/settle\b)""")
+STEP_LEAD = re.compile(r"""^[\s('"{]*""")
+STEP_KEYWORD = re.compile(r"(?:do|then|else|if|elif|while|until|!)\s+")
+STEP_WRAPPER = re.compile(r"(?:env|command|exec|time|nice|nohup|stdbuf)(?=\s)")
+STEP_TIMEOUT = re.compile(r"timeout(?=\s)")
+STEP_ASSIGNMENT = re.compile(r"\w+=\S*\s+")
+STEP_OPTION = re.compile(r"\s+-\S+")
+STEP_ARGUMENT = re.compile(r"\s+\S+")
+STEP_SPACE = re.compile(r"\s+")
+STEP_INTERPRETER = re.compile(r"(?:python3?|bash|sh)(?=\s)")
+STEP_INTERPRETER_OPTION = re.compile(r"\s+-\w+")
+STEP_MAKE = re.compile(r"make(?=\s)")
+STEP_MAKE_OPTION = re.compile(r"\s+(?:-C\s+\S+|-\S+|\w+=\S*)")
+STEP_MAKE_TARGET = re.compile(r"\s+(?:check|bench)\b")
+STEP_SETTLE = re.compile(r"(?:[\w.~/-]*/)?tools/settle\b")
+
+
+def starts_step(segment):
+    """Recognize a step at the start of a shell segment in one forward pass.
+
+    Each optional prefix consumes input before the next match. Repeating the
+    whole regex lets ambiguous options backtrack exponentially on commands
+    from model event previews.
+    """
+    at = STEP_LEAD.match(segment).end()
+    while match := STEP_KEYWORD.match(segment, at):
+        at = match.end()
+    while True:
+        if match := STEP_WRAPPER.match(segment, at):
+            end = match.end()
+            while option := STEP_OPTION.match(segment, end):
+                end = option.end()
+            space = STEP_SPACE.match(segment, end)
+            if space is None:
+                break
+            at = space.end()
+        elif match := STEP_TIMEOUT.match(segment, at):
+            end = match.end()
+            while option := STEP_OPTION.match(segment, end):
+                end = option.end()
+            argument = STEP_ARGUMENT.match(segment, end)
+            space = STEP_SPACE.match(segment, argument.end()) if argument else None
+            if space is None:
+                break
+            at = space.end()
+        elif match := STEP_ASSIGNMENT.match(segment, at):
+            at = match.end()
+        else:
+            break
+    if match := STEP_INTERPRETER.match(segment, at):
+        end = match.end()
+        while option := STEP_INTERPRETER_OPTION.match(segment, end):
+            end = option.end()
+        if space := STEP_SPACE.match(segment, end):
+            at = space.end()
+            if at < len(segment) and segment[at] in "'\"":
+                at += 1
+    if match := STEP_MAKE.match(segment, at):
+        at = match.end()
+        while option := STEP_MAKE_OPTION.match(segment, at):
+            at = option.end()
+        return STEP_MAKE_TARGET.match(segment, at) is not None
+    return STEP_SETTLE.match(segment, at) is not None
+
+
 # The plain step command the sustained prompt asks for, and any command
 # that names a step.
 PLAIN_STEP = re.compile(r'\s*(?:make (?:check|bench) CLOSE=[\w-]+|tools/settle [\w-]+)(?:\s+2>&1)?\s*$')
@@ -694,7 +752,7 @@ def step_command_faults(command, unread=False):
     # redirects, not separators.
     parts = re.split(f'({SEPARATORS})', command)
     segments, openers, closers = parts[0::2], [''] + parts[1::2], parts[1::2] + ['']
-    runs = [bool(STEP_RUN.match(segment)) for segment in segments]
+    runs = [starts_step(segment) for segment in segments]
     steps = [segment for segment, run in zip(segments, runs) if run]
     substituted = any(run and opener in ('$(', '<(', '`') for run, opener in zip(runs, openers))
 
@@ -702,7 +760,7 @@ def step_command_faults(command, unread=False):
         return closers[n] in ('|', '|&') or '>' in segments[n].replace('2>&1', '')
     filtered = (unread or substituted) and bool(steps) or any(sends(n) for n, run in enumerate(runs) if run) or any(
         GROUP_END.match(segment) and sends(n) and any(runs[:n]) for n, segment in enumerate(segments))
-    filtered = filtered or any(STEP_RUN.match(segment) for inner in redirected_groups(command)
+    filtered = filtered or any(starts_step(segment) for inner in redirected_groups(command)
                                for segment in re.split(SEPARATORS, inner))
     looped = any(re.match(r'[\s({]*do\s', step) for step in steps) or bool(
         re.search(r'xargs\b[^;&\n]*(?:make (?:check|bench)|tools/settle)', command))
