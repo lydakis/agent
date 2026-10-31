@@ -10862,10 +10862,12 @@ fn quoting(item: &Value) -> String {
             true => "replied",
             false => "wrote",
         };
-        let (bot, turn) = (quote["bot"].as_str().unwrap_or_default(), &quote["turn"]);
-        out.push_str(&format!("\n\n{who} {did} in turn:{bot}/{turn}:"));
+        out.push_str(&format!("\n\n{who} {did}:"));
         for line in words.lines() {
-            out.push_str(&format!("\n> {line}"));
+            out.push_str(&format!(
+                "\n>{}{line}",
+                if line.is_empty() { "" } else { " " }
+            ));
         }
     }
     out
@@ -14770,8 +14772,8 @@ mod tests {
                 {"bot": "calc.fix", "turn": 6, "reply": true, "person": "ana", "at": 5}]});
         assert_eq!(
             quoting(&item),
-            "News from your tasks.\n\nyou wrote in turn:calc.fix/5:\n> yes, ship it\n> and tag it\n\n\
-             ana replied in turn:calc.fix/6:\n> tagged"
+            "News from your tasks.\n\nyou wrote:\n> yes, ship it\n> and tag it\n\n\
+             ana replied:\n> tagged"
         );
         // Its own words are all a message without quotes shows.
         assert_eq!(text(&item), "News from your tasks.");

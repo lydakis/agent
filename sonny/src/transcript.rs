@@ -1232,21 +1232,38 @@ pub fn relayed(text: &str, from: Option<&str>, open: bool, width: usize) -> Vec<
     };
     let head = cut(&format!("↳ {}", head.trim()), width.saturating_sub(2));
     let mut out = vec![Line::from(format!("{head} ▾"))];
-    for line in text.lines() {
-        // Words it quotes as Markdown draws a quote: a bar, in italics.
-        let (line, rest) = match line.strip_prefix("> ") {
-            Some(quoted) => (
-                Line::from(vec![
-                    Span::raw("▌ "),
-                    Span::raw(quoted.to_string()).italic(),
-                ]),
-                Span::raw("  ▌ "),
-            ),
-            None => (Line::from(line.to_string()), Span::raw("  ")),
+    let mut lines = text.lines().peekable();
+    while let Some(line) = lines.next() {
+        let Some(quoted) = quote_line(line) else {
+            let line = Line::from(line.to_string());
+            out.extend(wrap(line, width, Span::raw("  "), Span::raw("  ")));
+            continue;
         };
-        out.extend(wrap(line, width, Span::raw("  "), rest));
+        // Words it quotes, drawn as the reply they were, behind a bar:
+        // their shape without their colors, so they never outweigh the
+        // words that quote them.
+        let mut words = quoted.to_string();
+        while let Some(quoted) = lines.peek().and_then(|line| quote_line(line)) {
+            words.push('\n');
+            words.push_str(quoted);
+            lines.next();
+        }
+        let bar = || Line::from("  ▌ ");
+        for mut line in markdown(&mut Markdown::default(), &words, width, (bar(), bar())) {
+            (line.style.fg, line.style.bg) = (None, None);
+            for span in &mut line.spans {
+                (span.style.fg, span.style.bg) = (None, None);
+            }
+            out.push(line);
+        }
     }
     out.into_iter().map(|line| line.dim()).collect()
+}
+
+/// A line of quoted words, as Markdown marks one: `> ` before it, or a
+/// lone `>` for a blank line between them.
+fn quote_line(line: &str) -> Option<&str> {
+    line.strip_prefix("> ").or((line == ">").then_some(""))
 }
 
 /// What the shut row of words between agents says: who sent them, not
@@ -2746,6 +2763,36 @@ mod tests {
         for width in 0..8 {
             relayed("Tests pass.", Some("calc.neg"), false, width);
         }
+    }
+
+    #[test]
+    fn words_a_message_quotes_draw_as_their_reply_did_behind_a_quiet_bar() {
+        let message = "Can this land?\n\ncalc.fix replied:\n> Fixed **it**:\n>\n> ```rust\n> let x = 1;\n> ```";
+        let rows = relayed(message, Some("ana"), true, 80);
+        assert_eq!(
+            text(&rows),
+            [
+                "↳ From ana ▾",
+                "  Can this land?",
+                "  ",
+                "  calc.fix replied:",
+                "  ▌ Fixed it:",
+                "  ▌ ",
+                "  ▌   let x = 1;",
+            ]
+        );
+        // Its shape stays, its colors go: all of it as quiet as the rest.
+        let spans = rows.iter().flat_map(|row| &row.spans);
+        assert!(
+            spans
+                .clone()
+                .any(|s| s.content == "it" && s.style.add_modifier.contains(Modifier::BOLD))
+        );
+        assert!(spans.clone().all(|s| s.style.fg.is_none()));
+        assert!(
+            rows.iter()
+                .all(|row| row.style.add_modifier.contains(Modifier::DIM))
+        );
     }
 
     #[test]
