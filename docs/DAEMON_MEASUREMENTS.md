@@ -6370,3 +6370,27 @@ O(log n) point reads, and storage grows about 10 bytes a node. The newest
 page costs about 0.2 ms more, for sizing the page against its byte budget.
 Stores from before schema 73 place every node when they open, in one pass
 in id order with the places held in memory.
+
+The write side under the hot-path screens, from the Perf workflow on the
+pull request (GitHub runner, base main 30845ba against head 9a49159,
+alternating rounds, medians):
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 45.728 | 46.527 | +1.7% |
+| admission | burst submit p99, ms | 6.214 | 6.152 | -1.0% |
+| completion | release to terminal p99, ms | 16.832 | 17.781 | +5.6% |
+| footprint | idle RSS, MiB | 20.059 | 20.152 | +0.5% |
+| footprint | per idle bot, KiB | 1.506 | 1.42 | -5.7% |
+| footprint | RSS after a turn each, MiB | 27.76 | 28.107 | +1.3% |
+| footprint | CPU per turn, ms | 1.592 | 1.64 | +3.0% |
+| lifecycle | CPU, s | 1.38 | 1.32 | -4.3% |
+| lifecycle | p95 turn, ms | 586.813 | 589.251 | +0.4% |
+| lifecycle | peak RSS, MiB | 26.826 | 26.877 | +0.2% |
+
+Store jobs per turn held at about 7.5 on both sides (the lineage row rides
+the node's own insert, so no job is added), and nothing passed the gate's
+15% line; per-round completion p99s on both sides ran from about 16 to
+20 ms, so its +0.9 ms is inside the noise. The extra per-write work shows in the
+single-commit microbenchmark above and not at fleet scale, where group
+commits carry it.
