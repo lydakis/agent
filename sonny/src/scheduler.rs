@@ -372,6 +372,82 @@ struct Followed {
     again: bool,
     /// When the scheduler last started a fire of it.
     started: Option<std::time::Instant>,
+    /// Starts that failed in a row, and when to try again: what was due
+    /// stays due.
+    failures: u32,
+    retry: Option<std::time::Instant>,
+}
+
+/// The fires the scheduler started and runs still, by process and by
+/// trigger, and how many may run at once.
+struct Fleet {
+    running: HashMap<libc::pid_t, String>,
+    busy: std::collections::HashSet<String>,
+    cap: usize,
+}
+
+impl Fleet {
+    fn new() -> Self {
+        // As make's and cargo's jobs scale with the machine: a burst of
+        // due triggers waits its turn rather than starting all at once.
+        let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+        Self {
+            running: HashMap::new(),
+            busy: std::collections::HashSet::new(),
+            cap: (cores * 4).max(8),
+        }
+    }
+    fn full(&self) -> bool {
+        self.running.len() >= self.cap
+    }
+    /// A fire that ended: its trigger, when the scheduler started it.
+    fn ended(&mut self, pid: libc::pid_t) -> Option<String> {
+        let name = self.running.remove(&pid)?;
+        self.busy.remove(&name);
+        Some(name)
+    }
+}
+
+/// How a trigger's fire is started: its process, or none while another
+/// fire of it holds its lock.
+type Spawn<'a> = dyn FnMut(&str, &Job) -> Result<Option<libc::pid_t>, String> + 'a;
+
+/// Start a due trigger's fire now if it may start: else it stays due
+/// (`again`), for when its fire ends, its last start is a moment old, a
+/// failed start's wait is over, or the fleet has room.
+fn launch(
+    name: &str,
+    f: &mut Followed,
+    fleet: &mut Fleet,
+    now: std::time::Instant,
+    spawn: &mut Spawn,
+) {
+    let soon = f
+        .started
+        .is_some_and(|at| now.duration_since(at) < AGAIN_AFTER);
+    let waiting = f.retry.is_some_and(|at| at > now);
+    if fleet.busy.contains(name) || soon || waiting || fleet.full() {
+        f.again = true;
+        return;
+    }
+    match spawn(name, &f.job) {
+        Ok(Some(pid)) => {
+            fleet.running.insert(pid, name.to_owned());
+            fleet.busy.insert(name.to_owned());
+            f.started = Some(now);
+            (f.failures, f.retry) = (0, None);
+        }
+        // A fire of it the scheduler did not start runs still.
+        Ok(None) => f.again = true,
+        // Tried again after a wait that doubles, up to five minutes.
+        Err(error) => {
+            eprintln!("{}", trigger::error_json(&error));
+            f.failures = f.failures.saturating_add(1);
+            let wait = AGAIN_AFTER * 2u32.pow(f.failures.min(9) - 1);
+            f.retry = Some(now + wait.min(LOOK_EVERY * 5));
+            f.again = true;
+        }
+    }
 }
 
 /// `sonny scheduler`: fire every trigger of this HOME, until its HOME is
@@ -406,9 +482,10 @@ pub fn run() -> i32 {
     let born = me.as_deref().and_then(identity);
     let mut followed: HashMap<String, Followed> = HashMap::new();
     let mut kept = read_looked(&places);
-    let mut running: HashMap<libc::pid_t, String> = HashMap::new();
+    let mut fleet = Fleet::new();
     let mut folder = None;
     let mut last_look = std::time::Instant::now() - LOOK_EVERY;
+    let mut last_watch = std::time::Instant::now() - WATCH_EVERY;
     let mut rang = true;
     loop {
         if orphaned() {
@@ -441,7 +518,7 @@ pub fn run() -> i32 {
             );
         }
         // Fires that ended: their queues are looked at again.
-        let mut ended = Vec::new();
+        let mut ended = std::collections::HashSet::new();
         loop {
             let mut status = 0;
             // SAFETY: waitpid only writes the status it is given.
@@ -449,8 +526,8 @@ pub fn run() -> i32 {
             if pid <= 0 {
                 break;
             }
-            if let Some(name) = running.remove(&pid) {
-                ended.push(name);
+            if let Some(name) = fleet.ended(pid) {
+                ended.insert(name);
             }
             if syncing == Some(pid) {
                 syncing = None;
@@ -471,13 +548,14 @@ pub fn run() -> i32 {
             fired = read_jobs(&places, &mut followed, &mut kept);
         }
         let now = trigger::now();
-        let mut names: Vec<String> = followed.keys().cloned().collect();
-        names.sort();
-        for name in names {
-            let Some(f) = followed.get_mut(&name) else {
-                continue;
-            };
-            let busy = running.values().any(|n| *n == name);
+        let instant = std::time::Instant::now();
+        // Watched paths every two seconds, however often it wakes.
+        let watch = instant.duration_since(last_watch) >= WATCH_EVERY;
+        if watch {
+            last_watch = instant;
+        }
+        for (name, f) in followed.iter_mut() {
+            let busy = fleet.busy.contains(name);
             let mut due = std::mem::take(&mut f.again);
             if f.next.is_some_and(|next| next <= now) {
                 // A time that comes while a fire runs is skipped, as
@@ -488,32 +566,20 @@ pub fn run() -> i32 {
                 kept.insert(name.clone(), (f.generation.clone(), now));
                 fired = true;
             }
-            if let Some(path) = &f.job.watch {
+            if let Some(path) = f.job.watch.as_ref().filter(|_| watch) {
                 let seen = look(path);
                 if seen != f.seen {
                     f.seen = seen;
                     due = true;
                 }
             }
-            if (rang || every_minute || ended.contains(&name)) && asked(&places, &name) {
+            if (rang || every_minute || ended.contains(name)) && asked(&places, name) {
                 due = true;
             }
-            if !due {
-                continue;
-            }
-            let soon = f.started.is_some_and(|at| at.elapsed() < AGAIN_AFTER);
-            if busy || soon {
-                f.again = true;
-                continue;
-            }
-            match spawn(&places, &name, &f.job) {
-                Ok(Some(pid)) => {
-                    running.insert(pid, name.clone());
-                    f.started = Some(std::time::Instant::now());
-                }
-                // A fire of it the scheduler did not start runs still.
-                Ok(None) => f.again = true,
-                Err(error) => eprintln!("{}", trigger::error_json(&error)),
+            if due {
+                launch(name, f, &mut fleet, instant, &mut |name, job| {
+                    spawn(&places, name, job)
+                });
             }
         }
         if fired {
@@ -535,11 +601,18 @@ pub fn run() -> i32 {
                 wake = wake.min(at.saturating_sub(now_exact));
             }
             if f.job.watch.is_some() {
-                wake = wake.min(WATCH_EVERY);
+                wake = wake.min(WATCH_EVERY.saturating_sub(last_watch.elapsed()));
             }
-            // One whose fire runs is woken by that fire's end.
-            if f.again && !running.values().any(|n| n == name) {
-                wake = wake.min(AGAIN_AFTER);
+            // One whose fire runs, or that waits for room, is woken by a
+            // fire's end.
+            if f.again && !fleet.full() && !fleet.busy.contains(name) {
+                let at = [f.started.map(|at| at + AGAIN_AFTER), f.retry]
+                    .into_iter()
+                    .flatten()
+                    .max();
+                wake = wake.min(at.map_or(Duration::ZERO, |at| {
+                    at.saturating_duration_since(std::time::Instant::now())
+                }));
             }
         }
         rang = bell.wait(wake.max(Duration::from_millis(50)));
@@ -623,6 +696,8 @@ fn read_jobs(
                 seen,
                 again,
                 started,
+                failures: 0,
+                retry: None,
             },
         );
     }
@@ -1029,6 +1104,82 @@ mod tests {
             next_after(&leap.entries, clock(2026, 10, 31, 12, 0)),
             Some(clock(2028, 2, 29, 0, 0))
         );
+    }
+
+    #[test]
+    fn ten_thousand_due_triggers_start_a_fleet_at_a_time_and_none_is_lost() {
+        let job = || Job {
+            program: vec!["/A/sonny".into()],
+            environment: Vec::new(),
+            calendar: Vec::new(),
+            watch: None,
+        };
+        let mut followed: HashMap<String, Followed> = (0..10_000)
+            .map(|i| {
+                let f = Followed {
+                    file: (0, 0, 0),
+                    job: job(),
+                    generation: "g".into(),
+                    looked: 0,
+                    next: None,
+                    seen: None,
+                    again: true,
+                    started: None,
+                    failures: 0,
+                    retry: None,
+                };
+                (format!("t{i:05}"), f)
+            })
+            .collect();
+        let mut fleet = Fleet {
+            running: HashMap::new(),
+            busy: std::collections::HashSet::new(),
+            cap: 64,
+        };
+        let (mut pid, mut fired) = (0, std::collections::HashSet::new());
+        let mut now = std::time::Instant::now();
+        // Every third start fails the first time it is tried.
+        let mut failed = std::collections::HashSet::new();
+        let mut spawn = |name: &str, _: &Job| {
+            let n: usize = name[1..].parse().unwrap();
+            if n.is_multiple_of(3) && failed.insert(name.to_owned()) {
+                return Err(format!("{name}: no such file"));
+            }
+            pid += 1;
+            Ok(Some(pid))
+        };
+        for _ in 0..1_000 {
+            for (name, f) in followed.iter_mut() {
+                if std::mem::take(&mut f.again) {
+                    launch(name, f, &mut fleet, now, &mut spawn);
+                }
+            }
+            assert!(fleet.running.len() <= fleet.cap);
+            // Every fire ends, and time passes past any wait.
+            for pid in fleet.running.keys().copied().collect::<Vec<_>>() {
+                fired.insert(fleet.ended(pid).unwrap());
+            }
+            now += LOOK_EVERY * 5;
+            if followed.values().all(|f| !f.again) {
+                break;
+            }
+        }
+        assert_eq!(fired.len(), 10_000, "every due trigger fired once");
+        assert!(
+            followed
+                .values()
+                .all(|f| f.failures == 0 && f.retry.is_none())
+        );
+        // A failed start waits, doubling, rather than spinning.
+        let f = followed.get_mut("t00000").unwrap();
+        f.again = true;
+        let mut failing = |_: &str, _: &Job| Err::<Option<libc::pid_t>, String>("gone".into());
+        launch("t00000", f, &mut fleet, now, &mut failing);
+        launch("t00000", f, &mut fleet, now, &mut failing);
+        assert_eq!((f.failures, f.again), (1, true));
+        assert_eq!(f.retry, Some(now + AGAIN_AFTER));
+        launch("t00000", f, &mut fleet, now + AGAIN_AFTER, &mut failing);
+        assert_eq!(f.retry, Some(now + AGAIN_AFTER * 3));
     }
 
     #[test]

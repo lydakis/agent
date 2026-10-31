@@ -287,7 +287,10 @@ watches changes (a write after the trigger was added and before the
 scheduler first read it included), and while its queue holds an ask. One fire of a trigger
 runs at a time, also across a restart of the scheduler: a fire holds a lock
 on its own file in `~/.agent/triggers/.scheduler` while it runs, which a daemon
-it starts does not inherit. A ring of its doorbell, the FIFO `~/.agent/triggers/.ring`, has it
+it starts does not inherit. At most four fires per core (eight at least)
+run at once, as make's and cargo's jobs scale with the machine: a burst of
+due triggers waits its turn. A fire that cannot start stays due, and is
+tried again after a wait that doubles from a second up to five minutes. A ring of its doorbell, the FIFO `~/.agent/triggers/.ring`, has it
 look again at once, and so does a fire that ends; else it sleeps until the
 next calendar time, and at most a minute, and looks at watched paths every
 two seconds. A lock of its own there keeps one scheduler per HOME. It also
