@@ -854,13 +854,12 @@ pub fn install_skill(host: Option<&str>) {
             skill("cmux-tabs", text, "CMUX_BIN", bin)
         }
         Some(Kind::Rex(bin)) => rex(bin),
-        // Out of every multiplexer, agents get none: nothing they opened
-        // in one would be seen.
-        None => ("", String::new()),
+        // Out of every multiplexer, none is installed: nothing opened in
+        // one would be seen. One installed stays, for another project's
+        // Sonny still in its multiplexer.
+        None => return,
     };
-    if !name.is_empty() {
-        crate::skills::install(name, &text);
-    }
+    crate::skills::install(name, &text);
     for other in ["rex-windows", "herdr-panes", "cmux-tabs"] {
         if other != name {
             crate::skills::remove(other);
