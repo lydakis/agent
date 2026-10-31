@@ -6336,3 +6336,37 @@ the rate it had, in exchange for no other session waiting behind them.
 Several sessions reading at once get more than before in total, since
 reads now run side by side. Each reader connection keeps its own 2 MiB
 page cache and statement cache.
+
+## History reads reach any ancestor in O(log n) (#472)
+
+`history_nodes` and `history_items` used to walk a bot's lineage node by
+node: an oldest-first page ordered the whole ancestry past its floor
+before its `LIMIT`, checking `from` walked from the head to it, and a
+batch of items walked from the head to the oldest one asked for. Each
+node now has a narrow `lineage` row (parent, depth, a skip pointer chosen
+as Bitcoin Core's block index chooses `pskip`, and its turn's start),
+written by the insert that writes the node, so those reads take O(log n)
+point lookups. A page also stops at 256 KiB sent.
+
+A synthetic store of one bot with 2,000 turns of ten 2 KB nodes (20,000
+nodes, 77.5 MiB), release build, main 16a9324 against the branch, two
+alternating runs each (2026-10-31, the cloud container):
+
+| Measure | Main | Branch |
+| --- | ---: | ---: |
+| writes, µs per node (each its own commit) | 906, 956 | 1,008, 1,022 |
+| store size, MiB | 77.5 | 77.7 |
+| newest page of 400, ms | 0.75, 0.74 | 1.06, 0.89 |
+| oldest-first page after the first 10%, ms | 50.5, 48.6 | 1.4, 1.2 |
+| oldest-first page after half, ms | 28.4, 29.1 | 1.3, 1.2 |
+| page from an early node, ms | 44.8, 43.2 | 0.96, 0.86 |
+| one early item, ms | 48.0, 48.1 | 0.61, 0.95 |
+| 100 items spread over the history, ms | 46.9, 58.7 | 4.4, 6.5 |
+
+The deep reads no longer grow with the history: they are 30 to 80 times
+faster here, and the gap widens with depth. A write costs about 7 to 11%
+more, mostly the lineage row's page in the same commit plus a skip walk of
+O(log n) point reads, and storage grows about 10 bytes a node. The newest
+page costs about 0.2 ms more, for sizing the page against its byte budget.
+Stores from before schema 72 place every node when they open, in one pass
+in id order with the places held in memory.
