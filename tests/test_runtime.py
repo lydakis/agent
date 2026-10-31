@@ -1458,7 +1458,7 @@ class ModelFixture(unittest.TestCase):
 @unittest.skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'set AGENT_TEST_RUNTIME=1 after a Rust release build')
 class RuntimeTests(ModelFixture):
     def test_detached_shell_releases_its_daemon_slot_after_exit(self):
-        client = self.client('shell', extra=('--max-detached', '1'))
+        client = self.client('shell', extra=('--max-lasting', '1'))
         client.request('create', bot='Bob', workspace=str(self.path), tools=['shell'])
 
         def result(prompt, request_id):
@@ -1474,7 +1474,7 @@ class RuntimeTests(ModelFixture):
         self.assertTrue(first['detached'])
         pid = first['pid']
         try:
-            self.assertEqual(result('detach:true', 'full')['error'], 'detached_limit')
+            self.assertEqual(result('detach:true', 'full')['error'], 'lasting_limit')
         finally:
             try:
                 os.kill(pid, 9)

@@ -55,15 +55,24 @@ struct State {
 }
 
 impl Terminal {
+    /// End the command's whole session: its own group, the job in the
+    /// terminal's foreground, and, looked up off the runtime thread, every
+    /// other group a shell with job control made in it.
     fn kill(&self) {
         // Only while the command runs: after its end the group's number
         // may be another's.
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.end.is_none() {
-            // SAFETY: kill takes no pointers; the group is this command's own.
+            // SAFETY: kill and tcgetpgrp take no pointers; the group and
+            // the terminal are this command's own.
             unsafe {
                 libc::kill(-self.group, libc::SIGKILL);
+                let foreground = libc::tcgetpgrp(self.master.get_ref().as_raw_fd());
+                if foreground > 0 {
+                    libc::kill(-foreground, libc::SIGKILL);
+                }
             }
+            end_session(self.group);
         }
     }
 
@@ -117,6 +126,21 @@ impl Terminal {
         )
         .await;
     }
+}
+
+/// `owner`'s least recently used terminal, when it has `share` or more.
+/// The scan is bounded: every terminal holds a lasting permit.
+fn least_used(
+    terminals: &HashMap<i64, Arc<Terminal>>,
+    owner: i64,
+    share: usize,
+) -> Option<Arc<Terminal>> {
+    let own = terminals.values().filter(|t| t.owner == owner);
+    if own.clone().count() < share {
+        return None;
+    }
+    own.min_by_key(|t| t.state.lock().unwrap_or_else(|e| e.into_inner()).used)
+        .cloned()
 }
 
 /// A start's, a write's, or an end's result: the output, and how the
@@ -195,6 +219,102 @@ fn lines(text: &str) -> String {
     lines
 }
 
+/// Kill every process group in session `session` but its leader's, which
+/// the caller ends: the jobs a shell with job control starts each get a
+/// group of their own, and one that ignores SIGHUP would outlive its
+/// terminal. A session's number stays its own while any member lives, so
+/// only a session already empty could find its number reused. The listing
+/// reads files, so it runs off the runtime thread when there is one.
+fn end_session(session: i32) {
+    match tokio::runtime::Handle::try_current() {
+        Ok(runtime) => drop(runtime.spawn_blocking(move || sweep(session))),
+        Err(_) => sweep(session),
+    }
+}
+
+fn sweep(session: i32) {
+    for group in session_groups(session) {
+        if group != session {
+            // SAFETY: kill takes no pointers.
+            unsafe {
+                libc::kill(-group, libc::SIGKILL);
+            }
+        }
+    }
+}
+
+/// The process groups with a member in `session`.
+#[cfg(target_os = "linux")]
+fn session_groups(session: i32) -> Vec<i32> {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    let mut groups = Vec::new();
+    for entry in entries.flatten() {
+        if !entry
+            .file_name()
+            .as_encoded_bytes()
+            .iter()
+            .all(u8::is_ascii_digit)
+        {
+            continue;
+        }
+        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        // After the command's name, which may hold spaces: state, parent,
+        // group, session.
+        let Some((_, fields)) = stat.rsplit_once(')') else {
+            continue;
+        };
+        let mut fields = fields.split_whitespace().skip(2);
+        if let (Some(Ok(group)), Some(Ok(sid))) = (
+            fields.next().map(str::parse::<i32>),
+            fields.next().map(str::parse::<i32>),
+        ) && sid == session
+            && !groups.contains(&group)
+        {
+            groups.push(group);
+        }
+    }
+    groups
+}
+
+/// The process groups with a member in `session`.
+#[cfg(target_os = "macos")]
+fn session_groups(session: i32) -> Vec<i32> {
+    // SAFETY: a null buffer asks only for the count.
+    let count = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
+    if count <= 0 {
+        return Vec::new();
+    }
+    // Room for processes started since the count.
+    let mut pids = vec![0 as libc::pid_t; count as usize + 64];
+    // SAFETY: the pointer and size are the buffer's own.
+    let listed = unsafe {
+        libc::proc_listallpids(
+            pids.as_mut_ptr().cast(),
+            (pids.len() * std::mem::size_of::<libc::pid_t>()) as libc::c_int,
+        )
+    };
+    pids.truncate(listed.max(0) as usize);
+    let mut groups = Vec::new();
+    for pid in pids {
+        // SAFETY: getsid and getpgid take no pointers.
+        let (sid, group) = unsafe { (libc::getsid(pid), libc::getpgid(pid)) };
+        if sid == session && group > 0 && !groups.contains(&group) {
+            groups.push(group);
+        }
+    }
+    groups
+}
+
+/// Elsewhere only the leader's group and the foreground job are ended.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn session_groups(_session: i32) -> Vec<i32> {
+    Vec::new()
+}
+
 /// A pseudo-terminal's two ends, each closed on exec.
 fn open() -> Result<(OwnedFd, OwnedFd)> {
     let (mut master, mut slave) = (-1, -1);
@@ -251,6 +371,10 @@ impl Registry {
         done: oneshot::Sender<Result<Outcome>>,
     ) -> Result<Outcome> {
         let started = async {
+            // The bot's least recently used terminal past its share ends
+            // first, so its permit is free for this one.
+            self.prune(owner).await;
+            let permit = self.lasting()?;
             let held = crate::sandbox::hold_for(sandbox.as_deref()).await;
             let (master, slave) = open()?;
             let mut process = sh(
@@ -284,7 +408,7 @@ impl Registry {
             // SAFETY: the OwnedFd is open, and it keeps the one descriptor
             // until the AsyncFd that owns it drops.
             let master = unsafe { AsyncFd::register(master) }.map_err(std::io::Error::from)?;
-            Ok::<_, Error>((child, master, group, held))
+            Ok::<_, Error>((child, master, group, (held, permit)))
         };
         let (mut child, master, group, held) = match started.await {
             Ok(started) => started,
@@ -307,15 +431,11 @@ impl Registry {
             }),
             exited,
         });
+        // Two starts at once can both find room: the later one's insert
+        // ends the bot's least recently used, as before.
         let pruned = {
             let mut terminals = self.terminals.lock().unwrap_or_else(|e| e.into_inner());
-            let own = terminals.values().filter(|t| t.owner == owner);
-            let pruned = (own.clone().count() >= MAX_TERMINALS)
-                .then(|| {
-                    own.min_by_key(|t| t.state.lock().unwrap_or_else(|e| e.into_inner()).used)
-                        .cloned()
-                })
-                .flatten();
+            let pruned = least_used(&terminals, owner, MAX_TERMINALS);
             terminals.insert(handle, terminal.clone());
             pruned
         };
@@ -388,6 +508,9 @@ impl Registry {
                 unsafe {
                     libc::kill(-group, libc::SIGKILL);
                 }
+                // The jobs it started in groups of their own go too, before
+                // its permit does.
+                let _ = tokio::task::spawn_blocking(move || sweep(group)).await;
                 drop(held);
                 let end = match status {
                     Ok(status) => {
@@ -425,6 +548,21 @@ impl Registry {
         }
         terminal.settle(yield_ms).await;
         Ok(terminal.take(self, handle))
+    }
+
+    /// End `owner`'s least recently used terminal when it already runs its
+    /// share, and wait a moment for it to go, so its permit is free.
+    async fn prune(&self, owner: i64) {
+        let pruned = least_used(
+            &self.terminals.lock().unwrap_or_else(|e| e.into_inner()),
+            owner,
+            MAX_TERMINALS,
+        );
+        if let Some(pruned) = pruned {
+            pruned.kill();
+            let mut exited = pruned.exited.clone();
+            let _ = tokio::time::timeout(Duration::from_secs(2), exited.wait_for(|e| *e)).await;
+        }
     }
 
     /// End every terminal, as the daemon stops; each reports its end on
@@ -527,6 +665,35 @@ mod tests {
         // A command's end holds nothing back.
         unread.extend_from_slice(b"sk-");
         assert_eq!(text(&mut unread, None), "sk-");
+    }
+
+    #[test]
+    fn a_secret_field_split_across_reads_is_redacted_whole() {
+        let credentials = Credentials::default();
+        credentials.redact_also(&["password".to_owned(), "api_key".to_owned()], &[]);
+        let read = |unread: &mut Vec<u8>, more: &[u8]| {
+            unread.extend_from_slice(more);
+            credentials.redact(text(unread, Some(&credentials)))
+        };
+        let mut unread = Vec::new();
+        // The name and separator wait for their value, and the value for
+        // its end.
+        assert_eq!(read(&mut unread, b"login ok\npassword="), "login ok\n");
+        assert_eq!(read(&mut unread, b"fake9fake9"), "");
+        assert_eq!(read(&mut unread, b"fake9\n> "), "password=[REDACTED]\n> ");
+        // So does a name cut inside, from four bytes of a field's start.
+        assert_eq!(read(&mut unread, b"export MY_PASS"), "export ");
+        assert_eq!(
+            read(&mut unread, b"WORD=abcd1234efgh\n"),
+            "MY_PASSWORD=[REDACTED]\n"
+        );
+        // Other words, and fields whose values ended, go out as typed.
+        assert_eq!(read(&mut unread, b"ls -la\n> "), "ls -la\n> ");
+        assert_eq!(read(&mut unread, b"api_key: set\n"), "api_key: set\n");
+        assert!(unread.is_empty());
+        // A command's end holds nothing back.
+        unread.extend_from_slice(b"password=");
+        assert_eq!(text(&mut unread, None), "password=");
     }
 
     #[test]

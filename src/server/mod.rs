@@ -781,8 +781,8 @@ pub struct Configuration {
     pub providers: Vec<ProviderSpec>,
     /// Concurrent child processes; default 64 per logical CPU; zero unbounded.
     pub max_processes: Option<usize>,
-    /// Detached commands still running, daemon-wide; default 16; zero unbounded.
-    pub max_detached: Option<usize>,
+    /// Terminals and detached commands still running, daemon-wide; default 4 per logical CPU; zero unbounded.
+    pub max_lasting: Option<usize>,
     /// Turns with a live task (model call or foreground tool); default 4,096; zero unbounded.
     pub max_active: Option<usize>,
     /// Provider requests awaiting response headers; unbounded by default,
@@ -820,7 +820,7 @@ pub struct Configuration {
 #[derive(Clone, Copy)]
 pub struct Limits {
     pub processes: usize,
-    pub detached: usize,
+    pub lasting: usize,
     pub active: usize,
     pub connecting: usize,
     pub pending: usize,
@@ -839,9 +839,9 @@ impl Limits {
         let active = config.max_active.unwrap_or(4096);
         Limits {
             processes: config.max_processes.unwrap_or(64 * cpus),
-            detached: config
-                .max_detached
-                .unwrap_or(agent_runtime::tools::DEFAULT_DETACHED_BUDGET),
+            lasting: config
+                .max_lasting
+                .unwrap_or_else(agent_runtime::tools::default_lasting),
             active,
             connecting: config.max_connecting.unwrap_or(0),
             pending: config.max_pending.unwrap_or(0),
@@ -1486,7 +1486,7 @@ pub async fn run(config: Configuration) -> Result<()> {
         .with_environment(environment)
         .with_daemon(daemon)
         .with_process_budget(limits.processes)
-        .with_detached_budget(limits.detached);
+        .with_lasting_budget(limits.lasting);
     let hub = Hub::default();
     let lineage = store.op("store_identity", |db| db.store_identity()).await?;
     let identity = store.instance_identity(lineage)?;
@@ -1495,7 +1495,7 @@ pub async fn run(config: Configuration) -> Result<()> {
     let ready = json!({"event":"ready","protocol":agent_client::PROTOCOL,"pid":std::process::id(),
         "paused":paused,
         "store":{"identity":format!("{identity:032x}"),"lineage":format!("{:016x}", lineage as u64)},
-        "limits":{"processes":limits.processes,"detached":limits.detached,"active":limits.active,"connecting":limits.connecting,
+        "limits":{"processes":limits.processes,"lasting":limits.lasting,"active":limits.active,"connecting":limits.connecting,
             "pending":limits.pending,"pending_bytes":limits.pending_bytes,
             "readers":limits.readers,"connections":limits.connections,
             "idle_exit_seconds":config.idle_exit,
@@ -5070,7 +5070,7 @@ mod tests {
                 pending_bytes: 0,
                 readers: 1,
                 processes: 16,
-                detached: 16,
+                lasting: 16,
                 active: 1024,
                 connecting: 64,
                 connections: 11,
@@ -5272,7 +5272,7 @@ mod tests {
                 pending_bytes: 0,
                 readers: 1,
                 processes: 16,
-                detached: 16,
+                lasting: 16,
                 active: 1024,
                 connecting: 64,
                 connections: 11,
@@ -5490,7 +5490,7 @@ mod tests {
                 pending_bytes: 0,
                 readers: 1,
                 processes: 16,
-                detached: 16,
+                lasting: 16,
                 active: 1024,
                 connecting: 64,
                 connections: 11,
@@ -5735,7 +5735,7 @@ mod tests {
                 pending_bytes: 0,
                 readers: 1,
                 processes: 16,
-                detached: 16,
+                lasting: 16,
                 active: 1024,
                 connecting: 64,
                 connections: 11,
