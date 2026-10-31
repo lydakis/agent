@@ -13,7 +13,7 @@ use ratatui::{
 };
 use serde_json::{Value, json};
 use std::borrow::Cow;
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -174,6 +174,13 @@ fn without(text: &str) -> String {
 /// For each thread, how many times each agent has read it or posted in
 /// it: a reply tells an agent once until it looks again.
 const SEEN: &str = ".seen";
+/// The invite holders each reply woke, which its subscribers' note leaves
+/// out: `{"THREAD/N": {"at", "bots"}}`, `bots` null while they are being
+/// woken. Kept a day.
+const WOKEN: &str = ".woken";
+/// How long the commons source waits on a reply's waking before it tells
+/// the reply's subscribers anyway.
+const WAKING: i64 = 60;
 
 pub fn dir(home: &Path) -> PathBuf {
     home.join(".agents").join("commons")
@@ -740,14 +747,20 @@ pub async fn invite(home: &Path, started: &Value, author: &str, invite: &Value) 
         let (client, _events) = agent_client::Client::connect(&socket).await.ok()?;
         if let Ok(turn) = std::env::var("AGENT_TURN") {
             let turn: i64 = turn.parse().ok()?;
-            // Someone who steered it there, a person or an agent, is behind it.
+            // Someone who steered it there, a person or an agent, is behind it:
+            // not the commons, nor a source's news of it (or of anything
+            // else, which no one steered either).
             let asked = json!({"bot": author, "turn": turn});
             let prompts = client.request("prompts", asked).await.ok()?;
             let prompts = prompts["prompts"]
                 .as_array()
                 .map(Vec::as_slice)
                 .unwrap_or(&[]);
-            if !prompts.iter().any(|prompt| prompt["origin"] != ORIGIN) {
+            let automatic = [ORIGIN, crate::lookout::sources::ORIGIN];
+            if prompts
+                .iter()
+                .all(|prompt| automatic.iter().any(|o| prompt["origin"] == *o))
+            {
                 return None;
             }
         }
@@ -804,6 +817,14 @@ fn add(dir: &Path, name: &str, post: &Value) -> Result<Value, String> {
         ));
     }
     append(&path, post)?;
+    // A reply that may wake invite holders is held from the commons source
+    // until it has, so none of them hears it twice.
+    let holders = (earlier.iter())
+        .filter_map(|earlier| earlier["by"].as_str())
+        .any(|by| by != post["by"] && holds(dir, name, by).is_some());
+    if holders {
+        woke(dir, &format!("{name}/{}", earlier.len()), Value::Null);
+    }
     saw(dir, name, post["by"].as_str().unwrap_or_default());
     answered(dir, name, post["by"].as_str().unwrap_or_default());
     // Each earlier poster, with how often it has looked: one note each
@@ -843,6 +864,25 @@ fn json_file(path: &Path) -> serde_json::Map<String, Value> {
         .and_then(|text| serde_json::from_str::<Value>(&text).ok())
         .and_then(|value| value.as_object().cloned())
         .unwrap_or_default()
+}
+
+/// Marks the reply `key` (`THREAD/N`) woke `bots`, null while waking, under
+/// the lock the caller holds or takes; marks a day old go.
+fn woke(dir: &Path, key: &str, bots: Value) {
+    let path = dir.join(WOKEN);
+    let mut woken = json_file(&path);
+    let at = now();
+    woken.retain(|_, mark| {
+        mark["at"]
+            .as_i64()
+            .is_some_and(|then| at - then < 24 * 60 * 60)
+    });
+    woken.insert(key.to_owned(), json!({"at": at, "bots": bots}));
+    let _ = agent_client::files::replace_mode(
+        &path,
+        Value::Object(woken).to_string().as_bytes(),
+        0o600,
+    );
 }
 
 /// `bot` has looked at `thread` once more: by reading it or posting in
@@ -1085,6 +1125,16 @@ pub async fn tell(home: &Path, replied: &Value, author: &str, tell: &Value) -> V
             told.push(bot.to_owned());
         }
     }
+    let thread = replied["thread"].as_str().unwrap_or_default();
+    let key = format!(
+        "{thread}/{}",
+        replied["posts"].as_u64().unwrap_or(1).saturating_sub(1)
+    );
+    if let Ok(_lock) = lock(&dir(home))
+        && json_file(&dir(home).join(WOKEN)).contains_key(&key)
+    {
+        woke(&dir(home), &key, json!(told));
+    }
     told
 }
 
@@ -1100,6 +1150,7 @@ pub fn news(home: &Path, cursor: &Path) -> Vec<String> {
     let mut read = json_file(&path);
     let mut lines = Vec::new();
     let mut changed = first;
+    let woken = json_file(&dir.join(WOKEN));
     let entries = std::fs::read_dir(&dir).into_iter().flatten().flatten();
     for entry in entries {
         let file = entry.path();
@@ -1125,7 +1176,18 @@ pub fn news(home: &Path, cursor: &Path) -> Vec<String> {
             .first()
             .and_then(|p| p["title"].as_str())
             .unwrap_or_default();
+        let mut upto = posts.len();
         for (n, post) in posts.iter().enumerate().skip(had).filter(|_| !first) {
+            // Its invite holders are still being woken: it waits for them,
+            // and the posts after it with it.
+            let mark = &woken.get(&format!("{thread}/{n}"));
+            if let Some(mark) = mark
+                && mark["bots"].is_null()
+                && mark["at"].as_i64().is_some_and(|at| now() - at < WAKING)
+            {
+                upto = n;
+                break;
+            }
             let text = post["text"].as_str().unwrap_or_default();
             let text = match n {
                 0 => format!("new thread {thread}, \"{title}\": {text}"),
@@ -1135,9 +1197,20 @@ pub fn news(home: &Path, cursor: &Path) -> Vec<String> {
             if let Some(by) = post["by"].as_str() {
                 line["from"] = json!(by);
             }
+            if let Some(bots) = mark.and_then(|mark| mark["bots"].as_array()) {
+                line["told"] = json!(bots);
+            }
             lines.push(line.to_string());
         }
-        read.insert(thread, json!({"posts": posts.len(), "bytes": bytes}));
+        // Read only so far, the file's size is not kept, so the next look
+        // reads it again.
+        read.insert(
+            thread,
+            match upto == posts.len() {
+                true => json!({"posts": upto, "bytes": bytes}),
+                false => json!({"posts": upto}),
+            },
+        );
         changed = true;
     }
     if changed && std::fs::create_dir_all(cursor).is_ok() {
@@ -1160,10 +1233,11 @@ pub fn subscribe(store: &Path, bot: &str, thread: &str) -> Result<bool, String> 
 /// subscribed them.
 pub const POSTERS: &str = "commons-subscriptions";
 
-/// Subscribes each of `bots`, the agents of `store`, to every thread it
-/// posted in, once for the store (`upgrade::once`, its record beside the
-/// store), so one that unsubscribed since stays so.
-pub fn subscribe_posters(home: &Path, store: &Path, bots: &HashSet<String>) {
+/// Subscribes each of `bots`, the agents of `store` by name with their
+/// IDs, to every thread it posted in, once for the store (`upgrade::once`,
+/// its record beside the store), so one that unsubscribed since stays so.
+/// A post by another agent of the name, since removed, is not its own.
+pub fn subscribe_posters(home: &Path, store: &Path, bots: &HashMap<String, Option<i64>>) {
     let mut record = store.as_os_str().to_owned();
     record.push(".migrated");
     crate::upgrade::once(Path::new(&record), POSTERS, || {
@@ -1173,7 +1247,7 @@ pub fn subscribe_posters(home: &Path, store: &Path, bots: &HashSet<String>) {
 
 /// Every one of `bots` subscribed to the threads it posted in: whether
 /// each was.
-fn subscribe_all(home: &Path, store: &Path, bots: &HashSet<String>) -> bool {
+fn subscribe_all(home: &Path, store: &Path, bots: &HashMap<String, Option<i64>>) -> bool {
     let mut all = true;
     let entries = std::fs::read_dir(dir(home)).into_iter().flatten().flatten();
     for entry in entries {
@@ -1186,7 +1260,12 @@ fn subscribe_all(home: &Path, store: &Path, bots: &HashSet<String>) -> bool {
             continue;
         };
         for post in posts(&file).unwrap_or_default() {
-            if let Some(by) = post["by"].as_str().filter(|by| bots.contains(*by)) {
+            let ours = |by: &&str| match (bots.get(*by), post["by_id"].as_i64()) {
+                (Some(Some(id)), Some(by_id)) => *id == by_id,
+                (Some(_), _) => true,
+                (None, _) => false,
+            };
+            if let Some(by) = post["by"].as_str().filter(ours) {
                 all &= subscribe(store, by, thread).is_ok();
             }
         }
@@ -1494,6 +1573,48 @@ mod tests {
     }
 
     #[test]
+    fn a_reply_waits_for_its_invite_holders_and_leaves_them_out() {
+        let home = home("woken");
+        let cursor = home.join("cursor");
+        let dir = dir(&home);
+        let post = |by: &str, arguments: Value| call(&home, by, None, None, &arguments).unwrap();
+        post(
+            "a.x",
+            json!({"post": {"name": "t", "title": "T", "text": "x"}}),
+        );
+        let golden = json!({"thread": "t", "at": now(), "bot": "a.x", "golden": true, "turns": []});
+        assert!(keep(&dir, &[golden], 1));
+        assert!(news(&home, &cursor).is_empty());
+        post("b.y", json!({"reply": {"thread": "t", "text": "y"}}));
+        // a.x holds a golden ticket: the reply waits on its waking, and the
+        // ones after it with it.
+        assert_eq!(json_file(&dir.join(WOKEN))["t/1"]["bots"], Value::Null);
+        assert!(news(&home, &cursor).is_empty());
+        post("c.z", json!({"reply": {"thread": "t", "text": "z"}}));
+        let marked = |at: i64, bots: Value| {
+            let mark = json!({"t/1": {"at": at, "bots": bots}, "t/2": {"at": now(), "bots": []}});
+            std::fs::write(dir.join(WOKEN), mark.to_string()).unwrap();
+        };
+        marked(now(), Value::Null);
+        assert!(news(&home, &cursor).is_empty());
+        marked(now(), json!(["a.x"]));
+        let lines: Vec<Value> = (news(&home, &cursor).iter())
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(lines[0]["id"], "t/1");
+        assert_eq!(lines[0]["told"], json!(["a.x"]));
+        assert_eq!(lines[1]["id"], "t/2");
+        assert_eq!(lines[1]["told"], json!([]));
+        assert!(news(&home, &cursor).is_empty());
+        // A waking that never says how it went holds the reply a minute.
+        post("d.w", json!({"reply": {"thread": "t", "text": "w"}}));
+        let mark = json!({"t/3": {"at": now() - WAKING, "bots": null}});
+        std::fs::write(dir.join(WOKEN), mark.to_string()).unwrap();
+        assert_eq!(news(&home, &cursor).len(), 1);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
     fn agents_that_posted_are_subscribed_to_their_threads_once() {
         let home = home("posters");
         let store = home.join("state.sqlite");
@@ -1504,7 +1625,20 @@ mod tests {
         );
         post("b.y", json!({"reply": {"thread": "t", "text": "y"}}));
         post("gone.z", json!({"reply": {"thread": "t", "text": "z"}}));
-        let bots: HashSet<String> = ["a.x".to_owned(), "b.y".to_owned()].into();
+        call(
+            &home,
+            "again.w",
+            Some(5),
+            None,
+            &json!({"reply": {"thread": "t", "text": "w"}}),
+        )
+        .unwrap();
+        let bots: HashMap<String, Option<i64>> = [
+            ("a.x".to_owned(), None),
+            ("b.y".to_owned(), Some(2)),
+            ("again.w".to_owned(), Some(9)),
+        ]
+        .into();
         subscribe_posters(&home, &store, &bots);
         let names = |bot: &str| -> Vec<String> {
             (crate::lookout::subs::read(&store, bot).into_iter())
@@ -1515,6 +1649,8 @@ mod tests {
         assert_eq!(names("b.y"), ["commons.t"]);
         // An agent of another store is not this store's to subscribe.
         assert!(names("gone.z").is_empty());
+        // Nor one that took the name of an agent since removed.
+        assert!(names("again.w").is_empty());
         // One that unsubscribed since stays so.
         crate::lookout::subs::remove(&store, "b.y", "commons.t").unwrap();
         subscribe_posters(&home, &store, &bots);

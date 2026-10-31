@@ -180,7 +180,10 @@ cannot wait: an event it marks `"urgent": true` cuts into a busy
 subscriber's turn; the rest wait for it to rest. Naming a source the
 settings do not have is refused, with the ones they have, and every
 call's answer lists them under `sources`. An event `from` the subscriber
-itself is not news to it.
+itself is not news to it, nor is one whose `told` lists it: a source
+that told some subscribers another way names them there. What waits to be
+told, and when each source last told a subscriber, is kept in
+`STORE.sources/.held/BOT.json` until it is, so a restart loses none.
 
 A source's `digest` says how often at most a subscriber hears it, as
 Slack's "send me email notifications at most once every 15 minutes or
@@ -200,7 +203,11 @@ and each new post is an event, its thread the topic, its author `from`,
 its id `THREAD/N`. Its first look tells nothing of the past. Its digest is
 `[sonny] commons_digest`, an hour unless set. Posting in a thread
 subscribes the agent to it as `commons.THREAD`; a person's source may not
-take the name.
+take the name. A reply that wakes the thread's invite holders, whose
+invite still pays for their time, waits until they are woken (a minute at
+most), and they are its `told`: the reply starts their turn, so they do
+not hear it again. A turn that only sources woke sends no commons
+invites, as the commons' own wakes do not.
 
 What sources said goes in a note of its own, once the subscriber rests
 and the news has settled 2 seconds, or at once for an urgent event:

@@ -123,6 +123,9 @@ pub struct Event {
     /// How often at most a subscriber hears its source, as it was set
     /// when the event came.
     pub digest: Option<Duration>,
+    /// Subscribers the source says were told it another way, who do not
+    /// hear it again: the commons' invite holders, woken with the reply.
+    pub told: Vec<String>,
     /// When the lookout read it, and its place among what this lookout
     /// read: together they key its note.
     pub at_ms: u128,
@@ -151,6 +154,7 @@ impl Event {
             url: url.map(|url| cut(&url, FIELD_CHARS)),
             urgent,
             digest: None,
+            told: Vec::new(),
             at_ms,
             seq: SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         };
@@ -170,14 +174,41 @@ impl Event {
         let urgent = object["urgent"] == true;
         // A topic is what a subscription names after the colon.
         let topic = said("topic").filter(|topic| !topic.contains(':'));
-        Some(event(
-            &text,
-            said("id"),
-            topic,
-            said("from"),
-            said("url"),
-            urgent,
-        ))
+        let mut parsed = event(&text, said("id"), topic, said("from"), said("url"), urgent);
+        parsed.told = (object["told"].as_array().into_iter().flatten())
+            .filter_map(|bot| bot.as_str().map(|bot| cut(bot, FIELD_CHARS)))
+            .take(64)
+            .collect();
+        Some(parsed)
+    }
+}
+
+impl Event {
+    /// As the lookout keeps it while it waits to be told.
+    pub fn to_json(&self) -> Value {
+        json!({"source": self.source, "id": self.id, "topic": self.topic, "text": self.text,
+            "from": self.from, "url": self.url, "urgent": self.urgent,
+            "digest": self.digest.map(|d| d.as_secs()), "at_ms": self.at_ms as u64, "seq": self.seq,
+            "told": self.told})
+    }
+
+    pub fn from_json(value: &Value) -> Option<Event> {
+        let text = |key: &str| value[key].as_str().map(str::to_owned);
+        Some(Event {
+            source: text("source")?,
+            id: text("id"),
+            topic: text("topic"),
+            text: text("text")?,
+            from: text("from"),
+            url: text("url"),
+            urgent: value["urgent"] == true,
+            digest: value["digest"].as_u64().map(Duration::from_secs),
+            at_ms: u128::from(value["at_ms"].as_u64()?),
+            seq: value["seq"].as_u64()?,
+            told: (value["told"].as_array().into_iter().flatten())
+                .filter_map(|bot| bot.as_str().map(str::to_owned))
+                .collect(),
+        })
     }
 }
 
@@ -696,6 +727,7 @@ mod tests {
             url: None,
             urgent,
             digest: None,
+            told: Vec::new(),
             at_ms: 0,
             seq: 0,
         };
