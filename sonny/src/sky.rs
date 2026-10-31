@@ -2056,7 +2056,13 @@ impl View {
             } else {
                 "Catching up with who is here…"
             };
-            lines.push(Line::from(cut(quiet, cols)).dim());
+            // A narrow column wraps the words, as a hint read whole; dim on
+            // the words, as the column keeps a span's style, not a line's.
+            lines.extend(
+                wrapped(quiet, cols)
+                    .into_iter()
+                    .map(|line| Line::from(Span::from(line).dim())),
+            );
         }
         if tall {
             let blank = room.saturating_sub(lines.len());
@@ -2527,6 +2533,21 @@ fn ago(now: Instant, at: Instant) -> String {
         0..=59 => format!("{s}s"),
         _ => format!("{}m", s / 60),
     }
+}
+
+/// Words wrapped to lines of `room` columns, a word too long for one cut.
+fn wrapped(text: &str, room: usize) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    for word in text.split_whitespace() {
+        match lines.last_mut() {
+            Some(line) if line.width() + 1 + word.width() <= room => {
+                line.push(' ');
+                line.push_str(word);
+            }
+            _ => lines.push(cut(word, room)),
+        }
+    }
+    lines
 }
 
 /// Words cut to `room` columns, an ellipsis saying so.
@@ -4824,6 +4845,13 @@ mod tests {
         assert_eq!(short("shop.lead.billing"), "shop lead billing");
         assert_eq!(short("shop.fix-login"), "fix-login");
         assert_eq!(short("solo"), "solo");
+    }
+
+    #[test]
+    fn a_hint_wraps_in_a_narrow_column() {
+        let lines = wrapped("Quiet. Messages light up here as they go.", 20);
+        assert_eq!(lines, ["Quiet. Messages", "light up here as", "they go."]);
+        assert_eq!(wrapped("Catching", 5), ["Catc…"]);
     }
 
     #[test]
