@@ -320,6 +320,8 @@ class ServedToolTests(ModelFixture):
     @unittest.skipUnless(shutil.which('agent-browser'), 'agent-browser is not installed')
     def test_an_agent_s_browser_shows_it_the_page_and_refuses_what_reaches_the_host(self):
         self.browser(settings={'sandbox': 'workspace-write'}, approve=['browser'], approver='manual')
+        # A config in the agent's folder names no program the host runs.
+        (self.path / 'agent-browser.json').write_text(json.dumps({'executablePath': '/nonexistent/chrome'}))
         self.model.requests = queue.Queue()
         page = 'data:text/html,<title>Calc</title><h1>Sums</h1><button>Add</button>'
         # The first command starts Chrome, which can take a while.

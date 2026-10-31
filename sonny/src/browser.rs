@@ -162,6 +162,8 @@ pub struct Reach {
     cwd: PathBuf,
     /// `None`: anywhere.
     roots: Option<Vec<PathBuf>>,
+    /// Whether it may write there, as its sandbox may: not when read only.
+    writes: bool,
 }
 
 impl Reach {
@@ -171,10 +173,8 @@ impl Reach {
         let workspace = record["workspace"].as_str().map(PathBuf::from);
         let cwd = workspace.clone().unwrap_or_else(std::env::temp_dir);
         let settings = &record["settings"];
-        let confined = matches!(
-            settings["sandbox"].as_str(),
-            Some("workspace-write" | "read-only")
-        );
+        let sandbox = settings["sandbox"].as_str();
+        let confined = matches!(sandbox, Some("workspace-write" | "read-only"));
         let home = std::env::var_os("HOME").map(PathBuf::from);
         let roots = confined.then(|| {
             let writable = settings["writable"].as_array().into_iter().flatten();
@@ -186,7 +186,27 @@ impl Reach {
             });
             workspace.into_iter().chain(writable).collect()
         });
-        Reach { cwd, roots }
+        Reach {
+            cwd,
+            roots,
+            writes: sandbox != Some("read-only"),
+        }
+    }
+
+    /// `path` as a file the browser writes, inside the reach, or why not.
+    fn output(&self, path: &str) -> Result<String, String> {
+        match self.writes {
+            true => self.file(path),
+            false => Err(format!("{path}: your sandbox writes no files")),
+        }
+    }
+
+    /// Whether `path`'s real path is somewhere this agent may write.
+    fn holds(&self, path: &Path) -> bool {
+        let real = real(path);
+        (self.roots.iter().flatten()).any(|root| {
+            real.starts_with(std::fs::canonicalize(root).unwrap_or_else(|_| root.clone()))
+        })
     }
 
     /// `path` as an absolute path inside the reach, or why it is not.
@@ -272,6 +292,11 @@ fn real(path: &Path) -> PathBuf {
     }
 }
 
+/// Whether `word`, which starts with `-`, is a negative number, not a flag.
+fn number(word: &str) -> bool {
+    (word.strip_prefix('-')).is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_digit()))
+}
+
 /// What a checked command runs with: its arguments, and the picture file
 /// the tool host named for a screenshot that named none.
 #[derive(Debug, PartialEq)]
@@ -308,9 +333,7 @@ fn checked(line: &str, reach: &Reach) -> Result<Checked, String> {
     let mut plain: Vec<(usize, String)> = Vec::new();
     let mut words = words.into_iter().skip(1);
     while let Some(word) = words.next() {
-        let negative = (word.strip_prefix('-'))
-            .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_digit()));
-        if !word.starts_with('-') || negative || word == "-" {
+        if !word.starts_with('-') || number(&word) || word == "-" {
             plain.push((args.len(), word.clone()));
             args.push(word);
             continue;
@@ -324,6 +347,14 @@ fn checked(line: &str, reach: &Reach) -> Result<Checked, String> {
                 .clone()
                 .or_else(|| words.next())
                 .ok_or_else(|| format!("{flag} takes a value"))
+                // agent-browser reads every word for its flags wherever it
+                // is, so a value that is one would be read as that flag.
+                .and_then(
+                    |value| match value.starts_with('-') && !number(&value) && value != "-" {
+                        true => Err(format!("{flag}'s value {value} would be read as a flag")),
+                        false => Ok(value),
+                    },
+                )
         };
         // `-b` is eval's base64 switch, and diff's baseline file.
         if SWITCHES.contains(&flag.as_str())
@@ -347,9 +378,10 @@ fn checked(line: &str, reach: &Reach) -> Result<Checked, String> {
                 ));
             }
             args.extend([flag, value]);
-        } else if ["--screenshot-dir", "-o", "--output", "-b", "--baseline"]
-            .contains(&flag.as_str())
-        {
+        } else if ["--screenshot-dir", "-o", "--output"].contains(&flag.as_str()) {
+            let file = reach.output(&value(&mut words)?)?;
+            args.extend([flag, file]);
+        } else if ["-b", "--baseline"].contains(&flag.as_str()) {
             let file = reach.file(&value(&mut words)?)?;
             args.extend([flag, file]);
         } else {
@@ -383,7 +415,7 @@ fn checked(line: &str, reach: &Reach) -> Result<Checked, String> {
             let path = (0..plain.len()).find(|&n| word(n).is_some_and(picture_file));
             match path {
                 Some(n) => {
-                    let file = reach.file(word(n).unwrap_or_default())?;
+                    let file = reach.output(word(n).unwrap_or_default())?;
                     set(n, file);
                 }
                 None => {
@@ -406,7 +438,7 @@ fn checked(line: &str, reach: &Reach) -> Result<Checked, String> {
             let Some(path) = word(n) else {
                 return refused("needs a file to save to");
             };
-            let file = reach.file(path)?;
+            let file = reach.output(path)?;
             set(n, file);
         }
         "upload" => {
@@ -423,7 +455,7 @@ fn checked(line: &str, reach: &Reach) -> Result<Checked, String> {
                 _ => return refused("is start or stop here"),
             };
             if let Some(n) = path.filter(|&n| word(n).is_some()) {
-                let file = reach.file(word(n).unwrap_or_default())?;
+                let file = reach.output(word(n).unwrap_or_default())?;
                 set(n, file);
             }
             if command == "record"
@@ -435,7 +467,7 @@ fn checked(line: &str, reach: &Reach) -> Result<Checked, String> {
         "network" => match (word(0), word(1)) {
             (Some("har"), Some("stop")) => {
                 if let Some(path) = word(2) {
-                    let file = reach.file(path)?;
+                    let file = reach.output(path)?;
                     set(2, file);
                 }
             }
@@ -454,11 +486,14 @@ fn checked(line: &str, reach: &Reach) -> Result<Checked, String> {
             _ => return refused("is snapshot, screenshot or url here"),
         },
         "state" => match word(0) {
-            Some("save" | "load") => {
+            Some(how @ ("save" | "load")) => {
                 let Some(path) = word(1) else {
                     return refused("needs a file");
                 };
-                let file = reach.file(path)?;
+                let file = match how {
+                    "save" => reach.output(path)?,
+                    _ => reach.file(path)?,
+                };
                 set(1, file);
             }
             _ => return refused("is save or load here: the person's saved states are their own"),
@@ -673,16 +708,25 @@ fn rendered(answer: &Value) -> String {
     }
 }
 
-/// The native program to run: the one npm's wrapper script would, so no
-/// node starts for each command, else what is on `PATH`.
-fn program() -> PathBuf {
-    let found = std::env::var_os("PATH").and_then(|path| {
-        std::env::split_paths(&path)
-            .map(|dir| dir.join(PROGRAM))
-            .find(|path| path.is_file())
-    });
+/// The program the tool runs, found once as Sonny finds git: the first on
+/// `PATH` in a folder named from the root, so one an agent puts later in
+/// a folder of its own, or `.`, is never run.
+fn program() -> &'static Path {
+    static FOUND: std::sync::LazyLock<PathBuf> =
+        std::sync::LazyLock::new(|| found(&std::env::var_os("PATH").unwrap_or_default()));
+    &FOUND
+}
+
+/// The native program in `path`: the one npm's wrapper script would run,
+/// so no node starts for each command, else the first found.
+fn found(path: &std::ffi::OsStr) -> PathBuf {
+    let found = std::env::split_paths(path)
+        .filter(|dir| dir.is_absolute())
+        .map(|dir| dir.join(PROGRAM))
+        .find(|path| path.is_file());
     let Some(found) = found else {
-        return PathBuf::from(PROGRAM);
+        // None found runs nothing: an absolute path that is not there.
+        return PathBuf::from("/nonexistent").join(PROGRAM);
     };
     let real = std::fs::canonicalize(&found).unwrap_or(found);
     if real.extension().is_some_and(|ext| ext == "js") {
@@ -726,13 +770,15 @@ pub fn tool() -> Option<Value> {
     })
 }
 
-/// Run one of agent-browser's commands for `session`, in `cwd`.
-async fn run(session: &str, cwd: &Path, args: &[String], confirm: &str) -> Ran {
+/// Run one of agent-browser's commands for `session`, in `/`: in the
+/// agent's folder it would read an `agent-browser.json` there, which can
+/// name the program it launches. Its paths are whole already.
+async fn run(session: &str, args: &[String], confirm: &str) -> Ran {
     let mut command = tokio::process::Command::new(program());
     command
         .arg("--json")
         .args(args)
-        .current_dir(cwd)
+        .current_dir("/")
         .env("AGENT_BROWSER_SESSION", session)
         .env("AGENT_BROWSER_CONTENT_BOUNDARIES", "1")
         .env("AGENT_BROWSER_IDLE_TIMEOUT_MS", IDLE_MS)
@@ -784,6 +830,15 @@ pub async fn answer(
         .await
         .map_err(|e| ("caller_unknown", e.to_string()))?;
     let reach = Reach::of(&record);
+    if reach.holds(program()) {
+        return Err((
+            "browser_refused",
+            format!(
+                "{} is in a folder you write, so it is not run for you",
+                program().display()
+            ),
+        ));
+    }
     let checked: Vec<Checked> = lines
         .iter()
         .map(|line| checked(line, &reach))
@@ -801,18 +856,18 @@ pub async fn answer(
         if lines.len() > 1 {
             text.push_str(&format!("$ {line}\n"));
         }
-        let mut ran = run(&session, &reach.cwd, &command.args, &confirm).await;
+        let mut ran = run(&session, &command.args, &confirm).await;
         if let Some(id) = ran.confirmation.take() {
             let asked = json!({"command": line, "confirmation": ran.said});
             match steps.ask(NAME, NAME, asked).await {
                 Ok(step) => {
-                    ran = run(&session, &reach.cwd, &["confirm".into(), id], &confirm).await;
+                    ran = run(&session, &["confirm".into(), id], &confirm).await;
                     if let Some(step) = step {
                         steps.ran(step, !ran.ok).await;
                     }
                 }
                 Err(why) => {
-                    let _ = run(&session, &reach.cwd, &["deny".into(), id], &confirm).await;
+                    let _ = run(&session, &["deny".into(), id], &confirm).await;
                     ran = Ran {
                         said: why,
                         ok: false,
@@ -955,9 +1010,14 @@ mod tests {
             "open chrome://settings",
             "tab new chrome-extension://x/y",
             "open javascript:alert(1)",
+            // agent-browser reads its flags wherever they are, values too.
+            "open about:blank --name --executable-path ./payload",
+            "open about:blank --user-agent --extension",
+            "fill @e1 --executable-path",
         ] {
             assert!(args(line, &dir).is_err(), "{line} ran");
         }
+        assert!(args("scroll down -100", &dir).is_ok());
     }
 
     #[test]
@@ -994,6 +1054,36 @@ mod tests {
         let free =
             Reach::of(&json!({"workspace": real, "settings": {"sandbox": "danger-full-access"}}));
         assert!(checked("pdf /tmp/page.pdf", &free).is_ok());
+        // A read-only agent's browser reads its folder and writes nothing.
+        let reader = Reach::of(&json!({"workspace": real, "settings": {"sandbox": "read-only"}}));
+        for line in [
+            "pdf report.pdf",
+            "screenshot page.png",
+            "state save s.json",
+            "download @e1 x.zip",
+            "screenshot --screenshot-dir shots",
+            "record start r.webm",
+            "network har stop h.har",
+        ] {
+            assert!(checked(line, &reader).is_err(), "{line} ran");
+        }
+        for line in [
+            "screenshot",
+            "upload @e1 page.png",
+            "state load s.json",
+            "snapshot -i",
+        ] {
+            assert!(
+                checked(line, &reader).is_ok(),
+                "{line}: {:?}",
+                checked(line, &reader)
+            );
+        }
+        // An agent-browser in a folder the agent writes is never run.
+        let writer = reach(&real);
+        assert!(writer.holds(&real.join("bin/agent-browser")));
+        assert!(!writer.holds(Path::new("/usr/bin/agent-browser")));
+        assert!(!free.holds(&real.join("bin/agent-browser")));
         // A confined agent with no folder named reaches no file.
         let lost = Reach::of(&json!({"settings": {"sandbox": "workspace-write"}}));
         assert!(checked("pdf page.pdf", &lost).is_err());
@@ -1063,6 +1153,17 @@ mod tests {
                 confirmation: None
             }
         );
+    }
+
+    #[test]
+    fn the_program_is_found_in_folders_named_from_the_root() {
+        let dir = scratch("program");
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        std::fs::write(dir.join("bin").join(PROGRAM), "").unwrap();
+        let path = std::env::join_paths(["bin".into(), dir.join("bin")]).unwrap();
+        // `bin` is relative: a folder of whoever runs it, so skipped.
+        assert_eq!(found(&path), dir.join("bin").join(PROGRAM));
+        assert!(found(std::ffi::OsStr::new("bin")).is_absolute());
     }
 
     #[test]
