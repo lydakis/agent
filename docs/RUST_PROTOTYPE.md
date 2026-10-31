@@ -363,16 +363,6 @@ removed `artifact_pruned` (see Retention).
 Line pages are assembled on the storage worker; only the bounded page crosses
 into the async runtime. Byte-oriented protocol pages continue to use SQL slicing.
 
-The cut also names a file holding the same retained text, written beside the
-store in `outputs/` (for `~/.agent/state.sqlite`, `~/.agent/outputs/`), so the
-model can search it with `grep` or `jq` instead of paging it, as Claude Code and
-Pi save a cut output to a file. A fetched page past 64 KiB gets one too. The
-text is redacted as the preview is. Files are kept a week: a spill removes
-those older than that, at most once an hour. A daemon with no store, or a
-failed write, names only the artifact. Like the store itself, the folder is
-readable from any bot's sandbox, so lineage limits apply to `read artifact`,
-not to these files.
-
 ## Limits
 
 Three daemon limits are flags on `serve`, forwarded by the client that starts

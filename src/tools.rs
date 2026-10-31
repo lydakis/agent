@@ -113,7 +113,7 @@ impl Tool {
                 "properties":{"text":{"type":"string"}},"required":["text"],"additionalProperties":false}),
             ),
             Tool::Shell => (
-                "Run a noninteractive bash command (sh where bash is not installed) in the workspace. stdout and stderr are returned separately; each is truncated to a head and tail beyond 64 KiB, with up to 1 MiB of it retained in a file the result names, to search with grep: past that, its first and last 512 KiB, and the command keeps running. Default timeout 120 s, maximum 600 s; a command that times out returns its output so far with timed_out. Every result reports wall_time_ms. Commands run with no terminal: TERM=dumb, NO_COLOR=1, and cat as the pager; AI_AGENT=agent tells tools an agent runs them. When the command returns or times out, every process it started is killed, so `cmd &` does not outlive it. With background=true the command is started and a proc handle is returned immediately; collect its result later with wait. A steer that arrives while a command runs moves it to the background: the result is its proc handle with steered=true, and the command keeps running. A background command runs until it exits, times out, or the daemon stops. With detach=true the command starts in its own session and its pid is returned at once; nothing kills or tracks it, so it outlives the turn and the daemon. Its output is discarded unless the command redirects it to a file. With tty=true it runs in a terminal, for a REPL or a program that prompts: the result is what it wrote within yield_time_ms (default 1000) and, while it runs, a proc handle for write_stdin.",
+                "Run a noninteractive bash command (sh where bash is not installed) in the workspace. stdout and stderr are returned separately; each is truncated to a head and tail beyond 64 KiB, with up to 1 MiB of it retained: past that, its first and last 512 KiB, and the command keeps running. Default timeout 120 s, maximum 600 s; a command that times out returns its output so far with timed_out. Every result reports wall_time_ms. Commands run with no terminal: TERM=dumb, NO_COLOR=1, and cat as the pager; AI_AGENT=agent tells tools an agent runs them. When the command returns or times out, every process it started is killed, so `cmd &` does not outlive it. With background=true the command is started and a proc handle is returned immediately; collect its result later with wait. A steer that arrives while a command runs moves it to the background: the result is its proc handle with steered=true, and the command keeps running. A background command runs until it exits, times out, or the daemon stops. With detach=true the command starts in its own session and its pid is returned at once; nothing kills or tracks it, so it outlives the turn and the daemon. Its output is discarded unless the command redirects it to a file. With tty=true it runs in a terminal, for a REPL or a program that prompts: the result is what it wrote within yield_time_ms (default 1000) and, while it runs, a proc handle for write_stdin.",
                 json!({"type":"object","properties":{"command":{"type":"string"},
                 "timeout_ms":{"type":"integer","minimum":1,"maximum":MAX_SHELL_TIMEOUT_MS},
                 "background":{"type":"boolean"},"detach":{"type":"boolean"},"tty":{"type":"boolean"},
@@ -161,7 +161,7 @@ impl Tool {
                 serde_json::from_str(include_str!("tools/web_run.json")).expect("web.run schema"),
             ),
             Tool::WebFetch => (
-                "Fetch a public http or https URL and return its text: an HTML page as Markdown, with its title and links resolved to absolute URLs; other text as it is. The result names the final URL after redirects and the HTTP status. Text past 64 KiB is cut to its start and end, with the whole kept as an artifact to page with read and in a file the result names, to search with grep. Use it to read a page you were given or found; it does not run the page's scripts or sign in.",
+                "Fetch a public http or https URL and return its text: an HTML page as Markdown, with its title and links resolved to absolute URLs; other text as it is. The result names the final URL after redirects and the HTTP status. Text past 64 KiB is cut to its start and end, with the whole kept as an artifact to page with read. Use it to read a page you were given or found; it does not run the page's scripts or sign in.",
                 json!({"type":"object","properties":{"url":{"type":"string","minLength":1,"maxLength":8192}},
                 "required":["url"],"additionalProperties":false}),
             ),
@@ -427,9 +427,6 @@ pub struct Registry {
     environment: Arc<Vec<(String, String)>>,
     /// What the daemon keeps that a sandbox leaves alone or lets through.
     daemon: Arc<Daemon>,
-    /// Where a cut output is written whole, beside the store, for the
-    /// model to search with its own tools.
-    outputs: Option<Arc<Path>>,
     /// Request encodings per (family, selection); see `encoded`.
     encodings: Encodings,
 }
@@ -957,7 +954,6 @@ impl Registry {
             credentials: Credentials::default(),
             environment: Arc::new(Vec::new()),
             daemon: Arc::default(),
-            outputs: None,
             encodings: Arc::default(),
         })
     }
@@ -1095,9 +1091,6 @@ impl Registry {
     /// The daemon's store and socket, which its bots' sandboxes keep
     /// read-only and reachable.
     pub fn with_daemon(mut self, daemon: Daemon) -> Self {
-        self.outputs = (daemon.store.as_deref())
-            .and_then(Path::parent)
-            .map(|dir| Arc::from(dir.join("outputs")));
         self.daemon = Arc::new(daemon);
         self
     }
@@ -1503,7 +1496,7 @@ impl Registry {
             Prepared::Note { .. } => fail("note_requires_runtime"),
             Prepared::Declared(_) => fail("declared_requires_runtime"),
             Prepared::WebSearch(_) => fail("web_search_requires_runtime"),
-            Prepared::WebFetch(url) => Ok(self.fetched(fetch::fetch(url).await?).await),
+            Prepared::WebFetch(url) => Ok(self.fetched(fetch::fetch(url).await?)),
             Prepared::Shell {
                 command,
                 timeout_ms,
@@ -1623,8 +1616,8 @@ impl Registry {
 
 impl Registry {
     /// A fetched page's result: its text up to the preview, the whole of
-    /// it kept as the `text` artifact and written to a file past that.
-    async fn fetched(&self, page: fetch::Page) -> Outcome {
+    /// it kept as the `text` artifact past that.
+    fn fetched(&self, page: fetch::Page) -> Outcome {
         let mut artifacts = Vec::new();
         let mut text = self.redact(page.text);
         // Kept as a shell stream is: at most its first and last `KEPT_END`.
@@ -1642,8 +1635,7 @@ impl Registry {
         let shown = if text.len() <= PREVIEW_BYTES {
             text
         } else {
-            let file = self.spill("text", &text).await;
-            let shown = truncate(&text, dropped, file.as_deref());
+            let shown = truncate(&text, dropped);
             artifacts.push(("text", text.into_bytes()));
             shown
         };
@@ -1665,47 +1657,7 @@ impl Registry {
         }
     }
 
-    /// A stream's preview: all of it up to `PREVIEW_BYTES`, past that its
-    /// head and tail, with what was kept added to `artifacts` and written
-    /// to a file the cut names.
-    async fn preview(
-        &self,
-        name: &'static str,
-        captured: Captured,
-        artifacts: &mut Vec<(&'static str, Vec<u8>)>,
-    ) -> String {
-        let (bytes, dropped) = captured.finish();
-        // Reuse the pipe buffer for ordinary UTF-8 output. Invalid
-        // bytes still get the same lossy decoding as before.
-        let text = String::from_utf8(bytes)
-            .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned());
-        let mut text = self.redact(text);
-        if text.len() <= PREVIEW_BYTES {
-            return text;
-        }
-        let file = self.spill(name, &text).await;
-        let shown = truncate(&text, dropped, file.as_deref());
-        // read_to_end may have reserved beyond the output length.
-        // Do not retain that spare capacity while storage catches up.
-        text.shrink_to_fit();
-        artifacts.push((name, text.into_bytes()));
-        shown
-    }
-
-    /// Write a cut output's kept text to a file of its own, as Claude Code
-    /// and Pi do, so the model can search it with grep or jq rather than
-    /// page it; `None` when the daemon keeps no store or the write fails,
-    /// and the cut then names only the artifact. Files are kept a week.
-    async fn spill(&self, name: &str, text: &str) -> Option<PathBuf> {
-        let dir = self.outputs.as_deref()?;
-        tokio::fs::create_dir_all(dir).await.ok()?;
-        sweep(dir);
-        let file = dir.join(format!("{}-{name}.txt", stamp()));
-        tokio::fs::write(&file, text).await.ok()?;
-        Some(file)
-    }
-
-    async fn shell_outcome(
+    fn shell_outcome(
         &self,
         stdout: Captured,
         stderr: Captured,
@@ -1713,8 +1665,24 @@ impl Registry {
         elapsed: Duration,
     ) -> Outcome {
         let mut artifacts = Vec::new();
-        let stdout = self.preview("stdout", stdout, &mut artifacts).await;
-        let stderr = self.preview("stderr", stderr, &mut artifacts).await;
+        let mut preview = |name: &'static str, captured: Captured| {
+            let (bytes, dropped) = captured.finish();
+            // Reuse the pipe buffer for ordinary UTF-8 output. Invalid
+            // bytes still get the same lossy decoding as before.
+            let text = String::from_utf8(bytes)
+                .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned());
+            let mut text = self.redact(text);
+            if text.len() <= PREVIEW_BYTES {
+                return text;
+            }
+            let shown = truncate(&text, dropped);
+            // read_to_end may have reserved beyond the output length.
+            // Do not retain that spare capacity while storage catches up.
+            text.shrink_to_fit();
+            artifacts.push((name, text.into_bytes()));
+            shown
+        };
+        let (stdout, stderr) = (preview("stdout", stdout), preview("stderr", stderr));
         let elapsed_ms = elapsed.as_millis() as u64;
         let (output, success) = match exit {
             Exit::Status(status) => (
@@ -1788,7 +1756,7 @@ impl Registry {
                 sandbox.as_deref(),
             )
             .await?;
-            Ok(registry.shell_outcome(stdout, stderr, exit, elapsed).await)
+            Ok(registry.shell_outcome(stdout, stderr, exit, elapsed))
         }
     }
 
@@ -1831,7 +1799,7 @@ impl Registry {
                     sandbox.as_deref(),
                 )
                 .await?;
-                Ok(registry.shell_outcome(stdout, stderr, exit, elapsed).await)
+                Ok(registry.shell_outcome(stdout, stderr, exit, elapsed))
             };
             // A command still running as the daemon stops is dropped, which
             // kills its group; its handle then reports the process lost, as
@@ -2021,9 +1989,8 @@ fn boundary(text: &str, mut index: usize) -> usize {
 }
 
 /// Head and tail of an oversized output, with the omission stated.
-/// `dropped` counts the bytes the retained text itself left out; `file`
-/// is where the retained text was written.
-fn truncate(text: &str, dropped: u64, file: Option<&Path>) -> String {
+/// `dropped` counts the bytes the retained text itself left out.
+fn truncate(text: &str, dropped: u64) -> String {
     let half = PREVIEW_BYTES / 2;
     let head = &text[..boundary(text, half)];
     let tail_start = boundary(text, text.len() - half);
@@ -2035,55 +2002,10 @@ fn truncate(text: &str, dropped: u64, file: Option<&Path>) -> String {
             "{dropped} more past 1 MiB were not kept, and its first and last {KEPT_END} bytes are retained"
         )
     };
-    let reach = match file {
-        Some(file) => format!(
-            "in {}, to search with grep or jq, and in this result's artifacts for the read tool",
-            file.display()
-        ),
-        None => "see this result's artifacts and read them with the read tool".to_owned(),
-    };
     format!(
-        "{head}\n[... {omitted} bytes omitted; {retained} {reach} ...]\n{}",
+        "{head}\n[... {omitted} bytes omitted; {retained}: see this result's artifacts and read them with the read tool ...]\n{}",
         &text[tail_start..]
     )
-}
-
-/// How long the files `spill` writes are kept.
-const OUTPUTS_KEPT: Duration = Duration::from_secs(7 * 24 * 3600);
-
-/// Remove what `spill` wrote to `dir` over `OUTPUTS_KEPT` ago, at most once
-/// an hour and off the runtime thread, so a week's worth is kept rather
-/// than ever more.
-fn sweep(dir: &Path) {
-    static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
-    {
-        let mut last = LAST.lock().unwrap();
-        if last.is_some_and(|at| at.elapsed() < Duration::from_secs(3600)) {
-            return;
-        }
-        *last = Some(std::time::Instant::now());
-    }
-    let dir = dir.to_owned();
-    tokio::task::spawn_blocking(move || {
-        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
-            let old = (entry.metadata().and_then(|m| m.modified()).ok())
-                .and_then(|modified| modified.elapsed().ok())
-                .is_some_and(|age| age > OUTPUTS_KEPT);
-            if old {
-                let _ = std::fs::remove_file(entry.path());
-            }
-        }
-    });
-}
-
-/// A file name no other spill takes: the time, the daemon's pid and a count.
-fn stamp() -> String {
-    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis());
-    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    format!("{now}-{}-{n}", std::process::id())
 }
 
 /// What a stream wrote, bounded: all of it up to `ARTIFACT_BYTES`, past
@@ -2488,14 +2410,12 @@ mod tests {
             "a".repeat(PREVIEW_BYTES),
             "z".repeat(PREVIEW_BYTES)
         );
-        let shown = truncate(&text, 0, None);
+        let shown = truncate(&text, 0);
         assert!(shown.starts_with("aaaa"));
         assert!(shown.ends_with("zzzz"));
         assert!(shown.contains("bytes omitted; the full output is retained"));
         assert!(shown.len() < text.len());
-        assert!(truncate(&text, 9, None).contains("9 more past 1 MiB were not kept"));
-        let named = truncate(&text, 0, Some(Path::new("/s/outputs/1-stdout.txt")));
-        assert!(named.contains("retained in /s/outputs/1-stdout.txt, to search with grep or jq"));
+        assert!(truncate(&text, 9).contains("9 more past 1 MiB were not kept"));
     }
     #[test]
     fn captured_output_keeps_both_ends_past_the_bound() {
