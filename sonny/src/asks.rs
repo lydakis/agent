@@ -10,6 +10,7 @@ use ratatui::{
     text::{Line, Span},
 };
 use serde_json::{Value, json};
+use unicode_width::UnicodeWidthStr;
 
 /// The name of the tool the lead asks with.
 pub const TOOL: &str = "ask";
@@ -83,6 +84,18 @@ pub fn tool() -> Value {
     })
 }
 
+/// What the agent wrote to be read, trimmed, its paragraphs kept apart
+/// by one blank line.
+fn prose(text: Option<&str>) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    for line in text.unwrap_or("").lines().map(str::trim_end) {
+        if !(line.is_empty() && out.last().is_none_or(|last| last.is_empty())) {
+            out.push(line);
+        }
+    }
+    out.join("\n").trim().to_owned()
+}
+
 /// `text` trimmed, without blank lines, so an answer that quotes it
 /// still reads as answering it.
 fn tidy(text: Option<&str>) -> String {
@@ -105,7 +118,7 @@ pub fn call(id: &str, arguments: &Value) -> Option<Ask> {
         .flatten()
         .map(|option| Choice {
             label: tidy(option["label"].as_str()),
-            explanation: tidy(option["explanation"].as_str()),
+            explanation: prose(option["explanation"].as_str()),
         })
         .filter(|choice| !choice.label.is_empty())
         .take(OPTIONS)
@@ -117,24 +130,28 @@ pub fn call(id: &str, arguments: &Value) -> Option<Ask> {
     (!question.is_empty()).then(|| Ask {
         id: id.to_owned(),
         question,
-        why: tidy(arguments["why"].as_str()),
+        why: prose(arguments["why"].as_str()),
         options,
         recommended,
-        reason: tidy(arguments["reason"].as_str()),
+        reason: prose(arguments["reason"].as_str()),
     })
 }
 
 /// The oldest question still open among a bot's `items`, newest first:
 /// an `ask` call that was taken, with no answer to it after, as the pinned
-/// questions are closed: only by the person's `You asked:` message naming
-/// it, one answer to one question.
+/// questions are closed: by the person's `You asked:` message naming it,
+/// one answer to one question, or by words of their own after it, the
+/// conversation going on past it.
 pub fn open(items: &[Value]) -> Option<String> {
     let (mut answers, mut refused, mut open) = (Vec::new(), Vec::new(), None);
+    let mut moved_on = false;
     for item in items {
-        if item["role"] == "user"
-            && let Some(question) = answered(&crate::text(item))
-        {
-            answers.push(question.to_owned());
+        if item["role"] == "user" {
+            let text = crate::text(item);
+            match answered(&text) {
+                Some(question) => answers.push(question.to_owned()),
+                None => moved_on |= moves_on(&text, item["from"].as_str()),
+            }
         }
         if item["type"] == "function_call_output"
             && (item["failed"] == true || crate::reactions::refused(item))
@@ -153,11 +170,24 @@ pub fn open(items: &[Value]) -> Option<String> {
                 Some(at) => {
                     answers.remove(at);
                 }
-                None => open = Some(ask.question),
+                None if !moved_on => open = Some(ask.question),
+                None => {}
             }
         }
     }
     open
+}
+
+/// Whether a message is the person's own words, answering no question:
+/// not another agent's, nor a reaction, a note taken away or what they
+/// ran. After it the questions asked before are set aside, the
+/// conversation having gone on past them, as a chat's thread does.
+pub fn moves_on(text: &str, from: Option<&str>) -> bool {
+    answered(text).is_none()
+        && !crate::transcript::relays(text, from)
+        && !crate::reactions::is_reaction(text)
+        && crate::margin::closed(text).is_none()
+        && crate::user_shell::read(text).is_none()
 }
 
 /// The question a person's message answers, when [`answer`] wrote it.
@@ -172,9 +202,15 @@ pub fn split(text: &str) -> Option<(&str, &str)> {
 
 /// The row that says which question a message answers, above it.
 pub fn answering(question: &str, width: usize) -> Line<'static> {
-    let first = question.lines().next().unwrap_or("");
-    let cut = crate::transcript::cut(first, width.saturating_sub(14).max(8));
-    Line::from(format!("  answering “{cut}”")).dim()
+    answering_row(question, "", width)
+}
+
+/// The row that names the question answered, as its card reads it,
+/// then `place`.
+fn answering_row(question: &str, place: &str, width: usize) -> Line<'static> {
+    let room = width.saturating_sub(14 + place.chars().count()).max(8);
+    let cut = crate::transcript::cut(&plain(question), room);
+    Line::from(format!("  answering “{cut}”{place}")).dim()
 }
 
 /// `asks` without the first one `text` answers; whether there was one.
@@ -196,18 +232,32 @@ pub fn answer(ask: &Ask, typed: &str) -> String {
     format!("You asked: {}\n\n{picked}", ask.question)
 }
 
+/// The decision as it is drawn where it was asked, as [`card`] lays it.
+pub struct Card {
+    pub rows: Vec<Line<'static>>,
+    /// The row each option starts on, which a click picks it on.
+    pub options: Vec<usize>,
+    /// What each row's rows past its first start with, should it be
+    /// drawn narrower than it was laid: the bar, then room to the text,
+    /// so the bar goes on down however the rows wrap.
+    pub hangs: Vec<Line<'static>>,
+}
+
 /// The decision as it is drawn where it was asked: the question, why,
-/// each option by number with what it means, and the recommendation;
-/// and the row each option starts on, which a click picks it on. A `?`
-/// in yellow, what needs the person, starts it, and a muted bar down its
-/// left side sets it apart from the replies around it, as a callout's
-/// does: a shape of its own without color too.
-pub fn lines(ask: &Ask, width: usize) -> (Vec<Line<'static>>, Vec<usize>) {
+/// each option by number with what it means, and the recommendation.
+/// A `?` in yellow, what needs the person, starts it, and a muted bar
+/// down its left side sets it apart from the replies around it, as a
+/// callout's does: a shape of its own without color too.
+pub fn card(ask: &Ask, width: usize) -> Card {
+    // Prose reads at most so wide, as a reply does, labels too.
+    let width = width.min(crate::PROSE);
     let mut options = Vec::new();
     let indent = || Span::raw(BAR).dim();
     // What the agent wrote reads as its Markdown, as a reply does; the
-    // bar keeps its own look.
+    // bar keeps its own look. Each row hangs under its text, past the
+    // `lead` columns every row of the part starts with.
     let markdown = |text: &str, first: Line<'static>, rest: Line<'static>, style: Style| {
+        let lead = rest.width();
         let mut markdown = crate::transcript::Markdown::default();
         let rows = crate::transcript::markdown(&mut markdown, text, width, (first, rest));
         rows.into_iter().map(move |mut row| {
@@ -216,10 +266,12 @@ pub fn lines(ask: &Ask, width: usize) -> (Vec<Line<'static>>, Vec<usize>) {
             {
                 span.style = style.patch(span.style);
             }
-            row
+            let hang = hang(&row, lead);
+            (row, hang)
         })
     };
-    let mut rows = Vec::new();
+    let mut rows: Vec<(Line<'static>, Line<'static>)> = Vec::new();
+    let spacer = || (Line::from(indent()), Line::from(indent()));
     rows.extend(markdown(
         &ask.question,
         Line::from(Span::raw(GLYPH).fg(Color::Yellow).bold()),
@@ -233,7 +285,7 @@ pub fn lines(ask: &Ask, width: usize) -> (Vec<Line<'static>>, Vec<usize>) {
         Style::new().dim(),
     ));
     if !ask.options.is_empty() {
-        rows.push(Line::from(indent()));
+        rows.push(spacer());
     }
     // The explanation sits under its label, past the number.
     let under = || vec![indent(), Span::raw("   ")];
@@ -243,12 +295,13 @@ pub fn lines(ask: &Ask, width: usize) -> (Vec<Line<'static>>, Vec<usize>) {
         if ask.recommended == Some(at) {
             label.push(Span::raw(" · recommended").dim());
         }
-        rows.extend(crate::transcript::wrap_lines(
+        let label = crate::transcript::wrap_lines(
             Line::from(label),
             width,
             Line::from(vec![indent(), Span::raw(format!("{:<3}", at + 1))]),
             Line::from(under()),
-        ));
+        );
+        rows.extend(label.into_iter().map(|row| (row, Line::from(under()))));
         rows.extend(markdown(
             &choice.explanation,
             Line::from(under()),
@@ -259,7 +312,7 @@ pub fn lines(ask: &Ask, width: usize) -> (Vec<Line<'static>>, Vec<usize>) {
     if let Some(at) = ask.recommended
         && !ask.reason.is_empty()
     {
-        rows.push(Line::from(indent()));
+        rows.push(spacer());
         rows.extend(markdown(
             &ask.reason,
             Line::from(vec![indent(), Span::raw(format!("Why {}: ", at + 1))]),
@@ -267,32 +320,92 @@ pub fn lines(ask: &Ask, width: usize) -> (Vec<Line<'static>>, Vec<usize>) {
             Style::new().dim(),
         ));
     }
-    (rows, options)
+    let (rows, hangs) = rows.into_iter().unzip();
+    Card {
+        rows,
+        options,
+        hangs,
+    }
 }
 
-/// The composer's hint while what is typed answers `ask`, cut to `width`.
-pub fn hint(ask: &Ask, more: usize, width: usize) -> String {
-    let keys = match ask.options.len() {
-        0 => "type your answer".to_owned(),
-        1 => "1 pick".to_owned(),
-        n => format!("1–{n} pick"),
+/// The lead a card's `row` goes on under when wrapped again: its bar,
+/// then room past the `lead` columns to its text, a list's marker or a
+/// quote's bar being lead too, the quote's bar kept.
+fn hang(row: &Line<'static>, lead: usize) -> Line<'static> {
+    let text: String = row.spans.iter().map(|span| span.content.as_ref()).collect();
+    let after: String = text.chars().skip(lead).collect();
+    let spaces = after.len() - after.trim_start_matches(' ').len();
+    let rest = &after[spaces..];
+    let digits = rest.len() - rest.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+    let marker = match rest {
+        _ if ["- ", "* ", "+ ", "• "].iter().any(|m| rest.starts_with(m)) => 2,
+        _ if digits > 0 && [". ", ") "].iter().any(|m| rest[digits..].starts_with(m)) => digits + 2,
+        _ => 0,
     };
-    let more = match more {
-        0 => String::new(),
-        n => format!(" · {n} more open"),
+    let mut spans = vec![
+        Span::raw(BAR).dim(),
+        Span::raw(" ".repeat(lead - BAR.width())),
+    ];
+    // Under a quote its bar goes on too.
+    match rest.strip_prefix("▌ ") {
+        Some(_) => spans.extend([Span::raw(" ".repeat(spaces)), Span::raw("▌ ").dim()]),
+        None => spans.push(Span::raw(" ".repeat(spaces + marker))),
+    }
+    Line::from(spans)
+}
+
+/// Which of the open questions `at` is, from 0, when there are several.
+fn place(at: usize, of: usize) -> String {
+    match of {
+        0 | 1 => String::new(),
+        of => format!(" ({} of {of})", at + 1),
+    }
+}
+
+/// The composer's hint while what is typed answers `ask`, the `at`th of
+/// `of` open, cut to `width`: which question, muted, then its keys in
+/// the one grammar.
+pub fn hint(ask: &Ask, at: usize, of: usize, width: usize) -> Vec<Span<'static>> {
+    let mut keys = match ask.options.len() {
+        0 => Vec::new(),
+        1 => vec!["1 pick".to_owned()],
+        n => vec![format!("1–{n} pick")],
     };
-    let tail = format!(": {keys}{more} · esc write instead");
-    let room = width.saturating_sub(tail.chars().count() + "Answer “”".chars().count());
-    // The question as it reads on the card, without its Markdown marks.
-    let question: String =
-        crate::transcript::inline(ask.question.lines().next().unwrap_or(""), Style::default())
-            .iter()
-            .map(|span| span.content.as_ref())
-            .collect();
-    format!(
-        "Answer “{}”{tail}",
-        crate::transcript::cut(&question, room.max(8))
-    )
+    if of > 1 {
+        keys.push("↑↓ switch".into());
+    }
+    keys.push("esc write instead".into());
+    let keys = keys.join(" · ");
+    let words = match ask.options.len() {
+        0 => " type your answer ·",
+        _ => "",
+    };
+    let place = place(at, of);
+    let room = width.saturating_sub(
+        "Answer “”: ".chars().count()
+            + place.chars().count()
+            + words.chars().count()
+            + keys.chars().count(),
+    );
+    let question = crate::transcript::cut(&plain(&ask.question), room.max(8));
+    let mut spans = vec![Span::raw(format!("Answer “{question}”{place}:{words} ")).dim()];
+    spans.extend(crate::hint::spans(&keys));
+    spans
+}
+
+/// The question as it reads on its card, without its Markdown marks.
+fn plain(question: &str) -> String {
+    crate::transcript::inline(question.lines().next().unwrap_or(""), Style::default())
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect()
+}
+
+/// The row over what is typed while it answers `ask`, the `at`th of
+/// `of` open: the row the answer has over it once sent, so what is
+/// written reads as it will be read.
+pub fn answering_typed(ask: &Ask, at: usize, of: usize, width: usize) -> Line<'static> {
+    answering_row(&ask.question, &place(at, of), width)
 }
 
 #[cfg(test)]
@@ -363,7 +476,7 @@ mod tests {
     #[test]
     fn the_decision_reads_as_question_why_options_and_recommendation() {
         let ask = call("c1", &keep_api()).unwrap();
-        let (rows, options) = lines(&ask, 60);
+        let Card { rows, options, .. } = card(&ask, 60);
         let shown: Vec<String> = rows.iter().map(|row| row.to_string()).collect();
         assert_eq!(
             shown,
@@ -382,8 +495,8 @@ mod tests {
         // Where a click picks each option.
         assert_eq!(options, [3, 5]);
         // Narrow, each part wraps under its own indent.
-        let narrow: Vec<String> = lines(&ask, 30)
-            .0
+        let narrow: Vec<String> = card(&ask, 30)
+            .rows
             .iter()
             .map(|row| row.to_string().trim_end().to_owned())
             .collect();
@@ -423,8 +536,8 @@ mod tests {
             }),
         )
         .unwrap();
-        let shown: Vec<String> = lines(&ask, 80)
-            .0
+        let shown: Vec<String> = card(&ask, 80)
+            .rows
             .iter()
             .map(|row| row.to_string())
             .collect();
@@ -434,7 +547,7 @@ mod tests {
             "┃    Runs n² checks, see the plan (https://x.dev)."
         );
         // The question stays bold, past what its words make bold.
-        let question = &lines(&ask, 80).0[0];
+        let question = &card(&ask, 80).rows[0];
         let words = question
             .spans
             .iter()
@@ -445,21 +558,61 @@ mod tests {
                 .contains(ratatui::style::Modifier::BOLD)
         }));
         // The composer names it without its marks.
-        assert!(hint(&ask, 0, 80).starts_with("Answer “Ship 0.5 with --fast on?”"));
+        assert!(text(&hint(&ask, 0, 1, 80)).starts_with("Answer “Ship 0.5 with --fast on?”"));
+    }
+
+    fn text(spans: &[Span]) -> String {
+        spans.iter().map(|span| span.content.as_ref()).collect()
     }
 
     #[test]
-    fn the_hint_names_the_question_and_its_keys() {
+    fn the_hint_names_the_question_which_of_those_open_and_its_keys() {
         let ask = call("c1", &keep_api()).unwrap();
         assert_eq!(
-            hint(&ask, 0, 80),
+            text(&hint(&ask, 0, 1, 80)),
             "Answer “Keep the old API?”: 1–2 pick · esc write instead"
         );
         assert_eq!(
-            hint(&ask, 1, 80),
-            "Answer “Keep the old API?”: 1–2 pick · 1 more open · esc write instead"
+            text(&hint(&ask, 1, 2, 80)),
+            "Answer “Keep the old API?” (2 of 2): 1–2 pick · ↑↓ switch · esc write instead"
         );
-        assert!(hint(&ask, 0, 50).contains('…'));
+        assert!(text(&hint(&ask, 0, 1, 50)).contains('…'));
+        // The question muted, the keys in the one grammar.
+        let spans = hint(&ask, 0, 2, 80);
+        let key = |text: &str| spans.iter().find(|span| span.content == text).unwrap();
+        for text in ["1–2", "↑↓", "esc"] {
+            let dim = key(text).style.add_modifier;
+            assert!(!dim.contains(ratatui::style::Modifier::DIM), "{text}");
+        }
+        assert!(
+            spans[0]
+                .style
+                .add_modifier
+                .contains(ratatui::style::Modifier::DIM)
+        );
+        // No options: the answer is typed.
+        let open = call("c2", &json!({"question": "Why?"})).unwrap();
+        assert_eq!(
+            text(&hint(&open, 0, 1, 80)),
+            "Answer “Why?”: type your answer · esc write instead"
+        );
+        // Over what is typed, the row the sent answer will have.
+        assert_eq!(
+            answering_typed(&ask, 0, 2, 80).to_string(),
+            "  answering “Keep the old API?” (1 of 2)"
+        );
+        assert_eq!(
+            answering_typed(&ask, 0, 1, 80).to_string(),
+            answering(&ask.question, 80).to_string()
+        );
+    }
+
+    #[test]
+    fn the_persons_own_words_move_on_and_nothing_else_does() {
+        assert!(moves_on("Meanwhile, why so slow?", None));
+        assert!(!moves_on("You asked: Keep it?\n\nYes", None));
+        assert!(!moves_on("Done: tests pass", Some("tally.halves")));
+        assert!(!moves_on(&crate::reactions::message("👍", None), None));
     }
 
     #[test]
@@ -476,14 +629,20 @@ mod tests {
             open(&[reply.clone(), output.clone(), asked.clone()]),
             Some("Keep it?".into())
         );
-        // A reaction, or a message of the person's own, answers nothing.
+        // A reaction answers nothing.
+        let thumbs = crate::reactions::message("👍", None);
         assert_eq!(
-            open(&[
-                person("👍"),
-                person("Meanwhile, why?"),
-                reply.clone(),
-                asked.clone()
-            ]),
+            open(&[person(&thumbs), reply.clone(), asked.clone()]),
+            Some("Keep it?".into())
+        );
+        // Words of the person's own after it set it aside: the
+        // conversation went on past it. Before it, they do not.
+        assert_eq!(
+            open(&[person("Meanwhile, why?"), reply.clone(), asked.clone()]),
+            None
+        );
+        assert_eq!(
+            open(&[reply.clone(), asked.clone(), person("Plan the release")]),
             Some("Keep it?".into())
         );
         assert_eq!(
@@ -505,5 +664,68 @@ mod tests {
         let unknown = json!({"type": "function_call_output", "call_id": "a1",
             "output": json!({"error": "unknown_tool"}).to_string()});
         assert_eq!(open(&[unknown, asked]), None);
+    }
+
+    /// The card's rows as a screen draws them at `width`, laid at `made`.
+    fn drawn(ask: &Ask, made: usize, width: u16) -> Vec<String> {
+        use ratatui::{buffer::Buffer, layout::Rect};
+        let card = card(ask, made);
+        let mut screen = crate::screen::Screen::default();
+        let marks = (card.hangs.into_iter().enumerate())
+            .map(|(row, hang)| (row, crate::screen::Mark::Hangs(hang)))
+            .collect();
+        screen.push_marked(card.rows, marks);
+        let area = Rect::new(0, 0, width, 60);
+        let mut buf = Buffer::empty(area);
+        screen.render(area, &mut buf, |_| None);
+        (0..area.height)
+            .map(|y| {
+                let row: String = (0..width).map(|x| buf[(x, y)].symbol()).collect();
+                row.trim_end().to_owned()
+            })
+            .filter(|row| !row.is_empty())
+            .collect()
+    }
+
+    #[test]
+    fn the_bar_goes_on_down_a_card_drawn_narrower_than_it_was_laid() {
+        let ask = call(
+            "c1",
+            &json!({
+                "question": "Which store migration should 0.8 ship with, the online one or the offline one?",
+                "why": "The choice decides how long the daemon is down.\n\n\n- **Online**: copies rows in batches while the daemon runs.\n- **Offline**: rewrites the table in one pass.\n\n> Both were tried on a copy of a real store.",
+                "options": [
+                    {"label": "Online migration, batched while the daemon keeps serving", "explanation": "No downtime, but the upgrade takes about forty minutes."},
+                    {"label": "Offline rewrite", "explanation": "About three minutes."}
+                ],
+                "recommended": 2,
+                "reason": "Three minutes of pause is less than forty of slow searches."
+            }),
+        )
+        .unwrap();
+        // Laid wide, as the margin opening after it narrows it.
+        let rows = drawn(&ask, 100, 34);
+        assert!(rows[0].starts_with("? Which"));
+        for row in &rows[1..] {
+            assert!(row.starts_with('┃'), "{row}\n{}", rows.join("\n"));
+        }
+        // Each row goes on under its own text: a list item past its
+        // marker, an option past its number, a quote under its bar.
+        let at = |text: &str| rows.iter().position(|row| row.contains(text)).unwrap();
+        assert!(rows[at("- Online")].starts_with("┃ - Online"));
+        assert!(rows[at("- Online") + 1].starts_with("┃   "));
+        assert!(rows[at("1  Online")].starts_with("┃ 1  Online"));
+        assert!(rows[at("1  Online") + 1].starts_with("┃    "));
+        assert!(rows[at("▌ Both")].starts_with("┃ ▌ Both"));
+        assert!(
+            rows[at("▌ Both") + 1].starts_with("┃ ▌ "),
+            "{}",
+            rows.join("\n")
+        );
+        // Paragraphs stay apart, by one row however many the agent left.
+        assert_eq!(rows[at("- Online") - 1], "┃");
+        assert_ne!(rows[at("- Online") - 2], "┃");
+        // Laid at the width it is drawn at, it reads the same.
+        assert_eq!(drawn(&ask, 34, 34), rows);
     }
 }
