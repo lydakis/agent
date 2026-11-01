@@ -6824,6 +6824,7 @@ fn schema_36_ends_a_turn_in_flight_and_keeps_its_history() {
         .unwrap()
         .execute_batch(
             "ALTER TABLE bots DROP COLUMN closed; ALTER TABLE bots DROP COLUMN open_calls;
+             DROP INDEX processes_untold; ALTER TABLE processes DROP COLUMN told;
              ALTER TABLE processes DROP COLUMN delivered; PRAGMA user_version=35;",
         )
         .unwrap();
@@ -15456,4 +15457,132 @@ fn a_bot_made_by_another_goes_by_its_creators_rules() {
     };
     let refused = db.set_settings("Ann", None, &named, &empty).unwrap_err();
     assert_eq!(refused.code, "invalid_setting");
+}
+
+/// The message that tells Bob its commands ended, from the queued event
+/// and the turn's own prompt.
+fn told(db: &Database, turn: i64) -> (Value, Value) {
+    let events = db.events("Bob", 0, 256).unwrap();
+    let queued = (events["events"].as_array().unwrap().iter())
+        .find(|e| e["event"] == "queued" && e["turn"] == turn)
+        .cloned()
+        .unwrap();
+    let prompts = db.prompts("Bob", turn, 4096).unwrap();
+    let text = prompts["prompts"][0]["text"].as_str().unwrap();
+    (queued["data"].clone(), serde_json::from_str(text).unwrap())
+}
+
+#[test]
+fn a_background_command_no_wait_collected_is_told_once_its_bot_rests() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let first = db
+        .begin(
+            "Bob",
+            "r1",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let waited = db.process_start(first, "shell-1").unwrap();
+    let seen = db.process_start(first, "tty-1").unwrap();
+    let late = db.process_start(first, "shell-2").unwrap();
+    let during = db.process_start(first, "shell-3").unwrap();
+    // While its turn runs, an end waits for the turn's end.
+    db.process_finish(waited, &json!({"stdout":"ok","exit_code":0}), &[], &[])
+        .unwrap();
+    assert!(!db.tell_finished("Bob").unwrap());
+    // A wait handed this one over; a write showed the bot this one's end.
+    let node = db.inspect("Bob").unwrap().head.unwrap();
+    db.delivered(node, &[waited]).unwrap();
+    db.saw_end(seen).unwrap();
+    db.process_finish(seen, &json!({"output":"$ ","exit_code":0}), &[], &[])
+        .unwrap();
+    db.process_finish(
+        during,
+        &json!({"stdout":"x".repeat(9000),"stderr":"","exit_code":0,
+        "success":true,"wall_time_ms":40}),
+        &[],
+        &[],
+    )
+    .unwrap();
+    // The turn ends with one uncollected: Bob is told of it alone.
+    db.finish(first, None).unwrap();
+    let (bot, note) = db.next_ready().unwrap().unwrap();
+    assert_eq!(bot, "Bob");
+    let (queued, words) = told(&db, note);
+    assert_eq!(queued["origin"], "background");
+    assert_eq!(queued["delivery"], "steer");
+    assert_eq!(
+        words,
+        json!({"finished":{format!("proc:{during}"):{"exit_code":0,"success":true,"wall_time_ms":40}}}),
+        "how it ended, its output left for a wait"
+    );
+    db.start(note, allow_provider).unwrap();
+    db.finish(note, None).unwrap();
+    assert_eq!(db.next_ready().unwrap(), None, "told once");
+    // One that ends while Bob rests is told at once, a failure as plainly.
+    db.process_finish(
+        late,
+        &json!({"error":"daemon_paused","detail":"stopped"}),
+        &[],
+        &[],
+    )
+    .unwrap();
+    assert!(db.tell_finished("Bob").unwrap(), "ready for a slot");
+    let (_, note) = db.next_ready().unwrap().unwrap();
+    assert_eq!(
+        told(&db, note).1,
+        json!({"finished":{format!("proc:{late}"):{"error":"daemon_paused","detail":"stopped"}}})
+    );
+    assert!(!db.tell_finished("Bob").unwrap());
+}
+
+#[test]
+fn schema_76_tells_no_bot_of_commands_that_ended_before() {
+    let path =
+        std::env::temp_dir().join(format!("agent-schema76-told-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let (ended, running) = {
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        db.create("Bob", Some("/synthetic"), binding()).unwrap();
+        let turn = db
+            .begin(
+                "Bob",
+                "r1",
+                "work",
+                true,
+                &TurnOptions::default(),
+                allow_provider,
+            )
+            .unwrap()
+            .turn;
+        let ended = db.process_start(turn, "shell-1").unwrap();
+        let running = db.process_start(turn, "shell-2").unwrap();
+        db.process_finish(ended, &json!({"exit_code":0}), &[], &[])
+            .unwrap();
+        (ended, running)
+    };
+    // Bob's turn was still running when that daemon stopped.
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            "DROP INDEX processes_untold; ALTER TABLE processes DROP COLUMN told;
+             PRAGMA user_version=76;",
+        )
+        .unwrap();
+    let db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    // The turn ended at the restart, and the command that was running with
+    // it is lost: Bob hears of that one, never of the one before.
+    let (_, note) = db.next_ready().unwrap().unwrap();
+    assert_eq!(
+        told(&db, note).1,
+        json!({"finished":{format!("proc:{running}"):{"error":"process_lost"}}})
+    );
+    assert_ne!(ended, running);
+    drop(db);
+    std::fs::remove_file(path).unwrap();
 }

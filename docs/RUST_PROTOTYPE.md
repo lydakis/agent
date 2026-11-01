@@ -205,6 +205,26 @@ produce handles, and one consumes them:
   anything is pending or errored. Inside a shell tool that command is refused,
   because a blocked client would hold a process-budget unit.
 
+A command no wait collected is told to the bot that started it, once the bot
+rests: when the command ends with no turn of the bot's running, or at the end
+of the turn that was running while it did. The daemon submits one `steer` from
+origin `background` whose words are JSON, each such command's handle and how
+it ended (`exit_code`, `success`, `timed_out`, `signal`, `wall_time_ms`, or
+`error` and `detail`), and nothing of its output, which a `wait` on the handle
+reads: `{"finished":{"proc:7":{"exit_code":0,"success":true,"wall_time_ms":5012}}}`.
+It is queued behind any work the bot has, so a turn that starts takes it at its
+first boundary. A command a wait delivered is never told, nor a terminal whose
+end a `write_stdin` (or the call that started it) returned. Each is told once:
+`processes.told` holds the steer's turn (0 for one the bot saw end, and for
+every command that ended before schema 77). A bot that takes no work when
+its commands end (being deleted, out of budget, past the pending bounds) is
+told at its next turn's end. Commands lost to a restart are told the same way
+once the daemon is back, and so are those the pull cord ended, after the pause
+lifts. Unlike a client's message, the steer moves no running command to the
+background and wakes no parked wait: a running turn hears at its end, and a
+wait takes its result earlier. Claude Code tells its model the same way when a
+background shell ends; Codex leaves it to the model to poll.
+
 A peer handle resolves from the daemon's own `turn_finished` for that turn and
 reports its status, checkpoint, error, and final assistant text (up to 16 KiB);
 a client's `wait` gets the whole turn view (below) with them, and a model's

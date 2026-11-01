@@ -2238,10 +2238,14 @@ impl Turn {
                         Some(Ok(Handle::Process(id))) => id,
                         _ => return fail("invalid_handle"),
                     };
-                    let outcome = self
-                        .registry
-                        .poll_end(record.bot_id, handle, ended.as_deref())
-                        .unwrap_or_else(failure);
+                    let outcome =
+                        match self
+                            .registry
+                            .poll_end(record.bot_id, handle, ended.as_deref())
+                        {
+                            Ok(outcome) => self.seen(handle, outcome).await?,
+                            Err(error) => failure(error),
+                        };
                     let id = waiting.call_id.clone();
                     self.store
                         .op("tool_finish", move |db| db.tool_finish(turn, &id, &outcome))
@@ -3973,7 +3977,7 @@ impl Turn {
                         sender,
                     );
                     match self.run_tool(start, None, warm.as_deref_mut()).await? {
-                        Ran::Done(Ok(outcome)) => outcome,
+                        Ran::Done(Ok(outcome)) => self.seen(id, outcome).await?,
                         Ran::Done(Err(error)) => failure(error),
                         Ran::Lifted(_) => unreachable!("only a command moves to the background"),
                     }
@@ -4000,7 +4004,7 @@ impl Turn {
                         sandbox,
                     );
                     match self.run_tool(hold, None, warm.as_deref_mut()).await? {
-                        Ran::Done(Ok(Some(outcome))) => outcome,
+                        Ran::Done(Ok(Some(outcome))) => self.seen(handle, outcome).await?,
                         Ran::Done(Ok(None)) => match self
                             .park_poll(
                                 &call.call_id,
@@ -4034,7 +4038,7 @@ impl Turn {
                         sandbox,
                     );
                     match self.run_tool(typed, None, warm.as_deref_mut()).await? {
-                        Ran::Done(Ok(outcome)) => outcome,
+                        Ran::Done(Ok(outcome)) => self.seen(handle, outcome).await?,
                         Ran::Done(Err(error)) => failure(error),
                         Ran::Lifted(_) => unreachable!("only a command moves to the background"),
                     }
@@ -5044,6 +5048,17 @@ impl Turn {
         Ok(ControlFlow::Break(lapse.map_or(Stop::Parked, Stop::Lapses)))
     }
 
+    /// What a terminal's write, poll or start returned, which says how it
+    /// ended once it has: its bot saw that, so nothing tells it later.
+    async fn seen(&self, id: i64, outcome: Outcome) -> Result<Outcome> {
+        let ended = serde_json::from_str::<Value>(&outcome.output)
+            .is_ok_and(|output| output.get("exit_code").is_some());
+        if ended {
+            self.store.op("saw_end", move |db| db.saw_end(id)).await?;
+        }
+        Ok(outcome)
+    }
+
     /// Start a command now; its result is retrievable through a proc handle
     /// that the store keeps unique and durable.
     #[allow(clippy::too_many_arguments)]
@@ -5122,11 +5137,12 @@ impl Turn {
         terminal: Option<Registry>,
     ) {
         let turn = self.turn;
-        let (store, handles, failures, call_id_for_refs) = (
+        let (store, handles, failures, call_id_for_refs, bot) = (
             self.store.clone(),
             self.handles.clone(),
             self.background_failures.clone(),
             call_id.to_owned(),
+            self.bot.clone(),
         );
         tokio::spawn(async move {
             let result = receiver.await.unwrap_or_else(|_| fail("process_lost"));
@@ -5154,16 +5170,23 @@ impl Turn {
             };
             // Commit the result and overflow together before waking waiters.
             // Report storage failures to the service instead of stranding waiters.
+            // A bot at rest is told it ended in the same job; one with a
+            // turn running hears at that turn's end, unless a wait takes it.
             let recorded = value.clone();
             match store
                 .op("process_finish", move |db| {
                     db.process_finish(id, &recorded, &artifacts, &files)?;
                     files.recorded();
-                    Ok(())
+                    db.tell_finished(&bot)
                 })
                 .await
             {
-                Ok(()) => handles.process_finished(id, value),
+                Ok(ready) => {
+                    handles.process_finished(id, value);
+                    if ready {
+                        handles.turn_ready();
+                    }
+                }
                 Err(error) => {
                     // A closed receiver means the service has already exited.
                     let _ = failures.send(error);

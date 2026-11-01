@@ -806,6 +806,29 @@ impl Delivery {
         }
     }
 }
+/// The origin of the message that tells a bot its background commands
+/// ended.
+pub const BACKGROUND_ORIGIN: &str = "background";
+/// How a background command ended, as its bot is told: its result without
+/// the output, which a `wait` on its handle reads.
+fn ended_as(result: &Value) -> Value {
+    const KEPT: [&str; 7] = [
+        "exit_code",
+        "success",
+        "timed_out",
+        "signal",
+        "wall_time_ms",
+        "error",
+        "detail",
+    ];
+    let mut ended = serde_json::Map::new();
+    for key in KEPT {
+        if let Some(value) = result.get(key) {
+            ended.insert(key.to_owned(), value.clone());
+        }
+    }
+    Value::Object(ended)
+}
 /// What the storage worker hands to the publisher after each job, in commit
 /// order: every durable event committed past its watermark, how far that
 /// covers when the newest were removed first, then the outcomes of turns
@@ -1850,7 +1873,7 @@ impl Database {
     /// Stored schema version, kept in `PRAGMA user_version`. Stores created
     /// before versioning and stores from newer binaries are rejected; an older
     /// versioned store is migrated forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 76;
+    pub const SCHEMA: i32 = 77;
     /// Verbatim user prompts a compaction keeps: per-prompt text, and the
     /// total text plus `(ordinal, String)` entry metadata. Empty entries cost
     /// space too, so the retained list cannot grow with conversation length.
@@ -2070,8 +2093,10 @@ impl Database {
             CREATE INDEX IF NOT EXISTS answers_waiting ON answers(tag,id) WHERE output IS NULL;
             CREATE INDEX IF NOT EXISTS answers_paused ON answers(turn) WHERE paused_ms IS NOT NULL;
             CREATE TABLE IF NOT EXISTS processes(id INTEGER PRIMARY KEY AUTOINCREMENT, turn INTEGER NOT NULL REFERENCES turns(id),
-                call_id TEXT NOT NULL, status TEXT NOT NULL, result TEXT, delivered INTEGER);
+                call_id TEXT NOT NULL, status TEXT NOT NULL, result TEXT, delivered INTEGER, told INTEGER);
             CREATE INDEX IF NOT EXISTS processes_turn ON processes(turn);
+            CREATE INDEX IF NOT EXISTS processes_untold ON processes(turn)
+                WHERE told IS NULL AND delivered IS NULL AND status<>'running';
             CREATE TABLE IF NOT EXISTS artifacts(turn INTEGER NOT NULL REFERENCES turns(id), call_id TEXT NOT NULL,
                 stream TEXT NOT NULL, data BLOB NOT NULL, raw_bytes INTEGER NOT NULL DEFAULT 0, file TEXT,
                 PRIMARY KEY(turn,call_id,stream));
@@ -2159,6 +2184,19 @@ impl Database {
                 GROUP BY t.bot)",
             [],
         )?;
+        // A command that ended with the daemon, or while it was down, is
+        // told to an idle bot now; a parked turn's bot hears at its end.
+        let untold: Vec<String> = db
+            .conn
+            .prepare(
+                "SELECT DISTINCT t.bot FROM processes p JOIN turns t ON t.id=p.turn
+                 WHERE p.told IS NULL AND p.delivered IS NULL AND p.status<>'running'",
+            )?
+            .query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        for bot in untold {
+            db.tell_finished(&bot)?;
+        }
         db.recount_pending()?;
         Ok(db)
     }
@@ -8850,6 +8888,8 @@ impl Database {
         self.approvals -= unstarted;
         self.forget_live(turn);
         entries.push(entry(cursor, &bot.name, Some(turn), "turn_finished", data));
+        // What its background commands did while it ran, uncollected.
+        self.tell_finished(&bot.name)?;
         Ok(entries)
     }
     fn waiting(&self, turn: i64) -> Result<Option<Waiting>> {
@@ -9501,6 +9541,77 @@ impl Database {
             }
         }
         tx.commit()?;
+        Ok(())
+    }
+    /// Tell `bot` of its background commands that ended with no wait
+    /// collecting them, once it rests: one steer, from the `background`
+    /// origin, whose words are each command's handle and how it ended,
+    /// its output left for a `wait` on the handle. A bot with a turn
+    /// running hears at that turn's end, unless a wait collects them
+    /// first. A bot that takes no work now (being deleted, out of budget,
+    /// past the pending bounds) is told at a later end. Whether a turn is
+    /// ready for a slot now.
+    pub fn tell_finished(&mut self, bot: &str) -> Result<bool> {
+        let running: Option<Option<i64>> = self
+            .conn
+            .prepare_cached("SELECT running_turn FROM bots WHERE name=?")?
+            .query_row([bot], |r| r.get(0))
+            .optional()?;
+        let Some(None) = running else {
+            return Ok(false);
+        };
+        let ended: Vec<(i64, Option<String>)> = self
+            .conn
+            .prepare_cached(
+                "SELECT p.id,p.result FROM processes p JOIN turns t ON t.id=p.turn
+                 WHERE p.told IS NULL AND p.delivered IS NULL AND p.status<>'running' AND t.bot=?
+                 ORDER BY p.id",
+            )?
+            .query_map([bot], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        let Some(&(first, _)) = ended.first() else {
+            return Ok(false);
+        };
+        let mut finished = serde_json::Map::new();
+        for (id, result) in &ended {
+            let result: Value = match result {
+                Some(result) => serde_json::from_str(result)?,
+                None => Value::Null,
+            };
+            finished.insert(format!("proc:{id}"), ended_as(&result));
+        }
+        let prompt = json!({"finished": finished}).to_string();
+        let options = TurnOptions {
+            delivery: Delivery::Steer,
+            origin: Some(BACKGROUND_ORIGIN.to_owned()),
+            ..TurnOptions::default()
+        };
+        let started = match self.begin(
+            bot,
+            &format!("{BACKGROUND_ORIGIN}-{first}"),
+            &prompt,
+            false,
+            &options,
+            |_, _| Ok(()),
+        ) {
+            Ok(started) => started,
+            Err(error) if error.code == "storage_error" => return Err(error),
+            Err(_) => return Ok(false),
+        };
+        let mut told = self
+            .conn
+            .prepare_cached("UPDATE processes SET told=? WHERE id=?")?;
+        for (id, _) in &ended {
+            told.execute(params![started.turn, id])?;
+        }
+        Ok(started.status == "ready")
+    }
+    /// The bot saw how terminal `id` ended, in what a write or a poll
+    /// returned: nothing is told of it later.
+    pub fn saw_end(&mut self, id: i64) -> Result<()> {
+        self.conn
+            .prepare_cached("UPDATE processes SET told=0 WHERE id=? AND told IS NULL")?
+            .execute([id])?;
         Ok(())
     }
     /// Why a bot may not wait on one of these background commands, if it
@@ -13146,6 +13257,21 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
         conn.execute_batch(
             "ALTER TABLE turns ADD COLUMN wait_ms INTEGER;
              ALTER TABLE turns ADD COLUMN due_ms INTEGER;",
+        )?;
+    }
+    // 76 -> 77: a background command's end is told to its bot when no
+    // wait collected it. Those that ended before were never going to be.
+    if from < 77
+        && conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='processes')
+             AND NOT EXISTS(SELECT 1 FROM pragma_table_info('processes') WHERE name='told')",
+            [],
+            |r| r.get::<_, bool>(0),
+        )?
+    {
+        conn.execute_batch(
+            "ALTER TABLE processes ADD COLUMN told INTEGER;
+             UPDATE processes SET told=0 WHERE status<>'running';",
         )?;
     }
     Ok(())
