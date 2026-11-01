@@ -112,6 +112,9 @@ fn run() -> Result<i32> {
     if args[0] == "login" {
         return sign_in::main(&args[1..]);
     }
+    if args[0] == "sandbox" {
+        return sandboxed(&args[1..]);
+    }
     if args[0] == "serve" {
         SERVING.store(true, std::sync::atomic::Ordering::Relaxed);
         let config = configuration(&args[1..])?;
@@ -120,6 +123,91 @@ fn run() -> Result<i32> {
     } else {
         client::main(args)
     }
+}
+
+/// `agent sandbox [--writable PATH]... -- COMMAND [ARGS...]`: the command
+/// in the sandbox a bot's commands run in, writing only the folders named
+/// (none: read-only), with the network off. Off, it reaches no Unix socket
+/// either, so not the daemon's, nor a bot's, which a bot's sandbox hides
+/// by the daemon's own knowledge of them. For a client that runs a
+/// program in a folder an agent may write, which could run what the agent
+/// left there: git runs a repository's hooks and the commands its config
+/// names. As Codex's `codex sandbox`, with no daemon: the same sandbox,
+/// run here. The agent's home stays read-only, as in every sandbox.
+fn sandboxed(args: &[String]) -> Result<i32> {
+    use agent_runtime::sandbox::{Daemon, Mode, Policy};
+    let split = args
+        .iter()
+        .position(|arg| arg == "--")
+        .ok_or(Error::with("usage", "sandbox needs -- before its command"))?;
+    let (flags, command) = (&args[..split], &args[split + 1..]);
+    let Some((program, rest)) = command.split_first() else {
+        return fail_with("usage", "sandbox needs a command after --");
+    };
+    let mut writable = Vec::new();
+    let mut iter = flags.iter();
+    while let Some(flag) = iter.next() {
+        match (flag.as_str(), iter.next()) {
+            // By its real path, which is what the sandbox sees.
+            ("--writable", Some(path)) => match std::fs::canonicalize(path)
+                .ok()
+                .and_then(|real| real.to_str().map(str::to_owned))
+            {
+                Some(real) => writable.push(real),
+                None => {
+                    return fail_with("usage", format!("--writable {path} is not a folder here"));
+                }
+            },
+            _ => return fail_with("usage", format!("sandbox does not accept {flag}")),
+        }
+    }
+    agent_runtime::sandbox::available()?;
+    // What a daemon this CLI starts keeps read-only in every root: a
+    // checkout's git folder, agents' settings, cloud keys.
+    let names = |names: &[&str]| names.iter().map(|name| name.to_string()).collect();
+    let daemon = Daemon {
+        protected: names(&agent_client::PROTECTED),
+        protected_existing: names(&agent_client::PROTECTED_EXISTING),
+        // By its real path, which the sandbox sees, kept when it is not
+        // there yet as well, so it may not be made.
+        protected_paths: agent_client::config::home()
+            .and_then(|home| {
+                std::fs::canonicalize(&home).ok().or_else(|| {
+                    Some(
+                        std::fs::canonicalize(home.parent()?)
+                            .ok()?
+                            .join(home.file_name()?),
+                    )
+                })
+            })
+            .into_iter()
+            .collect(),
+        ..Daemon::default()
+    };
+    let mode = match writable.is_empty() {
+        true => Mode::ReadOnly,
+        false => Mode::WorkspaceWrite,
+    };
+    let policy = Policy::new(Some(mode), None, &writable, false, &daemon)?
+        .ok_or(Error::new("sandbox_unavailable"))?;
+    let rest: Vec<&str> = rest.iter().map(String::as_str).collect();
+    let status = runtime()?.block_on(async {
+        // What the sandbox holds in place stays held while the command
+        // runs, and what it left in place for it is gone before this exits,
+        // as for a bot's command.
+        let held = agent_runtime::sandbox::hold(&policy).await;
+        let status = match agent_runtime::sandbox::command(&policy, program, &rest, false) {
+            Ok(mut child) => child.status().await.map_err(Error::from),
+            Err(e) => Err(e),
+        };
+        held.release();
+        status
+    })?;
+    // A command a signal ended exits as a shell reports it.
+    Ok(status.code().unwrap_or_else(|| {
+        use std::os::unix::process::ExitStatusExt;
+        128 + status.signal().unwrap_or(0)
+    }))
 }
 
 fn runtime() -> Result<tokio::runtime::Runtime> {

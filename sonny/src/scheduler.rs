@@ -576,6 +576,12 @@ pub fn run() -> i32 {
         eprintln!("{}", trigger::error_json("no HOME for triggers"));
         return 1;
     };
+    // Before anything is made under HOME, which would make HOME again:
+    // one gone while no scheduler ran is let go of as one gone while it
+    // runs.
+    if orphaned() {
+        return let_job_go();
+    }
     let bell = match Doorbell::open(&places) {
         Ok(Some(bell)) => bell,
         // Another scheduler of this HOME has it.
@@ -609,20 +615,7 @@ pub fn run() -> i32 {
     let mut rang = true;
     loop {
         if orphaned() {
-            let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
-            eprintln!(
-                "{}",
-                trigger::error_json("home_gone: its HOME is gone; the scheduler lets its job go")
-            );
-            let scheduler = Scheduler::here();
-            let file = job_file(scheduler, &home);
-            let _ = std::fs::remove_file(&file);
-            let_go(
-                scheduler,
-                file.parent().unwrap_or(Path::new("")),
-                &label(&home),
-            );
-            return 0;
+            return let_job_go();
         }
         let every_minute = last_look.elapsed() >= LOOK_EVERY;
         // Sonny upgraded where it stays: the new one schedules from here.
@@ -957,6 +950,25 @@ fn modified(dir: &Path) -> Option<(i64, i64)> {
     std::fs::metadata(dir)
         .ok()
         .map(|m| (m.mtime(), m.mtime_nsec()))
+}
+
+/// HOME gone: the scheduler removes its own job from the system, so it
+/// runs no more.
+fn let_job_go() -> i32 {
+    let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
+    eprintln!(
+        "{}",
+        trigger::error_json("home_gone: its HOME is gone; the scheduler lets its job go")
+    );
+    let scheduler = Scheduler::here();
+    let file = job_file(scheduler, &home);
+    let _ = std::fs::remove_file(&file);
+    let_go(
+        scheduler,
+        file.parent().unwrap_or(Path::new("")),
+        &label(&home),
+    );
+    0
 }
 
 /// Whether HOME is gone, as a test's or an eval's is.

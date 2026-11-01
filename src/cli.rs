@@ -201,6 +201,14 @@ const COMMANDS: &[Command] = &[
         startup: true,
     },
     Command {
+        name: "sandbox",
+        about: "Run a command in a sandbox: read-only, or writing only the folders named",
+        usage: "sandbox [--writable PATH]... -- COMMAND [ARGS...]",
+        flags: "--writable",
+        settings: "",
+        startup: false,
+    },
+    Command {
         name: "serve",
         about: "Run the daemon in the foreground; other commands start it for you",
         usage: "serve --store PATH --provider SPEC... [OPTIONS]",
@@ -459,7 +467,7 @@ fn print_flags(flags: &str) {
             "--env" => ("KEY=VALUE", "A variable a companion gets; repeat for more"),
             "--writable" => (
                 "PATH",
-                "Another folder a workspace-write bot may change; repeat for more",
+                "Another folder a workspace-write bot, or a sandboxed command, may change; repeat for more",
             ),
             "--network" => ("", "A workspace-write bot's commands may use the network"),
             "--outputs" => (
@@ -602,7 +610,7 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
     let mut positional = 0;
     while let Some(arg) = iter.next() {
         if arg == "--" {
-            if matches!(c.name, "run" | "wait" | "companion") {
+            if matches!(c.name, "run" | "wait" | "companion" | "sandbox") {
                 out.push(arg);
             }
             for value in iter {
@@ -760,6 +768,10 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
         if positional != 1 {
             return fail_with("usage", "login needs a provider: chatgpt");
         }
+    } else if c.name == "sandbox" {
+        if positional == 0 {
+            return fail_with("usage", "sandbox needs a command after --");
+        }
     } else if !matches!(c.name, "run" | "wait" | "companion") && positional != 0 {
         return fail_with("usage", format!("{} takes no positional arguments", c.name));
     }
@@ -839,5 +851,51 @@ mod tests {
         }
         assert_eq!(duration_secs("--keep-warm", "4m").ok(), Some(240));
         assert!(duration_secs("--keep-warm", "1500ms").is_err());
+    }
+
+    #[test]
+    fn a_sandboxed_command_keeps_its_words_after_the_separator() {
+        let words = |args: &[&str]| args.iter().map(|a| a.to_string()).collect::<Vec<_>>();
+        let prepared = prepare(words(&[
+            "sandbox",
+            "--writable",
+            "/r",
+            "--",
+            "git",
+            "--no-pager",
+            "status",
+        ]))
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            prepared,
+            words(&[
+                "sandbox",
+                "--writable",
+                "/r",
+                "--",
+                "git",
+                "--no-pager",
+                "status"
+            ])
+        );
+        // Each folder named; no command is refused, as is another flag.
+        assert!(
+            prepare(words(&[
+                "sandbox",
+                "--writable",
+                "/a",
+                "--writable",
+                "/b",
+                "--",
+                "ls"
+            ]))
+            .is_ok()
+        );
+        assert!(prepare(words(&["sandbox", "--writable", "/a"])).is_err());
+        assert!(prepare(words(&["sandbox", "--"])).is_err());
+        assert!(prepare(words(&["sandbox", "--bot", "x", "--", "ls"])).is_err());
+        // With the network off, it reaches no socket, the daemon's least.
+        assert!(prepare(words(&["sandbox", "--network", "--", "ls"])).is_err());
     }
 }
