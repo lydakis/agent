@@ -123,7 +123,7 @@ names it: upgrade step `ID`. Both name the release they are deleted in.
 | Feature | Status | History | Why | Used? |
 |---|---|---|---|---|
 | The pane beside the conversation: files, `/status`, `/background`, tasks; back and forward | shipped | added 10-28 #264; `/background` 10-28 #283; tasks in the pane 10-29 #326; `/status` opens the agent clicked 10-30 #384; ↑↓ Enter pick one 10-30 #421; a two-column gutter each side of its line 10-30 #427; `/status` opens on the agent named last 10-30 #435 | Look at something without losing the conversation | ? |
-| Pictures, HTML and diagrams in the pane; a folder as a tree | shipped | drawing 10-29 #303; tree 10-29 #319 | Read what agents made, in place | ? |
+| Pictures, HTML and diagrams in the pane; a folder as a tree | shipped | drawing 10-29 #303; tree 10-29 #319; a Markdown file laid out again at the width it is drawn at, so its tables and lists stay whole as the pane opens, narrows or the window resizes (George, 11-01) 11-01 | Read what agents made, in place | ? |
 | `/side`: a side chat with a copy of the agent | shipped | added 10-27 #183; a full fork with every tool 10-29 #315; dim text stays dim in the pane 10-30 | Ask about the work without steering it | ? |
 | Margin: notes agents keep beside the conversation (`/margin`) | experimental | added 10-29 #308; a task's notes in the lead's margin 10-29 #367; replay 10-30 #383; opens on its first note 10-30 #384; a note opens the agent that asks, ↗ 10-30 #395; prose at most 100 columns wide 10-30; ↩ quotes a note into the composer 10-31 | A place for state that outlives one reply | ? |
 
