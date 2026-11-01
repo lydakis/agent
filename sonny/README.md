@@ -705,8 +705,8 @@ way `/react` does, and each note in the margin has its own `↩`.
   conversation. The lead comes first; its tasks
   follow grouped by where they stand: **Needs you** (waiting on your
   approval, asking you a question, or failed),
-  **Working** (a turn running, queued, rate limited or waiting on other
-  tasks), **Ready for review** (finished, its last reply linking a pull
+  **Working** (a turn running, queued, rate limited, waiting on other
+  tasks, or `waiting on its reviewer` while the approver weighs a call), **Ready for review** (finished, its last reply linking a pull
   request), **Done** (finished or stopped with nothing open), and
   **Resolved**, only counted until `r` shows them. As threads in a
   claude.ai project do, a task resolves itself with the `resolve_task`
@@ -1365,10 +1365,15 @@ first row is a glance at what runs for the agent: a red `✗` for what
 failed in the background and `↻` for its automations and follows (a
 click on either opens `/background`), and its context, each
 left out when there is nothing to say; the footer stops saying them while
-it shows. Under the composer, the footer counts what needs you and the
-other agents at work, each with its word (`? 1 needs you  ● 2 working`),
+it shows. Under the composer, the footer counts the agents that need you
+and the other agents at work, each with its word (`? 1 needs you  ● 2 working`),
 marked as the roster and `/status` mark them, and a click on the count
-opens `/status`; and next to the model the agent's profile when it runs one
+opens `/status`. Every surface reads what needs you one way: an agent
+needs you while a call of its waits on your approval (gated for you, or
+handed to you by the approver) or a question it asked you is still open,
+read from the daemon whole when Sonny starts or reconnects, so a restart
+loses neither, and kept current by its events after. The footer, the task
+tabs' names, `/status`, the started roster and `/sky` agree; and next to the model the agent's profile when it runs one
 that isn't its seat's own (`lead` for a lead, `task` for a task). The left
 of the footer says what you talk to and where (the permissions mark, the
 model as pickers name it, its effort, the folder and its branch), and the

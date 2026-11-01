@@ -22,11 +22,11 @@ pub struct Task {
     pub state: String,
 }
 
-/// What a task is doing, from its newest turn as `turns` lists it.
+/// What a task is doing, from its newest turn as `turns` lists it; what
+/// it waits on the person for is [`crate::needs`]'s to say.
 pub fn state(turn: &Value) -> String {
     match turn["status"].as_str() {
         None => "starting",
-        Some("waiting") if turn["waiting_on"]["approval"] == true => "needs you",
         Some("completed" | "steered") => "done",
         Some("failed") if turn["error"] == "empty_completion" => QUIET,
         Some("failed") => "failed",
@@ -141,8 +141,10 @@ mod tests {
     fn a_task_reads_its_state_from_its_newest_turn() {
         assert_eq!(state(&Value::Null), "starting");
         assert_eq!(state(&json!({"status": "running"})), "working");
+        // Whether a call waits on the person, not a reviewer, the
+        // approvals listing says ([`crate::needs`]).
         let asked = json!({"status": "waiting", "waiting_on": {"approval": true}});
-        assert_eq!(state(&asked), "needs you");
+        assert_eq!(state(&asked), "working");
         assert_eq!(state(&json!({"status": "waiting"})), "working");
         assert_eq!(state(&json!({"status": "completed"})), "done");
         let empty = json!({"status": "failed", "error": "empty_completion"});
