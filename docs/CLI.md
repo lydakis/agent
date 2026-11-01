@@ -47,6 +47,13 @@ which a client passes as `~/.agent/rules`, and
 `rules check [--rules DIR] -- COMMAND...` prints what they decide about a
 command without a daemon: `{"decision", "matched"}`, with no `decision`
 when no rule matches, or `rules_invalid` with the file and line.
+The daemon's [limits](RUST_PROTOTYPE.md#limits) come from `[daemon]` in
+`~/.agent/config.toml` where the command line sets none, each a number or
+a formula of the machine, as `processes = "cpus * 64"` or
+`load = "cpus * 2"`, the default for `--max-load`: while the machine's
+1-minute load average is over it, new commands wait for one of the
+daemon's to end, as `make -l` does. A key it does not know, or a formula
+it cannot work out, is `config_invalid`.
 `run` without `--bot` creates a fresh identity. `run --bot NAME` continues an
 existing bot; add `--new` to create that name. A prompt of `-` reads stdin.
 
