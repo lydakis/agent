@@ -81,7 +81,7 @@ class ConfinedTests(unittest.TestCase):
     """What the eval allows has effects only in the run (#521)."""
 
     def test_only_a_plain_call_of_sonnys_scripts_is_allowed(self):
-        home = Path('/tmp/role/A1/h')
+        home = role_eval.ROOT / 'A1/h'
         shell = lambda command, **more: {'name': 'shell', 'arguments': {'command': command}, **more}
         for allowed in ['~/.agent/trigger add --bot shop.lead --every 10m -- "Check the tasks"',
                         '"$HOME/.agent/trigger" rm watch',
@@ -100,12 +100,30 @@ class ConfinedTests(unittest.TestCase):
                        '~/.agent/trigger ls > /Users/me/x',
                        '~/.agent/trigger ls\ntouch /x',
                        'FOO=1 ~/.agent/trigger ls',
+                       # What runs a command or starts an agent outside the eval's row.
+                       "~/.agent/trigger add --bot shop.lead --every 10m --if 'touch /x' -- ping",
+                       '~/.agent/trigger add --if=true --bot shop.lead -- ping',
+                       '~/.agent/trigger add --start helper --model chatgpt/x --in 5m -- go',
+                       '~/.agent/trigger add --bot shop.lead --every 10m',
+                       '~/.agent/trigger fire watch --if true',
+                       '~/.agent/trigger rm',
+                       '~/.agent/trigger edit watch',
+                       '~/.agent/memory schedule --model chatgpt/x',
+                       '~/.agent/memory cleanup start',
+                       '~/.agent/memory save flow --type -- text',
+                       '~/.agent/memory',
                        'git push origin main']:
             self.assertFalse(role_eval.determinable(home, shell(denied)), denied)
         # Not a shell call, or not seen whole.
         self.assertFalse(role_eval.determinable(home, {'name': 'write', 'arguments': {'path': '/x', 'content': ''}}))
         self.assertFalse(role_eval.determinable(home, shell('~/.agent/trigger ls', arguments_cut=['command'])))
         self.assertFalse(role_eval.determinable(home, shell('~/.agent/trigger ls', arguments_omitted=1)))
+
+    def test_runs_live_outside_what_the_sandbox_always_writes(self):
+        # /tmp and $TMPDIR are writable in every sandbox: a run there could
+        # have its copy of the build replaced.
+        for temporary in {Path('/tmp'), Path(tempfile.gettempdir())}:
+            self.assertFalse(role_eval.ROOT.resolve().is_relative_to(temporary.resolve()))
 
     def test_the_run_writes_its_folder_without_network_and_the_eval_approves(self):
         with tempfile.TemporaryDirectory() as tmp:

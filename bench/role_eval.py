@@ -62,8 +62,11 @@ MODEL = 'chatgpt/gpt-6.1-sol'
 LOGIN = Path(os.environ.get('AGENT_CHATGPT_LOGIN') or Path.home() / '.agent/chatgpt.json')
 # The key variable each built-in provider reads.
 KEYS = {'openai': 'OPENAI_API_KEY', 'anthropic': 'ANTHROPIC_API_KEY'}
-# Unix socket paths are short on macOS: keep each run's root short.
-ROOT = Path('/tmp/role')
+# Each run's root, outside temporary storage: the sandbox writes /tmp and
+# $TMPDIR, where an agent could replace the run's copy of the build, its
+# sources' script or another run (#521). A long socket path falls back to
+# /tmp/agent-UID on its own.
+ROOT = Path.home() / '.role-eval'
 
 # --- the project ------------------------------------------------------------
 
@@ -366,17 +369,61 @@ def land(root, env, author, message, files):
 REAL_HOME = Path.home().resolve()
 # What a call that leaves the sandbox may run: Sonny's own scripts, which
 # write only under the run's HOME, as `~/.agent/trigger add ...` adds a
-# trigger to the run's scheduler.
-SCRIPTS = ('trigger', 'memory')
+# trigger to the run's scheduler. Each verb names how many plain words it
+# takes, its flags (True when a flag takes a value) and whether free text
+# follows `--`. What runs a command or starts an agent is left out: a
+# trigger's `--if` runs in the scheduler, outside every sandbox, and
+# `--start` or `memory schedule` start an agent the eval never configured.
+SCOPE = {'--user': False, '--project': True}
+SCRIPTS = {
+    'trigger': {
+        'ls': (0, {'--after': True}, False),
+        'show': (1, {}, False),
+        'fire': (1, {}, False),
+        'rm': (1, {}, False),
+        'add': (0, {'--name': True, '--every': True, '--in': True, '--at': True, '--cron': True,
+                    '--bot': True, '--reply-to': True, '--runs': True,
+                    '--turn-budget-tokens': True, '--replace': False}, True),
+    },
+    'memory': {
+        'show': (0, SCOPE, False),
+        'read': (1, SCOPE, False),
+        'rm': (1, SCOPE, False),
+        'index': (0, SCOPE, False),
+        'check': (0, SCOPE, False),
+        'save': (1, {**SCOPE, '--type': True, '--description': True, '--source': True,
+                     '--confirmed': True, '--pushed-back': True, '--external': False}, True),
+    },
+}
+
+
+def plain(words, spec):
+    """Whether `words`, after a script's verb, are what `spec` allows."""
+    count, flags, text = spec
+    names = []
+    i = 0
+    while i < len(words):
+        word = words[i]
+        if word == '--':
+            return text and len(names) == count
+        if word.startswith('-'):
+            if word not in flags or (flags[word] and i + 1 == len(words)):
+                return False
+            i += 2 if flags[word] else 1
+        else:
+            names.append(word)
+            i += 1
+    return not text and len(names) == count
 
 
 def determinable(home, request):
     """Whether a call that would leave the sandbox is one whose effects stay
     in the run, so the eval may allow it. A command's words can't say where
     it writes (a script can build a path to the real home at run time), so
-    only one plain call of Sonny's own scripts is: no shell operators, no
-    expansions, no line breaks. Every other ask is denied; what the run's
-    work needs is writable without asking, and the sandbox is the boundary."""
+    only one plain call of Sonny's own scripts is, with a verb and flags
+    that run nothing else: no shell operators, no expansions, no line
+    breaks. Every other ask is denied; what the run's work needs is
+    writable without asking, and the sandbox is the boundary."""
     if not request or request.get('arguments_cut') or request.get('arguments_omitted'):
         return False
     call = request.get('toolCall') or request
@@ -399,9 +446,12 @@ def determinable(home, request):
     program, rest = words[0], words[1:]
     if any('$' in word for word in rest):
         return False
-    scripts = {form.format(name=name) for name in SCRIPTS
-               for form in ('~/.agent/{name}', '$HOME/.agent/{name}', f'{home}/.agent/{{name}}')}
-    return program in scripts
+    script = next((name for name in SCRIPTS
+                   for form in ('~/.agent/{name}', '$HOME/.agent/{name}', f'{home}/.agent/{{name}}')
+                   if program == form.format(name=name)), None)
+    if script is None or not rest or rest[0] not in SCRIPTS[script]:
+        return False
+    return plain(rest[1:], SCRIPTS[script][rest[0]])
 
 
 def changed_outside(since, root, limit=200):
@@ -564,8 +614,7 @@ def settle(env, agent, acp, quiet=60, cap=40 * 60):
 
 
 def run(arm, n, bins, model, spec=None):
-    # Short (macOS socket paths), and apart per model, so runs of two
-    # models at once never share a root.
+    # Apart per model, so runs of two models at once never share a root.
     # The day too, so a small day never clears a full day's run.
     root = ROOT / f'{zlib.crc32((model + DAY_NAME).encode()):08x}-{arm}{n}'
     home, repo, env, bin_dir = setup(root, Path(bins[arm]), model, spec)
