@@ -23,6 +23,9 @@ pub const SWITCH: &str = "ctrl+\\";
 pub const MARGIN: u16 = 40;
 /// What the keys do in the margin.
 pub const MARGIN_KEYS: &str = "esc close";
+/// The key, and its hint, that opens a picture or a drawing bigger: in
+/// the app the system opens such a file with, as large as it lets it be.
+pub const BIGGER: &str = "o open bigger";
 /// The most of a file read for its preview, and the most lines shown.
 const MOST_BYTES: u64 = 4 << 20;
 const MOST_LINES: usize = 9_000;
@@ -97,6 +100,10 @@ pub struct Pane {
     /// The keys were here when it was last drawn: its switch hint went
     /// back to the conversation then, and took them over while not.
     focused: bool,
+    /// A picture or a drawing it shows, which [`BIGGER`] opens outside
+    /// Sonny; and where that hint was last drawn, which a click on does too.
+    bigger: Option<PathBuf>,
+    bigger_at: Option<(u16, u16)>,
     /// The agent whose Sonny the program is, which the title's button
     /// opens in the main view; and that button's columns as last drawn.
     pub agent: Option<String>,
@@ -178,6 +185,7 @@ impl Pane {
         // Its escapes kept, as the path read back may hold `#` or `%`;
         // the line left off.
         let link = url.split('#').next().unwrap_or(url);
+        let bigger = (tree.is_none() && is_drawing(&path)).then(|| path.clone());
         Ok(Self {
             title,
             link: Some(link.to_owned()),
@@ -188,7 +196,10 @@ impl Pane {
             screen,
             area: Rect::default(),
             card: None,
-            keys: "esc close".into(),
+            keys: match bigger {
+                Some(_) => format!("{BIGGER} · esc close"),
+                None => "esc close".into(),
+            },
             program: None,
             foot: None,
             prose,
@@ -203,6 +214,8 @@ impl Pane {
             alone: false,
             switch_at: None,
             focused: false,
+            bigger,
+            bigger_at: None,
             agent: None,
             main_at: None,
             name_at: None,
@@ -325,6 +338,8 @@ impl Pane {
             alone: false,
             switch_at: None,
             focused: false,
+            bigger: None,
+            bigger_at: None,
             agent: None,
             main_at: None,
             name_at: None,
@@ -358,6 +373,8 @@ impl Pane {
             alone: false,
             switch_at: None,
             focused: false,
+            bigger: None,
+            bigger_at: None,
             agent: None,
             main_at: None,
             name_at: None,
@@ -413,6 +430,11 @@ impl Pane {
         self.margin
     }
 
+    /// The picture or drawing [`BIGGER`] opens, if it shows one.
+    pub fn bigger(&self) -> Option<&Path> {
+        self.bigger.as_deref()
+    }
+
     /// What its first row names it.
     pub fn title(&self) -> &str {
         &self.title
@@ -459,6 +481,11 @@ impl Pane {
                 false => "focus",
             };
             return Some(format!("{}{what}", crate::screen::BUTTON));
+        }
+        if let Some((from, to)) = self.bigger_at
+            && (from..to).contains(&column)
+        {
+            return Some(format!("{}bigger", crate::screen::BUTTON));
         }
         let (_, buttons) = self.head.as_ref()?;
         (buttons.iter())
@@ -586,7 +613,15 @@ impl Pane {
         // The switch key's hint is a button too: where it sits, as the
         // keys end at the title's right edge.
         let from = area.x + (area.width as usize).saturating_sub(keys.width()) as u16;
-        self.switch_at = switch_hint(&keys, focused, switch).map(|(a, b)| (from + a, from + b));
+        let said = match focused {
+            true => SWITCH,
+            false => switch,
+        };
+        self.switch_at = hint_at(&keys, said).map(|(a, b)| (from + a, from + b));
+        self.bigger_at = (focused && self.bigger.is_some())
+            .then(|| hint_at(&keys, BIGGER))
+            .flatten()
+            .map(|(a, b)| (from + a, from + b));
         self.focused = focused;
         // Keys in their one grammar while they go here, else dim.
         let key_spans = match focused {
@@ -716,6 +751,14 @@ impl Pane {
 
 /// Whether `path` is read as Markdown, whose tables and lists are laid
 /// out for the width they are drawn at.
+/// A picture, or a file Sonny draws: what [`BIGGER`] opens.
+fn is_drawing(path: &Path) -> bool {
+    let extension = (path.extension().and_then(|e| e.to_str()))
+        .unwrap_or_default()
+        .to_lowercase();
+    crate::image::bigger_kind(&extension).is_some()
+}
+
 fn is_markdown(path: &Path) -> bool {
     let extension = (path.extension().and_then(|e| e.to_str()))
         .unwrap_or_default()
@@ -723,14 +766,11 @@ fn is_markdown(path: &Path) -> bool {
     matches!(extension.as_str(), "md" | "markdown" | "mdx")
 }
 
-/// The columns within `keys`, as the title holds them, of the hint for
-/// the key that moves the keys between the conversation and the pane:
-/// `ctrl+\ conversation` while they are here, `tab focus` while not.
-fn switch_hint(keys: &str, focused: bool, switch: &str) -> Option<(u16, u16)> {
-    let said = match focused {
-        true => SWITCH,
-        false => switch,
-    };
+/// The columns within `keys`, as the title holds them, of the hint that
+/// starts with `said`, to its ` · `: the switch key's, `ctrl+\
+/// conversation` while the keys are here and `tab focus` while not, or
+/// [`BIGGER`]'s.
+fn hint_at(keys: &str, said: &str) -> Option<(u16, u16)> {
     let start = keys.find(said)?;
     let end = keys[start..]
         .find(" · ")
@@ -1123,6 +1163,35 @@ mod tests {
         assert_eq!(pane.url(), Some(url));
         std::fs::remove_dir_all(&dir).unwrap();
         assert!(file_url("https://x").is_none());
+    }
+
+    #[test]
+    fn a_picture_or_a_drawing_opens_bigger_from_its_title() {
+        let dir = std::env::temp_dir().join(format!("sonny-pane-bigger-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("flow.mmd");
+        std::fs::write(&file, "flowchart LR\n  a --> b\n").unwrap();
+        let mut pane = Pane::preview(&format!("file://{}", file.display()), &dir, 60).unwrap();
+        assert_eq!(pane.bigger(), Some(file.as_path()));
+        let head = rows(&mut pane, 60, 3).remove(0);
+        assert!(head.ends_with("o open bigger · esc close"), "{head}");
+        // Its hint is a button, as the switch key's is.
+        let at = head.find("open bigger").unwrap();
+        let column = head[..at].width() as u16;
+        assert_eq!(
+            pane.head_button(column).as_deref(),
+            Some(&*format!("{}bigger", crate::screen::BUTTON))
+        );
+        // Unfocused, its keys are not shown, and nothing there is a button.
+        let mut buf = Buffer::empty(Rect::new(0, 0, 60, 3));
+        pane.render(Rect::new(0, 0, 60, 3), &mut buf, false, "tab", |_| None);
+        assert_eq!(pane.head_button(column), None);
+        // Text is not a drawing.
+        let notes = dir.join("notes.md");
+        std::fs::write(&notes, "# Notes\n").unwrap();
+        let pane = Pane::preview(&format!("file://{}", notes.display()), &dir, 60).unwrap();
+        assert_eq!(pane.bigger(), None);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

@@ -8664,6 +8664,12 @@ impl App {
                         pane.screen.unselect();
                         self.copied(&text);
                     }
+                    // The picture or drawing shown, opened bigger outside Sonny.
+                    KeyCode::Char('o')
+                        if let Some(path) = pane.bigger().map(std::path::Path::to_path_buf) =>
+                    {
+                        self.open_bigger(&path)
+                    }
                     // Back and forward through what the pane has shown.
                     // Back to the margin from the first thing over it, as ‹ goes.
                     KeyCode::Left | KeyCode::Backspace if pane.goes_back() => {
@@ -9023,7 +9029,27 @@ impl App {
             "switch" if self.pane.is_some() => self.pane_keys = !self.pane_keys,
             // An unfocused pane's `tab focus` hint: the keys to it.
             "focus" if self.pane.is_some() => self.pane_keys = true,
+            // The pane's picture or drawing, opened bigger outside Sonny.
+            "bigger" => {
+                if let Some(path) = self.pane.as_ref().and_then(|p| p.bigger()) {
+                    let path = path.to_owned();
+                    self.open_bigger(&path);
+                }
+            }
             _ => self.pressed.push(what.to_owned()),
+        }
+    }
+
+    /// `path`, a picture or a drawing, opened in the app the system opens
+    /// such a file with, as large as it lets it be: a diagram drawn large
+    /// first. Over SSH, or with nothing to open it, where it was kept.
+    fn open_bigger(&mut self, path: &std::path::Path) {
+        let opened = image::bigger(path).and_then(|big| {
+            let target = big.display().to_string();
+            open(&target)
+        });
+        if let Err(error) = opened {
+            self.notice = Some(error);
         }
     }
 

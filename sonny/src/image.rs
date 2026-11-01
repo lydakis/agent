@@ -481,9 +481,123 @@ fn placeholders(id: u32, cols: u32, rows: u32) -> Vec<Line<'static>> {
         .collect()
 }
 
+/// What a file is to [`bigger`], by its extension.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Kind {
+    /// A picture, opened as it is.
+    Picture,
+    /// A page, opened as it is, in the browser.
+    Page,
+    /// An SVG or a Mermaid diagram, drawn large first.
+    Svg,
+    Mermaid,
+}
+
+/// The kind of picture or drawing a file with `extension` is, if one.
+pub fn bigger_kind(extension: &str) -> Option<Kind> {
+    match extension {
+        "png" | "jpg" | "jpeg" | "gif" | "webp" => Some(Kind::Picture),
+        "html" | "htm" => Some(Kind::Page),
+        "svg" => Some(Kind::Svg),
+        "mmd" | "mermaid" => Some(Kind::Mermaid),
+        _ => None,
+    }
+}
+
+/// The long side of a drawing opened bigger, in pixels: larger than a
+/// screen, so the app it opens in can zoom in on it.
+const BIG: f32 = 2_400.0;
+
+/// The file to open `path` bigger with, in the app the system opens it
+/// in: a picture or a page as it is; an SVG or a Mermaid diagram drawn
+/// as a large PNG, as it reads in the pane, on the terminal's own
+/// background, kept beside the others Sonny draws.
+pub fn bigger(path: &std::path::Path) -> Result<std::path::PathBuf, String> {
+    let extension = (path.extension().and_then(|e| e.to_str()))
+        .unwrap_or_default()
+        .to_lowercase();
+    let kind = bigger_kind(&extension).ok_or("not a picture or a drawing")?;
+    if matches!(kind, Kind::Picture | Kind::Page) {
+        return Ok(path.to_owned());
+    }
+    let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let svg = match kind {
+        Kind::Mermaid => crate::mermaid::svg(&text)?,
+        _ => text,
+    };
+    let background = background();
+    let out = {
+        use std::hash::{Hash, Hasher};
+        let dir = std::env::temp_dir().join("sonny-pages");
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let mut hasher = std::hash::DefaultHasher::new();
+        (&svg, background, "bigger").hash(&mut hasher);
+        dir.join(format!("{:016x}.png", hasher.finish()))
+    };
+    if !out.is_file() {
+        std::fs::write(&out, large(&svg, background)?).map_err(|e| e.to_string())?;
+    }
+    Ok(out)
+}
+
+/// The terminal's background, as it said it, or white or near-black.
+fn background() -> (u8, u8, u8) {
+    match (crate::term::theme().background, crate::term::light()) {
+        (Some(rgb), _) => rgb,
+        (None, true) => (255, 255, 255),
+        (None, false) => (24, 24, 24),
+    }
+}
+
+/// `svg` as a PNG whose long side is [`BIG`], a margin around it, on
+/// `background`.
+fn large(svg: &str, (r, g, b): (u8, u8, u8)) -> Result<Vec<u8>, String> {
+    let mut options = usvg::Options {
+        fontdb: fonts(),
+        ..usvg::Options::default()
+    };
+    options.font_family = "Helvetica".into();
+    let tree = usvg::Tree::from_str(svg, &options).map_err(|e| e.to_string())?;
+    let size = tree.size();
+    let scale = BIG / size.width().max(size.height());
+    let margin = BIG / 40.0;
+    let (w, h) = (
+        (size.width() * scale + 2.0 * margin).ceil() as u32,
+        (size.height() * scale + 2.0 * margin).ceil() as u32,
+    );
+    let mut pixmap = tiny_skia::Pixmap::new(w, h).ok_or("image too large")?;
+    pixmap.fill(tiny_skia::Color::from_rgba8(r, g, b, 255));
+    let transform = tiny_skia::Transform::from_scale(scale, scale).post_translate(margin, margin);
+    resvg::render(&tree, transform, &mut pixmap.as_mut());
+    pixmap.encode_png().map_err(|e| e.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_drawing_opens_bigger_as_a_large_png_and_a_picture_as_itself() {
+        let dir = std::env::temp_dir().join(format!("sonny-bigger-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let svg = dir.join("box.svg");
+        std::fs::write(
+            &svg,
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="160" height="80">
+            <rect width="160" height="80" fill="orange"/></svg>"#,
+        )
+        .unwrap();
+        let png = bigger(&svg).unwrap();
+        let drawn = image::open(&png).unwrap();
+        // The long side BIG, a margin of BIG/40 each side.
+        assert_eq!((drawn.width(), drawn.height()), (2_520, 1_320));
+        // A picture, or a page, is opened as it is.
+        let picture = dir.join("shot.PNG");
+        assert_eq!(bigger(&picture).unwrap(), picture);
+        assert_eq!(bigger(&dir.join("a.html")).unwrap(), dir.join("a.html"));
+        assert!(bigger(&dir.join("notes.md")).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn a_picture_fits_the_pane_and_keeps_its_shape() {
