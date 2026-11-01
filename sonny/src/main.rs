@@ -1384,13 +1384,14 @@ fn cache_to_take(bot: &Value) -> Option<&'static str> {
 /// A link, file or page, opened as the system opens it, by the first of
 /// the openers the `open` crate knows that is installed; with none, the
 /// link goes on the clipboard instead, as a login that can't open a
-/// browser prints its URL. Over SSH with no display to open on and no
-/// `BROWSER`, the opener would start on the remote machine's screen, so
-/// the link is copied straight away, as `gh` and other CLIs print it.
+/// browser prints its URL. Where nothing can show it (no display to open
+/// on and no `BROWSER`), an opener would start and fail out of sight, so
+/// the link is copied straight away and said so, as `gh` and other CLIs
+/// print it: a click never does nothing.
 fn open(target: &str) -> Result<(), String> {
-    if remote_without_display(&|key| std::env::var_os(key)) {
+    if nowhere_to_open(&|key| std::env::var_os(key), cfg!(target_os = "macos")) {
         term::copy(target);
-        return Err(format!("over SSH, nothing opens here; copied {target}"));
+        return Err(format!("nothing opens on this machine; copied {target}"));
     }
     open::that_detached(target).map_err(|error| {
         term::copy(target);
@@ -1398,14 +1399,21 @@ fn open(target: &str) -> Result<(), String> {
     })
 }
 
-/// In an SSH session with no X or Wayland display (forwarded or local)
-/// and no `BROWSER` of the person's to open with.
-fn remote_without_display(var: &dyn Fn(&str) -> Option<std::ffi::OsString>) -> bool {
+/// Whether nothing on this machine can show what is opened. On Linux: no
+/// X or Wayland display and no `BROWSER`, whether or not this is an SSH
+/// session, since a multiplexer's server (Herdr, tmux) outlives the SSH
+/// session that started it and its panes lose the SSH variables; WSL opens
+/// on Windows. On macOS: an SSH session with none of them, as `open` would
+/// show it on that Mac's own screen.
+fn nowhere_to_open(var: &dyn Fn(&str) -> Option<std::ffi::OsString>, mac: bool) -> bool {
     let set = |key: &str| var(key).is_some_and(|value| !value.is_empty());
-    (set("SSH_CONNECTION") || set("SSH_TTY"))
-        && !["DISPLAY", "WAYLAND_DISPLAY", "BROWSER"]
-            .iter()
-            .any(|key| set(key))
+    let display = ["DISPLAY", "WAYLAND_DISPLAY", "BROWSER"]
+        .iter()
+        .any(|key| set(key));
+    match mac {
+        true => (set("SSH_CONNECTION") || set("SSH_TTY")) && !display,
+        false => !display && !set("WSL_DISTRO_NAME"),
+    }
 }
 
 /// The composer's edge: the band the person's messages sit on, from the
@@ -3266,9 +3274,11 @@ impl Fleet {
     /// Open the task's window, unless it has one, it was closed for room,
     /// or the person uses another of the project's windows now. With `tell`, the lead's view hears where it opened, when not
     /// beside it, or why it did not; windows closed for room are said in
-    /// the status row.
+    /// the status row. A task that needs the person has its window, as
+    /// [`Fleet::needs_window`] opens it.
     fn show(&mut self, bot: &str, tell: bool) {
-        let doing = match self.needs.waits(bot) {
+        let needs = self.needs.waits(bot);
+        let doing = match needs {
             true => "needs you",
             false => "working",
         };
@@ -3290,7 +3300,7 @@ impl Fleet {
                 return;
             }
             room.most = windows.lock().map_or(0, |mut windows| windows.most());
-            let said = match layout.show_task(&bot_name, &name, &command, &room, false) {
+            let said = match layout.show_task(&bot_name, &name, &command, &room, needs) {
                 Ok(mux::Shown::Opened(closed)) => {
                     if !closed.is_empty() {
                         let _ =
@@ -3310,6 +3320,34 @@ impl Fleet {
             }
         });
         self.doing(bot, "working");
+    }
+
+    /// A task that came to need the person, its window set aside for
+    /// room, has it open again, as what needs them keeps its window: it
+    /// closes the window they used least recently for room, never one
+    /// they have not looked at yet nor one that needs them, and with no
+    /// other passes the limit. The person's focus stays where it is.
+    fn needs_window(&self, bot: &str) {
+        let (command, name) = self.window(bot, "needs you");
+        let (windows, mut room) = self.room();
+        let (bot, told) = (bot.to_owned(), self.tell.clone());
+        let (socket, project) = (self.socket.clone(), self.project.clone());
+        let (place, lead) = (self.place.clone(), self.lead.clone());
+        self.layout.send(move |layout| {
+            if !layout.aside(&bot) || !mux::mine(&socket, &project, &lead, &place) {
+                return;
+            }
+            room.most = windows.lock().map_or(0, |mut windows| windows.most());
+            match layout.show_task(&bot, &name, &command, &room, true) {
+                Ok(mux::Shown::Opened(closed)) if !closed.is_empty() => {
+                    let _ = told.send(Told::Notice(made_room(&closed, &room.project, room.most)));
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    let _ = told.send(Told::Notice(error));
+                }
+            }
+        });
     }
 
     /// Bring the task's own tab into view in the multiplexer, as the
@@ -3488,6 +3526,9 @@ impl Fleet {
         };
         if self.doing.get(bot) != Some(&doing) {
             self.doing.insert(bot.to_owned(), doing);
+            if doing == "needs you" && bot != self.lead && self.lineage.contains(bot) {
+                self.needs_window(bot);
+            }
             self.name_windows();
             let short = self.short(bot).to_owned();
             let alert = match doing {
@@ -8135,6 +8176,10 @@ impl App {
                     format!("tab {tab}, {side} {}", short(other, &project, &lead))
                 }
                 Some((tab, None)) => format!("tab {tab}"),
+                // Its window waits for room, until a click on the row.
+                None if (self.fleet.as_ref()).is_some_and(|fleet| fleet.layout.aside(name)) => {
+                    "window set aside for room".into()
+                }
                 None => String::new(),
             };
             // This window's turns run on its own model, when it has one.
@@ -12994,31 +13039,46 @@ mod tests {
     }
 
     #[test]
-    fn over_ssh_with_nothing_to_open_on_a_link_is_copied() {
-        let with = |vars: &[(&str, &str)]| {
+    fn with_nothing_to_open_on_a_link_is_copied() {
+        let with = |mac: bool, vars: &[(&str, &str)]| {
             let vars: Vec<(String, String)> = vars
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect();
-            remote_without_display(&move |key| {
-                vars.iter().find(|(k, _)| k == key).map(|(_, v)| v.into())
-            })
+            nowhere_to_open(
+                &move |key| vars.iter().find(|(k, _)| k == key).map(|(_, v)| v.into()),
+                mac,
+            )
         };
-        assert!(!with(&[]), "a local terminal opens");
-        assert!(with(&[("SSH_CONNECTION", "1.2.3.4 5 6.7.8.9 22")]));
-        assert!(with(&[("SSH_TTY", "/dev/pts/1"), ("DISPLAY", "")]));
-        assert!(!with(&[
-            ("SSH_CONNECTION", "c"),
-            ("DISPLAY", "localhost:10.0")
-        ]));
-        assert!(!with(&[
-            ("SSH_CONNECTION", "c"),
-            ("WAYLAND_DISPLAY", "wayland-0")
-        ]));
-        assert!(!with(&[
-            ("SSH_CONNECTION", "c"),
-            ("BROWSER", "open-on-client")
-        ]));
+        // A Mac opens on its own screen, unless reached over SSH.
+        assert!(!with(true, &[]), "a local terminal opens");
+        assert!(with(true, &[("SSH_CONNECTION", "1.2.3.4 5 6.7.8.9 22")]));
+        assert!(with(true, &[("SSH_TTY", "/dev/pts/1"), ("DISPLAY", "")]));
+        assert!(!with(
+            true,
+            &[("SSH_CONNECTION", "c"), ("BROWSER", "open-on-client")]
+        ));
+        // Linux opens where there is a display, SSH or not.
+        assert!(!with(false, &[("DISPLAY", ":0")]));
+        assert!(!with(
+            false,
+            &[("SSH_CONNECTION", "c"), ("DISPLAY", "localhost:10.0")]
+        ));
+        assert!(!with(
+            false,
+            &[("SSH_CONNECTION", "c"), ("WAYLAND_DISPLAY", "wayland-0")]
+        ));
+        assert!(!with(
+            false,
+            &[("SSH_CONNECTION", "c"), ("BROWSER", "open-on-client")]
+        ));
+        assert!(with(false, &[("SSH_CONNECTION", "c")]));
+        // A multiplexer's server outlived the SSH session: no SSH
+        // variables, and still no screen to open on.
+        assert!(with(false, &[]), "a headless box opens nothing");
+        assert!(with(false, &[("DISPLAY", "")]));
+        // WSL opens on Windows.
+        assert!(!with(false, &[("WSL_DISTRO_NAME", "Ubuntu")]));
     }
 
     #[test]
@@ -17428,6 +17488,79 @@ mod tests {
         ));
         assert_eq!(fleet.doing["calc.fix"], "working");
         assert_eq!(app.agents(), (1, 2));
+    }
+
+    #[tokio::test]
+    async fn a_task_set_aside_for_room_says_so_and_opens_once_it_needs_you() {
+        let (client, events) = daemon_with_events(json!({}), |asked| {
+            match asked["op"].as_str().unwrap_or("") {
+                "bots" => json!({"bots": [
+                    {"name": "calc.lead", "bot_id": 1, "head": 1},
+                    {"name": "calc.a", "bot_id": 2, "created_by": "calc.lead",
+                        "running_turn": 1, "head": 2},
+                    {"name": "calc.b", "bot_id": 3, "created_by": "calc.lead",
+                        "running_turn": 1, "head": 3},
+                ], "next_after": null}),
+                "approvals" => json!({"approvals": []}),
+                "turns" => json!({"turns": []}),
+                "history_nodes" => json!({"nodes": []}),
+                "history_items" => json!({"items": []}),
+                _ => json!({}),
+            }
+        })
+        .await;
+        let mut fleet = Fleet::in_memory(client.clone(), events, "calc", "calc.lead");
+        // One task window at most, as `/config` says.
+        let read = (agent_client::config::path().as_ref())
+            .and_then(|path| std::fs::metadata(path).ok())
+            .and_then(|file| file.modified().ok());
+        fleet.windows = Arc::new(std::sync::Mutex::new(TaskWindows {
+            read: Some(read),
+            most: 1,
+        }));
+        let event = |bot: &str, kind: &str, data: Value| json!({"event": kind, "bot": bot, "turn": 1, "data": data});
+        let windowed = |fleet: &Fleet| {
+            let (sent, got) = std::sync::mpsc::channel();
+            fleet.layout.send(move |layout| {
+                let labels: Vec<String> = (layout.windows().into_iter())
+                    .flat_map(|(_, labels)| labels)
+                    .collect();
+                let _ = sent.send(labels);
+            });
+            got.recv().unwrap()
+        };
+        for bot in ["calc.a", "calc.b"] {
+            fleet.lineage.insert(bot.into());
+            fleet.event(&event(bot, "accepted", json!({})));
+        }
+        // The first fills the room; the person has not looked at it, so the
+        // second's window waits for room.
+        fleet.layout.settle();
+        assert!(windowed(&fleet).contains(&"calc.a".to_owned()));
+        assert!(!windowed(&fleet).contains(&"calc.b".to_owned()));
+        assert!(fleet.layout.aside("calc.b"));
+        // Its /status row says so.
+        let mut app = app(client);
+        app.bot = "calc.lead".into();
+        app.fleet = Some(fleet);
+        let (_, rows) = app.status_rows().await.unwrap();
+        let place = |rows: &[status::Row], bot: &str| {
+            (rows.iter())
+                .find(|row| row.bot == bot)
+                .map(|row| row.place.clone())
+                .unwrap()
+        };
+        assert_eq!(place(&rows, "calc.b"), "window set aside for room");
+        assert_ne!(place(&rows, "calc.a"), "window set aside for room");
+        // A call of its held for the person: what needs them keeps its
+        // window, so it opens, past the limit, and the new one stays.
+        let fleet = app.fleet.as_mut().unwrap();
+        fleet.event(&event("calc.b", "approval_asked", json!({"call_id": "c1"})));
+        assert_eq!(fleet.doing["calc.b"], "needs you");
+        fleet.layout.settle();
+        let shown = windowed(fleet);
+        assert!(shown.contains(&"calc.a".to_owned()) && shown.contains(&"calc.b".to_owned()));
+        assert!(!fleet.layout.aside("calc.b"));
     }
 
     #[tokio::test]

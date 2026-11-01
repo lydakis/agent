@@ -342,7 +342,9 @@ not one you used least recently, so it is not closed for room either: while
 only such windows could make room, a new task's window does not open (the
 status row says so) and waits for you, as one closed for room does. A window closed for room stays closed while its
 task works on, and `/status` (or its name) opens it again, also after the
-lead starts again (kept in `~/.agent/sonny/aside/`). `--rex-host HOST` puts the session on another Rex
+lead starts again (kept in `~/.agent/sonny/aside/`); its `/status` row
+says `window set aside for room`. A task set aside that comes to need you
+opens its window again on its own, as what needs you keeps its window. `--rex-host HOST` puts the session on another Rex
 server; `--no-layout` turns the layout off. Sonny writes the skill for the
 multiplexer it runs in to `~/.agents/skills` (`rex-windows`,
 `herdr-panes` or `cmux-tabs`, from `skills/`), so any agent can run a long command where

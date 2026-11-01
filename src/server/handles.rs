@@ -137,6 +137,9 @@ pub struct Handles {
     /// Told when the schedule's first entry comes sooner, or a step is
     /// stepped: the run loop's sleep is out of date.
     sooner: Arc<tokio::sync::Notify>,
+    /// Told when a turn became ready away from the run loop, as one that
+    /// tells a bot its background command ended does.
+    ready: Arc<tokio::sync::Notify>,
 }
 
 impl Handles {
@@ -145,7 +148,18 @@ impl Handles {
             inner: Arc::new(Mutex::new(Inner::default())),
             resume,
             sooner: Default::default(),
+            ready: Default::default(),
         }
+    }
+
+    /// A turn is ready for a slot: the run loop looks for it.
+    pub fn turn_ready(&self) {
+        self.ready.notify_one();
+    }
+
+    /// Until a turn became ready away from the run loop.
+    pub async fn readied(&self) {
+        self.ready.notified().await;
     }
 
     fn schedule_locked(inner: &mut Inner, sooner: &tokio::sync::Notify, at: u64, due: Due) {

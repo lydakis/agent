@@ -328,6 +328,11 @@ class WaitTests(ModelFixture):
         fresh = client.request('submit', bot='Dave', request_id='d2', prompt='bg:printf fresh')['result']['turn']
         self.assertEqual(client.finished(fresh)['data']['status'], 'completed')
         self.assertNotEqual(self.tool_output(client, 'Dave', 'bg-1')['handle'], lost)
+        # No wait collected the fresh command, so Dave is told of its end
+        # in a turn of his own before he takes the next.
+        told = client.receive(lambda m: m.get('event') == 'queued'
+                              and m.get('data', {}).get('origin') == 'background', 10)
+        self.assertEqual(client.finished(told['turn'])['data']['status'], 'completed')
         relook = client.request('submit', bot='Dave', request_id='d3', prompt='wait:' + lost)['result']['turn']
         self.assertEqual(client.finished(relook)['data']['status'], 'completed')
         self.assertEqual(self.tool_output(client, 'Dave', 'wait-1')['results'][lost]['error'], 'process_lost')
