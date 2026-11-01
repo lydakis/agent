@@ -463,6 +463,17 @@ that ended on a question, so watching a task costs nothing.
 drops it, and Tab does what it does otherwise while none shows. Every Sonny
 has it, so a side chat or a task opened in the pane does too.
 
+A busy lead holds more than its last reply, so a guess may come from news
+you missed: another agent, the margin, the commons, or a reply of its own
+you scrolled past. Such a guess says where from after the key, dim, as in
+`› check pricing's failing test  tab  ↳ shop.pricing`; Tab takes only the
+words. The copy names the source from a fixed set (`earlier`, `margin`,
+`commons`, or an agent's name, which Sonny looks up), so a guess about the
+reply you are reading, or a source it made up, shows none, and a window
+too narrow for the whole guess and its source leaves the source out.
+
+![A guess from a task's news, its source after the key](../docs/sonny/suggest-origin.png)
+
 ![The guess, dim in the empty composer after a reply](../docs/sonny/suggest-shown.png)
 
 ![Tab took it into the composer, unsent](../docs/sonny/suggest-taken.png)

@@ -8,6 +8,13 @@
 //! tools and model, so the request reads as the agent's next would and its
 //! prompt cache is warm, but allowed no call. The daemon deletes it once
 //! idle a minute, should Sonny not get to.
+//!
+//! A busy lead holds more than its last reply: what other agents told it,
+//! the margin, the commons, replies of its own the person scrolled past.
+//! A guess drawn from one of those says so, from a fixed set Sonny checks
+//! (see [`Origin`]), so the person knows what they missed; one about the
+//! reply they are reading says nothing more. Neither Claude Code nor
+//! Codex names a source: their guesses only follow the last reply.
 use agent_client::Client;
 use serde_json::json;
 use std::sync::Arc;
@@ -35,17 +42,50 @@ NEVER SUGGEST:
 - Evaluative (\"looks good\", \"thanks\")
 - Questions (\"what about...?\")
 - Your own voice (\"Let me...\", \"I'll...\", \"Here's...\")
-- New ideas they didn't ask about
+- Ideas of your own they didn't ask about
 - Multiple sentences
 Say nothing if the next step isn't obvious from what they said.
 Say nothing if a suggestion could be unsafe or inappropriate, including any sensitive topic (security incidents, credentials, harm, private data).
 Format: 2-12 words, match the person's style. Or nothing.
-Call no tool. Reply with ONLY the suggestion, no quotes or explanation.";
+If it comes from anything other than your last reply, add a second line with exactly one of: earlier (a reply of yours before the last), margin, commons, or the name of the agent who told you. About your last reply, no second line.
+Call no tool. Reply with ONLY the suggestion, and that line when it applies, no quotes or explanation.";
+
+/// A guess at the person's next message, and where it came from when
+/// that is not the reply they are reading.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Guess {
+    pub text: String,
+    pub from: Option<Origin>,
+}
+
+/// Where a guess came from, other than the last reply: the only sources
+/// shown, so a source the model made up shows none.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Origin {
+    /// A reply of the agent's own before the last.
+    Earlier,
+    Margin,
+    Commons,
+    /// An agent the daemon keeps, by its name.
+    Agent(String),
+}
+
+impl Origin {
+    /// The words drawn after the arrow.
+    pub fn name(&self) -> &str {
+        match self {
+            Origin::Earlier => "earlier",
+            Origin::Margin => "margin",
+            Origin::Commons => "commons",
+            Origin::Agent(name) => name,
+        }
+    }
+}
 
 /// The guess of a copy of `bot` at its head, on `model` when the window's
 /// turns run on one of their own; `None` when it says nothing, or nothing
 /// worth showing.
-pub async fn guess(client: Arc<Client>, bot: String, model: Option<String>) -> Option<String> {
+pub async fn guess(client: Arc<Client>, bot: String, model: Option<String>) -> Option<Guess> {
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -63,7 +103,85 @@ pub async fn guess(client: Arc<Client>, bot: String, model: Option<String>) -> O
     let _ = client
         .request("delete", json!({"bot": name, "bot_id": forked["bot_id"]}))
         .await;
-    clean(&reply?)
+    let reply = reply?;
+    let (text, source) = split(&reply)?;
+    let text = clean(text)?;
+    let from = match source.map(|source| named(source, &bot)) {
+        Some(Named::Is(origin)) => Some(origin),
+        Some(Named::Agent(names)) => kept(&client, names).await.map(Origin::Agent),
+        Some(Named::Not) | None => None,
+    };
+    Some(Guess { text, from })
+}
+
+/// The guess's line and, when there is one, the line after it naming its
+/// source; `None` for more lines than that, which are not a guess.
+fn split(reply: &str) -> Option<(&str, Option<&str>)> {
+    let reply = reply.trim();
+    let Some((text, source)) = reply.split_once('\n') else {
+        return Some((reply, None));
+    };
+    let source = source.trim();
+    (!source.contains('\n')).then_some((text, Some(source).filter(|s| !s.is_empty())))
+}
+
+/// What the line naming a guess's source names.
+#[derive(Debug, PartialEq)]
+enum Named {
+    Is(Origin),
+    /// An agent, by the names it may go by, to be found among the agents.
+    Agent(Vec<String>),
+    Not,
+}
+
+/// The source `said` names, to a copy of `bot`: one of the fixed words,
+/// `bot` itself (its own earlier reply), or a name to look for, as given
+/// and inside `bot`'s project.
+fn named(said: &str, bot: &str) -> Named {
+    let said = said
+        .trim()
+        .trim_matches(|c: char| matches!(c, '"' | '`' | '\'' | '.' | '*'))
+        .trim();
+    match said.to_lowercase().as_str() {
+        "earlier" => return Named::Is(Origin::Earlier),
+        "margin" | "the margin" => return Named::Is(Origin::Margin),
+        "commons" | "the commons" => return Named::Is(Origin::Commons),
+        _ => {}
+    }
+    // A name is one word of a name's letters: never a pattern.
+    if said.is_empty()
+        || !said
+            .chars()
+            .all(|c| c.is_alphanumeric() || matches!(c, '.' | '-' | '_'))
+    {
+        return Named::Not;
+    }
+    if said == bot {
+        return Named::Is(Origin::Earlier);
+    }
+    let mut names = vec![said.to_owned()];
+    if let Some(project) = crate::project::lead_project(bot) {
+        let inside = format!("{project}.{said}");
+        if inside == bot {
+            return Named::Is(Origin::Earlier);
+        }
+        names.push(inside);
+    }
+    Named::Agent(names)
+}
+
+/// The first of `names` the daemon keeps an agent by.
+async fn kept(client: &Client, names: Vec<String>) -> Option<String> {
+    for name in names {
+        let page = client
+            .request("bots", json!({"name": name, "limit": 1}))
+            .await
+            .ok()?;
+        if page["bots"][0]["name"].as_str() == Some(name.as_str()) {
+            return Some(name);
+        }
+    }
+    None
 }
 
 /// The copy's reply, interrupting a turn that runs past `WAIT`.
@@ -324,6 +442,39 @@ mod tests {
             assert_eq!(clean(said), None, "{said}");
         }
         assert!(clean(&"word ".repeat(30)).is_none());
+    }
+
+    #[test]
+    fn a_second_line_names_the_source_and_more_is_no_guess() {
+        assert_eq!(split("run the tests"), Some(("run the tests", None)));
+        assert_eq!(
+            split("check pricing's failing test\nshop.pricing\n"),
+            Some(("check pricing's failing test", Some("shop.pricing")))
+        );
+        assert_eq!(split("push it\n  \n"), Some(("push it", None)));
+        assert_eq!(split("push it\nshop.pricing\nbecause it failed"), None);
+    }
+
+    #[test]
+    fn only_the_fixed_set_or_an_agent_s_name_is_a_source() {
+        let bot = "shop.lead";
+        assert_eq!(named("earlier", bot), Named::Is(Origin::Earlier));
+        assert_eq!(named("Margin", bot), Named::Is(Origin::Margin));
+        assert_eq!(named("the commons.", bot), Named::Is(Origin::Commons));
+        // Its own name is its own earlier reply.
+        assert_eq!(named("shop.lead", bot), Named::Is(Origin::Earlier));
+        assert_eq!(named("lead", bot), Named::Is(Origin::Earlier));
+        assert_eq!(
+            named("pricing", bot),
+            Named::Agent(vec!["pricing".into(), "shop.pricing".into()])
+        );
+        assert_eq!(
+            named("`web.lead`", bot),
+            Named::Agent(vec!["web.lead".into(), "shop.web.lead".into()])
+        );
+        // Words, or a pattern, name no agent.
+        assert_eq!(named("your last reply", bot), Named::Not);
+        assert_eq!(named("shop.[a-z]*", bot), Named::Not);
     }
 
     #[test]
