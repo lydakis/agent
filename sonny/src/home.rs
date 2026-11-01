@@ -84,9 +84,11 @@ fn error_json(message: &str) -> Value {
     }
 }
 
-/// Set up for this setup step: a repository with a remote.
+/// Set up for this setup step: a repository with a remote that setup has
+/// synced from, as a clone made by hand has not: it has had no home
+/// restored and no first sync, and the scheduler won't sync it.
 pub fn done(places: &Places) -> bool {
-    origin(&places.repo, None).is_some()
+    timed(places) && origin(&places.repo, None).is_some()
 }
 
 /// Whether the scheduler runs a sync now: backup is set up here and the
@@ -1308,6 +1310,34 @@ mod tests {
         let root = scratch("unset");
         let error = sync(&places(&root), None).unwrap_err();
         assert!(error.starts_with("backup_unset: "), "{error}");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_clone_made_by_hand_is_not_set_up_until_setup_syncs_it() {
+        let root = scratch("hand-clone");
+        let places = places(&root);
+        std::fs::create_dir_all(&places.repo).unwrap();
+        for args in [
+            &["init", "-q"][..],
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://example.invalid/home.git",
+            ],
+        ] {
+            let ran = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&places.repo)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(ran.success());
+        }
+        assert!(!done(&places), "no first sync");
+        write(&places.state, "{\"at_ms\": 1000000}");
+        assert!(done(&places));
         std::fs::remove_dir_all(&root).unwrap();
     }
 

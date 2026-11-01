@@ -47,6 +47,9 @@ const WRITE_BYTES: usize = 1024 * 1024;
 const DEFAULT_SHELL_TIMEOUT_MS: u64 = 120_000;
 const MAX_SHELL_TIMEOUT_MS: u64 = 600_000;
 const MAX_WAIT_TIMEOUT_MS: u64 = 86_400_000;
+/// A background command holds no turn while it runs, so it may run as long
+/// as a `wait` on it may last.
+const MAX_BACKGROUND_TIMEOUT_MS: u64 = MAX_WAIT_TIMEOUT_MS;
 /// Simultaneously running child processes, foreground or background.
 pub const DEFAULT_PROCESS_BUDGET: usize = 64;
 /// Processes that outlive their call, terminals and detached commands,
@@ -120,9 +123,9 @@ impl Tool {
                 "properties":{"text":{"type":"string"}},"required":["text"],"additionalProperties":false}),
             ),
             Tool::Shell => (
-                "Run a noninteractive bash command (sh where bash is not installed) in the workspace. stdout and stderr are returned separately; each is truncated to a head and tail beyond 64 KiB, with up to 1 MiB of it retained: past that, its first and last 512 KiB, and the command keeps running. Default timeout 120 s, maximum 600 s; a command that times out returns its output so far with timed_out. Every result reports wall_time_ms. Commands run with no terminal: TERM=dumb, NO_COLOR=1, and cat as the pager; AI_AGENT=agent tells tools an agent runs them. When the command returns or times out, every process it started is killed, so `cmd &` does not outlive it. With background=true the command is started and a proc handle is returned immediately; collect its result later with wait. A steer that arrives while a command runs moves it to the background: the result is its proc handle with steered=true, and the command keeps running. A background command runs until it exits, times out, or the daemon stops. With detach=true the command starts in its own session and its pid is returned at once; nothing tracks it and only a daemon pause kills it, so it outlives the turn and the daemon. Its output is discarded unless the command redirects it to a file. With tty=true it runs in a terminal, for a REPL or a program that prompts: the result is what it wrote within yield_time_ms (default 1000) and, while it runs, a proc handle for write_stdin.",
+                "Run a noninteractive bash command (sh where bash is not installed) in the workspace. stdout and stderr are returned separately; each is truncated to a head and tail beyond 64 KiB, with up to 1 MiB of it retained: past that, its first and last 512 KiB, and the command keeps running. Default timeout 120 s, maximum 600 s, or a day with background=true; a command that times out returns its output so far with timed_out. Every result reports wall_time_ms. Commands run with no terminal: TERM=dumb, NO_COLOR=1, and cat as the pager; AI_AGENT=agent tells tools an agent runs them. When the command returns or times out, every process it started is killed, so `cmd &` does not outlive it. With background=true the command is started and a proc handle is returned immediately; collect its result later with wait. A steer that arrives while a command runs moves it to the background: the result is its proc handle with steered=true, and the command keeps running. A background command runs until it exits, times out, or the daemon stops. With detach=true the command starts in its own session and its pid is returned at once; nothing tracks it and only a daemon pause kills it, so it outlives the turn and the daemon. Its output is discarded unless the command redirects it to a file. With tty=true it runs in a terminal, for a REPL or a program that prompts: the result is what it wrote within yield_time_ms (default 1000) and, while it runs, a proc handle for write_stdin.",
                 json!({"type":"object","properties":{"command":{"type":"string"},
-                "timeout_ms":{"type":"integer","minimum":1,"maximum":MAX_SHELL_TIMEOUT_MS},
+                "timeout_ms":{"type":"integer","minimum":1,"maximum":MAX_BACKGROUND_TIMEOUT_MS},
                 "background":{"type":"boolean"},"detach":{"type":"boolean"},"tty":{"type":"boolean"},
                 "yield_time_ms":{"type":"integer","minimum":0,"maximum":MAX_YIELD_MS}},
                 "required":["command"],"additionalProperties":false}),
@@ -1620,13 +1623,21 @@ impl Registry {
                     Some("command is over 16 KiB".to_owned())
                 } else if args.command.contains('\0') {
                     Some("command contains a NUL byte".to_owned())
-                } else if let Some(timeout_ms) = args
-                    .timeout_ms
-                    .filter(|t| !(1..=MAX_SHELL_TIMEOUT_MS).contains(t))
-                {
-                    Some(format!(
-                        "timeout_ms is {timeout_ms}; it runs from 1 to {MAX_SHELL_TIMEOUT_MS}"
-                    ))
+                } else if let Some(timeout_ms) = args.timeout_ms.filter(|t| {
+                    let most = match args.background {
+                        true => MAX_BACKGROUND_TIMEOUT_MS,
+                        false => MAX_SHELL_TIMEOUT_MS,
+                    };
+                    !(1..=most).contains(t)
+                }) {
+                    Some(match args.background {
+                        true => format!(
+                            "timeout_ms is {timeout_ms}; with background it runs from 1 to {MAX_BACKGROUND_TIMEOUT_MS}"
+                        ),
+                        false => format!(
+                            "timeout_ms is {timeout_ms}; it runs from 1 to {MAX_SHELL_TIMEOUT_MS}, or {MAX_BACKGROUND_TIMEOUT_MS} with background"
+                        ),
+                    })
                 } else if args.detach && args.background {
                     Some("detach and background cannot both be set".to_owned())
                 } else if args.tty && (args.detach || args.background || args.timeout_ms.is_some())
@@ -2648,7 +2659,8 @@ fn sh(
 /// turn and the daemon. Its output is discarded: a log the daemon wrote would
 /// bypass credential redaction, so a command that wants one redirects itself.
 /// No process slot or handle applies to it, and only the pull cord kills its
-/// session. An async waiter reaps it on exit and releases its detached slot.
+/// session. An async waiter reaps it on exit; its detached slot is released
+/// once nothing it left in its group runs either.
 #[cfg(unix)]
 async fn detach(
     command: &str,
@@ -2710,12 +2722,31 @@ async fn detach(
                 true
             }
         };
-        drop((permit, held));
         // What it left running in its group, as `cmd &` leaves, is still
-        // the pull's to end: looked for each second until the group is
-        // empty. The kernel keeps a group's id from new processes while any
-        // member lives, so only that last second could see it reused.
-        while !pulled && signal(0) {
+        // the pull's to end, and still holds the command's place: looked
+        // for each second until the group is empty, so a launcher that
+        // starts a service and exits does not hand its slot to the next
+        // while the service runs. The kernel keeps a group's id from new
+        // processes while any member lives, so only that last second could
+        // see it reused.
+        let members = move || async move {
+            tokio::task::spawn_blocking(move || group_members(-group))
+                .await
+                .unwrap_or(Members::Gone)
+        };
+        // Where only exited members answer, a walk of /proc is no one
+        // moment and can miss a member forked while it read: three walks a
+        // second apart must agree that nothing runs.
+        let mut exited = 0;
+        while !pulled && exited < 3 {
+            match members().await {
+                Members::Gone => break,
+                Members::Running => exited = 0,
+                Members::Exited => exited += 1,
+            }
+            if exited == 3 {
+                break;
+            }
             tokio::select! {
                 Ok(()) = pulls.changed() => {
                     signal(libc::SIGKILL);
@@ -2724,11 +2755,93 @@ async fn detach(
                 () = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
             }
         }
-        drop(listening);
+        drop((permit, held, listening));
     });
     Ok(Outcome::text(
         json!({"detached":true,"pid":pid}).to_string(),
     ))
+}
+
+/// What is left of a detached command's process group.
+#[cfg(unix)]
+enum Members {
+    /// Nothing answers a signal.
+    Gone,
+    Running,
+    /// Only members that have exited were seen, though something answers.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    Exited,
+}
+
+/// What is left of a process group. A member that has exited still answers
+/// a signal until it is reaped, and an init that does not reap orphans, as
+/// some containers run, leaves it so for good: on Linux only a member that
+/// is not a zombie runs, and a process whose main thread has exited is a
+/// zombie only once its other threads have too. Elsewhere init reaps orphans.
+#[cfg(target_os = "linux")]
+fn group_members(group: i32) -> Members {
+    // SAFETY: kill with a negative pid and signal 0 only checks the group.
+    if unsafe { libc::kill(-group, 0) } != 0 {
+        return Members::Gone;
+    }
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Members::Running;
+    };
+    let running = entries.flatten().any(|entry| {
+        let name = entry.file_name();
+        let Some(pid) = name
+            .to_str()
+            .filter(|n| n.bytes().all(|b| b.is_ascii_digit()))
+        else {
+            return false;
+        };
+        let Some((state, pgrp)) = stat(&entry.path().join("stat")) else {
+            return false;
+        };
+        pgrp == Some(group) && (!exited(state) || threads_run(pid))
+    });
+    if running {
+        Members::Running
+    } else {
+        Members::Exited
+    }
+}
+/// The state and process group in a `/proc` stat file, `pid (comm) state
+/// ppid pgrp ...`. comm is the process's name, any bytes up to 15 of them:
+/// spaces, parens, and UTF-8 the kernel cut short included.
+#[cfg(target_os = "linux")]
+fn stat(path: &Path) -> Option<(u8, Option<i32>)> {
+    let stat = std::fs::read(path).ok()?;
+    let after = &stat[stat.iter().rposition(|&b| b == b')')? + 1..];
+    let mut fields = after
+        .split(u8::is_ascii_whitespace)
+        .filter(|field| !field.is_empty());
+    let state = *fields.next()?.first()?;
+    let pgrp = (fields.nth(1)).and_then(|pgrp| std::str::from_utf8(pgrp).ok()?.parse().ok());
+    Some((state, pgrp))
+}
+#[cfg(target_os = "linux")]
+fn exited(state: u8) -> bool {
+    matches!(state, b'Z' | b'X')
+}
+/// Whether any thread of a process whose main thread is a zombie still runs.
+#[cfg(target_os = "linux")]
+fn threads_run(pid: &str) -> bool {
+    let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
+        return false;
+    };
+    tasks
+        .flatten()
+        .any(|task| stat(&task.path().join("stat")).is_some_and(|(state, _)| !exited(state)))
+}
+#[cfg(all(unix, not(target_os = "linux")))]
+fn group_members(group: i32) -> Members {
+    // SAFETY: kill with a negative pid and signal 0 only checks the group.
+    if unsafe { libc::kill(-group, 0) == 0 } {
+        Members::Running
+    } else {
+        Members::Gone
+    }
 }
 
 /// End the pid namespace a sandboxed detached command runs in. bubblewrap,
@@ -3102,7 +3215,20 @@ mod tests {
         };
         assert_eq!(
             detail(r#"{"command":"true","timeout_ms":900000}"#),
-            "timeout_ms is 900000; it runs from 1 to 600000"
+            "timeout_ms is 900000; it runs from 1 to 600000, or 86400000 with background"
+        );
+        // A background command may run as long as a wait on it may last.
+        assert!(
+            shell
+                .prepare(
+                    "shell",
+                    r#"{"command":"true","timeout_ms":3600000,"background":true}"#
+                )
+                .is_ok()
+        );
+        assert_eq!(
+            detail(r#"{"command":"true","timeout_ms":86400001,"background":true}"#),
+            "timeout_ms is 86400001; with background it runs from 1 to 86400000"
         );
         assert_eq!(detail(r#"{"command":""}"#), "command is empty");
         assert_eq!(

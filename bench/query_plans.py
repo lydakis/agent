@@ -19,8 +19,10 @@ import sys
 from pathlib import Path
 
 # Clauses a listing formats in by name, each planned with every value it
-# takes: keep in step with `list` and `turns` in src/store/db.rs.
-OPTIONAL = {'{glob}': ('', ' AND name GLOB ?3'), '{maker}': ('', ' AND created_by_id = ?4'),
+# takes: keep in step with `list`, `usage` and `turns` in src/store/db.rs.
+OPTIONAL = {'{glob}': ('', " AND t.bot GLOB ?3 AND t.bot >= ?4 AND t.bot < ?4 || CAST(x'ff' AS TEXT)"),
+            '{from}': ('name > ?1', "name >= max(?1 || char(1), ?5) AND name < ?5 || CAST(x'ff' AS TEXT) AND name GLOB ?3"),
+            '{maker}': ('', ' AND created_by_id = ?4'),
             '{running}': ('', ' AND running_turn IS NOT NULL'),
             '{order}': ('ASC', 'DESC')}
 
@@ -56,6 +58,17 @@ def statements(source):
                 yield re.sub(r'\s+', ' ', variant).strip()
 
 
+def connect(path):
+    """A connection that plans as the daemon's do: with the query planner
+    stability guarantee (`plan_stably` in src/store/db.rs), so no plan reads
+    a bound value, and with foreign keys on, to include the daemon's
+    constraint-check plans."""
+    conn = sqlite3.connect(path)
+    conn.setconfig(sqlite3.SQLITE_DBCONFIG_ENABLE_QPSG, True)
+    conn.execute('PRAGMA foreign_keys=ON')
+    return conn
+
+
 def main():
     if len(sys.argv) != 2:
         print(__doc__)
@@ -67,8 +80,7 @@ def main():
     while '\nfn migrate' in source:
         head, _, tail = source.partition('\nfn migrate')
         source = head + '\nfn ' + tail.partition('\nfn ')[2]
-    conn = sqlite3.connect(sys.argv[1])
-    conn.execute('PRAGMA foreign_keys=ON')  # Include the daemon's constraint-check plans.
+    conn = connect(sys.argv[1])
     seen, scans, structural = set(), [], []
     for statement in statements(source):
         if statement in seen:
@@ -93,7 +105,7 @@ def main():
         print('SCAN:', statement[:140])
         print('     ', ' | '.join(steps))
     print(f'{len(seen)} statements planned, {len(scans)} table scans, {len(structural)} structural flags '
-          f'(SQLite {sqlite3.sqlite_version}, foreign_keys=ON)')
+          f'(SQLite {sqlite3.sqlite_version}, stable plans, foreign_keys=ON)')
     return 1 if scans else 0
 
 

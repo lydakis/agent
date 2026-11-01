@@ -1,6 +1,6 @@
 ---
 name: rex-windows
-description: Run long or interactive commands (dev servers, watchers, builds or test runs past the shell tool's 10 minutes, REPLs) in a Rex terminal block the person can watch, then read, wait on or stop them; and put an agent's window where the person asks (its own tab, or a split beside another).
+description: Use whenever a command runs long or is interactive (dev servers, watchers, builds or test runs past the shell tool's 10 minutes, REPLs): run it in a Rex terminal block the person can watch, then read, wait on or stop it; and put an agent's window where the person asks (its own tab, or a split beside another).
 ---
 
 Rex is the terminal multiplexer the person watches the work in. Each project has one Rex session: the one its lead runs in. In it, every agent has a block labelled with its full name (`shop.fix-cart`), and a tab named after what it is doing. Use a block only for a command that runs longer than the shell tool allows (up to 10 minutes with `timeout_ms`), that keeps running (a server, a watcher), or that the person wants to watch. Everything else, a one-minute test run or build included, stays in the shell tool: give it a `timeout_ms` that covers it rather than a short one, since one shell call is faster than a block, a wait and a read.

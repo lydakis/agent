@@ -19,9 +19,16 @@ pub struct Sub {
     /// event one prints, or as `NAME:TOPIC` its events on that topic; of
     /// those, the ones its filter matches.
     pub sources: Vec<String>,
-    /// An event pattern on the fields of its sources' events, as
+    /// An event pattern on the fields of what it hears, its sources'
+    /// events and the typed events of the bots it watches alike, as
     /// `pattern` reads it: only those it matches are heard.
     pub filter: Option<Value>,
+    /// How often at most it tells what it hears, as `30s`, `5m` or `1h`,
+    /// in place of its sources' own digest; unset, as they say.
+    pub digest: Option<String>,
+    /// An event pattern for what it hears that cuts into a busy
+    /// subscriber's turn and skips any digest, as the person's words do.
+    pub urgent: Option<Value>,
     /// The bot it was made for, by ID, when Sonny made it on the bot's
     /// behalf: another bot that takes the name does not hold it.
     pub owner: Option<i64>,
@@ -43,6 +50,8 @@ impl Sub {
             },
             sources: Vec::new(),
             filter: None,
+            digest: None,
+            urgent: None,
             owner: None,
         }
     }
@@ -57,6 +66,8 @@ impl Sub {
             bots: Vec::new(),
             sources: vec![format!("{COMMONS_SOURCE}:{thread}")],
             filter: None,
+            digest: None,
+            urgent: None,
             owner,
         }
     }
@@ -97,7 +108,25 @@ impl Sub {
         if let Some(filter) = &self.filter {
             out["filter"] = filter.clone();
         }
+        if let Some(digest) = &self.digest {
+            out["digest"] = json!(digest);
+        }
+        if let Some(urgent) = &self.urgent {
+            out["urgent"] = urgent.clone();
+        }
         out
+    }
+
+    /// Whether it says more than what it watches: a filter, a digest or
+    /// what is urgent. One that says none costs the lookout nothing more.
+    pub fn rules(&self) -> bool {
+        self.filter.is_some() || self.digest.is_some() || self.urgent.is_some()
+    }
+
+    /// Its digest as a span; none unset or `0`.
+    pub fn digest_span(&self) -> Option<std::time::Duration> {
+        let secs = agent_client::config::span("digest", self.digest.as_deref()?).ok()?;
+        (secs > 0).then(|| std::time::Duration::from_secs(secs))
     }
 
     pub fn from_json(value: &Value) -> Option<Sub> {
@@ -124,6 +153,13 @@ impl Sub {
                     Err(_) => Some(Value::Bool(false)),
                 },
             },
+            digest: (value["digest"].as_str())
+                .filter(|d| agent_client::config::span("digest", d).is_ok())
+                .map(str::to_owned),
+            // One that does not check is never urgent.
+            urgent: (value.get("urgent"))
+                .filter(|urgent| !urgent.is_null() && super::pattern::check(urgent).is_ok())
+                .cloned(),
             owner: value["bot_id"].as_i64(),
         })
     }
@@ -138,7 +174,19 @@ impl Sub {
             Some(filter) => format!(" where {filter}"),
             None => String::new(),
         };
-        format!("{} · {}{filter}", self.name, watched.join(", "))
+        let digest = match &self.digest {
+            Some(digest) => format!(" at most every {digest}"),
+            None => String::new(),
+        };
+        let urgent = match &self.urgent {
+            Some(urgent) => format!(", urgent when {urgent}"),
+            None => String::new(),
+        };
+        format!(
+            "{} · {}{filter}{digest}{urgent}",
+            self.name,
+            watched.join(", ")
+        )
     }
 
     /// The first field in which two subscriptions under one name differ.
@@ -148,6 +196,8 @@ impl Sub {
             ("bot", self.bots != other.bots),
             ("sources", self.sources != other.sources),
             ("filter", self.filter != other.filter),
+            ("digest", self.digest != other.digest),
+            ("urgent", self.urgent != other.urgent),
         ]
         .into_iter()
         .find_map(|(field, differs)| differs.then_some(field))
@@ -371,16 +421,28 @@ pub fn change(
     if let Some(name) = remove {
         said["removed"] = json!(drop_named(store, subscriber, &mut subs, name)?);
     }
-    if let Some(sub) = &add
-        && let Some(filter) = &sub.filter
-    {
-        let unseen = unseen(store, sub, filter);
+    if let Some(sub) = &add {
+        let of: Vec<String> = (sub.sources.iter().cloned())
+            .chain((!sub.tasks_of.is_empty() || !sub.bots.is_empty()).then(|| "its bots".into()))
+            .collect();
+        let patterns = [
+            (&sub.filter, "the filter hears"),
+            (&sub.urgent, "urgent matches"),
+        ];
+        let unseen: Vec<String> = (patterns.into_iter())
+            .filter_map(|(pattern, what)| {
+                let unseen = unseen(store, sub, pattern.as_ref()?);
+                (!unseen.is_empty()).then(|| {
+                    format!(
+                        "no recent event of {} had {}: {what} none until one does",
+                        of.join(" or "),
+                        unseen.join(", ")
+                    )
+                })
+            })
+            .collect();
         if !unseen.is_empty() {
-            said["unseen"] = json!(format!(
-                "no recent event of {} had {}: the filter hears none until one does",
-                sub.sources.join(" or "),
-                unseen.join(", ")
-            ));
+            said["unseen"] = json!(unseen.join("; "));
         }
     }
     if let Some(sub) = add {
@@ -415,9 +477,22 @@ pub fn change(
 /// The fields that keep a filter from hearing any event like those its
 /// sources lately printed, where the lookout has seen one.
 fn unseen(store: &Path, sub: &Sub, filter: &Value) -> Vec<String> {
-    let seen: Vec<Vec<String>> = (sub.sources.iter())
+    let mut seen: Vec<Vec<String>> = (sub.sources.iter())
         .filter_map(|source| super::sources::fields_seen(store, super::sources::named(source).0))
         .collect();
+    // Sources whose shape is not known yet leave what it names unknown.
+    if !sub.sources.is_empty() && seen.is_empty() {
+        return Vec::new();
+    }
+    // The bots it watches say what every event of theirs may have.
+    if !sub.tasks_of.is_empty() || !sub.bots.is_empty() {
+        seen.push(
+            super::activity::FIELDS
+                .iter()
+                .map(|(field, _)| (*field).to_owned())
+                .collect(),
+        );
+    }
     if seen.is_empty() {
         return Vec::new();
     }
@@ -450,19 +525,33 @@ fn parse(value: &Value) -> Result<Sub, String> {
             Some(filter.clone())
         }
     };
+    let digest = match value.get("digest") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(digest)) => {
+            agent_client::config::span("digest", digest)?;
+            Some(digest.clone())
+        }
+        Some(_) => return Err("digest is a span, as 30s, 15m or 1h".into()),
+    };
+    let urgent = match value.get("urgent") {
+        None | Some(Value::Null) => None,
+        Some(urgent) => {
+            super::pattern::check(urgent).map_err(|e| format!("urgent: {e}"))?;
+            Some(urgent.clone())
+        }
+    };
     let sub = Sub {
         name: name.to_owned(),
         tasks_of: strings("tasks_of"),
         bots: strings("bots"),
         sources: strings("sources"),
         filter,
+        digest,
+        urgent,
         owner: None,
     };
     if sub.tasks_of.is_empty() && sub.bots.is_empty() && sub.sources.is_empty() {
         return Err("a subscription watches tasks_of a bot, bots by name or sources".into());
-    }
-    if sub.filter.is_some() && sub.sources.is_empty() {
-        return Err("a filter narrows what sources say: name the sources it filters".into());
     }
     Ok(sub)
 }
@@ -558,9 +647,35 @@ mod tests {
         // Another filter under the name is another subscription.
         let other = json!({"name": "crs", "sources": ["cr"], "filter": {"paths": ["x"]}});
         assert!(add(other).unwrap_err().contains("another filter"));
-        // A filter is for sources, and checked.
+        // A filter reads a bot's events too, whose fields are known.
         let bots = json!({"name": "b", "bots": ["a"], "filter": filter});
-        assert!(add(bots).unwrap_err().contains("name the sources"));
+        assert_eq!(
+            add(bots).unwrap()["unseen"],
+            "no recent event of its bots had paths: the filter hears none until one does"
+        );
+        let failed = json!({"name": "f", "bots": ["a"], "digest": "1h",
+            "filter": {"type": ["turn.ended"]}, "urgent": {"status": ["failed"]}});
+        let added = add(failed).unwrap();
+        assert!(added.get("unseen").is_none(), "{added}");
+        let sub = read(&store, "shop.lead")
+            .into_iter()
+            .find(|s| s.name == "f")
+            .unwrap();
+        assert_eq!(
+            sub.digest_span(),
+            Some(std::time::Duration::from_secs(3600))
+        );
+        assert_eq!(
+            sub.describe(),
+            r#"f · bots a where {"type":["turn.ended"]} at most every 1h, urgent when {"status":["failed"]}"#
+        );
+        let late = json!({"name": "f", "bots": ["a"], "digest": "2h",
+            "filter": {"type": ["turn.ended"]}, "urgent": {"status": ["failed"]}});
+        assert!(add(late).unwrap_err().contains("another digest"));
+        assert!(add(json!({"name": "d", "bots": ["a"], "digest": "soon"})).is_err());
+        let wrong = json!({"name": "u", "bots": ["a"], "urgent": {"status": "failed"}});
+        assert!(add(wrong).unwrap_err().starts_with("urgent: "));
+        // Checked as a filter is.
         let bad = json!({"name": "b", "sources": ["cr"], "filter": {"paths": "src/"}});
         assert!(add(bad).unwrap_err().contains("list of values"));
         // Once the lookout has seen the source's shape, a field it never

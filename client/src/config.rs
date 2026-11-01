@@ -14,6 +14,7 @@
 //! processes = "cpus * 64"       # commands running at once, the default
 //! load = "cpus * 2"             # new commands wait while the load average is this, the default; 0 no gate
 //! input_bytes = "memory / 16"   # also lasting, active, connecting, pending, pending_bytes, readers
+//! stall_timeout = "10m"         # a provider stream with no content this long is retried, the default
 //!
 //! [fallbacks]                   # the model a declined request goes to, by model
 //! "anthropic/claude-opus-5-5" = "anthropic/claude-opus-4-8"
@@ -68,6 +69,7 @@
 //! command = "~/bin/slack-poll"  # run with sh -c; each line it prints is one event
 //! every = "1m"                  # how long after it exits it runs again
 //! digest = "15m"                # a subscriber hears it at most this often; unset, as it comes
+//! urgent = { from = ["boss"] }  # what cuts into a busy subscriber's turn, as a filter is written
 //! ```
 //!
 //! Each unset value is the model's own, or, for a task, its lead's.
@@ -174,6 +176,12 @@ pub fn machine() -> (f64, f64) {
     let memory = (pages.max(0) as f64) * (size.max(0) as f64);
     (cpus as f64, memory)
 }
+
+/// The `[daemon]` keys that are durations, as the `agent serve` flag each
+/// sets takes them, with the least and most it takes in milliseconds: none
+/// given is the daemon's own default.
+pub const DAEMON_DURATIONS: [(&str, &str, u64, u64); 1] =
+    [("stall_timeout", "--stall-timeout", 1000, 86_400_000)];
 
 /// A `[daemon]` value worked out: a number, or `cpus` and `memory` (bytes)
 /// with numbers, `KiB` `MiB` `GiB`, `+ - * /`, parentheses, and
@@ -304,6 +312,11 @@ pub fn formula(key: &str, text: &str, cpus: f64, memory: f64) -> Result<f64, Str
 pub fn daemon_flags(daemon: &BTreeMap<String, String>) -> Result<Vec<(String, String)>, String> {
     let (cpus, memory) = machine();
     let mut flags = Vec::new();
+    for (key, flag, ..) in DAEMON_DURATIONS {
+        if let Some(text) = daemon.get(key) {
+            flags.push((flag.to_owned(), text.clone()));
+        }
+    }
     for (key, flag, default) in DAEMON_LIMITS {
         let Some(text) = daemon.get(key).map(String::as_str).or(default) else {
             continue;
@@ -603,6 +616,9 @@ pub struct Source {
     /// How often at most a subscriber hears it, as `every` is written,
     /// unless an event is urgent; unset or `0`, as events come.
     pub digest: Option<String>,
+    /// An event pattern, as a subscription's filter is written: an event
+    /// it matches is urgent, as one the command marks so.
+    pub urgent: Option<serde_json::Value>,
 }
 
 /// An MCP server, under Codex's key names for `[mcp_servers.NAME]`: a
@@ -955,6 +971,24 @@ fn parse(text: &str) -> Result<Config, String> {
             .ok_or_else(|| format!("unknown key {name}"))?;
         if name == "daemon" {
             for (key, value) in section {
+                if let Some((_, _, least, most)) =
+                    DAEMON_DURATIONS.iter().find(|(known, ..)| known == key)
+                {
+                    let refuse = || {
+                        format!(
+                            "daemon.{key} is a duration in whole seconds from {}s to {}s, as \"10m\"",
+                            least / 1000,
+                            most / 1000
+                        )
+                    };
+                    let text = value.as_str().ok_or_else(refuse)?;
+                    match duration_ms(text) {
+                        Some(ms) if ms % 1000 == 0 && (*least..=*most).contains(&ms) => {}
+                        _ => return Err(refuse()),
+                    }
+                    config.daemon.insert(key.clone(), text.to_owned());
+                    continue;
+                }
                 if !DAEMON_LIMITS.iter().any(|(known, ..)| known == key) {
                     return Err(format!("unknown key daemon.{key}"));
                 }
@@ -1303,6 +1337,7 @@ fn sources(value: &toml::Value) -> Result<Vec<Source>, String> {
         let mut command = None;
         let mut every = None;
         let mut digest = None;
+        let mut urgent = None;
         for (field, value) in fields {
             match field.as_str() {
                 "command" => command = Some(string(&key(field), value)?),
@@ -1312,6 +1347,15 @@ fn sources(value: &toml::Value) -> Result<Vec<Source>, String> {
                     span(&key(field), &value)?;
                     digest = Some(value);
                 }
+                "urgent" => {
+                    if !value.is_table() {
+                        return Err(format!(
+                            "{} is an event pattern, as {{ from = [\"ana\"] }}",
+                            key(field)
+                        ));
+                    }
+                    urgent = Some(serde_json::to_value(value).map_err(|e| e.to_string())?);
+                }
                 _ => return Err(format!("unknown key {}", key(field))),
             }
         }
@@ -1320,6 +1364,7 @@ fn sources(value: &toml::Value) -> Result<Vec<Source>, String> {
             command: command.ok_or_else(|| format!("{} is missing", key("command")))?,
             every,
             digest,
+            urgent,
         });
     }
     Ok(sources)
@@ -1573,6 +1618,23 @@ mod tests {
                 .unwrap_err()
                 .contains("daemon.processes")
         );
+        // A duration goes to its flag as written, checked when read.
+        let stall = parse("[daemon]\nstall_timeout = \"15m\"\n").unwrap();
+        let flags = daemon_flags(&stall.daemon).unwrap();
+        assert!(flags.contains(&("--stall-timeout".into(), "15m".into())));
+        for bad in ["600", "1500ms", "0", "2d", "\"soon\""] {
+            let text = match bad.starts_with('"') {
+                true => bad.to_owned(),
+                false if bad.chars().all(|c| c.is_ascii_digit()) => bad.to_owned(),
+                false => format!("\"{bad}\""),
+            };
+            assert!(
+                parse(&format!("[daemon]\nstall_timeout = {text}\n"))
+                    .unwrap_err()
+                    .contains("daemon.stall_timeout"),
+                "{bad}"
+            );
+        }
         // A formula is checked for this machine: one below 0 here is refused
         // when the file is read, not when a daemon starts.
         let over = machine().0 as u64 + 1;
@@ -1955,6 +2017,15 @@ mod tests {
             .map(|s| s.digest.as_deref())
             .collect();
         assert_eq!(digests, [None, Some("15m")]);
+        let urgent = parse(
+            "[sonny.sources.slack]\ncommand = \"x\"\nurgent = { from = [\"boss\"], text = [{ \"prefix\" = \"[prod]\" }] }\n",
+        )
+        .unwrap();
+        assert_eq!(
+            urgent.sonny.sources[0].urgent,
+            Some(serde_json::json!({"from": ["boss"], "text": [{"prefix": "[prod]"}]}))
+        );
+        assert_eq!(config.sonny.sources[0].urgent, None);
         let named: Vec<(&str, &str, Option<&str>)> = (config.sonny.sources.iter())
             .map(|s| (s.name.as_str(), s.command.as_str(), s.every.as_deref()))
             .collect();
@@ -1973,6 +2044,10 @@ mod tests {
             (
                 "[sonny.sources.slack]\ncommand = \"x\"\ndigest = \"1d\"",
                 "sonny.sources.slack.digest is a number and s, m or h, as 30s or 5m, not \"1d\"",
+            ),
+            (
+                "[sonny.sources.slack]\ncommand = \"x\"\nurgent = \"always\"",
+                "sonny.sources.slack.urgent is an event pattern, as { from = [\"ana\"] }",
             ),
             (
                 "[sonny.sources.commons]\ncommand = \"x\"",

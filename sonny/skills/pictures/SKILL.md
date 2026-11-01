@@ -1,6 +1,6 @@
 ---
 name: pictures
-description: Show the person a diagram, chart or sketch inside Sonny by putting an SVG in a ```svg fence in your reply; Sonny draws it inline.
+description: Use when a diagram, chart or sketch says it better than words: show it to the person inside Sonny by putting an SVG in a ```svg fence in your reply; Sonny draws it inline.
 ---
 
 Sonny, the terminal the person reads you in, draws an SVG in your reply as a picture where the fence is. Use one when a picture says it better than text: how parts connect, a flow, a layout, a small chart.

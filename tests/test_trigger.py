@@ -399,6 +399,30 @@ class TriggerFireTests(ModelFixture):
         self.assertIn('bot_exists', taken['last']['detail'])
         self.assertEqual(len(self.turns('p.review')), 3)
 
+    def test_an_agent_made_in_full_access_starts_ungated(self):
+        # `[sonny] default_permissions = "full"`: no sandbox and no one
+        # approving, so the agent is made with no gate, which `create`
+        # takes as no approval fields (it refuses an empty `approve`).
+        (self.home / '.agent').mkdir(exist_ok=True)
+        (self.home / '.agent/config.toml').write_text('[sonny]\ndefault_permissions = "full"\n')
+        self.agent('run', *self.common, '--new', '--bot', 'p.lead', 'hello')
+        lead = self.bot_id('p.lead')
+        work = self.path / 'work'
+        work.mkdir()
+        target = ['--start', 'p.free', '--model', 'openai/synthetic-model', '--by', 'p.lead', '--by-id', str(lead)]
+        env = {'AGENT_PROVIDER': f'openai=responses,{self.url}'}
+        fired = self.fire('p.free', 'Look around.', target=target, extra=['--dir', str(work)], app=self.bundle(),
+                          env=env, generation='g1')
+        self.assertEqual(fired['last']['outcome'], 'sent', fired)
+        connection = Connection(str(self.store) + '.sock')
+        try:
+            made = connection.request('inspect', bot='p.free')['result']
+        finally:
+            connection.close()
+        self.assertEqual(made['settings']['sandbox'], 'danger-full-access', made['settings'])
+        self.assertEqual(made['gates'], [])
+        self.settle('p.free')
+
     def test_an_answer_goes_to_the_reply_agent(self):
         self.agent('run', *self.common, '--new', '--bot', 'p.lead', 'hello')
         self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')

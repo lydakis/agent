@@ -57,11 +57,20 @@ the first is `<project>.lead`, and another is `<project>.lead.NAME`, a peer
 of the first rather than above it. `sonny` opens the one last written to in
 that folder, else the first. `--lead NAME` opens another (`--lead lead` the
 first), and `--new-lead NAME` makes one (numbered, as `lead.2`, with no
-name). In a window, `/lead` lists the folder's leads, `/lead NAME` opens one
-and `/lead new [NAME]` makes one. `/switch NAME` opens any agent in the
-window instead, a task or any other the daemon keeps (a name in this project
-may leave out the project); `/switch` alone, the `↗` beside the name of an
-agent open in the pane, or Ctrl+G moves that agent into the window. `/goal WHAT` asks the agent to set a goal
+name). In a window, `/switch` lists every agent the daemon keeps over the
+composer, found by typing as every list is: the folder's leads first, then
+the project's other agents, then other projects' leads, then the rest, the
+one beside the conversation picked to start. Enter opens the pick in the
+window; the last row, `new lead`, makes the folder another lead, named by
+what was typed when it can name one. `/switch NAME` opens that agent at once
+(a name in this project may leave out the project), or lists what NAME
+narrows to; `/lead` alone is `/switch`, `/lead NAME` opens a lead of the
+folder and `/lead new [NAME]` makes one. The `↗` beside the name of an agent
+open in the pane, or Ctrl+G, moves that agent into the window.
+
+![/switch listing every agent, narrowed by typing fix, making a new lead, in Flexoki light, and with NO_COLOR](../docs/sonny/switch-picker.png)
+
+`/goal WHAT` asks the agent to set a goal
 on itself and work until WHAT is done (`/goal` shows goals, `/goal clear`
 clears its own; see [Goals](../docs/SONNY.md#goals)). `/zen FOCUS` asks the agent to talk with you about
 that one thing and hold everything else back, and shows only your turns and
@@ -295,13 +304,23 @@ in the daemon, not in cmux, so set cmux's Settings > Automation to
 commands in tabs and read them. The tool host, the daemon's companion, reaches it
 either way when the daemon started from a cmux tab; otherwise it needs
 Automation mode too.
-The place a
-project was laid out in is kept in `~/.agent/sonny/places`, so an agent's
-`run_in_pane` and `show_agent` calls go to that Herdr or cmux workspace or
-Rex session, in that multiplexer, rather than one guessed from where the
-tool host answering them runs, which is in neither. A project whose lead is
-in no multiplexer gets none: such a call says nothing opened would be seen,
-and its agents get no layout skill. A task's window
+Each of a
+project's Sonny windows notes where it is in `~/.agent/sonny/places`, the
+agent it shows, and when the person last used it (a key, a click, a paste,
+or the window coming to the front). An agent acts in the terminal it is
+spoken to in: its `run_in_pane` and `show_agent` calls go where the open
+window used last of those showing it is, that Herdr or cmux workspace or
+Rex session; a task no window shows goes where the agent that made it is
+spoken to; and only a lead's own window, or one in the same home, opens
+tabs for its new tasks. An agent no window shows, made by none that is,
+goes by the project's window used last. A task's window keeps the home it
+opened in. This is tmux's rule for a command that names no client, the one
+used most recently, taken per agent. So with the lead in a bare terminal and
+another lead of the project in Rex, each acts where it is spoken to: the
+first's calls open nothing anywhere and say nothing opened would be seen,
+while the Rex lead opens its tasks' tabs as before. With every window closed, the last one used still names the place. A
+project whose lead is in no multiplexer gets none, and its agents get no
+layout skill. A task's window
 closes once its work is taken: its turn completed and the lead (or the task
 that started it) waited on it. One that failed, stopped or waits on you stays
 open, and a task given more work opens again; ask the lead to show one, or
@@ -501,8 +520,10 @@ agent then does. Esc stops a command still running.
 
 An emoji sent alone is a reaction, not a message: it goes under the
 agent's last reply and is attached to the agent's next call, so it starts
-no turn. `/react` picks an older reply, and sending an emoji already on a
-reply takes it off. The agent reacts too, with a `react` tool Sonny
+no turn. To react to an older reply, point at it: a muted `☺` shows
+under it, where its reactions go, and a click picks it for the emoji you
+send next. `/react` picks one from the keys. Sending an emoji already on a
+reply takes it off, and so does a click on it. The agent reacts too, with a `react` tool Sonny
 declares on it: 👍 or 🎉 under
 your message when that is all it needs, or 👀 while it looks, taken off
 once it answers. Every reaction sits right under the message it is on,
@@ -513,6 +534,8 @@ one of its tasks, with its name (`👀 calc.lead`) under the agent's own.
 ![The agent's 🎉 under a message, and a 👍 on its reply](../docs/sonny/reactions.png)
 
 ![/react picking an older reply](../docs/sonny/reactions-picker.png)
+
+![☺ under the reply under the mouse, after its 👍](../docs/sonny/react-mark.png)
 
 To answer one message, point at it: its bullet turns into `↩`, and a
 click quotes it into the composer (`> ` before each line, six lines at
@@ -707,6 +730,18 @@ way `/react` does, and each note in the margin has its own `↩`.
   ![/status naming each agent's profile beside its model: superlead, task, reviewer](../docs/sonny/status-profile.png)
 
   ![A task opened from /status in the pane, its ‹ going back to /status](../docs/sonny/status-opens-agent.png)
+
+  Under the lookout's line, `/status` says what is wrong around the
+  agents: a companion of the daemon that keeps restarting (down and waiting
+  for its next start, or up for less than a minute after a restart), with a
+  red `✗`, how it exits and its log; and, muted, the skills agents are
+  offered whose front matter has no `description` or one that never says
+  when to use the skill, since that line is all an agent reads before it
+  opens one. Each Sonny start keeps the approver again on its own binary
+  and build, with the judge it has, so an upgrade restarts it with the
+  lookout and the tool host.
+
+  ![/status: a red ✗ notes-sync keeps restarting · exits 1 · 4 restarts, its log, then 2 skills to fix, muted](../docs/sonny/status-alerts.png)
 - `/background` (or `/triggers`, `/lookout`) lists, in the pane beside the
   conversation, what runs for the project's agents with
   no one typing: the automations that wake them, with
@@ -978,6 +1013,18 @@ way `/react` does, and each note in the margin has its own `↩`.
   (`shop.wire asks you`), the task's row reads `needs you`, and a click on
   it opens the task in the pane, where an option's click answers the task
   itself.
+- **Steps only you can take:** when an agent needs something only you can
+  do, such as signing in or a command that needs your own terminal and
+  keyboard (`ssh -t`, a password prompt), it asks with `ask` too, with no
+  options and the exact line to run as `command`. The card shows that line
+  at the text's own weight under `Run this in your own terminal; a click
+  copies it.`, and a click on it copies it. Such an ask always waits
+  (`Waits for you to run it; a reminder at 21:30.`), and what you type next
+  says how it went. A task asking this way reads `needs you` like any
+  other, and its lead hears the line to run. Agents no longer send such
+  commands to a pane, where they sat unnoticed.
+
+  ![An action card: Sign in to the package registry, why, then npm login --auth-type=web under Run this in your own terminal; a click copies it.](../docs/sonny/action-card.png)
 
   ![Two open decisions, their bars whole after the window narrowed, and the composer answering the first of two](../docs/sonny/ask-several.png)
 

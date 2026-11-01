@@ -3,10 +3,13 @@
 One socket daemon on a streaming synthetic model (bench.lookout_scale's), and
 Sonny's three paths that grow with the fleet:
 
-- lookout: `sonny lookout` over 10 leads with S tasks between them, for
-  each S in --subscribers. How long until every lead is seated, its CPU per
+- lookout: `sonny lookout` over L subscribing leads with T tasks each, for
+  each LxT in --shapes, so how many leads subscribe and how many tasks feed
+  each vary apart. How long until every lead is seated, its CPU per
   thousand streamed deltas while every task runs turns, and how late a lead
-  hears that a task's turn ended.
+  hears that a task's turn ended: how many ended turns a note told (a line
+  with a count tells a task's turns since the last note), and each told
+  turn's wait in its stages.
 - window: one quiet lead's Sonny, in an 80x24 terminal, while the largest
   fleet's tasks run turns it has nothing to do with. Its CPU, its RSS, and
   what it asks the daemon for and reads back, counted on a socket that
@@ -187,31 +190,39 @@ class Screen:
         os.close(self.fd)
 
 
-def lookout(args, subscribers, out):
-    """The lookout over 10 leads and `subscribers` tasks; the bench stays
-    open, so the window and the sky can run over the same fleet."""
+def lookout(args, shape, out):
+    """The lookout over `shape`'s leads, each with its tasks; the bench
+    stays open, so the window and the sky can run over the same fleet."""
+    leads, tasks = shape
+    name = f'{leads}x{tasks}'
     bench = Bench(SimpleNamespace(
-        agent=args.agent, sonny=args.sonny, projects=10, tasks=max(1, subscribers // 10),
+        agent=args.agent, sonny=args.sonny, projects=leads, tasks=tasks,
         deltas=args.deltas, delta_ms=args.delta_ms, settle=args.settle, judge_ms=0,
-        out=str(out / f'lookout-{subscribers}')))
+        out=str(out / f'lookout-{name}')))
     bench.setup()
     result = {'start': bench.start_lookout('start')}
     if bench.lookout.poll() is not None:
-        raise RuntimeError(f'the lookout over {subscribers} exited as it started')
+        raise RuntimeError(f'the lookout over {name} exited as it started')
     since = int(time.time() * 1000)
-    load = bench.load(args.load_s)
+    load = bench.load(args.load_s, rounds=args.rounds)
     # A lookout that died tells no one and costs nothing: refuse the run.
     if not load['lookout_alive']:
-        raise RuntimeError(f'the lookout over {subscribers} exited under load')
+        raise RuntimeError(f'the lookout over {name} exited under load')
     notes = bench.note_delays(since)
     deltas = load['submitted_turns'] * args.deltas
     result.update({
         'deltas': deltas,
         'cpu_ms_per_1k_deltas': round(1000 * load['lookout']['cpu_s'] / deltas * 1000, 2) if deltas else None,
         'peak_rss_mib': load['lookout']['peak_rss_mib'],
-        'alive': load['lookout_alive'],
-        'note_delay_ms_p95': notes['delay_ms_p95'], 'told': notes['told'],
-        'turns_ended': notes['turns_ended']})
+        'alive': load['lookout_alive'], 'load_s': load['ran_s'],
+        'daemon_cpu_s': load['daemon']['cpu_s'],
+        'leads': leads, 'tasks_per_lead': tasks, 'tasks': leads * tasks,
+        'note_delay_ms_p95': notes['delay_ms_p95'], 'note_submit_ms_p95': notes['submit_ms_p95'],
+        'reply_read_ms_p95': notes['read_ms_p95'], 'notes': notes['notes'],
+        'told': notes['told'], 'untold': notes['untold'],
+        'notes_delivered': notes['notes_delivered'], 'notes_undelivered': notes['notes_undelivered'],
+        'oldest_untold_ms': notes['oldest_untold_ms'], 'turns_ended': notes['turns_ended'],
+        'told_share': round(notes['told'] / notes['turns_ended'], 3) if notes['turns_ended'] else None})
     return bench, result
 
 
@@ -288,10 +299,15 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--agent')
     parser.add_argument('--sonny')
-    parser.add_argument('--subscribers', default='10,100,1000')
+    # Subscribing leads x tasks each: 10x100 and 100x10 are both 1,000
+    # tasks, fanned into ten leads or spread over a hundred.
+    parser.add_argument('--shapes', default='10x1,10x10,10x100,100x10')
     parser.add_argument('--deltas', type=int, default=20)
     parser.add_argument('--delta-ms', type=int, default=50)
     parser.add_argument('--load-s', type=float, default=10)
+    # The lookout's load is a fixed number of rounds (every task one turn
+    # each), so base and head face the same turns however fast each runs.
+    parser.add_argument('--rounds', type=int, default=4)
     parser.add_argument('--idle-s', type=float, default=15)
     # Long enough for a lead's note of the last turns to start.
     parser.add_argument('--settle', type=float, default=10)
@@ -300,12 +316,14 @@ def main():
     # Absolute: the bots' workspaces must be, and the screens change folder.
     out = Path(args.out).resolve()
     out.mkdir(parents=True, exist_ok=True)
-    sizes = [int(n) for n in args.subscribers.split(',')]
+    shapes = [tuple(int(n) for n in shape.split('x')) for shape in args.shapes.split(',')]
+    # The window and the sky run over the first fleet with the most tasks.
+    largest = max(shapes, key=lambda shape: shape[0] * shape[1])
     run = {'lookout': {}}
-    for size in sizes:
-        bench, run['lookout'][str(size)] = lookout(args, size, out)
+    for shape in shapes:
+        bench, run['lookout']['x'.join(map(str, shape))] = lookout(args, shape, out)
         try:
-            if size == max(sizes):
+            if shape == largest:
                 run['window'] = window(args, bench)
                 run['sky'] = sky(args, bench)
         finally:

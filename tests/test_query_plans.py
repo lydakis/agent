@@ -6,7 +6,7 @@ import sys
 import tempfile
 import unittest
 
-from bench.query_plans import statements
+from bench.query_plans import connect, statements
 
 
 class QueryPlanTests(unittest.TestCase):
@@ -19,7 +19,7 @@ class QueryPlanTests(unittest.TestCase):
                 self.assertIn(f'DELETE FROM {table} WHERE turn=?', queries)
         self.assertIn("DELETE FROM processes WHERE turn=? AND status!='running'", queries)
         # Every filter and direction of a listing is planned.
-        bots = [q for q in queries if q.startswith('SELECT name,head,') and 'FROM bots WHERE name > ?1' in q]
+        bots = [q for q in queries if q.startswith('SELECT name,head,') and ' FROM bots WHERE name ' in q]
         self.assertEqual(len(bots), 8)
         self.assertTrue(any('name GLOB ?3 AND running_turn IS NOT NULL ORDER BY name' in q for q in bots))
         self.assertTrue(any('name GLOB ?3 AND created_by_id = ?4 AND running_turn IS NOT NULL' in q
@@ -76,6 +76,23 @@ class QueryPlanTests(unittest.TestCase):
                     self.assertIn(f'SCAN {table}', result.stdout)
                 else:
                     self.assertIn('0 table scans', result.stdout)
+
+    def test_plans_read_no_bound_value(self):
+        # As the daemon plans, a GLOB pattern's prefix bounds no index
+        # unless the query writes the bound out.
+        root = Path(__file__).resolve().parent.parent
+        source = (root / 'src/store/db.rs').read_text()
+        ddl = source.split('tx.execute_batch("', 1)[1].split('")?;', 1)[0]
+        with tempfile.TemporaryDirectory() as directory:
+            store = Path(directory) / 'store.sqlite'
+            with sqlite3.connect(store) as conn:
+                conn.executescript(ddl)
+            conn = connect(store)
+            plan = lambda sql: ' | '.join(r[3] for r in conn.execute('EXPLAIN QUERY PLAN ' + sql, ('m-*', 'm-')))
+            self.assertEqual(plan('SELECT id FROM bots WHERE name GLOB ?1 AND ?2 IS NOT NULL'), 'SCAN bots')
+            self.assertIn('(name>? AND name<?)', plan(
+                "SELECT id FROM bots WHERE name GLOB ?1 AND name >= ?2 AND name < ?2 || CAST(x'ff' AS TEXT)"))
+            conn.close()
 
 
 if __name__ == '__main__':

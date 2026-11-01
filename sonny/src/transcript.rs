@@ -1661,6 +1661,21 @@ pub fn reacted(emoji: &str) -> Line<'static> {
     ])
 }
 
+/// Where each of `emoji` is on the row [`reacted`] draws of them, joined
+/// by spaces: the columns it takes with the space before it, so a click
+/// anywhere on it lands.
+pub fn reacted_spans(emoji: &[String]) -> Vec<(u16, u16, String)> {
+    let mut x = 2u16;
+    (emoji.iter())
+        .map(|emoji| {
+            let to = x + 1 + emoji.width() as u16;
+            let span = (x, to, emoji.clone());
+            x = to;
+            span
+        })
+        .collect()
+}
+
 /// Whether a line of Markdown is a heading: a reply that opens with one
 /// takes no `•`, which would be two marks for one thing.
 pub fn heading(line: &str) -> bool {

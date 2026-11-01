@@ -1140,8 +1140,15 @@ pub async fn hold_for(policy: Option<&Policy>) -> Option<Hold> {
     }
 }
 
-impl Drop for Hold {
-    fn drop(&mut self) {
+impl Hold {
+    /// Let go now, on this thread, for a process that exits next, as
+    /// `agent sandbox` does: a drop removes the placeholders on a thread of
+    /// its own, which would end with the process, its work undone.
+    pub fn release(mut self) {
+        self.free(true);
+    }
+
+    fn free(&mut self, here: bool) {
         let mut released = Vec::new();
         {
             let mut held = HELD.lock().unwrap();
@@ -1185,6 +1192,9 @@ impl Drop for Hold {
                 remove();
             }
         };
+        if here {
+            return remove();
+        }
         let job: std::sync::Arc<Job> =
             std::sync::Arc::new(std::sync::Mutex::new(Some(Box::new(remove))));
         let theirs = job.clone();
@@ -1195,6 +1205,12 @@ impl Drop for Hold {
         {
             run(&job);
         }
+    }
+}
+
+impl Drop for Hold {
+    fn drop(&mut self) {
+        self.free(false);
     }
 }
 

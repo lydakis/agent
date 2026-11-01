@@ -391,13 +391,14 @@ the machine, where its own command line gives none: each key is a flag's
 name without `--max-` and with `_` for `-` (`processes`, `input_bytes`,
 `load`, ...), and its value a number or a formula of `cpus` and `memory`
 (bytes), as `"cpus * 64"` or `"max(memory / 16, 64 MiB)"`, with `+ - * /`,
-parentheses, `min` and `max`, and `KiB`, `MiB` and `GiB`. A running daemon
+parentheses, `min` and `max`, and `KiB`, `MiB` and `GiB`; `stall_timeout`
+is a duration in whole seconds instead, as `"15m"`. A running daemon
 keeps what it started with; the next start takes a change.
 
 | Flag | Bounds | Default |
 | --- | --- | --- |
 | `--max-processes` | Child processes running at once, foreground or background. Waiting never counts. | 64 per logical CPU |
-| `--max-lasting` | Processes that outlive their call, still running, daemon-wide: terminals and detached shell commands together. A terminal holds its slot until its whole session is gone, a detached command until it is reaped. Zero is unbounded. | 4 per logical CPU |
+| `--max-lasting` | Processes that outlive their call, still running, daemon-wide: terminals and detached shell commands together. A terminal holds its slot until its whole session is gone, a detached command until it and whatever it left running in its process group are gone. Zero is unbounded. | 4 per logical CPU |
 | `--max-active` | Turns with a live task: a model call in flight or a foreground tool. Parked turns never count. | 4,096 |
 | `--max-pending` | Submissions waiting to start: queued behind a bot's own work or ready for a slot, daemon-wide. A submission that would wait past the bound answers `pending_limit` and writes nothing; one that starts at once is never refused by it. | none |
 | `--max-pending-bytes` | UTF-8 bytes of those waiting submissions: their prompts and the words they quote, which wait with them. | none |
@@ -405,7 +406,7 @@ keeps what it started with; the next start takes a change.
 | `--max-readers` | Store reader connections, each on its own thread, for the reads clients ask for that decide nothing ([observation reads](#observation-reads)), which take all but one, and for turns' own reads. At least 1. | one per logical CPU |
 | `--max-load` | The 1-minute load average at which new foreground and background commands wait while one of the daemon's is running, as make's `-l`: never while none is, so a loaded machine slows the fleet and never stops it, and `--max-processes` stays the bound behind it. One thread reads the load each second; waiters hold no slot, go in the order they came, and take a freed slot only if the gate still admits them. A call that would be refused (forbidden, asked about with no gate, an escape no gate allows) is answered at once, never held; a gated one waits for its verdict instead, so a denial comes back as soon as it is given, and one allowed starts then. A round's calls that run together are let in or held whole. A foreground command held past 1.5 s parks its turn before the call (or the batch it starts with) starts: one commit, `turn_waiting` with `{call_id, load: true, deadline_ms}` (also its view's `waiting_on`), no task, no active slot, and it survives restart. The gate's next admitting reading wakes every parked turn once the load falls, or the oldest alone on a loaded machine where none of the daemon's commands runs; a turn whose round has a later gated call is woken at that call's lapse too. A fraction is kept. Zero is no gate. Reported in `ready` as `limits.load`, `null` for none (protocol 44). | none (the agent CLI passes `cpus * 2`) |
 | `--max-connecting` | Provider requests awaiting response headers, a Bedrock Runtime call's body digest included. Established streams are not capped. Both providers hold headers until the first token, so a permit is held for the whole time to first token; a bound of N caps throughput at N calls per first-token latency. | none |
-| `--stall-timeout` | How long an established provider stream may go without a content frame before the attempt fails as `provider_stream_stalled` and is retried. Keepalives do not count. Whole seconds, `1s` to `24h`. | `2m` |
+| `--stall-timeout` | How long an established provider stream may go without a content frame before the attempt fails as `provider_stream_stalled` and is retried. Keepalives do not count; a connection that sends no bytes at all, keepalives included, fails sooner, after 2 minutes. Whole seconds, `1s` to `24h`. `[daemon] stall_timeout` in `~/.agent/config.toml` sets it, as a duration such as `"15m"`. | `10m` |
 | `--idle-exit` | How long, in whole seconds, before a socket daemon with no sessions, no live turns, and no running background commands exits. Parked turns are durable and resume on the next start; the client restarts the daemon on demand. | none |
 | (derived) `connections` | HTTP/2 connections per provider: `max-active` divided by 64 streams per connection (both providers allow 100; fewer bounds how many turns one reset connection takes with it), 1 to 256; 64 when active is unbounded. Reported in `ready`, not a flag. | 64 |
 
@@ -2411,7 +2412,8 @@ A store remains bound to its tool set; changing it requires a new store.
 
 `shell` runs a noninteractive command with `/bin/bash -c` (`/bin/sh` where
 bash is not installed) in the bot workspace with
-`timeout_ms` (default 120 s, maximum 600 s), which bounds the command's
+`timeout_ms` (default 120 s, maximum 600 s, or a day for a background command,
+which holds no turn while it runs), which bounds the command's
 running time, not any time spent in line for a process slot. Commands are at
 most 16 KiB. At most `--max-processes` child processes run at once across the
 service, foreground or background; waiting never counts. Background commands
@@ -2451,8 +2453,14 @@ redaction; a command that wants its output redirects it to a file itself. No pro
 handle applies to it, so it outlives the turn and the daemon and is outside
 `--max-processes`; stopping it is the bot's job. What does bound it is
 `--max-lasting`, shared with terminals as a systemd slice holds a
-service's processes: each detached child retains a slot until its async
-waiter reaps it on exit, and a new detach or terminal refuses with
+service's processes: each detached command retains a slot until its async
+waiter has reaped it and nothing it left in its process group runs (a
+launcher that starts a service with `cmd &` and exits keeps the slot while
+the service runs, looked for each second; on Linux a member that has
+exited but is not reaped, as under an init that does not reap orphans, does
+not count, and since a walk of `/proc` is no one moment, a group whose
+members all look exited frees its slot only after three walks a second
+apart agree), and a new detach or terminal refuses with
 `lasting_limit`, naming how many terminals and detached commands hold the
 slots, while all are held. Nothing waits in line for one. It exists because Terminal-Bench
 tasks that leave a server for the grader failed when the server died with its
@@ -2641,8 +2649,20 @@ too, always.
 
 On Linux, bubblewrap makes an empty folder on the host to mount a missing
 `.git` read-only over; the daemon removes it once no running sandbox holds
-it, and a detached command holds it until it exits. A sandbox that needs
+it, and a detached command holds it until it and what it left in its group are gone. A sandbox that needs
 one being removed waits until it is gone.
+
+`agent sandbox [--writable PATH]... -- COMMAND [ARGS...]` runs one command
+in the same sandbox, with no daemon, as Codex's `codex sandbox` does:
+read-only with no `--writable`, else writing the folders named, `$TMPDIR` and
+`/tmp`, always with the network off. Off, it reaches no Unix socket either,
+so not the daemon's nor a bot's, which a bot's own sandbox hides by the
+daemon's knowledge of them and this one has no daemon to ask. The agent's
+home stays read-only, as `--protect-path` keeps it for a bot. It exits as its command does. It is for a client that runs a program
+where an agent may have written: git runs a repository's hooks and the
+programs its config names (an fsmonitor, a filter) even to list its files,
+so a repository an agent made would run what it left there as the person.
+Sonny runs its own git in such places this way (#597).
 
 ### Command rules
 

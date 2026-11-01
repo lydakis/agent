@@ -308,11 +308,12 @@ struct Following {
     stream: Option<Watching>,
 }
 
-/// A project's home, as its lead's Sonny last found it in the person's
-/// terminal: kept so that an agent's `run_in_pane` and `show_agent` calls
-/// go there, to that multiplexer, instead of one guessed from where the
-/// lookout answering them runs, which is in neither.
-#[derive(Debug, PartialEq)]
+/// A project's home, as one of its Sonny windows found it in the
+/// person's terminal: kept so that an agent's `run_in_pane` and
+/// `show_agent` calls go there, to that multiplexer, instead of one
+/// guessed from where the lookout answering them runs, which is in
+/// neither.
+#[derive(Clone, Debug, PartialEq)]
 pub enum Place {
     Herdr {
         workspace: String,
@@ -335,8 +336,8 @@ impl Place {
         Some(PathBuf::from(home).join(format!(".agent/sonny/places/{key}.json")))
     }
 
-    fn keep(&self, path: &Path) {
-        let json = match self {
+    fn json(&self) -> serde_json::Value {
+        match self {
             Self::Herdr { workspace } => {
                 serde_json::json!({"multiplexer": "herdr", "workspace": workspace})
             }
@@ -346,19 +347,26 @@ impl Place {
             Self::Rex { session, host } => {
                 serde_json::json!({"multiplexer": "rex", "session": session, "host": host})
             }
-        };
-        if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        let temp = path.with_extension(format!("{}.tmp", std::process::id()));
-        if std::fs::write(&temp, format!("{json}\n")).is_ok() {
-            let _ = std::fs::rename(&temp, path);
         }
     }
 
-    fn recall(path: &Path) -> Option<Self> {
-        let text = std::fs::read(path).ok()?;
-        let json: serde_json::Value = serde_json::from_slice(&text).ok()?;
+    /// A window's place, or none, as `--window-place` carries it.
+    pub fn encode(place: &Option<Place>) -> String {
+        place
+            .as_ref()
+            .map_or(serde_json::Value::Null, Place::json)
+            .to_string()
+    }
+
+    pub fn decode(text: &str) -> Option<Option<Place>> {
+        let json: serde_json::Value = serde_json::from_str(text).ok()?;
+        match json.is_null() {
+            true => Some(None),
+            false => Place::of(&json).map(Some),
+        }
+    }
+
+    fn of(json: &serde_json::Value) -> Option<Self> {
         let text = |key: &str| json[key].as_str().map(str::to_owned);
         match json["multiplexer"].as_str()? {
             "herdr" => Some(Self::Herdr {
@@ -374,6 +382,273 @@ impl Place {
             _ => None,
         }
     }
+}
+
+/// One of a project's Sonny windows, as the person last used it: its
+/// process, the agent it shows, when, and where it is, `None` for a
+/// terminal in no multiplexer.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Window {
+    pub pid: u32,
+    pub bot: String,
+    pub used_ms: u64,
+    pub place: Option<Place>,
+}
+
+/// A project's Sonny windows, newest use first, from the project's file.
+fn windows(file: &Path) -> Vec<Window> {
+    let json: serde_json::Value = (std::fs::read(file).ok())
+        .and_then(|text| serde_json::from_slice(&text).ok())
+        .unwrap_or_default();
+    let mut windows: Vec<Window> = (json["windows"].as_array().into_iter().flatten())
+        .filter_map(|window| {
+            Some(Window {
+                pid: u32::try_from(window["pid"].as_u64()?).ok()?,
+                bot: window["bot"].as_str().unwrap_or_default().to_owned(),
+                used_ms: window["used_ms"].as_u64()?,
+                place: Place::of(&window["place"]),
+            })
+        })
+        .collect();
+    windows.sort_by_key(|window| std::cmp::Reverse(window.used_ms));
+    windows
+}
+
+/// Whether process `pid` still runs: one this user may not signal runs too.
+fn alive(pid: u32) -> bool {
+    // 0 is a window closed by the process that goes on as another Sonny,
+    // and `kill(0, …)` would ask about this process group instead.
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    if pid == 0 {
+        return false;
+    }
+    // SAFETY: signal 0 checks the process without sending it anything,
+    // and `kill` reads nothing of this process's memory.
+    let signalled = unsafe { libc::kill(pid, 0) } == 0;
+    signalled || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// The window the person used last: the newest of those still open, else
+/// the newest of all, and whether it is still open. As tmux acts on the
+/// client used most recently when a command names none, this is where an
+/// agent's window opens and its lead's new tabs go: the window being
+/// typed in, not one in another terminal that only laid the project out
+/// first.
+fn latest_in(file: &Path, alive: impl Fn(u32) -> bool) -> Option<(Window, bool)> {
+    let windows = windows(file);
+    if let Some(open) = windows.iter().find(|window| alive(window.pid)) {
+        return Some((open.clone(), true));
+    }
+    windows.into_iter().next().map(|window| (window, false))
+}
+
+pub fn latest(socket: &Path, project: &str) -> Option<(Window, bool)> {
+    latest_in(&Place::file(socket, project)?, alive)
+}
+
+/// The window an agent acts in: the open one the person used last among
+/// those showing it, else among those showing the agent that made it, and
+/// so on up `chain` (the agent first, then its makers); else the project's
+/// window used last. So an agent spoken to in one terminal acts there
+/// while another terminal talks to another of the project's agents.
+fn latest_for_in(
+    file: &Path,
+    chain: &[String],
+    alive: impl Fn(u32) -> bool,
+) -> Option<(Window, bool)> {
+    let windows = windows(file);
+    for bot in chain {
+        if let Some(open) = (windows.iter()).find(|window| window.bot == *bot && alive(window.pid))
+        {
+            return Some((open.clone(), true));
+        }
+    }
+    latest_in(file, alive)
+}
+
+pub fn latest_for(socket: &Path, project: &str, chain: &[String]) -> Option<(Window, bool)> {
+    latest_for_in(&Place::file(socket, project)?, chain, alive)
+}
+
+/// Notes that the person used this window of `project`'s just now, at
+/// `place`. The windows since closed go, but for the newest, whose place
+/// still counts once every window is closed.
+fn mark_in(file: &Path, me: Window, alive: impl Fn(u32) -> bool) {
+    let mut kept: Vec<Window> = Vec::new();
+    let mut closed = false;
+    for window in windows(file) {
+        if window.pid == me.pid {
+            continue;
+        }
+        if alive(window.pid) {
+            kept.push(window);
+        } else if !closed {
+            closed = true;
+            kept.push(window);
+        }
+    }
+    kept.insert(0, me);
+    write(file, &kept);
+}
+
+/// Notes that window `me` of the project closed, though its process goes
+/// on as another agent's Sonny (`exec` keeps the process): its place
+/// stays, as a closed window's.
+fn retire_in(file: &Path, me: u32) {
+    let mut windows = windows(file);
+    if !windows.iter().any(|window| window.pid == me) {
+        return;
+    }
+    for window in windows.iter_mut().filter(|window| window.pid == me) {
+        window.pid = 0;
+    }
+    write(file, &windows);
+}
+
+fn write(file: &Path, windows: &[Window]) {
+    let list: Vec<serde_json::Value> = (windows.iter())
+        .map(|window| {
+            serde_json::json!({
+                "pid": window.pid,
+                "bot": window.bot,
+                "used_ms": window.used_ms,
+                "place": window.place.as_ref().map(Place::json),
+            })
+        })
+        .collect();
+    if let Some(dir) = file.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    // Two windows writing at once can drop the other's line: it is written
+    // again the next time the person uses that window.
+    let temp = file.with_extension(format!("{}.tmp", std::process::id()));
+    let json = serde_json::json!({ "windows": list });
+    if std::fs::write(&temp, format!("{json}\n")).is_ok() {
+        let _ = std::fs::rename(&temp, file);
+    }
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
+}
+
+/// This Sonny window of a project, noted as the one the person uses each
+/// time they do, at most once a second.
+pub struct Marker {
+    file: PathBuf,
+    /// The agent this window shows.
+    bot: String,
+    place: Option<Place>,
+    /// A window of an agent, not a lead, takes the place of the project's
+    /// window used last, since it opened in that one's home.
+    follows: bool,
+    last: Option<Instant>,
+}
+
+impl Marker {
+    /// A lead's window, laid out at `place` or in no multiplexer.
+    pub fn lead(socket: &Path, project: &str, bot: &str, place: Option<Place>) -> Option<Self> {
+        Some(Self {
+            file: Place::file(socket, project)?,
+            bot: bot.to_owned(),
+            place,
+            follows: false,
+            last: None,
+        })
+    }
+
+    /// The window of one of the project's agents, not its lead: `here`
+    /// when it runs in a multiplexer, so in the home its lead's window
+    /// laid out there.
+    /// `given` is the place of the window this one replaced in the same
+    /// terminal (`/switch`), which is this one's too.
+    pub fn agent(
+        socket: &Path,
+        project: &str,
+        bot: &str,
+        here: bool,
+        given: Option<Option<Place>>,
+    ) -> Option<Self> {
+        Some(Self {
+            file: Place::file(socket, project)?,
+            bot: bot.to_owned(),
+            follows: here && given.is_none(),
+            place: given.flatten(),
+            last: None,
+        })
+    }
+
+    /// Where this window is, once known: handed to the Sonny that
+    /// replaces it in the same terminal.
+    pub fn known(&self) -> Option<Option<Place>> {
+        (!self.follows).then(|| self.place.clone())
+    }
+
+    /// Typing: noted at most once a second.
+    pub fn used(&mut self) {
+        if self
+            .last
+            .is_some_and(|last| last.elapsed() < Duration::from_secs(1))
+        {
+            return;
+        }
+        self.used_now();
+    }
+
+    /// A click, a paste, Enter or the window coming to the front: noted
+    /// at once, as the person may have just come back from another window.
+    pub fn used_now(&mut self) {
+        self.last = Some(Instant::now());
+        // An agent's window Sonny opens is told its home; one opened by
+        // hand in a multiplexer was most likely opened in the home of the
+        // window used last that is in one, open or since closed. That home
+        // is its own from then on, wherever the person goes after.
+        if self.follows {
+            let windows = windows(&self.file);
+            let opened_in = (windows.iter())
+                .find(|window| window.place.is_some() && alive(window.pid))
+                .or_else(|| windows.iter().find(|window| window.place.is_some()))
+                .cloned();
+            let Some(window) = opened_in else {
+                return;
+            };
+            self.place = window.place;
+            self.follows = false;
+        }
+        let place = self.place.clone();
+        let me = Window {
+            pid: std::process::id(),
+            bot: self.bot.clone(),
+            used_ms: now_ms(),
+            place,
+        };
+        mark_in(&self.file, me, alive);
+    }
+
+    /// This window is gone, though its process goes on as another
+    /// agent's Sonny, which marks itself.
+    pub fn retire(&self) {
+        retire_in(&self.file, std::process::id());
+    }
+}
+
+/// Whether the window `lead` acts in ([`latest_for`]) is in `home`, the
+/// home of this lead's window (that window, or an agent's in the same
+/// home), or no open window is known: only then does the lead's new work
+/// open there.
+pub fn mine(socket: &Path, project: &str, lead: &str, home: &Place) -> bool {
+    Place::file(socket, project)
+        .is_none_or(|file| mine_in(&file, std::process::id(), lead, home, alive))
+}
+
+fn mine_in(file: &Path, me: u32, lead: &str, home: &Place, alive: impl Fn(u32) -> bool) -> bool {
+    latest_for_in(file, &[lead.to_owned()], alive).is_none_or(|(window, open)| {
+        !open || window.pid == me || window.place.as_ref() == Some(home)
+    })
 }
 
 pub struct Layout {
@@ -408,6 +683,11 @@ impl Drop for Layout {
 }
 
 impl Layout {
+    /// Where its home is, to be kept for the window that laid it out.
+    pub fn kept(&self) -> Place {
+        self.backend.place()
+    }
+
     pub fn new(backend: Box<dyn Backend>) -> Self {
         let spare = match backend.made() {
             true => (backend.blocks().unwrap_or_default().into_iter())
@@ -978,10 +1258,16 @@ fn current(host: Option<&str>) -> Option<Kind> {
     rex.then(crate::rex::find).flatten().map(Kind::Rex)
 }
 
+/// Whether Sonny runs in a multiplexer it lays work out in.
+pub fn inside(host: Option<&str>) -> bool {
+    current(host).is_some()
+}
+
 /// The project's home in the multiplexer Sonny runs in, from the person's
-/// terminal, kept as the place its agents' work goes. None when Sonny runs
-/// in none; tasks then run out of sight, in /status.
-pub fn here(socket: &Path, project: &str, host: Option<&str>) -> Option<Layout> {
+/// terminal; its window's [`Marker`] keeps it as the place its agents'
+/// work goes while it is the window the person used last. None when Sonny
+/// runs in none; tasks then run out of sight, in /status.
+pub fn here(project: &str, host: Option<&str>) -> Option<Layout> {
     let backend: Box<dyn Backend> = match current(host)? {
         Kind::Rex(bin) => Box::new(crate::rex::Rex::open(bin, host, project, true, None).ok()?),
         Kind::Herdr(bin) => {
@@ -993,26 +1279,40 @@ pub fn here(socket: &Path, project: &str, host: Option<&str>) -> Option<Layout> 
             Box::new(crate::cmux::Cmux::open(bin, project, surface.as_deref(), None).ok()?)
         }
     };
-    if let Some(file) = Place::file(socket, project) {
-        backend.place().keep(&file);
-    }
     Some(Layout::new(backend))
 }
 
 /// The project's home, for an agent's call, from the tool host answering it,
 /// whose multiplexer variables would name the terminal Sonny started it
-/// in: where the lead's Sonny last laid the project out, in that
-/// multiplexer; without one, in Herdr or cmux when the project's lead is in
-/// a Herdr pane or a cmux tab, else in the multiplexer project `like`'s
-/// home is in, made when needed. With none of these, the lead is in no
-/// multiplexer, and neither is anything it would see.
-pub fn for_agent(socket: &Path, project: &str, like: Option<&str>) -> Result<Layout, String> {
+/// in: where the project's Sonny window the person used last is, in that
+/// multiplexer; when that window is open in a terminal in none, nowhere,
+/// since another terminal is not where they look. Without a window, in
+/// Herdr or cmux when the project's lead is in a Herdr pane or a cmux tab,
+/// else in the multiplexer project `like`'s home is in, made when needed.
+/// With none of these, the lead is in no multiplexer, and neither is
+/// anything it would see.
+pub fn for_agent(
+    socket: &Path,
+    project: &str,
+    chain: &[String],
+    like: Option<&str>,
+) -> Result<Layout, String> {
+    let kept = match latest_for(socket, project, chain) {
+        Some((Window { place: None, .. }, true)) => {
+            return Err(format!(
+                "{project}'s Sonny was used last in a terminal outside Rex, Herdr and cmux, \
+                 so nothing opened in one would be seen there"
+            ));
+        }
+        Some((window, _)) => window.place,
+        None => None,
+    };
+    let like = like
+        .and_then(|like| latest(socket, like))
+        .and_then(|(window, _)| window.place);
     let herdr = crate::herdr::find();
     let cmux = crate::cmux::find();
     let rex = crate::rex::find();
-    let recall = |project| Place::file(socket, project).and_then(|file| Place::recall(&file));
-    let kept = recall(project);
-    let like = like.and_then(recall);
     let backend: Box<dyn Backend> = match (kept, herdr, cmux, rex) {
         (Some(Place::Herdr { workspace }), Some(herdr), _, _) => Box::new(
             crate::herdr::Herdr::open(herdr, project, None, Some(&workspace))?,
@@ -1614,29 +1914,272 @@ mod tests {
     }
 
     #[test]
-    fn a_project_keeps_the_place_it_was_laid_out_in() {
+    fn a_project_keeps_each_place_it_was_laid_out_in() {
         let file = std::env::temp_dir().join(format!("sonny-place-{}.json", std::process::id()));
-        let herdr = Place::Herdr {
-            workspace: "wD".into(),
-        };
-        herdr.keep(&file);
-        assert_eq!(Place::recall(&file), Some(herdr));
-        let cmux = Place::Cmux {
-            workspace: "8F2C".into(),
-        };
-        cmux.keep(&file);
-        assert_eq!(Place::recall(&file), Some(cmux));
-        let rex = Place::Rex {
-            session: "s7".into(),
-            host: Some("mini".into()),
-        };
-        rex.keep(&file);
-        assert_eq!(Place::recall(&file), Some(rex));
-        std::fs::write(&file, "{\"multiplexer\": \"tmux\"}").unwrap();
-        assert_eq!(Place::recall(&file), None);
+        let _ = std::fs::remove_file(&file);
+        let places = [
+            Place::Herdr {
+                workspace: "wD".into(),
+            },
+            Place::Cmux {
+                workspace: "8F2C".into(),
+            },
+            Place::Rex {
+                session: "s7".into(),
+                host: Some("mini".into()),
+            },
+        ];
+        for (at, place) in places.iter().enumerate() {
+            let me = Window {
+                pid: 10 + at as u32,
+                bot: "shop.lead".into(),
+                used_ms: 100 + at as u64,
+                place: Some(place.clone()),
+            };
+            mark_in(&file, me.clone(), |_| true);
+            assert_eq!(latest_in(&file, |_| true), Some((me, true)));
+        }
+        assert_eq!(windows(&file).len(), 3);
+        for place in [Some(places[2].clone()), None] {
+            assert_eq!(Place::decode(&Place::encode(&place)), Some(place));
+        }
+        std::fs::write(
+            &file,
+            "{\"windows\": [{\"pid\": 1, \"used_ms\": 1, \"place\": {\"multiplexer\": \"tmux\"}}]}",
+        )
+        .unwrap();
+        assert_eq!(windows(&file)[0].place, None);
         let _ = std::fs::remove_file(&file);
         let socket = Path::new("/tmp/agent.sock");
         assert_ne!(Place::file(socket, "shop"), Place::file(socket, "shop.web"));
+    }
+
+    /// Ghostty's Sonny typed in after Rex's: an agent's window opens in
+    /// neither, rather than in the terminal the person is not in.
+    #[test]
+    fn the_window_used_last_says_where_agents_open() {
+        let file = std::env::temp_dir().join(format!("sonny-used-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&file);
+        let rex = Window {
+            pid: 1,
+            bot: "shop.lead".into(),
+            used_ms: 100,
+            place: Some(Place::Rex {
+                session: "s1".into(),
+                host: None,
+            }),
+        };
+        let ghostty = Window {
+            pid: 2,
+            bot: "shop.lead".into(),
+            used_ms: 200,
+            place: None,
+        };
+        mark_in(&file, rex.clone(), |_| true);
+        mark_in(&file, ghostty.clone(), |_| true);
+        assert_eq!(latest_in(&file, |_| true), Some((ghostty.clone(), true)));
+        // Rex's typed in again: it is the one.
+        let again = Window {
+            used_ms: 300,
+            ..rex.clone()
+        };
+        mark_in(&file, again.clone(), |_| true);
+        assert_eq!(latest_in(&file, |_| true), Some((again.clone(), true)));
+        // Rex's closed: Ghostty's is the newest still open.
+        assert_eq!(latest_in(&file, |pid| pid != 1), Some((ghostty, true)));
+        // Every window closed: the last used still names its place.
+        assert_eq!(latest_in(&file, |_| false), Some((again.clone(), false)));
+        // A new window drops every closed one but the newest.
+        let third = Window {
+            pid: 3,
+            bot: "shop.lead".into(),
+            used_ms: 400,
+            place: None,
+        };
+        mark_in(&file, third.clone(), |pid| pid == 3);
+        assert_eq!(windows(&file), [third, again]);
+        let _ = std::fs::remove_file(&file);
+    }
+
+    /// Ghostty's Sonny talks to the lead and Rex's to another lead of the
+    /// project at once: each agent acts in the terminal it is spoken to
+    /// in, its tasks in their maker's, and an agent no window shows in the
+    /// project's window used last.
+    #[test]
+    fn each_agent_acts_in_the_terminal_it_is_spoken_to_in() {
+        let file = std::env::temp_dir().join(format!("sonny-each-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&file);
+        let home = Place::Rex {
+            session: "s1".into(),
+            host: None,
+        };
+        let rex = Window {
+            pid: 1,
+            bot: "shop.lead.web".into(),
+            used_ms: 100,
+            place: Some(home.clone()),
+        };
+        let ghostty = Window {
+            pid: 2,
+            bot: "shop.lead".into(),
+            used_ms: 200,
+            place: None,
+        };
+        mark_in(&file, rex.clone(), |_| true);
+        mark_in(&file, ghostty.clone(), |_| true);
+        let chain = |bots: &[&str]| bots.iter().map(|bot| bot.to_string()).collect::<Vec<_>>();
+        let open = |pid| pid == 1 || pid == 2;
+        assert_eq!(
+            latest_for_in(&file, &chain(&["shop.lead"]), open),
+            Some((ghostty.clone(), true))
+        );
+        assert_eq!(
+            latest_for_in(&file, &chain(&["shop.lead.web"]), open),
+            Some((rex.clone(), true))
+        );
+        // A task of the Rex lead's, shown nowhere, acts in its maker's.
+        let task = chain(&["shop.fix", "shop.lead.web"]);
+        assert_eq!(latest_for_in(&file, &task, open), Some((rex.clone(), true)));
+        // An agent no window shows, made by none that is: the project's
+        // window used last.
+        assert_eq!(
+            latest_for_in(&file, &chain(&["shop.cron"]), open),
+            Some((ghostty, true))
+        );
+        // The Rex lead's window opens its tasks' tabs though Ghostty's was
+        // used since; the Ghostty lead's work opens none in Rex.
+        assert!(mine_in(&file, 1, "shop.lead.web", &home, open));
+        let other = Place::Herdr {
+            workspace: "w2".into(),
+        };
+        assert!(!mine_in(&file, 3, "shop.lead", &other, open));
+        // The Rex lead's window closed: its tasks go by the project's.
+        assert_eq!(
+            latest_for_in(&file, &task, |pid| pid == 2).map(|(w, _)| w.pid),
+            Some(2)
+        );
+        let _ = std::fs::remove_file(&file);
+    }
+
+    /// A task's window, opened in the lead's home, takes that home as its
+    /// own when it starts and keeps it: used, it leaves the lead's new
+    /// tasks opening there, and never moves to a home typed in since.
+    #[test]
+    fn an_agents_window_keeps_the_home_it_opened_in() {
+        let file = std::env::temp_dir().join(format!("sonny-agent-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&file);
+        let me = std::process::id();
+        let gone = {
+            let mut child = Command::new("true").spawn().unwrap();
+            let pid = child.id();
+            child.wait().unwrap();
+            pid
+        };
+        let home = Place::Rex {
+            session: "s1".into(),
+            host: None,
+        };
+        let other = Place::Herdr {
+            workspace: "w2".into(),
+        };
+        // The lead's window in Rex, open; this test's process stands in
+        // for the task's window.
+        let lead = Window {
+            pid: gone,
+            bot: "shop.lead".into(),
+            used_ms: now_ms() - 10,
+            place: Some(home.clone()),
+        };
+        mark_in(&file, lead, |_| true);
+        let mut task = Marker {
+            file: file.clone(),
+            bot: "shop.fix".into(),
+            place: None,
+            follows: true,
+            last: None,
+        };
+        // Read while the lead's window counts as open.
+        let opened_in = windows(&file)[0].place.clone();
+        task.place = opened_in;
+        task.follows = false;
+        task.used();
+        assert_eq!(windows(&file)[0].place, Some(home.clone()));
+        // The task's window used last, in the lead's home: the lead still
+        // opens its tasks there; a lead elsewhere does not.
+        assert!(mine_in(&file, gone, "shop.fix", &home, |pid| pid == me));
+        assert!(!mine_in(&file, 2, "shop.fix", &other, |pid| pid == me));
+        // A window in another home used since: the task keeps its own.
+        mark_in(
+            &file,
+            Window {
+                pid: 1,
+                bot: "shop.lead".into(),
+                used_ms: now_ms() + 1000,
+                place: Some(other.clone()),
+            },
+            |_| true,
+        );
+        task.last = None;
+        task.used();
+        let own = windows(&file).into_iter().find(|window| window.pid == me);
+        assert_eq!(own.and_then(|window| window.place), Some(home));
+        let _ = std::fs::remove_file(&file);
+    }
+
+    /// `/switch` to another project keeps the process: the window it was
+    /// is closed for its old project, its place kept.
+    #[test]
+    fn a_window_switched_away_counts_as_closed() {
+        let file = std::env::temp_dir().join(format!("sonny-retire-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&file);
+        let me = std::process::id();
+        let bare = Window {
+            pid: me,
+            bot: "shop.lead".into(),
+            used_ms: 5,
+            place: None,
+        };
+        mark_in(&file, bare, |_| true);
+        assert_eq!(latest_in(&file, alive).map(|(_, open)| open), Some(true));
+        retire_in(&file, me);
+        let (window, open) = latest_in(&file, alive).unwrap();
+        assert_eq!((window.pid, window.place, open), (0, None, false));
+        let _ = std::fs::remove_file(&file);
+    }
+
+    /// `/switch` from a lead's window to one of its tasks: the task's
+    /// window is in the same terminal, so it takes the lead's place even
+    /// with no open window left to read it from, and hands it on in turn.
+    #[test]
+    fn a_window_switched_to_takes_the_place_it_replaced() {
+        let file = std::env::temp_dir().join(format!("sonny-given-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&file);
+        let home = Place::Cmux {
+            workspace: "9A".into(),
+        };
+        let mut task = Marker {
+            file: file.clone(),
+            bot: "shop.fix".into(),
+            follows: false,
+            place: Some(home.clone()),
+            last: None,
+        };
+        assert_eq!(task.known(), Some(Some(home.clone())));
+        task.used_now();
+        assert_eq!(windows(&file)[0].place, Some(home));
+        // One still to learn its home hands nothing on.
+        task.follows = true;
+        assert_eq!(task.known(), None);
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[test]
+    fn a_process_that_runs_is_alive_and_one_gone_is_not() {
+        assert!(alive(std::process::id()));
+        let mut child = Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        assert!(!alive(pid));
     }
 
     fn labels(layout: &mut Layout) -> Vec<(String, Vec<String>)> {

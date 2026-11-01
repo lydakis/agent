@@ -289,7 +289,12 @@ fn subscriptions() -> Value {
                         "sources": {"type": "array", "items": {"type": "string", "minLength": 1},
                             "description": "Sources it hears, by name: every event each says, unless filtered; or NAME:TOPIC, one topic of it."},
                         "filter": {"type": "object",
-                            "description": "Only the sources' events this matches are heard: an event pattern as \
+                            "description": "Only the events this matches are heard, its sources' and its bots' \
+                                alike. A bot's events have type (message.written, turn.ended, approval.waiting, \
+                                ask.posted, turn.silent, note.changed), bot, maker, by (you, person, an agent's \
+                                name, trigger), turn, status (completed, failed, stopped, interrupted), resolved, \
+                                goal, theirs (the person asked for the turn themselves), text (the person's \
+                                words), question, options and id (a margin note's). An event pattern as \
                                 AWS EventBridge writes one. Each field the event must have maps to a list of values, \
                                 any of which will do, or to a pattern for a field that is an object; every field \
                                 must match, and a field that is a list matches when any item does. A value is a \
@@ -297,7 +302,16 @@ fn subscriptions() -> Value {
                                 {\"wildcard\": S} (* any run of characters), {\"equals-ignore-case\": S}, \
                                 {\"anything-but\": V or [V, ...]}, {\"numeric\": [\">\", 0, \"<=\", 5]} or \
                                 {\"exists\": true or false}; \"$or\": [pattern, ...] takes any of several. \
-                                As {\"paths\": [{\"prefix\": \"src/billing/\"}], \"author\": [{\"anything-but\": \"me\"}]}."}
+                                As {\"paths\": [{\"prefix\": \"src/billing/\"}], \"author\": [{\"anything-but\": \"me\"}]}."},
+                        "digest": {"type": "string", "pattern": "^(0|[0-9]+[smh])$",
+                            "description": "Tell what it hears at most once this long, as 15m or 1h, in place of \
+                                its sources' own digest: the first after a quiet spell at once, the rest in one \
+                                note. The person's words, a question to them and an approval only they can give \
+                                never wait for it."},
+                        "urgent": {"type": "object",
+                            "description": "What it hears that this matches, a pattern as filter's, cuts into \
+                                your running turn and waits for no digest, as the person's words do. As \
+                                {\"type\": [\"turn.ended\"], \"status\": [\"failed\"]}."}
                     },
                     "required": ["name"],
                     "additionalProperties": false
@@ -519,7 +533,9 @@ fn run() -> Value {
             person wants to watch. It runs in your folder, or cwd, in the person's shell, which stays open after \
             the command exits so its output can be read. Running the same name again replaces its pane. A tab \
             is the default; a split puts it beside you, for something the person should see now, and float \
-            over your window, where the terminal can float it, for a moment (a sign-in, a quick look). The \
+            over your window, where the terminal can float it, for a quick look. A command that needs the \
+            person's own keyboard (a sign-in, a password or passphrase prompt, ssh -t) sits unnoticed in a \
+            pane: ask them with ask and its command instead, so the step shows as theirs to take. The \
             result holds the pane's ID as block.",
         "parameters": {
             "type": "object",

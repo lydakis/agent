@@ -78,6 +78,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
         sound: false,
         side: None,
         embedded: false,
+        window_place: None,
         lead: project::Pick::Last,
     };
     let agent = Arc::new(Agent {

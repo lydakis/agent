@@ -6760,6 +6760,40 @@ branch (the batch held whole, forbidden commands refused before the
 gate, the gate's waiters in order) change only which branch a call
 takes, not what runs on the hot path.
 
+### The load gate on a busy machine
+
+The screen above runs with no gate, so it says only that the check is
+cheap. `bench/load_gate.py` turns the gate on. Sixteen workers on a
+4-CPU box each run 15 turns back to back, and each turn runs one shell
+command of fixed CPU work (`sum(range(2e7))`, about half a CPU second).
+Every half second, three probes, each on its own connection, measure:
+
+- a turn with no command (submit to end);
+- a turn whose command is `true`, which the gate holds like any other;
+- a `bots` request.
+
+Each run starts once the 1-minute load is under 1. All runs use the same
+build. Work commands get the shell's longest timeout and each records that
+it finished; a run counts only if all 240 did, and in every run all did.
+
+| Measure | No gate | `--max-load 4` (CPUs) | `--max-load 8` (CPUs × 2, the CLI's default) |
+| --- | ---: | ---: | ---: |
+| Work's wall time, s | 39.2 | 68.7 | 35.8 |
+| Work commands running, mean | 15.2 | 6.2 | 15.2 |
+| 1-minute load, max | 7.85 | 4.77 | 7.7 |
+| `true` command, p50 / p95 ms | 89 / 140 | 80 / 9,956 | 77 / 126 |
+| Turn with no command, p50 / p95 ms | 38 / 71 | 14 / 56 | 36 / 67 |
+| `bots` request, p50 / p95 ms | 4.7 / 15.9 | 1.3 / 12.3 | 4.4 / 15.7 |
+| Daemon CPU, s | 3.74 | 4.26 | 3.42 |
+
+Results:
+
+- **The gate costs the daemon almost nothing.** Its own thread spends no CPU. The storage writer spends 2.2 to 2.8 s, the runtime about 1 s and the readers 0.2 to 0.3 s; the gated run, which lasts 1.75× as long, spends about 0.5 s more, mostly in the writer.
+- **At the CPU count, the gate holds the machine's load where it was set.** Turns that run no command get faster (p50 38 → 14 ms), and so do control requests (p50 4.7 → 1.3 ms). The cost is that the same work takes 1.75× as long. The 1-minute average trails what runs now, so the gate stays shut a while after the machine has room, as make's `-l` does. Short commands wait behind it (p95 10 s).
+- **At the default of twice the CPUs, the gate never shut** in this burst of under 40 seconds, because the 1-minute load peaked at 7.7. It acts only on overload that lasts.
+
+An earlier version of the screen polled `wait` every 20 ms per worker. That polling cost the daemon more than the gate did, and the cost grew with the longer gated runs. The screen now waits on each worker's own connection.
+
 ## An attached message waits only so long (#609)
 
 Submission gains a `wait_ms` field kept on the turn's row, and an attach
@@ -6792,3 +6826,72 @@ spread from run to run (#575 saw the same per-bot swing with no change to
 what is kept per bot); the screen's benches send no attach, so none of
 the new path runs in them beyond the submit field's parse. Sonny's rows
 moved within their noise too.
+
+## The lookout's notes at 1,000 tasks (#576)
+
+The lookout read every finished turn's reply on its one connection. The
+daemon answers one read at a time from each session, so at 1,000 tasks
+those reads queued: the stream heard each turn end within about 20 ms, but
+its reply was read 8 to 10 s later, and the note waited on it. The lookout
+now reads on a pool of connections (one per logical CPU, as many readers as
+the daemon keeps by default). A completed turn's reply is its checkpoint,
+so it is read in one request instead of two. A note waits only for reads
+that started before its news settled, and holds as many tasks as its bytes
+allow, where it took 32 before.
+
+The screen is repaired too. Shapes are leads × tasks per lead (`10x100` is
+ten leads of a hundred tasks), and the load is a fixed number of rounds
+(every task one turn each), so both builds face the same turns. A turn
+counts as told by the first note at or after its end that names its task
+at that turn or later, read from the lookout's own log. A note reaches
+its lead when its own turn starts or, for a note a busy lead took into its
+running turn (a steer, or an attach its next message carried), when that
+turn absorbed it; the screen reports how many notes went each way and how
+many never reached their lead. The gate now fails a head that leaves turns
+untold where its base told them all.
+
+One 4-CPU box, base `main` against this branch, four rounds of 1,000
+turns each:
+
+| Shape | Build | Note p95, s | Untold | Notes | Rounds took, s | Daemon CPU, s |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| 10 × 100 | base | 18.2 | 160 | 30 | 10.1 | 17.0 |
+| 10 × 100 | head | 3.5 | 0 | 40 | 16.2 | 25.9 |
+| 100 × 10 | base | 14.6 | 0 | 118 | 12.2 | |
+| 100 × 10 | head | 3.7 | 0 | 400 | 17.8 | |
+
+What it costs: reading concurrently takes more of the daemon. In a second pair of runs split by thread, the readers took 6.9 s on base and 13.4 s on head, and the storage writer took 9.6 s and 12.8 s. That stretched the tasks' own rounds by about 45% on this CPU-bound box, where the synthetic model streams from the same four CPUs; real tasks mostly wait on their model. A build of the head with one connection (cap and settle changes kept) sat between the two: p95 13.4 s and 20.9 s of daemon CPU. The pool is what brings the notes in on time.
+
+A rerun on today's `main` with the delivery count (same shapes, four rounds) told all 4,000 turns in each shape, with note p95 2.9 s at 10 × 100 and 4.2 s at 100 × 10. Every note reached its lead, all of them as a turn of their own: the screen's leads are idle between notes, so none was absorbed.
+
+## Cached statements planned once again (SQLite 3.54)
+
+#544 moved the bundled SQLite from 3.53.2 to 3.54.1. In 3.54, a join that
+binds an `x = ?` value is marked to be planned again whenever that value
+changes. rusqlite clears a statement's bindings each time it goes back to
+the cache, and SQLite now takes that clearing as a change. So every reuse
+of such a statement parsed and planned it again. `history_items` read
+each item that way: 384 of 384 calls planned again, at about half a
+millisecond each for its picture-stripping query. Both store connections
+now turn on SQLite's query planner stability guarantee (QPSG), so a plan
+no longer depends on bound values. The store never runs ANALYZE, so no
+statistics could make a plan better for one value than another.
+
+One plan did read a value: a GLOB pattern's literal prefix (`lead-*`)
+bounded the name index, in `list`, history search and `usage`. Those
+queries now write the bound out, `name >= prefix AND name < prefix ||
+x'ff'`, so the plan keeps the range whatever the planner reads. On
+100,010 names, a `m-*` page of five took 200,046 VM steps under the
+guarantee without the bound, and 65 with it, against 47 before.
+
+`bench.lifecycle` at concurrency 32 (three turns, 384 `history_items`
+calls), timing each request from the client. Three runs each, alternated
+on one 4-CPU box:
+
+| Build | `history_items` total, ms | Resume, replay, item, fork, ms |
+| --- | ---: | ---: |
+| SQLite 3.53.2 (before #544) | 313–352 | 518–592 |
+| SQLite 3.54.1, `main` | 655–880 | 870–1,133 |
+| SQLite 3.54.1, QPSG | 275–378 | 466–649 |
+
+No other request moved.

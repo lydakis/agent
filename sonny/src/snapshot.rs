@@ -62,7 +62,7 @@ pub struct Snapshot {
 /// The git Sonny runs: the first on `PATH` in a folder named from the
 /// root, found once. A folder named relative to where git runs, `.` say,
 /// would be inside the checkout, where a task may put a git of its own.
-fn git_program() -> &'static Path {
+pub(crate) fn git_program() -> &'static Path {
     static FOUND: std::sync::LazyLock<PathBuf> = std::sync::LazyLock::new(|| {
         // None found runs nothing: an absolute path that is not there.
         find_git(&std::env::var_os("PATH").unwrap_or_default())
@@ -711,6 +711,14 @@ pub fn restore(
 /// Take away the worktree at `path` of the repository `here` is in, and
 /// its branch, as git's run here does: so no hook or program of the
 /// folder's config runs, as it would where a task wrote it.
+/// git in `dir` as Sonny runs it where it reads a checkout's files: no
+/// hook and no fsmonitor of the repository's runs. For what reads no
+/// files git would filter, such as removing a worktree with `--force`,
+/// which checks none, or deleting a branch.
+pub(crate) fn plain(dir: &Path, args: &[&str]) -> Result<String, String> {
+    git(dir, args, None, None)
+}
+
 pub(crate) fn unwind(here: &Path, path: &Path, branch: &str) {
     let path = path.to_string_lossy();
     let _ = git(
