@@ -633,6 +633,9 @@ impl Pane {
         }
         let path = path.clone();
         let height = rows.height as usize;
+        // Not drawn yet, the view asked for (the file's top, at opening)
+        // is where the new rows open; drawn, they open as far through.
+        let going_to = self.screen.going_to();
         let before = self.screen.height(*laid).saturating_sub(height).max(1);
         let through = 1.0 - self.screen.back().min(before) as f64 / before as f64;
         let mut screen = Screen::default();
@@ -641,8 +644,13 @@ impl Pane {
             self.laid = None;
             return;
         }
-        let after = screen.height(width).saturating_sub(height);
-        screen.hold(((1.0 - through) * after as f64).round() as usize);
+        match going_to {
+            Some((row, above)) => screen.show_row(row, above),
+            None => {
+                let after = screen.height(width).saturating_sub(height);
+                screen.hold(((1.0 - through) * after as f64).round() as usize);
+            }
+        }
         self.screen = screen;
         self.laid = Some((path, width));
     }
@@ -1181,6 +1189,28 @@ mod tests {
             }
             assert!(shown.iter().any(|row| row.trim_start().starts_with('┌')));
         }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_tall_markdown_file_opens_at_its_top_whatever_width_it_is_drawn_at() {
+        let dir = std::env::temp_dir().join(format!("sonny-tall-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a.md");
+        let body: String = (0..60).map(|i| format!("Line {i}.\n\n")).collect();
+        std::fs::write(&file, format!("# Top\n\n{body}")).unwrap();
+        let url = format!("file://{}", file.display());
+        let mut pane = Pane::preview(&url, &dir, 60).unwrap();
+        let shown = rows(&mut pane, 40, 10);
+        assert!(shown.iter().any(|row| row.contains("# Top")), "{shown:?}");
+        // Scrolled to the end, a narrower width keeps it at the end.
+        pane.screen.latest();
+        rows(&mut pane, 40, 10);
+        let shown = rows(&mut pane, 30, 10);
+        assert!(
+            shown.iter().any(|row| row.contains("Line 59.")),
+            "{shown:?}"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
