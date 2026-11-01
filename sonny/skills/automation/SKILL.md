@@ -1,6 +1,6 @@
 ---
 name: automation
-description: Set up or run a recurring job (a daily brief, a digest, a monitor that watches a channel, inbox or queue for a lead) so each run reads only what is new, says what it could not read, and never double-posts
+description: Set up or run a recurring job (a daily brief, a digest, a monitor that watches a channel, inbox or queue for a lead) so each run reads only what is new, says what it could not read, and never double-posts. Use when asked for one, and on each of its runs
 ---
 
 # Recurring jobs

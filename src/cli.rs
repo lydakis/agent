@@ -381,7 +381,7 @@ fn print_flags(flags: &str) {
             ),
             "--stall-timeout" => (
                 "DURATION",
-                "Retry a provider stream with no content this long; default 2m",
+                "Retry a provider stream with no content this long; default 10m",
             ),
             "--keep-warm" => (
                 "DURATION",

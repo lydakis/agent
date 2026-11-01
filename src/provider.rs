@@ -67,8 +67,18 @@ pub(crate) fn encoded_len(text: &str) -> usize {
 pub const STREAMS_PER_CONNECTION: usize = 64;
 
 /// Default bound on time between content frames of an established stream.
-/// Keepalives do not count: a provider that only pings is stalled.
-pub const STALL_TIMEOUT: Duration = Duration::from_secs(120);
+/// Keepalives do not count: a provider that only pings is stalled once this
+/// passes. A stream that sends no bytes at all, pings included, fails sooner,
+/// on the transport's read bound (`IDLE_READ`). Ten minutes is about where
+/// Claude Code ends a stream of pings alone (its 5-minute event watchdog plus
+/// up to 7.5 more on pings); Anthropic and Bedrock document no gap bound and
+/// say thinking streams can pause, and Claude at high effort on long context
+/// was seen silent for most of a 9-minute call.
+pub const STALL_TIMEOUT: Duration = Duration::from_secs(600);
+/// How long an established connection may send nothing at all, keepalives
+/// included, before the read fails: a dead connection is found well inside
+/// the stall bound, since both Anthropic and Bedrock ping every few seconds.
+const IDLE_READ: Duration = Duration::from_secs(120);
 
 /// The ChatGPT Codex endpoint's sticky-routing header; see `Request::route`.
 const TURN_STATE: &str = "x-codex-turn-state";
@@ -174,7 +184,9 @@ impl Transport {
                     .no_proxy()
                     .redirect(reqwest::redirect::Policy::none())
                     .connect_timeout(Duration::from_secs(10))
-                    .read_timeout(Duration::from_secs(120))
+                    // reqwest's own TCP keepalive (15 s) stays on, as
+                    // Anthropic advises for networks that drop idle ones.
+                    .read_timeout(IDLE_READ)
                     .pool_idle_timeout(Duration::from_secs(60))
                     .pool_max_idle_per_host(1024)
                     .build()

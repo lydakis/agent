@@ -511,32 +511,55 @@ fn apply_env_file(command: &mut std::process::Command) -> Result<(), String> {
 /// keeps the judge it was given first, so leads on other models do not
 /// start it again.
 async fn serve_auto(client: &Client, model: &str) -> Result<(), String> {
-    let bin = std::env::current_exe().map_err(|e| e.to_string())?;
-    let args = daemon_args("approver");
-    let kept = client
-        .request("companions", json!({}))
-        .await
-        .map_err(|e| e.to_string())?;
-    if (kept["companions"].as_array().into_iter().flatten())
-        .any(|c| c["name"] == APPROVER && c["command"] == json!(bin) && c["args"] == json!(args))
-    {
-        return Ok(());
-    }
-    keep(client, APPROVER, &bin, args, json!({"AGENT_MODEL": model})).await
+    keep_approver(client, Some(model)).await
 }
 
 /// Sonny's companions in the daemon, so they run for as long as it does,
 /// whether or not a window is open, and come back with the next daemon:
 /// the lookout, `sonny lookout`, which tells leads what happens in their
 /// tasks, and the tool host, `sonny tool-host`, which answers the tools
-/// Sonny gives its agents. This Sonny's own build replaces another's: the
-/// build is part of what the daemon keeps, so a Sonny upgraded in place
-/// has the daemon start the new ones.
+/// Sonny gives its agents; and the approver, when one is kept already.
+/// This Sonny's own build replaces another's: the build is part of what
+/// the daemon keeps, so a Sonny upgraded in place has the daemon start the
+/// new ones, the approver too, with no window in `auto` needed.
 async fn start_companions(client: &Client) -> Result<(), String> {
     let me = std::env::current_exe().map_err(|e| e.to_string())?;
     let build = json!({"SONNY_BUILD": lookout::identity()});
     keep(client, LOOKOUT, &me, daemon_args("lookout"), build.clone()).await?;
-    keep(client, TOOL_HOST, &me, daemon_args(tool_host::NAME), build).await
+    keep(client, TOOL_HOST, &me, daemon_args(tool_host::NAME), build).await?;
+    keep_approver(client, None).await
+}
+
+/// Keep the approver running this Sonny's binary and build: the one kept
+/// already with the judge it has, else, given a `model`, a new one judged
+/// by it. Without one kept or a model, nothing.
+async fn keep_approver(client: &Client, model: Option<&str>) -> Result<(), String> {
+    let me = std::env::current_exe().map_err(|e| e.to_string())?;
+    let listed = client
+        .request("companions", json!({}))
+        .await
+        .map_err(|e| e.to_string())?;
+    let kept =
+        (listed["companions"].as_array().into_iter().flatten()).find(|c| c["name"] == APPROVER);
+    let Some(env) = approver_env(kept, model, &lookout::identity()) else {
+        return Ok(());
+    };
+    keep(client, APPROVER, &me, daemon_args("approver"), env).await
+}
+
+/// What the approver runs with: the judge the one `kept` has, else
+/// `model`, and this Sonny's `build`. `None` when there is neither one kept
+/// nor a model to start one with.
+fn approver_env(kept: Option<&Value>, model: Option<&str>, build: &str) -> Option<Value> {
+    let judge = match kept {
+        Some(kept) => kept["env"]["AGENT_MODEL"].as_str(),
+        None => Some(model?),
+    };
+    let mut env = json!({"SONNY_BUILD": build});
+    if let Some(judge) = judge {
+        env["AGENT_MODEL"] = json!(judge);
+    }
+    Some(env)
 }
 
 /// How long a word waits on the daemon to say whether it names an agent.
@@ -2049,6 +2072,8 @@ struct Watch {
     read: Instant,
     /// The lookout's line for the lead.
     lookout: String,
+    /// What is wrong around the agents, under the lookout's line.
+    alerts: Vec<status::Alert>,
     /// The resolved tasks are listed, not only counted.
     resolved: bool,
     /// `/background` holds the screen instead of the card.
@@ -2173,6 +2198,9 @@ struct App {
     /// message of their own after them: out of the composer and the
     /// count, their options still answering them.
     aside: Vec<asks::Ask>,
+    /// The line each ask for a step of the person's gave them to run, by
+    /// its call: a click on its card copies it.
+    commands: HashMap<String, String>,
     /// Questions this window answered and closed, until their answers
     /// land, so landing does not close another asked the same.
     sent_answers: Vec<String>,
@@ -3412,6 +3440,7 @@ impl App {
             asks: Vec::new(),
             focus: None,
             aside: Vec::new(),
+            commands: HashMap::new(),
             sent_answers: Vec::new(),
             bot_id: record["bot_id"].as_i64(),
             reactions_key: record["bot_id"].as_i64().map(|id| {
@@ -4564,6 +4593,15 @@ impl App {
                     let button = format!("{}answer/{at}/{id}", screen::BUTTON);
                     (from + row, screen::Mark::Link(button))
                 }));
+            // The line to run, a click on it copies.
+            if let Some(command) = &ask.command {
+                let button = format!("{}copy/{id}", screen::BUTTON);
+                self.marks.extend(
+                    (card.command.clone())
+                        .map(|row| (from + row, screen::Mark::Link(button.clone()))),
+                );
+                self.commands.insert(id.to_owned(), command.clone());
+            }
             // Drawn narrower later, as when the margin opens, its bar
             // goes on down every row.
             self.marks.extend(
@@ -5102,6 +5140,10 @@ impl App {
             if let Some(at) = self.cluster_of(node) {
                 self.draw_cluster(at);
             }
+        }
+        if let Some(command) = (button.strip_prefix("copy/")).and_then(|id| self.commands.get(id)) {
+            term::copy(command);
+            self.notice = Some("copied".into());
         }
         if let Some((at, id)) = button
             .strip_prefix("answer/")
@@ -7345,11 +7387,13 @@ impl App {
                 return;
             }
         };
+        let alerts = self.status_alerts().await;
         self.watch = Some(Watch {
             project,
             rows,
             read: Instant::now(),
             lookout: self.lookout_line(),
+            alerts,
             resolved: false,
             background: None,
             usage: None,
@@ -7390,6 +7434,7 @@ impl App {
             rows: Vec::new(),
             read: Instant::now(),
             lookout: String::new(),
+            alerts: Vec::new(),
             resolved: false,
             background: Some(view),
             usage: None,
@@ -7413,6 +7458,7 @@ impl App {
             rows: Vec::new(),
             read: Instant::now(),
             lookout: String::new(),
+            alerts: Vec::new(),
             resolved: false,
             background: None,
             usage: Some(view),
@@ -7436,6 +7482,7 @@ impl App {
             rows: Vec::new(),
             read: Instant::now(),
             lookout: String::new(),
+            alerts: Vec::new(),
             resolved: false,
             background: None,
             usage: None,
@@ -7455,6 +7502,7 @@ impl App {
             rows: Vec::new(),
             read: Instant::now(),
             lookout: String::new(),
+            alerts: Vec::new(),
             resolved: false,
             background: None,
             usage: None,
@@ -7507,13 +7555,40 @@ impl App {
             return;
         }
         let lookout = self.lookout_line();
+        let alerts = self.status_alerts().await;
         if let Ok((_, rows)) = self.status_rows().await
             && let Some(watch) = &mut self.watch
         {
             watch.rows = rows;
             watch.read = Instant::now();
             watch.lookout = lookout;
+            watch.alerts = alerts;
         }
+    }
+
+    /// What `/status` says is wrong around the agents: the daemon's
+    /// companions that keep restarting, and the skills the lead is offered
+    /// whose front matter needs a fix.
+    async fn status_alerts(&self) -> Vec<status::Alert> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let mut alerts = Vec::new();
+        if let Ok(listed) = self.client.request("companions", json!({})).await {
+            let logs = tilde(&format!("{}.companions", self.store().display()));
+            alerts.extend(status::companion_alerts(&listed["companions"], now, &logs));
+        }
+        let folder = (self
+            .client
+            .request("inspect", json!({"bot": self.bot}))
+            .await
+            .ok())
+        .and_then(|bot| bot["workspace"].as_str().map(PathBuf::from));
+        if let Some(skills) = folder.and_then(|f| agent_client::policy::skills(&f).ok()) {
+            alerts.extend(status::skill_alerts(&skills));
+        }
+        alerts
     }
 
     /// Count what runs for this agent in the background again, every ten
@@ -12203,13 +12278,19 @@ fn watch_card(
         .collect();
     let any_resolved = rows.iter().any(|row| row.group == status::Group::Resolved);
     let (mut card, named) = status::card(&watch.project, &rows, width, watch.resolved);
-    // The lookout's line goes under the heading, the agents' under it.
-    let lookout = !watch.lookout.is_empty();
-    if lookout {
-        card.insert(1, Line::from(watch.lookout.clone()).dim());
+    // The lookout's line goes under the heading, what is wrong under it,
+    // and the agents' under that.
+    let mut above: Vec<Line<'static>> = Vec::new();
+    if !watch.lookout.is_empty() {
+        above.push(Line::from(watch.lookout.clone()).dim());
     }
+    for alert in &watch.alerts {
+        above.extend(status::alert_lines(alert, width.saturating_sub(1)));
+    }
+    let added = above.len();
+    card.splice(1..1, above);
     let marks = (named.into_iter())
-        .map(|(at, bot)| (at + usize::from(lookout && at >= 1), bot))
+        .map(|(at, bot)| (at + if at >= 1 { added } else { 0 }, bot))
         .filter(|(_, bot)| bot != me)
         .map(|(at, bot)| {
             (
@@ -16674,6 +16755,55 @@ mod tests {
         assert_eq!(rows[2], "  ✗ bad    failed    Fix bad");
     }
 
+    #[test]
+    fn the_approver_is_kept_again_with_its_own_judge_and_this_build() {
+        let kept = json!({"name": APPROVER, "command": "/old/Cellar/sonny/0.7.0/bin/sonny",
+            "env": {"AGENT_MODEL": "openai/gpt-6", "SONNY_BUILD": "0.7.0 1"}});
+        // A connect with one kept: this binary's build, its judge kept.
+        assert_eq!(
+            approver_env(Some(&kept), None, "0.8.0 2"),
+            Some(json!({"AGENT_MODEL": "openai/gpt-6", "SONNY_BUILD": "0.8.0 2"}))
+        );
+        // A lead on another model in auto keeps the first judge too.
+        assert_eq!(
+            approver_env(Some(&kept), Some("anthropic/claude-opus-5-5"), "0.8.0 2"),
+            approver_env(Some(&kept), None, "0.8.0 2")
+        );
+        // None kept: a lead in auto starts one judged by its model; a
+        // connect alone starts none.
+        assert_eq!(
+            approver_env(None, Some("anthropic/claude-opus-5-5"), "0.8.0 2"),
+            Some(json!({"AGENT_MODEL": "anthropic/claude-opus-5-5", "SONNY_BUILD": "0.8.0 2"}))
+        );
+        assert_eq!(approver_env(None, None, "0.8.0 2"), None);
+    }
+
+    #[tokio::test]
+    async fn every_start_keeps_the_approver_again_on_this_binary_with_its_judge() {
+        let added = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = added.clone();
+        let client = daemon_answering(move |asked| {
+            if let Some(add) = asked["add"].as_object() {
+                seen.lock().unwrap().push(Value::Object(add.clone()));
+                return json!({});
+            }
+            json!({"companions": [{"name": APPROVER, "command": "/gone/sonny",
+                "args": ["approver"], "env": {"AGENT_MODEL": "openai/gpt-6"}}]})
+        })
+        .await;
+        start_companions(&client).await.unwrap();
+        let added = added.lock().unwrap().clone();
+        let names: Vec<&str> = added.iter().filter_map(|a| a["name"].as_str()).collect();
+        assert_eq!(names, [LOOKOUT, TOOL_HOST, APPROVER]);
+        let me = std::env::current_exe().unwrap();
+        assert_eq!(added[2]["command"], json!(me));
+        assert_eq!(added[2]["args"], json!(["approver"]));
+        assert_eq!(
+            added[2]["env"],
+            json!({"AGENT_MODEL": "openai/gpt-6", "SONNY_BUILD": lookout::identity()})
+        );
+    }
+
     #[tokio::test]
     async fn a_task_that_ended_on_a_question_needs_you() {
         let scans = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -16892,6 +17022,7 @@ mod tests {
             ],
             read: Instant::now(),
             lookout: "Lookout · on".into(),
+            alerts: Vec::new(),
             resolved: false,
             background: None,
             usage: None,
@@ -17188,6 +17319,7 @@ mod tests {
             rows: vec![row("add"), row("neg")],
             read: Instant::now(),
             lookout: String::new(),
+            alerts: Vec::new(),
             resolved: false,
             background: None,
             usage: None,

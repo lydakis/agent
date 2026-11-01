@@ -134,6 +134,8 @@ struct Asked {
     /// The options by their labels, and the one recommended, from 0.
     options: Vec<String>,
     recommended: Option<usize>,
+    /// For a step only the person can take: the line it gave them to run.
+    command: Option<String>,
     /// The subscription whose `urgent` matched it.
     urgent: Option<String>,
     hold: super::activity::Hold,
@@ -718,7 +720,7 @@ impl Updates {
                     let options: Vec<String> = asked.options.into_iter().map(|c| c.label).collect();
                     let gated = self.gate(name, true, || {
                         json!({"type": "ask.posted", "turn": turn, "question": asked.question,
-                            "options": options})
+                            "options": options, "command": asked.command})
                     });
                     if let Some((hold, urgent)) = gated {
                         self.news_of(name).merge(News {
@@ -728,6 +730,7 @@ impl Updates {
                                 question: asked.question,
                                 options,
                                 recommended: asked.recommended,
+                                command: asked.command,
                                 urgent,
                                 hold,
                             }],
@@ -1839,11 +1842,14 @@ fn ask_line(name: &str, asked: &Asked) -> Line {
         question,
         options,
         recommended,
+        command,
         ..
     } = asked;
-    let mut text = format!(
-        "- {name}: turn:{name}/{turn}, put a question to the person, which they answer in {name}:"
-    );
+    let what = match command {
+        Some(_) => "a step only they can take, which they run and answer",
+        None => "a question to the person, which they answer",
+    };
+    let mut text = format!("- {name}: turn:{name}/{turn}, put {what} in {name}:");
     let numbered: Vec<String> = (options.iter().enumerate())
         .map(|(at, label)| match *recommended == Some(at) {
             true => format!("{} {label} (recommended)", at + 1),
@@ -1851,7 +1857,10 @@ fn ask_line(name: &str, asked: &Asked) -> Line {
         })
         .collect();
     quote(&mut text, question);
-    quote(&mut text, &numbered.join(" · "));
+    match command {
+        Some(command) => quote(&mut text, command),
+        None => quote(&mut text, &numbered.join(" · ")),
+    }
     Line {
         quote: None,
         theirs: false,
