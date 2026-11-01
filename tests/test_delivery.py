@@ -636,6 +636,35 @@ class DeliveryTests(ModelFixture):
         ended = client.request('interrupt', bot='Bob', turn=late['turn'])['result']
         self.assertEqual(ended['status'], 'interrupted')
 
+    def test_an_attached_message_that_waits_its_time_goes_as_a_steer(self):
+        client = self.client('echo,shell')
+        client.request('create', bot='Bob', workspace=str(self.path))
+        refused = client.request('submit', bot='Bob', request_id='x', prompt='fyi', delivery='queue',
+                                 wait_ms=1000)
+        self.assertEqual(refused['error'], 'invalid_delivery')
+        for wait in (0, 365 * 86_400_000 + 1):
+            refused = client.request('submit', bot='Bob', request_id='x', prompt='fyi', delivery='attach',
+                                     wait_ms=wait)
+            self.assertEqual(refused['error'], 'invalid_wait')
+        # Idle: once its wait runs out it starts a turn of its own.
+        note = client.request('submit', bot='Bob', request_id='n1', prompt='fyi: scope changed',
+                              delivery='attach', wait_ms=300)['result']
+        self.assertEqual(note['status'], 'attached')
+        lapsed = client.receive(lambda m: m.get('event') == 'queued' and m.get('turn') == note['turn'])
+        self.assertEqual((lapsed['data']['lapsed'], lapsed['data']['delivery']), (True, 'steer'))
+        self.assertEqual(client.finished(note['turn'])['data']['status'], 'completed')
+        request = self.model.requests.get(timeout=5)
+        texts = [i['content'][0]['text'] for i in request['input'] if i.get('role') == 'user']
+        self.assertEqual(texts[-1], 'fyi: scope changed')
+        # Running: it joins the next round boundary, as a steer does.
+        first = client.request('submit', bot='Bob', request_id='2', prompt='shell:sleep 1')['result']['turn']
+        client.receive(lambda m: m.get('event') == 'tool_started' and m.get('turn') == first)
+        during = client.request('submit', bot='Bob', request_id='n2', prompt='fyi: mid-turn',
+                                delivery='attach', wait_ms=50)['result']
+        self.assertEqual(client.finished(during['turn'])['data']['into'], first)
+        self.assertEqual(client.finished(first)['data']['status'], 'completed')
+        self.assertEqual(client.request('stats')['result']['queued_turns'], 0)
+
     def test_a_steer_that_misses_the_last_boundary_becomes_the_next_turn(self):
         client = self.client()
         client.request('create', bot='Bob', workspace=str(self.path))

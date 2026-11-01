@@ -6759,3 +6759,36 @@ per bot (the gate's state is one per daemon). The later commits on this
 branch (the batch held whole, forbidden commands refused before the
 gate, the gate's waiters in order) change only which branch a call
 takes, not what runs on the hot path.
+
+## An attached message waits only so long (#609)
+
+Submission gains a `wait_ms` field kept on the turn's row, and an attach
+that sends one lowers one daemon-wide deadline (an `Option<Instant>`
+minimum, no store work). The run loop's look at that deadline reads the
+due bots on a reader through the partial `turns_due` index, then one
+writer job delivers at most 64 lapsed messages and reads the next
+deadline; nothing runs per turn, and an attach without `wait_ms` costs
+nothing new. The look arms only the due bots' running turns.
+
+The Perf workflow's matched screen, base `main` against this branch at
+8461a26, three alternating rounds each on a GitHub runner (medians):
+
+| Measure | Base | Head | Change |
+| --- | ---: | ---: | ---: |
+| Lone submit CPU, ms | 36.692 | 36.786 | +0.3% |
+| Burst submit p99, ms | 4.193 | 4.324 | +3.1% |
+| Release to terminal p99, ms | 12.627 | 12.327 | -2.4% |
+| Idle RSS, MiB | 20.615 | 20.648 | +0.2% |
+| Per idle bot, KiB | 1.42 | 1.488 | +4.8% |
+| RSS after a turn each, MiB | 28.32 | 29.377 | +3.7% |
+| Daemon CPU per turn, ms | 1.204 | 1.211 | +0.5% |
+| Lifecycle CPU, s | 1.1 | 1.08 | -1.8% |
+| Lifecycle p95 turn, ms | 698.14 | 590.174 | -15.5% |
+| Lifecycle peak RSS, MiB | 27.955 | 27.16 | -2.8% |
+
+Nothing moved past noise, and the gate counted no more store work per
+turn. Per idle bot and RSS after a turn rose within the footprint bench's
+spread from run to run (#575 saw the same per-bot swing with no change to
+what is kept per bot); the screen's benches send no attach, so none of
+the new path runs in them beyond the submit field's parse. Sonny's rows
+moved within their noise too.

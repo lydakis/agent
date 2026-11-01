@@ -6141,7 +6141,11 @@ mod tests {
             "turn": 1, "data": {"name": "ask"}}),
         ))
         .unwrap();
-        view.drain();
+        // A drain does half a frame's work, which seating two thousand
+        // agents can take on a slow machine: drained until all is in.
+        while !view.feed.is_empty() {
+            view.drain();
+        }
         let (cols, rows) = (150 - LOG_COLS - GAP, 46);
         let sky = text(&view.card(150, 46));
         // Who needs the person is always a star and named; the leads too.

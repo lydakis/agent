@@ -491,6 +491,22 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
             return failed(&place, false, format!("running {}: {e}", agent.display()));
         }
     };
+    // The profile it runs as, which nothing the daemon keeps names: the
+    // one asked for, else what the project tells every task; a fork's is
+    // its source's. Only said where it is shown, so a failed write starts
+    // the task all the same.
+    let profile = match &source {
+        Some(source) => crate::daemon_paths(None, None)
+            .ok()
+            .and_then(|(store, _)| noted_profile(&store, &source.name)),
+        None => start
+            .profile
+            .clone()
+            .or_else(|| crate::project::task_profile(&info).ok()),
+    };
+    if let (Some(profile), Ok((store, _))) = (profile, crate::daemon_paths(None, None)) {
+        let _ = note_profile(&store, name, &profile);
+    }
     let mut said = vec![format!(
         "Started {name}: {}",
         String::from_utf8_lossy(&output.stdout).trim()
@@ -505,6 +521,28 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
         ));
     }
     Ok(said.join("\n"))
+}
+
+/// Where Sonny keeps the profile each task was started as: beside the
+/// store, as the marks of resolved tasks are, one file per task.
+fn profile_file(store: &Path, task: &str) -> PathBuf {
+    let store = agent_client::socket::canonical_store(store).unwrap_or_else(|_| store.to_owned());
+    let mut dir = store.into_os_string();
+    dir.push(".profiles");
+    PathBuf::from(dir).join(task)
+}
+
+pub fn note_profile(store: &Path, task: &str, profile: &str) -> std::io::Result<()> {
+    let file = profile_file(store, task);
+    std::fs::create_dir_all(file.parent().unwrap_or(Path::new("/")))?;
+    std::fs::write(file, format!("{profile}\n"))
+}
+
+/// The profile the task `task` of the daemon of `store` was started as,
+/// when Sonny started it.
+pub fn noted_profile(store: &Path, task: &str) -> Option<String> {
+    let text = std::fs::read_to_string(profile_file(store, task)).ok()?;
+    Some(text.trim().to_owned()).filter(|profile| !profile.is_empty())
 }
 
 /// Whether two paths name one folder, links followed.

@@ -2432,9 +2432,9 @@ struct App {
     /// its end is followed by a guess at their next message.
     yours: Option<i64>,
     /// That guess, being made.
-    suggesting: Option<tokio::task::JoinHandle<Option<String>>>,
+    suggesting: Option<tokio::task::JoinHandle<Option<suggest::Guess>>>,
     /// The guess, shown in the empty composer for Tab to take.
-    suggestion: Option<String>,
+    suggestion: Option<suggest::Guess>,
 }
 
 /// What a job of the lead's layout has to say: a line in the lead's view,
@@ -2558,8 +2558,23 @@ fn room_for(
     }
 }
 
-/// A lead as the person tells it apart: `shop lead` for the folder's
-/// first, `shop lead billing` for `shop.lead.billing`.
+/// The profile an agent runs as: a lead's as the project in its `folder`
+/// or the config sets it; a task's as Sonny noted it when it started the
+/// task, which then had its own or its project's; none for another.
+fn seat_profile(
+    store: &std::path::Path,
+    bot: &str,
+    lead: bool,
+    folder: &std::path::Path,
+) -> Option<String> {
+    match lead {
+        true => agent_client::project::read(folder)
+            .ok()
+            .and_then(|info| project::lead_profile(&info).ok()),
+        false => task::noted_profile(store, bot),
+    }
+}
+
 fn lead_title(project: &str, bot: &str) -> String {
     match bot.ends_with(".lead") {
         true => format!("{project} lead"),
@@ -6650,9 +6665,13 @@ impl App {
                     self.answered(&text(item), item["from"].as_str());
                 }
             }
+            // An attached note whose wait ran out goes as a steer: the
+            // sender's, nothing the person put in line.
+            "queued" if data["lapsed"] == true => {}
             "queued" => self.notice = Some(format!("queued behind turn {}", data["behind"])),
             // Nothing until a call takes it in: it asks nothing of the
             // person, so nothing says it waits.
+            "attached" => {}
             "text_delta" => {
                 self.thought.clear();
                 // Words nobody reads in zen.
@@ -7469,6 +7488,9 @@ impl App {
             .as_millis() as u64;
         let store = self.store();
         let mut rows = Vec::new();
+        // Each lead's project file read once a refresh; a task's profile
+        // is the one noted when it started.
+        let mut profiles: HashMap<String, Option<String>> = HashMap::new();
         // With other leads in the folder, their tasks are theirs: each
         // lead shows as a row of its own.
         let shared = lead != format!("{project}.lead")
@@ -7615,6 +7637,23 @@ impl App {
                     bot["model"].as_str().unwrap_or("?")
                 ),
             };
+            // The profile it runs as, said even when it is its seat's own,
+            // which the footer leaves out.
+            let profile = match project::is_lead(name) {
+                true => {
+                    let folder = bot["workspace"].as_str().unwrap_or("").to_owned();
+                    (profiles.entry(folder))
+                        .or_insert_with_key(|folder| match folder.as_str() {
+                            "" => None,
+                            folder => {
+                                seat_profile(&store, name, true, std::path::Path::new(folder))
+                            }
+                        })
+                        .clone()
+                }
+                false => seat_profile(&store, name, false, std::path::Path::new("")),
+            }
+            .unwrap_or_default();
             rows.push(status::Row {
                 name: short(name, &project, &lead),
                 bot: name.to_owned(),
@@ -7623,6 +7662,7 @@ impl App {
                 seconds,
                 at,
                 model,
+                profile,
                 latest: step,
                 place,
                 pr: pr.unwrap_or_default(),
@@ -9062,7 +9102,8 @@ impl App {
             && !self.pane_keys
             && let Some(guess) = self.suggested()
         {
-            let guess = guess.to_owned();
+            // Only its words: where it came from is not part of it.
+            let guess = guess.text.clone();
             self.input.set(&guess);
             self.suggestion = None;
             return;
@@ -10337,7 +10378,7 @@ impl App {
 
     /// The guess, while the composer shows it: empty, with nothing running
     /// and nothing open over it.
-    fn suggested(&self) -> Option<&str> {
+    fn suggested(&self) -> Option<&suggest::Guess> {
         let open = self.picker.is_some()
             || self.confirming
             || self.choosing.is_some()
@@ -10351,7 +10392,7 @@ impl App {
             && self.asks.is_empty()
             && self.approvals.is_empty()
             && !open;
-        self.suggestion.as_deref().filter(|_| shows)
+        self.suggestion.as_ref().filter(|_| shows)
     }
 
     /// `/side`: a side chat with a copy of this bot, taken where it is now,
@@ -11318,17 +11359,34 @@ impl App {
         let answering = self.asking();
         // The guess at the next message, for Tab to take.
         if let Some(guess) = self.suggested() {
-            let room = width.saturating_sub(prompt::LEAD + TAB.width());
-            return (
-                vec![Line::from(vec![
-                    Span::raw("› ").bold(),
-                    // Italic too: a side chat's screen, read through vt100,
-                    // loses the dim.
-                    Span::raw(transcript::cut(guess, room)).dim().italic(),
-                    Span::raw(TAB).dim(),
-                ])],
-                (0, prompt::LEAD),
+            // Where it came from, when not the reply just read, after the
+            // key, so it reads as apart from what Tab takes; only beside
+            // the whole guess, which a narrow window gives the room.
+            let cue = (guess.from.as_ref())
+                .map(|from| (from, format!("  ↳ {}", from.name())))
+                .filter(|(_, cue)| {
+                    width >= prompt::LEAD + guess.text.width() + TAB.width() + cue.width()
+                });
+            let room = width.saturating_sub(
+                prompt::LEAD + TAB.width() + cue.as_ref().map_or(0, |(_, cue)| cue.width()),
             );
+            let mut spans = vec![
+                Span::raw("› ").bold(),
+                // Italic too: a side chat's screen, read through vt100,
+                // loses the dim.
+                Span::raw(transcript::cut(&guess.text, room)).dim().italic(),
+                Span::raw(TAB).dim(),
+            ];
+            if let Some((from, _)) = cue {
+                spans.push(Span::raw("  ↳ ").dim());
+                // An agent in the agents' colour, as "↳ From …" rows name
+                // one; the margin, the commons and "earlier" in words.
+                spans.push(match from {
+                    suggest::Origin::Agent(name) => Span::raw(name.clone()).fg(Color::Blue).dim(),
+                    other => Span::raw(other.name().to_owned()).dim(),
+                });
+            }
+            return (vec![Line::from(spans)], (0, prompt::LEAD));
         }
         if self.input.is_empty() {
             // Named, so a message typed in the wrong pane is caught first.
@@ -11533,9 +11591,8 @@ impl App {
     }
 
     /// The profile the agent runs as, when it isn't its seat's own: a
-    /// lead's other than `lead`, a task's other than `task`, as its
-    /// project or the config sets them. Read again only for another agent
-    /// or folder.
+    /// lead's other than `lead`, a task's other than `task`. Read again
+    /// only for another agent or folder.
     fn profile(&self) -> Option<String> {
         let key = (self.bot.clone(), self.workspace.clone());
         if let Some((read, profile)) = &*self.profile.borrow()
@@ -11543,16 +11600,10 @@ impl App {
         {
             return profile.clone();
         }
+        let lead = self.project.is_some();
         let here = std::path::Path::new(&self.workspace);
-        let info = |dir: &std::path::Path| agent_client::project::read(dir).ok();
-        let profile = match (&self.project, task::source_folder(here)) {
-            (Some(_), _) => (info(here).and_then(|info| project::lead_profile(&info).ok()))
-                .filter(|profile| profile != "lead"),
-            (None, Some(source)) => (info(&source))
-                .and_then(|info| project::task_profile(&info).ok())
-                .filter(|profile| profile != "task"),
-            (None, None) => None,
-        };
+        let profile = seat_profile(&self.store(), &self.bot, lead, here)
+            .filter(|profile| profile != if lead { "lead" } else { "task" });
         *self.profile.borrow_mut() = Some((key, profile.clone()));
         profile
     }
@@ -12920,6 +12971,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn status_names_each_agents_profile_even_its_seats_own() {
+        let dir = std::env::temp_dir().join(format!("sonny-status-profile-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join(".agents")).unwrap();
+        std::fs::write(
+            dir.join(".agents/project.toml"),
+            "name = \"shop\"\nprofile = \"superlead\"\n",
+        )
+        .unwrap();
+        let folder = dir.to_string_lossy().into_owned();
+        let client =
+            daemon_answering(
+                move |asked| match asked["op"].as_str().unwrap_or_default() {
+                    "bots" => json!({"bots": [
+                {"name": "shop.lead", "bot_id": 1, "head": 1, "workspace": folder,
+                    "status": "idle", "running_turn": null},
+                {"name": "shop.fix", "bot_id": 2, "head": 1,
+                    "status": "idle", "running_turn": null},
+                {"name": "shop.old", "bot_id": 3, "head": 1,
+                    "status": "idle", "running_turn": null},
+            ], "next_after": null}),
+                    "turns" => json!({"turns": [], "next_before": null}),
+                    "history_nodes" => json!({"nodes": [], "next_from": null}),
+                    "history_items" => json!({"items": []}),
+                    _ => json!({"error": {"code": "unexpected", "message": asked.to_string()}}),
+                },
+            )
+            .await;
+        let mut app = app(client);
+        app.bot = "shop.lead".into();
+        app.options.store = dir.join("store");
+        // A task runs as the profile it was started with, whatever its
+        // project tells tasks by default.
+        task::note_profile(&app.store(), "shop.fix", "reviewer").unwrap();
+        let (_, rows) = app.status_rows().await.unwrap();
+        let profile = |bot: &str| {
+            rows.iter()
+                .find(|row| row.bot == bot)
+                .unwrap()
+                .profile
+                .clone()
+        };
+        assert_eq!(profile("shop.lead"), "superlead");
+        assert_eq!(profile("shop.fix"), "reviewer");
+        // Not started by Sonny: nothing said rather than a guess.
+        assert_eq!(profile("shop.old"), "");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
     async fn a_message_the_daemon_dated_counts_by_when_it_was_written() {
         let said_ = |text: &str| {
             json!({"type": "message", "role": "user",
@@ -12994,6 +13094,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_guess_from_news_says_where_from_after_the_key_and_tab_takes_only_its_words() {
+        // The guess the copy makes, given what it says.
+        async fn guessed(said: &'static str) -> App {
+            let client = daemon_answering(move |asked| {
+                match (asked["op"].as_str(), asked["bot"].as_str()) {
+                    (Some("fork"), _) => json!({"bot_id": 9, "head": 4}),
+                    (Some("submit"), Some("b")) => json!({"turn": 1}),
+                    (Some("submit"), _) => json!({"turn": 1, "handle": "turn:copy/1"}),
+                    (Some("wait"), _) => json!({"results": {"turn:copy/1":
+                        {"status": "completed", "text": said}}}),
+                    // Only shop.pricing is an agent the daemon keeps.
+                    (Some("bots"), _) => match asked["name"].as_str() {
+                        Some("shop.pricing") => json!({"bots": [{"name": "shop.pricing"}]}),
+                        _ => json!({"bots": []}),
+                    },
+                    _ => json!({}),
+                }
+            })
+            .await;
+            let mut app = app(client);
+            app.input.set("what changed in the cart?");
+            app.submit().await;
+            app.daemon(turn_event("accepted", 1, json!({}))).await;
+            app.daemon(turn_event(
+                "turn_finished",
+                1,
+                json!({"status": "completed"}),
+            ))
+            .await;
+            for _ in 0..200 {
+                app.suggested_now().await;
+                if app.suggestion.is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            app
+        }
+        let row = |app: &App, width| -> String {
+            let (rows, _) = app.composer(width);
+            rows[0].spans.iter().map(|s| s.content.as_ref()).collect()
+        };
+        let mut app = guessed("check pricing's failing test\nshop.pricing").await;
+        assert_eq!(
+            row(&app, 80),
+            "› check pricing's failing test  tab  ↳ shop.pricing"
+        );
+        // Too narrow for both: the guess keeps the room.
+        assert_eq!(row(&app, 40), "› check pricing's failing test  tab");
+        app.key(Event::Key(ratatui::crossterm::event::KeyEvent::new(
+            KeyCode::Tab,
+            KeyModifiers::NONE,
+        )))
+        .await;
+        assert_eq!(&*app.input, "check pricing's failing test");
+        // The margin, the commons and an earlier reply are named in words.
+        let app = guessed("open the release notes\nmargin").await;
+        assert_eq!(row(&app, 80), "› open the release notes  tab  ↳ margin");
+        let app = guessed("rebase onto main first\nearlier").await;
+        assert_eq!(row(&app, 80), "› rebase onto main first  tab  ↳ earlier");
+        // A source not in the set, or no agent's, shows the guess alone.
+        for said in [
+            "check the ghost task\nghost",
+            "push it\nyour last reply",
+            "push it",
+        ] {
+            let app = guessed(said).await;
+            assert_eq!(app.suggestion.as_ref().unwrap().from, None, "{said}");
+            assert!(row(&app, 80).ends_with("  tab"), "{said}");
+        }
+    }
+
+    #[tokio::test]
     async fn after_a_turn_of_the_persons_a_copy_guesses_their_next_message_for_tab() {
         let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen = asked.clone();
@@ -13026,7 +13199,11 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        assert_eq!(app.suggested(), Some("run the tests"));
+        assert_eq!(
+            app.suggested().map(|g| g.text.as_str()),
+            Some("run the tests")
+        );
+        assert_eq!(app.suggested().unwrap().from, None);
         let (rows, _) = app.composer(80);
         let row: String = rows[0].spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(row, "› run the tests  tab");
@@ -13043,7 +13220,7 @@ mod tests {
         );
         // Something typed hides it; emptied again, it is back.
         app.input.set("x");
-        assert_eq!(app.suggested(), None);
+        assert!(app.suggested().is_none());
         app.input.clear();
         // Tab takes it into the composer, unsent.
         app.key(Event::Key(ratatui::crossterm::event::KeyEvent::new(
@@ -14564,6 +14741,15 @@ mod tests {
             "no clip, no count"
         );
         assert!(drawn(&mut app).iter().all(|row| !row.contains('📎')));
+        // Nor once its wait runs out and it goes as a steer: the sender's
+        // words, nothing the person put in line.
+        app.daemon(turn_event(
+            "queued",
+            5,
+            json!({"status": "ready", "delivery": "steer", "lapsed": true}),
+        ))
+        .await;
+        assert_eq!(app.notice, None, "nothing the person queued");
     }
 
     #[tokio::test]
@@ -14628,6 +14814,20 @@ mod tests {
         let text = app.footer_line(140).to_string();
         assert!(
             text.contains(&format!(" {} · superlead · ", models::label(&app.model))),
+            "{text}"
+        );
+        // A task, as Sonny noted it when it started it: named only when
+        // it is not `task`.
+        app.options.store = dir.join("store");
+        app.project = None;
+        app.bot = "top.fix".into();
+        task::note_profile(&app.store(), "top.fix", "task").unwrap();
+        assert!(!app.footer_line(140).to_string().contains("task ·"));
+        app.bot = "top.check".into();
+        task::note_profile(&app.store(), "top.check", "reviewer").unwrap();
+        let text = app.footer_line(140).to_string();
+        assert!(
+            text.contains(&format!(" {} · reviewer · ", models::label(&app.model))),
             "{text}"
         );
         std::fs::remove_dir_all(&dir).unwrap();
@@ -16638,7 +16838,10 @@ mod tests {
         app.key(key(KeyCode::Esc)).await;
         // Tab picks from the search, not the guess at the next message.
         app.input.clear();
-        app.suggestion = Some("run the tests".into());
+        app.suggestion = Some(suggest::Guess {
+            text: "run the tests".into(),
+            from: None,
+        });
         app.key(ctrl('r')).await;
         app.key(key(KeyCode::Tab)).await;
         assert!(app.searching.is_none());
