@@ -1521,6 +1521,23 @@ class ModelListTests(ModelFixture):
         # Two listings fill what the daemon keeps; the third is asked again.
         self.assertEqual(len(self.model.paths), 4)
 
+    def test_the_daemon_starts_with_the_config_file_s_limits(self):
+        (self.home / '.agent').mkdir(exist_ok=True)
+        (self.home / '.agent' / 'config.toml').write_text(
+            '[daemon]\nprocesses = 7\nreaders = "min(cpus, 1) + 1"\nload = 1.5\n')
+        # The command line's own wins over the file's.
+        self.agent('stats', *self.store, *self.providers[:2], '--max-processes', '9')
+        with socket.socket(socket.AF_UNIX) as s:
+            s.connect(str(self.path / 'state.sqlite.sock'))
+            limits = json.loads(s.makefile('r').readline())['limits']
+        self.assertEqual((limits['processes'], limits['readers'], limits['load']), (9, 2, 1.5))
+        # A mistake in the file is refused by name, before any daemon starts.
+        self.agent('shutdown', *self.store)
+        (self.home / '.agent' / 'config.toml').write_text('[daemon]\nprocesses = "lots"\n')
+        refused = self.agent('stats', *self.store, *self.providers[:2], check=False)
+        self.assertEqual(refused.returncode, 1, refused.stderr)
+        self.assertIn('daemon.processes', refused.stderr)
+
     def test_discover_writes_nothing_when_no_provider_lists(self):
         refused = self.agent('models', '--discover', *self.store,
                              '--provider', 'gone=responses,http://127.0.0.1:1/v1', check=False)

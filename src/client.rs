@@ -349,6 +349,10 @@ fn parse(args: &[String]) -> Result<Options> {
                         })?;
                         options.daemon_flags.push((flag.to_owned(), value));
                     }
+                    "--max-load" => {
+                        crate::cli::load(&value)?;
+                        options.daemon_flags.push((flag.to_owned(), value));
+                    }
                     "--stall-timeout" | "--idle-exit" => {
                         crate::cli::duration_secs(flag, &value)?;
                         options.daemon_flags.push((flag.to_owned(), value));
@@ -741,11 +745,21 @@ fn check_daemon(options: &Options, ready: &Value) -> Result<()> {
             "--max-pending-bytes" => "pending_bytes",
             "--max-input-bytes" => "input_bytes",
             "--max-readers" => "readers",
+            "--max-load" => "load",
             "--stall-timeout" => "stall_timeout_seconds",
             "--idle-exit" => "idle_exit_seconds",
             _ => continue,
         };
         let running = &ready["limits"][key];
+        if flag == "--max-load" {
+            let requested = crate::cli::load(value).ok().filter(|load| *load > 0.0);
+            if running.as_f64() != requested {
+                differences.push(format!(
+                    "{flag}: requested {value} but daemon has {running}"
+                ));
+            }
+            continue;
+        }
         let requested = match flag.as_str() {
             "--stall-timeout" | "--idle-exit" => crate::cli::duration_secs(flag, value).ok(),
             _ => value.parse::<u64>().ok(),
@@ -904,6 +918,15 @@ fn connect_or_start(options: &Options) -> Result<Connection> {
     }
     for (flag, value) in &options.daemon_flags {
         command.arg(flag).arg(value);
+    }
+    // The person's `[daemon]` limits, for this machine, where the command
+    // line set none.
+    let configured = agent_client::config::daemon_flags(&config()?.daemon)
+        .map_err(|error| Error::with("config_invalid", error))?;
+    for (flag, value) in configured {
+        if !options.daemon_flags.iter().any(|(given, _)| *given == flag) {
+            command.arg(flag).arg(value);
+        }
     }
     for name in agent_client::TERMINAL_PLACES {
         command.arg("--shell-exclude").arg(name);

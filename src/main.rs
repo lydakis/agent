@@ -140,6 +140,7 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
     let mut max_pending_bytes = None;
     let mut max_input_bytes = None;
     let mut max_readers = None;
+    let mut max_load = None;
     let mut idle_exit = None;
     let mut stall_timeout = None;
     let mut shell_excludes = Vec::new();
@@ -197,6 +198,10 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
                     _ => max_connecting = Some(parsed),
                 }
             }
+            "--max-load" => {
+                let load = cli::load(value)?;
+                max_load = (load > 0.0).then_some(load);
+            }
             // `prepare` has checked each range.
             "--stall-timeout" => stall_timeout = Some(cli::duration_secs(flag, value)?),
             "--idle-exit" => {
@@ -221,6 +226,7 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
         max_pending_bytes,
         max_input_bytes,
         max_readers,
+        max_load,
         stall_timeout,
         idle_exit,
         shell_excludes,

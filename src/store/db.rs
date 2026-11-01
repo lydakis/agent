@@ -880,6 +880,11 @@ pub struct Waiting {
     /// output when it ends or its yield runs out.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub poll: bool,
+    /// Parked before `call_id`, the first of `pending`, which has not
+    /// started: a command the daemon's load gate held back. The gate's
+    /// next reading that lets it start wakes the turn, which runs it then.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub load: bool,
     /// What the command rules made of the calls still to run, as their
     /// round was announced, by call id: read from them as the park resumes.
     #[serde(skip)]
@@ -1568,9 +1573,9 @@ const TURN_VIEW: &str = "t.id,t.bot,b.id,t.request_id,t.status,t.input_tokens,
     t.finished_ms,json_extract(t.waiting,'$.call_id'),json_extract(t.waiting,'$.approval'),
     json_extract(t.waiting,'$.handles'),json_extract(t.waiting,'$.any'),
     json_extract(t.waiting,'$.deadline_ms'),json_extract(t.waiting,'$.answer'),
-    json_extract(t.waiting,'$.halt')";
+    json_extract(t.waiting,'$.halt'),json_extract(t.waiting,'$.load')";
 /// Columns `TURN_VIEW` takes, for queries that select more after it.
-const TURN_VIEW_COLUMNS: usize = 20;
+const TURN_VIEW_COLUMNS: usize = 21;
 
 /// The turn view's own fields beside a turn's identity and status: who asked,
 /// what it waits on, its usage and timing. A model's `wait` leaves them out.
@@ -1605,6 +1610,9 @@ fn turn_view(r: &rusqlite::Row) -> rusqlite::Result<Value> {
         }
         "waiting" if r.get::<_, Option<i64>>(14)? == Some(1) => {
             json!({"call_id":call_id,"approval":true,"deadline_ms":deadline_ms})
+        }
+        "waiting" if r.get::<_, Option<i64>>(20)? == Some(1) => {
+            json!({"call_id":call_id,"load":true,"deadline_ms":deadline_ms})
         }
         "waiting" => {
             let handles = r
@@ -2376,6 +2384,7 @@ impl Database {
                 "SELECT t.id FROM bots b JOIN turns t ON t.id=b.running_turn
                  WHERE b.name=? AND b.status='waiting' AND t.status='waiting'
                  AND json_extract(t.waiting,'$.approval') IS NOT 1
+                 AND json_extract(t.waiting,'$.load') IS NOT 1
                  AND json_extract(t.waiting,'$.paced_since_ms') IS NULL",
             )?
             .query_row([name], |r| r.get(0))
@@ -6926,6 +6935,7 @@ impl Database {
             fallback: None,
             halt: None,
             poll: false,
+            load: false,
             rulings: BTreeMap::new(),
         };
         let tx = self.conn.savepoint()?;
@@ -6940,6 +6950,77 @@ impl Database {
         tx.commit()?;
         self.forget_live(turn);
         Ok(Some(deadline_ms))
+    }
+    /// Park a running turn before its next calls, when the daemon's load
+    /// gate holds back `held`, a command among them: they and the rest of
+    /// the round wait in `pending`, none of them started. Woken at the
+    /// round's first lapse, as a verdict park is, so a later gated call's
+    /// expiry still ends the turn. None when that lapse has passed: the
+    /// turn goes on and meets it.
+    pub fn suspend_load(
+        &mut self,
+        turn: i64,
+        held: &str,
+        pending: &[ToolCall],
+        now_ms: u64,
+        route: Option<&str>,
+        summary_retry_ms: Option<u64>,
+    ) -> Result<Option<Option<u64>>> {
+        let bot = self.active(turn)?;
+        let call = (pending.iter())
+            .find(|call| call.call_id == held)
+            .ok_or(Error::new("invalid_tool_state"))?;
+        if bot.status != "running" {
+            return fail("invalid_tool_state");
+        }
+        let deadline_ms = self.next_lapse(turn)?;
+        if deadline_ms.is_some_and(|at| now_ms >= at) {
+            return Ok(None);
+        }
+        let waiting = Waiting {
+            turn,
+            bot: bot.name.clone(),
+            call_id: call.call_id.clone(),
+            handles: Vec::new(),
+            deadline_ms,
+            any: false,
+            pending: pending.to_vec(),
+            paced_since_ms: None,
+            call_attempts: 0,
+            call_spent_ms: 0,
+            compaction: false,
+            route: route.map(str::to_owned),
+            approval: false,
+            answer: None,
+            copied: None,
+            summary_retry_ms,
+            fallback: None,
+            halt: None,
+            poll: false,
+            load: true,
+            rulings: BTreeMap::new(),
+        };
+        let tx = self.conn.savepoint()?;
+        flush(&tx, turn, self.live.get(&turn))?;
+        tx.execute(
+            "UPDATE turns SET status='waiting',waiting=? WHERE id=?",
+            params![serde_json::to_string(&waiting)?, turn],
+        )?;
+        tx.execute("UPDATE bots SET status='waiting' WHERE name=?", [&bot.name])?;
+        let data = json!({"call_id":call.call_id,"load":true,"deadline_ms":deadline_ms});
+        event(&tx, &bot.name, Some(turn), "turn_waiting", data)?;
+        tx.commit()?;
+        self.forget_live(turn);
+        Ok(Some(deadline_ms))
+    }
+    /// The turns parked on the load gate, oldest first, with their bots.
+    pub fn load_parked(&self) -> Result<Vec<(String, i64)>> {
+        let mut statement = self.conn.prepare_cached(
+            "SELECT bot,id FROM turns WHERE status='waiting'
+             AND json_extract(waiting,'$.load')=1 ORDER BY id",
+        )?;
+        let rows = statement.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
     /// An answered call's answer, held or stored, `tool_unserved` once its
     /// time ran out, or how long it may still wait.
@@ -7071,6 +7152,7 @@ impl Database {
             fallback: None,
             halt: None,
             poll: false,
+            load: false,
             rulings: BTreeMap::new(),
         };
         let tx = self.conn.savepoint()?;
@@ -8789,6 +8871,7 @@ impl Database {
             fallback: None,
             halt: None,
             poll,
+            load: false,
             rulings: BTreeMap::new(),
         };
         let tx = self.conn.savepoint()?;
@@ -8848,6 +8931,7 @@ impl Database {
             fallback,
             halt: None,
             poll: false,
+            load: false,
             rulings: BTreeMap::new(),
         };
         let tx = self.conn.savepoint()?;
@@ -8937,6 +9021,7 @@ impl Database {
             fallback: None,
             halt: Some(stop),
             poll: false,
+            load: false,
             rulings: BTreeMap::new(),
         };
         let tx = self.conn.savepoint()?;

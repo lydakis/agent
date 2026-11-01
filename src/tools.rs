@@ -484,6 +484,16 @@ pub struct Registry {
     /// gone and with each detached child until its wait completes.
     lasting_slots: Arc<Semaphore>,
     lasting_budget: usize,
+    /// Whether the machine's load lets a new command start, as make's
+    /// `-l`; see `admits`. None is no gate.
+    load: Option<watch::Receiver<bool>>,
+    /// Set when a turn parks on the load gate, so the daemon looks for
+    /// parked turns to wake only while some may be there.
+    load_parked: Arc<std::sync::atomic::AtomicBool>,
+    /// The line of background commands waiting at the load gate, in the
+    /// order they came: a fair lock its first holds while it waits, so a
+    /// later one never takes a slot ahead of it.
+    load_line: Arc<tokio::sync::Mutex<()>>,
     /// Running terminals, by proc handle, each its bot's own.
     #[cfg(unix)]
     terminals: terminal::Terminals,
@@ -1212,6 +1222,9 @@ impl Registry {
             tools,
             slots: Arc::new(Semaphore::new(DEFAULT_PROCESS_BUDGET)),
             budget: DEFAULT_PROCESS_BUDGET,
+            load: None,
+            load_parked: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            load_line: Arc::default(),
             pending: Arc::default(),
             lasting_slots: Arc::new(Semaphore::new(default_lasting())),
             lasting_budget: default_lasting(),
@@ -1329,6 +1342,101 @@ impl Registry {
         }));
         self
     }
+    /// Hold new commands back while the 1-minute load average is at
+    /// `limit` or over it and one of the daemon's commands is running, as
+    /// make's `-l` holds jobs: never while none is, so a busy machine
+    /// slows the fleet and never stops it, and the process budget stays
+    /// the bound behind it. One thread reads the load each second for
+    /// every waiter, which holds nothing as it waits. Zero is no gate.
+    pub fn with_load_gate(mut self, limit: f64) -> Self {
+        if !(limit > 0.0 && limit.is_finite()) {
+            self.load = None;
+            return self;
+        }
+        let (gate, open) = watch::channel(true);
+        let started = std::thread::Builder::new()
+            .name("load-gate".into())
+            .spawn(move || {
+                // Every waiter is woken each second the gate is shut, to
+                // look again at whether a command is still running.
+                while !gate.is_closed() {
+                    std::thread::sleep(Duration::from_secs(1));
+                    let below = load_average().is_none_or(|load| load < limit);
+                    gate.send_modify(|open| *open = below);
+                }
+            });
+        self.load = started.is_ok().then_some(open);
+        self
+    }
+    /// The load gate, read from `readings` instead of its own thread: the
+    /// same gate, for a caller that reads the load itself.
+    pub fn with_load_readings(mut self, readings: watch::Receiver<bool>) -> Self {
+        self.load = Some(readings);
+        self
+    }
+    /// Commands of the daemon's running now.
+    pub fn running(&self) -> usize {
+        let bound = match self.budget {
+            0 => Semaphore::MAX_PERMITS,
+            budget => budget,
+        };
+        bound.saturating_sub(self.slots.available_permits())
+    }
+    /// Whether the load gate lets a command start now, beside `holding`
+    /// of the daemon's commands that are this one's own slots.
+    pub fn admits(&self) -> bool {
+        self.admits_beside(0)
+    }
+    fn admits_beside(&self, holding: usize) -> bool {
+        self.load
+            .as_ref()
+            .is_none_or(|open| *open.borrow() || self.running() <= holding)
+    }
+    /// The load gate's readings, one a second while it is set: `true`
+    /// while the load is under its limit. None is no gate.
+    pub fn load_gate(&self) -> Option<watch::Receiver<bool>> {
+        self.load.clone()
+    }
+    /// A turn parked on the load gate: the daemon looks for it at the
+    /// gate's next reading that lets one start.
+    pub fn note_load_park(&self) {
+        self.load_parked
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    /// Whether a turn may have parked on the load gate since the last look,
+    /// clearing the mark; a daemon starts with it set, for parks from
+    /// before a restart.
+    pub fn take_load_parked(&self) -> bool {
+        self.load_parked
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+    }
+    /// Wait until the load gate lets a command start, then take a process
+    /// slot, and look again with the slot held: one that waited for its
+    /// slot while the gate shut gives it back and waits again. Waiters go
+    /// in the order they came, one at a time at the gate. A background
+    /// command waits here holding no turn; a turn's foreground command
+    /// parks before it gets here instead.
+    async fn admitted_slot(
+        &self,
+    ) -> std::result::Result<tokio::sync::OwnedSemaphorePermit, tokio::sync::AcquireError> {
+        let Some(open) = &self.load else {
+            return self.slots.clone().acquire_owned().await;
+        };
+        let mut open = open.clone();
+        let _first = self.load_line.lock().await;
+        loop {
+            while !*open.borrow_and_update() && self.running() > 0 {
+                // A gate that stopped reading lets everything through.
+                if open.changed().await.is_err() {
+                    return self.slots.clone().acquire_owned().await;
+                }
+            }
+            let slot = self.slots.clone().acquire_owned().await?;
+            if self.admits_beside(1) {
+                return Ok(slot);
+            }
+        }
+    }
     /// How many of one bot's calls may run together: `cap` at most, and
     /// no more than half the process budget, so one bot's wide round
     /// leaves room for the others.
@@ -1344,9 +1452,12 @@ impl Registry {
     pub fn queue(&self) -> Result<Queued> {
         use std::sync::atomic::Ordering::Relaxed;
         // A free slot is taken here, not in the task, so the line counts
-        // only commands that truly wait; the semaphore is fair, so this
-        // never overtakes a waiter.
-        if let Ok(permit) = self.slots.clone().try_acquire_owned() {
+        // only commands that truly wait; the semaphore is fair, and none
+        // waits at the load gate, so this never overtakes a waiter.
+        if let Ok(_line) = self.load_line.try_lock()
+            && self.admits()
+            && let Ok(permit) = self.slots.clone().try_acquire_owned()
+        {
             return Ok(Queued {
                 permit: Some(permit),
                 pending: None,
@@ -2091,7 +2202,7 @@ impl Registry {
             let result = async {
                 let slot = match queued.permit.take() {
                     Some(permit) => Ok(permit),
-                    None => registry.slots.clone().acquire_owned().await,
+                    None => registry.admitted_slot().await,
                 };
                 drop(queued);
                 // The slot and the sandbox's hold go once the command is
@@ -2329,6 +2440,14 @@ fn truncate(text: &str, dropped: u64) -> String {
         "{head}\n[... {omitted} bytes omitted; {retained}: see this result's artifacts and read them with the read tool ...]\n{}",
         &text[tail_start..]
     )
+}
+
+/// The machine's 1-minute load average, as uptime reports it.
+fn load_average() -> Option<f64> {
+    let mut load = [0.0f64; 1];
+    // SAFETY: getloadavg writes at most the one sample asked for.
+    let read = unsafe { libc::getloadavg(load.as_mut_ptr(), 1) };
+    (read == 1).then_some(load[0])
 }
 
 /// Output up to this many bytes is redacted on the runtime's thread: about
@@ -2756,6 +2875,66 @@ mod tests {
         assert!(!name_matches("AWS_*", "MY_AWS_PROFILE"));
         assert!(!name_matches("A?S", "AS"));
         assert!(!name_matches("*_KEY", "OPENAI_API_KEYS"));
+    }
+    #[tokio::test]
+    async fn a_shut_load_gate_holds_new_commands_only_while_one_runs() {
+        let (gate, open) = watch::channel(false);
+        let mut registry = Registry::new("shell").unwrap().with_process_budget(2);
+        registry.load = Some(open);
+        // With none running, a command starts however loaded the machine.
+        assert!(registry.admits());
+        let first = registry.admitted_slot().await.unwrap();
+        assert!(!registry.admits());
+        // Nor is a background command's slot taken for it at once.
+        assert!(registry.queue().unwrap().permit.is_none());
+        let waiting = tokio::spawn({
+            let registry = registry.clone();
+            async move { registry.admitted_slot().await.unwrap() }
+        });
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished());
+        // The running one ends. A command that comes before the next
+        // look waits behind the one at the gate, as a line does: then the
+        // first goes.
+        drop(first);
+        assert!(registry.admits());
+        assert!(registry.queue().unwrap().permit.is_none());
+        gate.send_modify(|_| {});
+        let second = tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .unwrap()
+            .unwrap();
+        // One that took its slot as the gate shut, with another running,
+        // gives it back and waits: the budget of two is full, so this one
+        // waits for the slot while the gate is open, and the gate shuts
+        // before the slot frees.
+        gate.send_replace(true);
+        let third = registry.admitted_slot().await.unwrap();
+        let late = tokio::spawn({
+            let registry = registry.clone();
+            async move { registry.admitted_slot().await.unwrap() }
+        });
+        tokio::task::yield_now().await;
+        gate.send_replace(false);
+        drop(third);
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        assert!(!late.is_finished());
+        assert_eq!(registry.running(), 1);
+        // The load falls: it goes, alongside what runs.
+        gate.send_replace(true);
+        let _late = tokio::time::timeout(Duration::from_secs(5), late)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(registry.running(), 2);
+        drop(second);
+    }
+    #[test]
+    fn a_load_gate_of_zero_is_none() {
+        let registry = Registry::new("shell").unwrap().with_load_gate(0.0);
+        assert!(registry.load.is_none());
+        assert!(load_average().is_some_and(|load| load >= 0.0));
     }
     #[test]
     fn one_bot_runs_at_most_half_the_process_budget_at_once() {

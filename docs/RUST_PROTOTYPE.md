@@ -335,7 +335,7 @@ A turn reads the same wherever a client meets it. Its view is `bot`,
 `input_tokens`, `cached_input_tokens`, `output_tokens`, `model_rounds`,
 `retries`, `paced_ms`, `started_ms` and `finished_ms`, all from the turn's row.
 `waiting_on` is what a parked turn waits for, as its `turn_waiting` or
-`turn_paced` event said (`call_id` and `approval` or `handles`, or
+`turn_paced` event said (`call_id` and `approval`, `load` or `handles`, or
 `resume_at_ms`, null with `paused: true` for a turn the pull cord parked), and
 null otherwise. A `wait` result is the view, plus the
 outcome once finished; an `interrupt` reply is the view plus
@@ -383,9 +383,16 @@ into the async runtime. Byte-oriented protocol pages continue to use SQL slicing
 
 ## Limits
 
-Three daemon limits are flags on `serve`, forwarded by the client that starts
+The daemon's limits are flags on `serve`, forwarded by the client that starts
 the daemon, and reported in the `ready` event as `limits`. Zero removes a
-bound; the operating system is then the only limit.
+bound; the operating system is then the only limit. The agent CLI starts a
+daemon with what `[daemon]` in `~/.agent/config.toml` gives, worked out for
+the machine, where its own command line gives none: each key is a flag's
+name without `--max-` and with `_` for `-` (`processes`, `input_bytes`,
+`load`, ...), and its value a number or a formula of `cpus` and `memory`
+(bytes), as `"cpus * 64"` or `"max(memory / 16, 64 MiB)"`, with `+ - * /`,
+parentheses, `min` and `max`, and `KiB`, `MiB` and `GiB`. A running daemon
+keeps what it started with; the next start takes a change.
 
 | Flag | Bounds | Default |
 | --- | --- | --- |
@@ -396,6 +403,7 @@ bound; the operating system is then the only limit.
 | `--max-pending-bytes` | UTF-8 bytes of those waiting submissions: their prompts and the words they quote, which wait with them. | none |
 | `--max-input-bytes` | Bytes of request lines every session together has read and the daemon has not yet taken up. A line is read on credit for its first 4 KiB, and one that goes on waits for credit for the longest line (8 MiB) at once and gives back what it did not use, so readers never each hold part of what they need; an eighth of the bound is kept for lines that end within 4 KiB, so interrupts, renewals and status reads get in while long submits wait. At least one longest line and its reserve. Zero is unbounded. | a sixteenth of physical memory, at least 64 MiB |
 | `--max-readers` | Store reader connections, each on its own thread, for the reads clients ask for that decide nothing ([observation reads](#observation-reads)), which take all but one, and for turns' own reads. At least 1. | one per logical CPU |
+| `--max-load` | The 1-minute load average at which new foreground and background commands wait while one of the daemon's is running, as make's `-l`: never while none is, so a loaded machine slows the fleet and never stops it, and `--max-processes` stays the bound behind it. One thread reads the load each second; waiters hold no slot, go in the order they came, and take a freed slot only if the gate still admits them. A call that would be refused (forbidden, asked about with no gate, an escape no gate allows) is answered at once, never held; a gated one waits for its verdict instead, so a denial comes back as soon as it is given, and one allowed starts then. A round's calls that run together are let in or held whole. A foreground command held past 1.5 s parks its turn before the call (or the batch it starts with) starts: one commit, `turn_waiting` with `{call_id, load: true, deadline_ms}` (also its view's `waiting_on`), no task, no active slot, and it survives restart. The gate's next admitting reading wakes every parked turn once the load falls, or the oldest alone on a loaded machine where none of the daemon's commands runs; a turn whose round has a later gated call is woken at that call's lapse too. A fraction is kept. Zero is no gate. Reported in `ready` as `limits.load`, `null` for none (protocol 44). | none (the agent CLI passes `cpus * 2`) |
 | `--max-connecting` | Provider requests awaiting response headers, a Bedrock Runtime call's body digest included. Established streams are not capped. Both providers hold headers until the first token, so a permit is held for the whole time to first token; a bound of N caps throughput at N calls per first-token latency. | none |
 | `--stall-timeout` | How long an established provider stream may go without a content frame before the attempt fails as `provider_stream_stalled` and is retried. Keepalives do not count. Whole seconds, `1s` to `24h`. | `2m` |
 | `--idle-exit` | How long, in whole seconds, before a socket daemon with no sessions, no live turns, and no running background commands exits. Parked turns are durable and resume on the next start; the client restarts the daemon on demand. | none |
@@ -1504,8 +1512,8 @@ for a gated call), `tool_completed` (with retained artifact names; `failed`
 for a call that failed, `denied` for a denied one, which also carries
 the refused call's `name` and argument preview as `tool_started` would),
 `approval_requested` (a round's gated calls, see [tool approval](#tool-approval)),
-`turn_waiting` and `turn_resumed` (a parked turn's handles, or the call whose
-verdict it waits for, and its wake-up), `turn_paced` (a turn parked at its model-call boundary because its
+`turn_waiting` and `turn_resumed` (a parked turn's handles, the call whose
+verdict it waits for, or with `load: true` the command the load gate holds, and its wake-up), `turn_paced` (a turn parked at its model-call boundary because its
 provider's pool is closed by a rate limit, with `resume_at_ms`, or because the
 pull cord stopped it, with `resume_at_ms` null and `paused: true`; it resumes
 through `turn_resumed` like a parked wait), `steered` (a steer's item joining
