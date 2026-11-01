@@ -706,27 +706,38 @@ fn changed_paths(tool: &str, arguments: &Value) -> Vec<String> {
     }
 }
 
-/// The agent's home as `bot`'s calls may reach it, `inspect` having said
-/// which folders it may write; none without a `$HOME`.
-fn own_home(inspected: &Value) -> Option<policy::Home> {
-    let home = PathBuf::from(std::env::var_os("HOME")?);
-    let agent = agent_client::config::home()?;
-    let real = agent_client::files::real(&agent);
-    let given = (inspected["workspace"].as_str().into_iter())
-        .chain(
-            (inspected["settings"]["writable"]
-                .as_array()
-                .into_iter()
-                .flatten())
-            .filter_map(Value::as_str),
-        )
-        .map(|folder| agent_client::files::real(Path::new(folder)).unwrap_or(folder.into()))
-        .collect();
-    Some(policy::Home {
+/// The agent's home as a bot's calls may reach it, given the folders it may
+/// write (its own and the writable ones, as `inspect` has them); none
+/// without a `$HOME`. The home and every folder given in it are kept both
+/// as `$HOME` spells them and by their real paths, so a path a command
+/// spells either way is matched against the same spelling.
+fn own_home(given: &[String]) -> Option<policy::Home> {
+    Some(own_home_in(PathBuf::from(std::env::var_os("HOME")?), given))
+}
+
+fn own_home_in(home: PathBuf, given: &[String]) -> policy::Home {
+    let agent = home.join(".agent");
+    let real = agent_client::files::real(&agent).filter(|real| *real != agent);
+    let mut folders = Vec::new();
+    for folder in given {
+        let folder = PathBuf::from(folder);
+        let resolved = agent_client::files::real(&folder).unwrap_or_else(|| folder.clone());
+        // A folder in the home's real place, as the home's own name spells it.
+        if let Some(real) = &real
+            && let Ok(rest) = resolved.strip_prefix(real)
+        {
+            folders.push(agent.join(rest));
+        }
+        folders.push(resolved);
+        folders.push(folder);
+    }
+    folders.sort();
+    folders.dedup();
+    policy::Home {
         home,
         agent: std::iter::once(agent).chain(real).collect(),
-        given,
-    })
+        given: folders,
+    }
 }
 
 /// Whether a planned call reaches the agent's home: a write, edit or patch
@@ -1171,15 +1182,29 @@ async fn intent(
         json!({"mode":settings["sandbox"],"writable":settings["writable"],
             "network":settings["network"]})
     });
-    // Only a person may let a call reach the agent's home.
-    if let Some(home) = own_home(&inspected) {
+    // Only a person may let a call reach the agent's home. Off the runtime
+    // thread: resolving a path may wait on a slow mount, and a stall here
+    // must not hold up the lease's renewal.
+    {
         let folder = workspace.clone();
         let confined = sandbox.is_some();
+        let given: Vec<String> = (inspected["workspace"].as_str().into_iter())
+            .chain(
+                (inspected["settings"]["writable"]
+                    .as_array()
+                    .into_iter()
+                    .flatten())
+                .filter_map(Value::as_str),
+            )
+            .map(str::to_owned)
+            .collect();
         let calls: Vec<(String, Value)> = (planned.iter())
             .map(|call| (call.tool.clone(), call.arguments.clone()))
             .collect();
-        // Off the runtime thread: resolving a path may wait on a slow mount.
         let flags = tokio::task::spawn_blocking(move || {
+            let Some(home) = own_home(&given) else {
+                return vec![false; calls.len()];
+            };
             (calls.iter().zip(changed_by_call))
                 .map(|((tool, arguments), changed)| {
                     reaches_home(
@@ -1598,6 +1623,62 @@ mod tests {
         assert!(reaches("apply_patch", json!({"input": patch}), true));
         // Other tools, such as Sonny's own triggers tool, are its way in.
         assert!(!reaches("triggers", json!({"add": {"message": job}}), true));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_home_kept_elsewhere_through_a_link_matches_its_given_folders_either_way() {
+        let dir = std::env::temp_dir().join(format!("sonny-linked-home-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let root = {
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::canonicalize(&dir).unwrap()
+        };
+        let kept = root.join("disk/agent");
+        let worktree = kept.join("worktrees/shop-fix");
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::os::unix::fs::symlink(&kept, root.join(".agent")).unwrap();
+        // The daemon gives the worktree by its real path.
+        let home = own_home_in(root.clone(), &[worktree.to_str().unwrap().to_owned()]);
+        let folder = root.join("code");
+        let reaches = |tool: &str, arguments: Value| {
+            let changed = changed_paths(tool, &arguments);
+            reaches_home(&home, tool, &arguments, &changed, Some(&folder), true)
+        };
+        let escalated =
+            |command: &str| json!({"command": command, "sandbox_permissions": "require_escalated"});
+        assert!(!reaches(
+            "shell",
+            escalated("git -C ~/.agent/worktrees/shop-fix push origin HEAD")
+        ));
+        assert!(!reaches(
+            "shell",
+            escalated(&format!("git -C {} push", worktree.display()))
+        ));
+        assert!(reaches(
+            "shell",
+            escalated("touch ~/.agent/triggers/jobs/x.json")
+        ));
+        assert!(reaches(
+            "shell",
+            escalated(&format!("touch {}/config.toml", kept.display()))
+        ));
+        assert!(!reaches(
+            "write",
+            json!({"path": "~/.agent/worktrees/shop-fix/a.rs", "content": "x"})
+        ));
+        assert!(!reaches(
+            "write",
+            json!({"path": worktree.join("a.rs"), "content": "x"})
+        ));
+        assert!(reaches(
+            "write",
+            json!({"path": "~/.agent/rules/x.rules", "content": "x"})
+        ));
+        assert!(reaches(
+            "write",
+            json!({"path": kept.join("env"), "content": "x"})
+        ));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

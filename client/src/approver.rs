@@ -352,19 +352,27 @@ impl Home {
 
     /// Whether a command's text names a `.agent` folder outside the folders
     /// the agent was given: every path word holding `.agent` as a whole
-    /// part, with `~`, `$HOME` and `${HOME}` read as the home and a
-    /// relative one read from `folder`. Read by its words alone, so a
+    /// part, or the home by one of its absolute spellings (its real path
+    /// need not hold the name), with `~`, `$HOME` and `${HOME}` read as the
+    /// home and a relative one read from `folder`. Read by its words alone, so a
     /// command that spells the name another way is left to the judge.
     pub fn named_by(&self, text: &str, folder: Option<&std::path::Path>) -> bool {
-        const NAME: &str = ".agent";
         let part =
             |c: Option<char>| c.is_some_and(|c| c.is_ascii_alphanumeric() || "_-.".contains(c));
         let ends = |c: char| c.is_whitespace() || "'\"`;|&()<>=:,".contains(c);
-        text.match_indices(NAME).any(|(at, _)| {
-            if part(text[..at].chars().next_back()) || part(text[at + NAME.len()..].chars().next())
-            {
-                return false;
-            }
+        // `.agent` anywhere, and the home by each of its absolute spellings,
+        // its real one too, which need not hold the name.
+        let spelled: Vec<String> = (self.agent.iter())
+            .map(|agent| agent.to_string_lossy().into_owned())
+            .collect();
+        let needles = std::iter::once(".agent").chain(spelled.iter().map(String::as_str));
+        let at: Vec<(usize, usize)> = needles
+            .flat_map(|needle| text.match_indices(needle).map(|(at, n)| (at, n.len())))
+            .filter(|&(at, len)| {
+                !part(text[..at].chars().next_back()) && !part(text[at + len..].chars().next())
+            })
+            .collect();
+        at.into_iter().any(|(at, _)| {
             let start = text[..at]
                 .char_indices()
                 .rev()
