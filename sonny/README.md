@@ -458,6 +458,8 @@ words. The copy names the source from a fixed set (`earlier`, `margin`,
 reply you are reading, or a source it made up, shows none, and a window
 too narrow for the whole guess and its source leaves the source out.
 
+![A guess from a task's news, its source after the key](../docs/sonny/suggest-origin.png)
+
 ![The guess, dim in the empty composer after a reply](../docs/sonny/suggest-shown.png)
 
 ![Tab took it into the composer, unsent](../docs/sonny/suggest-taken.png)
