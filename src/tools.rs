@@ -1385,9 +1385,10 @@ impl Registry {
         self.rules = Arc::new(crate::rules::Folder::new(folder));
         self
     }
-    /// The command rules as their folder holds them now.
-    pub fn rules(&self) -> Arc<crate::rules::Rules> {
-        self.rules.current()
+    /// The command rules' folder, which reads them as it holds them now
+    /// (off the runtime thread: it reads the filesystem).
+    pub fn rules_folder(&self) -> Arc<crate::rules::Folder> {
+        self.rules.clone()
     }
     pub fn names(&self) -> Vec<&'static str> {
         self.tools.iter().map(|t| t.name()).collect()

@@ -198,6 +198,9 @@ pub struct Turn {
     /// rules its calls by them, so one that announces a call and the run
     /// that starts it agree.
     pub rules: std::sync::OnceLock<Arc<agent_runtime::rules::Rules>>,
+    /// What the rules made of the calls being run, as their round's
+    /// announcement recorded it: read again as each run of calls starts.
+    pub ruled: std::sync::Mutex<Arc<agent_runtime::rules::Rules>>,
     /// The turn's model's context window, as the turn starts.
     pub window: std::sync::OnceLock<u64>,
     /// The park this task continues, already claimed by the service: record
@@ -782,6 +785,10 @@ impl Turn {
     }
     fn rules(&self) -> &agent_runtime::rules::Rules {
         self.rules.get().expect("rounds read the rules first")
+    }
+    /// The rulings of the calls being run ([`Turn::ruled`]).
+    fn ruled(&self) -> Arc<agent_runtime::rules::Rules> {
+        self.ruled.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
     /// The configured envelope bounds input. Completion headroom is a soft
     /// compaction trigger, not a tax on every request's usable history.
@@ -2114,7 +2121,15 @@ impl Turn {
         let context = self.store.op("context", move |db| db.context(turn)).await?;
         self.settings
             .get_or_init(|| self.with_one_lifetime(&record, &context.model));
-        self.rules.get_or_init(|| self.registry.rules());
+        if self.rules.get().is_none() {
+            // Reading the folder touches the filesystem: off the runtime
+            // thread.
+            let folder = self.registry.rules_folder();
+            let rules = tokio::task::spawn_blocking(move || folder.current())
+                .await
+                .map_err(|_| Error::with("rules_invalid", "the rules could not be read"))?;
+            let _ = self.rules.set(rules);
+        }
         // A turn may run at its own effort; everything after reads the record.
         record.effort = context.effort.clone();
         record.turn_budget = context.budget;
@@ -3718,6 +3733,9 @@ impl Turn {
         summary_retry_ms: Option<u64>,
     ) -> Result<Option<Stop>> {
         let (turn, allowed) = (self.turn, record.callable());
+        // As announced, whatever the rules say now.
+        let ruled = self.store.op("rulings", move |db| db.rulings(turn)).await?;
+        *self.ruled.lock().unwrap_or_else(|e| e.into_inner()) = Arc::new(ruled);
         let mut calls = calls.into_iter();
         while let Some(call) = calls.next() {
             // Nor any tool: the calls not yet started are answered as not
@@ -3747,7 +3765,7 @@ impl Turn {
             }
             // An escape from a sandbox runs unconfined only once a gate
             // allowed it.
-            let approved = record.gated(&call, workspace, self.rules());
+            let approved = record.gated(&call, workspace, &self.ruled());
             if approved {
                 match self
                     .approve(
@@ -3786,7 +3804,7 @@ impl Turn {
             // is refused, and one a rule asks about with no gate to ask is
             // refused too, as Codex refuses it under a policy that never
             // asks.
-            let ruling = record.ruling(&call, self.rules());
+            let ruling = record.ruling(&call, &self.ruled());
             let prepared = prepared.and_then(|prepared| match &ruling {
                 Ok(Ruling::Forbidden(why)) => Err(Error::with("command_forbidden", why.as_str())),
                 Ok(Ruling::Prompt(why)) if !approved => {
@@ -4141,10 +4159,11 @@ impl Turn {
         call: &ToolCall,
         workspace: &std::path::Path,
     ) -> Option<Prepared> {
+        let ruled = self.ruled();
         if !matches!(call.name.as_str(), "shell" | "read")
-            || record.gated(call, workspace, self.rules())
+            || record.gated(call, workspace, &ruled)
             || !matches!(
-                record.ruling(call, self.rules()),
+                record.ruling(call, &ruled),
                 Ok(Ruling::None | Ruling::Allow)
             )
             || record.declared(&call.name).is_some()
@@ -4194,7 +4213,8 @@ impl Turn {
         // A sandboxed bot's commands all run in its one sandbox; when it
         // can't be had, each command fails with why. A command a rule
         // allows runs unconfined.
-        let allowed = |call: &ToolCall| record.ruling(call, self.rules()) == Ok(Ruling::Allow);
+        let ruled = self.ruled();
+        let allowed = |call: &ToolCall| record.ruling(call, &ruled) == Ok(Ruling::Allow);
         let shells = batch
             .iter()
             .any(|(call, prepared)| matches!(prepared, Prepared::Shell { .. }) && !allowed(call));
@@ -4446,7 +4466,7 @@ impl Turn {
                 .iter()
                 .filter(|gate| {
                     round.clone().any(|c| {
-                        record.gated(c, workspace, self.rules()) && gate.tools.contains(&c.name)
+                        record.gated(c, workspace, &self.ruled()) && gate.tools.contains(&c.name)
                     })
                 })
                 .filter_map(|gate| gate.expire_ms)
@@ -6097,6 +6117,7 @@ mod tests {
             background_failures: mpsc::unbounded_channel().0,
             settings: Default::default(),
             rules: Default::default(),
+            ruled: Default::default(),
             window: Default::default(),
             resumed: None,
             steers: Arc::new(AtomicBool::new(true)),
@@ -6275,6 +6296,7 @@ mod tests {
             background_failures: mpsc::unbounded_channel().0,
             settings: Default::default(),
             rules: Default::default(),
+            ruled: Default::default(),
             window: Default::default(),
             resumed: None,
             steers: Arc::default(),

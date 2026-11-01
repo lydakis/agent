@@ -527,7 +527,7 @@ impl Bot {
             return Ok(Ruling::None);
         };
         match arguments["command"].as_str() {
-            Some(command) => rules.rule(command),
+            Some(command) => rules.rule_call(&call.call_id, command),
             None => Ok(Ruling::None),
         }
     }
@@ -1941,7 +1941,7 @@ impl Database {
             CREATE UNIQUE INDEX IF NOT EXISTS pauses_held ON pauses(ifnull(resumed_ms,0))
                 WHERE resumed_ms IS NULL;
             CREATE TABLE IF NOT EXISTS tools(turn INTEGER NOT NULL REFERENCES turns(id), call_id TEXT NOT NULL,
-                status TEXT NOT NULL, custom INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(turn,call_id));
+                status TEXT NOT NULL, custom INTEGER NOT NULL DEFAULT 0, ruling TEXT, PRIMARY KEY(turn,call_id));
             CREATE TABLE IF NOT EXISTS approvals(id INTEGER PRIMARY KEY AUTOINCREMENT, turn INTEGER NOT NULL REFERENCES turns(id),
                 call_id TEXT NOT NULL, name TEXT NOT NULL, node INTEGER NOT NULL, request INTEGER NOT NULL,
                 announced_ms INTEGER NOT NULL, gates TEXT NOT NULL, verdicts TEXT, arguments TEXT NOT NULL, asked TEXT,
@@ -6192,13 +6192,16 @@ impl Database {
         // A turn keys its calls by id. The provider checks one response's ids;
         // one that reuses an id from an earlier round of the turn is refused
         // the same way, and the round commits nothing.
+        // Each keeps what the command rules made of it, which its run reads:
+        // the rules may change before it runs.
         for call in calls {
+            let ruling = Ruling::stored(&bot.ruling(call, rules));
             let planned = tx
                 .prepare_cached(
-                    "INSERT INTO tools(turn,call_id,status,custom) VALUES (?,?,'planned',?)
+                    "INSERT INTO tools(turn,call_id,status,custom,ruling) VALUES (?,?,'planned',?,?)
                      ON CONFLICT DO NOTHING",
                 )?
-                .execute(params![turn, call.call_id, call.custom])?;
+                .execute(params![turn, call.call_id, call.custom, ruling])?;
             if planned == 0 {
                 return Err(Error::new("invalid_tool_call_id"));
             }
@@ -6599,6 +6602,23 @@ impl Database {
     /// Start a gated call once every gate allowed it, record its denial, or
     /// say what it still waits for. Allows ride the call's `tool_start`
     /// commit and a denial is its result, so a verdict adds no commit.
+    /// What the command rules made of each of the turn's calls still to
+    /// run, as their rounds were announced.
+    pub fn rulings(&self, turn: i64) -> Result<Rules> {
+        let mut statement = self.conn.prepare_cached(
+            "SELECT call_id,ruling FROM tools WHERE turn=? AND ruling IS NOT NULL
+             AND status IN ('planned','executing')",
+        )?;
+        let rows = statement.query_map([turn], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        let mut rulings = HashMap::new();
+        for row in rows {
+            let (call_id, stored) = row?;
+            rulings.insert(call_id, Ruling::read(&stored));
+        }
+        Ok(Rules::recorded(rulings))
+    }
     pub fn approval_start(&mut self, turn: i64, call: &ToolCall, now_ms: u64) -> Result<Gated> {
         let mut bot = self.active(turn)?;
         let request = self
@@ -12673,6 +12693,15 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
              WHERE json_extract(settings,'$.unsandboxed') IS NOT NULL",
             [],
         )?;
+        // A planned call keeps what the rules made of it as it was planned.
+        if conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='tools')
+             AND NOT EXISTS(SELECT 1 FROM pragma_table_info('tools') WHERE name='ruling')",
+            [],
+            |r| r.get::<_, bool>(0),
+        )? {
+            conn.execute_batch("ALTER TABLE tools ADD COLUMN ruling TEXT;")?;
+        }
     }
     Ok(())
 }

@@ -186,13 +186,47 @@ pub enum Ruling {
     Forbidden(String),
 }
 
-/// The rules a turn runs with: those last read, or why none could be.
+impl Ruling {
+    /// As a planned call keeps it, beside the call: none when no rule
+    /// names it.
+    pub fn stored(ruling: &std::result::Result<Ruling, Error>) -> Option<String> {
+        let value = match ruling {
+            Ok(Self::None) => return None,
+            Ok(Self::Allow) => serde_json::json!({"decision": "allow"}),
+            Ok(Self::Prompt(why)) => serde_json::json!({"decision": "prompt", "why": why}),
+            Ok(Self::Forbidden(why)) => serde_json::json!({"decision": "forbidden", "why": why}),
+            Err(error) => serde_json::json!({"error": error.code, "detail": error.detail}),
+        };
+        Some(value.to_string())
+    }
+
+    /// What [`Ruling::stored`] kept.
+    pub fn read(stored: &str) -> std::result::Result<Ruling, Error> {
+        let value: serde_json::Value = serde_json::from_str(stored).unwrap_or_default();
+        let why = || value["why"].as_str().unwrap_or_default().to_owned();
+        match (value["decision"].as_str(), value["error"].as_str()) {
+            (Some("allow"), _) => Ok(Self::Allow),
+            (Some("prompt"), _) => Ok(Self::Prompt(why())),
+            (Some("forbidden"), _) => Ok(Self::Forbidden(why())),
+            (_, Some(code)) => Err(match value["detail"].as_str() {
+                Some(detail) => Error::with(code, detail),
+                None => Error::new(code),
+            }),
+            _ => Ok(Self::None),
+        }
+    }
+}
+
+/// The rules a turn runs with: those last read, or why none could be; or,
+/// as a round runs its calls, what its announcement ruled of each.
 #[derive(Debug, Clone, Default)]
 pub struct Rules {
     policy: Policy,
     /// The folder's files failed to read before any did: every command is
     /// refused with this until they read.
     broken: Option<Error>,
+    /// Each planned call's ruling as its round was announced, by call id.
+    recorded: Option<std::collections::HashMap<String, std::result::Result<Ruling, Error>>>,
 }
 
 impl Rules {
@@ -200,6 +234,27 @@ impl Rules {
         Self {
             policy,
             broken: None,
+            recorded: None,
+        }
+    }
+
+    /// The rulings a round's announcement recorded, by call id: the calls
+    /// run as they were announced, also when the rules changed since, as
+    /// across a park or a restart. A call with none, none ruled.
+    pub fn recorded(
+        rulings: std::collections::HashMap<String, std::result::Result<Ruling, Error>>,
+    ) -> Self {
+        Self {
+            recorded: Some(rulings),
+            ..Self::default()
+        }
+    }
+
+    /// What these rules make of the shell call `call_id` running `script`.
+    pub fn rule_call(&self, call_id: &str, script: &str) -> std::result::Result<Ruling, Error> {
+        match &self.recorded {
+            Some(recorded) => recorded.get(call_id).cloned().unwrap_or(Ok(Ruling::None)),
+            None => self.rule(script),
         }
     }
 
@@ -290,8 +345,8 @@ impl Folder {
             Err(_) if state.read => {}
             Err(error) => {
                 state.current = Arc::new(Rules {
-                    policy: Policy::default(),
                     broken: Some(error),
+                    ..Rules::default()
                 });
             }
         }
@@ -311,9 +366,29 @@ fn files(folder: &Path) -> Result<Vec<PathBuf>> {
     for entry in entries {
         let entry = entry.map_err(|error| invalid(format!("{}: {error}", folder.display())))?;
         let path = entry.path();
-        if path.extension().is_some_and(|ext| ext == "rules")
-            && std::fs::metadata(&path).is_ok_and(|found| found.is_file())
-        {
+        if path.extension().is_none_or(|ext| ext != "rules") {
+            continue;
+        }
+        let Ok(found) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        // The sandbox keeps the folder read-only, not what a link in it
+        // names, nor another name for the same file: a bot could write one
+        // of those and so its own rules.
+        #[cfg(unix)]
+        let linked = {
+            use std::os::unix::fs::MetadataExt;
+            found.is_file() && found.nlink() > 1
+        };
+        #[cfg(not(unix))]
+        let linked = false;
+        if found.file_type().is_symlink() || linked {
+            return Err(invalid(format!(
+                "{}: a rules file is a file of its own in the rules folder, not a link",
+                path.display()
+            )));
+        }
+        if found.is_file() {
             files.push(path);
         }
     }
@@ -1101,6 +1176,19 @@ prefix_rule(pattern = [r"a\b", "\101\n"], decision = "allow",)
         assert!(error.detail.unwrap().contains("b.rules:1"));
         std::fs::write(dir.join("b.rules"), "# fixed\n").unwrap();
         assert_eq!(fresh.current().rule("rm x"), Ok(Ruling::Allow));
+        // A link, which the sandbox wouldn't keep read-only, is refused.
+        #[cfg(unix)]
+        {
+            let elsewhere = dir.with_extension("elsewhere");
+            std::fs::write(&elsewhere, "prefix_rule(pattern = [\"rm\"])").unwrap();
+            std::os::unix::fs::symlink(&elsewhere, dir.join("c.rules")).unwrap();
+            let error = Policy::load(&dir).unwrap_err();
+            assert!(error.detail.unwrap().contains("c.rules: a rules file"));
+            std::fs::remove_file(dir.join("c.rules")).unwrap();
+            std::fs::hard_link(&elsewhere, dir.join("c.rules")).unwrap();
+            assert_eq!(Policy::load(&dir).unwrap_err().code, "rules_invalid");
+            std::fs::remove_file(&elsewhere).unwrap();
+        }
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
