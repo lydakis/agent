@@ -4,8 +4,8 @@ use agent_runtime::{
     provider::{ToolCall, Usage},
     store::{
         Answered, Binding, Bot, CacheTtl, CompactionPlan, ContextUsage, Database, Decision,
-        Delivery, Fork, Gate, Gated, Planning, QuoteRef, Settings, Strip, TurnBudget, TurnOptions,
-        Wake,
+        Delivery, Fork, Gate, Gated, Halt, Halted, Planning, QuoteRef, Settings, Strip, TurnBudget,
+        TurnOptions, Wake,
     },
     tools::{Declared, Inherit, Outcome},
 };
@@ -9575,6 +9575,118 @@ fn a_store_from_before_skip_pointers_places_every_node() {
     assert_eq!((lineage(), pages(&db)), before);
     drop(db);
     std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn a_turn_parked_by_a_stop_continues_and_one_a_pull_parked_before_74_keeps_its_pause() {
+    let path = std::env::temp_dir().join(format!("agent-halt-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let turn = db
+        .begin(
+            "Bob",
+            "first",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    db.suspend_halted(turn, Halt::Shutdown, 0, 0, 0, None)
+        .unwrap();
+    // A stop leaves no deadline: the next start wakes it at once.
+    let parked = db.waiting_turns().unwrap();
+    assert_eq!(
+        (parked.len(), parked[0].halt, parked[0].deadline_ms),
+        (1, Some(Halt::Shutdown), None)
+    );
+    assert_eq!(
+        db.turn_view("Bob", turn).unwrap()["waiting_on"],
+        json!({"resume_at_ms":null,"stopped":true})
+    );
+    drop(db);
+    // As schema 73 wrote a pull's park.
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            "UPDATE turns SET waiting=json_set(json_remove(waiting,'$.halt'),'$.pulled',json('true'));
+             PRAGMA user_version=73;",
+        )
+        .unwrap();
+    let db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    assert_eq!(db.waiting_turns().unwrap()[0].halt, Some(Halt::Pause));
+    assert_eq!(
+        db.turn_view("Bob", turn).unwrap()["waiting_on"],
+        json!({"resume_at_ms":null,"paused":true})
+    );
+    let raw: String = Connection::open(&path)
+        .unwrap()
+        .query_row("SELECT waiting FROM turns WHERE id=?", [turn], |r| r.get(0))
+        .unwrap();
+    assert!(!raw.contains("pulled"), "{raw}");
+    drop(db);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn a_halt_says_a_call_it_cut_off_has_an_unknown_outcome_and_one_it_never_started_is_cancelled() {
+    for halt in [Halt::Pause, Halt::Shutdown] {
+        let mut db = db();
+        db.create("Bob", Some("/synthetic"), binding()).unwrap();
+        let turn = db
+            .begin(
+                "Bob",
+                "request",
+                "work",
+                true,
+                &TurnOptions::default(),
+                allow_provider,
+            )
+            .unwrap()
+            .turn;
+        let calls = ["executing", "planned"].map(|id| ToolCall {
+            custom: false,
+            name: "write".into(),
+            call_id: id.into(),
+            arguments: r#"{"path":"file","content":"hello"}"#.into(),
+        });
+        let items = calls
+            .iter()
+            .map(|call| {
+                serde_json::to_vec(&json!({"type":"function_call","call_id":call.call_id,
+                    "name":call.name,"arguments":call.arguments}))
+                .unwrap()
+                .into()
+            })
+            .collect();
+        db.append(turn, items, &calls, None).unwrap();
+        db.tool_start(turn, &calls[0]).unwrap();
+        let Halted::Parked(events) = db.suspend_halted(turn, halt, 0, 0, 0, None).unwrap() else {
+            panic!("a running turn parks");
+        };
+        let completed: Vec<_> = events
+            .iter()
+            .filter(|event| event["event"] == "tool_completed")
+            .map(|event| {
+                let data = &event["data"];
+                (
+                    data["call_id"].clone(),
+                    data["outcome_unknown"].clone(),
+                    data["cancelled"].clone(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            completed,
+            [
+                (json!("executing"), json!(true), json!(false)),
+                (json!("planned"), json!(false), json!(true)),
+            ],
+            "{halt:?}"
+        );
+    }
 }
 
 #[test]

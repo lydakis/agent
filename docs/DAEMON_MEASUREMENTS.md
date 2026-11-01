@@ -4955,8 +4955,8 @@ creations that must fit their session's output queue, and four clients
 sending the same submission at once. Two Python tests hold nine admissions
 uncommitted behind one slow store job: a `shutdown` request queued behind
 them is answered after all nine, and a SIGTERM that finds them queued still
-answers each; in both, every started turn ends `interrupted` with
-`daemon_shutdown` and the daemon exits cleanly. All of this is one
+answers each; in both, every started turn parks for the next start and the
+daemon exits cleanly. All of this is one
 Linux container with an injected sync delay; macOS, where a flush costs
 about 5.4 ms, is not measured. The burst uses one connection; many clients
 arrive interleaved, which the Python test exercises but no timing does.
@@ -6530,3 +6530,104 @@ adds no per-bot state. What the change is for is slots: before it, a
 bot polling a long build held an active slot and a task for every
 second it waited. Now, past the hold, it holds a `waiting` row. The
 head after a0e37bc changes only tests.
+
+## A planned stop parks running turns (#565)
+
+A turn now reads the daemon's stopping flag, one relaxed atomic load, at
+the top of each model round, again just before each model call, before
+each call a round runs in order, and as each call of a parallel batch
+starts. No store job is added to a turn that is not stopping; the park
+itself is the pull cord's one job. The other checks, before a gated
+call starts, before a model call's retry and before a cache refresh, run
+only on those paths.
+
+The Perf workflow's screen, run here by hand: 4-core Linux container,
+base main d617c75 against the head on the same base, both release builds,
+two alternating rounds as `.github/workflows/perf.yml` runs them
+(`bench.admission_burst` and `bench.completion_burst` 5 runs each,
+`bench.footprint` 2, `bench.lifecycle` 32-bot socket echo 1), medians:
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 74.8 | 72.4 | -3.2% |
+| admission | burst submit p99, ms | 10.6 | 11.7 | +10.5% |
+| completion | release to terminal p99, ms | 31.5 | 25.9 | -17.7% |
+| footprint | idle RSS, MiB | 20.2 | 20.4 | +1.1% |
+| footprint | per idle bot, KiB | 1.44 | 1.49 | +3.9% |
+| footprint | RSS after a turn each, MiB | 28.6 | 28.6 | +0.2% |
+| footprint | CPU per turn, ms | 2.40 | 2.53 | +5.2% |
+| lifecycle | CPU, s (5 rounds) | 2.40 | 2.53 | +5.4% |
+| lifecycle | p95 turn, ms | 633 | 610 | -3.6% |
+| lifecycle | peak RSS, MiB | 27.0 | 27.0 | -0.1% |
+
+Store work per turn is the same on both: every counted operation in the
+admission, completion and footprint benches matches, and footprint's store
+jobs per turn are 7.48-7.50 on the base and 7.47-7.51 on the head (how
+jobs fall into group commits moves with timing). No timing passes the
+gate's warning (15% on the median with no overlap). Lifecycle CPU's two
+head runs both came out above the base's two, so it ran three more
+alternating rounds: across five, the base spans 2.20-2.53 s and the head
+2.30-2.64 s, and the medians are 5% apart. The burst p99 runs overlap the
+same way (base 8.3-14.3 ms, head 9.1-15.2 ms). A relaxed load per round
+is nanoseconds against a turn's milliseconds, so these moves are taken as
+the container's noise.
+
+## Request bytes read on credit
+
+`bench/ingress_credits.py`: 400 clients connect to one socket daemon and each
+sends a 4 MiB request line, a padded `inspect`. With `--stall-s 5` each sends
+all of its line except the newline, and ends it five seconds later, as a slow
+client would. A probe session times a short `inspect` every 5 ms. The
+measurements are the daemon's peak resident memory (`VmHWM`) while the lines
+stall and the probe's p95 over the whole flood. The machine is a 4-core Linux
+container with 15 GiB of memory, so the default bound is a sixteenth of that,
+about 1 GiB. Base is main with #560 (2661e5b).
+
+| Daemon | Resident while stalled | Probe p95 | Flood |
+| --- | ---: | ---: | ---: |
+| base | 1,629 MiB | 6.0 ms | 10.4 s |
+| head, default bound (about 1 GiB) | 464 MiB | 3.4 ms | 11.6 s |
+| head, `--max-input-bytes 67108864` | 52 MiB | 19.0 ms | 12.3 s |
+
+On base, each stalled reader keeps its partial line, so memory grows with the
+number of clients. On head, a line that runs past 4 KiB waits for 8 MiB of
+credit before it reads further. Only as many lines as the bound covers read at
+once, and the others wait in their sockets' kernel buffers. At the default
+that is about 120 lines of 4 MiB. Under the small bound the probe's p95 rises
+to 19 ms, because the lines are read a few at a time across the whole flood.
+Every request is still answered.
+
+When the clients do not stall (1,000 clients sending 4 MiB lines at once), the
+small bound held peak memory at 57 to 58 MiB in two runs. Base peaked at 45 MiB
+in one run and 175 MiB in the other. In that test the senders, not the daemon,
+limit how much is in flight.
+
+An earlier version took credit 64 KiB at a time. In that version, 1,000 long
+lines under the 64 MiB bound each held part of the credit they needed and
+waited for the rest, so they deadlocked. That is why a line past its first
+4 KiB now waits for all of its credit at once.
+`long_lines_past_the_budget_together_all_get_in` is the regression test.
+
+The Perf workflow's matched screen of the ordinary request path, base
+main ec88749 against the PR head b739e2c, on the GitHub runner
+(2026-11-01):
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 45.908 | 46.601 | +1.5% |
+| admission | burst submit p99, ms | 6.235 | 6.34 | +1.7% |
+| completion | release to terminal p99, ms | 17.237 | 17.611 | +2.2% |
+| footprint | idle RSS, MiB | 20.277 | 20.07 | -1.0% |
+| footprint | per idle bot, KiB | 1.526 | 1.556 | +2.0% |
+| footprint | RSS after a turn each, MiB | 28.279 | 27.814 | -1.6% |
+| footprint | CPU per turn, ms | 1.617 | 1.614 | -0.2% |
+| lifecycle | CPU, s | 1.4 | 1.395 | -0.4% |
+| lifecycle | p95 turn, ms | 583.638 | 587.636 | +0.7% |
+| lifecycle | peak RSS, MiB | 27.02 | 26.85 | -0.6% |
+
+Every request line under 4 KiB, which is every line these benches send,
+takes one uncontended semaphore permit before its read and gives it back
+when the service takes the request up. No measure moves past 2.2%, inside
+the runner's spread between screens (release to terminal read 17.35 and
+17.24 ms on the base across the last two), and store jobs per turn held
+at about 7.5.

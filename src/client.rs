@@ -339,6 +339,7 @@ fn parse(args: &[String]) -> Result<Options> {
                     | "--max-connecting"
                     | "--max-pending"
                     | "--max-pending-bytes"
+                    | "--max-input-bytes"
                     | "--max-readers" => {
                         value.parse::<usize>().map_err(|_| {
                             Error::with("usage", format!("{flag} needs an integer"))
@@ -747,6 +748,7 @@ fn check_daemon(options: &Options, ready: &Value) -> Result<()> {
             "--max-connecting" => "connecting",
             "--max-pending" => "pending",
             "--max-pending-bytes" => "pending_bytes",
+            "--max-input-bytes" => "input_bytes",
             "--max-readers" => "readers",
             "--stall-timeout" => "stall_timeout_seconds",
             "--idle-exit" => "idle_exit_seconds",
@@ -793,10 +795,11 @@ fn ensure_daemon(options: &Options) -> Result<Connection> {
     }
 }
 
-/// How long an older daemon's running turns may take to finish when this
-/// agent replaces it; nothing new starts on it meanwhile, and what still
-/// runs then ends as interrupted. Kubernetes and systemd give a stopping
-/// service a bounded grace in the same way.
+/// How long an older daemon may drain when this agent replaces it: nothing
+/// new starts on it, its running turns park at their next boundary, and
+/// what still runs then parks where it is (a daemon before protocol 36
+/// lets turns finish and ends the rest as interrupted). Kubernetes and
+/// systemd give a stopping service a bounded grace in the same way.
 const REPLACE_GRACE: Duration = Duration::from_secs(120);
 
 /// Stop the older daemon `error` found on `socket`, once its running turns
@@ -1297,8 +1300,8 @@ pub fn main(args: Vec<String>) -> Result<i32> {
 }
 
 /// A daemon older than this agent cannot be asked to shut down in this
-/// protocol, but every protocol honours SIGTERM: running turns end as
-/// interrupted and the store keeps every chat. This is how an upgrade on a
+/// protocol, but every protocol honours SIGTERM: running turns park (end
+/// as interrupted before protocol 36) and the store keeps every chat. This is how an upgrade on a
 /// host replaces its daemon. A newer daemon, or a listener that did not greet
 /// as a daemon, is left alone and the error stands.
 fn stop_older(error: Error, pretty: bool) -> Result<i32> {
@@ -1330,9 +1333,9 @@ fn stopped(pid: i32, pretty: bool) -> Result<i32> {
 }
 
 /// Return once the daemon process is gone, so a caller may copy or reopen
-/// the store: it answers shutdown before it lets running turns finish within
-/// the grace period, cancels the rest, commits their records and closes the
-/// database. An unreaped zombie counts as gone.
+/// the store: it answers shutdown before it drains within the grace period,
+/// parks what still runs, commits their records and closes the database. An
+/// unreaped zombie counts as gone.
 fn await_exit(pid: i32, timeout: Duration) -> Result<()> {
     let deadline = Instant::now() + timeout;
     let running = || {
