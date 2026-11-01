@@ -1624,9 +1624,16 @@ impl Screen {
                 .nth(row)
                 .map(|(at, _)| at)
         };
+        // A row's last shown line, where it wrapped into several.
+        let last = |row: usize| {
+            first(row)?;
+            let next = first(row + 1).unwrap_or(self.shown.len());
+            next.checked_sub(1)
+        };
         match self.rows.get(hovered.end + 1) {
             Some(row) if row.tag == Some(Tag::Reactions(hovered.node)) => {
-                Some((first(hovered.end + 1)?, row.line.width() + 1))
+                let at = last(hovered.end + 1)?;
+                Some((at, self.shown[at].line.width() + 1))
             }
             Some(row) if row.tag.is_none() && row.line.width() == 0 => {
                 Some((first(hovered.end + 1)?, 2))
@@ -1634,9 +1641,8 @@ impl Screen {
             Some(_) => None,
             // The last row: its last shown line, past its words.
             None => {
-                first(hovered.end)?;
-                let last = self.shown.last()?;
-                Some((self.shown.len() - 1, last.line.width() + 2))
+                let at = last(hovered.end)?;
+                Some((at, self.shown[at].line.width() + 2))
             }
         }
     }
@@ -2430,6 +2436,34 @@ mod tests {
             }
         }
         assert_eq!(found, (0..emoji.len()).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn the_react_mark_follows_reactions_that_wrapped() {
+        let mut screen = Screen::default();
+        screen.push(vec![Line::from("• Merged it.")]);
+        screen.mark_last(Mark::Tag(Tag::End(5)));
+        let emoji = ["👍", "🎉", "🚀", "👀", "🙏"].map(String::from);
+        let pill = crate::transcript::reacted(&emoji.join(" "));
+        assert!(screen.put_under(Tag::End(5), Tag::Reactions(5), Some(pill)));
+        let area = Rect::new(0, 0, 14, 5);
+        let draw = |screen: &mut Screen| {
+            let mut buf = Buffer::empty(area);
+            screen.render(area, &mut buf, |_| None);
+            buf
+        };
+        draw(&mut screen);
+        screen.mouse(mouse(MouseEventKind::Moved, 4, 0));
+        let buf = draw(&mut screen);
+        // The mark after the last of them, on the row they wrapped onto.
+        let at = (0..5).find(|&y| row(&buf, y).contains(REACT));
+        assert_eq!(
+            at,
+            Some(2),
+            "{:?}",
+            (0..5).map(|y| row(&buf, y)).collect::<Vec<_>>()
+        );
+        assert!(row(&buf, 2).contains('🙏'));
     }
 
     #[test]
