@@ -1672,9 +1672,16 @@ impl Turn {
                     completion
                 }
                 Ok(None) => return Ok(Summary::Parked(accounting.parked_until)),
-                // A stopping daemon sent no retry: the turn parks, and the
-                // summary is planned again when it continues.
-                Err(error) if error.code == SHUTDOWN => return Err(error),
+                // A stopping daemon sent no request: a summary at the
+                // boundary parks the turn, planned again when it continues;
+                // one beside the turn's call is left for a later boundary.
+                Err(error) if error.code == SHUTDOWN => {
+                    accounting.copied = None;
+                    return match accounting.beside {
+                        true => Ok(Summary::Skipped),
+                        false => Err(error),
+                    };
+                }
                 Err(error) => {
                     accounting.copied = None;
                     self.hub
@@ -2984,9 +2991,9 @@ impl Turn {
         };
         let mut tool_calls = tool_calls;
         loop {
-            // A retry is another request: a stopping daemon sends none, and
-            // the turn parks as at a boundary.
-            if attempt > 0 && self.stopping.load(Relaxed) {
+            // A stopping daemon sends no request, first or retry, and the
+            // turn parks as at a boundary.
+            if self.stopping.load(Relaxed) {
                 return Err(Error::new(SHUTDOWN));
             }
             // A billed attempt that failed counts as a round: the retry that
