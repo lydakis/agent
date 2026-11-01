@@ -274,33 +274,39 @@ fn spread(
     if buttons.is_empty() {
         return vec![Vec::new(); rows.len()];
     }
-    let text: Vec<char> = (line.spans.iter())
-        .flat_map(|span| span.content.chars())
+    // The line's characters as the screen draws them: an emoji with its
+    // selector or joined into one counts once, at its drawn width.
+    let joined: String = (line.spans.iter())
+        .map(|span| span.content.as_ref())
         .collect();
-    // Where each character starts, counted once: no row scans the ones
-    // before it again.
+    let text: Vec<&str> = joined.graphemes(true).collect();
+    // Where each starts, counted once: no row counts the ones before it
+    // again.
     let mut columns = Vec::with_capacity(text.len() + 1);
     columns.push(0);
-    for c in &text {
-        columns.push(columns.last().copied().unwrap_or(0) + c.width().unwrap_or(0));
+    for grapheme in &text {
+        columns.push(columns.last().copied().unwrap_or(0) + grapheme.width());
     }
     let column = |upto: usize| columns[upto];
+    let blank = |grapheme: &str| grapheme.chars().all(char::is_whitespace);
     let mut at = 0;
     (rows.iter().enumerate())
         .map(|(n, row)| {
             let lead = if n == 0 { 0 } else { lead };
             // The row's own words, past its lead, as they are in `line`.
+            let drawn: String = (row.spans.iter())
+                .map(|span| span.content.as_ref())
+                .collect();
             let mut skipped = 0;
-            let words: Vec<char> = (row.spans.iter())
-                .flat_map(|span| span.content.chars())
-                .skip_while(|c| {
+            let words: Vec<&str> = (drawn.graphemes(true))
+                .skip_while(|grapheme| {
                     let skip = skipped < lead;
-                    skipped += c.width().unwrap_or(0);
+                    skipped += grapheme.width();
                     skip
                 })
                 .collect();
-            if words.first().is_some_and(|c| !c.is_whitespace()) {
-                while text.get(at).is_some_and(|c| c.is_whitespace()) {
+            if words.first().is_some_and(|grapheme| !blank(grapheme)) {
+                while text.get(at).is_some_and(|grapheme| blank(grapheme)) {
                     at += 1;
                 }
             }
@@ -2387,6 +2393,43 @@ mod tests {
             click(&mut screen, 12, 2),
             Some(Action::Open(format!("{BUTTON}w/delta")))
         );
+    }
+
+    #[test]
+    fn reactions_wrapped_keep_their_buttons_past_joined_emoji() {
+        let mut screen = Screen::default();
+        screen.push(vec![Line::from("• Merged it.")]);
+        screen.mark_last(Mark::Tag(Tag::End(5)));
+        // Emoji with a selector and joined ones: one cell pair each.
+        let emoji: Vec<String> = ["❤️", "👨‍👩‍👧‍👦", "👍", "🎉", "🚀", "👀"]
+            .map(String::from)
+            .to_vec();
+        let buttons = (crate::transcript::reacted_spans(&emoji).into_iter())
+            .map(|(from, to, emoji)| (from, to, format!("{BUTTON}unreact/5/{emoji}")))
+            .collect();
+        let pill = crate::transcript::reacted(&emoji.join(" "));
+        assert!(screen.put_under_with(Tag::End(5), Tag::Reactions(5), Some(pill), buttons));
+        let area = Rect::new(0, 0, 14, 4);
+        let mut buf = Buffer::empty(area);
+        screen.render(area, &mut buf, |_| None);
+        // Every emoji drawn, on whichever row, opens its own button.
+        let mut found = Vec::new();
+        for y in 1..4 {
+            for x in 0..14 {
+                let symbol = buf[(x, y)].symbol().to_owned();
+                if let Some(at) = emoji.iter().position(|e| *e == symbol) {
+                    screen.mouse(mouse(MouseEventKind::Down(MouseButton::Left), x, y));
+                    let opened = screen.mouse(mouse(MouseEventKind::Up(MouseButton::Left), x, y));
+                    assert_eq!(
+                        opened,
+                        Some(Action::Open(format!("{BUTTON}unreact/5/{}", emoji[at]))),
+                        "{symbol} at {x},{y}"
+                    );
+                    found.push(at);
+                }
+            }
+        }
+        assert_eq!(found, (0..emoji.len()).collect::<Vec<_>>());
     }
 
     #[test]
