@@ -2167,9 +2167,26 @@ impl Turn {
         record.turn_budget = context.budget;
         let (provider, model) = split_model(&context.model)?;
         let Some(provider) = self.providers.get(provider) else {
-            // A held turn this daemon resumed without its provider, set up
-            // again only by a restart, which tries it at once: still held.
-            accounting.hold(&Error::with("provider_unavailable", provider));
+            let error = Error::with("provider_unavailable", provider);
+            // A turn this daemon resumed at a model call without its
+            // provider, set up again only by a restart, which tries it at
+            // once: held there, keeping what its park kept. A park on a
+            // call the model made has that call's continuation to keep,
+            // which a park at a model call cannot: it ends, as before.
+            if let Some(waiting) = &self.resumed {
+                if waiting.paced_since_ms.is_none() {
+                    return Err(error);
+                }
+                if let Some(route) = &waiting.route {
+                    let _ = accounting.route.set(route.clone());
+                }
+                accounting.summary_retry_at = waiting.summary_retry_ms.unwrap_or(0);
+                accounting.held_since = waiting.held_since_ms;
+                accounting.call_fallback = waiting.fallback.clone();
+                accounting.compaction = waiting.compaction;
+                accounting.copied = waiting.copied.clone().filter(|_| waiting.compaction);
+            }
+            accounting.hold(&error);
             return Ok(Round::Paced(accounting.parked_until));
         };
         // The daemon runs whatever provider set started it; the one thing a

@@ -276,7 +276,9 @@ async fn tell_bounced(
     error: &str,
 ) -> agent_client::Result<()> {
     let prompt = bounce_note(bot, turn, error);
-    let mut submit = json!({"bot": to, "request_id": format!("bounce.{bot}.{turn}.{to}"),
+    // Bounded whatever the names' lengths, as request ids are.
+    let request_id = format!("bounce.{turn}.{}", digest(&format!("{bot}\n{turn}\n{to}")));
+    let mut submit = json!({"bot": to, "request_id": request_id,
         "prompt": crate::stamp::now(&prompt), "delivery": "attach", "origin": BOUNCE_ORIGIN,
         "wait_ms": crate::trigger::attach_wait()});
     if let Some(id) = to_id {
