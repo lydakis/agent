@@ -2,7 +2,10 @@
 //! profiles) and `~/.agent/config.toml`, copied into a git repository,
 //! `~/agent-home`, and pushed every ten minutes by Sonny's scheduler,
 //! so a machine that dies takes at most that much with it. Keys
-//! (`~/.agent/env`), logins and the daemon's store stay out.
+//! (`~/.agent/env`), logins and the daemon's store stay out. The triggers
+//! go as a list to read, `triggers.json`: each is tied to an agent of the
+//! store, so after a restore each folder's lead sets up again those the
+//! person asked for.
 //!
 //! `sonny setup backup URL` sets it up, and restores a home the repository
 //! already holds, which is how a new machine starts; `sonny home sync` is
@@ -26,10 +29,16 @@ pub const EVERY_SECONDS: u32 = 600;
 /// keeps out of its history (a lock, read counts, an open cleanup that
 /// names a commit the copy does not have).
 const SKIP: [&str; 5] = [".git", ".lock", ".reads", ".cleanup", ".DS_Store"];
+/// The list of triggers the copy holds, to read: tied to agents of this
+/// machine's store, they are set up again by each folder's lead after a
+/// restore, never by Sonny.
+const TRIGGERS: &str = "triggers.json";
 pub const USAGE: &str = "usage: home sync | home status\n       setup backup [URL]";
 
 /// Where the home, its copy and what its syncs did live.
 pub struct Places {
+    /// The HOME they are under.
+    home: PathBuf,
     agents: PathBuf,
     config: PathBuf,
     repo: PathBuf,
@@ -40,6 +49,7 @@ impl Places {
     pub fn home() -> Result<Self, String> {
         let home = PathBuf::from(std::env::var_os("HOME").ok_or("set HOME")?);
         Ok(Self {
+            home: home.clone(),
             agents: home.join(".agents"),
             config: home.join(".agent/config.toml"),
             repo: home.join("agent-home"),
@@ -232,7 +242,12 @@ fn adopt(places: &Places, url: &str, env: Option<&[(OsString, OsString)]>) -> Re
         std::fs::copy(&config, &places.config).map_err(|e| e.to_string())?;
         private(&places.config).map_err(|e| e.to_string())?;
     }
-    Ok(held.is_dir() || config.is_file())
+    let triggers = std::fs::read(places.repo.join(TRIGGERS)).ok();
+    crate::trigger::restore(&places.home, triggers.as_deref())?;
+    if triggers.is_some() {
+        println!("Each folder's lead will set up its triggers again when you next open it.");
+    }
+    Ok(held.is_dir() || config.is_file() || triggers.is_some())
 }
 
 /// Make the clone at `repo` hold the remote's last commit and nothing
@@ -317,6 +332,7 @@ fn sync_once(places: &Places, env: Option<&[(OsString, OsString)]>) -> Result<Va
             None => {}
         }
     }
+    keep_triggers(places)?;
     git(repo, &["add", "--all"], env)?;
     let changed = !git(repo, &["status", "--porcelain"], env)?
         .trim()
@@ -348,6 +364,32 @@ fn sync_once(places: &Places, env: Option<&[(OsString, OsString)]>) -> Result<Va
         "commit": commit.map(|c| c.trim().to_owned()),
         "config_skipped": skipped,
     }))
+}
+
+/// The copy's list of triggers made what this HOME's are, written only
+/// when it changed, and gone with the last of them.
+fn keep_triggers(places: &Places) -> Result<(), String> {
+    let held = places.repo.join(TRIGGERS);
+    let mut list = crate::trigger::backed_up(&crate::trigger::Places::under(&places.home));
+    // What a restore brought for leads not opened since stays backed up,
+    // under any trigger of the same name set up here since.
+    for row in crate::trigger::pending_restored(&places.home) {
+        if !list.iter().any(|kept| kept["name"] == row["name"]) {
+            list.push(row);
+        }
+    }
+    list.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+    if list.is_empty() {
+        return match std::fs::remove_file(&held) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.to_string()),
+            _ => Ok(()),
+        };
+    }
+    let text = serde_json::to_string_pretty(&list).map_err(|e| e.to_string())? + "\n";
+    if std::fs::read(&held).ok().as_deref() != Some(text.as_bytes()) {
+        std::fs::write(&held, text).map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 /// Whether the branch has commits its upstream lacks, or no upstream.
@@ -808,6 +850,7 @@ mod tests {
 
     fn places(root: &Path) -> Places {
         Places {
+            home: root.join("home"),
             agents: root.join("home/.agents"),
             config: root.join("home/.agent/config.toml"),
             repo: root.join("home/agent-home"),
@@ -974,6 +1017,55 @@ mod tests {
                 .unwrap_err()
                 .starts_with("backup_other_repo: ")
         );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_backup_lists_the_triggers_and_a_restore_leaves_them_for_the_leads() {
+        let root = scratch("triggers");
+        let remote = root.join("remote.git");
+        sh(&root, &["init", "--quiet", "--bare", "remote.git"]);
+        let url = remote.to_string_lossy().into_owned();
+        let first = places(&root.join("one"));
+        write(&first.agents.join("memory/fact.md"), "fact");
+        adopt(&first, &url, None).unwrap();
+        sh(&first.repo, &["config", "user.email", "t@example.com"]);
+        sh(&first.repo, &["config", "user.name", "T"]);
+        let job = first.home.join(".agent/triggers/jobs/p.digest.json");
+        write(&job, "not a trigger");
+        sync(&first, None).unwrap();
+        assert!(
+            !first.repo.join(TRIGGERS).exists(),
+            "none that can be read, no list"
+        );
+        write(&job, &crate::trigger::tests::definition_of("p.digest"));
+        sync(&first, None).unwrap();
+        let held = std::fs::read_to_string(first.repo.join(TRIGGERS)).unwrap();
+        assert!(held.contains("\"name\": \"p.digest\""), "{held}");
+        assert_eq!(sync(&first, None).unwrap()["committed"], false, "unchanged");
+
+        let second = places(&root.join("two"));
+        assert!(adopt(&second, &url, None).unwrap());
+        let restored = crate::trigger::restored_in(&second.home, "p").unwrap();
+        assert!(restored.note().contains("p.digest"), "{}", restored.note());
+        // Its sync before the lead opens keeps what the lead is yet to set
+        // up, and once the lead was handed it, only what is set up here.
+        sh(&second.repo, &["config", "user.email", "t@example.com"]);
+        sh(&second.repo, &["config", "user.name", "T"]);
+        // Its own remote, so the first machine's pushes below still go.
+        sh(&root, &["init", "--quiet", "--bare", "remote-two.git"]);
+        let two = root.join("remote-two.git").to_string_lossy().into_owned();
+        sh(&second.repo, &["remote", "set-url", "origin", &two]);
+        sync(&second, None).unwrap();
+        let kept = std::fs::read_to_string(second.repo.join(TRIGGERS)).unwrap();
+        assert!(kept.contains("\"name\": \"p.digest\""), "{kept}");
+        restored.told();
+        sync(&second, None).unwrap();
+        assert!(!second.repo.join(TRIGGERS).exists());
+        // The last one gone, the list goes too.
+        std::fs::remove_file(&job).unwrap();
+        sync(&first, None).unwrap();
+        assert!(!first.repo.join(TRIGGERS).exists());
         std::fs::remove_dir_all(&root).unwrap();
     }
 

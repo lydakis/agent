@@ -83,6 +83,14 @@ the last line of this skill is advice to the model, not a wall. Before
 watching such a source, tell the person, and say that isolation, such as a
 separate macOS user or a virtual machine, has to come from outside Agent.
 
+To move a job that runs elsewhere onto a trigger, add it with `shadow`
+first and leave the old job running: each fire goes to a read-only copy of
+the agent, which can read files and call tools that only read, but not run
+commands, post, change files or ask the person, and its answer comes to you
+as a report of what it would have done. Compare a
+few reports with what the old job did, then `add` it again with `replace`
+and without `shadow`, and tell the person the old job can be stopped.
+
 To change a trigger, `add` it again with its `name`, the new definition and
 `replace`: it is changed in place and keeps its last result, where `remove`
 and a new `add` would lose it. `fire` NAME runs it now, waits for the run,
@@ -119,8 +127,9 @@ under an hour old. The `!` makes that a skip, and makes anything else a
 fire, so a check that cannot tell, from a missing tool, an expired token or
 a source that errors, wakes the job to fail and say so instead of passing
 for a quiet day. A gate that runs past its minute is a failed fire with no
-turn, which nothing below hears of, so give every request in `quiet` a time
-limit well inside it, such as `curl --max-time 20`: a source that hangs then
+turn: the job hears of it once, and once when the gate works again, and
+misses every run in between. So give every request in `quiet` a time limit
+well inside it, such as `curl --max-time 20`: a source that hangs then
 makes `quiet` fail, and the job runs. The hour lets a run re-check the
 ledger's open items. The gate gets `HOME`, `SHELL`, the `PATH` it was added
 with and the daemon's socket, not the daemon's environment or anything it
