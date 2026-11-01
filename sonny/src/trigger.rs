@@ -146,6 +146,13 @@ impl Places {
         }
         let record = home.join(".agent/sonny/migrated");
         let done = crate::upgrade::once(&record, MOVED, || {
+            // For leads not opened since a restore before 0.8.0,
+            // whether or not the folder can move yet.
+            let list = home.join(".agent/sonny/restored-automations.json");
+            let before = home.join(".agent/sonny/restored-triggers.json");
+            if !list.exists() && before.exists() {
+                let _ = std::fs::rename(&before, &list);
+            }
             if !places.state.exists() && old.state.is_dir() {
                 let Some(_held) = old.quiet(scheduling) else {
                     return false;
@@ -158,12 +165,6 @@ impl Places {
                 // files' lock, held here until this link is there: it
                 // reaches the new folder through it.
                 let _ = std::os::unix::fs::symlink("automations", &old.state);
-            }
-            // For leads not opened since a restore before 0.8.0.
-            let list = home.join(".agent/sonny/restored-automations.json");
-            let before = home.join(".agent/sonny/restored-triggers.json");
-            if !list.exists() && before.exists() {
-                let _ = std::fs::rename(&before, &list);
             }
             true
         });
@@ -6463,6 +6464,8 @@ pub(crate) mod tests {
         assert!(!w.places.state.exists());
         let record = sonny.join("migrated");
         assert!(!crate::upgrade::lines(&record).contains(&MOVED.to_owned()));
+        // A restore's list is renamed without waiting for the folder.
+        assert!(sonny.join("restored-automations.json").exists());
         drop(fire);
         // Its scheduler, still running: only that scheduler moves it.
         let scheduler = hold(old.join(".scheduler/scheduler"));
@@ -6471,7 +6474,6 @@ pub(crate) mod tests {
         drop(scheduler);
         assert!(w.places.jobs.join("p.x.json").exists());
         assert!(crate::upgrade::lines(&record).contains(&MOVED.to_owned()));
-        assert!(sonny.join("restored-automations.json").exists());
         assert!(!sonny.join("restored-triggers.json").exists());
         // What chose the old folder before the move reaches the new one
         // through a link.
