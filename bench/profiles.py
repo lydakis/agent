@@ -24,7 +24,6 @@ def profile(engine):
         'claude-code': ['node_stream_json_adapter', 'native_cli_process_per_agent',
                         'bare_mode', 'no_session_persistence', 'no_tools_enabled',
                         'native_system_prompt_prefix_and_context_blocks',
-                        'connection_preconnect_request_per_process',
                         'git_probe_subprocesses_per_process',
                         'sampled_guards_scaled_per_agent_process',
                         'disabled_optional_features_not_proven_unallocated'],

@@ -164,6 +164,7 @@ sys.exit(7)
     def test_matrix_rss_guard_is_shared_by_every_selected_engine(self):
         self.assertEqual(rss_guard(['pi', 'codex', 'rust']), 512)
         self.assertEqual(rss_guard(['rust', 'opencode']), 2048)
+        self.assertEqual(rss_guard(['rust', 'fx']), 2048)
 
     def run_fake_claude(self, mode):
         root = Path(__file__).resolve().parent.parent
@@ -249,12 +250,13 @@ class EngineIntegrationTests(unittest.TestCase):
             # Adapter plus server; opencode also starts short-lived helpers.
             self.assertGreaterEqual(result['target']['processes'], 2)
             self.assertEqual(metadata['durability'], 'sqlite_wal_synchronous_normal')
-            self.assertEqual(metadata['opencode_version'], '1.18.32')
+            self.assertEqual(metadata['opencode_version'], '1.19.5')
             return
         if engine == 'claude-code':
             # Adapter plus one CLI per agent; short git probes may also be sampled.
+            # 2.1.316 no longer sends the HEAD /api/hello warm-up 2.1.267 did.
             self.assertGreaterEqual(result['target']['processes'], 5)
-            self.assertEqual(result['provider']['preconnect_requests'], 4)
+            self.assertEqual(result['provider']['preconnect_requests'], 0)
         elif engine == 'codex':
             # Adapter plus app-server; the app-server may also start a
             # short-lived git probe in its workspace.
@@ -263,7 +265,8 @@ class EngineIntegrationTests(unittest.TestCase):
             self.assertEqual(result['target']['processes'], 1)
         self.assertEqual(metadata['durability'], 'sqlite_full' if engine == 'rust' else 'ephemeral')
         if engine == 'fx':
-            self.assertEqual(result['provider']['catalog_requests'], 4)
+            # libfx 0.0.16 fetches the catalog once per turn; 0.0.8 did once per agent.
+            self.assertEqual(result['provider']['catalog_requests'], 12)
             self.assertEqual(metadata['backend'], 'native')
             self.assertGreater(result['target']['threads'], 4)
 
@@ -285,7 +288,7 @@ class FxIntegrationTests(unittest.TestCase):
 
 
 @unittest.skipUnless(os.environ.get('AGENT_BENCH_TEST_OPENCODE') == '1',
-                     'set AGENT_BENCH_TEST_OPENCODE=1 with opencode-ai 1.18.32 under .local/opencode')
+                     'set AGENT_BENCH_TEST_OPENCODE=1 with opencode-ai 1.19.5 under .local/opencode')
 class OpencodeIntegrationTests(unittest.TestCase):
     def test_shared_opencode_server_with_real_responses_transport(self):
         EngineIntegrationTests.check_engine(self, 'opencode')
