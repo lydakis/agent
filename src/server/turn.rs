@@ -3378,8 +3378,10 @@ impl Turn {
             // call's; the budget counts only the attempts and their backoff.
             if !retryable(&error.code) || attempt >= cap || spent >= RETRY_BUDGET {
                 // A cause a person can fix, or an outage that outlasted its
-                // retries, holds the turn rather than ending it.
-                if held(&error.code) || retryable(&error.code) {
+                // retries, holds the turn rather than ending it. A summary
+                // fails as before: the turn's own call goes on, and holds
+                // there if the cause outlasts it.
+                if !summary && (held(&error.code) || retryable(&error.code)) {
                     accounting.call_fallback = fallback.as_ref().map(Fallback::parked);
                     accounting.hold(&error);
                     return Ok(None);

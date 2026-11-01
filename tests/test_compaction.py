@@ -874,7 +874,13 @@ class AnthropicUnreadableThinkingTests(ModelFixture):
         self.model.unreadable, self.model.unreadable_error = {'sig-1'}, (
             403, 'The request signature we calculated does not match the signature you provided.')
         turn = client.request('submit', bot='Bob', request_id='1', prompt='second')['result']['turn']
-        self.assertEqual(client.finished(turn)['data']['status'], 'failed')
+        # A refused signature is the person's to fix (the keys, the clock):
+        # the turn is held on it, not ended.
+        held = client.receive(lambda m: m.get('event') == 'turn_paced' and m.get('turn') == turn
+                              and 'blocked' in m['data'])
+        self.assertEqual(held['data']['blocked']['code'], 'provider_http_403')
+        client.request('interrupt', bot='Bob', turn=turn)
+        self.assertEqual(client.finished(turn)['data']['status'], 'interrupted')
         self.model.unreadable_error = None
         self.turn(client, 2, 'third')
         self.assertEqual([self.signatures(r) for r in self.requests()], [['sig-1'], ['sig-1']])
