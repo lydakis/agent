@@ -334,11 +334,12 @@ fn parse(args: &[String]) -> Result<Options> {
                         options.timeout_ms = Some(crate::cli::duration_ms(flag, &value)?)
                     }
                     "--max-processes"
-                    | "--max-detached"
+                    | "--max-lasting"
                     | "--max-active"
                     | "--max-connecting"
                     | "--max-pending"
-                    | "--max-pending-bytes" => {
+                    | "--max-pending-bytes"
+                    | "--max-readers" => {
                         value.parse::<usize>().map_err(|_| {
                             Error::with("usage", format!("{flag} needs an integer"))
                         })?;
@@ -741,11 +742,12 @@ fn check_daemon(options: &Options, ready: &Value) -> Result<()> {
     for (flag, value) in &options.daemon_flags {
         let key = match flag.as_str() {
             "--max-processes" => "processes",
-            "--max-detached" => "detached",
+            "--max-lasting" => "lasting",
             "--max-active" => "active",
             "--max-connecting" => "connecting",
             "--max-pending" => "pending",
             "--max-pending-bytes" => "pending_bytes",
+            "--max-readers" => "readers",
             "--stall-timeout" => "stall_timeout_seconds",
             "--idle-exit" => "idle_exit_seconds",
             _ => continue,
@@ -873,16 +875,26 @@ fn connect_or_start(options: &Options) -> Result<Connection> {
             "no provider: pass --provider (anthropic, openai, openrouter, chatgpt, bedrock, bedrock-openai, or NAME=FAMILY,URL,KEY_ENV), set AGENT_PROVIDER, or export a provider key",
         );
     }
+    // The daemon's folder and log are its user's alone, as the daemon
+    // makes its own files; a folder that exists keeps its mode.
     if let Some(parent) = options.store.parent() {
-        std::fs::create_dir_all(parent)?;
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(parent)?;
     }
     let mut log = options.store.clone().into_os_string();
     log.push(".log");
     let log_path = log;
-    let log = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)?;
+    let log = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(&log_path)?
+    };
     // Other starts of this store append to the same log; only what follows
     // this point, from our child, is ours to report.
     let start = log.metadata()?.len();
@@ -1246,10 +1258,22 @@ pub fn main(args: Vec<String>) -> Result<i32> {
             print_json(&paused, options.pretty)?;
             Ok(0)
         }
+        // Let go as that agent, too, from an agent's own shell.
         "resume" => {
+            let by = std::env::var("AGENT_BOT").ok().filter(|b| !b.is_empty());
             let mut connection = ensure_daemon(&options)?;
-            let resumed = connection.request("resume", json!({}))?;
+            let resumed = connection.request("resume", json!({"by": by}))?;
             print_json(&resumed, options.pretty)?;
+            Ok(0)
+        }
+        "pauses" => {
+            let mut connection = ensure_existing_daemon(&options)?;
+            let page = connection.request(
+                "pauses",
+                json!({"after": options.after, "limit": options.limit.unwrap_or(64).min(256),
+                    "newest": options.newest}),
+            )?;
+            print_json(&page, options.pretty)?;
             Ok(0)
         }
         "shutdown" => {

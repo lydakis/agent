@@ -2,7 +2,7 @@
 name = "sonny"
 version = "0.7.0"
 edition = "2024"
-rust-version = "1.92"
+rust-version = "1.95"
 license = "MIT OR Apache-2.0"
 publish = false
 
@@ -12,7 +12,7 @@ publish = false
 [dependencies]
 agent-client = { path = "../client" }
 # Already built for the runtime; encodes program status titles (OSC 7501).
-base64 = "0.22"
+base64 = "0.23"
 # Splits the browser tool's command lines as a shell would, running none.
 shell-words = "1"
 # Reads the browser tool's URLs as the browser does (WHATWG), already
@@ -53,7 +53,7 @@ sha2 = "0.10"
 # client reads it.
 toml = "0.9"
 # Line and word diffs for edits, as Codex's TUI uses it.
-similar = { version = "2", features = ["inline"] }
+similar = { version = "3", features = ["inline"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros", "process", "signal"] }
 # Moves the cursor and wraps by what the terminal draws as one character.
 unicode-segmentation = "1"

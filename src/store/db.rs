@@ -22,6 +22,8 @@ const PROMPT_SHARE_BYTES: usize = 4096;
 
 const STEER_BATCH_ITEMS: usize = 32;
 const STEER_BATCH_BYTES: usize = 256 * 1024;
+/// The most a `history_nodes` page sends, well below the event limit.
+const HISTORY_PAGE_BYTES: usize = 256 * 1024;
 /// The most bytes of pictures one absorption takes in, past its first
 /// steer's: a message's pictures may be 5 MiB once decoded.
 const STEER_BATCH_PICTURE_BYTES: usize = 8 * 1024 * 1024;
@@ -834,6 +836,15 @@ pub struct Waiting {
     /// pool resumes there.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback: Option<ParkedFallback>,
+    /// Parked by the pull cord, not a closed pool: it waits for `resume`,
+    /// and the pause is not charged as pacing.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pulled: bool,
+    /// The wait is a terminal poll, an empty `write_stdin` past its hold:
+    /// `handles` names the terminal, and its result is the terminal's
+    /// output when it ends or its yield runs out.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub poll: bool,
 }
 /// A declined request's fallback model, as `provider/model`, and the credit
 /// its retry redeems.
@@ -859,6 +870,7 @@ pub struct CopiedCall {
 impl Waiting {
     fn paced_elapsed_ms(&self) -> i64 {
         self.paced_since_ms
+            .filter(|_| !self.pulled)
             .map_or(0, |since| epoch_ms().saturating_sub(since).max(0))
     }
 }
@@ -1055,6 +1067,15 @@ impl ApprovalPage {
         self.last = id;
         Ok(true)
     }
+}
+/// What a pull did to a running turn.
+#[derive(Debug)]
+pub enum Pulled {
+    /// Parked it, with these entries.
+    Parked(Vec<Value>),
+    /// Found it parked already, by its own park that committed as the pull
+    /// cancelled its task, with that park's next lapse.
+    Already(Box<Waiting>, Option<u64>),
 }
 /// What a wake-up for a parked turn finds.
 #[derive(Debug, PartialEq)]
@@ -1466,6 +1487,23 @@ pub struct Database {
     files_gone: Vec<String>,
 }
 
+/// A pause as clients read it, from its columns in the order
+/// `id,reason,pulled_by,at_ms,parked,resumed_by,resumed_ms`: `parked` holds the agents whose running turns
+/// it parked (`bots`, the first of them, and `total`); a lifted one also says
+/// who lifted it and when.
+fn pause_row(r: &rusqlite::Row) -> rusqlite::Result<Value> {
+    let parked: Option<String> = r.get(4)?;
+    let mut pause = json!({"id": r.get::<_, i64>(0)?, "reason": r.get::<_, String>(1)?,
+        "by": r.get::<_, Option<String>>(2)?, "at_ms": r.get::<_, i64>(3)?,
+        "parked": parked.and_then(|p| serde_json::from_str::<Value>(&p).ok())
+            .unwrap_or_else(|| json!({"bots": [], "total": 0}))});
+    if let Some(at) = r.get::<_, Option<i64>>(6)? {
+        pause["resumed_by"] = json!(r.get::<_, Option<String>>(5)?);
+        pause["resumed_ms"] = json!(at);
+    }
+    Ok(pause)
+}
+
 /// The columns of the turn view, from `turns t JOIN bots b ON b.name=t.bot`.
 /// A wait result, a `turns` item and an `interrupt` reply all start from it,
 /// so a client reads one shape wherever it meets a turn.
@@ -1473,9 +1511,10 @@ const TURN_VIEW: &str = "t.id,t.bot,b.id,t.request_id,t.status,t.input_tokens,
     t.cached_input_tokens,t.output_tokens,t.model_rounds,t.retries,t.paced_ms,t.started_ms,
     t.finished_ms,json_extract(t.waiting,'$.call_id'),json_extract(t.waiting,'$.approval'),
     json_extract(t.waiting,'$.handles'),json_extract(t.waiting,'$.any'),
-    json_extract(t.waiting,'$.deadline_ms'),json_extract(t.waiting,'$.answer')";
+    json_extract(t.waiting,'$.deadline_ms'),json_extract(t.waiting,'$.answer'),
+    json_extract(t.waiting,'$.pulled')";
 /// Columns `TURN_VIEW` takes, for queries that select more after it.
-const TURN_VIEW_COLUMNS: usize = 19;
+const TURN_VIEW_COLUMNS: usize = 20;
 
 /// The turn view's own fields beside a turn's identity and status: who asked,
 /// what it waits on, its usage and timing. A model's `wait` leaves them out.
@@ -1517,6 +1556,9 @@ fn turn_view(r: &rusqlite::Row) -> rusqlite::Result<Value> {
                 .and_then(|h| serde_json::from_str::<Value>(&h).ok());
             json!({"call_id":call_id,"handles":handles,"deadline_ms":deadline_ms,
                 "any":r.get::<_, Option<i64>>(16)? == Some(1)})
+        }
+        "paced" if r.get::<_, Option<i64>>(19)? == Some(1) => {
+            json!({"resume_at_ms":null,"paused":true})
         }
         "paced" => json!({"resume_at_ms":deadline_ms}),
         _ => Value::Null,
@@ -1704,7 +1746,7 @@ impl Database {
     /// Stored schema version, kept in `PRAGMA user_version`. Stores created
     /// before versioning and stores from newer binaries are rejected; an older
     /// versioned store is migrated forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 70;
+    pub const SCHEMA: i32 = 73;
     /// Verbatim user prompts a compaction keeps: per-prompt text, and the
     /// total text plus `(ordinal, String)` entry metadata. Empty entries cost
     /// space too, so the retained list cannot grow with conversation length.
@@ -1797,6 +1839,8 @@ impl Database {
                 total_thinking INTEGER NOT NULL DEFAULT 0, pictured INTEGER NOT NULL DEFAULT 0,
                 pictures INTEGER NOT NULL DEFAULT 0, written_ms INTEGER);
             CREATE INDEX IF NOT EXISTS nodes_turn_seq ON nodes(turn_seq) WHERE turn_seq IS NOT NULL;
+            CREATE TABLE IF NOT EXISTS lineage(node INTEGER PRIMARY KEY REFERENCES nodes(id),
+                parent INTEGER, depth INTEGER NOT NULL, skip INTEGER, start INTEGER);
             CREATE UNIQUE INDEX IF NOT EXISTS nodes_turn ON nodes(turn) WHERE turn IS NOT NULL;
             CREATE TABLE IF NOT EXISTS notes(node INTEGER PRIMARY KEY REFERENCES nodes(id),
                 previous INTEGER REFERENCES notes(node), text TEXT NOT NULL);
@@ -1817,7 +1861,8 @@ impl Database {
             CREATE TABLE IF NOT EXISTS declined(node INTEGER PRIMARY KEY REFERENCES nodes(id),
                 item BLOB NOT NULL);
             CREATE TABLE IF NOT EXISTS senders(node INTEGER PRIMARY KEY REFERENCES nodes(id),
-                bot TEXT, bot_id INTEGER, turn INTEGER, origin TEXT, person TEXT, quotes TEXT);
+                bot TEXT, bot_id INTEGER, turn INTEGER, origin TEXT, person TEXT, quotes TEXT,
+                attached INTEGER);
             CREATE TABLE IF NOT EXISTS elisions(node INTEGER PRIMARY KEY REFERENCES nodes(id),
                 previous INTEGER REFERENCES elisions(node), through INTEGER NOT NULL,
                 saved INTEGER NOT NULL);
@@ -1894,8 +1939,11 @@ impl Database {
             CREATE TABLE IF NOT EXISTS checkpoints(bot TEXT NOT NULL REFERENCES bots(name), head INTEGER NOT NULL REFERENCES nodes(id),
                 PRIMARY KEY(bot,head));
             CREATE TABLE IF NOT EXISTS companions(name TEXT PRIMARY KEY, spec TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS pause(singleton INTEGER PRIMARY KEY CHECK(singleton=1),
-                reason TEXT NOT NULL, pulled_by TEXT, at_ms INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS pauses(id INTEGER PRIMARY KEY AUTOINCREMENT,
+                reason TEXT NOT NULL, pulled_by TEXT, at_ms INTEGER NOT NULL, parked TEXT,
+                resumed_by TEXT, resumed_ms INTEGER);
+            CREATE UNIQUE INDEX IF NOT EXISTS pauses_held ON pauses(ifnull(resumed_ms,0))
+                WHERE resumed_ms IS NULL;
             CREATE TABLE IF NOT EXISTS tools(turn INTEGER NOT NULL REFERENCES turns(id), call_id TEXT NOT NULL,
                 status TEXT NOT NULL, custom INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(turn,call_id));
             CREATE TABLE IF NOT EXISTS approvals(id INTEGER PRIMARY KEY AUTOINCREMENT, turn INTEGER NOT NULL REFERENCES turns(id),
@@ -2889,32 +2937,10 @@ impl Database {
         let Some(head) = head else {
             return Ok(false);
         };
-        let depths: Option<(i64, i64)> = self
-            .conn
-            .query_row(
-                "SELECT h.depth,n.depth FROM nodes h, nodes n WHERE h.id=?1 AND n.id=?2",
-                params![head, node],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?;
-        let Some((from, to)) = depths.filter(|(from, to)| to <= from) else {
+        let (Some(top), Some(below)) = (place(&self.conn, head)?, place(&self.conn, node)?) else {
             return Ok(false);
         };
-        // A node's depth is its parent's plus one, so the walk counts its
-        // steps: `depth` follows the item in a row, and reading it would
-        // page through every large result on the way.
-        Ok(self
-            .conn
-            .query_row(
-                "WITH RECURSIVE chain(id,parent,steps) AS (
-                    SELECT id,parent,?3 FROM nodes WHERE id=?1
-                    UNION ALL SELECT n.id,n.parent,c.steps-1 FROM nodes n JOIN chain c ON n.id=c.parent WHERE c.steps>0)
-                 SELECT 1 FROM chain WHERE steps=0 AND id=?2",
-                params![head, node, from - to],
-                |_| Ok(()),
-            )
-            .optional()?
-            .is_some())
+        Ok(ancestor(&self.conn, head, top.depth, below.depth)? == Some(node))
     }
     /// The bounded model context for the bot's next request: the newest
     /// turns that fit `context_bytes` and `context_items`, starting at a turn
@@ -4561,40 +4587,88 @@ impl Database {
             == 1)
     }
     /// The pause that holds the daemon, if one does: why, who pulled it,
-    /// and when.
+    /// when, and the agents whose running turns it parked.
     pub fn pause(&self) -> Result<Option<Value>> {
         Ok(self
             .conn
-            .query_row(
-                "SELECT reason,pulled_by,at_ms FROM pause WHERE singleton=1",
-                [],
-                |r| {
-                    Ok(json!({"reason": r.get::<_, String>(0)?,
-                        "by": r.get::<_, Option<String>>(1)?, "at_ms": r.get::<_, i64>(2)?}))
-                },
-            )
+            .prepare_cached(
+                "SELECT id,reason,pulled_by,at_ms,parked,resumed_by,resumed_ms FROM pauses WHERE resumed_ms IS NULL",
+            )?
+            .query_row([], pause_row)
             .optional()?)
     }
     /// Hold the daemon paused, unless a pause already does: the pause that
-    /// holds, and whether it is this one.
+    /// holds, and whether it is this one. `parked` names the agents whose
+    /// running turns it parks, `parked_total` of them in all.
     pub fn put_pause(
         &mut self,
         reason: &str,
         by: Option<&str>,
         at_ms: i64,
+        parked: &[String],
+        parked_total: usize,
     ) -> Result<(Value, bool)> {
+        let parked = json!({"bots": parked, "total": parked_total}).to_string();
         let new = self.conn.execute(
-            "INSERT OR IGNORE INTO pause(singleton,reason,pulled_by,at_ms) VALUES(1,?1,?2,?3)",
-            params![reason, by, at_ms],
+            // Not OR IGNORE: an ignored insert would still spend an id.
+            "INSERT INTO pauses(reason,pulled_by,at_ms,parked) SELECT ?1,?2,?3,?4
+             WHERE NOT EXISTS(SELECT 1 FROM pauses WHERE resumed_ms IS NULL)",
+            params![reason, by, at_ms, parked],
         )? == 1;
         let held = self.pause()?.ok_or(Error::new("storage_error"))?;
         Ok((held, new))
     }
-    /// Lift the pause: the one lifted, if one held.
-    pub fn remove_pause(&mut self) -> Result<Option<Value>> {
-        let held = self.pause()?;
-        self.conn.execute("DELETE FROM pause", [])?;
-        Ok(held)
+    /// Lift the pause, as `by` lets the line go on: the one lifted, now
+    /// with who lifted it and when, if one held. It stays in the history.
+    pub fn remove_pause(&mut self, by: Option<&str>, at_ms: i64) -> Result<Option<Value>> {
+        Ok(self
+            .conn
+            .prepare_cached(
+                "UPDATE pauses SET resumed_by=?1,resumed_ms=?2 WHERE resumed_ms IS NULL
+                 RETURNING id,reason,pulled_by,at_ms,parked,resumed_by,resumed_ms",
+            )?
+            .query_row(params![by, at_ms], pause_row)
+            .optional()?)
+    }
+    /// Pauses, held and lifted, in the order pulled (newest first with
+    /// `newest`), after the pause `after` and before `before`: at most
+    /// `limit`, and whether more follow.
+    pub fn pauses(
+        &self,
+        after: i64,
+        before: Option<i64>,
+        limit: usize,
+        newest: bool,
+    ) -> Result<Value> {
+        if after < 0 || before.is_some_and(|b| b < 1) || !(1..=256).contains(&limit) {
+            return fail_with(
+                "invalid_pause_page",
+                "limit must be 1 to 256, after 0 or more and before 1 or more",
+            );
+        }
+        let mut statement = self.conn.prepare_cached(if newest {
+            "SELECT id,reason,pulled_by,at_ms,parked,resumed_by,resumed_ms FROM pauses WHERE id>?1 AND id<?2 ORDER BY id DESC LIMIT ?3"
+        } else {
+            "SELECT id,reason,pulled_by,at_ms,parked,resumed_by,resumed_ms FROM pauses WHERE id>?1 AND id<?2 ORDER BY id LIMIT ?3"
+        })?;
+        let rows = statement.query_map(
+            params![after, before.unwrap_or(i64::MAX), (limit + 1) as i64],
+            pause_row,
+        )?;
+        // Bounded by bytes as well as count, as `bots` pages are: a page of
+        // long reasons still fits one reply.
+        let (mut pauses, mut bytes, mut more) = (Vec::new(), 0, false);
+        for pause in rows {
+            let pause = pause?;
+            let size = crate::output::encoded_len(&pause)? + 1;
+            if pauses.len() == limit || bytes + size > crate::output::MAX_EVENT / 2 {
+                more = true;
+                break;
+            }
+            bytes += size;
+            pauses.push(pause);
+        }
+        Ok(json!({"pauses": pauses, "more": more}))
     }
     pub fn store_identity(&self) -> Result<i64> {
         Ok(self
@@ -4798,8 +4872,8 @@ impl Database {
     }
 
     /// Page a reading view of provider items as JSONL by byte offset in that
-    /// view. Only reasoning.encrypted_content is omitted; stored items and
-    /// provider replay remain unchanged.
+    /// view. Only the opaque state a provider replays is omitted (see
+    /// `READING_ITEM`); stored items and provider replay remain unchanged.
     /// Pages end at UTF-8 boundaries and may split a JSON record. Concatenate
     /// their text before decoding; no content is replaced with previews.
     /// A bot's newest `limit` conversation turns, newest first, as its
@@ -5650,6 +5724,7 @@ impl Database {
                 options.origin.as_deref(),
                 options.person.as_deref(),
                 quotes.as_deref(),
+                false,
             );
             (if attach { "attached" } else { "queued" }, data)
         };
@@ -6684,6 +6759,8 @@ impl Database {
             copied: None,
             summary_retry_ms,
             fallback: None,
+            pulled: false,
+            poll: false,
         };
         let tx = self.conn.savepoint()?;
         flush(&tx, turn, self.live.get(&turn))?;
@@ -6826,6 +6903,8 @@ impl Database {
             copied: None,
             summary_retry_ms,
             fallback: None,
+            pulled: false,
+            poll: false,
         };
         let tx = self.conn.savepoint()?;
         flush(&tx, turn, self.live.get(&turn))?;
@@ -8299,32 +8378,19 @@ impl Database {
             |r| r.get(0),
         )?;
         if pending {
-            let unanswered: Vec<(String, String, bool)> = tx
-                .prepare("SELECT call_id,status,custom FROM tools WHERE turn=? AND status IN ('planned','executing') ORDER BY rowid")?
-                .query_map([turn], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
-                .collect::<rusqlite::Result<_>>()?;
-            let family = bot.family()?;
-            for (call_id, status, custom) in unanswered {
-                let unknown = status == "executing" && waiting.is_none();
-                let detail = if unknown {
+            let parked = waiting.is_some();
+            (head, entries) = close_unanswered(&tx, &bot, turn, head, |executing| {
+                let unknown = executing && !parked;
+                let output = json!({"error":if unknown { "tool_outcome_unknown" } else { "cancelled" },
+                "detail":if unknown {
                     "turn ended before this tool's result was recorded; it may have had effects and may still be running. Inspect the current state before retrying"
-                } else if waiting.is_some() && status == "executing" {
+                } else if parked && executing {
                     "turn interrupted while parked"
                 } else {
                     "turn ended before this call ran"
-                };
-                let output = json!({"error":if unknown { "tool_outcome_unknown" } else { "cancelled" },"detail":detail}).to_string();
-                let item = family.tool_result_item(&call_id, custom, &output)?;
-                let id = node(&tx, head, &item)?;
-                head = Some(id);
-                tx.execute(
-                    "UPDATE tools SET status='completed' WHERE turn=? AND call_id=?",
-                    params![turn, call_id],
-                )?;
-                let data = json!({"call_id":call_id,"node":id,"artifacts":[],"cancelled":!unknown,"outcome_unknown":unknown});
-                let cursor = event(&tx, &bot.name, Some(turn), "tool_completed", data.clone())?;
-                entries.push(entry(cursor, &bot.name, Some(turn), "tool_completed", data));
-            }
+                }});
+                (output, unknown)
+            })?;
         }
         if let Some(waiting) = &waiting {
             tx.execute(
@@ -8501,6 +8567,32 @@ impl Database {
         route: Option<&str>,
         summary_retry_ms: Option<u64>,
     ) -> Result<Value> {
+        self.suspend_wait(
+            turn,
+            call_id,
+            handles,
+            deadline_ms,
+            any,
+            pending,
+            route,
+            summary_retry_ms,
+            false,
+        )
+    }
+    /// `suspend`, for a terminal poll when `poll` is set.
+    #[allow(clippy::too_many_arguments)]
+    pub fn suspend_wait(
+        &mut self,
+        turn: i64,
+        call_id: &str,
+        handles: &[String],
+        deadline_ms: Option<u64>,
+        any: bool,
+        pending: &[ToolCall],
+        route: Option<&str>,
+        summary_retry_ms: Option<u64>,
+        poll: bool,
+    ) -> Result<Value> {
         let bot = self.active(turn)?;
         let executing: bool = self.conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM tools WHERE turn=? AND call_id=? AND status='executing')",
@@ -8528,6 +8620,8 @@ impl Database {
             copied: None,
             summary_retry_ms,
             fallback: None,
+            pulled: false,
+            poll,
         };
         let tx = self.conn.savepoint()?;
         // A verdict for a later call of the round waits in the store.
@@ -8584,6 +8678,8 @@ impl Database {
             copied,
             summary_retry_ms,
             fallback,
+            pulled: false,
+            poll: false,
         };
         let tx = self.conn.savepoint()?;
         flush(&tx, turn, self.live.get(&turn))?;
@@ -8604,6 +8700,137 @@ impl Database {
         tx.commit()?;
         self.forget_live(turn);
         Ok(entry(cursor, &bot.name, Some(turn), "turn_paced", data))
+    }
+    /// Park a running turn the pull cord stopped, until `resume`. It is
+    /// parked as a closed pool parks it, at a model-call boundary: each call
+    /// it had not answered gets a result saying the pause stopped it, or
+    /// came before it ran, and none is run again. The reply it was writing
+    /// is asked for again when it continues. A turn whose own park committed
+    /// as the pull cancelled its task stays as it parked: its park comes
+    /// back, with its next lapse, for the task to register its wake-ups.
+    pub fn suspend_pulled(
+        &mut self,
+        turn: i64,
+        retries: u64,
+        paced_ms: u64,
+        summary_ms: u64,
+        route: Option<&str>,
+    ) -> Result<Pulled> {
+        let bot = self.active(turn)?;
+        match bot.status.as_str() {
+            "running" => {}
+            "waiting" | "paced" => {
+                self.note_pacing(turn, retries, paced_ms, summary_ms)?;
+                let waiting = self
+                    .waiting(turn)?
+                    .ok_or(Error::new("invalid_tool_state"))?;
+                return Ok(Pulled::Already(Box::new(waiting), self.next_lapse(turn)?));
+            }
+            _ => return fail("invalid_tool_state"),
+        }
+        let unanswered: Vec<String> = self
+            .conn
+            .prepare(
+                "SELECT call_id FROM tools WHERE turn=? AND status IN ('planned','executing')",
+            )?
+            .query_map([turn], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        // Why, who and when; not whose turns it parked.
+        let pause = self
+            .pause()?
+            .map(|p| json!({"reason":p["reason"],"by":p["by"],"at_ms":p["at_ms"]}));
+        let waiting = Waiting {
+            turn,
+            bot: bot.name.clone(),
+            call_id: String::new(),
+            handles: Vec::new(),
+            deadline_ms: None,
+            any: false,
+            pending: Vec::new(),
+            paced_since_ms: Some(epoch_ms()),
+            call_attempts: 0,
+            call_spent_ms: 0,
+            // It continues from the whole boundary, compaction included: the
+            // results just written may have filled the window.
+            compaction: true,
+            route: route.map(str::to_owned),
+            approval: false,
+            answer: None,
+            copied: None,
+            summary_retry_ms: None,
+            fallback: None,
+            pulled: true,
+            poll: false,
+        };
+        let tx = self.conn.savepoint()?;
+        flush(&tx, turn, self.live.get(&turn))?;
+        let (head, mut entries) = close_unanswered(&tx, &bot, turn, bot.head, |executing| {
+            let detail = if executing {
+                "the pause stopped this call before its result was recorded; it may have had effects. It is not run again"
+            } else {
+                "the pause came before this call ran; it did not run"
+            };
+            (
+                json!({"error":"daemon_paused","detail":detail,"pause":pause}),
+                false,
+            )
+        })?;
+        if head != bot.head {
+            // Every call of the round is answered, so the round is closed.
+            tx.execute(
+                "UPDATE bots SET head=?1,closed=?1,open_calls=0 WHERE name=?2",
+                params![head, bot.name],
+            )?;
+        }
+        // What waited on those calls went with them: their requests, what a
+        // client was to answer, and each step a call asked about, denied as
+        // an answered call's are.
+        let (mut requests, mut steps) = (0, Vec::new());
+        for call_id in &unanswered {
+            let asked: Vec<(i64, String, String)> = tx
+                .prepare_cached(
+                    "DELETE FROM approvals WHERE turn=? AND step_of=? RETURNING id,call_id,name",
+                )?
+                .query_map(params![turn, call_id], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                })?
+                .collect::<rusqlite::Result<_>>()?;
+            for (approval, id, name) in asked {
+                let data = json!({"call_id":id,"step_of":call_id,"name":name,"decision":"deny",
+                    "reason":"the pause stopped the call","approvals":[]});
+                event(&tx, &bot.name, Some(turn), "step_decided", data)?;
+                steps.push(approval);
+            }
+            requests += tx
+                .prepare_cached(
+                    "DELETE FROM approvals WHERE turn=? AND call_id=? AND step_of IS NULL",
+                )?
+                .execute(params![turn, call_id])? as i64;
+            tx.prepare_cached("DELETE FROM answers WHERE turn=? AND call_id=?")?
+                .execute(params![turn, call_id])?;
+        }
+        tx.execute(
+            "UPDATE turns SET status='paced',waiting=?,retries=retries+?,paced_ms=paced_ms+?,
+                summary_ms=summary_ms+? WHERE id=?",
+            params![
+                serde_json::to_string(&waiting)?,
+                retries as i64,
+                paced_ms as i64,
+                summary_ms as i64,
+                turn
+            ],
+        )?;
+        tx.execute("UPDATE bots SET status='paced' WHERE name=?", [&bot.name])?;
+        let data = json!({"resume_at_ms":null,"paused":true});
+        let cursor = event(&tx, &bot.name, Some(turn), "turn_paced", data.clone())?;
+        tx.commit()?;
+        self.forget_live(turn);
+        self.approvals -= requests + steps.len() as i64;
+        for approval in steps {
+            self.unstep(approval, true);
+        }
+        entries.push(entry(cursor, &bot.name, Some(turn), "turn_paced", data));
+        Ok(Pulled::Parked(entries))
     }
     /// Every parked turn, on handles or on a pool, for re-registration after
     /// a restart.
@@ -9576,6 +9803,7 @@ impl Database {
             tx.execute("DELETE FROM stubs WHERE node=?", [id])?;
             tx.execute("DELETE FROM declined WHERE node=?", [id])?;
             tx.execute("DELETE FROM senders WHERE node=?", [id])?;
+            tx.execute("DELETE FROM lineage WHERE node=?", [id])?;
             tx.execute("DELETE FROM nodes WHERE id=?", [id])?;
             freed += 1;
             node = parent;
@@ -9774,6 +10002,7 @@ impl Database {
         min_node: Option<i64>,
         oldest_first: bool,
     ) -> Result<Value> {
+        use std::collections::HashSet;
         if !(1..=400).contains(&limit) {
             return fail_with("invalid_history_limit", "limit must be 1 to 400");
         }
@@ -9787,16 +10016,27 @@ impl Database {
         {
             return fail("item_not_in_bot_history");
         }
-        if oldest_first {
-            // Node IDs increase along every lineage, including forks. Find the
-            // first bounded page after the visible window on the read worker.
-            let ids = self.conn.prepare_cached(
-                "WITH RECURSIVE chain(id,parent) AS (
-                    SELECT id,parent FROM nodes WHERE id=?1 AND id>=?2
-                    UNION ALL SELECT n.id,n.parent FROM nodes n JOIN chain c ON n.id=c.parent WHERE n.id>=?2
-                 ) SELECT id FROM chain ORDER BY id LIMIT ?3"
-            )?.query_map(params![next, floor, limit as i64], |r| r.get::<_,i64>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
-            next = ids.last().copied();
+        if oldest_first && let Some(top) = next {
+            // Node IDs increase along every lineage, including forks, so the
+            // nodes at or past the floor are the lineage's newest stretch.
+            // Halve depths to find where it starts, then end the first page
+            // in it: each probe is one skip-pointer walk.
+            let depth = place(&self.conn, top)?
+                .ok_or_else(|| Error::new("storage_error"))?
+                .depth;
+            next = None;
+            if top >= floor {
+                let (mut low, mut high) = (1, depth);
+                while low < high {
+                    let middle = low + (high - low) / 2;
+                    if ancestor(&self.conn, top, depth, middle)?.is_some_and(|id| id >= floor) {
+                        high = middle;
+                    } else {
+                        low = middle + 1;
+                    }
+                }
+                next = ancestor(&self.conn, top, depth, (low + limit as i64 - 1).min(depth))?;
+            }
         }
         let mut nodes = Vec::with_capacity(limit);
         let mut statement = self
@@ -9821,51 +10061,97 @@ impl Database {
                 break;
             }
         }
-        // Only turn-start nodes carry a turn. Complete a page ending mid-turn by
-        // finding its nearest start, including retained nodes of a deleted source.
-        let mut ancestor = next;
-        while unassigned < nodes.len() {
-            let Some(id) = ancestor else {
-                break;
-            };
-            let (parent, turn, _): (Option<i64>, Option<i64>, Option<i64>) =
-                statement.query_row([id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
-            if let Some(turn) = turn {
-                for node in &mut nodes[unassigned..] {
-                    node["turn"] = json!(turn);
-                }
-                break;
+        // Only turn-start nodes carry a turn. A page ending mid-turn takes the
+        // turn of the nearest start above its oldest node, including retained
+        // nodes of a deleted source.
+        if unassigned < nodes.len()
+            && let Some(oldest) = nodes.last().and_then(|n| n["node"].as_i64())
+            && let Some(start) = place(&self.conn, oldest)?.and_then(|p| p.start)
+        {
+            let turn: Option<i64> = self
+                .conn
+                .prepare_cached("SELECT turn FROM nodes WHERE id=?")?
+                .query_row([start], |r| r.get(0))?;
+            for node in &mut nodes[unassigned..] {
+                node["turn"] = json!(turn);
             }
-            ancestor = parent;
         }
-        let next_newer = nodes
-            .first()
-            .and_then(|n| n["node"].as_i64())
-            .filter(|id| Some(*id) != range_head)
-            .map(|id| id + 1);
         // The folder each turn on the page ran in, so a path its messages name
         // resolves where it was written. Each folder is listed once with its
         // turns. A turn whose rows went with a deleted fork source is left out.
         let mut turns: Vec<i64> = nodes.iter().filter_map(|n| n["turn"].as_i64()).collect();
         turns.sort_unstable();
         turns.dedup();
-        let workspaces = self
+        let folders: HashMap<i64, String> = self
             .conn
             .prepare_cached(
-                "SELECT workspace, json_group_array(id) FROM turns
-                 WHERE id IN (SELECT value FROM json_each(?1)) AND workspace IS NOT NULL
-                 GROUP BY workspace ORDER BY min(id)",
+                "SELECT id,workspace FROM turns
+                 WHERE id IN (SELECT value FROM json_each(?1)) AND workspace IS NOT NULL",
             )?
-            .query_map([json!(turns).to_string()], |r| {
-                let folder: String = r.get(0)?;
-                let turns: String = r.get(1)?;
-                Ok((folder, turns))
-            })?
-            .map(|row| {
-                let (folder, turns) = row?;
-                Ok(json!({"folder": folder, "turns": serde_json::from_str::<Value>(&turns)?}))
-            })
-            .collect::<Result<Vec<Value>>>()?;
+            .query_map([json!(turns).to_string()], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        // A page stays within `HISTORY_PAGE_BYTES` as sent: one whose turns
+        // ran in many long folders ends early, from the end the next page
+        // continues at (`next_from`, or `next_newer` oldest first). Its
+        // first node always fits.
+        let mut bytes = 0;
+        let mut counted_turns = HashSet::new();
+        let mut counted_folders = HashSet::new();
+        let mut fits = 0;
+        let order: Vec<usize> = if oldest_first {
+            (0..nodes.len()).rev().collect()
+        } else {
+            (0..nodes.len()).collect()
+        };
+        for index in order {
+            let node = &nodes[index];
+            let mut size = node.to_string().len() + 1;
+            if let Some(turn) = node["turn"].as_i64()
+                && counted_turns.insert(turn)
+                && let Some(folder) = folders.get(&turn)
+            {
+                size += turn.to_string().len() + 1;
+                if counted_folders.insert(folder.as_str()) {
+                    size += json!(folder).to_string().len() + r#"{"folder":,"turns":[]},"#.len();
+                }
+            }
+            if fits > 0 && bytes + size > HISTORY_PAGE_BYTES {
+                break;
+            }
+            bytes += size;
+            fits += 1;
+        }
+        if fits < nodes.len() {
+            if oldest_first {
+                nodes.drain(..nodes.len() - fits);
+            } else {
+                next = nodes[fits]["node"].as_i64();
+                nodes.truncate(fits);
+            }
+        }
+        let next_newer = nodes
+            .first()
+            .and_then(|n| n["node"].as_i64())
+            .filter(|id| Some(*id) != range_head)
+            .map(|id| id + 1);
+        let mut kept: Vec<i64> = nodes.iter().filter_map(|n| n["turn"].as_i64()).collect();
+        kept.sort_unstable();
+        kept.dedup();
+        let mut workspaces: Vec<Value> = Vec::new();
+        let mut listed: HashMap<&str, usize> = HashMap::new();
+        for turn in kept {
+            let Some(folder) = folders.get(&turn) else {
+                continue;
+            };
+            let at = *listed.entry(folder.as_str()).or_insert_with(|| {
+                workspaces.push(json!({"folder": folder, "turns": []}));
+                workspaces.len() - 1
+            });
+            workspaces[at]["turns"]
+                .as_array_mut()
+                .expect("listed with turns")
+                .push(json!(turn));
+        }
         snapshot.commit()?;
         Ok(
             json!({"nodes":nodes,"next_from":next.filter(|id| *id >= floor),
@@ -9884,16 +10170,10 @@ impl Database {
         }
         let snapshot = self.conn.unchecked_transaction()?;
         let head = self.inspect(name)?.head;
-        let floor = *wanted.iter().min().unwrap();
-        let ids = serde_json::to_string(wanted)?;
-        let found: HashSet<i64> = self.conn.prepare_cached(
-            "WITH RECURSIVE chain(id,parent) AS (
-                SELECT id,parent FROM nodes WHERE id=?1
-                UNION ALL SELECT n.id,n.parent FROM nodes n JOIN chain c ON n.id=c.parent WHERE n.id>=?2
-             ) SELECT id FROM chain WHERE id IN (SELECT value FROM json_each(?3))"
-        )?.query_map(params![head,floor,ids], |row| row.get(0))?.collect::<rusqlite::Result<_>>()?;
-        if found != unique {
-            return fail("item_not_in_bot_history");
+        for &node in wanted {
+            if !self.in_lineage(head, node)? {
+                return fail("item_not_in_bot_history");
+            }
         }
         let mut items = Vec::new();
         let mut bytes = 0;
@@ -9904,7 +10184,7 @@ impl Database {
         // bound is on the item as read, its pictures left out.
         let mut query = self.conn.prepare_cached(&format!(
             "SELECT CASE WHEN length(n.item)<=?2 THEN n.item END,s.bot,s.turn,s.bot_id,s.origin,
-                s.person,s.quotes,n.written_ms
+                s.person,s.quotes,n.written_ms,s.attached
              FROM (SELECT id,{PICTURELESS} AS item,written_ms FROM
                 (SELECT n.id,COALESCE(d.item,n.item) AS item,n.written_ms FROM nodes n LEFT JOIN declined d ON d.node=n.id WHERE n.id=?1)) n
              LEFT JOIN senders s ON s.node=n.id"
@@ -9919,9 +10199,10 @@ impl Database {
                 Option<String>,
                 Option<String>,
                 Option<i64>,
+                Option<bool>,
             );
-            let (raw, from, from_turn, bot_id, origin, person, quotes, written): Row = query
-                .query_row(params![node, maximum as i64], |r| {
+            let (raw, from, from_turn, bot_id, origin, person, quotes, written, attached): Row =
+                query.query_row(params![node, maximum as i64], |r| {
                     Ok((
                         r.get(0)?,
                         r.get(1)?,
@@ -9931,6 +10212,7 @@ impl Database {
                         r.get(5)?,
                         r.get(6)?,
                         r.get(7)?,
+                        r.get(8)?,
                     ))
                 })?;
             let mut entry = match raw {
@@ -9949,6 +10231,7 @@ impl Database {
                 origin.as_deref(),
                 person.as_deref(),
                 quotes.as_deref(),
+                attached.unwrap_or(false),
             );
             let mut size = serde_json::to_vec(&entry)?.len();
             // Leave room for the protocol envelope, including extra escaping
@@ -10928,6 +11211,41 @@ fn announcements(calls: Vec<Value>) -> Result<Vec<Vec<Value>>> {
 }
 /// Write the verdicts the worker holds for a turn into their requests, in
 /// the commit that parks the turn.
+/// Answer each call of `turn` that has no result yet, in the order they
+/// were made, with what `output` says of it (given whether it had started),
+/// on from `head`. `output` also says whether its outcome is unknown rather
+/// than cancelled. Answers the new head and the `tool_completed` entries.
+fn close_unanswered(
+    tx: &Connection,
+    bot: &Bot,
+    turn: i64,
+    mut head: Option<i64>,
+    output: impl Fn(bool) -> (Value, bool),
+) -> Result<(Option<i64>, Vec<Value>)> {
+    let unanswered: Vec<(String, String, bool)> = tx
+        .prepare("SELECT call_id,status,custom FROM tools WHERE turn=? AND status IN ('planned','executing') ORDER BY rowid")?
+        .query_map([turn], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut entries = Vec::new();
+    if unanswered.is_empty() {
+        return Ok((head, entries));
+    }
+    let family = bot.family()?;
+    for (call_id, status, custom) in unanswered {
+        let (said, unknown) = output(status == "executing");
+        let item = family.tool_result_item(&call_id, custom, &said.to_string())?;
+        let id = node(tx, head, &item)?;
+        head = Some(id);
+        tx.execute(
+            "UPDATE tools SET status='completed' WHERE turn=? AND call_id=?",
+            params![turn, call_id],
+        )?;
+        let data = json!({"call_id":call_id,"node":id,"artifacts":[],"cancelled":!unknown,"outcome_unknown":unknown});
+        let cursor = event(tx, &bot.name, Some(turn), "tool_completed", data.clone())?;
+        entries.push(entry(cursor, &bot.name, Some(turn), "tool_completed", data));
+    }
+    Ok((head, entries))
+}
 fn flush(tx: &Connection, turn: i64, live: Option<&Live>) -> Result<()> {
     let Some(live) = live else {
         return Ok(());
@@ -10973,14 +11291,17 @@ fn event(conn: &Connection, bot: &str, turn: Option<i64>, kind: &str, data: Valu
 /// bot's id is its id while the turn it wrote from still exists, so a later
 /// bot of that name is not taken for it.
 /// Keep who sent a turn's prompt with the node it became, and add the
-/// sender to `data`, the event that puts the node on the lineage.
+/// sender to `data`, the event that puts the node on the lineage. A prompt
+/// sent to ride along on a call (`attach`) says so too: it was read, not
+/// sent as a message of its own.
 fn keep_sender(tx: &Connection, turn: i64, node: i64, data: &mut Value) -> Result<()> {
     tx.prepare_cached(
-        "INSERT INTO senders(node,bot,bot_id,turn,origin,person,quotes)
-         SELECT ?2,t.from_bot,t.from_id,t.from_turn,t.origin,t.person,t.quotes
+        "INSERT INTO senders(node,bot,bot_id,turn,origin,person,quotes,attached)
+         SELECT ?2,t.from_bot,t.from_id,t.from_turn,t.origin,t.person,t.quotes,
+            CASE WHEN t.delivery='attach' THEN 1 END
          FROM turns t WHERE t.id=?1 AND (t.from_bot IS NOT NULL OR t.origin IS NOT NULL
-            OR t.person IS NOT NULL OR t.quotes IS NOT NULL)
-         RETURNING bot,turn,bot_id,origin,person,quotes",
+            OR t.person IS NOT NULL OR t.quotes IS NOT NULL OR t.delivery='attach')
+         RETURNING bot,turn,bot_id,origin,person,quotes,attached",
     )?
     .query_row(params![turn, node], |r| {
         let (from, origin): (Option<String>, Option<String>) = (r.get(0)?, r.get(3)?);
@@ -10993,6 +11314,7 @@ fn keep_sender(tx: &Connection, turn: i64, node: i64, data: &mut Value) -> Resul
             origin.as_deref(),
             person.as_deref(),
             quotes.as_deref(),
+            r.get::<_, Option<bool>>(6)?.unwrap_or(false),
         );
         Ok(())
     })
@@ -11010,7 +11332,11 @@ fn sender_fields(
     origin: Option<&str>,
     person: Option<&str>,
     quotes: Option<&str>,
+    attached: bool,
 ) {
+    if attached {
+        data["attached"] = json!(true);
+    }
     if let Some((bot, turn)) = from {
         data["from"] = json!({"bot":bot,"turn":turn,"bot_id":bot_id});
     }
@@ -11273,20 +11599,40 @@ fn keep_quotes(tx: &Connection, turn: i64, quotes: Option<&str>, node: i64) -> R
 /// of a user item or a tool's result without their bytes, each counted in
 /// `omitted_bytes` (a data URL keeps its media type). The model is sent
 /// them whole.
-/// An item as history reads show it: one line, without reasoning's
-/// encrypted content. Applied to `item`, which `PICTURELESS` provides.
+/// An item as history reads show it: one line, without the opaque state
+/// a provider hands back only to be replayed (reasoning's encrypted
+/// content; a thinking block's signature, a redacted one's data, a web
+/// search result's encrypted content). Applied to `item`, which
+/// `PICTURELESS` provides.
 const READING_ITEM: &str = "CASE
     WHEN json_extract(CAST(item AS TEXT),'$.type')='reasoning'
      AND json_type(CAST(item AS TEXT),'$.encrypted_content') IS NOT NULL
     THEN CAST(json_remove(CAST(item AS TEXT),'$.encrypted_content') AS BLOB)
+    WHEN json_extract(CAST(item AS TEXT),'$.role')='assistant'
+     AND json_type(CAST(item AS TEXT),'$.content')='array'
+     AND (instr(item,'\"signature\"')>0 OR instr(item,'\"redacted_thinking\"')>0
+          OR instr(item,'\"encrypted_content\"')>0)
+    THEN CAST(json_set(CAST(item AS TEXT),'$.content',json((SELECT json_group_array(CASE
+        WHEN json_extract(b.value,'$.type')='thinking' THEN json_remove(b.value,'$.signature')
+        WHEN json_extract(b.value,'$.type')='redacted_thinking' THEN json_remove(b.value,'$.data')
+        WHEN json_extract(b.value,'$.type')='web_search_tool_result'
+         AND json_type(b.value,'$.content')='array'
+        THEN json_set(b.value,'$.content',json((SELECT json_group_array(
+            json_remove(r.value,'$.encrypted_content'))
+            FROM json_each(b.value,'$.content') AS r)))
+        ELSE json(b.value) END)
+        FROM json_each(CAST(item AS TEXT),'$.content') AS b))) AS BLOB)
     WHEN instr(item,x'0a')=0 AND instr(item,x'0d')=0 THEN item
     ELSE CAST(json(CAST(item AS TEXT)) AS BLOB) END";
+/// Each subquery's array is passed through `json()`: a value's JSON subtype
+/// does not reliably survive a subquery (SQLite 3.54 drops it), and without
+/// it `json_set` stores the array as a string.
 const PICTURELESS: &str = "CASE WHEN instr(CAST(item AS TEXT),'image')>0
 THEN CASE WHEN json_extract(CAST(item AS TEXT),'$.role')='user' AND json_type(CAST(item AS TEXT),'$.content')='array'
-    THEN CAST(json_set(CAST(item AS TEXT),'$.content',(SELECT json_group_array(
+    THEN CAST(json_set(CAST(item AS TEXT),'$.content',json((SELECT json_group_array(
         CASE WHEN json_extract(b.value,'$.type')='tool_result'
             AND json_type(b.value,'$.content')='array'
-        THEN json_set(b.value,'$.content',(SELECT json_group_array(CASE
+        THEN json_set(b.value,'$.content',json((SELECT json_group_array(CASE
             WHEN json_extract(p.value,'$.type')='input_image' AND json_extract(p.value,'$.image_url') LIKE 'data:%'
             THEN json_set(p.value,'$.image_url',substr(json_extract(p.value,'$.image_url'),1,instr(json_extract(p.value,'$.image_url'),',')),
                 '$.omitted_bytes',length(json_extract(p.value,'$.image_url'))-instr(json_extract(p.value,'$.image_url'),','))
@@ -11294,7 +11640,7 @@ THEN CASE WHEN json_extract(CAST(item AS TEXT),'$.role')='user' AND json_type(CA
             THEN json_set(p.value,'$.source.data','',
                 '$.omitted_bytes',length(json_extract(p.value,'$.source.data')))
             ELSE json(p.value) END)
-            FROM json_each(b.value,'$.content') AS p))
+            FROM json_each(b.value,'$.content') AS p)))
         ELSE CASE
             WHEN json_extract(b.value,'$.type')='input_image' AND json_extract(b.value,'$.image_url') LIKE 'data:%'
             THEN json_set(b.value,'$.image_url',substr(json_extract(b.value,'$.image_url'),1,instr(json_extract(b.value,'$.image_url'),',')),
@@ -11303,9 +11649,9 @@ THEN CASE WHEN json_extract(CAST(item AS TEXT),'$.role')='user' AND json_type(CA
             THEN json_set(b.value,'$.source.data','',
                 '$.omitted_bytes',length(json_extract(b.value,'$.source.data')))
             ELSE json(b.value) END END)
-        FROM json_each(CAST(item AS TEXT),'$.content') AS b)) AS BLOB)
+        FROM json_each(CAST(item AS TEXT),'$.content') AS b))) AS BLOB)
     WHEN json_extract(CAST(item AS TEXT),'$.type') IN ('function_call_output','custom_tool_call_output') AND json_type(CAST(item AS TEXT),'$.output')='array'
-    THEN CAST(json_set(CAST(item AS TEXT),'$.output',(SELECT json_group_array(CASE
+    THEN CAST(json_set(CAST(item AS TEXT),'$.output',json((SELECT json_group_array(CASE
         WHEN json_extract(p.value,'$.type')='input_image' AND json_extract(p.value,'$.image_url') LIKE 'data:%'
         THEN json_set(p.value,'$.image_url',substr(json_extract(p.value,'$.image_url'),1,instr(json_extract(p.value,'$.image_url'),',')),
             '$.omitted_bytes',length(json_extract(p.value,'$.image_url'))-instr(json_extract(p.value,'$.image_url'),','))
@@ -11313,7 +11659,7 @@ THEN CASE WHEN json_extract(CAST(item AS TEXT),'$.role')='user' AND json_type(CA
         THEN json_set(p.value,'$.source.data','',
             '$.omitted_bytes',length(json_extract(p.value,'$.source.data')))
         ELSE json(p.value) END)
-        FROM json_each(CAST(item AS TEXT),'$.output') AS p)) AS BLOB)
+        FROM json_each(CAST(item AS TEXT),'$.output') AS p))) AS BLOB)
     ELSE item END
 ELSE item END";
 /// The bot's oldest queued turn now waits only for a slot. True when that
@@ -12190,6 +12536,97 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
              WHERE started_ms IS NOT NULL AND finished_ms IS NOT NULL;"
         ))?;
     }
+    // 70 -> 71: a prompt that rode along on a call (`attach`) says so with
+    // its node, found from the `steered` events retention has left; one
+    // whose event is gone reads as a steer.
+    if conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='senders')
+         AND NOT EXISTS(SELECT 1 FROM pragma_table_info('senders') WHERE name='attached')",
+        [],
+        |r| r.get::<_, bool>(0),
+    )? {
+        conn.execute_batch(
+            "ALTER TABLE senders ADD COLUMN attached INTEGER;
+             CREATE TEMP TABLE attached_nodes AS
+                SELECT DISTINCT json_extract(e.data,'$.node') AS node FROM events e
+                JOIN turns t ON t.id=json_extract(e.data,'$.steer')
+                WHERE e.kind='steered' AND t.delivery='attach'
+                    AND EXISTS(SELECT 1 FROM nodes n WHERE n.id=json_extract(e.data,'$.node'));
+             INSERT OR IGNORE INTO senders(node) SELECT node FROM attached_nodes;
+             UPDATE senders SET attached=1 WHERE node IN (SELECT node FROM attached_nodes);
+             DROP TABLE attached_nodes;",
+        )?;
+    }
+    // 71 -> 72: pauses are kept once lifted, with who lifted them, and say
+    // whose turns they parked. A pause that holds goes on holding; which
+    // turns it parked was not kept.
+    if conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='pause')",
+        [],
+        |r| r.get::<_, bool>(0),
+    )? {
+        conn.execute_batch(
+            "CREATE TABLE pauses(id INTEGER PRIMARY KEY AUTOINCREMENT,
+                reason TEXT NOT NULL, pulled_by TEXT, at_ms INTEGER NOT NULL, parked TEXT,
+                resumed_by TEXT, resumed_ms INTEGER);
+             INSERT INTO pauses(reason,pulled_by,at_ms) SELECT reason,pulled_by,at_ms FROM pause;
+             DROP TABLE pause;",
+        )?;
+    }
+    // 72 -> 73: each node's place in the history tree, so a history read
+    // reaches any ancestor in O(log n) steps rather than walking parents.
+    // Ids grow along every lineage, so a parent is placed before its
+    // children; the places are kept in memory until the walk is done.
+    if !conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='lineage')",
+        [],
+        |r| r.get::<_, bool>(0),
+    )? {
+        conn.execute_batch(
+            "CREATE TABLE lineage(node INTEGER PRIMARY KEY REFERENCES nodes(id),
+                parent INTEGER, depth INTEGER NOT NULL, skip INTEGER, start INTEGER);",
+        )?;
+        let mut placed: HashMap<i64, Place> = HashMap::new();
+        let mut nodes =
+            conn.prepare("SELECT id,parent,depth,turn IS NOT NULL FROM nodes ORDER BY id")?;
+        let mut insert =
+            conn.prepare("INSERT INTO lineage(node,parent,depth,skip,start) VALUES(?,?,?,?,?)")?;
+        let mut rows = nodes.query([])?;
+        while let Some(row) = rows.next()? {
+            let (id, parent, depth, starts): (i64, Option<i64>, i64, bool) =
+                (row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?);
+            let (skip, above) = match parent {
+                Some(parent) => {
+                    let above = *placed
+                        .get(&parent)
+                        .ok_or_else(|| Error::new("storage_error"))?;
+                    let skip = ancestor_by(
+                        |id| {
+                            let place =
+                                placed.get(&id).ok_or_else(|| Error::new("storage_error"))?;
+                            Ok((place.parent, place.skip))
+                        },
+                        parent,
+                        above.depth,
+                        skip_depth(depth),
+                    )?;
+                    (skip, above.start)
+                }
+                None => (None, None),
+            };
+            let start = if starts { Some(id) } else { above };
+            insert.execute(params![id, parent, depth, skip, start])?;
+            placed.insert(
+                id,
+                Place {
+                    parent,
+                    depth,
+                    skip,
+                    start,
+                },
+            );
+        }
+    }
     Ok(())
 }
 /// 53 -> 54: a turn's denial count became a window of its last decided
@@ -12605,11 +13042,17 @@ fn insert_node(
         return fail("storage_error");
     }
     let thinking = super::thinking_bytes(item) as i64;
-    let turn_seq = match (turn, parent) {
-        (None, _) => None,
-        (Some(_), None) => Some(1),
-        (Some(_), Some(parent)) => Some(previous_turn_seq(conn, parent)?.unwrap_or(0) + 1),
+    // The nearest turn start at or above the parent, and its ordinal.
+    let (start, start_seq): (Option<i64>, Option<i64>) = match parent {
+        Some(id) => conn
+            .prepare_cached(
+                "SELECT l.start,s.turn_seq FROM lineage l LEFT JOIN nodes s ON s.id=l.start
+                 WHERE l.node=?",
+            )?
+            .query_row([id], |r| Ok((r.get(0)?, r.get(1)?)))?,
+        None => (None, None),
     };
+    let turn_seq = turn.map(|_| start_seq.unwrap_or(0) + 1);
     // Surviving nodes and the durable deletion floor jointly bound every ID
     // ever committed. Allocate atomically in the insert, avoiding a separate
     // counter write for every message. Callers already hold a transaction.
@@ -12634,7 +13077,105 @@ fn insert_node(
         pictured.count,
         epoch_ms()
     ])?;
-    Ok(conn.last_insert_rowid())
+    let id = conn.last_insert_rowid();
+    let skip = match parent {
+        Some(parent) => ancestor(conn, parent, depth, skip_depth(depth + 1))?,
+        None => None,
+    };
+    conn.prepare_cached("INSERT INTO lineage(node,parent,depth,skip,start) VALUES(?,?,?,?,?)")?
+        .execute(params![
+            id,
+            parent,
+            depth + 1,
+            skip,
+            if turn.is_some() { Some(id) } else { start }
+        ])?;
+    Ok(id)
+}
+/// Where a node sits in the history tree, in a narrow row beside it so a
+/// walk never pages through the item: its parent, depth, skip pointer, and
+/// the nearest turn start at or above it.
+#[derive(Debug, Clone, Copy)]
+struct Place {
+    parent: Option<i64>,
+    depth: i64,
+    skip: Option<i64>,
+    start: Option<i64>,
+}
+fn place(conn: &Connection, node: i64) -> Result<Option<Place>> {
+    Ok(conn
+        .prepare_cached("SELECT parent,depth,skip,start FROM lineage WHERE node=?")?
+        .query_row([node], |r| {
+            Ok(Place {
+                parent: r.get(0)?,
+                depth: r.get(1)?,
+                skip: r.get(2)?,
+                start: r.get(3)?,
+            })
+        })
+        .optional()?)
+}
+/// The depth a node's skip pointer reaches, chosen as Bitcoin Core's block
+/// index chooses it (`GetSkipHeight`, shifted so a root has depth 1): any
+/// ancestor is then O(log n) steps away.
+fn skip_depth(depth: i64) -> i64 {
+    fn clear_lowest(n: i64) -> i64 {
+        n & (n - 1)
+    }
+    let height = depth - 1;
+    if height < 2 {
+        return 1;
+    }
+    1 + if height & 1 == 1 {
+        clear_lowest(clear_lowest(height - 1)) + 1
+    } else {
+        clear_lowest(height)
+    }
+}
+/// The ancestor of `node`, which sits at `depth`, at depth `target`
+/// (`node` itself at its own depth). `step` gives a node's parent and skip
+/// pointer. The walk takes a skip unless it would overshoot, or a later
+/// one would land closer (`CBlockIndex::GetAncestor`).
+fn ancestor_by(
+    mut step: impl FnMut(i64) -> Result<(Option<i64>, Option<i64>)>,
+    node: i64,
+    depth: i64,
+    target: i64,
+) -> Result<Option<i64>> {
+    if target < 1 || target > depth {
+        return Ok(None);
+    }
+    let (mut id, mut at) = (node, depth);
+    while at > target {
+        let (parent, skip) = step(id)?;
+        let jump = skip_depth(at);
+        let then = skip_depth(at - 1);
+        match skip {
+            Some(skip)
+                if jump == target || (jump > target && !(then < jump - 2 && then >= target)) =>
+            {
+                (id, at) = (skip, jump);
+            }
+            _ => {
+                let Some(parent) = parent else {
+                    return fail("storage_error");
+                };
+                (id, at) = (parent, at - 1);
+            }
+        }
+    }
+    Ok(Some(id))
+}
+fn ancestor(conn: &Connection, node: i64, depth: i64, target: i64) -> Result<Option<i64>> {
+    ancestor_by(
+        |id| {
+            let place = place(conn, id)?.ok_or_else(|| Error::new("storage_error"))?;
+            Ok((place.parent, place.skip))
+        },
+        node,
+        depth,
+        target,
+    )
 }
 
 // Last in the file: bench.query_plans audits the statements above the first
@@ -12656,6 +13197,50 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_history_read_leaves_out_the_state_a_provider_replays() {
+        let conn = Connection::open_in_memory().unwrap();
+        let read = |item: &str| -> Value {
+            let text: String = conn
+                .query_row(
+                    &format!(
+                        "SELECT CAST({READING_ITEM} AS TEXT) FROM (SELECT CAST(?1 AS BLOB) AS item)"
+                    ),
+                    [item],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(!text.contains('\n'), "{text}");
+            serde_json::from_str(&text).unwrap()
+        };
+        let claude = json!({"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "plan", "signature": "sig".repeat(100)},
+            {"type": "redacted_thinking", "data": "opaque"},
+            {"type": "server_tool_use", "id": "s", "name": "web_search", "input": {"query": "q"}},
+            {"type": "web_search_tool_result", "tool_use_id": "s", "content": [
+                {"type": "web_search_result", "url": "https://example.test", "title": "T",
+                 "encrypted_content": "opaque"}]},
+            {"type": "text", "text": "a \"signature\" in words stays"}]});
+        assert_eq!(
+            read(&serde_json::to_string_pretty(&claude).unwrap()),
+            json!({"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "plan"},
+                {"type": "redacted_thinking"},
+                {"type": "server_tool_use", "id": "s", "name": "web_search", "input": {"query": "q"}},
+                {"type": "web_search_tool_result", "tool_use_id": "s", "content": [
+                    {"type": "web_search_result", "url": "https://example.test", "title": "T"}]},
+                {"type": "text", "text": "a \"signature\" in words stays"}]})
+        );
+        let reasoning = json!({"type": "reasoning", "summary": [], "encrypted_content": "x"});
+        assert_eq!(
+            read(&reasoning.to_string()),
+            json!({"type": "reasoning", "summary": []})
+        );
+        // Anything else reads as it is stored.
+        let user = json!({"role": "user", "content": [{"type": "text", "text": "\"signature\""}]});
+        assert_eq!(read(&user.to_string()), user);
+    }
 
     #[test]
     fn a_cut_patch_still_names_every_file_it_changes() {
@@ -12811,6 +13396,70 @@ mod tests {
             ),
             ("é😀/\t\u{FFFD}z\u{FFFD}A\u{FFFD}".into(), false)
         );
+    }
+
+    #[test]
+    fn skip_pointers_reach_any_ancestor_in_logarithmic_steps() {
+        use std::collections::HashMap;
+        // A tree of 20,000 nodes: a long trunk with forks off it at every
+        // depth, each a little way back, placed as an insert places them.
+        let mut placed: HashMap<i64, (Option<i64>, i64, Option<i64>)> = HashMap::new();
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        let mut random = |n: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % n
+        };
+        for id in 1..=20_000_i64 {
+            let parent = (id > 1).then(|| {
+                if random(20) == 0 {
+                    (id - 1 - random(100) as i64).max(1)
+                } else {
+                    id - 1
+                }
+            });
+            let depth = parent.map_or(1, |p| placed[&p].1 + 1);
+            let skip = parent.and_then(|p| {
+                ancestor_by(
+                    |n| Ok((placed[&n].0, placed[&n].2)),
+                    p,
+                    placed[&p].1,
+                    skip_depth(depth),
+                )
+                .unwrap()
+            });
+            placed.insert(id, (parent, depth, skip));
+        }
+        let deepest = placed.values().map(|p| p.1).max().unwrap();
+        assert!(deepest > 4_000, "{deepest}");
+        let mut most = 0;
+        for _ in 0..2_000 {
+            let node = 1 + random(20_000) as i64;
+            let depth = placed[&node].1;
+            let target = 1 + random(depth as u64) as i64;
+            let mut steps = 0;
+            let found = ancestor_by(
+                |n| {
+                    steps += 1;
+                    Ok((placed[&n].0, placed[&n].2))
+                },
+                node,
+                depth,
+                target,
+            )
+            .unwrap();
+            let mut walked = node;
+            while placed[&walked].1 > target {
+                walked = placed[&walked].0.unwrap();
+            }
+            assert_eq!(found, Some(walked));
+            most = most.max(steps);
+        }
+        // Bitcoin Core's analysis bounds a walk near 2 log2 n steps.
+        assert!(most <= 4 * 15, "{most} steps");
+        assert_eq!(ancestor_by(|_| unreachable!(), 7, 3, 4).unwrap(), None);
+        assert_eq!(ancestor_by(|_| unreachable!(), 7, 3, 3).unwrap(), Some(7));
     }
 
     #[test]

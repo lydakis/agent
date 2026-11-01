@@ -20,8 +20,10 @@ def archive_name(version: str) -> str:
 FORMULAS = {
     "agent": (
         "Small daemon that hosts many durable AI agents",
-        # Its default sandbox on Linux runs commands in bubblewrap, which it
-        # never looks up on PATH: the build fixes where this one is.
+        # On Linux a sandboxed bot's commands run in bubblewrap (the daemon
+        # confines nothing unless a client asks; Sonny's agents are
+        # sandboxed by default), which it never looks up on PATH: the
+        # build fixes where this one is.
         '  on_linux do\n    depends_on "bubblewrap"\n  end\n',
         '    ENV["AGENT_BWRAP"] = (Formula["bubblewrap"].opt_bin/"bwrap").to_s if OS.linux?\n'
         '    system "cargo", "install", *std_cargo_args\n',

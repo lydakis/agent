@@ -46,7 +46,8 @@ pub const STEPS: [Step; 2] = [
         what: "memory, skills, profiles and config pushed every ten minutes to a private git \
                repository, so a lost machine loses little. Sonny names no host: find where \
                this machine keeps repositories (its checkouts' remotes, the tools signed in, \
-               what the person's other agents made) and make a private one there",
+               what the person's other agents made), make a private one there, and see \
+               that the host shows it private before the first push",
         how: "sonny setup backup URL",
         done: || crate::home::Places::home().is_ok_and(|places| crate::home::done(&places)),
     },

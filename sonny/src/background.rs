@@ -494,7 +494,9 @@ impl View {
         }
         let name = item.name.clone();
         self.notice = Some(
-            match trigger::Places::home().and_then(|places| trigger::fire_now(&places, &name)) {
+            match trigger::Places::home()
+                .and_then(|places| trigger::fire_now(&places, &name, &trigger::ring))
+            {
                 Ok(_) => format!("ran {name}"),
                 Err(error) => error,
             },
@@ -504,8 +506,9 @@ impl View {
 
     fn remove(&mut self, item: &Item) {
         let done = match item.kind {
-            Kind::Trigger => trigger::Places::home()
-                .and_then(|places| trigger::remove(&places, &item.name, &trigger::schedule)),
+            Kind::Trigger => {
+                trigger::Places::home().and_then(|places| trigger::remove(&places, &item.name))
+            }
             Kind::Subscription => {
                 lookout::subs::remove(&self.store, &item.bot, &item.name).map(drop)
             }

@@ -2,7 +2,7 @@
 use agent_runtime::{Error, Result, fail_with};
 
 const CONNECTION: &str = "--store --socket";
-const STARTUP: &str = "--provider --max-processes --max-detached --max-active --max-connecting --max-pending --max-pending-bytes --stall-timeout --idle-exit";
+const STARTUP: &str = "--provider --max-processes --max-lasting --max-active --max-connecting --max-pending --max-pending-bytes --max-readers --stall-timeout --idle-exit";
 
 struct Command {
     name: &'static str,
@@ -178,7 +178,7 @@ const COMMANDS: &[Command] = &[
     },
     Command {
         name: "pause",
-        about: "Stop every agent until resume, across restarts: running turns end, queued work waits",
+        about: "Stop every agent until resume, across restarts: running turns park, queued work waits",
         usage: "pause --reason TEXT",
         flags: "--reason --pretty",
         settings: "",
@@ -186,11 +186,19 @@ const COMMANDS: &[Command] = &[
     },
     Command {
         name: "resume",
-        about: "Lift a pause; what waited starts",
+        about: "Lift a pause; parked turns continue, what waited starts",
         usage: "resume",
         flags: "--pretty",
         settings: "",
         startup: false,
+    },
+    Command {
+        name: "pauses",
+        about: "Every pause, held or lifted: why, who pulled it and let it go, whose turns it parked",
+        usage: "pauses [--after ID] [--newest] [--limit N]",
+        flags: "--after --newest --limit --pretty --no-spawn",
+        settings: "",
+        startup: true,
     },
     Command {
         name: "serve",
@@ -338,11 +346,15 @@ fn print_flags(flags: &str) {
                 "The tools a fork may call, within its source's; '' allows none; default: the source's",
             ),
             "--max-processes" => ("N", "Concurrent process limit; 0 is unbounded"),
-            "--max-detached" => ("N", "Detached commands still running; 0 is unbounded"),
+            "--max-lasting" => (
+                "N",
+                "Terminals and detached commands still running; 0 is unbounded",
+            ),
             "--max-active" => ("N", "Concurrent active turn limit; 0 is unbounded"),
             "--max-connecting" => ("N", "Concurrent provider startup limit; 0 is unbounded"),
             "--max-pending" => ("N", "Submissions waiting to start; 0 is unbounded"),
             "--max-pending-bytes" => ("N", "Prompt bytes waiting to start; 0 is unbounded"),
+            "--max-readers" => ("N", "Store reader connections; default one per CPU"),
             "--max-output-tokens" => (
                 "N",
                 "A new bot's output token cap per model call; default the model's limit",
@@ -494,7 +506,7 @@ fn print_flags(flags: &str) {
             ),
             "--approval-hold" => (
                 "DURATION",
-                "A new bot's gated calls wait this long for a verdict before the turn parks; default 2s",
+                "A new bot's gated calls wait this long for a verdict, and its terminal reads for output, before the turn parks; default 2s",
             ),
             _ => unreachable!("flag missing help"),
         };

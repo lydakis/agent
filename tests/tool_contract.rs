@@ -412,7 +412,7 @@ async fn detached_commands_run_in_their_own_session_and_write_only_where_told() 
 
 #[tokio::test]
 async fn detached_commands_are_bounded_and_reaped() {
-    let tools = Registry::new("shell").unwrap().with_detached_budget(2);
+    let tools = Registry::new("shell").unwrap().with_lasting_budget(2);
     let dir = std::env::temp_dir().join(format!("agent-detach-bound-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let detach = |command: &str| {
@@ -440,13 +440,9 @@ async fn detached_commands_are_bounded_and_reaped() {
         .execute(detach("true"), &dir, &[], None)
         .await
         .unwrap_err();
-    assert_eq!(error.code, "detached_limit");
+    assert_eq!(error.code, "lasting_limit");
     assert!(
-        error
-            .detail
-            .as_deref()
-            .unwrap()
-            .contains("--max-detached 2"),
+        error.detail.as_deref().unwrap().contains("--max-lasting 2"),
         "{error:?}"
     );
     // One exits: its waiter reaps it without another detach, and releases
@@ -473,7 +469,7 @@ async fn detached_commands_are_bounded_and_reaped() {
         .output;
     assert!(output.contains("\"detached\":true"), "{output}");
     // Unbounded when asked.
-    let free = Registry::new("shell").unwrap().with_detached_budget(0);
+    let free = Registry::new("shell").unwrap().with_lasting_budget(0);
     for _ in 0..3 {
         free.execute(
             free.prepare(
@@ -686,9 +682,10 @@ async fn a_sandboxed_command_writes_only_its_roots() {
 }
 
 /// The daemon's socket is out of reach from inside a sandbox, network on
-/// or off, as Codex keeps its own, and so is every other Unix socket, even
-/// one in its folder: the command makes none. It reaches the daemon only
-/// by the connections handed it, each to its bot's own socket.
+/// or off. Every other Unix socket it reaches with the network on, as
+/// Codex's full network does, and none with it off: the command makes
+/// none. It reaches the daemon only by its bot's own socket, in the
+/// daemon's socket's place or by the connections handed it.
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn a_sandboxed_command_cannot_reach_the_daemon_socket() {
@@ -701,7 +698,8 @@ async fn a_sandboxed_command_cannot_reach_the_daemon_socket() {
         .join(format!("agent-socket-{}", std::process::id()));
     std::fs::create_dir_all(&base).unwrap();
     let socket = base.join("agent.sock");
-    let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let daemon_listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    daemon_listener.set_nonblocking(true).unwrap();
     let mine = base.join("mine.sock");
     let _mine = std::os::unix::net::UnixListener::bind(&mine).unwrap();
     let tools = Registry::new("shell").unwrap();
@@ -755,6 +753,7 @@ async fn a_sandboxed_command_cannot_reach_the_daemon_socket() {
         }
     };
     assert_eq!(run(None, to(&socket)).await, 0);
+    assert!(daemon_listener.accept().is_ok());
     assert_eq!(run(None, "python3 pair.py SOCK_DGRAM".into()).await, 0);
     assert!(datagram.recv(&mut [0u8; 1]).is_ok());
     for network in [false, true] {
@@ -776,18 +775,24 @@ async fn a_sandboxed_command_cannot_reach_the_daemon_socket() {
             0,
             "network {network}"
         );
-        assert_ne!(
-            run(Some(policy.clone()), to(&mine)).await,
-            0,
+        // Any other socket with the network on, as Codex's full network;
+        // with it off, none.
+        assert_eq!(
+            run(Some(policy.clone()), to(&mine)).await == 0,
+            network,
             "network {network}"
         );
         // A pair of sockets is the command's own, but a pair of datagram
-        // sockets, which would send to any socket's path, it doesn't make.
+        // sockets, which would send to any socket's path, it makes only
+        // with the network on.
         let pair = |kind: &str| format!("python3 pair.py {kind}");
         assert_eq!(run(Some(policy.clone()), pair("SOCK_STREAM")).await, 0);
         assert_eq!(run(Some(policy.clone()), pair("SOCK_SEQPACKET")).await, 0);
-        assert_ne!(run(Some(policy.clone()), pair("SOCK_DGRAM")).await, 0);
-        assert!(datagram.recv(&mut [0u8; 1]).is_err());
+        assert_eq!(
+            run(Some(policy.clone()), pair("SOCK_DGRAM")).await == 0,
+            network
+        );
+        assert_eq!(datagram.recv(&mut [0u8; 1]).is_ok(), network);
         // With the bot's own socket, laid out as the daemon lays them out,
         // the command is handed connections to that one, and only those.
         let folder = base.join(format!("agent.sock.d-{network}"));
@@ -799,12 +804,14 @@ async fn a_sandboxed_command_cannot_reach_the_daemon_socket() {
             capability: Some(own),
             ..policy
         };
-        assert_ne!(
-            run(Some(policy.clone()), to(&socket)).await,
-            0,
+        // By the daemon's socket's name it reaches its own, with the
+        // network on.
+        assert_eq!(
+            run(Some(policy.clone()), to(&socket)).await == 0,
+            network,
             "network {network}"
         );
-        assert!(listener.accept().is_err());
+        assert_eq!(listener.accept().is_ok(), network);
         assert_eq!(
             run(Some(policy.clone()), handed.into()).await,
             0,
@@ -827,12 +834,14 @@ async fn a_sandboxed_command_cannot_reach_the_daemon_socket() {
         let naming = policy.with_sockets(&[mine.display().to_string()]);
         assert_eq!(run(Some(naming), to(&mine)).await, 0, "network {network}");
     }
+    assert!(daemon_listener.accept().is_err());
     std::fs::remove_dir_all(base).unwrap();
 }
 
-/// On macOS a sandboxed command reaches only the Unix sockets its settings
-/// name, network on or off: not the daemon's, even inside its folder, nor
-/// one in its folder, which could be a hard link to any socket.
+/// On macOS a sandboxed command reaches every Unix socket with the network
+/// on, as Codex's full network does, and listens on its own; with it off,
+/// only those its settings name. Never the daemon's, even inside its
+/// folder, nor by a hard link to it there.
 #[cfg(target_os = "macos")]
 #[tokio::test]
 async fn a_sandboxed_command_reaches_only_the_sockets_it_names() {
@@ -857,6 +866,21 @@ async fn a_sandboxed_command_reaches_only_the_sockets_it_names() {
     ];
     let _listeners: Vec<_> = paths.iter().map(|path| listen(path)).collect();
     let tools = Registry::new("shell").unwrap();
+    let runs = |policy: Policy, command: String| {
+        let tools = tools.clone();
+        let workspace = workspace.clone();
+        async move {
+            let prepared = tools
+                .prepare("shell", &json!({"command": command}).to_string())
+                .unwrap();
+            let output = tools
+                .execute(prepared, &workspace, &[], Some(std::sync::Arc::new(policy)))
+                .await
+                .unwrap()
+                .output;
+            serde_json::from_str::<Value>(&output).unwrap()["exit_code"] == 0
+        }
+    };
     let reaches = |policy: Policy, path: std::path::PathBuf| {
         let tools = tools.clone();
         let workspace = workspace.clone();
@@ -904,9 +928,26 @@ async fn a_sandboxed_command_reaches_only_the_sockets_it_names() {
         ];
         assert_eq!(
             reached,
-            [false, false, false, true, true],
+            [false, network, network, true, true],
             "network {network}"
         );
+        // A hard link to the daemon's socket in its folder is not made, or
+        // reaches nothing.
+        let linked = workspace.join(format!("linked-{network}.sock"));
+        let link = format!(
+            "ln {} {} && python3 -c 'import socket; socket.socket(socket.AF_UNIX).connect(\"{}\")'",
+            socket.display(),
+            linked.display(),
+            linked.display()
+        );
+        assert!(!runs(policy.clone(), link).await, "network {network}");
+        // Its own server it runs with the network on.
+        let listens = format!(
+            "python3 -c 'import socket, os; p = \"{0}\"; s = socket.socket(socket.AF_UNIX); \
+             s.bind(p); s.listen(); socket.socket(socket.AF_UNIX).connect(p); os.unlink(p)'",
+            workspace.join(format!("serve-{network}.sock")).display()
+        );
+        assert_eq!(runs(policy.clone(), listens).await, network);
     }
     std::fs::remove_dir_all(base).unwrap();
 }
@@ -1172,6 +1213,18 @@ async fn a_terminal_takes_typed_input_and_reports_its_end() {
     let end: Value = serde_json::from_str(&end.await.unwrap().unwrap().output).unwrap();
     assert_eq!(end["exit_code"], 3);
     assert!(end.get("handle").is_none());
+    // Until its handle's result is recorded, a read still finds its end;
+    // then the terminal goes.
+    let read: Value = serde_json::from_str(
+        &tools
+            .write_stdin(1, 1, "", None, false, None)
+            .await
+            .unwrap()
+            .output,
+    )
+    .unwrap();
+    assert_eq!(read["exit_code"], 3);
+    tools.forget_terminal(1);
     let error = tools
         .write_stdin(1, 1, "", None, false, None)
         .await
@@ -1212,6 +1265,7 @@ async fn a_terminal_takes_typed_input_and_reports_its_end() {
         network: false,
         socket: None,
         capability: None,
+        listening: None,
         helper: None,
         sockets: Vec::new(),
     });
@@ -1248,4 +1302,126 @@ fn protecting() -> agent_runtime::sandbox::Daemon {
         protected_existing: agent_client::PROTECTED_EXISTING.map(String::from).to_vec(),
         ..Default::default()
     }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn terminals_hold_a_lasting_permit_and_end_their_whole_session() {
+    use std::time::Duration;
+    // Whether `pid` still runs: a zombie no init has reaped yet does not.
+    let alive = |pid: i32| {
+        if unsafe { libc::kill(pid, 0) } != 0 {
+            return false;
+        }
+        std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .map(|stat| {
+                !stat
+                    .rsplit_once(')')
+                    .is_some_and(|(_, rest)| rest.trim_start().starts_with('Z'))
+            })
+            .unwrap_or(true)
+    };
+    let cwd = std::env::temp_dir();
+    let tools = Registry::all().unwrap().with_lasting_budget(2);
+    let start = |owner: i64, handle: i64, command: &str| {
+        let (done, end) = tokio::sync::oneshot::channel();
+        let started = tools.terminal(
+            owner,
+            handle,
+            command.into(),
+            cwd.clone(),
+            1000,
+            Vec::new(),
+            None,
+            done,
+        );
+        (started, end)
+    };
+    // A shell with job control puts its jobs in groups of their own; one
+    // ignores SIGHUP. Killing the terminal still ends it.
+    let (started, end) = start(
+        1,
+        1,
+        "set -m; (trap '' HUP; exec sleep 300) & echo \"job=$!\"; sleep 300",
+    );
+    let started: Value = serde_json::from_str(&started.await.unwrap().output).unwrap();
+    let job: i32 = started["output"]
+        .as_str()
+        .unwrap()
+        .trim()
+        .strip_prefix("job=")
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(alive(job));
+    let (started, _second) = start(1, 2, "sleep 300");
+    started.await.unwrap();
+    // Both permits held: another terminal or a detached command is refused,
+    // naming what holds them.
+    let (refused, _) = start(2, 3, "sleep 300");
+    let error = refused.await.err().unwrap();
+    assert_eq!(error.code, "lasting_limit");
+    assert!(
+        error
+            .detail
+            .as_deref()
+            .unwrap()
+            .contains("2 terminals and 0 detached"),
+        "{error:?}"
+    );
+    let detach = tools
+        .prepare(
+            "shell",
+            &json!({"command":"true","detach":true}).to_string(),
+        )
+        .unwrap();
+    let error = tools.execute(detach, &cwd, &[], None).await.unwrap_err();
+    assert_eq!(error.code, "lasting_limit");
+    tools.write_stdin(1, 1, "", None, true, None).await.unwrap();
+    end.await.unwrap().unwrap();
+    for _ in 0..300 {
+        if !alive(job) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(!alive(job), "the job outlived its terminal");
+    // Its permit is free again.
+    let (started, _third) = start(2, 3, "sleep 300");
+    started.await.unwrap();
+    tools.end_terminals();
+
+    // A bot at its share of terminals ends its least recently used before
+    // the next one starts, so the next one finds that permit free.
+    let share = 16;
+    let tools = Registry::all().unwrap().with_lasting_budget(share);
+    let mut ends = Vec::new();
+    for handle in 1..=share as i64 + 1 {
+        let (done, end) = tokio::sync::oneshot::channel();
+        tools
+            .terminal(
+                1,
+                handle,
+                "sleep 300".into(),
+                cwd.clone(),
+                0,
+                Vec::new(),
+                None,
+                done,
+            )
+            .await
+            .unwrap();
+        ends.push(end);
+    }
+    let first: Value =
+        serde_json::from_str(&ends.remove(0).await.unwrap().unwrap().output).unwrap();
+    assert_eq!(first["signal"], libc::SIGKILL);
+    tools.forget_terminal(1);
+    let error = tools
+        .write_stdin(1, 1, "", None, false, None)
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(error.code, "terminal_not_running");
+    tools.end_terminals();
 }

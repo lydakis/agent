@@ -47,11 +47,14 @@ in [`Service::dispatch`](../src/server/mod.rs); storage execution is in
 | --- | --- |
 | `bots`, `turns`, `inspect`, `events`, `artifact`, store counts for `stats` | Storage worker shared with writes |
 | `history_nodes`, `history_items` | Reader shared with model-context construction |
-| `follow` | Bot inspection and replay on the worker; live delivery through the hub |
+| `follow` | Bot inspection on the worker; replay pages on the reader pool; the switch to live on the worker; live delivery through the hub |
 | `wait` | Handle registration and settlement against durable outcomes |
 
-[`Hub::replay`](../src/server/hub.rs) performs its final replay-to-live
-transition on the worker to avoid missing a commit between those modes.
+[`Hub::replay`](../src/server/hub.rs) reads its pages on the reader pool,
+at most all but one reader at a time across every replay, and holds no
+subscription lock while it reads. Only the final replay-to-live transition
+runs on the worker, as one job that reads at most one event, so no commit
+falls between those modes.
 `Hub::fan_out` visits subscriptions and clones events into their output
 queues. Slow socket followers close on a failed `try_send`; the stdio owner
 is backpressured and is not the observer transport.
@@ -92,13 +95,14 @@ The implementation must satisfy the whole path from admission to delivery:
    `inspect` returns a bounded bot view: `instructions` and
    `compaction_instructions` (64 KiB each today) are read through the
    range protocol rather than inlined. Bound the SQLite work behind a
-   page, not only its output: oldest-first `history_nodes` orders the
-   whole ancestry before its `LIMIT`, and `history_items` walks from the
-   head to the oldest requested node. Bound the work in each scheduled
+   page, not only its output. `history_nodes` and `history_items` now
+   reach any ancestor through skip pointers in O(log n) steps (#472),
+   where they used to order the whole ancestry before a `LIMIT` or walk
+   from the head to the oldest requested node. Bound the work in each scheduled
    chunk and make progress resumable, so one request cannot hold the
    reader for the length of a history. That bounds each chunk, not the
-   total cost of reaching a deep page. Choose an index (such as a stored
-   depth) only after measuring its write and storage cost. Update the
+   total cost of reaching a deep page. The skip pointers' write and
+   storage cost is measured in `DAEMON_MEASUREMENTS.md`. Update the
    CLI (including `follow` and `interrupt`), shared client, and app to
    consume the new pages.
 3. **Hold the charge through delivery.** Queued, materialized, serialized,
@@ -112,9 +116,10 @@ The implementation must satisfy the whole path from admission to delivery:
    subscriptions. Byte sharing does not remove per-subscriber CPU work.
    Close overloaded followers promptly; they reconnect from their last
    received durable cursor.
-5. **Preserve replay ordering.** Replay pages use the observer reader.
-   The final transition remains ordered with commits, but handoffs are
-   admitted in bounded batches with at most one batch queued on the
+5. **Preserve replay ordering.** Replay pages use the reader pool (done,
+   #391 follow-up). The final transition remains ordered with commits;
+   each is one single-event job today, and still to do is admitting
+   handoffs in bounded batches with at most one batch queued on the
    worker. Validate each follower against its requested stream, including
    a quiet bot whose last event is older than the fleet's last cursor.
    The hub keys subscriptions and replay by name today. Capture the bot

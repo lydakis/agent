@@ -32,6 +32,13 @@ fn number(setting: &Setting) -> bool {
     setting.values.is_empty() && setting.default.parse::<u64>().is_ok()
 }
 
+/// Whether a setting is a span of time, as `30s`, `15m` or `1h`.
+fn span(setting: &Setting) -> bool {
+    setting.values.is_empty()
+        && !number(setting)
+        && agent_client::config::span(setting.key, setting.default).is_ok()
+}
+
 /// The rows `/config` takes with room for all: the blank one, a heading
 /// for each table, and the settings.
 pub fn height() -> usize {
@@ -49,7 +56,7 @@ fn short(key: &str) -> &str {
 }
 
 /// Every key `agent_client::config` reads.
-pub const SETTINGS: [Setting; 22] = [
+pub const SETTINGS: [Setting; 29] = [
     Setting {
         key: "model",
         about: "a new agent's model, when none is named (provider/model)",
@@ -160,7 +167,7 @@ pub const SETTINGS: [Setting; 22] = [
     },
     Setting {
         key: "sonny.commons_invites",
-        about: "least invites a day new commons threads send, the square root of the week's agents if more, 0 for none; each answered one adds one, up to as many again",
+        about: "least commons threads a day that send invites, the square root of the week's agents if more, 0 for none; each answered thread adds one, up to as many again",
         values: &[],
         default: "3",
     },
@@ -169,6 +176,18 @@ pub const SETTINGS: [Setting; 22] = [
         about: "the tokens an invite pays for in its thread: its turn, and the turns replies there start while any are left",
         values: &[],
         default: "1000000",
+    },
+    Setting {
+        key: "sonny.commons_digest",
+        about: "how often at most an agent hears of new posts in the commons threads it posted in, as 30s, 15m or 1h; 0 for as they come",
+        values: &[],
+        default: "1h",
+    },
+    Setting {
+        key: "sonny.ask_wait_minutes",
+        about: "minutes an unanswered question waits before its agent goes on with what it recommended, where it said it could, or is reminded; 0 waits for you always",
+        values: &[],
+        default: "60",
     },
     Setting {
         key: "sonny.default_permissions",
@@ -182,6 +201,36 @@ pub const SETTINGS: [Setting; 22] = [
         values: &[],
         default: "2",
     },
+    Setting {
+        key: "sonny.sky_haikus",
+        about: "haikus a day from the agent the sky finds busiest, each written by a copy of it that calls no tool when the title passes; 0 for none",
+        values: &[],
+        default: "8",
+    },
+    Setting {
+        key: "sonny.sky_haiku_window",
+        about: "the minutes of messages and tool calls that make an agent the sky's busiest",
+        values: &[],
+        default: "10",
+    },
+    Setting {
+        key: "sonny.sky_haiku_margin",
+        about: "how much busier, in percent, an agent must be than the busiest to take the title, so it does not flicker",
+        values: &[],
+        default: "50",
+    },
+    Setting {
+        key: "sonny.sky_haiku_hold",
+        about: "the minutes the busiest keeps the title before another can take it",
+        values: &[],
+        default: "10",
+    },
+    Setting {
+        key: "sonny.tool_processes",
+        about: "processes each of Sonny's companions runs for agents at once (the tool host's tool calls, the lookout's goal checks), each agent at most half; 0 for twice the CPUs",
+        values: &[],
+        default: "0",
+    },
 ];
 
 /// The `sonny-config` skill: where the settings live and every key of the
@@ -192,6 +241,7 @@ pub fn skill() -> String {
         .map(|setting| {
             let values = match setting.values {
                 [] if number(setting) => "a whole number".to_owned(),
+                [] if span(setting) => "a span, as `30s`, `15m` or `1h`".to_owned(),
                 [] => "a name".to_owned(),
                 values => (values.iter())
                     .map(|value| format!("`{value}`"))
@@ -510,9 +560,10 @@ mod tests {
         };
         for (at, setting) in SETTINGS.iter().enumerate() {
             view.pick = at;
-            let named = match number(setting) {
-                true => "7",
-                false => "a/b",
+            let named = match (number(setting), span(setting)) {
+                (true, _) => "7",
+                (_, true) => "15m",
+                _ => "a/b",
             };
             let value = setting.values.last().copied().unwrap_or(named);
             view.write(Some(value.to_owned()));

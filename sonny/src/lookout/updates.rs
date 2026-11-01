@@ -18,6 +18,7 @@ use serde_json::{Value, json};
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
+    sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -50,6 +51,9 @@ const MEMORY_LINES: usize = 20;
 const ACTIVE: [&str; 5] = ["running", "waiting", "paced", "queued", "ready"];
 const APPROVAL: &str = "waiting for the person's approval";
 const QUIET: &str = "has printed nothing for 30 minutes";
+/// The origin of a turn that started before the lookout watched: who asked
+/// for it is unknown, never taken for the person.
+const UNKNOWN: &str = "";
 /// How long a running turn may print nothing before it is news.
 const QUIET_AFTER: Duration = super::QUIET_AFTER;
 /// An approval is news once the approver has had its say: a call the
@@ -72,6 +76,18 @@ struct Turn {
     goal: Option<String>,
     /// What the task replied, ending the turn.
     reply: Option<String>,
+}
+
+impl Turn {
+    /// A trigger's run that went well: news only once its reply has words.
+    /// One that failed, was stopped, resolved its task or ended a goal is
+    /// news however it replied.
+    fn run(&self) -> bool {
+        self.status == "completed"
+            && self.by.as_deref() == Some("trigger")
+            && !self.resolved
+            && self.goal.is_none()
+    }
 }
 
 /// A message written in a task: who wrote it, and the words, only when
@@ -226,8 +242,10 @@ pub struct Updates {
     /// The memory folders whose facts are news: the person's and the
     /// project's, as the subscriber's own memory indexes name them.
     memory: Vec<PathBuf>,
-    /// Bots with subscriptions of their own: no one's tasks here.
-    subscribers: HashSet<String>,
+    /// Bots with subscriptions of their own, this lead among them: no
+    /// one's tasks here. One set every lookout shares, so the lookouts
+    /// hold it once, not each a copy of all the others.
+    subscribers: Arc<HashSet<String>>,
     /// The bots whose news this is, as the lookout's subscriptions with
     /// task updates name them.
     pub watched: HashSet<String>,
@@ -240,6 +258,11 @@ pub struct Updates {
     bots: HashMap<String, Bot>,
     from: HashMap<Key, String>,
     origin: HashMap<Key, String>,
+    /// Turns seen starting: who asked for one started before the lookout
+    /// watched is read with its reply, and its end names no one until then.
+    started: HashSet<Key>,
+    /// Ended turns not seen starting, until who asked for them is read.
+    unknown: HashSet<Key>,
     answer_to: HashMap<Key, i64>,
     /// Turns whose answer a trigger passes to the lead, or whose end
     /// waits for their goal's check.
@@ -269,6 +292,12 @@ pub struct Updates {
     /// Turns whose reply is being read: how each ends waits for it, so a
     /// note tells a turn's end with its reply or not yet.
     replying: HashSet<Key>,
+    /// A trigger's runs that went well, each held apart until its reply is
+    /// read, and whether it answered a note the lead had not heard yet:
+    /// one that replied nothing is no news, as cron mails a job's output
+    /// only when it printed some, and held apart, two runs never merge
+    /// into one end that neither reply could clear.
+    runs: HashMap<Key, (Turn, bool)>,
 }
 
 /// A turn whose answer a trigger passes to the lead: when it becomes news
@@ -331,7 +360,7 @@ impl Updates {
         Self {
             lead: lead.to_owned(),
             memory,
-            subscribers: HashSet::new(),
+            subscribers: Arc::default(),
             watched: HashSet::new(),
             named: HashSet::new(),
             noted: HashSet::new(),
@@ -339,6 +368,8 @@ impl Updates {
             bots: HashMap::new(),
             from: HashMap::new(),
             origin: HashMap::new(),
+            started: HashSet::new(),
+            unknown: HashSet::new(),
             answer_to: HashMap::new(),
             forwarding: HashMap::new(),
             goaled: HashSet::new(),
@@ -353,6 +384,7 @@ impl Updates {
             opened: now_ms(),
             resolving: Default::default(),
             replying: HashSet::new(),
+            runs: HashMap::new(),
         }
     }
 
@@ -446,6 +478,7 @@ impl Updates {
             }
             "accepted" | "queued" => {
                 let Some(turn) = turn else { return };
+                self.started.insert(key(turn));
                 if (data["request_id"].as_str()).is_some_and(|id| id.starts_with("lookout-")) {
                     self.noted.insert(key(turn));
                 }
@@ -602,7 +635,15 @@ impl Updates {
                 self.approvals.remove(&key(turn));
                 let status = data["status"].as_str().unwrap_or("?").to_owned();
                 let from = self.from.remove(&key(turn));
-                let origin = self.origin.remove(&key(turn));
+                let origin = match self.started.remove(&key(turn)) {
+                    true => self.origin.remove(&key(turn)),
+                    false => {
+                        if self.live {
+                            self.unknown.insert(key(turn));
+                        }
+                        Some(UNKNOWN.to_owned())
+                    }
+                };
                 let answered = self.answer_to.remove(&key(turn));
                 let noted = self.noted.remove(&key(turn));
                 if let Some(bot) = self.bots.get_mut(name)
@@ -687,7 +728,7 @@ impl Updates {
     /// own, unless a subscription names it.
     fn task(&self, name: &str) -> bool {
         self.watched.contains(name)
-            && (!self.subscribers.contains(name) || self.named.contains(name))
+            && (!self.subscriber(name) || self.named.contains(name))
             && !name.starts_with(&format!("{}-", self.lead))
     }
 
@@ -733,8 +774,19 @@ impl Updates {
     pub fn replied(&mut self, name: &str, turn: i64, text: &str) {
         // Read, whether or not it found words: the turn waits no more.
         self.replying.remove(&(name.to_owned(), turn));
+        self.unknown.remove(&(name.to_owned(), turn));
         let text = text.trim();
-        if !self.live || text.is_empty() {
+        if !self.live {
+            return;
+        }
+        if let Some((mut run, answered)) = self.runs.remove(&(name.to_owned(), turn)) {
+            if text.is_empty() {
+                return;
+            }
+            run.reply = Some(quotable(text));
+            return self.put(name, run, answered);
+        }
+        if text.is_empty() {
             return;
         }
         let reply = quotable(text);
@@ -749,6 +801,87 @@ impl Updates {
             t.reply = Some(reply);
         } else if let Some(forwarding) = self.forwarding.get_mut(&(name.to_owned(), turn)) {
             forwarding.reply = Some(text.to_owned());
+        }
+    }
+
+    /// Whether who asked for a turn that just ended is still to be read.
+    pub fn asker_unknown(&self, name: &str, turn: i64) -> bool {
+        self.unknown.contains(&(name.to_owned(), turn))
+    }
+
+    /// Who asked for a turn the lookout did not see start, read with its
+    /// reply: its end names them as it would have.
+    pub fn asked_by(
+        &mut self,
+        name: &str,
+        turn: i64,
+        from: Option<String>,
+        origin: Option<String>,
+    ) {
+        let key = (name.to_owned(), turn);
+        if !self.unknown.remove(&key) {
+            return;
+        }
+        if let Some(forward) = self.forwarding.get_mut(&key) {
+            forward.from = from.clone();
+            forward.origin = origin.clone();
+        }
+        let Some(at) = self.tasks.iter().position(|(task, _)| task == name) else {
+            return;
+        };
+        let told = self.tasks[at].1.act.as_ref();
+        let Some(status) = told
+            .filter(|t| t.turn == turn && t.count == 1 && t.by.is_none())
+            .filter(|t| ![APPROVAL, QUIET].contains(&t.status.as_str()))
+            .map(|t| t.status.clone())
+        else {
+            return;
+        };
+        let by = self.by(&status, from, origin);
+        let news = &mut self.tasks[at].1;
+        let mut told = news.act.take().expect("found above");
+        told.by = by;
+        if told.run() {
+            if news.empty() {
+                self.tasks.remove(at);
+            }
+            self.replying.insert(key.clone());
+            self.runs.insert(key, (told, false));
+            return;
+        }
+        // The person's own completed turn is theirs, as when it was seen.
+        news.merge(
+            match told.by.as_deref() == Some("the person") && status == "completed" {
+                true => News {
+                    theirs: Some(told),
+                    ..News::default()
+                },
+                false => News {
+                    act: Some(told),
+                    ..News::default()
+                },
+            },
+        );
+    }
+
+    /// The reply of a turn could not be read: its end is told without it.
+    pub fn reply_unread(&mut self, name: &str, turn: i64) {
+        self.replying.remove(&(name.to_owned(), turn));
+        self.unknown.remove(&(name.to_owned(), turn));
+        if let Some((run, answered)) = self.runs.remove(&(name.to_owned(), turn))
+            && self.live
+        {
+            self.put(name, run, answered);
+        }
+    }
+
+    /// Who a turn's end names as having asked for it.
+    fn by(&self, status: &str, from: Option<String>, origin: Option<String>) -> Option<String> {
+        match status {
+            APPROVAL | QUIET => None,
+            _ if from.as_deref() == Some(self.lead.as_str()) => Some("you".to_owned()),
+            _ if from.is_none() && origin.as_deref() == Some(UNKNOWN) => None,
+            _ => Some(from.or(origin).unwrap_or_else(|| "the person".into())),
         }
     }
 
@@ -788,18 +921,12 @@ impl Updates {
         if goal.is_none() && self.bots[&self.lead].waiting_on.contains(&handle) {
             return;
         }
-        let by = match status {
-            APPROVAL | QUIET => None,
-            _ if from.as_deref() == Some(self.lead.as_str()) => Some("you".to_owned()),
-            _ => Some(from.or(origin).unwrap_or_else(|| "the person".into())),
-        };
+        let by = self.by(status, from, origin);
+        let key = (name.to_owned(), turn);
         let news = self.news_of(name);
         let answered = news.act.as_ref().is_some_and(|asked| {
             asked.turn == turn && [APPROVAL, QUIET].contains(&asked.status.as_str())
         });
-        // One that failed or was stopped is news to the person too: the
-        // lead hears it with its own.
-        let theirs = by.as_deref() == Some("the person") && !answered && status == "completed";
         let turn = Turn {
             first: turn,
             turn,
@@ -811,7 +938,29 @@ impl Updates {
             goal,
             reply: None,
         };
-        news.merge(match theirs {
+        if turn.run() {
+            // Its end answers the note about it, whatever its reply.
+            if answered {
+                news.act = None;
+            }
+            if news.empty() {
+                self.tasks.retain(|(task, _)| task != name);
+            }
+            self.replying.insert(key.clone());
+            self.runs.insert(key, (turn, answered));
+            return;
+        }
+        self.put(name, turn, answered);
+    }
+
+    /// How a turn ended, news for the next note: the person's own turn
+    /// that completed is theirs, unless it answered a note the lead had
+    /// not heard; one that failed or was stopped is news to the person
+    /// too, and the lead hears it with its own.
+    fn put(&mut self, name: &str, turn: Turn, answered: bool) {
+        let theirs =
+            turn.by.as_deref() == Some("the person") && !answered && turn.status == "completed";
+        self.news_of(name).merge(match theirs {
             true => News {
                 theirs: Some(turn),
                 ..News::default()
@@ -1025,6 +1174,12 @@ impl Updates {
     /// waits on them.
     pub fn replies_dropped(&mut self) {
         self.replying.clear();
+        let runs: Vec<_> = self.runs.drain().collect();
+        for ((name, _), (run, answered)) in runs {
+            if self.live && self.task(&name) {
+                self.put(&name, run, answered);
+            }
+        }
     }
 
     /// The news for the next note, taken: every task's, those with the
@@ -1189,22 +1344,37 @@ impl Updates {
     /// it is no one's.
     pub fn forget(&mut self) {
         self.tasks.clear();
+        self.runs.clear();
         self.forwarding.clear();
         self.goaled.clear();
         self.approvals.clear();
     }
 
+    /// Whether `name` is another bot with subscriptions of its own.
+    fn subscriber(&self, name: &str) -> bool {
+        name != self.lead && self.subscribers.contains(name)
+    }
+
     /// The bots with subscriptions of their own, now: what was news of
-    /// them is no longer.
-    pub fn subscribed(&mut self, subscribers: HashSet<String>) {
-        let new: Vec<String> = (subscribers.difference(&self.subscribers))
+    /// them is no longer. Only the bots this lookout holds news of are
+    /// looked up, so taking the shared set costs what this lookout holds,
+    /// not the number of subscribers.
+    pub fn subscribed(&mut self, subscribers: Arc<HashSet<String>>) {
+        let before = std::mem::replace(&mut self.subscribers, subscribers);
+        let held = (self.tasks.iter().map(|(task, _)| task))
+            .chain(self.forwarding.keys().map(|(task, _)| task))
+            .chain(self.runs.keys().map(|(task, _)| task))
+            .chain(self.goaled.iter().map(|(task, _)| task))
+            .chain(self.approvals.keys().map(|(task, _)| task))
+            .chain(self.noted.iter().map(|(task, _)| task));
+        let new: HashSet<String> = held
+            .filter(|name| self.subscriber(name) && !before.contains(*name))
             .filter(|name| !self.named.contains(*name))
             .cloned()
             .collect();
         for name in new {
             self.drop_news(&name);
         }
-        self.subscribers = subscribers;
     }
 
     /// The bot under `name` is gone: drop its news, or all of it when it
@@ -1219,6 +1389,7 @@ impl Updates {
 
     fn drop_news(&mut self, name: &str) {
         self.tasks.retain(|(task, _)| task != name);
+        self.runs.retain(|(task, _), _| task != name);
         self.forwarding.retain(|(task, _), _| task != name);
         self.goaled.retain(|(task, _)| task != name);
         self.approvals.retain(|(task, _), _| task != name);
@@ -1594,6 +1765,119 @@ mod tests {
              and 1 earlier since turn:shop.fix/5\n\
              - shop.docs: turn:shop.docs/6 completed, asked by you"
         );
+    }
+
+    #[test]
+    fn a_turn_that_started_before_the_lookout_watched_names_no_one() {
+        let mut updates = fleet();
+        let now = Instant::now();
+        updates.event(
+            &ev(
+                "shop.fix",
+                Some(4),
+                "turn_finished",
+                json!({"status": "failed"}),
+            ),
+            now,
+        );
+        let told = updates.take();
+        assert_eq!(text(&told), "- shop.fix: turn:shop.fix/4 failed");
+        assert!(!told.items[0].theirs);
+    }
+
+    #[test]
+    fn who_asked_for_a_turn_not_seen_starting_is_named_once_read() {
+        let mut updates = fleet();
+        let now = Instant::now();
+        let done = |turn| {
+            ev(
+                "shop.fix",
+                Some(turn),
+                "turn_finished",
+                json!({"status": "completed"}),
+            )
+        };
+        updates.event(&done(4), now);
+        assert!(updates.asker_unknown("shop.fix", 4));
+        updates.reading_reply("shop.fix", 4);
+        updates.asked_by("shop.fix", 4, None, None);
+        updates.replied("shop.fix", 4, "done");
+        let told = updates.take();
+        assert!(
+            text(&told).starts_with("- shop.fix: turn:shop.fix/4 completed, asked by the person"),
+            "{}",
+            text(&told)
+        );
+        assert!(told.items[0].theirs);
+        // A trigger's, read the same way.
+        updates.event(&done(5), now);
+        updates.asked_by("shop.fix", 5, None, Some("trigger".into()));
+        updates.replied("shop.fix", 5, "");
+        assert!(updates.take().items.is_empty());
+        // A reply that could not be read leaves the end as it was told.
+        updates.event(&done(6), now);
+        updates.reading_reply("shop.fix", 6);
+        updates.reply_unread("shop.fix", 6);
+        assert!(!updates.asker_unknown("shop.fix", 6));
+        assert_eq!(
+            text(&updates.take()),
+            "- shop.fix: turn:shop.fix/6 completed"
+        );
+    }
+
+    #[test]
+    fn a_trigger_s_run_that_went_well_and_said_nothing_is_no_news() {
+        let mut updates = fleet();
+        let trigger = || json!({"origin": "trigger"});
+        turn(&mut updates, "shop.fix", 4, trigger(), "completed");
+        updates.reading_reply("shop.fix", 4);
+        turn(&mut updates, "shop.docs", 2, trigger(), "failed");
+        updates.reading_reply("shop.docs", 2);
+        updates.replied("shop.fix", 4, "  \n");
+        updates.replied("shop.docs", 2, "");
+        // One that went wrong is told, words or none.
+        assert_eq!(
+            text(&updates.take()),
+            "- shop.docs: turn:shop.docs/2 failed, asked by trigger"
+        );
+        // One with words is told with them.
+        turn(&mut updates, "shop.fix", 5, trigger(), "completed");
+        updates.replied("shop.fix", 5, "posted 2 items");
+        assert!(text(&updates.take()).contains("posted 2 items"));
+    }
+
+    #[test]
+    fn two_quiet_runs_that_ended_before_their_replies_were_read_are_no_news() {
+        let mut updates = fleet();
+        let trigger = || json!({"origin": "trigger"});
+        turn(&mut updates, "shop.fix", 4, trigger(), "completed");
+        turn(&mut updates, "shop.fix", 5, trigger(), "completed");
+        // Both ended before either reply was read, each held apart.
+        assert!(!updates.news());
+        updates.replied("shop.fix", 5, "");
+        updates.replied("shop.fix", 4, "\n");
+        assert!(!updates.news(), "{}", text(&updates.take()));
+        // A run that failed beside them is still told, and one with words
+        // is told with them, once.
+        turn(&mut updates, "shop.fix", 6, trigger(), "failed");
+        turn(&mut updates, "shop.fix", 7, trigger(), "completed");
+        turn(&mut updates, "shop.fix", 8, trigger(), "completed");
+        updates.replied("shop.fix", 6, "");
+        updates.replied("shop.fix", 8, "");
+        updates.replied("shop.fix", 7, "posted 2 items");
+        let told = text(&updates.take());
+        assert!(told.contains("turn:shop.fix/7 completed"), "{told}");
+        assert!(told.contains("posted 2 items"), "{told}");
+        assert!(told.contains("1 earlier since turn:shop.fix/6"), "{told}");
+        // A run whose reply could not be read, or whose read was cut off,
+        // is told without it.
+        turn(&mut updates, "shop.fix", 9, trigger(), "completed");
+        updates.reply_unread("shop.fix", 9);
+        turn(&mut updates, "shop.docs", 3, trigger(), "completed");
+        updates.replies_dropped();
+        let told = text(&updates.take());
+        assert!(told.contains("turn:shop.fix/9 completed"), "{told}");
+        assert!(told.contains("turn:shop.docs/3 completed"), "{told}");
     }
 
     #[test]

@@ -1,5 +1,4 @@
 """A trigger's fire against a real daemon: what launchd or systemd runs, sent to the bot it was made for."""
-import html
 import json
 import os
 import re
@@ -11,7 +10,6 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from xml.sax.saxutils import escape as xml_escape
 
 from bench.targets import clean_env
 from bench.socket_client import Connection
@@ -21,11 +19,11 @@ ROOT = Path(__file__).resolve().parent.parent
 SONNY = next((p for p in (ROOT / '.local/target/debug/sonny', ROOT / '.local/target/release/sonny') if p.exists()), None)
 # What a fire puts before the message: `[trigger NAME · YYYY-MM-DD HH:MM · why]`.
 LINE = r'\[trigger {} · \d{{4}}-\d\d-\d\d \d\d:\d\d · {}\]\n'
-LABEL = 'me.lydakis.agent.trigger.'
+SCHEDULER = 'me.lydakis.agent.scheduler.'
 
 
 def home_tag(home):
-    """HOME's tag in its triggers' labels, as Sonny computes it: FNV-1a 64 of the path, folded to 32 bits."""
+    """HOME's tag in its scheduler job's label, as Sonny computes it: FNV-1a 64 of the path, folded to 32 bits."""
     data = str(home).encode().rstrip(b'/') or b'/'
     value = 0xcbf29ce484222325
     for byte in data:
@@ -33,47 +31,24 @@ def home_tag(home):
     return f'{(value ^ (value >> 32)) & 0xffffffff:08x}'
 
 
-def label_of(home, name):
-    """A trigger's launchd label, or its systemd units' name: each HOME has its own."""
-    return f'{LABEL}{home_tag(home)}.{name}'
-
-
 def job(home, name):
-    """Where a trigger's definition is under `home`: its plist on a Mac, its systemd service elsewhere."""
-    if sys.platform == 'darwin':
-        return home / 'Library/LaunchAgents' / f'{label_of(home, name)}.plist'
-    return home / '.config/systemd/user' / f'{label_of(home, name)}.service'
+    """Where a trigger's definition is under `home`: one file Sonny's scheduler reads."""
+    return home / '.agent/triggers/jobs' / f'{name}.json'
 
 
 def definition(args):
     """A definition running `args`, as Sonny writes one: all a fire reads of it."""
-    if sys.platform == 'darwin':
-        strings = ''.join(f'<string>{xml_escape(a)}</string>' for a in args)
-        return f'<plist><dict><key>ProgramArguments</key><array>{strings}</array></dict></plist>'
-
-    def quoted(word):
-        for raw, escaped in (('\\', '\\\\'), ('"', '\\"'), ('\n', '\\n'), ('\t', '\\t'), ('\r', '\\r'),
-                             ('%', '%%'), ('$', '$$')):
-            word = word.replace(raw, escaped)
-        return f'"{word}"'
-    return '[Service]\nType=oneshot\nExecStart=' + ' '.join(map(quoted, args)) + '\n'
+    return json.dumps({'program': args})
 
 
 def program(text):
     """The arguments a definition runs."""
-    if sys.platform == 'darwin':
-        array = re.search(r'<key>ProgramArguments</key>\s*<array>(.*?)</array>', text, re.S).group(1)
-        return [html.unescape(a) for a in re.findall(r'<string>(.*?)</string>', array)]
-    line = next(line for line in text.splitlines() if line.startswith('ExecStart='))
-    words = re.findall(r'"((?:[^"\\]|\\.)*)"', line[len('ExecStart='):])
-    escapes = {'n': '\n', 't': '\t', 'r': '\r'}
-    return [re.sub(r'\\(.)', lambda m: escapes.get(m.group(1), m.group(1)), w).replace('%%', '%').replace('$$', '$')
-            for w in words]
+    return json.loads(text)['program']
 
 
 def jobs(home):
     """Every trigger definition under `home`."""
-    return list(job(home, '*').parent.glob(job(home, '*').name))
+    return sorted(job(home, 'x').parent.glob('*.json'))
 
 
 @unittest.skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'set AGENT_TEST_RUNTIME=1 after a Rust release build')
@@ -173,24 +148,34 @@ class TriggerFireTests(ModelFixture):
             self.assertEqual(item['origin'], 'trigger')
         finally:
             connection.close()
-        # A working bot is not interrupted or queued behind: that time is skipped.
+        # A working bot is not interrupted: the fire waits behind its work,
+        # as anacron runs a missed job once, and one fire of the trigger at
+        # a time waits there.
         self.model.release_headers = threading.Event()
         self.model.all_streaming = self.model.release_headers
         self.addCleanup(self.model.release_headers.set)
         self.agent('run', '--store', str(self.store), '--bot', 'p.task', '--detach', 'gate')
         time.sleep(0.5)
-        skipped = self.fire('p.task', 'Check the PR again.')
+        late = self.fire('p.task', 'Check the PR again.', generation='7')
+        self.assertEqual((late['last']['outcome'], late['last'].get('late')), ('sent', True), late)
+        skipped = self.fire('p.task', 'Check the PR again.', generation='7')
         self.assertEqual(skipped['last']['outcome'], 'skipped', skipped)
+        # The waiting fire is found behind the notes the skipped ones left.
+        again = self.fire('p.task', 'Check the PR again.', generation='7')
+        self.assertEqual(again['last']['outcome'], 'skipped', again)
         self.model.release_headers.set()
         busy = next(t['turn'] for t in self.turns('p.task') if t['prompt_preview'] == 'gate')
-        self.agent('wait', '--store', str(self.store), f'turn:p.task/{busy}')
-        # The skip starts no turn: the bot is told in its next model call.
-        told = self.turns('p.task')[-1]
-        self.assertGreater(told['turn'], busy)
-        self.assertIn(told['status'], ('attached', 'steered'))
-        self.assertRegex(told['prompt_preview'],
-                         r'^\[trigger p\.task · .* · every 30m not sent to p\.task: bot_busy')
-        self.assertEqual(len(self.turns('p.task')), 4)
+        self.agent('wait', '--store', str(self.store), f"turn:p.task/{late['last']['turn']}")
+        turns = self.turns('p.task')
+        waited = next(t for t in turns if t['turn'] == late['last']['turn'])
+        self.assertGreater(waited['turn'], busy)
+        self.assertEqual(waited['status'], 'completed')
+        # The skipped fires start no turn: the bot is told in a model call.
+        for told in turns[-2:]:
+            self.assertIn(told['status'], ('attached', 'steered'))
+            self.assertRegex(told['prompt_preview'],
+                             r'^\[trigger p\.task · .* · every 30m not sent to p\.task: bot_busy')
+        self.assertEqual(len(turns), 6)
 
     def test_a_recurring_fire_waits_for_its_first_interval(self):
         self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
@@ -573,100 +558,40 @@ class TriggerFireTests(ModelFixture):
         self.assertEqual(json.loads(out.read_text())['error'], 'triggers_unsupported')
         self.assertEqual(jobs(self.home), [])
 
-    @unittest.skipUnless(sys.platform == 'darwin' and os.environ.get('AGENT_TEST_LAUNCHD') == '1',
-                         'real launchd: macOS with AGENT_TEST_LAUNCHD=1')
-    def test_real_launchd_fires_and_removes(self):
-        # The plists live under this test's HOME, so nothing loads at the next login.
-        name = f'ztest-{os.getpid()}'
-        label = label_of(self.home, name)
-        target = f'gui/{os.getuid()}/{label}'
-        plist = self.home / f'Library/LaunchAgents/{label}.plist'
-        self.addCleanup(lambda: subprocess.run(['/bin/launchctl', 'bootout', target], capture_output=True))
-        self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
-        env = {**clean_env(), 'HOME': str(self.home), 'AGENT_STORE': str(self.store)}
+    def scheduler(self, env):
+        """`sonny scheduler` for this test's HOME, run here as the system's job would run it."""
+        process = subprocess.Popen([str(env.get('SONNY', SONNY)), 'scheduler'], env=env, cwd=self.path,
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
 
-        def trigger(*args, ok=True):
-            result = subprocess.run([str(SONNY), 'trigger', *args], env=env, capture_output=True, text=True,
-                                    timeout=120, cwd=self.path)
-            if ok:
-                self.assertEqual(result.returncode, 0, result.stderr)
-            return result
+        def stop():
+            if process.poll() is None:
+                process.terminate()
+            process.communicate(timeout=10)
+        self.addCleanup(stop)
+        return process
 
-        def loaded():
-            return subprocess.run(['/bin/launchctl', 'print', target], capture_output=True).returncode == 0
+    def until(self, check, seconds):
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline and not check():
+            time.sleep(0.5)
+        return check()
 
-        def until(check, seconds):
-            deadline = time.monotonic() + seconds
-            while time.monotonic() < deadline and not check():
-                time.sleep(1)
-            return check()
-
-        # A one-off: launchd runs it at its minute, the bot gets the message, and it ends itself.
-        trigger('add', '--bot', 'p.task', '--name', name, '--in', '1m', '--', 'launchd says hi')
-        self.assertTrue(loaded())
-        self.assertTrue(until(lambda: len(self.turns('p.task')) == 2, 150), 'launchd did not fire it')
-        self.assertTrue(until(lambda: not loaded() and not plist.exists(), 30), 'it did not end itself')
-        # Its row stays, ended, until its turn is known to be done (#442).
-        rows = json.loads(trigger('ls').stdout)['triggers']
-        self.assertEqual([(r['name'], r['ended']) for r in rows], [(name, True)], rows)
-        # A file trigger: a write to the file fires it; the same add again is that trigger.
-        watched = self.path / 'notes.md'
-        trigger('add', '--bot', 'p.task', '--name', name, '--file', str(watched), '--', 'notes changed')
-        self.assertTrue(json.loads(trigger('add', '--bot', 'p.task', '--name', name, '--file', str(watched),
-                                           '--', 'notes changed').stdout)['duplicate'])
-        other = trigger('add', '--bot', 'p.task', '--name', name, '--every', '1h', '--', 'b', ok=False)
-        self.assertEqual(json.loads(other.stderr)['field'], 'when')
-        watched.write_text('synthetic\n')
-        self.assertTrue(until(lambda: len(self.turns('p.task')) == 3, 60), 'launchd did not fire on the write')
-        self.settle('p.task')
-        # Fire by name: launchd runs it now, and `fire` says the turn it sent.
-        fired = json.loads(trigger('fire', name).stdout)
-        self.assertEqual((fired['name'], fired['fired'], fired['outcome']), (name, True, 'sent'), fired)
-        self.assertTrue(until(lambda: len(self.turns('p.task')) == 4, 60), 'fire did not run it')
-        self.assertEqual(fired['handle'], f"turn:p.task/{self.turns('p.task')[-1]['turn']}")
-        self.assertTrue(self.turns('p.task')[-1]['prompt_preview'].startswith(f'[trigger {name} · '))
-        # A plist launchd no longer has, as after a failed reload: rm still removes it.
-        subprocess.run(['/bin/launchctl', 'bootout', target], check=True, capture_output=True)
-        trigger('rm', name)
-        self.assertFalse(plist.exists())
-        # A job loaded without its plist, as after an end cut short: rm reaches it by name.
-        trigger('add', '--bot', 'p.task', '--name', name, '--every', '30m', '--', 'c')
-        plist.unlink()
-        trigger('rm', name)
-        self.assertFalse(loaded())
-        # Nothing left: bootout's not-loaded answer reads as that.
-        self.assertEqual(json.loads(trigger('rm', name, ok=False).stderr)['error'], 'trigger_not_found')
-
-    @unittest.skipUnless(sys.platform.startswith('linux') and os.environ.get('AGENT_TEST_SYSTEMD') == '1',
-                         'real systemd: Linux with a user manager and AGENT_TEST_SYSTEMD=1')
-    def test_real_systemd_fires_and_removes(self):
-        # Units go where the user manager reads them; the rest stays under this test's HOME.
-        real = Path(os.environ.get('XDG_CONFIG_HOME') or Path.home() / '.config')
-        data = Path(os.environ.get('XDG_DATA_HOME') or Path.home() / '.local/share')
-        runtime = os.environ.get('XDG_RUNTIME_DIR') or f'/run/user/{os.getuid()}'
-        name = f'ztest-{os.getpid()}'
-        label = label_of(self.home, name)
-        units = real / 'systemd/user'
-        service = units / f'{label}.service'
-        # The user manager gives no provider keys: a daemon a fire starts gets them from the login shell's profile.
+    def test_the_scheduler_fires_and_removes(self):
+        # The user manager or launchd gives no provider keys: a daemon a fire starts gets them from the login shell.
         shell = self.path / 'login-shell'
         shell.write_text(f"#!/bin/sh\nexport AGENT_PROVIDER='openai=responses,{self.url}'\nexec /bin/sh -c \"$4\"\n")
         shell.chmod(0o755)
-        env = {**clean_env(), 'HOME': str(self.home), 'AGENT_STORE': str(self.store), 'SHELL': str(shell),
-               'XDG_CONFIG_HOME': str(real), 'XDG_DATA_HOME': str(data), 'XDG_RUNTIME_DIR': runtime}
-
-        def systemctl(*args):
-            return subprocess.run(['systemctl', '--user', *args], env=env, capture_output=True, text=True)
-
-        def cleanup():
-            systemctl('stop', f'{label}.timer', f'{label}.path', f'{label}.service')
-            for path in [*units.glob(f'{label}.*'), *units.glob(f'*.wants/{label}.*')]:
-                path.unlink()
-            systemctl('daemon-reload')
-        self.addCleanup(cleanup)
+        name = 'ztest'
         self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
         # Sonny with its agent beside it, so a fire can start the daemon it stopped.
         sonny = self.bundle()
+        env = {**clean_env(), 'HOME': str(self.home), 'AGENT_STORE': str(self.store), 'SHELL': str(shell),
+               'SONNY': str(sonny)}
+        # One scheduler for a HOME: of two, one leaves it to the other.
+        both = [self.scheduler(env), self.scheduler(env)]
+        self.assertTrue(self.until(lambda: any(p.poll() is not None for p in both), 30), 'two schedulers run')
+        (left,), (running,) = [p for p in both if p.poll() is not None], [p for p in both if p.poll() is None]
+        self.assertEqual(left.returncode, 0)
 
         def trigger(*args, ok=True):
             result = subprocess.run([str(sonny), 'trigger', *args], env=env, capture_output=True, text=True,
@@ -675,105 +600,118 @@ class TriggerFireTests(ModelFixture):
                 self.assertEqual(result.returncode, 0, result.stderr)
             return result
 
-        def loaded():
-            return systemctl('is-active', f'{label}.path').stdout.strip() == 'active'
-
-        def until(check, seconds):
-            deadline = time.monotonic() + seconds
-            while time.monotonic() < deadline and not check():
-                time.sleep(1)
-            return check()
-
-        # A one-off: its timer fires at its minute, the bot gets the message, and it ends itself.
-        trigger('add', '--bot', 'p.task', '--name', name, '--in', '1m', '--', 'systemd says hi')
-        self.assertTrue(loaded())
-        self.assertEqual(systemctl('is-active', f'{label}.timer').stdout.strip(), 'active')
-        self.assertTrue(until(lambda: len(self.turns('p.task')) == 2, 150), 'the timer did not fire it')
-        self.assertTrue(until(lambda: not loaded() and not service.exists(), 30), 'it did not end itself')
-        self.assertEqual(list(units.glob(f'{label}.*')), [])
-        # Its row stays, ended, until its turn is known to be done (#442).
-        rows = json.loads(trigger('ls').stdout)['triggers']
-        self.assertEqual([(r['name'], r['ended']) for r in rows], [(name, True)], rows)
+        # A one-off: the scheduler fires it at its minute, the bot gets the message, and it ends itself.
+        trigger('add', '--bot', 'p.task', '--name', name, '--in', '1m', '--', 'the scheduler says hi')
+        self.assertTrue(job(self.home, name).exists())
+        self.assertTrue(self.until(lambda: len(self.turns('p.task')) == 2, 150), 'the scheduler did not fire it')
+        self.assertTrue(self.until(lambda: not job(self.home, name).exists(), 30), 'it did not end itself')
+        ended = json.loads(trigger('ls').stdout)['triggers']
+        self.assertEqual([(r['name'], r['ended'], r['last']['outcome']) for r in ended], [(name, True, 'sent')])
         # A file trigger: a write to the file fires it; the same add again is that trigger.
         watched = self.path / 'notes.md'
         trigger('add', '--bot', 'p.task', '--name', name, '--file', str(watched), '--', 'notes changed')
-        self.assertFalse((units / f'{label}.timer').exists())
         self.assertTrue(json.loads(trigger('add', '--bot', 'p.task', '--name', name, '--file', str(watched),
                                            '--', 'notes changed').stdout)['duplicate'])
         other = trigger('add', '--bot', 'p.task', '--name', name, '--every', '1h', '--', 'b', ok=False)
         self.assertEqual(json.loads(other.stderr)['field'], 'when')
         watched.write_text('synthetic\n')
-        self.assertTrue(until(lambda: len(self.turns('p.task')) == 3, 60), 'the path unit did not fire on the write')
+        self.assertTrue(self.until(lambda: len(self.turns('p.task')) == 3, 60), 'it did not fire on the write')
         self.settle('p.task')
         # Fire by name, with the daemon stopped: the fire starts it, and it outlives the fire.
         self.agent('shutdown', '--store', str(self.store))
         fired = json.loads(trigger('fire', name).stdout)
         self.assertEqual((fired['name'], fired['fired'], fired['outcome']), (name, True, 'sent'), fired)
-        self.assertTrue(until(lambda: systemctl('is-active', f'{label}.service').stdout.strip() != 'activating', 30))
-        self.assertTrue(until(lambda: len(self.turns('p.task')) == 4, 60), 'fire did not run it')
+        self.assertTrue(self.until(lambda: len(self.turns('p.task')) == 4, 60), 'fire did not run it')
         self.assertEqual(fired['handle'], f"turn:p.task/{self.turns('p.task')[-1]['turn']}")
-        # The daemon it started runs in a scope of its own, not the fire's service, which took its own with it.
-        daemon = subprocess.run(['pgrep', '-f', f'serve --store {self.store}'], capture_output=True, text=True)
-        groups = Path(f'/proc/{daemon.stdout.split()[0]}/cgroup').read_text()
-        self.assertIn('.scope', groups)
-        self.assertNotIn(label, groups)
-        # Units the manager no longer has, as after a failed reload: rm still removes them.
-        systemctl('stop', f'{label}.path')
+        self.assertTrue(self.turns('p.task')[-1]['prompt_preview'].startswith(f'[trigger {name} · '))
+        # A trigger that recurs leaves the scheduler as it was: nothing for the system to tell anyone about.
+        trigger('add', '--bot', 'p.task', '--name', 'p.next', '--every', '30m', '--', 'look')
+        trigger('add', '--bot', 'p.task', '--name', 'p.next', '--every', '30m', '--replace', '--', 'look again')
+        self.assertIn('look again', job(self.home, 'p.next').read_text())
         trigger('rm', name)
-        self.assertEqual(list(units.glob(f'{label}.*')) + list(units.glob(f'*.wants/{label}.*')), [])
-        # Units left without their service, as after an end cut short: rm reaches them by name.
-        trigger('add', '--bot', 'p.task', '--name', name, '--every', '30m', '--', 'c')
-        self.assertTrue((data / f'systemd/timers/stamp-{label}.timer').exists())
-        service.unlink()
-        trigger('rm', name)
-        self.assertFalse(loaded())
-        self.assertFalse((data / f'systemd/timers/stamp-{label}.timer').exists())
-        # Nothing left: not loaded reads as that.
+        trigger('rm', 'p.next')
+        self.assertEqual(jobs(self.home), [])
         self.assertEqual(json.loads(trigger('rm', name, ok=False).stderr)['error'], 'trigger_not_found')
+        self.assertIsNone(running.poll())
 
-    @unittest.skipUnless(sys.platform.startswith('linux') and os.environ.get('AGENT_TEST_SYSTEMD') == '1',
-                         'real systemd: Linux with a user manager and AGENT_TEST_SYSTEMD=1')
-    def test_real_systemd_job_whose_home_is_gone_unloads_itself(self):
-        # One user manager for every HOME (#453): a test's HOME deleted with its trigger still loaded.
-        real = Path(os.environ.get('XDG_CONFIG_HOME') or Path.home() / '.config')
-        data = Path(os.environ.get('XDG_DATA_HOME') or Path.home() / '.local/share')
-        runtime = os.environ.get('XDG_RUNTIME_DIR') or f'/run/user/{os.getuid()}'
+    def test_a_scheduler_whose_home_is_gone_lets_its_job_go(self):
+        # One user manager for every HOME (#453): a test's HOME deleted with its scheduler still running.
         gone = self.path / 'gone-home'
         gone.mkdir()
-        name = f'ztest-gone-{os.getpid()}'
-        label = label_of(gone, name)
-        self.assertNotEqual(label, label_of(self.home, name))
-        units = real / 'systemd/user'
-        env = {**clean_env(), 'HOME': str(gone), 'AGENT_STORE': str(self.store),
-               'XDG_CONFIG_HOME': str(real), 'XDG_DATA_HOME': str(data), 'XDG_RUNTIME_DIR': runtime}
-
-        def systemctl(*args):
-            return subprocess.run(['systemctl', '--user', *args], env=env, capture_output=True, text=True)
-
-        def left():
-            return [*units.glob(f'{label}.*'), *units.glob(f'*.wants/{label}.*')]
-
-        def cleanup():
-            systemctl('stop', f'{label}.timer', f'{label}.path', f'{label}.service')
-            for path in left():
-                path.unlink()
-            systemctl('daemon-reload')
-        self.addCleanup(cleanup)
+        config = self.path / 'config'
+        env = {**clean_env(), 'HOME': str(gone), 'AGENT_STORE': str(self.store), 'XDG_CONFIG_HOME': str(config)}
+        label = f'{SCHEDULER}{home_tag(gone)}'
+        self.assertNotEqual(label, f'{SCHEDULER}{home_tag(self.home)}')
+        # Its job, as the system would have it; nothing here loads it.
+        job_file = (gone / f'Library/LaunchAgents/{label}.plist' if sys.platform == 'darwin'
+                    else config / f'systemd/user/{label}.service')
+        job_file.parent.mkdir(parents=True)
+        job_file.write_text('# a scheduler job\n')
         self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
-        added = subprocess.run([str(SONNY), 'trigger', 'add', '--bot', 'p.task', '--name', name, '--every', '30m',
-                                '--', 'nobody home'], env=env, capture_output=True, text=True, timeout=120)
+        running = self.scheduler(env)
+        added = subprocess.run([str(SONNY), 'trigger', 'add', '--bot', 'p.task', '--name', 'ztest-gone',
+                                '--every', '30m', '--', 'nobody home'], env=env, capture_output=True, text=True,
+                               timeout=120)
         self.assertEqual(added.returncode, 0, added.stderr)
-        self.assertEqual(systemctl('is-active', f'{label}.timer').stdout.strip(), 'active')
         turns = len(self.turns('p.task'))
         shutil.rmtree(gone)
-        systemctl('start', f'{label}.service')
-        deadline = time.monotonic() + 30
-        while left() and time.monotonic() < deadline:
-            time.sleep(0.5)
-        self.assertEqual(left(), [])
-        self.assertNotEqual(systemctl('is-active', f'{label}.timer').stdout.strip(), 'active')
+        running.wait(timeout=90)
+        self.assertEqual(running.returncode, 0)
+        self.assertFalse(job_file.exists())
         self.assertEqual(len(self.turns('p.task')), turns)
 
+    @unittest.skipUnless((sys.platform == 'darwin' and os.environ.get('AGENT_TEST_LAUNCHD') == '1')
+                         or (sys.platform.startswith('linux') and os.environ.get('AGENT_TEST_SYSTEMD') == '1'),
+                         'the real system: macOS with AGENT_TEST_LAUNCHD=1, or Linux with a user manager and '
+                         'AGENT_TEST_SYSTEMD=1')
+    def test_the_system_runs_one_scheduler_job_written_once(self):
+        mac = sys.platform == 'darwin'
+        label = f'{SCHEDULER}{home_tag(self.home)}'
+        real = Path(os.environ.get('XDG_CONFIG_HOME') or Path.home() / '.config')
+        runtime = os.environ.get('XDG_RUNTIME_DIR') or f'/run/user/{os.getuid()}'
+        # The plist lives under this test's HOME, so nothing loads at the next login; units where the manager reads them.
+        job_file = (self.home / f'Library/LaunchAgents/{label}.plist' if mac
+                    else real / f'systemd/user/{label}.service')
+        env = {**clean_env(), 'HOME': str(self.home), 'AGENT_STORE': str(self.store),
+               **({} if mac else {'XDG_CONFIG_HOME': str(real), 'XDG_RUNTIME_DIR': runtime})}
+
+        def running():
+            if mac:
+                return subprocess.run(['/bin/launchctl', 'print', f'gui/{os.getuid()}/{label}'],
+                                      capture_output=True).returncode == 0
+            return subprocess.run(['systemctl', '--user', 'is-active', f'{label}.service'], env=env,
+                                  capture_output=True, text=True).stdout.strip() == 'active'
+
+        def cleanup():
+            if mac:
+                subprocess.run(['/bin/launchctl', 'bootout', f'gui/{os.getuid()}/{label}'], capture_output=True)
+            else:
+                subprocess.run(['systemctl', '--user', 'disable', '--now', f'{label}.service'], env=env,
+                               capture_output=True)
+            job_file.unlink(missing_ok=True)
+            if not mac:
+                subprocess.run(['systemctl', '--user', 'daemon-reload'], env=env, capture_output=True)
+        self.addCleanup(cleanup)
+        self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
+
+        def trigger(*args):
+            result = subprocess.run([str(SONNY), 'trigger', *args], env=env, capture_output=True, text=True,
+                                    timeout=120, cwd=self.path)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return result
+
+        # The first trigger sets the job up; the system runs the scheduler, which fires it.
+        trigger('add', '--bot', 'p.task', '--name', 'ztest', '--in', '1m', '--', 'the system says hi')
+        self.assertTrue(job_file.exists())
+        written = job_file.stat().st_mtime_ns
+        self.assertTrue(self.until(running, 30), 'the system did not run the scheduler')
+        # Every trigger after, and every replace, leaves the job as it was.
+        for message in ('look', 'look again', 'and again'):
+            trigger('add', '--bot', 'p.task', '--name', 'p.next', '--every', '30m', '--replace', '--', message)
+        self.assertEqual(job_file.stat().st_mtime_ns, written)
+        self.assertTrue(self.until(lambda: len(self.turns('p.task')) == 2, 150), 'the scheduler did not fire it')
+        trigger('rm', 'p.next')
+        self.assertEqual(job_file.stat().st_mtime_ns, written)
 
 if __name__ == '__main__':
     unittest.main()

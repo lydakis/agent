@@ -2,7 +2,7 @@
 name = "agent-runtime"
 version = "0.7.0"
 edition = "2024"
-rust-version = "1.92"
+rust-version = "1.95"
 license = "MIT OR Apache-2.0"
 publish = false
 
@@ -15,7 +15,7 @@ agent-client = { path = "client" }
 # Already built for rustls; SigV4 signs with its HMAC and SHA-256.
 aws-lc-rs = { version = "1.18", default-features = false, features = ["aws-lc-sys"] }
 # Already built for reqwest; encodes program status titles (OSC 7501).
-base64 = "0.22"
+base64 = "0.23"
 bytes = "1.11"
 dhat = { version = "0.3", optional = true }
 futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
@@ -24,7 +24,7 @@ futures-util = { version = "0.3", default-features = false, features = ["std", "
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 lz4_flex = { version = "=0.14.0", default-features = false, features = ["std", "safe-encode", "safe-decode"] }
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "stream", "http2"] }
-rusqlite = { version = "0.40.2", features = ["bundled"] }
+rusqlite = { version = "0.41.1", features = ["bundled"] }
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
 rustls-platform-verifier = "0.7"
 serde = { version = "1", features = ["derive"] }

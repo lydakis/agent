@@ -6221,3 +6221,312 @@ container, base cd2813f against the same head:
 | lifecycle | CPU, s | 1.19 | 1.16 | -2.5% |
 | lifecycle | p95 turn, ms | 588.705 | 582.925 | -1.0% |
 | lifecycle | peak RSS, MiB | 25.805 | 25.695 | -0.4% |
+
+## Words attached to a call say so (#535)
+
+`keep_sender`, the `INSERT … SELECT … RETURNING` that already runs as a
+turn's prompt is absorbed, now also copies whether the turn was delivered
+with `attach` into a new `senders.attached` column, and `history_items`
+reads that column with the rest of the sender row. No store job is added:
+the same statements run, one column wider. An attach from a client that
+names no sender (no bot, origin, person or quotes) now keeps a sender row
+where it kept none; steers and queued turns are unchanged. The Perf
+workflow's matched screen, base main 09fe6ee against the PR head 2209f50
+(the later head changes only Sonny's test and README examples), on the
+GitHub runner (2026-10-31):
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 40.309 | 39.361 | -2.4% |
+| admission | burst submit p99, ms | 6.253 | 6.197 | -0.9% |
+| completion | release to terminal p99, ms | 13.813 | 14.151 | +2.4% |
+| footprint | idle RSS, MiB | 19.088 | 19.211 | +0.6% |
+| footprint | per idle bot, KiB | 1.598 | 1.532 | -4.1% |
+| footprint | RSS after a turn each, MiB | 27.182 | 27.574 | +1.4% |
+| footprint | CPU per turn, ms | 1.277 | 1.269 | -0.6% |
+| lifecycle | CPU, s | 1.145 | 1.15 | +0.4% |
+| lifecycle | p95 turn, ms | 582.418 | 579.83 | -0.4% |
+| lifecycle | peak RSS, MiB | 25.004 | 25.391 | +1.5% |
+
+Store jobs per turn held at about 7.5, and nothing passed the gate's 15% in
+the direction that costs.
+
+## The socket, the store and their folder are their owner's alone
+
+`Owner::bind` binds the daemon's socket under a `177` umask and gives the
+mask back after, so the name is `0600` from its first instant: two system
+calls on the runtime thread, once, before any session is accepted or
+companion started. `Store::open` makes a missing folder `0700`, makes a
+new `state.sqlite` `0600` before SQLite first opens it (the `-wal` and
+`-shm` SQLite makes take the main file's mode) and tightens a store an
+earlier daemon left looser: one `open(O_CREAT|O_EXCL)` and, for a store
+that exists, three `stat` calls and at most three `chmod`, on the storage
+thread as the rest of `open` is. The companions' folder and logs, the
+daemon's log and the lookout's log are made owner-only the same way,
+once each. Nothing is added per bot or per turn, and no store job. The
+matched screen, base main 36c6f49 against the head of this change, run
+alternately, two rounds each, on an Apple M1 Max, macOS 27.2, external
+power, Python 3.12.9 and psutil 7.2.2 (2026-10-31):
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| footprint | idle RSS, MiB | 13.117 | 13.055 | -0.5% |
+| footprint | per idle bot, KiB | 2.312 | 2.176 | -5.9% |
+| footprint | RSS after a turn each, MiB | 29.938 | 29.641 | -1.0% |
+| footprint | CPU per turn, ms | 0.754 | 0.623 | -17.4% |
+| lifecycle | CPU, s | 0.418 | 0.349 | -16.6% |
+| lifecycle | p95 turn, ms | 608.342 | 600.122 | -1.4% |
+| lifecycle | peak RSS, MiB | 24.289 | 23.734 | -2.3% |
+
+Store jobs per turn held at about 7.5 on both sides (7.488 to 7.499 base,
+7.455 to 7.498 head). The CPU drops are the laptop's: the base ran first
+in each round, and the change adds nothing to a turn's path; read them as
+no cost, not a gain. The Perf workflow screens the pull request with the
+admission and completion bursts as well.
+
+## Reads beside the service loop, on a reader pool (#391)
+
+Observation reads (`history_nodes`, `history_items`, `history_search`,
+`turns`, `bots`, `events`, `usage`, `prompts`) now run in a lane beside the
+service loop, on a pool of reader connections (`--max-readers`, one per
+logical CPU), taking all but one of them. A session waits for its read
+before its next request is taken and reads at most 8 requests ahead; what
+it queues while it waits does not count against the shared input queue.
+
+`bench/fair_queuing.py` gained floods of whole histories and searches
+across every bot, several flooding sessions at once (`--flooders`), deep
+histories (`--history-turns`, `--history-bytes`), a probe that lists bots
+(`--probe-bots`), and a probe in a process of its own, so parsing the
+flood's replies no longer holds it up. 4-core Linux container, 210 bots
+each with 10 turns of 64 KiB prompts (129 MiB store), 4 sessions flooding
+at once, probe p50 / p95 / max in ms, base main 9a34fc2 against the head:
+
+| Flood (4 sessions) | Probe | Base | Head | Flood rate, base / head |
+| --- | --- | ---: | ---: | ---: |
+| none | `inspect` | 1.3 / 1.6 / 4.6 | 1.1 / 1.5 / 10.5 | |
+| 8,000 `history_nodes` | `inspect` | 8.8 / 11.6 / 20.8 | 1.1 / 2.3 / 5.5 | 1,146 / 1,172 per s |
+| 1,600 `bots` | `inspect` | 18.0 / 25.5 / 33.5 | 2.4 / 4.8 / 6.9 | 509 / 903 per s |
+| 320 `history_search` of `*` | `inspect` | 1.2 / 1.7 / 63.4 | 1.1 / 2.1 / 11.0 | 3 / 8 per s |
+| none | `bots` | 3.8 / 5.1 / 14.7 | 3.5 / 4.5 / 10.2 | |
+| 8,000 `history_nodes` | `bots` | 11.4 / 15.0 / 26.4 | 4.3 / 6.6 / 21.3 | 957 / 1,195 per s |
+| 320 `history_search` of `*` | `bots` | 4.5 / 7.0 / 94,543 | 4.7 / 364 / 465 | 3 / 7 per s |
+
+The search row is the one #391 named: on main a `bots` listing queued on
+the one reader behind every search already sent, and the first probe
+waited 95 s. Now it waits for a free seat, behind at most the searches
+already running. Searches no longer wait for each other either, so the
+flood finishes in 44 s rather than 101 s. Main already answered searches
+off the loop, which is why `inspect` was quiet there; floods of history
+pages and listings, which main answered in the loop, held every other
+session's request behind one read each.
+
+A lone session pipelining cheap reads pays for the hand-off: one read at a
+time, each through the lane and back. The original single-session floods
+(210 bots, shallow histories, probe `inspect`):
+
+| Flood (1 session) | Base probe | Head probe | Flood rate, base / head |
+| --- | ---: | ---: | ---: |
+| 5,000 `inspect` | 1.0 / 1.9 / 10.5 | 1.0 / 1.5 / 5.1 | 6,050 / 4,813 per s |
+| 5,000 `events` | 1.1 / 1.7 / 4.0 | 1.0 / 1.5 / 5.7 | 4,897 / 2,204 per s |
+| 1,000 `bots` | 5.8 / 8.3 / 9.4 | 1.3 / 2.4 / 14.2 | 667 / 524 per s |
+| 2,500 `create` + `delete` | 5.2 / 7.7 / 30.6 | 3.5 / 5.4 / 13.4 | 974 / 951 per s |
+
+So a session that pipelines thousands of `events` pages gets about half
+the rate it had, in exchange for no other session waiting behind them.
+Several sessions reading at once get more than before in total, since
+reads now run side by side. Each reader connection keeps its own 2 MiB
+page cache and statement cache.
+
+## History reads reach any ancestor in O(log n) (#472)
+
+`history_nodes` and `history_items` used to walk a bot's lineage node by
+node: an oldest-first page ordered the whole ancestry past its floor
+before its `LIMIT`, checking `from` walked from the head to it, and a
+batch of items walked from the head to the oldest one asked for. Each
+node now has a narrow `lineage` row (parent, depth, a skip pointer chosen
+as Bitcoin Core's block index chooses `pskip`, and its turn's start),
+written by the insert that writes the node, so those reads take O(log n)
+point lookups. A page also stops at 256 KiB sent.
+
+A synthetic store of one bot with 2,000 turns of ten 2 KB nodes (20,000
+nodes, 77.5 MiB), release build, main 16a9324 against the branch, two
+alternating runs each (2026-10-31, the cloud container):
+
+| Measure | Main | Branch |
+| --- | ---: | ---: |
+| writes, µs per node (each its own commit) | 906, 956 | 1,008, 1,022 |
+| store size, MiB | 77.5 | 77.7 |
+| newest page of 400, ms | 0.75, 0.74 | 1.06, 0.89 |
+| oldest-first page after the first 10%, ms | 50.5, 48.6 | 1.4, 1.2 |
+| oldest-first page after half, ms | 28.4, 29.1 | 1.3, 1.2 |
+| page from an early node, ms | 44.8, 43.2 | 0.96, 0.86 |
+| one early item, ms | 48.0, 48.1 | 0.61, 0.95 |
+| 100 items spread over the history, ms | 46.9, 58.7 | 4.4, 6.5 |
+
+The deep reads no longer grow with the history: they are 30 to 80 times
+faster here, and the gap widens with depth. A write costs about 7 to 11%
+more, mostly the lineage row's page in the same commit plus a skip walk of
+O(log n) point reads, and storage grows about 10 bytes a node. The newest
+page costs about 0.2 ms more, for sizing the page against its byte budget.
+Stores from before schema 73 place every node when they open, in one pass
+in id order with the places held in memory.
+
+The write side under the hot-path screens, from the Perf workflow on the
+pull request (GitHub runner, base main 30845ba against head 9a49159,
+alternating rounds, medians):
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 45.728 | 46.527 | +1.7% |
+| admission | burst submit p99, ms | 6.214 | 6.152 | -1.0% |
+| completion | release to terminal p99, ms | 16.832 | 17.781 | +5.6% |
+| footprint | idle RSS, MiB | 20.059 | 20.152 | +0.5% |
+| footprint | per idle bot, KiB | 1.506 | 1.42 | -5.7% |
+| footprint | RSS after a turn each, MiB | 27.76 | 28.107 | +1.3% |
+| footprint | CPU per turn, ms | 1.592 | 1.64 | +3.0% |
+| lifecycle | CPU, s | 1.38 | 1.32 | -4.3% |
+| lifecycle | p95 turn, ms | 586.813 | 589.251 | +0.4% |
+| lifecycle | peak RSS, MiB | 26.826 | 26.877 | +0.2% |
+
+Store jobs per turn held at about 7.5 on both sides (the lineage row rides
+the node's own insert, so no job is added), and nothing passed the gate's
+15% line; per-round completion p99s on both sides ran from about 16 to
+20 ms, so its +0.9 ms is inside the noise. The extra per-write work shows in the
+single-commit microbenchmark above and not at fleet scale, where group
+commits carry it.
+
+## Replays off the writer and the subscription lock
+
+A `follow` replays its history in pages before it goes live. Each page
+used to be a job on the storage worker, read while holding the
+subscription's lock, so a client catching up from the first event put
+hundreds of reads in front of every write and every other request that
+needs the worker. Pages now come from the reader pool, sharing the
+observation lane's seats (all but one reader, across every replay at
+once), with no lock held while they read. Only the switch to live stays on
+the worker, as one job that reads at most one event: if an event landed
+since the last page it reads another page, and otherwise it marks the
+follow live, so nothing committed between the two modes is lost.
+
+`bench/fair_queuing.py` gained a `follow` flood: sessions that each follow
+`*` from the first event and wait for `follow_live`. 4-core Linux
+container, 210 bots each with 10 turns of 64 KiB prompts, 4 flooders with
+4 replays each (16 whole-store replays, 132,032 events delivered), probe
+`inspect` (a worker job) p50 / p95 / max in ms, base main 1413f05 against
+the head, two alternating runs each:
+
+| Flood | Base probe | Head probe | Flood, base / head |
+| --- | ---: | ---: | ---: |
+| none | 1.2 / 1.6 / 16.3, 1.3 / 1.7 / 3.7 | 1.1 / 1.4 / 21.1, 1.2 / 1.5 / 5.6 | |
+| 16 replays of `*` | 10.0 / 36.5 / 49.3, 1.4 / 42.9 / 49.3 | 1.2 / 14.5 / 25.7, 1.4 / 16.4 / 20.7 | 1.37, 1.41 / 1.05, 1.13 s |
+| 8,000 `history_nodes` (control) | 1.5 / 2.6 / 5.5, 1.4 / 2.8 / 4.9 | 1.4 / 2.8 / 6.6, 1.4 / 2.7 / 7.9 | 4.27, 4.05 / 4.05, 4.09 s |
+
+The probe's p95 behind the replays falls from about 40 ms to about 15 ms
+and its worst case halves, while the replays themselves finish about 20%
+sooner, since their pages now run side by side. The worker now sees one
+small job per replay, so what is left of the p95 is most likely the
+container's four cores busy encoding and sending 132,000 events beside
+the probe. The history flood, which this change
+does not touch, is the control and holds still.
+
+## Lasting processes under one cap, terminals killed whole (#562)
+
+Terminals and detached commands now share one `--max-lasting` cap. A
+terminal takes its permit before it spawns. A kill sweeps the command's
+whole session, and a terminal read holds back a secret field's value
+until it ends. The Perf workflow's matched screen, base main d617c75
+against the PR head e58304f, on the GitHub runner (2026-10-31):
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 46.117 | 45.963 | -0.3% |
+| admission | burst submit p99, ms | 6.528 | 6.343 | -2.8% |
+| completion | release to terminal p99, ms | 17.337 | 17.419 | +0.5% |
+| footprint | idle RSS, MiB | 20.07 | 20.137 | +0.3% |
+| footprint | per idle bot, KiB | 1.53 | 1.404 | -8.2% |
+| footprint | RSS after a turn each, MiB | 27.799 | 27.979 | +0.6% |
+| footprint | CPU per turn, ms | 1.625 | 1.622 | -0.2% |
+| lifecycle | CPU, s | 1.395 | 1.375 | -1.4% |
+| lifecycle | p95 turn, ms | 582.885 | 582.713 | -0.0% |
+| lifecycle | peak RSS, MiB | 26.797 | 26.783 | -0.1% |
+
+Store jobs per turn held at about 7.5. These benches run no terminal, so
+the terminal read itself was timed separately, in a release build on a
+4-core Linux container. Three credentials and three secret fields were
+set, and each read decoded, held back and redacted a buffer the way a
+`write_stdin` read does. Two alternating rounds:
+
+| Read | Base, µs | Head, µs |
+| --- | ---: | ---: |
+| 64 KiB of `ls -l` lines, ending in a prompt | 822 / 801 | 818 / 791 |
+| one 26-byte line | 1.41 / 1.41 | 1.55 / 1.42 |
+
+The field scan looks at the last 4 KiB at most, and the copy of the
+opening covers only a field's name and separator, so the cost of a read
+stays with the redaction it already did. The session sweep runs once per
+terminal or detached command, at its end, off the runtime thread.
+
+## A bot's socket listens while it is used (#563)
+
+A sandboxed bot's own socket now listens only while a share in it is
+held: by its turn's policy, or by a running command's sandbox hold. It
+closes 30 s after the last share goes. All the bots' graces wait in one
+daemon-wide queue, which one task sleeps on, and they are checked and
+unlinked off the runtime thread. A bot that never runs a sandboxed
+command pays nothing; one that does pays one refcount per command and
+one queue entry per last drop. The Perf workflow's matched screen, base
+main ee94271 against the PR head 27a842c, on the GitHub runner
+(2026-10-31):
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 36.104 | 35.656 | -1.2% |
+| admission | burst submit p99, ms | 4.065 | 4.03 | -0.8% |
+| completion | release to terminal p99, ms | 12.768 | 12.083 | -5.4% |
+| footprint | idle RSS, MiB | 20.18 | 19.771 | -2.0% |
+| footprint | per idle bot, KiB | 1.596 | 1.482 | -7.1% |
+| footprint | RSS after a turn each, MiB | 28.031 | 28.76 | +2.6% |
+| footprint | CPU per turn, ms | 1.209 | 1.179 | -2.5% |
+| lifecycle | CPU, s | 1.08 | 1.075 | -0.5% |
+| lifecycle | p95 turn, ms | 724.404 | 600.866 | -17.1% |
+| lifecycle | peak RSS, MiB | 27.516 | 27.018 | -1.8% |
+
+Store jobs per turn held at about 7.5. These benches run unsandboxed, so
+their path differs only by an `Option` that stays `None`. The lifecycle
+p95 drop is the runner's: the base read 724 ms here against 583 ms on
+the #562 screen. What the change is for is descriptors: before it, every
+bot that had ever run a sandboxed command kept a listening socket and an
+accept task until the bot was deleted. Now only bots in use, or within
+30 s of their last use, keep one.
+
+## Terminal polls park their turn (#567)
+
+A terminal read longer than the bot's `approval_hold_ms` now waits live
+only for the hold. After that its turn parks on the terminal's handle,
+as `wait` parks, and resumes when the command ends or the read's time
+runs out. A parked read holds no task and no active slot. It costs one
+`suspend` and one resume, the same store jobs a parked `wait` takes,
+and only reads past the hold pay them. Every other call's path differs
+by one match guard. The Perf workflow's matched screen, base main
+64590ae against the PR head a0e37bc, on the GitHub runner (2026-11-01):
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 46.041 | 45.811 | -0.5% |
+| admission | burst submit p99, ms | 6.561 | 6.348 | -3.2% |
+| completion | release to terminal p99, ms | 17.35 | 17.782 | +2.5% |
+| footprint | idle RSS, MiB | 20.23 | 20.07 | -0.8% |
+| footprint | per idle bot, KiB | 1.426 | 1.578 | +10.7% |
+| footprint | RSS after a turn each, MiB | 27.936 | 27.734 | -0.7% |
+| footprint | CPU per turn, ms | 1.623 | 1.611 | -0.7% |
+| lifecycle | CPU, s | 1.395 | 1.39 | -0.4% |
+| lifecycle | p95 turn, ms | 586.408 | 585.136 | -0.2% |
+| lifecycle | peak RSS, MiB | 26.924 | 27.072 | +0.6% |
+
+Store jobs per turn held at about 7.5. These benches make no terminal
+calls. The per-idle-bot figure moves by 150 bytes, inside the range
+the head's own runs spread over (1.36 to 1.76 KiB), and the change
+adds no per-bot state. What the change is for is slots: before it, a
+bot polling a long build held an active slot and a task for every
+second it waited. Now, past the hold, it holds a `waiting` row. The
+head after a0e37bc changes only tests.

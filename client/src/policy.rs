@@ -928,11 +928,12 @@ const MAX_EXTENDS: usize = 8;
 /// The profile named `name` for a bot in `workspace`: the workspace's own
 /// file, else the user's; `None` when neither exists.
 pub fn profile(workspace: &Path, name: &str) -> Result<Option<Profile>, Failure> {
-    profile_with(workspace, name, &[])
+    profile_with(workspace, name, &[], &[])
 }
 
 /// [`profile`], with the roles a client ships (`(name, text)`) after the
-/// person's: one of these names is never `None`.
+/// person's: one of these names is never `None`. `skills` are the client's
+/// own skills (`(name, SKILL.md)`), the same way after the person's.
 ///
 /// A profile builds on another with `extends: NAME` in its front matter.
 /// Extending its own name builds on the file of that name it shadows: a
@@ -942,6 +943,7 @@ pub fn profile_with(
     workspace: &Path,
     name: &str,
     builtins: &[(&str, &str)],
+    skills: &[(&str, &str)],
 ) -> Result<Option<Profile>, Failure> {
     let mut layers: Vec<Option<PathBuf>> = search(workspace, Kind::Profiles)
         .into_iter()
@@ -1005,6 +1007,7 @@ pub fn profile_with(
     role.model = None;
     role.tools = None;
     let mut bodies = Vec::new();
+    let shipped = skills;
     let mut skills: Vec<String> = Vec::new();
     for (profile, front) in chain.iter().rev() {
         if !profile.body.is_empty() {
@@ -1019,7 +1022,8 @@ pub fn profile_with(
         }
     }
     for skill in &skills {
-        let text = skill_text(workspace, skill, MAX_INSTRUCTIONS.saturating_sub(used))?;
+        let room = MAX_INSTRUCTIONS.saturating_sub(used);
+        let text = skill_text(workspace, skill, room, shipped)?;
         used += text.len();
         bodies.push(format!("## Skill: {skill}\n\n{text}"));
     }
@@ -1080,7 +1084,12 @@ fn role_file(path: &Path, room: usize) -> Result<String, Failure> {
 
 /// The body of the skill `name` a profile carries, if it fits in `room`:
 /// the workspace's, else the user's.
-fn skill_text(workspace: &Path, name: &str, room: usize) -> Result<String, Failure> {
+fn skill_text(
+    workspace: &Path,
+    name: &str,
+    room: usize,
+    shipped: &[(&str, &str)],
+) -> Result<String, Failure> {
     if !profile_name(name) {
         return Err(Failure::Invalid {
             path: name.into(),
@@ -1094,6 +1103,17 @@ fn skill_text(workspace: &Path, name: &str, room: usize) -> Result<String, Failu
         }
         let text = role_file(&path, room)?;
         return Ok(front_matter(&text).1.trim().to_owned());
+    }
+    // The client's own: the layer below the person's.
+    if let Some((_, text)) = shipped.iter().find(|(n, _)| *n == name) {
+        let body = front_matter(text).1.trim();
+        if body.len() > room {
+            return Err(Failure::TooLong {
+                path: name.into(),
+                total: MAX_INSTRUCTIONS - room + body.len(),
+            });
+        }
+        return Ok(body.to_owned());
     }
     Err(Failure::Missing {
         name: name.to_owned(),
@@ -1838,7 +1858,9 @@ mod tests {
             "---\nextends: lead\ndescription: A careful lead\nskills: [triage]\n---\nReview each change before it lands.\n",
         )
         .unwrap();
-        let role = profile_with(&root, "my-lead", &builtins).unwrap().unwrap();
+        let role = profile_with(&root, "my-lead", &builtins, &[])
+            .unwrap()
+            .unwrap();
         assert_eq!(role.name, "my-lead");
         assert_eq!(role.path, Some(agents.join("my-lead.md")));
         assert_eq!(role.model.as_deref(), Some("a/lead"));
@@ -1846,6 +1868,25 @@ mod tests {
             role.body,
             "Be the lead.\n\nReview each change before it lands.\n\n## Skill: triage\n\nSort every ask by owner."
         );
+        // A skill the client ships stands below the person's of that name.
+        std::fs::remove_dir_all(root.join(".agents/skills/triage")).unwrap();
+        let shipped = [("triage", "---\nname: triage\n---\nShipped triage.")];
+        let role = profile_with(&root, "my-lead", &builtins, &shipped)
+            .unwrap()
+            .unwrap();
+        assert!(role.body.ends_with("## Skill: triage\n\nShipped triage."));
+        assert_eq!(
+            profile_with(&root, "my-lead", &builtins, &[])
+                .unwrap_err()
+                .code(),
+            "skill_not_found"
+        );
+        std::fs::create_dir_all(root.join(".agents/skills/triage")).unwrap();
+        std::fs::write(
+            root.join(".agents/skills/triage/SKILL.md"),
+            "Sort every ask by owner.",
+        )
+        .unwrap();
         // Without the client's lead to build on, the base is missing.
         assert_eq!(
             profile(&root, "my-lead").unwrap_err().code(),
@@ -1857,11 +1898,15 @@ mod tests {
             "---\nextends: lead\nmodel: b/mine\n---\nAlso: be brief.",
         )
         .unwrap();
-        let lead = profile_with(&root, "lead", &builtins).unwrap().unwrap();
+        let lead = profile_with(&root, "lead", &builtins, &[])
+            .unwrap()
+            .unwrap();
         assert_eq!(lead.body, "Be the lead.\n\nAlso: be brief.");
         assert_eq!(lead.model.as_deref(), Some("b/mine"));
         // The variant now builds on that one, which builds on the client's.
-        let role = profile_with(&root, "my-lead", &builtins).unwrap().unwrap();
+        let role = profile_with(&root, "my-lead", &builtins, &[])
+            .unwrap()
+            .unwrap();
         assert!(
             role.body.starts_with(
                 "Be the lead.\n\nAlso: be brief.\n\nReview each change before it lands."

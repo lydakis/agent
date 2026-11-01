@@ -85,11 +85,23 @@ impl Picker {
         self.found().into_iter().map(|(model, _)| model).collect()
     }
 
-    /// The models the filter leaves, best first, with where its letters
-    /// are in each.
+    /// The models the filter leaves, best first, each with where the
+    /// letters typed are in its name as `named` gives it. A model is found
+    /// by that name or by its id, as `us.anthropic` finds one Bedrock
+    /// region's; found by its id, no letters of the name are marked.
     pub fn found(&self) -> Vec<(&str, Vec<usize>)> {
-        let models = self.models.iter().map(String::as_str);
-        (crate::fuzzy::rank(models, &self.filter, |_| 0.0).into_iter())
+        use crate::fuzzy::{better, find, order};
+        let found = self.models.iter().map(|id| {
+            let name = find(&named(id), &self.filter);
+            let best = better(name.clone(), find(id, &self.filter));
+            best.map(|mut best| {
+                if name.as_ref() != Some(&best) {
+                    best.at.clear();
+                }
+                best
+            })
+        });
+        (order(found, |_| 0.0).into_iter())
             .map(|(at, found)| (self.models[at].as_str(), found.at))
             .collect()
     }
@@ -130,6 +142,28 @@ impl Picker {
     pub fn chosen(&self) -> Option<(String, Option<String>)> {
         let model = self.shown().get(self.at())?.to_string();
         Some((model, self.effort().map(str::to_owned)))
+    }
+}
+
+/// The provider of a model as the daemon names it, `provider/id`: the
+/// binding in `config.toml` that serves it, as `bedrock` for
+/// `bedrock/us.anthropic.claude-opus-5-5-v1:0`. None for a bare id.
+pub fn provider(model: &str) -> Option<&str> {
+    let (provider, _) = model.split_once('/')?;
+    Some(provider).filter(|p| !p.is_empty())
+}
+
+/// A model and the provider that serves it, `Opus 5.5 · bedrock`, where
+/// a view lists or explains its agents' models: `/status`, `/model`, the
+/// welcome. One Sonny shows models by: the name as people say it
+/// (`label`), the provider after it in lower case as `config.toml` names
+/// it, and the raw id only where it is picked or typed. Where room is
+/// tight (the footer, a commons post, the sky's key) the name stands
+/// alone; a table gives the provider a column of its own, as `/usage`.
+pub fn named(model: &str) -> String {
+    match provider(model) {
+        Some(provider) => format!("{} · {provider}", label(model)),
+        None => label(model),
     }
 }
 
@@ -255,6 +289,18 @@ mod tests {
             assert_eq!(label(id), said, "{id}");
         }
     }
+
+    #[test]
+    fn a_model_is_named_with_the_provider_that_serves_it() {
+        let id = "bedrock/us.anthropic.claude-opus-5-5-v1:0";
+        assert_eq!(provider(id), Some("bedrock"));
+        assert_eq!(named(id), "Opus 5.5 · bedrock");
+        assert_eq!(named("chatgpt/gpt-6.1-sol"), "GPT 6.1 Sol · chatgpt");
+        // A bare id has no provider to name.
+        assert_eq!(provider("claude-opus-4-8[1m]"), None);
+        assert_eq!(named("claude-opus-4-8[1m]"), "Opus 4.8");
+        assert_eq!(provider("/gpt-6"), None);
+    }
     use serde_json::json;
 
     #[test]
@@ -290,9 +336,18 @@ mod tests {
         assert_eq!(picker.shown().len(), 2);
         assert_eq!(picker.at(), 0);
         // The letters in order find a model, as fzf's do.
+        // The letters are marked in the name the row shows,
+        // `GPT 6 Luna · chatgpt`.
         picker.narrow("g6l".into());
         assert_eq!(picker.shown(), ["chatgpt/gpt-6-luna", "openai/gpt-6-luna"]);
-        assert_eq!(picker.found()[0].1, [8, 12, 14]);
+        assert_eq!(picker.found()[0].1, [0, 4, 6]);
+        // The provider finds its models.
+        picker.narrow("open".into());
+        assert_eq!(picker.shown(), ["openai/gpt-6", "openai/gpt-6-luna"]);
+        // So does an id, though none of the name is marked.
+        picker.narrow("gpt-6-l".into());
+        assert_eq!(picker.shown(), ["chatgpt/gpt-6-luna", "openai/gpt-6-luna"]);
+        assert!(picker.found()[0].1.is_empty());
         picker.narrow("nothing".into());
         assert_eq!(picker.chosen(), None);
     }

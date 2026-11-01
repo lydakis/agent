@@ -9,7 +9,9 @@ import queue
 import re
 import signal
 import sqlite3
+import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -20,6 +22,8 @@ from bench.runtime_client import PROTECTING, Client, node_item, poll, serve_args
 
 # Longer than 256 bytes, with text a shell would run if pasted unquoted.
 ODD_CALL_ID = "odd $(touch pwned) 'x'\n" + 'L' * 300
+# The line Sonny ends a message to a bot with: when it was sent.
+SENT = re.compile(r'\n\n\[Sent [A-Z][a-z]{2} \d{1,2} [A-Z][a-z]{2} \d{4} \d{2}:\d{2}, UTC[+-]\d{2}:\d{2}\.\]$')
 
 
 
@@ -127,6 +131,8 @@ class Model(http.server.BaseHTTPRequestHandler):
             # A trigger's message comes after its one-line header.
             if user.startswith('[trigger ') and '\n' in user:
                 user = user.split('\n', 1)[1]
+            # Sonny's message ends with a line naming when it was sent.
+            user = SENT.sub('', user)
             if user in getattr(self.server, 'refused_prompts', ()):
                 # A refusal with no usage: the turn fails without a model round.
                 body = b'{"error":{"message":"synthetic refusal"}}'
@@ -806,7 +812,7 @@ class AnthropicModel(http.server.BaseHTTPRequestHandler):
                     blocks.append({'type': 'text', 'text': 'echo:' + last['content'][0]['content']})
                 stop = 'refusal' if details else 'end_turn'
             else:
-                user = last['content'][0]['text']
+                user = SENT.sub('', last['content'][0]['text'])
                 if user == 'think-only':
                     stop = 'end_turn'
                 elif user == 'silent':
@@ -1456,7 +1462,7 @@ class ModelFixture(unittest.TestCase):
 @unittest.skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'set AGENT_TEST_RUNTIME=1 after a Rust release build')
 class RuntimeTests(ModelFixture):
     def test_detached_shell_releases_its_daemon_slot_after_exit(self):
-        client = self.client('shell', extra=('--max-detached', '1'))
+        client = self.client('shell', extra=('--max-lasting', '1'))
         client.request('create', bot='Bob', workspace=str(self.path), tools=['shell'])
 
         def result(prompt, request_id):
@@ -1472,7 +1478,7 @@ class RuntimeTests(ModelFixture):
         self.assertTrue(first['detached'])
         pid = first['pid']
         try:
-            self.assertEqual(result('detach:true', 'full')['error'], 'detached_limit')
+            self.assertEqual(result('detach:true', 'full')['error'], 'lasting_limit')
         finally:
             try:
                 os.kill(pid, 9)
@@ -1580,15 +1586,23 @@ class RuntimeTests(ModelFixture):
         turn = client.request('submit', bot='Bob', request_id='running', prompt='gate')['result']['turn']
         self.model.requests.get(timeout=3)
         self.assertEqual(client.request('pause', reason=' ')['error'], 'usage')
+        # Who pulled it is told to every session, so it is bounded.
+        self.assertEqual(client.request('pause', reason='why', by='x' * 129)['error'], 'invalid_by')
+        self.assertIsNone(client.request('stats')['result']['paused'])
         paused = client.request('pause', reason='the migration is deleting rows', by='calc.a')['result']
-        self.assertEqual((paused['changed'], paused['interrupted']), (True, 1))
+        self.assertEqual((paused['changed'], paused['parked']), (True, 1))
         self.assertEqual(paused['pause']['reason'], 'the migration is deleting rows')
         self.assertEqual(paused['pause']['by'], 'calc.a')
+        # It names whose running turns it parked, so one can be stopped first.
+        self.assertEqual(paused['pause']['parked'], {'bots': ['Bob'], 'total': 1})
         heard = client.receive(lambda e: e.get('event') == 'paused')
         self.assertEqual(heard['pause'], paused['pause'])
-        # The running turn ends now, as interrupted by the pause.
-        ended = client.finished(turn)['data']
-        self.assertEqual((ended['status'], ended['error']), ('interrupted', 'daemon_paused'))
+        # The running turn parks now, to go on when the pause lifts.
+        parked = client.receive(lambda e: e.get('event') == 'turn_paced' and e.get('turn') == turn)
+        self.assertEqual(parked['data'], {'resume_at_ms': None, 'paused': True})
+        running = f'turn:Bob/{turn}'
+        view = client.request('wait', handles=[running], timeout_ms=0)['result']['results'][running]
+        self.assertEqual((view['status'], view['waiting_on']), ('paced', {'resume_at_ms': None, 'paused': True}))
         # A second pull changes nothing: the first pause holds.
         again = client.request('pause', reason='another', by='shop.b')['result']
         self.assertEqual((again['changed'], again['pause']), (False, paused['pause']))
@@ -1607,15 +1621,105 @@ class RuntimeTests(ModelFixture):
         time.sleep(.3)
         self.assertTrue(self.model.requests.empty())
         handle = f"turn:Alice/{held['turn']}"
-        # Resume lifts it, says so, and what waited runs.
+        # Resume lifts it, says so, what waited runs, and the parked turn
+        # goes on from where it stopped.
         self.model.release_headers.set()
-        resumed = restarted.request('resume')['result']
-        self.assertEqual((resumed['changed'], resumed['pause']), (True, paused['pause']))
-        restarted.receive(lambda e: e.get('event') == 'resumed')
-        waited = restarted.request('wait', handles=[handle], timeout_ms=5000)['result']
+        # Who resumed is bounded the same way, and the pause holds.
+        self.assertEqual(restarted.request('resume', by='x' * 129)['error'], 'invalid_by')
+        self.assertEqual(restarted.request('resume', by='')['error'], 'invalid_by')
+        self.assertEqual(restarted.request('stats')['result']['paused'], paused['pause'])
+        resumed = restarted.request('resume', by='shop.b')['result']
+        lifted = resumed['pause']
+        self.assertEqual((resumed['changed'], resumed['by'], lifted['resumed_by']), (True, 'shop.b', 'shop.b'))
+        self.assertGreaterEqual(lifted['resumed_ms'], lifted['at_ms'])
+        self.assertEqual({k: v for k, v in lifted.items() if not k.startswith('resumed')}, paused['pause'])
+        # Every session hears who let the line go on.
+        heard = restarted.receive(lambda e: e.get('event') == 'resumed')
+        self.assertEqual((heard['pause'], heard['by']), (lifted, 'shop.b'))
+        # The pause stays in the history, held or lifted.
+        self.assertEqual(restarted.request('pauses')['result'], {'pauses': [lifted], 'more': False})
+        waited = restarted.request('wait', handles=[handle, running], timeout_ms=5000)['result']
         self.assertEqual(waited['results'][handle]['status'], 'completed')
-        self.assertEqual(restarted.request('resume')['result'], {'pause': None, 'changed': False})
+        self.assertEqual(waited['results'][running]['status'], 'completed')
+        # The pause is not counted as time spent paced by a rate limit.
+        self.assertLess(waited['results'][running]['paced_ms'], 300)
+        self.assertEqual(restarted.request('resume')['result'], {'pause': None, 'by': None, 'changed': False})
         self.assertIsNone(restarted.request('stats')['result']['paused'])
+
+    def test_a_turn_a_pause_parked_can_be_stopped_before_the_resume(self):
+        self.model.release_headers = threading.Event()
+        self.model.all_streaming = self.model.release_headers
+        client = self.client()
+        self.addCleanup(lambda: client.close(kill=True))
+        client.request('create', bot='Bob', workspace=str(self.path))
+        turn = client.request('submit', bot='Bob', request_id='culprit', prompt='gate')['result']['turn']
+        self.model.requests.get(timeout=3)
+        client.request('pause', reason='Bob is deleting rows', by='calc.a')
+        client.receive(lambda e: e.get('event') == 'turn_paced' and e.get('turn') == turn)
+        self.model.release_headers.set()
+        client.request('interrupt', bot='Bob', turn=turn)
+        self.assertEqual(client.finished(turn)['data']['status'], 'interrupted')
+        client.request('resume')
+        time.sleep(.3)
+        self.assertTrue(self.model.requests.empty())
+
+    def test_every_pause_is_kept_with_who_pulled_and_who_lifted_it(self):
+        client = self.client()
+        self.addCleanup(lambda: client.close(kill=True))
+        self.assertEqual(client.request('pauses')['result'], {'pauses': [], 'more': False})
+        for n in range(3):
+            client.request('pause', reason=f'pull {n}', by='calc.a')
+            client.request('resume', by='shop.b')
+        held = client.request('pause', reason='pull 3')['result']['pause']
+        self.assertEqual(held['parked'], {'bots': [], 'total': 0})
+        first = client.request('pauses', limit=2)['result']
+        self.assertEqual(([p['reason'] for p in first['pauses']], first['more']), (['pull 0', 'pull 1'], True))
+        self.assertEqual({p['resumed_by'] for p in first['pauses']}, {'shop.b'})
+        rest = client.request('pauses', after=first['pauses'][-1]['id'])['result']
+        self.assertEqual(([p['reason'] for p in rest['pauses']], rest['more']), (['pull 2', 'pull 3'], False))
+        # The one that holds says nothing of a resume yet.
+        self.assertEqual(rest['pauses'][-1], held)
+        newest = client.request('pauses', newest=True, limit=1)['result']
+        self.assertEqual((newest['pauses'], newest['more']), ([held], True))
+        older = client.request('pauses', newest=True, before=held['id'], limit=1)['result']
+        self.assertEqual(older['pauses'][0]['reason'], 'pull 2')
+        for page in ({'limit': 0}, {'limit': 257}, {'after': -1}, {'before': 0}):
+            self.assertEqual(client.request('pauses', **page)['error'], 'invalid_pause_page')
+
+    def test_a_pause_stops_a_running_command_and_the_turn_goes_on_without_rerunning_it(self):
+        marker = self.path / 'ran'
+        self.model.slow_command = f'echo x >> {marker}; sleep 30'
+        client = self.client('echo,shell')
+        self.addCleanup(lambda: client.close(kill=True))
+        client.request('create', bot='Alice', workspace=str(self.path))
+        turn = client.request('submit', bot='Alice', request_id='a', prompt='sayslow:the review')['result']['turn']
+        client.receive(lambda m: m.get('event') == 'tool_started' and m.get('turn') == turn)
+        deadline = time.monotonic() + 5
+        while not marker.exists() and time.monotonic() < deadline:
+            time.sleep(.05)
+        paused = client.request('pause', reason='the loop is sending mail', by='calc.a')['result']
+        self.assertEqual(paused['parked'], 1)
+        # The command's call gets its result: the pause stopped it.
+        done = client.receive(lambda m: m.get('event') == 'tool_completed' and m.get('turn') == turn)
+        self.assertEqual(done['data']['call_id'], 'slow-1')
+        parked = client.receive(lambda e: e.get('event') == 'turn_paced' and e.get('turn') == turn)
+        self.assertTrue(parked['data']['paused'])
+        deadline = time.monotonic() + 5
+        while client.request('stats')['result']['running_processes'] and time.monotonic() < deadline:
+            time.sleep(.05)
+        self.assertEqual(client.request('stats')['result']['running_processes'], 0)
+        while not self.model.requests.empty():
+            self.model.requests.get_nowait()
+        client.request('resume')
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        # The model reads why, and the command did not run again.
+        request = self.model.requests.get(timeout=3)
+        output = json.loads(next(i for i in request['input'] if i.get('type') == 'function_call_output'
+                                 and i['call_id'] == 'slow-1')['output'])
+        self.assertEqual(output['error'], 'daemon_paused')
+        self.assertIn('not run again', output['detail'])
+        self.assertEqual(output['pause']['reason'], 'the loop is sending mail')
+        self.assertEqual(marker.read_text(), 'x\n')
 
     def test_a_pause_ends_the_background_commands_agents_started(self):
         self.model.background_timeout_ms = 30000
@@ -1631,6 +1735,64 @@ class RuntimeTests(ModelFixture):
         while client.request('stats')['result']['running_processes'] and time.monotonic() < deadline:
             time.sleep(.05)
         self.assertEqual(client.request('stats')['result']['running_processes'], 0)
+
+    def test_a_pause_ends_the_detached_commands_agents_started(self):
+        client = self.client('shell')
+        self.addCleanup(lambda: client.close(kill=True))
+        client.request('create', bot='Bob', workspace=str(self.path), tools=['shell'])
+
+        def detach(command, request_id):
+            turn = client.request('submit', bot='Bob', request_id=request_id,
+                                  prompt=f'detach:{command}')['result']['turn']
+            self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+            events = client.request('events', bot='Bob', after=0, limit=64)['result']['events']
+            completed = next(e for e in events if e['turn'] == turn and e['event'] == 'tool_completed')
+            return json.loads(node_item(client, 'Bob', completed['data']['node'])['result']['output'])['pid']
+
+        def alive(pid):
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return False
+            return True
+
+        running = detach('exec sleep 30', 'running')
+        # A launcher that leaves its work running in its group and exits.
+        left = self.path / 'left'
+        launcher = detach(f'sleep 30 & echo $! > {left}', 'launcher')
+        deadline = time.monotonic() + 5
+        while (alive(launcher) or not left.exists() or not left.read_text().strip()) and time.monotonic() < deadline:
+            time.sleep(.05)
+        child = int(left.read_text())
+        for pid in (running, child):
+            self.addCleanup(lambda pid=pid: subprocess.run(['kill', '-9', str(pid)], capture_output=True))
+            self.assertTrue(alive(pid))
+        client.request('pause', reason='the loop is sending mail', by='calc.a')
+        deadline = time.monotonic() + 5
+        while (alive(running) or alive(child)) and time.monotonic() < deadline:
+            time.sleep(.05)
+        self.assertEqual((alive(running), alive(child)), (False, False))
+
+    @unittest.skipUnless(shutil.which('bwrap') or sys.platform == 'darwin', 'sandboxes need bubblewrap')
+    def test_a_pause_ends_a_sandboxed_detached_command(self):
+        client = self.client('shell')
+        self.addCleanup(lambda: client.close(kill=True))
+        client.request('create', bot='Bob', workspace=str(self.path), tools=['shell'],
+                       settings={'sandbox': 'workspace-write'})
+        ticks = self.path / 'ticks'
+        turn = client.request('submit', bot='Bob', request_id='loop',
+                              prompt=f'detach:while :; do echo x >> {ticks}; sleep .05; done')['result']['turn']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        deadline = time.monotonic() + 5
+        while (not ticks.exists() or ticks.stat().st_size < 4) and time.monotonic() < deadline:
+            time.sleep(.05)
+        self.assertGreaterEqual(ticks.stat().st_size, 4)
+        client.request('pause', reason='the loop is sending mail', by='calc.a')
+        time.sleep(.5)
+        before = ticks.stat().st_size
+        time.sleep(.5)
+        # Nothing in the sandbox runs on: the loop stopped writing.
+        self.assertEqual(ticks.stat().st_size, before)
 
     def test_a_pause_ends_a_command_a_steer_moved_to_the_background(self):
         self.model.slow_command = 'sleep 30'
@@ -2492,6 +2654,52 @@ class RuntimeTests(ModelFixture):
         started = time.monotonic()
         client.close()
         self.assertLess(time.monotonic() - started, 3)
+
+    def test_a_terminal_poll_past_the_hold_parks_its_turn_off_the_active_slot(self):
+        client = self.client('echo,shell,write_stdin,wait', extra=('--max-active', '1'),
+                             settings={'approval_hold_ms': 100})
+        for bot in ('Bob', 'Eve'):
+            client.request('create', bot=bot, workspace=str(self.path),
+                           tools=['echo', 'shell', 'write_stdin', 'wait'])
+
+        def submit(bot, request_id, name, arguments):
+            prompt = 'calls:' + json.dumps([[name, arguments]])
+            return client.request('submit', bot=bot, request_id=request_id, prompt=prompt)['result']['turn']
+
+        def result(bot, turn):
+            self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+            return json.loads(poll(client, bot, turn)['result']['text'][5:])
+
+        started = result('Bob', submit('Bob', 's', 'shell', {
+            'command': 'printf ready; while [ ! -f release ]; do sleep .01; done; printf done',
+            'tty': True, 'yield_time_ms': 1000}))
+        self.assertEqual((started['output'], started['running']), ('ready', True))
+        handle = started['handle']
+        # A long poll parks its turn after the hold, waiting on the terminal.
+        turn = submit('Bob', 'p', 'write_stdin', {'handle': handle, 'yield_time_ms': 30000})
+        waiting = client.receive(lambda m: m.get('event') == 'turn_waiting' and m.get('turn') == turn)
+        self.assertEqual(waiting['data']['handles'], [handle])
+        # It holds no slot: another bot's turn runs to its end meanwhile.
+        other = submit('Eve', 'e', 'echo', {'text': 'hi'})
+        self.assertEqual(client.finished(other)['data']['status'], 'completed')
+        # The terminal's end wakes it, with what it wrote and how it ended.
+        began = time.monotonic()
+        (self.path / 'release').touch()
+        ended = result('Bob', turn)
+        self.assertLess(time.monotonic() - began, 10)
+        self.assertEqual((ended['output'], ended['exit_code'], ended['handle']), ('done', 0, handle))
+        # A poll whose time runs out reports the terminal still running.
+        handle = result('Bob', submit('Bob', 's2', 'shell', {
+            'command': 'sleep 600', 'tty': True, 'yield_time_ms': 0}))['handle']
+        turn = submit('Bob', 'p2', 'write_stdin', {'handle': handle, 'yield_time_ms': 400})
+        client.receive(lambda m: m.get('event') == 'turn_waiting' and m.get('turn') == turn)
+        lapsed = result('Bob', turn)
+        self.assertEqual((lapsed['output'], lapsed['running'], lapsed['handle']), ('', True, handle))
+        # A poll within the hold stays live.
+        turn = submit('Bob', 'p3', 'write_stdin', {'handle': handle, 'yield_time_ms': 50})
+        self.assertTrue(result('Bob', turn)['running'])
+        events = client.request('events', bot='Bob', after=0, limit=256)['result']['events']
+        self.assertFalse(any(e['event'] == 'turn_waiting' and e['turn'] == turn for e in events))
 
     def test_retention_prunes_records_and_deletes_idle_bots(self):
         client = self.client(settings={'keep_turns': 2})

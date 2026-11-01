@@ -1244,15 +1244,10 @@ impl Provider {
             http = http.header(TURN_STATE, state);
         }
         // Signed last, at send time: the signature covers the moment it is made.
+        let signed_at = std::time::SystemTime::now();
         if let Some((aws, keys)) = &signer {
             let payload = payload.as_deref().unwrap_or(aws::UNSIGNED_PAYLOAD);
-            for (name, value) in aws.sign(
-                keys,
-                "POST",
-                &self.url,
-                std::time::SystemTime::now(),
-                payload,
-            ) {
+            for (name, value) in aws.sign(keys, "POST", &self.url, signed_at, payload) {
                 http = http.header(name, value);
             }
         }
@@ -1292,7 +1287,10 @@ impl Provider {
             }
             // A signature refused for its time is made again on the retry,
             // as AWS's SDKs retry their clock-skew codes.
-            if matches!(status, 401 | 403) && signer.is_some() && aws::clock_skewed(&headers) {
+            if matches!(status, 401 | 403)
+                && signer.is_some()
+                && aws::clock_skewed(&headers, signed_at)
+            {
                 reservation.settle(0);
                 return Err(Error::with(
                     "provider_signature_expired",
@@ -2909,11 +2907,19 @@ mod tests {
     /// Serve one SSE response: text deltas `gap` apart with a ping and a
     /// comment keepalive between them, then only keepalives, forever.
     async fn pinging(deltas: usize, gap: Duration) -> String {
-        use tokio::io::AsyncWriteExt;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
+            // A server answers once it has the request: a reply that comes
+            // before the request is written is refused by the client.
+            let mut request = Vec::new();
+            let mut buffer = [0; 4096];
+            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = socket.read(&mut buffer).await.unwrap();
+                request.extend_from_slice(&buffer[..n]);
+            }
             let frame = |data: &str| format!("data: {data}\n\n");
             let mut out = String::from(
                 "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n",

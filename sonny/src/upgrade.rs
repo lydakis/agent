@@ -63,14 +63,25 @@ pub struct Migration {
 }
 
 /// Every migration [`once`] runs, so none outlives its release.
-pub const MIGRATIONS: &[Migration] = &[];
+pub const MIGRATIONS: &[Migration] = &[
+    // Each trigger's own LaunchAgent or unit, and the backup's and
+    // start-at-login's, become Sonny's scheduler's (0.8.0).
+    Migration {
+        id: "scheduler-job",
+        retire: "0.10.0",
+    },
+    // Agents that posted in the commons are subscribed to its threads
+    // (0.8.0).
+    Migration {
+        id: crate::commons::POSTERS,
+        retire: "0.10.0",
+    },
+];
 
 /// `run` once for each `record`: a file of the ids done, a line each,
 /// beside the state they changed (`~/.agent/sonny/migrated`, or one
 /// beside a store for what is the store's). What fails, `run` answering
 /// false, runs again next time. Whether `id` is done now.
-// Its first caller is the commons' move to lookout subscriptions.
-#[allow(dead_code)]
 pub fn once(record: &Path, id: &str, run: impl FnOnce() -> bool) -> bool {
     debug_assert!(
         MIGRATIONS.iter().any(|m| m.id == id),

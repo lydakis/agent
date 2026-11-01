@@ -134,7 +134,7 @@ class Conn:
         self.sock = socket.socket(socket.AF_UNIX)
         self.sock.connect(str(path))
         self.reader = self.sock.makefile('r')
-        self.replies, self.events = {}, 0
+        self.replies, self.events, self.live = {}, 0, 0
         self.cond = threading.Condition()
         self.next_id = 0
         self.ready = threading.Event()
@@ -152,7 +152,11 @@ class Conn:
                         self.replies[message['id']] = message
                         self.cond.notify_all()
                 else:
-                    self.events += 1
+                    with self.cond:
+                        self.events += 1
+                        if message.get('event') == 'follow_live':
+                            self.live += 1
+                            self.cond.notify_all()
         except (OSError, ValueError):
             pass
 
@@ -255,7 +259,8 @@ class Bench:
         self.env = {'PATH': os.environ['PATH'], 'HOME': str(self.home)}
         self.daemon = subprocess.Popen(
             [str(self.agent), 'serve', '--store', str(self.store), '--provider',
-             f'openai=responses,{self.url}', '--socket', str(self.socket)],
+             f'openai=responses,{self.url}', '--socket', str(self.socket),
+             *(['--max-readers', str(args.readers)] if getattr(args, 'readers', None) else [])],
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
             stderr=open(self.out / 'daemon.err', 'w'), env=self.env, start_new_session=True)
         deadline = time.monotonic() + 10

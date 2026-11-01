@@ -29,6 +29,8 @@ mod picture;
 mod terminal;
 use files::read_bounded;
 pub use patch::Patch;
+#[cfg(unix)]
+pub use terminal::POLL_YIELD_MS;
 
 /// Model-facing text per tool result stream.
 pub const PREVIEW_BYTES: usize = 64 * 1024;
@@ -47,8 +49,13 @@ const MAX_SHELL_TIMEOUT_MS: u64 = 600_000;
 const MAX_WAIT_TIMEOUT_MS: u64 = 86_400_000;
 /// Simultaneously running child processes, foreground or background.
 pub const DEFAULT_PROCESS_BUDGET: usize = 64;
-/// Detached commands still running at once, daemon-wide, unless configured.
-pub const DEFAULT_DETACHED_BUDGET: usize = 16;
+/// Processes that outlive their call, terminals and detached commands,
+/// running at once daemon-wide unless configured: four per logical CPU,
+/// which keeps their descriptors well inside a default 256-descriptor
+/// limit on a laptop.
+pub fn default_lasting() -> usize {
+    4 * std::thread::available_parallelism().map_or(4, |n| n.get())
+}
 /// How long a terminal's start waits for output by default, and how long
 /// it or a write waits at most.
 const START_YIELD_MS: u64 = 1_000;
@@ -113,7 +120,7 @@ impl Tool {
                 "properties":{"text":{"type":"string"}},"required":["text"],"additionalProperties":false}),
             ),
             Tool::Shell => (
-                "Run a noninteractive bash command (sh where bash is not installed) in the workspace. stdout and stderr are returned separately; each is truncated to a head and tail beyond 64 KiB, with up to 1 MiB of it retained: past that, its first and last 512 KiB, and the command keeps running. Default timeout 120 s, maximum 600 s; a command that times out returns its output so far with timed_out. Every result reports wall_time_ms. Commands run with no terminal: TERM=dumb, NO_COLOR=1, and cat as the pager; AI_AGENT=agent tells tools an agent runs them. When the command returns or times out, every process it started is killed, so `cmd &` does not outlive it. With background=true the command is started and a proc handle is returned immediately; collect its result later with wait. A steer that arrives while a command runs moves it to the background: the result is its proc handle with steered=true, and the command keeps running. A background command runs until it exits, times out, or the daemon stops. With detach=true the command starts in its own session and its pid is returned at once; nothing kills or tracks it, so it outlives the turn and the daemon. Its output is discarded unless the command redirects it to a file. With tty=true it runs in a terminal, for a REPL or a program that prompts: the result is what it wrote within yield_time_ms (default 1000) and, while it runs, a proc handle for write_stdin.",
+                "Run a noninteractive bash command (sh where bash is not installed) in the workspace. stdout and stderr are returned separately; each is truncated to a head and tail beyond 64 KiB, with up to 1 MiB of it retained: past that, its first and last 512 KiB, and the command keeps running. Default timeout 120 s, maximum 600 s; a command that times out returns its output so far with timed_out. Every result reports wall_time_ms. Commands run with no terminal: TERM=dumb, NO_COLOR=1, and cat as the pager; AI_AGENT=agent tells tools an agent runs them. When the command returns or times out, every process it started is killed, so `cmd &` does not outlive it. With background=true the command is started and a proc handle is returned immediately; collect its result later with wait. A steer that arrives while a command runs moves it to the background: the result is its proc handle with steered=true, and the command keeps running. A background command runs until it exits, times out, or the daemon stops. With detach=true the command starts in its own session and its pid is returned at once; nothing tracks it and only a daemon pause kills it, so it outlives the turn and the daemon. Its output is discarded unless the command redirects it to a file. With tty=true it runs in a terminal, for a REPL or a program that prompts: the result is what it wrote within yield_time_ms (default 1000) and, while it runs, a proc handle for write_stdin.",
                 json!({"type":"object","properties":{"command":{"type":"string"},
                 "timeout_ms":{"type":"integer","minimum":1,"maximum":MAX_SHELL_TIMEOUT_MS},
                 "background":{"type":"boolean"},"detach":{"type":"boolean"},"tty":{"type":"boolean"},
@@ -472,9 +479,11 @@ pub struct Registry {
     /// Background commands accepted and waiting for a slot. The operating
     /// system never sees these, so only this count can bound them.
     pending: Arc<std::sync::atomic::AtomicUsize>,
-    /// A permit stays with each detached child until its wait completes.
-    detached_slots: Arc<Semaphore>,
-    detached_budget: usize,
+    /// Processes that outlive their call, as a systemd slice holds a
+    /// service's: a permit stays with each terminal until its session is
+    /// gone and with each detached child until its wait completes.
+    lasting_slots: Arc<Semaphore>,
+    lasting_budget: usize,
     /// Running terminals, by proc handle, each its bot's own.
     #[cfg(unix)]
     terminals: terminal::Terminals,
@@ -648,8 +657,9 @@ impl Credentials {
         text
     }
     /// How many of `text`'s last bytes could begin a credential that more
-    /// output would finish: what a stream holds back until it can redact.
-    /// What it shows never ends inside a whole credential.
+    /// output would finish, or a secret field whose value more output
+    /// would carry: what a stream holds back until it can redact. What it
+    /// shows never ends inside a whole credential.
     pub fn unfinished(&self, text: &[u8]) -> usize {
         let set = self.0.read().unwrap_or_else(|e| e.into_inner());
         let values = || {
@@ -664,7 +674,8 @@ impl Credentials {
                     .find(|&n| text.ends_with(&value[..n]))
             })
             .max()
-            .unwrap_or(0);
+            .unwrap_or(0)
+            .max(open_field(text, &set.fields).value);
         // A whole credential across the cut, as one that ends with its own
         // start, is shown whole.
         let mut cut = text.len() - started;
@@ -681,6 +692,28 @@ impl Credentials {
             cut = end;
         }
         text.len() - cut
+    }
+    /// How many of `text`'s last bytes open a secret field whose value has
+    /// not started: a name, or a name and its separator. They are shown,
+    /// and kept so the next text is redacted as read after them.
+    pub fn opening(&self, text: &[u8]) -> usize {
+        let set = self.0.read().unwrap_or_else(|e| e.into_inner());
+        let open = open_field(text, &set.fields);
+        open.name - open.value
+    }
+    /// `text` redacted as it reads after `before`, already shown: a value
+    /// after a field's name shown earlier is still redacted.
+    pub fn redact_after(&self, before: &str, text: String) -> String {
+        if before.is_empty() {
+            return self.redact(text);
+        }
+        let mut whole = self.redact(format!("{before}{text}"));
+        if whole.starts_with(before) {
+            whole.replace_range(..before.len(), "");
+            whole
+        } else {
+            self.redact(text)
+        }
     }
 }
 
@@ -781,6 +814,89 @@ fn redact_fields(text: String, fields: &[String]) -> String {
     }
     out.push_str(&text[at..]);
     out
+}
+
+/// A secret field still open at a text's end, in bytes from that end.
+#[derive(Clone, Copy, Default)]
+struct Open {
+    /// Where its name starts: a name that may be one's start, a name and
+    /// separator with no value yet, or a name and a value not ended.
+    name: usize,
+    /// Where its value starts, when one has and not ended: held back so it
+    /// is redacted whole, at most `FIELD_HOLD` bytes of it. The name before
+    /// it is not secret, so it is shown: a prompt such as `Password: `
+    /// reaches whoever is to answer it.
+    value: usize,
+}
+
+fn open_field(text: &[u8], fields: &[String]) -> Open {
+    const FIELD_HOLD: usize = 4096;
+    // Four bytes of a field's start, so short words go out as typed.
+    const NAME_START: usize = 4;
+    let word = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'-';
+    let tail = &text[text.len().saturating_sub(FIELD_HOLD)..];
+    let key = |name: &[u8]| field_key(&String::from_utf8_lossy(name));
+    let mut i = 0;
+    while i < tail.len() {
+        if !word(tail[i]) || (i > 0 && word(tail[i - 1])) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < tail.len() && word(tail[i]) {
+            i += 1;
+        }
+        let name = key(&tail[start..i]);
+        if i == tail.len() {
+            // The last word: it may be the start of a field's name.
+            // Bytes, not characters: a field's name may be any text.
+            let begins = fields.iter().any(|field| {
+                (NAME_START.min(field.len())..=field.len())
+                    .any(|n| name.as_bytes().ends_with(&field.as_bytes()[..n]))
+            });
+            let name = if begins { tail.len() - start } else { 0 };
+            return Open { name, value: 0 };
+        }
+        if !fields.iter().any(|field| name.ends_with(field.as_str())) {
+            continue;
+        }
+        // As `redact_fields` reads one: a quote, a separator, a quote.
+        let mut j = i;
+        if j < tail.len() && matches!(tail[j], b'"' | b'\'') {
+            j += 1;
+        }
+        while j < tail.len() && matches!(tail[j], b' ' | b'\t') {
+            j += 1;
+        }
+        let name = tail.len() - start;
+        if j == tail.len() {
+            return Open { name, value: 0 };
+        }
+        if !matches!(tail[j], b'=' | b':') {
+            continue;
+        }
+        j += 1;
+        while j < tail.len() && matches!(tail[j], b' ' | b'\t') {
+            j += 1;
+        }
+        let quote = tail.get(j).copied().filter(|b| matches!(b, b'"' | b'\''));
+        if quote.is_some() {
+            j += 1;
+        }
+        let ended = tail[j..].iter().any(|&b| match quote {
+            Some(q) => b == q || b == b'\n',
+            None => {
+                b.is_ascii_whitespace() || matches!(b, b',' | b';' | b'"' | b'\'' | b'}' | b']')
+            }
+        });
+        if !ended {
+            return Open {
+                name,
+                value: tail.len() - j,
+            };
+        }
+    }
+    Open::default()
 }
 
 /// Replace the body of each PEM block in `text` whose header names one of
@@ -1087,8 +1203,8 @@ impl Registry {
             slots: Arc::new(Semaphore::new(DEFAULT_PROCESS_BUDGET)),
             budget: DEFAULT_PROCESS_BUDGET,
             pending: Arc::default(),
-            detached_slots: Arc::new(Semaphore::new(DEFAULT_DETACHED_BUDGET)),
-            detached_budget: DEFAULT_DETACHED_BUDGET,
+            lasting_slots: Arc::new(Semaphore::new(default_lasting())),
+            lasting_budget: default_lasting(),
             #[cfg(unix)]
             terminals: Arc::default(),
             stopping: Arc::new(watch::Sender::new(false)),
@@ -1162,12 +1278,34 @@ impl Registry {
         }
         Ok(encoded)
     }
-    /// Bound on detached commands still running, daemon-wide; exited ones
-    /// are reaped and stop counting. Zero removes the bound.
-    pub fn with_detached_budget(mut self, budget: usize) -> Self {
-        self.detached_budget = budget.min(Semaphore::MAX_PERMITS);
-        self.detached_slots = Arc::new(Semaphore::new(self.detached_budget));
+    /// Bound on terminals and detached commands still running, together,
+    /// daemon-wide; ended ones stop counting. Zero removes the bound.
+    pub fn with_lasting_budget(mut self, budget: usize) -> Self {
+        self.lasting_budget = budget.min(Semaphore::MAX_PERMITS);
+        self.lasting_slots = Arc::new(Semaphore::new(self.lasting_budget));
         self
+    }
+    /// A lasting process's permit, or `lasting_limit` naming what holds
+    /// them all. Nothing waits for one: a turn is never left in a line.
+    fn lasting(&self) -> Result<Option<tokio::sync::OwnedSemaphorePermit>> {
+        if self.lasting_budget == 0 {
+            return Ok(None);
+        }
+        self.lasting_slots.clone().try_acquire_owned().map(Some).map_err(|_| {
+            let held = self.lasting_budget - self.lasting_slots.available_permits();
+            #[cfg(unix)]
+            let terminals = self.terminals.lock().unwrap_or_else(|e| e.into_inner()).len();
+            #[cfg(not(unix))]
+            let terminals = 0;
+            Error::with(
+                "lasting_limit",
+                format!(
+                    "{held} lasting processes are running, the daemon's bound (--max-lasting {}): {terminals} terminals and {} detached commands; end one first",
+                    self.lasting_budget,
+                    held.saturating_sub(terminals)
+                ),
+            )
+        })
     }
     /// Bound on simultaneously running child processes. Waiting never counts.
     /// Zero removes the bound; the operating system is then the only limit.
@@ -1956,7 +2094,7 @@ impl Registry {
                 // The cord pulled: dropped the same way, its handle saying
                 // why.
                 Ok(()) = pulls.changed() => {
-                    let _ = done.send(Err(Error::new("daemon_paused")));
+                    let _ = done.send(Err(stopped_by_pause()));
                 }
             }
         });
@@ -1972,13 +2110,13 @@ impl Registry {
         async move {
             tokio::select! {
                 result = run => result,
-                Ok(()) = pulls.changed() => Err(Error::new("daemon_paused")),
+                Ok(()) = pulls.changed() => Err(stopped_by_pause()),
             }
         }
     }
 
-    /// End every background command and terminal now, as the pull cord
-    /// stops the line. A detached command is no one's to stop.
+    /// End every background command, terminal and detached command this
+    /// daemon started now, as the pull cord stops the line.
     pub fn end_running(&self) {
         self.pulls.send_modify(|pulls| *pulls += 1);
         self.end_terminals();
@@ -1988,6 +2126,14 @@ impl Registry {
     pub fn end_background(&self) {
         self.stopping.send_replace(true);
     }
+}
+
+/// How a command the pull cord ended answers: it is not run again.
+fn stopped_by_pause() -> Error {
+    Error::with(
+        "daemon_paused",
+        "the pause stopped this command before it finished; it may have had effects. It is not run again",
+    )
 }
 
 /// Number lines from a 1-based offset within the page budget. A single line
@@ -2303,8 +2449,8 @@ fn sh(
 /// Start a command in a new session for a service that must outlive the
 /// turn and the daemon. Its output is discarded: a log the daemon wrote would
 /// bypass credential redaction, so a command that wants one redirects itself.
-/// No process slot, group kill, or handle applies to it. An async waiter
-/// reaps it on exit and releases its detached slot.
+/// No process slot or handle applies to it, and only the pull cord kills its
+/// session. An async waiter reaps it on exit and releases its detached slot.
 #[cfg(unix)]
 async fn detach(
     command: &str,
@@ -2337,33 +2483,74 @@ async fn detach(
     }
     // Admission is atomic across concurrent turns. The child and its permit
     // move into one waiter, so no reusable PID is polled after Tokio reaps it.
-    let permit = if registry.detached_budget == 0 {
-        None
-    } else {
-        Some(registry.detached_slots.clone().try_acquire_owned().map_err(|_| {
-            Error::with(
-                "detached_limit",
-                format!(
-                    "{} detached commands are still running, the daemon's bound (--max-detached {}); stop one first",
-                    registry.detached_budget - registry.detached_slots.available_permits(),
-                    registry.detached_budget
-                ),
-            )
-        })?)
-    };
+    let permit = registry.lasting()?;
     // What the sandbox holds in place stays held while the command runs.
+    let sandboxed = sandbox.is_some();
     let held = crate::sandbox::hold_for(sandbox.as_deref()).await;
+    // The bot's socket listens while anything the command left in its
+    // group runs, not only while the command itself does.
+    let listening = sandbox.as_ref().and_then(|policy| policy.listening.clone());
     let mut child = process.spawn()?;
     let pid = child.id().ok_or(Error::new("shell_spawn_failed"))?;
+    // It outlives turns and the daemon, but not the pull cord: a pull ends
+    // the process group it leads, and a sandbox's namespace, as it ends
+    // every other command an agent runs.
+    let mut pulls = registry.pulls.subscribe();
+    let group = -(pid as i32);
+    // SAFETY: kill with a negative pid signals the process group setsid made
+    // this child lead; it touches no memory.
+    let signal = move |signal| unsafe { libc::kill(group, signal) } == 0;
     tokio::spawn(async move {
-        let _permit = permit;
-        let _ = child.wait().await;
-        drop(held);
+        let pulled = tokio::select! {
+            _ = child.wait() => false,
+            Ok(()) = pulls.changed() => {
+                if sandboxed {
+                    end_namespace(pid).await;
+                }
+                signal(libc::SIGKILL);
+                let _ = child.wait().await;
+                true
+            }
+        };
+        drop((permit, held));
+        // What it left running in its group, as `cmd &` leaves, is still
+        // the pull's to end: looked for each second until the group is
+        // empty. The kernel keeps a group's id from new processes while any
+        // member lives, so only that last second could see it reused.
+        while !pulled && signal(0) {
+            tokio::select! {
+                Ok(()) = pulls.changed() => {
+                    signal(libc::SIGKILL);
+                    break;
+                }
+                () = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+            }
+        }
+        drop(listening);
     });
     Ok(Outcome::text(
         json!({"detached":true,"pid":pid}).to_string(),
     ))
 }
+
+/// End the pid namespace a sandboxed detached command runs in. bubblewrap,
+/// the process `pid`, starts the namespace's init as its child in a session
+/// of its own and, for a detached command, does not take it down when it
+/// dies; killing that init ends every process in the namespace.
+#[cfg(target_os = "linux")]
+async fn end_namespace(pid: u32) {
+    // Read off the runtime thread, as every file is.
+    let children = tokio::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children")).await;
+    for init in
+        (children.unwrap_or_default().split_whitespace()).filter_map(|c| c.parse::<i32>().ok())
+    {
+        // SAFETY: kill only signals the process; it touches no memory.
+        unsafe { libc::kill(init, libc::SIGKILL) };
+    }
+}
+/// sandbox-exec runs the command in its own place: its group is the command's.
+#[cfg(all(unix, not(target_os = "linux")))]
+async fn end_namespace(_: u32) {}
 
 #[cfg(not(unix))]
 async fn detach(

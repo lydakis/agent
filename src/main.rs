@@ -84,7 +84,10 @@ fn run() -> Result<i32> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("--version") if args.len() == 1 => {
-            println!("agent-runtime {}", env!("CARGO_PKG_VERSION"));
+            match option_env!("AGENT_COMMIT") {
+                Some(commit) => println!("agent-runtime {} ({commit})", env!("CARGO_PKG_VERSION")),
+                None => println!("agent-runtime {}", env!("CARGO_PKG_VERSION")),
+            }
             return Ok(0);
         }
         Some("--help" | "-h") if args.len() == 1 => {
@@ -130,11 +133,12 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
     let mut socket = None;
     let mut providers = Vec::new();
     let mut max_processes = None;
-    let mut max_detached = None;
+    let mut max_lasting = None;
     let mut max_active = None;
     let mut max_connecting = None;
     let mut max_pending = None;
     let mut max_pending_bytes = None;
+    let mut max_readers = None;
     let mut idle_exit = None;
     let mut stall_timeout = None;
     let mut shell_excludes = Vec::new();
@@ -166,20 +170,25 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
             "--protect" => protected.push(value.clone()),
             "--protect-existing" => protected_existing.push(value.clone()),
             "--max-processes"
-            | "--max-detached"
+            | "--max-lasting"
             | "--max-active"
             | "--max-connecting"
             | "--max-pending"
-            | "--max-pending-bytes" => {
+            | "--max-pending-bytes"
+            | "--max-readers" => {
                 let parsed: usize = value
                     .parse()
                     .map_err(|_| Error::with("usage", format!("{flag} needs an integer")))?;
                 match flag.as_str() {
                     "--max-processes" => max_processes = Some(parsed),
-                    "--max-detached" => max_detached = Some(parsed),
+                    "--max-lasting" => max_lasting = Some(parsed),
                     "--max-active" => max_active = Some(parsed),
                     "--max-pending" => max_pending = Some(parsed),
                     "--max-pending-bytes" => max_pending_bytes = Some(parsed),
+                    "--max-readers" if parsed == 0 => {
+                        return fail_with("usage", "--max-readers needs at least 1");
+                    }
+                    "--max-readers" => max_readers = Some(parsed),
                     _ => max_connecting = Some(parsed),
                 }
             }
@@ -200,11 +209,12 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
         socket,
         providers,
         max_processes,
-        max_detached,
+        max_lasting,
         max_active,
         max_connecting,
         max_pending,
         max_pending_bytes,
+        max_readers,
         stall_timeout,
         idle_exit,
         shell_excludes,

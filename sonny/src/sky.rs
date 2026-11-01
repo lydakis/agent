@@ -18,7 +18,7 @@
 //! for the senders of past turns alone (who talked to whom, small events),
 //! then once live asks again for what animates the sky. Its connection is
 //! its own and closes with the view.
-use crate::project;
+use crate::{haiku, project};
 use agent_client::Client;
 use ratatui::{
     style::{Color, Modifier, Style, Stylize},
@@ -77,6 +77,22 @@ const FLASH_GROWTH: f32 = std::f32::consts::SQRT_2;
 /// The biggest, about two dozen at once, as wide as 0.7.0's commons
 /// ripple spread.
 const FLASH_MAX: f32 = 24.0;
+/// The andon cord, pulled: it drops from the sky's top to whoever pulled
+/// it, is tugged, and the stop rings out from them across the whole sky,
+/// each star going still as the ring passes, as a line stops station by
+/// station. Pulls are rare, so this is the sky's one loud moment.
+const CORD_DROP: Duration = Duration::from_millis(450);
+const CORD_TUG: Duration = Duration::from_millis(300);
+/// How long a stop's or a start's rings take to cross the sky, how many
+/// there are, and how far apart they set off.
+const CORD_WAVE: Duration = Duration::from_millis(2600);
+const CORD_RINGS: usize = 3;
+const CORD_RING_GAP: Duration = Duration::from_millis(260);
+/// Resumed: the cord drawn back up, and the start rings out from whoever
+/// resumed, each star waking as it passes.
+const CORD_LIFT: Duration = Duration::from_millis(600);
+/// While the cord hangs, its puller pulses this often, slowly.
+const CORD_PULSE: Duration = Duration::from_millis(2400);
 /// The pairs that talked, newest kept, each a curve: the web of who
 /// works with whom, as in 0.7.0.
 const TALKS: usize = 96;
@@ -109,9 +125,22 @@ const REPLAY_STEP: f64 = 10_000.0;
 const REPLAY_BACK: i64 = 3_600_000;
 /// The least room the sky is drawn in; with less, a list.
 const SKY_COLS: usize = 60;
+/// How often a sky reads the haiku rule from the config again.
+const RULE_READ: Duration = Duration::from_secs(10);
+/// How often a sky reads its daemon's triggers again: soon enough that
+/// one made from a shell shows within moments.
+const SCHEDULE_READ: Duration = Duration::from_secs(2);
+/// How long a schedule a `triggers` call made keeps a read of the
+/// triggers from telling of it again.
+const TOLD: Duration = Duration::from_secs(60);
 const SKY_ROWS: usize = 24;
 /// How much longer one way than the other the sky may be.
 const STRETCH: f32 = 2.0;
+/// A haiku streams in a word each half second, two words a second, with
+/// a breath between lines, and the one before fades out first.
+const WORD: f32 = 0.5;
+const LINE_BREATH: f32 = 1.1;
+const FADE: Duration = Duration::from_secs(2);
 
 /// An agent as its making tells of it, as the listing would.
 fn made(name: &str, data: &Value) -> Value {
@@ -123,6 +152,10 @@ fn made(name: &str, data: &Value) -> Value {
 
 /// The most events a replay keeps to step back through.
 const TAPE: usize = 100_000;
+/// Who told whom before a replay's tape starts, a message for each pair:
+/// as many as the web keeps, and room for copies, which fold into their
+/// agents' pairs.
+const PRIOR: usize = TALKS * 8;
 
 /// A tool call: code's colour, for its moment.
 const TOOL: Color = Color::Cyan;
@@ -164,6 +197,10 @@ enum Feed {
     /// An event a replay plays when its time comes, with when it was
     /// written.
     Tape(Value),
+    /// Who told whom before a replay's tape starts.
+    Prior(Prior),
+    /// The daemon's store, whose triggers the sky shows.
+    Store(String),
     /// Caught up: from here on, what happens.
     Ready,
     Down(String),
@@ -176,6 +213,8 @@ enum End {
     Agent(usize),
     /// The rim, at this agent's angle: a lookout, an automation.
     Rim(usize),
+    /// Just outside this agent's star, where its schedule's tick is.
+    Tick(usize),
 }
 
 /// What a tool call does, which its twinkle's shape tells: a shell's
@@ -291,11 +330,13 @@ struct Agent {
 }
 
 impl Agent {
-    /// Its model, as `m` colours it.
-    fn model_or_unknown(&self) -> &str {
+    /// Its model, as `m` colours it: by name and provider, so one
+    /// model's ids from one provider, as two Bedrock regions', share a
+    /// colour.
+    fn model_or_unknown(&self) -> String {
         match self.model.as_str() {
-            "" => "unknown",
-            model => model,
+            "" => "unknown".to_owned(),
+            model => crate::models::named(model),
         }
     }
 
@@ -346,6 +387,11 @@ pub struct View {
     sparks: Vec<Spark>,
     /// Who told whom, and when, agent to agent: an hour of it.
     said: VecDeque<(Instant, usize, usize)>,
+    /// How often each pair (the lower index first) told the other in that
+    /// hour, kept as `said` changes, so a frame and a new message look a
+    /// pair up rather than go through the hour (rolling counters, as a
+    /// time-series store keeps them).
+    pairs: HashMap<(usize, usize), usize>,
     /// Who has told whom, past turns and live, the last told at the back.
     talks: VecDeque<(usize, usize)>,
     /// When tools were called: an hour of it.
@@ -396,6 +442,85 @@ pub struct View {
     /// and its id when known): what one
     /// does is drawn on its agent, as the approver's judgments light it.
     copies: HashMap<String, (String, Option<i64>)>,
+    /// Who is busiest, by the rule, and the haiku each holder writes.
+    title: haiku::Title,
+    /// The haiku shown last, by its writer and when it was written: one
+    /// in the file that is not it is new here.
+    shown: (String, i64),
+    verse: Option<Verse>,
+    /// The haiku before, fading out, since when.
+    fading: Option<(Verse, Instant)>,
+    /// What the haiku's file work, off this thread, sends back: haikus
+    /// written, and the file and rule as read.
+    heard: (mpsc::UnboundedSender<Heard>, mpsc::UnboundedReceiver<Heard>),
+    /// A read of the file under way, not yet heard back.
+    reading: bool,
+    /// Where the haikus are kept.
+    store: haiku::Store,
+    /// The holder the kept haiku names, given the title once it is here.
+    heir: Option<(String, Instant)>,
+    /// When the title was last weighed: once a second is enough.
+    weighed: Option<Instant>,
+    /// When the haiku rule was last read from the config.
+    ruled: Option<Instant>,
+    /// Where the copies that write haikus run.
+    runtime: tokio::runtime::Handle,
+    /// The andon cord, while it hangs or its start rings out.
+    cord: Option<Cord>,
+    /// The daemon's store, whose triggers are this sky's.
+    store_id: Option<String>,
+    /// Its triggers as last read, soonest first, and which had been read
+    /// by then (none before the first read): one new since is a schedule
+    /// made.
+    schedules: Vec<crate::trigger::Upcoming>,
+    seen: Option<HashSet<(String, String)>>,
+    /// When the triggers were last read, and a read under way.
+    booked: Option<Instant>,
+    booking: bool,
+    /// Schedules `triggers` calls are making, by call; and those made, by
+    /// name, so a read of the triggers tells of them no second time.
+    /// `triggers` calls under way, by agent, turn and call: a call id is
+    /// unique only within its turn.
+    bookings: HashMap<(String, i64, String), Booking>,
+    told: HashMap<String, Instant>,
+}
+
+/// What the haiku's file work sends back, none of it on the thread that
+/// draws: the file waits on other skies' locks, and on the disk.
+enum Heard {
+    /// A haiku its copy wrote, kept for every sky: who wrote it, when it
+    /// was kept, in Unix ms, and its lines.
+    Poem(String, i64, Vec<String>),
+    /// The file as read, and the rule when it was read again too.
+    Read(haiku::Kept, Option<haiku::Rule>),
+    /// The day's haikus, for a replay to show each when it was up.
+    Poems(Vec<haiku::Poem>),
+    /// The daemon's triggers as read, soonest first.
+    Schedules(Vec<crate::trigger::Upcoming>),
+}
+
+/// A schedule a `triggers` call is making: for whom, how it was asked
+/// for (`every 30m`, `file`), and its name.
+#[derive(Debug, Clone, PartialEq)]
+struct Booking {
+    bot: String,
+    when: String,
+    name: String,
+}
+
+/// A haiku on the sky: who wrote it, its lines, when it starts to show,
+/// when it was written, and since when its writer held the title, until
+/// it passed.
+struct Verse {
+    by: String,
+    lines: Vec<String>,
+    from: Instant,
+    written: Instant,
+    since: Instant,
+    until: Option<Instant>,
+    /// In a replay, when it was written, in Unix ms: it streams in on the
+    /// replay's clock, at its speed, and holds still while it is paused.
+    story: Option<i64>,
 }
 
 /// A replay: the daemon's events from a time on, played as they happened,
@@ -419,45 +544,115 @@ struct Replay {
     played: usize,
     /// The tape holds all the past; what comes after is live.
     ready: bool,
+    /// Events not played yet went off the tape's start, so where it plays
+    /// from is seated again (`drain`).
+    cut: bool,
+    /// Who the tape's start made, folded into the cast as it went: kept
+    /// apart too, so the listing read once the past is in, which names
+    /// only who is here now, does not lose one deleted later on the tape.
+    folded: Vec<Value>,
+    /// Who told whom before the tape starts, so the web of who has
+    /// talked is whole from the first frame, as live; what goes off the
+    /// tape's start joins it.
+    prior: Prior,
+    /// The day's haikus, and when the one shown was written: the one up
+    /// at the replay's time shows, as it did then.
+    poems: Vec<haiku::Poem>,
+    poem: Option<i64>,
+}
+
+/// Who told whom, agent to agent: the last message of each pair, oldest
+/// first, at most [`PRIOR`].
+#[derive(Debug, Default)]
+struct Prior {
+    next: u64,
+    /// Each pair's message, by who was told and who told, as its place.
+    pairs: HashMap<(String, String), u64>,
+    told: BTreeMap<u64, Value>,
+}
+
+impl Prior {
+    /// Keeps `event` if it is one agent telling another: only what the
+    /// web reads of it, in place of the pair's message before.
+    fn keep(&mut self, event: &Value) {
+        let data = &event["data"];
+        let (Some(to), Some(by)) = (event["bot"].as_str(), data["from"]["bot"].as_str()) else {
+            return;
+        };
+        if !matches!(event["event"].as_str(), Some("accepted" | "steered")) {
+            return;
+        }
+        if let Some(old) = self.pairs.insert((to.to_owned(), by.to_owned()), self.next) {
+            self.told.remove(&old);
+        }
+        let slim = json!({"event": event["event"], "bot": to, "turn": event["turn"],
+            "written_ms": event["written_ms"],
+            "data": {"from": data["from"], "steer": data["steer"]}});
+        self.told.insert(self.next, slim);
+        self.next += 1;
+        while self.told.len() > PRIOR {
+            let Some((_, oldest)) = self.told.pop_first() else {
+                break;
+            };
+            if let (Some(to), Some(by)) = (
+                oldest["bot"].as_str(),
+                oldest["data"]["from"]["bot"].as_str(),
+            ) {
+                self.pairs.remove(&(to.to_owned(), by.to_owned()));
+            }
+        }
+    }
 }
 
 impl Replay {
     /// Puts an event on the tape. Past [`TAPE`] events, the oldest tenth
-    /// that has played goes and the replay starts where the rest does, as
-    /// a ring buffer keeps a recorder's last stretch: a replay left open
-    /// on a busy daemon stays bounded, and a step back reaches that far.
+    /// goes and the replay starts where the rest does, as a ring buffer
+    /// keeps a recorder's last stretch: a replay left open on a busy
+    /// daemon stays bounded, and a step back reaches that far. That holds
+    /// while the past loads and while paused too: what had not played
+    /// yet goes all the same, and the replay starts again from the start
+    /// that is left.
     /// Who was made or removed in what goes is folded into the cast, as a
     /// keyframe takes in the frames before it.
     fn keep(&mut self, event: Value) {
         self.tape.push(event);
         let gone = TAPE / 10;
-        if self.tape.len() <= TAPE || self.played < gone {
+        if self.tape.len() <= TAPE {
             return;
         }
+        self.cut |= self.played < gone;
         for event in self.tape.drain(..gone) {
+            self.prior.keep(&event);
             let Some(name) = event["bot"].as_str() else {
                 continue;
             };
             match event["event"].as_str() {
                 Some("created" | "forked") => {
+                    let bot = made(name, &event["data"]);
                     self.cast.retain(|bot| bot["name"] != name);
-                    self.cast.push(made(name, &event["data"]));
+                    self.cast.push(bot.clone());
+                    self.folded.retain(|bot| bot["name"] != name);
+                    self.folded.push(bot);
                 }
-                Some("deleted") => self.cast.retain(|bot| bot["name"] != name),
+                Some("deleted") => {
+                    self.cast.retain(|bot| bot["name"] != name);
+                    self.folded.retain(|bot| bot["name"] != name);
+                }
                 _ => {}
             }
         }
-        self.played -= gone;
+        self.played = self.played.saturating_sub(gone);
         if let Some(first) = self.tape.first().and_then(|e| e["written_ms"].as_i64()) {
             self.from = self.from.max(first);
         }
+        self.at = self.at.max(self.from as f64);
     }
 
     /// Gives agents their new models, by name, wherever a step back would
     /// seat them from: one pass over the cast and the tape, however many.
     fn remodel(&mut self, models: &HashMap<&str, &str>) {
         let new = |name: &Value| name.as_str().and_then(|name| models.get(name).copied());
-        for bot in &mut self.cast {
+        for bot in self.cast.iter_mut().chain(&mut self.folded) {
             if let Some(model) = new(&bot["name"]) {
                 bot["model"] = json!(model);
             }
@@ -482,6 +677,11 @@ impl Replay {
             tape: Vec::new(),
             played: 0,
             ready: false,
+            cut: false,
+            folded: Vec::new(),
+            prior: Prior::default(),
+            poems: Vec::new(),
+            poem: None,
         }
     }
 }
@@ -497,6 +697,50 @@ struct Note {
     /// In a replay, when it happened, in Unix ms, which it says for its
     /// time.
     written: Option<i64>,
+}
+
+/// The andon cord while it hangs: who pulled it, why and when; once
+/// resumed, who resumed it and when, until the start has rung out.
+struct Cord {
+    /// The agent that pulled it, by name, or none for the person.
+    by: Option<String>,
+    reason: String,
+    /// When it was pulled here: none for a pause already holding when the
+    /// view opened, which hangs without its drop.
+    pulled: Option<Instant>,
+    /// When it was pulled, in Unix ms, for how long the line stood still.
+    at_ms: Option<i64>,
+    /// Who resumed it (an agent by name, or none for the person), and when.
+    lifted: Option<(Option<String>, Instant)>,
+}
+
+/// The cord's rope: where it hangs to, the share of the way down, the
+/// dots past while tugged, its ink and its gap.
+#[derive(Clone, Copy, Debug)]
+struct Rope {
+    to: (f32, f32),
+    share: f32,
+    past: f32,
+    ink: Ink,
+    gap: usize,
+}
+
+/// The cord as one frame draws it, in dots.
+#[derive(Default)]
+struct CordFrame {
+    /// The rope down to who pulled it.
+    rope: Option<Rope>,
+    /// The stop's or the start's rings: where from, how wide, what ink.
+    rings: Vec<((f32, f32), f32, Ink)>,
+    /// Bursts round who pulled or resumed.
+    flares: Vec<((f32, f32), f32, Ink)>,
+    /// Where the stop has reached: stars within this many dots of the
+    /// point are still while it rings out, or, once resumed, beyond it.
+    front: Option<((f32, f32), f32, bool)>,
+    /// Who pulled it, drawn in the cord's colour while it hangs.
+    puller: Option<End>,
+    /// Who resumed it, named while the start rings out.
+    resumer: Option<End>,
 }
 
 /// A place drawn on the way from one to another.
@@ -525,6 +769,25 @@ impl View {
         feed: mpsc::UnboundedReceiver<Feed>,
         task: tokio::task::JoinHandle<()>,
     ) -> Self {
+        let now = Instant::now();
+        // The haiku every sky of this daemon shows, while it is fresh.
+        let store = haiku::Store::new();
+        let kept = haiku::Kept::load(&store, &socket);
+        let ago = |ms: i64| {
+            let ms = (wall_ms() - ms).max(0) as u64;
+            now.checked_sub(Duration::from_millis(ms)).unwrap_or(now)
+        };
+        let fresh = kept.lines.len() == 3 && wall_ms() - kept.at_ms < HOUR.as_millis() as i64;
+        let verse = fresh.then(|| Verse {
+            by: kept.by.clone(),
+            lines: kept.lines.clone(),
+            from: ago(kept.at_ms),
+            written: ago(kept.at_ms),
+            since: ago(kept.since_ms),
+            until: None,
+            story: None,
+        });
+        let heir = fresh.then(|| (kept.by.clone(), ago(kept.since_ms)));
         Self {
             socket,
             feed,
@@ -533,6 +796,7 @@ impl View {
             index: HashMap::new(),
             sparks: Vec::new(),
             said: VecDeque::new(),
+            pairs: HashMap::new(),
             talks: VecDeque::new(),
             calls: VecDeque::new(),
             sent: HashSet::new(),
@@ -556,6 +820,25 @@ impl View {
             down: None,
             replay: None,
             copies: HashMap::new(),
+            title: haiku::Title::new(haiku::Rule::load(), now),
+            shown: (kept.by.clone(), kept.at_ms),
+            verse,
+            fading: None,
+            heard: mpsc::unbounded_channel(),
+            reading: false,
+            store,
+            heir,
+            weighed: None,
+            ruled: Some(now),
+            runtime: tokio::runtime::Handle::current(),
+            cord: None,
+            store_id: None,
+            schedules: Vec::new(),
+            seen: None,
+            booked: None,
+            booking: false,
+            bookings: HashMap::new(),
+            told: HashMap::new(),
         }
     }
 
@@ -584,6 +867,7 @@ impl View {
             Some(replay) => {
                 replay.cast.clear();
                 replay.tape.clear();
+                replay.prior = Prior::default();
                 replay.played = 0;
                 replay.ready = false;
                 tokio::spawn(tape(self.socket.clone(), replay.from, send))
@@ -595,13 +879,17 @@ impl View {
         self.forget();
         self.live = false;
         self.down = None;
+        // The new connection's greeting says whether it still hangs.
+        self.cord = None;
     }
 
     /// Let go of every agent and what they did, to draw them again.
     fn forget(&mut self) {
+        self.bookings.clear();
         self.agents.clear();
         self.index.clear();
         self.said.clear();
+        self.pairs.clear();
         self.talks.clear();
         self.sent.clear();
         self.laid = false;
@@ -615,6 +903,12 @@ impl View {
         self.ticker.clear();
         self.recent.clear();
         self.calls.clear();
+        // A replay shows the haikus that were up then; live again, the
+        // file's shows anew.
+        (self.verse, self.fading) = (None, None);
+        self.shown = (String::new(), 0);
+        // Read at once, the day's haikus or the file's.
+        self.weighed = None;
         self.restart();
     }
 
@@ -632,7 +926,11 @@ impl View {
     /// Take what the follow brought, and let what landed light up.
     pub fn drain(&mut self) {
         let now = Instant::now();
-        while let Ok(feed) = self.feed.try_recv() {
+        // At most half a frame's work: what is left waits for the next
+        // frame, so a burst slows the sky's catching up, not its keys.
+        while now.elapsed() < FRAME / 2
+            && let Ok(feed) = self.feed.try_recv()
+        {
             match feed {
                 // A replay seats who was here once its tape is in.
                 Feed::Roll(bots) if let Some(replay) = &mut self.replay => {
@@ -643,11 +941,42 @@ impl View {
                         .filter_map(|bot| Some((bot["name"].as_str()?, bot["model"].as_str()?)))
                         .collect();
                     replay.remodel(&models);
+                    // Who the tape's let-go start made is here then, though
+                    // the listing of now may no longer name them. A name
+                    // used again is someone else, told apart by id as
+                    // `seek` tells them.
+                    let mut listed: HashMap<&str, Vec<Option<i64>>> = HashMap::new();
+                    for bot in &bots {
+                        if let Some(name) = bot["name"].as_str() {
+                            listed.entry(name).or_default().push(bot["bot_id"].as_i64());
+                        }
+                    }
+                    let folded: Vec<Value> = (replay.folded.iter())
+                        .filter(|bot| {
+                            let id = bot["bot_id"].as_i64();
+                            !bot["name"]
+                                .as_str()
+                                .and_then(|name| listed.get(name))
+                                .is_some_and(|ids| {
+                                    ids.iter().any(|listed| {
+                                        id.is_none() || listed.is_none() || *listed == id
+                                    })
+                                })
+                        })
+                        .cloned()
+                        .collect();
                     replay.cast = bots;
+                    replay.cast.extend(folded);
                 }
                 Feed::Tape(event) => {
                     if let Some(replay) = &mut self.replay {
                         replay.keep(event);
+                    }
+                }
+                Feed::Store(store) => self.store_id = Some(store),
+                Feed::Prior(prior) => {
+                    if let Some(replay) = &mut self.replay {
+                        replay.prior = prior;
                     }
                 }
                 Feed::Ready if self.replay.as_ref().is_some_and(|r| !r.ready) => {
@@ -655,6 +984,7 @@ impl View {
                     let at = self.replay.as_ref().map_or(0.0, |r| r.at);
                     if let Some(replay) = &mut self.replay {
                         replay.ready = true;
+                        replay.cut = false;
                         replay.tick = now;
                     }
                     self.seek(at, now);
@@ -698,9 +1028,355 @@ impl View {
                 Feed::Down(why) => self.down = Some(why),
             }
         }
+        // The tape let go of what had not played: the replay starts again
+        // from what is left, seated as it was then.
+        if let Some(replay) = self.replay.as_mut().filter(|r| r.ready && r.cut) {
+            replay.cut = false;
+            let from = replay.from as f64;
+            self.seek(from, now);
+        }
         self.play(now);
         self.sweep();
+        self.sweep_cord(now);
         self.land(now);
+        self.reign(now);
+    }
+
+    /// Take the haikus written and let an hour-old one go; then, live,
+    /// pass the busiest title by its rule, and have a new holder write.
+    fn reign(&mut self, now: Instant) {
+        while let Ok(heard) = self.heard.1.try_recv() {
+            match heard {
+                // A replay shows the past's; live again, the file has it.
+                Heard::Poem(..) if self.replay.is_some() => {}
+                Heard::Poem(by, at, lines) => {
+                    self.shown = (by.clone(), at);
+                    self.recite(by, lines, at, now);
+                }
+                Heard::Schedules(found) => {
+                    self.booking = false;
+                    self.timetable(found, now);
+                }
+                Heard::Poems(poems) => {
+                    self.reading = false;
+                    if let Some(replay) = &mut self.replay {
+                        replay.poems = poems;
+                    }
+                }
+                Heard::Read(kept, rule) => {
+                    self.reading = false;
+                    if let Some(rule) = rule {
+                        self.title.rule = rule;
+                    }
+                    self.heed(kept, now);
+                }
+            }
+        }
+        if self.replay.is_some() {
+            self.replayed_verse(now);
+        } else if (self.verse.as_ref())
+            .is_some_and(|verse| now.saturating_duration_since(verse.written) > HOUR)
+        {
+            self.fading = self.verse.take().map(|verse| (verse, now));
+        }
+        if (self.fading.as_ref()).is_some_and(|(_, at)| now.duration_since(*at) > FADE) {
+            self.fading = None;
+        }
+        if !self.live {
+            return;
+        }
+        if self
+            .weighed
+            .is_some_and(|at| now.duration_since(at) < Duration::from_secs(1))
+        {
+            return;
+        }
+        self.weighed = Some(now);
+        // The file read again, for what other skies wrote, and the rule as
+        // /config says now and then: haikus turned on or off, or the cap
+        // moved, since the sky opened.
+        if !self.reading && self.replay.is_some() {
+            // A replay reads the day's haikus again as it goes: one another
+            // sky writes while it plays shows when the replay reaches it.
+            self.reading = true;
+            let (store, socket) = (self.store.clone(), self.socket.clone());
+            let send = self.heard.0.clone();
+            self.runtime.spawn_blocking(move || {
+                let _ = send.send(Heard::Poems(haiku::Kept::load(&store, &socket).past));
+            });
+        } else if !self.reading {
+            self.reading = true;
+            let rule = self
+                .ruled
+                .is_none_or(|at| now.duration_since(at) >= RULE_READ);
+            if rule {
+                self.ruled = Some(now);
+            }
+            let (store, socket) = (self.store.clone(), self.socket.clone());
+            let send = self.heard.0.clone();
+            self.runtime.spawn_blocking(move || {
+                let rule = rule.then(haiku::Rule::load);
+                let _ = send.send(Heard::Read(haiku::Kept::load(&store, &socket), rule));
+            });
+        }
+        // The triggers read again: each tick's next time, and a schedule
+        // made outside a `triggers` call, as from a shell. A replay draws
+        // no ticks: they are now's.
+        if self.replay.is_none()
+            && !self.booking
+            && let Some(store) = self.store_id.clone()
+            && self
+                .booked
+                .is_none_or(|at| now.duration_since(at) >= SCHEDULE_READ)
+        {
+            (self.booking, self.booked) = (true, Some(now));
+            let send = self.heard.0.clone();
+            self.runtime.spawn_blocking(move || {
+                let found = crate::trigger::Places::home()
+                    .map(|places| crate::trigger::upcoming(&places, &store, wall_ms() / 1000))
+                    .unwrap_or_default();
+                let _ = send.send(Heard::Schedules(found));
+            });
+        }
+        if self.replay.is_some() || self.title.rule.daily == 0 {
+            return;
+        }
+        if let Some((name, since)) = self.heir.take()
+            && self.agent(&name).is_some()
+        {
+            self.title.holder = Some((name, since));
+        }
+        let (index, agents) = (&self.index, &self.agents);
+        let gone = |name: &str| index.get(name).is_none_or(|&at| agents[at].gone);
+        let Some(name) = self.title.crown(now, gone) else {
+            return;
+        };
+        if let Some(verse) = &mut self.verse
+            && verse.by != name
+        {
+            verse.until.get_or_insert(now);
+        }
+        let since = wall_ms();
+        let (store, socket) = (self.store.clone(), self.socket.clone());
+        let send = self.heard.0.clone();
+        // Counted in the file before it is spent, by the rule as /config
+        // says then, or not written at all; kept for every sky as it comes,
+        // this one closed or not, and only for its claim, should a newer
+        // one have taken over meanwhile.
+        self.runtime.spawn(async move {
+            let (claim, claim_socket, claim_name) = (store.clone(), socket.clone(), name.clone());
+            let claimed = tokio::task::spawn_blocking(move || {
+                let rule = haiku::Rule::load();
+                haiku::Kept::update(&claim, &claim_socket, |kept| {
+                    kept.claim(&rule, &claim_name, since, since)
+                })
+                .is_some_and(|(claimed, _)| claimed)
+            });
+            if !matches!(claimed.await, Ok(true)) {
+                return;
+            }
+            let Some(lines) = haiku::write(socket.clone(), name.clone()).await else {
+                return;
+            };
+            let kept = tokio::task::spawn_blocking(move || {
+                let at = wall_ms();
+                haiku::Kept::publish(&store, &socket, &name, since, &lines, at)
+                    .then_some(Heard::Poem(name, at, lines))
+            });
+            if let Ok(Some(poem)) = kept.await {
+                let _ = send.send(poem);
+            }
+        });
+    }
+
+    /// The file as read: a haiku another sky wrote shows here too, and its
+    /// writer holds the title here as there.
+    fn heed(&mut self, kept: haiku::Kept, now: Instant) {
+        let new = (kept.by != self.shown.0 || kept.at_ms != self.shown.1)
+            && kept.lines.len() == 3
+            && self.live
+            && self.replay.is_none();
+        if !new {
+            return;
+        }
+        if self.agent(&kept.by).is_some() {
+            let held = (wall_ms() - kept.since_ms).max(0) as u64;
+            let since = now.checked_sub(Duration::from_millis(held)).unwrap_or(now);
+            self.title.holder = Some((kept.by.clone(), since));
+        }
+        self.shown = (kept.by.clone(), kept.at_ms);
+        self.recite(kept.by, kept.lines, kept.at_ms, now);
+    }
+
+    /// The triggers as read: a new one no `triggers` call told of is told
+    /// now, for whom and how often, though not who made it.
+    fn timetable(&mut self, found: Vec<crate::trigger::Upcoming>, now: Instant) {
+        let ids: HashSet<(String, String)> = (found.iter())
+            .map(|u| (u.name.clone(), u.generation.clone()))
+            .collect();
+        self.told.retain(|_, at| now.duration_since(*at) < TOLD);
+        if let Some(seen) = &self.seen {
+            let new: Vec<(String, String)> = (found.iter())
+                .filter(|u| !seen.contains(&(u.name.clone(), u.generation.clone())))
+                .filter(|u| !self.told.contains_key(&u.name))
+                .map(|u| (u.bot.clone(), u.when.clone()))
+                .collect();
+            for (bot, when) in new {
+                let at = self.agent(&bot);
+                let whom = at.map_or(bot, |at| self.short(at));
+                let said = format!("{whom} {}, new", said_when(&when));
+                self.say(now, said, None, &Vec::from_iter(at));
+            }
+        }
+        (self.seen, self.schedules) = (Some(ids), found);
+    }
+
+    /// A `triggers` call made a schedule: a spark from who made it to its
+    /// agent's tick, and a line in the log.
+    fn booked(&mut self, by: usize, booking: Booking, now: Instant) {
+        self.told.insert(booking.name, now);
+        let to = self.agent(&booking.bot);
+        let whom = to.map_or_else(|| short(&booking.bot), |to| self.short(to));
+        let maker = match to == Some(by) {
+            true => "itself".to_owned(),
+            false => self.short(by),
+        };
+        // What the schedule is first, as the log is narrow.
+        let said = format!("{whom} {}, by {maker}", said_when(&booking.when));
+        let about: Vec<usize> = std::iter::once(by).chain(to).collect();
+        self.say(now, said, None, &about);
+        if let Some(to) = to {
+            // A spark of its own: no message, so no count of them.
+            let agent = &mut self.agents[by];
+            (agent.lit, agent.heated, agent.flash) = (Some(now), Some(now), None);
+            agent.heat = agent.warmth(now) + 1.0;
+            self.sparks.push(Spark {
+                from: End::Agent(by),
+                to: End::Tick(to),
+                born: now,
+                color: None,
+            });
+        }
+    }
+
+    /// In a replay, the haiku up at its time, as it was then: written
+    /// within the hour before, the last of them; none, and the one shown
+    /// fades.
+    fn replayed_verse(&mut self, now: Instant) {
+        let Some(replay) = self.replay.as_mut().filter(|replay| replay.ready) else {
+            return;
+        };
+        let at = replay.at as i64;
+        let hour = HOUR.as_millis() as i64;
+        let up = (replay.poems.iter().rev())
+            .find(|poem| poem.at_ms <= at && at - poem.at_ms < hour)
+            .cloned();
+        let poem = up.as_ref().map(|poem| poem.at_ms);
+        if poem == replay.poem {
+            return;
+        }
+        replay.poem = poem;
+        let old = self.verse.take();
+        let Some(up) = up else {
+            self.fading = old.map(|old| (old, now));
+            return;
+        };
+        // Its time is the replay's: it takes over from the one before at
+        // once, hours apart as they were written.
+        self.fading = old.map(|old| (old, now));
+        // Signed for as long as its writer had held the title then.
+        let held = Duration::from_millis((up.at_ms - up.since_ms).max(0) as u64);
+        self.verse = Some(Verse {
+            by: up.by,
+            lines: up.lines,
+            from: now,
+            written: now,
+            since: now.checked_sub(held).unwrap_or(now),
+            until: Some(now),
+            story: Some(up.at_ms),
+        });
+    }
+
+    /// Show `lines` by `by`, written at `at_ms`, once the haiku before has
+    /// faded: an hour from when it was written, however late it came.
+    fn recite(&mut self, by: String, lines: Vec<String>, at_ms: i64, now: Instant) {
+        let age = Duration::from_millis((wall_ms() - at_ms).max(0) as u64);
+        if age > HOUR {
+            return;
+        }
+        let written = now.checked_sub(age).unwrap_or(now);
+        let since = (self.title.holder.as_ref())
+            .filter(|(name, _)| *name == by)
+            .map_or(now, |(_, since)| *since);
+        let from = match self.verse.take() {
+            Some(old) => {
+                self.fading = Some((old, now));
+                now + FADE
+            }
+            None => now,
+        };
+        self.verse = Some(Verse {
+            by,
+            lines,
+            from,
+            written,
+            since,
+            until: None,
+            story: None,
+        });
+    }
+
+    /// The haiku's rows: its three lines streaming in a word at a time,
+    /// muted, each word up from faint, then its writer signed in faint;
+    /// the one before all faint as it fades; in a replay, the one up then.
+    fn haiku(&self, now: Instant) -> Vec<Line<'static>> {
+        let showing = self.verse.as_ref().filter(|verse| now >= verse.from);
+        let (verse, faded) = match (showing, &self.fading) {
+            (Some(verse), _) => (verse, false),
+            (None, Some((old, _))) => (old, true),
+            (None, None) => return Vec::new(),
+        };
+        let t = match (verse.story, &self.replay) {
+            (Some(at), Some(replay)) => ((replay.at - at as f64) / 1000.0).max(0.0) as f32,
+            _ => now.saturating_duration_since(verse.from).as_secs_f32(),
+        };
+        let mut lines = Vec::new();
+        let mut word = 0;
+        let mut last = 0.0;
+        for (row, line) in verse.lines.iter().enumerate() {
+            let mut spans = Vec::new();
+            for text in line.split_whitespace() {
+                let shows = word as f32 * WORD + row as f32 * LINE_BREATH;
+                (word, last) = (word + 1, shows);
+                if !faded && t < shows {
+                    continue;
+                }
+                let ink = match faded || t < shows + WORD {
+                    true => Ink::Faint,
+                    false => Ink::Muted,
+                };
+                if !spans.is_empty() {
+                    spans.push(Span::raw(" "));
+                }
+                spans.push(Span::styled(text.to_owned(), ink.style()));
+            }
+            lines.push(Line::from(spans));
+        }
+        if faded || t >= last + LINE_BREATH {
+            let name = self
+                .agent(&verse.by)
+                .map_or(verse.by.clone(), |at| self.short(at));
+            let held = verse
+                .until
+                .unwrap_or(now)
+                .saturating_duration_since(verse.since);
+            let minutes = (held.as_secs() / 60).max(1);
+            let signed = format!("— {name}, busiest for {minutes}m");
+            lines.push(Line::default());
+            let signed = Span::styled(cut(&signed, haiku::WIDTH), Ink::Faint.style());
+            lines.push(Line::from(signed));
+        }
+        lines
     }
 
     /// Move a replay on by the time since the last frame, at its speed,
@@ -788,6 +1464,7 @@ impl View {
                 .cloned()
                 .collect();
             replay.at = at;
+            let prior: Vec<Value> = replay.prior.told.values().cloned().collect();
             self.forget();
             self.ticker.clear();
             self.recent.clear();
@@ -797,6 +1474,11 @@ impl View {
                 if let Some(at) = self.seat(bot) {
                     self.agents[at].running = None;
                 }
+            }
+            // Who had talked before, as live reads past turns: the whole
+            // web from the first frame, not only the window's.
+            for event in &prior {
+                self.event(event, now, false);
             }
         }
         if let Some(replay) = &mut self.replay {
@@ -822,6 +1504,7 @@ impl View {
             End::Person => Some(End::Person),
             End::Agent(at) => moved[at].map(End::Agent),
             End::Rim(at) => moved[at].map(End::Rim),
+            End::Tick(at) => moved[at].map(End::Tick),
         };
         self.agents.retain(|agent| !agent.gone);
         for agent in &mut self.agents {
@@ -838,6 +1521,10 @@ impl View {
         self.said = (self.said.iter())
             .filter_map(|&(when, a, b)| Some((when, moved[a]?, moved[b]?)))
             .collect();
+        self.pairs = HashMap::new();
+        for &(_, a, b) in &self.said {
+            *self.pairs.entry(pair(a, b)).or_default() += 1;
+        }
         self.talks = (self.talks.iter())
             .filter_map(|&(a, b)| Some((moved[a]?, moved[b]?)))
             .collect();
@@ -884,10 +1571,17 @@ impl View {
             self.calls.pop_front();
         }
         while self.said.front().is_some_and(|(at, ..)| old(at)) {
-            if let Some((_, a, b)) = self.said.pop_front()
-                && self.centre.is_some()
-                && !(self.said.iter()).any(|&(_, x, y)| (x, y) == (a, b) || (x, y) == (b, a))
-            {
+            let Some((_, a, b)) = self.said.pop_front() else {
+                break;
+            };
+            let quiet = match self.pairs.get_mut(&pair(a, b)) {
+                Some(told) if *told > 1 => {
+                    *told -= 1;
+                    false
+                }
+                _ => self.pairs.remove(&pair(a, b)).is_some(),
+            };
+            if quiet && self.centre.is_some() {
                 // A pair gone quiet moves the rings of a centred sky.
                 self.laid = false;
             }
@@ -990,6 +1684,12 @@ impl View {
     /// One of the daemon's events: `{cursor, bot, turn, event, data}`,
     /// what is particular to its kind in `data`.
     fn event(&mut self, event: &Value, now: Instant, live: bool) {
+        // The cord is the daemon's, no one agent's: its notices name no bot.
+        match event["event"].as_str() {
+            Some("paused") => return self.pulled(&event["pause"], now, live),
+            Some("resumed") => return self.lifted(event, now, live),
+            _ => {}
+        }
         let Some(name) = event["bot"].as_str() else {
             return;
         };
@@ -1079,9 +1779,11 @@ impl View {
                     }
                     // A past turn of the last hour counts toward its pair's
                     // weight, at the time the daemon wrote it.
+                    // In a replay, the hour before the replay's time.
+                    let clock = self.replay.as_ref().map_or(wall_ms(), |r| r.at as i64);
                     if !live
                         && let Some(written) = event["written_ms"].as_i64()
-                        && let Some(ago) = wall_ms().checked_sub(written)
+                        && let Some(ago) = clock.checked_sub(written)
                         && let Some(when) =
                             now.checked_sub(Duration::from_millis(ago.max(0) as u64))
                         && now.duration_since(when) <= HOUR
@@ -1097,10 +1799,19 @@ impl View {
                         self.hear(then, by, at);
                     }
                     self.send(from, End::Agent(at), now);
+                    if self.replay.is_none() {
+                        if let End::Agent(by) = from {
+                            let by = self.agents[by].name.clone();
+                            self.title.note(now, &by);
+                        }
+                        // A copy's word counts for its agent.
+                        let to = self.agents[at].name.clone();
+                        self.title.note(now, &to);
+                    }
                     let by = match from {
                         End::Person => "you".to_owned(),
                         End::Agent(by) => self.short(by),
-                        End::Rim(_) => match data["person"].as_str() {
+                        End::Rim(_) | End::Tick(_) => match data["person"].as_str() {
                             Some(person) => person.to_owned(),
                             None => {
                                 crate::transcript::from_outside(data["origin"].as_str()).to_owned()
@@ -1131,6 +1842,19 @@ impl View {
                 self.agents[at].twinkle = Some((now, TOOL, Work::of(tool)));
                 if let Some(then) = self.then(now) {
                     self.calls.push_back(then);
+                }
+                if self.replay.is_none() {
+                    let by = self.agents[at].name.clone();
+                    self.title.note(now, &by);
+                }
+                // A schedule asked for is told once the call is done.
+                if tool == crate::served::TRIGGERS
+                    && own
+                    && let Some(call) = data["call_id"].as_str()
+                    && let Some(booking) = booking(&data["arguments"], name)
+                {
+                    let key = (name.to_owned(), turn, call.to_owned());
+                    self.bookings.insert(key, booking);
                 }
                 if tool == crate::asks::TOOL && own {
                     if self.agents[at].state() != Some(State::NeedsYou) {
@@ -1187,6 +1911,13 @@ impl View {
             "tool_completed" if live => {
                 if let Some(id) = data["call_id"].as_str() {
                     self.agents[at].held.remove(id);
+                    let key = (name.to_owned(), turn, id.to_owned());
+                    if let Some(booking) = self.bookings.remove(&key)
+                        && data["failed"] != true
+                        && data["denied"] != true
+                    {
+                        self.booked(at, booking, now);
+                    }
                 }
                 if data["failed"] == true || data["denied"] == true {
                     let work = Work::of(data["name"].as_str().unwrap_or(""));
@@ -1228,6 +1959,238 @@ impl View {
         }
     }
 
+    /// The cord pulled: live, it drops and the stop rings out; a pause
+    /// already holding when the view opened just hangs there.
+    fn pulled(&mut self, pause: &Value, now: Instant, live: bool) {
+        let by = pause["by"].as_str().map(str::to_owned);
+        let reason = pause["reason"].as_str().unwrap_or("").to_owned();
+        if live {
+            let who = self.called(&by);
+            let about: Vec<usize> = by
+                .as_deref()
+                .and_then(|name| self.agent(name))
+                .into_iter()
+                .collect();
+            let said = match reason.as_str() {
+                "" => format!("■ {who} pulled the cord"),
+                why => format!("■ {who} pulled the cord: {why}"),
+            };
+            self.say(now, said, Some(NEEDS), &about);
+        }
+        self.cord = Some(Cord {
+            by,
+            reason,
+            pulled: live.then_some(now),
+            at_ms: pause["at_ms"].as_i64(),
+            lifted: None,
+        });
+    }
+
+    /// The cord let go: drawn back up, and the start rings out from
+    /// whoever resumed. A resume read from the past just clears it.
+    fn lifted(&mut self, event: &Value, now: Instant, live: bool) {
+        if !live {
+            self.cord = None;
+            return;
+        }
+        let by = event["by"].as_str().map(str::to_owned);
+        let who = self.called(&by);
+        let stood = (event["pause"]["at_ms"].as_i64())
+            .or(self.cord.as_ref().and_then(|cord| cord.at_ms))
+            .map(|at| Duration::from_millis((wall_ms() - at).max(0) as u64));
+        let said = match stood {
+            Some(stood) => format!("▶ {who} resumed, after {}", span(stood)),
+            None => format!("▶ {who} resumed"),
+        };
+        let about: Vec<usize> = by
+            .as_deref()
+            .and_then(|name| self.agent(name))
+            .into_iter()
+            .collect();
+        self.say(now, said, None, &about);
+        // One the view never saw pulled still lifts, from the middle.
+        let cord = self.cord.get_or_insert_with(|| Cord {
+            by: None,
+            reason: String::new(),
+            pulled: None,
+            at_ms: None,
+            lifted: None,
+        });
+        cord.lifted = Some((by, now));
+    }
+
+    /// The cord this frame: dropping, tugged and ringing the stop out,
+    /// hanging, or drawn up again with the start ringing out.
+    fn cord_frame(&self, sky: &Sky, now: Instant) -> Option<CordFrame> {
+        let cord = self.cord.as_ref()?;
+        let since = |at: Instant| now.duration_since(at).as_secs_f32();
+        let pulled_by = self.cord_end(&cord.by);
+        let puller = self.end(pulled_by);
+        let wave = CORD_WAVE.as_secs_f32();
+        let gap = CORD_RING_GAP.as_secs_f32();
+        // A ring's width, `t` into its crossing: fast, then slowing as it
+        // reaches the sky's far edge, fading as it goes.
+        let ring = |from: (f32, f32), t: f32, strong: Ink, weak: Ink| {
+            let p = t / wave;
+            let ink = match p {
+                ..0.45 => strong,
+                ..0.75 => weak,
+                _ => Ink::Faint,
+            };
+            (from, sky.reach(from) * (1.0 - (1.0 - p).powi(2)), ink)
+        };
+        let rope = |share, past, ink, gap| Rope {
+            to: puller,
+            share,
+            past,
+            ink,
+            gap,
+        };
+        let mut frame = CordFrame::default();
+        match &cord.lifted {
+            None => {
+                frame.puller = Some(pulled_by);
+                let (drop, tug) = (CORD_DROP.as_secs_f32(), CORD_TUG.as_secs_f32());
+                // A pause the view opened on has long rung out.
+                let t = cord.pulled.map_or(f32::MAX, since);
+                let start = drop + tug * 0.3;
+                frame.rope = Some(if t < drop {
+                    rope(ease(t / drop), 0.0, Ink::Color(NEEDS, true), 1)
+                } else if t < drop + tug {
+                    let tugged = (std::f32::consts::PI * (t - drop) / tug).sin() * 4.0;
+                    rope(1.0, tugged, Ink::Color(NEEDS, true), 1)
+                } else if t < start + wave {
+                    rope(1.0, 0.0, Ink::Color(NEEDS, true), 1)
+                } else {
+                    // Hanging: the system's middle weight, not a siren.
+                    rope(1.0, 0.0, Ink::Color(NEEDS, false), 2)
+                });
+                // The tug bursts round the one who pulled.
+                let burst = t - drop;
+                if (0.0..tug + 0.5).contains(&burst) {
+                    let q = burst / (tug + 0.5);
+                    let ink = Ink::Color(NEEDS, q < 0.5);
+                    frame.flares.push((puller, 2.0 + 9.0 * ease(q), ink));
+                    frame.flares.push((puller, 1.0 + 4.5 * ease(q), ink));
+                }
+                for i in 0..CORD_RINGS {
+                    let t = t - start - i as f32 * gap;
+                    if (0.0..wave).contains(&t) {
+                        let strong = match i {
+                            0 => Ink::Color(NEEDS, true),
+                            _ => Ink::Color(NEEDS, false),
+                        };
+                        frame.rings.push(ring(puller, t, strong, Ink::Muted));
+                    }
+                }
+                frame.front = Some(match t - start {
+                    t if t < 0.0 => (puller, 0.0, true),
+                    t if t < wave => (puller, ring(puller, t, Ink::Faint, Ink::Faint).1, true),
+                    _ => (puller, f32::MAX, true),
+                });
+                // Then it hangs, its puller pulsing slowly: the line is
+                // still stopped, and by whom.
+                let held = cord.pulled.map_or(self.opened, |at| {
+                    at + CORD_DROP + CORD_TUG + CORD_WAVE + CORD_RING_GAP * CORD_RINGS as u32
+                });
+                if now >= held {
+                    let pulse = CORD_PULSE.as_secs_f32();
+                    let phase = (since(held) % pulse) / pulse;
+                    if phase < 0.5 {
+                        let ink = match phase < 0.25 {
+                            true => Ink::Color(NEEDS, false),
+                            false => Ink::Muted,
+                        };
+                        frame.flares.push((puller, 2.0 + 16.0 * phase, ink));
+                    }
+                }
+            }
+            Some((by, at)) => {
+                let resumed_by = self.cord_end(by);
+                let resumer = self.end(resumed_by);
+                frame.resumer = Some(resumed_by);
+                let u = since(*at);
+                let lift = CORD_LIFT.as_secs_f32();
+                if u < lift {
+                    let share = 1.0 - ease(u / lift);
+                    frame.rope = Some(rope(share, 0.0, Ink::Color(NEEDS, false), 2));
+                }
+                if u < 0.5 {
+                    frame
+                        .flares
+                        .push((resumer, 2.0 + 8.0 * ease(u / 0.5), Ink::Bright));
+                }
+                let start = 0.15;
+                for i in 0..2 {
+                    let t = u - start - i as f32 * gap;
+                    if (0.0..wave).contains(&t) {
+                        let strong = match i {
+                            0 => Ink::Bright,
+                            _ => Ink::Plain,
+                        };
+                        frame.rings.push(ring(resumer, t, strong, Ink::Muted));
+                    }
+                }
+                let t = u - start;
+                if t < wave {
+                    let front = ring(resumer, t.max(0.0), Ink::Faint, Ink::Faint).1;
+                    frame.front = Some((resumer, front, false));
+                }
+            }
+        }
+        Some(frame)
+    }
+
+    /// Whether the cord's stop holds a star still this frame.
+    fn stilled(frame: Option<&CordFrame>, sky: &Sky, at: (f32, f32)) -> bool {
+        frame
+            .and_then(|frame| frame.front)
+            .is_some_and(|(from, front, inside)| (sky.apart(from, at) <= front) == inside)
+    }
+
+    /// Lets go of a start that has rung out.
+    fn sweep_cord(&mut self, now: Instant) {
+        let done = CORD_WAVE + CORD_RING_GAP * 2;
+        if let Some((_, at)) = self.cord.as_ref().and_then(|cord| cord.lifted.as_ref())
+            && now.duration_since(*at) > done
+        {
+            self.cord = None;
+        }
+    }
+
+    /// Who pulled or resumed, as the sky says it: an agent by its short
+    /// name, or the person.
+    fn called(&self, by: &Option<String>) -> String {
+        match by {
+            Some(name) => short(name),
+            None => "you".into(),
+        }
+    }
+
+    /// The agents who pulled and resumed the cord, while it is drawn.
+    fn cord_ends(&self) -> [Option<usize>; 2] {
+        let end = |by: &Option<String>| match self.cord_end(by) {
+            End::Agent(at) => Some(at),
+            _ => None,
+        };
+        match &self.cord {
+            None => [None, None],
+            Some(cord) => [
+                end(&cord.by),
+                cord.lifted.as_ref().and_then(|(by, _)| end(by)),
+            ],
+        }
+    }
+
+    /// Where one who pulled or resumed is: their star, or the person's
+    /// place for the person or an agent not on the sky.
+    fn cord_end(&self, by: &Option<String>) -> End {
+        // A throwaway copy pulls it as the agent it is drawn on.
+        (by.as_deref())
+            .and_then(|name| self.agent(name).or_else(|| self.copied(name)))
+            .map_or(End::Person, End::Agent)
+    }
+
     /// Who sent a prompt: another agent, a client named by its origin or
     /// another person a client named (in from the rim), or the person.
     fn sender(&self, data: &Value, at: usize) -> End {
@@ -1252,7 +2215,9 @@ impl View {
     /// Remembers that `by` talked to `at` for the hour's weights. A pair new
     /// to the hour moves the rings of a centred sky, past turns as live ones.
     fn hear(&mut self, when: Instant, by: usize, at: usize) {
-        let new = !(self.said.iter()).any(|&(_, a, b)| (a, b) == (by, at) || (a, b) == (at, by));
+        let told = self.pairs.entry(pair(by, at)).or_default();
+        let new = *told == 0;
+        *told += 1;
         self.laid = self.laid && !(new && self.centre.is_some());
         self.said.push_back((when, by, at));
     }
@@ -1386,7 +2351,7 @@ impl View {
                 for &root in &roots {
                     link(you, root);
                 }
-                for &(_, a, b) in &self.said {
+                for &(a, b) in self.pairs.keys() {
                     link(a, b);
                 }
                 let name = |at: &usize| match self.agents.get(*at) {
@@ -1754,10 +2719,21 @@ impl View {
         // faint cloud on their arm (Furnas' degree of interest). What
         // needs the person or failed always draws.
         let room = (sky_cols * sky_rows / 24).max(8);
-        let shown = self.shown(now, room, &[picked, centre]);
+        // Who pulled or resumed the cord keeps a star, for it to hang from
+        // and ring out of.
+        let ends = self.cord_ends();
+        let shown = self.shown(now, room, &[picked, centre, ends[0], ends[1]]);
+        let cord = self.cord_frame(&sky, now);
+        let puller = cord.as_ref().and_then(|cord| cord.puller);
+        let resumer = cord.as_ref().and_then(|cord| cord.resumer);
         // The person: the place and the word say who. In the middle, or
-        // on a ring when an agent is centred.
-        sky.text_at(self.person.at, "you", Style::default().bold());
+        // on a ring when an agent is centred; in the cord's colour while
+        // the cord they pulled hangs.
+        let you = match puller {
+            Some(End::Person) => Style::default().fg(NEEDS).bold(),
+            _ => Style::default().bold(),
+        };
+        sky.text_at(self.person.at, "you", you);
         // Who made whom: dotted lines, dim, as all that says how things
         // stand rather than what happens.
         for (at, agent) in self.agents.iter().enumerate().filter(|(_, a)| !a.gone) {
@@ -1772,13 +2748,7 @@ impl View {
         // as in 0.7.0; told both ways, two, as each bends its own way. The
         // more a pair talked this hour the heavier its curve: denser, and
         // plain for the busiest, so where the work is shows.
-        let mut hour: HashMap<(usize, usize), usize> = HashMap::new();
-        for &(when, by, to) in self.said.iter().rev() {
-            if now.duration_since(when) > HOUR {
-                break;
-            }
-            *hour.entry((by.min(to), by.max(to))).or_default() += 1;
-        }
+        let hour = &self.pairs;
         let busiest = hour.values().copied().max().unwrap_or(1);
         for &(by, to) in &self.talks {
             if !(shown[by] && shown[to]) || self.agents[by].gone || self.agents[to].gone {
@@ -1795,6 +2765,25 @@ impl View {
             };
             let (a, b) = (self.agents[by].at, self.agents[to].at);
             sky.curve(a, bend(a, b), b, ink, gap);
+        }
+        // Each schedule a tick just outside its agent's star, out from the
+        // middle, as on a clock's face: muted, and plain in the last tenth
+        // of its wait. Now's, so not in a replay.
+        if self.replay.is_none() {
+            let wall = wall_ms() / 1000;
+            for upcoming in self.schedules.iter().filter(|u| keeps_time(u)) {
+                let Some(at) = self.agent(&upcoming.bot).filter(|&at| shown[at]) else {
+                    continue;
+                };
+                let near = upcoming.next.is_some_and(|next| {
+                    let wait = upcoming.then.map_or(600, |then| then - next).max(60);
+                    next - wall <= wait / 10
+                });
+                let ink = if near { Ink::Plain } else { Ink::Muted };
+                for past in [0.05, 0.07, 0.09] {
+                    sky.dot(self.tick_on(&sky, at, past), ink);
+                }
+            }
         }
         // Ripples and flashes, then sparks, then the stars over them.
         for (_, agent) in (self.agents.iter().enumerate()).filter(|(at, a)| !a.gone && shown[*at]) {
@@ -1826,7 +2815,11 @@ impl View {
         // The newest dozen in flight: more is a blur, not news.
         for spark in self.sparks.iter().rev().take(SPARKS) {
             let t = (now.duration_since(spark.born).as_secs_f32() / FLIGHT.as_secs_f32()).min(1.0);
-            let (a, b) = (self.end(spark.from), self.end(spark.to));
+            let end = |end: End| match end {
+                End::Tick(at) => self.tick_on(&sky, at, 0.07),
+                end => self.end(end),
+            };
+            let (a, b) = (end(spark.from), end(spark.to));
             let control = match (spark.from, spark.to) {
                 (End::Agent(_), End::Agent(_)) => bend(a, b),
                 _ => ((a.0 + b.0) / 2.0, (a.1 + b.1) / 2.0),
@@ -1848,6 +2841,15 @@ impl View {
                 }
             }
         }
+        // The cord and its rings, over the web and under the stars.
+        if let Some(cord) = &cord {
+            for &(at, radius, ink) in &cord.rings {
+                sky.wave(at, radius, ink);
+            }
+            if let Some(rope) = cord.rope {
+                sky.rope(rope);
+            }
+        }
         let shade = Shade::now();
         let hues: HashMap<String, Color> = self.hues().into_iter().collect();
         // The folded: a faint dot each, so a cloud's density says its size,
@@ -1862,7 +2864,9 @@ impl View {
             cloud.0 += 1;
             cloud.1 = (cloud.1.0 + agent.at.0, cloud.1.1 + agent.at.1);
         }
-        for (_, agent) in (self.agents.iter().enumerate()).filter(|(at, a)| !a.gone && shown[*at]) {
+        for (index, agent) in
+            (self.agents.iter().enumerate()).filter(|(at, a)| !a.gone && shown[*at])
+        {
             if let Some((at, color, work)) = agent.twinkle
                 && now.duration_since(at) < TWINKLE
             {
@@ -1874,9 +2878,15 @@ impl View {
             // On `m`, each in its model's colour instead, bold while it
             // works.
             let hue = (self.models)
-                .then(|| hues.get(agent.model_or_unknown()).copied())
+                .then(|| hues.get(&agent.model_or_unknown()).copied())
                 .flatten();
+            let stilled = Self::stilled(cord.as_ref(), &sky, agent.at);
             let (ink, big) = match (hue, agent.state()) {
+                // Who pulled the cord, in its colour while it hangs.
+                _ if puller == Some(End::Agent(index)) => (Ink::Color(NEEDS, true), true),
+                // The stop holds the rest still, as it reaches them; what
+                // needs the person or failed keeps its colour.
+                (_, None | Some(State::Working)) if stilled => (Ink::Muted, false),
                 (Some(hue), state) => {
                     let big = state.is_some() || agent.glow(now) > 0.4;
                     (Ink::Color(hue, big), big)
@@ -1887,6 +2897,9 @@ impl View {
                 (None, _) => (Ink::Plain, agent.glow(now) > 0.4),
             };
             sky.star(agent.at, ink, big);
+        }
+        for &(at, radius, ink) in cord.iter().flat_map(|cord| &cord.flares) {
+            sky.circle(at, radius, ink);
         }
         // Names: every star's that has room, leads and what works or was
         // just lit before the quiet, nearest the middle first, never over
@@ -1909,7 +2922,14 @@ impl View {
                 true
             })
             .collect();
-        for at in picked.into_iter().chain(centre) {
+        let cord_names: Vec<usize> = [puller, resumer]
+            .into_iter()
+            .filter_map(|end| match end {
+                Some(End::Agent(at)) if !self.agents[at].gone => Some(at),
+                _ => None,
+            })
+            .collect();
+        for &at in picked.iter().chain(&centre).chain(&cord_names) {
             if !named.contains(&at) {
                 named.push(at);
             }
@@ -1923,6 +2943,7 @@ impl View {
         named.sort_by_key(|&at| {
             let agent = &self.agents[at];
             (
+                !cord_names.contains(&at),
                 Some(at) != picked,
                 Some(at) != centre,
                 agent.state() != Some(State::NeedsYou),
@@ -1948,6 +2969,9 @@ impl View {
                 _ => None,
             };
             let style = match (Some(at) == picked, Some(at) == centre) {
+                // Who pulled the cord, in its colour; who resumed it, bold.
+                _ if puller == Some(End::Agent(at)) => Style::default().fg(NEEDS).bold(),
+                _ if resumer == Some(End::Agent(at)) => Style::default().bold(),
                 // The pick reversed, as a picker's selection is.
                 (true, _) => Style::default().reversed(),
                 (_, true) => Style::default().bold(),
@@ -1977,11 +3001,28 @@ impl View {
                 sky.label(middle, None, &format!("+{n}"), Ink::Muted.style());
             }
         }
+        // Zen keeps the haiku at the sky's top right, as does a sky over
+        // its log, whose log has no blank to spare.
+        if self.zen || !beside {
+            for (row, line) in self.haiku(now).iter().enumerate() {
+                let start = sky_cols.saturating_sub(haiku::WIDTH + 1);
+                sky.inscribe(row, start, line);
+            }
+        }
         let drawn = sky.lines();
         if beside {
             let column = match self.legend {
                 true => self.key(now, rows),
-                false => self.ticked(now, LOG_COLS, rows, true),
+                false => {
+                    // The haiku at the top, in the blank the log leaves.
+                    let mut column = self.ticked(now, LOG_COLS, rows, true);
+                    for (row, line) in self.haiku(now).into_iter().enumerate() {
+                        if column.get(row).is_some_and(|blank| blank.spans.is_empty()) {
+                            column[row] = line;
+                        }
+                    }
+                    column
+                }
             };
             for (row, mut line) in drawn.into_iter().enumerate() {
                 line.spans.push(Span::raw(" ".repeat(GAP)));
@@ -1996,7 +3037,7 @@ impl View {
         if !self.zen {
             lines.push(Line::default());
             lines.extend(match self.legend {
-                true => legend(false),
+                true => self.legend_under(cols),
                 false => self.ticked(now, cols, TICKER, false),
             });
         }
@@ -2154,10 +3195,20 @@ impl View {
                 Span::styled("⠁⠈", Ink::Muted.style()),
                 vec![says("  who made whom, who talked")],
             ),
+            row(
+                Span::raw("⡇").fg(NEEDS),
+                vec![says("   the cord, down to who pulled it")],
+            ),
+            row(
+                Span::styled("⠒", Ink::Muted.style()),
+                vec![says("   a schedule, lit as it nears")],
+            ),
             Line::default(),
             Line::from(says("now")),
             Line::default(),
         ]);
+        // The legend's marks, between its title and what is now.
+        let marks = lines.len() - 5;
         let shown: Vec<&Agent> = self.agents.iter().filter(|a| !a.gone).collect();
         let leads = shown.iter().filter(|a| project::is_lead(&a.name)).count();
         let projects: HashSet<&str> = (shown.iter())
@@ -2172,11 +3223,8 @@ impl View {
         let calls = (self.calls.iter())
             .filter(|at| now.duration_since(**at) <= minute)
             .count();
-        let mut pairs: HashMap<(usize, usize), usize> = HashMap::new();
-        for &(_, by, to) in &self.said {
-            *pairs.entry((by.min(to), by.max(to))).or_default() += 1;
-        }
-        let busiest = (pairs.into_iter())
+        let busiest = (self.pairs.iter())
+            .map(|(&pair, &n)| (pair, n))
             .filter(|((a, b), _)| !self.agents[*a].gone && !self.agents[*b].gone)
             .max_by_key(|&((a, b), n)| (n, std::cmp::Reverse((a, b))))
             .map(|((a, b), _)| format!("{} ⇄ {}", self.short(a), self.short(b)));
@@ -2197,21 +3245,76 @@ impl View {
         if let Some(busiest) = busiest {
             stat("busiest pair", busiest);
         }
+        for (n, next) in self.next_up().into_iter().enumerate() {
+            stat(if n == 0 { "next up" } else { "" }, next);
+        }
+        // Short of rows, the legend's last rows give way, not what is now.
+        if let Some(over) = lines.len().checked_sub(rows).filter(|&over| over > 0) {
+            let over = over.min(marks);
+            lines.drain(2 + marks - over..2 + marks);
+        }
         lines.truncate(rows);
+        lines
+    }
+
+    /// The next three schedules to fire, soonest first, then those that
+    /// watch a file or a repository.
+    fn next_up(&self) -> Vec<String> {
+        let wall = wall_ms() / 1000;
+        (self.schedules.iter().filter(|u| keeps_time(u)).take(3))
+            .map(|upcoming| {
+                let who = self
+                    .agent(&upcoming.bot)
+                    .map_or(short(&upcoming.bot), |at| self.short(at));
+                match upcoming.next {
+                    Some(next) => format!("{who} {}", until(next - wall)),
+                    // A watch: a file's or a repository's change.
+                    None => format!("{who} on change"),
+                }
+            })
+            .collect()
+    }
+
+    /// The legend under the sky, with a row for schedules and what is next
+    /// up.
+    fn legend_under(&self, cols: usize) -> Vec<Line<'static>> {
+        let says = |text: &str| Span::raw(text.to_owned()).dim();
+        let mut lines = legend(false);
+        let mut row = vec![
+            Span::styled("⠒", Ink::Muted.style()),
+            says(" a schedule, lit as it nears"),
+        ];
+        let next = self.next_up();
+        if !next.is_empty() {
+            row.extend([says("   next up "), Span::raw(next.join(" · "))]);
+        }
+        let mut width = 0;
+        let row: Vec<Span<'static>> = (row.into_iter())
+            .map_while(|span| {
+                let room = cols.saturating_sub(width);
+                (room > 0).then(|| {
+                    let text = cut(&span.content, room);
+                    width += text.width();
+                    Span::styled(text, span.style)
+                })
+            })
+            .collect();
+        lines.push(Line::from(row));
+        lines.truncate(LEGEND);
         lines
     }
 
     /// Each model's colour on `m`: the most agents' first, then by name,
     /// a hue each while they last; the rest share the text's.
     fn hues(&self) -> Vec<(String, Color)> {
-        let mut models: HashMap<&str, usize> = HashMap::new();
+        let mut models: HashMap<String, usize> = HashMap::new();
         for agent in self.agents.iter().filter(|a| !a.gone) {
             *models.entry(agent.model_or_unknown()).or_default() += 1;
         }
-        let mut models: Vec<(&str, usize)> = models.into_iter().collect();
-        models.sort_by_key(|&(model, n)| (std::cmp::Reverse(n), model));
+        let mut models: Vec<(String, usize)> = models.into_iter().collect();
+        models.sort_by(|(a, n), (b, m)| m.cmp(n).then_with(|| a.cmp(b)));
         (models.into_iter())
-            .map(|(model, _)| model.to_owned())
+            .map(|(model, _)| model)
             .zip(
                 MODEL_HUES
                     .iter()
@@ -2229,7 +3332,29 @@ impl View {
                 let angle = self.agents[at].angle;
                 (1.05 * angle.cos(), 1.05 * angle.sin())
             }
+            End::Tick(at) => self.tick(at, 0.07),
         }
+    }
+
+    /// Where an agent's tick is on this canvas: outward, or, where the
+    /// canvas's edge would cut it off, the same way inward.
+    fn tick_on(&self, sky: &Sky, at: usize, past: f32) -> (f32, f32) {
+        match sky.holds(self.tick(at, 0.09)) {
+            true => self.tick(at, past),
+            false => self.tick(at, -past),
+        }
+    }
+
+    /// A point on the line out from the middle through an agent, this far
+    /// past its star: where its schedule's tick is drawn.
+    fn tick(&self, at: usize, past: f32) -> (f32, f32) {
+        let (x, y) = self.agents[at].at;
+        let r = x.hypot(y);
+        if r < 1e-3 {
+            let angle = self.agents[at].angle;
+            return (past * angle.cos(), past * angle.sin());
+        }
+        (x + past * x / r, y + past * y / r)
     }
 
     /// The agents as a list where the sky has no room: the tree's order,
@@ -2324,9 +3449,37 @@ impl View {
             ))
             .dim(),
         ];
-        // On `m`, which colour is which model, as many as fit.
+        // The cord, while it hangs: by whom and how long, before anything
+        // else is counted; why, at the end, as far as it fits.
+        let hanging = self.cord.as_ref().filter(|cord| cord.lifted.is_none());
+        if let Some(cord) = hanging {
+            let mut said = format!(" paused by {}", self.called(&cord.by));
+            if let Some(at) = cord.at_ms {
+                let stood = Duration::from_millis((wall_ms() - at).max(0) as u64);
+                said.push_str(&format!(", {}", span(stood)));
+            }
+            spans.push(Span::raw(" · ").dim());
+            spans.push(Span::raw("■").fg(NEEDS));
+            spans.push(Span::raw(said).fg(NEEDS));
+        }
+        // On `m`, which colour is which model, as many as fit: by name
+        // alone, as the footer names it, and with its provider where two
+        // providers serve one model.
         if self.models {
-            for (model, hue) in self.hues() {
+            let hues = self.hues();
+            let names: HashMap<String, String> = (self.agents.iter())
+                .filter(|a| !a.model.is_empty())
+                .map(|a| (a.model_or_unknown(), crate::models::label(&a.model)))
+                .collect();
+            let named: Vec<String> = (hues.iter())
+                .map(|(key, _)| names.get(key).unwrap_or(key).clone())
+                .collect();
+            for ((key, hue), short) in hues.iter().zip(&named) {
+                let model = match named.iter().filter(|n| *n == short).count() {
+                    1 => short,
+                    _ => key,
+                };
+                let hue = *hue;
                 let key = format!(" ⠛ {model}");
                 let used: usize = spans.iter().map(|span| span.content.width()).sum();
                 if used + 3 + key.width() > width {
@@ -2371,8 +3524,15 @@ impl View {
         );
         // The states first: the messages' count goes where it won't fit.
         let used: usize = spans.iter().map(|span| span.content.width()).sum();
-        if used + sent.width() <= width {
+        if used + sent.width() <= width && hanging.is_none() {
             spans.push(Span::raw(sent).dim());
+        }
+        if let Some(cord) = hanging.filter(|cord| !cord.reason.is_empty()) {
+            let used: usize = spans.iter().map(|span| span.content.width()).sum();
+            let room = width.saturating_sub(used + 3);
+            if room >= 8 {
+                spans.push(Span::raw(format!(" · {}", cut(&cord.reason, room))).dim());
+            }
         }
         Line::from(spans)
     }
@@ -2570,6 +3730,18 @@ fn wrapped(text: &str, room: usize) -> Vec<String> {
         }
     }
     lines
+}
+
+/// How long something lasted, as the chat log says it: `40s`, `12m`,
+/// `2h 5m`.
+fn span(lasted: Duration) -> String {
+    let s = lasted.as_secs();
+    match s {
+        0..=59 => format!("{s}s"),
+        60..=3599 => format!("{}m", s / 60),
+        _ if s % 3600 < 60 => format!("{}h", s / 3600),
+        _ => format!("{}h {}m", s / 3600, s % 3600 / 60),
+    }
 }
 
 /// Words cut to `room` columns, an ellipsis saying so.
@@ -2922,6 +4094,13 @@ impl Sky {
         }
     }
 
+    /// Whether a point falls on the canvas.
+    fn holds(&self, at: (f32, f32)) -> bool {
+        let (x, y) = self.spot(at);
+        let (w, h) = (self.cols as f32 * 2.0, self.rows as f32 * 4.0);
+        (0.0..w).contains(&x) && (0.0..h).contains(&y)
+    }
+
     fn dot(&mut self, at: (f32, f32), ink: Ink) {
         let (x, y) = self.spot(at);
         self.plot(x, y, ink);
@@ -2973,6 +4152,43 @@ impl Sky {
         for step in 0..steps {
             let a = TAU * step as f32 / steps as f32;
             self.plot(x + r * a.cos(), y + r * a.sin(), ink);
+        }
+    }
+
+    /// A ring of `r` braille dots as wide as the sky: a dot every dot and a
+    /// half of its length however wide, where a mark's ring thins out.
+    fn wave(&mut self, at: (f32, f32), r: f32, ink: Ink) {
+        let (x, y) = self.spot(at);
+        let steps = (TAU * r / 1.5).clamp(8.0, 4096.0) as usize;
+        for step in 0..steps {
+            let a = TAU * step as f32 / steps as f32;
+            self.plot(x + r * a.cos(), y + r * a.sin(), ink);
+        }
+    }
+
+    /// Dots from a point to the canvas's farthest corner: how far a ring
+    /// from it goes to cross the whole sky.
+    fn reach(&self, at: (f32, f32)) -> f32 {
+        let (x, y) = self.spot(at);
+        let (w, h) = (self.cols as f32 * 2.0, self.rows as f32 * 4.0);
+        (x.max(w - x)).hypot(y.max(h - y))
+    }
+
+    /// Dots between two points.
+    fn apart(&self, a: (f32, f32), b: (f32, f32)) -> f32 {
+        let ((ax, ay), (bx, by)) = (self.spot(a), self.spot(b));
+        (ax - bx).hypot(ay - by)
+    }
+
+    /// The cord: every `gap`th dot straight down from the canvas's top,
+    /// `share` of the way to a point and `past` dots beyond.
+    fn rope(&mut self, rope: Rope) {
+        let (x, y) = self.spot(rope.to);
+        let end = y * rope.share.clamp(0.0, 1.0) + rope.past;
+        let mut down = 0.0;
+        while down <= end {
+            self.plot(x, down, rope.ink);
+            down += rope.gap.max(1) as f32;
         }
     }
 
@@ -3078,6 +4294,30 @@ impl Sky {
     /// Words put at a place in a row, a blank cell kept either side and
     /// a blank row above and below, so names never run together or
     /// stack into a column; false when they don't fit there.
+    /// `line` from `start` on `row`, whatever is near: what the person
+    /// reads over the sky, clear of the dots under it and either side.
+    fn inscribe(&mut self, row: usize, start: usize, line: &Line) {
+        if row >= self.rows {
+            return;
+        }
+        let mut col = start;
+        for span in &line.spans {
+            let style = line.style.patch(span.style);
+            for ch in span.content.chars() {
+                if col >= self.cols {
+                    return;
+                }
+                self.text[row * self.cols + col] = (ch != ' ').then_some((ch, style));
+                self.dots[row * self.cols + col] = 0;
+                col += 1;
+            }
+        }
+        let sides = [start.checked_sub(1), Some(col).filter(|&c| c < self.cols)];
+        for col in sides.into_iter().flatten() {
+            self.dots[row * self.cols + col] = 0;
+        }
+    }
+
     fn put(&mut self, row: usize, start: usize, words: &str, style: Style) -> bool {
         let count = words.chars().count();
         if start + count > self.cols {
@@ -3285,6 +4525,23 @@ async fn follow(socket: PathBuf, send: mpsc::UnboundedSender<Feed>) {
             return;
         }
     };
+    // Whose triggers are the sky's: its daemon's store's.
+    if let Some(store) = client.store()
+        && send.send(Feed::Store(store.to_owned())).is_err()
+    {
+        return;
+    }
+    // A cord already pulled when the sky opens hangs, without its drop;
+    // `paused` and `resumed` notices tell of what comes after.
+    if !client.paused().is_null()
+        && send
+            .send(Feed::Past(
+                json!({"event": "paused", "pause": client.paused()}),
+            ))
+            .is_err()
+    {
+        return;
+    }
     if !roll(&client, &send).await {
         return;
     }
@@ -3407,16 +4664,104 @@ fn slim(mut event: Value) -> Value {
         && event["data"]["name"] != "commons"
         && let Some(data) = event["data"].as_object_mut()
     {
-        data.remove("arguments");
+        // A schedule's call keeps what the sky tells of it: for whom, how
+        // often, its name; not its message.
+        let kept = (data.get("name") == Some(&json!(crate::served::TRIGGERS)))
+            .then(|| data.get("arguments").and_then(Value::as_str))
+            .flatten()
+            .and_then(|text| serde_json::from_str::<Value>(text).ok())
+            .and_then(|call| {
+                let add = call.get("add")?.as_object()?;
+                let keys = ["name", "bot", "every", "in", "at", "cron", "file", "commit"];
+                let mut kept: serde_json::Map<String, Value> = (add.iter())
+                    .filter(|(key, _)| keys.contains(&key.as_str()))
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect();
+                if let Some(start) = add.get("start").and_then(|start| start.get("name")) {
+                    kept.insert("start".into(), json!({"name": start}));
+                }
+                Some(json!({"add": kept}).to_string())
+            });
+        match kept {
+            Some(kept) => data.insert("arguments".into(), json!(kept)),
+            None => data.remove("arguments"),
+        };
     }
     event
+}
+
+/// The schedule a `triggers` call by `by` asks for, from its arguments, a
+/// JSON preview: for whom (`by` when no other), how it was asked for, as
+/// a trigger's `when` says it, and its name. None for any other call, or
+/// one cut too short to read.
+fn booking(arguments: &Value, by: &str) -> Option<Booking> {
+    let call = serde_json::from_str::<Value>(arguments.as_str()?).ok()?;
+    let add = call.get("add")?.as_object()?;
+    let text = |key: &str| add.get(key).and_then(Value::as_str);
+    let bot = (text("bot"))
+        .or_else(|| add.get("start")?.get("name")?.as_str())
+        .unwrap_or(by)
+        .to_owned();
+    let when = match ["every", "in", "at", "cron"]
+        .iter()
+        .find_map(|k| Some((k, text(k)?)))
+    {
+        Some((kind, value)) => format!("{kind} {value}"),
+        None if text("file").is_some() => "file".into(),
+        None if text("commit").is_some() => "commit".into(),
+        None => "fire".into(),
+    };
+    Some(Booking {
+        name: text("name").unwrap_or(&bot).to_owned(),
+        bot,
+        when,
+    })
+}
+
+/// How a schedule fires, as the chat log tells it: `every 30m`, `in 2h`,
+/// `on a file change`; never the path or the command.
+fn said_when(when: &str) -> String {
+    let (kind, value) = when.split_once(' ').unwrap_or((when, ""));
+    match kind {
+        "every" | "in" | "at" => format!("{kind} {value}"),
+        "cron" => "on a cron".into(),
+        "file" => "on a file change".into(),
+        "commit" => "on each commit".into(),
+        _ => "to run by hand".into(),
+    }
+}
+
+/// Whether a schedule has a time to come or a watch kept: not a one-off
+/// whose time went, nor one only run by hand.
+fn keeps_time(upcoming: &crate::trigger::Upcoming) -> bool {
+    upcoming.next.is_some()
+        || ["file ", "commit "]
+            .iter()
+            .any(|kind| upcoming.when.starts_with(kind))
+}
+
+/// How long until `secs` from now, as the legend's next up says it.
+fn until(secs: i64) -> String {
+    match secs.max(0) {
+        s if s < 60 => "now".into(),
+        s if s < 90 * 60 => format!("in {}m", s.div_euclid(60).max(1)),
+        s if s < 36 * 3600 => format!("in {}h", (s + 1800).div_euclid(3600)),
+        s => format!("in {}d", (s + 43_200).div_euclid(86_400)),
+    }
+}
+
+/// A pair of agents as `pairs` keys it: either way round, one key.
+fn pair(a: usize, b: usize) -> (usize, usize) {
+    (a.min(b), a.max(b))
 }
 
 /// An event of a replay's connection onto its tape; false once the sky
 /// or the daemon has gone.
 async fn taped(client: &Client, event: Value, send: &mpsc::UnboundedSender<Feed>) -> bool {
     let sent = match event["event"].as_str() {
-        Some("pruned") => return true,
+        // A pause's notices tell of now, not of the past a replay plays,
+        // and are no events to seek through: a replay leaves the cord out.
+        Some("pruned" | "paused" | "resumed") => return true,
         // As live: a new model is read again, for `m`.
         Some("configured") => match configured(client, &event).await {
             Some(model) => send.send(model),
@@ -3437,6 +4782,17 @@ async fn taped(client: &Client, event: Value, send: &mpsc::UnboundedSender<Feed>
 /// A replay's connection: every agent here now, then every event written
 /// since `from` (Unix ms), the past as one tape, then what follows live.
 async fn tape(socket: PathBuf, from: i64, send: mpsc::UnboundedSender<Feed>) {
+    match prior(&socket, from).await {
+        Ok(prior) => {
+            if send.send(Feed::Prior(prior)).is_err() {
+                return;
+            }
+        }
+        Err(error) => {
+            let _ = send.send(Feed::Down(error));
+            return;
+        }
+    }
     let (client, mut events) = match Client::connect(&socket).await {
         Ok(connected) => connected,
         Err(error) => {
@@ -3482,6 +4838,30 @@ async fn tape(socket: PathBuf, from: i64, send: mpsc::UnboundedSender<Feed>) {
         }
     }
     let _ = send.send(Feed::Down("the daemon closed the connection".into()));
+}
+
+/// Who told whom before `from` (Unix ms), from the turns kept, as live
+/// reads them: on a connection of its own, closed once read, so nothing
+/// it brings mixes into the tape's.
+async fn prior(socket: &std::path::Path, from: i64) -> Result<Prior, String> {
+    let (client, mut events) = Client::connect(socket).await.map_err(|e| e.to_string())?;
+    client
+        .request(
+            "follow",
+            json!({"bot": "*", "after": 0, "kinds": ["accepted", "steered"]}),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut prior = Prior::default();
+    while let Some(event) = events.recv().await {
+        match event["event"].as_str() {
+            Some("follow_live") => return Ok(prior),
+            Some("lagged" | "follow_lagged") => return Err("fell behind the daemon".into()),
+            _ if event["written_ms"].as_i64().is_some_and(|at| at < from) => prior.keep(&event),
+            _ => {}
+        }
+    }
+    Err("the daemon closed the connection".into())
 }
 
 /// Every agent the daemon keeps, page after page, as one roll; false when
@@ -3559,6 +4939,166 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    fn cord_sky() -> (View, mpsc::UnboundedSender<Feed>) {
+        let (mut view, send) = view();
+        send.send(Feed::Roll(vec![
+            json!({"name": "shop.lead", "running_turn": 3}),
+            json!({"name": "shop.pricing", "created_by": "shop.lead", "running_turn": 4}),
+            json!({"name": "shop.search", "created_by": "shop.lead"}),
+        ]))
+        .unwrap();
+        send.send(Feed::Ready).unwrap();
+        view.drain();
+        (view, send)
+    }
+
+    #[tokio::test]
+    async fn sonny_sky_drops_the_cord_on_whoever_pulled_it_and_hangs_it_there() {
+        let (mut view, send) = cord_sky();
+        let pause = json!({"reason": "the deploy is about to touch prod", "by": "shop.pricing",
+            "at_ms": wall_ms() - 90_000});
+        send.send(Feed::Live(
+            json!({"event": "paused", "pause": pause, "durable": false}),
+        ))
+        .unwrap();
+        view.drain();
+        // Who pulled it, and why, in the log in the cord's colour.
+        let note = view.ticker.back().unwrap();
+        assert_eq!(
+            note.text,
+            "■ pricing pulled the cord: the deploy is about to touch prod"
+        );
+        assert_eq!(note.hue, Some(NEEDS));
+        assert_eq!(note.about, vec!["shop.pricing".to_owned()]);
+        // The footer says by whom and how long, and why where it fits.
+        let footer = text(&[view.footer(120)]);
+        assert!(footer.contains("■ paused by pricing, 1m"), "{footer}");
+        assert!(
+            footer.contains("the deploy is about to touch prod"),
+            "{footer}"
+        );
+        // The cord drops on its puller, in its colour, and the stop rings
+        // out from there; the puller's name is drawn in it too.
+        let sky = Sky::new(60, 30);
+        let pricing = view.agent("shop.pricing").unwrap();
+        let at = Instant::now() + CORD_DROP + CORD_TUG + Duration::from_millis(400);
+        let frame = view.cord_frame(&sky, at).unwrap();
+        assert_eq!(frame.puller, Some(End::Agent(pricing)));
+        assert_eq!(frame.rope.unwrap().to, view.agents[pricing].at);
+        assert!(!frame.rings.is_empty());
+        let card = view.card(100, 40);
+        let yellow = (card.iter().flat_map(|line| &line.spans))
+            .any(|span| span.content.contains("pricing") && span.style.fg == Some(NEEDS));
+        assert!(yellow, "{}", text(&card));
+        // Once rung out, it hangs, the whole sky still and no rings.
+        let later = Instant::now() + Duration::from_secs(10);
+        let frame = view.cord_frame(&sky, later).unwrap();
+        assert!(frame.rings.is_empty());
+        assert_eq!(frame.rope.unwrap().ink, Ink::Color(NEEDS, false));
+        let search = view.agents[view.agent("shop.search").unwrap()].at;
+        assert!(View::stilled(Some(&frame), &sky, search));
+    }
+
+    #[tokio::test]
+    async fn sonny_sky_keeps_a_star_for_whoever_pulled_or_resumed_a_crowded_sky() {
+        let (mut view, send) = view();
+        let mut bots = vec![json!({"name": "shop.lead"})];
+        for n in 0..40 {
+            bots.push(json!({"name": format!("shop.a{n}"), "created_by": "shop.lead"}));
+        }
+        send.send(Feed::Roll(bots)).unwrap();
+        send.send(Feed::Ready).unwrap();
+        let pause = json!({"reason": "look", "by": "shop.a17", "at_ms": wall_ms()});
+        send.send(Feed::Live(json!({"event": "paused", "pause": pause})))
+            .unwrap();
+        send.send(Feed::Live(
+            json!({"event": "resumed", "pause": pause, "by": "shop.a29"}),
+        ))
+        .unwrap();
+        view.drain();
+        let ends = view.cord_ends();
+        let (a17, a29) = (view.agent("shop.a17"), view.agent("shop.a29"));
+        assert_eq!(ends, [a17, a29]);
+        // Idle, both would fold into the cloud; the cord keeps them stars.
+        let shown = view.shown(Instant::now(), 8, &ends);
+        assert!(shown[a17.unwrap()] && shown[a29.unwrap()]);
+        assert!(shown.iter().filter(|&&star| star).count() <= 10);
+    }
+
+    #[tokio::test]
+    async fn sonny_sky_shows_the_person_pulling_the_cord_and_one_already_hanging() {
+        let (mut view, send) = cord_sky();
+        // A pause the sky opened on hangs from the person, with no drop
+        // and nothing said: it happened before.
+        send.send(Feed::Past(json!({"event": "paused",
+            "pause": {"reason": "lunch", "by": null, "at_ms": wall_ms()}})))
+            .unwrap();
+        view.drain();
+        assert!(view.ticker.is_empty());
+        let sky = Sky::new(60, 30);
+        let frame = view.cord_frame(&sky, Instant::now()).unwrap();
+        assert_eq!(frame.puller, Some(End::Person));
+        assert!(frame.rings.is_empty());
+        assert!(text(&[view.footer(120)]).contains("paused by you"));
+        // "you", in the cord's colour.
+        let card = view.card(100, 40);
+        let you = (card.iter().flat_map(|line| &line.spans))
+            .any(|span| span.content.contains("you") && span.style.fg == Some(NEEDS));
+        assert!(you, "{}", text(&card));
+        // Pulled live by the person: said so.
+        send.send(Feed::Live(json!({"event": "paused",
+            "pause": {"reason": "", "by": null, "at_ms": wall_ms()}})))
+            .unwrap();
+        view.drain();
+        assert_eq!(view.ticker.back().unwrap().text, "■ you pulled the cord");
+    }
+
+    #[tokio::test]
+    async fn sonny_sky_draws_the_cord_up_and_wakes_the_sky_from_whoever_resumed() {
+        let (mut view, send) = cord_sky();
+        let pause = json!({"reason": "look", "by": "shop.pricing", "at_ms": wall_ms() - 252_000});
+        send.send(Feed::Live(json!({"event": "paused", "pause": pause})))
+            .unwrap();
+        view.drain();
+        send.send(Feed::Live(
+            json!({"event": "resumed", "pause": pause, "by": "shop.lead"}),
+        ))
+        .unwrap();
+        view.drain();
+        assert_eq!(
+            view.ticker.back().unwrap().text,
+            "▶ shop lead resumed, after 4m"
+        );
+        // The footer lets go of it at once; the start rings out from the
+        // one who resumed, waking the sky as it goes.
+        assert!(!text(&[view.footer(120)]).contains("paused"));
+        let sky = Sky::new(60, 30);
+        let lead = view.agent("shop.lead").unwrap();
+        let frame = view
+            .cord_frame(&sky, Instant::now() + Duration::from_millis(400))
+            .unwrap();
+        assert_eq!(frame.resumer, Some(End::Agent(lead)));
+        assert_eq!(frame.puller, None);
+        assert!(!frame.rings.is_empty());
+        let (from, front, inside) = frame.front.unwrap();
+        assert_eq!((from, inside), (view.agents[lead].at, false));
+        assert!(!View::stilled(Some(&frame), &sky, view.agents[lead].at));
+        assert!(front < sky.reach(from));
+        // Once rung out, the cord is gone.
+        view.sweep_cord(Instant::now() + Duration::from_secs(5));
+        assert!(view.cord.is_none());
+        // A resume by the person, of a pause the sky never saw, still
+        // rings out, from the middle.
+        send.send(Feed::Live(
+            json!({"event": "resumed", "pause": null, "by": null}),
+        ))
+        .unwrap();
+        view.drain();
+        assert_eq!(view.ticker.back().unwrap().text, "▶ you resumed");
+        let frame = view.cord_frame(&sky, Instant::now()).unwrap();
+        assert_eq!(frame.resumer, Some(End::Person));
     }
 
     #[tokio::test]
@@ -3712,6 +5252,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_model_key_names_models_and_a_provider_where_two_serve_one() {
+        use ratatui::crossterm::event::KeyCode;
+        let (mut view, send) = view();
+        send.send(Feed::Roll(vec![
+            json!({"name": "a.lead", "model": "bedrock/us.anthropic.claude-opus-5-5-v1:0"}),
+            json!({"name": "b.lead", "model": "bedrock/global.anthropic.claude-opus-5-5-v1:0"}),
+            json!({"name": "c.lead", "model": "anthropic/claude-opus-5-5"}),
+            json!({"name": "d.lead", "model": "chatgpt/gpt-6.1-sol"}),
+        ]))
+        .unwrap();
+        view.drain();
+        view.card(160, 40);
+        assert!(view.press(KeyCode::Char('m')));
+        // Two Bedrock regions' ids of one model share a colour.
+        assert_eq!(view.hues().len(), 3);
+        let footer = view.footer(160).to_string();
+        assert!(
+            footer.contains("⠛ Opus 5.5 · bedrock")
+                && footer.contains("⠛ Opus 5.5 · anthropic")
+                && footer.contains("⠛ GPT 6.1 Sol")
+                && !footer.contains("chatgpt"),
+            "{footer}"
+        );
+    }
+
+    #[tokio::test]
     async fn a_centred_agent_sits_in_the_middle_with_rings_by_hops() {
         use ratatui::crossterm::event::KeyCode;
         let (mut view, send) = view();
@@ -3857,6 +5423,314 @@ mod tests {
         assert!(!view.replaying());
     }
 
+    #[tokio::test]
+    async fn a_replay_draws_who_had_talked_before_it_and_the_haiku_up_then() {
+        let (mut view, send) = view();
+        let from = wall_ms() - 2 * 3_600_000;
+        view.replay = Some(Replay::new(from));
+        send.send(Feed::Roll(vec![
+            json!({"name": "shop.lead"}),
+            json!({"name": "shop.login", "created_by": "shop.lead"}),
+            json!({"name": "shop.cart", "created_by": "shop.lead"}),
+        ]))
+        .unwrap();
+        let said = |ago: i64, to: &str| {
+            json!({"event": "accepted", "bot": to, "turn": 1, "written_ms": from - ago,
+                "data": {"from": {"bot": "shop.lead", "turn": 1}, "prompt": "go"}})
+        };
+        let mut prior = Prior::default();
+        prior.keep(&said(3 * 3_600_000, "shop.cart"));
+        prior.keep(&said(2 * 3_600_000, "shop.login"));
+        // The person's own prompt draws no pair; the cart's later word is
+        // its pair's one message, and within the hour before, it weighs.
+        prior.keep(
+            &json!({"event": "accepted", "bot": "shop.login", "written_ms": from,
+            "data": {}}),
+        );
+        prior.keep(&said(600_000, "shop.cart"));
+        assert_eq!(prior.told.len(), 2);
+        assert!(prior.told.values().all(|e| e["data"]["prompt"].is_null()));
+        send.send(Feed::Prior(prior)).unwrap();
+        // The day's haikus as the file keeps them.
+        let lines = |first: &str| vec![first.to_owned(), "b".into(), "c".into()];
+        let poem = |by: &str, at: i64, first: &str| haiku::Poem {
+            by: by.into(),
+            lines: lines(first),
+            at_ms: at,
+            since_ms: at - 300_000,
+        };
+        haiku::Kept::update(&view.store, &view.socket, |kept| {
+            kept.past = vec![
+                poem("shop.cart", from - 2 * 3_600_000, "old"),
+                poem("shop.lead", from + 1_800_000, "dawn"),
+            ];
+        });
+        send.send(Feed::Ready).unwrap();
+        view.drain();
+        // The web of who had talked is there from the first frame, as live.
+        let (lead, login, cart) = (
+            view.index["shop.lead"],
+            view.index["shop.login"],
+            view.index["shop.cart"],
+        );
+        assert_eq!(view.talks, [(lead, login), (lead, cart)]);
+        assert_eq!(view.pairs, HashMap::from([(pair(lead, cart), 1)]));
+        assert!(view.ticker.is_empty());
+        // The haiku up at the replay's time shows, as it did then; none
+        // before it was written, nor an hour after. Read off the drawing
+        // thread, and heard back.
+        while view.reading {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            view.drain();
+        }
+        assert_eq!(view.replay.as_ref().unwrap().poems.len(), 2);
+        assert!(view.verse.is_none());
+        view.seek(from as f64 + 1_860_000.0, Instant::now());
+        view.drain();
+        let verse = view.verse.as_mut().expect("the haiku up then");
+        assert_eq!(
+            (verse.by.as_str(), &verse.lines),
+            ("shop.lead", &lines("dawn"))
+        );
+        let shown = text(&view.haiku(Instant::now()));
+        assert!(shown.contains("busiest for 5m"), "{shown}");
+        view.seek(from as f64 + 5_500_000.0, Instant::now());
+        view.drain();
+        assert!(view.verse.is_none() && view.fading.is_some());
+        // Back to before it: it shows again when its time comes.
+        view.seek(from as f64 + 1_900_000.0, Instant::now());
+        view.drain();
+        assert_eq!(view.verse.as_ref().unwrap().lines, lines("dawn"));
+        // It streams in on the replay's clock: just begun as the replay
+        // reaches it, held still while paused, signed seconds of the
+        // replay's time on, however fast it plays.
+        view.seek(from as f64 + 1_800_001.0, Instant::now());
+        view.drain();
+        let begun = text(&view.haiku(Instant::now()));
+        assert!(
+            begun.contains("dawn") && !begun.contains("busiest"),
+            "{begun}"
+        );
+        view.replay.as_mut().unwrap().playing = false;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        view.drain();
+        assert_eq!(text(&view.haiku(Instant::now())), begun);
+        view.seek(from as f64 + 1_815_000.0, Instant::now());
+        view.drain();
+        assert!(text(&view.haiku(Instant::now())).contains("busiest for 5m"));
+        // One another sky writes while the replay plays is read as it goes,
+        // and shows when the replay reaches it.
+        haiku::Kept::update(&view.store, &view.socket, |kept| {
+            kept.past.push(poem("shop.cart", from + 5_700_000, "late"));
+        });
+        view.weighed = None;
+        view.drain();
+        while view.reading {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            view.drain();
+        }
+        view.seek(from as f64 + 5_800_000.0, Instant::now());
+        view.drain();
+        assert_eq!(view.verse.as_ref().unwrap().lines, lines("late"));
+    }
+
+    #[test]
+    fn a_replay_keeps_a_message_for_each_pair_before_it_and_no_more_than_its_bound() {
+        let mut prior = Prior::default();
+        for n in 0..PRIOR + 5 {
+            prior.keep(&json!({"event": "steered", "bot": format!("a{n}"),
+                "written_ms": n, "data": {"from": {"bot": "lead"}}}));
+        }
+        assert_eq!((prior.told.len(), prior.pairs.len()), (PRIOR, PRIOR));
+        assert_eq!(prior.told.values().next().unwrap()["bot"], "a5");
+        // What goes off the tape's start joins it.
+        let mut replay = Replay::new(0);
+        replay.keep(json!({"event": "accepted", "bot": "b", "written_ms": 0,
+            "data": {"from": {"bot": "lead"}}}));
+        for at in 1..=TAPE as i64 {
+            replay.keep(json!({"event": "queued", "written_ms": at}));
+        }
+        assert_eq!(replay.prior.told.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_schedule_made_sparks_to_its_tick_and_the_legend_says_what_is_next() {
+        let (mut view, send) = view();
+        send.send(Feed::Roll(vec![
+            json!({"name": "shop.lead"}),
+            json!({"name": "shop.login", "created_by": "shop.lead"}),
+        ]))
+        .unwrap();
+        send.send(Feed::Ready).unwrap();
+        view.drain();
+        view.heard.0.send(Heard::Schedules(Vec::new())).unwrap();
+        let live = |kind: &str, data: Value| {
+            Feed::Live(json!({"event": kind, "bot": "shop.lead", "turn": 1, "data": data}))
+        };
+        let add = |call: &str, add: Value| {
+            let arguments = json!({"add": add}).to_string();
+            live(
+                "tool_started",
+                json!({"name": "triggers", "call_id": call, "arguments": arguments}),
+            )
+        };
+        send.send(add(
+            "c1",
+            json!({"bot": "shop.login", "every": "30m", "name": "login-ci", "message": "check CI"}),
+        ))
+        .unwrap();
+        // One the tool refuses is told of not at all.
+        send.send(add("c2", json!({"in": "5m", "message": "x"})))
+            .unwrap();
+        view.drain();
+        assert!(view.ticker.is_empty());
+        send.send(live(
+            "tool_completed",
+            json!({"call_id": "c2", "failed": true}),
+        ))
+        .unwrap();
+        // A call id is unique only within its turn: another agent's call
+        // of the same id, or this agent's in another turn, is not this one.
+        send.send(Feed::Live(
+            json!({"event": "tool_completed", "bot": "shop.login",
+            "turn": 1, "data": {"call_id": "c1"}}),
+        ))
+        .unwrap();
+        send.send(Feed::Live(
+            json!({"event": "tool_completed", "bot": "shop.lead",
+            "turn": 2, "data": {"call_id": "c1"}}),
+        ))
+        .unwrap();
+        view.drain();
+        assert!(view.ticker.is_empty());
+        send.send(live("tool_completed", json!({"call_id": "c1"})))
+            .unwrap();
+        view.drain();
+        let logged: Vec<&str> = view.ticker.iter().map(|n| n.text.as_str()).collect();
+        assert_eq!(logged, ["login every 30m, by shop lead"]);
+        let (lead, login) = (view.index["shop.lead"], view.index["shop.login"]);
+        let spark = view.sparks.last().unwrap();
+        assert_eq!((spark.from, spark.to), (End::Agent(lead), End::Tick(login)));
+        // A spark of its own, not a message.
+        assert!(view.recent.is_empty());
+        // Read from the triggers: the one the call made is not told again;
+        // ones made from a shell are, for whom and how, not who made them.
+        let wall = wall_ms() / 1000;
+        let upcoming =
+            |name: &str, bot: &str, when: &str, next: Option<i64>| crate::trigger::Upcoming {
+                name: name.into(),
+                generation: "g1".into(),
+                bot: bot.into(),
+                when: when.into(),
+                next,
+                then: next.map(|next| next + 1800),
+            };
+        let found = vec![
+            upcoming("login-ci", "shop.login", "every 30m", Some(wall + 750)),
+            upcoming(
+                "nightly",
+                "shop.lead",
+                "cron 0 3 * * *",
+                Some(wall + 30_000),
+            ),
+            upcoming("docs", "shop.login", "file /home/a/docs", None),
+            upcoming("gone", "shop.lead", "in 2h", None),
+        ];
+        view.heard.0.send(Heard::Schedules(found)).unwrap();
+        view.drain();
+        let logged: Vec<&str> = view.ticker.iter().map(|n| n.text.as_str()).collect();
+        assert_eq!(
+            logged,
+            [
+                "login every 30m, by shop lead",
+                "shop lead on a cron, new",
+                "login on a file change, new",
+                "shop lead in 2h, new",
+            ]
+        );
+        // What comes next, soonest first; a one-off whose time went, not.
+        let key = text(&view.key(Instant::now(), 60));
+        assert!(key.contains("a schedule, lit as it nears"), "{key}");
+        assert!(key.contains("next up       login in 12m"), "{key}");
+        assert!(key.contains("shop lead in 8h"), "{key}");
+        assert!(key.contains("login on change"), "{key}");
+        assert!(!key.contains("in 2h"), "{key}");
+        // A pane 24 rows tall keeps what is next up; the legend gives way.
+        let short = view.key(Instant::now(), 24);
+        assert_eq!(short.len(), 24);
+        let short = text(&short);
+        assert!(short.contains("next up       login in 12m"), "{short}");
+        assert!(short.starts_with("legend"), "{short}");
+        // Under a narrow sky, the legend's last row says it too.
+        let under = text(&view.legend_under(100));
+        assert!(
+            under.contains("a schedule, lit as it nears   next up login in 12m"),
+            "{under}"
+        );
+        assert!(view.legend_under(100).len() <= LEGEND);
+    }
+
+    #[tokio::test]
+    async fn a_tick_the_canvas_edge_would_cut_points_inward() {
+        let (mut view, send) = view();
+        send.send(Feed::Roll(vec![
+            json!({"name": "shop.lead"}),
+            json!({"name": "shop.login", "created_by": "shop.lead"}),
+        ]))
+        .unwrap();
+        view.drain();
+        let sky = Sky::new(80, 24);
+        let login = view.index["shop.login"];
+        // At the bottom of the rim: outward is off the canvas.
+        view.agents[login].at = (0.0, 1.0);
+        for past in [0.05, 0.07, 0.09] {
+            let (x, y) = view.tick_on(&sky, login, past);
+            assert!(sky.holds((x, y)), "{past}");
+            assert!(x.abs() < 1e-3 && y < 1.0, "{y}");
+        }
+        // Well inside: outward, as on a clock's face.
+        view.agents[login].at = (0.3, 0.0);
+        assert!(view.tick_on(&sky, login, 0.05).0 > 0.3);
+    }
+
+    #[test]
+    fn a_schedule_s_call_keeps_whom_and_how_often_on_the_tape_not_its_message() {
+        let arguments = json!({"add": {"bot": "b", "every": "1h", "message": "secret",
+            "if": "test -f x", "start": {"name": "n", "model": "m"}}})
+        .to_string();
+        let call = json!({"event": "tool_started", "bot": "a", "written_ms": 1,
+            "data": {"name": "triggers", "arguments": arguments}});
+        let kept = slim(call)["data"]["arguments"].as_str().unwrap().to_owned();
+        let kept: Value = serde_json::from_str(&kept).unwrap();
+        assert_eq!(
+            kept,
+            json!({"add": {"bot": "b", "every": "1h", "start": {"name": "n"}}})
+        );
+        let booked = booking(&json!(kept.to_string()), "a").unwrap();
+        assert_eq!(
+            (
+                booked.bot.as_str(),
+                booked.when.as_str(),
+                booked.name.as_str()
+            ),
+            ("b", "every 1h", "b")
+        );
+        // For itself when it names no other; cut short, nothing.
+        let own = booking(&json!(r#"{"add":{"file":"/x","message":"m"}}"#), "a").unwrap();
+        assert_eq!((own.bot.as_str(), own.when.as_str()), ("a", "file"));
+        assert!(booking(&json!(r#"{"add":{"every":"1h","mess"#), "a").is_none());
+        assert_eq!(said_when("commit /repo"), "on each commit");
+        assert_eq!(
+            (until(30), until(750), until(30_000), until(200_000)),
+            (
+                "now".into(),
+                "in 12m".into(),
+                "in 8h".into(),
+                "in 2d".into()
+            )
+        );
+    }
+
     #[test]
     fn a_replay_s_tape_keeps_tool_arguments_only_for_a_commons_post_and_dates_the_unwritten() {
         let call = |name: &str| json!({"event": "tool_started", "bot": "a", "data": {"name": name, "arguments": "{}"}});
@@ -3873,19 +5747,41 @@ mod tests {
     }
 
     #[test]
-    fn a_replay_s_tape_lets_its_oldest_played_tenth_go_past_its_bound() {
+    fn a_replay_s_tape_lets_its_oldest_tenth_go_past_its_bound() {
         let mut replay = Replay::new(0);
         for at in 0..TAPE as i64 {
             replay.keep(json!({"event": "queued", "written_ms": at}));
         }
-        // Nothing played yet: nothing goes.
-        replay.keep(json!({"event": "queued", "written_ms": TAPE}));
-        assert_eq!(replay.tape.len(), TAPE + 1);
         replay.played = TAPE;
-        replay.keep(json!({"event": "queued", "written_ms": TAPE + 1}));
-        assert_eq!(replay.tape.len(), TAPE + 2 - TAPE / 10);
+        replay.keep(json!({"event": "queued", "written_ms": TAPE}));
+        assert_eq!(replay.tape.len(), TAPE + 1 - TAPE / 10);
         assert_eq!(replay.played, TAPE - TAPE / 10);
         assert_eq!(replay.from, (TAPE / 10) as i64);
+        assert!(!replay.cut);
+        // Loading the past, nothing played: twice the bound is kept to it,
+        // the newest of it, and the replay starts where that does.
+        let mut replay = Replay::new(0);
+        for at in 0..2 * TAPE as i64 {
+            replay.keep(json!({"event": "queued", "written_ms": at}));
+        }
+        assert!(replay.tape.len() <= TAPE);
+        assert_eq!(replay.played, 0);
+        assert!(replay.cut);
+        assert!(replay.at >= replay.from as f64);
+        assert_eq!(
+            replay.tape.last().unwrap()["written_ms"],
+            2 * TAPE as i64 - 1
+        );
+        // Paused with a fifth played, twice the bound more stays bound too.
+        let mut replay = Replay::new(0);
+        for at in 0..TAPE as i64 {
+            replay.keep(json!({"event": "queued", "written_ms": at}));
+        }
+        replay.played = TAPE / 5;
+        for at in TAPE as i64..3 * TAPE as i64 {
+            replay.keep(json!({"event": "queued", "written_ms": at}));
+        }
+        assert!(replay.tape.len() <= TAPE);
         // Who was made, or removed, in what went is in the cast now.
         let mut replay = Replay::new(0);
         replay.cast = vec![json!({"name": "old"})];
@@ -3902,6 +5798,74 @@ mod tests {
             .map(|bot| (bot["name"].clone(), bot["bot_id"].clone()))
             .collect();
         assert_eq!(cast, [(json!("new"), json!(9))]);
+    }
+
+    #[tokio::test]
+    async fn the_hour_s_pair_counts_follow_what_was_said() {
+        let (mut view, _send) = view();
+        let now = Instant::now();
+        let long_ago = now - HOUR - Duration::from_secs(1);
+        view.hear(long_ago, 0, 1);
+        view.hear(now, 1, 0);
+        view.hear(now, 2, 1);
+        assert_eq!(view.pairs, HashMap::from([((0, 1), 2), ((1, 2), 1)]));
+        // The hour lets the oldest go: its pair counts one less.
+        view.land(now);
+        assert_eq!(view.pairs, HashMap::from([((0, 1), 1), ((1, 2), 1)]));
+        let counted = |view: &View| {
+            let mut pairs = HashMap::new();
+            for &(_, a, b) in &view.said {
+                *pairs.entry(pair(a, b)).or_default() += 1;
+            }
+            pairs
+        };
+        assert_eq!(view.pairs, counted(&view));
+    }
+
+    #[tokio::test]
+    async fn who_the_tape_let_go_of_stays_in_the_cast_past_the_last_listing() {
+        let (mut view, send) = view();
+        let mut replay = Replay::new(0);
+        // Made at the tape's start, deleted after it: the listing of now
+        // no longer names it.
+        replay.keep(json!({"event": "created", "bot": "shop.x", "data": {"bot_id": 4}}));
+        for at in 0..TAPE as i64 {
+            replay.keep(json!({"event": "queued", "bot": "shop.y", "written_ms": at}));
+        }
+        replay.keep(json!({"event": "deleted", "bot": "shop.x", "written_ms": TAPE}));
+        assert!(replay.folded.iter().any(|bot| bot["name"] == "shop.x"));
+        view.replay = Some(replay);
+        send.send(Feed::Roll(vec![json!({"name": "shop.y", "bot_id": 5})]))
+            .unwrap();
+        view.drain();
+        let cast: Vec<_> = (view.replay.as_ref().unwrap().cast.iter())
+            .map(|bot| bot["name"].clone())
+            .collect();
+        assert_eq!(cast, [json!("shop.y"), json!("shop.x")]);
+    }
+
+    #[tokio::test]
+    async fn who_the_tape_let_go_of_stays_though_its_name_is_used_again() {
+        let (mut view, send) = view();
+        let mut replay = Replay::new(0);
+        // Made at the tape's start; deleted, and its name used again, after.
+        replay.keep(json!({"event": "created", "bot": "shop.x", "data": {"bot_id": 4}}));
+        for at in 0..TAPE as i64 {
+            replay.keep(json!({"event": "queued", "bot": "shop.y", "written_ms": at}));
+        }
+        replay.keep(json!({"event": "deleted", "bot": "shop.x", "written_ms": TAPE}));
+        replay.keep(
+            json!({"event": "created", "bot": "shop.x", "written_ms": TAPE + 1,
+            "data": {"bot_id": 9}}),
+        );
+        view.replay = Some(replay);
+        send.send(Feed::Roll(vec![json!({"name": "shop.x", "bot_id": 9})]))
+            .unwrap();
+        view.drain();
+        let cast: Vec<_> = (view.replay.as_ref().unwrap().cast.iter())
+            .map(|bot| bot["bot_id"].clone())
+            .collect();
+        assert_eq!(cast, [json!(9), json!(4)]);
     }
 
     #[test]
@@ -4274,6 +6238,124 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_busiest_agent_s_haiku_streams_in_atop_the_log_and_copies_stay_off_the_sky() {
+        let (mut view, send) = view();
+        send.send(Feed::Roll(vec![
+            json!({"name": "shop.lead"}),
+            json!({"name": "shop.lead.suggest-1", "expire_ms": 60_000}),
+        ]))
+        .unwrap();
+        send.send(Feed::Ready).unwrap();
+        send.send(Feed::Live(
+            json!({"event": "forked", "bot": "shop.lead.haiku-1",
+            "data": {"bot_id": 7, "source": "shop.lead", "expire_ms": 120_000}}),
+        ))
+        .unwrap();
+        view.drain();
+        // Throwaway copies are no members of the sky.
+        assert!(view.agent("shop.lead.suggest-1").is_none());
+        assert!(view.agent("shop.lead.haiku-1").is_none());
+        let lines = [
+            "tests fail then pass",
+            "the pull request waits for me",
+            "morning merges in",
+        ];
+        let poem = (
+            "shop.lead".to_owned(),
+            wall_ms(),
+            lines.map(str::to_owned).to_vec(),
+        );
+        view.heard
+            .0
+            .send(Heard::Poem(poem.0, poem.1, poem.2))
+            .unwrap();
+        view.drain();
+        // Just in: its first word, faint, and nothing signed yet.
+        let shown = text(&view.card(150, 40));
+        assert!(
+            shown.contains("tests") && !shown.contains("fail"),
+            "{shown}"
+        );
+        assert!(!shown.contains("busiest"));
+        // A few seconds on, all of it, signed.
+        view.verse.as_mut().unwrap().from -= Duration::from_secs(10);
+        let card = view.card(150, 40);
+        let shown = text(&card);
+        for line in lines {
+            assert!(shown.contains(line), "{shown}");
+        }
+        assert!(shown.contains("— shop lead, busiest for 1m"), "{shown}");
+        // A sky stacked over its log keeps it at its top right, as zen.
+        let stacked = text(&view.card(80, 40));
+        assert!(stacked.contains("morning merges in"), "{stacked}");
+        // The next fades the last out first.
+        let poem = (
+            "shop.lead".to_owned(),
+            wall_ms() + 1,
+            vec!["a".into(), "b".into(), "c".into()],
+        );
+        view.heard
+            .0
+            .send(Heard::Poem(poem.0, poem.1, poem.2))
+            .unwrap();
+        view.drain();
+        assert!(text(&view.card(150, 40)).contains("morning merges in"));
+        assert!(view.fading.is_some());
+        // Zen keeps it, over the sky.
+        view.verse.as_mut().unwrap().from -= Duration::from_secs(10);
+        view.zen = true;
+        assert!(text(&view.card(150, 40)).contains("— shop lead"));
+    }
+
+    #[tokio::test]
+    async fn a_haiku_another_sky_wrote_shows_here_and_its_writer_holds_the_title() {
+        let (mut view, send) = view();
+        send.send(Feed::Roll(vec![json!({"name": "shop.lead"})]))
+            .unwrap();
+        send.send(Feed::Ready).unwrap();
+        view.drain();
+        assert!(view.verse.is_none());
+        let lines = [
+            "frost on the window",
+            "a build turns green at dawn",
+            "nobody saw it",
+        ];
+        haiku::Kept::update(&view.store, &view.socket, |kept| {
+            (kept.by, kept.lines) = ("shop.lead".into(), lines.map(str::to_owned).to_vec());
+            kept.at_ms = wall_ms();
+            kept.since_ms = wall_ms() - 60_000;
+        });
+        // Read off the drawing thread, and heard back.
+        view.weighed = None;
+        view.drain();
+        while view.reading {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            view.drain();
+        }
+        let verse = view.verse.as_ref().expect("the other sky's haiku");
+        assert_eq!(verse.lines, lines);
+        assert_eq!(view.title.holder.as_ref().unwrap().0, "shop.lead");
+        // Read once: weighing again shows it no second time.
+        view.weighed = None;
+        view.drain();
+        while view.reading {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            view.drain();
+        }
+        assert!(view.fading.is_none());
+        // One written over an hour ago, however late it comes, shows not.
+        let old = wall_ms() - 2 * HOUR.as_millis() as i64;
+        let late = Heard::Poem(
+            "shop.lead".into(),
+            old,
+            vec!["x".into(), "y".into(), "z".into()],
+        );
+        view.heard.0.send(late).unwrap();
+        view.drain();
+        assert_eq!(view.verse.as_ref().unwrap().lines, lines);
+    }
+
+    #[tokio::test]
     async fn a_copy_leaves_its_agents_asks_alone_and_no_stranger_takes_its_work() {
         let (mut view, send) = view();
         send.send(Feed::Roll(vec![json!({"name": "shop.lead", "bot_id": 2})]))
@@ -4522,7 +6604,13 @@ mod tests {
                 Feed::Live(event) => event["cursor"].to_string(),
                 Feed::Roll(_) => "roll".into(),
                 Feed::Ready => "ready".into(),
-                Feed::Past(_) | Feed::Held(_) | Feed::Down(_) | Feed::Model(..) | Feed::Tape(_) => {
+                Feed::Past(_)
+                | Feed::Held(_)
+                | Feed::Down(_)
+                | Feed::Model(..)
+                | Feed::Tape(_)
+                | Feed::Prior(_)
+                | Feed::Store(_) => {
                     continue;
                 }
             });

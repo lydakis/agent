@@ -66,15 +66,18 @@ pub struct Policy {
     /// and only as far as a sandboxed bot may go; in the daemon socket's
     /// place, so the `agent` CLI finds it there too.
     pub capability: Option<PathBuf>,
+    /// What keeps that socket listening: it lives while the policy, or a
+    /// command's [`Hold`] of it, does.
+    pub listening: Option<Listening>,
     /// The agent binary a confined write runs in ([`WRITE`]).
     pub helper: Option<PathBuf>,
-    /// The folders, or sockets, whose Unix sockets its commands reach,
-    /// those its settings name. No other, as Claude Code's sandbox and
-    /// Codex's managed network keep them: a socket may be a program's that
-    /// runs as the person, Docker's or a browser's, which runs what a
-    /// command asks of it outside the sandbox. Not even those in its own
-    /// folders: a hard link there to any socket, which needs no right to
-    /// the socket, would reach that one by a name in them.
+    /// The folders, or sockets, whose Unix sockets its commands reach with
+    /// the network off, those its settings name. With the network on they
+    /// reach every one, as Codex's full network does: MCPX's, Docker's or
+    /// ssh-agent's, which the person runs to be used. Off, only these, as
+    /// Codex's network off reaches none: a socket may be a program's that
+    /// runs as the person, which runs what a command asks of it outside
+    /// the sandbox. Never the daemon's nor another bot's, either way.
     pub sockets: Vec<PathBuf>,
 }
 
@@ -118,6 +121,7 @@ impl Policy {
             network: network && mode == Mode::WorkspaceWrite,
             socket: daemon.socket.clone(),
             capability: None,
+            listening: None,
             helper: daemon.helper.clone(),
             sockets: Vec::new(),
         }))
@@ -442,10 +446,29 @@ pub struct Daemon {
     pub protected_existing: Vec<String>,
 }
 
+/// A share in a bot's own socket, which listens while any share lives,
+/// as a refcounted handle or a systemd socket unit does, and a short grace
+/// after the last goes. Every policy is the same whichever share it holds.
+#[derive(Clone)]
+pub struct Listening(pub std::sync::Arc<dyn Send + Sync>);
+
+impl PartialEq for Listening {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+impl Eq for Listening {}
+impl std::fmt::Debug for Listening {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Listening")
+    }
+}
+
 impl Daemon {
-    /// Bot `bot`'s own socket, opened on first use; `None` when the daemon
-    /// has no socket for a sandboxed command to use.
-    pub fn capability(&self, bot: i64) -> Result<Option<PathBuf>> {
+    /// Bot `bot`'s own socket, opened on first use, with a share that keeps
+    /// it listening; `None` when the daemon has no socket for a sandboxed
+    /// command to use.
+    pub fn capability(&self, bot: i64) -> Result<Option<(PathBuf, Listening)>> {
         self.capabilities
             .as_ref()
             .map(|capabilities| (capabilities.open)(bot))
@@ -466,7 +489,7 @@ impl Daemon {
 pub struct Capabilities {
     pub folder: PathBuf,
     #[allow(clippy::type_complexity)]
-    pub open: std::sync::Arc<dyn Fn(i64) -> Result<PathBuf> + Send + Sync>,
+    pub open: std::sync::Arc<dyn Fn(i64) -> Result<(PathBuf, Listening)> + Send + Sync>,
     pub close: std::sync::Arc<dyn Fn(i64) + Send + Sync>,
 }
 
@@ -870,15 +893,18 @@ mod linux {
     }
 
     /// The seccomp filter bubblewrap loads, as Codex's Linux sandbox and
-    /// Claude Code's build theirs: what no path rule can hold. A command
-    /// makes no Unix socket, since bubblewrap's read-only root still lets
-    /// one connect to any it sees, the daemon's, Docker's or a desktop
-    /// session's bus that runs anything asked; one that names some is
-    /// let make them all, since seccomp can't tell them apart by path, as
-    /// Claude Code's `allowAllUnixSockets`. A pair (socketpair) it still
-    /// makes, which reaches nothing. io_uring, which makes sockets past
-    /// seccomp, it never sets up. Any other architecture's calls, which
-    /// number them otherwise, end the command.
+    /// Claude Code's build theirs: what no path rule can hold. With the
+    /// network off a command makes no Unix socket, as Codex's reaches
+    /// none, since bubblewrap's read-only root still lets one connect to
+    /// any it sees, Docker's or a desktop session's bus that runs anything
+    /// asked; one that names some is let make them all, since seccomp
+    /// can't tell them apart by path, as Claude Code's
+    /// `allowAllUnixSockets`. With the network on it makes any, as Codex's
+    /// full network does; the daemon's and the other bots' stay out of
+    /// sight. A pair (socketpair) it still makes, which reaches nothing.
+    /// io_uring, which makes sockets past seccomp, it never sets up. Any
+    /// other architecture's calls, which number them otherwise, end the
+    /// command.
     pub(super) fn filter(policy: &Policy) -> Result<Vec<u8>> {
         use seccompiler::{
             BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition,
@@ -921,7 +947,8 @@ mod linux {
             .map_err(|e| invalid(&e))?;
         let mut rules = std::collections::BTreeMap::new();
         rules.insert(libc::SYS_io_uring_setup, Vec::new());
-        if policy.sockets.is_empty() {
+        let blocked = !policy.network && policy.sockets.is_empty();
+        if blocked {
             rules.insert(libc::SYS_socket, vec![unix.clone()]);
             rules.insert(libc::SYS_socketpair, datagrams.clone());
         }
@@ -929,7 +956,7 @@ mod linux {
         if arch == TargetArch::x86_64 {
             const X32: i64 = 0x4000_0000;
             rules.insert(X32 | libc::SYS_io_uring_setup, Vec::new());
-            if policy.sockets.is_empty() {
+            if blocked {
                 rules.insert(X32 | libc::SYS_socket, vec![unix]);
                 rules.insert(X32 | libc::SYS_socketpair, datagrams);
             }
@@ -995,7 +1022,10 @@ mod linux {
             let flags = libc::fcntl(theirs.as_raw_fd(), libc::F_GETFL);
             libc::fcntl(theirs.as_raw_fd(), libc::F_SETFL, flags & !libc::O_NONBLOCK);
         }
-        let ours = tokio::io::unix::AsyncFd::new(ours)?;
+        // SAFETY: the OwnedFd is open, and it keeps the one descriptor
+        // until the AsyncFd that owns it drops.
+        let ours =
+            unsafe { tokio::io::unix::AsyncFd::register(ours) }.map_err(std::io::Error::from)?;
         let own = own.to_owned();
         runtime.spawn(async move {
             let mut byte = [0u8; 1];
@@ -1062,9 +1092,14 @@ fn held(path: &Path) -> bool {
 }
 
 /// What a running sandbox holds in place; dropping it lets the
-/// placeholders go once no other sandbox holds them, and removes what the
-/// command may not leave made.
-pub struct Hold(Vec<PathBuf>, Vec<PathBuf>);
+/// placeholders go once no other sandbox holds them, removes what the
+/// command may not leave made, and gives up its share in the bot's socket.
+pub struct Hold(
+    Vec<PathBuf>,
+    Vec<PathBuf>,
+    // Held only to be dropped with the rest.
+    #[allow(dead_code)] Option<Listening>,
+);
 
 /// Hold `policy`'s placeholders while its command runs, once any of them
 /// being removed is gone.
@@ -1102,7 +1137,7 @@ pub async fn hold(policy: &Policy) -> Hold {
                     .iter()
                     .flat_map(|root| root.left.iter().cloned())
                     .collect();
-                return Hold(paths, left);
+                return Hold(paths, left, policy.listening.clone());
             }
         }
         removed.await;
@@ -1298,11 +1333,16 @@ pub fn seatbelt(policy: &Policy) -> (String, Vec<(String, PathBuf)>) {
             "(allow network-outbound)\n(allow network-inbound)\n{SEATBELT_NETWORK}{SEATBELT_TLS_TRUST}"
         ));
     }
-    // Unix sockets only those its settings name.
+    // Unix sockets every one with the network on, as Codex's full network
+    // reaches them, and its own it listens on, as a test's server does;
+    // with it off, only those its settings name.
     if policy.network {
-        sections.push("(deny network-outbound (remote unix-socket))".to_owned());
-    }
-    if !policy.sockets.is_empty() {
+        sections.push(
+            "(allow system-socket (socket-domain AF_UNIX))\n\
+             (allow network-bind (local unix-socket))"
+                .to_owned(),
+        );
+    } else if !policy.sockets.is_empty() {
         let mut rules = vec!["(allow system-socket (socket-domain AF_UNIX))".to_owned()];
         for path in &policy.sockets {
             let key = param(path);
@@ -1314,11 +1354,14 @@ pub fn seatbelt(policy: &Policy) -> (String, Vec<(String, PathBuf)>) {
         sections.push(rules.join("\n"));
     }
     // Never the daemon's socket itself: the bot's own instead, which
-    // answers as that bot and only as far as a sandboxed bot may go.
+    // answers as that bot and only as far as a sandboxed bot may go. Nor
+    // by a hard link to it in a folder the command may write, which would
+    // reach it by another name.
     if let Some(socket) = &policy.socket {
         let key = param(socket);
         sections.push(format!(
-            "(deny network-outbound (remote unix-socket (subpath (param \"{key}\"))))"
+            "(deny network-outbound (remote unix-socket (subpath (param \"{key}\"))))\n\
+             (deny file-link (subpath (param \"{key}\")))"
         ));
     }
     if let Some(own) = &policy.capability {
@@ -1326,7 +1369,8 @@ pub fn seatbelt(policy: &Policy) -> (String, Vec<(String, PathBuf)>) {
         if let Some(folder) = own.parent() {
             let key = param(folder);
             sections.push(format!(
-                "(deny network-outbound (remote unix-socket (subpath (param \"{key}\"))))"
+                "(deny network-outbound (remote unix-socket (subpath (param \"{key}\"))))\n\
+                 (deny file-link (subpath (param \"{key}\")))"
             ));
         }
         let key = param(own);
@@ -1684,7 +1728,7 @@ mod tests {
     }
 
     #[test]
-    fn unix_sockets_are_reached_only_as_named() {
+    fn unix_sockets_are_all_reached_with_the_network_on_and_as_named_off() {
         let base =
             std::env::temp_dir().join(format!("agent-sandbox-sockets-{}", std::process::id()));
         std::fs::create_dir_all(base.join("cache")).unwrap();
@@ -1696,41 +1740,58 @@ mod tests {
                 Some(&base),
                 &[cache.to_str().unwrap().to_owned()],
                 network,
-                &protecting(),
+                &Daemon {
+                    socket: Some(base.join("agent.sock")),
+                    ..protecting()
+                },
             )
             .unwrap()
             .unwrap()
         };
         assert!(policy(true).sockets.is_empty());
-        let networked = policy(true).with_sockets(&["/tmp/ssh-agent.sock".to_owned()]);
-        assert_eq!(networked.sockets, [PathBuf::from("/tmp/ssh-agent.sock")]);
-        let (profile, params) = seatbelt(&networked);
-        let key = |path: &Path| {
+        let named = |network| policy(network).with_sockets(&["/tmp/ssh-agent.sock".to_owned()]);
+        assert_eq!(named(true).sockets, [PathBuf::from("/tmp/ssh-agent.sock")]);
+        let key = |params: &[(String, PathBuf)], path: &Path| {
             params
                 .iter()
                 .find(|(_, p)| p == path)
                 .map(|(k, _)| k.clone())
                 .unwrap()
         };
-        // The network on, every other socket stays out of reach, Docker's,
-        // those of what runs as the person, and those in its own folders.
-        let denied = profile
-            .find("(deny network-outbound (remote unix-socket))")
-            .unwrap();
+        // The network on, every socket, as Codex's full network: MCPX's,
+        // Docker's, ssh-agent's, and those it listens on itself.
+        let (profile, params) = seatbelt(&named(true));
+        assert!(!profile.contains("(deny network-outbound (remote unix-socket))"));
+        assert!(profile.contains("(allow network-bind (local unix-socket))"));
+        assert!(profile.contains("(allow system-socket (socket-domain AF_UNIX))"));
+        // But never the daemon's, by its name or a hard link to it.
+        let daemon = key(&params, &base.join("agent.sock"));
+        let denied = format!(
+            "(deny network-outbound (remote unix-socket (subpath (param \"{daemon}\"))))\n\
+             (deny file-link (subpath (param \"{daemon}\")))"
+        );
+        assert!(
+            profile.find(&denied).unwrap() > profile.find("(allow network-outbound)\n").unwrap()
+        );
+        // The network off, only those it names.
+        let (profile, params) = seatbelt(&named(false));
         let allowed = format!(
             "(allow network-outbound (remote unix-socket (subpath (param \"{}\"))))",
-            key(Path::new("/tmp/ssh-agent.sock"))
+            key(&params, Path::new("/tmp/ssh-agent.sock"))
         );
-        assert!(profile.find(&allowed).unwrap() > denied, "{allowed}");
-        assert!(profile.find("(allow network-outbound)\n").unwrap() < denied);
+        assert!(profile.contains(&allowed), "{allowed}");
+        assert!(!profile.contains("(allow network-bind (local unix-socket))"));
         for path in [&base, &cache] {
-            let own = format!("(remote unix-socket (subpath (param \"{}\")))", key(path));
+            let own = format!(
+                "(remote unix-socket (subpath (param \"{}\")))",
+                key(&params, path)
+            );
             assert!(!profile.contains(&own), "{own}");
         }
-        // The network off, none but those either.
+        // Off and naming none, none.
         let (profile, _) = seatbelt(&policy(false));
-        assert!(!profile.contains("(deny network-outbound (remote unix-socket))"));
         assert!(!profile.contains("(local unix-socket"));
+        assert!(!profile.contains("(allow system-socket (socket-domain AF_UNIX))"));
         // Read-only, it reaches only those it names.
         let read_only = Policy::new(Some(Mode::ReadOnly), Some(&base), &[], false, &protecting())
             .unwrap()
@@ -1765,6 +1826,7 @@ mod tests {
             network: true,
             socket: Some(path.join("agent.sock")),
             capability: None,
+            listening: None,
             helper: None,
             sockets: Vec::new(),
         };

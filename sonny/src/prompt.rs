@@ -167,6 +167,13 @@ impl Prompt {
         self.anchor = None;
     }
 
+    /// The cursor to the very start of the text.
+    pub fn top(&mut self) {
+        self.goal = None;
+        self.anchor = None;
+        self.at = 0;
+    }
+
     /// The start of the cursor's line.
     pub fn home(&mut self) {
         self.goal = None;

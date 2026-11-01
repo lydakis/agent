@@ -13,7 +13,7 @@ import unittest
 
 from bench.socket_client import SocketClient
 from bench.targets import clean_env
-from tests.test_runtime import ModelFixture
+from tests.test_runtime import SENT, ModelFixture
 from tests.test_served import declared
 
 
@@ -208,7 +208,9 @@ class AcpTests(ModelFixture):
         # reached: Sonny took the person's out of them.
         [turn] = self.daemon.request('turns', bot='calc.lead')['result']['turns']
         prompts = self.daemon.request('prompts', bot='calc.lead', turn=turn['turn'])['result']['prompts']
-        self.assertEqual(prompts[0]['text'], 'script')
+        # Stamped with when it was sent, as every message Sonny passes on.
+        self.assertRegex(prompts[0]['text'], SENT)
+        self.assertEqual(SENT.sub('', prompts[0]['text']), 'script')
 
         # The task opens as the lead thread's child, with its brief as the
         # first message, through this thread's own tools.
@@ -316,11 +318,11 @@ class AcpTests(ModelFixture):
         self.assertEqual([c['value'] for c in option['options']],
                          ['default', 'openai/synthetic-model', 'openai/other-model', 'openai/newer-model',
                           'anthropic/claude-x'])
-        # Shown by the name the provider lists, else the model's own id,
-        # beside the provider; the full id is in the description.
+        # Shown by the name the provider lists, else the name Sonny gives
+        # it, beside the provider; the full id is in the description.
         self.assertEqual([c['name'] for c in option['options'][1:]],
-                         ['synthetic-model · openai', 'other-model · openai', 'Newer Model · openai',
-                          'claude-x · anthropic'])
+                         ['Synthetic Model · openai', 'Other Model · openai', 'Newer Model · openai',
+                          'X · anthropic'])
         self.assertEqual(option['options'][2]['description'], 'faster (openai/other-model)')
         self.assertEqual(option['options'][3]['description'], 'openai/newer-model')
         self.assertEqual((effort['id'], effort['category'], effort['currentValue']),

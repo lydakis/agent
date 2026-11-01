@@ -154,8 +154,8 @@ every = "1m"   # how long after it exits it runs again: 30s, 5m, 1h; a minute un
 ```
 
 Every line the command prints is one event: plain text, or a JSON object
-with `text` and, if it has them, `id`, `from` (who wrote it there), `url`
-and `urgent`. One that exits runs again `every` later, so a poller that
+with `text` and, if it has them, `id`, `topic` (what it is about: a
+channel, a thread), `from` (who wrote it there), `url` and `urgent`. One that exits runs again `every` later, so a poller that
 prints what is new and exits and a stream that never exits both work. An
 event whose `id` the source printed lately (the last 1024) is not news
 again; a poller keeps its own cursor in `$SONNY_SOURCE_DIR`, a folder of
@@ -167,17 +167,93 @@ The lookout reads the settings again every 15 seconds: a source added or
 changed starts, one removed stops, and a lookout that stops stops its
 sources' commands.
 
-Agents never set a source up; they subscribe to one by name:
+Agents never set a source up; they subscribe to one by name, or to one
+of its topics as `NAME:TOPIC`:
 
 ```
 {"add": {"name": "eng", "sources": ["slack"]}}
+{"add": {"name": "deploys", "sources": ["slack:deploys"]}}
 ```
 
-Every event its sources print is told. The person's command decides what
-cannot wait: an event it marks `"urgent": true` cuts into a busy
-subscriber's turn; the rest wait for it to rest. Naming a source the
-settings do not have is refused, with the ones they have, and every
-call's answer lists them under `sources`.
+Every event its sources print is told, unless the subscription has a
+filter. The person's command decides what cannot wait: an event it marks
+`"urgent": true` cuts into a busy subscriber's turn; the rest wait for it
+to rest. Naming a source the settings do not have is refused, with the
+ones they have. An event `from` the subscriber itself is not news to it,
+nor is one whose `told` lists it: a source that told some subscribers
+another way names them there. What waits to be told, and when each source
+last told a subscriber, is kept in `STORE.sources/.held/BOT.json` until it
+is, so a restart loses none.
+
+A source's `digest` says how often at most a subscriber hears it, as
+Slack's "send me email notifications at most once every 15 minutes or
+hour": the first event after a quiet spell is told as it comes, and what
+comes after waits until the digest has passed since the note that last
+told that source, then goes in one note. An urgent event never waits.
+
+```toml
+[sonny.sources.slack]
+command = "~/bin/slack-poll"
+digest = "15m"   # 30s, 15m, 1h; unset or 0, as events come
+```
+
+Sonny makes one source of its own, `commons`, while agents have the
+commons: it reads `~/.agents/commons` every 10 seconds in the lookout,
+and each new post is an event, its thread the topic, its author `from`,
+its id `THREAD/N`. Its first look tells nothing of the past. Its digest is
+`[sonny] commons_digest`, an hour unless set. Posting in a thread
+subscribes the agent to it as `commons.THREAD`; a person's source may not
+take the name. A reply that wakes the thread's invite holders, whose
+invite still pays for their time, waits until they are woken (a minute at
+most), and they are its `told`: the reply starts their turn, so they do
+not hear it again. A turn that only sources woke sends no commons
+invites, as the commons' own wakes do not.
+
+### Filters
+
+An event's line may carry any other fields beside `text`, and a
+subscription's `filter` hears only the events whose fields match it. A CR
+poller that prints
+
+```
+{"text": "CR-12: tidy the billing tax rules", "id": "CR-12", "url": "https://cr.example/12", "author": "ana", "paths": ["src/billing/tax.rs", "docs/billing.md"]}
+```
+
+can be filtered to the changes an agent's work touches:
+
+```
+{"add": {"name": "billing-changes", "sources": ["cr"],
+         "filter": {"paths": [{"prefix": "src/billing/"}], "author": [{"anything-but": "me"}]}}}
+```
+
+A filter is an event pattern as AWS EventBridge and SNS filter policies
+write one. Each field the event must have maps to a list of values, any
+of which will do, or to a pattern of its own for a field that is an
+object. Every field must match, and a field that is a list matches when
+any of its items does. A value is a string, number, boolean or null to
+equal, or `{"prefix": S}`, `{"suffix": S}`, `{"wildcard": S}` (`*` any run
+of characters), `{"equals-ignore-case": S}`, `{"anything-but": V}` (a
+value, a list of them, or one of the string matchers), `{"numeric": [">",
+0, "<=", 5]}` or `{"exists": true}` / `{"exists": false}`. `"$or": [P1,
+P2]` beside the fields takes either pattern. A plain-text line is the
+event `{"text": LINE}`. A filter is at most 4 KiB, 256 values and 6 levels
+deep; nothing in it runs, and it only ever narrows what is heard.
+
+The lookout checks a filter as each event comes, before the event waits
+for the subscriber, so an event no subscription hears wakes no one.
+
+So an agent knows what it may filter on, the lookout keeps each source's
+shape: the fields its last 200 events had (an object's own fields named
+with dots, as `meta.team`), their kinds and a recent example, in
+`STORE.sources/.shapes/NAME.json`. Every `subscriptions` call's answer
+lists the sources under `sources`, each with its shape:
+
+```
+{"name": "cr", "events": 41, "fields": {"author": "string, as \"ana\"", "paths": "list of strings, as [\"src/billing/tax.rs\"]", "text": "string, as \"CR-12: tidy…\""}}
+```
+
+A filter naming a field no recent event of its sources had is added, and
+the answer says so under `unseen`: it hears nothing until one does.
 
 What sources said goes in a note of its own, once the subscriber rests
 and the news has settled 2 seconds, or at once for an urgent event:
@@ -189,7 +265,8 @@ From your sources: what the sources you subscribed to reported since you last he
 Handle what cannot wait, then carry on with your turn.
 ```
 
-Each event's text is quoted as a JSON string, so it stays one line. The
+Each event's text is quoted as a JSON string, so it stays one line, and
+its other fields follow as compact JSON, cut at 2,000 characters. The
 note goes with the origin `lookout.sources`, so the approver never reads
 it as the person's words, and Sonny shows it folded, as `↳ From your
 sources · slack 2`. A note names at most 16 events, urgent ones first, and

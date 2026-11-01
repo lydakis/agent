@@ -3,6 +3,7 @@
 mod companions;
 mod handles;
 mod hub;
+mod lane;
 mod session;
 mod socket;
 mod turn;
@@ -585,16 +586,33 @@ enum Command {
         grace_ms: u64,
     },
     /// Stop every agent until `resume`, across restarts: each running turn
-    /// ends with `daemon_paused`, no turn starts, and queued work waits.
+    /// parks at once, its unanswered calls answered `daemon_paused`, and
+    /// continues on `resume`; no turn starts, and queued work waits.
     /// `by` names who pulled it; a bot's own socket is that bot. While a
     /// pause holds, another changes nothing.
     Pause {
         reason: String,
         by: Option<String>,
     },
-    /// Lift the pause; what waited starts as capacity allows.
-    Resume,
+    /// Pauses, held and lifted, oldest first (newest first with `newest`),
+    /// as `turns` pages. A read.
+    Pauses {
+        #[serde(default)]
+        after: i64,
+        before: Option<i64>,
+        limit: Option<usize>,
+        #[serde(default)]
+        newest: bool,
+    },
+    /// Lift the pause; what waited, and the turns it parked, start as
+    /// capacity allows. `by` names who let the line go on, as a pause's does.
+    Resume {
+        #[serde(default)]
+        by: Option<String>,
+    },
 }
+/// The most agents a pause names as the ones it parked; it counts them all.
+const PAUSE_NAMES: usize = 64;
 /// The variable a Bedrock API key is read from, as the AWS tools name it.
 const BEDROCK_KEY: &str = "AWS_BEARER_TOKEN_BEDROCK";
 pub struct ProviderSpec {
@@ -763,8 +781,8 @@ pub struct Configuration {
     pub providers: Vec<ProviderSpec>,
     /// Concurrent child processes; default 64 per logical CPU; zero unbounded.
     pub max_processes: Option<usize>,
-    /// Detached commands still running, daemon-wide; default 16; zero unbounded.
-    pub max_detached: Option<usize>,
+    /// Terminals and detached commands still running, daemon-wide; default 4 per logical CPU; zero unbounded.
+    pub max_lasting: Option<usize>,
     /// Turns with a live task (model call or foreground tool); default 4,096; zero unbounded.
     pub max_active: Option<usize>,
     /// Provider requests awaiting response headers; unbounded by default,
@@ -775,6 +793,9 @@ pub struct Configuration {
     /// unbounded by default, since waiting work is durable rows.
     pub max_pending: Option<usize>,
     pub max_pending_bytes: Option<usize>,
+    /// Store reader connections serving observation reads; one per
+    /// logical CPU by default.
+    pub max_readers: Option<usize>,
     /// Seconds an established provider stream may go without a content
     /// frame before the attempt fails and is retried; default 120.
     pub stall_timeout: Option<u64>,
@@ -799,11 +820,14 @@ pub struct Configuration {
 #[derive(Clone, Copy)]
 pub struct Limits {
     pub processes: usize,
-    pub detached: usize,
+    pub lasting: usize,
     pub active: usize,
     pub connecting: usize,
     pub pending: usize,
     pub pending_bytes: usize,
+    /// Store reader connections; observation reads take all but one, which
+    /// is kept for turns' own reads.
+    pub readers: usize,
     /// HTTP/2 connections per provider, enough for `active` turns to stream
     /// at once at the providers' advertised streams per connection.
     pub connections: usize,
@@ -815,13 +839,17 @@ impl Limits {
         let active = config.max_active.unwrap_or(4096);
         Limits {
             processes: config.max_processes.unwrap_or(64 * cpus),
-            detached: config
-                .max_detached
-                .unwrap_or(agent_runtime::tools::DEFAULT_DETACHED_BUDGET),
+            lasting: config
+                .max_lasting
+                .unwrap_or_else(agent_runtime::tools::default_lasting),
             active,
             connecting: config.max_connecting.unwrap_or(0),
             pending: config.max_pending.unwrap_or(0),
             pending_bytes: config.max_pending_bytes.unwrap_or(0),
+            readers: config
+                .max_readers
+                .unwrap_or_else(agent_runtime::store::default_readers)
+                .max(1),
             connections: if active == 0 {
                 64
             } else {
@@ -1074,6 +1102,8 @@ struct Service {
     replays: JoinSet<()>,
     /// Retention tasks own outputs and must release them before stdout joins.
     retention: JoinSet<()>,
+    /// Reads that decide nothing, answered beside the run loop.
+    lane: lane::Lane,
     /// A turn may be ready to start: set whenever a slot opens or a turn
     /// is queued, cleared when the store has none. Keeps the idle loop free
     /// of a store read per iteration.
@@ -1242,10 +1272,11 @@ impl Active {
     }
     /// Cancel the turn with `code` unless a cause is already set: the first
     /// cause wins, so shutdown never relabels a client's pending interrupt.
+    /// A pause only parks the turn, so an interrupt after it still ends it.
     /// False when the task has already dropped its receiver.
     fn cancel(&self, code: &'static str) -> bool {
         self.cancel.send_if_modified(|cause| {
-            cause.is_none() && {
+            (cause.is_none() || (*cause == Some(turn::PAUSED) && code == turn::INTERRUPTED)) && {
                 *cause = Some(code);
                 true
             }
@@ -1385,7 +1416,7 @@ pub async fn run(config: Configuration) -> Result<()> {
     if providers.is_empty() {
         return fail("no_providers");
     }
-    let (store, publications) = Store::open(&config.store).await?;
+    let (store, publications) = Store::open_with(&config.store, limits.readers).await?;
     let (pending, pending_bytes) = (limits.pending, limits.pending_bytes);
     store
         .call(move |db| {
@@ -1455,8 +1486,11 @@ pub async fn run(config: Configuration) -> Result<()> {
         .with_environment(environment)
         .with_daemon(daemon)
         .with_process_budget(limits.processes)
-        .with_detached_budget(limits.detached);
-    let hub = Hub::default();
+        .with_lasting_budget(limits.lasting);
+    // Observation reads and replay pages share all but one reader, so turns'
+    // own reads always find one.
+    let lane = lane::Lane::new(limits.readers.saturating_sub(1), deliver);
+    let hub = Hub::default().with_page_seats(lane.seats());
     let lineage = store.op("store_identity", |db| db.store_identity()).await?;
     let identity = store.instance_identity(lineage)?;
     // A pause outlives the daemon that took it.
@@ -1464,9 +1498,9 @@ pub async fn run(config: Configuration) -> Result<()> {
     let ready = json!({"event":"ready","protocol":agent_client::PROTOCOL,"pid":std::process::id(),
         "paused":paused,
         "store":{"identity":format!("{identity:032x}"),"lineage":format!("{:016x}", lineage as u64)},
-        "limits":{"processes":limits.processes,"detached":limits.detached,"active":limits.active,"connecting":limits.connecting,
+        "limits":{"processes":limits.processes,"lasting":limits.lasting,"active":limits.active,"connecting":limits.connecting,
             "pending":limits.pending,"pending_bytes":limits.pending_bytes,
-            "connections":limits.connections,
+            "readers":limits.readers,"connections":limits.connections,
             "idle_exit_seconds":config.idle_exit,
             "stall_timeout_seconds":stall_timeout.as_secs()},
         "schema":agent_runtime::store::Database::SCHEMA,
@@ -1589,6 +1623,7 @@ pub async fn run(config: Configuration) -> Result<()> {
         jobs: JoinSet::new(),
         replays: JoinSet::new(),
         retention: JoinSet::new(),
+        lane,
         // Queued turns that survived a restart start as capacity allows.
         ready_hint: true,
         tokens: Arc::default(),
@@ -1695,6 +1730,13 @@ pub async fn run(config: Configuration) -> Result<()> {
                     let (session, output, id, result) = service.settled();
                     reply(&mut service, &mut sessions, stdio_owner, session, &output, id, result).await?;
                 }
+                // A read answered: its session's next request may be taken.
+                Some((asker, sent)) = service.lane.next(), if !service.lane.is_empty() => {
+                    if !sent {
+                        unanswered(&mut service, &mut sessions, stdio_owner, asker.session)?;
+                    }
+                    inbound.unpark(asker.session);
+                }
                 message = inbound.recv() => {
                     let Some(message) = message else { break };
                     // What a companion sends is no client's activity.
@@ -1781,6 +1823,8 @@ pub async fn run(config: Configuration) -> Result<()> {
                                         Some(error) => Err(error),
                                         None => service.dispatch(request.command, id, &output, request.id.clone(), bound).await,
                                     };
+                                    // A session given a read waits for it before its next request.
+                                    for session in service.lane.parked() { inbound.park(session); }
                                     if result.as_ref().is_err_and(|e| e.code == "deferred") { continue; }
                                     // A refused admission still answers after those queued before it.
                                     if admission && !service.admissions.is_empty() {
@@ -1851,6 +1895,7 @@ pub async fn run(config: Configuration) -> Result<()> {
     service.retention.abort_all();
     while service.retention.join_next().await.is_some() {}
     answer_queued(&mut service, &mut sessions, stdio_owner).await;
+    answer_observed(&mut service, &mut sessions, stdio_owner).await;
     // Release every slot as it is cancelled: a turn interrupted earlier keeps
     // its first cause, and its dropped sender still stops a finish retry.
     for active in std::mem::take(&mut service.active).into_values() {
@@ -1968,7 +2013,7 @@ impl Service {
             Command::Shutdown { .. } => return refuse("stop the daemon"),
             // Any agent may pull the cord; letting the line go on is the
             // person's, from outside any sandbox.
-            Command::Resume => return refuse("resume a pause"),
+            Command::Resume { .. } => return refuse("resume a pause"),
             // A companion runs as the daemon does, outside any sandbox.
             Command::Companions { .. } => return refuse("manage the daemon's companions"),
             _ => {}
@@ -2784,7 +2829,14 @@ impl Service {
             // Keep the cancellation receiver alive through completion so an
             // interrupt cannot mistake this task for an unreaped parked turn.
             let mut cancelled = cancelled;
-            let exit = task.execute(cancelled.clone()).await;
+            let mut exit = task.execute(cancelled.clone()).await;
+            // An interrupt that came as the turn parked, after it last
+            // looked, still ends it: its requester was told it would.
+            if !matches!(exit, turn::Exit::Finished(_))
+                && *cancelled.borrow() == Some(turn::INTERRUPTED)
+            {
+                exit = turn::Exit::Finished(Some(Error::new(turn::INTERRUPTED)));
+            }
             let result = match &exit {
                 turn::Exit::Finished(error) => {
                     ending.store(true, std::sync::atomic::Ordering::Release);
@@ -2845,6 +2897,27 @@ impl Service {
             self.wake_for_steer(bot, turn, steer);
         }
         Ok(())
+    }
+
+    /// Answer `read` from the observation lane, beside the run loop; the
+    /// session's next request waits for it.
+    fn observe(
+        &mut self,
+        session: u64,
+        output: &Output,
+        id: Value,
+        read: impl Future<Output = Result<Value>> + Send + 'static,
+    ) -> Result<Value> {
+        let output = output.clone();
+        self.lane.observe(
+            lane::Asker {
+                session,
+                output,
+                id,
+            },
+            read,
+        );
+        Err(Error::new("deferred"))
     }
 
     async fn dispatch(
@@ -3012,11 +3085,13 @@ impl Service {
                 limit,
                 newest,
             } => {
-                store
-                    .read("turns", move |db| {
+                let reader = store.reader();
+                self.observe(session, output, id, async move {
+                    (reader.read("turns", move |db| {
                         db.turns(&bot, after, before, limit.unwrap_or(64), newest)
-                    })
+                    }))
                     .await
+                })
             }
             Command::Usage {
                 name,
@@ -3024,18 +3099,13 @@ impl Service {
                 bucket_ms,
                 limit,
             } => {
-                // Off the dispatch path: it reads every matching turn, which
-                // grows with history, so other requests go on meanwhile.
-                let (reader, output) = (store.reader(), output.clone());
-                tokio::spawn(async move {
-                    let result = reader
-                        .read("usage", move |db| {
-                            db.usage(name.as_deref(), since_ms, bucket_ms, limit.unwrap_or(64))
-                        })
-                        .await;
-                    retention_reply(session, &output, id, result).await;
-                });
-                Err(Error::new("deferred"))
+                let reader = store.reader();
+                self.observe(session, output, id, async move {
+                    (reader.read("usage", move |db| {
+                        db.usage(name.as_deref(), since_ms, bucket_ms, limit.unwrap_or(64))
+                    }))
+                    .await
+                })
             }
             Command::Delete { bot, bot_id } => {
                 if let Some(id) = bot_id {
@@ -3385,20 +3455,34 @@ impl Service {
                 if reason.is_empty() || reason.len() > 4096 {
                     return fail_with("usage", "a pause's reason is 1 to 4096 bytes");
                 }
+                // Told to every session, so bounded as a verdict's `by` is.
+                if by.as_ref().is_some_and(|b| b.is_empty() || b.len() > 128) {
+                    return fail_with("invalid_by", "by must be 1 to 128 bytes");
+                }
                 let at = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map_or(0, |d| d.as_millis() as i64);
+                // Whose running turns it parks, kept with it so whoever looks
+                // can stop one before letting the line go on: the first
+                // names in order, and how many in all.
+                let mut running: Vec<String> = (self.active.iter())
+                    .filter(|(_, active)| active.running().is_some())
+                    .map(|(bot, _)| bot.clone())
+                    .collect();
+                running.sort_unstable();
+                let total = running.len();
+                running.truncate(PAUSE_NAMES);
                 let (pause, new) = store
                     .op("put_pause", move |db| {
-                        db.put_pause(&reason, by.as_deref(), at)
+                        db.put_pause(&reason, by.as_deref(), at, &running, total)
                     })
                     .await?;
                 self.paused = Some(pause.clone());
-                // The line stops: every running turn ends now. Parked and
-                // queued turns hold no slot and wait.
-                let mut interrupted = 0;
+                // The line stops: every running turn parks now, to continue
+                // on `resume`. Parked and queued turns hold no slot and wait.
+                let mut parked = 0;
                 if new {
-                    interrupted = (self.active.values())
+                    parked = (self.active.values())
                         .filter(|active| active.cancel(turn::PAUSED))
                         .count();
                     // And what they started that runs on without them.
@@ -3406,19 +3490,41 @@ impl Service {
                     self.notices
                         .push(json!({"event": "paused", "pause": pause, "durable": false}));
                 }
-                Ok(json!({"pause": pause, "changed": new, "interrupted": interrupted}))
+                Ok(json!({"pause": pause, "changed": new, "parked": parked}))
             }
-            Command::Resume => {
-                let lifted = store.op("remove_pause", |db| db.remove_pause()).await?;
+            Command::Pauses {
+                after,
+                before,
+                limit,
+                newest,
+            } => {
+                store
+                    .read("pauses", move |db| {
+                        db.pauses(after, before, limit.unwrap_or(64), newest)
+                    })
+                    .await
+            }
+            Command::Resume { by } => {
+                if by.as_ref().is_some_and(|b| b.is_empty() || b.len() > 128) {
+                    return fail_with("invalid_by", "by must be 1 to 128 bytes");
+                }
+                let at = now_ms() as i64;
+                let lifting = by.clone();
+                let lifted = store
+                    .op("remove_pause", move |db| {
+                        db.remove_pause(lifting.as_deref(), at)
+                    })
+                    .await?;
                 self.paused = None;
                 let changed = lifted.is_some();
                 if changed {
                     // What waited starts as capacity allows.
                     self.ready_hint = true;
-                    self.notices
-                        .push(json!({"event": "resumed", "pause": lifted, "durable": false}));
+                    self.notices.push(
+                        json!({"event": "resumed", "pause": lifted, "by": by, "durable": false}),
+                    );
                 }
-                Ok(json!({"pause": lifted, "changed": changed}))
+                Ok(json!({"pause": lifted, "by": by, "changed": changed}))
             }
             Command::Companions { add, remove } => match (add, remove) {
                 (Some(_), Some(_)) => {
@@ -3865,16 +3971,18 @@ impl Service {
                 name,
                 active,
             } => {
-                store
-                    .read("list", move |db| {
+                let reader = store.reader();
+                self.observe(session, output, id, async move {
+                    (reader.read("list", move |db| {
                         db.list(
                             after.as_deref(),
                             limit.unwrap_or(64),
                             name.as_deref(),
                             active,
                         )
-                    })
+                    }))
                     .await
+                })
             }
             Command::Fork {
                 source,
@@ -3964,9 +4072,10 @@ impl Service {
                 Ok(created)
             }
             Command::Events { bot, after, limit } => {
-                store
-                    .op("events", move |db| db.events(&bot, after, limit))
-                    .await
+                let reader = store.reader();
+                self.observe(session, output, id, async move {
+                    (reader.read("events", move |db| db.events(&bot, after, limit))).await
+                })
             }
             Command::HistoryNodes {
                 bot,
@@ -3975,39 +4084,39 @@ impl Service {
                 min_node,
                 oldest_first,
             } => {
-                store
-                    .read("history_nodes", move |db| {
+                let reader = store.reader();
+                self.observe(session, output, id, async move {
+                    (reader.read("history_nodes", move |db| {
                         db.history_nodes(&bot, from, limit.unwrap_or(400), min_node, oldest_first)
-                    })
+                    }))
                     .await
+                })
             }
             Command::HistoryItems { bot, nodes } => {
-                store
-                    .read("history_items", move |db| db.history_items(&bot, &nodes))
-                    .await
+                let reader = store.reader();
+                self.observe(session, output, id, async move {
+                    (reader.read("history_items", move |db| db.history_items(&bot, &nodes))).await
+                })
             }
             Command::HistorySearch { bot, query, before } => {
-                // Off the dispatch path, as usage is: a pattern reads every
-                // matching bot's history.
-                let (reader, output) = (store.reader(), output.clone());
-                tokio::spawn(async move {
+                let reader = store.reader();
+                self.observe(session, output, id, async move {
                     let many = bot.contains(['*', '?', '[']);
-                    let result = reader
-                        .read("history_search", move |db| match many {
-                            true => db.history_search_bots(&bot, &query, before, None),
-                            false => db.history_search(&bot, &query, before, false),
-                        })
-                        .await;
-                    retention_reply(session, &output, id, result).await;
-                });
-                Err(Error::new("deferred"))
+                    (reader.read("history_search", move |db| match many {
+                        true => db.history_search_bots(&bot, &query, before, None),
+                        false => db.history_search(&bot, &query, before, false),
+                    }))
+                    .await
+                })
             }
             Command::Prompts { bot, turn, bytes } => {
-                store
-                    .read("prompts", move |db| {
+                let reader = store.reader();
+                self.observe(session, output, id, async move {
+                    (reader.read("prompts", move |db| {
                         db.prompts(&bot, turn, bytes.unwrap_or(64 * 1024))
-                    })
+                    }))
                     .await
+                })
             }
             Command::Artifact {
                 bot,
@@ -4429,6 +4538,41 @@ async fn answer_queued(
     }
 }
 
+/// Answer the reads still running or waiting, within a few seconds; any
+/// left after that go unanswered, as the daemon stops.
+async fn answer_observed(
+    service: &mut Service,
+    sessions: &mut HashMap<u64, Output>,
+    stdio_owner: bool,
+) {
+    let by = tokio::time::Instant::now() + Duration::from_secs(5);
+    while let Ok(Some((asker, sent))) = tokio::time::timeout_at(by, service.lane.next()).await {
+        if !sent && unanswered(service, sessions, stdio_owner, asker.session).is_err() {
+            break;
+        }
+    }
+    service.lane.stop().await;
+}
+
+/// A session that could not take its answer goes, as `reply` drops it;
+/// for the stdio owner, the daemon ends.
+fn unanswered(
+    service: &mut Service,
+    sessions: &mut HashMap<u64, Output>,
+    stdio_owner: bool,
+    session: u64,
+) -> Result<()> {
+    if session == 0 && stdio_owner {
+        return fail("output_closed");
+    }
+    if sessions.remove(&session).is_some() {
+        service.sessions = sessions.len();
+        service.hub.close_session(session);
+        service.handles.close_session(session);
+    }
+    Ok(())
+}
+
 /// Answer a request: the stdio owner gets bounded backpressure, and losing
 /// it ends the daemon; a socket client that cannot take the reply is dropped.
 async fn reply(
@@ -4524,7 +4668,20 @@ async fn delete_pieces(
 
 /// Match ordinary replies: the stdio owner (session zero) gets bounded
 /// backpressure; socket clients cannot hold up a reply task when they lag.
-async fn retention_reply(session: u64, output: &Output, id: Value, result: Result<Value>) {
+/// Answer a read from the observation lane, in its own task.
+fn deliver(
+    session: u64,
+    output: Output,
+    id: Value,
+    result: Result<Value>,
+) -> futures_util::future::BoxFuture<'static, bool> {
+    Box::pin(async move { retention_reply(session, &output, id, result).await })
+}
+
+/// Answer a request from a task of its own: the stdio owner waits a few
+/// seconds for room, and a socket client that cannot take it is closed.
+/// Whether it was sent.
+async fn retention_reply(session: u64, output: &Output, id: Value, result: Result<Value>) -> bool {
     let sent = if session == 0 {
         matches!(
             tokio::time::timeout(Duration::from_secs(5), output.respond(id, result)).await,
@@ -4536,6 +4693,7 @@ async fn retention_reply(session: u64, output: &Output, id: Value, result: Resul
     if !sent {
         output.close();
     }
+    sent
 }
 
 /// One `provider_models` reply carries every listing, so it must fit one
@@ -4913,8 +5071,9 @@ mod tests {
             limits: Limits {
                 pending: 0,
                 pending_bytes: 0,
+                readers: 1,
                 processes: 16,
-                detached: 16,
+                lasting: 16,
                 active: 1024,
                 connecting: 64,
                 connections: 11,
@@ -4938,6 +5097,7 @@ mod tests {
             jobs: JoinSet::new(),
             replays: JoinSet::new(),
             retention: JoinSet::new(),
+            lane: lane::Lane::new(2, deliver),
             ready_hint: false,
             tokens: Arc::default(),
             wakes: Wakes::default(),
@@ -5001,6 +5161,32 @@ mod tests {
             "bot_not_found"
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+    #[test]
+    fn an_interrupt_supersedes_a_pause_and_nothing_relabels_an_interrupt() {
+        let active = |cancel| Active {
+            turn: 1,
+            task: 1,
+            cancel,
+            steers: Arc::default(),
+            compact: Arc::default(),
+            lift: Arc::default(),
+            ending: Arc::default(),
+        };
+        // A pause only parks the turn: an interrupt after it ends it.
+        let (cancel, cause) = watch::channel(None);
+        let pulled = active(cancel);
+        assert!(pulled.cancel(turn::PAUSED));
+        assert!(pulled.cancel(turn::INTERRUPTED));
+        assert_eq!(*cause.borrow(), Some(turn::INTERRUPTED));
+        // Nothing relabels an interrupt, and shutdown leaves a pause's park.
+        assert!(pulled.cancel(turn::PAUSED));
+        assert_eq!(*cause.borrow(), Some(turn::INTERRUPTED));
+        let (cancel, cause) = watch::channel(None);
+        let parked = active(cancel);
+        parked.cancel(turn::PAUSED);
+        parked.cancel(turn::SHUTDOWN);
+        assert_eq!(*cause.borrow(), Some(turn::PAUSED));
     }
     #[tokio::test]
     async fn interrupt_reconciles_a_parked_task_before_it_is_reaped() {
@@ -5087,8 +5273,9 @@ mod tests {
             limits: Limits {
                 pending: 0,
                 pending_bytes: 0,
+                readers: 1,
                 processes: 16,
-                detached: 16,
+                lasting: 16,
                 active: 1024,
                 connecting: 64,
                 connections: 11,
@@ -5112,6 +5299,7 @@ mod tests {
             jobs: JoinSet::new(),
             replays: JoinSet::new(),
             retention: JoinSet::new(),
+            lane: lane::Lane::new(2, deliver),
             ready_hint: false,
             tokens: Arc::default(),
             wakes: Wakes::default(),
@@ -5303,8 +5491,9 @@ mod tests {
             limits: Limits {
                 pending: 0,
                 pending_bytes: 0,
+                readers: 1,
                 processes: 16,
-                detached: 16,
+                lasting: 16,
                 active: 1024,
                 connecting: 64,
                 connections: 11,
@@ -5332,6 +5521,7 @@ mod tests {
             jobs: JoinSet::new(),
             replays: JoinSet::new(),
             retention: JoinSet::new(),
+            lane: lane::Lane::new(2, deliver),
             ready_hint: false,
             tokens: Arc::default(),
             wakes: Wakes::default(),
@@ -5546,8 +5736,9 @@ mod tests {
             limits: Limits {
                 pending: 0,
                 pending_bytes: 0,
+                readers: 1,
                 processes: 16,
-                detached: 16,
+                lasting: 16,
                 active: 1024,
                 connecting: 64,
                 connections: 11,
@@ -5560,6 +5751,7 @@ mod tests {
             jobs: JoinSet::new(),
             replays: JoinSet::new(),
             retention: JoinSet::new(),
+            lane: lane::Lane::new(2, deliver),
             ready_hint: false,
             tokens: Arc::default(),
             wakes: Wakes::default(),
@@ -6551,6 +6743,122 @@ mod tests {
         };
         output.try_respond(id, Ok(result.unwrap())).unwrap();
         assert_eq!(service.unpublished.len(), 1, "only the late event waits");
+        publisher.abort();
+        drop(service);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_replay_keeps_its_seat_until_its_read_is_done() {
+        let dir = scratch("replay-seat");
+        let (store, _publications) = Store::open_with(&dir.join("state.sqlite"), 1)
+            .await
+            .unwrap();
+        let seats = Arc::new(tokio::sync::Semaphore::new(1));
+        let hub = Hub::default().with_page_seats(seats.clone());
+        // The one reader is busy, so the replay's page waits in its queue.
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        let busy = tokio::spawn({
+            let store = store.clone();
+            async move {
+                store
+                    .read("busy", move |_| {
+                        let _ = gate.recv();
+                        Ok(())
+                    })
+                    .await
+            }
+        });
+        let sub = hub.subscribe(hub::ALL, 1, Output::writer(tokio::io::sink()), 0, None);
+        let paging = tokio::spawn(replay(store.clone(), hub.clone(), hub::ALL.to_owned(), sub));
+        while seats.available_permits() > 0 {
+            tokio::task::yield_now().await;
+        }
+        paging.abort();
+        let _ = paging.await;
+        // The read it queued still runs on the reader: its seat is still held.
+        assert_eq!(seats.available_permits(), 0);
+        release.send(()).unwrap();
+        busy.await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while seats.available_permits() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the read's end frees its seat");
+    }
+
+    #[tokio::test]
+    async fn a_replay_racing_new_events_delivers_each_once_in_order() {
+        use tokio::io::AsyncBufReadExt;
+        let dir = scratch("replay-race");
+        let (store, publications) = Store::open(&dir.join("state.sqlite")).await.unwrap();
+        let mut service = admitting(&store, 1024);
+        let publisher = tokio::spawn(publish(
+            publications,
+            service.hub.clone(),
+            service.handles.clone(),
+        ));
+        let output = Output::writer(tokio::io::sink());
+        let mut made = 0;
+        let mut make = async |service: &mut Service, count: usize| {
+            for _ in 0..count {
+                let command = create(&format!("B{made}"), &dir);
+                made += 1;
+                let bound = service.admission_sends(&command, &json!(made), 1);
+                let deferred = service
+                    .dispatch(command, 1, &output, json!(made), bound)
+                    .await;
+                assert_eq!(deferred.unwrap_err().code, "deferred");
+                while !service.admissions.is_empty() {
+                    let (_, _, _, result) = service.settle().await;
+                    result.unwrap();
+                }
+            }
+        };
+        // History to page through, then a follower that pages it while
+        // more events commit and publish.
+        make(&mut service, 600).await;
+        let (near, far) = tokio::io::duplex(1 << 20);
+        let follower = Output::writer(near);
+        let sub = service
+            .hub
+            .subscribe(hub::ALL, 2, follower.clone(), 0, None);
+        let paging = tokio::spawn(replay(
+            store.clone(),
+            service.hub.clone(),
+            hub::ALL.to_owned(),
+            sub,
+        ));
+        make(&mut service, 400).await;
+        paging.await.unwrap().unwrap();
+        let last = store
+            .op("last", |db| db.cursor_since(i64::MAX))
+            .await
+            .unwrap();
+        service.hub.published_through(last).await;
+        let mut lines = tokio::io::BufReader::new(far).lines();
+        let mut cursors = Vec::new();
+        let mut live = 0;
+        while let Ok(Ok(Some(line))) =
+            tokio::time::timeout(Duration::from_secs(5), lines.next_line()).await
+        {
+            let event: Value = serde_json::from_str(&line).unwrap();
+            match event["cursor"].as_i64() {
+                _ if event["event"] == "follow_live" => live += 1,
+                Some(cursor) => cursors.push(cursor),
+                None => {}
+            }
+            if live == 1 && cursors.last() == Some(&last) {
+                break;
+            }
+        }
+        assert_eq!(live, 1);
+        assert!(last >= 1000, "{last}");
+        let expected: Vec<i64> = (1..=last).collect();
+        assert_eq!(cursors, expected, "every event once, in order");
         publisher.abort();
         drop(service);
         drop(store);
