@@ -937,8 +937,11 @@ impl Margin {
                 .iter()
                 .filter(|step| step.starts_with("[x]"))
                 .count();
+            // ≡, one column in every terminal: ☰ is two since Unicode 16
+            // and one in most terminals still, which left a letter of what
+            // was drawn before beside it.
             lines.push(Line::from(vec![
-                Span::raw(" ☰ ").fg(Color::Cyan),
+                Span::raw(" ≡ ").fg(Color::Cyan),
                 Span::raw("Plan").bold(),
                 Span::raw(format!("  {done}/{}", self.plan.len())).dim(),
             ]));
@@ -1262,6 +1265,24 @@ mod tests {
 
     fn margin() -> Margin {
         Margin::default()
+    }
+
+    #[test]
+    fn the_plan_is_drawn_in_glyphs_one_column_wide_everywhere() {
+        let mut margin = margin();
+        margin.set_plan(&["[x] Run the tests".to_owned(), "[ ] Push".to_owned()]);
+        let (lines, _) = margin.lines(60, Path::new("/"), None);
+        // Each cell is one character: a glyph Unicode counts as two while
+        // terminals draw it as one leaves a stale letter beside it.
+        for line in &lines {
+            let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            assert_eq!(text.width(), text.chars().count(), "{text}");
+        }
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.spans.iter().any(|s| s.content.contains('≡')))
+        );
     }
 
     #[test]

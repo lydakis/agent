@@ -2,9 +2,12 @@
 //! on it, which the daemon records, and Sonny draws the question in the
 //! conversation where it was asked: why it is asked, each option with what
 //! picking it means, the one the lead recommends and why, and what the
-//! agent does while nobody answers. What the person types next answers
-//! it, and goes to the lead as their next message. The open questions are
-//! read from the history Sonny replays: its `ask` calls not yet answered.
+//! agent does while nobody answers. A pick (a click on an option, or its
+//! number typed) answers it, and goes to the lead as their next message.
+//! Words the person types are their own, never framed as an answer: they
+//! may be meant for anything, and the agent reads whether they answer, as
+//! a reply under a card in a chat is read. The open questions are read
+//! from the history Sonny replays: its `ask` calls not yet answered.
 //!
 //! Silence counts as a yes only where the agent says a step can be undone,
 //! as an Apache project's lazy consensus passes what is easy to revert once
@@ -44,6 +47,9 @@ pub struct Ask {
     /// Why it is asked: what the answer decides.
     pub why: String,
     pub options: Vec<Choice>,
+    /// For a step only the person can take, in place of options: the
+    /// exact line for them to run in their own terminal.
+    pub command: Option<String>,
     /// The option recommended, from 0, and why.
     pub recommended: Option<usize>,
     pub reason: String,
@@ -103,8 +109,9 @@ pub fn tool() -> Value {
             with what happens if they pick it, the one you recommend and why, and what you do until \
             they answer. Options without what they mean are useless to the person, so say what each \
             one does to their goal. Ask once, one decision per call, and do not repeat it in your \
-            reply. Their answer comes as their next message, starting \"You asked:\" and your \
-            question. Say in if_unanswered what you do until then. go_now goes on with the option \
+            reply. A pick comes as their next message, starting \"You asked:\" and your \
+            question; words they write instead come as they wrote them, so read whether they \
+            answer it. Say in if_unanswered what you do until then. go_now goes on with the option \
             you recommend at once, for a step you can undo once they have seen it. go_later goes \
             on with it once the wait passes with no word from them, for a step you can undo but \
             would rather they saw first. wait does nothing they have not picked: anything that goes \
@@ -113,8 +120,11 @@ pub fn tool() -> Value {
             on. Sonny wakes you at the deadline unless they answered or wrote to you since; that \
             wake is Sonny's, never their answer, so it allows nothing that needs their own words. \
             If they pick another option after you went ahead, undo what you did and follow their \
-            pick. Meanwhile do work that does not depend on the answer, or end your turn. A \
-            question with nothing to choose between goes in your reply instead.",
+            pick. Meanwhile do work that does not depend on the answer, or end your turn. A step \
+            only the person can take, such as a sign-in or a command that needs their own \
+            terminal and keyboard, is an ask too: give no options, put the exact line to run in \
+            command, say in why what it unblocks, and wait; their next message says how it went. \
+            Any other question with nothing to choose between goes in your reply instead.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -123,7 +133,7 @@ pub fn tool() -> Value {
                 "why": {"type": "string",
                     "description": "Why you ask now: what the answer decides and the background the person needs to choose, in a sentence or three."},
                 "options": {"type": "array",
-                    "description": "2 to 4 options, each a different way forward.",
+                    "description": "2 to 4 options, each a different way forward; none with command.",
                     "items": {
                         "type": "object",
                         "properties": {
@@ -134,9 +144,14 @@ pub fn tool() -> Value {
                         "required": ["label", "explanation"],
                         "additionalProperties": false
                     }},
+                "command": {"type": "string",
+                    "description": "For a step only the person can take, in place of options: the \
+                        exact line for them to paste into their own terminal, whole, with nothing \
+                        to fill in."},
                 "recommended": {"type": "integer",
-                    "description": "The number of the option you recommend, from 1."},
-                "reason": {"type": "string", "description": "Why you recommend it, in one sentence."},
+                    "description": "The number of the option you recommend, from 1; with options."},
+                "reason": {"type": "string",
+                    "description": "Why you recommend it, in one sentence; with options."},
                 "if_unanswered": {"type": "string", "enum": ["go_now", "go_later", "wait"],
                     "description": "What you do until they answer, as above."},
                 "wait_minutes": {"type": "integer", "minimum": 1, "maximum": MAX_MINUTES,
@@ -144,7 +159,7 @@ pub fn tool() -> Value {
                         are reminded, when the work runs on a clock, such as a meeting or a release; \
                         left out, the person's setting."}
             },
-            "required": ["question", "why", "options", "recommended", "reason", "if_unanswered"],
+            "required": ["question", "why", "if_unanswered"],
             "additionalProperties": false
         },
         "answered_by": crate::served::TAG,
@@ -191,6 +206,13 @@ pub fn call(id: &str, arguments: &Value) -> Option<Ask> {
         .filter(|choice| !choice.label.is_empty())
         .take(OPTIONS)
         .collect();
+    // The line to run as the agent wrote it, only its ends trimmed: a
+    // blank line or a space inside a quoted value or a here-document is
+    // part of what it does.
+    let command = (arguments["command"].as_str())
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .map(str::to_owned);
     let recommended = arguments["recommended"]
         .as_u64()
         .and_then(|n| (n as usize).checked_sub(1))
@@ -210,6 +232,7 @@ pub fn call(id: &str, arguments: &Value) -> Option<Ask> {
         question,
         why: prose(arguments["why"].as_str()),
         options,
+        command,
         recommended,
         reason: prose(arguments["reason"].as_str()),
         unanswered,
@@ -313,6 +336,13 @@ pub fn close(asks: &mut Vec<Ask>, text: &str) -> bool {
     at.map(|at| asks.remove(at)).is_some()
 }
 
+/// Whether what is typed picks one of `ask`'s options: its number alone.
+/// Only a pick answers a question from the composer; words are the
+/// person's own.
+pub fn picks(ask: &Ask, typed: &str) -> bool {
+    (typed.trim().parse::<usize>()).is_ok_and(|n| (1..=ask.options.len()).contains(&n))
+}
+
 /// The person's message answering `ask`: an option's number stands for
 /// the option.
 pub fn answer(ask: &Ask, typed: &str) -> String {
@@ -330,6 +360,8 @@ pub struct Card {
     pub rows: Vec<Line<'static>>,
     /// The row each option starts on, which a click picks it on.
     pub options: Vec<usize>,
+    /// The rows the command to run is on, which a click copies it from.
+    pub command: std::ops::Range<usize>,
     /// What each row's rows past its first start with, should it be
     /// drawn narrower than it was laid: the bar, then room to the text,
     /// so the bar goes on down however the rows wrap.
@@ -377,8 +409,25 @@ pub fn card(ask: &Ask, width: usize) -> Card {
         Line::from(indent()),
         Style::new().dim(),
     ));
-    if !ask.options.is_empty() {
+    if !ask.options.is_empty() || ask.command.is_some() {
         rows.push(spacer());
+    }
+    // A step for the person: the line to run at the text's own weight,
+    // under a muted row saying where, as a code block reads in a reply.
+    let mut command = 0..0;
+    if let Some(line) = &ask.command {
+        let said = Line::from("Run this in your own terminal; a click copies it.").dim();
+        let said =
+            crate::transcript::wrap_lines(said, width, Line::from(indent()), Line::from(indent()));
+        rows.extend(said.into_iter().map(|row| (row, Line::from(indent()))));
+        let under = || Line::from(vec![indent(), Span::raw("   ")]);
+        let from = rows.len();
+        for part in line.lines() {
+            let wrapped =
+                crate::transcript::wrap_lines(Line::from(part.to_owned()), width, under(), under());
+            rows.extend(wrapped.into_iter().map(|row| (row, under())));
+        }
+        command = from..rows.len();
     }
     // The explanation sits under its label, past the number.
     let under = || vec![indent(), Span::raw("   ")];
@@ -432,6 +481,7 @@ pub fn card(ask: &Ask, width: usize) -> Card {
     Card {
         rows,
         options,
+        command,
         hangs,
     }
 }
@@ -477,6 +527,11 @@ fn meanwhile(ask: &Ask, now: i64) -> Option<Vec<(String, bool)>> {
             at(deadline),
             muted(" unless you pick."),
         ],
+        (Unanswered::Wait, _, Some(deadline)) if ask.command.is_some() => vec![
+            muted("Waits for you to run it; a reminder at "),
+            at(deadline),
+            muted("."),
+        ],
         (Unanswered::Wait, _, Some(deadline)) => vec![
             muted("Waits for your pick; a reminder at "),
             at(deadline),
@@ -484,6 +539,7 @@ fn meanwhile(ask: &Ask, now: i64) -> Option<Vec<(String, bool)>> {
         ],
         // No deadline: the person's setting turned them off, or Sonny
         // could not say when.
+        _ if ask.command.is_some() => vec![muted("Waits for you to run it.")],
         _ => vec![muted("Waits for your pick.")],
     })
 }
@@ -522,6 +578,26 @@ pub fn served(arguments: &Value, bot: &str, turn: i64, call: &str) -> Result<Str
     let asked = arguments["if_unanswered"].as_str().unwrap_or_default();
     let plan = Unanswered::parse(asked)
         .ok_or("invalid_arguments: if_unanswered is go_now, go_later or wait")?;
+    if ask.command.is_some() && !ask.options.is_empty() {
+        return Err(
+            "invalid_arguments: a command is a step for the person to take, with no options; ask \
+             for one or the other"
+                .into(),
+        );
+    }
+    if ask.command.is_none() && ask.options.is_empty() {
+        return Err(
+            "invalid_arguments: options to pick from, or a command for a step only the person can \
+             take"
+                .into(),
+        );
+    }
+    // A step only the person can take waits for them, whatever was asked.
+    let plan = if ask.command.is_some() {
+        Unanswered::Wait
+    } else {
+        plan
+    };
     if plan != Unanswered::Wait && ask.recommended.is_none() {
         return Err(
             "invalid_arguments: going ahead needs the option you recommend, in recommended".into(),
@@ -550,6 +626,16 @@ pub fn served(arguments: &Value, bot: &str, turn: i64, call: &str) -> Result<Str
         };
     let when = deadline.map(|d| clock(d, now()));
     let next = match (plan, &when, &unset) {
+        _ if ask.command.is_some() => format!(
+            "Shown to the person with the command to run. Do nothing that needs it until they say \
+             how it went, in their next message.{} Meanwhile do work that does not depend on it, \
+             or end your turn.",
+            match &when {
+                Some(when) =>
+                    format!(" Unless they write to you first, Sonny reminds you at {when}."),
+                None => String::new(),
+            }
+        ),
         (Unanswered::Now, ..) => format!(
             "Shown to the person. Go on now with \"{label}\", keeping it undoable; if they pick \
              another, undo it and follow their pick."
@@ -765,9 +851,10 @@ pub fn hint(ask: &Ask, at: usize, of: usize, width: usize) -> Vec<Span<'static>>
     if of > 1 {
         keys.push("↑↓ switch".into());
     }
-    keys.push("esc write instead".into());
+    keys.push("esc set aside".into());
     let keys = keys.join(" · ");
     let words = match ask.options.len() {
+        0 if ask.command.is_some() => " say how it went ·",
         0 => " type your answer ·",
         _ => "",
     };
@@ -961,11 +1048,11 @@ mod tests {
         let ask = call("c1", &keep_api()).unwrap();
         assert_eq!(
             text(&hint(&ask, 0, 1, 80)),
-            "Answer “Keep the old API?”: 1–2 pick · esc write instead"
+            "Answer “Keep the old API?”: 1–2 pick · esc set aside"
         );
         assert_eq!(
             text(&hint(&ask, 1, 2, 80)),
-            "Answer “Keep the old API?” (2 of 2): 1–2 pick · ↑↓ switch · esc write instead"
+            "Answer “Keep the old API?” (2 of 2): 1–2 pick · ↑↓ switch · esc set aside"
         );
         assert!(text(&hint(&ask, 0, 1, 50)).contains('…'));
         // The question muted, the keys in the one grammar.
@@ -985,7 +1072,7 @@ mod tests {
         let open = call("c2", &json!({"question": "Why?"})).unwrap();
         assert_eq!(
             text(&hint(&open, 0, 1, 80)),
-            "Answer “Why?”: type your answer · esc write instead"
+            "Answer “Why?”: type your answer · esc set aside"
         );
         // Over what is typed, the row the sent answer will have.
         assert_eq!(
@@ -1223,6 +1310,135 @@ mod tests {
             ]
         );
         assert_eq!(card.hangs.len(), card.rows.len());
+    }
+
+    fn sign_in() -> Value {
+        json!({
+            "question": "Sign in to the package registry",
+            "why": "Publishing the release needs your account; the token stays on your machine.",
+            "command": "  npm login --auth-type=web  ",
+            "if_unanswered": "go_now",
+        })
+    }
+
+    #[test]
+    fn a_step_only_the_person_can_take_is_an_ask_with_its_command_and_no_options() {
+        let tool = tool();
+        let required = tool["parameters"]["required"].as_array().unwrap();
+        assert!(!required.contains(&json!("options")));
+        assert!(tool["parameters"]["properties"]["command"].is_object());
+        assert!(
+            tool["description"]
+                .as_str()
+                .unwrap()
+                .contains("put the exact line to run in")
+        );
+        let ask = call("c9", &sign_in()).unwrap();
+        assert_eq!(ask.command.as_deref(), Some("npm login --auth-type=web"));
+        assert!(ask.options.is_empty());
+        // Nothing to go ahead with: it waits, whatever was asked.
+        assert_eq!(ask.unanswered, Some(Unanswered::Wait));
+        // Still open until the person says how it went, as any ask.
+        let items = [
+            json!({"type": "function_call", "name": TOOL, "call_id": "c9",
+            "arguments": sign_in().to_string()}),
+        ];
+        assert_eq!(
+            open(&items).as_deref(),
+            Some("Sign in to the package registry")
+        );
+        assert_eq!(
+            answer(&ask, "done, signed in"),
+            "You asked: Sign in to the package registry\n\ndone, signed in"
+        );
+        let hint: String = hint(&ask, 0, 1, 80)
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(
+            hint,
+            "Answer “Sign in to the package registry”: say how it went · esc set aside"
+        );
+    }
+
+    #[test]
+    fn the_card_shows_the_line_to_run_where_a_click_copies_it() {
+        let mut ask = call("c9", &sign_in()).unwrap();
+        ask.deadline = None;
+        let card = card(&ask, 60);
+        let shown: Vec<String> = (card.rows.iter())
+            .map(|row| row.to_string().trim_end().to_owned())
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                "? Sign in to the package registry",
+                "┃ Publishing the release needs your account; the token stays",
+                "┃ on your machine.",
+                "┃",
+                "┃ Run this in your own terminal; a click copies it.",
+                "┃    npm login --auth-type=web",
+                "┃",
+                "┃ Waits for you to run it.",
+            ]
+        );
+        assert_eq!(card.command, 5..6);
+        assert!(card.options.is_empty());
+        assert_eq!(card.hangs.len(), card.rows.len());
+        // The line at the text's own weight; what it is, muted.
+        assert!(!card.rows[5].spans.iter().any(|s| s.content.contains("npm")
+            && s.style.add_modifier.contains(ratatui::style::Modifier::DIM)));
+        let now = 1_800_000_000;
+        ask.deadline = Some(now + 3600);
+        let said: String = meanwhile(&ask, now)
+            .unwrap()
+            .into_iter()
+            .map(|(t, _)| t)
+            .collect();
+        assert_eq!(
+            said,
+            format!(
+                "Waits for you to run it; a reminder at {}.",
+                clock(now + 3600, now)
+            )
+        );
+    }
+
+    #[test]
+    fn the_line_to_run_keeps_its_blank_lines_and_spaces() {
+        let mut asked = sign_in();
+        asked["command"] = json!("\n  cat <<'EOF' > notes.txt\nfirst  \n\nsecond\nEOF\n");
+        let ask = call("c9", &asked).unwrap();
+        assert_eq!(
+            ask.command.as_deref(),
+            Some("cat <<'EOF' > notes.txt\nfirst  \n\nsecond\nEOF")
+        );
+        let card = card(&ask, 60);
+        let shown: Vec<String> = card.rows[card.command.clone()]
+            .iter()
+            .map(|row| row.to_string())
+            .collect();
+        assert_eq!(shown.len(), 5, "{shown:?}");
+        assert_eq!(shown[2].trim_end(), "┃");
+    }
+
+    #[test]
+    fn an_ask_has_options_or_a_command_never_both_nor_neither() {
+        let mut both = sign_in();
+        both["options"] =
+            json!([{"label": "Yes", "explanation": "e"}, {"label": "No", "explanation": "f"}]);
+        let refused = served(&both, "shop.fix", 1, "c1").unwrap_err();
+        assert!(
+            refused.starts_with("invalid_arguments: a command is a step"),
+            "{refused}"
+        );
+        let mut neither = sign_in();
+        neither.as_object_mut().unwrap().remove("command");
+        let refused = served(&neither, "shop.fix", 1, "c1").unwrap_err();
+        assert!(
+            refused.starts_with("invalid_arguments: options to pick from"),
+            "{refused}"
+        );
     }
 
     #[test]

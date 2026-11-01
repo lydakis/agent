@@ -516,32 +516,55 @@ fn apply_env_file(command: &mut std::process::Command) -> Result<(), String> {
 /// keeps the judge it was given first, so leads on other models do not
 /// start it again.
 async fn serve_auto(client: &Client, model: &str) -> Result<(), String> {
-    let bin = std::env::current_exe().map_err(|e| e.to_string())?;
-    let args = daemon_args("approver");
-    let kept = client
-        .request("companions", json!({}))
-        .await
-        .map_err(|e| e.to_string())?;
-    if (kept["companions"].as_array().into_iter().flatten())
-        .any(|c| c["name"] == APPROVER && c["command"] == json!(bin) && c["args"] == json!(args))
-    {
-        return Ok(());
-    }
-    keep(client, APPROVER, &bin, args, json!({"AGENT_MODEL": model})).await
+    keep_approver(client, Some(model)).await
 }
 
 /// Sonny's companions in the daemon, so they run for as long as it does,
 /// whether or not a window is open, and come back with the next daemon:
 /// the lookout, `sonny lookout`, which tells leads what happens in their
 /// tasks, and the tool host, `sonny tool-host`, which answers the tools
-/// Sonny gives its agents. This Sonny's own build replaces another's: the
-/// build is part of what the daemon keeps, so a Sonny upgraded in place
-/// has the daemon start the new ones.
+/// Sonny gives its agents; and the approver, when one is kept already.
+/// This Sonny's own build replaces another's: the build is part of what
+/// the daemon keeps, so a Sonny upgraded in place has the daemon start the
+/// new ones, the approver too, with no window in `auto` needed.
 async fn start_companions(client: &Client) -> Result<(), String> {
     let me = std::env::current_exe().map_err(|e| e.to_string())?;
     let build = json!({"SONNY_BUILD": lookout::identity()});
     keep(client, LOOKOUT, &me, daemon_args("lookout"), build.clone()).await?;
-    keep(client, TOOL_HOST, &me, daemon_args(tool_host::NAME), build).await
+    keep(client, TOOL_HOST, &me, daemon_args(tool_host::NAME), build).await?;
+    keep_approver(client, None).await
+}
+
+/// Keep the approver running this Sonny's binary and build: the one kept
+/// already with the judge it has, else, given a `model`, a new one judged
+/// by it. Without one kept or a model, nothing.
+async fn keep_approver(client: &Client, model: Option<&str>) -> Result<(), String> {
+    let me = std::env::current_exe().map_err(|e| e.to_string())?;
+    let listed = client
+        .request("companions", json!({}))
+        .await
+        .map_err(|e| e.to_string())?;
+    let kept =
+        (listed["companions"].as_array().into_iter().flatten()).find(|c| c["name"] == APPROVER);
+    let Some(env) = approver_env(kept, model, &lookout::identity()) else {
+        return Ok(());
+    };
+    keep(client, APPROVER, &me, daemon_args("approver"), env).await
+}
+
+/// What the approver runs with: the judge the one `kept` has, else
+/// `model`, and this Sonny's `build`. `None` when there is neither one kept
+/// nor a model to start one with.
+fn approver_env(kept: Option<&Value>, model: Option<&str>, build: &str) -> Option<Value> {
+    let judge = match kept {
+        Some(kept) => kept["env"]["AGENT_MODEL"].as_str(),
+        None => Some(model?),
+    };
+    let mut env = json!({"SONNY_BUILD": build});
+    if let Some(judge) = judge {
+        env["AGENT_MODEL"] = json!(judge);
+    }
+    Some(env)
 }
 
 /// How long a word waits on the daemon to say whether it names an agent.
@@ -1215,6 +1238,9 @@ async fn run() -> Result<(), String> {
     // sandbox, and a side chat leaves it to its agent.
     if options.side.is_none() && project::is_lead(&name) {
         app.upgrades = skills::upgraded();
+        // So is the first of a folder's leads opened since a restore,
+        // which sets up again the folder's triggers the person asked for.
+        app.restored = project::lead_project(&name).and_then(trigger::restored);
     }
     if let Some(set) = setup::just_set() {
         app.notice = Some(set);
@@ -2103,6 +2129,8 @@ struct Watch {
     read: Instant,
     /// The lookout's line for the lead.
     lookout: String,
+    /// What is wrong around the agents, under the lookout's line.
+    alerts: Vec<status::Alert>,
     /// The resolved tasks are listed, not only counted.
     resolved: bool,
     /// `/background` holds the screen instead of the card.
@@ -2227,6 +2255,9 @@ struct App {
     /// message of their own after them: out of the composer and the
     /// count, their options still answering them.
     aside: Vec<asks::Ask>,
+    /// The line each ask for a step of the person's gave them to run, by
+    /// its call: a click on its card copies it.
+    commands: HashMap<String, String>,
     /// Questions this window answered and closed, until their answers
     /// land, so landing does not close another asked the same.
     sent_answers: Vec<String>,
@@ -2462,6 +2493,9 @@ struct App {
     /// What Sonny's upgrade set beside the person's own edits, told to the
     /// bot once it is set up.
     upgrades: Option<skills::Upgrades>,
+    /// The triggers a restore brought for this folder's lead to set up
+    /// again, until it is told of them.
+    restored: Option<trigger::Restored>,
     /// The folder the next message moves the bot to: its lead moved away.
     move_to: Option<String>,
     /// The name under which Sonny notes the instructions it wrote.
@@ -2687,6 +2721,15 @@ fn made_room(closed: &[String], project: &str, most: usize) -> String {
     )
 }
 
+/// The status row's word on a task window that waits for room: the ones
+/// open are all new to the person.
+fn no_room(bot: &str, project: &str, most: usize) -> String {
+    let name = bot.strip_prefix(&format!("{project}.")).unwrap_or(bot);
+    format!(
+        "{name} opened no window: {most} task windows at most (in /config) and you have not looked at those open yet; /status opens it"
+    )
+}
+
 /// What a lead may close for room in its multiplexer: only its own tasks'
 /// windows (another lead of the folder keeps its own there), none whose
 /// task it heard failed or need the person, and none whose window says so
@@ -2731,6 +2774,17 @@ fn seat_profile(
     }
 }
 
+/// `bot` as the person says it: a lead by its project, as `shop lead`,
+/// any other agent by its own name.
+fn spoken(bot: &str) -> String {
+    match project::lead_project(bot) {
+        Some(project) => lead_title(project, bot),
+        None => bot.to_owned(),
+    }
+}
+
+/// A lead as the person tells it apart: `shop lead` for the folder's
+/// first, `shop lead billing` for `shop.lead.billing`.
 fn lead_title(project: &str, bot: &str) -> String {
     match bot.ends_with(".lead") {
         true => format!("{project} lead"),
@@ -3118,6 +3172,10 @@ impl Fleet {
                     }
                     (!here).then(|| format!("{bot_name} is in {home}"))
                 }
+                Ok(mux::Shown::NoRoom) => {
+                    let _ = told.send(Told::Notice(no_room(&bot_name, &room.project, room.most)));
+                    None
+                }
                 Ok(_) => None,
                 Err(error) => Some(error),
             };
@@ -3478,6 +3536,7 @@ impl App {
             asks: Vec::new(),
             focus: None,
             aside: Vec::new(),
+            commands: HashMap::new(),
             sent_answers: Vec::new(),
             bot_id: record["bot_id"].as_i64(),
             reactions_key: record["bot_id"].as_i64().map(|id| {
@@ -3586,6 +3645,7 @@ impl App {
             elsewhere: false,
             instruct: None,
             upgrades: None,
+            restored: None,
             move_to: None,
             lead: String::new(),
             retry: None,
@@ -3998,6 +4058,27 @@ impl App {
     /// What Sonny's upgrade set beside the person's edits, told to the bot
     /// after any turn it runs, so it asks the person whether to bring it in.
     async fn tell_upgrades(&mut self) {
+        if let Some(restored) = self.restored.take() {
+            let mut all = true;
+            for (note, key) in restored.notes() {
+                let asked = json!({"bot": self.bot, "prompt": note, "request_id": key,
+                    "delivery": "queue", "origin": trigger::RESTORE_ORIGIN});
+                match self.client.request("submit", asked).await {
+                    Ok(_) => {}
+                    Err(error) if error.code == "idempotency_conflict" => {}
+                    Err(error) => {
+                        self.notice = Some(format!("telling of the restored triggers: {error}"));
+                        all = false;
+                        break;
+                    }
+                }
+            }
+            // Told once every part went; a part that went already is one
+            // turn when it goes again.
+            if all {
+                restored.told();
+            }
+        }
         let Some(upgrades) = self.upgrades.take() else {
             return;
         };
@@ -4664,6 +4745,15 @@ impl App {
                     let button = format!("{}answer/{at}/{id}", screen::BUTTON);
                     (from + row, screen::Mark::Link(button))
                 }));
+            // The line to run, a click on it copies.
+            if let Some(command) = &ask.command {
+                let button = format!("{}copy/{id}", screen::BUTTON);
+                self.marks.extend(
+                    (card.command.clone())
+                        .map(|row| (from + row, screen::Mark::Link(button.clone()))),
+                );
+                self.commands.insert(id.to_owned(), command.clone());
+            }
             // Drawn narrower later, as when the margin opens, its bar
             // goes on down every row.
             self.marks.extend(
@@ -5085,7 +5175,7 @@ impl App {
         }
         program.env("TERM", "xterm-256color");
         let height = self.height.saturating_sub(2).max(2) as u16;
-        let width = match pane::width(self.full_width, PROSE as u16) {
+        let width = match pane::width(self.full_width, PROSE as u16 + GUTTER) {
             0 => 80,
             width => width,
         };
@@ -5202,6 +5292,10 @@ impl App {
             if let Some(at) = self.cluster_of(node) {
                 self.draw_cluster(at);
             }
+        }
+        if let Some(command) = (button.strip_prefix("copy/")).and_then(|id| self.commands.get(id)) {
+            term::copy(command);
+            self.notice = Some("copied".into());
         }
         if let Some((at, id)) = button
             .strip_prefix("answer/")
@@ -7450,11 +7544,13 @@ impl App {
                 return;
             }
         };
+        let alerts = self.status_alerts().await;
         self.watch = Some(Watch {
             project,
             rows,
             read: Instant::now(),
             lookout: self.lookout_line(),
+            alerts,
             resolved: false,
             background: None,
             usage: None,
@@ -7472,7 +7568,7 @@ impl App {
                 .iter()
                 .position(|bot| *bot == named);
         }
-        self.open_pane(pane::Pane::card("/status", PICK_KEYS));
+        self.open_pane(pane::Pane::card("status", PICK_KEYS));
     }
 
     /// What runs for the project's agents with no one typing:
@@ -7495,6 +7591,7 @@ impl App {
             rows: Vec::new(),
             read: Instant::now(),
             lookout: String::new(),
+            alerts: Vec::new(),
             resolved: false,
             background: Some(view),
             usage: None,
@@ -7503,7 +7600,7 @@ impl App {
             picked: None,
             pick: None,
         });
-        self.open_pane(pane::Pane::card("/background", STATUS_KEYS));
+        self.open_pane(pane::Pane::card("background", STATUS_KEYS));
     }
 
     /// The tokens the project's agents spent, or every agent's, over
@@ -7518,6 +7615,7 @@ impl App {
             rows: Vec::new(),
             read: Instant::now(),
             lookout: String::new(),
+            alerts: Vec::new(),
             resolved: false,
             background: None,
             usage: Some(view),
@@ -7526,7 +7624,7 @@ impl App {
             picked: None,
             pick: None,
         });
-        self.open_pane(pane::Pane::card("/usage", STATUS_KEYS));
+        self.open_pane(pane::Pane::card("usage", STATUS_KEYS));
     }
 
     /// What the agents of every project share: `/commons` in the pane,
@@ -7541,6 +7639,7 @@ impl App {
             rows: Vec::new(),
             read: Instant::now(),
             lookout: String::new(),
+            alerts: Vec::new(),
             resolved: false,
             background: None,
             usage: None,
@@ -7549,7 +7648,7 @@ impl App {
             picked: None,
             pick: None,
         });
-        self.open_pane(pane::Pane::card("/commons", STATUS_KEYS));
+        self.open_pane(pane::Pane::card("commons", STATUS_KEYS));
     }
 
     /// Every agent the daemon keeps, lit up live as they talk: `/sky` in
@@ -7560,6 +7659,7 @@ impl App {
             rows: Vec::new(),
             read: Instant::now(),
             lookout: String::new(),
+            alerts: Vec::new(),
             resolved: false,
             background: None,
             usage: None,
@@ -7568,7 +7668,7 @@ impl App {
             picked: None,
             pick: None,
         });
-        self.open_pane(pane::Pane::card("/sky", STATUS_KEYS));
+        self.open_pane(pane::Pane::card("sky", STATUS_KEYS));
     }
 
     /// `view` read from the daemon again.
@@ -7612,13 +7712,40 @@ impl App {
             return;
         }
         let lookout = self.lookout_line();
+        let alerts = self.status_alerts().await;
         if let Ok((_, rows)) = self.status_rows().await
             && let Some(watch) = &mut self.watch
         {
             watch.rows = rows;
             watch.read = Instant::now();
             watch.lookout = lookout;
+            watch.alerts = alerts;
         }
+    }
+
+    /// What `/status` says is wrong around the agents: the daemon's
+    /// companions that keep restarting, and the skills the lead is offered
+    /// whose front matter needs a fix.
+    async fn status_alerts(&self) -> Vec<status::Alert> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let mut alerts = Vec::new();
+        if let Ok(listed) = self.client.request("companions", json!({})).await {
+            let logs = tilde(&format!("{}.companions", self.store().display()));
+            alerts.extend(status::companion_alerts(&listed["companions"], now, &logs));
+        }
+        let folder = (self
+            .client
+            .request("inspect", json!({"bot": self.bot}))
+            .await
+            .ok())
+        .and_then(|bot| bot["workspace"].as_str().map(PathBuf::from));
+        if let Some(skills) = folder.and_then(|f| agent_client::policy::skills(&f).ok()) {
+            alerts.extend(status::skill_alerts(&skills));
+        }
+        alerts
     }
 
     /// Count what runs for this agent in the background again, every ten
@@ -8393,7 +8520,7 @@ impl App {
                         }
                         // ‹ and › go back and forward, as a browser's do.
                         if down && let Some(back) = pane.on_arrow(mouse.column, mouse.row) {
-                            self.go(back);
+                            self.step_pane(back);
                             return true;
                         }
                         // A click on its name opens the file outside Sonny.
@@ -8647,7 +8774,10 @@ impl App {
                         self.copied(&text);
                     }
                     // Back and forward through what the pane has shown.
-                    KeyCode::Left | KeyCode::Backspace if pane.can_go(true) => self.go(true),
+                    // Back to the margin from the first thing over it, as ‹ goes.
+                    KeyCode::Left | KeyCode::Backspace if pane.goes_back() => {
+                        self.step_pane(true);
+                    }
                     KeyCode::Right if pane.can_go(false) => self.go(false),
                     KeyCode::Up => pane.screen.scroll(1),
                     KeyCode::Down => pane.screen.scroll(-1),
@@ -8996,6 +9126,12 @@ impl App {
                 self.jump = Some((pin, JUMP_PAGES));
             }
             "back" => self.close_pane(true),
+            // The pane's switch hint, or the footer's for a pane folded
+            // away: the keys, and in a window with room for one, the view,
+            // over to the other.
+            "switch" if self.pane.is_some() => self.pane_keys = !self.pane_keys,
+            // An unfocused pane's `tab focus` hint: the keys to it.
+            "focus" if self.pane.is_some() => self.pane_keys = true,
             _ => self.pressed.push(what.to_owned()),
         }
     }
@@ -9131,7 +9267,7 @@ impl App {
     /// The file `link` names, read for the pane at its width.
     fn preview(&self, link: &str) -> Result<pane::Pane, String> {
         let workspace = std::path::Path::new(&self.workspace);
-        let width = pane::width(self.full_width, PROSE as u16).max(20) as usize;
+        let width = pane::width(self.full_width, PROSE as u16 + GUTTER).max(20) as usize;
         pane::Pane::preview(link, workspace, width)
     }
 
@@ -9186,10 +9322,9 @@ impl App {
         if open.is_margin() && (margin.is_none() || self.zen.is_some()) && !self.pane_keys {
             return (self.centred(area), None);
         }
-        let pane = match margin.filter(|_| open.is_margin()) {
-            Some(margin) => margin,
-            None => pane::width(area.width, prose),
-        };
+        // One width for all the pane shows: the conversation keeps its
+        // columns where the window has room, so nothing opening moves it.
+        let pane = pane::width(area.width, prose);
         if pane == area.width {
             return match self.pane_keys {
                 true => (Rect { width: 0, ..area }, Some(area)),
@@ -10026,7 +10161,7 @@ impl App {
             let lines = mcp::card();
             // In the place of `/status` or `/background`, if open.
             self.watch = None;
-            let mut pane = pane::Pane::card("/mcp", "esc close");
+            let mut pane = pane::Pane::card("MCP servers", "esc close");
             pane.set_card(lines, "esc close");
             self.open_pane(pane);
             return;
@@ -10278,9 +10413,15 @@ impl App {
             self.side(question.trim().to_owned(), &pictures).await;
             return;
         }
-        // What is typed answers the lead's first open question, and goes
-        // with it; the question closes once the daemon has the answer.
-        let answering = self.asking().cloned();
+        // An option's number picks it on the open question in focus, and
+        // the question closes once the daemon has the answer. Words go as
+        // the person wrote them, answering nothing by themselves: one typed
+        // while a question was open may be meant for anything, and the
+        // agent reads whether it answers, as a reply to a card in a chat
+        // is read.
+        let answering = (self.asking())
+            .filter(|ask| asks::picks(ask, &prompt))
+            .cloned();
         let prompt = match &answering {
             Some(ask) => asks::answer(ask, &prompt),
             None => prompt,
@@ -10846,7 +10987,8 @@ impl App {
             args.extend(["--model".to_owned(), model.clone()]);
         }
         // Beside the conversation, on a terminal of its own.
-        if let Err(error) = self.embed("side chat", &args) {
+        let title = format!("side chat with {}", spoken(&self.bot));
+        if let Err(error) = self.embed(&title, &args) {
             self.notice = Some(format!("no side chat: {error}"));
         }
     }
@@ -11379,7 +11521,7 @@ impl App {
             && self.pane.as_ref().is_some_and(pane::Pane::is_margin)
         {
             let live = self.running.as_ref().map(|running| running.turn);
-            let width = at.width.saturating_sub(1) as usize;
+            let width = (at.width.saturating_sub(1) as usize).min(PROSE);
             let (lines, marks) = self.margin.lines(width, &workspace, live);
             let glance = self.glance().line();
             if let Some(pane) = &mut self.pane {
@@ -11394,10 +11536,15 @@ impl App {
         {
             let wide = match chat.width {
                 0 => size.width,
-                _ => pane::width(size.width, PROSE as u16),
+                _ => pane::width(size.width, PROSE as u16 + GUTTER),
             };
-            let width = wide.saturating_sub(2) as usize;
+            // The sky fills the pane, however wide; the other cards are
+            // prose, read at the conversation's measure.
+            let full = wide.saturating_sub(2) as usize;
+            let width = full.min(PROSE);
+            pane.prose = watch.sky.is_none();
             if let Some(view) = &mut watch.sky {
+                let width = full;
                 view.drain();
                 let rows = size.height.saturating_sub(4) as usize;
                 let lines: Vec<Line<'static>> = (view.card(width.saturating_sub(1), rows))
@@ -11427,8 +11574,8 @@ impl App {
                         Line::from(spans).style(line.style)
                     })
                     .collect();
-                pane.set_card(lines, STATUS_KEYS);
-                pane.foot = Some(view.footer());
+                pane.set_card(lines, &view.keys());
+                pane.foot = view.footer();
                 // A new pick is scrolled to, with the two rows under it.
                 if watch.picked != Some(at) {
                     watch.picked = Some(at);
@@ -11444,8 +11591,8 @@ impl App {
                         Line::from(spans).style(line.style)
                     })
                     .collect();
-                pane.set_card(lines, STATUS_KEYS);
-                pane.foot = Some(view.footer());
+                pane.set_card(lines, view.keys());
+                pane.foot = view.footer();
                 if view.reading() {
                     // A thread just opened starts at its top, after the
                     // card's swap kept the list's scroll.
@@ -11467,17 +11614,17 @@ impl App {
                         Line::from(spans).style(line.style)
                     })
                     .collect();
-                pane.set_card(lines, STATUS_KEYS);
-                pane.foot = Some(view.footer());
+                pane.set_card(lines, &view.keys());
+                pane.foot = None;
             } else {
                 let (mut lines, any_resolved, marks) = watch_card(watch, width, &self.bot);
                 let mut picked = None;
-                // The agent picked from the keys leads with `›`, as a
-                // pick in Codex's lists does.
+                // The agent picked from the keys is drawn as the picker
+                // draws its pick, reversed.
                 if let Some(&(row, _)) = watch.pick.and_then(|pick| marks.get(pick))
-                    && let Some(first) = lines.get_mut(row).and_then(|line| line.spans.first_mut())
+                    && let Some(line) = lines.get_mut(row)
                 {
-                    *first = Span::raw("›").bold();
+                    list::pick(line);
                     picked = Some(row);
                 }
                 let keys = match any_resolved && watch.resolved {
@@ -11518,6 +11665,7 @@ impl App {
                         .or_else(|| links::file_line(&workspace, word))
                         .or_else(|| self.names.borrow_mut().link(word))
                 };
+                open.alone = area.width == 0;
                 pane_cursor = open.render(at, frame.buffer_mut(), self.pane_keys, switch, file);
                 linked.extend(open.screen.link_cells(frame.buffer_mut()));
                 // The line between them, as a split's.
@@ -11918,8 +12066,8 @@ impl App {
         Ok(())
     }
 
-    /// The row over what is typed while it answers a question: which,
-    /// and which of those open.
+    /// The row over what is typed while it picks an option of a
+    /// question: which, and which of those open.
     fn answering_over(&self, width: usize) -> Option<Line<'static>> {
         // `/new`'s first message has what it starts over it.
         if self.new_brief()
@@ -11934,7 +12082,7 @@ impl App {
                 None => Line::from(format!("  {}", transcript::cut(&making.heading(), room))).dim(),
             });
         }
-        let ask = self.asking().filter(|_| !self.input.is_empty())?;
+        let ask = self.asking().filter(|ask| asks::picks(ask, &self.input))?;
         let open = [
             self.listing_open(),
             self.config.is_some(),
@@ -11987,6 +12135,8 @@ impl App {
             // Named, so a message typed in the wrong pane is caught first.
             let name = match &self.project {
                 Some(project) => lead_title(project, &self.bot),
+                // A side chat by what it is, not the copy's own id.
+                None if self.options.side.is_some() => "the side chat".to_owned(),
                 None => self.bot.clone(),
             };
             // What Enter does, muted, then its keys in the one grammar.
@@ -12313,10 +12463,30 @@ impl App {
             items.push(Item::new(
                 Slot::Side,
                 vec![vec![
-                    Span::raw(format!("side chat with {with} · esc back")).dim(),
+                    Span::raw(format!("side chat with {} · esc back", spoken(with))).dim(),
                 ]],
             ));
             return footer::lay(items, width);
+        }
+        // The pane folded away where the window has room for one of the
+        // two: its key and its name, a click flipping over to it.
+        let room = pane::width(self.full_width, PROSE as u16 + GUTTER);
+        if let Some(open) = &self.pane
+            && !open.is_margin()
+            && !self.pane_keys
+            && room == self.full_width
+        {
+            let key = Span::raw(pane::SWITCH);
+            items.push(
+                Item::new(
+                    Slot::Folded,
+                    vec![
+                        vec![key.clone(), Span::raw(format!(" {}", open.title())).dim()],
+                        vec![key, Span::raw(" pane").dim()],
+                    ],
+                )
+                .opens("switch"),
+            );
         }
         let (working, waiting) = self.agents();
         // Marks as the roster and /status draw them, each with its word,
@@ -12462,13 +12632,19 @@ fn watch_card(
         .collect();
     let any_resolved = rows.iter().any(|row| row.group == status::Group::Resolved);
     let (mut card, named) = status::card(&watch.project, &rows, width, watch.resolved);
-    // The lookout's line goes under the heading, the agents' under it.
-    let lookout = !watch.lookout.is_empty();
-    if lookout {
-        card.insert(1, Line::from(watch.lookout.clone()).dim());
+    // The lookout's line goes under the heading, what is wrong under it,
+    // and the agents' under that.
+    let mut above: Vec<Line<'static>> = Vec::new();
+    if !watch.lookout.is_empty() {
+        above.push(Line::from(watch.lookout.clone()).dim());
     }
+    for alert in &watch.alerts {
+        above.extend(status::alert_lines(alert, width.saturating_sub(1)));
+    }
+    let added = above.len();
+    card.splice(1..1, above);
     let marks = (named.into_iter())
-        .map(|(at, bot)| (at + usize::from(lookout && at >= 1), bot))
+        .map(|(at, bot)| (at + if at >= 1 { added } else { 0 }, bot))
         .filter(|(_, bot)| bot != me)
         .map(|(at, bot)| {
             (
@@ -12762,8 +12938,11 @@ mod tests {
             ("shop.b".to_owned(), "done"),
         ]
         .into();
+        // The person has looked at every window.
+        let seen: mux::Used = Arc::new(|_: &str| Some(std::time::SystemTime::UNIX_EPOCH));
         let room = mux::Room {
             most: 3,
+            used: seen.clone(),
             ..room_for(
                 "shop",
                 &lineage,
@@ -12778,11 +12957,12 @@ mod tests {
             mux::Shown::Opened(vec!["shop.b".into()])
         );
         // One more closes the only window left that nothing holds, however
-        // lately it opened.
+        // lately it opened, once the person has looked at it.
         let more: std::collections::HashSet<String> =
             lineage.iter().cloned().chain(["shop.e".into()]).collect();
         let room = mux::Room {
             most: 3,
+            used: seen,
             ..room_for("shop", &more, &doing, Arc::new(|bot: &str| bot == "shop.c"))
         };
         assert_eq!(
@@ -14099,7 +14279,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn what_is_typed_answers_the_leads_first_question_unless_set_aside() {
+    async fn only_a_pick_answers_the_leads_question_and_words_are_the_persons_own() {
         let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen = sent.clone();
         let client = daemon_answering(move |asked| {
@@ -14130,9 +14310,10 @@ mod tests {
         app.submit().await;
         // Its answer landing leaves the other question asked the same open.
         app.answered("You asked: Keep the old API?\n\nDrop it", None);
-        // Esc sets the rest aside: the next message is the person's own.
-        app.chatting = true;
+        // Words typed while one is open are the person's own, sent as they
+        // wrote them: no question is named over them, nor answered.
         app.input.set("how is it going?");
+        assert!(app.answering_over(80).is_none());
         app.submit().await;
         assert_eq!(
             *sent.lock().unwrap(),
@@ -14145,9 +14326,8 @@ mod tests {
             app.asks,
             [ask("c2", "Tag it?"), ask("c3", "Keep the old API?")]
         );
-        // Down picks the next to answer; what is typed then answers it,
-        // named over the words as the sent answer will be.
-        app.chatting = false;
+        // Down picks the next to answer; an option's number then picks on
+        // it, named over it as the sent answer will be.
         app.step_ask(true);
         assert_eq!(app.asking().map(|a| a.id.as_str()), Some("c3"));
         app.input.set("1");
@@ -17099,6 +17279,55 @@ mod tests {
         assert_eq!(rows[2], "  ✗ bad    failed    Fix bad");
     }
 
+    #[test]
+    fn the_approver_is_kept_again_with_its_own_judge_and_this_build() {
+        let kept = json!({"name": APPROVER, "command": "/old/Cellar/sonny/0.7.0/bin/sonny",
+            "env": {"AGENT_MODEL": "openai/gpt-6", "SONNY_BUILD": "0.7.0 1"}});
+        // A connect with one kept: this binary's build, its judge kept.
+        assert_eq!(
+            approver_env(Some(&kept), None, "0.8.0 2"),
+            Some(json!({"AGENT_MODEL": "openai/gpt-6", "SONNY_BUILD": "0.8.0 2"}))
+        );
+        // A lead on another model in auto keeps the first judge too.
+        assert_eq!(
+            approver_env(Some(&kept), Some("anthropic/claude-opus-5-5"), "0.8.0 2"),
+            approver_env(Some(&kept), None, "0.8.0 2")
+        );
+        // None kept: a lead in auto starts one judged by its model; a
+        // connect alone starts none.
+        assert_eq!(
+            approver_env(None, Some("anthropic/claude-opus-5-5"), "0.8.0 2"),
+            Some(json!({"AGENT_MODEL": "anthropic/claude-opus-5-5", "SONNY_BUILD": "0.8.0 2"}))
+        );
+        assert_eq!(approver_env(None, None, "0.8.0 2"), None);
+    }
+
+    #[tokio::test]
+    async fn every_start_keeps_the_approver_again_on_this_binary_with_its_judge() {
+        let added = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = added.clone();
+        let client = daemon_answering(move |asked| {
+            if let Some(add) = asked["add"].as_object() {
+                seen.lock().unwrap().push(Value::Object(add.clone()));
+                return json!({});
+            }
+            json!({"companions": [{"name": APPROVER, "command": "/gone/sonny",
+                "args": ["approver"], "env": {"AGENT_MODEL": "openai/gpt-6"}}]})
+        })
+        .await;
+        start_companions(&client).await.unwrap();
+        let added = added.lock().unwrap().clone();
+        let names: Vec<&str> = added.iter().filter_map(|a| a["name"].as_str()).collect();
+        assert_eq!(names, [LOOKOUT, TOOL_HOST, APPROVER]);
+        let me = std::env::current_exe().unwrap();
+        assert_eq!(added[2]["command"], json!(me));
+        assert_eq!(added[2]["args"], json!(["approver"]));
+        assert_eq!(
+            added[2]["env"],
+            json!({"AGENT_MODEL": "openai/gpt-6", "SONNY_BUILD": lookout::identity()})
+        );
+    }
+
     #[tokio::test]
     async fn a_task_that_ended_on_a_question_needs_you() {
         let scans = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -17317,6 +17546,7 @@ mod tests {
             ],
             read: Instant::now(),
             lookout: "Lookout · on".into(),
+            alerts: Vec::new(),
             resolved: false,
             background: None,
             usage: None,
@@ -17607,12 +17837,13 @@ mod tests {
             group: status::Group::Working,
             ..Default::default()
         };
-        app.open_pane(pane::Pane::card("/status", PICK_KEYS));
+        app.open_pane(pane::Pane::card("status", PICK_KEYS));
         app.watch = Some(Watch {
             project: "calc".into(),
             rows: vec![row("add"), row("neg")],
             read: Instant::now(),
             lookout: String::new(),
+            alerts: Vec::new(),
             resolved: false,
             background: None,
             usage: None,
@@ -18159,10 +18390,10 @@ mod tests {
         assert!(margin(&app) && !app.margin.closed());
         // Under what is open, to go back to; emptied there, it is still
         // there to go back to.
-        app.open_pane(pane::Pane::card("/status", STATUS_KEYS));
+        app.open_pane(pane::Pane::card("status", STATUS_KEYS));
         app.close_pane(true);
         app.close_pane(true);
-        app.open_pane(pane::Pane::card("/status", STATUS_KEYS));
+        app.open_pane(pane::Pane::card("status", STATUS_KEYS));
         let change = json!({"id": "repro", "markdown": "y"});
         app.margin.apply("m4", &change, None, None);
         app.margin_back();
@@ -18202,7 +18433,7 @@ mod tests {
         app.margin.apply("m1", &post, None, None);
         app.margin_back();
         assert!(app.pane.as_ref().is_some_and(pane::Pane::is_margin));
-        app.open_pane(pane::Pane::card("/status", STATUS_KEYS));
+        app.open_pane(pane::Pane::card("status", STATUS_KEYS));
         assert!(app.pane.as_ref().is_some_and(|p| p.is_card() && p.over));
         assert!(app.under.is_some());
         // Esc: back to the margin, the keys with it.
@@ -18214,7 +18445,7 @@ mod tests {
         app.margin_back();
         assert!(app.pane.is_none() && app.margin.closed());
         // A card opened now has no margin under it.
-        app.open_pane(pane::Pane::card("/status", STATUS_KEYS));
+        app.open_pane(pane::Pane::card("status", STATUS_KEYS));
         assert!(!app.pane.as_ref().unwrap().over);
         app.close_pane(true);
         assert!(app.pane.is_none());
@@ -18230,7 +18461,7 @@ mod tests {
         let post = json!({"id": "repro", "title": "Repro", "markdown": "x"});
         app.margin.apply("m1", &post, None, None);
         app.margin_back();
-        app.open_pane(pane::Pane::card("/status", STATUS_KEYS));
+        app.open_pane(pane::Pane::card("status", STATUS_KEYS));
         assert!(app.step_pane(true));
         assert!(app.pane.as_ref().is_some_and(pane::Pane::is_margin));
         // The margin has nothing before it, and stays.
@@ -18379,10 +18610,31 @@ mod tests {
         assert_eq!((chat.width, margin.map(|m| m.width)), (100, Some(66)));
         let (chat, margin) = app.split(Rect::new(0, 0, 130, 40));
         assert_eq!((chat.width, margin), (130, None));
-        // Asked for with Tab, it takes its half as anything opened does.
+        // Asked for with Tab, it has the window to itself, as anything
+        // opened in a window too narrow for both does, the conversation
+        // a key away.
         app.pane_keys = true;
-        let (_, margin) = app.split(Rect::new(0, 0, 130, 40));
-        assert_eq!(margin.map(|m| m.width), Some(63));
+        let (chat, margin) = app.split(Rect::new(0, 0, 130, 40));
+        assert_eq!((chat.width, margin.map(|m| m.width)), (0, Some(130)));
+        // Anything else opened takes what the margin takes, beside the
+        // conversation's 100 where there is room for both.
+        app.open_pane(pane::Pane::card("status", "esc close"));
+        let (chat, pane) = app.split(Rect::new(0, 0, 170, 40));
+        assert_eq!((chat.width, pane.map(|m| m.width)), (100, Some(66)));
+        let (chat, pane) = app.split(Rect::new(0, 0, 130, 40));
+        assert_eq!((chat.width, pane.map(|m| m.width)), (0, Some(130)));
+        // The conversation back, the footer says how over to the pane,
+        // and a click on that does it.
+        app.full_width = 130;
+        app.pane_keys = false;
+        let (line, opens) = app.footer(130);
+        assert!(line.to_string().contains("ctrl+\\ status"), "{line}");
+        assert!(opens.iter().any(|(_, link)| *link == "switch"));
+        app.follow(&format!("{}switch", screen::BUTTON));
+        assert!(app.pane_keys);
+        app.full_width = 170;
+        assert!(!app.footer(170).0.to_string().contains("ctrl+\\"));
+        app.close_pane(false);
         // A note's marker clicked shows it there too.
         app.pane_keys = false;
         app.follow("sonny:note/repro");

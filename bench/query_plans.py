@@ -58,6 +58,17 @@ def statements(source):
                 yield re.sub(r'\s+', ' ', variant).strip()
 
 
+def connect(path):
+    """A connection that plans as the daemon's do: with the query planner
+    stability guarantee (`plan_stably` in src/store/db.rs), so no plan reads
+    a bound value, and with foreign keys on, to include the daemon's
+    constraint-check plans."""
+    conn = sqlite3.connect(path)
+    conn.setconfig(sqlite3.SQLITE_DBCONFIG_ENABLE_QPSG, True)
+    conn.execute('PRAGMA foreign_keys=ON')
+    return conn
+
+
 def main():
     if len(sys.argv) != 2:
         print(__doc__)
@@ -69,8 +80,7 @@ def main():
     while '\nfn migrate' in source:
         head, _, tail = source.partition('\nfn migrate')
         source = head + '\nfn ' + tail.partition('\nfn ')[2]
-    conn = sqlite3.connect(sys.argv[1])
-    conn.execute('PRAGMA foreign_keys=ON')  # Include the daemon's constraint-check plans.
+    conn = connect(sys.argv[1])
     seen, scans, structural = set(), [], []
     for statement in statements(source):
         if statement in seen:
@@ -95,7 +105,7 @@ def main():
         print('SCAN:', statement[:140])
         print('     ', ' | '.join(steps))
     print(f'{len(seen)} statements planned, {len(scans)} table scans, {len(structural)} structural flags '
-          f'(SQLite {sqlite3.sqlite_version}, foreign_keys=ON)')
+          f'(SQLite {sqlite3.sqlite_version}, stable plans, foreign_keys=ON)')
     return 1 if scans else 0
 
 

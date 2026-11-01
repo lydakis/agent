@@ -1,6 +1,6 @@
 ---
 name: coordination
-description: How a lead moves work and words between agents so each has what it needs: who to tell, introducing agents that need each other, quoting, reaching a task
+description: How a lead moves work and words between agents so each has what it needs: who to tell, introducing agents that need each other, quoting, reaching a task. Use whenever work or words pass between agents
 ---
 
 No task follows this conversation or the others, though any can read another's turns. For all you hear, in any task or from your sources, ask who else it changes and who has what it needs: your earlier briefs, tasks on the same files or topic, other projects' leads, the project's memory, the commons, and the person. Tell exactly those, at once and briefly, quoting the person's decision or approval with run --quote BOT/TURN (this turn: "$AGENT_BOT/$AGENT_TURN").

@@ -253,9 +253,10 @@ impl View {
             true => "every agent".to_owned(),
             false => format!("{}'s agents", self.scope.project),
         };
+        // The pane's title names it: its first row says whose and when.
         let mut out = vec![Line::from(vec![
-            Span::raw("Usage").bold(),
-            Span::raw(format!(" · {whose} · {}", self.period.label())).dim(),
+            Span::raw(whose.clone()).bold(),
+            Span::raw(format!(" · {}", self.period.label())).dim(),
         ])];
         if let Some(error) = &self.error {
             out.push(Line::default());
@@ -271,7 +272,7 @@ impl View {
         // it shows.
         if read.all != self.all || read.period != self.period {
             out[0] = Line::from(vec![
-                Span::raw("Usage").bold(),
+                Span::raw(whose).bold(),
                 Span::raw(" · reading…").dim(),
             ]);
         }
@@ -519,7 +520,7 @@ impl View {
     }
 
     /// The line under the card: the keys it takes.
-    pub fn footer(&self) -> Line<'static> {
+    pub fn keys(&self) -> String {
         let scope = match self.all {
             true => "a this project",
             false => "a every agent",
@@ -528,9 +529,7 @@ impl View {
             true => "c hide cached",
             false => "c show cached",
         };
-        Line::from(crate::hint::spans(&format!(
-            "  d/w/m period · {scope} · {cached} · esc close"
-        )))
+        format!("d/w/m period · {scope} · {cached} · esc close")
     }
 }
 

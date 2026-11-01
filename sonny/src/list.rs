@@ -80,6 +80,26 @@ pub fn lines(items: &[Item], pick: usize, width: usize, room: usize) -> Vec<Line
     out
 }
 
+/// `line`, a row of a list in the pane, drawn as the picker draws its
+/// pick: reversed from its first mark to a column past its last word, in
+/// the text's own colour and weight as the picker's rows are, so the band
+/// reads as one, its lead left as it was.
+pub fn pick(line: &mut Line<'static>) {
+    let mut leading = true;
+    for span in &mut line.spans {
+        if leading && span.content.trim().is_empty() {
+            continue;
+        }
+        leading = false;
+        span.style.fg = None;
+        span.style = span.style.remove_modifier(ratatui::style::Modifier::DIM);
+        span.style = span.style.add_modifier(ratatui::style::Modifier::REVERSED);
+    }
+    if !leading {
+        line.spans.push(Span::raw(" ").reversed());
+    }
+}
+
 /// `name` in runs, the chars at `found` bold, all reversed when picked.
 fn marked(name: &str, found: &[usize], picked: bool) -> Vec<Span<'static>> {
     let mut runs: Vec<(String, bool)> = Vec::new();
@@ -289,6 +309,26 @@ impl Picker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::style::{Color, Modifier, Stylize};
+
+    #[test]
+    fn a_pane_rows_pick_is_one_reversed_band_past_its_lead() {
+        let mut row = Line::from(vec![
+            Span::raw("  "),
+            Span::raw("✓ ").green(),
+            Span::raw("readme").blue(),
+            Span::raw(" · took 0s").dim(),
+        ]);
+        pick(&mut row);
+        assert_eq!(row.spans[0].style, ratatui::style::Style::default());
+        for span in &row.spans[1..] {
+            assert!(span.style.add_modifier.contains(Modifier::REVERSED));
+            assert!(!span.style.add_modifier.contains(Modifier::DIM));
+            assert_ne!(span.style.fg, Some(Color::Blue));
+            assert_eq!(span.style.fg, None);
+        }
+        assert_eq!(row.spans.last().unwrap().content, " ");
+    }
 
     #[test]
     fn a_long_list_shows_eight_rows_around_the_pick_under_a_blank_one() {

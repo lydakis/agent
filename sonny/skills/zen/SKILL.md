@@ -1,6 +1,6 @@
 ---
 name: zen
-description: The person wrote `/zen FOCUS`, or asked in words to work on one thing with everything else held back. Talk with them only about that focus, hold back the rest, and interrupt only for what they would want to hear now, until they leave zen
+description: Use when the person wrote `/zen FOCUS`, or asked in words to work on one thing with everything else held back. Talk with them only about that focus, hold back the rest, and interrupt only for what they would want to hear now, until they leave zen
 ---
 
 # Zen

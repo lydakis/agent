@@ -43,7 +43,7 @@
 //! commons_invite_tokens = 1000000  # what an invite pays for in its thread
 //! commons_digest = "1h"         # an agent hears its commons threads at most this often, unless asked sooner; 0 at once
 //! ask_wait_minutes = 60         # how long an unanswered ask waits to go ahead or remind; 0 never
-//! task_windows = 64            # task windows a lead keeps open, 32 by default; past it the least recently used closes; 0 no limit
+//! task_windows = 64            # task windows a lead keeps open, 32 by default; past it the least recently used closes, never one not looked at yet; 0 no limit
 //! task_depth = 3                # generations of tasks below a lead, 2 by default (tasks' own start none); 0 no end
 //! sky_haikus = 0                # haikus a day from the sky's busiest agent, 8 by default; 0 none
 //! sky_haiku_window = 10         # minutes of messages and tool calls that make an agent busiest
@@ -443,7 +443,8 @@ pub struct Sonny {
     pub ask_wait_minutes: u64,
     /// How many of its tasks' windows a lead keeps open in its
     /// multiplexer: past it, a new one closes the window the person used
-    /// least recently; 0 for no limit.
+    /// least recently, never one they have not looked at yet; 0 for no
+    /// limit.
     pub task_windows: u64,
     /// How many generations below a lead its line goes: a lead's tasks
     /// are the first, and an agent of the last starts none; 0 for no end.

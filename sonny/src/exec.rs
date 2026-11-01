@@ -486,6 +486,11 @@ struct Nested {
     description: String,
     /// Whether a call of it asks the agent's gate first.
     asks: bool,
+    /// Whether its server says it only reads (`readOnlyHint`).
+    reads: bool,
+    /// Whether a call of it is refused outright: in a trigger's shadow
+    /// run, whatever does not only read, or would ask.
+    refused: bool,
 }
 
 /// Calls answered in this process, so two answerings of one call differ.
@@ -605,7 +610,7 @@ async fn run(
     })
     .await;
     let budget = script.max_output_tokens.unwrap_or(OUTPUT_TOKENS);
-    let (alive, running, (nested, listed, failed)) = match readied {
+    let (alive, running, (mut nested, listed, failed)) = match readied {
         Ok(readied) => readied?,
         Err(_) => {
             let ended = Ended::Terminated("it ran out of time before it started".into());
@@ -619,6 +624,14 @@ async fn run(
             )));
         }
     };
+    // A trigger's shadow run reads and does nothing else: a call of a tool
+    // that does not say it only reads, or that would ask the person, is
+    // refused, never asked about.
+    if crate::trigger::shadow_source(bot).is_some() {
+        for tool in nested.values_mut() {
+            tool.refused = !tool.reads || tool.asks;
+        }
+    }
     let run = Run {
         hub: hub.clone(),
         host: tokio::runtime::Handle::current(),
@@ -771,6 +784,8 @@ async fn discover(hub: &Hub) -> (BTreeMap<String, Nested>, Vec<Value>, Vec<Strin
                     tool: name.to_owned(),
                     description,
                     asks,
+                    reads: tool["annotations"]["readOnlyHint"] == true,
+                    refused: false,
                 },
             );
         }
@@ -1363,6 +1378,12 @@ impl Caller {
             }
             return Err(error);
         };
+        if nested.refused {
+            return Err(format!(
+                "tools.{id} refused: this is a shadow run, a read-only copy, and the tool does \
+                 not say it only reads; say what you would have called it with instead"
+            ));
+        }
         let arguments: Value = serde_json::from_str(&arguments).map_err(|e| e.to_string())?;
         // Put to the agent's gate first, with the script's time stopped,
         // on the host's runtime, where its connection lives.
@@ -1943,6 +1964,58 @@ text("done");"#;
         .unwrap()
         .to_owned();
         assert!(said.ends_with("Output:\nhi\ntrue\ndone"), "{said}");
+    }
+
+    #[tokio::test]
+    async fn a_shadow_runs_only_what_says_it_reads_and_asks_nothing() {
+        let dir = scratch("shadow");
+        let hub = hub(&dir).await;
+        let (client, mut steps) = gate(&dir, Duration::ZERO, None).await;
+        let asker = Steps::new(client, "shop.lead.shadow-1a2b".into(), 7, "c1".into());
+        let script = r#"text(await tools.mcp__test__echo({text: "hi"}).then(r => r.content[0].text));
+try { await tools.mcp__test__add({a: 1, b: 2}); } catch (e) { text(e.message); }
+text("done");"#;
+        let said = run(
+            &hub,
+            Some(&dir),
+            "shop.lead.shadow-1a2b",
+            script,
+            Duration::from_secs(30),
+            Some(asker),
+        )
+        .await
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .to_owned();
+        assert!(
+            said.ends_with(
+                "Output:\nhi\ntools.mcp__test__add refused: this is a shadow run, a read-only \
+                 copy, and the tool does not say it only reads; say what you would have called \
+                 it with instead\ndone"
+            ),
+            "{said}"
+        );
+        assert!(steps.try_recv().is_err(), "nothing asked the gate");
+        // Under `prompt`, a read asks first, so a shadow refuses it too.
+        let mut servers = hub.servers();
+        servers.get_mut("test").unwrap().default_tools_approval_mode =
+            agent_client::config::ApprovalMode::Prompt;
+        hub.configure(&servers).await;
+        let said = run(
+            &hub,
+            Some(&dir),
+            "shop.lead.shadow-1a2b",
+            "try { await tools.mcp__test__echo({text: 'hi'}); } catch (e) { text('refused'); }",
+            Duration::from_secs(30),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            said.as_str().unwrap().ends_with("Output:\nrefused"),
+            "{said}"
+        );
     }
 
     #[tokio::test]

@@ -352,7 +352,10 @@ needs you (an approval, or a question open in it), failed, or holds a
 block its task asked for (a dev server) is never closed for room, as the
 lead heard or as that window's own Sonny last said (kept in
 `~/.agent/sonny/held/`, so it holds across either one starting again);
-with no other, the limit is passed. A window closed for room stays closed while its
+with no other, the limit is passed. A window you have not looked at yet is
+not one you used least recently, so it is not closed for room either: while
+only such windows could make room, a new task's window does not open (the
+status row says so) and waits for you, as one closed for room does. A window closed for room stays closed while its
 task works on, and `/status` (or its name) opens it again, also after the
 lead starts again (kept in `~/.agent/sonny/aside/`). `--rex-host HOST` puts the session on another Rex
 server; `--no-layout` turns the layout off. Sonny writes the skill for the
@@ -748,6 +751,18 @@ way `/react` does, and each note in the margin has its own `↩`.
   ![/status naming each agent's profile beside its model: superlead, task, reviewer](../docs/sonny/status-profile.png)
 
   ![A task opened from /status in the pane, its ‹ going back to /status](../docs/sonny/status-opens-agent.png)
+
+  Under the lookout's line, `/status` says what is wrong around the
+  agents: a companion of the daemon that keeps restarting (down and waiting
+  for its next start, or up for less than a minute after a restart), with a
+  red `✗`, how it exits and its log; and, muted, the skills agents are
+  offered whose front matter has no `description` or one that never says
+  when to use the skill, since that line is all an agent reads before it
+  opens one. Each Sonny start keeps the approver again on its own binary
+  and build, with the judge it has, so an upgrade restarts it with the
+  lookout and the tool host.
+
+  ![/status: a red ✗ notes-sync keeps restarting · exits 1 · 4 restarts, its log, then 2 skills to fix, muted](../docs/sonny/status-alerts.png)
 - `/background` (or `/triggers`, `/lookout`) lists, in the pane beside the
   conversation, what runs for the project's agents with
   no one typing: the automations that wake them, with
@@ -986,13 +1001,17 @@ way `/react` does, and each note in the margin has its own `↩`.
   picking it means, and the one it recommends and why. Sonny draws the
   decision in the conversation where it was asked, its words read as
   Markdown with the same renderer a reply uses, and the composer's hint
-  names it: what you type next answers it (an option's number picks it),
-  and goes to the lead as `You asked: QUESTION` and your answer. While you
-  type, the composer's band names the question over your words, as the
-  sent answer shows it. With several open, the composer answers one at a
-  time, the oldest first, and says which (`1 of 2`); ↑↓ with nothing typed
-  switches to another, and a click on any card's option answers that one.
-  Esc sets them aside for a message of your own, and Esc again goes back.
+  names it: a pick answers it (an option's number, or a click on the
+  option), and goes to the lead as `You asked: QUESTION` and the option.
+  While you type a number, the composer's band names the question over
+  it, as the sent answer shows it. Words you type are your own message,
+  sent as you wrote them and never framed as an answer, so something
+  typed while a question is open, meant for anything, answers nothing by
+  accident; the lead reads whether your words answer it, as a reply under
+  a card in a chat is read. With several open, the composer picks for one
+  at a time, the oldest first, and says which (`1 of 2`); ↑↓ with nothing
+  typed switches to another, and a click on any card's option answers
+  that one. Esc sets them aside, and Esc again brings them back.
   Once you send words of your own, the conversation has moved on: the open
   questions leave the composer and the `needs you` count, and their cards'
   options still answer them. The lead does not wait on you blindly: each
@@ -1019,6 +1038,18 @@ way `/react` does, and each note in the margin has its own `↩`.
   (`shop.wire asks you`), the task's row reads `needs you`, and a click on
   it opens the task in the pane, where an option's click answers the task
   itself.
+- **Steps only you can take:** when an agent needs something only you can
+  do, such as signing in or a command that needs your own terminal and
+  keyboard (`ssh -t`, a password prompt), it asks with `ask` too, with no
+  options and the exact line to run as `command`. The card shows that line
+  at the text's own weight under `Run this in your own terminal; a click
+  copies it.`, and a click on it copies it. Such an ask always waits
+  (`Waits for you to run it; a reminder at 21:30.`), and what you type next
+  says how it went. A task asking this way reads `needs you` like any
+  other, and its lead hears the line to run. Agents no longer send such
+  commands to a pane, where they sat unnoticed.
+
+  ![An action card: Sign in to the package registry, why, then npm login --auth-type=web under Run this in your own terminal; a click copies it.](../docs/sonny/action-card.png)
 
   ![Two open decisions, their bars whole after the window narrowed, and the composer answering the first of two](../docs/sonny/ask-several.png)
 

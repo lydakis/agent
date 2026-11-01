@@ -24,6 +24,9 @@ pub enum Slot {
     Place,
     /// A side chat, said for as long as it is open.
     Side,
+    /// What the pane shows while the window has room for one of the two
+    /// and the conversation has it: the way over to it, a click away.
+    Folded,
     Needs,
     Failed,
     Working,
@@ -43,7 +46,8 @@ impl Slot {
 
 /// The order things give way: each step takes that item to its next
 /// form, and a step for an item absent or at its last form is passed.
-const LADDER: [Slot; 16] = [
+const LADDER: [Slot; 17] = [
+    Slot::Folded,
     Slot::Background,
     Slot::Access,
     Slot::Place,
