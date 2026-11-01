@@ -8108,6 +8108,7 @@ impl App {
                 || key.code == KeyCode::Tab
                     && self.input.is_empty()
                     && self.picker.is_none()
+                    && self.searching.is_none()
                     && self.config.is_none()
                     && self.choosing.is_none()
                     && self.reacting.is_none()
@@ -10074,7 +10075,8 @@ impl App {
             || self.approving.is_some()
             || self.reacting.is_some()
             || self.finding.is_some()
-            || self.react_to.is_some();
+            || self.react_to.is_some()
+            || self.searching.is_some();
         let shows = self.input.is_empty()
             && self.running.is_none()
             && self.asks.is_empty()
@@ -16327,6 +16329,13 @@ mod tests {
         app.key(key(KeyCode::Esc)).await;
         assert!(app.searching.is_none());
         assert_eq!(&*app.input, "draft");
+        // Tab picks from the search, not the guess at the next message.
+        app.input.clear();
+        app.suggestion = Some("run the tests".into());
+        app.key(ctrl('r')).await;
+        app.key(key(KeyCode::Tab)).await;
+        assert!(app.searching.is_none());
+        assert_eq!(&*app.input, "fix the readme");
     }
 
     #[tokio::test]
