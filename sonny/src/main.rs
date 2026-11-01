@@ -3664,9 +3664,12 @@ impl App {
         self.configure().await;
         self.tell_upgrades().await;
         // The first message `/new` was given, sent as the person wrote it.
-        if let Some(first) = self.options.send.take() {
+        // A message as it is, never a command or a shell line typed anew.
+        if let Some(first) = self.options.send.take()
+            && let Err(error) = self.send(first.clone(), None, false, false, &[]).await
+        {
             self.input.set(&first);
-            self.submit().await;
+            self.notice = Some(error);
         }
         let (keys_tx, mut keys) = tokio::sync::mpsc::unbounded_channel();
         // Poll, not a bare read, so the reader ends with the client.
@@ -9629,7 +9632,8 @@ impl App {
                             && !alt
                             && !self.approvals.is_empty()
                             && self.paused.is_none()
-                            && self.input.is_empty() =>
+                            && self.input.is_empty()
+                            && !self.new_brief() =>
                     {
                         // A call whose whole arguments could not be read
                         // can only be denied.
@@ -9646,6 +9650,7 @@ impl App {
                             && !alt
                             && self.paused.is_none()
                             && self.input.is_empty()
+                            && !self.new_brief()
                             && let Some(prefix) =
                                 self.approvals.first().and_then(approvals::always) =>
                     {
@@ -9895,9 +9900,17 @@ impl App {
         }
         // `/new`'s first message starts the agent it makes.
         if self.new_brief()
-            && let Some(making) = self.making.take()
+            && let Some(mut making) = self.making.take()
         {
-            self.make_new(making, prompt).await;
+            // Words only: neither a task's start nor the new window's first
+            // send carries a picture, which the agent is shown once it runs.
+            if self.placed(&prompt).is_empty() {
+                self.make_new(making, prompt).await;
+            } else {
+                making.failed =
+                    Some("a new agent starts from words; send the picture once it runs".into());
+                self.making = Some(making);
+            }
             return;
         }
         if let Some(command) = prompt.strip_prefix('!') {
@@ -10994,8 +11007,10 @@ impl App {
         let every = (agent_client::project::read(dir))
             .and_then(|info| project::task_profile(&info))
             .unwrap_or_else(|_| "task".to_owned());
-        // This lead's task, on this window's daemon.
-        let env = vec![
+        // This lead's task, on this window's daemon, on the lead's model
+        // and effort unless the project says the tasks' own, as a task
+        // the lead starts from its shell has them.
+        let mut env = vec![
             (
                 "AGENT_SOCKET".to_owned(),
                 self.options.socket.display().to_string(),
@@ -11005,6 +11020,12 @@ impl App {
                 self.options.store.display().to_string(),
             ),
         ];
+        if !self.model.is_empty() {
+            env.push(("AGENT_MODEL".to_owned(), self.model.clone()));
+        }
+        if let Some(effort) = &self.effort {
+            env.push(("AGENT_EFFORT".to_owned(), effort.clone()));
+        }
         let start = task::Start {
             name: short.clone(),
             brief,
@@ -13136,6 +13157,24 @@ mod tests {
             rows[0].to_string().contains("What should it do?"),
             "{rows:?}"
         );
+        // The lead's approval keys are letters of the message here.
+        app.approvals
+            .push(json!({"name": "shell", "arguments": {"command": "ls"}}));
+        app.key(key(KeyCode::Char('y'))).await;
+        assert_eq!((app.input.trim(), app.approvals.len()), ("y", 1));
+        app.approvals.clear();
+        app.input.clear();
+        // A picture is refused, nothing made and the message kept.
+        app.attach(Ok(attach::Picture {
+            media_type: "image/png",
+            data: vec![1],
+        }));
+        app.input.set("look at [Image #1]");
+        app.submit().await;
+        let making = app.making.as_mut().unwrap();
+        assert!(making.failed.take().unwrap().contains("picture"));
+        assert!(app.new_brief() && app.input.trim().contains("look at"));
+        app.discard();
         // Esc goes back a step at a time, then closes.
         app.key(key(KeyCode::Esc)).await;
         assert!(app.new_listing());

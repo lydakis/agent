@@ -66,9 +66,10 @@ pub struct Start {
     /// work: in the repository it works in, unless `folder` or
     /// `own_folder` says otherwise, from the last commit on its branch.
     pub builds_on: Option<String>,
-    /// What the agent command runs with beyond Sonny's own environment:
-    /// the daemon it starts the task on, when a window of Sonny's starts it
-    /// rather than an agent's shell, which has it already.
+    /// What the agent commands run with beyond Sonny's own environment,
+    /// when a window of Sonny's starts the task rather than an agent's
+    /// shell, which has them already: the daemon it starts the task on,
+    /// and the lead's model and effort, which it inherits.
     pub env: Vec<(String, String)>,
     /// The lead a window of Sonny's starts the task for, which makes it
     /// that lead's task while its brief stays the person's words; an
@@ -183,7 +184,7 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
     let mut written = source.is_some();
     // The lead's mode, whose sandbox the task works in, and Sonny's git for
     // it in a sandbox too unless the lead has none.
-    let mode = lead_mode(&agent, starter).unwrap_or_else(crate::approvals::default);
+    let mode = lead_mode(&agent, &start.env, starter).unwrap_or_else(crate::approvals::default);
     let confine = crate::approvals::sandbox(mode, here)
         .get("sandbox")
         .and_then(Value::as_str)
@@ -306,7 +307,7 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
     // Only a run that started can have made the task, which then keeps
     // its folder; anything that failed before leaves nothing behind.
     let failed = |place: &Place, ran: bool, error: String| {
-        if !ran || !listed(&agent, name) {
+        if !ran || !listed_on(&agent, &start.env, name) {
             undo(&place.undo);
             if let Some(record) = &recorded {
                 let _ = std::fs::remove_file(record);
@@ -380,10 +381,7 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
             ));
         }
     }
-    let lead_picks = (
-        std::env::var("AGENT_MODEL").ok(),
-        std::env::var("AGENT_EFFORT").ok(),
-    );
+    let lead_picks = (env_of(start, "AGENT_MODEL"), env_of(start, "AGENT_EFFORT"));
     let flags: Vec<&String> = flags.iter().collect();
     let flags = with_defaults(&info, &flags, lead_picks, config.sonny.task_effort);
     let flags: Vec<&String> = flags.iter().collect();
@@ -614,6 +612,14 @@ fn branch_name(name: &str) -> bool {
             .stderr(Stdio::null())
             .status()
             .is_ok_and(|status| status.success())
+}
+
+/// `key` as the task's agent commands see it: as `start` sets it, else as
+/// Sonny has it.
+fn env_of(start: &Start, key: &str) -> Option<String> {
+    (start.env.iter().find(|(k, _)| k == key))
+        .map(|(_, value)| value.clone())
+        .or_else(|| std::env::var(key).ok())
 }
 
 /// The run flags with the task's model and effort, unless they name their
@@ -924,8 +930,9 @@ fn ends_name(after: &str, part_of_name: impl Fn(char) -> bool) -> bool {
 }
 
 /// The permissions row of the lead `name`, from its gates and sandbox.
-fn lead_mode(agent: &Path, name: &str) -> Option<&'static str> {
+fn lead_mode(agent: &Path, env: &[(String, String)], name: &str) -> Option<&'static str> {
     let output = Command::new(agent)
+        .envs(env.iter().map(|(key, value)| (key, value)))
         .args(["inspect", "--bot", name])
         .stdin(Stdio::null())
         .stderr(Stdio::null())
@@ -1078,7 +1085,13 @@ fn own(bots: &[Value], lead: &str) -> Vec<(String, String)> {
 }
 
 fn listed(agent: &Path, name: &str) -> bool {
+    listed_on(agent, &[], name)
+}
+
+/// [`listed`], on the daemon `env` names when it names one.
+fn listed_on(agent: &Path, env: &[(String, String)], name: &str) -> bool {
     let Ok(output) = Command::new(agent)
+        .envs(env.iter().map(|(key, value)| (key, value)))
         .args(["ls", "--name", name])
         .stdin(Stdio::null())
         .stderr(Stdio::null())
