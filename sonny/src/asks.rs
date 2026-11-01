@@ -202,7 +202,13 @@ pub fn call(id: &str, arguments: &Value) -> Option<Ask> {
         .filter(|choice| !choice.label.is_empty())
         .take(OPTIONS)
         .collect();
-    let command = Some(tidy(arguments["command"].as_str())).filter(|c| !c.is_empty());
+    // The line to run as the agent wrote it, only its ends trimmed: a
+    // blank line or a space inside a quoted value or a here-document is
+    // part of what it does.
+    let command = (arguments["command"].as_str())
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .map(str::to_owned);
     let recommended = arguments["recommended"]
         .as_u64()
         .and_then(|n| (n as usize).checked_sub(1))
@@ -1385,6 +1391,24 @@ mod tests {
                 clock(now + 3600, now)
             )
         );
+    }
+
+    #[test]
+    fn the_line_to_run_keeps_its_blank_lines_and_spaces() {
+        let mut asked = sign_in();
+        asked["command"] = json!("\n  cat <<'EOF' > notes.txt\nfirst  \n\nsecond\nEOF\n");
+        let ask = call("c9", &asked).unwrap();
+        assert_eq!(
+            ask.command.as_deref(),
+            Some("cat <<'EOF' > notes.txt\nfirst  \n\nsecond\nEOF")
+        );
+        let card = card(&ask, 60);
+        let shown: Vec<String> = card.rows[card.command.clone()]
+            .iter()
+            .map(|row| row.to_string())
+            .collect();
+        assert_eq!(shown.len(), 5, "{shown:?}");
+        assert_eq!(shown[2].trim_end(), "┃");
     }
 
     #[test]
