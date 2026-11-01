@@ -7898,8 +7898,10 @@ impl App {
             };
             // The profile it runs as, said even when it is its seat's own,
             // which the footer leaves out.
+            // A folder's own lead profile is read once; a lead made in a
+            // role of its own by `/new` keeps that.
             let profile = match project::is_lead(name) {
-                true => {
+                true => project::chosen(&store, name).or_else(|| {
                     let folder = bot["workspace"].as_str().unwrap_or("").to_owned();
                     (profiles.entry(folder))
                         .or_insert_with_key(|folder| match folder.as_str() {
@@ -7909,7 +7911,7 @@ impl App {
                             }
                         })
                         .clone()
-                }
+                }),
                 false => seat_profile(&store, name, false, std::path::Path::new("")),
             }
             .unwrap_or_default();
@@ -13733,6 +13735,10 @@ mod tests {
                     "bots" => json!({"bots": [
                 {"name": "shop.lead", "bot_id": 1, "head": 1, "workspace": folder,
                     "status": "idle", "running_turn": null},
+                {"name": "shop.lead.rex", "bot_id": 4, "head": 1, "workspace": folder,
+                    "status": "idle", "running_turn": null},
+                {"name": "shop.lead.ada", "bot_id": 5, "head": 1, "workspace": folder,
+                    "status": "idle", "running_turn": null},
                 {"name": "shop.fix", "bot_id": 2, "head": 1,
                     "status": "idle", "running_turn": null},
                 {"name": "shop.old", "bot_id": 3, "head": 1,
@@ -13751,6 +13757,9 @@ mod tests {
         // A task runs as the profile it was started with, whatever its
         // project tells tasks by default.
         task::note_profile(&app.store(), "shop.fix", "reviewer").unwrap();
+        // A lead `/new` made in a role of its own keeps it beside the
+        // folder's other leads, whichever is listed first.
+        task::note_profile(&app.store(), "shop.lead.rex", "lead").unwrap();
         let (_, rows) = app.status_rows().await.unwrap();
         let profile = |bot: &str| {
             rows.iter()
@@ -13760,6 +13769,8 @@ mod tests {
                 .clone()
         };
         assert_eq!(profile("shop.lead"), "superlead");
+        assert_eq!(profile("shop.lead.rex"), "lead");
+        assert_eq!(profile("shop.lead.ada"), "superlead");
         assert_eq!(profile("shop.fix"), "reviewer");
         // Not started by Sonny: nothing said rather than a guess.
         assert_eq!(profile("shop.old"), "");

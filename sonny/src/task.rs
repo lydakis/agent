@@ -513,17 +513,16 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
     // one asked for, else what the project tells every task; a fork's is
     // its source's. Only said where it is shown, so a failed write starts
     // the task all the same.
+    let store = started_on(start);
     let profile = match &source {
-        Some(source) => crate::daemon_paths(None, None)
-            .ok()
-            .and_then(|(store, _)| noted_profile(&store, &source.name)),
+        Some(source) => (store.as_ref()).and_then(|store| noted_profile(store, &source.name)),
         None => start
             .profile
             .clone()
             .or_else(|| crate::project::task_profile(&info).ok()),
     };
-    if let (Some(profile), Ok((store, _))) = (profile, crate::daemon_paths(None, None)) {
-        let _ = note_profile(&store, name, &profile);
+    if let (Some(profile), Some(store)) = (profile, &store) {
+        let _ = note_profile(store, name, &profile);
     }
     let mut said = vec![format!(
         "Started {name}: {}",
@@ -613,6 +612,14 @@ fn branch_name(name: &str) -> bool {
             .stderr(Stdio::null())
             .status()
             .is_ok_and(|status| status.success())
+}
+
+/// The store of the daemon a task is started on, beside which its profile
+/// is noted: the one `start.env` names over Sonny's own.
+fn started_on(start: &Start) -> Option<PathBuf> {
+    crate::daemon_paths(env_of(start, "AGENT_STORE").map(PathBuf::from), None)
+        .ok()
+        .map(|(store, _)| store)
 }
 
 /// `key` as the task's agent commands see it: as `start` sets it, else as
@@ -2175,6 +2182,36 @@ mod tests {
             run(none, &["--model", "a/lead"], None),
             ["--model", "a/lead", "--effort", "high"]
         );
+    }
+
+    #[test]
+    fn a_task_s_profile_is_noted_beside_the_store_it_was_started_on() {
+        let dir = std::env::temp_dir().join(format!("sonny-task-store-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = dir.join("state.sqlite");
+        let start = Start {
+            name: "fix".into(),
+            brief: String::new(),
+            profile: None,
+            setup: false,
+            model: None,
+            effort: None,
+            own_folder: false,
+            here: false,
+            folder: None,
+            from: None,
+            turn: None,
+            builds_on: None,
+            env: vec![("AGENT_STORE".into(), store.to_string_lossy().into_owned())],
+            made_by: None,
+        };
+        // The store a window's `--store` names, not the one Sonny's own
+        // environment would find.
+        assert_eq!(
+            started_on(&start),
+            Some(agent_client::socket::canonical_store(&store).unwrap())
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
