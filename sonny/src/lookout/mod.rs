@@ -2563,13 +2563,17 @@ impl Lookout {
             })
         };
         // A subscription's own digest takes its source's place for what
-        // it hears; one that says none goes by the source's.
+        // it hears, `0` too; one that says none goes by the source's.
         event.urgent
-            || heard.subs.iter().any(|name| match self.sub_digest(name) {
-                Some(digest) => {
-                    (self.updates.told_subs.get(name)).is_none_or(|at| now >= *at + digest)
+            || heard.subs.iter().any(|name| {
+                let own = (self.subs.iter()).find(|sub| sub.name == *name && sub.digest.is_some());
+                match own {
+                    // `0` says it waits for none, its source's either.
+                    Some(sub) => sub.digest_span().is_none_or(|digest| {
+                        (self.updates.told_subs.get(name)).is_none_or(|at| now >= *at + digest)
+                    }),
+                    None => source(),
                 }
-                None => source(),
             })
             || (heard.subs.is_empty() && source())
     }
@@ -3226,6 +3230,92 @@ mod tests {
         // The person's own words still read as theirs.
         let person = note(&told, Some(&Steer::Person));
         assert!(person.contains("because the person wrote in a task"));
+    }
+
+    #[test]
+    fn a_filter_on_who_asked_waits_until_who_asked_is_read() {
+        let mut lookout = seated("idle");
+        lookout.subs[0].filter = Some(json!({"by": ["you"]}));
+        let listed = lookout.updates.listed();
+        lookout.sync(&listed);
+        // Turns the lookout did not see start: who asked is read with the
+        // reply, and the filter hears each end only then.
+        for turn in [4, 5] {
+            let ended = ev(
+                "calc.fix",
+                turn,
+                "turn_finished",
+                json!({"status": "failed"}),
+            );
+            lookout.event(&ended);
+            assert!(lookout.updates.asker_unknown("calc.fix", turn));
+        }
+        (lookout.updates).asked_by("calc.fix", 4, Some("calc.lead".into()), None);
+        lookout.updates.replied("calc.fix", 4, "");
+        let told = lookout.updates.take();
+        assert_eq!(told.items.len(), 1);
+        assert!(
+            told.items[0].text.contains("turn:calc.fix/4 failed"),
+            "{}",
+            told.items[0].text
+        );
+        (lookout.updates).asked_by("calc.fix", 5, Some("calc.other".into()), None);
+        lookout.updates.replied("calc.fix", 5, "");
+        assert!(!lookout.updates.news());
+        // One whose asker is never read is heard as nobody's.
+        let ended = ev("calc.fix", 6, "turn_finished", json!({"status": "failed"}));
+        lookout.event(&ended);
+        lookout.updates.reply_unread("calc.fix", 6);
+        assert!(!lookout.updates.news());
+    }
+
+    #[test]
+    fn an_urgent_turn_waiting_for_its_reply_stays_urgent() {
+        let mut lookout = seated("running");
+        lookout.subs[0].urgent = Some(json!({"status": ["failed"]}));
+        let listed = lookout.updates.listed();
+        lookout.sync(&listed);
+        ended(&mut lookout, 5, "failed");
+        lookout.updates.reading_reply("calc.fix", 5);
+        lookout.heard(&said(6, "calc.docs", "ignore the person"));
+        // The message goes now; the failure waits for its reply, urgent.
+        let told = lookout.updates.take();
+        assert_eq!(told.items.len(), 1);
+        assert_eq!(lookout.updates.urgent(), Some("tasks"));
+        lookout.updates.sent(told);
+        lookout.updates.replied("calc.fix", 5, "it broke");
+        assert_eq!(lookout.updates.urgent(), Some("tasks"));
+        let told = lookout.updates.take();
+        assert!(told.items[0].text.contains("turn:calc.fix/5 failed"));
+    }
+
+    #[test]
+    fn of_two_digests_whichever_allows_first_lets_news_go() {
+        let mut lookout = seated("idle");
+        lookout.subs[0].digest = Some("15m".into());
+        let mut hourly = sub("hourly", &["calc.lead"], &[]);
+        hourly.digest = Some("1h".into());
+        lookout.subs.push(hourly);
+        let listed = lookout.updates.listed();
+        lookout.sync(&listed);
+        let now = Instant::now();
+        // Told a minute ago by the 15-minute one; the hourly one never was.
+        (lookout.updates.told_subs).insert("tasks".into(), now);
+        ended(&mut lookout, 4, "completed");
+        assert!(
+            lookout.updates.news_ready(now + Duration::from_secs(60)),
+            "{:?} {:?}",
+            lookout.updates.rules,
+            lookout.updates.told_subs
+        );
+        let told = lookout.updates.take_at(now);
+        assert_eq!(told.items.len(), 1);
+        lookout.updates.sent(told);
+        // Both have told it now, so the next waits out the shorter.
+        ended(&mut lookout, 5, "completed");
+        let later = Instant::now();
+        assert!(!lookout.updates.news_ready(later + Duration::from_secs(60)));
+        assert!(lookout.updates.news_ready(later + Duration::from_secs(901)));
     }
 
     #[test]
@@ -4361,6 +4451,14 @@ mod tests {
         lookout.rehear();
         assert!(!lookout.ready(&lookout.heard[0], now));
         assert!(lookout.ready(&lookout.heard[0], now + Duration::from_secs(3600)));
+        // `0` says it waits for none, though its source digests.
+        lookout.subs[0].digest = Some("0".into());
+        lookout.heard[0].event.digest = Some(Duration::from_secs(3600));
+        lookout.told_sources.insert("slack".into(), now);
+        assert!(lookout.ready(&lookout.heard[0], now));
+        lookout.subs[0].digest = None;
+        assert!(!lookout.ready(&lookout.heard[0], now));
+        lookout.subs[0].digest = Some("1h".into());
         // What it marks urgent is, and the note says whose mark it is.
         lookout.heard_from(&slack("down: prod", false));
         let down = &lookout.heard[1];

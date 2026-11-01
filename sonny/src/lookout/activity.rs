@@ -69,22 +69,28 @@ pub enum Hold {
     Unset,
     /// As soon as the subscriber rests, as news always went.
     Now,
-    /// No sooner than this long after a note last told what this
-    /// subscription held.
-    Window(String, Duration),
+    /// No sooner than one of these subscriptions' digests allows: this
+    /// long after a note last told what that subscription held. Each keeps
+    /// its own time, so the earliest any allows is when it goes.
+    Window(Vec<(String, Duration)>),
 }
 
 impl Hold {
     /// Two pieces of one task's news together: what may go now takes the
-    /// rest along, and of two windows the shorter holds.
+    /// rest along, and windows join, whichever allows first letting both
+    /// go.
     pub fn merge(self, other: Hold) -> Hold {
         match (self, other) {
             (Hold::Unset, other) | (other, Hold::Unset) => other,
             (Hold::Now, _) | (_, Hold::Now) => Hold::Now,
-            (Hold::Window(a, x), Hold::Window(b, y)) => match y < x {
-                true => Hold::Window(b, y),
-                false => Hold::Window(a, x),
-            },
+            (Hold::Window(mut a), Hold::Window(b)) => {
+                for window in b {
+                    if !a.contains(&window) {
+                        a.push(window);
+                    }
+                }
+                Hold::Window(a)
+            }
         }
     }
 }
@@ -115,7 +121,7 @@ pub fn hear(rules: &[Rule], event: &Value, skips: bool) -> Option<Heard> {
             urgent = Some(rule.sub.clone());
         }
         hold = hold.merge(match (skips, rule.digest) {
-            (false, Some(digest)) => Hold::Window(rule.sub.clone(), digest),
+            (false, Some(digest)) => Hold::Window(vec![(rule.sub.clone(), digest)]),
             _ => Hold::Now,
         });
     }
@@ -173,7 +179,10 @@ mod tests {
             hear(&[hourly.clone(), tenth.clone()], &event, false)
                 .unwrap()
                 .hold,
-            Hold::Window("tenth".into(), Duration::from_secs(600))
+            Hold::Window(vec![
+                ("hourly".into(), Duration::from_secs(3600)),
+                ("tenth".into(), Duration::from_secs(600))
+            ])
         );
         let plain = rule("plain", None, None, 0);
         assert_eq!(
@@ -204,11 +213,14 @@ mod tests {
     }
 
     #[test]
-    fn holds_merge_toward_now_and_the_shorter_window() {
-        let w = |s: &str, n| Hold::Window(s.into(), Duration::from_secs(n));
-        assert_eq!(Hold::Unset.merge(w("a", 5)), w("a", 5));
-        assert_eq!(w("a", 5).merge(Hold::Now), Hold::Now);
-        assert_eq!(w("a", 50).merge(w("b", 5)), w("b", 5));
-        assert_eq!(w("a", 5).merge(w("b", 50)), w("a", 5));
+    fn holds_merge_toward_now_and_keep_every_window() {
+        let w = |s: &str, n| (s.to_owned(), Duration::from_secs(n));
+        let a = Hold::Window(vec![w("a", 5)]);
+        assert_eq!(Hold::Unset.merge(a.clone()), a);
+        assert_eq!(a.clone().merge(Hold::Now), Hold::Now);
+        assert_eq!(
+            Hold::Window(vec![w("a", 50)]).merge(Hold::Window(vec![w("b", 5), w("a", 50)])),
+            Hold::Window(vec![w("a", 50), w("b", 5)])
+        );
     }
 }

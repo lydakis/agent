@@ -76,6 +76,9 @@ struct Turn {
     goal: Option<String>,
     /// What the task replied, ending the turn.
     reply: Option<String>,
+    /// The subscription whose `urgent` matched it, kept with the turn as
+    /// it waits apart for its reply.
+    urgent: Option<String>,
 }
 
 impl Turn {
@@ -150,10 +153,12 @@ impl News {
                     let (newer, older) = if t.turn >= a.turn { (t, a) } else { (a, t) };
                     // How a goal ended stays news when a later turn joins it.
                     let goal = newer.goal.clone().or(older.goal);
+                    let urgent = newer.urgent.clone().or(older.urgent);
                     Some(Turn {
                         first,
                         count,
                         goal,
+                        urgent,
                         ..newer
                     })
                 }
@@ -311,6 +316,11 @@ pub struct Updates {
     /// only when it printed some, and held apart, two runs never merge
     /// into one end that neither reply could clear.
     runs: HashMap<Key, (Turn, bool)>,
+    /// Turns' ends a subscription's rules are to hear once who asked for
+    /// each is read, held apart till then, and whether each answered a
+    /// note the lead had not heard: a filter on who asked hears them as
+    /// they are.
+    unheard: HashMap<Key, (Turn, bool)>,
 }
 
 /// A turn whose answer a trigger passes to the lead: when it becomes news
@@ -430,6 +440,7 @@ impl Updates {
             resolving: Default::default(),
             replying: HashSet::new(),
             runs: HashMap::new(),
+            unheard: HashMap::new(),
         }
     }
 
@@ -867,9 +878,9 @@ impl Updates {
     fn ready(&self, news: &News, now: Instant) -> bool {
         news.urgent.is_some()
             || match &news.hold {
-                super::activity::Hold::Window(sub, digest) => {
+                super::activity::Hold::Window(windows) => (windows.iter()).any(|(sub, digest)| {
                     (self.told_subs.get(sub)).is_none_or(|at| now >= *at + *digest)
-                }
+                }),
                 _ => true,
             }
     }
@@ -899,7 +910,7 @@ impl Updates {
     pub fn replied(&mut self, name: &str, turn: i64, text: &str) {
         // Read, whether or not it found words: the turn waits no more.
         self.replying.remove(&(name.to_owned(), turn));
-        self.unknown.remove(&(name.to_owned(), turn));
+        self.asker_unread(name, turn);
         let text = text.trim();
         if !self.live {
             return;
@@ -951,6 +962,15 @@ impl Updates {
             forward.from = from.clone();
             forward.origin = origin.clone();
         }
+        if let Some((mut told, answered)) = self.unheard.remove(&key) {
+            told.by = self.by(&told.status, from, origin);
+            if told.run() {
+                self.replying.insert(key.clone());
+                self.runs.insert(key, (told, answered));
+                return;
+            }
+            return self.put(name, told, answered);
+        }
         let Some(at) = self.tasks.iter().position(|(task, _)| task == name) else {
             return;
         };
@@ -984,6 +1004,7 @@ impl Updates {
             }
             return;
         };
+        told.urgent = urgent.clone();
         news.merge(match theirs {
             true => News {
                 theirs: Some(told),
@@ -1000,10 +1021,16 @@ impl Updates {
         });
     }
 
+    /// Who asked for a turn will not be read: its end is told, and heard
+    /// by the subscriptions, as one nobody is known to have asked for.
+    fn asker_unread(&mut self, name: &str, turn: i64) {
+        self.asked_by(name, turn, None, Some(UNKNOWN.to_owned()));
+    }
+
     /// The reply of a turn could not be read: its end is told without it.
     pub fn reply_unread(&mut self, name: &str, turn: i64) {
         self.replying.remove(&(name.to_owned(), turn));
-        self.unknown.remove(&(name.to_owned(), turn));
+        self.asker_unread(name, turn);
         if let Some((run, answered)) = self.runs.remove(&(name.to_owned(), turn))
             && self.live
         {
@@ -1073,6 +1100,7 @@ impl Updates {
             resolved,
             goal,
             reply: None,
+            urgent: None,
         };
         if turn.run() {
             // Its end answers the note about it, whatever its reply.
@@ -1093,10 +1121,17 @@ impl Updates {
     /// that completed is theirs, unless it answered a note the lead had
     /// not heard; one that failed or was stopped is news to the person
     /// too, and the lead hears it with its own.
-    fn put(&mut self, name: &str, turn: Turn, answered: bool) {
+    fn put(&mut self, name: &str, mut turn: Turn, answered: bool) {
         let theirs =
             turn.by.as_deref() == Some("the person") && !answered && turn.status == "completed";
         let skips = turn.status == APPROVAL;
+        // Who asked is still to be read: the subscriptions hear its end
+        // once it is, as `asked_by` tells it.
+        let key = (name.to_owned(), turn.turn);
+        if turn.by.is_none() && self.rules.contains_key(name) && self.unknown.contains(&key) {
+            self.unheard.insert(key, (turn, answered));
+            return;
+        }
         let Some((hold, urgent)) = self.gate(name, skips, || turn_event(&turn, theirs)) else {
             // What it answers, a wait for approval or a silence, is no
             // news any more either.
@@ -1111,6 +1146,7 @@ impl Updates {
             }
             return;
         };
+        turn.urgent = urgent.clone();
         self.news_of(name).merge(match theirs {
             true => News {
                 theirs: Some(turn),
@@ -1330,6 +1366,10 @@ impl Updates {
     /// waits on them.
     pub fn replies_dropped(&mut self) {
         self.replying.clear();
+        let unread: Vec<Key> = self.unknown.iter().cloned().collect();
+        for (name, turn) in unread {
+            self.asker_unread(&name, turn);
+        }
         let runs: Vec<_> = self.runs.drain().collect();
         for ((name, _), (run, answered)) in runs {
             if self.live && self.task(&name) {
@@ -1405,6 +1445,14 @@ impl Updates {
             if replying(&news.theirs) {
                 held.theirs = news.theirs.take();
             }
+            // It may go as it might now, and what of it was urgent still is.
+            if held != News::default() {
+                held.hold = super::activity::Hold::Now;
+                held.urgent = [&held.act, &held.theirs]
+                    .into_iter()
+                    .flatten()
+                    .find_map(|t| t.urgent.clone());
+            }
             // How its turns end, each with its reply, as they will read: the
             // first thing a note tells always fits; past that, turns that do
             // not wait for the next note.
@@ -1467,8 +1515,10 @@ impl Updates {
         // What a digest held was told: the digest counts from now.
         let now = Instant::now();
         for (_, news) in &told.sent {
-            if let super::activity::Hold::Window(sub, _) = &news.hold {
-                self.told_subs.insert(sub.clone(), now);
+            if let super::activity::Hold::Window(windows) = &news.hold {
+                for (sub, _) in windows {
+                    self.told_subs.insert(sub.clone(), now);
+                }
             }
         }
         if let Some(seen) = told.seen {
@@ -1515,6 +1565,7 @@ impl Updates {
     pub fn forget(&mut self) {
         self.tasks.clear();
         self.runs.clear();
+        self.unheard.clear();
         self.forwarding.clear();
         self.goaled.clear();
         self.approvals.clear();
@@ -1560,6 +1611,7 @@ impl Updates {
     fn drop_news(&mut self, name: &str) {
         self.tasks.retain(|(task, _)| task != name);
         self.runs.retain(|(task, _), _| task != name);
+        self.unheard.retain(|(task, _), _| task != name);
         self.forwarding.retain(|(task, _), _| task != name);
         self.goaled.retain(|(task, _)| task != name);
         self.approvals.retain(|(task, _), _| task != name);
