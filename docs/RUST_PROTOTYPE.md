@@ -397,7 +397,7 @@ keeps what it started with; the next start takes a change.
 | Flag | Bounds | Default |
 | --- | --- | --- |
 | `--max-processes` | Child processes running at once, foreground or background. Waiting never counts. | 64 per logical CPU |
-| `--max-lasting` | Processes that outlive their call, still running, daemon-wide: terminals and detached shell commands together. A terminal holds its slot until its whole session is gone, a detached command until it is reaped. Zero is unbounded. | 4 per logical CPU |
+| `--max-lasting` | Processes that outlive their call, still running, daemon-wide: terminals and detached shell commands together. A terminal holds its slot until its whole session is gone, a detached command until it and whatever it left running in its process group are gone. Zero is unbounded. | 4 per logical CPU |
 | `--max-active` | Turns with a live task: a model call in flight or a foreground tool. Parked turns never count. | 4,096 |
 | `--max-pending` | Submissions waiting to start: queued behind a bot's own work or ready for a slot, daemon-wide. A submission that would wait past the bound answers `pending_limit` and writes nothing; one that starts at once is never refused by it. | none |
 | `--max-pending-bytes` | UTF-8 bytes of those waiting submissions: their prompts and the words they quote, which wait with them. | none |
@@ -2434,8 +2434,10 @@ redaction; a command that wants its output redirects it to a file itself. No pro
 handle applies to it, so it outlives the turn and the daemon and is outside
 `--max-processes`; stopping it is the bot's job. What does bound it is
 `--max-lasting`, shared with terminals as a systemd slice holds a
-service's processes: each detached child retains a slot until its async
-waiter reaps it on exit, and a new detach or terminal refuses with
+service's processes: each detached command retains a slot until its async
+waiter has reaped it and nothing it left in its process group runs (a
+launcher that starts a service with `cmd &` and exits keeps the slot while
+the service runs, looked for each second), and a new detach or terminal refuses with
 `lasting_limit`, naming how many terminals and detached commands hold the
 slots, while all are held. Nothing waits in line for one. It exists because Terminal-Bench
 tasks that leave a server for the grader failed when the server died with its
@@ -2624,7 +2626,7 @@ too, always.
 
 On Linux, bubblewrap makes an empty folder on the host to mount a missing
 `.git` read-only over; the daemon removes it once no running sandbox holds
-it, and a detached command holds it until it exits. A sandbox that needs
+it, and a detached command holds it until it and what it left in its group are gone. A sandbox that needs
 one being removed waits until it is gone.
 
 ### Command rules

@@ -2648,7 +2648,8 @@ fn sh(
 /// turn and the daemon. Its output is discarded: a log the daemon wrote would
 /// bypass credential redaction, so a command that wants one redirects itself.
 /// No process slot or handle applies to it, and only the pull cord kills its
-/// session. An async waiter reaps it on exit and releases its detached slot.
+/// session. An async waiter reaps it on exit; its detached slot is released
+/// once nothing it left in its group runs either.
 #[cfg(unix)]
 async fn detach(
     command: &str,
@@ -2710,11 +2711,13 @@ async fn detach(
                 true
             }
         };
-        drop((permit, held));
         // What it left running in its group, as `cmd &` leaves, is still
-        // the pull's to end: looked for each second until the group is
-        // empty. The kernel keeps a group's id from new processes while any
-        // member lives, so only that last second could see it reused.
+        // the pull's to end, and still holds the command's place: looked
+        // for each second until the group is empty, so a launcher that
+        // starts a service and exits does not hand its slot to the next
+        // while the service runs. The kernel keeps a group's id from new
+        // processes while any member lives, so only that last second could
+        // see it reused.
         while !pulled && signal(0) {
             tokio::select! {
                 Ok(()) = pulls.changed() => {
@@ -2724,7 +2727,7 @@ async fn detach(
                 () = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
             }
         }
-        drop(listening);
+        drop((permit, held, listening));
     });
     Ok(Outcome::text(
         json!({"detached":true,"pid":pid}).to_string(),
