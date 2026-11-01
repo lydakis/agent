@@ -75,3 +75,49 @@ class BlindTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class ConfinedTests(unittest.TestCase):
+    """What the eval allows may not reach the real home (#521)."""
+
+    def test_a_call_into_the_real_home_is_denied_and_one_inside_the_run_allowed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            real = Path(tmp) / 'Users' / 'me'
+            root = Path(tmp) / 'role' / 'A1'
+            root.mkdir(parents=True)
+            with mock.patch.object(role_eval, 'REAL_HOME', real.resolve()):
+                inside = {'toolCall': {'rawInput': {'command': f'git clone --mirror . {root}/backups/shop.git'}}}
+                self.assertTrue(role_eval.confined(root, inside))
+                outside = {'toolCall': {'rawInput': {'command': f'mkdir -p {real}/Backups/shop'}}}
+                self.assertFalse(role_eval.confined(root, outside))
+                # A path that climbs out of the run counts where it lands.
+                climbs = {'arguments': {'path': f'{root}/../../Users/me/notes.md'}}
+                self.assertFalse(role_eval.confined(root, climbs))
+                # Escalations with no path, and system paths, are not the home.
+                self.assertTrue(role_eval.confined(root, {'arguments': {'command': 'git push origin main'}}))
+                self.assertTrue(role_eval.confined(root, {'arguments': {'command': 'ls /usr/bin > /dev/null'}}))
+
+    def test_what_changed_in_the_real_home_is_found_past_hidden_folders_and_the_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            real = Path(tmp) / 'me'
+            (real / '.cache').mkdir(parents=True)
+            (real / 'Library').mkdir()
+            root = real / 'role' / 'A1'
+            root.mkdir(parents=True)
+            old = real / 'old.txt'
+            old.write_text('x')
+            os.utime(old, (0, 0))
+            since = 1.0
+            (real / '.cache' / 'noise').write_text('x')
+            (real / 'Library' / 'noise').write_text('x')
+            (root / 'backup').write_text('x')
+            (real / 'Backups').mkdir()
+            (real / 'Backups' / 'shop.git').write_text('x')
+            with mock.patch.object(role_eval, 'REAL_HOME', real.resolve()):
+                found = role_eval.changed_outside(since, root)
+            names = {Path(p).name for p in found}
+            self.assertIn('shop.git', names)
+            self.assertNotIn('old.txt', names)
+            self.assertNotIn('noise', names)
+            self.assertNotIn('backup', names)
+

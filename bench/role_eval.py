@@ -338,11 +338,74 @@ def land(root, env, author, message, files):
     return sh(['git', 'rev-parse', 'HEAD'], cwd=clone, env=env).stdout.strip()
 
 
+# The home of whoever runs the eval, which a run's own HOME stands in for:
+# what an agent is allowed may not reach it (#521).
+REAL_HOME = Path.home().resolve()
+PATHS = re.compile(r'(?<![\w.~-])(/[^\s\'"`;|&<>(){}$,]+)')
+
+
+def confined(root, request):
+    """Whether a call asked about leaves the person's real home alone: every
+    absolute path in it is inside the run's `root` or outside the real home.
+    The sandbox asks before a write outside the run, so allowing every ask
+    let an agent write into the real home, which a fake HOME does not hide."""
+    root = Path(root).resolve()
+    texts = []
+
+    def walk(value):
+        if isinstance(value, str):
+            texts.append(value)
+        elif isinstance(value, dict):
+            for item in value.values():
+                walk(item)
+        elif isinstance(value, list):
+            for item in value:
+                walk(item)
+    walk(request)
+    for text in texts:
+        for found in PATHS.findall(text):
+            path = Path(os.path.normpath(found))
+            try:
+                path = path.resolve()
+            except (OSError, RuntimeError):
+                pass
+            if path.is_relative_to(root):
+                continue
+            if path == REAL_HOME or path.is_relative_to(REAL_HOME):
+                return False
+    return True
+
+
+def changed_outside(since, root, limit=200):
+    """What changed in the real home after `since`, a few levels down and
+    past its hidden folders and Library, which other programs write all
+    day: a run should leave none of it (#521)."""
+    root = Path(root).resolve()
+    found = []
+    for top, dirs, files in os.walk(REAL_HOME):
+        top = Path(top)
+        depth = len(top.relative_to(REAL_HOME).parts)
+        dirs[:] = [d for d in dirs if not d.startswith('.') and d != 'Library'
+                   and not (top / d).resolve().is_relative_to(root) and depth < 3]
+        for name in files + dirs:
+            path = top / name
+            try:
+                if path.lstat().st_mtime > since:
+                    found.append(str(path))
+            except OSError:
+                continue
+            if len(found) >= limit:
+                return found
+    return found
+
+
 class Acp:
     """One `sonny acp` process, driven as T3 Code drives it, logging every
-    line it writes and allowing every call it asks the person about."""
+    line it writes and allowing every call it asks the person about that
+    leaves the real home alone, denying the rest."""
 
-    def __init__(self, sonny, env, cwd, log):
+    def __init__(self, sonny, env, cwd, log, root=None):
+        self.root = Path(root) if root else Path(cwd).parent
         self.p = subprocess.Popen([str(sonny), 'acp'], env=env, cwd=cwd, stdin=subprocess.PIPE,
                                   stdout=subprocess.PIPE, stderr=open(log.with_suffix('.stderr'), 'w'),
                                   text=True)
@@ -364,7 +427,8 @@ class Acp:
             self.log.flush()
             m = json.loads(line)
             if m.get('method') == 'session/request_permission':
-                self.write({'id': m['id'], 'result': {'outcome': {'outcome': 'selected', 'optionId': 'allow'}}})
+                choice = 'allow' if confined(self.root, m.get('params')) else 'deny'
+                self.write({'id': m['id'], 'result': {'outcome': {'outcome': 'selected', 'optionId': choice}}})
             elif 'method' in m and 'id' in m:
                 self.write({'id': m['id'], 'error': {'code': -32601, 'message': 'not offered'}})
             elif 'id' in m:
@@ -426,10 +490,11 @@ def until_subscribed(home, cap=10 * 60):
     return False
 
 
-def allow_waiting(env, agent):
-    """Allow every call a task waits on the person for. Only the lead's
-    session runs through `sonny acp`, which answers the lead's own; a
-    task's would otherwise park and stall the day."""
+def allow_waiting(env, agent, root):
+    """Allow every call a task waits on the person for that leaves the real
+    home alone, and deny the rest. Only the lead's session runs through
+    `sonny acp`, which answers the lead's own; a task's would otherwise park
+    and stall the day."""
     out = subprocess.run([str(agent), 'approvals'], env=env, capture_output=True, text=True).stdout
     try:
         calls = json.loads(out or '[]')
@@ -440,8 +505,9 @@ def allow_waiting(env, agent):
         if call.get('bot') == 'shop.lead' or (call.get('asked') is None and 'manual' not in gates):
             continue
         tag = ['--tag', 'manual'] if 'manual' in gates else []
+        choice = 'allow' if confined(root, call) else 'deny'
         subprocess.run([str(agent), 'answer', '--bot', call['bot'], '--turn', str(call['turn']),
-                        '--call', call['call_id'], '--request', str(call['request']), *tag, 'allow'],
+                        '--call', call['call_id'], '--request', str(call['request']), *tag, choice],
                        env=env, capture_output=True)
 
 
@@ -452,7 +518,7 @@ def settle(env, agent, acp, quiet=60, cap=40 * 60):
     start = time.monotonic()
     calm = None
     while time.monotonic() - start < cap:
-        allow_waiting(env, agent)
+        allow_waiting(env, agent, acp.root)
         busy = active(env, agent)
         idle = not busy and time.monotonic() - acp.last > 10
         if idle:
@@ -479,6 +545,7 @@ def run(arm, n, bins, model, spec=None):
     # The build, so `blind` can hide it from the scorer.
     (out / 'bin.txt').write_text(bins[arm])
     log = out / 'acp.jsonl'
+    started = time.time()
     sh([str(agent), 'start', '--idle-exit', '0'], env=env)
     acp = None
     timeline = []
@@ -491,7 +558,7 @@ def run(arm, n, bins, model, spec=None):
         (root / 'step').write_text(str(step))
 
     try:
-        acp = Acp(sonny, env, repo, log)
+        acp = Acp(sonny, env, repo, log, root)
         acp.ask('initialize', {'protocolVersion': 2, 'clientCapabilities': {}, 'clientInfo': {'name': 'role-eval'}})
         session = acp.ask('session/new', {'cwd': str(repo), 'mcpServers': []})['result']['sessionId']
         for step, s in enumerate(DAY, 1):
@@ -553,6 +620,13 @@ def run(arm, n, bins, model, spec=None):
             main += [f'--- main:{path}', shown.stdout or '(none)']
         (out / 'main.txt').write_text('\n'.join(main) + '\n')
         messages(home, out)
+        # Nothing outside the run should have changed: what did is kept, and
+        # said, for whoever reads the run.
+        outside = changed_outside(started, root)
+        (out / 'outside.txt').write_text(''.join(f'{path}\n' for path in outside))
+        if outside:
+            print(f'{arm}{n}: {len(outside)} paths changed in the real home, see {out / "outside.txt"}',
+                  file=sys.stderr)
     transcript(out)
     return out
 
