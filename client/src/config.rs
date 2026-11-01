@@ -903,8 +903,10 @@ fn parse(text: &str) -> Result<Config, String> {
                         ));
                     }
                 };
-                // Worked out once here so a mistake is refused by name.
-                formula(key, &text, 64.0, 64.0 * 1024.0 * 1024.0 * 1024.0)?;
+                // Worked out here for this machine, as the agent CLI will
+                // start the daemon, so a mistake is refused by name now.
+                let (cpus, memory) = machine();
+                formula(key, &text, cpus, memory)?;
                 config.daemon.insert(key.clone(), text);
             }
             continue;
@@ -1497,6 +1499,14 @@ mod tests {
         );
         assert!(
             parse("[daemon]\nprocesses = -1\n")
+                .unwrap_err()
+                .contains("daemon.processes")
+        );
+        // A formula is checked for this machine: one below 0 here is refused
+        // when the file is read, not when a daemon starts.
+        let over = machine().0 as u64 + 1;
+        assert!(
+            parse(&format!("[daemon]\nprocesses = \"cpus - {over}\"\n"))
                 .unwrap_err()
                 .contains("daemon.processes")
         );

@@ -52,8 +52,9 @@ The daemon's [limits](RUST_PROTOTYPE.md#limits) come from `[daemon]` in
 a formula of the machine, as `processes = "cpus * 64"` or
 `load = "cpus * 2"`, the default for `--max-load`: while the machine's
 1-minute load average is over it, new commands wait for one of the
-daemon's to end, as `make -l` does. A key it does not know, or a formula
-it cannot work out, is `config_invalid`.
+daemon's to end, as `make -l` does, a turn held long parking until then.
+A key it does not know, or a formula it cannot work out for this machine
+(one below 0 here included), is `config_invalid` when the file is read.
 `run` without `--bot` creates a fresh identity. `run --bot NAME` continues an
 existing bot; add `--new` to create that name. A prompt of `-` reads stdin.
 

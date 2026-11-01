@@ -54,6 +54,9 @@ pub const PAUSED: &str = "daemon_paused";
 /// wall-clock budget those attempts may span. A model call has no side
 /// effects, so retrying one is always safe; a tool is never rerun.
 const MAX_ATTEMPTS: u32 = 8;
+/// How long a command the load gate holds back waits live, a reading or
+/// two of the gate, before its turn parks.
+const LOAD_HOLD: std::time::Duration = std::time::Duration::from_millis(1500);
 /// Refusals for pace are spaced by the pool and are not the request's fault,
 /// so they get many more attempts inside the same time budget.
 const MAX_PACED_ATTEMPTS: u32 = 64;
@@ -685,7 +688,7 @@ impl Turn {
         if waiting.paced_since_ms.is_some() {
             return Round::Lapses(waiting.deadline_ms.unwrap_or(0));
         }
-        if waiting.approval || waiting.answer.is_some() {
+        if waiting.approval || waiting.load || waiting.answer.is_some() {
             self.handles.wake(self.bot.clone(), self.turn);
             return match waiting.deadline_ms.filter(|&at| at > now_ms()) {
                 Some(at) => Round::Lapses(at),
@@ -2246,7 +2249,7 @@ impl Turn {
                     self.store
                         .op("tool_finish", move |db| db.tool_finish(turn, &id, &outcome))
                         .await?;
-                } else if !waiting.approval {
+                } else if !waiting.approval && !waiting.load {
                     // A later call's lapse can wake the wait before its
                     // handles resolve: those are reported pending, as the
                     // wait's own timeout reports them.
@@ -3752,6 +3755,15 @@ impl Turn {
             if self.stopping.load(Relaxed) {
                 return Ok(Some(Stop::Drained));
             }
+            // A command the machine's load holds back waits for it parked,
+            // before it or the calls after it start.
+            if self.load_holds(record, &call)
+                && let Some(stop) = self
+                    .await_load(&call, &calls, route, summary_retry_ms)
+                    .await?
+            {
+                return Ok(Some(stop));
+            }
             // Calls in a row that only read or run commands, none of them
             // gated, run together, as Codex runs them.
             if let Some(first) = self.parallel(record, &call, workspace)
@@ -4555,6 +4567,72 @@ impl Turn {
                 Some(None) => return Ok(Approval::Stop(Stop::Parked)),
             }
         }
+    }
+
+    /// Whether the daemon's load gate holds `call` back now: a foreground
+    /// command, while the machine is over its load and one of the
+    /// daemon's commands runs.
+    fn load_holds(&self, record: &Bot, call: &ToolCall) -> bool {
+        !self.registry.admits()
+            && record.declared(&call.name).is_none()
+            && record.callable().iter().any(|name| name == &call.name)
+            && matches!(
+                self.registry.prepare(&call.name, &call.arguments),
+                Ok(Prepared::Shell {
+                    background: false,
+                    ..
+                })
+            )
+    }
+
+    /// Wait for the load gate to let `call` start: live until its next
+    /// readings (a second apart) have passed, then parked as a verdict
+    /// waits, holding no task and no slot, with the call and the rest of
+    /// its round not started. The daemon wakes the turn at the gate's
+    /// first reading that lets a command start. None: run it now.
+    async fn await_load(
+        &self,
+        call: &ToolCall,
+        calls: &std::vec::IntoIter<ToolCall>,
+        route: Option<&str>,
+        summary_retry_ms: Option<u64>,
+    ) -> Result<Option<Stop>> {
+        let Some(mut open) = self.registry.load_gate() else {
+            return Ok(None);
+        };
+        let hold = tokio::time::Instant::now() + LOAD_HOLD;
+        loop {
+            if self.registry.admits() {
+                return Ok(None);
+            }
+            if self.stopping.load(Relaxed) {
+                return Ok(Some(Stop::Drained));
+            }
+            tokio::select! {
+                changed = open.changed() => if changed.is_err() {
+                    return Ok(None);
+                },
+                () = tokio::time::sleep_until(hold) => break,
+            }
+        }
+        let turn = self.turn;
+        let pending: Vec<ToolCall> = std::iter::once(call.clone())
+            .chain(calls.as_slice().iter().cloned())
+            .collect();
+        let route = route.map(str::to_owned);
+        let parked = self
+            .store
+            .op("suspend_load", move |db| {
+                db.suspend_load(turn, &pending, now_ms(), route.as_deref(), summary_retry_ms)
+            })
+            .await?;
+        self.registry.note_load_park();
+        Ok(match parked {
+            // A later call's gate lapsed: the turn goes on and meets it.
+            None => None,
+            Some(Some(at)) => Some(Stop::Lapses(at)),
+            Some(None) => Some(Stop::Parked),
+        })
     }
 
     /// Wait for an answered call's answer: live for the hold, then parked

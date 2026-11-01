@@ -1073,6 +1073,76 @@ fn epoch_now() -> u64 {
 }
 
 #[test]
+fn a_turn_parks_on_the_load_gate_before_its_command_and_wakes_to_run_it() {
+    let mut db = db();
+    let tools = ["shell".to_owned()];
+    db.create(
+        "Bob",
+        Some("/synthetic"),
+        Binding {
+            tools: &tools,
+            ..binding()
+        },
+    )
+    .unwrap();
+    let turn = db
+        .begin(
+            "Bob",
+            "request",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let round: Vec<ToolCall> = ["s1", "s2"]
+        .iter()
+        .map(|&call_id| ToolCall {
+            custom: false,
+            name: "shell".into(),
+            call_id: call_id.into(),
+            arguments: json!({"command":"true"}).to_string(),
+        })
+        .collect();
+    let items = round
+        .iter()
+        .map(|call| {
+            serde_json::to_vec(&json!({"type":"function_call","call_id":call.call_id,
+                "name":call.name,"arguments":call.arguments}))
+            .unwrap()
+            .into()
+        })
+        .collect();
+    db.append(turn, items, &round, None).unwrap();
+    assert!(db.load_parked().unwrap().is_empty());
+    // Parked before s1, which has not started, with s2 after it.
+    assert_eq!(
+        db.suspend_load(turn, &round, epoch_now(), None, None)
+            .unwrap(),
+        Some(None)
+    );
+    assert_eq!(db.load_parked().unwrap(), [("Bob".to_owned(), turn)]);
+    let view = db.turn_view("Bob", turn).unwrap();
+    assert_eq!(view["status"], "waiting");
+    assert_eq!(
+        view["waiting_on"],
+        json!({"call_id":"s1","load":true,"deadline_ms":null})
+    );
+    // Not the bot's own wait: a steer does not wake it.
+    assert_eq!(db.steered_park("Bob").unwrap(), None);
+    // The gate's wake resumes it with the round still to run.
+    assert!(matches!(db.wake("Bob", turn, false).unwrap(), Wake::Resume));
+    let (waiting, _, _) = db.resume(turn).unwrap();
+    assert!(waiting.load);
+    assert_eq!(waiting.call_id, "s1");
+    assert_eq!(waiting.pending.len(), 2);
+    assert!(db.load_parked().unwrap().is_empty());
+    // It runs s1 as any call: it had not started.
+    db.tool_start(turn, &round[0]).unwrap();
+}
+
+#[test]
 fn a_turn_parked_on_one_verdict_ends_when_a_later_call_lapses_first() {
     let mut db = db();
     // The first call waits on a gate with no expiry; the second one's lapses.

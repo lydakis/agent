@@ -1318,6 +1318,42 @@ impl Active {
     }
 }
 
+/// Wake the turns parked on the load gate at each of its readings that
+/// lets a command start: every one once the load is under its limit, and
+/// the oldest while none of the daemon's commands runs, as make's `-l`
+/// starts one job on an idle, loaded machine. It reads the store only
+/// after a turn parked, or at a start, for parks from before it.
+async fn wake_load_parks(
+    mut gate: tokio::sync::watch::Receiver<bool>,
+    registry: Registry,
+    reader: agent_runtime::store::Reader,
+    handles: Handles,
+) {
+    loop {
+        let open = *gate.borrow_and_update();
+        if (open || registry.running() == 0) && registry.take_load_parked() {
+            match reader.read("load_parked", |db| db.load_parked()).await {
+                Ok(parked) => {
+                    let all = parked.len();
+                    let woken = if open { all } else { all.min(1) };
+                    for (bot, turn) in parked.into_iter().take(woken) {
+                        handles.wake(bot, turn);
+                    }
+                    // Those left wait for a later reading.
+                    if woken < all {
+                        registry.note_load_park();
+                    }
+                }
+                // Looked for again at the next reading.
+                Err(_) => registry.note_load_park(),
+            }
+        }
+        if gate.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
 /// The one path durable events take to followers and waiters. The storage
 /// worker hands over what each job committed, in commit order, so a
 /// follower's cursors only ever rise and a committed batch is published
@@ -1579,6 +1615,14 @@ pub async fn run(config: Configuration) -> Result<()> {
     let (failure_sender, mut failures) = mpsc::unbounded_channel();
     let handles = Handles::new(resume_sender);
     let mut publisher = tokio::spawn(publish(publications, hub.clone(), handles.clone()));
+    if let Some(gate) = registry.load_gate() {
+        tokio::spawn(wake_load_parks(
+            gate,
+            registry.clone(),
+            store.reader(),
+            handles.clone(),
+        ));
+    }
     // Turns parked before a restart keep waiting; their processes are gone.
     // Those parked on a closed pool wait for their time, not for handles.
     let mut wakes = Wakes::default();
@@ -1590,7 +1634,8 @@ pub async fn run(config: Configuration) -> Result<()> {
             db.waiting_turns()?
                 .into_iter()
                 .map(|w| {
-                    let own = !w.approval && w.answer.is_none() && w.paced_since_ms.is_none();
+                    let own =
+                        !w.approval && !w.load && w.answer.is_none() && w.paced_since_ms.is_none();
                     let lapse = own.then(|| lapses.get(&w.turn).copied()).flatten();
                     // A steer sent while the daemon was down wakes the wait.
                     let steered = match own {
@@ -1610,7 +1655,8 @@ pub async fn run(config: Configuration) -> Result<()> {
         // A verdict park wakes on an answer, which may have committed
         // before the restart, or when a gate lapses: check now as an answer
         // would, and keep the lapse unless it has already passed.
-        if waiting.approval || waiting.answer.is_some() {
+        // A load park wakes too: nothing of the daemon's runs yet.
+        if waiting.approval || waiting.load || waiting.answer.is_some() {
             if let Some(at) = waiting.deadline_ms.filter(|&at| at > now_ms()) {
                 wakes.set(at, waiting.bot.clone(), waiting.turn);
             }
@@ -7559,6 +7605,96 @@ mod tests {
             .await
             .unwrap();
         drop(service);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn load_parks_wake_one_on_an_idle_machine_and_all_once_the_load_falls() {
+        let dir = scratch("load-parks");
+        let (store, _publications) = Store::open(&dir.join("state.sqlite")).await.unwrap();
+        let mut turns = Vec::new();
+        for name in ["Ann", "Bob"] {
+            let turn = running(&store, &[name.into()]).await[0].1;
+            store
+                .call(move |db| {
+                    let call = agent_runtime::provider::ToolCall {
+                        custom: false,
+                        name: "shell".into(),
+                        call_id: "shell-1".into(),
+                        arguments: r#"{"command":"true"}"#.into(),
+                    };
+                    let item = serde_json::to_vec(&json!({"type":"function_call",
+                        "name":call.name,"call_id":call.call_id,"arguments":call.arguments}))?
+                    .into();
+                    db.append(turn, vec![item], std::slice::from_ref(&call), None)?;
+                    db.suspend_load(turn, &[call], now_ms(), None, None)
+                        .map(|_| ())
+                })
+                .await
+                .unwrap();
+            turns.push((name.to_owned(), turn));
+        }
+        let (gate, readings) = tokio::sync::watch::channel(false);
+        let registry = Registry::new("shell")
+            .unwrap()
+            .with_process_budget(4)
+            .with_load_readings(readings.clone());
+        let (sender, mut woken) = mpsc::unbounded_channel();
+        let waker = tokio::spawn(wake_load_parks(
+            readings,
+            registry.clone(),
+            store.reader(),
+            Handles::new(sender),
+        ));
+        async fn next(woken: &mut mpsc::UnboundedReceiver<(String, i64)>) -> (String, i64) {
+            tokio::time::timeout(Duration::from_secs(5), woken.recv())
+                .await
+                .unwrap()
+                .unwrap()
+        }
+        // Loaded, with none of the daemon's commands running: the oldest
+        // goes, as at a start.
+        assert_eq!(next(&mut woken).await, turns[0]);
+        tokio::task::yield_now().await;
+        assert!(woken.try_recv().is_err());
+        // Ann's turn takes its wake and leaves the park; Bob's still waits,
+        // so the next reading on an idle machine wakes his.
+        let ann = turns[0].1;
+        store
+            .call(move |db| db.resume(ann).map(|_| ()))
+            .await
+            .unwrap();
+        gate.send_modify(|_| {});
+        assert_eq!(next(&mut woken).await, turns[1]);
+        // Nothing is read again until a turn parks once more: Bob's park
+        // stays in the store, unread, while no turn notes a new one.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        while woken.try_recv().is_ok() {}
+        gate.send_modify(|_| {});
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(woken.try_recv().is_err());
+        // Ann's turn parks again and the load falls: every parked turn wakes.
+        store
+            .call(move |db| {
+                let call = agent_runtime::provider::ToolCall {
+                    custom: false,
+                    name: "shell".into(),
+                    call_id: "shell-2".into(),
+                    arguments: r#"{"command":"true"}"#.into(),
+                };
+                db.suspend_load(ann, &[call], now_ms(), None, None)
+                    .map(|_| ())
+            })
+            .await
+            .unwrap();
+        registry.note_load_park();
+        gate.send_replace(true);
+        let mut all = vec![next(&mut woken).await, next(&mut woken).await];
+        all.sort();
+        assert_eq!(all, turns);
+        drop(gate);
+        waker.await.unwrap();
         drop(store);
         std::fs::remove_dir_all(dir).unwrap();
     }
