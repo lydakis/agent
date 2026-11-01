@@ -79,10 +79,32 @@ pub fn focus(key: Option<&str>) -> Option<String> {
     focus_in(&home()?, key?)
 }
 
+/// The focus kept for `key` under `home`. A sandboxed agent may write the
+/// folder, so only a plain file of at most [`MAX_FOCUS`] bytes is read, and
+/// never through a link: a pipe, a device or a link to one would otherwise
+/// hold the window that asks, which reads it on its own loop.
 pub fn focus_in(home: &Path, key: &str) -> Option<String> {
-    let text = std::fs::read_to_string(file(home, key)?).ok()?;
-    Some(text.trim().to_owned()).filter(|focus| !focus.is_empty())
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(file(home, key)?)
+        .ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    let mut text = String::new();
+    file.take(MAX_FOCUS as u64 + 1)
+        .read_to_string(&mut text)
+        .ok()?;
+    (text.len() <= MAX_FOCUS)
+        .then(|| text.trim().to_owned())
+        .filter(|focus| !focus.is_empty())
 }
+
+/// The most a focus file is read: far past any focus a person types.
+pub const MAX_FOCUS: usize = 16 * 1024;
 
 /// Whether any agent is in zen, before asking which.
 pub fn any_in(home: &Path) -> bool {
@@ -161,6 +183,32 @@ mod tests {
         set_in(&home, "1a-3", None).unwrap();
         assert_eq!(focus_in(&home, "1a-3"), None);
         assert!(set_in(&home, "../x", Some("no")).is_err());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// An agent may write the folder, so what it leaves there must not hold
+    /// the window that reads it.
+    #[test]
+    fn only_a_plain_small_focus_file_is_read() {
+        let home = std::env::temp_dir().join(format!("sonny-zen-odd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let dir = home.join(".agent/sonny/zen");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("aim"), "the receipts").unwrap();
+        std::os::unix::fs::symlink(dir.join("aim"), dir.join("link")).unwrap();
+        assert_eq!(focus_in(&home, "link"), None);
+        std::os::unix::fs::symlink("/dev/zero", dir.join("zero")).unwrap();
+        assert_eq!(focus_in(&home, "zero"), None);
+        let fifo =
+            std::ffi::CString::new(dir.join("fifo").into_os_string().into_encoded_bytes()).unwrap();
+        // SAFETY: `fifo` is a valid NUL-terminated path for the call.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        assert_eq!(focus_in(&home, "fifo"), None);
+        std::fs::write(dir.join("big"), "x".repeat(MAX_FOCUS + 1)).unwrap();
+        assert_eq!(focus_in(&home, "big"), None);
+        std::fs::write(dir.join("full"), "x".repeat(MAX_FOCUS)).unwrap();
+        assert_eq!(focus_in(&home, "full").map(|f| f.len()), Some(MAX_FOCUS));
+        assert_eq!(focus_in(&home, "aim").as_deref(), Some("the receipts"));
         let _ = std::fs::remove_dir_all(&home);
     }
 }
