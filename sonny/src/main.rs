@@ -2390,10 +2390,12 @@ struct App {
 }
 
 /// What a job of the lead's layout has to say: a line in the lead's view,
-/// or, for something the person asked of it, a notice.
+/// or, for something the person asked of it, a notice; or that an agent
+/// clicked has no tab, so it opens in the pane.
 enum Told {
     Line(String),
     Notice(String),
+    Beside(String),
 }
 
 /// The lead's tasks, laid out in the project's home in a multiplexer: a window for
@@ -2792,12 +2794,16 @@ impl Fleet {
     }
 
     /// Bring the task's own tab into view in the multiplexer, as the
-    /// person asked.
-    fn go_to(&self, bot: &str) {
+    /// person asked; looked for on the worker, after every window opened
+    /// so far. With none, `beside` opens it in the pane, else says so.
+    fn go_to(&self, bot: &str, beside: bool) {
         let (bot, told) = (bot.to_owned(), self.tell.clone());
         self.layout.send(move |layout| {
             if let Err(error) = layout.focus(&bot) {
-                let _ = told.send(Told::Notice(error));
+                let _ = told.send(match beside {
+                    true => Told::Beside(bot),
+                    false => Told::Notice(error),
+                });
             }
         });
     }
@@ -3393,6 +3399,10 @@ impl App {
                         }
                         Err(Told::Notice(notice)) => {
                             self.notice = Some(notice);
+                            continue;
+                        }
+                        Err(Told::Beside(bot)) => {
+                            self.open_task(&bot);
                             continue;
                         }
                     };
@@ -4562,8 +4572,6 @@ impl App {
         turn
     }
 
-    /// The task `bot` opened in the pane: its own Sonny, to watch it and
-    /// talk to it.
     /// An agent named or picked: to its own tab, when the lead's layout
     /// has one for it, or a look at it in the pane, as `[sonny]
     /// agent_opens` says; `other`, a right click, the one it doesn't. With
@@ -4572,7 +4580,7 @@ impl App {
         use agent_client::config::AgentOpens;
         let tab = (self.agent_opens == AgentOpens::Tab) != other;
         match &self.fleet {
-            Some(fleet) if tab && fleet.layout.places().contains_key(bot) => fleet.go_to(bot),
+            Some(fleet) if tab => fleet.go_to(bot, true),
             // A task's window, or one in the pane, lays nothing out
             // itself: its project's layout is found off the screen, and
             // with no tab there the agent opens in the pane after all.
@@ -4617,6 +4625,8 @@ impl App {
         }
     }
 
+    /// The task `bot` opened in the pane: its own Sonny, to watch it and
+    /// talk to it.
     fn open_task(&mut self, bot: &str) {
         let name = (self.tasks.values().flatten())
             .find(|task| task.bot == bot)
@@ -8559,7 +8569,7 @@ impl App {
             "main" => self.switch_command(id).await,
             // Its name: its own tab, where the lead's tasks are laid out.
             "tab" => match &self.fleet {
-                Some(fleet) => fleet.go_to(id),
+                Some(fleet) => fleet.go_to(id, false),
                 None => {
                     self.notice = Some(format!(
                         "{id} has no tab: this Sonny is not in Rex, Herdr or cmux"
