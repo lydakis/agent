@@ -71,26 +71,40 @@ pub fn find(name: &str, typed: &str) -> Option<Found> {
         });
     }
     // The tightest run of the letters in order: from each word the first
-    // letter starts, the nearest of each next one. Every run takes its next
-    // letter at once, from where that letter is next found, so a long name,
-    // as a prompt sent before can be, costs its length times the letters
-    // typed and not its length squared.
-    let mut runs: Vec<Vec<usize>> = (0..lowered.len())
+    // letter starts, the nearest of each next one. A long name, as a
+    // prompt sent before can be, is not scanned on from every start: each
+    // run keeps only where it starts and where it is, the runs end in
+    // order so one pass finds every run's next letter, and runs that reach
+    // the same letter go on alike, so only the later, tighter one is kept.
+    // That costs the name's length times the letters typed, in time, and
+    // its starts in memory; the winner's letters are found again at the end.
+    let mut runs: Vec<(usize, usize)> = (0..lowered.len())
         .filter(|&at| starts(at) && lowered[at] == typed[0])
-        .map(|at| vec![at])
+        .map(|at| (at, at))
         .collect();
-    let mut next = vec![usize::MAX; lowered.len() + 1];
     for &c in &typed[1..] {
-        for i in (0..lowered.len()).rev() {
-            next[i] = if lowered[i] == c { i } else { next[i + 1] };
-        }
-        runs.retain_mut(|run| {
-            let at = next[run[run.len() - 1] + 1];
-            run.push(at);
-            at != usize::MAX
+        let mut seen = Some(0);
+        runs.retain_mut(|(_, last)| {
+            let from = *last + 1;
+            if seen.is_some_and(|at| at < from) {
+                seen = (lowered[from..].iter().position(|&l| l == c)).map(|at| from + at);
+            }
+            seen.map(|at| *last = at).is_some()
+        });
+        runs.dedup_by(|later, earlier| {
+            let same = later.1 == earlier.1;
+            if same {
+                *earlier = *later;
+            }
+            same
         });
     }
-    let found = runs.into_iter().min_by_key(|f| f[f.len() - 1] - f[0])?;
+    let (start, _) = runs.into_iter().min_by_key(|(start, last)| last - start)?;
+    let mut found = vec![start];
+    for &c in &typed[1..] {
+        let from = found[found.len() - 1] + 1;
+        found.push(from + lowered[from..].iter().position(|&l| l == c)?);
+    }
     Some(Found {
         tier: Tier::Letters,
         spread: found[found.len() - 1] - found[0] + 1 - typed.len(),
@@ -300,6 +314,11 @@ mod tests {
         let long = "a ".repeat(200_000) + "z";
         assert_eq!(find(&long, "az").unwrap().at, [399_998, 400_000]);
         assert!(find(&long, "zz").is_none());
+        // A long query keeps one place per run, not one per letter.
+        let long = "a ".repeat(5_000) + "z";
+        let found = find(&long, &("a".repeat(500) + "z")).unwrap();
+        assert_eq!(found.at.len(), 501);
+        assert_eq!((found.at[0], found.at[500]), (9_000, 10_000));
     }
 
     #[test]
