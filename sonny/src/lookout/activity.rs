@@ -67,7 +67,7 @@ impl Rule {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Hold {
     /// Something in it goes as soon as the subscriber rests: heard by a
-    /// subscription with no digest, the person's own, or urgent.
+    /// subscription with no digest, or the person's own.
     pub now: bool,
     /// Subscriptions with a digest that heard it, each with its digest:
     /// no sooner than one allows, this long after a note last told what
@@ -133,7 +133,8 @@ pub fn hear(rules: &[Rule], event: &Value, skips: bool) -> Option<Heard> {
             None => hold.now = true,
         }
     }
-    hold.now |= urgent.is_some();
+    // What is urgent goes as it comes by its own mark, while it is still
+    // to be told.
     Some(Heard { hold, urgent })
 }
 
@@ -219,7 +220,7 @@ mod tests {
             hear(&rules, &event, false),
             Some(Heard {
                 hold: Hold {
-                    now: true,
+                    now: false,
                     windows: vec![("migration".into(), Duration::from_secs(3600))]
                 },
                 urgent: Some("migration".into())

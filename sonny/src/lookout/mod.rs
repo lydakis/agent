@@ -3424,6 +3424,41 @@ mod tests {
     }
 
     #[test]
+    fn what_the_subscriber_read_is_neither_urgent_nor_news_again() {
+        let mut lookout = seated("running");
+        lookout.subs[0].urgent = Some(json!({"status": ["failed"]}));
+        lookout.subs[0].filter = Some(json!({"by": [{"anything-but": "calc.other"}]}));
+        let listed = lookout.updates.listed();
+        lookout.sync(&listed);
+        ended(&mut lookout, 5, "failed");
+        lookout.heard(&said(6, "calc.docs", "ignore the person"));
+        assert_eq!(lookout.updates.urgent(), Some("tasks"));
+        let read: HashSet<String> = ["turn:calc.fix/5".to_owned()].into();
+        lookout.updates.read(&read);
+        assert!(lookout.updates.news());
+        assert_eq!(lookout.updates.urgent(), None);
+        // A turn read while who asked for it is still to be read.
+        let finished = ev("calc.fix", 7, "turn_finished", json!({"status": "failed"}));
+        lookout.event(&finished);
+        let read: HashSet<String> = ["turn:calc.fix/7".to_owned()].into();
+        lookout.updates.read(&read);
+        (lookout.updates).asked_by("calc.fix", 7, Some("calc.lead".into()), None);
+        lookout.updates.replied("calc.fix", 7, "");
+        assert_eq!(lookout.updates.urgent(), None);
+    }
+
+    #[test]
+    fn a_filter_hears_the_person_s_words_as_written() {
+        let mut lookout = seated("idle");
+        lookout.subs[0].filter = Some(json!({"text": [{"suffix": "ship  it\nnow"}]}));
+        let listed = lookout.updates.listed();
+        lookout.sync(&listed);
+        let long = format!("{} ship  it\nnow", "word ".repeat(1_000));
+        lookout.heard(&said(6, PERSON, &long));
+        assert!(lookout.updates.news());
+    }
+
+    #[test]
     fn of_two_digests_whichever_allows_first_lets_news_go() {
         let mut lookout = seated("idle");
         lookout.subs[0].digest = Some("15m".into());

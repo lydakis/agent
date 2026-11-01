@@ -102,6 +102,8 @@ struct Said {
     from: String,
     words: Option<String>,
     bytes: usize,
+    /// The subscription whose `urgent` matched it.
+    urgent: Option<String>,
 }
 
 /// A note a task put in its own margin, changed or took away: by its
@@ -113,6 +115,8 @@ struct Noted {
     removed: bool,
     /// The call that changed it: each change news of its own.
     call: String,
+    /// The subscription whose `urgent` matched it.
+    urgent: Option<String>,
 }
 
 /// A question a task put to the person with the `ask` tool, which they
@@ -126,6 +130,8 @@ struct Asked {
     /// The options by their labels, and the one recommended, from 0.
     options: Vec<String>,
     recommended: Option<usize>,
+    /// The subscription whose `urgent` matched it.
+    urgent: Option<String>,
 }
 
 /// The most questions a task's news keeps, newest kept.
@@ -140,8 +146,6 @@ struct News {
     asks: Vec<Asked>,
     /// When it may be told, as the subscriptions that heard it say.
     hold: super::activity::Hold,
-    /// The subscription whose `urgent` matched some of it.
-    urgent: Option<String>,
 }
 
 impl News {
@@ -196,7 +200,17 @@ impl News {
             self.asks.drain(..self.asks.len() - ASKS);
         }
         self.hold = std::mem::take(&mut self.hold).merge(news.hold);
-        self.urgent = self.urgent.take().or(news.urgent);
+    }
+
+    /// The subscription whose `urgent` matched some of it, while that is
+    /// still to be told: each piece keeps its own.
+    fn urgent(&self) -> Option<&str> {
+        let turns = [&self.act, &self.theirs].into_iter().flatten();
+        (turns.filter_map(|t| t.urgent.as_deref()))
+            .chain(self.said.iter().filter_map(|s| s.urgent.as_deref()))
+            .chain(self.notes.iter().filter_map(|n| n.urgent.as_deref()))
+            .chain(self.asks.iter().filter_map(|a| a.urgent.as_deref()))
+            .next()
     }
 
     /// It holds the person's words.
@@ -664,9 +678,9 @@ impl Updates {
                                 id,
                                 removed,
                                 call,
+                                urgent,
                             }],
                             hold,
-                            urgent,
                             ..News::default()
                         });
                     }
@@ -690,9 +704,9 @@ impl Updates {
                                 question: asked.question,
                                 options,
                                 recommended: asked.recommended,
+                                urgent,
                             }],
                             hold,
-                            urgent,
                             ..News::default()
                         });
                     }
@@ -831,14 +845,15 @@ impl Updates {
         // Only what a note quotes is kept.
         let line = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
         let bytes = words.map_or(0, str::len);
-        let words = words.map(|words| line(&super::cut(&line(words), super::QUOTE_CHARS)));
+        // A subscription hears the words as written, not as a note cuts them.
         let gated = self.gate(name, words.is_some(), || {
             let mut event = json!({"type": "message.written", "turn": turn, "by": by_field(from)});
-            if let Some(words) = &words {
+            if let Some(words) = words {
                 event["text"] = json!(words);
             }
             event
         });
+        let words = words.map(|words| line(&super::cut(&line(words), super::QUOTE_CHARS)));
         let Some((hold, urgent)) = gated else {
             return false;
         };
@@ -847,11 +862,11 @@ impl Updates {
             from: from.to_owned(),
             words,
             bytes,
+            urgent,
         };
         self.news_of(name).merge(News {
             said: vec![said],
             hold,
-            urgent,
             ..News::default()
         });
         true
@@ -882,7 +897,7 @@ impl Updates {
     /// Whether a task's news may be told now: urgent, or no digest holds it.
     fn ready(&self, news: &News, now: Instant) -> bool {
         let hold = &news.hold;
-        news.urgent.is_some()
+        news.urgent().is_some()
             || hold.now
             || hold.windows.is_empty()
             || (hold.windows.iter()).any(|(sub, digest)| {
@@ -906,7 +921,7 @@ impl Updates {
         if !self.live {
             return None;
         }
-        (self.tasks.iter()).find_map(|(_, news)| news.urgent.as_deref())
+        (self.tasks.iter()).find_map(|(_, news)| news.urgent())
     }
 
     /// What a task replied, ending a turn: told with that turn's news,
@@ -1009,18 +1024,16 @@ impl Updates {
             }
             return;
         };
-        told.urgent = urgent.clone();
+        told.urgent = urgent;
         news.merge(match theirs {
             true => News {
                 theirs: Some(told),
                 hold,
-                urgent,
                 ..News::default()
             },
             false => News {
                 act: Some(told),
                 hold,
-                urgent,
                 ..News::default()
             },
         });
@@ -1151,18 +1164,16 @@ impl Updates {
             }
             return;
         };
-        turn.urgent = urgent.clone();
+        turn.urgent = urgent;
         self.news_of(name).merge(match theirs {
             true => News {
                 theirs: Some(turn),
                 hold,
-                urgent,
                 ..News::default()
             },
             false => News {
                 act: Some(turn),
                 hold,
-                urgent,
                 ..News::default()
             },
         });
@@ -1283,6 +1294,10 @@ impl Updates {
             }
         }
         self.tasks.retain(|(_, news)| !news.empty());
+        // As is one whose asker is still to be read.
+        self.unheard.retain(|(name, turn), (t, _)| {
+            t.goal.is_some() || !handles.contains(&format!("turn:{name}/{turn}"))
+        });
         // A turn its goal's check holds stays: the wait read how it ended,
         // not how its goal did.
         self.forwarding.retain(|key, _| {
@@ -1473,17 +1488,8 @@ impl Updates {
                     waiting.asks = std::mem::take(&mut news.asks);
                 }
                 // Left for a reply or for room, it may go as it might have
-                // now, and what of it was urgent still is: a turn's own
-                // urgency, else its task's for what else did not fit.
+                // now; each piece of it keeps its urgency.
                 waiting.hold = super::activity::Hold::now();
-                let others = !(waiting.said.is_empty()
-                    && waiting.notes.is_empty()
-                    && waiting.asks.is_empty());
-                waiting.urgent = [&waiting.act, &waiting.theirs]
-                    .into_iter()
-                    .flatten()
-                    .find_map(|t| t.urgent.clone())
-                    .or_else(|| news.urgent.clone().filter(|_| others));
                 later.push((name.clone(), waiting));
             }
             // A message that started a turn told below as asked by its
@@ -1741,6 +1747,7 @@ fn note_line(name: &str, noted: &Noted) -> Line {
         id,
         removed,
         call,
+        ..
     } = noted;
     let text = match removed {
         true => format!("- {name}: turn:{name}/{turn}, took its margin note \"{id}\" away"),
@@ -1766,6 +1773,7 @@ fn ask_line(name: &str, asked: &Asked) -> Line {
         question,
         options,
         recommended,
+        ..
     } = asked;
     let mut text = format!(
         "- {name}: turn:{name}/{turn}, put a question to the person, which they answer in {name}:"
