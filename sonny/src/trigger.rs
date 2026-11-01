@@ -1449,7 +1449,14 @@ impl Trigger {
 /// Where a restore leaves the backup's list of triggers, and which
 /// projects' leads were handed theirs, a line each.
 fn restored_list(home: &Path) -> PathBuf {
-    home.join(".agent/sonny/restored-automations.json")
+    let list = home.join(".agent/sonny/restored-automations.json");
+    // Its name before 0.8.0, for leads not opened since a restore then
+    // (upgrade migration `automations-folder`).
+    let old = home.join(".agent/sonny/restored-triggers.json");
+    if !list.exists() && old.exists() {
+        let _ = std::fs::rename(&old, &list);
+    }
+    list
 }
 
 fn restored_told(home: &Path) -> PathBuf {

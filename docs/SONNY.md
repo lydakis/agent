@@ -374,7 +374,11 @@ the last fire ending, then runs again from the new one. The old path stays
 as a link to the new folder, so what chose it just before the move (an
 `add` still asking its daemon, say) writes where everything else reads; one
 that finds neither between the move and the link is told
-`automations_moved` and tries again. Sonny's start
+`automations_moved` and tries again. A restore's list for leads not yet
+opened, `~/.agent/sonny/restored-triggers.json`, becomes
+`restored-automations.json` when next read, and a backup's `triggers.json`
+is read when the copy has no `automations.json` and goes at its next sync.
+Sonny's start
 removes its old `~/.agent/trigger` script (upgrade migration
 `automations-folder`, retired at 0.10.0). Prompts sent before still carry
 `origin: "trigger"`, which Sonny reads as an automation's.

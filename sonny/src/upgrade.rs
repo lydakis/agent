@@ -77,8 +77,10 @@ pub const MIGRATIONS: &[Migration] = &[
         id: crate::commons::POSTERS,
         retire: "0.10.0",
     },
-    // `~/.agent/triggers` becomes `~/.agent/automations`, and Sonny's old
-    // `~/.agent/trigger` script goes; run where they are read
+    // `~/.agent/triggers` becomes `~/.agent/automations`, Sonny's old
+    // `~/.agent/trigger` script goes, a restore's `restored-triggers.json`
+    // becomes `restored-automations.json` and the backup's `triggers.json`
+    // `automations.json`; run where they are read
     // (`trigger::Places::moved`, `skills::install_own`) rather than through
     // [`once`], since the script and the scheduler read the folder without
     // Sonny's start (0.8.0).
