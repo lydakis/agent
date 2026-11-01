@@ -2267,8 +2267,10 @@ struct App {
     /// The bot's latest replies, by node, with their first lines: what
     /// `/react` offers, newest last.
     replies: Vec<(i64, String)>,
-    /// `/react`'s list of the replies, open over the composer.
-    reacting: Option<list::Picker>,
+    /// `/react`'s list of the replies, open over the composer, with the
+    /// replies as they were when it opened: one that comes or goes while
+    /// it is open moves no row onto another reply.
+    reacting: Option<(Vec<(i64, String)>, list::Picker)>,
     /// The list is `/reply`'s: the pick is quoted, not reacted to.
     quoting: bool,
     /// What Ctrl+F looks for on the full screen, while it does.
@@ -9358,10 +9360,10 @@ impl App {
             }
             return;
         }
-        if let Some(list) = &mut self.reacting {
+        if let Some((replies, list)) = &mut self.reacting {
             match list.event(&event) {
                 list::Act::Take(at) => {
-                    let picked = self.replies.get(at).cloned();
+                    let picked = replies.get(at).cloned();
                     self.reacting = None;
                     match std::mem::take(&mut self.quoting) {
                         true => {
@@ -10103,7 +10105,8 @@ impl App {
                 let rows = (self.replies.iter())
                     .map(|(_, said)| (said.clone(), String::new()))
                     .collect();
-                self.reacting = Some(list::Picker::new(rows, self.replies.len() - 1));
+                let list = list::Picker::new(rows, self.replies.len() - 1);
+                self.reacting = Some((self.replies.clone(), list));
             }
             return;
         }
@@ -11534,11 +11537,11 @@ impl App {
                 frame.render_widget(Paragraph::new(keys), footer);
                 return;
             }
-            if let Some(list) = &self.reacting {
+            if let Some((replies, list)) = &self.reacting {
                 // Newest at the bottom, nearest the composer, as they read.
                 let items: Vec<list::Item> = (list.shown().into_iter())
                     .filter_map(|(at, found)| {
-                        let (node, said) = self.replies.get(at)?;
+                        let (node, said) = replies.get(at)?;
                         let on = self.reactions.on(*node).join(" ");
                         let room = width.saturating_sub(10 + on.width());
                         Some(list::Item::new(transcript::cut(said, room), on).found(&found))
@@ -15650,7 +15653,7 @@ mod tests {
         app.submit().await;
         // The newest picked to start.
         assert_eq!(
-            app.reacting.as_ref().and_then(list::Picker::chosen),
+            app.reacting.as_ref().and_then(|(_, list)| list.chosen()),
             Some(1)
         );
         // The replies going with a change of view take the list with them.
@@ -15658,12 +15661,17 @@ mod tests {
         app.zen_view_changed();
         assert!(app.reacting.is_none());
         drawn(&mut app);
-        app.replies = replies;
+        app.replies = replies.clone();
         app.input.set("/react");
         app.submit().await;
+        // Replies that come and go while it is open, as the oldest does
+        // past the limit, move no row onto another.
+        app.saw_reply(11, "Later.");
+        app.replies.remove(0);
         app.key(Event::Key(KeyCode::Up.into())).await;
         app.key(Event::Key(KeyCode::Enter.into())).await;
         assert_eq!(app.react_to, Some((4, "Merged it.".into())));
+        app.replies = replies;
         app.input.set("🎉");
         app.submit().await;
         assert_eq!(sent.lock().unwrap()[1]["prompt"], "> Merged it.\n\n🎉");
