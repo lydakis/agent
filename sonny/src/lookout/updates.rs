@@ -25,7 +25,6 @@ use std::{
 /// How long news waits on a lead its events say is busy before the
 /// daemon is asked whether it is.
 pub const DOUBT: Duration = Duration::from_secs(60);
-const WAKE_TASKS: usize = 32;
 /// About what one note may take, well under the daemon's 256 KiB prompt
 /// limit, which counts what it quotes too; a message counts as its quoted
 /// words and `LINE_BYTES`, and a turn as its line and reply as they read.
@@ -1201,7 +1200,6 @@ impl Updates {
                     && replying(name, &news.theirs)
             });
         tasks.sort_by_key(|(_, news)| (!news.quotes(), news.said.is_empty() && news.act.is_none()));
-        let rest = tasks.split_off(tasks.len().min(WAKE_TASKS));
         let mut quoted = HashMap::new();
         let mut items: Vec<Line> = Vec::new();
         let mut sent = Vec::new();
@@ -1282,7 +1280,6 @@ impl Updates {
             }
             sent.push((name, news));
         }
-        later.extend(rest);
         self.tasks = later;
         // The person's own turns come last, under a line of their own.
         items.sort_by_key(|item| item.theirs);
@@ -2274,9 +2271,9 @@ mod tests {
     }
 
     #[test]
-    fn the_person_s_words_go_first_in_a_bounded_note() {
+    fn the_person_s_words_go_first_and_every_task_that_fits_goes_too() {
         let mut updates = fleet();
-        for n in 0..WAKE_TASKS + 8 {
+        for n in 0..100 {
             let name = format!("shop.t{n}");
             updates.seat(&json!({"name": name, "bot_id": 10 + n, "status": "idle"}));
             updates.watched.insert(name.clone());
@@ -2288,7 +2285,10 @@ mod tests {
             told.items[0].text,
             "- shop.fix: turn:shop.fix/2, the person wrote the words quoted from it below"
         );
-        assert_eq!(told.more, 9);
+        // A hundred tasks ending together go in one note: only its bytes
+        // and quotes bound it, so none waits for a note after it.
+        assert_eq!(told.items.len(), 101);
+        assert_eq!(told.more, 0);
         assert!(!updates.quoting());
     }
 
@@ -2296,7 +2296,7 @@ mod tests {
     fn turns_whose_replies_are_being_read_leave_the_note_to_others() {
         let mut updates = fleet();
         let lead = json!({"from": {"bot": "shop.lead"}});
-        for n in 0..WAKE_TASKS + 1 {
+        for n in 0..40 {
             let name = format!("shop.t{n}");
             updates.seat(&json!({"name": name, "bot_id": 10 + n, "status": "idle"}));
             updates.watched.insert(name.clone());
@@ -2308,7 +2308,7 @@ mod tests {
         let text = text(&told);
         assert!(text.contains("turn:shop.fix/2"), "{text}");
         assert!(!text.contains("shop.t0"), "{text}");
-        assert_eq!(told.more, WAKE_TASKS + 1);
+        assert_eq!(told.more, 40);
     }
 
     #[test]

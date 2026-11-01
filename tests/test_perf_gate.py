@@ -35,6 +35,20 @@ class PerfGateTests(unittest.TestCase):
         _, failed, _ = self.screen([footprint(1.0)], [footprint(1.0, jobs=4)])
         self.assertEqual(failed, ['footprint: begin rose from 3 to 4'])
 
+    def test_a_turn_no_note_told_fails_where_the_base_told_every_one(self):
+        def sonny(untold, p95):
+            return {'lookout': {'10x100': {'untold': untold, 'note_delay_ms_p95': p95,
+                                           'cpu_ms_per_1k_deltas': 10.0}}}
+        root = Path(tempfile.mkdtemp())
+        for side, run in (('base', sonny(0, 3000)), ('head', sonny(4, 1000))):
+            folder = root / f'sonny-{side}-0'
+            folder.mkdir()
+            (folder / 'result.json').write_text(json.dumps({'runs': [run]}))
+        _, failed, _ = compare(root)
+        # However much faster the head's notes are.
+        self.assertEqual(failed, ['sonny: lookout at 10x100 left 4 ended turns untold, '
+                                  'where the base told every one'])
+
 
 if __name__ == '__main__':
     unittest.main()

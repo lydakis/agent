@@ -49,6 +49,22 @@ def counts(name, run):
     return {}
 
 
+def untold(base, head):
+    """Turns no note told by the end of the settle: a lost note is not
+    timing noise, so the head telling fewer than every one fails where the
+    base told them all."""
+    failed = []
+    shapes = sorted({shape for run in head for shape in run.get('lookout', {})})
+    for shape in shapes:
+        was = [run['lookout'].get(shape, {}).get('untold') for run in base]
+        now = [run['lookout'][shape].get('untold') for run in head if shape in run['lookout']]
+        if None in was or None in now:
+            continue
+        if max(now) > 0 and max(was) == 0:
+            failed.append(f'sonny: lookout at {shape} left {max(now)} ended turns untold, where the base told every one')
+    return failed
+
+
 # What each bench's runs say that moves with the runner: (label, value).
 TIMINGS = {
     'admission': [('lone submit CPU, ms', lambda r: r['lone_submit']['cpu_ms']),
@@ -60,10 +76,12 @@ TIMINGS = {
                   ('RSS after a turn each, MiB', lambda r: r['turns_rss_mib']),
                   ('CPU per turn, ms', lambda r: r['cpu_ms_per_turn'])],
     # bench.sonny_screen: Sonny's own paths that grow with the fleet.
+    # Lookout shapes are subscribing leads x tasks each.
     'sonny': [*((f'lookout CPU per 1k deltas at {n}, ms', lambda r, n=n: r['lookout'][n]['cpu_ms_per_1k_deltas'])
-                for n in ('10', '100', '1000')),
-              ('lookout seated at 1000, s', lambda r: r['lookout']['1000']['start']['seated_s']),
-              ('lookout note p95 at 1000, ms', lambda r: r['lookout']['1000']['note_delay_ms_p95']),
+                for n in ('10x1', '10x10', '10x100', '100x10')),
+              ('lookout seated at 100x10, s', lambda r: r['lookout']['100x10']['start']['seated_s']),
+              *((f'lookout note p95 at {n}, ms', lambda r, n=n: r['lookout'][n]['note_delay_ms_p95'])
+                for n in ('10x100', '100x10')),
               ('quiet window CPU, ms/s', lambda r: r['window']['cpu_ms_per_s']),
               ('quiet window reads, KiB/s', lambda r: r['window']['read_kib_per_s']),
               ('quiet window requests, /s', lambda r: r['window']['requests_per_s']),
@@ -87,6 +105,8 @@ def compare(root):
         if name == 'lifecycle':
             base = [r for r in base if r['status'] == 'ok']
             head = [r for r in head if r['status'] == 'ok']
+        if name == 'sonny':
+            failed += untold(base, head)
         before, after = counts(name, base[0]), counts(name, head[0])
         for kind in sorted(set(before) | set(after)):
             was, now = before.get(kind, 0), after.get(kind, 0)
