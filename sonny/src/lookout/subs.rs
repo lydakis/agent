@@ -402,7 +402,13 @@ pub fn change(
         }
     }
     said["subscriptions"] = subs.iter().map(Sub::to_json).collect();
-    said["sources"] = json!(super::sources::listed(store, sources));
+    // Examples come only from events these subscriptions hear, and are
+    // what sources printed, as a note from them is.
+    let (listed, examples) = super::sources::listed(store, sources, &subs);
+    said["sources"] = json!(listed);
+    if examples {
+        said["examples"] = json!(super::sources::EXAMPLES);
+    }
     Ok(said)
 }
 
@@ -561,12 +567,17 @@ mod tests {
         // had is said.
         let shapes = super::super::beside(&store, ".sources").join(".shapes");
         std::fs::create_dir_all(&shapes).unwrap();
+        let sample = |fields: Value| json!({"fields": fields, "cut": false});
         std::fs::write(
             shapes.join("cr.json"),
             json!({"events": 3, "fields": {
-                "text": {"kinds": ["string"], "example": "\"CR-1\""},
-                "paths": {"kinds": ["list of strings"], "example": "[\"src/a.rs\"]"},
-                "meta.team": {"kinds": ["string"], "example": "\"core\""}}})
+                "text": {"kinds": ["string"]},
+                "paths": {"kinds": ["list of strings"]},
+                "meta.team": {"kinds": ["string"]}},
+                "recent": [
+                    sample(json!({"text": "CR-1", "paths": ["src/billing/a.rs"], "meta": {"team": "core"}})),
+                    sample(json!({"text": "CR-2", "paths": ["src/secret/b.rs"]})),
+                ]})
             .to_string(),
         )
         .unwrap();
@@ -577,12 +588,22 @@ mod tests {
             warned["unseen"],
             "no recent event of cr had path: the filter hears none until one does"
         );
+        // Examples only from the newest event its subscriptions hear, the
+        // billing one rather than the later one its filter leaves out, with
+        // the outside-content warning.
         let listed = &warned["sources"][0];
         assert_eq!(listed["name"], "cr");
         assert_eq!(
             listed["fields"]["paths"],
-            "list of strings, as [\"src/a.rs\"]"
+            "list of strings, as [\"src/billing/a.rs\"]"
         );
+        assert_eq!(listed["fields"]["meta.team"], "string, as \"core\"");
+        assert_eq!(warned["examples"], super::super::sources::EXAMPLES);
+        // A caller hearing none of them sees each field's kinds alone.
+        let other = change(&store, "ops.lead", None, None, &sources).unwrap();
+        assert_eq!(other["sources"][0]["fields"]["paths"], "list of strings");
+        assert_eq!(other["sources"][0]["fields"]["text"], "string");
+        assert!(other.get("examples").is_none(), "{other}");
         // A file edited by hand with a filter that does not check hears
         // nothing rather than everything.
         let bad =
