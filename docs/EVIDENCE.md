@@ -145,18 +145,18 @@ more turns is not here, because its work changes with its speed; it is under
   [Record](HARNESS_MEASUREMENTS.md).
 - **Pi Durable on the durable lifecycle.** 32 named conversations, three
   turns each, both engines syncing every commit (`synchronous=FULL`, which
-  the adapter sets; Pi's default is NORMAL): text turns took Agent 26.7 MiB
-  peak, 1.62 s CPU and 535/620 ms p50/p99, Pi Durable 1.4.0 143.3 MiB,
-  4.25 s and 550/752 ms; with shell tools 186.3 against 208.4 MiB, 1.92
-  against 6.78 s. Exploratory, not a ranking: Pi has no event log to
+  the adapter sets; Pi's default is NORMAL): text turns took Agent 26.0 MiB
+  peak, 1.50 s CPU and 534/549 ms p50/p99, Pi Durable 1.4.0 153.7 MiB,
+  4.61 s and 561/822 ms; with shell tools 185.1 against 208.1 MiB, 1.58
+  against 7.11 s. Exploratory, not a ranking: Pi has no event log to
   replay, commits partial answers, and delivers events per commit. After a
   kill and reopen, Agent's resume, re-read, per-item reads, duplicate and
-  fork for all 32 bots now take longer than Pi Durable's (echo case 864
-  against 459 ms; 2026-10-09: 165 against 200). That is a regression from
-  the bundled SQLite 3.54.1 in rusqlite 0.41.1 (#544): per-item history
-  reads went from about 0.55 to 1.5 ms. Shared 4-vCPU Linux VM, 2026-11-01
-  at `70637f9`, medians of three runs.
-  [Record](LIFECYCLE_MEASUREMENTS.md#re-run-2026-11-01).
+  fork for all 32 bots take less time than Pi Durable's (echo case 430
+  against 498 ms). The bundled SQLite 3.54.1 (#544) had doubled that phase
+  for Agent (864 ms at `70637f9`) until #617 kept cached statements from
+  being planned again. Shared 4-vCPU Linux VM, 2026-11-01 at `37ebb4d`,
+  medians of three runs.
+  [Record](LIFECYCLE_MEASUREMENTS.md#re-run-after-the-sqlite-fix-2026-11-01).
 - **Storage size.** A 1,024-turn conversation fell from 79.23 to 45.68 MiB with
   LZ4-compressed artifacts and prompts shared with their user node, node
   payloads unchanged. This reduces growth; retained history is still
