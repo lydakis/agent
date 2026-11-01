@@ -2896,7 +2896,12 @@ impl Fleet {
     /// The room the project's task windows have, its limit read on the
     /// worker: what needs the person or failed keeps its window.
     fn room(&self) -> (Arc<std::sync::Mutex<TaskWindows>>, mux::Room) {
-        let room = room_for(&self.project, &self.lineage, &self.doing, Arc::new(used::held));
+        let room = room_for(
+            &self.project,
+            &self.lineage,
+            &self.doing,
+            Arc::new(used::held),
+        );
         (self.windows.clone(), room)
     }
 
@@ -12116,12 +12121,22 @@ mod tests {
             ("shop.c", "c"),
         ]);
         let lineage: std::collections::HashSet<String> =
-            ["shop.lead", "shop.a", "shop.b", "shop.c", "shop.d"].map(String::from).into();
-        let doing: HashMap<String, &'static str> =
-            [("shop.a".to_owned(), "failed"), ("shop.b".to_owned(), "done")].into();
+            ["shop.lead", "shop.a", "shop.b", "shop.c", "shop.d"]
+                .map(String::from)
+                .into();
+        let doing: HashMap<String, &'static str> = [
+            ("shop.a".to_owned(), "failed"),
+            ("shop.b".to_owned(), "done"),
+        ]
+        .into();
         let room = mux::Room {
             most: 3,
-            ..room_for("shop", &lineage, &doing, Arc::new(|bot: &str| bot == "shop.c"))
+            ..room_for(
+                "shop",
+                &lineage,
+                &doing,
+                Arc::new(|bot: &str| bot == "shop.c"),
+            )
         };
         // Its three windows are full: the one nothing holds closes, never
         // the other lead's, the failed one or the one asking.
@@ -12131,7 +12146,8 @@ mod tests {
         );
         // One more closes the only window left that nothing holds, however
         // lately it opened.
-        let more: std::collections::HashSet<String> = lineage.iter().cloned().chain(["shop.e".into()]).collect();
+        let more: std::collections::HashSet<String> =
+            lineage.iter().cloned().chain(["shop.e".into()]).collect();
         let room = mux::Room {
             most: 3,
             ..room_for("shop", &more, &doing, Arc::new(|bot: &str| bot == "shop.c"))

@@ -35,7 +35,9 @@ fn in_dir(dir: &str, bot: &str) -> Option<PathBuf> {
 /// closing, which leaves the file as it was for the next) lets it go.
 pub fn reported(bot: &str, state: &str) {
     if state != "clear" {
-        hold(bot, true, |held| held.status = matches!(state, "error" | "blocked"));
+        hold(bot, true, |held| {
+            held.status = matches!(state, "error" | "blocked")
+        });
     }
 }
 

@@ -1169,7 +1169,9 @@ mod tests {
             most,
             project: "shop".into(),
             // `shop.other` is another lead's of the folder.
-            mine: ["a", "b", "c", "d", "e", "f"].map(|t| format!("shop.{t}")).into(),
+            mine: ["a", "b", "c", "d", "e", "f"]
+                .map(|t| format!("shop.{t}"))
+                .into(),
             keep: keep.iter().map(|k| k.to_string()).collect(),
             used: Arc::new(move |bot: &str| match bot {
                 "shop.a" => Some(at(20)),
@@ -1265,7 +1267,9 @@ mod tests {
         }
         layout.used.clear();
         assert_eq!(
-            layout.show_task("shop.c", "shop.c", &[], &room, false).unwrap(),
+            layout
+                .show_task("shop.c", "shop.c", &[], &room, false)
+                .unwrap(),
             Shown::Opened(vec!["shop.b".into()])
         );
     }
