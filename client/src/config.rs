@@ -68,6 +68,7 @@
 //! command = "~/bin/slack-poll"  # run with sh -c; each line it prints is one event
 //! every = "1m"                  # how long after it exits it runs again
 //! digest = "15m"                # a subscriber hears it at most this often; unset, as it comes
+//! urgent = { from = ["boss"] }  # what cuts into a busy subscriber's turn, as a filter is written
 //! ```
 //!
 //! Each unset value is the model's own, or, for a task, its lead's.
@@ -603,6 +604,9 @@ pub struct Source {
     /// How often at most a subscriber hears it, as `every` is written,
     /// unless an event is urgent; unset or `0`, as events come.
     pub digest: Option<String>,
+    /// An event pattern, as a subscription's filter is written: an event
+    /// it matches is urgent, as one the command marks so.
+    pub urgent: Option<serde_json::Value>,
 }
 
 /// An MCP server, under Codex's key names for `[mcp_servers.NAME]`: a
@@ -1303,6 +1307,7 @@ fn sources(value: &toml::Value) -> Result<Vec<Source>, String> {
         let mut command = None;
         let mut every = None;
         let mut digest = None;
+        let mut urgent = None;
         for (field, value) in fields {
             match field.as_str() {
                 "command" => command = Some(string(&key(field), value)?),
@@ -1312,6 +1317,15 @@ fn sources(value: &toml::Value) -> Result<Vec<Source>, String> {
                     span(&key(field), &value)?;
                     digest = Some(value);
                 }
+                "urgent" => {
+                    if !value.is_table() {
+                        return Err(format!(
+                            "{} is an event pattern, as {{ from = [\"ana\"] }}",
+                            key(field)
+                        ));
+                    }
+                    urgent = Some(serde_json::to_value(value).map_err(|e| e.to_string())?);
+                }
                 _ => return Err(format!("unknown key {}", key(field))),
             }
         }
@@ -1320,6 +1334,7 @@ fn sources(value: &toml::Value) -> Result<Vec<Source>, String> {
             command: command.ok_or_else(|| format!("{} is missing", key("command")))?,
             every,
             digest,
+            urgent,
         });
     }
     Ok(sources)
@@ -1955,6 +1970,15 @@ mod tests {
             .map(|s| s.digest.as_deref())
             .collect();
         assert_eq!(digests, [None, Some("15m")]);
+        let urgent = parse(
+            "[sonny.sources.slack]\ncommand = \"x\"\nurgent = { from = [\"boss\"], text = [{ \"prefix\" = \"[prod]\" }] }\n",
+        )
+        .unwrap();
+        assert_eq!(
+            urgent.sonny.sources[0].urgent,
+            Some(serde_json::json!({"from": ["boss"], "text": [{"prefix": "[prod]"}]}))
+        );
+        assert_eq!(config.sonny.sources[0].urgent, None);
         let named: Vec<(&str, &str, Option<&str>)> = (config.sonny.sources.iter())
             .map(|s| (s.name.as_str(), s.command.as_str(), s.every.as_deref()))
             .collect();
@@ -1973,6 +1997,10 @@ mod tests {
             (
                 "[sonny.sources.slack]\ncommand = \"x\"\ndigest = \"1d\"",
                 "sonny.sources.slack.digest is a number and s, m or h, as 30s or 5m, not \"1d\"",
+            ),
+            (
+                "[sonny.sources.slack]\ncommand = \"x\"\nurgent = \"always\"",
+                "sonny.sources.slack.urgent is an event pattern, as { from = [\"ana\"] }",
             ),
             (
                 "[sonny.sources.commons]\ncommand = \"x\"",

@@ -12,7 +12,8 @@ the automatic approver's own cost, at `81458d2` for the judges
 compared, at `7a66687` for the finish cost of per-bot settings, by
 the change that keyed creation for its cost, and at `3ad9e2f`, the change
 that runs summaries beside the turn's call and adds the Pi Durable
-baseline, on `b026767`, and at `2182b4a` for the five-harness rescreen.
+baseline, on `b026767`, at `2182b4a` for the five-harness rescreen, and at
+`70637f9` (2026-11-01) for the rescreens on every harness's newest release.
 This is the one place that says what is currently
 known. The documents it links to
 keep the method, the raw tables and superseded runs. When a history document's
@@ -133,26 +134,29 @@ more turns is not here, because its work changes with its speed; it is under
   Because every call should run, this says nothing about false allows.
   [Record](APPROVALS.md#measure-before-building).
 - **Five harnesses, same synthetic work.** 32 agents, three turns each adding
-  64 KiB: Agent 28.9 MiB peak and 0.65 s CPU, Pi 172 MiB and 1.8 s, Codex
-  301 MiB and 35.5 s, opencode 991 MiB and 19.8 s, Claude Code 7,348 MiB and
-  32.7 s. Exploratory, not a ranking: the harnesses do unequal work, and
-  Codex and Claude Code did not reach 32 concurrent streams on this host.
-  Agent is unchanged within host drift from the 2026-10-28 screen (28.7 MiB,
-  0.69 s at `3a9f7df`); the other engines, with unchanged binaries, moved by
-  up to about 20% between screens. Linux VM, main `2182b4a` (the 0.7.0
-  code), 2026-10-30.
+  64 KiB: Agent 30.4 MiB peak and 0.75 s CPU, Pi 1.4.0 155 MiB and 2.0 s,
+  Codex 0.166.0 368 MiB and 9.3 s, opencode 1.19.5 869 MiB and 13.8 s, Claude
+  Code 2.1.316 6,257 MiB and 36.8 s. Exploratory, not a ranking: the
+  harnesses do unequal work. Codex now reaches 30 to 32 of 32 concurrent
+  streams (0.153.1: 8 to 10, at 35.5 s CPU); Claude Code still reaches only
+  26 to 28. Agent is unchanged within host drift from the 2026-10-30 screen
+  (28.9 MiB, 0.65 s at `2182b4a`) after the 2026-10-31 daemon work. Linux VM,
+  main `70637f9`, 2026-11-01.
   [Record](HARNESS_MEASUREMENTS.md).
 - **Pi Durable on the durable lifecycle.** 32 named conversations, three
   turns each, both engines syncing every commit (`synchronous=FULL`, which
-  the adapter sets; Pi's default is NORMAL): text turns took Agent 22.1 MiB
-  peak, 0.79 s CPU and 521/526 ms p50/p99, Pi Durable 1.0.0 135.9 MiB,
-  2.22 s and 526/632 ms; with shell tools 135.1 against 273.5 MiB, 0.96
-  against 3.62 s. Exploratory, not a ranking: Pi has no event log to
-  replay, commits partial answers, and delivers events per commit. Shared
-  4-vCPU Linux container, 2026-10-09 at `3ad9e2f`, medians of three runs.
-  The 2026-10-02 run at `0a6f2b2` gave the same picture; Pi's shell peak
-  varied most between them (253.2, then 273.5 MiB).
-  [Record](LIFECYCLE_MEASUREMENTS.md#pi-durable-baseline).
+  the adapter sets; Pi's default is NORMAL): text turns took Agent 26.7 MiB
+  peak, 1.62 s CPU and 535/620 ms p50/p99, Pi Durable 1.4.0 143.3 MiB,
+  4.25 s and 550/752 ms; with shell tools 186.3 against 208.4 MiB, 1.92
+  against 6.78 s. Exploratory, not a ranking: Pi has no event log to
+  replay, commits partial answers, and delivers events per commit. After a
+  kill and reopen, Agent's resume, re-read, per-item reads, duplicate and
+  fork for all 32 bots now take longer than Pi Durable's (echo case 864
+  against 459 ms; 2026-10-09: 165 against 200). That is a regression from
+  the bundled SQLite 3.54.1 in rusqlite 0.41.1 (#544): per-item history
+  reads went from about 0.55 to 1.5 ms. Shared 4-vCPU Linux VM, 2026-11-01
+  at `70637f9`, medians of three runs.
+  [Record](LIFECYCLE_MEASUREMENTS.md#re-run-2026-11-01).
 - **Storage size.** A 1,024-turn conversation fell from 79.23 to 45.68 MiB with
   LZ4-compressed artifacts and prompts shared with their user node, node
   payloads unchanged. This reduces growth; retained history is still
@@ -409,7 +413,6 @@ the 10 focused hub tests, Clippy, formatting, and diff checks also passed.
 ## Not established
 
 - Any Terminal-Bench score: five tasks are a screen.
-- The five-harness screen at the current build.
 - Compaction quality and cost on real coding tasks, beyond two synthetic
   ones.
 - Whether choosing between a copy of the bot's call and a request of its

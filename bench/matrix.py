@@ -11,8 +11,10 @@ from .report import compare
 # Sampled-RSS guard per target tree, in MiB. opencode's one Bun server exceeds
 # 512 MiB with a single agent (about 0.8 GiB at c1 and 1.0 GiB at c32-h65536,
 # observed 2026-09-23). compare() requires identical limits, so every engine in
-# a matrix runs under the largest guard among the selected engines.
-RSS_GUARD_MIB = {'opencode': 2048}
+# a matrix runs under the largest guard among the selected engines. libfx
+# 0.0.16 passed 512 MiB at c32-h65536 (about 530 MiB, 2026-10-31; 0.0.8 used
+# about 270), so FX gets the same 2 GiB guard.
+RSS_GUARD_MIB = {'opencode': 2048, 'fx': 2048}
 DEFAULT_RSS_GUARD_MIB = 512
 PROCESS_GUARD = 16
 

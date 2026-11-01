@@ -41,7 +41,7 @@ models.setProvider(createProvider({
 const echo = defineTool({
   name: 'echo', description: 'Return the given text.',
   parameters: Type.Object({ text: Type.String() }),
-  execute: async args => ({ content: [{ type: 'text', text: args.text }] }),
+  execute: async args => ({ output: [{ type: 'text', text: args.text }] }),
 });
 const available = { echo, shell: createBashTool(), read: createReadTool(), write: createWriteTool(),
                     edit: createEditTool() };

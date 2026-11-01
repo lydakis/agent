@@ -23,8 +23,8 @@ Matching prompts and responses is necessary, but insufficient.
 Evidence reviewed locally 2026-09-07: our source and adapters; installed Pi core
 and model package READMEs/distribution at **0.85.1**; Codex source at
 **0896bf6fc05ead454888b90044e1a08f99b6d778**. The tested native Codex binary is
-**0.153.1**; source/documentation claims are not a claim that every API was tested
-on that binary. The [pinned source evidence](RUNTIMES.md) supplies upstream links.
+**0.153.1** (0.166.0 since 2026-10-31, and Pi 1.4.0); source/documentation
+claims are not a claim that every API was tested on that binary. The [pinned source evidence](RUNTIMES.md) supplies upstream links.
 The installed [Pi core README](../bench/adapters/node_modules/@earendil-works/pi-agent-core/README.md)
 and [Pi model README](../bench/adapters/node_modules/@earendil-works/pi-ai/README.md)
 are the evidence for its broader capabilities (install the pinned packages first);
@@ -95,7 +95,8 @@ produced. See [FX measurements](FX_MEASUREMENTS.md).
 
 ## opencode server comparison
 
-The 2026-09-23 adapter drives one pinned native `opencode serve` (1.18.32) with
+The 2026-09-23 adapter drives one pinned native `opencode serve` (1.18.32, 1.19.5
+since 2026-10-31) with
 one session per agent over its HTTP API and event stream. Node and the server
 are charged to the target. It uses the same Responses fixture, with no tool
 schemas and no title request. opencode's SQLite session store is still written
@@ -107,7 +108,8 @@ known difference.
 
 ## Claude Code process-per-agent comparison
 
-The 2026-09-23 adapter drives pinned Claude Code 2.1.267 as one native CLI
+The 2026-09-23 adapter drives pinned Claude Code (2.1.267, 2.1.316 since
+2026-10-31) as one native CLI
 process per agent over its stream-json protocol, with the Node adapter and every
 CLI process charged to the target. It speaks Anthropic Messages SSE to the
 fixture, which validates the same conversation through the shared transcript
