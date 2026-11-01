@@ -1508,10 +1508,82 @@ pub fn side_copy(record: &Value) -> Option<&str> {
     (record["created_by"] == source && record["expire_ms"].is_u64()).then_some(source)
 }
 
+/// How long `/status` waits, as it opens, for where the windows sit now.
+const PLACES_NOW: Duration = Duration::from_millis(500);
+
+/// What this window last said its agent is doing, and whether a question
+/// the agent put to the person is open here: the bot, the state, and the
+/// question.
+static REPORTED: std::sync::Mutex<Option<(String, String, bool)>> = std::sync::Mutex::new(None);
+
+/// What the multiplexer is told: a question open says the agent needs the
+/// person (`asking`), as its tab, `/status` and the footer say
+/// ([`needs`]), whatever its turn does; a call waiting on their approval
+/// says so first (`blocked`), and a window closing says nothing more.
+fn shown_status(state: &str, asking: bool) -> &str {
+    match state {
+        "blocked" | "clear" => state,
+        _ if asking => "asking",
+        _ => state,
+    }
+}
+
+/// The agent's state, as its turns and calls go: said to the multiplexer
+/// with any question still open here.
+fn status_report(state: &str, bot: &str) {
+    let asking = match REPORTED.lock() {
+        Ok(mut reported) => {
+            let asking = (reported.as_ref()).is_some_and(|(of, _, asking)| of == bot && *asking);
+            *reported = Some((bot.to_owned(), state.to_owned(), asking));
+            asking
+        }
+        Err(_) => false,
+    };
+    report_status(shown_status(state, asking), bot);
+}
+
+/// Whether a question the agent put to the person is open in this window,
+/// as each frame finds: said to the multiplexer once it changes.
+fn status_asking(bot: &str, open: bool) {
+    let Some(state) = REPORTED
+        .lock()
+        .ok()
+        .and_then(|mut reported| asked_now(&mut reported, bot, open))
+    else {
+        return;
+    };
+    report_status(shown_status(&state, open), bot);
+}
+
+/// What to say again now that a question is `open` here or not: the
+/// agent's state last said, when that changes what the multiplexer is
+/// told. Nothing before the agent's state was first said, which says the
+/// question with it, nor once its window closed.
+fn asked_now(
+    reported: &mut Option<(String, String, bool)>,
+    bot: &str,
+    open: bool,
+) -> Option<String> {
+    match reported.as_mut() {
+        Some((of, state, asking)) if of == bot => {
+            if *asking == open {
+                return None;
+            }
+            *asking = open;
+            (!state.is_empty() && state != "clear").then(|| state.clone())
+        }
+        _ => {
+            *reported = Some((bot.to_owned(), String::new(), open));
+            None
+        }
+    }
+}
+
 /// Program status (OSC 7501), so a terminal or multiplexer that reads it
 /// (Ghostty, Rex, cmux) can mark this pane working, blocked or done; and
-/// the same to Herdr, which takes it from its own CLI instead.
-fn status_report(state: &str, bot: &str) {
+/// the same to Herdr, which takes it from its own CLI instead. `asking`
+/// is blocked on the person's answer, not their approval.
+fn report_status(state: &str, bot: &str) {
     use base64::Engine;
     // A side chat borrows its agent's pane, which keeps saying what the
     // agent itself is doing.
@@ -1523,10 +1595,13 @@ fn status_report(state: &str, bot: &str) {
     if state == "clear" {
         cmux::release();
     }
-    let mut body = format!("state={state}");
-    if state == "blocked" {
-        body.push_str(":kind=permission");
-    }
+    // OSC 7501 says why a program is blocked: on an approval, or on an
+    // answer the person types.
+    let mut body = match state {
+        "blocked" => "state=blocked:kind=permission".to_owned(),
+        "asking" => "state=blocked:kind=question".to_owned(),
+        _ => format!("state={state}"),
+    };
     if state != "clear" {
         let title = base64::engine::general_purpose::STANDARD.encode(bot);
         body.push_str(&format!(":app=agent:title={title}"));
@@ -1537,7 +1612,7 @@ fn status_report(state: &str, bot: &str) {
     // its project, and what it is doing.
     let name = bot.split_once('.').map_or(bot, |(_, name)| name);
     let doing = match state {
-        "blocked" => "needs you",
+        "blocked" | "asking" => "needs you",
         "error" => "failed",
         "clear" => "",
         other => other,
@@ -7544,6 +7619,11 @@ impl App {
     /// The project's agents on one card, from the daemon and Rex alone,
     /// in the pane beside the conversation, live until Esc.
     async fn status(&mut self) {
+        // Where each task's window sits as of now, not as when the card was
+        // last open: windows closed for room and opened since included.
+        if let Some(fleet) = &self.fleet {
+            fleet.layout.places_now(PLACES_NOW).await;
+        }
         let (project, rows) = match self.status_rows().await {
             Ok(read) => read,
             Err(error) => {
@@ -11346,6 +11426,7 @@ impl App {
         // A question open here holds this window's place in its lead's
         // multiplexer, as the person still has it to answer.
         used::asking(&self.bot, !self.asks.is_empty());
+        status_asking(&self.bot, !self.asks.is_empty());
         self.show_asked();
         self.margin_back();
         // /status beside the conversation, gone once the pane is.
@@ -12811,6 +12892,38 @@ fn zen_notice(on: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_question_open_says_the_agent_needs_you_to_its_multiplexer() {
+        // As its tab, `/status` and the footer say: an approval waiting
+        // says so first, and a closing window says nothing more.
+        assert_eq!(shown_status("done", true), "asking");
+        assert_eq!(shown_status("idle", true), "asking");
+        assert_eq!(shown_status("working", true), "asking");
+        assert_eq!(shown_status("error", true), "asking");
+        assert_eq!(shown_status("blocked", true), "blocked");
+        assert_eq!(shown_status("clear", true), "clear");
+        assert_eq!(shown_status("done", false), "done");
+        // A question found open before anything was said waits for the
+        // state, which says it.
+        let mut reported = None;
+        assert_eq!(asked_now(&mut reported, "shop.a", true), None);
+        // The turn ended on the question: said again once it opens and
+        // once it closes, and not with every frame between.
+        reported = Some(("shop.a".into(), "done".into(), false));
+        assert_eq!(
+            asked_now(&mut reported, "shop.a", true).as_deref(),
+            Some("done")
+        );
+        assert_eq!(asked_now(&mut reported, "shop.a", true), None);
+        assert_eq!(
+            asked_now(&mut reported, "shop.a", false).as_deref(),
+            Some("done")
+        );
+        // A closed window says nothing more.
+        reported = Some(("shop.a".into(), "clear".into(), false));
+        assert_eq!(asked_now(&mut reported, "shop.a", true), None);
+    }
 
     #[test]
     fn a_lead_makes_room_only_from_its_own_windows_that_nothing_holds() {
