@@ -21,7 +21,7 @@ use agent_runtime::{
         Bot, CallAnswer, ContextPrefix, ContextUsage, Database, ElisionPlan, Gated, Pulled,
         Settings, Slot, Store, Strip, TURN_VIEW_ACCOUNTING, Waiting, Window, unserved,
     },
-    tools::{Files, Outcome, Prepared, ReadSource, Registry},
+    tools::{Files, Outcome, POLL_YIELD_MS, Prepared, ReadSource, Registry},
 };
 use bytes::Bytes;
 use futures_util::{StreamExt, stream};
@@ -2151,6 +2151,27 @@ impl Turn {
                     self.store
                         .op("tool_finish", move |db| db.tool_finish(turn, &id, &outcome))
                         .await?;
+                } else if waiting.poll {
+                    // A terminal poll reads what the terminal wrote while
+                    // the turn was parked, or how it ended; a restart ended
+                    // it, so it no longer runs.
+                    let results = self
+                        .handles
+                        .take_settled(&self.store, turn, &waiting.handles)
+                        .await;
+                    let ended = results.values().next().cloned();
+                    let handle = match waiting.handles.first().map(|h| Handle::parse(h)) {
+                        Some(Ok(Handle::Process(id))) => id,
+                        _ => return fail("invalid_handle"),
+                    };
+                    let outcome = self
+                        .registry
+                        .poll_end(record.bot_id, handle, ended.as_deref())
+                        .unwrap_or_else(failure);
+                    let id = waiting.call_id.clone();
+                    self.store
+                        .op("tool_finish", move |db| db.tool_finish(turn, &id, &outcome))
+                        .await?;
                 } else if !waiting.approval {
                     // A later call's lapse can wake the wait before its
                     // handles resolve: those are reported pending, as the
@@ -3781,7 +3802,13 @@ impl Turn {
                         .op("process_start", move |db| db.process_start(turn, &started))
                         .await?;
                     let (sender, receiver) = oneshot::channel();
-                    self.collect(id, &call.call_id, receiver, self.outputs(record, workspace));
+                    self.collect(
+                        id,
+                        &call.call_id,
+                        receiver,
+                        self.outputs(record, workspace),
+                        Some(self.registry.clone()),
+                    );
                     let start = self.registry.terminal(
                         record.bot_id,
                         id,
@@ -3794,6 +3821,47 @@ impl Turn {
                     );
                     match self.run_tool(start, None, warm.as_deref_mut()).await? {
                         Ran::Done(Ok(outcome)) => outcome,
+                        Ran::Done(Err(error)) => failure(error),
+                        Ran::Lifted(_) => unreachable!("only a command moves to the background"),
+                    }
+                }
+                // A poll past the bot's hold parks the turn as `wait` does,
+                // holding no slot until the terminal ends or the poll's
+                // time runs out; a steer waiting for the boundary keeps it
+                // live, as it makes a wait a poll.
+                Ok(Prepared::WriteStdin {
+                    handle,
+                    ref chars,
+                    yield_ms,
+                    kill: false,
+                }) if chars.is_empty()
+                    && !self.lift.is_armed()
+                    && yield_ms.unwrap_or(POLL_YIELD_MS) > self.settings().approval_hold_ms() =>
+                {
+                    let yield_ms = yield_ms.unwrap_or(POLL_YIELD_MS);
+                    let deadline_ms = now_ms() + yield_ms;
+                    let hold = self.registry.poll_hold(
+                        record.bot_id,
+                        handle,
+                        self.settings().approval_hold_ms(),
+                        sandbox,
+                    );
+                    match self.run_tool(hold, None, warm.as_deref_mut()).await? {
+                        Ran::Done(Ok(Some(outcome))) => outcome,
+                        Ran::Done(Ok(None)) => match self
+                            .park_poll(
+                                &call.call_id,
+                                handle,
+                                deadline_ms,
+                                &mut calls,
+                                route,
+                                summary_retry_ms,
+                            )
+                            .await?
+                        {
+                            ControlFlow::Continue(outcome) => outcome,
+                            ControlFlow::Break(stop) => return Ok(Some(stop)),
+                        },
                         Ran::Done(Err(error)) => failure(error),
                         Ran::Lifted(_) => unreachable!("only a command moves to the background"),
                     }
@@ -4211,7 +4279,7 @@ impl Turn {
             // The bot's own socket, so its commands may use the daemon as
             // far as a sandboxed bot may; opened first, so its folder is
             // there to be kept read-only.
-            let capability = daemon.capability(bot)?;
+            let (capability, listening) = daemon.capability(bot)?.unzip();
             let policy = Policy::new(
                 settings.sandbox,
                 Some(&root),
@@ -4221,6 +4289,7 @@ impl Turn {
             )?;
             Ok(policy.map(|policy| Policy {
                 capability,
+                listening,
                 ..policy.with_sockets(&settings.unix_sockets)
             }))
         })
@@ -4663,6 +4732,55 @@ impl Turn {
         Ok(ControlFlow::Break(lapse.map_or(Stop::Parked, Stop::Lapses)))
     }
 
+    /// Park the turn on a terminal poll, as `park` parks a wait on the
+    /// terminal's handle until `deadline_ms`; the poll's result is read
+    /// from the terminal when the turn resumes.
+    async fn park_poll(
+        &self,
+        call_id: &str,
+        handle: i64,
+        deadline_ms: u64,
+        calls: &mut std::vec::IntoIter<ToolCall>,
+        route: Option<&str>,
+        summary_retry_ms: Option<u64>,
+    ) -> Result<ControlFlow<Stop, Outcome>> {
+        let pending: Vec<ToolCall> = calls.collect();
+        let handles = vec![format!("proc:{handle}")];
+        let (turn, id, list) = (self.turn, call_id.to_owned(), handles.clone());
+        let route = route.map(str::to_owned);
+        let lapse = self
+            .store
+            .op("suspend", move |db| {
+                db.suspend_wait(
+                    turn,
+                    &id,
+                    &list,
+                    Some(deadline_ms),
+                    true,
+                    &pending,
+                    route.as_deref(),
+                    summary_retry_ms,
+                    true,
+                )?;
+                db.next_lapse(turn)
+            })
+            .await?;
+        self.handles
+            .attach(
+                &self.store,
+                Waiter::Turn(self.turn),
+                &handles,
+                Some(deadline_ms),
+                true,
+                Completion::Resume {
+                    bot: self.bot.clone(),
+                    turn: self.turn,
+                },
+            )
+            .await;
+        Ok(ControlFlow::Break(lapse.map_or(Stop::Parked, Stop::Lapses)))
+    }
+
     /// Start a command now; its result is retrievable through a proc handle
     /// that the store keeps unique and durable.
     #[allow(clippy::too_many_arguments)]
@@ -4693,7 +4811,7 @@ impl Turn {
             queued,
             sender,
         );
-        self.collect(id, call_id, receiver, outputs);
+        self.collect(id, call_id, receiver, outputs, None);
         Ok(Outcome::text(
             json!({"handle":format!("proc:{id}"),"background":true}).to_string(),
         ))
@@ -4722,20 +4840,23 @@ impl Turn {
         tokio::spawn(async move {
             let _ = sender.send(run.await);
         });
-        self.collect(id, call_id, receiver, outputs);
+        self.collect(id, call_id, receiver, outputs, None);
         Ok(Outcome::text(
             json!({"handle":format!("proc:{id}"),"background":true,"steered":true}).to_string(),
         ))
     }
 
     /// Record a background command's result when it arrives and wake those
-    /// waiting on its handle.
+    /// waiting on its handle. A terminal's, `terminal`, stays in the
+    /// registry with its end until then, so a poll never finds it gone
+    /// with no result.
     fn collect(
         &self,
         id: i64,
         call_id: &str,
         receiver: oneshot::Receiver<Result<Outcome>>,
         outputs: Option<Outputs>,
+        terminal: Option<Registry>,
     ) {
         let turn = self.turn;
         let (store, handles, failures, call_id_for_refs) = (
@@ -4784,6 +4905,9 @@ impl Turn {
                     // A closed receiver means the service has already exited.
                     let _ = failures.send(error);
                 }
+            }
+            if let Some(registry) = terminal {
+                registry.forget_terminal(id);
             }
         });
     }

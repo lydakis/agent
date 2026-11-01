@@ -66,6 +66,9 @@ pub struct Policy {
     /// and only as far as a sandboxed bot may go; in the daemon socket's
     /// place, so the `agent` CLI finds it there too.
     pub capability: Option<PathBuf>,
+    /// What keeps that socket listening: it lives while the policy, or a
+    /// command's [`Hold`] of it, does.
+    pub listening: Option<Listening>,
     /// The agent binary a confined write runs in ([`WRITE`]).
     pub helper: Option<PathBuf>,
     /// The folders, or sockets, whose Unix sockets its commands reach with
@@ -118,6 +121,7 @@ impl Policy {
             network: network && mode == Mode::WorkspaceWrite,
             socket: daemon.socket.clone(),
             capability: None,
+            listening: None,
             helper: daemon.helper.clone(),
             sockets: Vec::new(),
         }))
@@ -442,10 +446,29 @@ pub struct Daemon {
     pub protected_existing: Vec<String>,
 }
 
+/// A share in a bot's own socket, which listens while any share lives,
+/// as a refcounted handle or a systemd socket unit does, and a short grace
+/// after the last goes. Every policy is the same whichever share it holds.
+#[derive(Clone)]
+pub struct Listening(pub std::sync::Arc<dyn Send + Sync>);
+
+impl PartialEq for Listening {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+impl Eq for Listening {}
+impl std::fmt::Debug for Listening {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Listening")
+    }
+}
+
 impl Daemon {
-    /// Bot `bot`'s own socket, opened on first use; `None` when the daemon
-    /// has no socket for a sandboxed command to use.
-    pub fn capability(&self, bot: i64) -> Result<Option<PathBuf>> {
+    /// Bot `bot`'s own socket, opened on first use, with a share that keeps
+    /// it listening; `None` when the daemon has no socket for a sandboxed
+    /// command to use.
+    pub fn capability(&self, bot: i64) -> Result<Option<(PathBuf, Listening)>> {
         self.capabilities
             .as_ref()
             .map(|capabilities| (capabilities.open)(bot))
@@ -466,7 +489,7 @@ impl Daemon {
 pub struct Capabilities {
     pub folder: PathBuf,
     #[allow(clippy::type_complexity)]
-    pub open: std::sync::Arc<dyn Fn(i64) -> Result<PathBuf> + Send + Sync>,
+    pub open: std::sync::Arc<dyn Fn(i64) -> Result<(PathBuf, Listening)> + Send + Sync>,
     pub close: std::sync::Arc<dyn Fn(i64) + Send + Sync>,
 }
 
@@ -1069,9 +1092,14 @@ fn held(path: &Path) -> bool {
 }
 
 /// What a running sandbox holds in place; dropping it lets the
-/// placeholders go once no other sandbox holds them, and removes what the
-/// command may not leave made.
-pub struct Hold(Vec<PathBuf>, Vec<PathBuf>);
+/// placeholders go once no other sandbox holds them, removes what the
+/// command may not leave made, and gives up its share in the bot's socket.
+pub struct Hold(
+    Vec<PathBuf>,
+    Vec<PathBuf>,
+    // Held only to be dropped with the rest.
+    #[allow(dead_code)] Option<Listening>,
+);
 
 /// Hold `policy`'s placeholders while its command runs, once any of them
 /// being removed is gone.
@@ -1109,7 +1137,7 @@ pub async fn hold(policy: &Policy) -> Hold {
                     .iter()
                     .flat_map(|root| root.left.iter().cloned())
                     .collect();
-                return Hold(paths, left);
+                return Hold(paths, left, policy.listening.clone());
             }
         }
         removed.await;
@@ -1798,6 +1826,7 @@ mod tests {
             network: true,
             socket: Some(path.join("agent.sock")),
             capability: None,
+            listening: None,
             helper: None,
             sockets: Vec::new(),
         };

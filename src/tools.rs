@@ -29,6 +29,8 @@ mod picture;
 mod terminal;
 use files::read_bounded;
 pub use patch::Patch;
+#[cfg(unix)]
+pub use terminal::POLL_YIELD_MS;
 
 /// Model-facing text per tool result stream.
 pub const PREVIEW_BYTES: usize = 64 * 1024;
@@ -47,8 +49,13 @@ const MAX_SHELL_TIMEOUT_MS: u64 = 600_000;
 const MAX_WAIT_TIMEOUT_MS: u64 = 86_400_000;
 /// Simultaneously running child processes, foreground or background.
 pub const DEFAULT_PROCESS_BUDGET: usize = 64;
-/// Detached commands still running at once, daemon-wide, unless configured.
-pub const DEFAULT_DETACHED_BUDGET: usize = 16;
+/// Processes that outlive their call, terminals and detached commands,
+/// running at once daemon-wide unless configured: four per logical CPU,
+/// which keeps their descriptors well inside a default 256-descriptor
+/// limit on a laptop.
+pub fn default_lasting() -> usize {
+    4 * std::thread::available_parallelism().map_or(4, |n| n.get())
+}
 /// How long a terminal's start waits for output by default, and how long
 /// it or a write waits at most.
 const START_YIELD_MS: u64 = 1_000;
@@ -472,9 +479,11 @@ pub struct Registry {
     /// Background commands accepted and waiting for a slot. The operating
     /// system never sees these, so only this count can bound them.
     pending: Arc<std::sync::atomic::AtomicUsize>,
-    /// A permit stays with each detached child until its wait completes.
-    detached_slots: Arc<Semaphore>,
-    detached_budget: usize,
+    /// Processes that outlive their call, as a systemd slice holds a
+    /// service's: a permit stays with each terminal until its session is
+    /// gone and with each detached child until its wait completes.
+    lasting_slots: Arc<Semaphore>,
+    lasting_budget: usize,
     /// Running terminals, by proc handle, each its bot's own.
     #[cfg(unix)]
     terminals: terminal::Terminals,
@@ -648,8 +657,9 @@ impl Credentials {
         text
     }
     /// How many of `text`'s last bytes could begin a credential that more
-    /// output would finish: what a stream holds back until it can redact.
-    /// What it shows never ends inside a whole credential.
+    /// output would finish, or a secret field whose value more output
+    /// would carry: what a stream holds back until it can redact. What it
+    /// shows never ends inside a whole credential.
     pub fn unfinished(&self, text: &[u8]) -> usize {
         let set = self.0.read().unwrap_or_else(|e| e.into_inner());
         let values = || {
@@ -664,7 +674,8 @@ impl Credentials {
                     .find(|&n| text.ends_with(&value[..n]))
             })
             .max()
-            .unwrap_or(0);
+            .unwrap_or(0)
+            .max(open_field(text, &set.fields).value);
         // A whole credential across the cut, as one that ends with its own
         // start, is shown whole.
         let mut cut = text.len() - started;
@@ -681,6 +692,28 @@ impl Credentials {
             cut = end;
         }
         text.len() - cut
+    }
+    /// How many of `text`'s last bytes open a secret field whose value has
+    /// not started: a name, or a name and its separator. They are shown,
+    /// and kept so the next text is redacted as read after them.
+    pub fn opening(&self, text: &[u8]) -> usize {
+        let set = self.0.read().unwrap_or_else(|e| e.into_inner());
+        let open = open_field(text, &set.fields);
+        open.name - open.value
+    }
+    /// `text` redacted as it reads after `before`, already shown: a value
+    /// after a field's name shown earlier is still redacted.
+    pub fn redact_after(&self, before: &str, text: String) -> String {
+        if before.is_empty() {
+            return self.redact(text);
+        }
+        let mut whole = self.redact(format!("{before}{text}"));
+        if whole.starts_with(before) {
+            whole.replace_range(..before.len(), "");
+            whole
+        } else {
+            self.redact(text)
+        }
     }
 }
 
@@ -781,6 +814,89 @@ fn redact_fields(text: String, fields: &[String]) -> String {
     }
     out.push_str(&text[at..]);
     out
+}
+
+/// A secret field still open at a text's end, in bytes from that end.
+#[derive(Clone, Copy, Default)]
+struct Open {
+    /// Where its name starts: a name that may be one's start, a name and
+    /// separator with no value yet, or a name and a value not ended.
+    name: usize,
+    /// Where its value starts, when one has and not ended: held back so it
+    /// is redacted whole, at most `FIELD_HOLD` bytes of it. The name before
+    /// it is not secret, so it is shown: a prompt such as `Password: `
+    /// reaches whoever is to answer it.
+    value: usize,
+}
+
+fn open_field(text: &[u8], fields: &[String]) -> Open {
+    const FIELD_HOLD: usize = 4096;
+    // Four bytes of a field's start, so short words go out as typed.
+    const NAME_START: usize = 4;
+    let word = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'-';
+    let tail = &text[text.len().saturating_sub(FIELD_HOLD)..];
+    let key = |name: &[u8]| field_key(&String::from_utf8_lossy(name));
+    let mut i = 0;
+    while i < tail.len() {
+        if !word(tail[i]) || (i > 0 && word(tail[i - 1])) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < tail.len() && word(tail[i]) {
+            i += 1;
+        }
+        let name = key(&tail[start..i]);
+        if i == tail.len() {
+            // The last word: it may be the start of a field's name.
+            // Bytes, not characters: a field's name may be any text.
+            let begins = fields.iter().any(|field| {
+                (NAME_START.min(field.len())..=field.len())
+                    .any(|n| name.as_bytes().ends_with(&field.as_bytes()[..n]))
+            });
+            let name = if begins { tail.len() - start } else { 0 };
+            return Open { name, value: 0 };
+        }
+        if !fields.iter().any(|field| name.ends_with(field.as_str())) {
+            continue;
+        }
+        // As `redact_fields` reads one: a quote, a separator, a quote.
+        let mut j = i;
+        if j < tail.len() && matches!(tail[j], b'"' | b'\'') {
+            j += 1;
+        }
+        while j < tail.len() && matches!(tail[j], b' ' | b'\t') {
+            j += 1;
+        }
+        let name = tail.len() - start;
+        if j == tail.len() {
+            return Open { name, value: 0 };
+        }
+        if !matches!(tail[j], b'=' | b':') {
+            continue;
+        }
+        j += 1;
+        while j < tail.len() && matches!(tail[j], b' ' | b'\t') {
+            j += 1;
+        }
+        let quote = tail.get(j).copied().filter(|b| matches!(b, b'"' | b'\''));
+        if quote.is_some() {
+            j += 1;
+        }
+        let ended = tail[j..].iter().any(|&b| match quote {
+            Some(q) => b == q || b == b'\n',
+            None => {
+                b.is_ascii_whitespace() || matches!(b, b',' | b';' | b'"' | b'\'' | b'}' | b']')
+            }
+        });
+        if !ended {
+            return Open {
+                name,
+                value: tail.len() - j,
+            };
+        }
+    }
+    Open::default()
 }
 
 /// Replace the body of each PEM block in `text` whose header names one of
@@ -1087,8 +1203,8 @@ impl Registry {
             slots: Arc::new(Semaphore::new(DEFAULT_PROCESS_BUDGET)),
             budget: DEFAULT_PROCESS_BUDGET,
             pending: Arc::default(),
-            detached_slots: Arc::new(Semaphore::new(DEFAULT_DETACHED_BUDGET)),
-            detached_budget: DEFAULT_DETACHED_BUDGET,
+            lasting_slots: Arc::new(Semaphore::new(default_lasting())),
+            lasting_budget: default_lasting(),
             #[cfg(unix)]
             terminals: Arc::default(),
             stopping: Arc::new(watch::Sender::new(false)),
@@ -1162,12 +1278,34 @@ impl Registry {
         }
         Ok(encoded)
     }
-    /// Bound on detached commands still running, daemon-wide; exited ones
-    /// are reaped and stop counting. Zero removes the bound.
-    pub fn with_detached_budget(mut self, budget: usize) -> Self {
-        self.detached_budget = budget.min(Semaphore::MAX_PERMITS);
-        self.detached_slots = Arc::new(Semaphore::new(self.detached_budget));
+    /// Bound on terminals and detached commands still running, together,
+    /// daemon-wide; ended ones stop counting. Zero removes the bound.
+    pub fn with_lasting_budget(mut self, budget: usize) -> Self {
+        self.lasting_budget = budget.min(Semaphore::MAX_PERMITS);
+        self.lasting_slots = Arc::new(Semaphore::new(self.lasting_budget));
         self
+    }
+    /// A lasting process's permit, or `lasting_limit` naming what holds
+    /// them all. Nothing waits for one: a turn is never left in a line.
+    fn lasting(&self) -> Result<Option<tokio::sync::OwnedSemaphorePermit>> {
+        if self.lasting_budget == 0 {
+            return Ok(None);
+        }
+        self.lasting_slots.clone().try_acquire_owned().map(Some).map_err(|_| {
+            let held = self.lasting_budget - self.lasting_slots.available_permits();
+            #[cfg(unix)]
+            let terminals = self.terminals.lock().unwrap_or_else(|e| e.into_inner()).len();
+            #[cfg(not(unix))]
+            let terminals = 0;
+            Error::with(
+                "lasting_limit",
+                format!(
+                    "{held} lasting processes are running, the daemon's bound (--max-lasting {}): {terminals} terminals and {} detached commands; end one first",
+                    self.lasting_budget,
+                    held.saturating_sub(terminals)
+                ),
+            )
+        })
     }
     /// Bound on simultaneously running child processes. Waiting never counts.
     /// Zero removes the bound; the operating system is then the only limit.
@@ -2345,23 +2483,13 @@ async fn detach(
     }
     // Admission is atomic across concurrent turns. The child and its permit
     // move into one waiter, so no reusable PID is polled after Tokio reaps it.
-    let permit = if registry.detached_budget == 0 {
-        None
-    } else {
-        Some(registry.detached_slots.clone().try_acquire_owned().map_err(|_| {
-            Error::with(
-                "detached_limit",
-                format!(
-                    "{} detached commands are still running, the daemon's bound (--max-detached {}); stop one first",
-                    registry.detached_budget - registry.detached_slots.available_permits(),
-                    registry.detached_budget
-                ),
-            )
-        })?)
-    };
+    let permit = registry.lasting()?;
     // What the sandbox holds in place stays held while the command runs.
     let sandboxed = sandbox.is_some();
     let held = crate::sandbox::hold_for(sandbox.as_deref()).await;
+    // The bot's socket listens while anything the command left in its
+    // group runs, not only while the command itself does.
+    let listening = sandbox.as_ref().and_then(|policy| policy.listening.clone());
     let mut child = process.spawn()?;
     let pid = child.id().ok_or(Error::new("shell_spawn_failed"))?;
     // It outlives turns and the daemon, but not the pull cord: a pull ends
@@ -2398,6 +2526,7 @@ async fn detach(
                 () = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
             }
         }
+        drop(listening);
     });
     Ok(Outcome::text(
         json!({"detached":true,"pid":pid}).to_string(),

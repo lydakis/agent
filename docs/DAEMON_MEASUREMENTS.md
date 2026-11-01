@@ -6428,3 +6428,105 @@ small job per replay, so what is left of the p95 is most likely the
 container's four cores busy encoding and sending 132,000 events beside
 the probe. The history flood, which this change
 does not touch, is the control and holds still.
+
+## Lasting processes under one cap, terminals killed whole (#562)
+
+Terminals and detached commands now share one `--max-lasting` cap. A
+terminal takes its permit before it spawns. A kill sweeps the command's
+whole session, and a terminal read holds back a secret field's value
+until it ends. The Perf workflow's matched screen, base main d617c75
+against the PR head e58304f, on the GitHub runner (2026-10-31):
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 46.117 | 45.963 | -0.3% |
+| admission | burst submit p99, ms | 6.528 | 6.343 | -2.8% |
+| completion | release to terminal p99, ms | 17.337 | 17.419 | +0.5% |
+| footprint | idle RSS, MiB | 20.07 | 20.137 | +0.3% |
+| footprint | per idle bot, KiB | 1.53 | 1.404 | -8.2% |
+| footprint | RSS after a turn each, MiB | 27.799 | 27.979 | +0.6% |
+| footprint | CPU per turn, ms | 1.625 | 1.622 | -0.2% |
+| lifecycle | CPU, s | 1.395 | 1.375 | -1.4% |
+| lifecycle | p95 turn, ms | 582.885 | 582.713 | -0.0% |
+| lifecycle | peak RSS, MiB | 26.797 | 26.783 | -0.1% |
+
+Store jobs per turn held at about 7.5. These benches run no terminal, so
+the terminal read itself was timed separately, in a release build on a
+4-core Linux container. Three credentials and three secret fields were
+set, and each read decoded, held back and redacted a buffer the way a
+`write_stdin` read does. Two alternating rounds:
+
+| Read | Base, µs | Head, µs |
+| --- | ---: | ---: |
+| 64 KiB of `ls -l` lines, ending in a prompt | 822 / 801 | 818 / 791 |
+| one 26-byte line | 1.41 / 1.41 | 1.55 / 1.42 |
+
+The field scan looks at the last 4 KiB at most, and the copy of the
+opening covers only a field's name and separator, so the cost of a read
+stays with the redaction it already did. The session sweep runs once per
+terminal or detached command, at its end, off the runtime thread.
+
+## A bot's socket listens while it is used (#563)
+
+A sandboxed bot's own socket now listens only while a share in it is
+held: by its turn's policy, or by a running command's sandbox hold. It
+closes 30 s after the last share goes. All the bots' graces wait in one
+daemon-wide queue, which one task sleeps on, and they are checked and
+unlinked off the runtime thread. A bot that never runs a sandboxed
+command pays nothing; one that does pays one refcount per command and
+one queue entry per last drop. The Perf workflow's matched screen, base
+main ee94271 against the PR head 27a842c, on the GitHub runner
+(2026-10-31):
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 36.104 | 35.656 | -1.2% |
+| admission | burst submit p99, ms | 4.065 | 4.03 | -0.8% |
+| completion | release to terminal p99, ms | 12.768 | 12.083 | -5.4% |
+| footprint | idle RSS, MiB | 20.18 | 19.771 | -2.0% |
+| footprint | per idle bot, KiB | 1.596 | 1.482 | -7.1% |
+| footprint | RSS after a turn each, MiB | 28.031 | 28.76 | +2.6% |
+| footprint | CPU per turn, ms | 1.209 | 1.179 | -2.5% |
+| lifecycle | CPU, s | 1.08 | 1.075 | -0.5% |
+| lifecycle | p95 turn, ms | 724.404 | 600.866 | -17.1% |
+| lifecycle | peak RSS, MiB | 27.516 | 27.018 | -1.8% |
+
+Store jobs per turn held at about 7.5. These benches run unsandboxed, so
+their path differs only by an `Option` that stays `None`. The lifecycle
+p95 drop is the runner's: the base read 724 ms here against 583 ms on
+the #562 screen. What the change is for is descriptors: before it, every
+bot that had ever run a sandboxed command kept a listening socket and an
+accept task until the bot was deleted. Now only bots in use, or within
+30 s of their last use, keep one.
+
+## Terminal polls park their turn (#567)
+
+A terminal read longer than the bot's `approval_hold_ms` now waits live
+only for the hold. After that its turn parks on the terminal's handle,
+as `wait` parks, and resumes when the command ends or the read's time
+runs out. A parked read holds no task and no active slot. It costs one
+`suspend` and one resume, the same store jobs a parked `wait` takes,
+and only reads past the hold pay them. Every other call's path differs
+by one match guard. The Perf workflow's matched screen, base main
+64590ae against the PR head a0e37bc, on the GitHub runner (2026-11-01):
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 46.041 | 45.811 | -0.5% |
+| admission | burst submit p99, ms | 6.561 | 6.348 | -3.2% |
+| completion | release to terminal p99, ms | 17.35 | 17.782 | +2.5% |
+| footprint | idle RSS, MiB | 20.23 | 20.07 | -0.8% |
+| footprint | per idle bot, KiB | 1.426 | 1.578 | +10.7% |
+| footprint | RSS after a turn each, MiB | 27.936 | 27.734 | -0.7% |
+| footprint | CPU per turn, ms | 1.623 | 1.611 | -0.7% |
+| lifecycle | CPU, s | 1.395 | 1.39 | -0.4% |
+| lifecycle | p95 turn, ms | 586.408 | 585.136 | -0.2% |
+| lifecycle | peak RSS, MiB | 26.924 | 27.072 | +0.6% |
+
+Store jobs per turn held at about 7.5. These benches make no terminal
+calls. The per-idle-bot figure moves by 150 bytes, inside the range
+the head's own runs spread over (1.36 to 1.76 KiB), and the change
+adds no per-bot state. What the change is for is slots: before it, a
+bot polling a long build held an active slot and a task for every
+second it waited. Now, past the hold, it holds a `waiting` row. The
+head after a0e37bc changes only tests.

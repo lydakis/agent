@@ -816,7 +816,7 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     Anthropic server-side fallbacks are a bot's choice
     (`--fallbacks`, inherited by forks), off by default, because a fallback
     answers with a model the caller did not pick; the Harbor adapter asks
-    for it. Detached shell commands are bounded by `--max-detached` (16)
+    for it. Detached shell commands are bounded, with terminals, by `--max-lasting` (4 per logical CPU)
     and reaped as they exit, so they neither pile up nor linger as zombies.
 
 42. Anthropic prompt-cache refreshes during long tool calls, measured before

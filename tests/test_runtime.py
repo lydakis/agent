@@ -22,6 +22,8 @@ from bench.runtime_client import PROTECTING, Client, node_item, poll, serve_args
 
 # Longer than 256 bytes, with text a shell would run if pasted unquoted.
 ODD_CALL_ID = "odd $(touch pwned) 'x'\n" + 'L' * 300
+# The line Sonny ends a message to a bot with: when it was sent.
+SENT = re.compile(r'\n\n\[Sent [A-Z][a-z]{2} \d{1,2} [A-Z][a-z]{2} \d{4} \d{2}:\d{2}, UTC[+-]\d{2}:\d{2}\.\]$')
 
 
 
@@ -129,6 +131,8 @@ class Model(http.server.BaseHTTPRequestHandler):
             # A trigger's message comes after its one-line header.
             if user.startswith('[trigger ') and '\n' in user:
                 user = user.split('\n', 1)[1]
+            # Sonny's message ends with a line naming when it was sent.
+            user = SENT.sub('', user)
             if user in getattr(self.server, 'refused_prompts', ()):
                 # A refusal with no usage: the turn fails without a model round.
                 body = b'{"error":{"message":"synthetic refusal"}}'
@@ -808,7 +812,7 @@ class AnthropicModel(http.server.BaseHTTPRequestHandler):
                     blocks.append({'type': 'text', 'text': 'echo:' + last['content'][0]['content']})
                 stop = 'refusal' if details else 'end_turn'
             else:
-                user = last['content'][0]['text']
+                user = SENT.sub('', last['content'][0]['text'])
                 if user == 'think-only':
                     stop = 'end_turn'
                 elif user == 'silent':
@@ -1458,7 +1462,7 @@ class ModelFixture(unittest.TestCase):
 @unittest.skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'set AGENT_TEST_RUNTIME=1 after a Rust release build')
 class RuntimeTests(ModelFixture):
     def test_detached_shell_releases_its_daemon_slot_after_exit(self):
-        client = self.client('shell', extra=('--max-detached', '1'))
+        client = self.client('shell', extra=('--max-lasting', '1'))
         client.request('create', bot='Bob', workspace=str(self.path), tools=['shell'])
 
         def result(prompt, request_id):
@@ -1474,7 +1478,7 @@ class RuntimeTests(ModelFixture):
         self.assertTrue(first['detached'])
         pid = first['pid']
         try:
-            self.assertEqual(result('detach:true', 'full')['error'], 'detached_limit')
+            self.assertEqual(result('detach:true', 'full')['error'], 'lasting_limit')
         finally:
             try:
                 os.kill(pid, 9)
@@ -2650,6 +2654,52 @@ class RuntimeTests(ModelFixture):
         started = time.monotonic()
         client.close()
         self.assertLess(time.monotonic() - started, 3)
+
+    def test_a_terminal_poll_past_the_hold_parks_its_turn_off_the_active_slot(self):
+        client = self.client('echo,shell,write_stdin,wait', extra=('--max-active', '1'),
+                             settings={'approval_hold_ms': 100})
+        for bot in ('Bob', 'Eve'):
+            client.request('create', bot=bot, workspace=str(self.path),
+                           tools=['echo', 'shell', 'write_stdin', 'wait'])
+
+        def submit(bot, request_id, name, arguments):
+            prompt = 'calls:' + json.dumps([[name, arguments]])
+            return client.request('submit', bot=bot, request_id=request_id, prompt=prompt)['result']['turn']
+
+        def result(bot, turn):
+            self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+            return json.loads(poll(client, bot, turn)['result']['text'][5:])
+
+        started = result('Bob', submit('Bob', 's', 'shell', {
+            'command': 'printf ready; while [ ! -f release ]; do sleep .01; done; printf done',
+            'tty': True, 'yield_time_ms': 1000}))
+        self.assertEqual((started['output'], started['running']), ('ready', True))
+        handle = started['handle']
+        # A long poll parks its turn after the hold, waiting on the terminal.
+        turn = submit('Bob', 'p', 'write_stdin', {'handle': handle, 'yield_time_ms': 30000})
+        waiting = client.receive(lambda m: m.get('event') == 'turn_waiting' and m.get('turn') == turn)
+        self.assertEqual(waiting['data']['handles'], [handle])
+        # It holds no slot: another bot's turn runs to its end meanwhile.
+        other = submit('Eve', 'e', 'echo', {'text': 'hi'})
+        self.assertEqual(client.finished(other)['data']['status'], 'completed')
+        # The terminal's end wakes it, with what it wrote and how it ended.
+        began = time.monotonic()
+        (self.path / 'release').touch()
+        ended = result('Bob', turn)
+        self.assertLess(time.monotonic() - began, 10)
+        self.assertEqual((ended['output'], ended['exit_code'], ended['handle']), ('done', 0, handle))
+        # A poll whose time runs out reports the terminal still running.
+        handle = result('Bob', submit('Bob', 's2', 'shell', {
+            'command': 'sleep 600', 'tty': True, 'yield_time_ms': 0}))['handle']
+        turn = submit('Bob', 'p2', 'write_stdin', {'handle': handle, 'yield_time_ms': 400})
+        client.receive(lambda m: m.get('event') == 'turn_waiting' and m.get('turn') == turn)
+        lapsed = result('Bob', turn)
+        self.assertEqual((lapsed['output'], lapsed['running'], lapsed['handle']), ('', True, handle))
+        # A poll within the hold stays live.
+        turn = submit('Bob', 'p3', 'write_stdin', {'handle': handle, 'yield_time_ms': 50})
+        self.assertTrue(result('Bob', turn)['running'])
+        events = client.request('events', bot='Bob', after=0, limit=256)['result']['events']
+        self.assertFalse(any(e['event'] == 'turn_waiting' and e['turn'] == turn for e in events))
 
     def test_retention_prunes_records_and_deletes_idle_bots(self):
         client = self.client(settings={'keep_turns': 2})

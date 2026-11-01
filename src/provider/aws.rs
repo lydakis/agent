@@ -37,15 +37,58 @@ const CLOCK_SKEW: [&str; 6] = [
     "AuthFailure",
 ];
 
-/// Whether a refusal's error type, as AWS services name it in
-/// `x-amzn-ErrorType` (`Code:namespace`), says the signature's time was
-/// wrong.
-pub fn clock_skewed(headers: &reqwest::header::HeaderMap) -> bool {
-    headers
+/// How far the server's `Date` may be from when a request was signed before
+/// its refusal reads as the clock's: the AWS SDK for Java's threshold.
+const SKEW: Duration = Duration::from_secs(4 * 60);
+
+/// Whether a refusal of a request signed at `signed_at` was for the
+/// signature's time: its error type, as AWS services name it in
+/// `x-amzn-ErrorType` (`Code:namespace`), says so, or, as the AWS SDK for
+/// Java also reads it, the response's `Date` is more than [`SKEW`] from the
+/// signing time, as after a machine slept between the two.
+pub fn clock_skewed(headers: &reqwest::header::HeaderMap, signed_at: SystemTime) -> bool {
+    let named = headers
         .get("x-amzn-errortype")
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.split(':').next())
-        .is_some_and(|code| CLOCK_SKEW.contains(&code.trim()))
+        .is_some_and(|code| CLOCK_SKEW.contains(&code.trim()));
+    named
+        || headers
+            .get(reqwest::header::DATE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(http_date)
+            .is_some_and(|server| {
+                let apart = server
+                    .duration_since(signed_at)
+                    .or_else(|_| signed_at.duration_since(server))
+                    .unwrap_or_default();
+                apart > SKEW
+            })
+}
+
+/// An HTTP `Date`: `Sat, 31 Oct 2026 20:12:00 GMT` (RFC 9110's IMF-fixdate).
+fn http_date(text: &str) -> Option<SystemTime> {
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let (_, rest) = text.trim().split_once(", ")?;
+    let mut parts = rest.split(' ');
+    let day: i64 = parts.next()?.parse().ok()?;
+    let month = parts.next()?;
+    let month = MONTHS.iter().position(|m| *m == month)? as i64 + 1;
+    let year: i64 = parts.next()?.parse().ok()?;
+    let mut clock = parts.next()?.splitn(3, ':');
+    let (hour, minute, second): (i64, i64, i64) = (
+        clock.next()?.parse().ok()?,
+        clock.next()?.parse().ok()?,
+        clock.next()?.parse().ok()?,
+    );
+    if parts.next()? != "GMT" || !(1..=31).contains(&day) || hour > 23 || minute > 59 || second > 60
+    {
+        return None;
+    }
+    let secs = days_from_civil(year, month, day) * 86_400 + hour * 3600 + minute * 60 + second;
+    Some(UNIX_EPOCH + Duration::from_secs(u64::try_from(secs).ok()?))
 }
 
 /// Re-resolve temporary keys this long before they expire, as AWS SDKs do.
@@ -811,7 +854,11 @@ mod tests {
             if let Some(kind) = kind {
                 headers.insert("x-amzn-errortype", kind.parse().unwrap());
             }
-            clock_skewed(&headers)
+            headers.insert("date", "Sat, 31 Oct 2026 20:12:00 GMT".parse().unwrap());
+            clock_skewed(
+                &headers,
+                http_date("Sat, 31 Oct 2026 20:13:00 GMT").unwrap(),
+            )
         };
         assert!(refused(Some(
             "InvalidSignatureException:http://internal.example/"
@@ -822,6 +869,37 @@ mod tests {
         )));
         assert!(!refused(Some("UnrecognizedClientException")));
         assert!(!refused(None));
+    }
+
+    #[test]
+    fn a_refusal_whose_date_is_far_from_the_signing_is_for_the_time() {
+        let refused = |date: &str, signed: &str| {
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert("date", date.parse().unwrap());
+            clock_skewed(&headers, http_date(signed).unwrap())
+        };
+        assert_eq!(
+            http_date("Thu, 01 Jan 1970 00:01:00 GMT"),
+            Some(UNIX_EPOCH + Duration::from_secs(60))
+        );
+        // Signed before the machine slept, refused once it woke.
+        assert!(refused(
+            "Sat, 31 Oct 2026 09:48:00 GMT",
+            "Sat, 31 Oct 2026 00:16:00 GMT"
+        ));
+        // A clock ahead of the server's is as wrong as one behind it.
+        assert!(refused(
+            "Sat, 31 Oct 2026 20:00:00 GMT",
+            "Sat, 31 Oct 2026 20:05:00 GMT"
+        ));
+        assert!(!refused(
+            "Sat, 31 Oct 2026 20:03:59 GMT",
+            "Sat, 31 Oct 2026 20:00:00 GMT"
+        ));
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("date", "yesterday".parse().unwrap());
+        assert!(!clock_skewed(&headers, UNIX_EPOCH));
+        assert_eq!(http_date("Sat, 31 Oct 2026 20:12:00 PST"), None);
     }
 
     fn at(secs: u64) -> SystemTime {
