@@ -9943,15 +9943,18 @@ impl Database {
     /// The bots with an attached message due by `now`, as `lapse` would
     /// take up to `limit` of them.
     pub fn due_bots(&self, now: i64, limit: usize) -> Result<Vec<String>> {
-        Ok(self
+        let mut bots: Vec<String> = self
             .conn
             .prepare_cached(
-                "SELECT DISTINCT bot FROM (SELECT t.bot FROM turns t JOIN bots b ON b.name=t.bot
+                "SELECT t.bot FROM turns t JOIN bots b ON b.name=t.bot
                  WHERE t.status='attached' AND t.due_ms<=?1 AND b.status!='deleting'
-                 ORDER BY t.due_ms,t.id LIMIT ?2)",
+                 ORDER BY t.due_ms,t.id LIMIT ?2",
             )?
             .query_map(params![now, limit as i64], |r| r.get(0))?
-            .collect::<rusqlite::Result<_>>()?)
+            .collect::<rusqlite::Result<_>>()?;
+        bots.sort_unstable();
+        bots.dedup();
+        Ok(bots)
     }
     /// Deliver up to `limit` attached messages whose wait ran out by `now`,
     /// oldest due first, each as a steer sent now would go: `queued` for a
