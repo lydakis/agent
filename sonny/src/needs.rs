@@ -294,6 +294,12 @@ impl Needs {
         self.unsure.contains(bot)
     }
 
+    /// `bot`'s turn is over, its end unseen: its history, read next, says
+    /// what is open.
+    pub fn sure(&mut self, bot: &str) {
+        self.unsure.remove(bot);
+    }
+
     /// The agents to read again, their turn over, with that turn.
     pub fn due(&mut self) -> Vec<(String, Option<i64>)> {
         std::mem::take(&mut self.due)

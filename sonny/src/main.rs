@@ -2851,11 +2851,13 @@ impl Naming {
 
 /// The kinds of event a lead's layout acts on (`Fleet::event`, `taken`,
 /// `Resolving::event`).
-const FLEET_KINDS: [&str; 11] = [
+const FLEET_KINDS: [&str; 12] = [
     "created",
     "forked",
     "deleted",
     "accepted",
+    // The person's words steered into a running turn answer its question.
+    "steered",
     "approval_requested",
     "approval_asked",
     "step_decided",
@@ -3053,6 +3055,11 @@ impl Fleet {
             {
                 self.activity.insert(name.to_owned(), "idle");
                 self.doing.insert(name.to_owned(), "idle");
+            }
+            // A turn that ended while away ends what its events left
+            // unsure: its history, read below, says.
+            if !running {
+                self.needs.sure(name);
             }
         }
         // The calls of other projects' agents are theirs to show.
@@ -7971,7 +7978,8 @@ impl App {
                     .or(seen.ask),
                 false => seen.ask,
             };
-            if name == self.bot && held.is_ok() {
+            // Unlisted, this window's own calls still say what they wait on.
+            if name == self.bot && held.is_err() {
                 let calls = (self.approvals.iter()).filter_map(|call| {
                     let (turn, id) = (call["turn"].as_i64()?, call["call_id"].as_str()?);
                     Some((name.to_owned(), turn, id.to_owned()))
@@ -17233,6 +17241,11 @@ mod tests {
         assert_eq!(fleet.ended.get("calc.new"), Some(&3));
         fleet.rescan().await;
         assert_eq!(fleet.doing["calc.new"], "needs you");
+        // The person's words steered into a turn running then answer it,
+        // as the fleet follows steers too.
+        assert!(FLEET_KINDS.contains(&"steered"));
+        fleet.event(&event("steered", 4, json!({"steer": 5})));
+        assert_eq!(fleet.doing["calc.new"], "done");
     }
 
     #[tokio::test]
