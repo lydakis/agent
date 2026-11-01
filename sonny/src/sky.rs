@@ -96,8 +96,16 @@ const CORD_PULSE: Duration = Duration::from_millis(2400);
 /// The pairs that talked, newest kept, each a curve: the web of who
 /// works with whom, as in 0.7.0.
 const TALKS: usize = 96;
+/// How long a schedule's tick flashes as it fires.
+const TICK_FLASH: Duration = Duration::from_millis(1500);
+/// Calls kept waiting on a reviewer at most; past it, all are let go.
+const REVIEWED: usize = 4096;
 /// What was said and called, kept an hour for the counts.
 const HOUR: Duration = Duration::from_secs(3600);
+/// The haiku's first row under the key hints: twice the blank that keeps
+/// its name from its lines, so it reads as a poem of its own, not a
+/// line under the hints.
+const HAIKU_TOP: usize = 1;
 /// A working star's breath, in seconds: about thirteen a minute, the
 /// pace of Apple's sleep light, slow enough to stay in the corner of the
 /// eye.
@@ -299,6 +307,8 @@ struct Agent {
     twinkle: Option<(Instant, Color, Work)>,
     /// A commons post's ripple: when, and how far it spreads.
     ripple: Option<(Instant, f32)>,
+    /// When one of its schedules last woke it: its tick flashes.
+    fired: Option<Instant>,
     /// How much it has been messaged lately: each message that lands adds
     /// one, and it halves as a glow does.
     heat: f32,
@@ -482,6 +492,9 @@ pub struct View {
     /// `triggers` calls under way, by agent, turn and call: a call id is
     /// unique only within its turn.
     bookings: HashMap<(String, i64, String), Booking>,
+    /// Calls waiting on a reviewer such as `auto`, by agent, turn and call:
+    /// the reviewer's tag.
+    reviewed: HashMap<(String, i64, String), String>,
     told: HashMap<String, Instant>,
 }
 
@@ -838,6 +851,7 @@ impl View {
             booked: None,
             booking: false,
             bookings: HashMap::new(),
+            reviewed: HashMap::new(),
             told: HashMap::new(),
         }
     }
@@ -886,6 +900,7 @@ impl View {
     /// Let go of every agent and what they did, to draw them again.
     fn forget(&mut self) {
         self.bookings.clear();
+        self.reviewed.clear();
         self.agents.clear();
         self.index.clear();
         self.said.clear();
@@ -1723,6 +1738,11 @@ impl View {
         if !own && !lent {
             return;
         }
+        // A reviewer's question to its own copy is no one's message: its
+        // verdict, on the agent whose call it was, is what the sky draws.
+        if !own && data["origin"] == "judge" && kind != "tool_started" {
+            return;
+        }
         let turn = event["turn"].as_i64().unwrap_or(-1);
         match event["event"].as_str().unwrap_or("") {
             kind @ ("queued" | "accepted" | "steered") => {
@@ -1790,6 +1810,21 @@ impl View {
                     {
                         self.hear(when, by, at);
                     }
+                }
+                let origin = data["origin"].as_str().unwrap_or("");
+                // An agent's goal asks it to go on: its own loop, so its
+                // star pulses, and nothing flies.
+                if live && origin == "goal" && from != End::Person {
+                    let agent = &mut self.agents[at];
+                    (agent.lit, agent.heated, agent.flash) = (Some(now), Some(now), None);
+                    agent.heat = agent.warmth(now) + 1.0;
+                    let said = format!("{} keeps at its goal", self.short(at));
+                    self.say(now, said, None, &[at]);
+                    return;
+                }
+                // A schedule woke it: in from the edge, its tick flashing.
+                if live && origin == "trigger" {
+                    self.agents[at].fired = Some(now);
                 }
                 if live {
                     if let End::Agent(by) = from
@@ -1887,10 +1922,22 @@ impl View {
             "approval_requested" if live => {
                 let waiting = self.agents[at].state() == Some(State::NeedsYou);
                 for call in data["calls"].as_array().into_iter().flatten() {
-                    let manual = (call["gates"].as_array())
-                        .is_some_and(|gates| gates.iter().any(|g| g == "manual"));
-                    if let (true, Some(id)) = (manual, call["call_id"].as_str()) {
+                    let gates = call["gates"].as_array().map_or(&[][..], Vec::as_slice);
+                    let manual = gates.iter().any(|g| g == "manual");
+                    let reviewer =
+                        (gates.iter().filter_map(Value::as_str)).find(|&gate| gate != "manual");
+                    let Some(id) = call["call_id"].as_str() else {
+                        continue;
+                    };
+                    if manual {
                         self.agents[at].held.insert(id.to_owned());
+                    }
+                    if let Some(reviewer) = reviewer {
+                        if self.reviewed.len() >= REVIEWED {
+                            self.reviewed.clear();
+                        }
+                        let key = (name.to_owned(), turn, id.to_owned());
+                        self.reviewed.insert(key, reviewer.to_owned());
                     }
                 }
                 self.waits(at, waiting, now);
@@ -1899,6 +1946,11 @@ impl View {
                 let waiting = self.agents[at].state() == Some(State::NeedsYou);
                 if let Some(id) = data["call_id"].as_str() {
                     self.agents[at].held.insert(id.to_owned());
+                    // A reviewer handed the call to the person.
+                    let key = (name.to_owned(), turn, id.to_owned());
+                    if self.reviewed.remove(&key).is_some() {
+                        self.verdict(at, NEEDS, now);
+                    }
                 }
                 self.waits(at, waiting, now);
             }
@@ -1912,6 +1964,14 @@ impl View {
                 if let Some(id) = data["call_id"].as_str() {
                     self.agents[at].held.remove(id);
                     let key = (name.to_owned(), turn, id.to_owned());
+                    if let Some(reviewer) = self.reviewed.remove(&key)
+                        && data["denied"] == true
+                    {
+                        self.verdict(at, FAILED, now);
+                        let tool = data["name"].as_str().unwrap_or("a call");
+                        let said = format!("✗ {reviewer} denied {}'s {tool}", self.short(at));
+                        self.say(now, said, Some(FAILED), &[at]);
+                    }
                     if let Some(booking) = self.bookings.remove(&key)
                         && data["failed"] != true
                         && data["denied"] != true
@@ -2206,6 +2266,31 @@ impl View {
                 })
                 .map_or(End::Rim(at), End::Agent);
         }
+        let origin = data["origin"].as_str().unwrap_or("");
+        // A margin note closed is the person's click.
+        if origin == "margin" {
+            return End::Person;
+        }
+        // The commons invites and wakes on someone's post: from them.
+        if origin == "commons"
+            && let Some(thread) = commons_thread(data["request_id"].as_str().unwrap_or(""))
+            && let Some(home) = std::env::var_os("HOME")
+            && let Some(by) = crate::commons::last_poster(std::path::Path::new(&home), thread)
+            && let Some(by) = self.agent(&by).filter(|&by| by != at)
+        {
+            return End::Agent(by);
+        }
+        // Task updates quote the task they tell of: from it, when one.
+        if origin == crate::lookout::TASKS_ORIGIN {
+            let quoted: HashSet<usize> = (data["quotes"].as_array().into_iter().flatten())
+                .filter_map(|quote| quote["bot"].as_str())
+                .filter_map(|bot| self.agent(bot))
+                .filter(|&by| by != at)
+                .collect();
+            if let [by] = quoted.into_iter().collect::<Vec<_>>()[..] {
+                return End::Agent(by);
+            }
+        }
         match data["origin"].is_string() || data["person"].is_string() {
             true => End::Rim(at),
             false => End::Person,
@@ -2243,6 +2328,18 @@ impl View {
         if let Some(then) = self.then(now) {
             self.recent.push_back(then);
         }
+    }
+
+    /// A reviewer's verdict on an agent's call: a streak from the edge onto
+    /// it, red for a call denied, yellow for one handed to the person. An
+    /// allowed call says so itself, as it runs.
+    fn verdict(&mut self, at: usize, color: Color, now: Instant) {
+        self.sparks.push(Spark {
+            from: End::Rim(at),
+            to: End::Agent(at),
+            born: now,
+            color: Some(color),
+        });
     }
 
     /// When what happens at `now` happened, for the hour's counts: `now`
@@ -2779,8 +2876,19 @@ impl View {
                     let wait = upcoming.then.map_or(600, |then| then - next).max(60);
                     next - wall <= wait / 10
                 });
-                let ink = if near { Ink::Plain } else { Ink::Muted };
-                for past in [0.05, 0.07, 0.09] {
+                // Just fired: plain, and half again as long, for a moment.
+                let fired = (self.agents[at].fired)
+                    .is_some_and(|when| now.duration_since(when) < TICK_FLASH);
+                let ink = if near || fired {
+                    Ink::Plain
+                } else {
+                    Ink::Muted
+                };
+                let pasts: &[f32] = match fired {
+                    true => &[0.05, 0.07, 0.09, 0.11, 0.13],
+                    false => &[0.05, 0.07, 0.09],
+                };
+                for &past in pasts {
                     sky.dot(self.tick_on(&sky, at, past), ink);
                 }
             }
@@ -3006,7 +3114,7 @@ impl View {
         if self.zen || !beside {
             for (row, line) in self.haiku(now).iter().enumerate() {
                 let start = sky_cols.saturating_sub(haiku::WIDTH + 1);
-                sky.inscribe(row, start, line);
+                sky.inscribe(HAIKU_TOP + row, start, line);
             }
         }
         let drawn = sky.lines();
@@ -3015,8 +3123,12 @@ impl View {
                 true => self.key(now, rows),
                 false => {
                     // The haiku at the top, in the blank the log leaves.
-                    let mut column = self.ticked(now, LOG_COLS, rows, true);
+                    // A blank under its newest line, as over the haiku: two
+                    // from the footer, as two from the key hints.
+                    let mut column = self.ticked(now, LOG_COLS, rows.saturating_sub(1), true);
+                    column.push(Line::default());
                     for (row, line) in self.haiku(now).into_iter().enumerate() {
+                        let row = HAIKU_TOP + row;
                         if column.get(row).is_some_and(|blank| blank.spans.is_empty()) {
                             column[row] = line;
                         }
@@ -3653,6 +3765,14 @@ fn hue(from: End, to: End) -> Option<Color> {
         (End::Agent(_), End::Agent(_)) => Some(AGENTS),
         _ => None,
     }
+}
+
+/// The commons thread a commons note's request names: an invite's
+/// (`commons.invite.THREAD`) or a reply's (`commons.THREAD.SEEN.woken`).
+fn commons_thread(request: &str) -> Option<&str> {
+    let rest = request.strip_prefix("commons.")?;
+    let rest = rest.strip_prefix("invite.").unwrap_or(rest);
+    rest.split('.').next().filter(|thread| !thread.is_empty())
 }
 
 /// A time of day, as a replay's chat log and footer say it: `02:10`.
@@ -6187,6 +6307,158 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn what_comes_in_comes_from_who_sent_it_and_a_goal_flies_nowhere() {
+        let (mut view, send) = view();
+        send.send(Feed::Roll(vec![
+            json!({"name": "shop.lead"}),
+            json!({"name": "shop.login", "created_by": "shop.lead"}),
+        ]))
+        .unwrap();
+        send.send(Feed::Ready).unwrap();
+        view.drain();
+        let (lead, login) = (view.index["shop.lead"], view.index["shop.login"]);
+        // A margin note closed: the person's.
+        assert_eq!(view.sender(&json!({"origin": "margin"}), lead), End::Person);
+        // Task updates from the one task they quote; several, the edge.
+        let tasks = crate::lookout::TASKS_ORIGIN;
+        let one = json!({"origin": tasks, "quotes": [{"bot": "shop.login", "turn": 3}]});
+        assert_eq!(view.sender(&one, lead), End::Agent(login));
+        let two = json!({"origin": tasks, "quotes": [{"bot": "shop.login"}, {"bot": "shop.cart"}]});
+        assert_eq!(view.sender(&two, lead), End::Agent(login));
+        let none = json!({"origin": tasks});
+        assert_eq!(view.sender(&none, lead), End::Rim(lead));
+        // Follows and other people stay outside.
+        assert_eq!(
+            view.sender(&json!({"origin": "lookout.github"}), lead),
+            End::Rim(lead)
+        );
+        assert_eq!(view.sender(&json!({"person": "Ana"}), lead), End::Rim(lead));
+        // The commons names the thread its note is about.
+        assert_eq!(
+            commons_thread("commons.invite.release-notes"),
+            Some("release-notes")
+        );
+        assert_eq!(
+            commons_thread("commons.release-notes.4.woken"),
+            Some("release-notes")
+        );
+        assert_eq!(commons_thread("lookout-abc"), None);
+        // A goal: the star pulses, nothing flies, the log says so.
+        send.send(Feed::Live(
+            json!({"event": "accepted", "bot": "shop.login", "turn": 1,
+            "data": {"origin": "goal"}}),
+        ))
+        .unwrap();
+        // A schedule: in from the edge, its tick flashing.
+        send.send(Feed::Live(
+            json!({"event": "accepted", "bot": "shop.lead", "turn": 1,
+            "data": {"origin": "trigger"}}),
+        ))
+        .unwrap();
+        view.drain();
+        assert!(view.agents[login].heated.is_some());
+        let froms: Vec<End> = view.sparks.iter().map(|s| s.from).collect();
+        assert_eq!(froms, [End::Rim(lead)]);
+        assert!(view.agents[lead].fired.is_some());
+        let logged: Vec<&str> = view.ticker.iter().map(|n| n.text.as_str()).collect();
+        assert_eq!(
+            logged,
+            ["login keeps at its goal", "an automation → shop lead"]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reviewer_s_no_streaks_red_onto_the_agent_and_a_hand_off_yellow() {
+        let (mut view, send) = view();
+        send.send(Feed::Roll(vec![
+            json!({"name": "approver.auto"}),
+            json!({"name": "shop.lead"}),
+        ]))
+        .unwrap();
+        send.send(Feed::Ready).unwrap();
+        view.drain();
+        let lead = view.index["shop.lead"];
+        let live = |kind: &str, turn: i64, data: Value| {
+            Feed::Live(json!({"event": kind, "bot": "shop.lead", "turn": turn, "data": data}))
+        };
+        let asked = |turn: i64, call: &str, gates: Value| {
+            live(
+                "approval_requested",
+                turn,
+                json!({"calls": [{"call_id": call, "gates": gates}]}),
+            )
+        };
+        send.send(asked(1, "c1", json!(["auto"]))).unwrap();
+        send.send(asked(1, "c2", json!(["auto"]))).unwrap();
+        send.send(asked(1, "c3", json!(["auto"]))).unwrap();
+        send.send(asked(1, "c4", json!(["manual"]))).unwrap();
+        view.drain();
+        // Asking is not drawn: everyone asks the reviewer all the time.
+        assert!(view.sparks.is_empty());
+        // Allowed: the call runs, no streak.
+        send.send(live(
+            "tool_completed",
+            1,
+            json!({"call_id": "c1", "name": "shell"}),
+        ))
+        .unwrap();
+        // The same id in another turn is another call.
+        send.send(live(
+            "tool_completed",
+            2,
+            json!({"call_id": "c2", "name": "shell", "denied": true}),
+        ))
+        .unwrap();
+        // The person's own no is the person's, not the reviewer's.
+        send.send(live(
+            "tool_completed",
+            1,
+            json!({"call_id": "c4", "name": "edit", "denied": true}),
+        ))
+        .unwrap();
+        view.drain();
+        assert!(view.sparks.is_empty());
+        send.send(live(
+            "tool_completed",
+            1,
+            json!({"call_id": "c2", "name": "shell", "denied": true}),
+        ))
+        .unwrap();
+        send.send(live(
+            "approval_asked",
+            1,
+            json!({"call_id": "c3", "tag": "auto"}),
+        ))
+        .unwrap();
+        view.drain();
+        let streaks: Vec<(End, End, Option<Color>)> = view
+            .sparks
+            .iter()
+            .map(|s| (s.from, s.to, s.color))
+            .collect();
+        assert_eq!(
+            streaks,
+            [
+                (End::Rim(lead), End::Agent(lead), Some(FAILED)),
+                (End::Rim(lead), End::Agent(lead), Some(NEEDS)),
+            ]
+        );
+        let logged: Vec<&str> = view.ticker.iter().map(|n| n.text.as_str()).collect();
+        assert_eq!(
+            logged,
+            [
+                // The manual call waits on the person from the start.
+                "? shop lead waits for you",
+                "✗ auto denied shop lead's shell",
+                "? shop lead waits for you",
+            ]
+        );
+        assert_eq!(view.ticker[1].hue, Some(FAILED));
+        // Not counted as messages.
+        assert!(view.recent.is_empty());
+    }
+
+    #[tokio::test]
     async fn a_throwaway_copy_lends_its_agent_what_it_is_told_and_no_star_of_its_own() {
         let (mut view, send) = view();
         send.send(Feed::Roll(vec![
@@ -6205,7 +6477,7 @@ mod tests {
         assert!(view.agent("approver.auto.1.9.0").is_none());
         assert!(view.agent("shop.lead.suggest-1").is_none());
         let auto = view.index["approver.auto"];
-        // A judgment: from the judge, at the edge, onto the approver.
+        // A reviewer's question to its copy: no one's message, not drawn.
         send.send(Feed::Live(
             json!({"event": "accepted", "bot": "approver.auto.1.9.0",
             "turn": 1, "data": {"origin": "judge"}}),
@@ -6224,11 +6496,9 @@ mod tests {
         ))
         .unwrap();
         view.drain();
-        assert_eq!(view.sparks.len(), 1);
-        assert!(matches!(view.sparks[0].from, End::Rim(_)));
-        assert!(matches!(view.sparks[0].to, End::Agent(at) if at == auto));
+        assert!(view.sparks.is_empty());
         assert_eq!(view.agents[auto].state(), None);
-        assert!(text(&view.ticked(Instant::now(), 40, 12, true)).contains("a judge → auto"));
+        assert!(!text(&view.ticked(Instant::now(), 40, 12, true)).contains("a judge"));
         send.send(Feed::Live(
             json!({"event": "deleted", "bot": "approver.auto.1.9.0"}),
         ))
@@ -6944,10 +7214,12 @@ mod tests {
             .map(|line| text(std::slice::from_ref(line)))
             .collect();
         assert_eq!(rows.len(), 40);
-        // The newest at the bottom of the column, what needs you in its hue.
-        assert!(rows[39].ends_with("? a asks you"), "{:?}", rows[39]);
-        assert!(rows[38].ends_with("you → a"), "{:?}", rows[38]);
-        assert!(rows[37].ends_with("a → b"), "{:?}", rows[37]);
+        // The newest at the bottom of the column, a blank under it, what
+        // needs you in its hue.
+        assert!(!rows[39].trim_end().ends_with("asks you"), "{:?}", rows[39]);
+        assert!(rows[38].ends_with("? a asks you"), "{:?}", rows[38]);
+        assert!(rows[37].ends_with("you → a"), "{:?}", rows[37]);
+        assert!(rows[36].ends_with("a → b"), "{:?}", rows[36]);
         assert!(rows[0].trim().is_empty() || !rows[0].contains('→'));
         // Zen: the sky alone, and no names but what needs the person.
         view.zen = true;

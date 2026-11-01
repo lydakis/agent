@@ -908,6 +908,14 @@ pub fn audience(home: &Path, thread: &str, author: &str) -> usize {
         .map_or(0, |by| by.keys().filter(|bot| *bot != author).count())
 }
 
+/// Who posted last in `thread`: who an invite to it or a reply's note
+/// comes from. None for no such thread.
+pub fn last_poster(home: &Path, thread: &str) -> Option<String> {
+    valid_name(thread).ok()?;
+    let posts = posts(&dir(home).join(format!("{thread}.jsonl"))).ok()?;
+    posts.last()?["by"].as_str().map(str::to_owned)
+}
+
 /// A thread as the tool shows it, read by no one yet.
 fn thread(dir: &Path, name: &str) -> Result<Value, String> {
     valid_name(name)?;
