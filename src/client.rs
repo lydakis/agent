@@ -390,6 +390,11 @@ fn parse(args: &[String]) -> Result<Options> {
                         options.settings.insert(key, json!(number));
                         options.settings_flags.push(flag.to_owned());
                     }
+                    "--hold" => {
+                        let ms = crate::cli::duration_ms(flag, &value)?;
+                        options.settings.insert("hold_ms".to_owned(), json!(ms));
+                        options.settings_flags.push(flag.to_owned());
+                    }
                     "--approval-hold" => {
                         let ms = crate::cli::duration_ms(flag, &value)?;
                         options
@@ -1332,6 +1337,18 @@ pub fn main(args: Vec<String>) -> Result<i32> {
             print_json(&resumed, options.pretty)?;
             Ok(0)
         }
+        "held" => {
+            let mut connection = ensure_existing_daemon(&options)?;
+            let held = connection.request("held", json!({}))?;
+            print_json(&held, options.pretty)?;
+            Ok(0)
+        }
+        "retry" => {
+            let mut connection = ensure_daemon(&options)?;
+            let retried = connection.request("retry_held", json!({"bot": options.bot}))?;
+            print_json(&retried, options.pretty)?;
+            Ok(0)
+        }
         "pauses" => {
             let mut connection = ensure_existing_daemon(&options)?;
             let page = connection.request(
@@ -1614,6 +1631,9 @@ fn run(options: &Options) -> Result<i32> {
         let mut settings = options.settings.clone();
         if config()?.hide_senders {
             settings.entry("hide_senders").or_insert(json!(true));
+        }
+        if let Some(ms) = config()?.hold_ms {
+            settings.entry("hold_ms").or_insert(json!(ms));
         }
         // Cut outputs go whole to a folder beside the store, as the
         // summary prompt goes by default; --outputs names another.
@@ -2526,6 +2546,17 @@ impl Renderer {
                         say!("{}", self.dim(&format!("  {}", streamed(line))));
                     }
                 }
+            }
+            // Held on a cause the person can fix: say what, and how to go on.
+            "turn_paced" | "turn_held" if data["blocked"].is_object() => {
+                self.flush();
+                let blocked = &data["blocked"];
+                let mut line = format!("⏸ held: {}", blocked["code"].as_str().unwrap_or("?"));
+                if let Some(detail) = blocked["detail"].as_str() {
+                    line.push_str(&format!(" ({detail})"));
+                }
+                line.push_str("; tried again on its own, or now with `agent retry` once fixed");
+                say!("{}", self.dim(&line));
             }
             "usage" => {
                 self.usage.0 += data["input_tokens"].as_u64().unwrap_or(0);

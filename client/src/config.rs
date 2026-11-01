@@ -9,6 +9,7 @@
 //! web_search = "disabled"       # "live", the default, lets new agents search and fetch
 //! senders = "hidden"            # "shown", the default, labels what agents send
 //! attach_wait = "1d"            # how long an attached note waits for a call, the default; "0" as long as it takes
+//! hold = "5d"                   # how long a new agent's turn waits on a cause you can fix before it fails, the default; "0" fails at once
 //!
 //! [daemon]                      # what the agent CLI starts the daemon with; restart it to apply
 //! processes = "cpus * 64"       # commands running at once, the default
@@ -100,6 +101,11 @@ pub struct Config {
     /// milliseconds; unset is `ATTACH_WAIT_MS`, and 0 waits as long as it
     /// takes. See `attach_wait`.
     pub attach_wait_ms: Option<u64>,
+    /// `hold`: how long a new agent's turn is held on a cause the person
+    /// can fix (a sign-in, a usage limit, a provider down) before it fails
+    /// with it, in milliseconds, as the bot setting `hold_ms`; unset leaves
+    /// the daemon's five days, and 0 fails at once.
+    pub hold_ms: Option<u64>,
     /// Each model's fallback, as `provider/model` in its family: a new
     /// agent on that model that names none sends a request a safety
     /// classifier declined to it, that request alone.
@@ -957,6 +963,16 @@ fn parse(text: &str) -> Result<Config, String> {
             };
             continue;
         }
+        if name == "hold" {
+            let text = string(name, value)?;
+            let ms = duration_ms(&text)
+                .filter(|&ms| ms <= MAX_ATTACH_WAIT_MS)
+                .ok_or_else(|| {
+                    format!("hold is a duration such as 1h or 5d, up to 365d, or \"0\", not {text}")
+                })?;
+            config.hold_ms = Some(ms);
+            continue;
+        }
         if name == "attach_wait" {
             let text = string(name, value)?;
             let ms = duration_ms(&text)
@@ -1671,6 +1687,17 @@ mod tests {
                 .unwrap_err()
                 .contains("daemon.processes")
         );
+    }
+
+    #[test]
+    fn a_hold_is_the_daemon_s_unless_the_file_says_otherwise() {
+        assert_eq!(Config::default().hold_ms, None);
+        assert_eq!(parse("hold = \"2d\"").unwrap().hold_ms, Some(172_800_000));
+        assert_eq!(parse("hold = \"0\"").unwrap().hold_ms, Some(0));
+        for refused in ["\"366d\"", "\"30\"", "1"] {
+            let error = parse(&format!("hold = {refused}")).unwrap_err();
+            assert!(error.contains("hold"), "{refused}: {error}");
+        }
     }
 
     #[test]

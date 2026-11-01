@@ -57,6 +57,9 @@ pub fn main(args: &[String]) -> Result<i32> {
         .enable_all()
         .build()?;
     let signed = runtime.block_on(sign_in(&path, port))?;
+    // Turns held on a refused or expired sign-in are tried again now, not
+    // at their next try: the running daemon takes the new token then.
+    runtime.block_on(retry_held());
     if pretty {
         let who = signed.email.as_deref().unwrap_or("your ChatGPT account");
         println!(
@@ -71,6 +74,30 @@ pub fn main(args: &[String]) -> Result<i32> {
         );
     }
     Ok(0)
+}
+
+/// Tell the daemon at the default store, if one runs, that what held its
+/// turns may be fixed. Best effort: no daemon, or one that cannot be
+/// reached in a few seconds, has nothing to retry or tries on its own.
+async fn retry_held() {
+    let store = match std::env::var_os("AGENT_STORE") {
+        Some(store) => std::path::PathBuf::from(store),
+        None => match std::env::var_os("HOME") {
+            Some(home) => std::path::PathBuf::from(home).join(".agent/state.sqlite"),
+            None => return,
+        },
+    };
+    let Ok(socket) = agent_client::socket::default_socket(&store) else {
+        return;
+    };
+    if !socket.exists() {
+        return;
+    }
+    let told = async {
+        let (client, _events) = agent_client::Client::connect(&socket).await.ok()?;
+        client.request("retry_held", json!({})).await.ok()
+    };
+    let _ = tokio::time::timeout(Duration::from_secs(5), told).await;
 }
 
 async fn sign_in(path: &Path, port: u16) -> Result<Saved> {

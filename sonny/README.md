@@ -727,7 +727,8 @@ way `/react` does, and each note in the margin has its own `↩`.
 - `/status` shows the project's agents in the pane beside the
   conversation. The lead comes first; its tasks
   follow grouped by where they stand: **Needs you** (waiting on your
-  approval, asking you a question, or failed),
+  approval, asking you a question, held on something only you can fix,
+  such as a ChatGPT sign-in, or failed),
   **Working** (a turn running, queued, rate limited, waiting on other
   tasks, or `waiting on its reviewer` while the approver weighs a call), **Ready for review** (finished, its last reply linking a pull
   request), **Done** (finished or stopped with nothing open), and

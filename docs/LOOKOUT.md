@@ -101,6 +101,21 @@ Because the lookout watches the tasks, a lead no longer sets itself
 automations to check on running work; automations stay for what the person
 schedules.
 
+### Bounced messages
+
+The lookout also hands back what a turn never carried out, as mail
+returns a letter it could not deliver. It notes which bots sent each
+message (an `accepted`, `queued` or `steered` event's `from`), and when
+that turn ends failed or interrupted it attaches a note to each sender:
+`[your message to BOT was not carried out: turn N ended CODE]`, stamped
+like any note. The sender knows what the message was for, so it decides
+whether to send again, wait, or tell the person; nobody else could. A
+sender that already hears the bot, such as a lead with its own task, gets
+the turn's end as a task update instead, and a bot's own messages never
+bounce. A cause a person can fix does not end a turn at once: the daemon
+[holds it](RUST_PROTOTYPE.md#held-turns) for the bot's `hold_ms`, five
+days unset, so what bounces is final, or was held that long.
+
 ## Subscriptions
 
 Each subscriber has a lookout of its own while it has a subscription. When
