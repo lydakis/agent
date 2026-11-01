@@ -728,8 +728,15 @@ way `/react` does, and each note in the margin has its own `↩`.
   none sit on the outer edge, as a tree's leaves do, so the sky fills to
   its rim. Throwaway copies, such as the approver's judges or a
   suggestion's writer, get no star: what they are told and do lights the
-  agent that made them, and a judge's question comes in from the edge, not
-  from you. It is a
+  agent that made them; a judge's question to its copy is not drawn. A
+  reviewer's verdict is: a red streak onto the agent whose call it
+  denied, a yellow one when it hands the call to you, nothing for an
+  allow, whose call runs. What comes in from no agent flies in from the
+  edge only when it is from outside: a follow, another person, a
+  schedule (whose tick flashes as it fires), a reply's note from the
+  commons, task updates. A commons invite flies from whoever started the
+  thread, a margin note you closed from you, and an agent's own goal only
+  pulses its star. It is a
   calm window to keep open and watch: dim lines join who made whom, and
   every pair that has ever talked keeps a dim curve, the last 96 pairs, past
   turns and live, denser and brighter the more the pair talked this hour. A
@@ -803,6 +810,8 @@ way `/react` does, and each note in the margin has its own `↩`.
   ![/sky with the busiest agent's haiku](../docs/sonny/sky-haiku.gif)
 
   ![/sky with an agent scheduling another, its tick on the rim and what is next up](../docs/sonny/sky-schedules.gif)
+
+  ![/sky: a reviewer's no streaking red onto an agent, a hand-off yellow, a schedule's tick flashing as it fires, a goal pulsing a star](../docs/sonny/sky-origins.gif)
 
   ![/sky with states and its chat log](../docs/sonny/sky-states.png)
 
