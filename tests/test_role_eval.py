@@ -78,37 +78,45 @@ if __name__ == '__main__':
 
 
 class ConfinedTests(unittest.TestCase):
-    """What the eval allows may not reach the real home (#521)."""
+    """What the eval allows has effects only in the run (#521)."""
 
-    def test_a_call_into_the_real_home_is_denied_and_one_inside_the_run_allowed(self):
+    def test_only_a_plain_call_of_sonnys_scripts_is_allowed(self):
+        home = Path('/tmp/role/A1/h')
+        shell = lambda command, **more: {'name': 'shell', 'arguments': {'command': command}, **more}
+        for allowed in ['~/.agent/trigger add --bot shop.lead --every 10m -- "Check the tasks"',
+                        '"$HOME/.agent/trigger" rm watch',
+                        f'{home}/.agent/memory save flow --type project -- \'text\'']:
+            self.assertTrue(role_eval.determinable(home, shell(allowed)), allowed)
+        # The ACP shape of the same call.
+        acp = {'toolCall': {'name': 'shell', 'rawInput': {'command': '~/.agent/trigger ls'}}}
+        self.assertTrue(role_eval.determinable(home, acp))
+        for denied in ['mkdir -p ~/Backups/shop',
+                       'cd /Users && mkdir -p me/Backups/shop',
+                       'python3 -c "import pwd,os; os.makedirs(pwd.getpwuid(os.getuid()).pw_dir + \'/x\')"',
+                       '~/.agent/trigger ls; rm -rf ~/x',
+                       '~/.agent/trigger ls && touch /x',
+                       '~/.agent/trigger add -- "$(touch /x)"',
+                       '~/.agent/trigger add -- `touch /x`',
+                       '~/.agent/trigger ls > /Users/me/x',
+                       '~/.agent/trigger ls\ntouch /x',
+                       'FOO=1 ~/.agent/trigger ls',
+                       'git push origin main']:
+            self.assertFalse(role_eval.determinable(home, shell(denied)), denied)
+        # Not a shell call, or not seen whole.
+        self.assertFalse(role_eval.determinable(home, {'name': 'write', 'arguments': {'path': '/x', 'content': ''}}))
+        self.assertFalse(role_eval.determinable(home, shell('~/.agent/trigger ls', arguments_cut=['command'])))
+        self.assertFalse(role_eval.determinable(home, shell('~/.agent/trigger ls', arguments_omitted=1)))
+
+    def test_the_run_writes_its_folder_without_network_and_the_eval_approves(self):
         with tempfile.TemporaryDirectory() as tmp:
-            real = Path(tmp) / 'Users' / 'me'
-            root = Path(tmp) / 'role' / 'A1'
-            root.mkdir(parents=True)
-            with mock.patch.object(role_eval, 'REAL_HOME', real.resolve()):
-                inside = {'toolCall': {'rawInput': {'command': f'git clone --mirror . {root}/backups/shop.git'}}}
-                self.assertTrue(role_eval.confined(root, inside))
-                outside = {'toolCall': {'rawInput': {'command': f'mkdir -p {real}/Backups/shop'}}}
-                self.assertFalse(role_eval.confined(root, outside))
-                # A path that climbs out of the run counts where it lands.
-                climbs = {'arguments': {'path': f'{root}/../../Users/me/notes.md'}}
-                self.assertFalse(role_eval.confined(root, climbs))
-                # Escalations with no path, and system paths, are not the home.
-                self.assertTrue(role_eval.confined(root, {'arguments': {'command': 'git push origin main'}}))
-                self.assertTrue(role_eval.confined(root, {'arguments': {'command': 'ls /usr/bin > /dev/null'}}))
-                # A folder above the home, reached relative from there.
-                above = {'arguments': {'command': f'cd {real.parent} && mkdir -p me/Backups/shop'}}
-                self.assertFalse(role_eval.confined(root, above))
-                # The step's own backup, next to the repository, is in the run.
-                self.assertTrue(role_eval.confined(root, {'arguments': {'command': 'git clone --mirror . ../backups/shop.git'}}))
-                # A climb out of the run, or someone's home by name, is not.
-                self.assertFalse(role_eval.confined(root, {'arguments': {'command': 'cp -r . ../../../../x'}}))
-                self.assertFalse(role_eval.confined(root, {'arguments': {'command': 'cp -r . ~me/Backups'}}))
-                self.assertTrue(role_eval.confined(root, {'arguments': {'command': 'cp -r . ~/backups'}}))
-                # A call listed cut can't be seen whole, so it is denied.
-                cut = {'arguments': {'command': 'git push'}, 'arguments_cut': ['command']}
-                self.assertFalse(role_eval.confined(root, cut))
-                self.assertFalse(role_eval.confined(root, {'arguments': {}, 'arguments_omitted': 3}))
+            root = Path(tmp) / 'A1'
+            home, _, _, _ = role_eval.setup(root, build(tmp), 'chatgpt/gpt-6.1-sol')
+            config = (home / '.agent/config.toml').read_text()
+            self.assertIn('default_permissions = "eval"', config)
+            self.assertIn('extends = "ask"', config)
+            self.assertIn('network = false', config)
+            self.assertIn(f'writable = ["{root}/backups", "{root}/origin.git"]', config)
+            self.assertTrue((root / 'backups').is_dir())
 
     def test_what_changed_in_the_real_home_is_found_past_hidden_folders_and_the_run(self):
         with tempfile.TemporaryDirectory() as tmp:
