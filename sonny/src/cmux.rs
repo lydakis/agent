@@ -437,6 +437,11 @@ impl Backend for Cmux {
         }
     }
 
+    fn focus(&self, block: &Block) -> Result<(), String> {
+        let at = json!({"surface_id": block.id, "workspace_id": self.workspace});
+        self.call("surface.focus", at).map(|_| ())
+    }
+
     /// cmux's heartbeats keep the stream from outliving Sonny: the first
     /// one written after it is gone ends the command.
     fn watch(&self) -> Option<Watch> {

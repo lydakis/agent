@@ -807,7 +807,7 @@ async fn run(goal: &Goal, store: &Path, socket: &Path) -> (Option<i32>, String) 
     let started = std::time::Instant::now();
     let Ok(_place) = tokio::time::timeout(
         Duration::from_secs(goal.timeout_s),
-        crate::budget::processes().admit(&goal.bot),
+        crate::budget::processes(crate::budget::Companion::Lookout).admit(&goal.bot),
     )
     .await
     else {

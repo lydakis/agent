@@ -124,12 +124,7 @@ impl<A: Clone + Default + PartialEq> Recall<A> {
         if !self.showing(current) {
             self.walk = None;
         }
-        if self.before.is_none() {
-            self.before = Some(match &self.file {
-                Some(file) => read(file, self.opened),
-                None => Vec::new(),
-            });
-        }
+        self.read_file();
         let back = self.walk.as_ref().map_or(0, |walk| walk.back);
         // The same prompt twice in a row, with the same attached, is
         // shown once.
@@ -185,6 +180,50 @@ impl<A: Clone + Default + PartialEq> Recall<A> {
     fn same(&self, back: usize, text: &str, attached: &A) -> bool {
         let (prompt, with) = self.nth(back);
         prompt == text && with.cloned().unwrap_or_default() == *attached
+    }
+
+    /// Every prompt, newest first, each once (its newest), as `back` and
+    /// its words: what Ctrl+R searches.
+    pub fn all(&mut self) -> Vec<(usize, &str)> {
+        self.read_file();
+        let mut seen = std::collections::HashSet::new();
+        (1..=self.len())
+            .map(|back| (back, self.nth(back).0))
+            .filter(|(_, text)| seen.insert(*text))
+            .collect()
+    }
+
+    /// The prompt `back` from now, picked by a search, for the composer
+    /// now holding `current` with `attached`: Up and Down go on from it,
+    /// and past the newest `current` comes back.
+    pub fn jump(&mut self, back: usize, current: &str, attached: &mut A) -> Option<String> {
+        if back == 0 || back > self.len() {
+            return None;
+        }
+        let (text, with) = self.nth(back);
+        let (text, with) = (text.to_owned(), with.cloned().unwrap_or_default());
+        let (draft, draft_attached) = match self.walk.take() {
+            Some(walk) if walk.shown == current => (walk.draft, walk.attached),
+            _ => (current.to_owned(), std::mem::take(attached)),
+        };
+        *attached = with;
+        self.walk = Some(Walk {
+            back,
+            draft,
+            attached: draft_attached,
+            shown: text.clone(),
+        });
+        Some(text)
+    }
+
+    /// The file's prompts, read once.
+    fn read_file(&mut self) {
+        if self.before.is_none() {
+            self.before = Some(match &self.file {
+                Some(file) => read(file, self.opened),
+                None => Vec::new(),
+            });
+        }
     }
 
     fn len(&self) -> usize {
@@ -398,6 +437,21 @@ mod tests {
             1,
             "one longer than the budget stays alone"
         );
+    }
+
+    #[test]
+    fn a_search_lists_each_prompt_once_and_jumps_into_the_walk() {
+        let mut recall = Recall::default();
+        for prompt in ["one", "two", "one", "three"] {
+            recall.sent(prompt, (), 0);
+        }
+        assert_eq!(recall.all(), [(1, "three"), (2, "one"), (3, "two")]);
+        assert_eq!(recall.jump(3, "draft", &mut ()).as_deref(), Some("two"));
+        assert_eq!(
+            walk(&mut recall, "↑↓↓↓↓", "two".into()),
+            ["one", "two", "one", "three", "draft"]
+        );
+        assert_eq!(recall.jump(9, "draft", &mut ()), None);
     }
 
     #[test]

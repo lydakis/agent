@@ -1695,6 +1695,16 @@ impl Screen {
                     selection.dragged = true;
                 }
             }
+            // A right click on an agent's name or row: the other way to it
+            // than a click's, its tab or a look beside.
+            MouseEventKind::Down(MouseButton::Right) => {
+                let (.., url) = (self.links.iter()).find(|(y, from, to, _)| {
+                    *y == event.row && (*from..*to).contains(&event.column)
+                })?;
+                let bot = (url.strip_prefix(crate::links::AGENT))
+                    .or(url.strip_prefix(&format!("{BUTTON}task/")))?;
+                return Some(Action::Open(format!("{BUTTON}other/{bot}")));
+            }
             MouseEventKind::Up(MouseButton::Left) => {
                 let selection = self.selection.as_ref()?;
                 if selection.dragged || selection.unit != Unit::Cell {
@@ -2966,6 +2976,17 @@ mod tests {
         );
         assert_eq!(screen.last_agent().as_deref(), Some("calc.neg"));
         assert!(screen.link_cells(&buf).is_empty(), "never an OSC 8 link");
+        // A right click on a name is the other way to it; elsewhere,
+        // nothing.
+        let right = |screen: &mut Screen, x, y| {
+            screen.mouse(mouse(MouseEventKind::Down(MouseButton::Right), x, y))
+        };
+        assert_eq!(
+            right(&mut screen, 2, 0),
+            Some(Action::Open("sonny:other/calc.neg".into()))
+        );
+        assert_eq!(right(&mut screen, 3, 1), None);
+        assert_eq!(right(&mut screen, 8, 0), None);
     }
 
     #[test]

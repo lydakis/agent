@@ -11,6 +11,8 @@ pub struct Settings {
     pub verbose: bool,
     /// When a note opens the margin; `/config` changes it.
     pub margin_opens: agent_client::config::MarginOpens,
+    /// Where a click on an agent's name takes the person.
+    pub agent_opens: agent_client::config::AgentOpens,
 }
 
 impl Default for Settings {
@@ -30,6 +32,7 @@ impl Settings {
             chime: sonny.chime,
             verbose: sonny.verbose,
             margin_opens: sonny.margin_opens,
+            agent_opens: sonny.agent_opens,
         }
     }
 
