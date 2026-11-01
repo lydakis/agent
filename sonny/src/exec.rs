@@ -687,11 +687,64 @@ pub async fn answer(
     run(hub, home_dir().as_deref(), bot, input, left, steps).await
 }
 
+/// Where the whole of an output cut to its budget goes.
+pub enum Whole<'a> {
+    /// Saved in this folder's `output`, when there is one.
+    Saved(Option<&'a Path>),
+    /// Handed back to the machine that called over a link, under the name
+    /// of the file there it is saved to.
+    Sent(&'a Path, &'a Mutex<Option<String>>),
+}
+
+/// Answer the `exec` call `bot` of another machine made over a link, as
+/// `answer` does, with the whole of an output cut to its budget handed
+/// back with the answer, for that machine to save as `named`, since no
+/// file here is that agent's.
+pub async fn lent(
+    hub: &Hub,
+    bot: &str,
+    input: &str,
+    left: Duration,
+    steps: Steps,
+    named: Option<&Path>,
+) -> Result<Value, String> {
+    let servers = agent_client::config::load()?.sonny.mcp_servers;
+    hub.configure(&servers).await;
+    let cut = Mutex::new(None);
+    let whole = match named {
+        Some(named) => Whole::Sent(named, &cut),
+        None => Whole::Saved(None),
+    };
+    let dir = home_dir();
+    let answer = run_keeping(hub, dir.as_deref(), &whole, bot, input, left, Some(steps)).await?;
+    Ok(json!({"answer": answer, "whole": cut.into_inner().unwrap()}))
+}
+
+/// A file for the whole of a cut output, here, for a machine linked here
+/// to name: what it hands back is saved to it.
+pub fn whole_file() -> Option<PathBuf> {
+    let dir = home_dir()?.join("output");
+    Some(fresh(&dir).ok()?.join(format!("{}.txt", stamp())))
+}
+
 /// Run a script against the servers `hub` serves, keeping what it saves
 /// under `dir`.
 async fn run(
     hub: &Hub,
     dir: Option<&Path>,
+    bot: &str,
+    input: &str,
+    left: Duration,
+    steps: Option<Steps>,
+) -> Result<Value, String> {
+    run_keeping(hub, dir, &Whole::Saved(dir), bot, input, left, steps).await
+}
+
+/// `run`, with the whole of an output cut to its budget going to `whole`.
+async fn run_keeping(
+    hub: &Hub,
+    dir: Option<&Path>,
+    whole: &Whole<'_>,
     bot: &str,
     input: &str,
     left: Duration,
@@ -724,7 +777,7 @@ async fn run(
                 &BTreeMap::new(),
                 String::new(),
                 budget,
-                dir,
+                whole,
             )));
         }
     };
@@ -774,7 +827,7 @@ async fn run(
     let body = std::mem::take(&mut *output.lock().unwrap()).body();
     let pictures = std::mem::take(&mut *pictures.lock().unwrap());
     Ok(parts(
-        said(&ended, started, &calls, body, budget, dir),
+        said(&ended, started, &calls, body, budget, whole),
         pictures,
     ))
 }
@@ -905,7 +958,7 @@ fn said(
     calls: &BTreeMap<String, usize>,
     mut body: String,
     budget: usize,
-    dir: Option<&Path>,
+    whole: &Whole<'_>,
 ) -> String {
     let status = match ended {
         Ended::Completed => "Script completed".to_owned(),
@@ -930,7 +983,7 @@ fn said(
         }
         body.push_str(&format!("Script error:\n{error}"));
     }
-    head + &budgeted(body, budget, dir)
+    head + &budgeted(body, budget, whole)
 }
 
 /// What a script printed, a line for each `text()`, kept within
@@ -1026,18 +1079,24 @@ impl Drop for Stop {
 
 /// `body` within `tokens`, of about four bytes each: its start and end,
 /// with the whole saved to a file the cut names.
-fn budgeted(body: String, tokens: usize, dir: Option<&Path>) -> String {
+fn budgeted(body: String, tokens: usize, whole: &Whole<'_>) -> String {
     let bytes = tokens.saturating_mul(4);
     if body.len() <= bytes {
         return body;
     }
-    let saved = dir.and_then(|dir| {
-        let file = fresh(&dir.join("output"))
-            .ok()?
-            .join(format!("{}.txt", stamp()));
-        std::fs::write(&file, &body).ok()?;
-        Some(file)
-    });
+    let saved = match whole {
+        Whole::Saved(dir) => dir.and_then(|dir| {
+            let file = fresh(&dir.join("output"))
+                .ok()?
+                .join(format!("{}.txt", stamp()));
+            std::fs::write(&file, &body).ok()?;
+            Some(file)
+        }),
+        Whole::Sent(named, cut) => {
+            *cut.lock().unwrap() = Some(body.clone());
+            Some(named.to_path_buf())
+        }
+    };
     let half = bytes / 2;
     let mut start = half;
     while !body.is_char_boundary(start) {
@@ -2678,7 +2737,7 @@ text(ALL_TOOLS.map(t => t.name).join(","));"#,
         (std::fs::File::options().write(true).open(&old).unwrap())
             .set_modified(week_ago)
             .unwrap();
-        budgeted("y".repeat(100), 1, dir.parent());
+        budgeted("y".repeat(100), 1, &Whole::Saved(dir.parent()));
         let left: Vec<String> = (std::fs::read_dir(&dir).unwrap().flatten())
             .map(|entry| entry.file_name().to_string_lossy().into_owned())
             .collect();

@@ -408,13 +408,17 @@ pub async fn call(
 /// Open `target`, a web address or a file here, on a machine linked here
 /// that is connected: the machine's name, or why none did.
 pub fn open(target: &str) -> Result<String, String> {
-    let machine = (machines().into_iter())
+    // Those heard from lately, each tried in turn while one is not there.
+    let connected: Vec<Machine> = (machines().into_iter())
         .filter(|machine| machine.open)
-        .find(|machine| {
+        .filter(|machine| {
             seen(&machine.name)
                 .is_some_and(|ms| now_ms().saturating_sub(ms) < SILENT.as_millis() as u64)
         })
-        .ok_or("no machine linked here is connected")?;
+        .collect();
+    if connected.is_empty() {
+        return Err("no machine linked here is connected".into());
+    }
     let payload = match target.starts_with("https://") || target.starts_with("http://") {
         true => json!({"url": target}),
         false => {
@@ -442,28 +446,51 @@ pub fn open(target: &str) -> Result<String, String> {
         }
     };
     let (tx, rx) = std::sync::mpsc::channel();
-    let name = machine.name.clone();
     std::thread::spawn(move || {
-        let answer = tokio::runtime::Builder::new_current_thread()
+        let runtime = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .map_err(|e| e.to_string())
-            .and_then(|runtime| {
-                runtime
-                    .block_on(call(&name, "open", payload, None))
-                    .map_err(|(_, detail)| detail)
-            });
-        let _ = tx.send(answer);
+        {
+            Ok(runtime) => runtime,
+            Err(e) => {
+                let _ = tx.send(Err(e.to_string()));
+                return;
+            }
+        };
+        let mut why = String::new();
+        for machine in connected {
+            // Which it is going to, for a window that stops waiting.
+            let _ = tx.send(Ok(Err(machine.name.clone())));
+            match runtime.block_on(call(&machine.name, "open", payload.clone(), None)) {
+                Ok(_) => {
+                    let _ = tx.send(Ok(Ok(machine.name)));
+                    return;
+                }
+                Err(("not_connected", detail)) => why = detail,
+                Err((_, detail)) => {
+                    let _ = tx.send(Err(detail));
+                    return;
+                }
+            }
+        }
+        let _ = tx.send(Err(why));
     });
-    match rx.recv_timeout(Duration::from_secs(15)) {
-        Ok(Ok(_)) => Ok(machine.name),
-        Ok(Err(error)) => Err(error),
-        // Still on its way, which a large file over a slow link may be: it
-        // opens when it gets there, and this window does not wait.
-        Err(_) => Err(format!(
-            "still sending it to {}; it opens there when it arrives",
-            machine.name
-        )),
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut going = String::new();
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match rx.recv_timeout(left) {
+            Ok(Ok(Ok(name))) => return Ok(name),
+            Ok(Ok(Err(name))) => going = name,
+            Ok(Err(error)) => return Err(error),
+            // Still on its way, which a large file over a slow link may be:
+            // it opens when it gets there, and this window does not wait.
+            Err(_) => {
+                return Err(format!(
+                    "still sending it to {going}; it opens there when it arrives"
+                ));
+            }
+        }
     }
 }
 
@@ -877,8 +904,24 @@ async fn dial(
     let mut ping = tokio::time::interval(PING);
     let mut refused = None;
     // What the host was last told this machine has, told again as it
-    // changes: a server added or taken away, agent-browser installed.
+    // changes: a server added or taken away, agent-browser installed. Read
+    // apart from the calls, since a server starting holds what it knows.
     let mut told: Option<Value> = None;
+    let (fresh, mut freshened) = mpsc::channel::<Value>(1);
+    let refresher = {
+        let (link, hub) = (link.clone(), hub.clone());
+        tokio::spawn(async move {
+            let mut every = tokio::time::interval(PING);
+            loop {
+                every.tick().await;
+                if fresh.send(lends(&link, &hub).await).await.is_err() {
+                    return;
+                }
+            }
+        })
+    };
+    // Aborted however the dial ends, dropped included.
+    let _refresher = AbortOnDrop(refresher);
     loop {
         tokio::select! {
             said = stdout.recv() => {
@@ -927,12 +970,11 @@ async fn dial(
             }
             _ = ping.tick() => {
                 let _ = out.send(json!({"ping": true}));
-                if told.is_some() && refused.is_none() {
-                    let lends = lends(link, hub).await;
-                    if told.as_ref() != Some(&lends) {
-                        let _ = out.send(json!({"hello": {"protocol": PROTOCOL, "lends": lends}}));
-                        told = Some(lends);
-                    }
+            }
+            Some(lends) = freshened.recv() => {
+                if told.is_some() && refused.is_none() && told.as_ref() != Some(&lends) {
+                    let _ = out.send(json!({"hello": {"protocol": PROTOCOL, "lends": lends}}));
+                    told = Some(lends);
                 }
             }
         }
@@ -945,6 +987,14 @@ async fn dial(
         true => "the link closed".into(),
         false => said,
     }))
+}
+
+/// A task aborted when this is dropped.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 /// What this machine lends over `link`: its browser, while agent-browser
@@ -995,7 +1045,8 @@ async fn lend(
         Some(crate::exec::NAME) => {
             let input = payload["input"].as_str().unwrap_or_default();
             let bot = format!("{key}.{}", payload["bot"].as_str().unwrap_or_default());
-            crate::exec::answer(hub, &bot, input, left, Some(steps))
+            let named = payload["whole"].as_str().map(Path::new);
+            crate::exec::lent(hub, &bot, input, left, steps, named)
                 .await
                 .map_err(|e| ("exec_refused", e))
         }

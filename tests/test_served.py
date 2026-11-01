@@ -4,6 +4,7 @@ call's output."""
 import json
 import os
 import queue
+import re
 import shutil
 import subprocess
 import sys
@@ -813,6 +814,15 @@ os.execvpe('sh', ['sh', '-c', command], {{**os.environ, 'HOME': {json.dumps(str(
         self.assertTrue(said.endswith('MCP calls: test 1\nOutput:\nhi'), said)
         # It ran there: the laptop started its server.
         self.assertEqual(len((laptop / 'starts').read_text().splitlines()), 1)
+        # What the output's budget cuts comes back whole, saved here, where the agent reads it.
+        cut = self.call('calc.lead', 'exec', '// @exec: {"machine": "laptop", "max_output_tokens": 10}\n'
+                        'for (let i = 0; i < 50; i++) text("line " + i);', wait=30)
+        saved = re.search(r'the whole output is in (\S+?)…', cut)
+        self.assertTrue(saved, cut)
+        whole = Path(saved.group(1))
+        self.assertTrue(whole.is_relative_to(self.path / '.agent/sonny/exec/output'), whole)
+        self.assertIn('line 25', whole.read_text())
+        self.assertFalse((laptop / '.agent/sonny/exec/output').exists())
         unknown = json.loads(self.call('calc.lead', 'exec', '// @exec: {"machine": "pc"}\ntext(1);'))
         self.assertEqual(unknown['error'], 'no_machine')
         self.assertIn('only laptop', unknown['detail'])

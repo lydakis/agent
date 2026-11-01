@@ -1154,8 +1154,16 @@ async fn script(
         ..
     }) = crate::exec::parse(input)
     {
-        let lent = json!({"input": input, "bot": bot, "timeout_ms": left(call).as_millis() as u64});
-        return crate::link::call(&machine, EXEC, lent, Some(&steps)).await;
+        // What the output's budget cuts comes back whole, saved here, where
+        // the agent reads it.
+        let whole = crate::exec::whole_file();
+        let lent = json!({"input": input, "bot": bot, "timeout_ms": left(call).as_millis() as u64,
+            "whole": whole});
+        let answer = crate::link::call(&machine, EXEC, lent, Some(&steps)).await?;
+        if let (Some(file), Some(text)) = (&whole, answer["whole"].as_str()) {
+            let _ = std::fs::write(file, text);
+        }
+        return Ok(answer["answer"].clone());
     }
     crate::exec::answer(hub, &bot, input, left(call), Some(steps))
         .await
