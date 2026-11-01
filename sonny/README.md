@@ -678,6 +678,8 @@ way `/react` does, and each note in the margin has its own `↩`.
 
   ![/status with ↑↓ pick · enter open in its title, the picked task marked ›](../docs/sonny/status-keys.png)
 
+  ![/status naming each agent's profile beside its model: superlead, task, reviewer](../docs/sonny/status-profile.png)
+
   ![A task opened from /status in the pane, its ‹ going back to /status](../docs/sonny/status-opens-agent.png)
 - `/background` (or `/triggers`, `/lookout`) lists, in the pane beside the
   conversation, what runs for the project's agents with
