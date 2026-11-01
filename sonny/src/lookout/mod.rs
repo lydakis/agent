@@ -119,6 +119,16 @@ pub const TASK_UPDATES: &str = "Task updates: ";
 pub const TASKS_ORIGIN: &str = "lookout.tasks";
 /// An agent whose message a turn carries, by name and id when known.
 type Sender = (String, Option<i64>);
+/// A sender a failed turn's message goes back to, and the turn.
+struct Sent {
+    from: String,
+    id: Option<i64>,
+    bot: String,
+    turn: i64,
+    status: String,
+    error: String,
+}
+
 /// A bounce: the agent and turn that did not carry a message out, and who
 /// sent it.
 type Bounce = (String, i64, String);
@@ -1142,25 +1152,12 @@ impl Service {
                         };
                         self.telling.insert(key, telling);
                     }
-                    // A message another agent sent that a failed turn
-                    // never carried out goes back to it, as a bounce.
+                    // The senders of a turn that failed, kept to bounce
+                    // its message back once the lookouts hear its end.
                     let began = (event["bot"].as_str())
                         .zip(event["turn"].as_i64())
                         .and_then(|(bot, turn)| self.in_flight.get(&(bot.to_owned(), turn)).copied());
-                    for (to, to_id, bot, turn, error) in self.bounced(&event, live) {
-                        let (client, told) = (client.clone(), bounce_told.clone());
-                        let key = (bot.clone(), turn, to.clone());
-                        let note = tokio::spawn(async move {
-                            let sent = tell_bounced(&client, (&to, to_id), (&bot, turn), &error).await;
-                            // Taken, or refused for good: a dropped
-                            // connection's replay tells it again.
-                            if sent.is_err_and(|error| error.code == "daemon_disconnected") {
-                                return;
-                            }
-                            let _ = told.send((bot, turn, to)).await;
-                        });
-                        self.bouncing.insert(key, Telling { note: note.abort_handle(), began, ended: cursor });
-                    }
+                    let bounces = self.sent(&event, live);
                     if let Some((bot, turn)) = self.goals.event(&event, bot_id, live, &client, &checked) {
                         for lookout in self.lookouts.values_mut() {
                             lookout.updates.goal_turn(&bot, turn);
@@ -1206,6 +1203,23 @@ impl Service {
                         (event["event"].as_str(), event["bot"].as_str())
                     {
                         self.index_bot(bot);
+                    }
+                    // A message another agent sent that a failed turn
+                    // never carried out goes back to it, as a bounce: to
+                    // each sender whose lookout did not just hear it end.
+                    for (to, to_id, bot, turn, error) in self.unheard(bounces) {
+                        let (client, told) = (client.clone(), bounce_told.clone());
+                        let key = (bot.clone(), turn, to.clone());
+                        let note = tokio::spawn(async move {
+                            let sent = tell_bounced(&client, (&to, to_id), (&bot, turn), &error).await;
+                            // Taken, or refused for good: a dropped
+                            // connection's replay tells it again.
+                            if sent.is_err_and(|error| error.code == "daemon_disconnected") {
+                                return;
+                            }
+                            let _ = told.send((bot, turn, to)).await;
+                        });
+                        self.bouncing.insert(key, Telling { note: note.abort_handle(), began, ended: cursor });
                     }
                     // The replay tells who belongs to each subscriber and
                     // each task's current brief; what it holds was news then.
@@ -1339,11 +1353,7 @@ impl Service {
     /// than the bot itself and any whose lookout hears the bot already
     /// (a lead hears its task's turn end). Told only of what happens
     /// live; a turn whose start was never seen tells no one.
-    fn bounced(
-        &mut self,
-        event: &Value,
-        live: bool,
-    ) -> Vec<(String, Option<i64>, String, i64, String)> {
+    fn sent(&mut self, event: &Value, live: bool) -> Vec<Sent> {
         let (Some(bot), Some(turn)) = (event["bot"].as_str(), event["turn"].as_i64()) else {
             return Vec::new();
         };
@@ -1376,21 +1386,50 @@ impl Service {
                 {
                     return Vec::new();
                 }
-                // Heard only through a subscription whose filters let this
-                // end through: one that hears only what went well bounces.
-                let hearing = self.watchers.get(bot);
-                let hears = |from: &str| {
-                    hearing.is_some_and(|names| names.iter().any(|n| n == from))
-                        && (self.lookouts.get(from))
-                            .is_none_or(|lookout| lookout.updates.hears_end(bot, turn, status))
-                };
                 (senders.into_iter())
-                    .filter(|(from, _)| !hears(from))
-                    .map(|(from, id)| (from, id, bot.to_owned(), turn, error.to_owned()))
+                    .map(|(from, id)| Sent {
+                        from,
+                        id,
+                        bot: bot.to_owned(),
+                        turn,
+                        status: status.to_owned(),
+                        error: error.to_owned(),
+                    })
                     .collect()
             }
             _ => Vec::new(),
         }
+    }
+
+    /// The senders to tell, of those `sent` named, once the lookouts have
+    /// the turn's end: each but those whose lookout hears it as news, as
+    /// a subscription whose filters let this end through tells it. One
+    /// that hears only what went well bounces.
+    fn unheard(&self, sent: Vec<Sent>) -> Vec<(String, Option<i64>, String, i64, String)> {
+        let hears = |sent: &Sent| {
+            (self.watchers.get(&sent.bot)).is_some_and(|names| names.contains(&sent.from))
+                && (self.lookouts.get(&sent.from)).is_none_or(|lookout| {
+                    lookout
+                        .updates
+                        .hears_end(&sent.bot, sent.turn, &sent.status)
+                })
+        };
+        (sent.into_iter())
+            .filter(|sent| !hears(sent))
+            .map(|sent| (sent.from, sent.id, sent.bot, sent.turn, sent.error))
+            .collect()
+    }
+
+    /// `sent` and `unheard` together, as the event loop runs them around
+    /// the lookouts hearing the event.
+    #[cfg(test)]
+    fn bounced(
+        &mut self,
+        event: &Value,
+        live: bool,
+    ) -> Vec<(String, Option<i64>, String, i64, String)> {
+        let sent = self.sent(event, live);
+        self.unheard(sent)
     }
 
     /// A bot whose sandbox changed is read again before any later event,
