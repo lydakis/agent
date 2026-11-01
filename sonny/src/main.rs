@@ -2160,11 +2160,6 @@ struct App {
     finding: Option<String>,
     /// The reply `/react` picked, which the next emoji sent answers.
     react_to: Option<(i64, String)>,
-    /// The turn of the last reaction sent, whose attaching says nothing.
-    reaction_turn: Option<i64>,
-    /// Messages attached to the bot's next call, by their turns, until a
-    /// call takes them in: the footer's clip.
-    attached: Vec<i64>,
     /// The profile the agent runs as when not its seat's own, for the
     /// agent and folder it was read for.
     profile: std::cell::RefCell<Option<(Seat, Option<String>)>>,
@@ -3213,8 +3208,6 @@ impl App {
             reacting: None,
             finding: None,
             react_to: None,
-            reaction_turn: None,
-            attached: Vec::new(),
             profile: Default::default(),
             declare: None,
             role: served::Role::at(2, 2),
@@ -6104,10 +6097,9 @@ impl App {
     }
 
     /// Drop the staged prompts that landed while Sonny was away, whose
-    /// `accepted` or `steered` it missed, and the attached messages a call
-    /// took in meanwhile: those whose turn no longer waits.
+    /// `accepted` or `steered` it missed: those whose turn no longer waits.
     async fn unstage_landed(&mut self) {
-        let ids = (self.staged.iter().map(|(turn, _)| *turn)).chain(self.attached.iter().copied());
+        let ids = self.staged.iter().map(|(turn, _)| *turn);
         let (Some(first), Some(last)) = (ids.clone().min(), ids.max()) else {
             return;
         };
@@ -6126,12 +6118,7 @@ impl App {
                     .as_array()
                     .into_iter()
                     .flatten()
-                    .filter(|row| {
-                        matches!(
-                            row["status"].as_str(),
-                            Some("queued" | "ready" | "attached")
-                        )
-                    })
+                    .filter(|row| matches!(row["status"].as_str(), Some("queued" | "ready")))
                     .filter_map(|row| row["turn"].as_i64()),
             );
             match page["next_after"].as_i64() {
@@ -6140,7 +6127,6 @@ impl App {
             }
         }
         self.staged.retain(|(turn, _)| waiting.contains(turn));
-        self.attached.retain(|turn| waiting.contains(turn));
     }
 
     /// What was sent and has not landed yet, dim, the way it will read
@@ -6527,10 +6513,8 @@ impl App {
                 }
             }
             "queued" => self.notice = Some(format!("queued behind turn {}", data["behind"])),
-            // Shown as a clip in the footer until a call takes it in.
-            "attached" if turn.is_some() && turn != self.reaction_turn => {
-                self.attached.extend(turn);
-            }
+            // Nothing until a call takes it in: it asks nothing of the
+            // person, so nothing says it waits.
             "text_delta" => {
                 self.thought.clear();
                 // Words nobody reads in zen.
@@ -6880,10 +6864,8 @@ impl App {
                 }
             }
             "turn_finished" => {
-                // A staged prompt whose turn ended without starting, or an
-                // attached message a call took in.
+                // A staged prompt whose turn ended without starting.
                 self.staged.retain(|(staged, _)| Some(*staged) != turn);
-                self.attached.retain(|attached| Some(*attached) != turn);
                 if self.running.as_ref().is_some_and(|r| Some(r.turn) != turn) {
                     return;
                 }
@@ -8608,13 +8590,11 @@ impl App {
                     )
                     .await;
                 match sent {
-                    // No clip in the footer: the margin says it.
                     // Taken away once the agent will hear of it; kept to
                     // close again when it could not be told.
-                    Ok(reply) => {
+                    Ok(_) => {
                         self.margin.remove(id, None);
                         self.closing.insert(id.to_owned());
-                        self.reaction_turn = reply["turn"].as_i64();
                     }
                     Err(error) => self.notice = Some(error.to_string()),
                 }
@@ -10136,13 +10116,10 @@ impl App {
                         "delivery": "attach"}),
                 )
                 .await;
-            match sent {
-                Ok(reply) => self.reaction_turn = reply["turn"].as_i64(),
-                Err(error) => {
-                    let _ = self.reactions.toggle(node, &emoji);
-                    self.notice = Some(error.to_string());
-                    return;
-                }
+            if let Err(error) = sent {
+                let _ = self.reactions.toggle(node, &emoji);
+                self.notice = Some(error.to_string());
+                return;
             }
         }
         self.input.clear();
@@ -11592,18 +11569,6 @@ impl App {
         if notes > 0 && !glancing {
             let forms = vec![vec![Span::raw(format!("✎ {notes}")).dim()], Vec::new()];
             items.push(Item::new(Slot::Notes, forms));
-        }
-        // Messages its next call takes in, which need nothing of the person.
-        let clip = match self.attached.len() {
-            0 => None,
-            1 => Some("📎".to_owned()),
-            n => Some(format!("📎 {n}")),
-        };
-        if let Some(clip) = clip {
-            items.push(Item::new(
-                Slot::Attached,
-                vec![vec![Span::raw(clip).dim()], Vec::new()],
-            ));
         }
         // How full the next round is, as what is left of its window: no
         // hue while there is room, then yellow, then red, and it never
@@ -14378,30 +14343,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_attached_message_is_a_clip_in_the_footer_until_a_call_takes_it() {
+    async fn an_attached_message_says_nothing_while_it_waits() {
         let client = daemon_with(json!([])).await;
         let mut app = app(client);
-        app.daemon(turn_event("attached", 5, json!({"status": "attached"})))
-            .await;
-        assert_eq!(app.notice, None, "nothing for the person to do");
-        let footer = app.footer_line(120).to_string();
-        assert!(
-            footer.contains("📎") && !footer.contains("📎 2"),
-            "{footer}"
-        );
-        app.daemon(turn_event("attached", 6, json!({"status": "attached"})))
-            .await;
-        assert!(app.footer_line(120).to_string().contains("📎 2"));
-        // Taken in by the running turn's next call.
+        let before = app.footer_line(120).to_string();
         for turn in [5, 6] {
-            app.daemon(turn_event(
-                "turn_finished",
-                turn,
-                json!({"status": "steered", "into": 4}),
-            ))
-            .await;
+            app.daemon(turn_event("attached", turn, json!({"status": "attached"})))
+                .await;
         }
-        assert!(!app.footer_line(120).to_string().contains('📎'));
+        assert_eq!(app.notice, None, "nothing for the person to do");
+        assert_eq!(
+            app.footer_line(120).to_string(),
+            before,
+            "no clip, no count"
+        );
+        assert!(drawn(&mut app).iter().all(|row| !row.contains('📎')));
     }
 
     #[tokio::test]
@@ -16195,7 +16151,6 @@ mod tests {
             let post = json!({"id": id, "title": id, "markdown": "x"});
             app.margin.apply(id, &post, None, None);
         }
-        app.attached = vec![1, 2];
         app.context = Some(126_000);
         app.window = Some(200_000);
         let sgr = |span: &Span| {
@@ -17315,8 +17270,6 @@ mod tests {
         assert_eq!(margin::closed(told), Some("repro"));
         assert_eq!(sent[0]["origin"], "margin");
         assert!(quiet_message(told));
-        // No clip in the footer for it.
-        assert_eq!(app.reaction_turn, Some(12));
     }
 
     #[tokio::test]

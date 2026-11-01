@@ -29,7 +29,6 @@ pub enum Slot {
     Working,
     Background,
     Notes,
-    Attached,
     /// The context while under half of it is used: good to know.
     RoomyContext,
     /// The context once half of it is used: it never goes.
@@ -44,12 +43,11 @@ impl Slot {
 
 /// The order things give way: each step takes that item to its next
 /// form, and a step for an item absent or at its last form is passed.
-const LADDER: [Slot; 17] = [
+const LADDER: [Slot; 16] = [
     Slot::Background,
     Slot::Access,
     Slot::Place,
     Slot::RoomyContext,
-    Slot::Attached,
     Slot::Working,
     Slot::Place,
     Slot::Notes,
@@ -273,7 +271,6 @@ mod tests {
             Item::new(Slot::Working, count("●", Color::Cyan, 2, "working", true)).opens("status"),
             word(Slot::Background, &["↻ 3 in background", "↻ 3", ""]),
             word(Slot::Notes, &["✎ 2", ""]),
-            word(Slot::Attached, &["📎 2", ""]),
             Item::new(
                 Slot::LowContext,
                 vec![

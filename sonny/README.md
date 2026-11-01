@@ -476,8 +476,7 @@ agent then does. Esc stops a command still running.
 
 An emoji sent alone is a reaction, not a message: it goes under the
 agent's last reply and is attached to the agent's next call, so it starts
-no turn. While something waits to go with the next call, the footer shows
-a small 📎 (`📎 2` for two). `/react` picks an older reply, and sending an emoji already on a
+no turn. `/react` picks an older reply, and sending an emoji already on a
 reply takes it off. The agent reacts too, with a `react` tool Sonny
 declares on it: 👍 or 🎉 under
 your message when that is all it needs, or 👀 while it looks, taken off
@@ -1088,8 +1087,9 @@ between agents) sit together, with no blank row between. Words that only
 rode along on a call, an attach note from an automation that found the
 agent busy or from another agent, are no message: once the agent reads
 them they hang right under what that call carried, your message or the
-step it joined, as `📎 From an automation ▸`, the clip the footer showed
-while they waited, and a click opens them the same way. A turn that ends
+step it joined, as `📎 From an automation ▸`, and a click opens them the
+same way. Nothing says such words are waiting: they ask nothing of you, so
+they turn up only once the agent has read them. A turn that ends
 with the model saying nothing (`empty_completion`) ends quietly, not as a
 failure.
 
@@ -1275,7 +1275,7 @@ opens `/status`; and next to the model the agent's profile when it runs one
 that isn't its seat's own (`lead` for a lead, `task` for a task). The left
 of the footer says what you talk to and where (the permissions mark, the
 model as pickers name it, its effort, the folder and its branch), and the
-right what wants you (needs you, failed, working, `↻`, `✎`, `📎`, the
+right what wants you (needs you, failed, working, `↻`, `✎`, the
 context). The agent's name is left to the composer, which says it. When
 the window is too narrow for all of it, items give way in one order, as
 Powerline drops its lowest segments first: words before marks, marks
