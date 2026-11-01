@@ -4582,11 +4582,13 @@ impl Turn {
     }
 
     /// Whether the daemon's load gate holds `call` back now: a foreground
-    /// command, while the machine is over its load and one of the
-    /// daemon's commands runs.
+    /// command that may run, while the machine is over its load and one
+    /// of the daemon's commands runs.
     fn load_holds(&self, record: &Bot, call: &ToolCall) -> bool {
         !self.registry.admits()
             && record.declared(&call.name).is_none()
+            // A forbidden command is refused at once: it starts nothing.
+            && !matches!(record.ruling(call, &self.ruled()), Ok(Ruling::Forbidden(_)))
             && record.callable().iter().any(|name| name == &call.name)
             && matches!(
                 self.registry.prepare(&call.name, &call.arguments),
@@ -6565,8 +6567,26 @@ mod tests {
             side: Default::default(),
             stopping: Arc::new(AtomicBool::new(false)),
         };
-        let _ = task.rules.set(Arc::default());
+        let mut policy = agent_runtime::rules::Policy::default();
+        (policy.parse(
+            "test.rules",
+            r#"prefix_rule(pattern = ["rm"], decision = "forbidden")"#,
+        ))
+        .unwrap();
+        let _ = task
+            .rules
+            .set(Arc::new(agent_runtime::rules::Rules::new(policy)));
         let _ = task.settings.set(record.settings.clone());
+        // A forbidden command starts nothing: it is refused at once,
+        // however loaded the machine.
+        let forbidden = ToolCall {
+            custom: false,
+            name: "shell".into(),
+            call_id: "shell-2".into(),
+            arguments: json!({"command": "rm -rf x"}).to_string(),
+        };
+        assert!(task.load_holds(&record, &calls[1]));
+        assert!(!task.load_holds(&record, &forbidden));
         // The read first would run with the command beside it: the gate
         // holds both, neither started, and names the command it holds.
         let stop = tokio::time::timeout(

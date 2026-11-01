@@ -6727,3 +6727,35 @@ the load, at a p95 of 20 s. At 100 subscribers they named every one, at a
 p95 of 2.8 s. A lead takes its notes one turn at a time, so a hundred
 tasks finishing together queue behind each other. That is the lookout's
 batching question, not the daemon's.
+
+## Daemon limits from the config, and a load gate (#575)
+
+Every tool round now asks the load gate whether its commands may start,
+and a round's parallel batch is formed before that check. With no gate
+(`serve` alone, as the screen runs it) the check is one `Option` test per
+call; with one, a borrow of a `watch` value and a semaphore count. Parks
+on the gate are one commit, as a verdict park is, and the waker reads the
+store only after a turn parks.
+
+The Perf workflow's matched screen, base `main` against this branch at
+f933397, three alternating rounds each on a GitHub runner (medians):
+
+| Measure | Base | Head | Change |
+| --- | ---: | ---: | ---: |
+| Lone submit CPU, ms | 30.129 | 30.134 | +0.0% |
+| Burst submit p99, ms | 3.113 | 3.084 | -0.9% |
+| Release to terminal p99, ms | 8.919 | 8.62 | -3.3% |
+| Idle RSS, MiB | 20.34 | 20.396 | +0.3% |
+| Per idle bot, KiB | 1.448 | 1.526 | +5.4% |
+| RSS after a turn each, MiB | 28.805 | 28.506 | -1.0% |
+| Daemon CPU per turn, ms | 0.93 | 0.901 | -3.1% |
+| Lifecycle CPU, s | 0.9 | 0.84 | -6.7% |
+| Lifecycle p95 turn, ms | 589.565 | 585.295 | -0.7% |
+| Lifecycle peak RSS, MiB | 27.223 | 27.314 | +0.3% |
+
+Nothing moved past noise. Per idle bot rose by 0.08 KiB, within the
+footprint bench's spread from run to run; the change adds nothing kept
+per bot (the gate's state is one per daemon). The later commits on this
+branch (the batch held whole, forbidden commands refused before the
+gate, the gate's waiters in order) change only which branch a call
+takes, not what runs on the hot path.

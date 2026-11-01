@@ -490,6 +490,10 @@ pub struct Registry {
     /// Set when a turn parks on the load gate, so the daemon looks for
     /// parked turns to wake only while some may be there.
     load_parked: Arc<std::sync::atomic::AtomicBool>,
+    /// The line of background commands waiting at the load gate, in the
+    /// order they came: a fair lock its first holds while it waits, so a
+    /// later one never takes a slot ahead of it.
+    load_line: Arc<tokio::sync::Mutex<()>>,
     /// Running terminals, by proc handle, each its bot's own.
     #[cfg(unix)]
     terminals: terminal::Terminals,
@@ -1222,6 +1226,7 @@ impl Registry {
             budget: DEFAULT_PROCESS_BUDGET,
             load: None,
             load_parked: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            load_line: Arc::default(),
             pending: Arc::default(),
             lasting_slots: Arc::new(Semaphore::new(default_lasting())),
             lasting_budget: default_lasting(),
@@ -1410,9 +1415,10 @@ impl Registry {
     }
     /// Wait until the load gate lets a command start, then take a process
     /// slot, and look again with the slot held: one that waited for its
-    /// slot while the gate shut gives it back and waits again. A
-    /// background command waits here holding no turn; a turn's foreground
-    /// command parks before it gets here instead.
+    /// slot while the gate shut gives it back and waits again. Waiters go
+    /// in the order they came, one at a time at the gate. A background
+    /// command waits here holding no turn; a turn's foreground command
+    /// parks before it gets here instead.
     async fn admitted_slot(
         &self,
     ) -> std::result::Result<tokio::sync::OwnedSemaphorePermit, tokio::sync::AcquireError> {
@@ -1420,6 +1426,7 @@ impl Registry {
             return self.slots.clone().acquire_owned().await;
         };
         let mut open = open.clone();
+        let _first = self.load_line.lock().await;
         loop {
             while !*open.borrow_and_update() && self.running() > 0 {
                 // A gate that stopped reading lets everything through.
@@ -1448,9 +1455,10 @@ impl Registry {
     pub fn queue(&self) -> Result<Queued> {
         use std::sync::atomic::Ordering::Relaxed;
         // A free slot is taken here, not in the task, so the line counts
-        // only commands that truly wait; the semaphore is fair, so this
-        // never overtakes a waiter.
-        if self.admits()
+        // only commands that truly wait; the semaphore is fair, and none
+        // waits at the load gate, so this never overtakes a waiter.
+        if let Ok(_line) = self.load_line.try_lock()
+            && self.admits()
             && let Ok(permit) = self.slots.clone().try_acquire_owned()
         {
             return Ok(Queued {
@@ -2898,8 +2906,12 @@ mod tests {
         });
         tokio::task::yield_now().await;
         assert!(!waiting.is_finished());
-        // The running one ends: at the next look, the waiter goes.
+        // The running one ends. A command that comes before the next
+        // look waits behind the one at the gate, as a line does: then the
+        // first goes.
         drop(first);
+        assert!(registry.admits());
+        assert!(registry.queue().unwrap().permit.is_none());
         gate.send_modify(|_| {});
         let second = tokio::time::timeout(Duration::from_secs(5), waiting)
             .await
