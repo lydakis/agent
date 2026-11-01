@@ -649,8 +649,18 @@ pub fn card() -> Vec<ratatui::text::Line<'static>> {
         }
         lines.push(Line::default());
     }
-    lines.push(Line::from(" Agents call these through exec. Add or remove one with").dim());
-    lines.push(Line::from(" sonny mcp add or sonny mcp remove; sonny mcp list starts each.").dim());
+    // Commands in code's hue, as a reply draws them.
+    let code = |text: &'static str| Span::raw(text).fg(ratatui::style::Color::Cyan);
+    lines.push(Line::from(" Agents call these through exec.").dim());
+    lines.push(Line::from(vec![
+        Span::raw(" Add or remove one with ").dim(),
+        code("sonny mcp add"),
+        Span::raw(" or ").dim(),
+        code("sonny mcp remove"),
+        Span::raw("; ").dim(),
+        code("sonny mcp list"),
+        Span::raw(" starts each.").dim(),
+    ]));
     lines
 }
 

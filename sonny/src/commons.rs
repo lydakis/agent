@@ -1486,11 +1486,15 @@ impl View {
         let count = self.threads.len();
         // Numbers, read as numbers: a listing short of one says 0, never null.
         let invites = |key: &str| self.invites[key].as_u64().unwrap_or(0);
+        // The pane's title names it: its first row counts what it holds.
         let mut out = vec![Line::from(vec![
-            Span::raw("The commons").bold(),
             Span::raw(format!(
-                " · {count} thread{} · {} of {} invited today, {} invites each · {} of {} answered this week",
-                if count == 1 { "" } else { "s" },
+                "{count} thread{}",
+                if count == 1 { "" } else { "s" }
+            ))
+            .bold(),
+            Span::raw(format!(
+                " · {} of {} invited today, {} invites each · {} of {} answered this week",
                 invites("today"),
                 invites("a_day"),
                 invites("reach"),
@@ -1517,20 +1521,17 @@ impl View {
                 at = out.len();
             }
             let text = |key: &str| thread[key].as_str().unwrap_or_default().to_owned();
-            let title = match picked {
-                true => Span::raw(text("title")).bold().reversed(),
-                false => Span::raw(text("title")).bold(),
-            };
-            let pick = match picked {
-                true => Span::raw("› ").fg(Color::Cyan).bold(),
-                false => Span::raw("  "),
-            };
-            out.extend(crate::transcript::wrap(
-                Line::from(vec![pick, title]),
+            let title = Span::raw(text("title")).bold();
+            let mut first = crate::transcript::wrap(
+                Line::from(vec![Span::raw("  "), title]),
                 width,
                 Span::raw(""),
                 Span::raw("  "),
-            ));
+            );
+            if picked && let Some(row) = first.first_mut() {
+                crate::list::pick(row);
+            }
+            out.extend(first);
             let posts = thread["posts"].as_u64().unwrap_or(0);
             let mut facts = vec![
                 format!("{posts} post{}", if posts == 1 { "" } else { "s" }),
@@ -1564,8 +1565,9 @@ impl View {
         for post in read["posts"].as_array().into_iter().flatten() {
             out.push(Line::default());
             let mut head = vec![
+                // An agent's name in the agents' hue, as everywhere.
                 Span::raw(post["by"].as_str().unwrap_or_default().to_owned())
-                    .fg(Color::Cyan)
+                    .fg(Color::Blue)
                     .bold(),
             ];
             // The model it was written with, as people say it.
@@ -1574,7 +1576,8 @@ impl View {
             }
             head.push(Span::raw(format!(" · {}", post["when"].as_str().unwrap_or_default())).dim());
             if post["external"] == true {
-                head.push(Span::raw(" · external").fg(Color::Yellow));
+                // Nothing to act on: muted, as the rest of the line.
+                head.push(Span::raw(" · external").dim());
             }
             out.push(Line::from(head));
             let mut markdown = crate::transcript::Markdown::default();
@@ -1589,17 +1592,20 @@ impl View {
     }
 
     /// The line under the card: what went wrong, or the keys.
-    pub fn footer(&self) -> Line<'static> {
-        if let Some(notice) = &self.notice {
-            return Line::from(format!("  {notice}")).fg(Color::Yellow);
-        }
-        let keys = match (&self.open, self.threads.len()) {
+    pub fn footer(&self) -> Option<Line<'static>> {
+        self.notice
+            .as_ref()
+            .map(|notice| Line::from(notice.clone()))
+    }
+
+    /// What the keys do, as the pane's title says it.
+    pub fn keys(&self) -> &'static str {
+        match (&self.open, self.threads.len()) {
             (Some(_), _) => "↑↓ scroll · esc back",
             (None, 0) => "esc close",
             (None, 1) => "enter read · esc close",
             (None, _) => "↑↓ pick · enter read · esc close",
-        };
-        Line::from(crate::hint::spans(&format!("  {keys}")))
+        }
     }
 }
 
@@ -2135,13 +2141,8 @@ mod tests {
         let listed = text(view.card(60).0);
         let at = |needle: &str| listed.iter().position(|l| l.contains(needle)).unwrap();
         assert!(at("New one") < at("Old one"), "{listed:?}");
-        let footer: String = view
-            .footer()
-            .spans
-            .iter()
-            .map(|span| span.content.as_ref())
-            .collect();
-        assert_eq!(footer, "  ↑↓ pick · enter read · esc close");
+        assert_eq!(view.keys(), "↑↓ pick · enter read · esc close");
+        assert_eq!(view.footer(), None);
         view.key(KeyEvent::from(KeyCode::Down));
         view.key(KeyEvent::from(KeyCode::Enter));
         let read = text(view.card(60).0);

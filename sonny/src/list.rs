@@ -80,6 +80,24 @@ pub fn lines(items: &[Item], pick: usize, width: usize, room: usize) -> Vec<Line
     out
 }
 
+/// `line`, a row of a list in the pane, drawn as the picker draws its
+/// pick: reversed from its first mark to a column past its last word, its
+/// muted words at the text's own weight, its lead left as it was.
+pub fn pick(line: &mut Line<'static>) {
+    let mut leading = true;
+    for span in &mut line.spans {
+        if leading && span.content.trim().is_empty() {
+            continue;
+        }
+        leading = false;
+        span.style = span.style.remove_modifier(ratatui::style::Modifier::DIM);
+        span.style = span.style.add_modifier(ratatui::style::Modifier::REVERSED);
+    }
+    if !leading {
+        line.spans.push(Span::raw(" ").reversed());
+    }
+}
+
 /// `name` in runs, the chars at `found` bold, all reversed when picked.
 fn marked(name: &str, found: &[usize], picked: bool) -> Vec<Span<'static>> {
     let mut runs: Vec<(String, bool)> = Vec::new();
