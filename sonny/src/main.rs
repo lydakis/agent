@@ -2786,6 +2786,8 @@ impl Fleet {
         let note = (!layout.here()).then(|| format!("tasks open in {}", layout.home()));
         mux::install_skill(options.rex_host.as_deref());
         let (tell, said) = tokio::sync::mpsc::unbounded_channel();
+        let mut layout = layout;
+        layout.keep_aside(used::aside());
         let mut fleet = Self {
             layout: mux::Worker::new(layout),
             said,

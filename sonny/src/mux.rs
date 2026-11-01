@@ -137,6 +137,17 @@ pub type Used = Arc<dyn Fn(&str) -> Option<SystemTime> + Send + Sync>;
 /// Whether a task's window holds its place, by its task.
 pub type Held = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
+/// Where a lead keeps which of its tasks' windows it closed for room, so
+/// that a lead started again still opens one the person asks to see.
+#[derive(Clone)]
+pub struct Aside {
+    pub was: Held,
+    pub set: SetAside,
+}
+
+/// Mark a task's window as closed for room, or not.
+pub type SetAside = Arc<dyn Fn(&str, bool) + Send + Sync>;
+
 /// What [`Layout::show_task`] did.
 #[derive(Debug, PartialEq)]
 pub enum Shown {
@@ -374,8 +385,10 @@ pub struct Layout {
     following: Arc<Mutex<Following>>,
     /// When Sonny last opened or brought each task's window into view.
     used: HashMap<String, SystemTime>,
-    /// Tasks whose window was closed for room ([`Room`]).
+    /// Tasks whose window was closed for room ([`Room`]), and where they
+    /// are kept past this Sonny, when they are.
     aside: HashSet<String>,
+    kept: Option<Aside>,
 }
 
 impl Drop for Layout {
@@ -406,6 +419,24 @@ impl Layout {
             following: Arc::default(),
             used: HashMap::new(),
             aside: HashSet::new(),
+            kept: None,
+        }
+    }
+
+    /// Keep which tasks' windows were closed for room in `kept` too.
+    pub fn keep_aside(&mut self, kept: Aside) {
+        self.kept = Some(kept);
+    }
+
+    fn set_aside(&mut self, bot: &str, aside: bool) {
+        let changed = match aside {
+            true => self.aside.insert(bot.to_owned()),
+            false => self.aside.remove(bot),
+        };
+        if let Some(kept) = &self.kept
+            && (changed || (kept.was)(bot) != aside)
+        {
+            (kept.set)(bot, aside);
         }
     }
 
@@ -579,23 +610,24 @@ impl Layout {
         if self.adopt(bot, &listed) {
             return Ok(Shown::Had);
         }
-        if self.aside.contains(bot) && !asked {
+        if self.aside(bot) && !asked {
             return Ok(Shown::Aside);
         }
         let closed = self.make_room(bot, &listed, room);
         self.place(bot, name, command, &Placement::Window)?;
-        self.aside.remove(bot);
+        self.set_aside(bot, false);
         self.used.insert(bot.to_owned(), SystemTime::now());
         Ok(Shown::Opened(closed))
     }
 
     /// Whether the task's window was closed for room.
     pub fn aside(&self, bot: &str) -> bool {
-        self.aside.contains(bot)
+        self.aside.contains(bot) || self.kept.as_ref().is_some_and(|kept| (kept.was)(bot))
     }
 
     /// Close the windows the person used least recently, so that one more
-    /// for `bot` keeps the project's within `room`. Returns their tasks.
+    /// for `bot` keeps the project's within `room`. A window counts once,
+    /// with every task placed in it, and closes whole. Returns their tasks.
     fn make_room(&mut self, bot: &str, listed: &[Block], room: &Room) -> Vec<String> {
         if room.most == 0 {
             return Vec::new();
@@ -604,35 +636,62 @@ impl Layout {
         let owners: HashSet<&str> = (listed.iter())
             .filter_map(|b| b.label.split_once('/').map(|(owner, _)| owner))
             .collect();
-        let mut windows: Vec<&str> = (listed.iter())
-            .map(|b| b.label.as_str())
-            .filter(|label| {
-                label.starts_with(&tasks)
-                    && !label.contains('/')
-                    && !crate::project::is_lead(label)
-                    && room.mine.contains(*label)
-                    && *label != bot
-            })
-            .collect();
-        windows.sort_unstable();
-        windows.dedup();
+        let task = |label: &str| {
+            label.starts_with(&tasks)
+                && !label.contains('/')
+                && !crate::project::is_lead(label)
+                && room.mine.contains(label)
+                && label != bot
+        };
+        // Each window and its tasks; a task window holds this lead's tasks
+        // and the blocks they asked for alone (a task split beside its
+        // lead is the lead's).
+        let mut windows: Vec<(&str, Vec<&str>)> = Vec::new();
+        let mut others: HashSet<&str> = HashSet::new();
+        for block in listed {
+            let owner =
+                (block.label.split_once('/')).map_or(block.label.as_str(), |(owner, _)| owner);
+            if !task(owner) {
+                others.insert(&block.window);
+                continue;
+            }
+            match windows
+                .iter_mut()
+                .find(|(window, _)| *window == block.window)
+            {
+                Some((_, labels)) => labels.push(owner),
+                None => windows.push((&block.window, vec![owner])),
+            }
+        }
+        windows.retain(|(window, _)| !others.contains(window));
+        for (_, labels) in &mut windows {
+            labels.sort_unstable();
+            labels.dedup();
+        }
         let over = (windows.len() + 1).saturating_sub(room.most);
-        let mut spare: Vec<(SystemTime, &str)> = (windows.into_iter())
-            .filter(|label| {
-                !room.keep.contains(*label) && !owners.contains(label) && !(room.held)(label)
+        let mut spare: Vec<(SystemTime, Vec<&str>)> = (windows.into_iter())
+            .filter(|(_, labels)| {
+                labels.iter().all(|label| {
+                    !room.keep.contains(*label) && !owners.contains(label) && !(room.held)(label)
+                })
             })
-            .map(|label| {
-                let used = self.used.get(label).copied().max((room.used)(label));
-                (used.unwrap_or(SystemTime::UNIX_EPOCH), label)
+            .map(|(_, labels)| {
+                let used = (labels.iter())
+                    .filter_map(|label| self.used.get(*label).copied().max((room.used)(label)))
+                    .max();
+                (used.unwrap_or(SystemTime::UNIX_EPOCH), labels)
             })
             .collect();
         spare.sort_unstable();
-        let closed: Vec<String> = (spare.into_iter().take(over))
-            .map(|(_, label)| label.to_owned())
+        let mut closed: Vec<String> = (spare.into_iter().take(over))
+            .flat_map(|(_, labels)| labels)
+            .map(str::to_owned)
             .collect();
+        closed.sort_unstable();
+        closed.dedup();
         for bot in &closed {
             self.close(bot);
-            self.aside.insert(bot.clone());
+            self.set_aside(bot, true);
         }
         closed
     }
@@ -789,7 +848,7 @@ impl Layout {
     pub fn close(&mut self, bot: &str) {
         let known = self.blocks.remove(bot);
         self.used.remove(bot);
-        self.aside.remove(bot);
+        self.set_aside(bot, false);
         let owned = format!("{bot}/");
         for block in self.listed().into_iter().filter(|b| {
             b.label == bot || b.label.starts_with(&owned) || Some(&b.id) == known.as_ref()
@@ -1242,6 +1301,100 @@ mod tests {
             open(&mut layout, "shop.c", &room(0, &[]), false),
             Shown::Opened(vec![])
         );
+    }
+
+    #[test]
+    fn a_window_counts_once_with_every_task_placed_in_it_and_closes_whole() {
+        let fake = Fake::default();
+        fake.add("shop.lead", "lead");
+        let mut layout = Layout::new(Box::new(fake));
+        let mut room = Room {
+            most: 2,
+            project: "shop".into(),
+            mine: ["shop.a", "shop.b", "shop.c", "shop.d"]
+                .map(String::from)
+                .into(),
+            keep: HashSet::new(),
+            used: Arc::new(|bot: &str| (bot == "shop.a").then(SystemTime::now)),
+            held: Arc::new(|_: &str| false),
+        };
+        for bot in ["shop.a", "shop.b"] {
+            layout.show_task(bot, bot, &[], &room, false).unwrap();
+        }
+        // `c` shown beside `b`: two windows still, so nothing closes.
+        let beside = Placement::Split {
+            side: "right".into(),
+            beside: "shop.b".into(),
+        };
+        layout.place("shop.c", "shop.c", &[], &beside).unwrap();
+        layout.used.clear();
+        // One more is over: the window used longest ago goes, both its tasks.
+        assert_eq!(
+            layout
+                .show_task("shop.d", "shop.d", &[], &room, false)
+                .unwrap(),
+            Shown::Opened(vec!["shop.b".into(), "shop.c".into()])
+        );
+        // A window one of whose tasks failed stays whole.
+        room.most = 1;
+        room.held = Arc::new(|bot: &str| bot == "shop.d");
+        layout.used.clear();
+        assert_eq!(
+            layout
+                .show_task("shop.b", "shop.b", &[], &room, true)
+                .unwrap(),
+            Shown::Opened(vec!["shop.a".into()])
+        );
+    }
+
+    #[test]
+    fn a_lead_started_again_still_opens_a_window_it_closed_for_room() {
+        let kept: Arc<Mutex<HashSet<String>>> = Arc::default();
+        let aside = || {
+            let (was, set) = (kept.clone(), kept.clone());
+            Aside {
+                was: Arc::new(move |bot: &str| was.lock().unwrap().contains(bot)),
+                set: Arc::new(move |bot: &str, aside| {
+                    let mut set = set.lock().unwrap();
+                    match aside {
+                        true => set.insert(bot.to_owned()),
+                        false => set.remove(bot),
+                    };
+                }),
+            }
+        };
+        let room = Room {
+            most: 1,
+            project: "shop".into(),
+            mine: ["shop.a", "shop.b"].map(String::from).into(),
+            keep: HashSet::new(),
+            used: Arc::new(|_: &str| None),
+            held: Arc::new(|_: &str| false),
+        };
+        let fake = Fake::default();
+        let mut layout = Layout::new(Box::new(fake));
+        layout.keep_aside(aside());
+        layout
+            .show_task("shop.a", "shop.a", &[], &room, false)
+            .unwrap();
+        layout
+            .show_task("shop.b", "shop.b", &[], &room, false)
+            .unwrap();
+        assert!(kept.lock().unwrap().contains("shop.a"));
+        // Started again: it knows `a` was closed for room, not done.
+        let mut again = Layout::new(Box::new(Fake::default()));
+        again.keep_aside(aside());
+        assert!(again.aside("shop.a"));
+        assert_eq!(
+            again
+                .show_task("shop.a", "shop.a", &[], &room, false)
+                .unwrap(),
+            Shown::Aside
+        );
+        again
+            .show_task("shop.a", "shop.a", &[], &room, true)
+            .unwrap();
+        assert!(!kept.lock().unwrap().contains("shop.a"));
     }
 
     #[test]

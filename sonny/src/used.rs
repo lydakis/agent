@@ -5,7 +5,11 @@
 //! lead reads the file's time only when it needs room. A file is a
 //! window's own, so two windows never write one line of the same file.
 //!
-//! Beside it, in `~/.agent/sonny/held/`, a window's Sonny keeps a file
+//! A lead keeps, in `~/.agent/sonny/aside/`, a file for each of its tasks
+//! whose window it closed for room, so that one started again still opens
+//! that window when the person asks to see the task ([`aside`]).
+//!
+//! Beside them, in `~/.agent/sonny/held/`, a window's Sonny keeps a file
 //! while its agent failed or needs the person, as it reports its status to
 //! the multiplexer: such a window is never closed for room, also by a lead
 //! that started again since and has not heard so itself.
@@ -125,6 +129,25 @@ pub fn held(bot: &str) -> bool {
     in_dir("held", bot).is_some_and(|file| file.exists())
 }
 
+/// Where a lead keeps which of its tasks' windows it closed for room: a
+/// file each, written on the layout's own thread.
+pub fn aside() -> crate::mux::Aside {
+    crate::mux::Aside {
+        was: std::sync::Arc::new(|bot| in_dir("aside", bot).is_some_and(|file| file.exists())),
+        set: std::sync::Arc::new(|bot, aside| {
+            let Some(file) = in_dir("aside", bot) else {
+                return;
+            };
+            match aside {
+                true => mark(&file),
+                false => {
+                    let _ = std::fs::remove_file(file);
+                }
+            }
+        }),
+    }
+}
+
 /// A window's marks: the last one, kept so the next waits [`EVERY`].
 #[derive(Default)]
 pub struct Marks {
@@ -167,7 +190,7 @@ pub fn when(bot: &str) -> Option<SystemTime> {
 
 /// The agent is gone: so is its file.
 pub fn forget(bot: &str) {
-    for dir in ["used", "held"] {
+    for dir in ["used", "held", "aside"] {
         if let Some(file) = in_dir(dir, bot) {
             let _ = std::fs::remove_file(file);
         }

@@ -310,13 +310,15 @@ windows open, 32 by default (0 for no limit), as VS Code's editor limit
 keeps editors: past it, a new one closes the window you used least
 recently, as each window's own Sonny saw you focus, type or click there
 (marked in `~/.agent/sonny/used/`). Only the lead's own tasks' windows
-count and close, as another lead of the folder keeps its own. One that
+count and close, as another lead of the folder keeps its own; tasks shown
+together in one window count once and close together. One that
 needs you (an approval, or a question open in it), failed, or holds a
 block its task asked for (a dev server) is never closed for room, as the
 lead heard or as that window's own Sonny last said (kept in
 `~/.agent/sonny/held/`, so it holds across either one starting again);
 with no other, the limit is passed. A window closed for room stays closed while its
-task works on, and `/status` (or its name) opens it again. `--rex-host HOST` puts the session on another Rex
+task works on, and `/status` (or its name) opens it again, also after the
+lead starts again (kept in `~/.agent/sonny/aside/`). `--rex-host HOST` puts the session on another Rex
 server; `--no-layout` turns the layout off. Sonny writes the skill for the
 multiplexer it runs in to `~/.agents/skills` (`rex-windows`,
 `herdr-panes` or `cmux-tabs`, from `skills/`), so any agent can run a long command where
