@@ -206,10 +206,10 @@ the last through scripts that call many tools and return only what they print.
 For one quick task, use Claude Code or Codex: you ask, you watch, and the
 answer comes straight back, with no lead between you and the work. That is a
 recommendation from using both, not a measured comparison. They keep your
-attention on one task; Sonny lets you spend less attention across many. It is for the work
-you don't want to watch closely: five things rather than one, each needing a
-question answered or a decision now and then, while mail, chat and other
-people keep adding to it.
+attention on one task; Sonny lets you spend less attention across many. It
+is for the work you don't want to watch closely: five things rather than
+one, each needing a question answered or a decision now and then, while
+mail, chat and other people keep adding to it.
 
 You hand the folder's lead several things at once. It starts a task for
 each and hears how every turn ended through the [lookout](docs/LOOKOUT.md),
