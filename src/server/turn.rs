@@ -197,9 +197,9 @@ pub struct Turn {
     /// The bot's context, compaction and approval settings, read with its
     /// record when the turn's rounds begin.
     pub settings: std::sync::OnceLock<Settings>,
-    /// The command rules, read as the turn's rounds begin: every round
-    /// rules its calls by them, so one that announces a call and the run
-    /// that starts it agree.
+    /// The bot's command rules, read with its record as the turn's rounds
+    /// begin: every round rules its calls by them, so one that announces a
+    /// call and the run that starts it agree.
     pub rules: std::sync::OnceLock<Arc<agent_runtime::rules::Rules>>,
     /// While a resumed park's calls run, what the rules made of them as
     /// their round was announced; otherwise the turn's own `rules`.
@@ -2134,13 +2134,10 @@ impl Turn {
         self.settings
             .get_or_init(|| self.with_one_lifetime(&record, &context.model));
         if self.rules.get().is_none() {
-            // Reading the folder touches the filesystem: off the runtime
-            // thread.
-            let folder = self.registry.rules_folder();
-            let rules = tokio::task::spawn_blocking(move || folder.current())
-                .await
-                .map_err(|_| Error::with("rules_invalid", "the rules could not be read"))?;
-            let _ = self.rules.set(rules);
+            let policy = record.settings.rules.clone().unwrap_or_default();
+            let _ = self
+                .rules
+                .set(Arc::new(agent_runtime::rules::Rules::new(policy)));
         }
         // A turn may run at its own effort; everything after reads the record.
         record.effort = context.effort.clone();
@@ -6580,12 +6577,10 @@ mod tests {
             side: Default::default(),
             stopping: Arc::new(AtomicBool::new(false)),
         };
-        let mut policy = agent_runtime::rules::Policy::default();
-        (policy.parse(
-            "test.rules",
-            "prefix_rule(pattern = [\"rm\"], decision = \"forbidden\")\n\
-             prefix_rule(pattern = [\"git\", \"push\"], decision = \"prompt\")\n",
-        ))
+        let policy = serde_json::from_value(json!({"prefix_rules": [
+            {"pattern": ["rm"], "decision": "forbidden"},
+            {"pattern": ["git", "push"], "decision": "prompt"},
+        ]}))
         .unwrap();
         let _ = task
             .rules

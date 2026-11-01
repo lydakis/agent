@@ -47,6 +47,12 @@ rmcp = { version = "3.8", default-features = false, features = ["client", "trans
 # beside V8, with a memory limit and an interrupt for a script's time.
 rquickjs = { version = "0.14", features = ["futures", "disable-assertions"] }
 serde_json = "1"
+# Runs command rules files as Codex runs them: Starlark (Meta's crate, as
+# Codex uses it), its examples split as shell words with shlex, as Codex
+# splits them, and builtins that fail with anyhow, as starlark's want.
+starlark = { version = "0.14.2", default-features = false }
+shlex = "2"
+anyhow = "1"
 # Digests an MCP server's config, secrets and all, for its listing's cache.
 sha2 = "0.10"
 # Checks an edited project file before it replaces the person's, as the

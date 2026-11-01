@@ -4042,7 +4042,7 @@ fn a_bot_keeps_its_settings_and_a_fork_copies_them() {
         json!({"context_bytes":4096,"context_items":4096,"note_turns":48,"compact_at":75,
             "compact_keep":25,"compact_tokens":null,"keep_turns":1,"max_rounds":null,"approval_hold_ms":2000,"max_output_tokens":null,
             "keep_warm":0,"cache_ttl":"1h","speed":"fast","sandbox":null,"writable":[],"network":false,"outputs":null,"hide_senders":false,
-            "unix_sockets":[]})
+            "unix_sockets":[],"rules":null})
     );
     // Retention follows the bot's own setting.
     for n in 1..=3 {
@@ -15066,14 +15066,11 @@ fn a_planned_call_keeps_what_the_rules_made_of_it() {
     use agent_runtime::rules::{Policy, Rules, Ruling};
     let mut db = db();
     let turn = gated_turn(&mut db, None);
-    let mut policy = Policy::default();
-    policy
-        .parse(
-            "test.rules",
-            "prefix_rule(pattern = [\"rm\"], decision = \"forbidden\")\n\
-             prefix_rule(pattern = [\"git\"], decision = \"prompt\")",
-        )
-        .unwrap();
+    let policy: Policy = serde_json::from_value(json!({"prefix_rules": [
+        {"pattern": ["rm"], "decision": "forbidden", "source": "test.rules:1"},
+        {"pattern": ["git"], "decision": "prompt", "source": "test.rules:2"},
+    ]}))
+    .unwrap();
     let rules = Rules::new(policy);
     let (rm, rm_call) = shell_call("fc_1", "c1", "rm -rf x");
     let (git, git_call) = shell_call("fc_2", "c2", "git push");
@@ -15143,4 +15140,93 @@ fn a_bots_commands_let_out_of_its_sandbox_leave_its_settings_for_the_rules() {
         .prepare("SELECT ruling FROM tools")
         .unwrap();
     std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn a_bot_made_by_another_goes_by_its_creators_rules() {
+    use agent_runtime::rules::Policy;
+    let mut db = db();
+    let rules = |words: &[&str]| -> Policy {
+        serde_json::from_value(
+            json!({"prefix_rules": [{"pattern": words, "decision": "forbidden"}]}),
+        )
+        .unwrap()
+    };
+    let ann = db
+        .create(
+            "Ann",
+            Some("/synthetic"),
+            Binding {
+                settings: Settings {
+                    rules: Some(rules(&["rm"])),
+                    ..Default::default()
+                },
+                ..binding()
+            },
+        )
+        .unwrap();
+    // Whatever rules a child is made with, it takes its creator's.
+    let made = |db: &mut Database, name: &str, by: &str| {
+        let by_id = db.inspect(by).unwrap().bot_id;
+        db.create(
+            name,
+            Some("/synthetic"),
+            Binding {
+                created_by: Some(by),
+                created_by_id: Some(by_id),
+                settings: Settings {
+                    rules: Some(rules(&["ls"])),
+                    ..Default::default()
+                },
+                ..binding()
+            },
+        )
+        .unwrap();
+    };
+    made(&mut db, "Bob", &ann.0.name.clone());
+    made(&mut db, "Cat", "Bob");
+    assert_eq!(
+        db.inspect("Bob").unwrap().settings.rules,
+        Some(rules(&["rm"]))
+    );
+    // Nor can it be given its own.
+    let named = ["rules".to_owned()];
+    let own = Settings {
+        rules: Some(rules(&["ls"])),
+        ..Default::default()
+    };
+    let refused = db.set_settings("Bob", None, &named, &own).unwrap_err();
+    assert_eq!(refused.code, "invalid_setting");
+    // The creator's change reaches every bot it made, and theirs.
+    let changed = db.set_settings("Ann", None, &named, &own).unwrap();
+    assert_eq!(changed, ["rules"]);
+    for name in ["Bob", "Cat"] {
+        assert_eq!(
+            db.inspect(name).unwrap().settings.rules,
+            Some(rules(&["ls"]))
+        );
+    }
+    let changed = db
+        .set_settings("Ann", None, &named, &Settings::default())
+        .unwrap();
+    assert_eq!(changed, ["rules"]);
+    assert_eq!(db.inspect("Cat").unwrap().settings, Settings::default());
+    // A bot whose creator is gone keeps the rules it had, as made by it,
+    // and is given its own from then on.
+    db.set_settings("Ann", None, &named, &own).unwrap();
+    db.delete_bot("Bob").unwrap();
+    let cat = db.inspect("Cat").unwrap();
+    assert_eq!(cat.created_by.as_deref(), Some("Bob"));
+    assert_eq!(cat.settings.rules, Some(rules(&["ls"])));
+    let changed = db
+        .set_settings("Cat", None, &named, &Settings::default())
+        .unwrap();
+    assert_eq!(changed, ["rules"]);
+    // Rules that could never match are refused.
+    let empty = Settings {
+        rules: Some(serde_json::from_value(json!({"prefix_rules": [{"pattern": []}]})).unwrap()),
+        ..Default::default()
+    };
+    let refused = db.set_settings("Ann", None, &named, &empty).unwrap_err();
+    assert_eq!(refused.code, "invalid_setting");
 }

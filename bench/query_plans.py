@@ -4,7 +4,8 @@ Run from the repository root against a store at the current schema (open it
 once with the current binary to migrate a copy). Flags full scans on growing
 tables and temporary B-trees. Structural cases are listed, not counted:
 `SCAN CONSTANT ROW` from EXISTS subqueries, the recursive-CTE step scans that
-are bounded by a window or one turn, and per-turn sorts over a turn's tool
+are bounded by a window or one turn, or by one bot's descendants (`kin`,
+each step found by the `bots_maker` index), and per-turn sorts over a turn's tool
 rows, plus schema metadata (`sqlite_sequence` holds one row per
 autoincrement table). Statements inside
 the one-time migration function are skipped. Exit
@@ -23,7 +24,7 @@ OPTIONAL = {'{glob}': ('', ' AND name GLOB ?3'), '{maker}': ('', ' AND created_b
             '{running}': ('', ' AND running_turn IS NOT NULL'),
             '{order}': ('ASC', 'DESC')}
 
-STRUCTURAL_SCANS = {'SCAN CONSTANT ROW', 'SCAN c', 'SCAN chain', 'SCAN sqlite_master',
+STRUCTURAL_SCANS = {'SCAN CONSTANT ROW', 'SCAN c', 'SCAN chain', 'SCAN kin', 'SCAN sqlite_master',
                     'SCAN sqlite_sequence'}
 
 

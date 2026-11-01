@@ -45,7 +45,9 @@ each setting is; what to set is the person's call.
   `forbidden` never runs, with a `justification`). Agents can read but not
   write that folder from a sandbox, so suggest a rule to the person;
   "always allow" on an approval prompt adds one, and
-  `agent rules check -- COMMAND` shows what the rules decide.
+  `sonny rules check -- COMMAND` shows what the rules decide. The files
+  are Starlark, as in Codex (`host_executable` works; `network_rule`
+  is refused).
 
 ## ~/.agent/config.toml
 

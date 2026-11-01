@@ -403,7 +403,7 @@ keeps what it started with; the next start takes a change.
 | `--max-pending-bytes` | UTF-8 bytes of those waiting submissions: their prompts and the words they quote, which wait with them. | none |
 | `--max-input-bytes` | Bytes of request lines every session together has read and the daemon has not yet taken up. A line is read on credit for its first 4 KiB, and one that goes on waits for credit for the longest line (8 MiB) at once and gives back what it did not use, so readers never each hold part of what they need; an eighth of the bound is kept for lines that end within 4 KiB, so interrupts, renewals and status reads get in while long submits wait. At least one longest line and its reserve. Zero is unbounded. | a sixteenth of physical memory, at least 64 MiB |
 | `--max-readers` | Store reader connections, each on its own thread, for the reads clients ask for that decide nothing ([observation reads](#observation-reads)), which take all but one, and for turns' own reads. At least 1. | one per logical CPU |
-| `--max-load` | The 1-minute load average at which new foreground and background commands wait while one of the daemon's is running, as make's `-l`: never while none is, so a loaded machine slows the fleet and never stops it, and `--max-processes` stays the bound behind it. One thread reads the load each second; waiters hold no slot, go in the order they came, and take a freed slot only if the gate still admits them. A call that would be refused (forbidden, asked about with no gate, an escape no gate allows) is answered at once, never held; a gated one waits for its verdict instead, so a denial comes back as soon as it is given, and one allowed starts then. A round's calls that run together are let in or held whole. A foreground command held past 1.5 s parks its turn before the call (or the batch it starts with) starts: one commit, `turn_waiting` with `{call_id, load: true, deadline_ms}` (also its view's `waiting_on`), no task, no active slot, and it survives restart. The gate's next admitting reading wakes every parked turn once the load falls, or the oldest alone on a loaded machine where none of the daemon's commands runs; a turn whose round has a later gated call is woken at that call's lapse too. A fraction is kept. Zero is no gate. Reported in `ready` as `limits.load`, `null` for none (protocol 42). | none (the agent CLI passes `cpus * 2`) |
+| `--max-load` | The 1-minute load average at which new foreground and background commands wait while one of the daemon's is running, as make's `-l`: never while none is, so a loaded machine slows the fleet and never stops it, and `--max-processes` stays the bound behind it. One thread reads the load each second; waiters hold no slot, go in the order they came, and take a freed slot only if the gate still admits them. A call that would be refused (forbidden, asked about with no gate, an escape no gate allows) is answered at once, never held; a gated one waits for its verdict instead, so a denial comes back as soon as it is given, and one allowed starts then. A round's calls that run together are let in or held whole. A foreground command held past 1.5 s parks its turn before the call (or the batch it starts with) starts: one commit, `turn_waiting` with `{call_id, load: true, deadline_ms}` (also its view's `waiting_on`), no task, no active slot, and it survives restart. The gate's next admitting reading wakes every parked turn once the load falls, or the oldest alone on a loaded machine where none of the daemon's commands runs; a turn whose round has a later gated call is woken at that call's lapse too. A fraction is kept. Zero is no gate. Reported in `ready` as `limits.load`, `null` for none (protocol 44). | none (the agent CLI passes `cpus * 2`) |
 | `--max-connecting` | Provider requests awaiting response headers, a Bedrock Runtime call's body digest included. Established streams are not capped. Both providers hold headers until the first token, so a permit is held for the whole time to first token; a bound of N caps throughput at N calls per first-token latency. | none |
 | `--stall-timeout` | How long an established provider stream may go without a content frame before the attempt fails as `provider_stream_stalled` and is retried. Keepalives do not count. Whole seconds, `1s` to `24h`. | `2m` |
 | `--idle-exit` | How long, in whole seconds, before a socket daemon with no sessions, no live turns, and no running background commands exits. Parked turns are durable and resume on the next start; the client restarts the daemon on demand. | none |
@@ -447,6 +447,7 @@ keep-warm when it sets any of them.
 | `hide_senders` (`--hide-senders`) | Its model reads what other bots and clients send it without the line naming the sender (see [fleet controllers](#fleet-controllers)); `senders = "hidden"` in `~/.agent/config.toml` sets it on the bots the CLI and Sonny make. | off |
 | `outputs` (`--outputs`) | An absolute folder that holds each tool output stream cut for the model whole, one file per stream, in place of the store's copy (see [retained outputs](#retained-outputs)). The daemon makes it, owner-only, and writes there only while the bot's sandbox cannot write it; otherwise the stream stays in the store. `agent run --new` and Sonny name `outputs` beside the store unless told otherwise. | none |
 | `unix_sockets` (`--unix-socket`, repeatable) | Absolute Unix sockets, or folders of them, the only ones a sandboxed bot's commands reach, such as a Docker or SSH agent socket (see [sandbox](#sandbox)). Each is stored by its real path while it exists. At most 64. | none |
+| `rules` (none) | The bot's [command rules](#command-rules), as its client read them: `prefix_rules`, `host_executables`, or `invalid` with why they couldn't be read. A bot another made takes its creator's, always. At most 256 KiB as JSON. | none |
 
 Provider requests multiplex over HTTP/2, and one connection carries at most
 the 100 streams the provider advertises; the HTTP layer queues the rest, so a
@@ -1402,7 +1403,9 @@ doesn't take is `invalid_setting`). `sandbox` given puts `writable`,
 `network` and `unix_sockets` back to none, off and none unless they are
 given too; a bot another bot made keeps no weaker a sandbox than its
 creator's, as when it was made, and a bot's own socket may not configure
-at all. `cache_ttl` takes effect from the bot's next model call, and
+at all. `rules` may not be configured on a bot another made, which goes by
+its creator's, and a change to them reaches every bot made under it
+([command rules](#command-rules)). `cache_ttl` takes effect from the bot's next model call, and
 `speed` is refused `invalid_speed` where the provider it is on, or moves
 to with `model`, does not serve it. `fallback`, `compaction_instructions`
 and `compaction_model` are taken as `create` takes them, the models of the
@@ -2616,8 +2619,8 @@ and which never run is the person's to say, in [command rules](#command-rules).
 A bot that a sandboxed bot makes (its `created_by`), or forks, takes the
 creator's sandbox and `writable` folders unless it names a stricter sandbox,
 and reaches the network only if both do, as Codex's subagents inherit their
-parent's sandbox. Command rules are the daemon's, so they hold for every
-bot alike.
+parent's sandbox. It takes its creator's [command rules](#command-rules)
+too, always.
 
 On Linux, bubblewrap makes an empty folder on the host to mount a missing
 `.git` read-only over; the daemon removes it once no running sandbox holds
@@ -2626,50 +2629,50 @@ one being removed waits until it is gone.
 
 ### Command rules
 
-Command rules are Codex's: files of `prefix_rule` calls, matched and
-decided as Codex's execpolicy does (see NOTICE), that say which commands
-run outside a sandbox without asking, which always ask, and which never
-run. Codex's files are Starlark; the daemon reads the calls they hold,
-with literal arguments (strings, lists, `None`, `True`, `False`) and
-comments, as Codex documents them and writes "don't ask again", and
-refuses anything else Starlark has, a variable or a loop, as
-`rules_invalid` rather than carry a language runtime. The daemon
-reads every `*.rules` file in the folder it was started with as
-`serve --rules DIR`, in name order; the CLI passes `~/.agent/rules`, so
-Sonny's leads and every bot the CLI starts share one set. Without
-`--rules` there are none.
+Command rules are Codex's execpolicy: `prefix_rule`s that say which
+commands run outside a sandbox without asking, which always ask, and
+which never run, matched and decided as Codex's execpolicy does (see
+NOTICE). They are a bot's `rules` setting, as data its client gives on
+`create` and `configure`; reading rules files, and in what language, is
+the client's. Sonny reads Codex's own files (see Sonny's README), so the
+daemon carries no language for them.
 
-```python
-prefix_rule(
-    pattern = ["rm", ["-rf", "-fr"]],
-    decision = "forbidden",
-    justification = "Move it to the trash instead.",
-    match = ["rm -rf build"],
-    not_match = ["rm build"],
-)
-prefix_rule(pattern = ["mcpx"], decision = "allow")
-prefix_rule(pattern = ["git", "push"], decision = "prompt")
+```json
+{"prefix_rules": [
+   {"pattern": ["rm", ["-rf", "-fr"]], "decision": "forbidden",
+    "justification": "Move it to the trash instead.", "source": "default.rules:1"},
+   {"pattern": ["mcpx"], "decision": "allow"},
+   {"pattern": ["git", "push"], "decision": "prompt"}],
+ "host_executables": {"git": ["/usr/bin/git", "/opt/homebrew/bin/git"]}}
 ```
 
 A pattern is a command's first words; a list in it is a choice of words.
-`decision` is `allow` (the default), `prompt` or `forbidden`, and the
-optional `justification` is said to the model when the rule refuses.
-`match` and `not_match` are examples the file is checked against when it
-is read: an example the rule does not decide as it says makes the file
-invalid. `host_executable` is read and has no effect yet; `network_rule`
-is refused, since a sandbox's network is on or off. Each command of a
-plain script is checked (words, quoted or not, joined by `&&`, `||`, `;`,
-`|` or a newline, as [sandbox](#sandbox) reads them), and the strictest
-decision wins, as in Codex: a script runs outside only when every command
-in it is allowed. A script that isn't plain, with `$`, a backquote, a
-redirection, parentheses, `&` alone or a comment, matches no rule.
+`decision` is `allow` (the default), `prompt` or `forbidden`; the optional
+`justification` is said to the model when the rule refuses or asks, and
+the optional `source`, where the rule was written, when it has none. A
+command run by an absolute path that no rule matches as written is
+matched by its program's name, as Codex resolves it: when
+`host_executables` lists that path for the name, or lists nothing for it;
+by the name's `allow` rules, only at a path it lists.
+`invalid`, with why, says the client couldn't read the rules: every shell
+call fails `rules_invalid` with it, where Codex would refuse to start. A
+pattern or list of choices that is empty, an empty justification, or a
+`host_executables` entry that isn't a bare name with absolute paths
+ending in it is `invalid_setting`, as are rules over 256 KiB as JSON.
+
+Each command of a plain script is checked (words, quoted or not, joined
+by `&&`, `||`, `;`, `|` or a newline, as [sandbox](#sandbox) reads them),
+and the strictest decision wins, as in Codex: a script runs outside only
+when every command in it is allowed. A script that isn't plain, with `$`,
+a backquote, a redirection, parentheses, `&` alone or a comment, matches
+no rule.
 
 A shell call of the daemon's own `shell` tool, on a sandboxed bot or not,
 is then decided by the rule that matches:
 
 - **`forbidden`** never runs, even when it asks to escalate, and is never
   gated: the call fails `command_forbidden` with the justification, or
-  with the file and line of the rule and the prefix it names.
+  with where the rule was written and the prefix it names.
 - **`prompt`** waits on the bot's gate (see [tool approval](#tool-approval)),
   also when the sandbox would confine it, and allowed runs where it asked
   to: confined unless it escalated. With no gate there is no one to ask,
@@ -2684,30 +2687,46 @@ is then decided by the rule that matches:
 - With no match the call goes as the [sandbox](#sandbox) says.
 
 The command is found on the daemon's `PATH`, so an allowed command is
-only as trusted as the folders there. A turn reads the rules once, off
-the runtime thread, when its first round begins, and each call a round
-plans keeps what they made of it, which a parked turn reads back as it
-resumes: a call runs as its round was announced, also after a park or a
-restart and whatever the rules say by then. The folder is read again
-when a file in it changes, and a turn started after that takes the new
-rules. A file that can't be looked at, read or parsed, before any has
-been, fails every shell call with `rules_invalid`, naming the file
-and line, where Codex would refuse to start; after that, the last rules
-read stay until the folder reads again. `agent rules check -- COMMAND...`
-prints what the rules decide about a command, or what is wrong with them.
-The rules folder is read-only inside every sandbox and, when missing,
-may not be made there, so no bot writes its own rules. A rules file that
-is a symlink, or has another hard link, is `rules_invalid`, since the
-sandbox keeps the folder read-only and not what such a file also is
-elsewhere. A rules folder inside a
+only as trusted as the folders there. A turn takes its bot's rules when
+its first round begins, and each call a round plans keeps what they made
+of it, which a parked turn reads back as it resumes: a call runs as its
+round was announced, also after a park or a restart and whatever the
+rules say by then. A turn started after a `configure` takes the new
+rules.
+
+A bot made by another (its `created_by`) goes by its creator's rules: it
+takes them when it is made, whatever its own client gives, and follows
+them when they change, as do the bots it makes; configuring `rules` on it
+is `invalid_setting`. So no bot loosens the rules by making another. Once its
+creator is deleted, a bot keeps the rules it had and is given its own from
+then on, as no creator's sandbox holds it either; Sonny gives such an agent
+its rules as it gives a root one.
+
+A sandbox never lets a bot write the files its rules come from:
+`serve --protect-path PATH`, which repeats, keeps a path read-only in
+every sandbox and, when missing, from being made there. The CLI passes
+`~/.agent/rules`, where Sonny reads them. A protected path inside a
 writable folder that is a symlink refuses the call with
-`sandbox_unavailable`. Sonny's
-"always allow" on an approval prompt adds an `allow` rule to
-`default.rules`, as Codex's "don't ask again" does.
+`sandbox_unavailable`.
+
+Where this differs from Codex:
+
+- `network_rule` waits for a proxy that filters a sandbox's network by
+  host, which the daemon doesn't have; a sandbox's network is on or off.
+  Sonny refuses a rules file that has one, so no rule is taken as kept
+  that isn't.
+- Codex lets a program run by any absolute path out by its name's
+  `allow` rules when no `host_executable` names it. Here such a path is
+  only asked about or refused by them, since a sandboxed bot could write
+  `/tmp/rg` and so leave the sandbox unasked; `host_executable` names the
+  paths an `allow` rule lets out.
 
 Protocol 39 replaces the bot setting `unsandboxed`, a sandboxed bot's
-list of command prefixes run outside it, with these rules, which hold for
-every bot and can ask or refuse as well as allow. A store from before
+list of command prefixes run outside it, with these rules, which can ask
+or refuse as well as allow. Protocol 43 makes them a bot's setting, which
+its client gives, in place of `serve --rules DIR` and `agent rules
+check`, which are gone; Sonny reads the folder and runs `sonny rules
+check`. A store from before
 schema 75 drops the setting from its bots; Sonny moves its own
 `[sonny] unsandboxed` list into `allow` rules in `default.rules` once.
 

@@ -407,14 +407,13 @@ class ApprovalTests(ModelFixture):
         (ROOT / '.local').mkdir(exist_ok=True)
         outside = Path(tempfile.mkdtemp(dir=ROOT / '.local'))
         self.addCleanup(shutil.rmtree, outside)
-        rules = self.path / 'rules'
-        rules.mkdir()
-        (rules / 'default.rules').write_text(
-            'prefix_rule(pattern=["touch"], decision="allow")\n'
-            'prefix_rule(pattern=["rm", ["-rf", "-fr"]], decision="forbidden",\n'
-            '            justification="Move it to the trash instead.", match=["rm -rf x"])\n'
-            'prefix_rule(pattern=["cp"], decision="prompt")\n')
-        client = self.gated(settings={'sandbox': 'workspace-write'}, extra=('--rules', str(rules)))
+        # The rules as a client gives them: Sonny reads them from its files.
+        rules = {'prefix_rules': [
+            {'pattern': ['touch'], 'decision': 'allow', 'source': 'default.rules:1'},
+            {'pattern': ['rm', ['-rf', '-fr']], 'decision': 'forbidden',
+             'justification': 'Move it to the trash instead.', 'source': 'default.rules:2'},
+            {'pattern': ['cp'], 'decision': 'prompt', 'source': 'default.rules:4'}]}
+        client = self.gated(settings={'sandbox': 'workspace-write', 'rules': rules})
         # The setting the rules took the place of is gone.
         self.assertNotIn('unsandboxed', client.request('inspect', bot='Bob')['result']['settings'])
         self.assertIn('error', client.request('create', bot='Old', workspace=str(self.path),
@@ -455,23 +454,36 @@ class ApprovalTests(ModelFixture):
         self.assertFalse((outside / 'asked').exists())
         # With no gate to ask, it is refused, as Codex refuses it under a
         # policy that never asks.
-        client.request('create', bot='Solo', workspace=str(self.path), settings={'sandbox': 'workspace-write'})
+        client.request('create', bot='Solo', workspace=str(self.path),
+                       settings={'sandbox': 'workspace-write', 'rules': rules})
         turn = client.request('submit', bot='Solo', request_id='solo',
                               prompt=f'shell:cp /dev/null {self.path}/copied')['result']['turn']
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
         output = self.tool_output(client, 'shell-1', bot='Solo')[1]
         self.assertEqual((output['error'], output['detail']),
-                         ('command_needs_approval',
-                          f'the rule at {os.path.realpath(rules)}/default.rules:4 names `cp`'))
+                         ('command_needs_approval', 'the rule at default.rules:4 names `cp`'))
         self.assertFalse((self.path / 'copied').exists())
-        # A rule written now holds from the next turn on.
-        with open(rules / 'default.rules', 'a') as file:
-            file.write('prefix_rule(pattern=["mkdir"], decision="forbidden")\n')
+        # Rules configured now hold from the next turn on.
+        rules['prefix_rules'].append({'pattern': ['mkdir'], 'decision': 'forbidden'})
+        self.assertEqual(client.request('configure', bot='Solo', settings={'rules': rules})['result']['changed'],
+                         ['rules'])
         turn = client.request('submit', bot='Solo', request_id='later',
                               prompt=f'shell:mkdir {self.path}/made')['result']['turn']
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
         self.assertEqual(self.tool_output(client, 'shell-1', bot='Solo')[1]['error'], 'command_forbidden')
         self.assertFalse((self.path / 'made').exists())
+        # Rules its client couldn't read refuse every shell call, with why.
+        why = 'default.rules:1:1: pattern is empty'
+        client.request('configure', bot='Solo', settings={'rules': {'invalid': why}})
+        turn = client.request('submit', bot='Solo', request_id='invalid',
+                              prompt=f'shell:touch {self.path}/never')['result']['turn']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        output = self.tool_output(client, 'shell-1', bot='Solo')[1]
+        self.assertEqual((output['error'], output['detail']), ('rules_invalid', why))
+        self.assertFalse((self.path / 'never').exists())
+        # Rules that could never match are refused as a setting.
+        refused = client.request('configure', bot='Solo', settings={'rules': {'prefix_rules': [{'pattern': []}]}})
+        self.assertEqual(refused['error'], 'invalid_setting')
 
     def test_a_denial_is_the_result_and_the_turn_goes_on(self):
         client = self.gated()

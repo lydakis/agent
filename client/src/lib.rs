@@ -11,6 +11,7 @@ pub mod memory;
 pub mod models;
 pub mod policy;
 pub mod project;
+pub mod rules;
 pub mod socket;
 
 use serde_json::{Value, json};
@@ -107,7 +108,7 @@ pub fn default_tools(
 
 /// The socket protocol's version in `ready`. The daemon and its clients ship
 /// together, so a client refuses a daemon of any other version.
-pub const PROTOCOL: u64 = 42;
+pub const PROTOCOL: u64 = 44;
 
 /// Variables naming the terminal a daemon was started in: a terminal
 /// multiplexer's place. A client starting the daemon leaves them out of its

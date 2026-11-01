@@ -16,7 +16,7 @@ use agent_runtime::{
     provider::{Listed, Provider, STREAMS_PER_CONNECTION, Transport},
     store::{
         Answer, Binding, Bot, Decision, Delivery, FOLDERS_JSON, Fork, Gate, MAX_GATES, Publication,
-        Settings, Started, Step, Stepped, Store, TurnOptions, Waiting, Wake,
+        RULES_JSON, Settings, Started, Step, Stepped, Store, TurnOptions, Waiting, Wake,
     },
     tools::{
         ANSWER_BYTES, DECLARED_BYTES, Declared, MAX_DECLARED, Outcome, Registry, validate_declared,
@@ -145,15 +145,19 @@ fn admission_bound(command: &Command, id: &Value, deliveries: usize) -> Bound {
                     }
             }),
             output::encoded_len(&(bot, created_by)),
-            // The workspace, the writable folders and the Unix sockets,
-            // canonical, which the reply's settings repeat; a bot a
-            // sandboxed bot makes can take its creator's.
+            // The workspace, the writable folders, the Unix sockets,
+            // canonical, and the command rules, which the reply's settings
+            // repeat; a bot another makes takes its creator's rules, and a
+            // sandboxed one's folders.
             usize::from(workspace.is_some()) * PATH_JSON
                 + match created_by {
-                    Some(_) => 2 * FOLDERS_JSON,
+                    Some(_) => 2 * FOLDERS_JSON + RULES_JSON,
                     None => {
                         (settings.writable.len() * PATH_JSON).min(FOLDERS_JSON)
                             + (settings.unix_sockets.len() * PATH_JSON).min(FOLDERS_JSON)
+                            + (settings.rules.as_ref())
+                                .map_or(0, |rules| output::encoded_len(rules).unwrap_or(RULES_JSON))
+                                .min(RULES_JSON)
                     }
                 },
             // Both the bot and its event carry its gates, most of them
@@ -823,9 +827,8 @@ pub struct Configuration {
     pub protected: Vec<String>,
     /// Names kept read-only at the top of every writable root that has them.
     pub protected_existing: Vec<String>,
-    /// The folder of command rules (`*.rules`), read as each turn starts;
-    /// none, no rules.
-    pub rules: Option<PathBuf>,
+    /// Paths kept read-only in every sandbox, and kept from being made.
+    pub protected_paths: Vec<PathBuf>,
 }
 
 /// `path` by its real path, or, while it doesn't exist, by the real path
@@ -1513,7 +1516,9 @@ pub async fn run(config: Configuration) -> Result<()> {
             std::path::absolute(path)?.to_string_lossy().into_owned(),
         ));
     }
-    let rules = config.rules.as_deref().map(real_or_named).transpose()?;
+    let protected_paths = (config.protected_paths.iter())
+        .map(|path| real_or_named(path))
+        .collect::<Result<Vec<_>>>()?;
     agent_runtime::sandbox::warm();
     let (sender, mut inbound) = session::channel_with(64, limits.input_bytes);
     let sessions_next = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
@@ -1537,9 +1542,9 @@ pub async fn run(config: Configuration) -> Result<()> {
         capabilities: None,
         protected: config.protected.clone(),
         protected_existing: config.protected_existing.clone(),
-        // By its real path once it exists, as a root is matched; a missing
-        // one by the real path of the folder it would be made in.
-        rules: rules.clone(),
+        // Each by its real path once it exists, as a root is matched; a
+        // missing one by the real path of the folder it would be made in.
+        protected_paths,
     };
     daemon.capabilities = daemon
         .socket
@@ -1559,7 +1564,6 @@ pub async fn run(config: Configuration) -> Result<()> {
         .with_credentials(credentials)
         .with_environment(environment)
         .with_daemon(daemon)
-        .with_rules(rules)
         .with_process_budget(limits.processes)
         .with_lasting_budget(limits.lasting)
         .with_load_gate(limits.load);
@@ -7157,6 +7161,15 @@ mod tests {
             *effort = Some("high".into());
             *compaction_instructions = Some(awkward);
             *compaction_model = Some("openai/synthetic".into());
+        }
+        // Command rules as large as a bot may be given, escaped in JSON.
+        if let Command::Create { settings, .. } = &mut create {
+            let why = "\u{1}".repeat((RULES_JSON - 200) / 6);
+            settings.rules = Some(
+                serde_json::from_value(json!({"prefix_rules": [
+                    {"pattern": ["rm"], "decision": "forbidden", "justification": why}]}))
+                .unwrap(),
+            );
         }
         // Its sockets as many as it may name, each escaped in JSON, where a
         // sandbox can run.
