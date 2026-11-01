@@ -19,7 +19,8 @@ from pathlib import Path
 
 # Clauses a listing formats in by name, each planned with every value it
 # takes: keep in step with `list` and `turns` in src/store/db.rs.
-OPTIONAL = {'{glob}': ('', ' AND name GLOB ?3'), '{running}': ('', ' AND running_turn IS NOT NULL'),
+OPTIONAL = {'{glob}': ('', ' AND name GLOB ?3'), '{maker}': ('', ' AND created_by_id = ?4'),
+            '{running}': ('', ' AND running_turn IS NOT NULL'),
             '{order}': ('ASC', 'DESC')}
 
 STRUCTURAL_SCANS = {'SCAN CONSTANT ROW', 'SCAN c', 'SCAN chain', 'SCAN sqlite_master',

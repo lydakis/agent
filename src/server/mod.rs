@@ -569,13 +569,15 @@ enum Command {
     /// list. Asked when requested and kept five minutes; nothing runs on it.
     ProviderModels,
     /// A page of bots in name order: with `name`, those matching a GLOB
-    /// pattern; with `active`, those with a turn running.
+    /// pattern; with `active`, those with a turn running; with
+    /// `created_by_id`, those the bot with that id made.
     Bots {
         after: Option<String>,
         limit: Option<usize>,
         name: Option<String>,
         #[serde(default)]
         active: bool,
+        created_by_id: Option<i64>,
     },
     /// Stop the daemon. With `grace_ms`, it first drains for up to that
     /// long: nothing starts, and each running turn parks at its next
@@ -4052,6 +4054,7 @@ impl Service {
                 limit,
                 name,
                 active,
+                created_by_id,
             } => {
                 let reader = store.reader();
                 self.observe(session, output, id, async move {
@@ -4061,6 +4064,7 @@ impl Service {
                             limit.unwrap_or(64),
                             name.as_deref(),
                             active,
+                            created_by_id,
                         )
                     }))
                     .await

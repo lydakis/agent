@@ -51,8 +51,8 @@ const COMMANDS: &[Command] = &[
     Command {
         name: "ls",
         about: "List the bots",
-        usage: "ls [--name GLOB] [--active] [--limit N]",
-        flags: "--name --active --limit --pretty",
+        usage: "ls [--name GLOB] [--active] [--created-by BOT] [--limit N]",
+        flags: "--name --active --created-by --limit --pretty",
         settings: "",
         startup: false,
     },
@@ -497,6 +497,7 @@ fn print_flags(flags: &str) {
                 "Only bots whose name matches, as SQLite GLOB: * any run, ? one byte, [..] a set",
             ),
             "--active" => ("", "Only bots with a turn running"),
+            "--created-by" => ("BOT", "Only bots this bot made"),
             "--newest" => ("", "Newest first, read from the end"),
             "--limit" => ("N", "List at most N"),
             "--since" => (
