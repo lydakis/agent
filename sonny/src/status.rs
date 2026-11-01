@@ -199,6 +199,104 @@ pub fn card(
     (out, named)
 }
 
+/// Something wrong around the agents, which `/status` says under its
+/// heading: a companion that keeps restarting, a skill to fix.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Alert {
+    /// Whether it is broken now (`✗`), not only something to tidy.
+    pub failed: bool,
+    pub said: String,
+    /// Where to look, muted under it.
+    pub detail: String,
+}
+
+/// How long a companion's run must last to count as healthy, as the
+/// daemon counts it before its restart backoff starts over.
+const HEALTHY_MS: u64 = 60_000;
+
+/// The companions the daemon keeps (`companions`' list) that keep
+/// restarting, as of `now_ms`: one that restarted and is down now,
+/// waiting for its next start, or up for less than a healthy run. Each log
+/// is in `logs`, the daemon's `STORE.companions`.
+pub fn companion_alerts(companions: &serde_json::Value, now_ms: u64, logs: &str) -> Vec<Alert> {
+    let listed = companions.as_array().into_iter().flatten();
+    listed
+        .filter(|c| {
+            let restarts = c["restarts"].as_u64().unwrap_or(0);
+            let up_for = c["started_ms"].as_u64().map(|at| now_ms.saturating_sub(at));
+            restarts > 0 && (c["running"] != true || up_for.is_none_or(|up| up < HEALTHY_MS))
+        })
+        .map(|c| {
+            let name = c["name"].as_str().unwrap_or("a companion");
+            let restarts = c["restarts"].as_u64().unwrap_or(0);
+            let exit = &c["last_exit"];
+            let how = match (
+                exit["error"].as_str(),
+                exit["code"].as_i64(),
+                exit["signal"].as_i64(),
+            ) {
+                (Some("spawn_failed"), ..) => "could not start".to_owned(),
+                (Some(_), ..) => "lost track of it".to_owned(),
+                (None, Some(code), _) => format!("exits {code}"),
+                (None, None, Some(signal)) => format!("killed by signal {signal}"),
+                (None, None, None) => "exits".to_owned(),
+            };
+            Alert {
+                failed: true,
+                said: format!(
+                    "{name} keeps restarting · {how} · {restarts} restart{}",
+                    if restarts == 1 { "" } else { "s" }
+                ),
+                detail: format!("its log: {logs}/{name}.log"),
+            }
+        })
+        .collect()
+}
+
+/// The skills agents are offered whose front matter needs a fix, in one
+/// alert: each by name and what is wrong.
+pub fn skill_alerts(skills: &[agent_client::policy::Skill]) -> Vec<Alert> {
+    let warned: Vec<String> = (skills.iter())
+        .filter_map(|skill| Some(format!("{}: {}", skill.name, skill.warning?)))
+        .collect();
+    if warned.is_empty() {
+        return Vec::new();
+    }
+    let n = warned.len();
+    vec![Alert {
+        failed: false,
+        said: format!(
+            "{n} skill{} to fix, agents may not know when to read {}",
+            if n == 1 { "" } else { "s" },
+            if n == 1 { "it" } else { "them" }
+        ),
+        detail: warned.join(" · "),
+    }]
+}
+
+/// An alert's lines at `width`: a failure after its red `✗`, the rest
+/// muted, and where to look muted under it.
+pub fn alert_lines(alert: &Alert, width: usize) -> Vec<Line<'static>> {
+    let head = match alert.failed {
+        true => Line::from(vec![
+            Span::raw("✗ ").fg(Color::Red),
+            Span::raw(alert.said.clone()),
+        ]),
+        false => Line::from(alert.said.clone()).dim(),
+    };
+    let lead = if alert.failed { "  " } else { "" };
+    let mut out = crate::transcript::wrap(head, width, Span::raw(""), Span::raw(lead));
+    if !alert.detail.is_empty() {
+        out.extend(crate::transcript::wrap(
+            Line::from(alert.detail.clone()).dim(),
+            width,
+            Span::raw(lead),
+            Span::raw(lead),
+        ));
+    }
+    out
+}
+
 /// One agent's lines: its mark, name, state and time; its model, profile,
 /// place and pull request; its latest step.
 fn row_lines(row: &Row, width: usize) -> Vec<Line<'static>> {
@@ -279,6 +377,87 @@ mod tests {
         assert_eq!(
             plain_line("```mermaid\nflowchart LR\n```\n## Done\n- Added `x` on **line 2**"),
             "Added x on line 2"
+        );
+    }
+
+    #[test]
+    fn a_companion_that_keeps_restarting_is_named_one_that_recovered_is_not() {
+        let now = 10_000_000;
+        let listed = serde_json::json!([
+            // Never started again: fine.
+            {"name": "sonny-lookout", "running": true, "started_ms": 1, "restarts": 0},
+            // Restarted once, up for an hour since: recovered.
+            {"name": "sonny-tool-host", "running": true, "started_ms": now - 3_600_000,
+                "restarts": 1, "last_exit": {"code": 1}},
+            // A removed binary: down, waiting for its next start.
+            {"name": "approver-auto", "running": false, "started_ms": null, "restarts": 14,
+                "last_exit": {"error": "spawn_failed", "detail": "No such file"}},
+            // Up again only seconds ago, after dying on a signal.
+            {"name": "helper", "running": true, "started_ms": now - 5_000, "restarts": 1,
+                "last_exit": {"code": null, "signal": 9}},
+        ]);
+        let alerts = companion_alerts(&listed, now, "~/.agent/state.sqlite.companions");
+        let said: Vec<&str> = alerts.iter().map(|a| a.said.as_str()).collect();
+        assert_eq!(
+            said,
+            [
+                "approver-auto keeps restarting · could not start · 14 restarts",
+                "helper keeps restarting · killed by signal 9 · 1 restart",
+            ]
+        );
+        assert!(alerts.iter().all(|a| a.failed));
+        assert_eq!(
+            alerts[0].detail,
+            "its log: ~/.agent/state.sqlite.companions/approver-auto.log"
+        );
+        let lines = alert_lines(&alerts[0], 80);
+        let mark = (lines[0].spans.iter())
+            .find(|s| !s.content.is_empty())
+            .unwrap();
+        assert_eq!(mark.content, "✗ ");
+        assert_eq!(mark.style.fg, Some(Color::Red));
+        assert_eq!(
+            lines[1].to_string(),
+            "  its log: ~/.agent/state.sqlite.companions/approver-auto.log"
+        );
+    }
+
+    #[test]
+    fn skills_to_fix_are_one_muted_alert_naming_each() {
+        let skill = |name: &str, warning| agent_client::policy::Skill {
+            name: name.into(),
+            path: std::path::PathBuf::from(format!("/s/{name}/SKILL.md")),
+            summary: String::new(),
+            warning,
+        };
+        assert!(skill_alerts(&[skill("good", None)]).is_empty());
+        let alerts = skill_alerts(&[
+            skill("good", None),
+            skill("bare", Some(agent_client::policy::NO_DESCRIPTION)),
+            skill("vague", Some(agent_client::policy::NO_TRIGGER)),
+        ]);
+        assert_eq!(
+            alerts,
+            [Alert {
+                failed: false,
+                said: "2 skills to fix, agents may not know when to read them".into(),
+                detail: "bare: no description · vague: its description never says when to use it"
+                    .into(),
+            }]
+        );
+        let lines = alert_lines(&alerts[0], 40);
+        let dim = |s: &Span| {
+            let style = s.style;
+            s.content.trim().is_empty()
+                || style.add_modifier.contains(ratatui::style::Modifier::DIM)
+        };
+        assert!(
+            lines.iter().all(|line| line
+                .style
+                .add_modifier
+                .contains(ratatui::style::Modifier::DIM)
+                || line.spans.iter().all(dim)),
+            "{lines:?}"
         );
     }
 

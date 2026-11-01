@@ -1,6 +1,6 @@
 ---
 name: plan
-description: Keep your plan where the person sees it, for any task of three or more steps, and update it as each step starts and ends
+description: Keep your plan where the person sees it when a task has three or more steps, and update it as each step starts and ends
 ---
 
 # Your plan

@@ -424,8 +424,41 @@ pub struct Entry {
     /// The `description` in its front matter, or its first non-empty line,
     /// stripped of heading marks.
     pub summary: String,
+    /// What is wrong with a skill's front matter, for the client to show
+    /// the person: no `description`, or one that never says when to use
+    /// it. The skill is listed all the same.
+    pub warning: Option<&'static str>,
 }
 pub type Skill = Entry;
+
+/// A skill with no `description`: agents see its first line instead.
+pub const NO_DESCRIPTION: &str = "no description";
+/// A skill whose description says what it is but not when to read it.
+pub const NO_TRIGGER: &str = "its description never says when to use it";
+
+/// What is wrong with a skill's `description`, as the agentskills.io
+/// format asks of one: there, and saying both what the skill does and
+/// when to use it, since that is all an agent reads before it opens the
+/// file. When is a word such as "when", "use" or "before".
+pub fn skill_warning(description: Option<&str>) -> Option<&'static str> {
+    const WHEN: [&str; 12] = [
+        "when", "whenever", "use", "used", "using", "if", "before", "after", "while", "during",
+        "trigger", "triggers",
+    ];
+    let Some(description) = description.filter(|d| !d.trim().is_empty()) else {
+        return Some(NO_DESCRIPTION);
+    };
+    let says_when = description
+        .split(|c: char| !c.is_alphanumeric())
+        .any(|word| WHEN.iter().any(|when| word.eq_ignore_ascii_case(when)));
+    (!says_when).then_some(NO_TRIGGER)
+}
+
+/// The skills a bot in `workspace` is offered, as its instructions index
+/// them, each with what is wrong with it, if anything.
+pub fn skills(workspace: &Path) -> Result<Vec<Skill>, Failure> {
+    index(search(workspace, Kind::Skills), Kind::Skills, usize::MAX)
+}
 
 /// Roles a client starts its own bots in: Sonny's lead, and the task
 /// text Sonny tells every other agent it starts. A `.agents/agents` file
@@ -820,6 +853,7 @@ fn index(dirs: Vec<PathBuf>, kind: Kind, budget: usize) -> Result<Vec<Entry>, Fa
                 name,
                 path: file,
                 summary: String::new(),
+                warning: None,
             };
             let too_long = |size| Failure::TooLong {
                 path: entry.path.clone(),
@@ -851,6 +885,9 @@ fn index(dirs: Vec<PathBuf>, kind: Kind, budget: usize) -> Result<Vec<Entry>, Fa
             }
             if let Some(base) = front.extends.filter(|b| *b != entry.name) {
                 bases.insert(entry.name.clone(), base);
+            }
+            if matches!(kind, Kind::Skills) {
+                entry.warning = skill_warning(front.description.as_deref());
             }
             let summary = front.description.filter(|d| !d.is_empty()).or_else(|| {
                 body.lines()
@@ -1835,6 +1872,60 @@ mod tests {
         assert_eq!(profile(&root, "missing").unwrap(), None);
         for bad in ["", "../x", ".hidden", "a/b"] {
             assert_eq!(profile(&root, bad).unwrap_err().code(), "profile_invalid");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_skill_index_warns_of_a_description_missing_or_never_saying_when() {
+        let root = temp("skill-warnings");
+        for (name, text) in [
+            (
+                "good",
+                "---\nname: good\ndescription: Cuts a release. Use when tagging.\n---\n",
+            ),
+            (
+                "vague",
+                "---\nname: vague\ndescription: Release helpers\n---\n",
+            ),
+            ("bare", "# Bare\n\nNo front matter at all.\n"),
+            ("blank", "---\nname: blank\ndescription: ''\n---\nbody\n"),
+        ] {
+            std::fs::create_dir_all(root.join(".agents/skills").join(name)).unwrap();
+            std::fs::write(
+                root.join(".agents/skills").join(name).join("SKILL.md"),
+                text,
+            )
+            .unwrap();
+        }
+        // A profile's description is not a skill's: it is never warned of.
+        std::fs::create_dir_all(root.join(".agents/agents")).unwrap();
+        std::fs::write(root.join(".agents/agents/reviewer.md"), "Review.\n").unwrap();
+        let warned: Vec<_> = (skills(&root).unwrap().into_iter())
+            .map(|skill| (skill.name, skill.warning))
+            .collect();
+        assert_eq!(
+            warned,
+            [
+                ("bare".to_owned(), Some(NO_DESCRIPTION)),
+                ("blank".to_owned(), Some(NO_DESCRIPTION)),
+                ("good".to_owned(), None),
+                ("vague".to_owned(), Some(NO_TRIGGER)),
+            ]
+        );
+        // Listed all the same, a bare one by its first line.
+        let composed = instructions(&root, None, &[]).unwrap();
+        assert_eq!(composed.skills.len(), 4);
+        assert!(composed.text.contains("- bare: Bare ("));
+        assert!(composed.profiles.iter().all(|p| p.warning.is_none()));
+        for (said, warned) in [
+            ("Whenever a PR opens", None),
+            ("Reads PDFs; for forms, tables", Some(NO_TRIGGER)),
+            ("Run before every deploy", None),
+            ("Housekeeping", Some(NO_TRIGGER)),
+            ("useful things", Some(NO_TRIGGER)),
+        ] {
+            assert_eq!(skill_warning(Some(said)), warned, "{said}");
         }
         let _ = std::fs::remove_dir_all(&root);
     }

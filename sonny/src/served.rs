@@ -533,7 +533,9 @@ fn run() -> Value {
             person wants to watch. It runs in your folder, or cwd, in the person's shell, which stays open after \
             the command exits so its output can be read. Running the same name again replaces its pane. A tab \
             is the default; a split puts it beside you, for something the person should see now, and float \
-            over your window, where the terminal can float it, for a moment (a sign-in, a quick look). The \
+            over your window, where the terminal can float it, for a quick look. A command that needs the \
+            person's own keyboard (a sign-in, a password or passphrase prompt, ssh -t) sits unnoticed in a \
+            pane: ask them with ask and its command instead, so the step shows as theirs to take. The \
             result holds the pane's ID as block.",
         "parameters": {
             "type": "object",
