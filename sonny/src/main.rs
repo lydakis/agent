@@ -636,32 +636,64 @@ async fn keep(
         .map_err(|e| format!("{name}: {e}"))
 }
 
+/// Whether [`connect`] may ask the person for a provider when the daemon
+/// will not start without one.
+#[derive(Clone, Copy, PartialEq)]
+enum Asking {
+    /// Sonny's start, before its screen is up: the first run's setup, when
+    /// there is a terminal to ask in.
+    AtStart,
+    /// The screen is up and the daemon went away: a daemon that stopped is
+    /// never a first run, so nothing is asked over the screen and no
+    /// setting is written; the person runs `sonny setup` to change one.
+    Never,
+}
+
 /// The daemon, started the way the CLI starts it when it is not running.
-/// With no provider set anywhere, the person is asked for one first, and a
-/// first model list is written once it runs.
-async fn connect(options: &Options) -> Result<(Arc<Client>, agent_client::Events), String> {
-    if let Ok(connected) = Client::connect(&options.socket).await {
+/// At start, with no provider set anywhere, the person is asked for one
+/// first, and a first model list is written once it runs.
+async fn connect(
+    options: &Options,
+    asking: Asking,
+) -> Result<(Arc<Client>, agent_client::Events), String> {
+    let start = || start_daemon(&options.store, &options.socket, false);
+    connect_starting(&options.socket, asking, start).await
+}
+
+/// [`connect`], with `start` starting the daemon.
+async fn connect_starting(
+    socket: &Path,
+    asking: Asking,
+    start: impl Fn() -> Result<(), NotStarted>,
+) -> Result<(Arc<Client>, agent_client::Events), String> {
+    if let Ok(connected) = Client::connect(socket).await {
         return Ok(connected);
     }
-    match start_daemon(&options.store, &options.socket, false) {
+    match start() {
         Err(failed) if failed.code.as_deref() == Some("provider_required") => {
+            if asking == Asking::Never {
+                return Err(NO_PROVIDER.to_owned());
+            }
             if !setup::interactive() {
                 return Err(format!("{failed}; run sonny in a terminal to choose one"));
             }
             let bin = agent_bin().ok_or("Agent's binary was not found; set AGENT_BIN")?;
             setup::provider(&bin, false)?;
-            start_daemon(&options.store, &options.socket, false).map_err(|e| e.to_string())?;
+            start().map_err(|e| e.to_string())?;
         }
         started => started.map_err(|e| e.to_string())?,
     }
-    let connected = Client::connect(&options.socket)
-        .await
-        .map_err(|e| e.to_string())?;
+    let connected = Client::connect(socket).await.map_err(|e| e.to_string())?;
     if let Some(path) = agent_client::models::path().filter(|path| !path.exists()) {
         tokio::spawn(first_models(connected.0.clone(), path));
     }
     Ok(connected)
 }
+
+/// Why a daemon that stopped is not started again: it has no provider,
+/// which only setup sets.
+const NO_PROVIDER: &str =
+    "the daemon has no provider to start with; run `sonny setup` in another terminal";
 
 /// Whether `error` met a daemon on an older protocol than this Sonny's,
 /// one `agent start` replaces.
@@ -1063,7 +1095,7 @@ async fn run() -> Result<(), String> {
                     "sonny: the running daemon is older than this Sonny; it stops once its running turns end (at most 2 minutes), then this one starts"
                 );
             }
-            connect(&options).await?
+            connect(&options, Asking::AtStart).await?
         }
     };
     trigger::restamp_at_start(client.identity(), client.store());
@@ -4752,7 +4784,7 @@ impl App {
     /// or began. Tried again every two seconds until it works.
     async fn reattach(&mut self, events: &mut Events) {
         let lead = async {
-            let (client, mut fresh) = connect(&self.options).await?;
+            let (client, mut fresh) = connect(&self.options, Asking::Never).await?;
             client
                 .request("follow", json!({"bot": self.bot, "after": 0}))
                 .await
@@ -4767,9 +4799,13 @@ impl App {
             Ok::<_, String>((client, fresh, record, caught))
         };
         if self.down {
-            let Ok((client, fresh, record, caught)) = lead.await else {
-                self.retry = Some(Instant::now() + Duration::from_secs(2));
-                return;
+            let (client, fresh, record, caught) = match lead.await {
+                Ok(back) => back,
+                Err(error) => {
+                    self.notice = Some(format!("reconnecting to the daemon: {error}"));
+                    self.retry = Some(Instant::now() + Duration::from_secs(2));
+                    return;
+                }
             };
             self.paused = caught.paused(&client);
             self.client = client;
@@ -17323,6 +17359,25 @@ mod tests {
             app.notice.as_deref(),
             Some("that question was answered already")
         );
+    }
+
+    /// A daemon that stopped and will not start again for want of a
+    /// provider leaves the screen reconnecting: no first-run picker over
+    /// it, so no setting is rewritten.
+    #[tokio::test]
+    async fn a_stopped_daemon_without_a_provider_asks_nothing_on_reconnect() {
+        let socket = std::env::temp_dir().join(format!("sonny-gone-{}.sock", std::process::id()));
+        let starts = std::cell::Cell::new(0);
+        let start = || {
+            starts.set(starts.get() + 1);
+            Err(NotStarted {
+                code: Some("provider_required".into()),
+                reason: "no provider".into(),
+            })
+        };
+        let refused = connect_starting(&socket, Asking::Never, start).await;
+        assert_eq!(refused.err().as_deref(), Some(NO_PROVIDER));
+        assert_eq!(starts.get(), 1, "tried once, never again after a setup");
     }
 
     #[tokio::test]
