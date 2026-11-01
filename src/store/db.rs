@@ -1,4 +1,5 @@
 use super::artifact;
+use crate::rules::{Rules, Ruling};
 use crate::{
     Error, Result,
     codec::Family,
@@ -243,16 +244,15 @@ pub struct Settings {
     /// allowed; none bounds them only by the turn's token budget.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_rounds: Option<usize>,
-    /// Command prefixes, each of words, that run outside the sandbox
-    /// without asking, as a Codex rule that allows a prefix runs it
-    /// ([`crate::sandbox::unsandboxed`]).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub unsandboxed: Vec<String>,
     /// Unix sockets, or folders of them, the only ones a sandbox's commands
     /// reach, each an absolute path
     /// ([`crate::sandbox::Policy::sockets`]).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unix_sockets: Vec<String>,
+    /// The command rules its shell calls go by, as its client read them
+    /// ([`crate::rules`]); a bot made by another goes by its creator's.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rules: Option<crate::rules::Policy>,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, Serialize)]
 pub enum CacheTtl {
@@ -262,6 +262,8 @@ pub enum CacheTtl {
     Hour,
 }
 const MIN_CONTEXT_BYTES: usize = 1024;
+/// The most a bot's command rules take as JSON.
+pub const RULES_JSON: usize = 256 << 10;
 /// The most a bot's `writable` folders, and its `unix_sockets`, each take
 /// as JSON, by their real paths, so a reply that repeats them has a bound.
 pub const FOLDERS_JSON: usize = 32 << 10;
@@ -321,10 +323,11 @@ impl Settings {
     /// makes: no weaker a sandbox than its creator's, as Codex's subagents
     /// inherit their parent's. A sandboxed creator's child takes the
     /// creator's sandbox and writable folders unless it names a stricter
-    /// sandbox, and reaches the network only if both do; it runs outside
-    /// the sandbox only commands its creator does.
+    /// sandbox, and reaches the network only if both do. Every child goes
+    /// by its creator's command rules, so none is made to get past them.
     pub fn under(mut self, creator: &Settings) -> Settings {
         use crate::sandbox::Mode;
+        self.rules = creator.rules.clone();
         let sandboxed = |settings: &Settings| {
             matches!(
                 settings.sandbox,
@@ -337,11 +340,8 @@ impl Settings {
         if !sandboxed(&self) {
             self.writable = creator.writable.clone();
             self.network = creator.network;
-            self.unsandboxed = creator.unsandboxed.clone();
             self.unix_sockets = creator.unix_sockets.clone();
         }
-        self.unsandboxed
-            .retain(|prefix| creator.unsandboxed.contains(prefix));
         self.unix_sockets
             .retain(|path| creator.unix_sockets.contains(path));
         self.sandbox = Mode::stricter(self.sandbox, creator.sandbox);
@@ -411,9 +411,6 @@ impl Settings {
             self.sandbox,
             Some(crate::sandbox::Mode::ReadOnly | crate::sandbox::Mode::WorkspaceWrite)
         );
-        if !sandboxed && !self.unsandboxed.is_empty() {
-            return refuse("unsandboxed goes with sandbox read-only or workspace-write");
-        }
         if !sandboxed && !self.unix_sockets.is_empty() {
             return refuse("unix_sockets goes with sandbox read-only or workspace-write");
         }
@@ -424,13 +421,13 @@ impl Settings {
         {
             return refuse("unix_sockets names at most 64 absolute paths, 32 KiB in all");
         }
-        if self.unsandboxed.len() > 64
-            || self
-                .unsandboxed
-                .iter()
-                .any(|prefix| prefix.split_whitespace().next().is_none() || prefix.len() > 1024)
-        {
-            return refuse("unsandboxed names at most 64 commands, each words of at most 1 KiB");
+        if let Some(rules) = &self.rules {
+            rules
+                .validate()
+                .map_err(|why| Error::with("invalid_setting", format!("rules: {why}")))?;
+            if crate::output::encoded_len(rules).unwrap_or(usize::MAX) > RULES_JSON {
+                return refuse("rules take at most 256 KiB as JSON");
+            }
         }
         if self.writable.len() > 64
             || crate::output::encoded_len(&self.writable).unwrap_or(usize::MAX) > FOLDERS_JSON
@@ -468,13 +465,45 @@ impl Settings {
             "speed":self.speed().map_or("standard", crate::provider::Speed::name),
             "sandbox":self.sandbox,"writable":self.writable,"network":self.network,
             "outputs":self.outputs,
-            "hide_senders":self.hide_senders,"unsandboxed":self.unsandboxed,
-            "unix_sockets":self.unix_sockets})
+            "hide_senders":self.hide_senders,"unix_sockets":self.unix_sockets,
+            "rules":self.rules})
     }
     fn stored(&self) -> Result<Option<String>> {
         Ok((*self != Self::default())
             .then(|| serde_json::to_string(self))
             .transpose()?)
+    }
+}
+/// The settings that make a bot's sandbox, which change together.
+pub const SANDBOX: [&str; 4] = ["sandbox", "writable", "network", "unix_sockets"];
+/// Every setting's name, as `create` and `configure` take it.
+pub const SETTINGS: [&str; 20] = [
+    "context_bytes",
+    "context_items",
+    "note_turns",
+    "compact_at",
+    "compact_keep",
+    "compact_tokens",
+    "keep_turns",
+    "approval_hold_ms",
+    "max_output_tokens",
+    "keep_warm",
+    "cache_ttl",
+    "speed",
+    "sandbox",
+    "writable",
+    "network",
+    "outputs",
+    "hide_senders",
+    "max_rounds",
+    "unix_sockets",
+    "rules",
+];
+/// Settings as their stored fields, those at their defaults left out.
+fn settings_map(settings: &Settings) -> Result<serde_json::Map<String, Value>> {
+    match serde_json::to_value(settings)? {
+        Value::Object(map) => Ok(map),
+        _ => Ok(serde_json::Map::new()),
     }
 }
 fn resolved_settings<S: serde::Serializer>(
@@ -521,15 +550,35 @@ impl Bot {
         )
     }
     /// Whether this call, of the daemon's tool or a declared one, waits
-    /// for a verdict, run in the turn's `workspace`. A call the bot may not
-    /// make is refused, never announced, and one its sandbox confines runs
-    /// without a verdict: only an escape is gated, as in Codex. A call
-    /// whose steps go to the gate one by one waits for none as a whole.
-    pub fn gated(&self, call: &ToolCall, workspace: &std::path::Path) -> bool {
+    /// for a verdict, run in the turn's `workspace` under `rules`. A call
+    /// the bot may not make is refused, never announced, and one its
+    /// sandbox confines runs without a verdict: only an escape is gated,
+    /// as in Codex. A command a rule asks about waits, sandbox or not; one
+    /// a rule allows or forbids doesn't. A call whose steps go to the gate
+    /// one by one waits for none as a whole.
+    pub fn gated(&self, call: &ToolCall, workspace: &std::path::Path, rules: &Rules) -> bool {
         gated(&self.gates, &call.name)
             && self.may_call(&call.name)
             && !self.declared(&call.name).is_some_and(|tool| tool.steps)
-            && !self.confines(call, workspace)
+            && match self.ruling(call, rules) {
+                Ok(Ruling::Prompt(_)) => true,
+                Ok(Ruling::None) => !self.confines(call, workspace),
+                Ok(Ruling::Allow | Ruling::Forbidden(_)) | Err(_) => false,
+            }
+    }
+    /// What `rules` make of this call: only the daemon's own `shell` is
+    /// ruled, by its command, never a declared tool of that name.
+    pub fn ruling(&self, call: &ToolCall, rules: &Rules) -> Result<Ruling> {
+        if call.name != "shell" || self.declared(&call.name).is_some() {
+            return Ok(Ruling::None);
+        }
+        let Ok(arguments) = serde_json::from_str::<Value>(&call.arguments) else {
+            return Ok(Ruling::None);
+        };
+        match arguments["command"].as_str() {
+            Some(command) => rules.rule_call(&call.call_id, command),
+            None => Ok(Ruling::None),
+        }
     }
     /// Whether the bot's commands run in a sandbox.
     pub fn sandboxed(&self) -> bool {
@@ -538,21 +587,6 @@ impl Bot {
             self.settings.sandbox,
             Some(Mode::ReadOnly | Mode::WorkspaceWrite)
         )
-    }
-    /// Whether this call is a command the bot's client lets run outside its
-    /// sandbox without asking: one the bot doesn't ask to escalate, which
-    /// runs nothing but its `unsandboxed` commands.
-    pub fn unsandboxed(&self, call: &ToolCall) -> bool {
-        if call.name != "shell" || self.settings.unsandboxed.is_empty() || !self.sandboxed() {
-            return false;
-        }
-        let Ok(arguments) = serde_json::from_str::<Value>(&call.arguments) else {
-            return false;
-        };
-        arguments["sandbox_permissions"] != "require_escalated"
-            && arguments["command"].as_str().is_some_and(|command| {
-                crate::sandbox::unsandboxed(&self.settings.unsandboxed, command)
-            })
     }
     /// Whether this call runs inside the bot's sandbox: the bot has one, the
     /// tool is one a sandbox holds, and the call doesn't ask to leave it.
@@ -836,10 +870,25 @@ pub struct Waiting {
     /// pool resumes there.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback: Option<ParkedFallback>,
-    /// Parked by the pull cord, not a closed pool: it waits for `resume`,
-    /// and the pause is not charged as pacing.
+    /// Parked by the pull cord, until `resume`, or by the daemon stopping,
+    /// until the next start, not by a closed pool: that time is not charged
+    /// as pacing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub halt: Option<Halt>,
+    /// The wait is a terminal poll, an empty `write_stdin` past its hold:
+    /// `handles` names the terminal, and its result is the terminal's
+    /// output when it ends or its yield runs out.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub pulled: bool,
+    pub poll: bool,
+    /// Parked before `call_id`, the first of `pending`, which has not
+    /// started: a command the daemon's load gate held back. The gate's
+    /// next reading that lets it start wakes the turn, which runs it then.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub load: bool,
+    /// What the command rules made of the calls still to run, as their
+    /// round was announced, by call id: read from them as the park resumes.
+    #[serde(skip)]
+    pub rulings: BTreeMap<String, String>,
 }
 /// A declined request's fallback model, as `provider/model`, and the credit
 /// its retry redeems.
@@ -863,9 +912,17 @@ pub struct CopiedCall {
     pub prefix: Option<(String, usize)>,
 }
 impl Waiting {
+    /// The calls still to run as their round's announcement ruled them.
+    pub fn rules(&self) -> Rules {
+        Rules::recorded(
+            (self.rulings.iter())
+                .map(|(id, stored)| (id.clone(), Ruling::read(stored)))
+                .collect(),
+        )
+    }
     fn paced_elapsed_ms(&self) -> i64 {
         self.paced_since_ms
-            .filter(|_| !self.pulled)
+            .filter(|_| self.halt.is_none())
             .map_or(0, |since| epoch_ms().saturating_sub(since).max(0))
     }
 }
@@ -1063,9 +1120,18 @@ impl ApprovalPage {
         Ok(true)
     }
 }
-/// What a pull did to a running turn.
+/// What parks a running turn that its own rounds did not: the pull cord,
+/// which holds it until `resume`, or the daemon stopping, which leaves it
+/// for the next start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Halt {
+    Pause,
+    Shutdown,
+}
+/// What a pull or a stop did to a running turn.
 #[derive(Debug)]
-pub enum Pulled {
+pub enum Halted {
     /// Parked it, with these entries.
     Parked(Vec<Value>),
     /// Found it parked already, by its own park that committed as the pull
@@ -1507,9 +1573,9 @@ const TURN_VIEW: &str = "t.id,t.bot,b.id,t.request_id,t.status,t.input_tokens,
     t.finished_ms,json_extract(t.waiting,'$.call_id'),json_extract(t.waiting,'$.approval'),
     json_extract(t.waiting,'$.handles'),json_extract(t.waiting,'$.any'),
     json_extract(t.waiting,'$.deadline_ms'),json_extract(t.waiting,'$.answer'),
-    json_extract(t.waiting,'$.pulled')";
+    json_extract(t.waiting,'$.halt'),json_extract(t.waiting,'$.load')";
 /// Columns `TURN_VIEW` takes, for queries that select more after it.
-const TURN_VIEW_COLUMNS: usize = 20;
+const TURN_VIEW_COLUMNS: usize = 21;
 
 /// The turn view's own fields beside a turn's identity and status: who asked,
 /// what it waits on, its usage and timing. A model's `wait` leaves them out.
@@ -1545,6 +1611,9 @@ fn turn_view(r: &rusqlite::Row) -> rusqlite::Result<Value> {
         "waiting" if r.get::<_, Option<i64>>(14)? == Some(1) => {
             json!({"call_id":call_id,"approval":true,"deadline_ms":deadline_ms})
         }
+        "waiting" if r.get::<_, Option<i64>>(20)? == Some(1) => {
+            json!({"call_id":call_id,"load":true,"deadline_ms":deadline_ms})
+        }
         "waiting" => {
             let handles = r
                 .get::<_, Option<String>>(15)?
@@ -1552,10 +1621,11 @@ fn turn_view(r: &rusqlite::Row) -> rusqlite::Result<Value> {
             json!({"call_id":call_id,"handles":handles,"deadline_ms":deadline_ms,
                 "any":r.get::<_, Option<i64>>(16)? == Some(1)})
         }
-        "paced" if r.get::<_, Option<i64>>(19)? == Some(1) => {
-            json!({"resume_at_ms":null,"paused":true})
-        }
-        "paced" => json!({"resume_at_ms":deadline_ms}),
+        "paced" => match r.get::<_, Option<String>>(19)?.as_deref() {
+            Some("pause") => json!({"resume_at_ms":null,"paused":true}),
+            Some("shutdown") => json!({"resume_at_ms":null,"stopped":true}),
+            _ => json!({"resume_at_ms":deadline_ms}),
+        },
         _ => Value::Null,
     };
     Ok(json!({"bot":bot,"bot_id":r.get::<_, i64>(2)?,"turn":turn,
@@ -1741,7 +1811,7 @@ impl Database {
     /// Stored schema version, kept in `PRAGMA user_version`. Stores created
     /// before versioning and stores from newer binaries are rejected; an older
     /// versioned store is migrated forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 73;
+    pub const SCHEMA: i32 = 75;
     /// Verbatim user prompts a compaction keeps: per-prompt text, and the
     /// total text plus `(ordinal, String)` entry metadata. Empty entries cost
     /// space too, so the retained list cannot grow with conversation length.
@@ -1940,7 +2010,7 @@ impl Database {
             CREATE UNIQUE INDEX IF NOT EXISTS pauses_held ON pauses(ifnull(resumed_ms,0))
                 WHERE resumed_ms IS NULL;
             CREATE TABLE IF NOT EXISTS tools(turn INTEGER NOT NULL REFERENCES turns(id), call_id TEXT NOT NULL,
-                status TEXT NOT NULL, custom INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(turn,call_id));
+                status TEXT NOT NULL, custom INTEGER NOT NULL DEFAULT 0, ruling TEXT, PRIMARY KEY(turn,call_id));
             CREATE TABLE IF NOT EXISTS approvals(id INTEGER PRIMARY KEY AUTOINCREMENT, turn INTEGER NOT NULL REFERENCES turns(id),
                 call_id TEXT NOT NULL, name TEXT NOT NULL, node INTEGER NOT NULL, request INTEGER NOT NULL,
                 announced_ms INTEGER NOT NULL, gates TEXT NOT NULL, verdicts TEXT, arguments TEXT NOT NULL, asked TEXT,
@@ -1982,6 +2052,7 @@ impl Database {
             CREATE INDEX IF NOT EXISTS processes_running ON processes(turn) WHERE status='running';
             CREATE INDEX IF NOT EXISTS bots_deleting ON bots(name) WHERE status='deleting';
             CREATE INDEX IF NOT EXISTS bots_running ON bots(name) WHERE running_turn IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS bots_maker ON bots(created_by_id, name) WHERE created_by_id IS NOT NULL;
             CREATE INDEX IF NOT EXISTS bots_expiring ON bots(expires_at) WHERE expires_at IS NOT NULL;")?;
         if version != Self::SCHEMA {
             tx.pragma_update(None, "user_version", Self::SCHEMA)?;
@@ -2313,6 +2384,7 @@ impl Database {
                 "SELECT t.id FROM bots b JOIN turns t ON t.id=b.running_turn
                  WHERE b.name=? AND b.status='waiting' AND t.status='waiting'
                  AND json_extract(t.waiting,'$.approval') IS NOT 1
+                 AND json_extract(t.waiting,'$.load') IS NOT 1
                  AND json_extract(t.waiting,'$.paced_since_ms') IS NULL",
             )?
             .query_row([name], |r| r.get(0))
@@ -2603,99 +2675,167 @@ impl Database {
         )?;
         Ok(changed == 1)
     }
-    /// Replace a bot's sandbox with `sandbox`'s: its mode, the folders it
-    /// may write besides its own, whether it reaches the network and the
-    /// commands that run outside it. A bot another bot made
-    /// keeps no weaker a sandbox than its creator's, as when it was made.
-    /// Whether anything changed.
-    pub fn set_sandbox(
+    /// Replace the settings `named` with `given`'s, a setting `given`
+    /// leaves at its default going back to it, and keep the rest. A bot
+    /// another bot made keeps no weaker a sandbox than its creator's, as
+    /// when it was made. The settings that changed, by name, the sandbox
+    /// and the folders, network and sockets that go with it as `sandbox`.
+    pub fn set_settings(
         &mut self,
         name: &str,
         bot_id: Option<i64>,
-        sandbox: Settings,
-    ) -> Result<bool> {
+        named: &[String],
+        given: &Settings,
+    ) -> Result<Vec<String>> {
         let id = self.identity(name, bot_id)?;
         let bot = self.inspect(name)?;
-        let settings = Settings {
-            sandbox: sandbox.sandbox,
-            writable: sandbox.writable,
-            network: sandbox.network,
-            unsandboxed: sandbox.unsandboxed,
-            unix_sockets: sandbox.unix_sockets,
-            ..bot.settings
-        };
-        let creator = match bot.created_by_id {
-            Some(creator) => self
+        let before = settings_map(&bot.settings)?;
+        let wanted = settings_map(given)?;
+        let mut after = before.clone();
+        for key in named {
+            match wanted.get(key) {
+                Some(value) => after.insert(key.clone(), value.clone()),
+                None => after.remove(key),
+            };
+        }
+        let mut settings: Settings = serde_json::from_value(Value::Object(after))
+            .map_err(|error| Error::with("invalid_setting", error.to_string()))?;
+        settings.speed = settings
+            .speed
+            .filter(|speed| *speed != crate::provider::Speed::Standard);
+        // Its creator's while there is one: a bot whose creator is gone
+        // keeps the rules it had, and its client sets them from then on, as
+        // no creator's sandbox holds it either.
+        if let Some(creator) = bot.created_by_id
+            && named.iter().any(|key| key == "rules")
+            && self
+                .conn
+                .query_row("SELECT 1 FROM bots WHERE id=?", [creator], |_| Ok(()))
+                .optional()?
+                .is_some()
+        {
+            return fail_with(
+                "invalid_setting",
+                "rules: a bot made by another goes by its creator's rules",
+            );
+        }
+        let confining = named.iter().any(|key| SANDBOX.contains(&key.as_str()));
+        if confining && let Some(creator) = bot.created_by_id {
+            let creator = self
                 .conn
                 .query_row("SELECT settings FROM bots WHERE id=?", [creator], |r| {
                     r.get::<_, Option<String>>(0)
                 })
                 .optional()?
-                .map(|text| match text {
-                    Some(text) => serde_json::from_str(&text),
-                    None => Ok(Settings::default()),
-                })
-                .transpose()?,
-            None => None,
-        };
-        let settings = match &creator {
-            Some(creator) => settings.under(creator),
-            None => settings,
-        };
+                .flatten()
+                .map(|text| serde_json::from_str::<Settings>(&text))
+                .transpose()?;
+            if let Some(creator) = creator {
+                settings = settings.under(&creator);
+            }
+        }
         settings.validate()?;
+        let after = settings_map(&settings)?;
+        let mut changed = Vec::new();
+        for key in before.keys().chain(after.keys()) {
+            if before.get(key) == after.get(key) {
+                continue;
+            }
+            let key = match SANDBOX.contains(&key.as_str()) {
+                true => "sandbox",
+                false => key.as_str(),
+            };
+            if !changed.iter().any(|c| c == key) {
+                changed.push(key.to_owned());
+            }
+        }
+        if changed.is_empty() {
+            return Ok(changed);
+        }
         let stored = settings.stored()?;
-        let changed = self.conn.execute(
-            "UPDATE bots SET settings=? WHERE id=? AND settings IS NOT ?",
-            params![stored, id, stored],
-        )?;
-        Ok(changed == 1)
+        let tx = self.conn.savepoint()?;
+        tx.execute("UPDATE bots SET settings=? WHERE id=?", params![stored, id])?;
+        // The bots it made, and theirs, go by the same rules.
+        if changed.iter().any(|key| key == "rules") {
+            let rules = settings
+                .rules
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?;
+            tx.execute(
+                "WITH RECURSIVE kin(id) AS (
+                     SELECT id FROM bots WHERE created_by_id=?1
+                     UNION SELECT b.id FROM bots b JOIN kin ON b.created_by_id=kin.id)
+                 UPDATE bots SET settings=NULLIF(CASE WHEN ?2 IS NULL
+                     THEN json_remove(COALESCE(settings,'{}'),'$.rules')
+                     ELSE json_set(COALESCE(settings,'{}'),'$.rules',json(?2)) END,'{}')
+                 WHERE id IN kin",
+                params![id, rules],
+            )?;
+        }
+        tx.commit()?;
+        changed.sort();
+        Ok(changed)
     }
-    /// The tier the bot's calls are served at; whether that changed it.
-    /// Standard is stored as none, as a bot that never chose one has.
-    pub fn set_speed(
+    /// The model a declined request goes to, as `provider/model`, or none;
+    /// whether that changed it. The daemon has checked its family.
+    pub fn set_fallback(
         &mut self,
         name: &str,
         bot_id: Option<i64>,
-        speed: crate::provider::Speed,
+        fallback: Option<&str>,
     ) -> Result<bool> {
         let id = self.identity(name, bot_id)?;
-        let mut settings = self.inspect(name)?.settings;
-        settings.speed = Some(speed).filter(|speed| *speed != crate::provider::Speed::Standard);
-        let stored = settings.stored()?;
         let changed = self.conn.execute(
-            "UPDATE bots SET settings=? WHERE id=? AND settings IS NOT ?",
-            params![stored, id, stored],
+            "UPDATE bots SET fallback=? WHERE id=? AND fallback IS NOT ?",
+            params![fallback, id, fallback],
         )?;
         Ok(changed == 1)
     }
-    /// The bot's prompt-cache lifetime; whether that changed it.
-    pub fn set_cache_ttl(
+    /// How the bot summarizes its context: its compaction instructions, none
+    /// never compacting, or its summarizer, none being its own model; whether
+    /// that changed it. A summary it already has stays.
+    pub fn set_compaction(
         &mut self,
         name: &str,
         bot_id: Option<i64>,
-        ttl: CacheTtl,
-    ) -> Result<bool> {
+        instructions: Option<Option<&str>>,
+        model: Option<Option<&str>>,
+    ) -> Result<Vec<&'static str>> {
         let id = self.identity(name, bot_id)?;
-        let mut settings = self.inspect(name)?.settings;
-        settings.cache_ttl = Some(ttl);
-        let stored = settings.stored()?;
-        let changed = self.conn.execute(
-            "UPDATE bots SET settings=? WHERE id=? AND settings IS NOT ?",
-            params![stored, id, stored],
-        )?;
-        Ok(changed == 1)
+        let mut changed = Vec::new();
+        if let Some(instructions) = instructions
+            && self.conn.execute(
+                "UPDATE bots SET compaction_instructions=? WHERE id=? AND compaction_instructions IS NOT ?",
+                params![instructions, id, instructions],
+            )? == 1
+        {
+            changed.push("compaction_instructions");
+        }
+        if let Some(model) = model
+            && self.conn.execute(
+                "UPDATE bots SET compaction_model=? WHERE id=? AND compaction_model IS NOT ?",
+                params![model, id, model],
+            )? == 1
+        {
+            changed.push("compaction_model");
+        }
+        Ok(changed)
     }
     /// Bounded keyset pages. Full instructions remain available through inspect.
     /// A page of bots in name order after `after`. `name` keeps those whose
     /// name matches a GLOB pattern, which reads only its literal prefix's
     /// range of the name index; `active` keeps those with a turn running,
-    /// read from an index of only them.
+    /// read from an index of only them; `created_by` keeps those the bot
+    /// with that id made, read from an index by maker, so a page costs that
+    /// bot's own children whatever else the store holds.
     pub fn list(
         &self,
         after: Option<&str>,
         limit: usize,
         name: Option<&str>,
         active: bool,
+        created_by: Option<i64>,
     ) -> Result<Value> {
         if !(1..=256).contains(&limit) || after.is_some_and(|s| s.len() > 128) {
             return fail_with(
@@ -2709,11 +2849,27 @@ impl Database {
                 "name is a GLOB pattern of 1 to 256 bytes",
             );
         }
+        let after = after.unwrap_or("");
+        let limit_rows = (limit + 1) as i64;
+        // Fixed numbers, so bench.query_plans plans every variant: a
+        // maker without a name binds ?3 as NULL, which nothing reads.
         let glob = if name.is_some() {
             " AND name GLOB ?3"
         } else {
             ""
         };
+        let maker = if created_by.is_some() {
+            " AND created_by_id = ?4"
+        } else {
+            ""
+        };
+        let mut values: Vec<&dyn rusqlite::ToSql> = vec![&after, &limit_rows];
+        if name.is_some() || created_by.is_some() {
+            values.push(&name);
+        }
+        if created_by.is_some() {
+            values.push(&created_by);
+        }
         let running = if active {
             " AND running_turn IS NOT NULL"
         } else {
@@ -2722,14 +2878,9 @@ impl Database {
         let mut statement = self.conn.prepare_cached(&format!(
             "SELECT name,head,workspace,status,running_turn,provider,family,model,reasoning,budget_tokens,tokens_used,tools,
                     input_tokens,cached_input_tokens,id,created_by,created_by_id,gates,allowed,expire_ms,expires_at
-             FROM bots WHERE name > ?1{glob}{running} ORDER BY name LIMIT ?2"
+             FROM bots WHERE name > ?1{glob}{maker}{running} ORDER BY name LIMIT ?2"
         ))?;
-        let after = after.unwrap_or("");
-        let limit_rows = (limit + 1) as i64;
-        let mut rows = match name {
-            Some(pattern) => statement.query(params![after, limit_rows, pattern])?,
-            None => statement.query(params![after, limit_rows])?,
-        };
+        let mut rows = statement.query(values.as_slice())?;
         let mut bots = Vec::new();
         let mut bytes = 0;
         let mut more = false;
@@ -4867,8 +5018,8 @@ impl Database {
     }
 
     /// Page a reading view of provider items as JSONL by byte offset in that
-    /// view. Only reasoning.encrypted_content is omitted; stored items and
-    /// provider replay remain unchanged.
+    /// view. Only the opaque state a provider replays is omitted (see
+    /// `READING_ITEM`); stored items and provider replay remain unchanged.
     /// Pages end at UTF-8 boundaries and may split a JSON record. Concatenate
     /// their text before decoding; no content is replaced with previews.
     /// A bot's newest `limit` conversation turns, newest first, as its
@@ -6133,12 +6284,24 @@ impl Database {
         }
         Ok(absorbed)
     }
+    /// A round's items and calls, with no command rules.
     pub fn append(
         &mut self,
         turn: i64,
         items: Vec<Bytes>,
         calls: &[ToolCall],
         usage: Option<&Usage>,
+    ) -> Result<Vec<Value>> {
+        self.append_under(turn, items, calls, usage, &Rules::default())
+    }
+    /// A round's items and calls, under the `rules` its turn runs with.
+    pub fn append_under(
+        &mut self,
+        turn: i64,
+        items: Vec<Bytes>,
+        calls: &[ToolCall],
+        usage: Option<&Usage>,
+        rules: &Rules,
     ) -> Result<Vec<Value>> {
         let bot = self.active(turn)?;
         // A gated round notes which item plans each call. Whether a
@@ -6157,7 +6320,7 @@ impl Database {
         let tx = self.conn.savepoint()?;
         let mut head = bot.head;
         let mut entries = Vec::new();
-        let gated = calls.iter().any(|call| bot.gated(call, workspace));
+        let gated = calls.iter().any(|call| bot.gated(call, workspace, rules));
         let mut planned = HashMap::new();
         let last_reasoning = items.last().is_some_and(|item| {
             serde_json::from_slice::<Kind>(item).is_ok_and(|k| k.kind == "reasoning")
@@ -6180,13 +6343,16 @@ impl Database {
         // A turn keys its calls by id. The provider checks one response's ids;
         // one that reuses an id from an earlier round of the turn is refused
         // the same way, and the round commits nothing.
+        // Each keeps what the command rules made of it, which its run reads:
+        // the rules may change before it runs.
         for call in calls {
+            let ruling = Ruling::stored(&bot.ruling(call, rules));
             let planned = tx
                 .prepare_cached(
-                    "INSERT INTO tools(turn,call_id,status,custom) VALUES (?,?,'planned',?)
+                    "INSERT INTO tools(turn,call_id,status,custom,ruling) VALUES (?,?,'planned',?,?)
                      ON CONFLICT DO NOTHING",
                 )?
-                .execute(params![turn, call.call_id, call.custom])?;
+                .execute(params![turn, call.call_id, call.custom, ruling])?;
             if planned == 0 {
                 return Err(Error::new("invalid_tool_call_id"));
             }
@@ -6199,7 +6365,10 @@ impl Database {
             let announced_ms = epoch_ms();
             let mut announced = Vec::new();
             let mut judged = Vec::new();
-            for call in calls.iter().filter(|call| bot.gated(call, workspace)) {
+            for call in calls
+                .iter()
+                .filter(|call| bot.gated(call, workspace, rules))
+            {
                 let gates: Vec<CallGate> = bot
                     .gates
                     .iter()
@@ -6584,6 +6753,16 @@ impl Database {
     /// Start a gated call once every gate allowed it, record its denial, or
     /// say what it still waits for. Allows ride the call's `tool_start`
     /// commit and a denial is its result, so a verdict adds no commit.
+    /// What the command rules made of each of the turn's calls still to
+    /// run, as their rounds were announced.
+    fn rulings(&self, turn: i64) -> Result<BTreeMap<String, String>> {
+        let mut statement = self.conn.prepare_cached(
+            "SELECT call_id,ruling FROM tools WHERE turn=? AND ruling IS NOT NULL
+             AND status IN ('planned','executing')",
+        )?;
+        let rows = statement.query_map([turn], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
     pub fn approval_start(&mut self, turn: i64, call: &ToolCall, now_ms: u64) -> Result<Gated> {
         let mut bot = self.active(turn)?;
         let request = self
@@ -6754,7 +6933,10 @@ impl Database {
             copied: None,
             summary_retry_ms,
             fallback: None,
-            pulled: false,
+            halt: None,
+            poll: false,
+            load: false,
+            rulings: BTreeMap::new(),
         };
         let tx = self.conn.savepoint()?;
         flush(&tx, turn, self.live.get(&turn))?;
@@ -6768,6 +6950,77 @@ impl Database {
         tx.commit()?;
         self.forget_live(turn);
         Ok(Some(deadline_ms))
+    }
+    /// Park a running turn before its next calls, when the daemon's load
+    /// gate holds back `held`, a command among them: they and the rest of
+    /// the round wait in `pending`, none of them started. Woken at the
+    /// round's first lapse, as a verdict park is, so a later gated call's
+    /// expiry still ends the turn. None when that lapse has passed: the
+    /// turn goes on and meets it.
+    pub fn suspend_load(
+        &mut self,
+        turn: i64,
+        held: &str,
+        pending: &[ToolCall],
+        now_ms: u64,
+        route: Option<&str>,
+        summary_retry_ms: Option<u64>,
+    ) -> Result<Option<Option<u64>>> {
+        let bot = self.active(turn)?;
+        let call = (pending.iter())
+            .find(|call| call.call_id == held)
+            .ok_or(Error::new("invalid_tool_state"))?;
+        if bot.status != "running" {
+            return fail("invalid_tool_state");
+        }
+        let deadline_ms = self.next_lapse(turn)?;
+        if deadline_ms.is_some_and(|at| now_ms >= at) {
+            return Ok(None);
+        }
+        let waiting = Waiting {
+            turn,
+            bot: bot.name.clone(),
+            call_id: call.call_id.clone(),
+            handles: Vec::new(),
+            deadline_ms,
+            any: false,
+            pending: pending.to_vec(),
+            paced_since_ms: None,
+            call_attempts: 0,
+            call_spent_ms: 0,
+            compaction: false,
+            route: route.map(str::to_owned),
+            approval: false,
+            answer: None,
+            copied: None,
+            summary_retry_ms,
+            fallback: None,
+            halt: None,
+            poll: false,
+            load: true,
+            rulings: BTreeMap::new(),
+        };
+        let tx = self.conn.savepoint()?;
+        flush(&tx, turn, self.live.get(&turn))?;
+        tx.execute(
+            "UPDATE turns SET status='waiting',waiting=? WHERE id=?",
+            params![serde_json::to_string(&waiting)?, turn],
+        )?;
+        tx.execute("UPDATE bots SET status='waiting' WHERE name=?", [&bot.name])?;
+        let data = json!({"call_id":call.call_id,"load":true,"deadline_ms":deadline_ms});
+        event(&tx, &bot.name, Some(turn), "turn_waiting", data)?;
+        tx.commit()?;
+        self.forget_live(turn);
+        Ok(Some(deadline_ms))
+    }
+    /// The turns parked on the load gate, oldest first, with their bots.
+    pub fn load_parked(&self) -> Result<Vec<(String, i64)>> {
+        let mut statement = self.conn.prepare_cached(
+            "SELECT bot,id FROM turns WHERE status='waiting'
+             AND json_extract(waiting,'$.load')=1 ORDER BY id",
+        )?;
+        let rows = statement.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
     /// An answered call's answer, held or stored, `tool_unserved` once its
     /// time ran out, or how long it may still wait.
@@ -6897,7 +7150,10 @@ impl Database {
             copied: None,
             summary_retry_ms,
             fallback: None,
-            pulled: false,
+            halt: None,
+            poll: false,
+            load: false,
+            rulings: BTreeMap::new(),
         };
         let tx = self.conn.savepoint()?;
         flush(&tx, turn, self.live.get(&turn))?;
@@ -8560,6 +8816,32 @@ impl Database {
         route: Option<&str>,
         summary_retry_ms: Option<u64>,
     ) -> Result<Value> {
+        self.suspend_wait(
+            turn,
+            call_id,
+            handles,
+            deadline_ms,
+            any,
+            pending,
+            route,
+            summary_retry_ms,
+            false,
+        )
+    }
+    /// `suspend`, for a terminal poll when `poll` is set.
+    #[allow(clippy::too_many_arguments)]
+    pub fn suspend_wait(
+        &mut self,
+        turn: i64,
+        call_id: &str,
+        handles: &[String],
+        deadline_ms: Option<u64>,
+        any: bool,
+        pending: &[ToolCall],
+        route: Option<&str>,
+        summary_retry_ms: Option<u64>,
+        poll: bool,
+    ) -> Result<Value> {
         let bot = self.active(turn)?;
         let executing: bool = self.conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM tools WHERE turn=? AND call_id=? AND status='executing')",
@@ -8587,7 +8869,10 @@ impl Database {
             copied: None,
             summary_retry_ms,
             fallback: None,
-            pulled: false,
+            halt: None,
+            poll,
+            load: false,
+            rulings: BTreeMap::new(),
         };
         let tx = self.conn.savepoint()?;
         // A verdict for a later call of the round waits in the store.
@@ -8644,7 +8929,10 @@ impl Database {
             copied,
             summary_retry_ms,
             fallback,
-            pulled: false,
+            halt: None,
+            poll: false,
+            load: false,
+            rulings: BTreeMap::new(),
         };
         let tx = self.conn.savepoint()?;
         flush(&tx, turn, self.live.get(&turn))?;
@@ -8666,21 +8954,24 @@ impl Database {
         self.forget_live(turn);
         Ok(entry(cursor, &bot.name, Some(turn), "turn_paced", data))
     }
-    /// Park a running turn the pull cord stopped, until `resume`. It is
-    /// parked as a closed pool parks it, at a model-call boundary: each call
-    /// it had not answered gets a result saying the pause stopped it, or
-    /// came before it ran, and none is run again. The reply it was writing
+    /// Park a running turn the pull cord stopped, until `resume`, or one the
+    /// daemon stopping cut off, until the next start. It is parked as a
+    /// closed pool parks it, at a model-call boundary: each call it had not
+    /// answered gets a result saying the pause or the stop cut it off, or
+    /// came before it ran, and none is run again, as Codex answers the
+    /// calls an interrupt cut off. The reply it was writing
     /// is asked for again when it continues. A turn whose own park committed
     /// as the pull cancelled its task stays as it parked: its park comes
     /// back, with its next lapse, for the task to register its wake-ups.
-    pub fn suspend_pulled(
+    pub fn suspend_halted(
         &mut self,
         turn: i64,
+        stop: Halt,
         retries: u64,
         paced_ms: u64,
         summary_ms: u64,
         route: Option<&str>,
-    ) -> Result<Pulled> {
+    ) -> Result<Halted> {
         let bot = self.active(turn)?;
         match bot.status.as_str() {
             "running" => {}
@@ -8689,7 +8980,7 @@ impl Database {
                 let waiting = self
                     .waiting(turn)?
                     .ok_or(Error::new("invalid_tool_state"))?;
-                return Ok(Pulled::Already(Box::new(waiting), self.next_lapse(turn)?));
+                return Ok(Halted::Already(Box::new(waiting), self.next_lapse(turn)?));
             }
             _ => return fail("invalid_tool_state"),
         }
@@ -8701,9 +8992,13 @@ impl Database {
             .query_map([turn], |r| r.get(0))?
             .collect::<rusqlite::Result<_>>()?;
         // Why, who and when; not whose turns it parked.
-        let pause = self
-            .pause()?
-            .map(|p| json!({"reason":p["reason"],"by":p["by"],"at_ms":p["at_ms"]}));
+        let pause = match stop {
+            Halt::Pause => self
+                .pause()?
+                .map(|p| json!({"reason":p["reason"],"by":p["by"],"at_ms":p["at_ms"]})),
+            Halt::Shutdown => None,
+        };
+        // No deadline: the pause's `resume`, or the next start, wakes it.
         let waiting = Waiting {
             turn,
             bot: bot.name.clone(),
@@ -8724,20 +9019,28 @@ impl Database {
             copied: None,
             summary_retry_ms: None,
             fallback: None,
-            pulled: true,
+            halt: Some(stop),
+            poll: false,
+            load: false,
+            rulings: BTreeMap::new(),
         };
         let tx = self.conn.savepoint()?;
         flush(&tx, turn, self.live.get(&turn))?;
         let (head, mut entries) = close_unanswered(&tx, &bot, turn, bot.head, |executing| {
-            let detail = if executing {
-                "the pause stopped this call before its result was recorded; it may have had effects. It is not run again"
-            } else {
-                "the pause came before this call ran; it did not run"
+            let result = match (stop, executing) {
+                (Halt::Pause, true) => json!({"error":"daemon_paused","detail":
+                    "the pause stopped this call before its result was recorded; it may have had effects. It is not run again",
+                    "pause":pause}),
+                (Halt::Pause, false) => json!({"error":"daemon_paused","detail":
+                    "the pause came before this call ran; it did not run","pause":pause}),
+                (Halt::Shutdown, true) => json!({"error":"daemon_shutdown","detail":
+                    "the daemon stopped this call before its result was recorded; it may have had effects. It is not run again"}),
+                (Halt::Shutdown, false) => json!({"error":"daemon_shutdown","detail":
+                    "the daemon stopped before this call ran; it did not run"}),
             };
-            (
-                json!({"error":"daemon_paused","detail":detail,"pause":pause}),
-                false,
-            )
+            // A call cut off while it ran may have had effects: its event
+            // says the outcome is unknown, as its result does.
+            (result, executing)
         })?;
         if head != bot.head {
             // Every call of the round is answered, so the round is closed.
@@ -8760,8 +9063,12 @@ impl Database {
                 })?
                 .collect::<rusqlite::Result<_>>()?;
             for (approval, id, name) in asked {
+                let reason = match stop {
+                    Halt::Pause => "the pause stopped the call",
+                    Halt::Shutdown => "the daemon stopped the call",
+                };
                 let data = json!({"call_id":id,"step_of":call_id,"name":name,"decision":"deny",
-                    "reason":"the pause stopped the call","approvals":[]});
+                    "reason":reason,"approvals":[]});
                 event(&tx, &bot.name, Some(turn), "step_decided", data)?;
                 steps.push(approval);
             }
@@ -8785,7 +9092,10 @@ impl Database {
             ],
         )?;
         tx.execute("UPDATE bots SET status='paced' WHERE name=?", [&bot.name])?;
-        let data = json!({"resume_at_ms":null,"paused":true});
+        let data = match stop {
+            Halt::Pause => json!({"resume_at_ms":null,"paused":true}),
+            Halt::Shutdown => json!({"resume_at_ms":null,"stopped":true}),
+        };
         let cursor = event(&tx, &bot.name, Some(turn), "turn_paced", data.clone())?;
         tx.commit()?;
         self.forget_live(turn);
@@ -8794,7 +9104,7 @@ impl Database {
             self.unstep(approval, true);
         }
         entries.push(entry(cursor, &bot.name, Some(turn), "turn_paced", data));
-        Ok(Pulled::Parked(entries))
+        Ok(Halted::Parked(entries))
     }
     /// Every parked turn, on handles or on a pool, for re-registration after
     /// a restart.
@@ -8958,7 +9268,7 @@ impl Database {
     /// Bring a parked turn back to running; the caller then records the wait
     /// result. Also answers whether a steer queued while it was parked.
     pub fn resume(&mut self, turn: i64) -> Result<(Waiting, Value, bool)> {
-        let waiting = self.waiting(turn)?.ok_or(Error::new("turn_not_waiting"))?;
+        let mut waiting = self.waiting(turn)?.ok_or(Error::new("turn_not_waiting"))?;
         let bot = self.active(turn)?;
         if bot.status != "waiting" && bot.status != "paced" {
             return fail("turn_not_waiting");
@@ -8973,6 +9283,7 @@ impl Database {
         let cursor = event(&tx, &bot.name, Some(turn), "turn_resumed", data.clone())?;
         tx.commit()?;
         let steers = self.steers_waiting(&bot.name)?;
+        waiting.rulings = self.rulings(turn)?;
         Ok((
             waiting,
             entry(cursor, &bot.name, Some(turn), "turn_resumed", data),
@@ -11563,12 +11874,29 @@ fn keep_quotes(tx: &Connection, turn: i64, quotes: Option<&str>, node: i64) -> R
 /// of a user item or a tool's result without their bytes, each counted in
 /// `omitted_bytes` (a data URL keeps its media type). The model is sent
 /// them whole.
-/// An item as history reads show it: one line, without reasoning's
-/// encrypted content. Applied to `item`, which `PICTURELESS` provides.
+/// An item as history reads show it: one line, without the opaque state
+/// a provider hands back only to be replayed (reasoning's encrypted
+/// content; a thinking block's signature, a redacted one's data, a web
+/// search result's encrypted content). Applied to `item`, which
+/// `PICTURELESS` provides.
 const READING_ITEM: &str = "CASE
     WHEN json_extract(CAST(item AS TEXT),'$.type')='reasoning'
      AND json_type(CAST(item AS TEXT),'$.encrypted_content') IS NOT NULL
     THEN CAST(json_remove(CAST(item AS TEXT),'$.encrypted_content') AS BLOB)
+    WHEN json_extract(CAST(item AS TEXT),'$.role')='assistant'
+     AND json_type(CAST(item AS TEXT),'$.content')='array'
+     AND (instr(item,'\"signature\"')>0 OR instr(item,'\"redacted_thinking\"')>0
+          OR instr(item,'\"encrypted_content\"')>0)
+    THEN CAST(json_set(CAST(item AS TEXT),'$.content',json((SELECT json_group_array(CASE
+        WHEN json_extract(b.value,'$.type')='thinking' THEN json_remove(b.value,'$.signature')
+        WHEN json_extract(b.value,'$.type')='redacted_thinking' THEN json_remove(b.value,'$.data')
+        WHEN json_extract(b.value,'$.type')='web_search_tool_result'
+         AND json_type(b.value,'$.content')='array'
+        THEN json_set(b.value,'$.content',json((SELECT json_group_array(
+            json_remove(r.value,'$.encrypted_content'))
+            FROM json_each(b.value,'$.content') AS r)))
+        ELSE json(b.value) END)
+        FROM json_each(CAST(item AS TEXT),'$.content') AS b))) AS BLOB)
     WHEN instr(item,x'0a')=0 AND instr(item,x'0d')=0 THEN item
     ELSE CAST(json(CAST(item AS TEXT)) AS BLOB) END";
 /// Each subquery's array is passed through `json()`: a value's JSON subtype
@@ -12574,6 +12902,33 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
             );
         }
     }
+    // 73 -> 74: a turn the pull cord parked says so as its halt, beside the
+    // daemon stopping, rather than with a flag of its own.
+    if from < 74 {
+        conn.execute(
+            "UPDATE turns SET waiting=json_set(json_remove(waiting,'$.pulled'),'$.halt','pause')
+             WHERE json_extract(waiting,'$.pulled')=1",
+            [],
+        )?;
+    }
+    // 74 -> 75: a bot's commands that ran outside its sandbox are the
+    // command rules' now, which every bot shares; the setting goes.
+    if from < 75 {
+        conn.execute(
+            "UPDATE bots SET settings=json_remove(settings,'$.unsandboxed')
+             WHERE json_extract(settings,'$.unsandboxed') IS NOT NULL",
+            [],
+        )?;
+        // A planned call keeps what the rules made of it as it was planned.
+        if conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='tools')
+             AND NOT EXISTS(SELECT 1 FROM pragma_table_info('tools') WHERE name='ruling')",
+            [],
+            |r| r.get::<_, bool>(0),
+        )? {
+            conn.execute_batch("ALTER TABLE tools ADD COLUMN ruling TEXT;")?;
+        }
+    }
     Ok(())
 }
 /// 53 -> 54: a turn's denial count became a window of its last decided
@@ -13144,6 +13499,96 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_setting_is_named() {
+        // Every field, so a new one doesn't compile until it is listed.
+        let all = Settings {
+            context_bytes: Some(1),
+            context_items: Some(1),
+            note_turns: Some(1),
+            compact_at: Some(1),
+            compact_keep: Some(1),
+            compact_tokens: Some(1),
+            keep_turns: Some(1),
+            approval_hold_ms: Some(1),
+            max_output_tokens: Some(1),
+            keep_warm: Some(1),
+            cache_ttl: Some(CacheTtl::Hour),
+            speed: Some(crate::provider::Speed::Fast),
+            sandbox: Some(crate::sandbox::Mode::ReadOnly),
+            writable: vec!["/".into()],
+            network: true,
+            outputs: Some("/".into()),
+            hide_senders: true,
+            max_rounds: Some(1),
+            unix_sockets: vec!["/".into()],
+            rules: Some(crate::rules::Policy {
+                invalid: Some("x".into()),
+                ..Default::default()
+            }),
+        };
+        let mut names: Vec<String> = settings_map(&all)
+            .unwrap()
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        let mut listed = SETTINGS.map(String::from).to_vec();
+        names.sort();
+        listed.sort();
+        assert_eq!(names, listed);
+        // And clients are shown each, as it applies.
+        let Value::Object(resolved) = Settings::default().resolved() else {
+            unreachable!("settings are an object");
+        };
+        let mut shown: Vec<String> = resolved.into_iter().map(|(k, _)| k).collect();
+        shown.sort();
+        assert_eq!(shown, listed);
+    }
+
+    #[test]
+    fn a_history_read_leaves_out_the_state_a_provider_replays() {
+        let conn = Connection::open_in_memory().unwrap();
+        let read = |item: &str| -> Value {
+            let text: String = conn
+                .query_row(
+                    &format!(
+                        "SELECT CAST({READING_ITEM} AS TEXT) FROM (SELECT CAST(?1 AS BLOB) AS item)"
+                    ),
+                    [item],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(!text.contains('\n'), "{text}");
+            serde_json::from_str(&text).unwrap()
+        };
+        let claude = json!({"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "plan", "signature": "sig".repeat(100)},
+            {"type": "redacted_thinking", "data": "opaque"},
+            {"type": "server_tool_use", "id": "s", "name": "web_search", "input": {"query": "q"}},
+            {"type": "web_search_tool_result", "tool_use_id": "s", "content": [
+                {"type": "web_search_result", "url": "https://example.test", "title": "T",
+                 "encrypted_content": "opaque"}]},
+            {"type": "text", "text": "a \"signature\" in words stays"}]});
+        assert_eq!(
+            read(&serde_json::to_string_pretty(&claude).unwrap()),
+            json!({"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "plan"},
+                {"type": "redacted_thinking"},
+                {"type": "server_tool_use", "id": "s", "name": "web_search", "input": {"query": "q"}},
+                {"type": "web_search_tool_result", "tool_use_id": "s", "content": [
+                    {"type": "web_search_result", "url": "https://example.test", "title": "T"}]},
+                {"type": "text", "text": "a \"signature\" in words stays"}]})
+        );
+        let reasoning = json!({"type": "reasoning", "summary": [], "encrypted_content": "x"});
+        assert_eq!(
+            read(&reasoning.to_string()),
+            json!({"type": "reasoning", "summary": []})
+        );
+        // Anything else reads as it is stored.
+        let user = json!({"role": "user", "content": [{"type": "text", "text": "\"signature\""}]});
+        assert_eq!(read(&user.to_string()), user);
+    }
 
     #[test]
     fn a_cut_patch_still_names_every_file_it_changes() {

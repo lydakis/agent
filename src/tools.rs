@@ -29,6 +29,8 @@ mod picture;
 mod terminal;
 use files::read_bounded;
 pub use patch::Patch;
+#[cfg(unix)]
+pub use terminal::POLL_YIELD_MS;
 
 /// Model-facing text per tool result stream.
 pub const PREVIEW_BYTES: usize = 64 * 1024;
@@ -47,8 +49,13 @@ const MAX_SHELL_TIMEOUT_MS: u64 = 600_000;
 const MAX_WAIT_TIMEOUT_MS: u64 = 86_400_000;
 /// Simultaneously running child processes, foreground or background.
 pub const DEFAULT_PROCESS_BUDGET: usize = 64;
-/// Detached commands still running at once, daemon-wide, unless configured.
-pub const DEFAULT_DETACHED_BUDGET: usize = 16;
+/// Processes that outlive their call, terminals and detached commands,
+/// running at once daemon-wide unless configured: four per logical CPU,
+/// which keeps their descriptors well inside a default 256-descriptor
+/// limit on a laptop.
+pub fn default_lasting() -> usize {
+    4 * std::thread::available_parallelism().map_or(4, |n| n.get())
+}
 /// How long a terminal's start waits for output by default, and how long
 /// it or a write waits at most.
 const START_YIELD_MS: u64 = 1_000;
@@ -472,9 +479,21 @@ pub struct Registry {
     /// Background commands accepted and waiting for a slot. The operating
     /// system never sees these, so only this count can bound them.
     pending: Arc<std::sync::atomic::AtomicUsize>,
-    /// A permit stays with each detached child until its wait completes.
-    detached_slots: Arc<Semaphore>,
-    detached_budget: usize,
+    /// Processes that outlive their call, as a systemd slice holds a
+    /// service's: a permit stays with each terminal until its session is
+    /// gone and with each detached child until its wait completes.
+    lasting_slots: Arc<Semaphore>,
+    lasting_budget: usize,
+    /// Whether the machine's load lets a new command start, as make's
+    /// `-l`; see `admits`. None is no gate.
+    load: Option<watch::Receiver<bool>>,
+    /// Set when a turn parks on the load gate, so the daemon looks for
+    /// parked turns to wake only while some may be there.
+    load_parked: Arc<std::sync::atomic::AtomicBool>,
+    /// The line of background commands waiting at the load gate, in the
+    /// order they came: a fair lock its first holds while it waits, so a
+    /// later one never takes a slot ahead of it.
+    load_line: Arc<tokio::sync::Mutex<()>>,
     /// Running terminals, by proc handle, each its bot's own.
     #[cfg(unix)]
     terminals: terminal::Terminals,
@@ -490,6 +509,9 @@ pub struct Registry {
     daemon: Arc<Daemon>,
     /// Request encodings per (family, selection); see `encoded`.
     encodings: Encodings,
+    /// Bytes of tool output being redacted off the runtime at once; see
+    /// `off_runtime`.
+    heavy: Arc<Semaphore>,
 }
 type Encodings = Arc<std::sync::Mutex<HashMap<(Family, String), Arc<RawValue>>>>;
 /// What a file that is not text holds, named by its first bytes, as `file`
@@ -528,6 +550,7 @@ impl Drop for Queued {
         }
     }
 }
+#[derive(Clone)]
 struct Credential {
     name: String,
     value: String,
@@ -535,11 +558,14 @@ struct Credential {
 
 /// Values that never appear in tool output and never reach a shell's
 /// environment. Shared, so a login re-read while the daemon runs is
-/// redacted from then on; earlier values stay listed.
+/// redacted from then on; earlier values stay listed. Readers take the
+/// current set and let the lock go, so a scan of a large output on a
+/// blocking thread never holds up a refresh on the runtime's; a change
+/// copies the set if a scan still reads it.
 #[derive(Clone, Default)]
-pub struct Credentials(Arc<std::sync::RwLock<CredentialSet>>);
+pub struct Credentials(Arc<std::sync::RwLock<Arc<CredentialSet>>>);
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct CredentialSet {
     /// Longer values first, so a shorter old token cannot mask only a prefix
     /// of a new token. Refreshes pay for insertion; tool output stays sorted.
@@ -590,7 +616,8 @@ impl Credentials {
         if value.is_empty() {
             return;
         }
-        let mut set = self.0.write().unwrap_or_else(|e| e.into_inner());
+        let mut guard = self.0.write().unwrap_or_else(|e| e.into_inner());
+        let set = Arc::make_mut(&mut guard);
         if set
             .values
             .iter()
@@ -613,27 +640,29 @@ impl Credentials {
     /// Keep a variable out of shell environments without a value to
     /// redact: configuration the daemon read for itself.
     pub fn withhold(&self, name: &str) {
-        let mut set = self.0.write().unwrap_or_else(|e| e.into_inner());
+        let mut guard = self.0.write().unwrap_or_else(|e| e.into_inner());
+        let set = Arc::make_mut(&mut guard);
         if !set.names.iter().any(|existing| existing == name) {
             set.names.push(name.to_owned());
         }
     }
     pub fn names(&self) -> Vec<String> {
-        self.0
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .names
-            .clone()
+        self.current().names.clone()
+    }
+    /// The set as it is now, the lock held only to take it.
+    fn current(&self) -> Arc<CredentialSet> {
+        self.0.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
     /// Also redact the values after these field names, matched as a name's
     /// end, and the bodies of PEM blocks whose header names one of `blocks`.
     pub fn redact_also(&self, fields: &[String], blocks: &[String]) {
-        let mut set = self.0.write().unwrap_or_else(|e| e.into_inner());
+        let mut guard = self.0.write().unwrap_or_else(|e| e.into_inner());
+        let set = Arc::make_mut(&mut guard);
         set.fields = fields.iter().map(|field| field_key(field)).collect();
         set.blocks = blocks.to_vec();
     }
     pub fn redact(&self, mut text: String) -> String {
-        let set = self.0.read().unwrap_or_else(|e| e.into_inner());
+        let set = self.current();
         for credential in &set.values {
             if text.contains(&credential.value) {
                 text = text.replace(&credential.value, REDACTED);
@@ -648,10 +677,11 @@ impl Credentials {
         text
     }
     /// How many of `text`'s last bytes could begin a credential that more
-    /// output would finish: what a stream holds back until it can redact.
-    /// What it shows never ends inside a whole credential.
+    /// output would finish, or a secret field whose value more output
+    /// would carry: what a stream holds back until it can redact. What it
+    /// shows never ends inside a whole credential.
     pub fn unfinished(&self, text: &[u8]) -> usize {
-        let set = self.0.read().unwrap_or_else(|e| e.into_inner());
+        let set = self.current();
         let values = || {
             set.values
                 .iter()
@@ -664,7 +694,8 @@ impl Credentials {
                     .find(|&n| text.ends_with(&value[..n]))
             })
             .max()
-            .unwrap_or(0);
+            .unwrap_or(0)
+            .max(open_field(text, &set.fields).value);
         // A whole credential across the cut, as one that ends with its own
         // start, is shown whole.
         let mut cut = text.len() - started;
@@ -681,6 +712,28 @@ impl Credentials {
             cut = end;
         }
         text.len() - cut
+    }
+    /// How many of `text`'s last bytes open a secret field whose value has
+    /// not started: a name, or a name and its separator. They are shown,
+    /// and kept so the next text is redacted as read after them.
+    pub fn opening(&self, text: &[u8]) -> usize {
+        let set = self.current();
+        let open = open_field(text, &set.fields);
+        open.name - open.value
+    }
+    /// `text` redacted as it reads after `before`, already shown: a value
+    /// after a field's name shown earlier is still redacted.
+    pub fn redact_after(&self, before: &str, text: String) -> String {
+        if before.is_empty() {
+            return self.redact(text);
+        }
+        let mut whole = self.redact(format!("{before}{text}"));
+        if whole.starts_with(before) {
+            whole.replace_range(..before.len(), "");
+            whole
+        } else {
+            self.redact(text)
+        }
     }
 }
 
@@ -781,6 +834,89 @@ fn redact_fields(text: String, fields: &[String]) -> String {
     }
     out.push_str(&text[at..]);
     out
+}
+
+/// A secret field still open at a text's end, in bytes from that end.
+#[derive(Clone, Copy, Default)]
+struct Open {
+    /// Where its name starts: a name that may be one's start, a name and
+    /// separator with no value yet, or a name and a value not ended.
+    name: usize,
+    /// Where its value starts, when one has and not ended: held back so it
+    /// is redacted whole, at most `FIELD_HOLD` bytes of it. The name before
+    /// it is not secret, so it is shown: a prompt such as `Password: `
+    /// reaches whoever is to answer it.
+    value: usize,
+}
+
+fn open_field(text: &[u8], fields: &[String]) -> Open {
+    const FIELD_HOLD: usize = 4096;
+    // Four bytes of a field's start, so short words go out as typed.
+    const NAME_START: usize = 4;
+    let word = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'-';
+    let tail = &text[text.len().saturating_sub(FIELD_HOLD)..];
+    let key = |name: &[u8]| field_key(&String::from_utf8_lossy(name));
+    let mut i = 0;
+    while i < tail.len() {
+        if !word(tail[i]) || (i > 0 && word(tail[i - 1])) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < tail.len() && word(tail[i]) {
+            i += 1;
+        }
+        let name = key(&tail[start..i]);
+        if i == tail.len() {
+            // The last word: it may be the start of a field's name.
+            // Bytes, not characters: a field's name may be any text.
+            let begins = fields.iter().any(|field| {
+                (NAME_START.min(field.len())..=field.len())
+                    .any(|n| name.as_bytes().ends_with(&field.as_bytes()[..n]))
+            });
+            let name = if begins { tail.len() - start } else { 0 };
+            return Open { name, value: 0 };
+        }
+        if !fields.iter().any(|field| name.ends_with(field.as_str())) {
+            continue;
+        }
+        // As `redact_fields` reads one: a quote, a separator, a quote.
+        let mut j = i;
+        if j < tail.len() && matches!(tail[j], b'"' | b'\'') {
+            j += 1;
+        }
+        while j < tail.len() && matches!(tail[j], b' ' | b'\t') {
+            j += 1;
+        }
+        let name = tail.len() - start;
+        if j == tail.len() {
+            return Open { name, value: 0 };
+        }
+        if !matches!(tail[j], b'=' | b':') {
+            continue;
+        }
+        j += 1;
+        while j < tail.len() && matches!(tail[j], b' ' | b'\t') {
+            j += 1;
+        }
+        let quote = tail.get(j).copied().filter(|b| matches!(b, b'"' | b'\''));
+        if quote.is_some() {
+            j += 1;
+        }
+        let ended = tail[j..].iter().any(|&b| match quote {
+            Some(q) => b == q || b == b'\n',
+            None => {
+                b.is_ascii_whitespace() || matches!(b, b',' | b';' | b'"' | b'\'' | b'}' | b']')
+            }
+        });
+        if !ended {
+            return Open {
+                name,
+                value: tail.len() - j,
+            };
+        }
+    }
+    Open::default()
 }
 
 /// Replace the body of each PEM block in `text` whose header names one of
@@ -1086,9 +1222,12 @@ impl Registry {
             tools,
             slots: Arc::new(Semaphore::new(DEFAULT_PROCESS_BUDGET)),
             budget: DEFAULT_PROCESS_BUDGET,
+            load: None,
+            load_parked: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            load_line: Arc::default(),
             pending: Arc::default(),
-            detached_slots: Arc::new(Semaphore::new(DEFAULT_DETACHED_BUDGET)),
-            detached_budget: DEFAULT_DETACHED_BUDGET,
+            lasting_slots: Arc::new(Semaphore::new(default_lasting())),
+            lasting_budget: default_lasting(),
             #[cfg(unix)]
             terminals: Arc::default(),
             stopping: Arc::new(watch::Sender::new(false)),
@@ -1097,6 +1236,7 @@ impl Registry {
             environment: Arc::new(Vec::new()),
             daemon: Arc::default(),
             encodings: Arc::default(),
+            heavy: Arc::new(Semaphore::new(heavy_bytes())),
         })
     }
     /// A bot's selection must name registered tools, each once.
@@ -1162,12 +1302,34 @@ impl Registry {
         }
         Ok(encoded)
     }
-    /// Bound on detached commands still running, daemon-wide; exited ones
-    /// are reaped and stop counting. Zero removes the bound.
-    pub fn with_detached_budget(mut self, budget: usize) -> Self {
-        self.detached_budget = budget.min(Semaphore::MAX_PERMITS);
-        self.detached_slots = Arc::new(Semaphore::new(self.detached_budget));
+    /// Bound on terminals and detached commands still running, together,
+    /// daemon-wide; ended ones stop counting. Zero removes the bound.
+    pub fn with_lasting_budget(mut self, budget: usize) -> Self {
+        self.lasting_budget = budget.min(Semaphore::MAX_PERMITS);
+        self.lasting_slots = Arc::new(Semaphore::new(self.lasting_budget));
         self
+    }
+    /// A lasting process's permit, or `lasting_limit` naming what holds
+    /// them all. Nothing waits for one: a turn is never left in a line.
+    fn lasting(&self) -> Result<Option<tokio::sync::OwnedSemaphorePermit>> {
+        if self.lasting_budget == 0 {
+            return Ok(None);
+        }
+        self.lasting_slots.clone().try_acquire_owned().map(Some).map_err(|_| {
+            let held = self.lasting_budget - self.lasting_slots.available_permits();
+            #[cfg(unix)]
+            let terminals = self.terminals.lock().unwrap_or_else(|e| e.into_inner()).len();
+            #[cfg(not(unix))]
+            let terminals = 0;
+            Error::with(
+                "lasting_limit",
+                format!(
+                    "{held} lasting processes are running, the daemon's bound (--max-lasting {}): {terminals} terminals and {} detached commands; end one first",
+                    self.lasting_budget,
+                    held.saturating_sub(terminals)
+                ),
+            )
+        })
     }
     /// Bound on simultaneously running child processes. Waiting never counts.
     /// Zero removes the bound; the operating system is then the only limit.
@@ -1179,6 +1341,101 @@ impl Registry {
             self.budget
         }));
         self
+    }
+    /// Hold new commands back while the 1-minute load average is at
+    /// `limit` or over it and one of the daemon's commands is running, as
+    /// make's `-l` holds jobs: never while none is, so a busy machine
+    /// slows the fleet and never stops it, and the process budget stays
+    /// the bound behind it. One thread reads the load each second for
+    /// every waiter, which holds nothing as it waits. Zero is no gate.
+    pub fn with_load_gate(mut self, limit: f64) -> Self {
+        if !(limit > 0.0 && limit.is_finite()) {
+            self.load = None;
+            return self;
+        }
+        let (gate, open) = watch::channel(true);
+        let started = std::thread::Builder::new()
+            .name("load-gate".into())
+            .spawn(move || {
+                // Every waiter is woken each second the gate is shut, to
+                // look again at whether a command is still running.
+                while !gate.is_closed() {
+                    std::thread::sleep(Duration::from_secs(1));
+                    let below = load_average().is_none_or(|load| load < limit);
+                    gate.send_modify(|open| *open = below);
+                }
+            });
+        self.load = started.is_ok().then_some(open);
+        self
+    }
+    /// The load gate, read from `readings` instead of its own thread: the
+    /// same gate, for a caller that reads the load itself.
+    pub fn with_load_readings(mut self, readings: watch::Receiver<bool>) -> Self {
+        self.load = Some(readings);
+        self
+    }
+    /// Commands of the daemon's running now.
+    pub fn running(&self) -> usize {
+        let bound = match self.budget {
+            0 => Semaphore::MAX_PERMITS,
+            budget => budget,
+        };
+        bound.saturating_sub(self.slots.available_permits())
+    }
+    /// Whether the load gate lets a command start now, beside `holding`
+    /// of the daemon's commands that are this one's own slots.
+    pub fn admits(&self) -> bool {
+        self.admits_beside(0)
+    }
+    fn admits_beside(&self, holding: usize) -> bool {
+        self.load
+            .as_ref()
+            .is_none_or(|open| *open.borrow() || self.running() <= holding)
+    }
+    /// The load gate's readings, one a second while it is set: `true`
+    /// while the load is under its limit. None is no gate.
+    pub fn load_gate(&self) -> Option<watch::Receiver<bool>> {
+        self.load.clone()
+    }
+    /// A turn parked on the load gate: the daemon looks for it at the
+    /// gate's next reading that lets one start.
+    pub fn note_load_park(&self) {
+        self.load_parked
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    /// Whether a turn may have parked on the load gate since the last look,
+    /// clearing the mark; a daemon starts with it set, for parks from
+    /// before a restart.
+    pub fn take_load_parked(&self) -> bool {
+        self.load_parked
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+    }
+    /// Wait until the load gate lets a command start, then take a process
+    /// slot, and look again with the slot held: one that waited for its
+    /// slot while the gate shut gives it back and waits again. Waiters go
+    /// in the order they came, one at a time at the gate. A background
+    /// command waits here holding no turn; a turn's foreground command
+    /// parks before it gets here instead.
+    async fn admitted_slot(
+        &self,
+    ) -> std::result::Result<tokio::sync::OwnedSemaphorePermit, tokio::sync::AcquireError> {
+        let Some(open) = &self.load else {
+            return self.slots.clone().acquire_owned().await;
+        };
+        let mut open = open.clone();
+        let _first = self.load_line.lock().await;
+        loop {
+            while !*open.borrow_and_update() && self.running() > 0 {
+                // A gate that stopped reading lets everything through.
+                if open.changed().await.is_err() {
+                    return self.slots.clone().acquire_owned().await;
+                }
+            }
+            let slot = self.slots.clone().acquire_owned().await?;
+            if self.admits_beside(1) {
+                return Ok(slot);
+            }
+        }
     }
     /// How many of one bot's calls may run together: `cap` at most, and
     /// no more than half the process budget, so one bot's wide round
@@ -1195,9 +1452,12 @@ impl Registry {
     pub fn queue(&self) -> Result<Queued> {
         use std::sync::atomic::Ordering::Relaxed;
         // A free slot is taken here, not in the task, so the line counts
-        // only commands that truly wait; the semaphore is fair, so this
-        // never overtakes a waiter.
-        if let Ok(permit) = self.slots.clone().try_acquire_owned() {
+        // only commands that truly wait; the semaphore is fair, and none
+        // waits at the load gate, so this never overtakes a waiter.
+        if let Ok(_line) = self.load_line.try_lock()
+            && self.admits()
+            && let Ok(permit) = self.slots.clone().try_acquire_owned()
+        {
             return Ok(Queued {
                 permit: Some(permit),
                 pending: None,
@@ -1638,7 +1898,11 @@ impl Registry {
             Prepared::Note { .. } => fail("note_requires_runtime"),
             Prepared::Declared(_) => fail("declared_requires_runtime"),
             Prepared::WebSearch(_) => fail("web_search_requires_runtime"),
-            Prepared::WebFetch(url) => Ok(self.fetched(fetch::fetch(url).await?)),
+            Prepared::WebFetch(url) => {
+                let page = fetch::fetch(url).await?;
+                self.off_runtime(page.text.len(), move |registry| registry.fetched(page))
+                    .await
+            }
             Prepared::Shell {
                 command,
                 timeout_ms,
@@ -1882,25 +2146,34 @@ impl Registry {
     ) -> impl Future<Output = Result<Outcome>> + Send + 'static {
         let registry = self.clone();
         async move {
-            // Held until the command and the sandbox around it are gone,
-            // and taken before the slot, so no slot waits on it.
-            let _held = crate::sandbox::hold_for(sandbox.as_deref()).await;
-            let _slot = registry
-                .slots
-                .acquire()
+            let (stdout, stderr, exit, elapsed) = {
+                // Held until the command and the sandbox around it are
+                // gone, and taken before the slot, so no slot waits on it.
+                // Both go before the output is redacted, so a result
+                // waiting for that holds no process budget.
+                let _held = crate::sandbox::hold_for(sandbox.as_deref()).await;
+                let _slot = registry
+                    .slots
+                    .acquire()
+                    .await
+                    .map_err(|_| Error::new("tool_scheduler_closed"))?;
+                let _ = started.send(());
+                shell(
+                    &command,
+                    &workspace,
+                    Duration::from_millis(timeout_ms),
+                    &registry,
+                    &environment,
+                    sandbox.as_deref(),
+                )
+                .await?
+            };
+            let bytes = stdout.len() + stderr.len();
+            registry
+                .off_runtime(bytes, move |registry| {
+                    registry.shell_outcome(stdout, stderr, exit, elapsed)
+                })
                 .await
-                .map_err(|_| Error::new("tool_scheduler_closed"))?;
-            let _ = started.send(());
-            let (stdout, stderr, exit, elapsed) = shell(
-                &command,
-                &workspace,
-                Duration::from_millis(timeout_ms),
-                &registry,
-                &environment,
-                sandbox.as_deref(),
-            )
-            .await?;
-            Ok(registry.shell_outcome(stdout, stderr, exit, elapsed))
         }
     }
 
@@ -1929,21 +2202,30 @@ impl Registry {
             let result = async {
                 let slot = match queued.permit.take() {
                     Some(permit) => Ok(permit),
-                    None => registry.slots.clone().acquire_owned().await,
+                    None => registry.admitted_slot().await,
                 };
                 drop(queued);
-                let _slot = slot.map_err(|_| Error::new("tool_scheduler_closed"))?;
-                let _held = crate::sandbox::hold_for(sandbox.as_deref()).await;
-                let (stdout, stderr, exit, elapsed) = shell(
-                    &command,
-                    &workspace,
-                    Duration::from_millis(timeout_ms),
-                    &registry,
-                    &environment,
-                    sandbox.as_deref(),
-                )
-                .await?;
-                Ok(registry.shell_outcome(stdout, stderr, exit, elapsed))
+                // The slot and the sandbox's hold go once the command is
+                // done, before its output is redacted.
+                let (stdout, stderr, exit, elapsed) = {
+                    let _slot = slot.map_err(|_| Error::new("tool_scheduler_closed"))?;
+                    let _held = crate::sandbox::hold_for(sandbox.as_deref()).await;
+                    shell(
+                        &command,
+                        &workspace,
+                        Duration::from_millis(timeout_ms),
+                        &registry,
+                        &environment,
+                        sandbox.as_deref(),
+                    )
+                    .await?
+                };
+                let bytes = stdout.len() + stderr.len();
+                registry
+                    .off_runtime(bytes, move |registry| {
+                        registry.shell_outcome(stdout, stderr, exit, elapsed)
+                    })
+                    .await
             };
             // A command still running as the daemon stops is dropped, which
             // kills its group; its handle then reports the process lost, as
@@ -2160,6 +2442,57 @@ fn truncate(text: &str, dropped: u64) -> String {
     )
 }
 
+/// The machine's 1-minute load average, as uptime reports it.
+fn load_average() -> Option<f64> {
+    let mut load = [0.0f64; 1];
+    // SAFETY: getloadavg writes at most the one sample asked for.
+    let read = unsafe { libc::getloadavg(load.as_mut_ptr(), 1) };
+    (read == 1).then_some(load[0])
+}
+
+/// Output up to this many bytes is redacted on the runtime's thread: about
+/// half a millisecond with the default fields and blocks and a few
+/// credentials. Past it the scans take milliseconds (8 ms a MiB), so they
+/// run on a blocking thread.
+const INLINE_BYTES: usize = 64 * 1024;
+
+/// Bytes of output redacted on blocking threads at once: a few of the
+/// largest results for each logical CPU, so a burst of large outputs waits
+/// its turn rather than taking every blocking thread.
+fn heavy_bytes() -> usize {
+    let cpus = std::thread::available_parallelism().map_or(4, |n| n.get());
+    (cpus * 2 * (ARTIFACT_BYTES + PREVIEW_BYTES)).min(u32::MAX as usize)
+}
+
+impl Registry {
+    /// Run `work` over `bytes` of output: here when they are few, or else on
+    /// a blocking thread once the bytes being worked on there leave room,
+    /// as Tokio's `spawn_blocking` is meant for CPU-bound work.
+    async fn off_runtime<T: Send + 'static>(
+        &self,
+        bytes: usize,
+        work: impl FnOnce(&Registry) -> T + Send + 'static,
+    ) -> Result<T> {
+        if bytes <= INLINE_BYTES {
+            return Ok(work(self));
+        }
+        let wanted = bytes.min(heavy_bytes()) as u32;
+        let permit = self
+            .heavy
+            .clone()
+            .acquire_many_owned(wanted)
+            .await
+            .map_err(|_| Error::new("tool_scheduler_closed"))?;
+        let registry = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            work(&registry)
+        })
+        .await
+        .map_err(|_| Error::new("tool_redaction_failed"))
+    }
+}
+
 /// What a stream wrote, bounded: all of it up to `ARTIFACT_BYTES`, past
 /// that its first and last `KEPT_END` bytes and a count of the rest.
 #[derive(Default)]
@@ -2169,6 +2502,9 @@ struct Captured {
     dropped: u64,
 }
 impl Captured {
+    fn len(&self) -> usize {
+        self.head.len() + self.tail.len()
+    }
     /// Output past the head. Once the whole would pass the bound, the tail
     /// keeps only its last `KEPT_END` bytes.
     fn keep(&mut self, bytes: &[u8]) {
@@ -2345,23 +2681,13 @@ async fn detach(
     }
     // Admission is atomic across concurrent turns. The child and its permit
     // move into one waiter, so no reusable PID is polled after Tokio reaps it.
-    let permit = if registry.detached_budget == 0 {
-        None
-    } else {
-        Some(registry.detached_slots.clone().try_acquire_owned().map_err(|_| {
-            Error::with(
-                "detached_limit",
-                format!(
-                    "{} detached commands are still running, the daemon's bound (--max-detached {}); stop one first",
-                    registry.detached_budget - registry.detached_slots.available_permits(),
-                    registry.detached_budget
-                ),
-            )
-        })?)
-    };
+    let permit = registry.lasting()?;
     // What the sandbox holds in place stays held while the command runs.
     let sandboxed = sandbox.is_some();
     let held = crate::sandbox::hold_for(sandbox.as_deref()).await;
+    // The bot's socket listens while anything the command left in its
+    // group runs, not only while the command itself does.
+    let listening = sandbox.as_ref().and_then(|policy| policy.listening.clone());
     let mut child = process.spawn()?;
     let pid = child.id().ok_or(Error::new("shell_spawn_failed"))?;
     // It outlives turns and the daemon, but not the pull cord: a pull ends
@@ -2398,6 +2724,7 @@ async fn detach(
                 () = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
             }
         }
+        drop(listening);
     });
     Ok(Outcome::text(
         json!({"detached":true,"pid":pid}).to_string(),
@@ -2548,6 +2875,66 @@ mod tests {
         assert!(!name_matches("AWS_*", "MY_AWS_PROFILE"));
         assert!(!name_matches("A?S", "AS"));
         assert!(!name_matches("*_KEY", "OPENAI_API_KEYS"));
+    }
+    #[tokio::test]
+    async fn a_shut_load_gate_holds_new_commands_only_while_one_runs() {
+        let (gate, open) = watch::channel(false);
+        let mut registry = Registry::new("shell").unwrap().with_process_budget(2);
+        registry.load = Some(open);
+        // With none running, a command starts however loaded the machine.
+        assert!(registry.admits());
+        let first = registry.admitted_slot().await.unwrap();
+        assert!(!registry.admits());
+        // Nor is a background command's slot taken for it at once.
+        assert!(registry.queue().unwrap().permit.is_none());
+        let waiting = tokio::spawn({
+            let registry = registry.clone();
+            async move { registry.admitted_slot().await.unwrap() }
+        });
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished());
+        // The running one ends. A command that comes before the next
+        // look waits behind the one at the gate, as a line does: then the
+        // first goes.
+        drop(first);
+        assert!(registry.admits());
+        assert!(registry.queue().unwrap().permit.is_none());
+        gate.send_modify(|_| {});
+        let second = tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .unwrap()
+            .unwrap();
+        // One that took its slot as the gate shut, with another running,
+        // gives it back and waits: the budget of two is full, so this one
+        // waits for the slot while the gate is open, and the gate shuts
+        // before the slot frees.
+        gate.send_replace(true);
+        let third = registry.admitted_slot().await.unwrap();
+        let late = tokio::spawn({
+            let registry = registry.clone();
+            async move { registry.admitted_slot().await.unwrap() }
+        });
+        tokio::task::yield_now().await;
+        gate.send_replace(false);
+        drop(third);
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        assert!(!late.is_finished());
+        assert_eq!(registry.running(), 1);
+        // The load falls: it goes, alongside what runs.
+        gate.send_replace(true);
+        let _late = tokio::time::timeout(Duration::from_secs(5), late)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(registry.running(), 2);
+        drop(second);
+    }
+    #[test]
+    fn a_load_gate_of_zero_is_none() {
+        let registry = Registry::new("shell").unwrap().with_load_gate(0.0);
+        assert!(registry.load.is_none());
+        assert!(load_average().is_some_and(|load| load >= 0.0));
     }
     #[test]
     fn one_bot_runs_at_most_half_the_process_budget_at_once() {

@@ -499,7 +499,7 @@ class SocketAndCliTests(ModelFixture):
                              (('--provider', 'other=responses,http://127.0.0.1:1/v1'), '--provider other: not registered'),
                              (('--provider', f'openai=responses-ws,{self.url}'), 'over websocket but daemon has'),
                              (('--max-processes', '3'), '--max-processes'),
-                             (('--max-detached', '2'), '--max-detached'),
+                             (('--max-lasting', '2'), '--max-lasting'),
                              (('--max-pending', '5'), '--max-pending')):
             refused = attempt(*flags)
             self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
@@ -708,7 +708,7 @@ class SocketAndCliTests(ModelFixture):
         client.verify_followers({'Bob': page})
         self.assertEqual([e['turn'] for e in page['events'] if e['event'] == 'turn_finished'], turns)
 
-    def test_socket_shutdown_delivers_completion_and_wait_result(self):
+    def test_socket_shutdown_parks_the_turn_and_answers_its_waits(self):
         client = SocketClient(self.binary, self.store, self.url, 'echo')
         self.addCleanup(client.close)
         client.request('create', bot='Bob', workspace=str(self.path))
@@ -721,11 +721,12 @@ class SocketAndCliTests(ModelFixture):
         # arrives on the independent control connection.
         follower.request('inspect', bot='Bob')
         client.request('shutdown')
-        # Shutdown, not a client, cancelled the turn: the cause is its error.
-        self.assertEqual(client.finished(turn)['data']['error'], 'daemon_shutdown')
+        # The turn parks for the next start rather than ending, and its wait
+        # is answered as its deadline would answer it: still pending.
+        follower.receive(lambda e: e.get('event') == 'turn_paced' and e.get('turn') == turn)
         result = follower.receive(lambda e: e.get('id') == 'waiter')['result']
-        self.assertEqual(result['results'][handle]['error'], 'daemon_shutdown')
-        self.assertEqual(result['pending'], [])
+        self.assertEqual(result['pending'], [handle])
+        self.assertEqual(result['results'][handle]['waiting_on'], {'resume_at_ms': None, 'stopped': True})
         self.assertEqual(client.process.wait(timeout=2), 0)
 
     def test_the_same_command_resent_gets_what_it_made(self):
@@ -1519,6 +1520,23 @@ class ModelListTests(ModelFixture):
             next(m for m in map(json.loads, lines) if m.get('id') == 1)
         # Two listings fill what the daemon keeps; the third is asked again.
         self.assertEqual(len(self.model.paths), 4)
+
+    def test_the_daemon_starts_with_the_config_file_s_limits(self):
+        (self.home / '.agent').mkdir(exist_ok=True)
+        (self.home / '.agent' / 'config.toml').write_text(
+            '[daemon]\nprocesses = 7\nreaders = "min(cpus, 1) + 1"\nload = 1.5\n')
+        # The command line's own wins over the file's.
+        self.agent('stats', *self.store, *self.providers[:2], '--max-processes', '9')
+        with socket.socket(socket.AF_UNIX) as s:
+            s.connect(str(self.path / 'state.sqlite.sock'))
+            limits = json.loads(s.makefile('r').readline())['limits']
+        self.assertEqual((limits['processes'], limits['readers'], limits['load']), (9, 2, 1.5))
+        # A mistake in the file is refused by name, before any daemon starts.
+        self.agent('shutdown', *self.store)
+        (self.home / '.agent' / 'config.toml').write_text('[daemon]\nprocesses = "lots"\n')
+        refused = self.agent('stats', *self.store, *self.providers[:2], check=False)
+        self.assertEqual(refused.returncode, 1, refused.stderr)
+        self.assertIn('daemon.processes', refused.stderr)
 
     def test_discover_writes_nothing_when_no_provider_lists(self):
         refused = self.agent('models', '--discover', *self.store,

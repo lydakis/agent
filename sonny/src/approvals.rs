@@ -363,15 +363,14 @@ pub fn gate(name: &str, tools: &[String]) -> Map<String, Value> {
 }
 
 /// The sandbox fields, as `configure` takes them and `create`'s settings
-/// hold them, for an agent in the row `name` working in `workspace`, with
-/// the commands the person's config lets out of it (`[sonny]
-/// unsandboxed`). A row's repositories are the folder's own and each
+/// hold them, for an agent in the row `name` working in `workspace`. The
+/// commands let out of it are the daemon's command rules'. A row's repositories are the folder's own and each
 /// inside it, given as folders of their own so the daemon keeps their
 /// hooks and config read-only; a row's other folders are those that are
 /// there, by their real paths. A row no longer in the config is the
 /// default's.
 pub fn sandbox(name: &str, workspace: &std::path::Path) -> Map<String, Value> {
-    let mut fields = sandbox_with(name, workspace, &unsandboxed());
+    let mut fields = sandbox_with(name, workspace);
     // Sonny's own folder an agent's shell writes, by `sonny zen`, as Codex
     // adds its own folders to the roots it may write.
     if let Some(Value::Array(writable)) = fields.get_mut("writable")
@@ -390,24 +389,20 @@ fn zen_root() -> Option<String> {
     zen.to_str().map(str::to_owned)
 }
 
-/// [`sandbox`]'s fields, with `unsandboxed` the commands let out of it.
-fn sandbox_with(
-    name: &str,
-    workspace: &std::path::Path,
-    unsandboxed: &[String],
-) -> Map<String, Value> {
+/// [`sandbox`]'s fields, without Sonny's own folder.
+fn sandbox_with(name: &str, workspace: &std::path::Path) -> Map<String, Value> {
     let mode = find(name)
         .or_else(|| find(default()))
         .or_else(|| builtin(DEFAULT));
     match mode {
-        Some(mode) => fields(&mode, workspace, unsandboxed),
+        Some(mode) => fields(&mode, workspace),
         None => confined(json!({"sandbox": "danger-full-access"})),
     }
 }
 
 /// The sandbox fields of `mode` in `workspace`.
-fn fields(mode: &Mode, workspace: &std::path::Path, unsandboxed: &[String]) -> Map<String, Value> {
-    let mut fields = match &mode.sandbox {
+fn fields(mode: &Mode, workspace: &std::path::Path) -> Map<String, Value> {
+    let fields = match &mode.sandbox {
         Sandbox::Full => return confined(json!({"sandbox": "danger-full-access"})),
         Sandbox::ReadOnly => json!({"sandbox": "read-only"}),
         Sandbox::Workspace {
@@ -437,9 +432,6 @@ fn fields(mode: &Mode, workspace: &std::path::Path, unsandboxed: &[String]) -> M
             fields
         }
     };
-    if !unsandboxed.is_empty() {
-        fields["unsandboxed"] = json!(unsandboxed);
-    }
     confined(fields)
 }
 
@@ -484,14 +476,6 @@ fn real(folders: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// The commands the person's config lets agents run outside their
-/// sandboxes; none when it can't be read, which Sonny reports on start.
-pub fn unsandboxed() -> Vec<String> {
-    agent_client::config::load()
-        .map(|config| config.sonny.unsandboxed)
-        .unwrap_or_default()
-}
-
 /// The command prefix the person may let out of every sandbox when they
 /// allow `call` for good: the program and, when it reads as one, its
 /// subcommand, as Codex suggests a prefix rule (`cargo test`, not the whole
@@ -533,41 +517,58 @@ pub fn always(call: &Value) -> Option<String> {
     })
 }
 
-/// Adds `prefix` to `[sonny] unsandboxed` in the person's config, so every
-/// agent's sandbox lets it out from the next time Sonny sets it.
+/// Allows `prefix` for good, outside every agent's sandbox: an allow rule
+/// in the person's `~/.agent/rules/default.rules`, which the daemon reads
+/// as each agent's next turn starts.
 pub fn allow_always(prefix: &str) -> Result<(), String> {
-    let path = agent_client::config::path().ok_or("no config file to keep it in")?;
-    let commands = agent_client::config::read(&path)?.sonny.unsandboxed;
-    let Some(commands) = adding(commands, prefix)? else {
-        return Ok(());
+    let folder = agent_client::config::rules().ok_or("no HOME to keep it in")?;
+    let words: Vec<String> = prefix.split_whitespace().map(str::to_owned).collect();
+    agent_client::config::allow_rule(&folder, &words).map(drop)
+}
+
+/// The upgrade migration that moves `[sonny] unsandboxed` into rules.
+pub const UNSANDBOXED_RULES: &str = "unsandboxed-rules";
+
+/// At start, once: the commands `[sonny] unsandboxed` let out of every
+/// sandbox become allow rules, and the key leaves the config, now that the
+/// daemon's command rules hold them (0.8.0). Run before any agent is made,
+/// so none runs a turn without them.
+pub fn at_start() {
+    let (Some(home), Some(path), Some(folder)) = (
+        std::env::var_os("HOME").map(std::path::PathBuf::from),
+        agent_client::config::path(),
+        agent_client::config::rules(),
+    ) else {
+        return;
     };
-    let value = toml::Value::Array(commands.into_iter().map(toml::Value::String).collect());
-    agent_client::config::write(&path, &[("sonny.unsandboxed", Some(value))])
+    let record = home.join(".agent/sonny/migrated");
+    crate::upgrade::once(&record, UNSANDBOXED_RULES, || {
+        move_unsandboxed(&path, &folder)
+    });
 }
 
-/// `commands` with `prefix` added, None when it is there already, or why
-/// not when the daemon's bound on them would refuse every sandbox Sonny
-/// sets after: at most 64 commands, each of at most 1 KiB.
-fn adding(mut commands: Vec<String>, prefix: &str) -> Result<Option<Vec<String>>, String> {
-    if commands.iter().any(|command| command == prefix) {
-        return Ok(None);
+/// `[sonny] unsandboxed` in the config at `path`, as allow rules in
+/// `folder`: the rules first, then the key, so a stop between the two
+/// loses nothing. Whether it is done.
+fn move_unsandboxed(path: &std::path::Path, folder: &std::path::Path) -> bool {
+    let commands = match agent_client::config::read(path) {
+        Ok(config) => config.sonny.unsandboxed,
+        // No config, nothing to move.
+        Err(_) if !path.exists() => return true,
+        // One that doesn't read is told as Sonny starts; tried again next time.
+        Err(_) => return false,
+    };
+    if commands.is_empty() {
+        return true;
     }
-    if prefix.len() > MAX_COMMAND {
-        return Err("it is longer than a command let out may be".into());
+    for command in &commands {
+        let words: Vec<String> = command.split_whitespace().map(str::to_owned).collect();
+        if agent_client::config::allow_rule(folder, &words).is_err() {
+            return false;
+        }
     }
-    if commands.len() >= MAX_UNSANDBOXED {
-        return Err(format!(
-            "[sonny] unsandboxed holds the most commands it may, {MAX_UNSANDBOXED}"
-        ));
-    }
-    commands.push(prefix.to_owned());
-    Ok(Some(commands))
+    agent_client::config::write(path, &[("sonny.unsandboxed", None)]).is_ok()
 }
-
-/// The most commands a sandbox lets out, and the longest, as the daemon
-/// bounds them.
-const MAX_UNSANDBOXED: usize = 64;
-const MAX_COMMAND: usize = 1024;
 
 /// The git folder of the repository `dir` is in, which its linked
 /// worktrees share, by its real path as the daemon keeps it. Only one
@@ -648,7 +649,6 @@ pub fn sandboxed_as(record: &Value, fields: &Map<String, Value>) -> bool {
     let settings = &record["settings"];
     settings["sandbox"] == fields["sandbox"]
         && list(settings, "writable") == list(&fields, "writable")
-        && list(settings, "unsandboxed") == list(&fields, "unsandboxed")
         && list(settings, "unix_sockets") == list(&fields, "unix_sockets")
         && settings["network"].as_bool().unwrap_or(false)
             == fields["network"].as_bool().unwrap_or(false)
@@ -751,7 +751,7 @@ pub fn regate(record: &Value, mode: &str) -> Option<Map<String, Value>> {
     if let Some(workspace) = record["workspace"].as_str() {
         let sandbox = sandbox(mode, std::path::Path::new(workspace));
         confined = sandboxed_as(record, &sandbox);
-        fields.extend(sandbox);
+        fields.insert("settings".into(), Value::Object(sandbox));
     }
     (!has || !confined).then_some(fields)
 }
@@ -769,20 +769,20 @@ mod tests {
         let git = dir.join(".git").display().to_string();
         let confined = json!({"sandbox": "workspace-write", "writable": [git], "network": true});
         for mode in ["auto", "ask"] {
-            let fields = sandbox_with(mode, &dir, &[]);
+            let fields = sandbox_with(mode, &dir);
             assert_eq!(Value::Object(fields.clone()), confined);
             assert!(sandboxed_as(&json!({"settings": fields}), &fields));
         }
         // Read only writes nothing, its repository included, and reaches
-        // no network; the commands let out of every sandbox leave it too.
-        let reading = sandbox_with("read-only", &dir, &["mcpx".to_owned()]);
+        // no network.
+        let reading = sandbox_with("read-only", &dir);
         assert_eq!(
             Value::Object(reading.clone()),
-            json!({"sandbox": "read-only", "unsandboxed": ["mcpx"]})
+            json!({"sandbox": "read-only"})
         );
         assert!(sandboxed_as(&json!({"settings": reading}), &reading));
-        assert_eq!(Value::Object(sandbox_with("auto", &dir, &[])), confined);
-        let full = sandbox_with("full", &dir, &[]);
+        assert_eq!(Value::Object(sandbox_with("auto", &dir)), confined);
+        let full = sandbox_with("full", &dir);
         assert_eq!(
             Value::Object(full.clone()),
             json!({"sandbox": "danger-full-access"})
@@ -792,7 +792,7 @@ mod tests {
         let task = json!({"workspace": dir, "gates": [],
             "settings": {"sandbox": "workspace-write", "writable": [git], "network": true}});
         assert_eq!(
-            regate(&task, "full").unwrap()["sandbox"],
+            regate(&task, "full").unwrap()["settings"]["sandbox"],
             "danger-full-access"
         );
         let freed = json!({"workspace": dir, "gates": [],
@@ -802,28 +802,17 @@ mod tests {
         assert!(sandboxed_as(&unconfined, &full));
         // A lead made before leads were confined is confined again, and
         // one whose repository moved is given it where it is now.
-        let auto = sandbox_with("auto", &dir, &[]);
+        let auto = sandbox_with("auto", &dir);
         assert!(!sandboxed_as(&json!({"settings": {}}), &auto));
         let moved = json!({"settings": {"sandbox": "workspace-write", "writable": ["/gone/.git"],
             "network": true}});
         assert!(!sandboxed_as(&moved, &auto));
-        // The commands the config lets out of the sandbox go with it, and
-        // a lead made before they were named takes them.
-        let mcpx = sandbox_with("auto", &dir, &["mcpx".to_owned()]);
-        assert_eq!(mcpx["unsandboxed"], json!(["mcpx"]));
-        assert!(!sandboxed_as(&json!({"settings": auto}), &mcpx));
-        assert!(sandboxed_as(&json!({"settings": mcpx}), &mcpx));
-        assert!(
-            sandbox_with("full", &dir, &["mcpx".to_owned()])
-                .get("unsandboxed")
-                .is_none()
-        );
         // Outside a repository, only its own folder; with a git folder
         // named otherwise, whose hooks the daemon wouldn't know to keep,
         // commits ask.
         let plain = std::env::temp_dir().join(format!("sonny-plain-{}", std::process::id()));
         std::fs::create_dir_all(&plain).unwrap();
-        assert_eq!(sandbox_with("ask", &plain, &[])["writable"], json!([]));
+        assert_eq!(sandbox_with("ask", &plain)["writable"], json!([]));
         let apart = dir.join("apart");
         let tree = dir.join("tree");
         std::fs::create_dir_all(&tree).unwrap();
@@ -832,7 +821,7 @@ mod tests {
             &["init", "-q", "--separate-git-dir", apart.to_str().unwrap()],
         )
         .unwrap();
-        assert_eq!(sandbox_with("ask", &tree, &[])["writable"], json!([]));
+        assert_eq!(sandbox_with("ask", &tree)["writable"], json!([]));
         std::fs::remove_dir_all(&dir).unwrap();
         std::fs::remove_dir_all(&plain).unwrap();
     }
@@ -860,23 +849,23 @@ mod tests {
         std::fs::create_dir_all(dir.join("src/linked")).unwrap();
         std::fs::write(dir.join("src/linked/.git"), "gitdir: /elsewhere\n").unwrap();
         let git = |repo: &str| dir.join(repo).join(".git").display().to_string();
-        let fields = sandbox_with("auto", &dir, &[]);
+        let fields = sandbox_with("auto", &dir);
         assert_eq!(
             fields["writable"],
             json!([git("src/api"), git("src/web/ui")])
         );
         // A repository's own folder comes first, and what is inside its
         // tree is its own.
-        let fields = sandbox_with("auto", &dir.join("src/api"), &[]);
+        let fields = sandbox_with("auto", &dir.join("src/api"));
         assert_eq!(fields["writable"], json!([git("src/api")]));
         // A repository cloned since makes an agent's sandbox stale, so it
         // is given its folder too.
-        let before = sandbox_with("auto", &dir, &[]);
+        let before = sandbox_with("auto", &dir);
         std::fs::create_dir_all(dir.join("src/new")).unwrap();
         crate::task::git(&dir.join("src/new"), &["init", "-q"]).unwrap();
         assert!(!sandboxed_as(
             &json!({"settings": before}),
-            &sandbox_with("auto", &dir, &[])
+            &sandbox_with("auto", &dir)
         ));
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -894,7 +883,7 @@ mod tests {
                 Some(tag) => json!([{"tag": tag, "tools": fields["approve"]}]),
                 None => json!([]),
             };
-            let settings = sandbox_with(name, &plain, &[]);
+            let settings = sandbox_with(name, &plain);
             let record = json!({"gates": gates, "settings": settings, "workspace": plain});
             assert_eq!(mode(&record), Some(name));
         }
@@ -983,7 +972,7 @@ mod tests {
             "Like Ask me, as ~/.agent/config.toml changes it"
         );
         let reviewing = json!([{"tag": "auto", "tools": ["shell"]}]);
-        let record = |mode: &Mode, gates: &Value| json!({"gates": gates, "workspace": dir, "settings": fields(mode, &dir, &[])});
+        let record = |mode: &Mode, gates: &Value| json!({"gates": gates, "workspace": dir, "settings": fields(mode, &dir)});
         // Offline, with its repository read-only, so commits ask.
         let strict = record(&modes[5], &reviewing);
         assert_eq!(
@@ -1052,7 +1041,7 @@ mod tests {
         };
         let modes = modes_of(&sonny);
         let docker = modes.iter().find(|mode| mode.name == "docker").unwrap();
-        let fields = fields(docker, &dir, &[]);
+        let fields = fields(docker, &dir);
         assert_eq!(
             fields["unix_sockets"],
             json!([
@@ -1066,7 +1055,7 @@ mod tests {
         let record = json!({"gates": gates, "workspace": dir, "settings": fields});
         assert_eq!(mode_in(&record, &modes), Some("docker"));
         assert!(sandboxed_as(&record, &fields));
-        let auto = super::fields(&modes[0], &dir, &[]);
+        let auto = super::fields(&modes[0], &dir);
         assert!(auto.get("unix_sockets").is_none());
         assert!(!sandboxed_as(&record, &auto));
         let record = json!({"gates": gates, "workspace": dir, "settings": auto});
@@ -1098,7 +1087,7 @@ mod tests {
         let modes = modes_of(&sonny);
         let offline = modes.iter().find(|mode| mode.name == "offline").unwrap();
         let record = json!({"gates": [{"tag": "auto", "tools": ["shell"]}], "workspace": dir,
-            "settings": fields(offline, &dir, &[])});
+            "settings": fields(offline, &dir)});
         assert_eq!(mode_in(&record, &modes), Some("offline"));
         // A repository made there since: still offline, not widened to auto.
         crate::task::git(&dir, &["init", "-q"]).unwrap();
@@ -1126,14 +1115,32 @@ mod tests {
     }
 
     #[test]
-    fn a_command_is_kept_only_within_the_daemon_s_bound() {
-        let kept: Vec<String> = (0..63).map(|n| format!("tool{n}")).collect();
-        let more = adding(kept.clone(), "cargo test").unwrap().unwrap();
-        assert_eq!(more.last().map(String::as_str), Some("cargo test"));
-        // One there already changes nothing, even with no room left.
-        assert_eq!(adding(more.clone(), "tool3"), Ok(None));
-        assert!(adding(more, "make").is_err());
-        assert!(adding(kept, &"x".repeat(MAX_COMMAND + 1)).is_err());
+    fn the_commands_let_out_of_every_sandbox_become_allow_rules() {
+        let dir = std::env::temp_dir().join(format!("sonny-unsandboxed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = dir.join("config.toml");
+        let rules = dir.join("rules");
+        // Nothing to move: done, and nothing written.
+        assert!(move_unsandboxed(&config, &rules));
+        assert!(!rules.exists());
+        std::fs::write(
+            &config,
+            "[sonny]\nlead_effort = \"high\"\nunsandboxed = [\"mcpx\", \"docker compose\"]\n",
+        )
+        .unwrap();
+        // One already allowed stays once.
+        agent_client::config::allow_rule(&rules, &["mcpx".to_owned()]).unwrap();
+        assert!(move_unsandboxed(&config, &rules));
+        assert_eq!(
+            std::fs::read_to_string(rules.join("default.rules")).unwrap(),
+            "prefix_rule(pattern=[\"mcpx\"], decision=\"allow\")\n\
+             prefix_rule(pattern=[\"docker\",\"compose\"], decision=\"allow\")\n"
+        );
+        let left = agent_client::config::read(&config).unwrap();
+        assert!(left.sonny.unsandboxed.is_empty());
+        assert_eq!(left.sonny.lead_effort.as_deref(), Some("high"));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

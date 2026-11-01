@@ -228,6 +228,7 @@ fn run_as(
         }
         *slot = Some(it.next().ok_or_else(usage)?.clone());
     }
+    let scoped = scope.is_some();
     // The scope is resolved once the command is known to be whole, so a
     // usage error says so even outside a project.
     let project = || -> Result<Option<String>, String> {
@@ -293,6 +294,25 @@ fn run_as(
                 noted(root, caller, &path, now)
             })
         }
+        // A name not in the project's facts is looked for in the person's,
+        // as `show` lists both: unscoped, a read finds either, and outside
+        // a project the person's. A scope given is the only one read.
+        ("read", Some(name), [None, None, None], None) if !scoped => match project() {
+            Err(error) if error.starts_with("project_unknown: ") => read(root, &name),
+            Err(error) => Err(error),
+            Ok(None) => read(root, &name),
+            Ok(Some(project)) => match read(&root.join("projects").join(project), &name) {
+                Err(error) if error.starts_with("fact_not_found: ") => {
+                    read(root, &name).map_err(|e| match e.starts_with("fact_not_found: ") {
+                        true => format!(
+                            "fact_not_found: {name}: no such fact in this project or the person's"
+                        ),
+                        false => e,
+                    })
+                }
+                found => found,
+            },
+        },
         ("read", Some(name), [None, None, None], None) => read(&scope()?, &name),
         ("rm", Some(name), [None, None, None], None) => {
             let dir = scope()?;
@@ -1783,6 +1803,48 @@ mod tests {
         );
         std::fs::remove_dir_all(root).unwrap();
         std::fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn an_unscoped_read_finds_the_persons_fact_from_a_project_and_from_outside_one() {
+        let home = temp("read-scopes");
+        let root = home.join(".agents/memory");
+        let work = home.join("work");
+        std::fs::create_dir_all(work.join(".agents")).unwrap();
+        std::fs::write(work.join(".agents/project.toml"), "name = \"demo\"\n").unwrap();
+        let outside = home.join("elsewhere");
+        std::fs::create_dir_all(&outside).unwrap();
+        save_user(&root, "short-replies", "keep replies short", "Short.").unwrap();
+        let read = |cwd: &Path, line: &[&str]| run(&root, cwd, &args(line), &no_stdin);
+        let found = read(&work, &["read", "short-replies"]).unwrap();
+        assert!(found["text"].as_str().unwrap().contains("Short."));
+        let found = read(&outside, &["read", "short-replies"]).unwrap();
+        assert!(found["text"].as_str().unwrap().contains("Short."));
+        // A project's own fact of the same name comes first.
+        read(
+            &work,
+            &[
+                "save",
+                "short-replies",
+                "--type",
+                "feedback",
+                "--description",
+                "d",
+                "--source",
+                "s",
+                "--",
+                "Project.",
+            ],
+        )
+        .unwrap();
+        let found = read(&work, &["read", "short-replies"]).unwrap();
+        assert!(found["text"].as_str().unwrap().contains("Project."));
+        // A scope given is the only one read.
+        let error = read(&work, &["read", "short-replies", "--project", "other"]).unwrap_err();
+        assert!(error.starts_with("fact_not_found: "), "{error}");
+        let error = read(&work, &["read", "missing"]).unwrap_err();
+        assert!(error.starts_with("fact_not_found: missing: "), "{error}");
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]

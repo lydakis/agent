@@ -3,6 +3,7 @@
 #![allow(clippy::undocumented_unsafe_blocks)]
 use agent_runtime::tools::{Credentials, Prepared, Registry};
 use serde_json::{Value, json};
+use std::collections::HashMap;
 
 #[tokio::test]
 async fn shell_preserves_exit_status_and_separate_outputs() {
@@ -148,6 +149,38 @@ async fn known_credential_text_is_redacted_before_tool_result_serialization() {
         .unwrap();
     let result: Value = serde_json::from_str(&outcome.output).unwrap();
     assert_eq!(result["stdout"], "\u{fffd}[REDACTED]");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn large_output_is_redacted_off_the_runtime_whole() {
+    let credentials = Credentials::default();
+    credentials.set("AGENT_TEST_FAKE_KEY", "synthetic-large-value");
+    let tools = Registry::new("shell")
+        .unwrap()
+        .with_credentials(credentials);
+    // Past the inline bound on both streams: each is redacted on a
+    // blocking thread, its preview and its artifact alike.
+    let command = "head -c 300000 /dev/zero | tr '\\0' a; printf ' synthetic-large-value'; \
+                   printf 'synthetic-large-value ' >&2; head -c 300000 /dev/zero | tr '\\0' b >&2";
+    let shell = tools
+        .prepare("shell", &json!({ "command": command }).to_string())
+        .unwrap();
+    let outcome = tools
+        .execute(shell, &std::env::temp_dir(), &[], None)
+        .await
+        .unwrap();
+    let result: Value = serde_json::from_str(&outcome.output).unwrap();
+    assert_eq!(result["exit_code"], 0);
+    let streams: HashMap<&str, String> = outcome
+        .artifacts
+        .iter()
+        .map(|(name, bytes)| (*name, String::from_utf8(bytes.clone()).unwrap()))
+        .collect();
+    assert!(streams["stdout"].ends_with(" [REDACTED]"));
+    assert!(streams["stderr"].starts_with("[REDACTED] "));
+    for text in streams.values().chain([&outcome.output]) {
+        assert!(!text.contains("synthetic-large-value"));
+    }
 }
 
 #[tokio::test]
@@ -412,7 +445,7 @@ async fn detached_commands_run_in_their_own_session_and_write_only_where_told() 
 
 #[tokio::test]
 async fn detached_commands_are_bounded_and_reaped() {
-    let tools = Registry::new("shell").unwrap().with_detached_budget(2);
+    let tools = Registry::new("shell").unwrap().with_lasting_budget(2);
     let dir = std::env::temp_dir().join(format!("agent-detach-bound-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let detach = |command: &str| {
@@ -440,13 +473,9 @@ async fn detached_commands_are_bounded_and_reaped() {
         .execute(detach("true"), &dir, &[], None)
         .await
         .unwrap_err();
-    assert_eq!(error.code, "detached_limit");
+    assert_eq!(error.code, "lasting_limit");
     assert!(
-        error
-            .detail
-            .as_deref()
-            .unwrap()
-            .contains("--max-detached 2"),
+        error.detail.as_deref().unwrap().contains("--max-lasting 2"),
         "{error:?}"
     );
     // One exits: its waiter reaps it without another detach, and releases
@@ -473,7 +502,7 @@ async fn detached_commands_are_bounded_and_reaped() {
         .output;
     assert!(output.contains("\"detached\":true"), "{output}");
     // Unbounded when asked.
-    let free = Registry::new("shell").unwrap().with_detached_budget(0);
+    let free = Registry::new("shell").unwrap().with_lasting_budget(0);
     for _ in 0..3 {
         free.execute(
             free.prepare(
@@ -1217,6 +1246,18 @@ async fn a_terminal_takes_typed_input_and_reports_its_end() {
     let end: Value = serde_json::from_str(&end.await.unwrap().unwrap().output).unwrap();
     assert_eq!(end["exit_code"], 3);
     assert!(end.get("handle").is_none());
+    // Until its handle's result is recorded, a read still finds its end;
+    // then the terminal goes.
+    let read: Value = serde_json::from_str(
+        &tools
+            .write_stdin(1, 1, "", None, false, None)
+            .await
+            .unwrap()
+            .output,
+    )
+    .unwrap();
+    assert_eq!(read["exit_code"], 3);
+    tools.forget_terminal(1);
     let error = tools
         .write_stdin(1, 1, "", None, false, None)
         .await
@@ -1257,6 +1298,7 @@ async fn a_terminal_takes_typed_input_and_reports_its_end() {
         network: false,
         socket: None,
         capability: None,
+        listening: None,
         helper: None,
         sockets: Vec::new(),
     });
@@ -1293,4 +1335,126 @@ fn protecting() -> agent_runtime::sandbox::Daemon {
         protected_existing: agent_client::PROTECTED_EXISTING.map(String::from).to_vec(),
         ..Default::default()
     }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn terminals_hold_a_lasting_permit_and_end_their_whole_session() {
+    use std::time::Duration;
+    // Whether `pid` still runs: a zombie no init has reaped yet does not.
+    let alive = |pid: i32| {
+        if unsafe { libc::kill(pid, 0) } != 0 {
+            return false;
+        }
+        std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .map(|stat| {
+                !stat
+                    .rsplit_once(')')
+                    .is_some_and(|(_, rest)| rest.trim_start().starts_with('Z'))
+            })
+            .unwrap_or(true)
+    };
+    let cwd = std::env::temp_dir();
+    let tools = Registry::all().unwrap().with_lasting_budget(2);
+    let start = |owner: i64, handle: i64, command: &str| {
+        let (done, end) = tokio::sync::oneshot::channel();
+        let started = tools.terminal(
+            owner,
+            handle,
+            command.into(),
+            cwd.clone(),
+            1000,
+            Vec::new(),
+            None,
+            done,
+        );
+        (started, end)
+    };
+    // A shell with job control puts its jobs in groups of their own; one
+    // ignores SIGHUP. Killing the terminal still ends it.
+    let (started, end) = start(
+        1,
+        1,
+        "set -m; (trap '' HUP; exec sleep 300) & echo \"job=$!\"; sleep 300",
+    );
+    let started: Value = serde_json::from_str(&started.await.unwrap().output).unwrap();
+    let job: i32 = started["output"]
+        .as_str()
+        .unwrap()
+        .trim()
+        .strip_prefix("job=")
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(alive(job));
+    let (started, _second) = start(1, 2, "sleep 300");
+    started.await.unwrap();
+    // Both permits held: another terminal or a detached command is refused,
+    // naming what holds them.
+    let (refused, _) = start(2, 3, "sleep 300");
+    let error = refused.await.err().unwrap();
+    assert_eq!(error.code, "lasting_limit");
+    assert!(
+        error
+            .detail
+            .as_deref()
+            .unwrap()
+            .contains("2 terminals and 0 detached"),
+        "{error:?}"
+    );
+    let detach = tools
+        .prepare(
+            "shell",
+            &json!({"command":"true","detach":true}).to_string(),
+        )
+        .unwrap();
+    let error = tools.execute(detach, &cwd, &[], None).await.unwrap_err();
+    assert_eq!(error.code, "lasting_limit");
+    tools.write_stdin(1, 1, "", None, true, None).await.unwrap();
+    end.await.unwrap().unwrap();
+    for _ in 0..300 {
+        if !alive(job) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(!alive(job), "the job outlived its terminal");
+    // Its permit is free again.
+    let (started, _third) = start(2, 3, "sleep 300");
+    started.await.unwrap();
+    tools.end_terminals();
+
+    // A bot at its share of terminals ends its least recently used before
+    // the next one starts, so the next one finds that permit free.
+    let share = 16;
+    let tools = Registry::all().unwrap().with_lasting_budget(share);
+    let mut ends = Vec::new();
+    for handle in 1..=share as i64 + 1 {
+        let (done, end) = tokio::sync::oneshot::channel();
+        tools
+            .terminal(
+                1,
+                handle,
+                "sleep 300".into(),
+                cwd.clone(),
+                0,
+                Vec::new(),
+                None,
+                done,
+            )
+            .await
+            .unwrap();
+        ends.push(end);
+    }
+    let first: Value =
+        serde_json::from_str(&ends.remove(0).await.unwrap().unwrap().output).unwrap();
+    assert_eq!(first["signal"], libc::SIGKILL);
+    tools.forget_terminal(1);
+    let error = tools
+        .write_stdin(1, 1, "", None, false, None)
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(error.code, "terminal_not_running");
+    tools.end_terminals();
 }

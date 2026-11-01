@@ -135,7 +135,10 @@ impl Base {
                 // again is refused where none runs now.
                 if !tools.is_empty() {
                     client
-                        .request("configure", json!({"bot": name, "sandbox": "read-only"}))
+                        .request(
+                            "configure",
+                            json!({"bot": name, "settings": {"sandbox": "read-only"}}),
+                        )
                         .await?;
                 }
                 return base(&bot);

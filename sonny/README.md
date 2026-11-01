@@ -247,6 +247,7 @@ at its model's own effort (`AGENT_EFFORT` when its model is
 | A guess at your next message | `[sonny] suggest` (true, the default, or false) | |
 | Whether agents have the commons | `[sonny] commons` (true, the default, or false) | |
 | When a note opens the margin | `[sonny] margin_opens` (`always`, the default, `unless-closed` or `never`) | |
+| Where a click on an agent's name goes | `[sonny] agent_opens` (`tab`, the default, or `beside`) | |
 | The daemon started with the machine | `[sonny] start_at_boot` (true or false, the default) | |
 | News from outside for the lookout | `[sonny.sources.NAME] command`, `every` | |
 
@@ -380,7 +381,7 @@ you wrote to run after it, as Codex does, Esc interrupts, `y`/`n` answer a
 pending approval, Ctrl-C clears the composer or quits. Shift-Enter or
 Alt-Enter (or Ctrl-J) starts a new line. The composer takes a shell's editing
 keys, as Codex's does: Ctrl-A/E and Ctrl-B/F move, Alt-B/F (or Alt- or
-Ctrl-arrows) move a word, Ctrl-P/N move a row, Ctrl-H and Ctrl-D delete a
+Ctrl-arrows) move a word, Up and Down (or Ctrl-P/N) move a row, Ctrl-H and Ctrl-D delete a
 character, Ctrl-W (or Alt-Backspace) and Alt-D (or Alt-Delete) a word,
 Ctrl-U and Ctrl-K to the line's start and end, and Ctrl-Y puts back what the
 last of those took. Shift-Enter needs a terminal that speaks the kitty
@@ -390,6 +391,29 @@ or Ctrl-J still start a line. Markdown shows in the composer as it will
 read, its marks kept and dim: `**bold**` bold, `` `code` `` in code's colour,
 a `#` line as a heading, a `>` quote in italics, a link's label underlined;
 what is sent is the text as typed.
+
+Up and Down also bring back what you sent before, as a shell's history
+and Codex's and Claude Code's do: Up on the composer's first row goes back
+a prompt, Down on its last row comes forward, and past the newest what you
+were writing comes back. A prompt of several rows opens at its top going
+back and at its end coming forward, so the next press keeps going; in
+between, the arrows move through its rows. Every window keeps its prompts in
+`~/.agent/sonny/history.jsonl` (only you can read it), and recalls its own
+first, newest first, then those any window sent before it opened. Edit a
+prompt brought back and it is yours to send, or Up starts again from it.
+Ctrl+R finds one by typing, as a shell's reverse search and Claude Code's
+do: the prompts sent before are a list over the composer, newest first,
+narrowed by the letters typed (in order, the first starting a word, as the
+slash menu finds commands). Ctrl+R again or the arrows pick, Enter or Tab puts
+the pick in the composer to edit (Up and Down go on from it), and Esc leaves
+the composer as it was.
+
+![Ctrl+R lists the prompts sent before, newest first; fix narrows it to two with the letters bold; Enter puts the picked one in the composer](../docs/sonny/prompt-search.png)
+A prompt this window sent comes back with its pictures (the newest as many
+as one message may carry; older ones let theirs go), and the draft with its
+own; one from the file comes back as text alone.
+
+![Up brings back a two-row prompt with the cursor at its top, Up again the one before, and Down twice returns the draft](../docs/sonny/prompt-history.png)
 
 Alt-T boosts the next message: the turn it starts runs at a higher effort
 (`xhigh`, or `high` where the model has no `xhigh`), Alt-T again at `max`
@@ -494,13 +518,16 @@ way `/react` does, and each note in the margin has its own `↩`.
 - `/config` (or `/settings`) lists every key `~/.agent/config.toml` takes,
   with its value or what its default is, over the composer. ↑/↓ picks
   one; ←/→ steps a key with a few values (efforts, `web_search`,
-  `senders`, `side_chat`, `chime`, `verbose`, `margin_opens`, `suggest`,
+  `senders`, `side_chat`, `chime`, `verbose`, `margin_opens`, `agent_opens`, `suggest`,
   `start_at_boot`) through them
   and its default; Enter types one that takes a name (`model`, `provider`,
   `judge.model`, the profiles), empty for its default; ⌫
   takes a key back to its default. Each change is written at once, the
   file's comments and order kept, and a file that does not read is
-  refused by name, as every reader refuses it.
+  refused by name, as every reader refuses it. What the file gives an
+  agent when it is made, its model's `[fallbacks]` entry and `senders`,
+  every agent Sonny made takes within seconds of the file changing, or,
+  at work, once its turn ends.
 
   ![/config over the composer, side_chat set to fork](../docs/sonny/config.png)
 - `/model` picks the lead's model, from every model its provider family
@@ -581,14 +608,28 @@ way `/react` does, and each note in the margin has its own `↩`.
   opens it. On Linux sandboxes need bubblewrap.
 
   A tool that keeps a daemon of its own, such as mcpx, can't run inside a
-  sandbox: `[sonny] unsandboxed = ["mcpx"]` has every agent run it outside
-  without asking, as a Codex rule that allows a command does. Each entry
-  is a command's first words (`"docker compose"`), and a call runs outside
-  only when everything it runs is named, so `mcpx … | jq` still asks.
-  When you approve a plain command that asked to leave, `a` (always allow
-  `cargo test`) adds its first words to the list, and the lead and its
-  agents take it at once. The list holds for every folder, so a program
-  named from the folder it runs in (`./build.sh`) is never offered.
+  sandbox: a command rule in `~/.agent/rules/default.rules`,
+  `prefix_rule(pattern = ["mcpx"], decision = "allow")`, has every agent
+  run it outside without asking, as Codex's rules do (Codex's own rules
+  files work unchanged). A rule names a command's first words
+  (`["docker", "compose"]`), and a call runs outside only when everything
+  it runs is allowed, so `mcpx … | jq` still asks. A rule can also always
+  ask (`"prompt"`) or never run a command (`"forbidden"`, with a
+  `justification` the agent is told); `sonny rules check -- git push`
+  shows what the rules say. The files are Starlark, as Codex runs them,
+  so variables, loops and functions work, and `host_executable` names
+  where a program lives (`/usr/bin/git` runs as `git`; a path it doesn't
+  name stays in the sandbox, as the name's `allow` rules never let it out); Codex's
+  `network_rule` is refused, since a sandbox's network is on or off. A
+  file that doesn't read keeps the rules last read, or, with none read
+  yet, has every command refused with where it went wrong. When you
+  approve a plain command that asked to leave, `a` (always allow `cargo test`) adds the rule, and every agent
+  takes it from its next turn: Sonny reads the folder again when a file
+  in it changes. The rules hold for every folder, so a
+  program named from the folder it runs in (`./build.sh`) is never
+  offered. Agents can't write the rules folder from their sandbox, and
+  an agent another made goes by its maker's rules. A
+  `[sonny] unsandboxed` list from before moves into `default.rules` once.
 
   An agent that reaches the network reaches every Unix socket too, as
   Codex's full network does, so MCPX, Docker and ssh-agent just work; and
@@ -626,8 +667,8 @@ way `/react` does, and each note in the margin has its own `↩`.
   reopens it. Each agent's
   time is how long its running turn has been at it, or how long its last
   turn took. An agent with automations or follows of its own
-  shows `↻ 2 automations` beside its model. A click on an agent's name opens
-  it in the pane, as a click on a task in a roster does, and so does
+  shows `↻ 2 automations` beside its model. A click on an agent's name goes
+  to it as a click on a task in a roster does (below), and so does
   Enter on the agent ↑ and ↓ pick (`›`); ‹ in its title,
   or Ctrl+[ from the conversation, goes back to `/status`. It opens
   with the agent the conversation named last already picked, so
@@ -1075,15 +1116,21 @@ say did not fail, but did not reply either, so it reads `no reply`, not
 once a turn ends, and `checked` once its goal's check passed.
 
 ![A task whose goal's check passed beside one still checking and one only done](../docs/sonny/tasks-checked.png) A click
-on a task opens it in the pane: its own Sonny, live, to watch and to talk
-to, as a side chat is. Ctrl+\ takes the keys back to the conversation and
+on a task goes to its own tab, where the lead laid it out in Rex, Herdr or
+cmux; a right click (or a click, with no tab) opens it in the pane: its own
+Sonny, live, to watch and to talk to, as a side chat is. `[sonny]
+agent_opens = "beside"` swaps the two. In the pane, its name in the title
+goes to its tab too, drawn in the agents' blue, as Ctrl+T does; where the
+title is narrow, its keys go from the last before the name is cut.
+
+![The pane's title at 72, 59 and 40 columns, outside a multiplexer and laid out, with the keys in the pane and in the chat](../docs/sonny/agent-pane-title.png) Ctrl+\ takes the keys back to the conversation and
 gives them to the pane again; from the conversation Ctrl+[ hides the task
 and Ctrl+] shows it again.
 
 ![Three tasks started together, each with what it does now](../docs/sonny/tasks-roster.png)
 
-An agent's name anywhere in the conversation opens that agent in the
-pane, as a GitHub `@name` links to its account: in a reply ("tally.halves
+An agent's name anywhere in the conversation goes to that agent, as a
+click on a task does, the way a GitHub `@name` links to its account: in a reply ("tally.halves
 has a question for you"), in a row of task updates, in a message from
 another agent, and in the pane's own text. Only a name the daemon knows
 is one, so it is drawn in the agents' blue, and a word that only looks

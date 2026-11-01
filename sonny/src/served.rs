@@ -315,8 +315,8 @@ fn triggers() -> Value {
         "name": TRIGGERS,
         "description": "Your triggers, which wake an agent later, again and again, or when something \
             happens, even with Sonny closed (a Mac keeps watch). Each fire gives the agent the message in its \
-            own conversation after a line with the fire time and what fired it; a repeating trigger skips a fire \
-            while the agent is working. Add one, or remove, fire or show one by name; with none, the result lists \
+            own conversation after a line with the fire time and what fired it; a fire while the agent is working \
+            waits for its work, one fire of a repeating trigger at a time. Add one, or remove, fire or show one by name; with none, the result lists \
             them all with any problems. Adding the same one again changes nothing; a different one under a name \
             in use is refused with the field that differs unless replace is set. Write the message as what to \
             check and when to stop, including removing its own trigger once the work is done.",
@@ -1339,15 +1339,18 @@ async fn answer(client: &Client, call: &Value, me: &Path, store: &Path, socket: 
     // A place among the processes Sonny runs for agents, within the call's
     // time: held until its process is done.
     let owner = str_of(&caller["name"]);
-    let _place = tokio::time::timeout(left(call), crate::budget::processes().admit(&owner))
-        .await
-        .map_err(|_| {
-            (
-                "tool_unserved",
-                "ran out of time waiting for one of Sonny's processes (sonny.tool_processes)"
-                    .to_owned(),
-            )
-        })?;
+    let _place = tokio::time::timeout(
+        left(call),
+        crate::budget::processes(crate::budget::Companion::ToolHost).admit(&owner),
+    )
+    .await
+    .map_err(|_| {
+        (
+            "tool_unserved",
+            "ran out of time waiting for one of Sonny's processes (sonny.tool_processes)"
+                .to_owned(),
+        )
+    })?;
     let mut child = command
         .spawn()
         .map_err(|e| ("tool_failed", format!("{}: {e}", me.display())))?;

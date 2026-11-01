@@ -4955,8 +4955,8 @@ creations that must fit their session's output queue, and four clients
 sending the same submission at once. Two Python tests hold nine admissions
 uncommitted behind one slow store job: a `shutdown` request queued behind
 them is answered after all nine, and a SIGTERM that finds them queued still
-answers each; in both, every started turn ends `interrupted` with
-`daemon_shutdown` and the daemon exits cleanly. All of this is one
+answers each; in both, every started turn parks for the next start and the
+daemon exits cleanly. All of this is one
 Linux container with an injected sync delay; macOS, where a flush costs
 about 5.4 ms, is not measured. The burst uses one connection; many clients
 arrive interleaved, which the Python test exercises but no timing does.
@@ -6394,3 +6394,368 @@ the node's own insert, so no job is added), and nothing passed the gate's
 20 ms, so its +0.9 ms is inside the noise. The extra per-write work shows in the
 single-commit microbenchmark above and not at fleet scale, where group
 commits carry it.
+
+## Replays off the writer and the subscription lock
+
+A `follow` replays its history in pages before it goes live. Each page
+used to be a job on the storage worker, read while holding the
+subscription's lock, so a client catching up from the first event put
+hundreds of reads in front of every write and every other request that
+needs the worker. Pages now come from the reader pool, sharing the
+observation lane's seats (all but one reader, across every replay at
+once), with no lock held while they read. Only the switch to live stays on
+the worker, as one job that reads at most one event: if an event landed
+since the last page it reads another page, and otherwise it marks the
+follow live, so nothing committed between the two modes is lost.
+
+`bench/fair_queuing.py` gained a `follow` flood: sessions that each follow
+`*` from the first event and wait for `follow_live`. 4-core Linux
+container, 210 bots each with 10 turns of 64 KiB prompts, 4 flooders with
+4 replays each (16 whole-store replays, 132,032 events delivered), probe
+`inspect` (a worker job) p50 / p95 / max in ms, base main 1413f05 against
+the head, two alternating runs each:
+
+| Flood | Base probe | Head probe | Flood, base / head |
+| --- | ---: | ---: | ---: |
+| none | 1.2 / 1.6 / 16.3, 1.3 / 1.7 / 3.7 | 1.1 / 1.4 / 21.1, 1.2 / 1.5 / 5.6 | |
+| 16 replays of `*` | 10.0 / 36.5 / 49.3, 1.4 / 42.9 / 49.3 | 1.2 / 14.5 / 25.7, 1.4 / 16.4 / 20.7 | 1.37, 1.41 / 1.05, 1.13 s |
+| 8,000 `history_nodes` (control) | 1.5 / 2.6 / 5.5, 1.4 / 2.8 / 4.9 | 1.4 / 2.8 / 6.6, 1.4 / 2.7 / 7.9 | 4.27, 4.05 / 4.05, 4.09 s |
+
+The probe's p95 behind the replays falls from about 40 ms to about 15 ms
+and its worst case halves, while the replays themselves finish about 20%
+sooner, since their pages now run side by side. The worker now sees one
+small job per replay, so what is left of the p95 is most likely the
+container's four cores busy encoding and sending 132,000 events beside
+the probe. The history flood, which this change
+does not touch, is the control and holds still.
+
+## Lasting processes under one cap, terminals killed whole (#562)
+
+Terminals and detached commands now share one `--max-lasting` cap. A
+terminal takes its permit before it spawns. A kill sweeps the command's
+whole session, and a terminal read holds back a secret field's value
+until it ends. The Perf workflow's matched screen, base main d617c75
+against the PR head e58304f, on the GitHub runner (2026-10-31):
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 46.117 | 45.963 | -0.3% |
+| admission | burst submit p99, ms | 6.528 | 6.343 | -2.8% |
+| completion | release to terminal p99, ms | 17.337 | 17.419 | +0.5% |
+| footprint | idle RSS, MiB | 20.07 | 20.137 | +0.3% |
+| footprint | per idle bot, KiB | 1.53 | 1.404 | -8.2% |
+| footprint | RSS after a turn each, MiB | 27.799 | 27.979 | +0.6% |
+| footprint | CPU per turn, ms | 1.625 | 1.622 | -0.2% |
+| lifecycle | CPU, s | 1.395 | 1.375 | -1.4% |
+| lifecycle | p95 turn, ms | 582.885 | 582.713 | -0.0% |
+| lifecycle | peak RSS, MiB | 26.797 | 26.783 | -0.1% |
+
+Store jobs per turn held at about 7.5. These benches run no terminal, so
+the terminal read itself was timed separately, in a release build on a
+4-core Linux container. Three credentials and three secret fields were
+set, and each read decoded, held back and redacted a buffer the way a
+`write_stdin` read does. Two alternating rounds:
+
+| Read | Base, µs | Head, µs |
+| --- | ---: | ---: |
+| 64 KiB of `ls -l` lines, ending in a prompt | 822 / 801 | 818 / 791 |
+| one 26-byte line | 1.41 / 1.41 | 1.55 / 1.42 |
+
+The field scan looks at the last 4 KiB at most, and the copy of the
+opening covers only a field's name and separator, so the cost of a read
+stays with the redaction it already did. The session sweep runs once per
+terminal or detached command, at its end, off the runtime thread.
+
+## A bot's socket listens while it is used (#563)
+
+A sandboxed bot's own socket now listens only while a share in it is
+held: by its turn's policy, or by a running command's sandbox hold. It
+closes 30 s after the last share goes. All the bots' graces wait in one
+daemon-wide queue, which one task sleeps on, and they are checked and
+unlinked off the runtime thread. A bot that never runs a sandboxed
+command pays nothing; one that does pays one refcount per command and
+one queue entry per last drop. The Perf workflow's matched screen, base
+main ee94271 against the PR head 27a842c, on the GitHub runner
+(2026-10-31):
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 36.104 | 35.656 | -1.2% |
+| admission | burst submit p99, ms | 4.065 | 4.03 | -0.8% |
+| completion | release to terminal p99, ms | 12.768 | 12.083 | -5.4% |
+| footprint | idle RSS, MiB | 20.18 | 19.771 | -2.0% |
+| footprint | per idle bot, KiB | 1.596 | 1.482 | -7.1% |
+| footprint | RSS after a turn each, MiB | 28.031 | 28.76 | +2.6% |
+| footprint | CPU per turn, ms | 1.209 | 1.179 | -2.5% |
+| lifecycle | CPU, s | 1.08 | 1.075 | -0.5% |
+| lifecycle | p95 turn, ms | 724.404 | 600.866 | -17.1% |
+| lifecycle | peak RSS, MiB | 27.516 | 27.018 | -1.8% |
+
+Store jobs per turn held at about 7.5. These benches run unsandboxed, so
+their path differs only by an `Option` that stays `None`. The lifecycle
+p95 drop is the runner's: the base read 724 ms here against 583 ms on
+the #562 screen. What the change is for is descriptors: before it, every
+bot that had ever run a sandboxed command kept a listening socket and an
+accept task until the bot was deleted. Now only bots in use, or within
+30 s of their last use, keep one.
+
+## Terminal polls park their turn (#567)
+
+A terminal read longer than the bot's `approval_hold_ms` now waits live
+only for the hold. After that its turn parks on the terminal's handle,
+as `wait` parks, and resumes when the command ends or the read's time
+runs out. A parked read holds no task and no active slot. It costs one
+`suspend` and one resume, the same store jobs a parked `wait` takes,
+and only reads past the hold pay them. Every other call's path differs
+by one match guard. The Perf workflow's matched screen, base main
+64590ae against the PR head a0e37bc, on the GitHub runner (2026-11-01):
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 46.041 | 45.811 | -0.5% |
+| admission | burst submit p99, ms | 6.561 | 6.348 | -3.2% |
+| completion | release to terminal p99, ms | 17.35 | 17.782 | +2.5% |
+| footprint | idle RSS, MiB | 20.23 | 20.07 | -0.8% |
+| footprint | per idle bot, KiB | 1.426 | 1.578 | +10.7% |
+| footprint | RSS after a turn each, MiB | 27.936 | 27.734 | -0.7% |
+| footprint | CPU per turn, ms | 1.623 | 1.611 | -0.7% |
+| lifecycle | CPU, s | 1.395 | 1.39 | -0.4% |
+| lifecycle | p95 turn, ms | 586.408 | 585.136 | -0.2% |
+| lifecycle | peak RSS, MiB | 26.924 | 27.072 | +0.6% |
+
+Store jobs per turn held at about 7.5. These benches make no terminal
+calls. The per-idle-bot figure moves by 150 bytes, inside the range
+the head's own runs spread over (1.36 to 1.76 KiB), and the change
+adds no per-bot state. What the change is for is slots: before it, a
+bot polling a long build held an active slot and a task for every
+second it waited. Now, past the hold, it holds a `waiting` row. The
+head after a0e37bc changes only tests.
+
+## A planned stop parks running turns (#565)
+
+A turn now reads the daemon's stopping flag, one relaxed atomic load, at
+the top of each model round, again just before each model call, before
+each call a round runs in order, and as each call of a parallel batch
+starts. No store job is added to a turn that is not stopping; the park
+itself is the pull cord's one job. The other checks, before a gated
+call starts, before a model call's retry and before a cache refresh, run
+only on those paths.
+
+The Perf workflow's screen, run here by hand: 4-core Linux container,
+base main d617c75 against the head on the same base, both release builds,
+two alternating rounds as `.github/workflows/perf.yml` runs them
+(`bench.admission_burst` and `bench.completion_burst` 5 runs each,
+`bench.footprint` 2, `bench.lifecycle` 32-bot socket echo 1), medians:
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 74.8 | 72.4 | -3.2% |
+| admission | burst submit p99, ms | 10.6 | 11.7 | +10.5% |
+| completion | release to terminal p99, ms | 31.5 | 25.9 | -17.7% |
+| footprint | idle RSS, MiB | 20.2 | 20.4 | +1.1% |
+| footprint | per idle bot, KiB | 1.44 | 1.49 | +3.9% |
+| footprint | RSS after a turn each, MiB | 28.6 | 28.6 | +0.2% |
+| footprint | CPU per turn, ms | 2.40 | 2.53 | +5.2% |
+| lifecycle | CPU, s (5 rounds) | 2.40 | 2.53 | +5.4% |
+| lifecycle | p95 turn, ms | 633 | 610 | -3.6% |
+| lifecycle | peak RSS, MiB | 27.0 | 27.0 | -0.1% |
+
+Store work per turn is the same on both: every counted operation in the
+admission, completion and footprint benches matches, and footprint's store
+jobs per turn are 7.48-7.50 on the base and 7.47-7.51 on the head (how
+jobs fall into group commits moves with timing). No timing passes the
+gate's warning (15% on the median with no overlap). Lifecycle CPU's two
+head runs both came out above the base's two, so it ran three more
+alternating rounds: across five, the base spans 2.20-2.53 s and the head
+2.30-2.64 s, and the medians are 5% apart. The burst p99 runs overlap the
+same way (base 8.3-14.3 ms, head 9.1-15.2 ms). A relaxed load per round
+is nanoseconds against a turn's milliseconds, so these moves are taken as
+the container's noise.
+
+## Request bytes read on credit
+
+`bench/ingress_credits.py`: 400 clients connect to one socket daemon and each
+sends a 4 MiB request line, a padded `inspect`. With `--stall-s 5` each sends
+all of its line except the newline, and ends it five seconds later, as a slow
+client would. A probe session times a short `inspect` every 5 ms. The
+measurements are the daemon's peak resident memory (`VmHWM`) while the lines
+stall and the probe's p95 over the whole flood. The machine is a 4-core Linux
+container with 15 GiB of memory, so the default bound is a sixteenth of that,
+about 1 GiB. Base is main with #560 (2661e5b).
+
+| Daemon | Resident while stalled | Probe p95 | Flood |
+| --- | ---: | ---: | ---: |
+| base | 1,629 MiB | 6.0 ms | 10.4 s |
+| head, default bound (about 1 GiB) | 464 MiB | 3.4 ms | 11.6 s |
+| head, `--max-input-bytes 67108864` | 52 MiB | 19.0 ms | 12.3 s |
+
+On base, each stalled reader keeps its partial line, so memory grows with the
+number of clients. On head, a line that runs past 4 KiB waits for 8 MiB of
+credit before it reads further. Only as many lines as the bound covers read at
+once, and the others wait in their sockets' kernel buffers. At the default
+that is about 120 lines of 4 MiB. Under the small bound the probe's p95 rises
+to 19 ms, because the lines are read a few at a time across the whole flood.
+Every request is still answered.
+
+When the clients do not stall (1,000 clients sending 4 MiB lines at once), the
+small bound held peak memory at 57 to 58 MiB in two runs. Base peaked at 45 MiB
+in one run and 175 MiB in the other. In that test the senders, not the daemon,
+limit how much is in flight.
+
+An earlier version took credit 64 KiB at a time. In that version, 1,000 long
+lines under the 64 MiB bound each held part of the credit they needed and
+waited for the rest, so they deadlocked. That is why a line past its first
+4 KiB now waits for all of its credit at once.
+`long_lines_past_the_budget_together_all_get_in` is the regression test.
+
+The Perf workflow's matched screen of the ordinary request path, base
+main ec88749 against the PR head b739e2c, on the GitHub runner
+(2026-11-01):
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 45.908 | 46.601 | +1.5% |
+| admission | burst submit p99, ms | 6.235 | 6.34 | +1.7% |
+| completion | release to terminal p99, ms | 17.237 | 17.611 | +2.2% |
+| footprint | idle RSS, MiB | 20.277 | 20.07 | -1.0% |
+| footprint | per idle bot, KiB | 1.526 | 1.556 | +2.0% |
+| footprint | RSS after a turn each, MiB | 28.279 | 27.814 | -1.6% |
+| footprint | CPU per turn, ms | 1.617 | 1.614 | -0.2% |
+| lifecycle | CPU, s | 1.4 | 1.395 | -0.4% |
+| lifecycle | p95 turn, ms | 583.638 | 587.636 | +0.7% |
+| lifecycle | peak RSS, MiB | 27.02 | 26.85 | -0.6% |
+
+Every request line under 4 KiB, which is every line these benches send,
+takes one uncontended semaphore permit before its read and gives it back
+when the service takes the request up. No measure moves past 2.2%, inside
+the runner's spread between screens (release to terminal read 17.35 and
+17.24 ms on the base across the last two), and store jobs per turn held
+at about 7.5.
+
+## Redaction cost by size (#316)
+
+This measures `Credentials::redact` in release mode with the CLI's default
+fields (`agent_client::SECRET_FIELDS`), the `PRIVATE KEY` block, and eight
+credentials, over prose that mentions `password` and `key:` on every line.
+Each figure is the mean of 20 runs on a 4-core Linux container.
+
+| Output | 4 KiB | 16 KiB | 64 KiB | 256 KiB | 1 MiB | 4 MiB |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Redaction | 0.04 ms | 0.13 ms | 0.49 ms | 2.2 ms | 7.7 ms | 35 ms |
+
+Output up to 64 KiB is still redacted inline, which costs at most half a
+millisecond. Anything larger goes to `spawn_blocking` under a byte budget of
+two of the largest results per logical CPU. A busy fleet's 1 MiB shell
+outputs and 4 MiB pages therefore no longer stall the daemon's runtime for
+8 to 35 ms each.
+
+The matched screen (CI `screen` job, base 33f5e38 against head 4cfe08a,
+two alternating rounds on one runner) shows nothing moving outside the
+runner's spread. No store-work count changed, since the change only moves
+where redaction runs. The screen's outputs are all under 64 KiB and stay
+inline, so it measures the cost the change adds to every tool result: one
+`Arc` clone of the credential set and a length check.
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 29.789 | 29.862 | +0.2% |
+| admission | burst submit p99, ms | 3.299 | 3.072 | -6.9% |
+| completion | release to terminal p99, ms | 8.971 | 8.822 | -1.7% |
+| footprint | idle RSS, MiB | 20.506 | 20.4 | -0.5% |
+| footprint | per idle bot, KiB | 1.352 | 1.454 | +7.5% |
+| footprint | RSS after a turn each, MiB | 28.4 | 28.268 | -0.5% |
+| footprint | CPU per turn, ms | 0.934 | 0.884 | -5.3% |
+| lifecycle | CPU, s | 0.865 | 0.845 | -2.3% |
+| lifecycle | p95 turn, ms | 577.489 | 578.919 | +0.2% |
+| lifecycle | peak RSS, MiB | 27.01 | 27.031 | +0.1% |
+
+The per-idle-bot figure is about a tenth of a KiB on a 1.4 KiB measure,
+which is within that figure's spread between runs; this change adds no
+per-bot state.
+
+## A quiet lead's window reads only its own tasks (bots by maker)
+
+`bench.sonny_screen` opens one quiet lead's Sonny in an 80x24 terminal. A
+socket in front of the daemon's counts what the window asks for and what
+it reads back, while 1,000 tasks of ten other leads run turns it has
+nothing to do with. Before this change, the window paged every running
+bot every three seconds and kept its own locally. Now it asks `bots` for
+those its lead made (`created_by_id`), which come from the `bots_maker`
+index. Each figure is one run on a 4-core Linux container with release
+builds:
+
+| Quiet window, 1,000 busy tasks elsewhere | Before | After |
+| --- | ---: | ---: |
+| Bytes read from the daemon, KiB/s | 34.41 | 0.02 |
+| `bots` requests, /s | 0.59 | 0.34 |
+| Sonny CPU, ms/s | 7.49 | 5.03 |
+| Sonny peak RSS, MiB | 18.4 | 18.1 |
+
+Each page now holds that lead's own running tasks, which is none here, so
+what the window reads no longer grows with the fleet. The Perf workflow
+now runs this bench on `sonny/**` and `client/**` changes too. It also
+covers the lookout at 10, 100 and 1,000 subscribers and a sky replay of
+the hour at 512x, and like the daemon's timings it warns rather than
+fails.
+
+The Perf workflow's matched screen, base `main` against this branch at
+dfd5509, three alternating rounds each on a GitHub runner (medians):
+
+| Measure | Base | Head | Change |
+| --- | ---: | ---: | ---: |
+| Quiet window reads, KiB/s | 29.745 | 0.61 | -97.9% |
+| Quiet window requests, /s | 0.6 | 0.445 | -25.8% |
+| Quiet window CPU, ms/s | 4.12 | 3.705 | -10.1% |
+| Quiet window RSS, MiB | 20.2 | 18.7 | -7.4% |
+| Lookout CPU per 1k deltas at 1,000, ms | 10.46 | 10.26 | -1.9% |
+| Lookout note p95 at 1,000, ms | 12199.0 | 11627.5 | -4.7% |
+| Sky replay CPU per 1k lines, ms | 7.875 | 7.81 | -0.8% |
+| Sky replay RSS, MiB | 65.7 | 80.35 | +22.3% |
+| Daemon CPU per turn, ms | 1.198 | 1.164 | -2.8% |
+| Lone submit CPU, ms | 36.139 | 35.855 | -0.8% |
+| Burst submit p99, ms | 4.192 | 4.089 | -2.5% |
+
+The daemon's own timings did not move. The sky's peak RSS warned. A
+replay keeps the events it played to step back through, so its peak most
+likely follows how much history the fleet wrote in the screen's fixed
+time (this side's last round read 40,412 lines). Its CPU per line is
+unchanged, and nothing in this change touches the sky.
+
+The same run shows the next limit at 1,000 subscribers: of 5,000 task
+turns that ended, the leads' notes named 660 within the ten seconds after
+the load, at a p95 of 20 s. At 100 subscribers they named every one, at a
+p95 of 2.8 s. A lead takes its notes one turn at a time, so a hundred
+tasks finishing together queue behind each other. That is the lookout's
+batching question, not the daemon's.
+
+## Daemon limits from the config, and a load gate (#575)
+
+Every tool round now asks the load gate whether its commands may start,
+and a round's parallel batch is formed before that check. With no gate
+(`serve` alone, as the screen runs it) the check is one `Option` test per
+call; with one, a borrow of a `watch` value and a semaphore count. Parks
+on the gate are one commit, as a verdict park is, and the waker reads the
+store only after a turn parks.
+
+The Perf workflow's matched screen, base `main` against this branch at
+f933397, three alternating rounds each on a GitHub runner (medians):
+
+| Measure | Base | Head | Change |
+| --- | ---: | ---: | ---: |
+| Lone submit CPU, ms | 30.129 | 30.134 | +0.0% |
+| Burst submit p99, ms | 3.113 | 3.084 | -0.9% |
+| Release to terminal p99, ms | 8.919 | 8.62 | -3.3% |
+| Idle RSS, MiB | 20.34 | 20.396 | +0.3% |
+| Per idle bot, KiB | 1.448 | 1.526 | +5.4% |
+| RSS after a turn each, MiB | 28.805 | 28.506 | -1.0% |
+| Daemon CPU per turn, ms | 0.93 | 0.901 | -3.1% |
+| Lifecycle CPU, s | 0.9 | 0.84 | -6.7% |
+| Lifecycle p95 turn, ms | 589.565 | 585.295 | -0.7% |
+| Lifecycle peak RSS, MiB | 27.223 | 27.314 | +0.3% |
+
+Nothing moved past noise. Per idle bot rose by 0.08 KiB, within the
+footprint bench's spread from run to run; the change adds nothing kept
+per bot (the gate's state is one per daemon). The later commits on this
+branch (the batch held whole, forbidden commands refused before the
+gate, the gate's waiters in order) change only which branch a call
+takes, not what runs on the hot path.

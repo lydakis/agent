@@ -200,8 +200,10 @@ impl Event {
         };
         let text = said("text")?;
         let urgent = object["urgent"] == true;
-        // A topic is what a subscription names after the colon.
-        let topic = said("topic").filter(|topic| !topic.contains(':'));
+        // A topic is what a subscription names after the colon, and goes in
+        // the note unquoted, so it holds no colon and no line break.
+        let topic = said("topic")
+            .filter(|topic| !topic.contains(':') && !topic.chars().any(char::is_control));
         let (id, from, url) = (said("id"), said("from"), said("url"));
         let told = (object["told"].as_array().into_iter().flatten())
             .filter_map(|bot| bot.as_str().map(|bot| cut(bot, FIELD_CHARS)))
@@ -956,6 +958,9 @@ mod tests {
         // A topic with a colon could not be named by a subscription.
         let colon = Event::parse("slack", r#"{"text": "x", "topic": "a:b"}"#, 0).unwrap();
         assert_eq!(colon.topic, None);
+        // Nor one that would break the note's lines.
+        let broken = Event::parse("slack", r#"{"text": "x", "topic": "a\n- b"}"#, 0).unwrap();
+        assert_eq!(broken.topic, None);
         // Not an object: the line itself.
         assert_eq!(Event::parse("slack", "{half", 0).unwrap().text, "{half");
         let long = Event::parse("slack", &"a".repeat(TEXT_CHARS + 10), 0).unwrap();

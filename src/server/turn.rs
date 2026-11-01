@@ -16,12 +16,13 @@ use agent_runtime::{
     codec::split_model,
     fail,
     provider::{Chain, Delta, Items, Provider, Report, Request as ModelRequest, ToolCall},
+    rules::Ruling,
     sandbox::Policy,
     store::{
-        Bot, CallAnswer, ContextPrefix, ContextUsage, Database, ElisionPlan, Gated, Pulled,
+        Bot, CallAnswer, ContextPrefix, ContextUsage, Database, ElisionPlan, Gated, Halt, Halted,
         Settings, Slot, Store, Strip, TURN_VIEW_ACCOUNTING, Waiting, Window, unserved,
     },
-    tools::{Files, Outcome, Prepared, ReadSource, Registry},
+    tools::{Files, Outcome, POLL_YIELD_MS, Prepared, ReadSource, Registry},
 };
 use bytes::Bytes;
 use futures_util::{StreamExt, stream};
@@ -41,13 +42,21 @@ use tokio::sync::{Notify, mpsc, oneshot, watch};
 /// The error a cancelled turn ends with, sent on its cancel channel: a
 /// client's interrupt, or the daemon shutting down around it.
 pub const INTERRUPTED: &str = "cancelled";
+/// The daemon stopping around a running turn, which parks it for the next
+/// start rather than ending it.
 pub const SHUTDOWN: &str = "daemon_shutdown";
+/// The daemon stopping on a fatal error around a running turn, which ends
+/// it as a crash would: only a planned stop parks a turn.
+pub const DIED: &str = "process_interrupted";
 /// A running turn's end when the daemon is paused.
 pub const PAUSED: &str = "daemon_paused";
 /// Attempts per model call before its failure is the turn's failure, and the
 /// wall-clock budget those attempts may span. A model call has no side
 /// effects, so retrying one is always safe; a tool is never rerun.
 const MAX_ATTEMPTS: u32 = 8;
+/// How long a command the load gate holds back waits live, a reading or
+/// two of the gate, before its turn parks.
+const LOAD_HOLD: std::time::Duration = std::time::Duration::from_millis(1500);
 /// Refusals for pace are spaced by the pool and are not the request's fault,
 /// so they get many more attempts inside the same time budget.
 const MAX_PACED_ATTEMPTS: u32 = 64;
@@ -188,6 +197,13 @@ pub struct Turn {
     /// The bot's context, compaction and approval settings, read with its
     /// record when the turn's rounds begin.
     pub settings: std::sync::OnceLock<Settings>,
+    /// The bot's command rules, read with its record as the turn's rounds
+    /// begin: every round rules its calls by them, so one that announces a
+    /// call and the run that starts it agree.
+    pub rules: std::sync::OnceLock<Arc<agent_runtime::rules::Rules>>,
+    /// While a resumed park's calls run, what the rules made of them as
+    /// their round was announced; otherwise the turn's own `rules`.
+    pub ruled: std::sync::Mutex<Option<Arc<agent_runtime::rules::Rules>>>,
     /// The turn's model's context window, as the turn starts.
     pub window: std::sync::OnceLock<u64>,
     /// The park this task continues, already claimed by the service: record
@@ -209,6 +225,10 @@ pub struct Turn {
     pub read_results: std::sync::Mutex<Vec<i64>>,
     /// What summaries held and spent beside the turn's own accounting.
     pub side: SideCounts,
+    /// Set by the service when the daemon stops taking work: the turn
+    /// starts no model call or tool call after it and parks at its next
+    /// boundary, for the next start to continue.
+    pub stopping: Arc<AtomicBool>,
 }
 
 /// A steer waiting for the running turn's next boundary. Armed by `steer`
@@ -408,6 +428,8 @@ enum Round {
     Paced(u64),
     /// Parked on a verdict whose gate lapses at the given time.
     Lapses(u64),
+    /// The daemon is stopping: park here, with nothing in flight.
+    Drained,
 }
 /// How long an answered call holds its turn's slot for the answer before
 /// it parks, at most: the bot's approval hold, when that is shorter.
@@ -420,12 +442,15 @@ enum Stop {
     Parked,
     /// Parked on a verdict or a wait; the service wakes it when a gate lapses.
     Lapses(u64),
+    /// The daemon is stopping: the calls left in the round do not start.
+    Drained,
 }
 impl Stop {
     fn round(self) -> Round {
         match self {
             Stop::Parked => Round::Parked,
             Stop::Lapses(at) => Round::Lapses(at),
+            Stop::Drained => Round::Drained,
         }
     }
 }
@@ -522,16 +547,28 @@ impl Turn {
         let mut landed = None;
         // Cancelling mid-job loses nothing: a job the worker has taken runs
         // to its commit, and the worker publishes whatever committed.
-        // The pull cord parks the turn rather than ending it.
-        let mut pulled = false;
+        // The pull cord parks the turn rather than ending it, and so does
+        // the daemon stopping: the next start continues it.
+        let mut stopped = None;
         let mut result = tokio::select! {
             biased;
             code = interrupt => {
-                pulled = code == PAUSED;
+                stopped = match code {
+                    PAUSED => Some(Halt::Pause),
+                    SHUTDOWN => Some(Halt::Shutdown),
+                    _ => None,
+                };
                 fail(code)
             }
             result = self.rounds(&mut accounting, &mut landed) => result,
         };
+        // Drained at a boundary, or before a model call's retry: parked as
+        // a stop parks it, with nothing left uncertain.
+        if matches!(&result, Ok(Round::Drained))
+            || matches!(&result, Err(error) if error.code == SHUTDOWN)
+        {
+            (stopped, result) = (Some(Halt::Shutdown), fail(SHUTDOWN));
+        }
         // The rounds future is gone, so cancellation cannot discard this flush.
         // A refresh it had already sent is billed: record what it cost.
         if let Some(Ok((usage, sent_at))) = settle(&mut accounting.refresh).await
@@ -580,22 +617,23 @@ impl Turn {
                     .map(|_| ())
                 })
                 .await
-        } else if pulled {
+        } else if let Some(stop) = stopped {
             let route = accounting.route.get().cloned();
             let parked = self
                 .store
-                .op("suspend_pulled", move |db| {
-                    db.suspend_pulled(turn, retries, paced_ms, summary_ms, route.as_deref())
+                .op("suspend_halted", move |db| {
+                    db.suspend_halted(turn, stop, retries, paced_ms, summary_ms, route.as_deref())
                 })
                 .await;
             // Parked: nothing more to commit, and the service keeps a
-            // wake-up that holds until `resume`. A park of the turn's own
-            // that committed as the pull cancelled it keeps its wake-ups,
-            // registered here as the rounds would have. A park that could
-            // not be written ends the turn as the pull used to.
+            // wake-up that holds until `resume`, or the next start finds it.
+            // A park of the turn's own that committed as the pull cancelled
+            // it keeps its wake-ups, registered here as the rounds would
+            // have. A park that could not be written ends the turn as the
+            // pull or the stop used to.
             match parked {
-                Ok(Pulled::Parked(_)) => result = Ok(Round::Paced(0)),
-                Ok(Pulled::Already(waiting, lapse)) => {
+                Ok(Halted::Parked(_)) => result = Ok(Round::Paced(0)),
+                Ok(Halted::Already(waiting, lapse)) => {
                     result = Ok(self.rejoin(*waiting, lapse).await);
                 }
                 Err(_) => {}
@@ -615,10 +653,12 @@ impl Turn {
         }
         // An interrupt may arrive while the non-cancellable flush is pending.
         // Honor it before retiring a parked task whose receiver is still live.
-        // A pull leaves a park as it is: the pause holds its wake-up.
+        // A pull or a stop leaves a park as it is: the pause holds its
+        // wake-up, and the next start finds it.
         if result.is_ok()
             && let Some(code) = *cancelled.borrow()
             && code != PAUSED
+            && code != SHUTDOWN
         {
             result = fail(code);
         }
@@ -628,6 +668,8 @@ impl Turn {
             // The park is committed; the service only keeps its wake-up.
             Ok(Round::Lapses(at)) => return Exit::Paced(at),
             Ok(Round::Finished) => None,
+            // Drained became a stop's park above; this is never reached.
+            Ok(Round::Drained) => Some(Error::new(SHUTDOWN)),
             Err(error) => {
                 self.handles.forget(Waiter::Turn(self.turn));
                 Some(error)
@@ -646,7 +688,7 @@ impl Turn {
         if waiting.paced_since_ms.is_some() {
             return Round::Lapses(waiting.deadline_ms.unwrap_or(0));
         }
-        if waiting.approval || waiting.answer.is_some() {
+        if waiting.approval || waiting.load || waiting.answer.is_some() {
             self.handles.wake(self.bot.clone(), self.turn);
             return match waiting.deadline_ms.filter(|&at| at > now_ms()) {
                 Some(at) => Round::Lapses(at),
@@ -743,6 +785,22 @@ impl Turn {
         self.settings
             .get()
             .expect("rounds read the bot's settings first")
+    }
+    fn rules(&self) -> &agent_runtime::rules::Rules {
+        self.rules.get().expect("rounds read the rules first")
+    }
+    /// The rulings of the calls being run ([`Turn::ruled`]).
+    fn ruled(&self) -> Arc<agent_runtime::rules::Rules> {
+        let ruled = self.ruled.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        ruled.unwrap_or_else(|| {
+            self.rules
+                .get()
+                .expect("rounds read the rules first")
+                .clone()
+        })
+    }
+    fn set_ruled(&self, ruled: Option<Arc<agent_runtime::rules::Rules>>) {
+        *self.ruled.lock().unwrap_or_else(|e| e.into_inner()) = ruled;
     }
     /// The configured envelope bounds input. Completion headroom is a soft
     /// compaction trigger, not a tax on every request's usable history.
@@ -1641,6 +1699,16 @@ impl Turn {
                     completion
                 }
                 Ok(None) => return Ok(Summary::Parked(accounting.parked_until)),
+                // A stopping daemon sent no request: a summary at the
+                // boundary parks the turn, planned again when it continues;
+                // one beside the turn's call is left for a later boundary.
+                Err(error) if error.code == SHUTDOWN => {
+                    accounting.copied = None;
+                    return match accounting.beside {
+                        true => Ok(Summary::Skipped),
+                        false => Err(error),
+                    };
+                }
                 Err(error) => {
                     accounting.copied = None;
                     self.hub
@@ -2065,6 +2133,12 @@ impl Turn {
         let context = self.store.op("context", move |db| db.context(turn)).await?;
         self.settings
             .get_or_init(|| self.with_one_lifetime(&record, &context.model));
+        if self.rules.get().is_none() {
+            let policy = record.settings.rules.clone().unwrap_or_default();
+            let _ = self
+                .rules
+                .set(Arc::new(agent_runtime::rules::Rules::new(policy)));
+        }
         // A turn may run at its own effort; everything after reads the record.
         record.effort = context.effort.clone();
         record.turn_budget = context.budget;
@@ -2151,7 +2225,28 @@ impl Turn {
                     self.store
                         .op("tool_finish", move |db| db.tool_finish(turn, &id, &outcome))
                         .await?;
-                } else if !waiting.approval {
+                } else if waiting.poll {
+                    // A terminal poll reads what the terminal wrote while
+                    // the turn was parked, or how it ended; a restart ended
+                    // it, so it no longer runs.
+                    let results = self
+                        .handles
+                        .take_settled(&self.store, turn, &waiting.handles)
+                        .await;
+                    let ended = results.values().next().cloned();
+                    let handle = match waiting.handles.first().map(|h| Handle::parse(h)) {
+                        Some(Ok(Handle::Process(id))) => id,
+                        _ => return fail("invalid_handle"),
+                    };
+                    let outcome = self
+                        .registry
+                        .poll_end(record.bot_id, handle, ended.as_deref())
+                        .unwrap_or_else(failure);
+                    let id = waiting.call_id.clone();
+                    self.store
+                        .op("tool_finish", move |db| db.tool_finish(turn, &id, &outcome))
+                        .await?;
+                } else if !waiting.approval && !waiting.load {
                     // A later call's lapse can wake the wait before its
                     // handles resolve: those are reported pending, as the
                     // wait's own timeout reports them.
@@ -2195,8 +2290,10 @@ impl Turn {
                         })
                         .await?;
                 }
-                // Calls that followed in the same model response.
-                if let Some(stop) = self
+                // Calls that followed in the same model response, run as
+                // their round was announced, whatever the rules say now.
+                self.set_ruled(Some(Arc::new(waiting.rules())));
+                let stop = self
                     .execute_calls(
                         waiting.pending.clone(),
                         (provider, model),
@@ -2208,8 +2305,9 @@ impl Turn {
                         accounting.route.get().map(String::as_str),
                         accounting.summary_retry(),
                     )
-                    .await?
-                {
+                    .await;
+                self.set_ruled(None);
+                if let Some(stop) = stop? {
                     return Ok(stop.round());
                 }
             }
@@ -2257,6 +2355,11 @@ impl Turn {
                 })
         });
         while model_rounds < self.settings().max_rounds() {
+            // A stopping daemon starts no call: the turn parks here, every
+            // result so far committed, and the next start continues it.
+            if self.stopping.load(Relaxed) {
+                return Ok(Round::Drained);
+            }
             // A refresh the last call left in flight ends here: the next call
             // reads the cache itself, and the budget counts what it billed.
             self.settle_refresh(&mut record, accounting).await?;
@@ -2466,6 +2569,11 @@ impl Turn {
                 },
                 Err(error) => return Err(error),
             };
+            // Nor after this boundary's own steps: a summary that ran
+            // while the stop began is kept, and its call does not start.
+            if self.stopping.load(Relaxed) {
+                return Ok(Round::Drained);
+            }
             self.bind_thinking(&mut record, &mut context, (provider, model))
                 .await?;
             // This call's view replaces the last one's, which goes before
@@ -2583,12 +2691,19 @@ impl Turn {
                 });
             record.sent = sent.or(record.sent);
             let name = self.bot.clone();
-            let gated = calls.iter().any(|call| record.gated(call, &workspace));
+            let gated = calls
+                .iter()
+                .any(|call| record.gated(call, &workspace, self.rules()));
+            let rules = self
+                .rules
+                .get()
+                .expect("rounds read the rules first")
+                .clone();
             // Taken before the commit that stamps the gates' announcement,
             // so a gate's first lapse is never counted late.
             let planned = tokio::time::Instant::now();
             let append = self.store.op("append", move |db| {
-                let entries = db.append(turn, items, &calls, usage.as_ref())?;
+                let entries = db.append_under(turn, items, &calls, usage.as_ref(), &rules)?;
                 if let Some((bytes, tokens)) = sent {
                     db.record_sent(&name, bytes, tokens)?;
                 }
@@ -2940,6 +3055,11 @@ impl Turn {
         };
         let mut tool_calls = tool_calls;
         loop {
+            // A stopping daemon sends no request, first or retry, and the
+            // turn parks as at a boundary.
+            if self.stopping.load(Relaxed) {
+                return Err(Error::new(SHUTDOWN));
+            }
             // A billed attempt that failed counts as a round: the retry that
             // is the turn's last allowed call goes without calls, as that
             // call would have.
@@ -3375,6 +3495,11 @@ impl Turn {
                 if self.side.replaced.load(Relaxed) {
                     return Ok(call.await);
                 }
+                // Nor once the daemon is stopping: no call after this one
+                // would read it, and the drain sends no new request.
+                if self.stopping.load(Relaxed) {
+                    return Ok(call.await);
+                }
                 *warm.pending = Some(self.refresh(warm));
             }
             let refreshed = {
@@ -3434,6 +3559,15 @@ impl Turn {
                     result = &mut run => return Ok(Ran::Done(result)),
                     () = &mut lifted => return Ok(Ran::Lifted(run)),
                     () = tokio::time::sleep_until(warm.read_at + warm.after) => {}
+                }
+                // A stopping daemon sends no new refresh: the next call that
+                // would read the cache waits for the next start.
+                if self.stopping.load(Relaxed) {
+                    return Ok(tokio::select! {
+                        biased;
+                        result = &mut run => Ran::Done(result),
+                        () = &mut lifted => Ran::Lifted(run),
+                    });
                 }
                 *warm.pending = Some(self.refresh(warm));
             }
@@ -3613,21 +3747,48 @@ impl Turn {
         let (turn, allowed) = (self.turn, record.callable());
         let mut calls = calls.into_iter();
         while let Some(call) = calls.next() {
+            // Nor any tool: the calls not yet started are answered as not
+            // run when the turn parks.
+            if self.stopping.load(Relaxed) {
+                return Ok(Some(Stop::Drained));
+            }
             // Calls in a row that only read or run commands, none of them
             // gated, run together, as Codex runs them.
-            if let Some(first) = self.parallel(record, &call, workspace)
-                && calls
-                    .as_slice()
-                    .first()
-                    .is_some_and(|next| self.parallel(record, next, workspace).is_some())
-            {
-                let mut batch = vec![(call, first)];
-                while let Some(prepared) = calls
-                    .as_slice()
-                    .first()
-                    .and_then(|next| self.parallel(record, next, workspace))
+            let together = match self.parallel(record, &call, workspace) {
+                Some(first)
+                    if (calls.as_slice().first())
+                        .is_some_and(|next| self.parallel(record, next, workspace).is_some()) =>
                 {
-                    batch.push((calls.next().expect("a next call"), prepared));
+                    let mut batch = vec![(call.clone(), first)];
+                    for next in calls.as_slice() {
+                        let Some(prepared) = self.parallel(record, next, workspace) else {
+                            break;
+                        };
+                        batch.push((next.clone(), prepared));
+                    }
+                    Some(batch)
+                }
+                _ => None,
+            };
+            // A command the machine's load holds back waits for it parked,
+            // before it, the calls it starts with, or those after start: a
+            // batch is let in or held whole.
+            let starting: Vec<&ToolCall> = match &together {
+                Some(batch) => batch.iter().map(|(call, _)| call).collect(),
+                None => vec![&call],
+            };
+            if let Some(held) =
+                (starting.iter()).find(|call| self.load_holds(record, call, workspace))
+                && let Some(stop) = self
+                    .await_load(&held.call_id, &call, &calls, route, summary_retry_ms)
+                    .await?
+            {
+                return Ok(Some(stop));
+            }
+            if let Some(batch) = together {
+                // The batch's first is `call`; the rest leave the round now.
+                for _ in 1..batch.len() {
+                    calls.next();
                 }
                 self.execute_parallel(batch, record, workspace, environment, warm.as_deref_mut())
                     .await?;
@@ -3635,7 +3796,7 @@ impl Turn {
             }
             // An escape from a sandbox runs unconfined only once a gate
             // allowed it.
-            let approved = record.gated(&call, workspace);
+            let approved = record.gated(&call, workspace, &self.ruled());
             if approved {
                 match self
                     .approve(
@@ -3670,17 +3831,30 @@ impl Turn {
             } else {
                 Err(Error::with("tool_not_available", call.name.as_str()))
             };
+            // The command rules come next, as in Codex: a forbidden command
+            // is refused, and one a rule asks about with no gate to ask is
+            // refused too, as Codex refuses it under a policy that never
+            // asks.
+            let ruling = record.ruling(&call, &self.ruled());
+            let prepared = prepared.and_then(|prepared| match &ruling {
+                Ok(Ruling::Forbidden(why)) => Err(Error::with("command_forbidden", why.as_str())),
+                Ok(Ruling::Prompt(why)) if !approved => {
+                    Err(Error::with("command_needs_approval", why.as_str()))
+                }
+                Err(error) => Err(error.clone()),
+                Ok(_) => Ok(prepared),
+            });
             // A call its sandbox confines runs in it; one that can't be
             // confined fails rather than run unconfined. An escape no gate
             // approved is refused, as Codex refuses one under a policy that
             // never asks: a command, or a write or edit held to the sandbox.
-            // A command its client lets out of the sandbox runs unconfined,
-            // as a Codex rule that allows it does.
+            // A command a rule allows runs unconfined, as in Codex; one a
+            // rule asked about runs where it asked to, once allowed.
             let mut sandbox = None;
             let confined = record.sandboxed()
                 && agent_runtime::sandbox::confinable(&call.name)
-                && !approved
-                && !record.unsandboxed(&call);
+                && !(approved && !record.confines(&call, workspace))
+                && ruling != Ok(Ruling::Allow);
             let prepared = match prepared {
                 Ok(Prepared::Shell { .. } | Prepared::Detach(_) | Prepared::Terminal { .. })
                     if confined && !record.confines(&call, workspace) =>
@@ -3781,7 +3955,13 @@ impl Turn {
                         .op("process_start", move |db| db.process_start(turn, &started))
                         .await?;
                     let (sender, receiver) = oneshot::channel();
-                    self.collect(id, &call.call_id, receiver, self.outputs(record, workspace));
+                    self.collect(
+                        id,
+                        &call.call_id,
+                        receiver,
+                        self.outputs(record, workspace),
+                        Some(self.registry.clone()),
+                    );
                     let start = self.registry.terminal(
                         record.bot_id,
                         id,
@@ -3794,6 +3974,47 @@ impl Turn {
                     );
                     match self.run_tool(start, None, warm.as_deref_mut()).await? {
                         Ran::Done(Ok(outcome)) => outcome,
+                        Ran::Done(Err(error)) => failure(error),
+                        Ran::Lifted(_) => unreachable!("only a command moves to the background"),
+                    }
+                }
+                // A poll past the bot's hold parks the turn as `wait` does,
+                // holding no slot until the terminal ends or the poll's
+                // time runs out; a steer waiting for the boundary keeps it
+                // live, as it makes a wait a poll.
+                Ok(Prepared::WriteStdin {
+                    handle,
+                    ref chars,
+                    yield_ms,
+                    kill: false,
+                }) if chars.is_empty()
+                    && !self.lift.is_armed()
+                    && yield_ms.unwrap_or(POLL_YIELD_MS) > self.settings().approval_hold_ms() =>
+                {
+                    let yield_ms = yield_ms.unwrap_or(POLL_YIELD_MS);
+                    let deadline_ms = now_ms() + yield_ms;
+                    let hold = self.registry.poll_hold(
+                        record.bot_id,
+                        handle,
+                        self.settings().approval_hold_ms(),
+                        sandbox,
+                    );
+                    match self.run_tool(hold, None, warm.as_deref_mut()).await? {
+                        Ran::Done(Ok(Some(outcome))) => outcome,
+                        Ran::Done(Ok(None)) => match self
+                            .park_poll(
+                                &call.call_id,
+                                handle,
+                                deadline_ms,
+                                &mut calls,
+                                route,
+                                summary_retry_ms,
+                            )
+                            .await?
+                        {
+                            ControlFlow::Continue(outcome) => outcome,
+                            ControlFlow::Break(stop) => return Ok(Some(stop)),
+                        },
                         Ran::Done(Err(error)) => failure(error),
                         Ran::Lifted(_) => unreachable!("only a command moves to the background"),
                     }
@@ -3969,8 +4190,13 @@ impl Turn {
         call: &ToolCall,
         workspace: &std::path::Path,
     ) -> Option<Prepared> {
+        let ruled = self.ruled();
         if !matches!(call.name.as_str(), "shell" | "read")
-            || record.gated(call, workspace)
+            || record.gated(call, workspace, &ruled)
+            || !matches!(
+                record.ruling(call, &ruled),
+                Ok(Ruling::None | Ruling::Allow)
+            )
             || record.declared(&call.name).is_some()
             || !record.callable().iter().any(|name| name == &call.name)
             || (call.name == "shell" && record.sandboxed() && !record.confines(call, workspace))
@@ -4016,18 +4242,20 @@ impl Turn {
             })
             .await?;
         // A sandboxed bot's commands all run in its one sandbox; when it
-        // can't be had, each command fails with why.
-        // A command its client lets out of it runs unconfined.
-        let shells = batch.iter().any(|(call, prepared)| {
-            matches!(prepared, Prepared::Shell { .. }) && !record.unsandboxed(call)
-        });
+        // can't be had, each command fails with why. A command a rule
+        // allows runs unconfined.
+        let ruled = self.ruled();
+        let allowed = |call: &ToolCall| record.ruling(call, &ruled) == Ok(Ruling::Allow);
+        let shells = batch
+            .iter()
+            .any(|(call, prepared)| matches!(prepared, Prepared::Shell { .. }) && !allowed(call));
         let sandbox = match shells && record.sandboxed() {
             true => self.sandbox(record, workspace).await,
             false => Ok(None),
         };
         let runs = batch.into_iter().map(|(call, prepared)| {
             let sandbox = match (&prepared, &sandbox) {
-                _ if record.unsandboxed(&call) => Ok(None),
+                _ if allowed(&call) => Ok(None),
                 (Prepared::Shell { .. }, Err(error)) => Err(error.clone()),
                 (_, sandbox) => Ok(sandbox.clone().unwrap_or_default()),
             };
@@ -4097,6 +4325,15 @@ impl Turn {
         environment: &[(String, String)],
         sandbox: Result<Option<Arc<Policy>>>,
     ) -> (String, Result<Outcome>) {
+        // A batch wider than its width starts its later calls as earlier
+        // ones finish; once the daemon is stopping, those do not run.
+        if self.stopping.load(Relaxed) {
+            let stopped = Error::with(
+                SHUTDOWN,
+                "the daemon stopped before this call ran; it did not run",
+            );
+            return (call_id, Ok(failure(stopped)));
+        }
         let sandbox = match sandbox {
             Ok(sandbox) => sandbox,
             Err(error) => return (call_id, Ok(failure(error))),
@@ -4211,7 +4448,7 @@ impl Turn {
             // The bot's own socket, so its commands may use the daemon as
             // far as a sandboxed bot may; opened first, so its folder is
             // there to be kept read-only.
-            let capability = daemon.capability(bot)?;
+            let (capability, listening) = daemon.capability(bot)?.unzip();
             let policy = Policy::new(
                 settings.sandbox,
                 Some(&root),
@@ -4221,6 +4458,7 @@ impl Turn {
             )?;
             Ok(policy.map(|policy| Policy {
                 capability,
+                listening,
                 ..policy.with_sockets(&settings.unix_sockets)
             }))
         })
@@ -4258,9 +4496,9 @@ impl Turn {
                 .gates
                 .iter()
                 .filter(|gate| {
-                    round
-                        .clone()
-                        .any(|c| record.gated(c, workspace) && gate.tools.contains(&c.name))
+                    round.clone().any(|c| {
+                        record.gated(c, workspace, &self.ruled()) && gate.tools.contains(&c.name)
+                    })
                 })
                 .filter_map(|gate| gate.expire_ms)
                 .min();
@@ -4270,6 +4508,11 @@ impl Turn {
             let (notify, lapse) = match first.take() {
                 Some(first) => first,
                 None => {
+                    // A drain that began while this waited for its verdict
+                    // starts nothing: the call is answered as not run.
+                    if self.stopping.load(Relaxed) {
+                        return Ok(Approval::Stop(Stop::Drained));
+                    }
                     // The job reads the clock when it judges, and the lapse
                     // is measured from a fresh read, so time spent queued for
                     // the worker moves neither.
@@ -4334,6 +4577,95 @@ impl Turn {
                 Some(None) => return Ok(Approval::Stop(Stop::Parked)),
             }
         }
+    }
+
+    /// Whether the daemon's load gate holds `call` back now: a foreground
+    /// command that would start at once, while the machine is over its
+    /// load and one of the daemon's commands runs. A call that is refused
+    /// (forbidden, asked about with no gate, an escape no gate allows) is
+    /// answered at once, and a gated one waits for its verdict instead: a
+    /// denial comes back as soon as it is given, and one allowed starts
+    /// then, as the person or approver who allowed it meant.
+    fn load_holds(&self, record: &Bot, call: &ToolCall, workspace: &std::path::Path) -> bool {
+        if self.registry.admits()
+            || record.declared(&call.name).is_some()
+            || !record.callable().iter().any(|name| name == &call.name)
+        {
+            return false;
+        }
+        let ruled = self.ruled();
+        let ruling = record.ruling(call, &ruled);
+        !record.gated(call, workspace, &ruled)
+            && matches!(ruling, Ok(Ruling::None | Ruling::Allow))
+            && !(record.sandboxed()
+                && ruling != Ok(Ruling::Allow)
+                && !record.confines(call, workspace))
+            && matches!(
+                self.registry.prepare(&call.name, &call.arguments),
+                Ok(Prepared::Shell {
+                    background: false,
+                    ..
+                })
+            )
+    }
+
+    /// Wait for the load gate to let `held` start, a command among `call`
+    /// and those starting with it: live until its next readings (a second
+    /// apart) have passed, then parked as a verdict waits, holding no task
+    /// and no slot, with `call` and the rest of its round not started. The daemon wakes the turn at the gate's
+    /// first reading that lets a command start. None: run it now.
+    async fn await_load(
+        &self,
+        held: &str,
+        call: &ToolCall,
+        calls: &std::vec::IntoIter<ToolCall>,
+        route: Option<&str>,
+        summary_retry_ms: Option<u64>,
+    ) -> Result<Option<Stop>> {
+        let Some(mut open) = self.registry.load_gate() else {
+            return Ok(None);
+        };
+        let hold = tokio::time::Instant::now() + LOAD_HOLD;
+        loop {
+            if self.registry.admits() {
+                return Ok(None);
+            }
+            if self.stopping.load(Relaxed) {
+                return Ok(Some(Stop::Drained));
+            }
+            tokio::select! {
+                changed = open.changed() => if changed.is_err() {
+                    return Ok(None);
+                },
+                () = tokio::time::sleep_until(hold) => break,
+            }
+        }
+        let turn = self.turn;
+        let pending: Vec<ToolCall> = std::iter::once(call.clone())
+            .chain(calls.as_slice().iter().cloned())
+            .collect();
+        let (held, route) = (held.to_owned(), route.map(str::to_owned));
+        let parked = self
+            .store
+            .op("suspend_load", move |db| {
+                let at = now_ms();
+                db.suspend_load(
+                    turn,
+                    &held,
+                    &pending,
+                    at,
+                    route.as_deref(),
+                    summary_retry_ms,
+                )
+            })
+            .await?;
+        self.registry.note_load_park();
+        Ok(match parked {
+            // A later call's gate lapsed: the turn goes on and meets it.
+            None => None,
+            Some(Some(at)) => Some(Stop::Lapses(at)),
+            Some(None) => Some(Stop::Parked),
+        })
     }
 
     /// Wait for an answered call's answer: live for the hold, then parked
@@ -4663,6 +4995,55 @@ impl Turn {
         Ok(ControlFlow::Break(lapse.map_or(Stop::Parked, Stop::Lapses)))
     }
 
+    /// Park the turn on a terminal poll, as `park` parks a wait on the
+    /// terminal's handle until `deadline_ms`; the poll's result is read
+    /// from the terminal when the turn resumes.
+    async fn park_poll(
+        &self,
+        call_id: &str,
+        handle: i64,
+        deadline_ms: u64,
+        calls: &mut std::vec::IntoIter<ToolCall>,
+        route: Option<&str>,
+        summary_retry_ms: Option<u64>,
+    ) -> Result<ControlFlow<Stop, Outcome>> {
+        let pending: Vec<ToolCall> = calls.collect();
+        let handles = vec![format!("proc:{handle}")];
+        let (turn, id, list) = (self.turn, call_id.to_owned(), handles.clone());
+        let route = route.map(str::to_owned);
+        let lapse = self
+            .store
+            .op("suspend", move |db| {
+                db.suspend_wait(
+                    turn,
+                    &id,
+                    &list,
+                    Some(deadline_ms),
+                    true,
+                    &pending,
+                    route.as_deref(),
+                    summary_retry_ms,
+                    true,
+                )?;
+                db.next_lapse(turn)
+            })
+            .await?;
+        self.handles
+            .attach(
+                &self.store,
+                Waiter::Turn(self.turn),
+                &handles,
+                Some(deadline_ms),
+                true,
+                Completion::Resume {
+                    bot: self.bot.clone(),
+                    turn: self.turn,
+                },
+            )
+            .await;
+        Ok(ControlFlow::Break(lapse.map_or(Stop::Parked, Stop::Lapses)))
+    }
+
     /// Start a command now; its result is retrievable through a proc handle
     /// that the store keeps unique and durable.
     #[allow(clippy::too_many_arguments)]
@@ -4693,7 +5074,7 @@ impl Turn {
             queued,
             sender,
         );
-        self.collect(id, call_id, receiver, outputs);
+        self.collect(id, call_id, receiver, outputs, None);
         Ok(Outcome::text(
             json!({"handle":format!("proc:{id}"),"background":true}).to_string(),
         ))
@@ -4722,20 +5103,23 @@ impl Turn {
         tokio::spawn(async move {
             let _ = sender.send(run.await);
         });
-        self.collect(id, call_id, receiver, outputs);
+        self.collect(id, call_id, receiver, outputs, None);
         Ok(Outcome::text(
             json!({"handle":format!("proc:{id}"),"background":true,"steered":true}).to_string(),
         ))
     }
 
     /// Record a background command's result when it arrives and wake those
-    /// waiting on its handle.
+    /// waiting on its handle. A terminal's, `terminal`, stays in the
+    /// registry with its end until then, so a poll never finds it gone
+    /// with no result.
     fn collect(
         &self,
         id: i64,
         call_id: &str,
         receiver: oneshot::Receiver<Result<Outcome>>,
         outputs: Option<Outputs>,
+        terminal: Option<Registry>,
     ) {
         let turn = self.turn;
         let (store, handles, failures, call_id_for_refs) = (
@@ -4784,6 +5168,9 @@ impl Turn {
                     // A closed receiver means the service has already exited.
                     let _ = failures.send(error);
                 }
+            }
+            if let Some(registry) = terminal {
+                registry.forget_terminal(id);
             }
         });
     }
@@ -5849,6 +6236,8 @@ mod tests {
             handles: handles.clone(),
             background_failures: mpsc::unbounded_channel().0,
             settings: Default::default(),
+            rules: Default::default(),
+            ruled: Default::default(),
             window: Default::default(),
             resumed: None,
             steers: Arc::new(AtomicBool::new(true)),
@@ -5857,6 +6246,7 @@ mod tests {
             tokens: Arc::default(),
             read_results: Default::default(),
             side: Default::default(),
+            stopping: Arc::default(),
         };
         let running = tokio::spawn(async move { task.execute(cancelled).await });
         let last = steers[31];
@@ -5872,8 +6262,9 @@ mod tests {
         })
         .await
         .unwrap();
-        // Cancelled by shutdown: the turn ends with the error its cause names.
-        cancel.send(Some(SHUTDOWN)).unwrap();
+        // Cancelled by an interrupt: the turn ends with the error its cause
+        // names. (Shutdown parks the turn instead of ending it.)
+        cancel.send(Some(INTERRUPTED)).unwrap();
         drop(output);
         let drain = tokio::spawn(async move {
             let mut bytes = Vec::new();
@@ -5884,7 +6275,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(matches!(exit, Exit::Finished(Some(error)) if error.code == SHUTDOWN));
+        assert!(matches!(exit, Exit::Finished(Some(error)) if error.code == INTERRUPTED));
         // The worker publishes every committed batch regardless of the task;
         // ending the store ends the stream once all of it is delivered.
         drop(store);
@@ -5947,6 +6338,309 @@ mod tests {
         cursors.dedup();
         assert_eq!(cursors.len(), events.len(), "and exactly once");
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_stopping_daemon_parks_the_turn_before_its_next_call() {
+        use agent_runtime::{
+            codec::Family,
+            provider::Transport,
+            store::{Binding, TurnOptions},
+        };
+        let dir = std::env::temp_dir().join(format!("agent-drain-park-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (store, publications) = Store::open(&dir.join("state.sqlite")).await.unwrap();
+        let turn = store
+            .op("create", |db| {
+                db.create(
+                    "Bob",
+                    Some("/synthetic"),
+                    Binding {
+                        provider: "openai",
+                        family: Family::Responses,
+                        model: "synthetic",
+                        instructions: "",
+                        effort: None,
+                        budget_tokens: None,
+                        tools: &[],
+                        created_by: None,
+                        created_by_id: None,
+                        compaction_instructions: None,
+                        compaction_model: None,
+                        fallback: None,
+                        gate: None,
+                        settings: Default::default(),
+                        declared: None,
+                        request_id: None,
+                    },
+                )?;
+                Ok(db
+                    .begin(
+                        "Bob",
+                        "first",
+                        "work",
+                        true,
+                        &TurnOptions::default(),
+                        |_, _| Ok(()),
+                    )?
+                    .turn)
+            })
+            .await
+            .unwrap();
+        let handles = Handles::new(mpsc::unbounded_channel().0);
+        let publisher = tokio::spawn(crate::server::publish(
+            publications,
+            Hub::default(),
+            handles.clone(),
+        ));
+        let (_cancel, cancelled) = watch::channel(None);
+        // Nothing listens there: the turn must park before any call.
+        let task = Turn {
+            identity: 0,
+            bot: "Bob".into(),
+            turn,
+            store: store.clone(),
+            providers: Arc::new(HashMap::from([(
+                "openai".into(),
+                Provider::new(
+                    Transport::new(1, 1).unwrap(),
+                    Family::Responses,
+                    "http://127.0.0.1:9/v1",
+                    None,
+                )
+                .unwrap(),
+            )])),
+            registry: Registry::new("echo").unwrap(),
+            hub: Hub::default(),
+            handles,
+            background_failures: mpsc::unbounded_channel().0,
+            settings: Default::default(),
+            rules: Default::default(),
+            ruled: Default::default(),
+            window: Default::default(),
+            resumed: None,
+            steers: Arc::default(),
+            compact: Arc::default(),
+            lift: Arc::default(),
+            tokens: Arc::default(),
+            read_results: Default::default(),
+            side: Default::default(),
+            stopping: Arc::new(AtomicBool::new(true)),
+        };
+        let exit = tokio::time::timeout(Duration::from_secs(5), task.execute(cancelled))
+            .await
+            .unwrap();
+        assert!(matches!(exit, Exit::Paced(0)));
+        let (status, waiting) = store
+            .op("parked", move |db| {
+                let waiting = db.waiting_turns()?.into_iter().find(|w| w.turn == turn);
+                Ok((db.turn_status("Bob", turn)?, waiting.unwrap()))
+            })
+            .await
+            .unwrap();
+        assert_eq!(status, "paced");
+        assert_eq!(waiting.halt, Some(Halt::Shutdown));
+        assert_eq!(waiting.deadline_ms, None);
+        let paced = store
+            .op("events", move |db| db.events("Bob", 0, 64))
+            .await
+            .unwrap();
+        let paced = paced["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["event"] == "turn_paced")
+            .unwrap()
+            .clone();
+        assert_eq!(paced["data"], json!({"resume_at_ms":null,"stopped":true}));
+        drop(store);
+        let _ = tokio::time::timeout(Duration::from_secs(2), publisher).await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_shut_load_gate_holds_a_batch_whole_when_a_later_call_is_a_command() {
+        use agent_runtime::{
+            codec::Family,
+            provider::Transport,
+            store::{Binding, TurnOptions},
+        };
+        let dir = std::env::temp_dir().join(format!("agent-load-batch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("notes.txt"), "hello").unwrap();
+        let (store, _publications) = Store::open(&dir.join("state.sqlite")).await.unwrap();
+        let tools = ["shell".to_owned(), "read".to_owned()];
+        let calls: Vec<ToolCall> = [
+            ("read", "read-1", json!({"path": dir.join("notes.txt")})),
+            ("shell", "shell-1", json!({"command": "true"})),
+        ]
+        .into_iter()
+        .map(|(name, id, arguments)| ToolCall {
+            custom: false,
+            name: name.into(),
+            call_id: id.into(),
+            arguments: arguments.to_string(),
+        })
+        .collect();
+        let round = calls.clone();
+        let workspace = dir.clone();
+        let (turn, record) = store
+            .op("create", move |db| {
+                db.create(
+                    "Bob",
+                    workspace.to_str(),
+                    Binding {
+                        provider: "openai",
+                        family: Family::Responses,
+                        model: "synthetic",
+                        instructions: "",
+                        effort: None,
+                        budget_tokens: None,
+                        tools: &tools,
+                        created_by: None,
+                        created_by_id: None,
+                        compaction_instructions: None,
+                        compaction_model: None,
+                        fallback: None,
+                        gate: None,
+                        settings: Default::default(),
+                        declared: None,
+                        request_id: None,
+                    },
+                )?;
+                let turn = (db.begin(
+                    "Bob",
+                    "first",
+                    "work",
+                    true,
+                    &TurnOptions::default(),
+                    |_, _| Ok(()),
+                )?)
+                .turn;
+                let items = (round.iter())
+                    .map(|call| {
+                        serde_json::to_vec(&json!({"type":"function_call","call_id":call.call_id,
+                            "name":call.name,"arguments":call.arguments}))
+                        .unwrap()
+                        .into()
+                    })
+                    .collect();
+                db.append(turn, items, &round, None)?;
+                Ok((turn, db.inspect("Bob")?))
+            })
+            .await
+            .unwrap();
+        // The machine is loaded and one of the daemon's commands runs.
+        let (_gate, readings) = watch::channel(false);
+        let registry = (Registry::new("shell,read").unwrap())
+            .with_process_budget(4)
+            .with_load_readings(readings);
+        let (started, running) = tokio::sync::oneshot::channel();
+        let busy = tokio::spawn(registry.foreground(
+            "sleep 30".into(),
+            dir.clone(),
+            60_000,
+            Vec::new(),
+            None,
+            started,
+        ));
+        running.await.unwrap();
+        assert!(!registry.admits());
+        let provider = Provider::new(
+            Transport::new(1, 1).unwrap(),
+            Family::Responses,
+            "http://127.0.0.1:9/v1",
+            None,
+        )
+        .unwrap();
+        let task = Turn {
+            identity: 0,
+            bot: "Bob".into(),
+            turn,
+            store: store.clone(),
+            providers: Arc::default(),
+            registry: registry.clone(),
+            hub: Hub::default(),
+            handles: Handles::new(mpsc::unbounded_channel().0),
+            background_failures: mpsc::unbounded_channel().0,
+            settings: Default::default(),
+            rules: Default::default(),
+            ruled: Default::default(),
+            window: Default::default(),
+            resumed: None,
+            steers: Arc::default(),
+            compact: Arc::default(),
+            lift: Arc::default(),
+            tokens: Arc::default(),
+            read_results: Default::default(),
+            side: Default::default(),
+            stopping: Arc::new(AtomicBool::new(false)),
+        };
+        let policy = serde_json::from_value(json!({"prefix_rules": [
+            {"pattern": ["rm"], "decision": "forbidden"},
+            {"pattern": ["git", "push"], "decision": "prompt"},
+        ]}))
+        .unwrap();
+        let _ = task
+            .rules
+            .set(Arc::new(agent_runtime::rules::Rules::new(policy)));
+        let _ = task.settings.set(record.settings.clone());
+        // A forbidden command starts nothing: it is refused at once,
+        // however loaded the machine.
+        let forbidden = ToolCall {
+            custom: false,
+            name: "shell".into(),
+            call_id: "shell-2".into(),
+            arguments: json!({"command": "rm -rf x"}).to_string(),
+        };
+        assert!(task.load_holds(&record, &calls[1], &dir));
+        assert!(!task.load_holds(&record, &forbidden, &dir));
+        // Nor is one a rule asks about with no gate to ask: it is refused.
+        let asked = ToolCall {
+            call_id: "shell-3".into(),
+            arguments: json!({"command": "git push"}).to_string(),
+            ..forbidden.clone()
+        };
+        assert!(!task.load_holds(&record, &asked, &dir));
+        // The read first would run with the command beside it: the gate
+        // holds both, neither started, and names the command it holds.
+        let stop = tokio::time::timeout(
+            Duration::from_secs(10),
+            task.execute_calls(
+                calls.clone(),
+                (&provider, "synthetic"),
+                None,
+                &dir,
+                &[],
+                &record,
+                None,
+                None,
+                None,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(matches!(stop, Some(Stop::Parked)));
+        let (waiting, started) = store
+            .op("parked", move |db| {
+                let waiting = db.waiting_turns()?.into_iter().find(|w| w.turn == turn);
+                let events = db.events("Bob", 0, 64)?;
+                let started = (events["events"].as_array().unwrap().iter())
+                    .filter(|e| e["event"] == "tool_started")
+                    .count();
+                Ok((waiting.unwrap(), started))
+            })
+            .await
+            .unwrap();
+        assert!(waiting.load);
+        assert_eq!(waiting.call_id, "shell-1");
+        assert_eq!(waiting.pending, calls);
+        assert_eq!(started, 0);
+        busy.abort();
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

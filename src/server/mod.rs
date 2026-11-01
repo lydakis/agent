@@ -16,7 +16,7 @@ use agent_runtime::{
     provider::{Listed, Provider, STREAMS_PER_CONNECTION, Transport},
     store::{
         Answer, Binding, Bot, Decision, Delivery, FOLDERS_JSON, Fork, Gate, MAX_GATES, Publication,
-        Settings, Started, Step, Stepped, Store, TurnOptions, Waiting, Wake,
+        RULES_JSON, Settings, Started, Step, Stepped, Store, TurnOptions, Waiting, Wake,
     },
     tools::{
         ANSWER_BYTES, DECLARED_BYTES, Declared, MAX_DECLARED, Outcome, Registry, validate_declared,
@@ -145,15 +145,19 @@ fn admission_bound(command: &Command, id: &Value, deliveries: usize) -> Bound {
                     }
             }),
             output::encoded_len(&(bot, created_by)),
-            // The workspace, the writable folders and the Unix sockets,
-            // canonical, which the reply's settings repeat; a bot a
-            // sandboxed bot makes can take its creator's.
+            // The workspace, the writable folders, the Unix sockets,
+            // canonical, and the command rules, which the reply's settings
+            // repeat; a bot another makes takes its creator's rules, and a
+            // sandboxed one's folders.
             usize::from(workspace.is_some()) * PATH_JSON
                 + match created_by {
-                    Some(_) => 2 * FOLDERS_JSON,
+                    Some(_) => 2 * FOLDERS_JSON + RULES_JSON,
                     None => {
                         (settings.writable.len() * PATH_JSON).min(FOLDERS_JSON)
                             + (settings.unix_sockets.len() * PATH_JSON).min(FOLDERS_JSON)
+                            + (settings.rules.as_ref())
+                                .map_or(0, |rules| output::encoded_len(rules).unwrap_or(RULES_JSON))
+                                .min(RULES_JSON)
                     }
                 },
             // Both the bot and its event carry its gates, most of them
@@ -268,8 +272,9 @@ enum Command {
     },
     /// Change what a bot's client chose for it when it was made: its
     /// instructions, recomposed with the skills, memory and folder rules
-    /// added since, and its model (another of its family) and effort level.
-    /// Refused while a turn runs; the next turn uses them.
+    /// added since, its model (another of its family) and effort level, and
+    /// every other setting `create` takes, by the same names. Refused while
+    /// a turn runs; the next turn uses them.
     Configure {
         bot: String,
         /// The identity `bot` must hold; another is `bot_not_found`.
@@ -286,20 +291,18 @@ enum Command {
         /// The tools its client declares, replacing those it has; `[]`
         /// removes them.
         declare: Option<Vec<Declared>>,
-        /// Its command sandbox, replacing the one it has, as `create`'s
-        /// settings name it: with `writable`, `network`, `unsandboxed` and
-        /// `unix_sockets`, which otherwise go back to none, off, none and
-        /// none.
-        sandbox: Option<agent_runtime::sandbox::Mode>,
-        writable: Option<Vec<String>>,
-        network: Option<bool>,
-        /// Its prompt-cache lifetime, as `create`'s settings name it.
-        cache_ttl: Option<agent_runtime::store::CacheTtl>,
-        unsandboxed: Option<Vec<String>>,
-        unix_sockets: Option<Vec<String>>,
-        /// The tier its calls are served at, as `create`'s settings name
-        /// it; `standard` goes back to none.
-        speed: Option<agent_runtime::provider::Speed>,
+        /// `create`'s settings, by its names: each one given replaces the
+        /// bot's, `null` puts it back to its default, and the rest stay.
+        /// `sandbox` given puts `writable`, `network` and `unix_sockets`
+        /// back to theirs unless they are given too.
+        settings: Option<serde_json::Map<String, Value>>,
+        /// As `create` takes them; `null` removes the bot's.
+        #[serde(default, deserialize_with = "present")]
+        fallback: Option<Option<String>>,
+        #[serde(default, deserialize_with = "present")]
+        compaction_instructions: Option<Option<String>>,
+        #[serde(default, deserialize_with = "present")]
+        compaction_model: Option<Option<String>>,
     },
     /// Summarize a bot's context with its compaction instructions before
     /// its next model call: a running turn's next round boundary, or an
@@ -570,17 +573,20 @@ enum Command {
     /// list. Asked when requested and kept five minutes; nothing runs on it.
     ProviderModels,
     /// A page of bots in name order: with `name`, those matching a GLOB
-    /// pattern; with `active`, those with a turn running.
+    /// pattern; with `active`, those with a turn running; with
+    /// `created_by_id`, those the bot with that id made.
     Bots {
         after: Option<String>,
         limit: Option<usize>,
         name: Option<String>,
         #[serde(default)]
         active: bool,
+        created_by_id: Option<i64>,
     },
-    /// Stop the daemon. With `grace_ms`, running turns first get up to that
-    /// long to finish while nothing new starts; whatever still runs is then
-    /// cancelled with `daemon_shutdown`.
+    /// Stop the daemon. With `grace_ms`, it first drains for up to that
+    /// long: nothing starts, and each running turn parks at its next
+    /// boundary. Whatever still runs at exit parks, its unanswered calls
+    /// answered `daemon_shutdown`; the next start continues it.
     Shutdown {
         #[serde(default)]
         grace_ms: u64,
@@ -781,8 +787,8 @@ pub struct Configuration {
     pub providers: Vec<ProviderSpec>,
     /// Concurrent child processes; default 64 per logical CPU; zero unbounded.
     pub max_processes: Option<usize>,
-    /// Detached commands still running, daemon-wide; default 16; zero unbounded.
-    pub max_detached: Option<usize>,
+    /// Terminals and detached commands still running, daemon-wide; default 4 per logical CPU; zero unbounded.
+    pub max_lasting: Option<usize>,
     /// Turns with a live task (model call or foreground tool); default 4,096; zero unbounded.
     pub max_active: Option<usize>,
     /// Provider requests awaiting response headers; unbounded by default,
@@ -793,9 +799,15 @@ pub struct Configuration {
     /// unbounded by default, since waiting work is durable rows.
     pub max_pending: Option<usize>,
     pub max_pending_bytes: Option<usize>,
+    /// Bytes of request lines read and not yet taken up, every session
+    /// together; a sixteenth of physical memory by default; zero unbounded.
+    pub max_input_bytes: Option<usize>,
     /// Store reader connections serving observation reads; one per
     /// logical CPU by default.
     pub max_readers: Option<usize>,
+    /// The 1-minute load average at which new commands wait while one is
+    /// running, as make's `-l`; none by default.
+    pub max_load: Option<f64>,
     /// Seconds an established provider stream may go without a content
     /// frame before the attempt fails and is retried; default 120.
     pub stall_timeout: Option<u64>,
@@ -815,19 +827,39 @@ pub struct Configuration {
     pub protected: Vec<String>,
     /// Names kept read-only at the top of every writable root that has them.
     pub protected_existing: Vec<String>,
+    /// Paths kept read-only in every sandbox, and kept from being made.
+    pub protected_paths: Vec<PathBuf>,
+}
+
+/// `path` by its real path, or, while it doesn't exist, by the real path
+/// of the folder that would hold it.
+fn real_or_named(path: &Path) -> Result<PathBuf> {
+    let path = std::path::absolute(path)?;
+    if let Ok(real) = std::fs::canonicalize(&path) {
+        return Ok(real);
+    }
+    Ok(match (path.parent(), path.file_name()) {
+        (Some(folder), Some(name)) => {
+            std::fs::canonicalize(folder).map_or_else(|_| path.clone(), |folder| folder.join(name))
+        }
+        _ => path,
+    })
 }
 
 #[derive(Clone, Copy)]
 pub struct Limits {
     pub processes: usize,
-    pub detached: usize,
+    pub lasting: usize,
     pub active: usize,
     pub connecting: usize,
     pub pending: usize,
     pub pending_bytes: usize,
+    pub input_bytes: usize,
     /// Store reader connections; observation reads take all but one, which
     /// is kept for turns' own reads.
     pub readers: usize,
+    /// The load average new commands wait under; zero is no gate.
+    pub load: f64,
     /// HTTP/2 connections per provider, enough for `active` turns to stream
     /// at once at the providers' advertised streams per connection.
     pub connections: usize,
@@ -839,17 +871,21 @@ impl Limits {
         let active = config.max_active.unwrap_or(4096);
         Limits {
             processes: config.max_processes.unwrap_or(64 * cpus),
-            detached: config
-                .max_detached
-                .unwrap_or(agent_runtime::tools::DEFAULT_DETACHED_BUDGET),
+            lasting: config
+                .max_lasting
+                .unwrap_or_else(agent_runtime::tools::default_lasting),
             active,
             connecting: config.max_connecting.unwrap_or(0),
             pending: config.max_pending.unwrap_or(0),
             pending_bytes: config.max_pending_bytes.unwrap_or(0),
+            input_bytes: config
+                .max_input_bytes
+                .unwrap_or_else(session::default_input_bytes),
             readers: config
                 .max_readers
                 .unwrap_or_else(agent_runtime::store::default_readers)
                 .max(1),
+            load: config.max_load.unwrap_or(0.0),
             connections: if active == 0 {
                 64
             } else {
@@ -1117,9 +1153,10 @@ struct Service {
     wakes: Wakes,
     /// The newest steer each parked turn has been woken for.
     steer_wakes: HashMap<i64, i64>,
-    /// Shutting down with a grace period: running turns go on, no turn
-    /// starts, and accepted submissions wait durably for the next start.
-    draining: bool,
+    /// Shutting down with a grace period: no turn starts, each running turn
+    /// parks at its next boundary, and accepted submissions wait durably
+    /// for the next start. Every turn task reads it.
+    draining: Arc<std::sync::atomic::AtomicBool>,
     /// The pause that holds, as the store keeps it: no turn starts and
     /// accepted submissions wait for `resume`.
     paused: Option<Value>,
@@ -1285,6 +1322,42 @@ impl Active {
     }
 }
 
+/// Wake the turns parked on the load gate at each of its readings that
+/// lets a command start: every one once the load is under its limit, and
+/// the oldest while none of the daemon's commands runs, as make's `-l`
+/// starts one job on an idle, loaded machine. It reads the store only
+/// after a turn parked, or at a start, for parks from before it.
+async fn wake_load_parks(
+    mut gate: tokio::sync::watch::Receiver<bool>,
+    registry: Registry,
+    reader: agent_runtime::store::Reader,
+    handles: Handles,
+) {
+    loop {
+        let open = *gate.borrow_and_update();
+        if (open || registry.running() == 0) && registry.take_load_parked() {
+            match reader.read("load_parked", |db| db.load_parked()).await {
+                Ok(parked) => {
+                    let all = parked.len();
+                    let woken = if open { all } else { all.min(1) };
+                    for (bot, turn) in parked.into_iter().take(woken) {
+                        handles.wake(bot, turn);
+                    }
+                    // Those left wait for a later reading.
+                    if woken < all {
+                        registry.note_load_park();
+                    }
+                }
+                // Looked for again at the next reading.
+                Err(_) => registry.note_load_park(),
+            }
+        }
+        if gate.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
 /// The one path durable events take to followers and waiters. The storage
 /// worker hands over what each job committed, in commit order, so a
 /// follower's cursors only ever rise and a committed batch is published
@@ -1443,8 +1516,11 @@ pub async fn run(config: Configuration) -> Result<()> {
             std::path::absolute(path)?.to_string_lossy().into_owned(),
         ));
     }
+    let protected_paths = (config.protected_paths.iter())
+        .map(|path| real_or_named(path))
+        .collect::<Result<Vec<_>>>()?;
     agent_runtime::sandbox::warm();
-    let (sender, mut inbound) = session::channel(64);
+    let (sender, mut inbound) = session::channel_with(64, limits.input_bytes);
     let sessions_next = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
     let mut daemon = agent_runtime::sandbox::Daemon {
         store: Some(std::fs::canonicalize(&config.store)?),
@@ -1466,6 +1542,9 @@ pub async fn run(config: Configuration) -> Result<()> {
         capabilities: None,
         protected: config.protected.clone(),
         protected_existing: config.protected_existing.clone(),
+        // Each by its real path once it exists, as a root is matched; a
+        // missing one by the real path of the folder it would be made in.
+        protected_paths,
     };
     daemon.capabilities = daemon
         .socket
@@ -1486,8 +1565,12 @@ pub async fn run(config: Configuration) -> Result<()> {
         .with_environment(environment)
         .with_daemon(daemon)
         .with_process_budget(limits.processes)
-        .with_detached_budget(limits.detached);
-    let hub = Hub::default();
+        .with_lasting_budget(limits.lasting)
+        .with_load_gate(limits.load);
+    // Observation reads and replay pages share all but one reader, so turns'
+    // own reads always find one.
+    let lane = lane::Lane::new(limits.readers.saturating_sub(1), deliver);
+    let hub = Hub::default().with_page_seats(lane.seats());
     let lineage = store.op("store_identity", |db| db.store_identity()).await?;
     let identity = store.instance_identity(lineage)?;
     // A pause outlives the daemon that took it.
@@ -1495,9 +1578,10 @@ pub async fn run(config: Configuration) -> Result<()> {
     let ready = json!({"event":"ready","protocol":agent_client::PROTOCOL,"pid":std::process::id(),
         "paused":paused,
         "store":{"identity":format!("{identity:032x}"),"lineage":format!("{:016x}", lineage as u64)},
-        "limits":{"processes":limits.processes,"detached":limits.detached,"active":limits.active,"connecting":limits.connecting,
-            "pending":limits.pending,"pending_bytes":limits.pending_bytes,
+        "limits":{"processes":limits.processes,"lasting":limits.lasting,"active":limits.active,"connecting":limits.connecting,
+            "pending":limits.pending,"pending_bytes":limits.pending_bytes,"input_bytes":limits.input_bytes,
             "readers":limits.readers,"connections":limits.connections,
+            "load":(limits.load > 0.0).then_some(limits.load),
             "idle_exit_seconds":config.idle_exit,
             "stall_timeout_seconds":stall_timeout.as_secs()},
         "schema":agent_runtime::store::Database::SCHEMA,
@@ -1536,6 +1620,14 @@ pub async fn run(config: Configuration) -> Result<()> {
     let (failure_sender, mut failures) = mpsc::unbounded_channel();
     let handles = Handles::new(resume_sender);
     let mut publisher = tokio::spawn(publish(publications, hub.clone(), handles.clone()));
+    if let Some(gate) = registry.load_gate() {
+        tokio::spawn(wake_load_parks(
+            gate,
+            registry.clone(),
+            store.reader(),
+            handles.clone(),
+        ));
+    }
     // Turns parked before a restart keep waiting; their processes are gone.
     // Those parked on a closed pool wait for their time, not for handles.
     let mut wakes = Wakes::default();
@@ -1547,7 +1639,8 @@ pub async fn run(config: Configuration) -> Result<()> {
             db.waiting_turns()?
                 .into_iter()
                 .map(|w| {
-                    let own = !w.approval && w.answer.is_none() && w.paced_since_ms.is_none();
+                    let own =
+                        !w.approval && !w.load && w.answer.is_none() && w.paced_since_ms.is_none();
                     let lapse = own.then(|| lapses.get(&w.turn).copied()).flatten();
                     // A steer sent while the daemon was down wakes the wait.
                     let steered = match own {
@@ -1567,7 +1660,8 @@ pub async fn run(config: Configuration) -> Result<()> {
         // A verdict park wakes on an answer, which may have committed
         // before the restart, or when a gate lapses: check now as an answer
         // would, and keep the lapse unless it has already passed.
-        if waiting.approval || waiting.answer.is_some() {
+        // A load park wakes too: nothing of the daemon's runs yet.
+        if waiting.approval || waiting.load || waiting.answer.is_some() {
             if let Some(at) = waiting.deadline_ms.filter(|&at| at > now_ms()) {
                 wakes.set(at, waiting.bot.clone(), waiting.turn);
             }
@@ -1620,13 +1714,13 @@ pub async fn run(config: Configuration) -> Result<()> {
         jobs: JoinSet::new(),
         replays: JoinSet::new(),
         retention: JoinSet::new(),
-        lane: lane::Lane::new(limits.readers.saturating_sub(1), deliver),
+        lane,
         // Queued turns that survived a restart start as capacity allows.
         ready_hint: true,
         tokens: Arc::default(),
         wakes,
         steer_wakes,
-        draining: false,
+        draining: Arc::default(),
         paused,
         notices: Vec::new(),
         admissions: std::collections::VecDeque::with_capacity(ADMISSION_WINDOW),
@@ -1654,7 +1748,7 @@ pub async fn run(config: Configuration) -> Result<()> {
     // the stdio owner's output is what failed.
     let served: Result<()> = async {
         loop {
-            if service.draining && service.active.is_empty() {
+            if service.draining() && service.active.is_empty() {
                 break;
             }
             // Computed before the select so its arms borrow the service freely.
@@ -1701,7 +1795,7 @@ pub async fn run(config: Configuration) -> Result<()> {
                 }
                 // Idle bots whose time ran out are deleted, here and not on a
                 // client's request, so a client that stopped leaves none.
-                _ = tokio::time::sleep_until(expiry.unwrap_or_else(tokio::time::Instant::now)), if expiry.is_some() && !service.draining => {
+                _ = tokio::time::sleep_until(expiry.unwrap_or_else(tokio::time::Instant::now)), if expiry.is_some() && !service.draining() => {
                     service.expire().await?;
                 }
                 // A parked turn's time comes due (a pool reopens, a gate lapses,
@@ -1739,7 +1833,7 @@ pub async fn run(config: Configuration) -> Result<()> {
                     // What a companion sends is no client's activity.
                     let companion = match &message {
                         Inbound::Open(_, _, _, peer) => peer.is_some_and(|pid| service.companions.runs_pid(pid)),
-                        Inbound::Request(id, _) | Inbound::Closed(id) => companion_sessions.contains(id),
+                        Inbound::Request(id, ..) | Inbound::Closed(id) => companion_sessions.contains(id),
                     };
                     if !companion {
                         last_activity = std::time::Instant::now();
@@ -1766,7 +1860,8 @@ pub async fn run(config: Configuration) -> Result<()> {
                             service.abandon_steps(id);
                             if id == 0 && stdio_owner { break; }
                         }
-                        Inbound::Request(id, request) => {
+                        // The line's credit goes back as this request is taken up.
+                        Inbound::Request(id, request, _credit) => {
                             let Some(output) = sessions.get(&id).cloned() else { continue };
                             // A bad id is refused like a malformed line, after the
                             // admissions queued before it.
@@ -1860,7 +1955,7 @@ pub async fn run(config: Configuration) -> Result<()> {
                                 // A later shutdown can only bring the deadline closer.
                                 let until = tokio::time::Instant::now() + Duration::from_millis(grace_ms);
                                 drain_until = Some(drain_until.map_or(until, |current| current.min(until)));
-                                service.draining = true;
+                                service.draining.store(true, std::sync::atomic::Ordering::Relaxed);
                                 if grace_ms == 0 || service.active.is_empty() {
                                     // The socket writer is a task on this runtime. Give
                                     // it time to acknowledge shutdown before exiting.
@@ -1895,8 +1990,13 @@ pub async fn run(config: Configuration) -> Result<()> {
     answer_observed(&mut service, &mut sessions, stdio_owner).await;
     // Release every slot as it is cancelled: a turn interrupted earlier keeps
     // its first cause, and its dropped sender still stops a finish retry.
+    // A planned stop parks each running turn for the next start; a fatal
+    // error ends it, as a crash would, so a failing daemon never brings a
+    // turn back on its own.
+    let planned = served.is_ok();
+    let cause = if planned { turn::SHUTDOWN } else { turn::DIED };
     for active in std::mem::take(&mut service.active).into_values() {
-        active.cancel(turn::SHUTDOWN);
+        active.cancel(cause);
     }
     // A completion that could not commit leaves its turn for the next start
     // to end as interrupted; the rest still drain, and the exit reports it.
@@ -1933,6 +2033,11 @@ pub async fn run(config: Configuration) -> Result<()> {
         let _ = publisher.await;
     }
     drop(firehose_hub);
+    // After a planned stop a wait still open gets its answer, the turns it
+    // waits on shown as they stand: parked ones go on only at the next start.
+    if planned {
+        handles.expire_requests();
+    }
     let mut reads = handles.shutdown();
     // Socket writers need runtime time to flush terminal events and wait
     // results. Drain concurrently under one deadline, so slow clients cannot
@@ -2222,6 +2327,9 @@ impl Service {
             None => Ok(()),
         }
     }
+    fn draining(&self) -> bool {
+        self.draining.load(std::sync::atomic::Ordering::Relaxed)
+    }
     fn has_capacity(&self) -> bool {
         self.held().is_none()
             && (self.limit_active == 0 || self.active.len() + self.reserved < self.limit_active)
@@ -2230,7 +2338,7 @@ impl Service {
     /// Why no turn may start, if none may: the daemon is shutting down or
     /// paused.
     fn held(&self) -> Option<&'static str> {
-        if self.draining {
+        if self.draining() {
             Some("daemon_draining")
         } else if self.paused.is_some() {
             Some(turn::PAUSED)
@@ -2812,6 +2920,8 @@ impl Service {
             handles: self.handles.clone(),
             background_failures: self.background_failures.clone(),
             settings: Default::default(),
+            rules: Default::default(),
+            ruled: Default::default(),
             window: Default::default(),
             resumed,
             steers,
@@ -2820,6 +2930,7 @@ impl Service {
             tokens: self.tokens.clone(),
             read_results: Default::default(),
             side: Default::default(),
+            stopping: self.draining.clone(),
         };
         self.jobs.spawn(async move {
             let (bot, id) = (task.bot.clone(), task.turn);
@@ -3195,49 +3306,14 @@ impl Service {
                 approver,
                 approve_expire_ms,
                 declare,
-                sandbox,
-                writable,
-                network,
-                cache_ttl,
-                unsandboxed,
-                unix_sockets,
-                speed,
+                settings,
+                fallback,
+                compaction_instructions,
+                compaction_model,
             } => {
                 if effort.is_some() && model.is_none() {
                     return fail_with("invalid_effort", "effort goes with model");
                 }
-                let sandbox = match sandbox {
-                    Some(mode) => {
-                        let mut settings = Settings {
-                            sandbox: Some(mode),
-                            writable: writable.unwrap_or_default(),
-                            network: network.unwrap_or(false),
-                            unsandboxed: unsandboxed.unwrap_or_default(),
-                            unix_sockets: unix_sockets.unwrap_or_default(),
-                            ..Settings::default()
-                        };
-                        settings.validate()?;
-                        // Checking for a sandbox and resolving folders touch
-                        // the filesystem: off the runtime thread.
-                        let settings = tokio::task::spawn_blocking(move || {
-                            confine(&mut settings).map(|()| settings)
-                        })
-                        .await
-                        .map_err(|_| Error::new("sandbox_unavailable"))??;
-                        Some(settings)
-                    }
-                    None if writable.is_some()
-                        || network.is_some()
-                        || unsandboxed.is_some()
-                        || unix_sockets.is_some() =>
-                    {
-                        return fail_with(
-                            "invalid_setting",
-                            "writable, network, unsandboxed and unix_sockets go with sandbox",
-                        );
-                    }
-                    None => None,
-                };
                 let gate = match (&approve, &approver, approve_expire_ms) {
                     (None, None, None) => None,
                     (Some(tools), None, None) if tools.is_empty() => Some(None),
@@ -3248,11 +3324,19 @@ impl Service {
                         self.registry.tool_count() + MAX_DECLARED,
                     )?),
                 };
-                if instructions.as_ref().is_some_and(|i| i.len() > 64 * 1024) {
-                    return Err(Error::with(
-                        "instructions_limit",
-                        "instructions may be up to 65536 bytes",
-                    ));
+                for (text, what) in [
+                    (instructions.as_ref(), "instructions"),
+                    (
+                        compaction_instructions.as_ref().and_then(Option::as_ref),
+                        "compaction_instructions",
+                    ),
+                ] {
+                    if text.is_some_and(|text| text.len() > 64 * 1024) {
+                        return Err(Error::with(
+                            "instructions_limit",
+                            format!("{what} may be up to 65536 bytes"),
+                        ));
+                    }
                 }
                 if let Some(declare) = &declare {
                     validate_declared(declare)?;
@@ -3264,52 +3348,111 @@ impl Service {
                     )
                     .facts(json!({"running_turn":turn})));
                 }
-                // Another model of the bot's family: its history is kept in
-                // that family's encoding.
-                let model = match model {
-                    Some(reference) => {
-                        let (provider, name) = split_model(&reference)?;
-                        let served = self
-                            .providers
-                            .get(provider)
-                            .ok_or(Error::with("provider_unavailable", provider))?;
-                        let record = store
+                // The settings named, `sandbox` taking the rest of the
+                // sandbox with it, over the bot's own.
+                let mut named = Vec::new();
+                let mut changes = settings.unwrap_or_default();
+                // Named before a null drops one, so a reset of a setting
+                // that isn't one is refused like any other.
+                if let Some(unknown) = (changes.keys())
+                    .find(|key| !agent_runtime::store::SETTINGS.contains(&key.as_str()))
+                {
+                    return fail_with("invalid_setting", format!("unknown setting `{unknown}`"));
+                }
+                if changes.contains_key("sandbox") {
+                    for key in agent_runtime::store::SANDBOX {
+                        changes.entry(key).or_insert(Value::Null);
+                    }
+                }
+                named.extend(changes.keys().cloned());
+                let others = [compaction_model.as_ref(), fallback.as_ref()];
+                let record = match model.is_some()
+                    || !named.is_empty()
+                    || others.iter().any(|other| matches!(other, Some(Some(_))))
+                {
+                    true => Some(
+                        store
                             .op("inspect", {
                                 let bot = bot.clone();
                                 move |db| db.inspect(&bot)
                             })
-                            .await?;
-                        let family = record.family()?;
-                        if served.family() != family {
-                            return fail_with("provider_family_mismatch", reference.clone());
+                            .await?,
+                    ),
+                    false => None,
+                };
+                // What its settings will be, checked as `create` checks them,
+                // on the provider it will be on.
+                let given = match &record {
+                    Some(record) if !named.is_empty() => {
+                        let Value::Object(mut merged) = serde_json::to_value(&record.settings)?
+                        else {
+                            unreachable!("settings are an object");
+                        };
+                        for (key, value) in changes {
+                            match value {
+                                Value::Null => merged.remove(&key),
+                                value => merged.insert(key, value),
+                            };
                         }
-                        // The speed it will have, on the provider it moves to.
-                        let mut settings = record.settings.clone();
-                        settings.speed = speed.or(settings.speed);
-                        turn::shaped(served, &settings)?;
+                        let mut merged: Settings = serde_json::from_value(Value::Object(merged))
+                            .map_err(|error| Error::with("invalid_setting", error.to_string()))?;
+                        merged.validate()?;
+                        // Checking for a sandbox and resolving folders touch
+                        // the filesystem: off the runtime thread, and only
+                        // when the sandbox changes, so a folder gone since
+                        // fails no other setting.
+                        let sandboxed = (agent_runtime::store::SANDBOX.iter())
+                            .any(|key| named.iter().any(|name| name == key));
+                        if sandboxed {
+                            merged = tokio::task::spawn_blocking(move || {
+                                confine(&mut merged).map(|()| merged)
+                            })
+                            .await
+                            .map_err(|_| Error::new("sandbox_unavailable"))??;
+                        }
+                        Some(merged)
+                    }
+                    _ => None,
+                };
+                // Another model of the bot's family: its history is kept in
+                // that family's encoding. So must a summarizer or a fallback
+                // be, which are sent its items as they are.
+                let model = match &record {
+                    Some(record) => {
+                        let family = record.family()?;
+                        let reference = model.as_deref();
+                        let (provider, name) = match reference {
+                            Some(reference) => split_model(reference)?,
+                            None => (record.provider.as_str(), record.model.as_str()),
+                        };
+                        let served = self
+                            .providers
+                            .get(provider)
+                            .ok_or(Error::with("provider_unavailable", provider.to_owned()))?;
+                        if served.family() != family {
+                            return fail_with(
+                                "provider_family_mismatch",
+                                reference.unwrap_or(provider).to_owned(),
+                            );
+                        }
+                        turn::shaped(served, given.as_ref().unwrap_or(&record.settings))?;
                         if let Some(level) = &effort {
                             family.check_effort(level)?;
                         }
-                        Some((provider.to_owned(), name.to_owned()))
+                        for reference in others.into_iter().flatten().flatten() {
+                            let (other, _) = split_model(reference)?;
+                            let known = self
+                                .providers
+                                .get(other)
+                                .ok_or(Error::with("provider_unavailable", other.to_owned()))?;
+                            if known.family() != family {
+                                return fail_with("provider_family_mismatch", reference.clone());
+                            }
+                        }
+                        reference.map(|_| (provider.to_owned(), name.to_owned()))
                     }
                     None => None,
                 };
-                // A speed its own provider must serve.
-                if let (Some(speed), None) = (speed, &model) {
-                    let record = store
-                        .op("inspect", {
-                            let bot = bot.clone();
-                            move |db| db.inspect(&bot)
-                        })
-                        .await?;
-                    let served = self
-                        .providers
-                        .get(&record.provider)
-                        .ok_or(Error::with("provider_unavailable", record.provider.clone()))?;
-                    let mut settings = record.settings.clone();
-                    settings.speed = Some(speed);
-                    turn::shaped(served, &settings)?;
-                }
                 let answer = store
                     .op("configure", move |db| {
                         let id = db.identity(&bot, bot_id)?;
@@ -3321,44 +3464,46 @@ impl Service {
                             )
                             .facts(json!({"running_turn":turn})));
                         }
-                        let mut changed = Vec::new();
-                        // First: the one change that may be refused here.
+                        let mut changed: Vec<String> = Vec::new();
+                        // First: the changes that may be refused here.
                         if let Some(gate) = gate
                             && db.set_gate(&bot, Some(id), gate, declare.as_deref())?
                         {
-                            changed.push("gates");
+                            changed.push("gates".into());
+                        }
+                        if let Some(given) = &given {
+                            changed.extend(db.set_settings(&bot, Some(id), &named, given)?);
                         }
                         if let Some((provider, name)) = &model
                             && db.set_model(&bot, Some(id), provider, name, effort.as_deref())?
                         {
-                            changed.push("model");
+                            changed.push("model".into());
                         }
                         if let Some(instructions) = instructions
                             && db.set_instructions(&bot, Some(id), &instructions)?
                         {
-                            changed.push("instructions");
+                            changed.push("instructions".into());
                         }
                         if let Some(declare) = &declare
                             && db.set_declared(&bot, Some(id), declare)?
                         {
-                            changed.push("declared");
+                            changed.push("declared".into());
                         }
-                        if let Some(sandbox) = sandbox
-                            && db.set_sandbox(&bot, Some(id), sandbox)?
+                        if let Some(fallback) = &fallback
+                            && db.set_fallback(&bot, Some(id), fallback.as_deref())?
                         {
-                            changed.push("sandbox");
+                            changed.push("fallback".into());
                         }
-                        if let Some(ttl) = cache_ttl
-                            && db.set_cache_ttl(&bot, Some(id), ttl)?
-                        {
-                            changed.push("cache_ttl");
-                        }
-                        if let Some(speed) = speed
-                            && db.set_speed(&bot, Some(id), speed)?
-                        {
-                            changed.push("speed");
-                        }
-
+                        changed.extend(
+                            db.set_compaction(
+                                &bot,
+                                Some(id),
+                                compaction_instructions.as_ref().map(Option::as_deref),
+                                compaction_model.as_ref().map(Option::as_deref),
+                            )?
+                            .into_iter()
+                            .map(String::from),
+                        );
                         Ok(json!({"bot":bot,"bot_id":id,"changed":changed}))
                     })
                     .await?;
@@ -3590,7 +3735,7 @@ impl Service {
                     "store": store.stats(),
                     "tokens": self.tokens.snapshot(),
                     "handles": {"waiters": waiters, "retained": retained},
-                    "draining": self.draining,
+                    "draining": self.draining(),
                     "paused": self.paused,
                 }))
             }
@@ -3967,6 +4112,7 @@ impl Service {
                 limit,
                 name,
                 active,
+                created_by_id,
             } => {
                 let reader = store.reader();
                 self.observe(session, output, id, async move {
@@ -3976,6 +4122,7 @@ impl Service {
                             limit.unwrap_or(64),
                             name.as_deref(),
                             active,
+                            created_by_id,
                         )
                     }))
                     .await
@@ -4514,7 +4661,8 @@ fn delivered(hub: &Hub, events: &Unpublished) -> bool {
 }
 
 /// Answer the admissions still queued at shutdown and start their turns, so
-/// shutdown ends those turns like any other running turn. A stdio owner that
+/// shutdown parks those turns like any other running turn (or, on a fatal
+/// error, ends them). A stdio owner that
 /// cannot take a reply within its timeout gets no more: the rest settle
 /// without waiting on it again.
 async fn answer_queued(
@@ -5068,9 +5216,11 @@ mod tests {
             limits: Limits {
                 pending: 0,
                 pending_bytes: 0,
+                input_bytes: 0,
                 readers: 1,
+                load: 0.0,
                 processes: 16,
-                detached: 16,
+                lasting: 16,
                 active: 1024,
                 connecting: 64,
                 connections: 11,
@@ -5099,7 +5249,7 @@ mod tests {
             tokens: Arc::default(),
             wakes: Wakes::default(),
             steer_wakes: HashMap::new(),
-            draining: false,
+            draining: Arc::default(),
             paused: None,
             notices: Vec::new(),
             admissions: std::collections::VecDeque::new(),
@@ -5270,9 +5420,11 @@ mod tests {
             limits: Limits {
                 pending: 0,
                 pending_bytes: 0,
+                input_bytes: 0,
                 readers: 1,
+                load: 0.0,
                 processes: 16,
-                detached: 16,
+                lasting: 16,
                 active: 1024,
                 connecting: 64,
                 connections: 11,
@@ -5301,7 +5453,7 @@ mod tests {
             tokens: Arc::default(),
             wakes: Wakes::default(),
             steer_wakes: HashMap::new(),
-            draining: false,
+            draining: Arc::default(),
             paused: None,
             notices: Vec::new(),
             admissions: std::collections::VecDeque::new(),
@@ -5488,9 +5640,11 @@ mod tests {
             limits: Limits {
                 pending: 0,
                 pending_bytes: 0,
+                input_bytes: 0,
                 readers: 1,
+                load: 0.0,
                 processes: 16,
-                detached: 16,
+                lasting: 16,
                 active: 1024,
                 connecting: 64,
                 connections: 11,
@@ -5523,7 +5677,7 @@ mod tests {
             tokens: Arc::default(),
             wakes: Wakes::default(),
             steer_wakes: HashMap::new(),
-            draining: false,
+            draining: Arc::default(),
             paused: None,
             notices: Vec::new(),
             admissions: std::collections::VecDeque::new(),
@@ -5733,9 +5887,11 @@ mod tests {
             limits: Limits {
                 pending: 0,
                 pending_bytes: 0,
+                input_bytes: 0,
                 readers: 1,
+                load: 0.0,
                 processes: 16,
-                detached: 16,
+                lasting: 16,
                 active: 1024,
                 connecting: 64,
                 connections: 11,
@@ -5753,7 +5909,7 @@ mod tests {
             tokens: Arc::default(),
             wakes: Wakes::default(),
             steer_wakes: HashMap::new(),
-            draining: false,
+            draining: Arc::default(),
             paused: None,
             notices: Vec::new(),
             admissions: std::collections::VecDeque::new(),
@@ -6747,6 +6903,122 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_cancelled_replay_keeps_its_seat_until_its_read_is_done() {
+        let dir = scratch("replay-seat");
+        let (store, _publications) = Store::open_with(&dir.join("state.sqlite"), 1)
+            .await
+            .unwrap();
+        let seats = Arc::new(tokio::sync::Semaphore::new(1));
+        let hub = Hub::default().with_page_seats(seats.clone());
+        // The one reader is busy, so the replay's page waits in its queue.
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        let busy = tokio::spawn({
+            let store = store.clone();
+            async move {
+                store
+                    .read("busy", move |_| {
+                        let _ = gate.recv();
+                        Ok(())
+                    })
+                    .await
+            }
+        });
+        let sub = hub.subscribe(hub::ALL, 1, Output::writer(tokio::io::sink()), 0, None);
+        let paging = tokio::spawn(replay(store.clone(), hub.clone(), hub::ALL.to_owned(), sub));
+        while seats.available_permits() > 0 {
+            tokio::task::yield_now().await;
+        }
+        paging.abort();
+        let _ = paging.await;
+        // The read it queued still runs on the reader: its seat is still held.
+        assert_eq!(seats.available_permits(), 0);
+        release.send(()).unwrap();
+        busy.await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while seats.available_permits() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the read's end frees its seat");
+    }
+
+    #[tokio::test]
+    async fn a_replay_racing_new_events_delivers_each_once_in_order() {
+        use tokio::io::AsyncBufReadExt;
+        let dir = scratch("replay-race");
+        let (store, publications) = Store::open(&dir.join("state.sqlite")).await.unwrap();
+        let mut service = admitting(&store, 1024);
+        let publisher = tokio::spawn(publish(
+            publications,
+            service.hub.clone(),
+            service.handles.clone(),
+        ));
+        let output = Output::writer(tokio::io::sink());
+        let mut made = 0;
+        let mut make = async |service: &mut Service, count: usize| {
+            for _ in 0..count {
+                let command = create(&format!("B{made}"), &dir);
+                made += 1;
+                let bound = service.admission_sends(&command, &json!(made), 1);
+                let deferred = service
+                    .dispatch(command, 1, &output, json!(made), bound)
+                    .await;
+                assert_eq!(deferred.unwrap_err().code, "deferred");
+                while !service.admissions.is_empty() {
+                    let (_, _, _, result) = service.settle().await;
+                    result.unwrap();
+                }
+            }
+        };
+        // History to page through, then a follower that pages it while
+        // more events commit and publish.
+        make(&mut service, 600).await;
+        let (near, far) = tokio::io::duplex(1 << 20);
+        let follower = Output::writer(near);
+        let sub = service
+            .hub
+            .subscribe(hub::ALL, 2, follower.clone(), 0, None);
+        let paging = tokio::spawn(replay(
+            store.clone(),
+            service.hub.clone(),
+            hub::ALL.to_owned(),
+            sub,
+        ));
+        make(&mut service, 400).await;
+        paging.await.unwrap().unwrap();
+        let last = store
+            .op("last", |db| db.cursor_since(i64::MAX))
+            .await
+            .unwrap();
+        service.hub.published_through(last).await;
+        let mut lines = tokio::io::BufReader::new(far).lines();
+        let mut cursors = Vec::new();
+        let mut live = 0;
+        while let Ok(Ok(Some(line))) =
+            tokio::time::timeout(Duration::from_secs(5), lines.next_line()).await
+        {
+            let event: Value = serde_json::from_str(&line).unwrap();
+            match event["cursor"].as_i64() {
+                _ if event["event"] == "follow_live" => live += 1,
+                Some(cursor) => cursors.push(cursor),
+                None => {}
+            }
+            if live == 1 && cursors.last() == Some(&last) {
+                break;
+            }
+        }
+        assert_eq!(live, 1);
+        assert!(last >= 1000, "{last}");
+        let expected: Vec<i64> = (1..=last).collect();
+        assert_eq!(cursors, expected, "every event once, in order");
+        publisher.abort();
+        drop(service);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
     async fn a_follow_still_replaying_keeps_room_for_published_events() {
         let dir = scratch("admit-replaying");
         let (store, publications) = Store::open(&dir.join("state.sqlite")).await.unwrap();
@@ -6889,6 +7161,15 @@ mod tests {
             *effort = Some("high".into());
             *compaction_instructions = Some(awkward);
             *compaction_model = Some("openai/synthetic".into());
+        }
+        // Command rules as large as a bot may be given, escaped in JSON.
+        if let Command::Create { settings, .. } = &mut create {
+            let why = "\u{1}".repeat((RULES_JSON - 200) / 6);
+            settings.rules = Some(
+                serde_json::from_value(json!({"prefix_rules": [
+                    {"pattern": ["rm"], "decision": "forbidden", "justification": why}]}))
+                .unwrap(),
+            );
         }
         // Its sockets as many as it may name, each escaped in JSON, where a
         // sandbox can run.
@@ -7378,6 +7659,96 @@ mod tests {
             .await
             .unwrap();
         drop(service);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn load_parks_wake_one_on_an_idle_machine_and_all_once_the_load_falls() {
+        let dir = scratch("load-parks");
+        let (store, _publications) = Store::open(&dir.join("state.sqlite")).await.unwrap();
+        let mut turns = Vec::new();
+        for name in ["Ann", "Bob"] {
+            let turn = running(&store, &[name.into()]).await[0].1;
+            store
+                .call(move |db| {
+                    let call = agent_runtime::provider::ToolCall {
+                        custom: false,
+                        name: "shell".into(),
+                        call_id: "shell-1".into(),
+                        arguments: r#"{"command":"true"}"#.into(),
+                    };
+                    let item = serde_json::to_vec(&json!({"type":"function_call",
+                        "name":call.name,"call_id":call.call_id,"arguments":call.arguments}))?
+                    .into();
+                    db.append(turn, vec![item], std::slice::from_ref(&call), None)?;
+                    db.suspend_load(turn, "shell-1", &[call], now_ms(), None, None)
+                        .map(|_| ())
+                })
+                .await
+                .unwrap();
+            turns.push((name.to_owned(), turn));
+        }
+        let (gate, readings) = tokio::sync::watch::channel(false);
+        let registry = Registry::new("shell")
+            .unwrap()
+            .with_process_budget(4)
+            .with_load_readings(readings.clone());
+        let (sender, mut woken) = mpsc::unbounded_channel();
+        let waker = tokio::spawn(wake_load_parks(
+            readings,
+            registry.clone(),
+            store.reader(),
+            Handles::new(sender),
+        ));
+        async fn next(woken: &mut mpsc::UnboundedReceiver<(String, i64)>) -> (String, i64) {
+            tokio::time::timeout(Duration::from_secs(5), woken.recv())
+                .await
+                .unwrap()
+                .unwrap()
+        }
+        // Loaded, with none of the daemon's commands running: the oldest
+        // goes, as at a start.
+        assert_eq!(next(&mut woken).await, turns[0]);
+        tokio::task::yield_now().await;
+        assert!(woken.try_recv().is_err());
+        // Ann's turn takes its wake and leaves the park; Bob's still waits,
+        // so the next reading on an idle machine wakes his.
+        let ann = turns[0].1;
+        store
+            .call(move |db| db.resume(ann).map(|_| ()))
+            .await
+            .unwrap();
+        gate.send_modify(|_| {});
+        assert_eq!(next(&mut woken).await, turns[1]);
+        // Nothing is read again until a turn parks once more: Bob's park
+        // stays in the store, unread, while no turn notes a new one.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        while woken.try_recv().is_ok() {}
+        gate.send_modify(|_| {});
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(woken.try_recv().is_err());
+        // Ann's turn parks again and the load falls: every parked turn wakes.
+        store
+            .call(move |db| {
+                let call = agent_runtime::provider::ToolCall {
+                    custom: false,
+                    name: "shell".into(),
+                    call_id: "shell-2".into(),
+                    arguments: r#"{"command":"true"}"#.into(),
+                };
+                db.suspend_load(ann, "shell-2", &[call], now_ms(), None, None)
+                    .map(|_| ())
+            })
+            .await
+            .unwrap();
+        registry.note_load_park();
+        gate.send_replace(true);
+        let mut all = vec![next(&mut woken).await, next(&mut woken).await];
+        all.sort();
+        assert_eq!(all, turns);
+        drop(gate);
+        waker.await.unwrap();
         drop(store);
         std::fs::remove_dir_all(dir).unwrap();
     }

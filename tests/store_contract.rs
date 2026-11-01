@@ -4,8 +4,8 @@ use agent_runtime::{
     provider::{ToolCall, Usage},
     store::{
         Answered, Binding, Bot, CacheTtl, CompactionPlan, ContextUsage, Database, Decision,
-        Delivery, Fork, Gate, Gated, Planning, QuoteRef, Settings, Strip, TurnBudget, TurnOptions,
-        Wake,
+        Delivery, Fork, Gate, Gated, Halt, Halted, Planning, QuoteRef, Settings, Strip, TurnBudget,
+        TurnOptions, Wake,
     },
     tools::{Declared, Inherit, Outcome},
 };
@@ -899,7 +899,7 @@ fn a_sandboxed_bot_waits_for_a_verdict_only_on_an_escape() {
     let folder = std::path::Path::new("/synthetic");
     let gated: Vec<&str> = calls
         .iter()
-        .filter(|call| bot.gated(call, folder))
+        .filter(|call| bot.gated(call, folder, &Default::default()))
         .map(|call| call.call_id.as_str())
         .collect();
     assert_eq!(gated, ["up", "climbs", "outside"]);
@@ -1070,6 +1070,76 @@ fn epoch_now() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_millis() as u64
+}
+
+#[test]
+fn a_turn_parks_on_the_load_gate_before_its_command_and_wakes_to_run_it() {
+    let mut db = db();
+    let tools = ["shell".to_owned()];
+    db.create(
+        "Bob",
+        Some("/synthetic"),
+        Binding {
+            tools: &tools,
+            ..binding()
+        },
+    )
+    .unwrap();
+    let turn = db
+        .begin(
+            "Bob",
+            "request",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let round: Vec<ToolCall> = ["s1", "s2"]
+        .iter()
+        .map(|&call_id| ToolCall {
+            custom: false,
+            name: "shell".into(),
+            call_id: call_id.into(),
+            arguments: json!({"command":"true"}).to_string(),
+        })
+        .collect();
+    let items = round
+        .iter()
+        .map(|call| {
+            serde_json::to_vec(&json!({"type":"function_call","call_id":call.call_id,
+                "name":call.name,"arguments":call.arguments}))
+            .unwrap()
+            .into()
+        })
+        .collect();
+    db.append(turn, items, &round, None).unwrap();
+    assert!(db.load_parked().unwrap().is_empty());
+    // Parked before s1, which has not started, with s2 after it.
+    assert_eq!(
+        db.suspend_load(turn, &round[0].call_id, &round, epoch_now(), None, None)
+            .unwrap(),
+        Some(None)
+    );
+    assert_eq!(db.load_parked().unwrap(), [("Bob".to_owned(), turn)]);
+    let view = db.turn_view("Bob", turn).unwrap();
+    assert_eq!(view["status"], "waiting");
+    assert_eq!(
+        view["waiting_on"],
+        json!({"call_id":"s1","load":true,"deadline_ms":null})
+    );
+    // Not the bot's own wait: a steer does not wake it.
+    assert_eq!(db.steered_park("Bob").unwrap(), None);
+    // The gate's wake resumes it with the round still to run.
+    assert!(matches!(db.wake("Bob", turn, false).unwrap(), Wake::Resume));
+    let (waiting, _, _) = db.resume(turn).unwrap();
+    assert!(waiting.load);
+    assert_eq!(waiting.call_id, "s1");
+    assert_eq!(waiting.pending.len(), 2);
+    assert!(db.load_parked().unwrap().is_empty());
+    // It runs s1 as any call: it had not started.
+    db.tool_start(turn, &round[0]).unwrap();
 }
 
 #[test]
@@ -3971,8 +4041,8 @@ fn a_bot_keeps_its_settings_and_a_fork_copies_them() {
         serde_json::to_value(&bob).unwrap()["settings"],
         json!({"context_bytes":4096,"context_items":4096,"note_turns":48,"compact_at":75,
             "compact_keep":25,"compact_tokens":null,"keep_turns":1,"max_rounds":null,"approval_hold_ms":2000,"max_output_tokens":null,
-            "keep_warm":0,"cache_ttl":"1h","speed":"fast","sandbox":null,"writable":[],"network":false,"outputs":null,"hide_senders":false,"unsandboxed":[],
-            "unix_sockets":[]})
+            "keep_warm":0,"cache_ttl":"1h","speed":"fast","sandbox":null,"writable":[],"network":false,"outputs":null,"hide_senders":false,
+            "unix_sockets":[],"rules":null})
     );
     // Retention follows the bot's own setting.
     for n in 1..=3 {
@@ -3993,10 +4063,27 @@ fn a_bot_keeps_its_settings_and_a_fork_copies_them() {
     assert_eq!(fork.settings, settings);
     // Back to standard, it holds no speed, as a bot that never chose one.
     use agent_runtime::provider::Speed;
-    assert!(db.set_speed("Fork", None, Speed::Standard).unwrap());
+    let speed = |speed| Settings {
+        speed: Some(speed),
+        ..Settings::default()
+    };
+    let named = ["speed".to_owned()];
+    assert_eq!(
+        db.set_settings("Fork", None, &named, &speed(Speed::Standard))
+            .unwrap(),
+        ["speed"]
+    );
     assert_eq!(db.inspect("Fork").unwrap().settings.speed, None);
-    assert!(!db.set_speed("Fork", None, Speed::Standard).unwrap());
-    assert!(db.set_speed("Fork", None, Speed::Ultrafast).unwrap());
+    assert!(
+        db.set_settings("Fork", None, &named, &speed(Speed::Standard))
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        db.set_settings("Fork", None, &named, &speed(Speed::Ultrafast))
+            .unwrap(),
+        ["speed"]
+    );
     assert_eq!(
         serde_json::to_value(db.inspect("Fork").unwrap()).unwrap()["settings"]["speed"],
         "ultrafast"
@@ -5227,13 +5314,13 @@ fn bot_pages_obey_byte_budget_without_loading_instructions() {
         db.create(&format!("bot-{n:03}"), Some(&workspace), config)
             .unwrap();
     }
-    let page = db.list(None, 256, None, false).unwrap();
+    let page = db.list(None, 256, None, false, None).unwrap();
     let bots = page["bots"].as_array().unwrap();
     assert!(!bots.is_empty() && bots.len() < 140);
     assert!(serde_json::to_vec(&page).unwrap().len() < 524288);
     assert!(bots.iter().all(|b| b.get("instructions").is_none()));
     let rest = db
-        .list(page["next_after"].as_str(), 256, None, false)
+        .list(page["next_after"].as_str(), 256, None, false, None)
         .unwrap();
     assert_eq!(bots.len() + rest["bots"].as_array().unwrap().len(), 140);
     assert!(rest["next_after"].is_null());
@@ -5272,34 +5359,34 @@ fn bot_pages_filter_by_name_pattern_and_activity() {
             .collect()
     };
     assert_eq!(
-        names(db.list(None, 64, Some("alpha.*"), false).unwrap()),
+        names(db.list(None, 64, Some("alpha.*"), false, None).unwrap()),
         ["alpha.lead", "alpha.worker"]
     );
     assert_eq!(
-        names(db.list(None, 64, Some("*.lead"), false).unwrap()),
+        names(db.list(None, 64, Some("*.lead"), false, None).unwrap()),
         ["alpha.lead", "beta.lead"]
     );
     assert_eq!(
-        names(db.list(None, 64, None, true).unwrap()),
+        names(db.list(None, 64, None, true, None).unwrap()),
         ["alpha.worker", "beta.lead"]
     );
     assert_eq!(
-        names(db.list(None, 64, Some("beta.*"), true).unwrap()),
+        names(db.list(None, 64, Some("beta.*"), true, None).unwrap()),
         ["beta.lead"]
     );
     // Filtered pages continue from their cursor like any other.
-    let page = db.list(None, 1, Some("*.lead"), false).unwrap();
+    let page = db.list(None, 1, Some("*.lead"), false, None).unwrap();
     assert_eq!(page["next_after"], "alpha.lead");
     let rest = db
-        .list(page["next_after"].as_str(), 1, Some("*.lead"), false)
+        .list(page["next_after"].as_str(), 1, Some("*.lead"), false, None)
         .unwrap();
     assert_eq!(names(rest.clone()), ["beta.lead"]);
     assert!(rest["next_after"].is_null());
     // GLOB is case-sensitive, like names.
-    assert!(names(db.list(None, 64, Some("ALPHA.*"), false).unwrap()).is_empty());
+    assert!(names(db.list(None, 64, Some("ALPHA.*"), false, None).unwrap()).is_empty());
     for bad in ["", &"*".repeat(257)] {
         assert_eq!(
-            db.list(None, 64, Some(bad), false).unwrap_err().code,
+            db.list(None, 64, Some(bad), false, None).unwrap_err().code,
             "invalid_bot_filter"
         );
     }
@@ -5317,6 +5404,94 @@ fn bot_pages_filter_by_name_pattern_and_activity() {
         .unwrap();
     let _ = std::fs::remove_file(&path);
     assert!(plan.contains("bots_running"), "{plan}");
+}
+
+#[test]
+fn bot_pages_filter_by_maker_from_its_own_index() {
+    let mut db = db();
+    let lead = db
+        .create("lead", Some("/synthetic"), binding())
+        .unwrap()
+        .0
+        .bot_id;
+    let other = db
+        .create("other", Some("/synthetic"), binding())
+        .unwrap()
+        .0
+        .bot_id;
+    for (name, by, id) in [
+        ("a.task", "lead", lead),
+        ("b.task", "other", other),
+        ("c.task", "lead", lead),
+    ] {
+        let mut made = binding();
+        made.created_by = Some(by);
+        made.created_by_id = Some(id);
+        db.create(name, Some("/synthetic"), made).unwrap();
+    }
+    db.begin(
+        "c.task",
+        "r1",
+        "work",
+        true,
+        &TurnOptions::default(),
+        allow_provider,
+    )
+    .unwrap();
+    let names = |page: Value| -> Vec<String> {
+        page["bots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|b| b["name"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    assert_eq!(
+        names(db.list(None, 64, None, false, Some(lead)).unwrap()),
+        ["a.task", "c.task"]
+    );
+    assert_eq!(
+        names(db.list(None, 64, None, true, Some(lead)).unwrap()),
+        ["c.task"]
+    );
+    assert_eq!(
+        names(db.list(None, 64, Some("b.*"), false, Some(lead)).unwrap()),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        names(
+            db.list(None, 64, Some("*.task"), false, Some(other))
+                .unwrap()
+        ),
+        ["b.task"]
+    );
+    // Pages by maker continue from their cursor like any other.
+    let page = db.list(None, 1, None, false, Some(lead)).unwrap();
+    assert_eq!(page["next_after"], "a.task");
+    let rest = db
+        .list(page["next_after"].as_str(), 1, None, false, Some(lead))
+        .unwrap();
+    assert_eq!(names(rest.clone()), ["c.task"]);
+    assert!(rest["next_after"].is_null());
+    // A maker reused by name is another id, and sees none of the first's.
+    assert!(names(db.list(None, 64, None, false, Some(lead + 1000)).unwrap()).is_empty());
+    // The maker filter reads its own index, with or without activity.
+    let path = std::env::temp_dir().join(format!("agent-maker-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    drop(Database::initialize(Connection::open(&path).unwrap()).unwrap());
+    let connection = Connection::open(&path).unwrap();
+    for running in ["", " AND running_turn IS NOT NULL"] {
+        let plan: String = connection
+            .query_row(
+                &format!("EXPLAIN QUERY PLAN SELECT name FROM bots WHERE name > ?1 AND created_by_id = ?3{running} ORDER BY name LIMIT ?2"),
+                rusqlite::params!["", 2, 1],
+                |r| r.get(3),
+            )
+            .unwrap();
+        assert!(plan.contains("bots_maker"), "{plan}");
+    }
+    drop(connection);
+    let _ = std::fs::remove_file(&path);
 }
 
 #[test]
@@ -5662,7 +5837,7 @@ fn creation_and_fork_reject_incomplete_deleted_and_reused_creator_identities() {
             (Some("Creator"), None, "creator_identity_required"),
             (None, Some(creator.bot_id), "creator_identity_required"),
         ] {
-            let before = db.list(None, 64, None, false).unwrap();
+            let before = db.list(None, 64, None, false, None).unwrap();
             let mut b = binding();
             b.created_by = name;
             b.created_by_id = id;
@@ -5684,7 +5859,7 @@ fn creation_and_fork_reject_incomplete_deleted_and_reused_creator_identities() {
                 .code,
                 code
             );
-            assert_eq!(db.list(None, 64, None, false).unwrap(), before);
+            assert_eq!(db.list(None, 64, None, false, None).unwrap(), before);
         }
         if !reused {
             db.create("Creator", Some("/synthetic"), binding()).unwrap();
@@ -5711,7 +5886,7 @@ fn lineage_pins_the_creator_identity_so_a_reused_name_is_a_stranger() {
         Some(first_a.bot_id),
         "B still names the A that made it"
     );
-    let page = db.list(None, 64, None, false).unwrap();
+    let page = db.list(None, 64, None, false, None).unwrap();
     let listed = page["bots"].as_array().unwrap();
     let b_row = listed.iter().find(|r| r["name"] == "B").unwrap();
     assert_eq!(b_row["created_by_id"], first_a.bot_id);
@@ -5870,7 +6045,7 @@ fn forks_keep_the_binding_and_instructions_and_record_a_creator() {
     );
     assert_eq!(db.inspect("Bob").unwrap().instructions, "first text");
     // Listing carries the creator; a fork keeps the model and tools.
-    let page = db.list(None, 64, None, false).unwrap();
+    let page = db.list(None, 64, None, false, None).unwrap();
     let listed: Vec<(&str, Option<&str>)> = page["bots"]
         .as_array()
         .unwrap()
@@ -7256,7 +7431,16 @@ fn history_normalizes_multiline_items_without_changing_fields_or_replay() {
             .collect();
         assert_eq!(records.len(), 2);
         assert_eq!(completed_items, 2);
-        assert_eq!(records[1], serde_json::from_str::<Value>(item).unwrap());
+        // The view leaves out only what a provider replays: a thinking
+        // block's signature and a redacted one's data. A top-level field of
+        // that name on anything else stays.
+        let mut read = serde_json::from_str::<Value>(item).unwrap();
+        if family == Family::Anthropic {
+            let content = read["content"].as_array_mut().unwrap();
+            content[0].as_object_mut().unwrap().remove("signature");
+            content[1].as_object_mut().unwrap().remove("data");
+        }
+        assert_eq!(records[1], read);
         if !item.contains(['\r', '\n']) {
             assert_eq!(joined.lines().nth(1).unwrap(), item);
         }
@@ -8643,7 +8827,7 @@ fn cached_input_tokens_are_kept_per_turn_and_per_bot_with_their_ratio() {
         (400, 240, 0.6)
     );
     assert_eq!(bot.tokens_used, 420);
-    let page = db.list(None, 10, None, false).unwrap();
+    let page = db.list(None, 10, None, false, None).unwrap();
     assert_eq!(page["bots"][0]["cache_hit"], 0.6);
     assert_eq!(agent_runtime::store::cache_hit(0, 0), 0.0);
     assert_eq!(agent_runtime::store::cache_hit(1, 3), 0.333);
@@ -9062,7 +9246,7 @@ fn bot_identities_are_assigned_in_creation_order_and_never_reused() {
         let db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
         assert_eq!(db.inspect("New").unwrap().bot_id, 3);
         assert_eq!(
-            db.list(None, 8, None, false).unwrap()["bots"][0]["bot_id"],
+            db.list(None, 8, None, false, None).unwrap()["bots"][0]["bot_id"],
             1
         );
     }
@@ -9566,6 +9750,118 @@ fn a_store_from_before_skip_pointers_places_every_node() {
     assert_eq!((lineage(), pages(&db)), before);
     drop(db);
     std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn a_turn_parked_by_a_stop_continues_and_one_a_pull_parked_before_74_keeps_its_pause() {
+    let path = std::env::temp_dir().join(format!("agent-halt-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let turn = db
+        .begin(
+            "Bob",
+            "first",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    db.suspend_halted(turn, Halt::Shutdown, 0, 0, 0, None)
+        .unwrap();
+    // A stop leaves no deadline: the next start wakes it at once.
+    let parked = db.waiting_turns().unwrap();
+    assert_eq!(
+        (parked.len(), parked[0].halt, parked[0].deadline_ms),
+        (1, Some(Halt::Shutdown), None)
+    );
+    assert_eq!(
+        db.turn_view("Bob", turn).unwrap()["waiting_on"],
+        json!({"resume_at_ms":null,"stopped":true})
+    );
+    drop(db);
+    // As schema 73 wrote a pull's park.
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            "UPDATE turns SET waiting=json_set(json_remove(waiting,'$.halt'),'$.pulled',json('true'));
+             PRAGMA user_version=73;",
+        )
+        .unwrap();
+    let db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    assert_eq!(db.waiting_turns().unwrap()[0].halt, Some(Halt::Pause));
+    assert_eq!(
+        db.turn_view("Bob", turn).unwrap()["waiting_on"],
+        json!({"resume_at_ms":null,"paused":true})
+    );
+    let raw: String = Connection::open(&path)
+        .unwrap()
+        .query_row("SELECT waiting FROM turns WHERE id=?", [turn], |r| r.get(0))
+        .unwrap();
+    assert!(!raw.contains("pulled"), "{raw}");
+    drop(db);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn a_halt_says_a_call_it_cut_off_has_an_unknown_outcome_and_one_it_never_started_is_cancelled() {
+    for halt in [Halt::Pause, Halt::Shutdown] {
+        let mut db = db();
+        db.create("Bob", Some("/synthetic"), binding()).unwrap();
+        let turn = db
+            .begin(
+                "Bob",
+                "request",
+                "work",
+                true,
+                &TurnOptions::default(),
+                allow_provider,
+            )
+            .unwrap()
+            .turn;
+        let calls = ["executing", "planned"].map(|id| ToolCall {
+            custom: false,
+            name: "write".into(),
+            call_id: id.into(),
+            arguments: r#"{"path":"file","content":"hello"}"#.into(),
+        });
+        let items = calls
+            .iter()
+            .map(|call| {
+                serde_json::to_vec(&json!({"type":"function_call","call_id":call.call_id,
+                    "name":call.name,"arguments":call.arguments}))
+                .unwrap()
+                .into()
+            })
+            .collect();
+        db.append(turn, items, &calls, None).unwrap();
+        db.tool_start(turn, &calls[0]).unwrap();
+        let Halted::Parked(events) = db.suspend_halted(turn, halt, 0, 0, 0, None).unwrap() else {
+            panic!("a running turn parks");
+        };
+        let completed: Vec<_> = events
+            .iter()
+            .filter(|event| event["event"] == "tool_completed")
+            .map(|event| {
+                let data = &event["data"];
+                (
+                    data["call_id"].clone(),
+                    data["outcome_unknown"].clone(),
+                    data["cancelled"].clone(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            completed,
+            [
+                (json!("executing"), json!(true), json!(false)),
+                (json!("planned"), json!(false), json!(true)),
+            ],
+            "{halt:?}"
+        );
+    }
 }
 
 #[test]
@@ -11106,7 +11402,8 @@ fn merged_schema_preserves_stores_from_both_published_branches() {
                 conn.execute("UPDATE bots SET note=? WHERE name='Bob'", [head])
                     .unwrap();
                 conn.execute_batch(
-                    "ALTER TABLE bots DROP COLUMN created_by;
+                    "DROP INDEX bots_maker;
+                    ALTER TABLE bots DROP COLUMN created_by;
                     ALTER TABLE bots DROP COLUMN created_by_id;
                     PRAGMA user_version=24;",
                 )
@@ -13308,8 +13605,12 @@ fn a_fork_narrows_what_it_may_call_and_never_widens() {
         custom: false,
     };
     let folder = std::path::Path::new("/synthetic");
-    assert!(db.inspect("Bob").unwrap().gated(&shell, folder));
-    assert!(!reader.gated(&shell, folder));
+    assert!(
+        db.inspect("Bob")
+            .unwrap()
+            .gated(&shell, folder, &Default::default())
+    );
+    assert!(!reader.gated(&shell, folder, &Default::default()));
     let (plain, _) = db.fork("Reader", "Plain", Fork::default()).unwrap();
     assert_eq!(plain.allowed.as_deref(), Some(&read[..]));
     assert_eq!(
@@ -13373,7 +13674,7 @@ fn a_fork_narrows_what_it_may_call_and_never_widens() {
         .collect();
     assert_eq!(announced.len(), 1);
     assert_eq!(announced[0]["name"], "read");
-    let listed = db.list(None, 16, None, false).unwrap();
+    let listed = db.list(None, 16, None, false, None).unwrap();
     let reader = listed["bots"]
         .as_array()
         .unwrap()
@@ -14026,7 +14327,7 @@ fn an_expiring_fork_is_due_once_idle_that_long_and_never_while_a_turn_runs() {
     let at = side.expires_at.unwrap();
     assert!(at >= before + 900_000, "{at} from {before}");
     // Records show it; a source that never asked for one shows none.
-    let listed = db.list(None, 10, None, false).unwrap();
+    let listed = db.list(None, 10, None, false, None).unwrap();
     assert_eq!(listed["bots"][0]["name"], "Bob");
     assert!(listed["bots"][0].get("expires_at").is_none());
     assert_eq!(listed["bots"][1]["expires_at"], at);
@@ -14758,4 +15059,174 @@ fn a_page_of_pauses_fits_one_reply() {
         )
         .unwrap();
     assert_eq!(rest["pauses"][0]["id"], shown as i64 + 1);
+}
+
+#[test]
+fn a_planned_call_keeps_what_the_rules_made_of_it() {
+    use agent_runtime::rules::{Policy, Rules, Ruling};
+    let mut db = db();
+    let turn = gated_turn(&mut db, None);
+    let policy: Policy = serde_json::from_value(json!({"prefix_rules": [
+        {"pattern": ["rm"], "decision": "forbidden", "source": "test.rules:1"},
+        {"pattern": ["git"], "decision": "prompt", "source": "test.rules:2"},
+    ]}))
+    .unwrap();
+    let rules = Rules::new(policy);
+    let (rm, rm_call) = shell_call("fc_1", "c1", "rm -rf x");
+    let (git, git_call) = shell_call("fc_2", "c2", "git push");
+    let (ls, ls_call) = shell_call("fc_3", "c3", "ls");
+    let calls = [rm_call.clone(), git_call.clone(), ls_call.clone()];
+    db.append_under(turn, vec![rm, git, ls], &calls, None, &rules)
+        .unwrap();
+    // The prompt one is announced.
+    let page = db.approvals(Some("Bob"), None, 0, None, 64).unwrap();
+    let announced: Vec<_> = (page["approvals"].as_array().unwrap().iter())
+        .map(|a| a["call_id"].clone())
+        .collect();
+    assert!(announced.contains(&json!("c2")));
+    // Parked on the prompt one and resumed, the park reads them back with
+    // no rules at all, as after a restart that changed them.
+    db.suspend_approval(turn, &calls[1..], 0, None, None)
+        .unwrap()
+        .expect("parked");
+    let (waiting, _, _) = db.resume(turn).unwrap();
+    let ruled = waiting.rules();
+    let bot = db.inspect("Bob").unwrap();
+    assert_eq!(
+        bot.ruling(&rm_call, &ruled),
+        Ok(Ruling::Forbidden(
+            "the rule at test.rules:1 names `rm`".into()
+        ))
+    );
+    assert!(matches!(
+        bot.ruling(&git_call, &ruled),
+        Ok(Ruling::Prompt(_))
+    ));
+    assert_eq!(bot.ruling(&ls_call, &ruled), Ok(Ruling::None));
+    // It was announced, so its run waits on it.
+    let workspace = std::path::Path::new("/synthetic");
+    assert!(bot.gated(&git_call, workspace, &ruled));
+}
+
+#[test]
+fn a_bots_commands_let_out_of_its_sandbox_leave_its_settings_for_the_rules() {
+    let path =
+        std::env::temp_dir().join(format!("agent-unsandboxed-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    db.create("Ann", Some("/synthetic"), binding()).unwrap();
+    drop(db);
+    // As a store before schema 75 kept them.
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            r#"UPDATE bots SET settings='{"sandbox":"read-only","unsandboxed":["mcpx"]}' WHERE name='Bob';
+               UPDATE bots SET settings='{"unsandboxed":["mcpx"]}' WHERE name='Ann';
+               PRAGMA user_version=73;"#,
+        )
+        .unwrap();
+    let db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    let bob = db.inspect("Bob").unwrap();
+    assert_eq!(
+        bob.settings.sandbox,
+        Some(agent_runtime::sandbox::Mode::ReadOnly)
+    );
+    assert_eq!(db.inspect("Ann").unwrap().settings, Default::default());
+    drop(db);
+    // Its planned calls keep their rulings from now on.
+    Connection::open(&path)
+        .unwrap()
+        .prepare("SELECT ruling FROM tools")
+        .unwrap();
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn a_bot_made_by_another_goes_by_its_creators_rules() {
+    use agent_runtime::rules::Policy;
+    let mut db = db();
+    let rules = |words: &[&str]| -> Policy {
+        serde_json::from_value(
+            json!({"prefix_rules": [{"pattern": words, "decision": "forbidden"}]}),
+        )
+        .unwrap()
+    };
+    let ann = db
+        .create(
+            "Ann",
+            Some("/synthetic"),
+            Binding {
+                settings: Settings {
+                    rules: Some(rules(&["rm"])),
+                    ..Default::default()
+                },
+                ..binding()
+            },
+        )
+        .unwrap();
+    // Whatever rules a child is made with, it takes its creator's.
+    let made = |db: &mut Database, name: &str, by: &str| {
+        let by_id = db.inspect(by).unwrap().bot_id;
+        db.create(
+            name,
+            Some("/synthetic"),
+            Binding {
+                created_by: Some(by),
+                created_by_id: Some(by_id),
+                settings: Settings {
+                    rules: Some(rules(&["ls"])),
+                    ..Default::default()
+                },
+                ..binding()
+            },
+        )
+        .unwrap();
+    };
+    made(&mut db, "Bob", &ann.0.name.clone());
+    made(&mut db, "Cat", "Bob");
+    assert_eq!(
+        db.inspect("Bob").unwrap().settings.rules,
+        Some(rules(&["rm"]))
+    );
+    // Nor can it be given its own.
+    let named = ["rules".to_owned()];
+    let own = Settings {
+        rules: Some(rules(&["ls"])),
+        ..Default::default()
+    };
+    let refused = db.set_settings("Bob", None, &named, &own).unwrap_err();
+    assert_eq!(refused.code, "invalid_setting");
+    // The creator's change reaches every bot it made, and theirs.
+    let changed = db.set_settings("Ann", None, &named, &own).unwrap();
+    assert_eq!(changed, ["rules"]);
+    for name in ["Bob", "Cat"] {
+        assert_eq!(
+            db.inspect(name).unwrap().settings.rules,
+            Some(rules(&["ls"]))
+        );
+    }
+    let changed = db
+        .set_settings("Ann", None, &named, &Settings::default())
+        .unwrap();
+    assert_eq!(changed, ["rules"]);
+    assert_eq!(db.inspect("Cat").unwrap().settings, Settings::default());
+    // A bot whose creator is gone keeps the rules it had, as made by it,
+    // and is given its own from then on.
+    db.set_settings("Ann", None, &named, &own).unwrap();
+    db.delete_bot("Bob").unwrap();
+    let cat = db.inspect("Cat").unwrap();
+    assert_eq!(cat.created_by.as_deref(), Some("Bob"));
+    assert_eq!(cat.settings.rules, Some(rules(&["ls"])));
+    let changed = db
+        .set_settings("Cat", None, &named, &Settings::default())
+        .unwrap();
+    assert_eq!(changed, ["rules"]);
+    // Rules that could never match are refused.
+    let empty = Settings {
+        rules: Some(serde_json::from_value(json!({"prefix_rules": [{"pattern": []}]})).unwrap()),
+        ..Default::default()
+    };
+    let refused = db.set_settings("Ann", None, &named, &empty).unwrap_err();
+    assert_eq!(refused.code, "invalid_setting");
 }

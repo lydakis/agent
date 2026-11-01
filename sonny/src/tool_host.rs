@@ -98,6 +98,8 @@ async fn serve(store: PathBuf, socket: PathBuf) -> Result<(), String> {
                 let bots = crate::lookout::all_bots(&client).await;
                 tokio::spawn(refresh_tools(client.clone(), bots));
             }
+            // For as long as this connection lasts.
+            let following = tokio::spawn(follow_config(client.clone()));
             let follow = json!({"bot": "*", "after": cursor, "kinds": KINDS});
             match client.request("follow", follow).await {
                 Ok(_) => {
@@ -117,6 +119,7 @@ async fn serve(store: PathBuf, socket: PathBuf) -> Result<(), String> {
                     json!({"event": "follow_refused", "error": error.code, "after": cursor})
                 ),
             }
+            following.abort();
         }
         if gone.get_or_insert_with(Instant::now).elapsed() >= GONE_AFTER {
             println!("{}", json!({"event": "daemon_gone"}));
@@ -211,9 +214,232 @@ async fn refresh_tools(client: Arc<Client>, bots: Vec<Value>) {
     }
 }
 
+/// How often the host looks at `config.toml`, and asks a busy agent
+/// again: an agent takes a change at the first idle point after.
+const CONFIG_EVERY: Duration = Duration::from_secs(5);
+
+/// Keep Sonny's agents on what `config.toml` gives an agent when it is
+/// made: each model's fallback and whether senders are named, and on the
+/// command rules in `~/.agent/rules`. Read at first and whenever either
+/// changes; an agent at work is asked again until it is idle, since
+/// `configure` waits for the turn to end.
+async fn follow_config(client: Arc<Client>) {
+    let stamp = || {
+        let found = agent_client::config::path().and_then(|path| std::fs::metadata(path).ok());
+        found.map(|found| (found.len(), found.modified().ok()))
+    };
+    let mut seen = None;
+    let mut waiting: Vec<Value> = Vec::new();
+    let mut live = std::collections::HashSet::new();
+    loop {
+        let rules = crate::rules::given();
+        let now = (stamp(), rules.clone());
+        if seen.as_ref() != Some(&now) {
+            seen = Some(now);
+            waiting = crate::lookout::all_bots(&client).await;
+            live = (waiting.iter())
+                .filter_map(|bot| bot["bot_id"].as_i64())
+                .collect();
+        }
+        if !waiting.is_empty() {
+            match agent_client::config::load() {
+                Ok(config) => {
+                    let given = Given {
+                        config: &config,
+                        rules: rules.as_ref(),
+                        live: &live,
+                    };
+                    waiting = apply_config(&client, &given, waiting).await;
+                }
+                // Its next change is read again.
+                Err(error) => {
+                    println!("{}", json!({"event": "config_unread", "error": error}));
+                    waiting.clear();
+                }
+            }
+        }
+        tokio::time::sleep(CONFIG_EVERY).await;
+    }
+}
+
+/// What Sonny gives an agent it makes, that the agent follows after.
+struct Given<'a> {
+    config: &'a agent_client::config::Config,
+    rules: Option<&'a agent_client::rules::Policy>,
+    /// The bots there are, by id: one whose creator is among them goes by
+    /// that creator's rules.
+    live: &'a std::collections::HashSet<i64>,
+}
+
+/// Configure each of `bots` that `given` would make otherwise; those at
+/// work, to ask again.
+async fn apply_config(client: &Client, given: &Given<'_>, bots: Vec<Value>) -> Vec<Value> {
+    let mut busy = Vec::new();
+    for bot in bots {
+        let Ok(record) = client
+            .request(
+                "inspect",
+                json!({"bot": bot["name"], "bot_id": bot["bot_id"]}),
+            )
+            .await
+        else {
+            continue;
+        };
+        let Some(mut fields) = configured(&record, given) else {
+            continue;
+        };
+        fields.insert("bot".into(), bot["name"].clone());
+        fields.insert("bot_id".into(), bot["bot_id"].clone());
+        match client.request("configure", Value::Object(fields)).await {
+            Ok(answer) => println!(
+                "{}",
+                json!({"event": "config_applied", "bot": bot["name"], "changed": answer["changed"]})
+            ),
+            Err(error) if error.code == "bot_busy" => busy.push(bot),
+            Err(error) => println!(
+                "{}",
+                json!({"event": "config_failed", "bot": bot["name"], "error": error.code})
+            ),
+        }
+    }
+    busy
+}
+
+/// The `configure` fields that bring one of Sonny's agents, as `inspect`
+/// gives it, to what `given` gives an agent on its model when it is made
+/// ([`crate::made`]); none when it is there, or isn't Sonny's. An agent
+/// made by another goes by its creator's rules, which the daemon keeps,
+/// while that creator is there.
+fn configured(record: &Value, given: &Given<'_>) -> Option<serde_json::Map<String, Value>> {
+    let declared = record["declared"].as_array()?;
+    if !declared
+        .iter()
+        .any(|tool| tool["answered_by"] == crate::served::TAG)
+    {
+        return None;
+    }
+    let model = format!(
+        "{}/{}",
+        record["provider"].as_str()?,
+        record["model"].as_str()?
+    );
+    let mut fields = serde_json::Map::new();
+    let mut settings = serde_json::Map::new();
+    let fallback = given.config.fallbacks.get(&model);
+    if record["fallback"].as_str() != fallback.map(String::as_str) {
+        fields.insert("fallback".into(), json!(fallback));
+    }
+    let hidden = record["settings"]["hide_senders"]
+        .as_bool()
+        .unwrap_or(false);
+    if hidden != given.config.hide_senders {
+        let hide = given.config.hide_senders.then_some(true);
+        settings.insert("hide_senders".into(), json!(hide));
+    }
+    let rules = json!(given.rules);
+    let creator = record["created_by_id"].as_i64();
+    let own = creator.is_none_or(|creator| !given.live.contains(&creator));
+    if own && record["settings"]["rules"] != rules {
+        settings.insert("rules".into(), rules);
+    }
+    if !settings.is_empty() {
+        fields.insert("settings".into(), Value::Object(settings));
+    }
+    (!fields.is_empty()).then_some(fields)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
+    use std::sync::LazyLock;
+
+    #[test]
+    fn an_agent_follows_what_config_gives_its_model() {
+        let mut config = agent_client::config::Config::default();
+        let agent = |fallback: Value, hidden: bool| {
+            json!({"provider": "anthropic", "model": "claude", "fallback": fallback,
+                "settings": {"hide_senders": hidden},
+                "declared": [{"name": "start_task", "answered_by": crate::served::TAG}]})
+        };
+        fn given(config: &agent_client::config::Config) -> Given<'_> {
+            static NONE: LazyLock<HashSet<i64>> = LazyLock::new(HashSet::new);
+            Given {
+                config,
+                rules: None,
+                live: &NONE,
+            }
+        }
+        assert_eq!(
+            configured(&agent(Value::Null, false), &given(&config)),
+            None
+        );
+        config
+            .fallbacks
+            .insert("anthropic/claude".into(), "anthropic/other".into());
+        config.hide_senders = true;
+        assert_eq!(
+            configured(&agent(Value::Null, false), &given(&config)).map(Value::Object),
+            Some(json!({"fallback": "anthropic/other", "settings": {"hide_senders": true}}))
+        );
+        assert_eq!(
+            configured(&agent(json!("anthropic/other"), true), &given(&config)),
+            None
+        );
+        // Taken out of the config, it goes from the agent too.
+        let config = agent_client::config::Config::default();
+        assert_eq!(
+            configured(&agent(json!("anthropic/other"), true), &given(&config)).map(Value::Object),
+            Some(json!({"fallback": null, "settings": {"hide_senders": null}}))
+        );
+        // Another client's bot is its own.
+        let mut other = agent(json!("x/y"), true);
+        other["declared"] = json!([]);
+        assert_eq!(configured(&other, &given(&config)), None);
+    }
+
+    #[test]
+    fn an_agent_follows_the_rules_and_one_made_by_another_its_creators() {
+        let config = agent_client::config::Config::default();
+        let policy: agent_client::rules::Policy = serde_json::from_value(json!({
+            "prefix_rules": [{"pattern": ["git", "push"], "decision": "prompt",
+                "source": "default.rules:1"}]
+        }))
+        .unwrap();
+        let live = HashSet::from([7]);
+        let ruled = Given {
+            config: &config,
+            rules: Some(&policy),
+            live: &live,
+        };
+        let unruled = Given {
+            config: &config,
+            rules: None,
+            live: &live,
+        };
+        let agent = |rules: Value, creator: Value| {
+            json!({"provider": "anthropic", "model": "claude", "fallback": null,
+                "settings": {"rules": rules}, "created_by_id": creator,
+                "declared": [{"name": "start_task", "answered_by": crate::served::TAG}]})
+        };
+        assert_eq!(
+            configured(&agent(Value::Null, Value::Null), &ruled).map(Value::Object),
+            Some(json!({"settings": {"rules": policy}}))
+        );
+        assert_eq!(configured(&agent(json!(policy), Value::Null), &ruled), None);
+        // Taken out of the folder, they go from the agent too.
+        assert_eq!(
+            configured(&agent(json!(policy), Value::Null), &unruled).map(Value::Object),
+            Some(json!({"settings": {"rules": null}}))
+        );
+        // One made by another takes its creator's, which the daemon keeps,
+        // and once that creator is gone, Sonny's.
+        assert_eq!(configured(&agent(Value::Null, json!(7)), &ruled), None);
+        assert_eq!(
+            configured(&agent(Value::Null, json!(8)), &ruled).map(Value::Object),
+            Some(json!({"settings": {"rules": policy}}))
+        );
+    }
 
     #[test]
     fn the_host_starts_where_it_stopped_or_else_where_the_lookout_did() {

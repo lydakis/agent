@@ -6,7 +6,7 @@
 use agent_runtime::{
     Error, Result, fail,
     output::Output,
-    store::{Served, Store},
+    store::{Database, Served, Store},
 };
 use serde_json::{Value, json};
 use std::{
@@ -17,7 +17,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{Semaphore, mpsc, watch};
 
 pub struct Subscription {
     session: u64,
@@ -50,8 +50,8 @@ fn wanted(kinds: Option<&Arc<HashSet<String>>>, event: &Value) -> bool {
     kinds.is_none_or(|kinds| (event["event"].as_str()).is_some_and(|kind| kinds.contains(kind)))
 }
 /// Keep `subs` other than `session`'s, cancelling that session's. The
-/// session is read without locking, since a replay holds its subscription's
-/// lock across a store page.
+/// session is read without locking, since a replay's switch to live holds
+/// its subscription's lock across a store job.
 fn retain_other_session(subs: &mut Vec<(u64, Sub)>, session: u64) {
     subs.retain(|(id, sub)| {
         if *id == session {
@@ -208,6 +208,10 @@ pub struct Hub {
     inner: Arc<Mutex<HubInner>>,
     /// The newest durable cursor delivered to every live follower.
     published: Arc<watch::Sender<i64>>,
+    /// Seats for replay pages on the reader pool: all readers but one, as
+    /// the observation lane takes them, so a turn's own reads always find
+    /// a connection however many followers are catching up.
+    pages: Arc<Semaphore>,
 }
 impl Default for Hub {
     fn default() -> Self {
@@ -226,6 +230,7 @@ impl Default for Hub {
                 ..HubInner::default()
             })),
             published: Arc::default(),
+            pages: Arc::new(Semaphore::new(1)),
         }
     }
 }
@@ -293,6 +298,12 @@ fn lost(tag: &str, lease: u64) -> Value {
     json!({"event":"approvals_lost","tag":tag,"lease":lease,"durable":false})
 }
 impl Hub {
+    /// Replay pages take `seats`, shared with the observation lane, so
+    /// together they leave a reader for turns' own reads.
+    pub fn with_page_seats(mut self, seats: Arc<Semaphore>) -> Self {
+        self.pages = seats;
+        self
+    }
     /// Hand `tag` to `session` under a new lease, not yet live: the job
     /// that lists the tag's waiting calls makes it live. A tag another
     /// session holds is refused until that session closes or lets its
@@ -652,38 +663,81 @@ impl Hub {
     }
 }
 
-/// Page durable history to a follower, then hand it to live delivery. The
-/// switch happens inside a store job, so no committed event can fall between
-/// the last page and the first live delivery.
+/// `limit` of `bot`'s durable events after `after`, or every bot's for `*`.
+fn event_page(db: &Database, bot: &str, after: i64, limit: usize) -> Result<Value> {
+    if bot == ALL {
+        db.events_after(after, limit)
+    } else {
+        db.events(bot, after, limit)
+    }
+}
+
+/// Page durable history to a follower, then hand it to live delivery, as a
+/// catch-up subscription does. Pages are read on the reader pool without
+/// the subscription's lock, so they hold up neither commits nor the
+/// publisher. Once a page comes back empty, the switch to live is a store
+/// job: under the lock it checks that nothing was committed past the
+/// follower's cursor, and goes live only then, so no committed event can
+/// fall between the last page and the first live delivery. Otherwise it
+/// pages on.
 pub async fn replay(store: Store, hub: Hub, bot: String, sub: Sub) -> Result<()> {
+    let reader = store.reader();
     loop {
-        let (page_sub, page_bot) = (sub.clone(), bot.clone());
-        let mut page = store
-            .op("events_after", move |db| {
-                let mut s = page_sub.lock().unwrap();
-                if s.cancelled {
-                    return Ok(json!({"events":[]}));
-                }
-                let page = if page_bot == ALL {
-                    db.events_after(s.last_cursor, 256)?
-                } else {
-                    db.events(&page_bot, s.last_cursor, 256)?
-                };
-                if page["events"].as_array().is_some_and(Vec::is_empty) {
-                    s.live = true;
-                } else if let Some(next) = page["next_cursor"].as_i64() {
-                    s.last_cursor = next;
-                }
-                Ok(page)
+        let (session, output, after, kinds) = {
+            let s = sub.lock().unwrap();
+            if s.cancelled {
+                return Ok(());
+            }
+            (s.session, s.output.clone(), s.last_cursor, s.kinds.clone())
+        };
+        let page_bot = bot.clone();
+        // The seat goes with the read itself: a replay cancelled while its
+        // page waits or runs on a reader keeps it until the read is done.
+        let seat = hub
+            .pages
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("page seats are never closed");
+        let mut page = reader
+            .read("events_after", move |db| {
+                let _seat = seat;
+                event_page(db, &page_bot, after, 256)
             })
             .await?;
         let Value::Array(events) = page["events"].take() else {
             return fail("invalid_event_page");
         };
-        let (session, output, cursor, kinds) = {
-            let s = sub.lock().unwrap();
-            (s.session, s.output.clone(), s.last_cursor, s.kinds.clone())
-        };
+        let mut cursor = after;
+        if events.is_empty() {
+            let (switch_sub, switch_bot) = (sub.clone(), bot.clone());
+            let (live, pruned) = store
+                .op("follow_live", move |db| {
+                    let mut s = switch_sub.lock().unwrap();
+                    let behind = event_page(db, &switch_bot, s.last_cursor, 1)?;
+                    if s.cancelled || behind["events"].as_array().is_some_and(|e| !e.is_empty()) {
+                        return Ok((false, None));
+                    }
+                    s.live = true;
+                    Ok((true, behind["pruned_before"].as_i64()))
+                })
+                .await?;
+            if !live {
+                continue;
+            }
+            // A deletion since the empty page may have removed events past
+            // the cursor: the switch's own check is the one to report.
+            if let Some(before) = pruned {
+                page["pruned_before"] = before.into();
+            }
+        } else if let Some(next) = page["next_cursor"].as_i64() {
+            let mut s = sub.lock().unwrap();
+            if s.cancelled {
+                return Ok(());
+            }
+            s.last_cursor = next;
+            cursor = next;
+        }
         if let Some(before) = page.get("pruned_before").and_then(Value::as_i64) {
             // Retention removed events the follower asked for: say so once,
             // ahead of what remains, rather than replaying a silent gap.

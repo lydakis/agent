@@ -204,10 +204,16 @@ fn adopt(places: &Places, url: &str, env: Option<&[(OsString, OsString)]>) -> Re
     if ever_synced(places) {
         return Ok(false);
     }
+    // Only what the remote holds is restored: a first sync that failed
+    // part way left this machine's own copy in the clone, which is no
+    // backup, and an empty remote holds nothing.
+    if !from_remote(&places.repo, env)? {
+        return Ok(false);
+    }
     let held = places.repo.join("agents");
     let config = places.repo.join("config.toml");
     if held.is_dir() {
-        mirror(&held, &places.agents, false)?;
+        mirror(&held, &places.agents, false, &Default::default())?;
     }
     if config.is_file() {
         if let Some(dir) = places.config.parent() {
@@ -225,6 +231,30 @@ fn adopt(places: &Places, url: &str, env: Option<&[(OsString, OsString)]>) -> Re
         private(&places.config).map_err(|e| e.to_string())?;
     }
     Ok(held.is_dir() || config.is_file())
+}
+
+/// Make the clone at `repo` hold the remote's last commit and nothing
+/// else, as it is before a restore. Whether the remote holds a commit.
+fn from_remote(repo: &Path, env: Option<&[(OsString, OsString)]>) -> Result<bool, String> {
+    git(repo, &["fetch", "--quiet", "origin"], env)?;
+    // A clone has `origin/HEAD`; a repository given a remote finds it now.
+    // An empty remote has neither.
+    let _ = git(repo, &["remote", "set-head", "origin", "--auto"], env);
+    let Ok(head) = git(
+        repo,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            "refs/remotes/origin/HEAD",
+        ],
+        env,
+    ) else {
+        return Ok(false);
+    };
+    git(repo, &["reset", "--quiet", "--hard", head.trim()], env)?;
+    git(repo, &["clean", "--quiet", "-ffdx"], env)?;
+    Ok(true)
 }
 
 /// Whether a sync from this machine ever went through: a machine that only
@@ -268,7 +298,8 @@ fn sync_once(places: &Places, env: Option<&[(OsString, OsString)]>) -> Result<Va
         return Err("backup_unset: run `sonny setup backup URL` first".into());
     }
     if places.agents.is_dir() {
-        mirror(&places.agents, &repo.join("agents"), true)?;
+        let left_out = ignored(repo, "agents", &places.agents, env)?;
+        mirror(&places.agents, &repo.join("agents"), true, &left_out)?;
     }
     let mut skipped = None;
     if let Ok(text) = std::fs::read_to_string(&places.config) {
@@ -339,6 +370,26 @@ fn origin(repo: &Path, env: Option<&[(OsString, OsString)]>) -> Option<String> {
 
 /// `git -C dir ARGS`, its output, or its error as `backup_git_failed`.
 fn git(dir: &Path, args: &[&str], env: Option<&[(OsString, OsString)]>) -> Result<String, String> {
+    let (status, out, err) = run_git(dir, args, env, None)?;
+    match status == Some(0) {
+        true => Ok(String::from_utf8_lossy(&out).into_owned()),
+        false => Err(format!(
+            "backup_git_failed: git {}: {}",
+            args.iter().find(|a| !a.starts_with('-')).unwrap_or(&""),
+            err.trim()
+        )),
+    }
+}
+
+/// `git -C dir ARGS` with `input` on its stdin: its exit code, stdout and
+/// stderr.
+fn run_git(
+    dir: &Path,
+    args: &[&str],
+    env: Option<&[(OsString, OsString)]>,
+    input: Option<&[u8]>,
+) -> Result<(Option<i32>, Vec<u8>, String), String> {
+    use std::io::Write;
     let mut command = std::process::Command::new("git");
     if let Some(env) = env {
         command.env_clear().envs(env.iter().map(|(k, v)| (k, v)));
@@ -346,7 +397,7 @@ fn git(dir: &Path, args: &[&str], env: Option<&[(OsString, OsString)]>) -> Resul
     for key in ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"] {
         command.env_remove(key);
     }
-    let out = command
+    let mut child = command
         .arg("-C")
         .arg(dir)
         // The person's own git settings must not sign, run hooks, change
@@ -366,22 +417,175 @@ fn git(dir: &Path, args: &[&str], env: Option<&[(OsString, OsString)]>) -> Resul
             "core.attributesFile=/dev/null",
         ])
         .args(args)
-        .stdin(std::process::Stdio::null())
-        .output()
+        .stdin(match input {
+            Some(_) => std::process::Stdio::piped(),
+            None => std::process::Stdio::null(),
+        })
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .map_err(|e| format!("backup_git_failed: git: {e}"))?;
-    match out.status.success() {
-        true => Ok(String::from_utf8_lossy(&out.stdout).into_owned()),
-        false => Err(format!(
-            "backup_git_failed: git {}: {}",
-            args.iter().find(|a| !a.starts_with('-')).unwrap_or(&""),
-            String::from_utf8_lossy(&out.stderr).trim()
-        )),
+    // Written beside the reads: git answers as it reads, and an answer that
+    // fills its pipe stops it reading.
+    let writer = match (input, child.stdin.take()) {
+        (Some(bytes), Some(mut stdin)) => {
+            let bytes = bytes.to_owned();
+            Some(std::thread::spawn(move || stdin.write_all(&bytes)))
+        }
+        _ => None,
+    };
+    let out = child
+        .wait_with_output()
+        .map_err(|e| format!("backup_git_failed: git: {e}"))?;
+    if let Some(writer) = writer {
+        match writer.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(format!("backup_git_failed: git: {e}")),
+            Err(_) => return Err("backup_git_failed: git: its input was not written".into()),
+        }
     }
+    Ok((
+        out.status.code(),
+        out.stdout,
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    ))
 }
 
-/// Make `to` hold what `from` holds, leaving out `SKIP`; with `delete`,
-/// also remove what `from` no longer has. Links are copied as links.
-fn mirror(from: &Path, to: &Path, delete: bool) -> Result<(), String> {
+/// What under `from` the ignore files leave out, as paths relative to
+/// `from`, so the copy at `at` (a folder of the repository) never holds it:
+/// walked a level at a time, asking git once a level, and never into a
+/// folder left out. The rules are the ones coming in: each folder's
+/// `.gitignore` is copied from `from` before its level is asked, and what
+/// the copy has where `from` now has a folder goes, as the copy would.
+fn ignored(
+    repo: &Path,
+    at: &str,
+    from: &Path,
+    env: Option<&[(OsString, OsString)]>,
+) -> Result<std::collections::HashSet<PathBuf>, String> {
+    let mut left_out = std::collections::HashSet::new();
+    let mut level = vec![PathBuf::new()];
+    let copy = repo.join(at);
+    let fail = |e: std::io::Error| format!("backup_copy_failed: {e}");
+    while !level.is_empty() {
+        let mut asked = Vec::new();
+        for dir in &level {
+            let (here, there) = (from.join(dir), copy.join(dir));
+            if !std::fs::symlink_metadata(&there).is_ok_and(|m| m.is_dir()) {
+                let _ = std::fs::remove_file(&there);
+            }
+            // A copy that is not a plain file (a link, say) goes first, so
+            // the rules never land wherever it points.
+            let (rules, kept) = (here.join(".gitignore"), there.join(".gitignore"));
+            let plain = std::fs::symlink_metadata(&rules).is_ok_and(|m| m.is_file());
+            match std::fs::symlink_metadata(&kept) {
+                Ok(m) if m.is_dir() => std::fs::remove_dir_all(&kept).map_err(fail)?,
+                Ok(m) if !(plain && m.is_file()) => std::fs::remove_file(&kept).map_err(fail)?,
+                _ => {}
+            }
+            if plain {
+                std::fs::create_dir_all(&there).map_err(fail)?;
+                std::fs::copy(&rules, &kept).map_err(fail)?;
+            }
+        }
+        for dir in &level {
+            let Ok(entries) = std::fs::read_dir(from.join(dir)) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                if SKIP.iter().any(|skip| name == *skip) {
+                    continue;
+                }
+                let folder = entry.file_type().is_ok_and(|kind| kind.is_dir());
+                asked.push((dir.join(&name), folder));
+            }
+        }
+        if asked.is_empty() {
+            break;
+        }
+        // A folder is asked with its slash, so a pattern only for folders
+        // (`monitor/`) matches it. Git judges a path by what the copy has
+        // there too, so what changed kind goes first, as the copy would
+        // replace it: what is not a folder where the home has one, and a
+        // folder where the home has none (else `cache/` would leave out the
+        // home's file `cache`). Paths end in NUL, as git then reads and
+        // writes them unquoted.
+        for (path, folder) in &asked {
+            let there = copy.join(path);
+            match std::fs::symlink_metadata(&there) {
+                Ok(m) if *folder && !m.is_dir() => std::fs::remove_file(&there).map_err(fail)?,
+                Ok(m) if !*folder && m.is_dir() => std::fs::remove_dir_all(&there).map_err(fail)?,
+                _ => {}
+            }
+        }
+        // Byte for byte: a name that is not UTF-8 is still the name a rule
+        // names.
+        use std::os::unix::ffi::OsStrExt;
+        let full = |path: &Path| {
+            let mut bytes = format!("{at}/").into_bytes();
+            bytes.extend_from_slice(path.as_os_str().as_bytes());
+            bytes
+        };
+        let mut input = Vec::new();
+        for (path, folder) in &asked {
+            input.extend(full(path));
+            if *folder {
+                input.push(b'/');
+            }
+            input.push(0);
+        }
+        // Tracked or not: a file the ignore files name now is left out
+        // from now on.
+        let (status, out, err) = run_git(
+            repo,
+            &["check-ignore", "--no-index", "--stdin", "-z"],
+            env,
+            Some(&input),
+        )?;
+        // 1 is none of them.
+        if !matches!(status, Some(0 | 1)) {
+            return Err(format!(
+                "backup_git_failed: git check-ignore: {}",
+                err.trim()
+            ));
+        }
+        let named: std::collections::HashSet<&[u8]> = (out.split(|b| *b == 0))
+            .filter(|path| !path.is_empty())
+            .map(|path| path.strip_suffix(b"/").unwrap_or(path))
+            .collect();
+        level = Vec::new();
+        for (path, folder) in asked {
+            if named.contains(full(&path).as_slice()) {
+                left_out.insert(path);
+            } else if folder {
+                level.push(path);
+            }
+        }
+    }
+    Ok(left_out)
+}
+
+/// Make `to` hold what `from` holds, leaving out `SKIP` and what `left_out`
+/// names (paths relative to `from`); with `delete`, also remove what `from`
+/// no longer has or leaves out. Links are copied as links; what is neither
+/// a file, a folder nor a link (a socket, a pipe) is no backup's.
+fn mirror(
+    from: &Path,
+    to: &Path,
+    delete: bool,
+    left_out: &std::collections::HashSet<PathBuf>,
+) -> Result<(), String> {
+    mirror_at(from, to, delete, Path::new(""), left_out)
+}
+
+fn mirror_at(
+    from: &Path,
+    to: &Path,
+    delete: bool,
+    at: &Path,
+    left_out: &std::collections::HashSet<PathBuf>,
+) -> Result<(), String> {
     let fail =
         |path: &Path, e: std::io::Error| format!("backup_copy_failed: {}: {e}", path.display());
     std::fs::create_dir_all(to).map_err(|e| fail(to, e))?;
@@ -390,7 +594,7 @@ fn mirror(from: &Path, to: &Path, delete: bool) -> Result<(), String> {
     for entry in std::fs::read_dir(from).map_err(|e| fail(from, e))? {
         let entry = entry.map_err(|e| fail(from, e))?;
         let name = entry.file_name();
-        if SKIP.iter().any(|skip| name == *skip) {
+        if SKIP.iter().any(|skip| name == *skip) || left_out.contains(&at.join(&name)) {
             continue;
         }
         let (source, target) = (entry.path(), to.join(&name));
@@ -405,8 +609,8 @@ fn mirror(from: &Path, to: &Path, delete: bool) -> Result<(), String> {
             if std::fs::symlink_metadata(&target).is_ok_and(|m| !m.is_dir()) {
                 remove(&target).map_err(|e| fail(&target, e))?;
             }
-            mirror(&source, &target, delete)?;
-        } else {
+            mirror_at(&source, &target, delete, &at.join(&name), left_out)?;
+        } else if kind.is_file() {
             // A link or folder in its place is replaced even when what it
             // leads to reads the same.
             let file = std::fs::symlink_metadata(&target).is_ok_and(|m| m.is_file());
@@ -417,6 +621,8 @@ fn mirror(from: &Path, to: &Path, delete: bool) -> Result<(), String> {
                 std::fs::copy(&source, &target).map_err(|e| fail(&target, e))?;
             }
             own_bits(&source, &target).map_err(|e| fail(&target, e))?;
+        } else {
+            continue;
         }
         kept.insert(name);
     }
@@ -627,7 +833,7 @@ mod tests {
         write(&from.join("skills/plan/SKILL.md"), "plan");
         std::os::unix::fs::symlink("plan", from.join("skills/link")).unwrap();
         write(&to.join("memory/gone.md"), "old");
-        mirror(&from, &to, true).unwrap();
+        mirror(&from, &to, true, &Default::default()).unwrap();
         assert_eq!(
             std::fs::read_to_string(to.join("memory/a.md")).unwrap(),
             "a"
@@ -645,7 +851,7 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             let script = from.join("skills/plan/SKILL.md");
             std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
-            mirror(&from, &to, true).unwrap();
+            mirror(&from, &to, true, &Default::default()).unwrap();
             let mode = std::fs::metadata(to.join("skills/plan/SKILL.md"))
                 .unwrap()
                 .permissions()
@@ -655,7 +861,7 @@ mod tests {
         // A link that became a file with the same bytes is a file in the copy.
         std::fs::remove_file(from.join("skills/link")).unwrap();
         write(&from.join("skills/link"), "plan");
-        mirror(&from, &to, true).unwrap();
+        mirror(&from, &to, true, &Default::default()).unwrap();
         assert!(
             std::fs::symlink_metadata(to.join("skills/link"))
                 .unwrap()
@@ -663,7 +869,7 @@ mod tests {
         );
         // A restore adds and overwrites but removes nothing.
         write(&to.join("extra.md"), "x");
-        mirror(&from, &to, false).unwrap();
+        mirror(&from, &to, false, &Default::default()).unwrap();
         assert!(to.join("extra.md").exists());
         std::fs::remove_dir_all(&root).unwrap();
     }
@@ -869,6 +1075,231 @@ mod tests {
             std::fs::read_to_string(&second.config).unwrap(),
             "provider = \"chatgpt\"\n"
         );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_socket_in_the_home_is_left_out_of_the_copy() {
+        let root = scratch("socket");
+        let (from, to) = (root.join("from"), root.join("to"));
+        write(&from.join("memory/a.md"), "a");
+        let _listener =
+            std::os::unix::net::UnixListener::bind(from.join("memory/daemon.sock")).unwrap();
+        mirror(&from, &to, true, &Default::default()).unwrap();
+        assert!(to.join("memory/a.md").exists());
+        assert!(!to.join("memory/daemon.sock").exists());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn what_the_repository_ignores_is_never_copied_and_a_copy_already_there_goes() {
+        let root = scratch("ignored");
+        sh(&root, &["init", "--quiet", "--bare", "remote.git"]);
+        let at = places(&root.join("one"));
+        write(&at.agents.join("memory/fact.md"), "fact");
+        write(&at.agents.join("monitor/inbox/mail.json"), "mail");
+        write(&at.agents.join("skills/plan/cache.tmp"), "tmp");
+        adopt(&at, &root.join("remote.git").to_string_lossy(), None).unwrap();
+        sh(&at.repo, &["config", "user.email", "t@example.com"]);
+        sh(&at.repo, &["config", "user.name", "T"]);
+        sync(&at, None).unwrap();
+        assert!(at.repo.join("agents/monitor/inbox/mail.json").exists());
+        // The agent that set it up leaves monitor content out.
+        write(&at.repo.join(".gitignore"), "agents/monitor/\n*.tmp\n");
+        sync(&at, None).unwrap();
+        assert!(at.repo.join("agents/memory/fact.md").exists());
+        assert!(!at.repo.join("agents/monitor").exists());
+        assert!(!at.repo.join("agents/skills/plan/cache.tmp").exists());
+        let held = sh(
+            &root.join("remote.git"),
+            &["ls-tree", "-r", "--name-only", "HEAD"],
+        );
+        assert_eq!(
+            held.lines().collect::<Vec<_>>(),
+            [".gitignore", "agents/memory/fact.md"]
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn the_home_s_own_new_ignore_rules_hold_from_the_sync_that_brings_them() {
+        let root = scratch("rules");
+        sh(&root, &["init", "--quiet", "--bare", "remote.git"]);
+        let at = places(&root.join("one"));
+        write(&at.agents.join("memory/fact.md"), "fact");
+        write(
+            &at.agents.join("memory/café.md"),
+            "kept until a rule names it",
+        );
+        std::fs::create_dir_all(at.agents.join("skills")).unwrap();
+        std::os::unix::fs::symlink("/nowhere", at.agents.join("skills/plan")).unwrap();
+        adopt(&at, &root.join("remote.git").to_string_lossy(), None).unwrap();
+        sh(&at.repo, &["config", "user.email", "t@example.com"]);
+        sh(&at.repo, &["config", "user.name", "T"]);
+        sync(&at, None).unwrap();
+        assert!(at.repo.join("agents/memory/café.md").exists());
+        // A rule in the home, for a name git would quote, and a link that
+        // became a folder.
+        write(&at.agents.join("memory/café.md"), "a secret now");
+        write(&at.agents.join("memory/.gitignore"), "café.md\n");
+        std::fs::remove_file(at.agents.join("skills/plan")).unwrap();
+        write(&at.agents.join("skills/plan/SKILL.md"), "plan");
+        sync(&at, None).unwrap();
+        let held = |what: &str| {
+            sh(
+                &root.join("remote.git"),
+                &["log", "--all", "-p", "--", what],
+            )
+        };
+        assert!(!held("agents/memory/café.md").contains("a secret now"));
+        let tree = sh(
+            &root.join("remote.git"),
+            &["ls-tree", "-r", "--name-only", "-z", "HEAD"],
+        );
+        assert_eq!(
+            tree.split('\0')
+                .filter(|p| !p.is_empty())
+                .collect::<Vec<_>>(),
+            [
+                "agents/memory/.gitignore",
+                "agents/memory/fact.md",
+                "agents/skills/plan/SKILL.md"
+            ]
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_rules_link_that_became_a_file_never_writes_where_it_pointed() {
+        let root = scratch("rules-link");
+        sh(&root, &["init", "--quiet", "--bare", "remote.git"]);
+        let at = places(&root.join("one"));
+        let outside = root.join("outside.txt");
+        write(&outside, "untouched");
+        write(&at.agents.join("memory/fact.md"), "fact");
+        std::os::unix::fs::symlink(&outside, at.agents.join("memory/.gitignore")).unwrap();
+        adopt(&at, &root.join("remote.git").to_string_lossy(), None).unwrap();
+        sh(&at.repo, &["config", "user.email", "t@example.com"]);
+        sh(&at.repo, &["config", "user.name", "T"]);
+        sync(&at, None).unwrap();
+        assert!(
+            std::fs::symlink_metadata(at.repo.join("agents/memory/.gitignore"))
+                .unwrap()
+                .is_symlink()
+        );
+        // The home's link becomes rules of its own.
+        std::fs::remove_file(at.agents.join("memory/.gitignore")).unwrap();
+        write(&at.agents.join("memory/.gitignore"), "fact.md\n");
+        sync(&at, None).unwrap();
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "untouched");
+        assert!(!at.repo.join("agents/memory/fact.md").exists());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_folder_that_became_a_file_is_kept_past_a_rule_for_folders() {
+        let root = scratch("folder-file");
+        sh(&root, &["init", "--quiet", "--bare", "remote.git"]);
+        let at = places(&root.join("one"));
+        write(&at.agents.join("cache/old.md"), "old");
+        adopt(&at, &root.join("remote.git").to_string_lossy(), None).unwrap();
+        sh(&at.repo, &["config", "user.email", "t@example.com"]);
+        sh(&at.repo, &["config", "user.name", "T"]);
+        sync(&at, None).unwrap();
+        assert!(at.repo.join("agents/cache/old.md").exists());
+        std::fs::remove_dir_all(at.agents.join("cache")).unwrap();
+        write(&at.agents.join("cache"), "a file now");
+        write(&at.agents.join(".gitignore"), "cache/\n");
+        sync(&at, None).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(at.repo.join("agents/cache")).unwrap(),
+            "a file now"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // macOS keeps only UTF-8 names, so there is no such name to make.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_name_that_is_not_utf8_is_checked_as_it_is() {
+        use std::os::unix::ffi::OsStrExt;
+        let root = scratch("raw-name");
+        sh(&root, &["init", "--quiet", "--bare", "remote.git"]);
+        let at = places(&root.join("one"));
+        let name = std::ffi::OsStr::from_bytes(b"private-\xff.txt");
+        write(&at.agents.join(name), "before");
+        adopt(&at, &root.join("remote.git").to_string_lossy(), None).unwrap();
+        sh(&at.repo, &["config", "user.email", "t@example.com"]);
+        sh(&at.repo, &["config", "user.name", "T"]);
+        sync(&at, None).unwrap();
+        assert!(at.repo.join("agents").join(name).exists());
+        write(&at.agents.join(name), "secret");
+        write(&at.agents.join(".gitignore"), "private-*\n");
+        sync(&at, None).unwrap();
+        assert!(!at.repo.join("agents").join(name).exists());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn many_paths_at_one_level_are_checked_without_a_stall() {
+        let root = scratch("many");
+        sh(&root, &["init", "--quiet", "--bare", "remote.git"]);
+        let at = places(&root.join("one"));
+        for n in 0..3000 {
+            write(
+                &at.agents
+                    .join(format!("cache/entry-with-a-long-name-{n:05}.tmp")),
+                "",
+            );
+        }
+        write(&at.agents.join("memory/fact.md"), "fact");
+        adopt(&at, &root.join("remote.git").to_string_lossy(), None).unwrap();
+        write(&at.repo.join(".gitignore"), "*.tmp\n");
+        sh(&at.repo, &["config", "user.email", "t@example.com"]);
+        sh(&at.repo, &["config", "user.name", "T"]);
+        sync(&at, None).unwrap();
+        let copied = std::fs::read_dir(at.repo.join("agents/cache")).map_or(0, |d| d.count());
+        assert_eq!(copied, 0);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_first_sync_that_failed_part_way_restores_nothing_over_the_home() {
+        let root = scratch("partial");
+        sh(&root, &["init", "--quiet", "--bare", "remote.git"]);
+        let url = root.join("remote.git").to_string_lossy().into_owned();
+        let at = places(&root.join("one"));
+        write(&at.agents.join("memory/fact.md"), "old");
+        assert!(!adopt(&at, &url, None).unwrap());
+        // The first sync copied an older home and failed before it pushed.
+        mirror(
+            &at.agents,
+            &at.repo.join("agents"),
+            true,
+            &Default::default(),
+        )
+        .unwrap();
+        write(&at.agents.join("memory/fact.md"), "new");
+        assert!(!adopt(&at, &url, None).unwrap(), "the remote holds nothing");
+        assert_eq!(
+            std::fs::read_to_string(at.agents.join("memory/fact.md")).unwrap(),
+            "new"
+        );
+
+        // With a backup there, a half-done copy gives way to what it holds.
+        let first = places(&root.join("two"));
+        write(&first.agents.join("memory/fact.md"), "backed up");
+        adopt(&first, &url, None).unwrap();
+        sh(&first.repo, &["config", "user.email", "t@example.com"]);
+        sh(&first.repo, &["config", "user.name", "T"]);
+        sync(&first, None).unwrap();
+        write(&at.repo.join("agents/memory/stray.md"), "stray");
+        assert!(adopt(&at, &url, None).unwrap());
+        assert_eq!(
+            std::fs::read_to_string(at.agents.join("memory/fact.md")).unwrap(),
+            "backed up"
+        );
+        assert!(!at.agents.join("memory/stray.md").exists());
         std::fs::remove_dir_all(&root).unwrap();
     }
 

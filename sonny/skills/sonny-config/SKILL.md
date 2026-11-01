@@ -39,9 +39,15 @@ each setting is; what to set is the person's call.
   `description` for the list. Codex's own stricter workspace is
   `network = false` and `git = "read-only"`. `/permissions` lists it the
   next time it opens; `sonny.default_permissions` names it for new leads.
-- `sonny.unsandboxed` in the config: commands, by their first words, every
-  agent runs outside its sandbox without asking (`["mcpx", "cargo test"]`);
-  "always allow" on an approval prompt adds one.
+- Command rules are not in the config: `~/.agent/rules/*.rules` holds
+  Codex-style `prefix_rule(pattern = ["mcpx"], decision = "allow")` lines
+  (`allow` runs outside the sandbox without asking, `prompt` always asks,
+  `forbidden` never runs, with a `justification`). Agents can read but not
+  write that folder from a sandbox, so suggest a rule to the person;
+  "always allow" on an approval prompt adds one, and
+  `sonny rules check -- COMMAND` shows what the rules decide. The files
+  are Starlark, as in Codex (`host_executable` works; `network_rule`
+  is refused).
 
 ## ~/.agent/config.toml
 

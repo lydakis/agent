@@ -41,7 +41,19 @@ LABEL. A client that starts a daemon passes `agent_client::SECRET_FIELDS`
 Likewise `serve --protect NAME` keeps NAME at the top of a sandboxed bot's
 writable folders read-only and from being made, and `--protect-existing NAME`
 keeps it read-only where it exists; a client passes `.git`, `.agents` and
-`.codex`, and `.aws` where it exists.
+`.codex`, and `.aws` where it exists. `serve --protect-path PATH`
+keeps PATH, by its absolute path, read-only in every sandbox and from being
+made there; the CLI passes `~/.agent/rules`, where Sonny reads the
+[command rules](RUST_PROTOTYPE.md#command-rules) it gives its bots, so no
+bot writes its own.
+The daemon's [limits](RUST_PROTOTYPE.md#limits) come from `[daemon]` in
+`~/.agent/config.toml` where the command line sets none, each a number or
+a formula of the machine, as `processes = "cpus * 64"` or
+`load = "cpus * 2"`, the default for `--max-load`: while the machine's
+1-minute load average is over it, new commands wait for one of the
+daemon's to end, as `make -l` does, a turn held long parking until then.
+A key it does not know, or a formula it cannot work out for this machine
+(one below 0 here included), is `config_invalid` when the file is read.
 `run` without `--bot` creates a fresh identity. `run --bot NAME` continues an
 existing bot; add `--new` to create that name. A prompt of `-` reads stdin.
 
@@ -161,14 +173,16 @@ identity is `bot_not_found`.
   `--idle-exit` and `--keep-warm`. The last three count whole seconds. The
   protocol keeps its own units (`timeout_ms`, `grace_ms`, `approval_hold_ms`,
   `keep_warm` seconds). `--approval-hold` is how long a new bot's gated calls
-  wait live for a verdict before the turn parks (default `2s`; `0` parks at
-  once). `--after` is an exclusive event cursor for `follow` and an exclusive
+  wait live for a verdict, and its terminal reads for output, before the turn
+  parks (default `2s`; `0` parks at once). `--after` is an exclusive event cursor for `follow` and an exclusive
   turn ID for `turns`. `--checkpoint` is a history node ID.
 - Listings read only what they print. `--limit N` stops `ls`, `turns` and
   `approvals` after N entries. `ls --name GLOB` keeps the bots whose name
   matches (`'project.*'`, `'*.lead'`; SQLite GLOB, case-sensitive) and
-  `ls --active` those with a turn running; the daemon filters, so neither
-  pages through every bot. `turns --newest` lists newest first, read from the
+  `ls --active` those with a turn running, and `ls --created-by BOT` those
+  that bot made (by its id, so a later bot of the same name lists none of
+  an earlier one's); the daemon filters, so none of them pages through
+  every bot. `turns --newest` lists newest first, read from the
   end, so `turns --bot NAME --newest --limit 3` is a bot's last three turns.
 - `usage` prints what the bots' turns spent as one JSON object: tokens in
   all, by bot (the `--limit` that spent most, 64 by default, the rest summed),
@@ -183,8 +197,7 @@ identity is `bot_not_found`.
   `--note-turns`, `--compact-at`, `--compact-keep`, `--compact-tokens`, `--keep-turns`,
   `--approval-hold`, `--max-output-tokens`, `--keep-warm`, `--cache-ttl`,
   `--sandbox`, `--writable` (repeatable, made absolute from the current
-  folder), `--network`, `--hide-senders`, `--unsandboxed` (repeatable: a
-  command's first words, such as `mcpx`), `--unix-socket` (repeatable: an
+  folder), `--network`, `--hide-senders`, `--unix-socket` (repeatable: an
   absolute socket, or folder of them, its commands reach) and `--outputs` (made absolute; a new
   bot gets `outputs` beside the store without it); they are not daemon options,
   and an existing bot keeps its own (see [bot settings](RUST_PROTOTYPE.md#bot-settings)).
@@ -237,13 +250,16 @@ return arrays. Every command prints its reply: `interrupt` the turn view,
 daemon is gone. Every client command takes `--pretty`; `serve` runs until
 stopped and prints no reply to render.
 `shutdown` returns once the daemon process has exited and its store is closed.
-`shutdown --grace DURATION` first lets running turns finish for up to that long
-while starting none; turns still running then end `interrupted` with
-`daemon_shutdown`. A daemon whose ready line announces an older protocol than
+`shutdown --grace DURATION` first drains for up to that long: nothing starts,
+and each running turn parks at its next boundary, once its model's answer and
+the calls already running have committed, or finishes if that answer ends it.
+Turns still running at exit, and every running turn without `--grace`, park
+with their unanswered calls answered `daemon_shutdown`; the next start
+continues them. A daemon whose ready line announces an older protocol than
 this `agent`'s cannot be asked in this protocol, so `shutdown` sends SIGTERM to
 the process that ready line names (a process already gone counts as stopped)
-and waits for it the same way: its running
-turns end interrupted and the store keeps every chat. That is how an upgrade on
+and waits for it the same way: the older daemon's running
+turns end interrupted (from protocol 36 they park) and the store keeps every chat. That is how an upgrade on
 a machine replaces the daemon an older `agent` started. A newer daemon is left
 running and `shutdown` fails with `daemon_protocol_mismatch`.
 
@@ -326,8 +342,8 @@ protocol, `start` still prints its ready line and then fails with
 one. An older one that names its pid is replaced instead, by every command
 that may start the daemon (not with `--no-spawn`, and not from inside a bot's
 turn, where `AGENT_BOT_ID` is set, since that turn is one it would wait on):
-it is asked to shut down with a 2-minute grace, so running turns may finish
-while none starts, or sent SIGTERM when it refuses that request, as daemons
+it is asked to shut down with a 2-minute grace, so running turns park at their
+next boundary while none starts, or sent SIGTERM when it refuses that request, as daemons
 before 0.6.0 do; once it exits, this `agent`'s daemon starts on the same
 socket and upgrades the store. Sonny starts the daemon this way, so opening it
 after an upgrade replaces the old daemon, and it says so first. `stats` starts it as `start` does, so it answers on a fresh install;
@@ -379,7 +395,9 @@ so `--tools` while continuing one is a usage error.
 `run --fallback PROVIDER/MODEL` gives a new bot a model, in its family, that
 answers a request a safety classifier declined, that request alone; the next
 goes to the bot's own model. Without it the bot takes its model's entry in
-`[fallbacks]` in `~/.agent/config.toml`, if any:
+`[fallbacks]` in `~/.agent/config.toml`, if any (Sonny's agents follow
+that entry as it changes; a bot the CLI made keeps the one it took, and
+`configure` with `fallback` changes it):
 
 ```toml
 [fallbacks]

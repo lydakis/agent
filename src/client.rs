@@ -84,6 +84,7 @@ struct Options {
     /// newest first.
     name: Option<String>,
     active: bool,
+    created_by: Option<String>,
     newest: bool,
     /// The most a listing prints.
     limit: Option<usize>,
@@ -167,6 +168,7 @@ fn parse(args: &[String]) -> Result<Options> {
         after: 0,
         name: None,
         active: false,
+        created_by: None,
         newest: false,
         limit: None,
         pretty: false,
@@ -267,6 +269,7 @@ fn parse(args: &[String]) -> Result<Options> {
                     }
                     "--tag" => options.tag = Some(value),
                     "--name" => options.name = Some(value),
+                    "--created-by" => options.created_by = Some(value),
                     "--limit" => {
                         options.limit = Some(
                             value
@@ -334,15 +337,20 @@ fn parse(args: &[String]) -> Result<Options> {
                         options.timeout_ms = Some(crate::cli::duration_ms(flag, &value)?)
                     }
                     "--max-processes"
-                    | "--max-detached"
+                    | "--max-lasting"
                     | "--max-active"
                     | "--max-connecting"
                     | "--max-pending"
                     | "--max-pending-bytes"
+                    | "--max-input-bytes"
                     | "--max-readers" => {
                         value.parse::<usize>().map_err(|_| {
                             Error::with("usage", format!("{flag} needs an integer"))
                         })?;
+                        options.daemon_flags.push((flag.to_owned(), value));
+                    }
+                    "--max-load" => {
+                        crate::cli::load(&value)?;
                         options.daemon_flags.push((flag.to_owned(), value));
                     }
                     "--stall-timeout" | "--idle-exit" => {
@@ -415,18 +423,6 @@ fn parse(args: &[String]) -> Result<Options> {
                             .ok_or(Error::with("usage", "--outputs needs a UTF-8 path"))?;
                         options.settings.insert("outputs".to_owned(), json!(path));
                         options.settings_flags.push(flag.to_owned());
-                    }
-                    "--unsandboxed" => {
-                        let unsandboxed = options
-                            .settings
-                            .entry("unsandboxed".to_owned())
-                            .or_insert_with(|| json!([]));
-                        if let Value::Array(commands) = unsandboxed {
-                            commands.push(json!(value));
-                        }
-                        if !options.settings_flags.iter().any(|f| f == flag) {
-                            options.settings_flags.push(flag.to_owned());
-                        }
                     }
                     "--unix-socket" => {
                         let path = std::path::absolute(&value)?;
@@ -742,17 +738,28 @@ fn check_daemon(options: &Options, ready: &Value) -> Result<()> {
     for (flag, value) in &options.daemon_flags {
         let key = match flag.as_str() {
             "--max-processes" => "processes",
-            "--max-detached" => "detached",
+            "--max-lasting" => "lasting",
             "--max-active" => "active",
             "--max-connecting" => "connecting",
             "--max-pending" => "pending",
             "--max-pending-bytes" => "pending_bytes",
+            "--max-input-bytes" => "input_bytes",
             "--max-readers" => "readers",
+            "--max-load" => "load",
             "--stall-timeout" => "stall_timeout_seconds",
             "--idle-exit" => "idle_exit_seconds",
             _ => continue,
         };
         let running = &ready["limits"][key];
+        if flag == "--max-load" {
+            let requested = crate::cli::load(value).ok().filter(|load| *load > 0.0);
+            if running.as_f64() != requested {
+                differences.push(format!(
+                    "{flag}: requested {value} but daemon has {running}"
+                ));
+            }
+            continue;
+        }
         let requested = match flag.as_str() {
             "--stall-timeout" | "--idle-exit" => crate::cli::duration_secs(flag, value).ok(),
             _ => value.parse::<u64>().ok(),
@@ -793,10 +800,11 @@ fn ensure_daemon(options: &Options) -> Result<Connection> {
     }
 }
 
-/// How long an older daemon's running turns may take to finish when this
-/// agent replaces it; nothing new starts on it meanwhile, and what still
-/// runs then ends as interrupted. Kubernetes and systemd give a stopping
-/// service a bounded grace in the same way.
+/// How long an older daemon may drain when this agent replaces it: nothing
+/// new starts on it, its running turns park at their next boundary, and
+/// what still runs then parks where it is (a daemon before protocol 36
+/// lets turns finish and ends the rest as interrupted). Kubernetes and
+/// systemd give a stopping service a bounded grace in the same way.
 const REPLACE_GRACE: Duration = Duration::from_secs(120);
 
 /// Stop the older daemon `error` found on `socket`, once its running turns
@@ -911,6 +919,15 @@ fn connect_or_start(options: &Options) -> Result<Connection> {
     for (flag, value) in &options.daemon_flags {
         command.arg(flag).arg(value);
     }
+    // The person's `[daemon]` limits, for this machine, where the command
+    // line set none.
+    let configured = agent_client::config::daemon_flags(&config()?.daemon)
+        .map_err(|error| Error::with("config_invalid", error))?;
+    for (flag, value) in configured {
+        if !options.daemon_flags.iter().any(|(given, _)| *given == flag) {
+            command.arg(flag).arg(value);
+        }
+    }
     for name in agent_client::TERMINAL_PLACES {
         command.arg("--shell-exclude").arg(name);
     }
@@ -925,6 +942,15 @@ fn connect_or_start(options: &Options) -> Result<Connection> {
     }
     for name in agent_client::PROTECTED_EXISTING {
         command.arg("--protect-existing").arg(name);
+    }
+    // Sonny reads its bots' command rules from here.
+    if let Some(rules) = agent_client::config::rules() {
+        command.arg("--protect-path").arg(rules);
+    }
+    // And the scheduler runs its jobs from here, unsandboxed; the settings
+    // say how every bot is sandboxed.
+    if let Some(home) = agent_client::config::home() {
+        command.arg("--protect-path").arg(home);
     }
     for pattern in config()?.shell_environment_policy.excludes() {
         command.arg("--shell-exclude").arg(pattern);
@@ -1297,8 +1323,8 @@ pub fn main(args: Vec<String>) -> Result<i32> {
 }
 
 /// A daemon older than this agent cannot be asked to shut down in this
-/// protocol, but every protocol honours SIGTERM: running turns end as
-/// interrupted and the store keeps every chat. This is how an upgrade on a
+/// protocol, but every protocol honours SIGTERM: running turns park (end
+/// as interrupted before protocol 36) and the store keeps every chat. This is how an upgrade on a
 /// host replaces its daemon. A newer daemon, or a listener that did not greet
 /// as a daemon, is left alone and the error stands.
 fn stop_older(error: Error, pretty: bool) -> Result<i32> {
@@ -1330,9 +1356,9 @@ fn stopped(pid: i32, pretty: bool) -> Result<i32> {
 }
 
 /// Return once the daemon process is gone, so a caller may copy or reopen
-/// the store: it answers shutdown before it lets running turns finish within
-/// the grace period, cancels the rest, commits their records and closes the
-/// database. An unreaped zombie counts as gone.
+/// the store: it answers shutdown before it drains within the grace period,
+/// parks what still runs, commits their records and closes the database. An
+/// unreaped zombie counts as gone.
 fn await_exit(pid: i32, timeout: Duration) -> Result<()> {
     let deadline = Instant::now() + timeout;
     let running = || {
@@ -2235,13 +2261,20 @@ fn list(options: &Options) -> Result<i32> {
     let mut after = Value::Null;
     let mut left = options.limit.unwrap_or(usize::MAX);
     let mut first = true;
+    // The maker by its id, so a bot that reuses its name lists none of
+    // the earlier one's.
+    let created_by_id = match &options.created_by {
+        Some(bot) => Some(connection.request("inspect", json!({"bot":bot}))?["bot_id"].clone()),
+        None => None,
+    };
     if !options.pretty {
         say_raw!("[");
     }
     loop {
         let page = connection.request(
             "bots",
-            json!({"after":after,"limit":left.min(256),"name":options.name,"active":options.active}),
+            json!({"after":after,"limit":left.min(256),"name":options.name,"active":options.active,
+                "created_by_id":created_by_id}),
         )?;
         let bots = page["bots"]
             .as_array()

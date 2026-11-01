@@ -2,7 +2,7 @@
 use agent_runtime::{Error, Result, fail_with};
 
 const CONNECTION: &str = "--store --socket";
-const STARTUP: &str = "--provider --max-processes --max-detached --max-active --max-connecting --max-pending --max-pending-bytes --max-readers --stall-timeout --idle-exit";
+const STARTUP: &str = "--provider --max-processes --max-lasting --max-active --max-connecting --max-pending --max-pending-bytes --max-input-bytes --max-readers --max-load --stall-timeout --idle-exit";
 
 struct Command {
     name: &'static str,
@@ -21,7 +21,7 @@ const COMMANDS: &[Command] = &[
         about: "Send a prompt to a bot, or make one with --new; prints the turn as it runs",
         usage: "run [OPTIONS] [--] PROMPT...",
         flags: "--bot --new --fork --allow --expires --detach --delivery --turn --model --workspace --effort --turn-budget-tokens --image --quote --agents --profile --request-id --bot-id --pretty --no-spawn",
-        settings: "--tools --instructions --instructions-file --budget-tokens --compaction-instructions --compaction-instructions-file --compaction-model --no-compaction --fallback --approval --approve --context-bytes --context-items --note-turns --compact-at --compact-keep --compact-tokens --max-rounds --keep-turns --approval-hold --max-output-tokens --keep-warm --cache-ttl --speed --sandbox --writable --network --hide-senders --unsandboxed --unix-socket --outputs",
+        settings: "--tools --instructions --instructions-file --budget-tokens --compaction-instructions --compaction-instructions-file --compaction-model --no-compaction --fallback --approval --approve --context-bytes --context-items --note-turns --compact-at --compact-keep --compact-tokens --max-rounds --keep-turns --approval-hold --max-output-tokens --keep-warm --cache-ttl --speed --sandbox --writable --network --hide-senders --unix-socket --outputs",
         startup: true,
     },
     Command {
@@ -51,8 +51,8 @@ const COMMANDS: &[Command] = &[
     Command {
         name: "ls",
         about: "List the bots",
-        usage: "ls [--name GLOB] [--active] [--limit N]",
-        flags: "--name --active --limit --pretty",
+        usage: "ls [--name GLOB] [--active] [--created-by BOT] [--limit N]",
+        flags: "--name --active --created-by --limit --pretty",
         settings: "",
         startup: false,
     },
@@ -170,7 +170,7 @@ const COMMANDS: &[Command] = &[
     },
     Command {
         name: "shutdown",
-        about: "Stop the daemon once running turns end or the grace passes",
+        about: "Stop the daemon; running turns park and the next start continues them",
         usage: "shutdown [--grace DURATION]",
         flags: "--grace --pretty",
         settings: "",
@@ -204,7 +204,7 @@ const COMMANDS: &[Command] = &[
         name: "serve",
         about: "Run the daemon in the foreground; other commands start it for you",
         usage: "serve --store PATH --provider SPEC... [OPTIONS]",
-        flags: "--shell-exclude --redact-field --redact-block --protect --protect-existing",
+        flags: "--shell-exclude --redact-field --redact-block --protect --protect-existing --protect-path",
         settings: "",
         startup: true,
     },
@@ -346,12 +346,23 @@ fn print_flags(flags: &str) {
                 "The tools a fork may call, within its source's; '' allows none; default: the source's",
             ),
             "--max-processes" => ("N", "Concurrent process limit; 0 is unbounded"),
-            "--max-detached" => ("N", "Detached commands still running; 0 is unbounded"),
+            "--max-lasting" => (
+                "N",
+                "Terminals and detached commands still running; 0 is unbounded",
+            ),
             "--max-active" => ("N", "Concurrent active turn limit; 0 is unbounded"),
             "--max-connecting" => ("N", "Concurrent provider startup limit; 0 is unbounded"),
             "--max-pending" => ("N", "Submissions waiting to start; 0 is unbounded"),
             "--max-pending-bytes" => ("N", "Prompt bytes waiting to start; 0 is unbounded"),
+            "--max-input-bytes" => (
+                "N",
+                "Request bytes read ahead of the service; default memory/16; 0 is unbounded",
+            ),
             "--max-readers" => ("N", "Store reader connections; default one per CPU"),
+            "--max-load" => (
+                "LOAD",
+                "New commands wait while the 1-minute load average is this or more and one is running; 0 is no gate",
+            ),
             "--max-output-tokens" => (
                 "N",
                 "A new bot's output token cap per model call; default the model's limit",
@@ -384,6 +395,10 @@ fn print_flags(flags: &str) {
             "--redact-block" => (
                 "LABEL",
                 "Redact the body of each PEM block whose header names LABEL, such as PRIVATE KEY, from tool output; repeatable",
+            ),
+            "--protect-path" => (
+                "PATH",
+                "Keep PATH, by its absolute path, read-only in every sandbox, and from being made when missing; repeatable",
             ),
             "--protect" => (
                 "NAME",
@@ -451,10 +466,6 @@ fn print_flags(flags: &str) {
                 "",
                 "A new bot's model reads what other bots and clients send it with no line naming the sender",
             ),
-            "--unsandboxed" => (
-                "COMMAND",
-                "A command, by its first words, a sandboxed bot runs outside its sandbox without asking; repeat for more",
-            ),
             "--unix-socket" => (
                 "PATH",
                 "A Unix socket, or a folder of them, the only ones a sandboxed bot's commands reach; repeat for more",
@@ -482,6 +493,7 @@ fn print_flags(flags: &str) {
                 "Only bots whose name matches, as SQLite GLOB: * any run, ? one byte, [..] a set",
             ),
             "--active" => ("", "Only bots with a turn running"),
+            "--created-by" => ("BOT", "Only bots this bot made"),
             "--newest" => ("", "Newest first, read from the end"),
             "--limit" => ("N", "List at most N"),
             "--since" => (
@@ -503,7 +515,7 @@ fn print_flags(flags: &str) {
             ),
             "--approval-hold" => (
                 "DURATION",
-                "A new bot's gated calls wait this long for a verdict before the turn parks; default 2s",
+                "A new bot's gated calls wait this long for a verdict, and its terminal reads for output, before the turn parks; default 2s",
             ),
             _ => unreachable!("flag missing help"),
         };
@@ -570,6 +582,15 @@ pub fn duration_ms(flag: &str, value: &str) -> Result<u64> {
         .ok_or_else(refuse)
 }
 
+/// `--max-load`: a load average, 0 or more, as uptime prints one.
+pub fn load(value: &str) -> Result<f64> {
+    value
+        .parse::<f64>()
+        .ok()
+        .filter(|load| load.is_finite() && *load >= 0.0)
+        .ok_or_else(|| Error::with("usage", "--max-load needs a load average, 0 or more"))
+}
+
 /// A duration flag the daemon counts in whole seconds.
 pub fn duration_secs(flag: &str, value: &str) -> Result<u64> {
     let ms = duration_ms(flag, value)?;
@@ -632,7 +653,6 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
                     | "--image"
                     | "--quote"
                     | "--writable"
-                    | "--unsandboxed"
                     | "--unix-socket"
                     | "--env"
                     | "--shell-exclude"
@@ -640,6 +660,7 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
                     | "--redact-block"
                     | "--protect"
                     | "--protect-existing"
+                    | "--protect-path"
             )
         {
             return fail_with("usage", format!("{flag} may only be specified once"));
@@ -791,7 +812,6 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
             "--writable",
             "--network",
             "--hide-senders",
-            "--unsandboxed",
             "--unix-socket",
             "--approval",
             "--approve",

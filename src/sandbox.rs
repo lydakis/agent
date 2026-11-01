@@ -66,6 +66,9 @@ pub struct Policy {
     /// and only as far as a sandboxed bot may go; in the daemon socket's
     /// place, so the `agent` CLI finds it there too.
     pub capability: Option<PathBuf>,
+    /// What keeps that socket listening: it lives while the policy, or a
+    /// command's [`Hold`] of it, does.
+    pub listening: Option<Listening>,
     /// The agent binary a confined write runs in ([`WRITE`]).
     pub helper: Option<PathBuf>,
     /// The folders, or sockets, whose Unix sockets its commands reach with
@@ -118,6 +121,7 @@ impl Policy {
             network: network && mode == Mode::WorkspaceWrite,
             socket: daemon.socket.clone(),
             capability: None,
+            listening: None,
             helper: daemon.helper.clone(),
             sockets: Vec::new(),
         }))
@@ -295,36 +299,9 @@ pub fn escapes(
     }
 }
 
-/// Whether `command` runs nothing but commands `unsandboxed` lets out of
-/// the sandbox, as a Codex rule that allows a command prefix lets it out
-/// without asking: each entry is a prefix of words, such as `mcpx` or
-/// `docker compose`. Such a command, as a tool with a daemon of its own
-/// needs, runs where the bot's client trusted it to. Only a plain script
-/// is read, as Codex reads one: words, quoted or not, in commands joined by
-/// `&&`, `||`, `;`, `|` or a newline, every one of them a match. Anything
-/// that could run something else (an expansion, a substitution, a
-/// redirection, a subshell, a command in the background) and anything
-/// ill-formed is no match, and the command stays in the sandbox.
-pub fn unsandboxed(unsandboxed: &[String], command: &str) -> bool {
-    let Some(commands) = commands(command) else {
-        return false;
-    };
-    let prefixes: Vec<Vec<&str>> = unsandboxed
-        .iter()
-        .map(|prefix| prefix.split_whitespace().collect())
-        .filter(|words: &Vec<&str>| !words.is_empty())
-        .collect();
-    !commands.is_empty()
-        && commands.iter().all(|words| {
-            prefixes.iter().any(|prefix| {
-                words.len() >= prefix.len() && words.iter().zip(prefix).all(|(a, b)| a == b)
-            })
-        })
-}
-
 /// The words of each command in a plain script, as bash reads them; `None`
 /// for anything else.
-fn commands(script: &str) -> Option<Vec<Vec<String>>> {
+pub(crate) fn commands(script: &str) -> Option<Vec<Vec<String>>> {
     let mut commands = Vec::new();
     let mut words = Vec::new();
     let mut word: Option<String> = None;
@@ -427,6 +404,10 @@ pub struct Daemon {
     /// The store's path; it and the files SQLite keeps beside it stay
     /// read-only in every root.
     pub store: Option<PathBuf>,
+    /// Paths read-only in every root and, when missing, not to be made,
+    /// such as the files a client reads its bots' command rules from: a
+    /// bot that wrote a rule could allow itself out (`--protect-path`).
+    pub protected_paths: Vec<PathBuf>,
     pub socket: Option<PathBuf>,
     /// The agent binary, which a confined write runs in.
     pub helper: Option<PathBuf>,
@@ -442,10 +423,29 @@ pub struct Daemon {
     pub protected_existing: Vec<String>,
 }
 
+/// A share in a bot's own socket, which listens while any share lives,
+/// as a refcounted handle or a systemd socket unit does, and a short grace
+/// after the last goes. Every policy is the same whichever share it holds.
+#[derive(Clone)]
+pub struct Listening(pub std::sync::Arc<dyn Send + Sync>);
+
+impl PartialEq for Listening {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+impl Eq for Listening {}
+impl std::fmt::Debug for Listening {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Listening")
+    }
+}
+
 impl Daemon {
-    /// Bot `bot`'s own socket, opened on first use; `None` when the daemon
-    /// has no socket for a sandboxed command to use.
-    pub fn capability(&self, bot: i64) -> Result<Option<PathBuf>> {
+    /// Bot `bot`'s own socket, opened on first use, with a share that keeps
+    /// it listening; `None` when the daemon has no socket for a sandboxed
+    /// command to use.
+    pub fn capability(&self, bot: i64) -> Result<Option<(PathBuf, Listening)>> {
         self.capabilities
             .as_ref()
             .map(|capabilities| (capabilities.open)(bot))
@@ -466,7 +466,7 @@ impl Daemon {
 pub struct Capabilities {
     pub folder: PathBuf,
     #[allow(clippy::type_complexity)]
-    pub open: std::sync::Arc<dyn Fn(i64) -> Result<PathBuf> + Send + Sync>,
+    pub open: std::sync::Arc<dyn Fn(i64) -> Result<(PathBuf, Listening)> + Send + Sync>,
     pub close: std::sync::Arc<dyn Fn(i64) + Send + Sync>,
 }
 
@@ -572,6 +572,17 @@ fn root(path: &Path, daemon: &Daemon) -> Result<Root> {
         && store.starts_with(path)
     {
         read_only.extend(store_files(store).filter(|file| file.exists()));
+    }
+    for kept in daemon
+        .protected_paths
+        .iter()
+        .filter(|kept| kept.starts_with(path))
+    {
+        match std::fs::symlink_metadata(kept) {
+            Ok(found) if found.file_type().is_symlink() => return linked(kept),
+            Ok(_) => read_only.push(kept.clone()),
+            Err(_) => missing.push(kept.clone()),
+        }
     }
     // A socket the bot could rename or link would be reachable by its new
     // name, past a rule that names the old one; and one bot could put its
@@ -1069,9 +1080,14 @@ fn held(path: &Path) -> bool {
 }
 
 /// What a running sandbox holds in place; dropping it lets the
-/// placeholders go once no other sandbox holds them, and removes what the
-/// command may not leave made.
-pub struct Hold(Vec<PathBuf>, Vec<PathBuf>);
+/// placeholders go once no other sandbox holds them, removes what the
+/// command may not leave made, and gives up its share in the bot's socket.
+pub struct Hold(
+    Vec<PathBuf>,
+    Vec<PathBuf>,
+    // Held only to be dropped with the rest.
+    #[allow(dead_code)] Option<Listening>,
+);
 
 /// Hold `policy`'s placeholders while its command runs, once any of them
 /// being removed is gone.
@@ -1109,7 +1125,7 @@ pub async fn hold(policy: &Policy) -> Hold {
                     .iter()
                     .flat_map(|root| root.left.iter().cloned())
                     .collect();
-                return Hold(paths, left);
+                return Hold(paths, left, policy.listening.clone());
             }
         }
         removed.await;
@@ -1372,49 +1388,39 @@ mod tests {
         }
     }
 
+    /// A bot whose folder holds the agent's home (Sonny opened in HOME)
+    /// leaves it alone, the scheduler's jobs and the settings with it, but
+    /// for a folder in it the bot was given by name.
     #[test]
-    fn only_a_plain_script_of_allowed_commands_leaves_the_sandbox() {
-        let allowed = ["mcpx".to_owned(), "docker  compose".to_owned()];
-        for command in [
-            "mcpx",
-            "mcpx github search_issues --query 'is:open label:\"bug\"'",
-            "mcpx a && mcpx b || mcpx c; mcpx d | mcpx e\nmcpx f",
-            "'mcpx' \"x y\" a\\ b \\\n  --flag=1 2>x#y",
-            "docker compose up",
-            "mcpx a;;",
-        ] {
-            let command = command.replace("2>x#y", "x#y");
-            assert!(unsandboxed(&allowed, &command), "{command}");
-        }
-        for command in [
-            "",
-            "  ;",
-            "mcpx a | jq .",
-            "docker ps",
-            "docker",
-            "mcpxx a",
-            "/usr/bin/mcpx a",
-            "PATH=. mcpx a",
-            "mcpx a & evil",
-            "mcpx a |& evil",
-            "mcpx $(evil)",
-            "mcpx `evil`",
-            "mcpx \"$(evil)\"",
-            "mcpx \"`evil`\"",
-            "mcpx $HOME",
-            "mcpx > ~/.zshrc",
-            "mcpx < input",
-            "mcpx <(evil)",
-            "(mcpx a)",
-            "mcpx a # ; evil",
-            "mcpx 'unclosed",
-            "mcpx \"unclosed",
-            "mcpx a\\",
-        ] {
-            assert!(!unsandboxed(&allowed, command), "{command}");
-        }
-        assert!(!unsandboxed(&[], "mcpx a"));
-        assert!(!unsandboxed(&[" ".to_owned()], "mcpx a"));
+    fn a_protected_home_stays_read_only_but_for_a_folder_given_in_it() {
+        let base = std::env::temp_dir().join(format!("agent-sandbox-home-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let home = base.join(".agent");
+        std::fs::create_dir_all(home.join("triggers/jobs")).unwrap();
+        std::fs::create_dir_all(home.join("sonny/zen")).unwrap();
+        std::fs::write(home.join("config.toml"), "").unwrap();
+        let base = std::fs::canonicalize(&base).unwrap();
+        let home = base.join(".agent");
+        let zen = home.join("sonny/zen");
+        let daemon = Daemon {
+            protected_paths: vec![home.clone()],
+            ..protecting()
+        };
+        let policy = Policy::new(
+            Some(Mode::WorkspaceWrite),
+            Some(&base),
+            &[zen.to_str().unwrap().to_owned()],
+            false,
+            &daemon,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(policy.can_write(&base.join("notes.txt")));
+        assert!(!policy.can_write(&home.join("triggers/jobs/nightly.json")));
+        assert!(!policy.can_write(&home.join("config.toml")));
+        assert!(!policy.can_write(&home.join("env")));
+        assert!(policy.can_write(&zen.join("key")));
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
@@ -1798,6 +1804,7 @@ mod tests {
             network: true,
             socket: Some(path.join("agent.sock")),
             capability: None,
+            listening: None,
             helper: None,
             sockets: Vec::new(),
         };

@@ -4,7 +4,8 @@ Run from the repository root against a store at the current schema (open it
 once with the current binary to migrate a copy). Flags full scans on growing
 tables and temporary B-trees. Structural cases are listed, not counted:
 `SCAN CONSTANT ROW` from EXISTS subqueries, the recursive-CTE step scans that
-are bounded by a window or one turn, and per-turn sorts over a turn's tool
+are bounded by a window or one turn, or by one bot's descendants (`kin`,
+each step found by the `bots_maker` index), and per-turn sorts over a turn's tool
 rows, plus schema metadata (`sqlite_sequence` holds one row per
 autoincrement table). Statements inside
 the one-time migration function are skipped. Exit
@@ -19,15 +20,17 @@ from pathlib import Path
 
 # Clauses a listing formats in by name, each planned with every value it
 # takes: keep in step with `list` and `turns` in src/store/db.rs.
-OPTIONAL = {'{glob}': ('', ' AND name GLOB ?3'), '{running}': ('', ' AND running_turn IS NOT NULL'),
+OPTIONAL = {'{glob}': ('', ' AND name GLOB ?3'), '{maker}': ('', ' AND created_by_id = ?4'),
+            '{running}': ('', ' AND running_turn IS NOT NULL'),
             '{order}': ('ASC', 'DESC')}
 
-STRUCTURAL_SCANS = {'SCAN CONSTANT ROW', 'SCAN c', 'SCAN chain', 'SCAN sqlite_master',
+STRUCTURAL_SCANS = {'SCAN CONSTANT ROW', 'SCAN c', 'SCAN chain', 'SCAN kin', 'SCAN sqlite_master',
                     'SCAN sqlite_sequence'}
 
 
 def statements(source):
-    constants = dict(re.findall(r'const (COLUMNS|READING_ITEM|TURN_VIEW|PICTURELESS|REPLY_NODE): &str = "([^"]*)";', source, re.S))
+    constants = {name: value.replace('\\"', '"') for name, value in re.findall(
+        r'const (COLUMNS|READING_ITEM|TURN_VIEW|PICTURELESS|REPLY_NODE): &str = "((?:[^"\\]|\\.)*)";', source, re.S)}
     literals = re.findall(r'r?#?"((?:[^"\\]|\\.)*)"#?', source, re.S)
     for literal in literals:
         text = re.sub(r'\s+', ' ', literal.replace('\\n', ' ')).strip()

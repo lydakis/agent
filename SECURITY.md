@@ -84,7 +84,7 @@ vulnerability, whether or not the code's own documentation agrees.
   another bot, and deleting or interrupting a bot it did not make. The
   folder of those sockets is read-only inside every sandbox, so no bot can
   put a listener in another's place. A command that runs outside the
-  sandbox, allowed to escalate or named in `unsandboxed`, gets the
+  sandbox, allowed to escalate or by an `allow` command rule, gets the
   daemon's own socket.
 - The daemon collects and sends no usage analytics. Its outbound
   connections are to the model providers a bot's model names, the ChatGPT
@@ -124,13 +124,20 @@ vulnerability, whether or not the code's own documentation agrees.
 - A call that would leave the sandbox (a shell call asking
   `require_escalated`, a write outside the writable folders) waits on the
   bot's approval gate and runs unconfined only when allowed. With no gate
-  it is refused. A command runs outside without asking only when every
-  command in a plain script begins with one of the bot's `unsandboxed`
-  entries; any script with substitution, redirection or an unnamed command
-  stays inside.
+  it is refused. A command runs outside without asking only when an
+  `allow` command rule, which the bot's client gives it (Sonny's are in
+  `~/.agent/rules`), matches every command in a
+  plain script; any script with substitution, redirection or an unmatched
+  command stays inside. A `forbidden` rule refuses a command even when it
+  escalates, and a `prompt` rule makes it wait on the gate, or refuses it
+  without one, even when the sandbox would confine it. The rules folder
+  is read-only inside every sandbox (`serve --protect-path`), so no bot
+  widens its own rules; rules its client couldn't read refuse every
+  command.
 - A bot made or forked by a sandboxed bot inherits its creator's sandbox
   and writable folders, may only narrow them, reaches the network only if
-  both do, and runs unsandboxed only what its creator does.
+  both do. It goes by its creator's command rules, and can't be given
+  others.
 - A bot made with `danger-full-access`, or with no `sandbox`, runs
   unconfined with the caller's full permissions. That is the daemon's
   default; Sonny's default is a sandbox.
@@ -313,8 +320,10 @@ is built.
 - With the network on, Sonny's default, a sandboxed bot reaches every
   Unix socket on the machine. One that runs a program outside the sandbox
   on request, such as Docker's or ssh-agent's, is a way out of it.
-- One allowed escalation, or one `unsandboxed` prefix, gives a command
-  the daemon's own socket and so full daemon authority.
+- One allowed escalation, or one `allow` rule, gives a command the
+  daemon's own socket and so full daemon authority. A rule matches a
+  command's first words, so `allow` on `git` lets out every `git`
+  subcommand, and the program is found on the daemon's `PATH`.
 - A judge model is a model. The automatic approver reduces, and does not
   remove, the chance that an injected instruction is carried out.
 - `web_fetch` reaches the daemon host's own networks.

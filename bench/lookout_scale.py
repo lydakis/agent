@@ -134,7 +134,7 @@ class Conn:
         self.sock = socket.socket(socket.AF_UNIX)
         self.sock.connect(str(path))
         self.reader = self.sock.makefile('r')
-        self.replies, self.events = {}, 0
+        self.replies, self.events, self.live = {}, 0, 0
         self.cond = threading.Condition()
         self.next_id = 0
         self.ready = threading.Event()
@@ -152,7 +152,11 @@ class Conn:
                         self.replies[message['id']] = message
                         self.cond.notify_all()
                 else:
-                    self.events += 1
+                    with self.cond:
+                        self.events += 1
+                        if message.get('event') == 'follow_live':
+                            self.live += 1
+                            self.cond.notify_all()
         except (OSError, ValueError):
             pass
 
@@ -234,8 +238,8 @@ class Bench:
     def __init__(self, args):
         self.args = args
         root = Path(__file__).resolve().parents[1]
-        self.agent = root / '.local/target/release/agent'
-        self.sonny = root / '.local/target/release/sonny'
+        self.agent = Path(getattr(args, 'agent', None) or root / '.local/target/release/agent').resolve()
+        self.sonny = Path(getattr(args, 'sonny', None) or root / '.local/target/release/sonny').resolve()
         self.out = Path(args.out)
         self.out.mkdir(parents=True, exist_ok=True)
         self.home = self.out / 'home'
@@ -256,7 +260,8 @@ class Bench:
         self.daemon = subprocess.Popen(
             [str(self.agent), 'serve', '--store', str(self.store), '--provider',
              f'openai=responses,{self.url}', '--socket', str(self.socket),
-             *(['--max-readers', str(args.readers)] if getattr(args, 'readers', None) else [])],
+             *(['--max-readers', str(args.readers)] if getattr(args, 'readers', None) else []),
+             *getattr(args, 'daemon_flags', ())],
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
             stderr=open(self.out / 'daemon.err', 'w'), env=self.env, start_new_session=True)
         deadline = time.monotonic() + 10
@@ -438,7 +443,7 @@ class Bench:
         self.create(names, tools=('echo', 'shell'), approve=['shell'], approver='auto')
         log = open(self.out / 'approver.out', 'w')
         process = subprocess.Popen(
-            [str(self.agent.parent / 'sonny'), 'approver', '--store', str(self.store), '--socket', str(self.socket),
+            [str(self.sonny), 'approver', '--store', str(self.store), '--socket', str(self.socket),
              '--judge', 'openai/synthetic-model'],
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=log, env=self.env, text=True,
             start_new_session=True)

@@ -376,6 +376,7 @@ impl Agent {
         self.ready
             .get_or_try_init(|| async {
                 crate::skills::install_own();
+                crate::approvals::at_start();
                 crate::trigger::at_start();
                 crate::connect(&self.options).await.map(drop)
             })
@@ -938,7 +939,7 @@ impl Session {
         };
         let steer = state.running.is_some();
         let mut asked = json!({"bot": bound.bot, "bot_id": bound.bot_id,
-            "request_id": crate::unique("acp"), "prompt": text,
+            "request_id": crate::unique("acp"), "prompt": crate::stamp::now(&text),
             "delivery": if steer { "steer" } else { "reject" },
             "images": if images.is_empty() { Value::Null } else { json!(images) }});
         if !steer && let Some(dir) = &bound.moving {
@@ -1625,7 +1626,10 @@ async fn setup_lead(
             mode,
             &approvals::gateable(&tools, declared),
         ));
-        fields.extend(approvals::sandbox(mode, Path::new(&workspace)));
+        fields.insert(
+            "settings".into(),
+            Value::Object(approvals::sandbox(mode, Path::new(&workspace))),
+        );
     }
     // A lead at work keeps its setup until the next thread finds it idle.
     if asked.as_object().is_some_and(|fields| fields.len() > 1) {
