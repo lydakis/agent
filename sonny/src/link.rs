@@ -244,6 +244,31 @@ async fn line<R: AsyncBufRead + Unpin>(
     }
 }
 
+/// The lines of JSON from `reader`, each at most `max` bytes, read by a
+/// task of their own: a line half read is never lost to a `select!` that
+/// took another branch. They end at the reader's end or its first fault.
+fn lines<R: AsyncBufRead + Unpin + Send + 'static>(
+    mut reader: R,
+    max: usize,
+) -> mpsc::Receiver<std::io::Result<Value>> {
+    let (tx, rx) = mpsc::channel(4);
+    tokio::spawn(async move {
+        loop {
+            let read = line(&mut reader, max).await;
+            let ended = !matches!(read, Ok(Some(_)));
+            let sent = match read {
+                Ok(Some(value)) => tx.send(Ok(value)).await,
+                Ok(None) => return,
+                Err(e) => tx.send(Err(e)).await,
+            };
+            if ended || sent.is_err() {
+                return;
+            }
+        }
+    });
+    rx
+}
+
 async fn send<W: AsyncWrite + Unpin>(writer: &mut W, value: &Value) -> std::io::Result<()> {
     let mut text = value.to_string();
     text.push('\n');
@@ -400,7 +425,13 @@ pub fn open(target: &str) -> Result<String, String> {
             if !viewed(name) {
                 return Err(format!("{name} is not a file a viewer opens"));
             }
-            let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+            // At most one byte more than may go, however large the file.
+            use std::io::Read;
+            let mut bytes = Vec::new();
+            (std::fs::File::open(path).map_err(|e| e.to_string())?)
+                .take(OPEN_BYTES as u64 + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|e| e.to_string())?;
             if bytes.len() > OPEN_BYTES {
                 return Err(format!("{name} is more than {} MB", OPEN_BYTES >> 20));
             }
@@ -477,14 +508,14 @@ async fn serve(machine: String) -> Result<(), String> {
     let waiting: Waiting = Arc::default();
     let ready: Ready = Arc::default();
     let next = Arc::new(AtomicU64::new(1));
-    let mut stdin = BufReader::new(tokio::io::stdin());
+    let mut stdin = lines(BufReader::new(tokio::io::stdin()), LINE_BYTES);
     let mut heard = Instant::now();
     let mut told = Instant::now() - PING;
     let mut tick = tokio::time::interval(Duration::from_secs(5));
     loop {
         tokio::select! {
-            said = line(&mut stdin, LINE_BYTES) => {
-                let Ok(Some(said)) = said else { break };
+            said = stdin.recv() => {
+                let Some(Ok(said)) = said else { break };
                 heard = Instant::now();
                 if told.elapsed() >= Duration::from_secs(10) {
                     told = Instant::now();
@@ -579,6 +610,7 @@ async fn borrow(
         .await;
     }
     let id = next.fetch_add(1, Ordering::SeqCst);
+    let mut read = lines(read, LINE_BYTES);
     let (to, mut from) = mpsc::unbounded_channel();
     waiting.lock().unwrap().insert(id, to);
     let _ = out.send(json!({"id": id, "call": called["call"]}));
@@ -594,9 +626,9 @@ async fn borrow(
                     break true;
                 }
             }
-            said = line(&mut read, LINE_BYTES) => {
+            said = read.recv() => {
                 match said {
-                    Ok(Some(mut said)) => {
+                    Some(Ok(mut said)) => {
                         said["id"] = json!(id);
                         let _ = out.send(said);
                     }
@@ -695,8 +727,22 @@ pub async fn keep(hub: crate::mcp::Hub) {
     }
 }
 
-/// Dial `link` over and over, waiting longer each time it fails soon.
+/// Dial `link` over and over, waiting longer each time it fails soon:
+/// once this is the one tool host of this home that holds it, since the
+/// host keeps one session of each machine, and a second would put the
+/// first out.
 async fn redial(key: String, link: agent_client::config::Link, hub: crate::mcp::Hub) {
+    let _held = loop {
+        let lock = format!("{key}.lock");
+        let held = tokio::task::spawn_blocking(move || {
+            let dir = mine().filter(|dir| private(dir).is_ok())?;
+            crate::lookout::hold(&dir.join(lock)).ok().flatten()
+        });
+        match held.await {
+            Ok(Some(file)) => break file,
+            _ => tokio::time::sleep(Duration::from_secs(5)).await,
+        }
+    };
     let mut wait = BACKOFF;
     loop {
         let started = Instant::now();
@@ -817,14 +863,20 @@ async fn dial(
         }
     });
     let verdicts: Verdicts = Arc::default();
+    // The calls in flight, ended with the dial however it ends: dropped
+    // with it, they are aborted too.
+    let mut running = tokio::task::JoinSet::new();
     let mut calls: HashMap<u64, tokio::task::AbortHandle> = HashMap::new();
-    let mut stdout = BufReader::new(stdout);
+    let mut stdout = lines(BufReader::new(stdout), LINE_BYTES);
     let mut ping = tokio::time::interval(PING);
     let mut refused = None;
+    // What the host was last told this machine has, told again as it
+    // changes: a server added or taken away, agent-browser installed.
+    let mut told: Option<Value> = None;
     loop {
         tokio::select! {
-            said = line(&mut stdout, LINE_BYTES) => {
-                let Ok(Some(said)) = said else { break };
+            said = stdout.recv() => {
+                let Some(Ok(said)) = said else { break };
                 if let Some(hello) = said.get("hello") {
                     if hello["protocol"].as_u64() != Some(PROTOCOL) {
                         refused = Some(format!(
@@ -834,11 +886,13 @@ async fn dial(
                     }
                     let lends = lends(link, hub).await;
                     let _ = out.send(json!({"hello": {"protocol": PROTOCOL, "lends": lends}}));
+                    told = Some(lends);
                     stood(key, link, refused.is_none(), refused.clone());
                     continue;
                 }
                 let Some(id) = said["id"].as_u64() else { continue };
                 if let Some(called) = said.get("call") {
+                    while running.try_join_next().is_some() {}
                     calls.retain(|_, job| !job.is_finished());
                     let asker = Asker {
                         id,
@@ -848,12 +902,12 @@ async fn dial(
                     };
                     let (called, link, hub, out, key) =
                         (called.clone(), link.clone(), hub.clone(), out.clone(), key.to_owned());
-                    let job = tokio::spawn(async move {
+                    let job = running.spawn(async move {
                         let _ = out.send(json!({"id": id, "ack": true}));
                         let answer = lend(&key, &link, &hub, &called, asker).await;
                         let _ = out.send(json!({"id": id, "done": done(answer)}));
                     });
-                    calls.insert(id, job.abort_handle());
+                    calls.insert(id, job);
                 } else if said.get("cancel").is_some() {
                     if let Some(job) = calls.remove(&id) {
                         job.abort();
@@ -867,12 +921,17 @@ async fn dial(
             }
             _ = ping.tick() => {
                 let _ = out.send(json!({"ping": true}));
+                if told.is_some() && refused.is_none() {
+                    let lends = lends(link, hub).await;
+                    if told.as_ref() != Some(&lends) {
+                        let _ = out.send(json!({"hello": {"protocol": PROTOCOL, "lends": lends}}));
+                        told = Some(lends);
+                    }
+                }
             }
         }
     }
-    for job in calls.values() {
-        job.abort();
-    }
+    running.abort_all();
     writer.abort();
     let _ = child.kill().await;
     let said = complaint.await.unwrap_or_default();
@@ -1272,6 +1331,26 @@ mod tests {
         let made_up = json!({"error": {"code": "anything", "detail": "x"}});
         assert_eq!(ended(&made_up), Err(("link_refused", "x".into())));
         assert_eq!(ended(&done(Ok(json!("hi")))), Ok(json!("hi")));
+    }
+
+    #[tokio::test]
+    async fn a_line_that_comes_in_pieces_is_read_whole_whatever_else_wakes() {
+        let (mut write, read) = tokio::io::duplex(64);
+        let mut said = lines(BufReader::new(read), 1024);
+        tokio::spawn(async move {
+            write.write_all(b"{\"a\":").await.unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            write.write_all(b"1}\n").await.unwrap();
+        });
+        let mut tick = tokio::time::interval(Duration::from_millis(5));
+        let got = loop {
+            tokio::select! {
+                got = said.recv() => break got,
+                _ = tick.tick() => {}
+            }
+        };
+        assert_eq!(got.unwrap().unwrap(), json!({"a": 1}));
+        assert!(said.recv().await.is_none());
     }
 
     #[tokio::test]

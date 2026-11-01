@@ -222,6 +222,9 @@ pub struct Reach {
     /// Whether its sandbox reaches the network, as the daemon's does: a
     /// workspace-write one with `network` on, or none at all.
     network: bool,
+    /// Whether it reads this machine's files, as its sandbox reads anywhere
+    /// here: not over a link, whose agent has no file of this machine.
+    reads: bool,
 }
 
 impl Reach {
@@ -249,6 +252,7 @@ impl Reach {
             roots,
             writes: sandbox != Some("read-only"),
             network: !confined || sandbox == Some("workspace-write") && settings["network"] == true,
+            reads: true,
         }
     }
 
@@ -260,6 +264,7 @@ impl Reach {
             roots: Some(Vec::new()),
             writes: false,
             network: true,
+            reads: false,
         }
     }
 
@@ -335,7 +340,7 @@ impl Reach {
 
     /// `url`, unless it opens the browser's own pages or a file on another
     /// machine. A file page it opens anywhere, as the agent's sandbox reads
-    /// anywhere, Codex's as well. Read as the browser reads it, so `%2e%2e`,
+    /// anywhere, Codex's as well; over a link, none. Read as the browser reads it, so `%2e%2e`,
     /// `file:/`, a host or a tab inside the scheme mean to the check what
     /// they mean to it.
     fn url(&self, url: &str) -> Result<String, String> {
@@ -349,6 +354,11 @@ impl Reach {
         }
         if scheme != "file" {
             return Ok(url.to_owned());
+        }
+        if !self.reads {
+            return Err(format!(
+                "{url} is a file of this machine, which is not yours to read"
+            ));
         }
         if parsed.host_str().is_some_and(|host| host != "localhost") {
             return Err(format!("{url} is a file on another machine"));
@@ -1509,6 +1519,12 @@ mod tests {
         let lost = Reach::of(&json!({"settings": {"sandbox": "workspace-write"}}));
         assert!(checked("pdf page.pdf", &lost).is_err());
         assert!(checked("open file:///etc/passwd", &lost).is_ok());
+        // An agent over a link reads no file here, page or otherwise.
+        let lent = Reach::lent();
+        assert!(checked("open file:///etc/passwd", &lent).is_err());
+        assert!(checked("open --name x file:/etc/passwd", &lent).is_err());
+        assert!(checked("open https://example.com", &lent).is_ok());
+        assert!(checked("pdf page.pdf", &lent).is_err());
         // The browser is handed the real path, not the link.
         std::os::unix::fs::symlink(real.join("shots"), real.join("in")).unwrap();
         std::fs::create_dir_all(real.join("shots")).unwrap();

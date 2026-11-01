@@ -850,6 +850,31 @@ os.execvpe('sh', ['sh', '-c', command], {{**os.environ, 'HOME': {json.dumps(str(
             self.assertEqual(self.daemon.finished(turn, 30)['data']['status'], 'completed')
             self.assertIn(said, self.output('calc.lead', turn))
 
+    def test_one_tool_host_of_a_home_holds_its_link_and_tells_the_host_what_changes(self):
+        laptop, _ = self.linked()
+        sock = self.path / '.agent/links/laptop.sock'
+        first = sock.stat().st_ino
+        # A second tool host there, for another store, leaves the link be.
+        other = SocketClient(self.binary, laptop / 'other.sqlite', self.url, 'echo')
+        self.addCleanup(other.close)
+        env = {**clean_env(), 'HOME': str(laptop), 'AGENT_BIN': str(self.binary),
+               'SONNY_LINK_SSH': str(self.path / 'ssh')}
+        second = subprocess.Popen([str(self.sonny), 'tool-host', '--store', str(laptop / 'other.sqlite'),
+                                   '--socket', str(other.socket_path)], env=env, stdout=subprocess.PIPE, text=True)
+        self.addCleanup(lambda: (second.kill(), second.wait(timeout=5), second.stdout.close()))
+        self.assertEqual(json.loads(second.stdout.readline())['event'], 'serving')
+        time.sleep(8)
+        self.assertEqual(sock.stat().st_ino, first)
+        # Its server turned off, the host hears of it over the same link.
+        config = laptop / '.agent/config.toml'
+        config.write_text(config.read_text() + 'enabled = false\n')
+        lent = self.path / '.agent/links/laptop.json'
+        deadline = time.monotonic() + 30
+        while json.loads(lent.read_text())['servers']:
+            self.assertLess(time.monotonic(), deadline, 'the host never heard the server went')
+            time.sleep(.2)
+        self.assertEqual(sock.stat().st_ino, first)
+
     def test_a_connection_that_cannot_prove_itself_sends_no_call(self):
         self.linked()
         import socket as sockets
@@ -861,7 +886,13 @@ os.execvpe('sh', ['sh', '-c', command], {{**os.environ, 'HOME': {json.dumps(str(
             conn.sendall((json.dumps({'proof': challenge}) + '\n').encode())
             conn.sendall((json.dumps({'call': {'tool': 'exec', 'payload': {'input': 'text(1)'}}}) + '\n').encode())
             conn.settimeout(10)
-            self.assertEqual(reader.readline(), '')
+            # Closed, unanswered: a close with the call still unread comes
+            # as a reset.
+            try:
+                said = reader.readline()
+            except ConnectionResetError:
+                said = ''
+            self.assertEqual(said, '')
 
 
 if __name__ == '__main__':
