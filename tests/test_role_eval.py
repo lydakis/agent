@@ -96,6 +96,19 @@ class ConfinedTests(unittest.TestCase):
                 # Escalations with no path, and system paths, are not the home.
                 self.assertTrue(role_eval.confined(root, {'arguments': {'command': 'git push origin main'}}))
                 self.assertTrue(role_eval.confined(root, {'arguments': {'command': 'ls /usr/bin > /dev/null'}}))
+                # A folder above the home, reached relative from there.
+                above = {'arguments': {'command': f'cd {real.parent} && mkdir -p me/Backups/shop'}}
+                self.assertFalse(role_eval.confined(root, above))
+                # The step's own backup, next to the repository, is in the run.
+                self.assertTrue(role_eval.confined(root, {'arguments': {'command': 'git clone --mirror . ../backups/shop.git'}}))
+                # A climb out of the run, or someone's home by name, is not.
+                self.assertFalse(role_eval.confined(root, {'arguments': {'command': 'cp -r . ../../../../x'}}))
+                self.assertFalse(role_eval.confined(root, {'arguments': {'command': 'cp -r . ~me/Backups'}}))
+                self.assertTrue(role_eval.confined(root, {'arguments': {'command': 'cp -r . ~/backups'}}))
+                # A call listed cut can't be seen whole, so it is denied.
+                cut = {'arguments': {'command': 'git push'}, 'arguments_cut': ['command']}
+                self.assertFalse(role_eval.confined(root, cut))
+                self.assertFalse(role_eval.confined(root, {'arguments': {}, 'arguments_omitted': 3}))
 
     def test_what_changed_in_the_real_home_is_found_past_hidden_folders_and_the_run(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -341,14 +341,23 @@ def land(root, env, author, message, files):
 # The home of whoever runs the eval, which a run's own HOME stands in for:
 # what an agent is allowed may not reach it (#521).
 REAL_HOME = Path.home().resolve()
-PATHS = re.compile(r'(?<![\w.~-])(/[^\s\'"`;|&<>(){}$,]+)')
+STOPS = '\\s\'"`;|&<>(){}$,='
+ABSOLUTE = re.compile(rf'(?<![\w.~-])(/[^{STOPS}]*)')
+CLIMBING = re.compile(rf'(?<![^{STOPS}])((?:[^{STOPS}/]*/)*\.\.(?:/[^{STOPS}]*)?)')
+SOMEONES = re.compile(r'(?<![\w/.-])~[A-Za-z_][\w.-]*')
 
 
 def confined(root, request):
-    """Whether a call asked about leaves the person's real home alone: every
-    absolute path in it is inside the run's `root` or outside the real home.
-    The sandbox asks before a write outside the run, so allowing every ask
-    let an agent write into the real home, which a fake HOME does not hide."""
+    """Whether a call asked about plainly leaves the person's real home
+    alone. The sandbox asks before a write outside the run, so allowing
+    every ask let an agent write into the real home, which a fake HOME does
+    not hide. A shell command's targets can't be known from its words, so
+    this fails closed on what could reach the home: an absolute path in it,
+    under it or above it (`cd /Users && mkdir me/x`), a `..` that climbs
+    out of the run from its shallowest folder, a `~name`, or arguments the
+    listing cut. The eval's backstop is `changed_outside` after each run."""
+    if request is None or request.get('arguments_cut') or request.get('arguments_omitted'):
+        return False
     root = Path(root).resolve()
     texts = []
 
@@ -362,16 +371,21 @@ def confined(root, request):
             for item in value:
                 walk(item)
     walk(request)
+
+    def outside(path):
+        path = Path(os.path.normpath(path))
+        if path.is_relative_to(root):
+            return False
+        return path == REAL_HOME or path.is_relative_to(REAL_HOME) or REAL_HOME.is_relative_to(path)
+
     for text in texts:
-        for found in PATHS.findall(text):
-            path = Path(os.path.normpath(found))
-            try:
-                path = path.resolve()
-            except (OSError, RuntimeError):
-                pass
-            if path.is_relative_to(root):
-                continue
-            if path == REAL_HOME or path.is_relative_to(REAL_HOME):
+        if SOMEONES.search(text):
+            return False
+        for found in ABSOLUTE.findall(text):
+            if outside(found) or outside(os.path.realpath(found)):
+                return False
+        for found in CLIMBING.findall(text):
+            if not found.startswith('/') and not Path(os.path.normpath(root / 'shop' / found)).is_relative_to(root):
                 return False
     return True
 
@@ -427,7 +441,10 @@ class Acp:
             self.log.flush()
             m = json.loads(line)
             if m.get('method') == 'session/request_permission':
-                choice = 'allow' if confined(self.root, m.get('params')) else 'deny'
+                params = m.get('params') or {}
+                # Without an allow, Sonny could not read the whole call.
+                offered = {o.get('optionId') for o in params.get('options', [])}
+                choice = 'allow' if 'allow' in offered and confined(self.root, params) else 'deny'
                 self.write({'id': m['id'], 'result': {'outcome': {'outcome': 'selected', 'optionId': choice}}})
             elif 'method' in m and 'id' in m:
                 self.write({'id': m['id'], 'error': {'code': -32601, 'message': 'not offered'}})
