@@ -3092,9 +3092,14 @@ fn a_run_of_holds_keeps_when_it_began_and_waits_longer_each_try() {
         detail: None,
         since_ms,
     };
-    assert_eq!(held(1_000).wait_ms(1_000), 60_000);
-    assert_eq!(held(0).wait_ms(600_000), 600_000);
-    assert_eq!(held(0).wait_ms(86_400_000), 3_600_000);
+    let days = 5 * 86_400_000;
+    assert_eq!(held(1_000).wait_ms(1_000, days), 60_000);
+    assert_eq!(held(0).wait_ms(600_000, days), 600_000);
+    assert_eq!(held(0).wait_ms(86_400_000, days), 3_600_000);
+    // No later than the hold's end, for its last try.
+    assert_eq!(held(1_000).wait_ms(1_000, 1_000), 1_000);
+    assert_eq!(held(0).wait_ms(days - 60_000, days), 60_000);
+    assert_eq!(held(0).wait_ms(days - 10, days), 10);
     // A turn no longer ready is not held.
     db.end_queued(turn, &Error::new("cancelled")).unwrap();
     assert_eq!(

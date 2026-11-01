@@ -408,8 +408,9 @@ struct Accounting {
 }
 impl Accounting {
     /// Park on a cause a person can fix: the call is tried again after the
-    /// hold's wait, with a fresh retry budget. Returns when.
-    fn hold(&mut self, error: &Error) -> u64 {
+    /// hold's wait, no later than the bot's `hold_ms` allows, with a fresh
+    /// retry budget. Returns when.
+    fn hold(&mut self, error: &Error, hold_ms: u64) -> u64 {
         let now = now_ms();
         let blocked = agent_runtime::store::Blocked {
             code: error.code.clone(),
@@ -418,7 +419,7 @@ impl Accounting {
         };
         self.call_attempts = 0;
         self.call_spent_ms = 0;
-        self.parked_until = now + blocked.wait_ms(now);
+        self.parked_until = now + blocked.wait_ms(now, hold_ms);
         self.blocked = Some(blocked);
         self.parked_until
     }
@@ -2188,7 +2189,7 @@ impl Turn {
             accounting.call_fallback = waiting.fallback.clone();
             accounting.compaction = waiting.compaction;
             accounting.copied = waiting.copied.clone().filter(|_| waiting.compaction);
-            accounting.hold(&error);
+            accounting.hold(&error, record.settings.hold_ms());
             return Ok(Round::Paced(accounting.parked_until));
         };
         // The daemon runs whatever provider set started it; the one thing a
@@ -3416,7 +3417,7 @@ impl Turn {
                     && (held(&error.code) || retryable(&error.code))
                 {
                     accounting.call_fallback = fallback.as_ref().map(Fallback::parked);
-                    accounting.hold(&error);
+                    accounting.hold(&error, record.settings.hold_ms());
                     return Ok(None);
                 }
                 return Err(error);

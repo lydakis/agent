@@ -2186,8 +2186,9 @@ restart may follow a fix to the config or a key, and `agent login chatgpt`
 asks the running daemon to once it has saved the new sign-in. A turn is
 held for its bot's `hold_ms` from when the hold began, five days unset, as
 mail is retried for four to five days (RFC 5321) before it is returned to
-its sender; the first try after that fails it with its cause, as it would
-have failed before, so whoever sent it hears (Sonny's lookout bounces it to
+its sender. Its last try comes when the hold ends, sooner than its backoff
+would bring it, and if that fails the turn fails with its cause, as it
+would have failed before, so whoever sent it hears (Sonny's lookout bounces it to
 the agent that sent it). `hold_ms` 0 fails at once, for a caller that waits
 on no person. An interrupt ends a held turn sooner. A turn resumed from a
 park on a call the model made, such as a wait, whose provider is gone

@@ -707,6 +707,19 @@ class DeliveryTests(ModelFixture):
         self.assertEqual((ended['status'], ended['error']), ('failed', 'provider_http_401'))
         self.assertEqual(client.request('held')['result']['held'], [])
 
+    def test_a_short_hold_tries_once_more_at_its_end_then_fails(self):
+        client = self.client()
+        client.request('create', bot='Bob', workspace=str(self.path), settings={'hold_ms': 1500})
+        self.model.unauthorized_prompts = {'locked'}
+        began = time.monotonic()
+        turn = client.request('submit', bot='Bob', request_id='1', prompt='locked')['result']['turn']
+        held = client.receive(lambda m: m.get('event') == 'turn_paced' and m.get('turn') == turn)
+        # Its next try is when the hold ends, not the first hold's minute.
+        self.assertLessEqual(held['data']['resume_at_ms'] - held['data']['blocked']['since_ms'], 1500)
+        ended = client.finished(turn)['data']
+        self.assertEqual((ended['status'], ended['error']), ('failed', 'provider_http_401'))
+        self.assertLess(time.monotonic() - began, 30)
+
     def test_a_held_turn_a_restart_resumes_without_its_provider_stays_held(self):
         client = self.client()
         client.request('create', bot='Bob', workspace=str(self.path))

@@ -937,11 +937,15 @@ pub struct Blocked {
 }
 impl Blocked {
     /// The wait before the next try: as long as the hold has lasted, from
-    /// a minute up to an hour, so each try about doubles the last wait.
-    pub fn wait_ms(&self, now_ms: u64) -> u64 {
+    /// a minute up to an hour, so each try about doubles the last wait;
+    /// but no later than the hold's end, `hold_ms` after it began, when
+    /// one last try either works or ends the turn with its cause.
+    pub fn wait_ms(&self, now_ms: u64, hold_ms: u64) -> u64 {
+        let left = self.since_ms.saturating_add(hold_ms).saturating_sub(now_ms);
         now_ms
             .saturating_sub(self.since_ms)
             .clamp(HOLD_FIRST_MS, HOLD_LAST_MS)
+            .min(left)
     }
 }
 /// The first and the longest wait between tries of a held turn.
@@ -6230,7 +6234,8 @@ impl Database {
             .and_then(|held| serde_json::from_str::<Blocked>(held).ok())
             .map_or(now, |held| held.since_ms);
         // Held as long as its bot holds turns, then it ends with the cause.
-        if !self.inspect(&name)?.settings.holds(Some(since), now) {
+        let settings = self.inspect(&name)?.settings;
+        if !settings.holds(Some(since), now) {
             return Ok(None);
         }
         let blocked = Blocked {
@@ -6238,7 +6243,7 @@ impl Database {
             detail: error.detail.clone(),
             since_ms: since,
         };
-        let due = now + blocked.wait_ms(now);
+        let due = now + blocked.wait_ms(now, settings.hold_ms());
         let tx = self.conn.savepoint()?;
         tx.execute(
             "UPDATE turns SET held=?2,due_ms=?3 WHERE id=?1",
