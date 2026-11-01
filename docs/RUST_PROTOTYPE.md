@@ -2659,11 +2659,12 @@ is then decided by the rule that matches:
 The command is found on the daemon's `PATH`, so an allowed command is
 only as trusted as the folders there. A turn reads the rules once, off
 the runtime thread, when its first round begins, and each call a round
-plans keeps what they made of it, which its run reads: a call runs as its
-round was announced, also after a park or a restart and whatever the
-rules say by then. The folder is read again when a file in it changes,
-and a turn started after that takes the new rules. A file that can't be read or parsed, before
-any has been, fails every shell call with `rules_invalid`, naming the file
+plans keeps what they made of it, which a parked turn reads back as it
+resumes: a call runs as its round was announced, also after a park or a
+restart and whatever the rules say by then. The folder is read again
+when a file in it changes, and a turn started after that takes the new
+rules. A file that can't be looked at, read or parsed, before any has
+been, fails every shell call with `rules_invalid`, naming the file
 and line, where Codex would refuse to start; after that, the last rules
 read stay until the folder reads again. `agent rules check -- COMMAND...`
 prints what the rules decide about a command, or what is wrong with them.
