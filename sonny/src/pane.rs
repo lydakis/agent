@@ -69,9 +69,10 @@ pub struct Pane {
     /// `/background`'s keys, or what its last key did.
     pub foot: Option<Line<'static>>,
     /// Its rows are prose, read at the width the conversation is written
-    /// at however wide the pane: Markdown and plain text. Code, pictures,
-    /// diagrams and pages go as wide as the pane.
-    prose: bool,
+    /// at however wide the pane, its title over them as wide: Markdown,
+    /// plain text, a tree, the margin and the cards. Code, pictures,
+    /// diagrams, pages and the sky go as wide as the pane.
+    pub prose: bool,
     /// What the pane showed before, as a browser keeps it, the latest
     /// last, each as it was left; and what it went back from.
     back: Vec<Pane>,
@@ -304,7 +305,7 @@ impl Pane {
             keys: keys.to_owned(),
             program: None,
             foot: None,
-            prose: false,
+            prose: true,
             back: Vec::new(),
             forward: Vec::new(),
             tree: None,
@@ -489,6 +490,17 @@ impl Pane {
         switch: &str,
         file: impl Fn(&str) -> Option<String>,
     ) -> Option<(u16, u16)> {
+        // Prose and its title read at the conversation's measure, a column
+        // in from the line between; what is left of a wide pane stays
+        // empty on the right, as beside the conversation alone.
+        let measure = crate::PROSE as u16 + 1;
+        let area = match self.prose && self.program.is_none() {
+            true => Rect {
+                width: area.width.min(measure),
+                ..area
+            },
+            false => area,
+        };
         self.area = area;
         if area.height == 0 {
             return None;
@@ -1315,7 +1327,7 @@ mod tests {
         std::fs::write(&file, format!("{}\n", "word ".repeat(60))).unwrap();
         let mut pane = Pane::preview(&format!("file://{}", file.display()), &dir, 100).unwrap();
         let shown = rows(&mut pane, 150, 5);
-        // The title spans the pane; the file's rows stop at 100 columns.
+        // The title and the file's rows stop at 100 columns.
         assert!(shown[0].ends_with("esc close"), "{shown:?}");
         assert!(shown[2].width() <= crate::PROSE, "{}", shown[2].width());
         assert!(shown[3].starts_with("    word"), "{shown:?}");
@@ -1330,9 +1342,15 @@ mod tests {
         let mut pane = Pane::preview(&format!("file://{}", doc.display()), &dir, 150).unwrap();
         let shown = rows(&mut pane, 150, 4);
         assert!(shown[2].width() <= crate::PROSE, "{shown:?}");
-        // A card is not a file, and keeps the pane's width.
-        let mut card = Pane::card("/status", "esc close");
+        // A card is prose too, its title over it as wide; one that fills
+        // the pane, as the sky does, keeps the pane's width.
+        let mut card = Pane::card("status", "esc close");
         card.set_card(vec![Line::from("x".repeat(140))], "esc close");
+        let shown = rows(&mut card, 150, 4);
+        assert_eq!(shown[2].width(), crate::PROSE);
+        assert!(shown[0].width() <= crate::PROSE + 1, "{shown:?}");
+        assert!(shown[0].ends_with("esc close"), "{shown:?}");
+        card.prose = false;
         assert_eq!(rows(&mut card, 150, 3)[2].width(), 140);
         std::fs::remove_dir_all(&dir).unwrap();
     }

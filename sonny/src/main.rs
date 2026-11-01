@@ -10844,7 +10844,7 @@ impl App {
             && self.pane.as_ref().is_some_and(pane::Pane::is_margin)
         {
             let live = self.running.as_ref().map(|running| running.turn);
-            let width = at.width.saturating_sub(1) as usize;
+            let width = (at.width.saturating_sub(1) as usize).min(PROSE);
             let (lines, marks) = self.margin.lines(width, &workspace, live);
             let glance = self.glance().line();
             if let Some(pane) = &mut self.pane {
@@ -10861,8 +10861,13 @@ impl App {
                 0 => size.width,
                 _ => pane::width(size.width, PROSE as u16 + GUTTER),
             };
-            let width = wide.saturating_sub(2) as usize;
+            // The sky fills the pane, however wide; the other cards are
+            // prose, read at the conversation's measure.
+            let full = wide.saturating_sub(2) as usize;
+            let width = full.min(PROSE);
+            pane.prose = watch.sky.is_none();
             if let Some(view) = &mut watch.sky {
+                let width = full;
                 view.drain();
                 let rows = size.height.saturating_sub(4) as usize;
                 let lines: Vec<Line<'static>> = (view.card(width.saturating_sub(1), rows))
