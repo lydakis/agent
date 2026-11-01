@@ -622,9 +622,13 @@ pub fn run() -> i32 {
         // So does a new one when the time zone changed, as the C library
         // keeps the zone it read at the start: its calendar times are
         // worked out again from the times kept, as at any start.
+        // Or the folder of triggers from before 0.8.0, which it works in
+        // while a fire of the old Sonny ran there, moved now that none
+        // does: the new one schedules from its new place.
         if every_minute
             && let Some(me) = &me
-            && identity(me).is_some_and(|now| Some(now) != born || zone() != zoned)
+            && (identity(me).is_some_and(|now| Some(now) != born || zone() != zoned)
+                || moved(&places))
         {
             use std::os::unix::process::CommandExt;
             let error = std::process::Command::new(me).arg(VERB).exec();
@@ -969,6 +973,17 @@ fn let_job_go() -> i32 {
         &label(&home),
     );
     0
+}
+
+/// Whether `places`, the folder of triggers from before 0.8.0 this
+/// scheduler works in, moved to its new place just now.
+fn moved(places: &Places) -> bool {
+    let Some(home) = std::env::var_os("HOME") else {
+        return false;
+    };
+    let home = Path::new(&home);
+    places.state != Places::under(home).state
+        && Places::moved(home, true).state == Places::under(home).state
 }
 
 /// Whether HOME is gone, as a test's or an eval's is.

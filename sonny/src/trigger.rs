@@ -121,24 +121,64 @@ pub struct Places {
 impl Places {
     pub fn home() -> Result<Self, String> {
         let home = std::env::var_os("HOME").ok_or("no HOME for automations")?;
-        let places = Self::under(Path::new(&home));
-        places.moved_from_triggers(Path::new(&home));
-        Ok(places)
+        Ok(Self::moved(Path::new(&home), false))
     }
-    /// `~/.agent/triggers`, as the folder was named before 0.8.0, moved to
-    /// its place: whatever runs first, Sonny, its scheduler or the script,
-    /// moves it, before anything is read or written there. A folder made
-    /// in its place since is left as it is (upgrade migration
-    /// `automations-folder`).
-    fn moved_from_triggers(&self, home: &Path) {
-        let old = home.join(".agent/triggers");
-        if !self.state.exists() && old.is_dir() {
-            let _ = std::fs::rename(&old, &self.state);
+    /// The places under `home`, with `~/.agent/triggers`, as the folder was
+    /// named before 0.8.0, moved to its place first (upgrade migration
+    /// `automations-folder`). It moves only while nothing works in it: no
+    /// change to its files, no fire running, and no scheduler but the
+    /// caller, when `scheduling` says the caller is its scheduler. Else
+    /// this caller works in the old folder, as what works there does, and
+    /// the scheduler moves it once its fires are done. A folder made in
+    /// its place since is left as it is.
+    pub(crate) fn moved(home: &Path, scheduling: bool) -> Self {
+        let places = Self::under(home);
+        let old = Self::at(home.join(".agent/triggers"));
+        if places.state.exists() || !old.state.is_dir() {
+            return places;
         }
+        match old.quiet(scheduling) {
+            Some(_held) if std::fs::rename(&old.state, &places.state).is_ok() => places,
+            _ => old,
+        }
+    }
+    /// Locks on everything that works in this folder: its files' lock, its
+    /// scheduler's unless the caller is that scheduler, and each running
+    /// fire's. None while any of them is held.
+    fn quiet(&self, scheduling: bool) -> Option<Vec<std::fs::File>> {
+        let mut paths = vec![self.state.join(".lock")];
+        if !scheduling {
+            paths.push(self.scheduling());
+        }
+        let fires = std::fs::read_dir(self.locks())
+            .into_iter()
+            .flatten()
+            .flatten();
+        paths.extend(
+            fires
+                .map(|entry| entry.path())
+                .filter(|path| path.extension().is_some_and(|e| e == "lock")),
+        );
+        let mut held = vec![];
+        for path in paths {
+            // One never made is held by nobody.
+            let Ok(file) = std::fs::OpenOptions::new().write(true).open(&path) else {
+                continue;
+            };
+            use std::os::fd::AsRawFd;
+            // SAFETY: flock on a descriptor this function owns.
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+                return None;
+            }
+            held.push(file);
+        }
+        Some(held)
     }
     /// Under the HOME `home`.
     pub(crate) fn under(home: &Path) -> Self {
-        let state = home.join(".agent/automations");
+        Self::at(home.join(".agent/automations"))
+    }
+    fn at(state: PathBuf) -> Self {
         Self {
             jobs: state.join("jobs"),
             state,
@@ -6365,12 +6405,32 @@ pub(crate) mod tests {
         let old = w.root.join(".agent/triggers");
         std::fs::create_dir_all(old.join("jobs")).unwrap();
         std::fs::write(old.join("jobs/p.x.json"), "{}").unwrap();
-        w.places.moved_from_triggers(&w.root);
+        let hold = |path: PathBuf| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let file = std::fs::File::create(path).unwrap();
+            use std::os::fd::AsRawFd;
+            // SAFETY: flock on a descriptor this closure owns.
+            assert_eq!(unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) }, 0);
+            file
+        };
+        // A fire of the old Sonny still running there: everything stays
+        // in the old folder until it is done, its scheduler too.
+        let fire = hold(old.join(".scheduler/p.x.lock"));
+        for scheduling in [false, true] {
+            assert_eq!(Places::moved(&w.root, scheduling).state, old);
+        }
+        assert!(!w.places.state.exists());
+        drop(fire);
+        // Its scheduler, still running: only that scheduler moves it.
+        let scheduler = hold(old.join(".scheduler/scheduler"));
+        assert_eq!(Places::moved(&w.root, false).state, old);
+        assert_eq!(Places::moved(&w.root, true).state, w.places.state);
+        drop(scheduler);
         assert!(!old.exists());
         assert!(w.places.jobs.join("p.x.json").exists());
         // One made in its place since stays as it is.
         std::fs::create_dir_all(old.join("jobs")).unwrap();
-        w.places.moved_from_triggers(&w.root);
+        assert_eq!(Places::moved(&w.root, false).state, w.places.state);
         assert!(old.exists() && w.places.jobs.join("p.x.json").exists());
         // Prompts from before the rename are still an automation's.
         assert!(sent_it("trigger") && sent_it(ORIGIN) && !sent_it("commons"));

@@ -79,7 +79,7 @@ pub const MIGRATIONS: &[Migration] = &[
     },
     // `~/.agent/triggers` becomes `~/.agent/automations`, and Sonny's old
     // `~/.agent/trigger` script goes; run where they are read
-    // (`trigger::Places::home`, `skills::install_own`) rather than through
+    // (`trigger::Places::moved`, `skills::install_own`) rather than through
     // [`once`], since the script and the scheduler read the folder without
     // Sonny's start (0.8.0).
     Migration {

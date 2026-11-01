@@ -366,8 +366,12 @@ jobs go the same way, for the scheduler runs both.
 
 Automations were triggers before 0.8.0. The first Sonny, scheduler or
 script of 0.8.0 to look moves `~/.agent/triggers` to
-`~/.agent/automations` (unless a folder is there already), and Sonny's
-start removes its old `~/.agent/trigger` script (upgrade migration
+`~/.agent/automations` (unless a folder is there already), but only while
+nothing works in it: no change to its files, no fire running (a fire of the
+old Sonny keeps its paths to its end) and no other scheduler. Until then
+each works in the old folder, and the scheduler moves it within a minute of
+the last fire ending, then runs again from the new one. Sonny's start
+removes its old `~/.agent/trigger` script (upgrade migration
 `automations-folder`, retired at 0.10.0). Prompts sent before still carry
 `origin: "trigger"`, which Sonny reads as an automation's.
 
