@@ -54,14 +54,16 @@ struct Held {
     asking: bool,
 }
 
+/// What this window's Sonny knows holds its agent's window, and what it
+/// last wanted the file to say.
+static HELD: std::sync::Mutex<Option<(String, Held, Option<bool>)>> = std::sync::Mutex::new(None);
+
 /// Change what holds `bot`'s window; its file is written, off the
 /// screen's thread, only when whether anything holds it changes. What a
 /// window that just opened has not heard yet lets nothing go: the file a
 /// window before it left stands until its status says otherwise
 /// (`definite`), or something this window held lets go.
 fn hold(bot: &str, definite: bool, change: impl FnOnce(&mut Held)) {
-    static HELD: std::sync::Mutex<Option<(String, Held, Option<bool>)>> =
-        std::sync::Mutex::new(None);
     let Ok(mut last) = HELD.lock() else {
         return;
     };
@@ -70,24 +72,40 @@ fn hold(bot: &str, definite: bool, change: impl FnOnce(&mut Held)) {
         _ => (Held::default(), None),
     };
     change(&mut held);
-    let holds = held.status || held.asking;
-    let now = file_after(holds, written, definite);
+    let now = file_after(held.status || held.asking, written, definite);
     *last = Some((bot.to_owned(), held, now));
     if now == written {
         return;
     }
-    let Some(file) = in_dir("held", bot) else {
+    drop(last);
+    match tokio::runtime::Handle::try_current() {
+        Ok(runtime) => drop(runtime.spawn_blocking(write_held)),
+        Err(_) => write_held(),
+    }
+}
+
+/// Make the held file say what the window wants of it now, not what it
+/// wanted when this write was asked for: writes asked one after another
+/// can run in any order, and each, one at a time, writes the latest.
+fn write_held() {
+    static WRITING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let Ok(_writing) = WRITING.lock() else {
         return;
     };
-    let write = move || match holds {
+    let Some((bot, Some(holds))) = HELD.lock().ok().and_then(|last| {
+        last.as_ref()
+            .map(|(bot, _, written)| (bot.clone(), *written))
+    }) else {
+        return;
+    };
+    let Some(file) = in_dir("held", &bot) else {
+        return;
+    };
+    match holds {
         true => mark(&file),
         false => {
             let _ = std::fs::remove_file(&file);
         }
-    };
-    match tokio::runtime::Handle::try_current() {
-        Ok(runtime) => drop(runtime.spawn_blocking(write)),
-        Err(_) => write(),
     }
 }
 

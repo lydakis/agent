@@ -3481,7 +3481,25 @@ impl App {
             }
             self.approvals_for(Some(turn)).await;
         } else {
-            status_report("idle", &self.bot);
+            // Its last turn's end, as a turn's end reports it live: a window
+            // opened again on an agent whose turn failed still says so, and
+            // keeps its place among the lead's windows.
+            // A model that said nothing is no failure, as live.
+            let failed = match self
+                .client
+                .request(
+                    "turns",
+                    json!({"bot": self.bot, "newest": true, "limit": 4}),
+                )
+                .await
+            {
+                Ok(page) => {
+                    let last = self.task_turn(&page).await;
+                    last["status"] == "failed" && last["error"] != EMPTY
+                }
+                Err(_) => false,
+            };
+            status_report(if failed { "error" } else { "idle" }, &self.bot);
         }
         self.configure().await;
         self.tell_upgrades().await;
