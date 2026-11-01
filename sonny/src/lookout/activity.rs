@@ -61,37 +61,42 @@ impl Rule {
     }
 }
 
-/// When a task's news may be told, as the subscriptions that heard it say.
+/// When a task's news may be told, as the subscriptions that heard it say,
+/// and which of them told it once it is: nothing heard yet says, so it
+/// goes as news always went.
 #[derive(Clone, Debug, Default, PartialEq)]
-pub enum Hold {
-    /// Nothing heard yet says.
-    #[default]
-    Unset,
-    /// As soon as the subscriber rests, as news always went.
-    Now,
-    /// No sooner than one of these subscriptions' digests allows: this
-    /// long after a note last told what that subscription held. Each keeps
-    /// its own time, so the earliest any allows is when it goes.
-    Window(Vec<(String, Duration)>),
+pub struct Hold {
+    /// Something in it goes as soon as the subscriber rests: heard by a
+    /// subscription with no digest, the person's own, or urgent.
+    pub now: bool,
+    /// Subscriptions with a digest that heard it, each with its digest:
+    /// no sooner than one allows, this long after a note last told what
+    /// that one heard. Each keeps its own time, so the earliest any allows
+    /// is when it goes, and a note that tells it, however soon, starts
+    /// each one's time again.
+    pub windows: Vec<(String, Duration)>,
 }
 
 impl Hold {
+    /// As soon as the subscriber rests.
+    pub fn now() -> Hold {
+        Hold {
+            now: true,
+            windows: Vec::new(),
+        }
+    }
+
     /// Two pieces of one task's news together: what may go now takes the
     /// rest along, and windows join, whichever allows first letting both
     /// go.
-    pub fn merge(self, other: Hold) -> Hold {
-        match (self, other) {
-            (Hold::Unset, other) | (other, Hold::Unset) => other,
-            (Hold::Now, _) | (_, Hold::Now) => Hold::Now,
-            (Hold::Window(mut a), Hold::Window(b)) => {
-                for window in b {
-                    if !a.contains(&window) {
-                        a.push(window);
-                    }
-                }
-                Hold::Window(a)
+    pub fn merge(mut self, other: Hold) -> Hold {
+        self.now |= other.now;
+        for window in other.windows {
+            if !self.windows.contains(&window) {
+                self.windows.push(window);
             }
         }
+        self
     }
 }
 
@@ -112,7 +117,10 @@ pub fn hear(rules: &[Rule], event: &Value, skips: bool) -> Option<Heard> {
         .filter(|rule| (rule.filter.as_deref()).is_none_or(|f| super::pattern::matches(f, event)))
         .peekable();
     hearing.peek()?;
-    let mut hold = Hold::Unset;
+    let mut hold = Hold {
+        now: skips,
+        windows: Vec::new(),
+    };
     let mut urgent = None;
     for rule in hearing {
         if urgent.is_none()
@@ -120,14 +128,12 @@ pub fn hear(rules: &[Rule], event: &Value, skips: bool) -> Option<Heard> {
         {
             urgent = Some(rule.sub.clone());
         }
-        hold = hold.merge(match (skips, rule.digest) {
-            (false, Some(digest)) => Hold::Window(vec![(rule.sub.clone(), digest)]),
-            _ => Hold::Now,
-        });
+        match rule.digest {
+            Some(digest) => hold.windows.push((rule.sub.clone(), digest)),
+            None => hold.now = true,
+        }
     }
-    if urgent.is_some() {
-        hold = Hold::Now;
-    }
+    hold.now |= urgent.is_some();
     Some(Heard { hold, urgent })
 }
 
@@ -164,7 +170,7 @@ mod tests {
         assert_eq!(
             hear(&both, &event, false),
             Some(Heard {
-                hold: Hold::Now,
+                hold: Hold::now(),
                 urgent: None
             })
         );
@@ -179,17 +185,25 @@ mod tests {
             hear(&[hourly.clone(), tenth.clone()], &event, false)
                 .unwrap()
                 .hold,
-            Hold::Window(vec![
-                ("hourly".into(), Duration::from_secs(3600)),
-                ("tenth".into(), Duration::from_secs(600))
-            ])
+            Hold {
+                now: false,
+                windows: vec![
+                    ("hourly".into(), Duration::from_secs(3600)),
+                    ("tenth".into(), Duration::from_secs(600))
+                ]
+            }
         );
+        // What goes now still counts as told for the digests that heard it.
+        let hourly_told = Hold {
+            now: true,
+            windows: vec![("hourly".into(), Duration::from_secs(3600))],
+        };
         let plain = rule("plain", None, None, 0);
         assert_eq!(
             hear(&[hourly.clone(), plain], &event, false).unwrap().hold,
-            Hold::Now
+            hourly_told
         );
-        assert_eq!(hear(&[hourly], &event, true).unwrap().hold, Hold::Now);
+        assert_eq!(hear(&[hourly], &event, true).unwrap().hold, hourly_told);
     }
 
     #[test]
@@ -204,7 +218,10 @@ mod tests {
         assert_eq!(
             hear(&rules, &event, false),
             Some(Heard {
-                hold: Hold::Now,
+                hold: Hold {
+                    now: true,
+                    windows: vec![("migration".into(), Duration::from_secs(3600))]
+                },
                 urgent: Some("migration".into())
             })
         );
@@ -215,12 +232,22 @@ mod tests {
     #[test]
     fn holds_merge_toward_now_and_keep_every_window() {
         let w = |s: &str, n| (s.to_owned(), Duration::from_secs(n));
-        let a = Hold::Window(vec![w("a", 5)]);
-        assert_eq!(Hold::Unset.merge(a.clone()), a);
-        assert_eq!(a.clone().merge(Hold::Now), Hold::Now);
+        let a = Hold {
+            now: false,
+            windows: vec![w("a", 50)],
+        };
+        assert_eq!(Hold::default().merge(a.clone()), a);
         assert_eq!(
-            Hold::Window(vec![w("a", 50)]).merge(Hold::Window(vec![w("b", 5), w("a", 50)])),
-            Hold::Window(vec![w("a", 50), w("b", 5)])
+            a.clone().merge(Hold::now()),
+            Hold {
+                now: true,
+                windows: vec![w("a", 50)]
+            }
         );
+        let b = Hold {
+            now: false,
+            windows: vec![w("b", 5), w("a", 50)],
+        };
+        assert_eq!(a.merge(b).windows, [w("a", 50), w("b", 5)]);
     }
 }

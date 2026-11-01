@@ -3265,6 +3265,10 @@ mod tests {
             "{texts:?}"
         );
         assert!(told.items.iter().any(|l| l.quote.is_some()));
+        // What the digest held went with them: its time starts again.
+        let first = lookout.updates.told_subs["tasks"];
+        lookout.updates.sent(told);
+        assert!(lookout.updates.told_subs["tasks"] > first);
     }
 
     #[test]

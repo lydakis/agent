@@ -863,7 +863,7 @@ impl Updates {
         event: impl FnOnce() -> Value,
     ) -> Option<(super::activity::Hold, Option<String>)> {
         let Some(rules) = self.rules.get(name) else {
-            return Some((super::activity::Hold::Unset, None));
+            return Some((super::activity::Hold::default(), None));
         };
         let mut event = event();
         event["bot"] = json!(name);
@@ -876,13 +876,13 @@ impl Updates {
 
     /// Whether a task's news may be told now: urgent, or no digest holds it.
     fn ready(&self, news: &News, now: Instant) -> bool {
+        let hold = &news.hold;
         news.urgent.is_some()
-            || match &news.hold {
-                super::activity::Hold::Window(windows) => (windows.iter()).any(|(sub, digest)| {
-                    (self.told_subs.get(sub)).is_none_or(|at| now >= *at + *digest)
-                }),
-                _ => true,
-            }
+            || hold.now
+            || hold.windows.is_empty()
+            || (hold.windows.iter()).any(|(sub, digest)| {
+                (self.told_subs.get(sub)).is_none_or(|at| now >= *at + *digest)
+            })
     }
 
     /// Whether there is news a note may tell now.
@@ -1447,7 +1447,7 @@ impl Updates {
             }
             // It may go as it might now, and what of it was urgent still is.
             if held != News::default() {
-                held.hold = super::activity::Hold::Now;
+                held.hold = super::activity::Hold::now();
                 held.urgent = [&held.act, &held.theirs]
                     .into_iter()
                     .flatten()
@@ -1512,13 +1512,12 @@ impl Updates {
 
     /// The note was sent: what it said of memory has been told.
     pub fn sent(&mut self, told: Told) {
-        // What a digest held was told: the digest counts from now.
+        // What a digest's subscription heard was told, however soon: its
+        // digest counts from now.
         let now = Instant::now();
         for (_, news) in &told.sent {
-            if let super::activity::Hold::Window(windows) = &news.hold {
-                for (sub, _) in windows {
-                    self.told_subs.insert(sub.clone(), now);
-                }
+            for (sub, _) in &news.hold.windows {
+                self.told_subs.insert(sub.clone(), now);
             }
         }
         if let Some(seen) = told.seen {

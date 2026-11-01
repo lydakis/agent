@@ -379,9 +379,11 @@ told once the subscriber rests, as news always was, and what comes after
 waits until the digest has passed since the note that last told what it
 held, then goes in one note. A task's news heard by a subscription with no
 digest goes as it comes, and takes the rest of that task's news along.
+Heard by several with digests, it goes when the first of them allows.
 The person's words, a question to them and an approval only they can give
 never wait for one: a digest never holds what only the person can
-unblock. What a digest holds is untold news, so the cursor waits for it
+unblock. However soon a note tells what a subscription heard, its digest
+counts again from that note. What a digest holds is untold news, so the cursor waits for it
 (One lookout a daemon) and a restart loses none of it; when each
 subscription's digest last told is kept with what sources hold, in
 `STORE.sources/.held/BOT.json`.
