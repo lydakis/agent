@@ -27,7 +27,8 @@ use std::{
 pub const DOUBT: Duration = Duration::from_secs(60);
 /// About what one note may take, well under the daemon's 256 KiB prompt
 /// limit, which counts what it quotes too; a message counts as its quoted
-/// words and `LINE_BYTES`, and a turn as its line and reply as they read.
+/// words and its line at the longest (`said_bytes`), and a turn as its line
+/// and reply as they read.
 const NOTE_BYTES: usize = 192 * 1024;
 /// The most of the person's messages one note quotes, the most the daemon
 /// copies into one prompt.
@@ -1503,7 +1504,7 @@ impl Updates {
             let (mut kept, mut wait) = (Vec::new(), Vec::new());
             for message in std::mem::take(&mut news.said) {
                 let quote = usize::from(message.words.is_some());
-                let size = quote * message.bytes + LINE_BYTES;
+                let size = quote * message.bytes + said_bytes(&name, &message);
                 let first = items.is_empty() && kept.is_empty();
                 if wait.is_empty()
                     && quotes + quote <= NOTE_QUOTES
@@ -1857,6 +1858,13 @@ fn ask_line(name: &str, asked: &Asked) -> Line {
         text,
         key: format!("{name}/{turn}/ask/{call}"),
     }
+}
+
+/// The most one message adds to the lines `said` writes for it: its task's
+/// name twice, its writer's, and `LINE_BYTES` for the rest. Where many
+/// messages share one line, their bounds add up to more than it takes.
+fn said_bytes(name: &str, message: &Said) -> usize {
+    2 * name.len() + message.from.len() + LINE_BYTES
 }
 
 /// What was written in a task, as the note says it: each of the person's
@@ -2524,6 +2532,36 @@ mod tests {
              - shop.fix: turn:shop.fix/7, shop.docs wrote in it\n\
              - shop.fix: turn:shop.fix/6 completed, asked by shop.docs"
         );
+    }
+
+    #[test]
+    fn long_names_count_as_a_note_writes_them() {
+        let mut updates = fleet();
+        let now = Instant::now();
+        let from = format!("shop.{}", "w".repeat(123));
+        let tasks: Vec<String> = (0..1000)
+            .map(|n| format!("shop.{}{n:04}", "t".repeat(118)))
+            .collect();
+        for (n, task) in tasks.iter().enumerate() {
+            let id = n as i64 + 10;
+            updates.event(
+                &ev(task, None, "created",
+                    json!({"bot_id": id, "status": "idle", "created_by": "shop.lead", "created_by_id": 1})),
+                now,
+            );
+            updates.watched.insert(task.clone());
+            updates.said(task, 1, &from, None);
+        }
+        let mut told = 0;
+        while told < tasks.len() {
+            let note = updates.take();
+            let size: usize = note.items.iter().map(|i| i.text.len() + 1).sum();
+            assert!(size <= NOTE_BYTES, "{size}");
+            assert!(!note.items.is_empty());
+            told += note.items.len();
+            updates.sent(note);
+        }
+        assert_eq!(told, tasks.len());
     }
 
     #[test]

@@ -464,27 +464,29 @@ class Bench:
                 turn = rest.partition('/')[0]
                 if turn.isdigit():
                     named.setdefault(task, []).append((note['at_ms'], int(turn), begun, note.get('read_ms')))
-        sent, begun, reads = [], [], []
+        # A turn is told once a note naming it reaches its lead; a note sent
+        # but still queued tells nothing yet, though its submit is timed.
+        sent, begun, reads, untold = [], [], [], []
         for (task, turn), finished in ended.items():
-            first = min(((at, start, read) for at, newest, start, read in named.get(task, [])
-                         if at >= finished and newest >= turn), default=None)
-            if first is None:
-                continue
-            at, start, read = first
-            sent.append(at - finished)
-            if start is not None:
-                begun.append(start - finished)
-            if read is not None:
-                reads.append(read)
-        untold = [finished for key, finished in ended.items()
-                  if not any(at >= finished and newest >= key[1] for at, newest, _, _ in named.get(key[0], []))]
+            naming = [(at, start, read) for at, newest, start, read in named.get(task, [])
+                      if at >= finished and newest >= turn]
+            if naming:
+                at, _, read = min(naming, key=lambda note: note[0])
+                sent.append(at - finished)
+                if read is not None:
+                    reads.append(read)
+            reached = [start for _, start, _ in naming if start is not None]
+            if reached:
+                begun.append(min(reached) - finished)
+            else:
+                untold.append(finished)
         now = int(time.time() * 1000)
 
         def pct(values, q):
             values = sorted(values)
             return values[min(len(values) - 1, int(q * len(values)))] if values else None
         return {'leads': len(leads), 'tasks': len(tasks), 'tasks_per_lead': self.args.tasks,
-                'turns_ended': len(ended), 'told': len(sent), 'untold': len(untold),
+                'turns_ended': len(ended), 'told': len(begun), 'untold': len(untold),
                 'oldest_untold_ms': now - min(untold) if untold else None,
                 'notes': len(notes), 'notes_delivered': delivered,
                 'notes_undelivered': sum(

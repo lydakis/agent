@@ -3,6 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from bench.lookout_scale import Bench
 from bench.perf_gate import compare
 
 
@@ -48,6 +49,26 @@ class PerfGateTests(unittest.TestCase):
         # However much faster the head's notes are.
         self.assertEqual(failed, ['sonny: lookout at 10x100 left 4 ended turns untold, '
                                   'where the base told every one'])
+
+
+    def test_a_turn_counts_as_told_only_once_its_note_reaches_the_lead(self):
+        class Control:
+            def many(self, requests):
+                return [{'result': {'turns': replies[r[1]['bot']]}} for r in requests]
+        replies = {'t1': [{'turn': 1, 'finished_ms': 100}], 't2': [{'turn': 1, 'finished_ms': 100}],
+                   # Only the note about t1 became a turn of the lead's.
+                   'lead': [{'request_id': 'lookout-a', 'started_ms': 400}]}
+        bench = Bench.__new__(Bench)
+        bench.args = type('Args', (), {'tasks': 2})()
+        bench.control = Control()
+        bench.tasks = lambda: ['t1', 't2']
+        bench.leads = lambda: ['lead']
+        bench.log_lines = lambda: [
+            {'woke': ['t1/1/end'], 'lead': 'lead', 'request_id': 'lookout-a', 'at_ms': 200},
+            {'woke': ['t2/1/end'], 'lead': 'lead', 'request_id': 'lookout-b', 'at_ms': 250}]
+        notes = bench.note_delays(0)
+        self.assertEqual((notes['told'], notes['untold'], notes['notes_undelivered']), (1, 1, 1))
+        self.assertEqual((notes['submit_ms_p95'], notes['delay_ms_max']), (150, 300))
 
 
 if __name__ == '__main__':
