@@ -2476,8 +2476,10 @@ struct App {
     /// Calls it denied while Sonny watched, newest last: what `/retry`
     /// offers to retry once.
     denials: Vec<Denial>,
-    /// `/retry`'s list of the denials, open over the composer.
-    approving: Option<list::Picker>,
+    /// `/retry`'s list of the denials, open over the composer, with the
+    /// denials as they were when it opened: one that comes or ages out
+    /// while it is open moves no row onto another call.
+    approving: Option<(Vec<Denial>, list::Picker)>,
     /// The denied call written out whole for the person to read, which a
     /// second Enter then approves.
     approve_shown: Option<String>,
@@ -9379,15 +9381,16 @@ impl App {
             }
             return;
         }
-        if let Some(list) = &mut self.approving {
+        if let Some((denials, list)) = &mut self.approving {
             match list.event(&event) {
                 list::Act::Take(at) => {
+                    let Some(denied) = denials.get(at).cloned() else {
+                        return;
+                    };
                     // The person approves only what they have read:
                     // the whole call first, then a second Enter.
-                    if let Some(denied) = self.denials.get(at)
-                        && self.approve_shown.as_deref() != Some(denied.call_id.as_str())
-                    {
-                        let lines = retry_shown(denied);
+                    if self.approve_shown.as_deref() != Some(denied.call_id.as_str()) {
+                        let lines = retry_shown(&denied);
                         // Past what the screen keeps, the start would
                         // scroll away unread.
                         if lines.len() > RETRY_ROWS {
@@ -9404,18 +9407,17 @@ impl App {
                     }
                     self.approving = None;
                     self.approve_shown = None;
-                    if at < self.denials.len() {
-                        let denied = self.denials.remove(at);
-                        self.notice = Some(
-                            match self.send(approval(&denied), None, false, false, &[]).await {
-                                Ok(()) => "approved one retry; the retry is still reviewed".into(),
-                                Err(error) => {
-                                    self.denials.insert(at, denied);
-                                    error
-                                }
-                            },
-                        );
-                    }
+                    let kept = self.denials.clone();
+                    self.denials.retain(|d| d.call_id != denied.call_id);
+                    self.notice = Some(
+                        match self.send(approval(&denied), None, false, false, &[]).await {
+                            Ok(()) => "approved one retry; the retry is still reviewed".into(),
+                            Err(error) => {
+                                self.denials = kept;
+                                error
+                            }
+                        },
+                    );
                 }
                 list::Act::Close => {
                     self.approving = None;
@@ -10118,7 +10120,8 @@ impl App {
                     let rows = (self.denials.iter())
                         .map(|denied| (self.denied_what(denied), denied_why(denied)))
                         .collect();
-                    self.approving = Some(list::Picker::new(rows, newest - 1));
+                    let list = list::Picker::new(rows, newest - 1);
+                    self.approving = Some((self.denials.clone(), list));
                 }
             }
             return;
@@ -11569,13 +11572,13 @@ impl App {
                 frame.render_widget(Paragraph::new(keys), footer);
                 return;
             }
-            if let Some(list) = &self.approving {
+            if let Some((denials, list)) = &self.approving {
                 // Newest last, as they happened; the reason stays in view
                 // before a retry is approved.
                 let room = (composer.width as usize).saturating_sub(8);
                 let items: Vec<list::Item> = (list.shown().into_iter())
                     .filter_map(|(at, found)| {
-                        let denied = self.denials.get(at)?;
+                        let denied = denials.get(at)?;
                         let what = self.denied_what(denied);
                         Some(
                             list::Item::new(transcript::cut(&what, room / 2), denied_why(denied))
@@ -14786,14 +14789,22 @@ mod tests {
         app.input.set("/retry");
         app.submit().await;
         assert_eq!(
-            app.approving.as_ref().and_then(list::Picker::chosen),
+            app.approving.as_ref().and_then(|(_, list)| list.chosen()),
             Some(0)
         );
+        // A denial that comes while it is open moves no row onto another.
+        let other = Denial {
+            call_id: "c0".into(),
+            name: "shell".into(),
+            arguments: json!({"command": "ls"}),
+            reason: "No.".into(),
+        };
+        app.denials.insert(0, other.clone());
         let enter = || Event::Key(event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         // The first Enter writes the whole call out; nothing is sent yet.
         app.key(enter()).await;
         assert_eq!(
-            app.approving.as_ref().and_then(list::Picker::chosen),
+            app.approving.as_ref().and_then(|(_, list)| list.chosen()),
             Some(0)
         );
         assert!(sent.lock().unwrap().is_empty());
@@ -14806,7 +14817,9 @@ mod tests {
             "{rows:?}"
         );
         app.key(enter()).await;
-        assert!(app.approving.is_none() && app.denials.is_empty());
+        assert!(app.approving.is_none());
+        assert_eq!(app.denials, [other]);
+        app.denials.clear();
         let prompt = sent.lock().unwrap()[0].as_str().unwrap().to_owned();
         assert!(prompt.starts_with(
             "I approve one retry of the action the reviewer denied: shell {\"command\":\"git push --force origin main\"}"
