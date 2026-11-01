@@ -271,7 +271,8 @@ pub fn daemon_flags(daemon: &BTreeMap<String, String>) -> Result<Vec<(String, St
         flags.push((
             flag.to_owned(),
             match key {
-                "load" => format!("{}", (value * 100.0).round() / 100.0),
+                // Kept whole: a small positive limit is still a limit.
+                "load" => format!("{value}"),
                 _ => format!("{}", value.floor() as u64),
             },
         ));
@@ -1485,6 +1486,10 @@ mod tests {
         assert!(flags.contains(&("--max-processes".into(), (cpus * 8).to_string())));
         assert!(flags.contains(&("--max-readers".into(), "3".into())));
         assert!(flags.contains(&("--max-load".into(), "0".into())));
+        // A small positive limit stays one, not 0 for none.
+        let small = parse("[daemon]\nload = 0.001\n").unwrap();
+        let flags = daemon_flags(&small.daemon).unwrap();
+        assert!(flags.contains(&("--max-load".into(), "0.001".into())));
         // With none given, only the gate's default is passed.
         let flags = daemon_flags(&BTreeMap::new()).unwrap();
         assert_eq!(flags, [("--max-load".to_owned(), (cpus * 2).to_string())]);

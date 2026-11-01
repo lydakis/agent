@@ -3780,7 +3780,8 @@ impl Turn {
                 Some(batch) => batch.iter().map(|(call, _)| call).collect(),
                 None => vec![&call],
             };
-            if let Some(held) = starting.iter().find(|call| self.load_holds(record, call))
+            if let Some(held) =
+                (starting.iter()).find(|call| self.load_holds(record, call, workspace))
                 && let Some(stop) = self
                     .await_load(&held.call_id, &call, &calls, route, summary_retry_ms)
                     .await?
@@ -4582,14 +4583,26 @@ impl Turn {
     }
 
     /// Whether the daemon's load gate holds `call` back now: a foreground
-    /// command that may run, while the machine is over its load and one
-    /// of the daemon's commands runs.
-    fn load_holds(&self, record: &Bot, call: &ToolCall) -> bool {
-        !self.registry.admits()
-            && record.declared(&call.name).is_none()
-            // A forbidden command is refused at once: it starts nothing.
-            && !matches!(record.ruling(call, &self.ruled()), Ok(Ruling::Forbidden(_)))
-            && record.callable().iter().any(|name| name == &call.name)
+    /// command that would start at once, while the machine is over its
+    /// load and one of the daemon's commands runs. A call that is refused
+    /// (forbidden, asked about with no gate, an escape no gate allows) is
+    /// answered at once, and a gated one waits for its verdict instead: a
+    /// denial comes back as soon as it is given, and one allowed starts
+    /// then, as the person or approver who allowed it meant.
+    fn load_holds(&self, record: &Bot, call: &ToolCall, workspace: &std::path::Path) -> bool {
+        if self.registry.admits()
+            || record.declared(&call.name).is_some()
+            || !record.callable().iter().any(|name| name == &call.name)
+        {
+            return false;
+        }
+        let ruled = self.ruled();
+        let ruling = record.ruling(call, &ruled);
+        !record.gated(call, workspace, &ruled)
+            && matches!(ruling, Ok(Ruling::None | Ruling::Allow))
+            && !(record.sandboxed()
+                && ruling != Ok(Ruling::Allow)
+                && !record.confines(call, workspace))
             && matches!(
                 self.registry.prepare(&call.name, &call.arguments),
                 Ok(Prepared::Shell {
@@ -6570,7 +6583,8 @@ mod tests {
         let mut policy = agent_runtime::rules::Policy::default();
         (policy.parse(
             "test.rules",
-            r#"prefix_rule(pattern = ["rm"], decision = "forbidden")"#,
+            "prefix_rule(pattern = [\"rm\"], decision = \"forbidden\")\n\
+             prefix_rule(pattern = [\"git\", \"push\"], decision = \"prompt\")\n",
         ))
         .unwrap();
         let _ = task
@@ -6585,8 +6599,15 @@ mod tests {
             call_id: "shell-2".into(),
             arguments: json!({"command": "rm -rf x"}).to_string(),
         };
-        assert!(task.load_holds(&record, &calls[1]));
-        assert!(!task.load_holds(&record, &forbidden));
+        assert!(task.load_holds(&record, &calls[1], &dir));
+        assert!(!task.load_holds(&record, &forbidden, &dir));
+        // Nor is one a rule asks about with no gate to ask: it is refused.
+        let asked = ToolCall {
+            call_id: "shell-3".into(),
+            arguments: json!({"command": "git push"}).to_string(),
+            ..forbidden.clone()
+        };
+        assert!(!task.load_holds(&record, &asked, &dir));
         // The read first would run with the command beside it: the gate
         // holds both, neither started, and names the command it holds.
         let stop = tokio::time::timeout(
