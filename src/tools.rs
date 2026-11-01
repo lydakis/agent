@@ -499,6 +499,9 @@ pub struct Registry {
     daemon: Arc<Daemon>,
     /// Request encodings per (family, selection); see `encoded`.
     encodings: Encodings,
+    /// Bytes of tool output being redacted off the runtime at once; see
+    /// `off_runtime`.
+    heavy: Arc<Semaphore>,
 }
 type Encodings = Arc<std::sync::Mutex<HashMap<(Family, String), Arc<RawValue>>>>;
 /// What a file that is not text holds, named by its first bytes, as `file`
@@ -537,6 +540,7 @@ impl Drop for Queued {
         }
     }
 }
+#[derive(Clone)]
 struct Credential {
     name: String,
     value: String,
@@ -544,11 +548,14 @@ struct Credential {
 
 /// Values that never appear in tool output and never reach a shell's
 /// environment. Shared, so a login re-read while the daemon runs is
-/// redacted from then on; earlier values stay listed.
+/// redacted from then on; earlier values stay listed. Readers take the
+/// current set and let the lock go, so a scan of a large output on a
+/// blocking thread never holds up a refresh on the runtime's; a change
+/// copies the set if a scan still reads it.
 #[derive(Clone, Default)]
-pub struct Credentials(Arc<std::sync::RwLock<CredentialSet>>);
+pub struct Credentials(Arc<std::sync::RwLock<Arc<CredentialSet>>>);
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct CredentialSet {
     /// Longer values first, so a shorter old token cannot mask only a prefix
     /// of a new token. Refreshes pay for insertion; tool output stays sorted.
@@ -599,7 +606,8 @@ impl Credentials {
         if value.is_empty() {
             return;
         }
-        let mut set = self.0.write().unwrap_or_else(|e| e.into_inner());
+        let mut guard = self.0.write().unwrap_or_else(|e| e.into_inner());
+        let set = Arc::make_mut(&mut guard);
         if set
             .values
             .iter()
@@ -622,27 +630,29 @@ impl Credentials {
     /// Keep a variable out of shell environments without a value to
     /// redact: configuration the daemon read for itself.
     pub fn withhold(&self, name: &str) {
-        let mut set = self.0.write().unwrap_or_else(|e| e.into_inner());
+        let mut guard = self.0.write().unwrap_or_else(|e| e.into_inner());
+        let set = Arc::make_mut(&mut guard);
         if !set.names.iter().any(|existing| existing == name) {
             set.names.push(name.to_owned());
         }
     }
     pub fn names(&self) -> Vec<String> {
-        self.0
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .names
-            .clone()
+        self.current().names.clone()
+    }
+    /// The set as it is now, the lock held only to take it.
+    fn current(&self) -> Arc<CredentialSet> {
+        self.0.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
     /// Also redact the values after these field names, matched as a name's
     /// end, and the bodies of PEM blocks whose header names one of `blocks`.
     pub fn redact_also(&self, fields: &[String], blocks: &[String]) {
-        let mut set = self.0.write().unwrap_or_else(|e| e.into_inner());
+        let mut guard = self.0.write().unwrap_or_else(|e| e.into_inner());
+        let set = Arc::make_mut(&mut guard);
         set.fields = fields.iter().map(|field| field_key(field)).collect();
         set.blocks = blocks.to_vec();
     }
     pub fn redact(&self, mut text: String) -> String {
-        let set = self.0.read().unwrap_or_else(|e| e.into_inner());
+        let set = self.current();
         for credential in &set.values {
             if text.contains(&credential.value) {
                 text = text.replace(&credential.value, REDACTED);
@@ -661,7 +671,7 @@ impl Credentials {
     /// would carry: what a stream holds back until it can redact. What it
     /// shows never ends inside a whole credential.
     pub fn unfinished(&self, text: &[u8]) -> usize {
-        let set = self.0.read().unwrap_or_else(|e| e.into_inner());
+        let set = self.current();
         let values = || {
             set.values
                 .iter()
@@ -697,7 +707,7 @@ impl Credentials {
     /// not started: a name, or a name and its separator. They are shown,
     /// and kept so the next text is redacted as read after them.
     pub fn opening(&self, text: &[u8]) -> usize {
-        let set = self.0.read().unwrap_or_else(|e| e.into_inner());
+        let set = self.current();
         let open = open_field(text, &set.fields);
         open.name - open.value
     }
@@ -1213,6 +1223,7 @@ impl Registry {
             environment: Arc::new(Vec::new()),
             daemon: Arc::default(),
             encodings: Arc::default(),
+            heavy: Arc::new(Semaphore::new(heavy_bytes())),
         })
     }
     /// A bot's selection must name registered tools, each once.
@@ -1776,7 +1787,11 @@ impl Registry {
             Prepared::Note { .. } => fail("note_requires_runtime"),
             Prepared::Declared(_) => fail("declared_requires_runtime"),
             Prepared::WebSearch(_) => fail("web_search_requires_runtime"),
-            Prepared::WebFetch(url) => Ok(self.fetched(fetch::fetch(url).await?)),
+            Prepared::WebFetch(url) => {
+                let page = fetch::fetch(url).await?;
+                self.off_runtime(page.text.len(), move |registry| registry.fetched(page))
+                    .await
+            }
             Prepared::Shell {
                 command,
                 timeout_ms,
@@ -2020,25 +2035,34 @@ impl Registry {
     ) -> impl Future<Output = Result<Outcome>> + Send + 'static {
         let registry = self.clone();
         async move {
-            // Held until the command and the sandbox around it are gone,
-            // and taken before the slot, so no slot waits on it.
-            let _held = crate::sandbox::hold_for(sandbox.as_deref()).await;
-            let _slot = registry
-                .slots
-                .acquire()
+            let (stdout, stderr, exit, elapsed) = {
+                // Held until the command and the sandbox around it are
+                // gone, and taken before the slot, so no slot waits on it.
+                // Both go before the output is redacted, so a result
+                // waiting for that holds no process budget.
+                let _held = crate::sandbox::hold_for(sandbox.as_deref()).await;
+                let _slot = registry
+                    .slots
+                    .acquire()
+                    .await
+                    .map_err(|_| Error::new("tool_scheduler_closed"))?;
+                let _ = started.send(());
+                shell(
+                    &command,
+                    &workspace,
+                    Duration::from_millis(timeout_ms),
+                    &registry,
+                    &environment,
+                    sandbox.as_deref(),
+                )
+                .await?
+            };
+            let bytes = stdout.len() + stderr.len();
+            registry
+                .off_runtime(bytes, move |registry| {
+                    registry.shell_outcome(stdout, stderr, exit, elapsed)
+                })
                 .await
-                .map_err(|_| Error::new("tool_scheduler_closed"))?;
-            let _ = started.send(());
-            let (stdout, stderr, exit, elapsed) = shell(
-                &command,
-                &workspace,
-                Duration::from_millis(timeout_ms),
-                &registry,
-                &environment,
-                sandbox.as_deref(),
-            )
-            .await?;
-            Ok(registry.shell_outcome(stdout, stderr, exit, elapsed))
         }
     }
 
@@ -2070,18 +2094,27 @@ impl Registry {
                     None => registry.slots.clone().acquire_owned().await,
                 };
                 drop(queued);
-                let _slot = slot.map_err(|_| Error::new("tool_scheduler_closed"))?;
-                let _held = crate::sandbox::hold_for(sandbox.as_deref()).await;
-                let (stdout, stderr, exit, elapsed) = shell(
-                    &command,
-                    &workspace,
-                    Duration::from_millis(timeout_ms),
-                    &registry,
-                    &environment,
-                    sandbox.as_deref(),
-                )
-                .await?;
-                Ok(registry.shell_outcome(stdout, stderr, exit, elapsed))
+                // The slot and the sandbox's hold go once the command is
+                // done, before its output is redacted.
+                let (stdout, stderr, exit, elapsed) = {
+                    let _slot = slot.map_err(|_| Error::new("tool_scheduler_closed"))?;
+                    let _held = crate::sandbox::hold_for(sandbox.as_deref()).await;
+                    shell(
+                        &command,
+                        &workspace,
+                        Duration::from_millis(timeout_ms),
+                        &registry,
+                        &environment,
+                        sandbox.as_deref(),
+                    )
+                    .await?
+                };
+                let bytes = stdout.len() + stderr.len();
+                registry
+                    .off_runtime(bytes, move |registry| {
+                        registry.shell_outcome(stdout, stderr, exit, elapsed)
+                    })
+                    .await
             };
             // A command still running as the daemon stops is dropped, which
             // kills its group; its handle then reports the process lost, as
@@ -2298,6 +2331,49 @@ fn truncate(text: &str, dropped: u64) -> String {
     )
 }
 
+/// Output up to this many bytes is redacted on the runtime's thread: about
+/// half a millisecond with the default fields and blocks and a few
+/// credentials. Past it the scans take milliseconds (8 ms a MiB), so they
+/// run on a blocking thread.
+const INLINE_BYTES: usize = 64 * 1024;
+
+/// Bytes of output redacted on blocking threads at once: a few of the
+/// largest results for each logical CPU, so a burst of large outputs waits
+/// its turn rather than taking every blocking thread.
+fn heavy_bytes() -> usize {
+    let cpus = std::thread::available_parallelism().map_or(4, |n| n.get());
+    (cpus * 2 * (ARTIFACT_BYTES + PREVIEW_BYTES)).min(u32::MAX as usize)
+}
+
+impl Registry {
+    /// Run `work` over `bytes` of output: here when they are few, or else on
+    /// a blocking thread once the bytes being worked on there leave room,
+    /// as Tokio's `spawn_blocking` is meant for CPU-bound work.
+    async fn off_runtime<T: Send + 'static>(
+        &self,
+        bytes: usize,
+        work: impl FnOnce(&Registry) -> T + Send + 'static,
+    ) -> Result<T> {
+        if bytes <= INLINE_BYTES {
+            return Ok(work(self));
+        }
+        let wanted = bytes.min(heavy_bytes()) as u32;
+        let permit = self
+            .heavy
+            .clone()
+            .acquire_many_owned(wanted)
+            .await
+            .map_err(|_| Error::new("tool_scheduler_closed"))?;
+        let registry = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            work(&registry)
+        })
+        .await
+        .map_err(|_| Error::new("tool_redaction_failed"))
+    }
+}
+
 /// What a stream wrote, bounded: all of it up to `ARTIFACT_BYTES`, past
 /// that its first and last `KEPT_END` bytes and a count of the rest.
 #[derive(Default)]
@@ -2307,6 +2383,9 @@ struct Captured {
     dropped: u64,
 }
 impl Captured {
+    fn len(&self) -> usize {
+        self.head.len() + self.tail.len()
+    }
     /// Output past the head. Once the whole would pass the bound, the tail
     /// keeps only its last `KEPT_END` bytes.
     fn keep(&mut self, bytes: &[u8]) {

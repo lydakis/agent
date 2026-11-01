@@ -6631,3 +6631,44 @@ when the service takes the request up. No measure moves past 2.2%, inside
 the runner's spread between screens (release to terminal read 17.35 and
 17.24 ms on the base across the last two), and store jobs per turn held
 at about 7.5.
+
+## Redaction cost by size (#316)
+
+This measures `Credentials::redact` in release mode with the CLI's default
+fields (`agent_client::SECRET_FIELDS`), the `PRIVATE KEY` block, and eight
+credentials, over prose that mentions `password` and `key:` on every line.
+Each figure is the mean of 20 runs on a 4-core Linux container.
+
+| Output | 4 KiB | 16 KiB | 64 KiB | 256 KiB | 1 MiB | 4 MiB |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Redaction | 0.04 ms | 0.13 ms | 0.49 ms | 2.2 ms | 7.7 ms | 35 ms |
+
+Output up to 64 KiB is still redacted inline, which costs at most half a
+millisecond. Anything larger goes to `spawn_blocking` under a byte budget of
+two of the largest results per logical CPU. A busy fleet's 1 MiB shell
+outputs and 4 MiB pages therefore no longer stall the daemon's runtime for
+8 to 35 ms each.
+
+The matched screen (CI `screen` job, base 33f5e38 against head 4cfe08a,
+two alternating rounds on one runner) shows nothing moving outside the
+runner's spread. No store-work count changed, since the change only moves
+where redaction runs. The screen's outputs are all under 64 KiB and stay
+inline, so it measures the cost the change adds to every tool result: one
+`Arc` clone of the credential set and a length check.
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 29.789 | 29.862 | +0.2% |
+| admission | burst submit p99, ms | 3.299 | 3.072 | -6.9% |
+| completion | release to terminal p99, ms | 8.971 | 8.822 | -1.7% |
+| footprint | idle RSS, MiB | 20.506 | 20.4 | -0.5% |
+| footprint | per idle bot, KiB | 1.352 | 1.454 | +7.5% |
+| footprint | RSS after a turn each, MiB | 28.4 | 28.268 | -0.5% |
+| footprint | CPU per turn, ms | 0.934 | 0.884 | -5.3% |
+| lifecycle | CPU, s | 0.865 | 0.845 | -2.3% |
+| lifecycle | p95 turn, ms | 577.489 | 578.919 | +0.2% |
+| lifecycle | peak RSS, MiB | 27.01 | 27.031 | +0.1% |
+
+The per-idle-bot figure is about a tenth of a KiB on a 1.4 KiB measure,
+which is within that figure's spread between runs; this change adds no
+per-bot state.

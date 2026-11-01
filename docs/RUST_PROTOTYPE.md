@@ -2390,7 +2390,10 @@ one the daemon was started with (`--redact-field`, any case, with or without
 `_` or `-`, as `NAME=`, `NAME:` or `"NAME":`), when it is at least 8 bytes and
 mixes letters and digits; and the body of a PEM block whose header names a
 `--redact-block` label. Which names count as secrets is the client's
-judgement: the CLI passes `agent_client::SECRET_FIELDS` and `PRIVATE KEY`. Results include separate output, exit code, and
+judgement: the CLI passes `agent_client::SECRET_FIELDS` and `PRIVATE KEY`. A command's or a fetched page's output
+over 64 KiB is redacted on a blocking thread rather than the runtime's (a
+MiB takes about 8 ms), and those threads work on at most two of the largest
+results per logical CPU at once. Results include separate output, exit code, and
 success status. Nonzero exit is a recorded tool result. A command's return,
 timeout, or overflow kills its owned process group, so a process it started
 with `&` does not outlive it; the tool description tells the model so. A
