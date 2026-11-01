@@ -298,7 +298,8 @@ class Bench:
         folder.mkdir(exist_ok=True)
         for p in range(self.args.projects):
             tasks = {'name': 'tasks', 'tasks_of': [f'p{p}.lead'], 'bots': [f'p{p}.*']}
-            if self.args.rules:
+            # Benches that set up through this one may say nothing of rules.
+            if getattr(self.args, 'rules', False):
                 # Every event built and matched, none held or dropped: the
                 # rules' own cost, with the notes going as they would.
                 tasks['filter'] = {'type': [{'anything-but': 'note.changed'}]}
