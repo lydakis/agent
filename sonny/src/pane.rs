@@ -91,6 +91,9 @@ pub struct Pane {
     /// It has the window to itself, the conversation a key away, as a
     /// window too narrow for both shows one at a time.
     pub alone: bool,
+    /// The columns the switch key's hint was last drawn at on its title,
+    /// which a click on takes the keys over, as the key does.
+    switch_at: Option<(u16, u16)>,
     /// The agent whose Sonny the program is, which the title's button
     /// opens in the main view; and that button's columns as last drawn.
     pub agent: Option<String>,
@@ -195,6 +198,7 @@ impl Pane {
             margin: false,
             over: false,
             alone: false,
+            switch_at: None,
             agent: None,
             main_at: None,
             name_at: None,
@@ -315,6 +319,7 @@ impl Pane {
             margin: false,
             over: false,
             alone: false,
+            switch_at: None,
             agent: None,
             main_at: None,
             name_at: None,
@@ -346,6 +351,7 @@ impl Pane {
             margin: false,
             over: false,
             alone: false,
+            switch_at: None,
             agent: None,
             main_at: None,
             name_at: None,
@@ -401,6 +407,11 @@ impl Pane {
         self.margin
     }
 
+    /// What its first row names it.
+    pub fn title(&self) -> &str {
+        &self.title
+    }
+
     /// The margin's lines, with their tags and buttons, put in only when
     /// they changed, as [`Pane::set_card`] puts a card's; and its first row.
     pub fn set_margin(
@@ -431,6 +442,11 @@ impl Pane {
             && (from..to).contains(&column)
         {
             return Some(format!("{}tab/{agent}", crate::screen::BUTTON));
+        }
+        if let Some((from, to)) = self.switch_at
+            && (from..to).contains(&column)
+        {
+            return Some(format!("{}switch", crate::screen::BUTTON));
         }
         let (_, buttons) = self.head.as_ref()?;
         (buttons.iter())
@@ -555,6 +571,10 @@ impl Pane {
                 head.iter().map(|s| s.content.width()).sum::<usize>() + self.title.width() + button;
             keys = fit_keys(&keys, (area.width as usize).saturating_sub(name));
         }
+        // The switch key's hint is a button too: where it sits, as the
+        // keys end at the title's right edge.
+        let from = area.x + (area.width as usize).saturating_sub(keys.width()) as u16;
+        self.switch_at = switch_hint(&keys, focused, switch).map(|(a, b)| (from + a, from + b));
         // Keys in their one grammar while they go here, else dim.
         let key_spans = match focused {
             true => crate::hint::spans(&keys),
@@ -688,6 +708,21 @@ fn is_markdown(path: &Path) -> bool {
         .unwrap_or_default()
         .to_lowercase();
     matches!(extension.as_str(), "md" | "markdown" | "mdx")
+}
+
+/// The columns within `keys`, as the title holds them, of the hint for
+/// the key that moves the keys between the conversation and the pane:
+/// `ctrl+\ conversation` while they are here, `tab focus` while not.
+fn switch_hint(keys: &str, focused: bool, switch: &str) -> Option<(u16, u16)> {
+    let said = match focused {
+        true => SWITCH,
+        false => switch,
+    };
+    let start = keys.find(said)?;
+    let end = keys[start..]
+        .find(" · ")
+        .map_or(keys.trim_end().len(), |at| start + at);
+    Some((keys[..start].width() as u16, keys[..end].width() as u16))
 }
 
 /// `keys`, padded as the title holds them, in at most `room` columns. "← back"
@@ -951,7 +986,10 @@ mod tests {
         // Too narrow for both: the name stays, the button goes.
         let head = rows(&mut pane, 24, 3).remove(0);
         assert!(!head.contains('↗'), "{head}");
-        assert_eq!(pane.head_button(column), None);
+        assert_ne!(
+            pane.head_button(column).as_deref(),
+            Some("sonny:main/shop.fix")
+        );
     }
 
     #[test]
@@ -1005,6 +1043,12 @@ mod tests {
         // Narrow, the pick goes before the way back does.
         let head = rows(&mut pane, 44, 3).remove(0);
         assert!(head.ends_with("ctrl+\\ conversation · esc close"), "{head}");
+        // The hint is a button that does what the key does.
+        let column = pane.area.x + 43 - "ctrl+\\ conversation · esc close".width() as u16;
+        assert_eq!(
+            pane.head_button(column).as_deref(),
+            Some(&*format!("{}switch", crate::screen::BUTTON))
+        );
         // Beside the conversation it needs no saying.
         pane.alone = false;
         let head = rows(&mut pane, 70, 3).remove(0);

@@ -8734,6 +8734,10 @@ impl App {
                 self.jump = Some((pin, JUMP_PAGES));
             }
             "back" => self.close_pane(true),
+            // The pane's switch hint, or the footer's for a pane folded
+            // away: the keys, and in a window with room for one, the view,
+            // over to the other.
+            "switch" if self.pane.is_some() => self.pane_keys = !self.pane_keys,
             _ => self.pressed.push(what.to_owned()),
         }
     }
@@ -11742,6 +11746,26 @@ impl App {
                 ]],
             ));
             return footer::lay(items, width);
+        }
+        // The pane folded away where the window has room for one of the
+        // two: its key and its name, a click flipping over to it.
+        let room = pane::width(self.full_width, PROSE as u16 + GUTTER);
+        if let Some(open) = &self.pane
+            && !open.is_margin()
+            && !self.pane_keys
+            && room == self.full_width
+        {
+            let key = Span::raw(pane::SWITCH);
+            items.push(
+                Item::new(
+                    Slot::Folded,
+                    vec![
+                        vec![key.clone(), Span::raw(format!(" {}", open.title())).dim()],
+                        vec![key, Span::raw(" pane").dim()],
+                    ],
+                )
+                .opens("switch"),
+            );
         }
         let (working, waiting) = self.agents();
         // Marks as the roster and /status draw them, each with its word,
@@ -17501,6 +17525,17 @@ mod tests {
         assert_eq!((chat.width, pane.map(|m| m.width)), (100, Some(66)));
         let (chat, pane) = app.split(Rect::new(0, 0, 130, 40));
         assert_eq!((chat.width, pane.map(|m| m.width)), (0, Some(130)));
+        // The conversation back, the footer says how over to the pane,
+        // and a click on that does it.
+        app.full_width = 130;
+        app.pane_keys = false;
+        let (line, opens) = app.footer(130);
+        assert!(line.to_string().contains("ctrl+\\ status"), "{line}");
+        assert!(opens.iter().any(|(_, link)| *link == "switch"));
+        app.follow(&format!("{}switch", screen::BUTTON));
+        assert!(app.pane_keys);
+        app.full_width = 170;
+        assert!(!app.footer(170).0.to_string().contains("ctrl+\\"));
         app.close_pane(false);
         // A note's marker clicked shows it there too.
         app.pane_keys = false;
