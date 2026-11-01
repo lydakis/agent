@@ -2708,6 +2708,17 @@ fn seat_profile(
     }
 }
 
+/// `bot` as the person says it: a lead by its project, as `shop lead`,
+/// any other agent by its own name.
+fn spoken(bot: &str) -> String {
+    match project::lead_project(bot) {
+        Some(project) => lead_title(project, bot),
+        None => bot.to_owned(),
+    }
+}
+
+/// A lead as the person tells it apart: `shop lead` for the folder's
+/// first, `shop lead billing` for `shop.lead.billing`.
 fn lead_title(project: &str, bot: &str) -> String {
     match bot.ends_with(".lead") {
         true => format!("{project} lead"),
@@ -5064,7 +5075,7 @@ impl App {
         }
         program.env("TERM", "xterm-256color");
         let height = self.height.saturating_sub(2).max(2) as u16;
-        let width = match pane::width(self.full_width, PROSE as u16) {
+        let width = match pane::width(self.full_width, PROSE as u16 + GUTTER) {
             0 => 80,
             width => width,
         };
@@ -7452,7 +7463,7 @@ impl App {
                 .iter()
                 .position(|bot| *bot == named);
         }
-        self.open_pane(pane::Pane::card("/status", PICK_KEYS));
+        self.open_pane(pane::Pane::card("status", PICK_KEYS));
     }
 
     /// What runs for the project's agents with no one typing:
@@ -7484,7 +7495,7 @@ impl App {
             picked: None,
             pick: None,
         });
-        self.open_pane(pane::Pane::card("/background", STATUS_KEYS));
+        self.open_pane(pane::Pane::card("background", STATUS_KEYS));
     }
 
     /// The tokens the project's agents spent, or every agent's, over
@@ -7508,7 +7519,7 @@ impl App {
             picked: None,
             pick: None,
         });
-        self.open_pane(pane::Pane::card("/usage", STATUS_KEYS));
+        self.open_pane(pane::Pane::card("usage", STATUS_KEYS));
     }
 
     /// What the agents of every project share: `/commons` in the pane,
@@ -7532,7 +7543,7 @@ impl App {
             picked: None,
             pick: None,
         });
-        self.open_pane(pane::Pane::card("/commons", STATUS_KEYS));
+        self.open_pane(pane::Pane::card("commons", STATUS_KEYS));
     }
 
     /// Every agent the daemon keeps, lit up live as they talk: `/sky` in
@@ -7552,7 +7563,7 @@ impl App {
             picked: None,
             pick: None,
         });
-        self.open_pane(pane::Pane::card("/sky", STATUS_KEYS));
+        self.open_pane(pane::Pane::card("sky", STATUS_KEYS));
     }
 
     /// `view` read from the daemon again.
@@ -8400,7 +8411,7 @@ impl App {
                         }
                         // ‹ and › go back and forward, as a browser's do.
                         if down && let Some(back) = pane.on_arrow(mouse.column, mouse.row) {
-                            self.go(back);
+                            self.step_pane(back);
                             return true;
                         }
                         // A click on its name opens the file outside Sonny.
@@ -8654,7 +8665,10 @@ impl App {
                         self.copied(&text);
                     }
                     // Back and forward through what the pane has shown.
-                    KeyCode::Left | KeyCode::Backspace if pane.can_go(true) => self.go(true),
+                    // Back to the margin from the first thing over it, as ‹ goes.
+                    KeyCode::Left | KeyCode::Backspace if pane.goes_back() => {
+                        self.step_pane(true);
+                    }
                     KeyCode::Right if pane.can_go(false) => self.go(false),
                     KeyCode::Up => pane.screen.scroll(1),
                     KeyCode::Down => pane.screen.scroll(-1),
@@ -9003,6 +9017,12 @@ impl App {
                 self.jump = Some((pin, JUMP_PAGES));
             }
             "back" => self.close_pane(true),
+            // The pane's switch hint, or the footer's for a pane folded
+            // away: the keys, and in a window with room for one, the view,
+            // over to the other.
+            "switch" if self.pane.is_some() => self.pane_keys = !self.pane_keys,
+            // An unfocused pane's `tab focus` hint: the keys to it.
+            "focus" if self.pane.is_some() => self.pane_keys = true,
             _ => self.pressed.push(what.to_owned()),
         }
     }
@@ -9138,7 +9158,7 @@ impl App {
     /// The file `link` names, read for the pane at its width.
     fn preview(&self, link: &str) -> Result<pane::Pane, String> {
         let workspace = std::path::Path::new(&self.workspace);
-        let width = pane::width(self.full_width, PROSE as u16).max(20) as usize;
+        let width = pane::width(self.full_width, PROSE as u16 + GUTTER).max(20) as usize;
         pane::Pane::preview(link, workspace, width)
     }
 
@@ -9193,10 +9213,9 @@ impl App {
         if open.is_margin() && (margin.is_none() || self.zen.is_some()) && !self.pane_keys {
             return (self.centred(area), None);
         }
-        let pane = match margin.filter(|_| open.is_margin()) {
-            Some(margin) => margin,
-            None => pane::width(area.width, prose),
-        };
+        // One width for all the pane shows: the conversation keeps its
+        // columns where the window has room, so nothing opening moves it.
+        let pane = pane::width(area.width, prose);
         if pane == area.width {
             return match self.pane_keys {
                 true => (Rect { width: 0, ..area }, Some(area)),
@@ -10047,7 +10066,7 @@ impl App {
             let lines = mcp::card();
             // In the place of `/status` or `/background`, if open.
             self.watch = None;
-            let mut pane = pane::Pane::card("/mcp", "esc close");
+            let mut pane = pane::Pane::card("MCP servers", "esc close");
             pane.set_card(lines, "esc close");
             self.open_pane(pane);
             return;
@@ -10856,7 +10875,8 @@ impl App {
             args.extend(["--model".to_owned(), model.clone()]);
         }
         // Beside the conversation, on a terminal of its own.
-        if let Err(error) = self.embed("side chat", &args) {
+        let title = format!("side chat with {}", spoken(&self.bot));
+        if let Err(error) = self.embed(&title, &args) {
             self.notice = Some(format!("no side chat: {error}"));
         }
     }
@@ -11245,7 +11265,7 @@ impl App {
             && self.pane.as_ref().is_some_and(pane::Pane::is_margin)
         {
             let live = self.running.as_ref().map(|running| running.turn);
-            let width = at.width.saturating_sub(1) as usize;
+            let width = (at.width.saturating_sub(1) as usize).min(PROSE);
             let (lines, marks) = self.margin.lines(width, &workspace, live);
             let glance = self.glance().line();
             if let Some(pane) = &mut self.pane {
@@ -11260,10 +11280,15 @@ impl App {
         {
             let wide = match chat.width {
                 0 => size.width,
-                _ => pane::width(size.width, PROSE as u16),
+                _ => pane::width(size.width, PROSE as u16 + GUTTER),
             };
-            let width = wide.saturating_sub(2) as usize;
+            // The sky fills the pane, however wide; the other cards are
+            // prose, read at the conversation's measure.
+            let full = wide.saturating_sub(2) as usize;
+            let width = full.min(PROSE);
+            pane.prose = watch.sky.is_none();
             if let Some(view) = &mut watch.sky {
+                let width = full;
                 view.drain();
                 let rows = size.height.saturating_sub(4) as usize;
                 let lines: Vec<Line<'static>> = (view.card(width.saturating_sub(1), rows))
@@ -11293,8 +11318,8 @@ impl App {
                         Line::from(spans).style(line.style)
                     })
                     .collect();
-                pane.set_card(lines, STATUS_KEYS);
-                pane.foot = Some(view.footer());
+                pane.set_card(lines, &view.keys());
+                pane.foot = view.footer();
                 // A new pick is scrolled to, with the two rows under it.
                 if watch.picked != Some(at) {
                     watch.picked = Some(at);
@@ -11310,8 +11335,8 @@ impl App {
                         Line::from(spans).style(line.style)
                     })
                     .collect();
-                pane.set_card(lines, STATUS_KEYS);
-                pane.foot = Some(view.footer());
+                pane.set_card(lines, view.keys());
+                pane.foot = view.footer();
                 if view.reading() {
                     // A thread just opened starts at its top, after the
                     // card's swap kept the list's scroll.
@@ -11333,17 +11358,17 @@ impl App {
                         Line::from(spans).style(line.style)
                     })
                     .collect();
-                pane.set_card(lines, STATUS_KEYS);
-                pane.foot = Some(view.footer());
+                pane.set_card(lines, &view.keys());
+                pane.foot = None;
             } else {
                 let (mut lines, any_resolved, marks) = watch_card(watch, width, &self.bot);
                 let mut picked = None;
-                // The agent picked from the keys leads with `›`, as a
-                // pick in Codex's lists does.
+                // The agent picked from the keys is drawn as the picker
+                // draws its pick, reversed.
                 if let Some(&(row, _)) = watch.pick.and_then(|pick| marks.get(pick))
-                    && let Some(first) = lines.get_mut(row).and_then(|line| line.spans.first_mut())
+                    && let Some(line) = lines.get_mut(row)
                 {
-                    *first = Span::raw("›").bold();
+                    list::pick(line);
                     picked = Some(row);
                 }
                 let keys = match any_resolved && watch.resolved {
@@ -11384,6 +11409,7 @@ impl App {
                         .or_else(|| links::file_line(&workspace, word))
                         .or_else(|| self.names.borrow_mut().link(word))
                 };
+                open.alone = area.width == 0;
                 pane_cursor = open.render(at, frame.buffer_mut(), self.pane_keys, switch, file);
                 linked.extend(open.screen.link_cells(frame.buffer_mut()));
                 // The line between them, as a split's.
@@ -11852,6 +11878,8 @@ impl App {
             // Named, so a message typed in the wrong pane is caught first.
             let name = match &self.project {
                 Some(project) => lead_title(project, &self.bot),
+                // A side chat by what it is, not the copy's own id.
+                None if self.options.side.is_some() => "the side chat".to_owned(),
                 None => self.bot.clone(),
             };
             // What Enter does, muted, then its keys in the one grammar.
@@ -12176,10 +12204,30 @@ impl App {
             items.push(Item::new(
                 Slot::Side,
                 vec![vec![
-                    Span::raw(format!("side chat with {with} · esc back")).dim(),
+                    Span::raw(format!("side chat with {} · esc back", spoken(with))).dim(),
                 ]],
             ));
             return footer::lay(items, width);
+        }
+        // The pane folded away where the window has room for one of the
+        // two: its key and its name, a click flipping over to it.
+        let room = pane::width(self.full_width, PROSE as u16 + GUTTER);
+        if let Some(open) = &self.pane
+            && !open.is_margin()
+            && !self.pane_keys
+            && room == self.full_width
+        {
+            let key = Span::raw(pane::SWITCH);
+            items.push(
+                Item::new(
+                    Slot::Folded,
+                    vec![
+                        vec![key.clone(), Span::raw(format!(" {}", open.title())).dim()],
+                        vec![key, Span::raw(" pane").dim()],
+                    ],
+                )
+                .opens("switch"),
+            );
         }
         let (working, waiting) = self.agents();
         // Marks as the roster and /status draw them, each with its word,
@@ -17364,7 +17412,7 @@ mod tests {
             group: status::Group::Working,
             ..Default::default()
         };
-        app.open_pane(pane::Pane::card("/status", PICK_KEYS));
+        app.open_pane(pane::Pane::card("status", PICK_KEYS));
         app.watch = Some(Watch {
             project: "calc".into(),
             rows: vec![row("add"), row("neg")],
@@ -17917,10 +17965,10 @@ mod tests {
         assert!(margin(&app) && !app.margin.closed());
         // Under what is open, to go back to; emptied there, it is still
         // there to go back to.
-        app.open_pane(pane::Pane::card("/status", STATUS_KEYS));
+        app.open_pane(pane::Pane::card("status", STATUS_KEYS));
         app.close_pane(true);
         app.close_pane(true);
-        app.open_pane(pane::Pane::card("/status", STATUS_KEYS));
+        app.open_pane(pane::Pane::card("status", STATUS_KEYS));
         let change = json!({"id": "repro", "markdown": "y"});
         app.margin.apply("m4", &change, None, None);
         app.margin_back();
@@ -17960,7 +18008,7 @@ mod tests {
         app.margin.apply("m1", &post, None, None);
         app.margin_back();
         assert!(app.pane.as_ref().is_some_and(pane::Pane::is_margin));
-        app.open_pane(pane::Pane::card("/status", STATUS_KEYS));
+        app.open_pane(pane::Pane::card("status", STATUS_KEYS));
         assert!(app.pane.as_ref().is_some_and(|p| p.is_card() && p.over));
         assert!(app.under.is_some());
         // Esc: back to the margin, the keys with it.
@@ -17972,7 +18020,7 @@ mod tests {
         app.margin_back();
         assert!(app.pane.is_none() && app.margin.closed());
         // A card opened now has no margin under it.
-        app.open_pane(pane::Pane::card("/status", STATUS_KEYS));
+        app.open_pane(pane::Pane::card("status", STATUS_KEYS));
         assert!(!app.pane.as_ref().unwrap().over);
         app.close_pane(true);
         assert!(app.pane.is_none());
@@ -17988,7 +18036,7 @@ mod tests {
         let post = json!({"id": "repro", "title": "Repro", "markdown": "x"});
         app.margin.apply("m1", &post, None, None);
         app.margin_back();
-        app.open_pane(pane::Pane::card("/status", STATUS_KEYS));
+        app.open_pane(pane::Pane::card("status", STATUS_KEYS));
         assert!(app.step_pane(true));
         assert!(app.pane.as_ref().is_some_and(pane::Pane::is_margin));
         // The margin has nothing before it, and stays.
@@ -18137,10 +18185,31 @@ mod tests {
         assert_eq!((chat.width, margin.map(|m| m.width)), (100, Some(66)));
         let (chat, margin) = app.split(Rect::new(0, 0, 130, 40));
         assert_eq!((chat.width, margin), (130, None));
-        // Asked for with Tab, it takes its half as anything opened does.
+        // Asked for with Tab, it has the window to itself, as anything
+        // opened in a window too narrow for both does, the conversation
+        // a key away.
         app.pane_keys = true;
-        let (_, margin) = app.split(Rect::new(0, 0, 130, 40));
-        assert_eq!(margin.map(|m| m.width), Some(63));
+        let (chat, margin) = app.split(Rect::new(0, 0, 130, 40));
+        assert_eq!((chat.width, margin.map(|m| m.width)), (0, Some(130)));
+        // Anything else opened takes what the margin takes, beside the
+        // conversation's 100 where there is room for both.
+        app.open_pane(pane::Pane::card("status", "esc close"));
+        let (chat, pane) = app.split(Rect::new(0, 0, 170, 40));
+        assert_eq!((chat.width, pane.map(|m| m.width)), (100, Some(66)));
+        let (chat, pane) = app.split(Rect::new(0, 0, 130, 40));
+        assert_eq!((chat.width, pane.map(|m| m.width)), (0, Some(130)));
+        // The conversation back, the footer says how over to the pane,
+        // and a click on that does it.
+        app.full_width = 130;
+        app.pane_keys = false;
+        let (line, opens) = app.footer(130);
+        assert!(line.to_string().contains("ctrl+\\ status"), "{line}");
+        assert!(opens.iter().any(|(_, link)| *link == "switch"));
+        app.follow(&format!("{}switch", screen::BUTTON));
+        assert!(app.pane_keys);
+        app.full_width = 170;
+        assert!(!app.footer(170).0.to_string().contains("ctrl+\\"));
+        app.close_pane(false);
         // A note's marker clicked shows it there too.
         app.pane_keys = false;
         app.follow("sonny:note/repro");

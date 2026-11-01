@@ -15,9 +15,9 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::screen::Screen;
 
-/// The narrowest the conversation and the pane are side by side; a
-/// window narrower than both shows one of them at a time.
-pub const NARROWEST: u16 = 50;
+/// The key that moves the keys between the conversation and the pane, and
+/// in a window too narrow for both, which of them shows.
+pub const SWITCH: &str = "ctrl+\\";
 /// The narrowest the margin is shown by itself, beside a conversation
 /// that has all it is written at.
 pub const MARGIN: u16 = 40;
@@ -30,15 +30,13 @@ const MOST_LINES: usize = 9_000;
 const ABOVE: usize = 3;
 
 /// How wide the pane is in a window `width` columns wide, beside a
-/// conversation written at most `prose` wide: half the window, or more
-/// when the conversation has all it is written at beside it; and all of
-/// a window too narrow for both, where it is shown while keys go to it.
+/// conversation written at most `prose` wide, whatever it shows: what the
+/// conversation leaves when it keeps all it is written at, as the margin
+/// takes, so opening a file or a card never moves it. A window with less
+/// room than [`MARGIN`] beside it shows one at a time: all pane while the
+/// keys are in it, [`SWITCH`] back to the conversation.
 pub fn width(width: u16, prose: u16) -> u16 {
-    if width < 2 * NARROWEST + 1 {
-        return width;
-    }
-    let rest = width - 1;
-    (rest / 2).max(rest.saturating_sub(prose))
+    margin_width(width, prose).unwrap_or(width)
 }
 
 /// How wide the margin is by itself in a window `width` columns wide,
@@ -64,16 +62,17 @@ pub struct Pane {
     /// (`/status`), rather than a file read once.
     card: Option<Vec<Line<'static>>>,
     /// What the keys do here, after the title while they go to it.
-    keys: &'static str,
+    keys: String,
     /// A program drawn here instead of rows: a side chat's Sonny.
     pub program: Option<crate::embed::Embedded>,
     /// A line kept on the last row under a card, however it is scrolled:
     /// `/background`'s keys, or what its last key did.
     pub foot: Option<Line<'static>>,
     /// Its rows are prose, read at the width the conversation is written
-    /// at however wide the pane: Markdown and plain text. Code, pictures,
-    /// diagrams and pages go as wide as the pane.
-    prose: bool,
+    /// at however wide the pane, its title over them as wide: Markdown,
+    /// plain text, a tree, the margin and the cards. Code, pictures,
+    /// diagrams, pages and the sky go as wide as the pane.
+    pub prose: bool,
     /// What the pane showed before, as a browser keeps it, the latest
     /// last, each as it was left; and what it went back from.
     back: Vec<Pane>,
@@ -89,6 +88,15 @@ pub struct Pane {
     margin: bool,
     /// The margin is under it, which its title's arrow goes back to.
     pub over: bool,
+    /// It has the window to itself, the conversation a key away, as a
+    /// window too narrow for both shows one at a time.
+    pub alone: bool,
+    /// The columns the switch key's hint was last drawn at on its title,
+    /// which a click on takes the keys over, as the key does.
+    switch_at: Option<(u16, u16)>,
+    /// The keys were here when it was last drawn: its switch hint went
+    /// back to the conversation then, and took them over while not.
+    focused: bool,
     /// The agent whose Sonny the program is, which the title's button
     /// opens in the main view; and that button's columns as last drawn.
     pub agent: Option<String>,
@@ -108,10 +116,10 @@ pub struct Pane {
 /// is back's.
 const MAIN: &str = " ↗";
 /// What the keys do on an agent's Sonny in the pane.
-const AGENT_KEYS: &str = "ctrl+g main view · ctrl+\\ chat";
+const AGENT_KEYS: &str = "ctrl+g main view · ctrl+\\ conversation";
 /// The same, for one laid out in a multiplexer, whose tab its name and
 /// Ctrl+T go to.
-const LAID_OUT_KEYS: &str = "ctrl+g main view · ctrl+\\ chat · ctrl+t its tab";
+const LAID_OUT_KEYS: &str = "ctrl+g main view · ctrl+t its tab · ctrl+\\ conversation";
 
 /// Ctrl+G, which opens the agent in the pane in the main view, as its
 /// title's button does: no Sonny key takes it.
@@ -180,7 +188,7 @@ impl Pane {
             screen,
             area: Rect::default(),
             card: None,
-            keys: "esc close",
+            keys: "esc close".into(),
             program: None,
             foot: None,
             prose,
@@ -192,6 +200,9 @@ impl Pane {
             marks: Vec::new(),
             margin: false,
             over: false,
+            alone: false,
+            switch_at: None,
+            focused: false,
             agent: None,
             main_at: None,
             name_at: None,
@@ -265,23 +276,33 @@ impl Pane {
     }
 
     /// Whether `(column, row)` is on the title's ‹ (true) or › (false),
-    /// shown while there is somewhere to go back or forward to.
+    /// while it goes somewhere: back is what was shown before, or the
+    /// margin under it, the first step back.
     pub fn on_arrow(&self, column: u16, row: u16) -> Option<bool> {
-        if row != self.area.y || (self.back.is_empty() && self.forward.is_empty()) {
+        if row != self.area.y || !self.arrows() {
             return None;
         }
-        // After the margin's ←, when there is one.
-        let at = column.checked_sub(self.area.x + 2 * self.over as u16)?;
-        match at {
-            1 => Some(true),
-            3 => Some(false),
+        match column.checked_sub(self.area.x)? {
+            1 if self.goes_back() => Some(true),
+            3 if !self.forward.is_empty() => Some(false),
             _ => None,
         }
     }
 
+    /// Whether back goes somewhere: to what was shown before, or to the
+    /// margin under it.
+    pub fn goes_back(&self) -> bool {
+        self.over || !self.back.is_empty()
+    }
+
+    /// Whether the title shows ‹ and ›: while either goes somewhere.
+    fn arrows(&self) -> bool {
+        self.goes_back() || !self.forward.is_empty()
+    }
+
     /// A card titled `title` whose lines the app sets as they change,
     /// as `/status` counts on; `keys` says what the keys do on it.
-    pub fn card(title: &str, keys: &'static str) -> Self {
+    pub fn card(title: &str, keys: &str) -> Self {
         Self {
             title: title.to_owned(),
             link: None,
@@ -289,10 +310,10 @@ impl Pane {
             screen: Screen::default(),
             area: Rect::default(),
             card: Some(Vec::new()),
-            keys,
+            keys: keys.to_owned(),
             program: None,
             foot: None,
-            prose: false,
+            prose: true,
             back: Vec::new(),
             forward: Vec::new(),
             tree: None,
@@ -301,6 +322,9 @@ impl Pane {
             marks: Vec::new(),
             margin: false,
             over: false,
+            alone: false,
+            switch_at: None,
+            focused: false,
             agent: None,
             main_at: None,
             name_at: None,
@@ -319,7 +343,7 @@ impl Pane {
             screen: Screen::default(),
             area: Rect::default(),
             card: None,
-            keys: "ctrl+\\ chat",
+            keys: "ctrl+\\ conversation".into(),
             program: Some(program),
             foot: None,
             prose: false,
@@ -331,6 +355,9 @@ impl Pane {
             marks: Vec::new(),
             margin: false,
             over: false,
+            alone: false,
+            switch_at: None,
+            focused: false,
             agent: None,
             main_at: None,
             name_at: None,
@@ -348,7 +375,8 @@ impl Pane {
         self.keys = match tab {
             true => LAID_OUT_KEYS,
             false => AGENT_KEYS,
-        };
+        }
+        .to_owned();
     }
 
     /// Whether Ctrl+T goes to the agent's tab.
@@ -385,6 +413,11 @@ impl Pane {
         self.margin
     }
 
+    /// What its first row names it.
+    pub fn title(&self) -> &str {
+        &self.title
+    }
+
     /// The margin's lines, with their tags and buttons, put in only when
     /// they changed, as [`Pane::set_card`] puts a card's; and its first row.
     pub fn set_margin(
@@ -406,9 +439,6 @@ impl Pane {
     /// glance, or the arrow back to the margin.
     pub fn head_button(&self, column: u16) -> Option<String> {
         let at = column.checked_sub(self.area.x)?;
-        if self.over && at < 3 {
-            return Some(format!("{}back", crate::screen::BUTTON));
-        }
         if let (Some(agent), Some((from, to))) = (&self.agent, self.main_at)
             && (from..to).contains(&column)
         {
@@ -419,6 +449,17 @@ impl Pane {
         {
             return Some(format!("{}tab/{agent}", crate::screen::BUTTON));
         }
+        if let Some((from, to)) = self.switch_at
+            && (from..to).contains(&column)
+        {
+            // Unfocused, the hint says `tab focus`: a click there gives
+            // the pane the keys, as a click anywhere on it already has.
+            let what = match self.focused {
+                true => "switch",
+                false => "focus",
+            };
+            return Some(format!("{}{what}", crate::screen::BUTTON));
+        }
         let (_, buttons) = self.head.as_ref()?;
         (buttons.iter())
             .find(|(from, to, _)| (*from..*to).contains(&at))
@@ -427,7 +468,7 @@ impl Pane {
 
     /// A card's lines, put in only when they changed, so a selection in
     /// them lasts while they do not, and the view stays where it was.
-    pub fn set_card(&mut self, lines: Vec<Line<'static>>, keys: &'static str) {
+    pub fn set_card(&mut self, lines: Vec<Line<'static>>, keys: &str) {
         self.set_card_marked(lines, Vec::new(), keys);
     }
 
@@ -437,9 +478,11 @@ impl Pane {
         &mut self,
         lines: Vec<Line<'static>>,
         marks: Vec<(usize, crate::screen::Mark)>,
-        keys: &'static str,
+        keys: &str,
     ) {
-        self.keys = keys;
+        if self.keys != keys {
+            self.keys = keys.to_owned();
+        }
         if self.card.as_ref() != Some(&lines) || self.marks != marks {
             self.screen.replace_marked(lines.clone(), marks.clone());
             self.card = Some(lines);
@@ -475,14 +518,31 @@ impl Pane {
         switch: &str,
         file: impl Fn(&str) -> Option<String>,
     ) -> Option<(u16, u16)> {
+        // Prose and its title read at the conversation's measure, a column
+        // in from the line between; what is left of a wide pane stays
+        // empty on the right, as beside the conversation alone.
+        let measure = crate::PROSE as u16 + 1;
+        let area = match self.prose && self.program.is_none() {
+            true => Rect {
+                width: area.width.min(measure),
+                ..area
+            },
+            false => area,
+        };
         self.area = area;
         if area.height == 0 {
             return None;
         }
+        // Alone, the way back to the conversation comes first after back,
+        // the last of the keys to go when the title runs out of room.
+        let own = match self.alone && !self.keys.contains(SWITCH) {
+            true => format!("{SWITCH} conversation · {}", self.keys),
+            false => self.keys.clone(),
+        };
         let mut keys = match focused {
-            true if !self.back.is_empty() => format!("  ← back · {} ", self.keys),
-            true => format!("  {} ", self.keys),
-            false => format!("  {switch} "),
+            true if self.goes_back() => format!("  ← back · {own} "),
+            true => format!("  {own} "),
+            false => format!("  {switch} focus "),
         };
         let mut style = Style::new();
         // A file's name is a link to it. A laid out agent's goes to its
@@ -498,24 +558,21 @@ impl Pane {
         } else {
             style = style.add_modifier(Modifier::BOLD);
         }
-        // ← goes back to the margin under it, and ‹ › back and forward,
-        // while there is somewhere to go.
+        // ‹ and › go back and forward as a browser's do, the margin under
+        // what is open the first step back, while either goes somewhere.
         let mut head = vec![Span::raw(" ")];
-        if self.over {
-            head.push(Span::raw("← "));
-        }
-        if !self.back.is_empty() || !self.forward.is_empty() {
+        if self.arrows() {
             let arrow = |text, there: bool| match there {
                 true => Span::raw(text),
                 false => Span::raw(text).dark_gray(),
             };
-            head.push(arrow("‹", !self.back.is_empty()));
+            head.push(arrow("‹", self.goes_back()));
             head.push(Span::raw(" "));
             head.push(arrow("›", !self.forward.is_empty()));
             head.push(Span::raw(" "));
         }
-        // A name keeps its room: the last keys go first, as the footer's
-        // least urgent do.
+        // A name keeps its room: the keys before esc go first, from the
+        // last, as the footer's least urgent do; esc, named last, stays.
         if self.head.is_none() {
             let button = if self.agent.is_some() {
                 MAIN.width()
@@ -524,12 +581,13 @@ impl Pane {
             };
             let name =
                 head.iter().map(|s| s.content.width()).sum::<usize>() + self.title.width() + button;
-            while name + keys.width() > area.width as usize
-                && let Some((kept, _)) = keys.trim_end().rsplit_once(" · ")
-            {
-                keys = format!("{kept} ");
-            }
+            keys = fit_keys(&keys, (area.width as usize).saturating_sub(name));
         }
+        // The switch key's hint is a button too: where it sits, as the
+        // keys end at the title's right edge.
+        let from = area.x + (area.width as usize).saturating_sub(keys.width()) as u16;
+        self.switch_at = switch_hint(&keys, focused, switch).map(|(a, b)| (from + a, from + b));
+        self.focused = focused;
         // Keys in their one grammar while they go here, else dim.
         let key_spans = match focused {
             true => crate::hint::spans(&keys),
@@ -591,7 +649,7 @@ impl Pane {
             && rows.height > 2
         {
             rows.height -= 2;
-            buf.set_line(area.x, rows.bottom() + 1, foot, area.width);
+            buf.set_line(area.x, rows.bottom() + 1, &inset(foot), area.width);
         }
         match &mut self.program {
             // A column off the line between, as the title is.
@@ -663,6 +721,38 @@ fn is_markdown(path: &Path) -> bool {
         .unwrap_or_default()
         .to_lowercase();
     matches!(extension.as_str(), "md" | "markdown" | "mdx")
+}
+
+/// The columns within `keys`, as the title holds them, of the hint for
+/// the key that moves the keys between the conversation and the pane:
+/// `ctrl+\ conversation` while they are here, `tab focus` while not.
+fn switch_hint(keys: &str, focused: bool, switch: &str) -> Option<(u16, u16)> {
+    let said = match focused {
+        true => SWITCH,
+        false => switch,
+    };
+    let start = keys.find(said)?;
+    let end = keys[start..]
+        .find(" · ")
+        .map_or(keys.trim_end().len(), |at| start + at);
+    Some((keys[..start].width() as u16, keys[..end].width() as u16))
+}
+
+/// `keys`, padded as the title holds them, in at most `room` columns. "← back"
+/// goes first, since the ‹ beside the name already says it; then the pairs
+/// before the last, from the one before it, so esc, which every view names
+/// last, stays while anything does.
+fn fit_keys(keys: &str, room: usize) -> String {
+    let mut pairs: Vec<&str> = keys.trim().split(" · ").collect();
+    let said = |pairs: &[&str]| format!("  {} ", pairs.join(" · "));
+    while said(&pairs).width() > room && pairs.len() > 1 {
+        let at = match pairs.iter().position(|pair| *pair == "← back") {
+            Some(at) if at + 1 < pairs.len() => at,
+            _ => pairs.len() - 2,
+        };
+        pairs.remove(at);
+    }
+    said(&pairs)
 }
 
 /// The path and line a `file://` address names, its `%XX` escapes read.
@@ -792,7 +882,8 @@ fn preview(
         // A document reads at the conversation's width, its pictures too.
         prose = true;
         let mut markdown = crate::transcript::Markdown::document(folder);
-        let leads = (Line::from("  "), Line::from("  "));
+        // From the column the title starts at, as every row in the pane.
+        let leads = (Line::from(" "), Line::from(" "));
         let text = lines[..shown].join("\n");
         let rows = crate::transcript::markdown(&mut markdown, &text, width, leads);
         screen.push(rows);
@@ -838,6 +929,25 @@ fn list(screen: &mut Screen, line: Line<'static>, url: Option<String>) {
     }
 }
 
+/// `line` with the pane's one column of inset before it, whatever its own
+/// lead: every row in the pane starts where the title's does.
+fn inset(line: &Line<'static>) -> Line<'static> {
+    let mut spans = line.spans.clone();
+    while let Some(first) = spans.first_mut() {
+        let trimmed = first.content.trim_start();
+        if trimmed.is_empty() {
+            spans.remove(0);
+            continue;
+        }
+        if trimmed.len() != first.content.len() {
+            first.content = trimmed.to_owned().into();
+        }
+        break;
+    }
+    spans.insert(0, Span::raw(" "));
+    Line::from(spans).style(line.style)
+}
+
 fn note(text: &str) -> Line<'static> {
     Line::from(format!(" {text}")).dim()
 }
@@ -875,7 +985,10 @@ mod tests {
         pane.as_agent("shop.fix", false);
         let head = rows(&mut pane, 60, 3).remove(0);
         assert!(head.starts_with(" shop.fix ↗ "), "{head}");
-        assert!(head.ends_with("ctrl+g main view · ctrl+\\ chat"), "{head}");
+        assert!(
+            head.ends_with("ctrl+g main view · ctrl+\\ conversation"),
+            "{head}"
+        );
         let column = " shop.fix ".width() as u16;
         assert_eq!(
             pane.head_button(column).as_deref(),
@@ -886,7 +999,10 @@ mod tests {
         // Too narrow for both: the name stays, the button goes.
         let head = rows(&mut pane, 24, 3).remove(0);
         assert!(!head.contains('↗'), "{head}");
-        assert_eq!(pane.head_button(column), None);
+        assert_ne!(
+            pane.head_button(column).as_deref(),
+            Some("sonny:main/shop.fix")
+        );
     }
 
     #[test]
@@ -897,7 +1013,7 @@ mod tests {
         let head = rows(&mut pane, 72, 3).remove(0);
         assert!(head.starts_with(" shop.fix ↗ "), "{head}");
         assert!(
-            head.ends_with("ctrl+g main view · ctrl+\\ chat · ctrl+t its tab"),
+            head.ends_with("ctrl+g main view · ctrl+t its tab · ctrl+\\ conversation"),
             "{head}"
         );
         let name = " shop.fix".width() as u16;
@@ -911,13 +1027,16 @@ mod tests {
             pane.head_button(name + 1).as_deref(),
             Some("sonny:main/shop.fix")
         );
-        // Narrower, the keys go from the last before the name is cut.
-        let head = rows(&mut pane, 48, 3).remove(0);
+        // Narrower, the keys before the last go first, before the name is cut.
+        let head = rows(&mut pane, 56, 3).remove(0);
         assert!(head.starts_with(" shop.fix ↗ "), "{head}");
-        assert!(head.ends_with("ctrl+g main view · ctrl+\\ chat"), "{head}");
-        let head = rows(&mut pane, 32, 3).remove(0);
+        assert!(
+            head.ends_with("ctrl+g main view · ctrl+\\ conversation"),
+            "{head}"
+        );
+        let head = rows(&mut pane, 36, 3).remove(0);
         assert!(head.starts_with(" shop.fix ↗ "), "{head}");
-        assert!(head.ends_with("ctrl+g main view"), "{head}");
+        assert!(head.ends_with("  ctrl+\\ conversation"), "{head}");
         // Not laid out: the name is only a name.
         pane.as_agent("shop.fix", false);
         rows(&mut pane, 72, 3);
@@ -926,32 +1045,67 @@ mod tests {
     }
 
     #[test]
+    fn a_pane_alone_says_how_to_get_back_to_the_conversation() {
+        let mut pane = Pane::card("status", "↑↓ pick · esc close");
+        pane.alone = true;
+        let head = rows(&mut pane, 70, 3).remove(0);
+        assert!(
+            head.ends_with("ctrl+\\ conversation · ↑↓ pick · esc close"),
+            "{head}"
+        );
+        // Narrow, the pick goes before the way back does.
+        let head = rows(&mut pane, 44, 3).remove(0);
+        assert!(head.ends_with("ctrl+\\ conversation · esc close"), "{head}");
+        // The hint is a button that does what the key does.
+        let column = pane.area.x + 43 - "ctrl+\\ conversation · esc close".width() as u16;
+        assert_eq!(
+            pane.head_button(column).as_deref(),
+            Some(&*format!("{}switch", crate::screen::BUTTON))
+        );
+        // Beside the conversation it needs no saying.
+        pane.alone = false;
+        let head = rows(&mut pane, 70, 3).remove(0);
+        assert!(!head.contains("conversation"), "{head}");
+        // Unfocused, its `tab focus` hint gives the pane the keys, never
+        // takes them away, though a click on the pane gave them first.
+        let mut buf = Buffer::empty(Rect::new(0, 0, 70, 3));
+        pane.render(Rect::new(0, 0, 70, 3), &mut buf, false, "tab", |_| None);
+        let column = 70 - "tab focus ".width() as u16;
+        assert_eq!(
+            pane.head_button(column).as_deref(),
+            Some(&*format!("{}focus", crate::screen::BUTTON))
+        );
+    }
+
+    #[test]
     fn a_cards_foot_stays_on_the_last_row_however_it_is_scrolled() {
-        let mut pane = Pane::card("/background", "esc close");
+        let mut pane = Pane::card("background", "esc close");
         let lines = (0..20).map(|i| Line::from(format!("row {i}"))).collect();
         pane.set_card(lines, "esc close");
         pane.foot = Some(Line::from("d again removes nightly"));
         let shown = rows(&mut pane, 30, 8);
-        assert_eq!(shown[0], " /background        esc close");
+        assert_eq!(shown[0], " background         esc close");
         assert_eq!(shown[2], "row 0");
         assert_eq!(shown[5], "row 3");
         assert_eq!(shown[6], "");
-        assert_eq!(shown[7], "d again removes nightly");
+        assert_eq!(shown[7], " d again removes nightly");
         pane.screen.latest();
         let shown = rows(&mut pane, 30, 8);
         assert_eq!(shown[5], "row 19");
-        assert_eq!(shown[7], "d again removes nightly");
+        assert_eq!(shown[7], " d again removes nightly");
     }
 
     #[test]
-    fn the_pane_takes_half_or_what_the_conversation_leaves() {
-        // Half, a column kept for the line between.
-        assert_eq!(width(161, 100), 80);
-        // A wide window: the conversation keeps its 100 columns.
+    fn the_pane_takes_what_the_conversation_leaves_or_the_window() {
+        // The conversation keeps its 100 columns, as beside the margin,
+        // a column kept for the line between.
         assert_eq!(width(260, 100), 159);
-        // Too narrow for both: all of it.
+        assert_eq!(width(161, 100), 60);
+        assert_eq!(width(141, 100), MARGIN);
+        assert_eq!(width(141, 100), margin_width(141, 100).unwrap());
+        // Less than the margin's room: one at a time, all of it.
+        assert_eq!(width(140, 100), 140);
         assert_eq!(width(100, 100), 100);
-        assert_eq!(width(101, 100), 50);
     }
 
     #[test]
@@ -1094,9 +1248,9 @@ mod tests {
             shown_rows[2..5].contains(&" │   b.rs".to_owned()),
             "{shown_rows:?}"
         );
-        // The title's arrows: ‹ dim with nowhere back to go, › forward.
+        // The title's arrows: ‹ dim and dead with nowhere back to go, › forward.
         assert!(shown_rows[0].starts_with(" ‹ › "), "{shown_rows:?}");
-        assert_eq!(shown.on_arrow(1, 0), Some(true));
+        assert_eq!(shown.on_arrow(1, 0), None);
         assert_eq!(shown.on_arrow(3, 0), Some(false));
         assert_eq!(shown.on_arrow(5, 0), None);
         let mut a = shown.go(false);
@@ -1111,13 +1265,17 @@ mod tests {
         let mut card = Pane::card("/status", "esc close");
         assert!(!rows(&mut card, 30, 2)[0].contains('‹'));
         assert_eq!(card.on_arrow(1, 0), None);
-        // Over the margin, its ← comes first and the arrows after it.
+        // Over the margin, the same ‹ goes back, the margin its last step.
         a.over = true;
-        assert!(rows(&mut a, 60, 3)[0].starts_with(" ← ‹ › a.md"));
-        assert_eq!(a.head_button(1).as_deref(), Some("sonny:back"));
-        assert_eq!(a.on_arrow(1, 0), None);
-        assert_eq!(a.on_arrow(3, 0), Some(true));
-        assert_eq!(a.on_arrow(5, 0), Some(false));
+        assert!(rows(&mut a, 60, 3)[0].starts_with(" ‹ › a.md"));
+        assert_eq!(a.head_button(1), None);
+        assert_eq!(a.on_arrow(1, 0), Some(true));
+        assert_eq!(a.on_arrow(3, 0), Some(false));
+        card.over = true;
+        assert!(rows(&mut card, 40, 2)[0].starts_with(" ‹ › /status"));
+        assert!(rows(&mut card, 40, 2)[0].contains("← back"));
+        assert_eq!(card.on_arrow(1, 0), Some(true));
+        assert_eq!(card.on_arrow(3, 0), None);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1235,7 +1393,7 @@ mod tests {
         std::fs::write(&file, format!("{}\n", "word ".repeat(60))).unwrap();
         let mut pane = Pane::preview(&format!("file://{}", file.display()), &dir, 100).unwrap();
         let shown = rows(&mut pane, 150, 5);
-        // The title spans the pane; the file's rows stop at 100 columns.
+        // The title and the file's rows stop at 100 columns.
         assert!(shown[0].ends_with("esc close"), "{shown:?}");
         assert!(shown[2].width() <= crate::PROSE, "{}", shown[2].width());
         assert!(shown[3].starts_with("    word"), "{shown:?}");
@@ -1250,9 +1408,15 @@ mod tests {
         let mut pane = Pane::preview(&format!("file://{}", doc.display()), &dir, 150).unwrap();
         let shown = rows(&mut pane, 150, 4);
         assert!(shown[2].width() <= crate::PROSE, "{shown:?}");
-        // A card is not a file, and keeps the pane's width.
-        let mut card = Pane::card("/status", "esc close");
+        // A card is prose too, its title over it as wide; one that fills
+        // the pane, as the sky does, keeps the pane's width.
+        let mut card = Pane::card("status", "esc close");
         card.set_card(vec![Line::from("x".repeat(140))], "esc close");
+        let shown = rows(&mut card, 150, 4);
+        assert_eq!(shown[2].width(), crate::PROSE);
+        assert!(shown[0].width() <= crate::PROSE + 1, "{shown:?}");
+        assert!(shown[0].ends_with("esc close"), "{shown:?}");
+        card.prose = false;
         assert_eq!(rows(&mut card, 150, 3)[2].width(), 140);
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -1282,9 +1446,9 @@ mod tests {
         .unwrap();
         let mut pane = Pane::preview(&format!("file://{}", file.display()), &dir, 30).unwrap();
         let shown = rows(&mut pane, 30, 8);
-        assert_eq!(shown[2], "  # Title");
-        assert_eq!(shown[4], "  Some code.");
-        assert_eq!(shown[6], "    fn a() {}");
+        assert_eq!(shown[2], " # Title");
+        assert_eq!(shown[4], " Some code.");
+        assert_eq!(shown[6], "   fn a() {}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
