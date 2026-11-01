@@ -6766,29 +6766,30 @@ The screen above runs with no gate, so it says only that the check is
 cheap. `bench/load_gate.py` turns the gate on. Sixteen workers on a
 4-CPU box each run 15 turns back to back, and each turn runs one shell
 command of fixed CPU work (`sum(range(2e7))`, about half a CPU second).
-Every half second, a probe measures three things:
+Every half second, three probes, each on its own connection, measure:
 
 - a turn with no command (submit to end);
 - a turn whose command is `true`, which the gate holds like any other;
 - a `bots` request.
 
 Each run starts once the 1-minute load is under 1. All runs use the same
-build.
+build. Work commands get the shell's longest timeout and each records that
+it finished; a run counts only if all 240 did, and in every run all did.
 
 | Measure | No gate | `--max-load 4` (CPUs) | `--max-load 8` (CPUs × 2, the CLI's default) |
 | --- | ---: | ---: | ---: |
-| Work's wall time, s | 36.4 | 62.9 | 36.3 |
-| Work commands running, mean | 15.1 | 6.8 | 15.0 |
-| 1-minute load, max | 7.29 | 4.7 | 7.45 |
-| `true` command, p50 / p95 ms | 89 / 134 | 74 / 8,049 | 80 / 124 |
-| Turn with no command, p50 / p95 ms | 45 / 72 | 30 / 54 | 37 / 67 |
-| `bots` request, p95 ms | 11.6 | 15.9 | 15.1 |
-| Daemon CPU, s | 3.61 | 3.59 | 3.50 |
+| Work's wall time, s | 39.2 | 68.7 | 35.8 |
+| Work commands running, mean | 15.2 | 6.2 | 15.2 |
+| 1-minute load, max | 7.85 | 4.77 | 7.7 |
+| `true` command, p50 / p95 ms | 89 / 140 | 80 / 9,956 | 77 / 126 |
+| Turn with no command, p50 / p95 ms | 38 / 71 | 14 / 56 | 36 / 67 |
+| `bots` request, p50 / p95 ms | 4.7 / 15.9 | 1.3 / 12.3 | 4.4 / 15.7 |
+| Daemon CPU, s | 3.74 | 4.26 | 3.42 |
 
 Results:
 
-- **The gate costs the daemon nothing.** Its CPU is the same in every run. The storage writer spends about 2.4 s of it, the runtime 1.0 s and the readers 0.2 s, and the gate's thread spends none.
-- **At the CPU count, the gate holds the machine's load where it was set.** Turns that run no command get faster (p50 45 → 30 ms). The cost is that the same work takes 1.7× as long. The 1-minute average trails what runs now, so the gate stays shut a while after the machine has room, as make's `-l` does. Short commands wait behind it (p95 8 s).
-- **At the default of twice the CPUs, the gate never shut** in this 36-second burst, because the 1-minute load peaked at 7.45. It acts only on overload that lasts.
+- **The gate costs the daemon almost nothing.** Its own thread spends no CPU. The storage writer spends 2.2 to 2.8 s, the runtime about 1 s and the readers 0.2 to 0.3 s; the gated run, which lasts 1.75× as long, spends about 0.5 s more, mostly in the writer.
+- **At the CPU count, the gate holds the machine's load where it was set.** Turns that run no command get faster (p50 38 → 14 ms), and so do control requests (p50 4.7 → 1.3 ms). The cost is that the same work takes 1.75× as long. The 1-minute average trails what runs now, so the gate stays shut a while after the machine has room, as make's `-l` does. Short commands wait behind it (p95 10 s).
+- **At the default of twice the CPUs, the gate never shut** in this burst of under 40 seconds, because the 1-minute load peaked at 7.7. It acts only on overload that lasts.
 
 An earlier version of the screen polled `wait` every 20 ms per worker. That polling cost the daemon more than the gate did, and the cost grew with the longer gated runs. The screen now waits on each worker's own connection.

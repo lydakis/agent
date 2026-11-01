@@ -536,7 +536,16 @@ async fn a_detached_command_keeps_its_place_while_what_it_left_runs() {
             )
             .unwrap()
     };
-    let alive = |pid: i32| unsafe { libc::kill(pid, 0) } == 0;
+    // A process that has exited but is not reaped yet, as under an init that
+    // does not reap orphans, still answers a signal: on Linux it is gone.
+    fn alive(pid: i32) -> bool {
+        let signalled = unsafe { libc::kill(pid, 0) == 0 };
+        let zombie = cfg!(target_os = "linux")
+            && (std::fs::read_to_string(format!("/proc/{pid}/stat")).ok())
+                .and_then(|stat| Some(stat.rsplit_once(')')?.1.trim_start().starts_with('Z')))
+                .unwrap_or(false);
+        signalled && !zombie
+    }
     async fn until(what: &str, mut done: impl FnMut() -> bool) {
         for _ in 0..500 {
             if done() {

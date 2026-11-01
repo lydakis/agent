@@ -2718,7 +2718,12 @@ async fn detach(
         // while the service runs. The kernel keeps a group's id from new
         // processes while any member lives, so only that last second could
         // see it reused.
-        while !pulled && signal(0) {
+        let runs = move || async move {
+            tokio::task::spawn_blocking(move || group_runs(-group))
+                .await
+                .unwrap_or(false)
+        };
+        while !pulled && runs().await {
             tokio::select! {
                 Ok(()) = pulls.changed() => {
                     signal(libc::SIGKILL);
@@ -2732,6 +2737,46 @@ async fn detach(
     Ok(Outcome::text(
         json!({"detached":true,"pid":pid}).to_string(),
     ))
+}
+
+/// Whether anything in a process group still runs. A member that has exited
+/// still answers a signal until it is reaped, and an init that does not reap
+/// orphans, as some containers run, leaves it so for good: on Linux only a
+/// member that is not a zombie counts. Elsewhere init reaps orphans.
+#[cfg(target_os = "linux")]
+fn group_runs(group: i32) -> bool {
+    // SAFETY: kill with a negative pid and signal 0 only checks the group.
+    if unsafe { libc::kill(-group, 0) } != 0 {
+        return false;
+    }
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return true;
+    };
+    entries.flatten().any(|entry| {
+        let name = entry.file_name();
+        let Some(pid) = name
+            .to_str()
+            .filter(|n| n.bytes().all(|b| b.is_ascii_digit()))
+        else {
+            return false;
+        };
+        // `pid (comm) state ppid pgrp ...`; comm may hold spaces and parens.
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            return false;
+        };
+        let mut fields = stat
+            .rsplit_once(')')
+            .map_or("", |(_, rest)| rest)
+            .split_whitespace();
+        let state = fields.next();
+        let pgrp = fields.nth(1).and_then(|pgrp| pgrp.parse::<i32>().ok());
+        pgrp == Some(group) && !matches!(state, Some("Z" | "X"))
+    })
+}
+#[cfg(all(unix, not(target_os = "linux")))]
+fn group_runs(group: i32) -> bool {
+    // SAFETY: kill with a negative pid and signal 0 only checks the group.
+    unsafe { libc::kill(-group, 0) == 0 }
 }
 
 /// End the pid namespace a sandboxed detached command runs in. bubblewrap,

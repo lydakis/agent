@@ -31,11 +31,17 @@ from types import SimpleNamespace
 from bench.lookout_scale import TICK, Bench, Conn, Sampler
 
 MARK = 'gatebusy'
+# A work command has as long as the shell tool allows: a run counts only work
+# that finished, so none may end on its timeout.
+TIMEOUT_MS = 600_000
 
 
-def busy_command(iterations):
-    # The mark names the process, so the sampler can count work commands.
-    return f"python3 -c \"import sys; sum(range({iterations}))\" {MARK}"
+def busy_command(iterations, done):
+    """Each command adds a line to `done` once its work is finished, so a run
+    counts only work that ran to the end, not a command its timeout ended.
+    The mark names the process, so the sampler can count work commands."""
+    return (f"python3 -c \"import sys; sum(range({iterations})); "
+            f"open(sys.argv[1], 'a').write('.')\" {done} {MARK}")
 
 
 def calibrate():
@@ -107,7 +113,8 @@ def run(args, gate):
                                   judge_ms=0, out=str(out), daemon_flags=flags))
     workers = [f'w{i}' for i in range(args.workers)]
     bench.create(workers + ['probe', 'probe.sh'], tools=('shell',))
-    command = busy_command(args.iterations)
+    done = out / 'done'
+    command = busy_command(args.iterations, done)
     stop, samples = threading.Event(), {'work': [], 'load': []}
 
     def sample():
@@ -117,30 +124,39 @@ def run(args, gate):
 
     probes = {'turn_ms': [], 'short_command_ms': [], 'control_ms': []}
 
-    def probe():
+    # Each probe samples on its own connection and thread, so a `true` the
+    # gate holds does not stop the other two from sampling while it is shut.
+    def control():
+        conn = Conn(bench.socket)
+        while not stop.wait(.5):
+            started = time.monotonic()
+            conn.request('bots', limit=1)
+            probes['control_ms'].append(1000 * (time.monotonic() - started))
+
+    def turns(bot, prompt, key):
         conn, n = Conn(bench.socket), 0
         while not stop.wait(.5):
             n += 1
             started = time.monotonic()
-            conn.request('bots', limit=1)
-            probes['control_ms'].append(1000 * (time.monotonic() - started))
-            for bot, prompt, key in (('probe', 'hi', 'turn_ms'), ('probe.sh', 'shell:true', 'short_command_ms')):
-                started = time.monotonic()
-                reply = conn.request('submit', bot=bot, request_id=f'p{n}', prompt=prompt,
-                                     delivery='reject')
-                if 'result' in reply and turn_ended(conn, bot, reply['result']['turn'], 120):
-                    probes[key].append(1000 * (time.monotonic() - started))
+            reply = conn.request('submit', bot=bot, request_id=f'p{n}', prompt=prompt,
+                                 delivery='reject')
+            if 'result' in reply and turn_ended(conn, bot, reply['result']['turn'], 120):
+                probes[key].append(1000 * (time.monotonic() - started))
 
     def worker(bot):
         conn = Conn(bench.socket)
         for r in range(args.rounds):
             reply = conn.request('submit', bot=bot, request_id=f'r{r}',
-                                 prompt=f'shell:{command}', delivery='reject')
+                                 prompt=f'shell@{TIMEOUT_MS}:{command}', delivery='reject')
             turn_ended(conn, bot, reply['result']['turn'])
 
     daemon = Sampler(bench.daemon.pid)
     before = threads_cpu(bench.daemon.pid)
-    watching = [threading.Thread(target=sample, daemon=True), threading.Thread(target=probe, daemon=True)]
+    watching = [threading.Thread(target=sample, daemon=True),
+                threading.Thread(target=control, daemon=True),
+                threading.Thread(target=turns, args=('probe', 'hi', 'turn_ms'), daemon=True),
+                threading.Thread(target=turns, args=('probe.sh', 'shell:true', 'short_command_ms'),
+                                 daemon=True)]
     for thread in watching:
         thread.start()
     started = time.monotonic()
@@ -158,6 +174,10 @@ def run(args, gate):
     spent = sorted(((round(cpu - before.get(name, 0), 2), name) for name, cpu in after.items()),
                    reverse=True)
     bench.close()
+    finished = len(done.read_text()) if done.exists() else 0
+    if finished != args.workers * args.rounds:
+        sys.exit(f'{finished} of {args.workers * args.rounds} work commands finished their work '
+                 f'with gate {gate:g}: the run does not compare')
     return {
         'gate': gate or None, 'workers': args.workers, 'rounds': args.rounds,
         'work_wall_s': round(wall, 1),
@@ -168,7 +188,7 @@ def run(args, gate):
         'short_command_ms_p50': pct(probes['short_command_ms'], .5),
         'short_command_ms_p95': pct(probes['short_command_ms'], .95),
         'control_ms_p50': pct(probes['control_ms'], .5), 'control_ms_p95': pct(probes['control_ms'], .95),
-        'probes': len(probes['turn_ms']),
+        'probes': {key: len(found) for key, found in probes.items()},
         'daemon_cpu_s': stats['cpu_s'], 'daemon_peak_rss_mib': stats['peak_rss_mib'],
         'daemon_threads_cpu_s': {name: cpu for cpu, name in spent[:4]},
     }

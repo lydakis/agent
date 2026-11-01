@@ -59,10 +59,13 @@ async def respond(request, writer, judge_ms):
     elif re.match(r'stream:\d+:\d+', text) and not after_tool:
         count, ms = re.match(r'stream:(\d+):(\d+)', text).groups()
         deltas, gap = ['word '] * int(count), int(ms) / 1000
-    elif text.startswith('shell:') and not after_tool:
+    elif re.match(r'shell(@\d+)?:', text) and not after_tool:
+        # `shell@<ms>:` sets the command's timeout; plain `shell:` gives 5 s.
+        timeout, command = re.match(r'shell(?:@(\d+))?:(.*)', text, re.S).groups()
         deltas = []
         output = [{'type': 'function_call', 'name': 'shell', 'call_id': 'sh-1',
-                   'arguments': json.dumps({'command': text[6:], 'timeout_ms': 5000})}]
+                   'arguments': json.dumps({'command': command,
+                                            'timeout_ms': int(timeout or 5000)})}]
     if os.environ.get('LS_MODEL_LOG'):
         with open(os.environ['LS_MODEL_LOG'], 'a') as log:
             log.write(json.dumps({'text': text[:200], 'last': str(last)[:200],
