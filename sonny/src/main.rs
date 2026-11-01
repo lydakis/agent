@@ -9283,7 +9283,10 @@ impl App {
                 }
             }
             Event::Paste(text) => {
-                search.typed.push_str(&text.replace('\n', " "));
+                // A line ends as the composer's paste reads it, CR or
+                // CRLF too, and shows as a space, as in the list.
+                let text = text.replace("\r\n", " ").replace(['\r', '\n'], " ");
+                search.typed.push_str(&text);
                 search.narrow();
             }
             Event::Resize(width, _) => self.width = width as usize,
@@ -16329,6 +16332,11 @@ mod tests {
         app.key(key(KeyCode::Esc)).await;
         assert!(app.searching.is_none());
         assert_eq!(&*app.input, "draft");
+        // A paste's lines, however they end, are the prompt's.
+        app.key(ctrl('r')).await;
+        app.key(Event::Paste("0.2\r\nand".into())).await;
+        assert_eq!(shown(&app), ["tag 0.2 and push"]);
+        app.key(key(KeyCode::Esc)).await;
         // Tab picks from the search, not the guess at the next message.
         app.input.clear();
         app.suggestion = Some("run the tests".into());
