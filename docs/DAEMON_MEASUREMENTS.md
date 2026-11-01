@@ -6826,3 +6826,40 @@ spread from run to run (#575 saw the same per-bot swing with no change to
 what is kept per bot); the screen's benches send no attach, so none of
 the new path runs in them beyond the submit field's parse. Sonny's rows
 moved within their noise too.
+
+## The lookout's notes at 1,000 tasks (#576)
+
+The lookout read every finished turn's reply on its one connection. The
+daemon answers one read at a time from each session, so at 1,000 tasks
+those reads queued: the stream heard each turn end within about 20 ms, but
+its reply was read 8 to 10 s later, and the note waited on it. The lookout
+now reads on a pool of connections (one per logical CPU, as many readers as
+the daemon keeps by default). A completed turn's reply is its checkpoint,
+so it is read in one request instead of two. A note waits only for reads
+that started before its news settled, and holds as many tasks as its bytes
+allow, where it took 32 before.
+
+The screen is repaired too. Shapes are leads × tasks per lead (`10x100` is
+ten leads of a hundred tasks), and the load is a fixed number of rounds
+(every task one turn each), so both builds face the same turns. A turn
+counts as told by the first note at or after its end that names its task
+at that turn or later, read from the lookout's own log. A note reaches
+its lead when its own turn starts or, for a note a busy lead took into its
+running turn (a steer, or an attach its next message carried), when that
+turn absorbed it; the screen reports how many notes went each way and how
+many never reached their lead. The gate now fails a head that leaves turns
+untold where its base told them all.
+
+One 4-CPU box, base `main` against this branch, four rounds of 1,000
+turns each:
+
+| Shape | Build | Note p95, s | Untold | Notes | Rounds took, s | Daemon CPU, s |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| 10 × 100 | base | 18.2 | 160 | 30 | 10.1 | 17.0 |
+| 10 × 100 | head | 3.5 | 0 | 40 | 16.2 | 25.9 |
+| 100 × 10 | base | 14.6 | 0 | 118 | 12.2 | |
+| 100 × 10 | head | 3.7 | 0 | 400 | 17.8 | |
+
+What it costs: reading concurrently takes more of the daemon. In a second pair of runs split by thread, the readers took 6.9 s on base and 13.4 s on head, and the storage writer took 9.6 s and 12.8 s. That stretched the tasks' own rounds by about 45% on this CPU-bound box, where the synthetic model streams from the same four CPUs; real tasks mostly wait on their model. A build of the head with one connection (cap and settle changes kept) sat between the two: p95 13.4 s and 20.9 s of daemon CPU. The pool is what brings the notes in on time.
+
+A rerun on today's `main` with the delivery count (same shapes, four rounds) told all 4,000 turns in each shape, with note p95 2.9 s at 10 × 100 and 4.2 s at 100 × 10. Every note reached its lead, all of them as a turn of their own: the screen's leads are idle between notes, so none was absorbed.

@@ -400,9 +400,22 @@ words in a task are always urgent, whatever any subscription says.
 `/background` lists each subscription with its filter, digest and
 `urgent`. A steer joins the running turn and starts none, so what it
 interrupts makes no news of its own for another subscriber: urgent
-subscriptions on each other cannot wake each other in a loop. News settles for 2
-seconds first, and up to 15 while a message's words are still being read,
-so turns that end together go in one note. When a note has waited a minute for a subscriber the events
+subscriptions on each other cannot wake each other in a loop.
+
+News settles for 2 seconds first, and up to 15 while words that came as
+it settled are still being read, so turns that end together go in one
+note; what came after goes in the next, as on a busy fleet some read is
+always under way. A note holds as many tasks as its bytes allow; what a
+full note leaves out has settled already and goes as soon as the
+subscriber rests again.
+
+The lookout reads words and replies on connections of their own beside
+the one its stream and notes go on, one per logical CPU, as a database
+client keeps a pool: the daemon answers one read at a time from each
+connection, so on a single one a busy fleet's replies were read one by
+one, about 8 seconds behind at 1,000 tasks (#576). A turn that completed
+ended on its reply, its checkpoint, so that is one read; another turn's
+nodes are looked through for its last words. When a note has waited a minute for a subscriber the events
 say is busy, the lookout asks the daemon, so a missed event never holds
 the note until the next turn.
 

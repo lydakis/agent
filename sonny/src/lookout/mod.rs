@@ -69,6 +69,9 @@ struct Seen {
     node: Option<i64>,
     /// The reply a turn ended with, not a message.
     reply: bool,
+    /// For a reply: the turn completed, so its checkpoint is what it ended
+    /// with.
+    completed: bool,
     /// The node of the subscriber's latest message to the task, unless the
     /// person wrote to it since.
     brief: Option<i64>,
@@ -215,6 +218,25 @@ const REPLY_NODES: usize = 30;
 /// The last thing the task said in the turn, read back from where the turn
 /// left its history, not from wherever it has moved on to.
 async fn reply_text(client: &Client, seen: &Seen) -> Option<String> {
+    // Anthropic tasks keep calls as blocks inside a message.
+    let said = |read: &Value| {
+        (read["items"].as_array().into_iter())
+            .flatten()
+            .flat_map(|entry| crate::responses(&entry["item"]))
+            .find(|item| item["role"] == "assistant" && !crate::text(item).trim().is_empty())
+            .map(|item| crate::text(&item))
+    };
+    // A turn that completed ended on its reply, its checkpoint: one read,
+    // where a busy fleet's every read waits its turn.
+    if seen.completed
+        && let Some(node) = seen.node
+        && let Ok(read) = (client)
+            .request("history_items", json!({"bot": seen.task, "nodes": [node]}))
+            .await
+        && let Some(text) = said(&read)
+    {
+        return Some(text);
+    }
     let page = client
         .request(
             "history_nodes",
@@ -231,15 +253,7 @@ async fn reply_text(client: &Client, seen: &Seen) -> Option<String> {
         .request("history_items", json!({"bot": seen.task, "nodes": nodes}))
         .await
         .ok()?;
-    // Anthropic tasks keep calls as blocks inside a message.
-    Some(
-        (read["items"].as_array().into_iter())
-            .flatten()
-            .flat_map(|entry| crate::responses(&entry["item"]))
-            .find(|item| item["role"] == "assistant" && !crate::text(item).trim().is_empty())
-            .map(|item| crate::text(&item))
-            .unwrap_or_default(),
-    )
+    Some(said(&read).unwrap_or_default())
 }
 
 /// Who asked for a task's turn, as its prompt records it: the bot whose turn
@@ -595,6 +609,48 @@ async fn serve(settings: Settings) -> Result<(), String> {
     }
 }
 
+/// The connections words are read on, beside the one the stream and the
+/// notes go on. The daemon takes one read at a time from a session, in
+/// order, as a database serves one connection's queries, so a lookout
+/// reading every reply of a busy fleet on one connection would read them
+/// one by one, its notes queued behind; it keeps a pool, as a database
+/// client does, one connection for each reader the daemon keeps by
+/// default. They last as long as the stream's connection: when it drops,
+/// the next takes new ones.
+struct Readers {
+    pool: Vec<(Arc<Client>, agent_client::Events)>,
+    /// The stream's connection, when no other could be had.
+    main: Arc<Client>,
+    next: std::sync::atomic::AtomicUsize,
+}
+
+impl Readers {
+    async fn connect(socket: &Path, main: Arc<Client>) -> Self {
+        let count = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let mut pool = Vec::with_capacity(count);
+        for _ in 0..count {
+            match Client::connect(socket).await {
+                Ok(connected) => pool.push(connected),
+                Err(_) => break,
+            }
+        }
+        Self {
+            pool,
+            main,
+            next: Default::default(),
+        }
+    }
+
+    /// The connection for the next read, in turn.
+    fn next(&self) -> Arc<Client> {
+        if self.pool.is_empty() {
+            return self.main.clone();
+        }
+        let at = (self.next).fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.pool[at % self.pool.len()].0.clone()
+    }
+}
+
 /// Every subscriber's lookout on one daemon.
 /// A failed fire's note under way.
 struct Telling {
@@ -824,6 +880,7 @@ impl Service {
         mut events: agent_client::Events,
         from_sources: &mut tokio::sync::mpsc::Receiver<sources::Said>,
     ) {
+        let readers = Readers::connect(&self.socket, client.clone()).await;
         let (bots, complete) = listed(&client).await;
         self.records = (bots.iter())
             .filter_map(|b| Some((b["name"].as_str()?.to_owned(), b.clone())))
@@ -918,7 +975,7 @@ impl Service {
         for lookout in self.lookouts.values_mut() {
             // Reads a dropped connection left under way answer the old
             // channel, never this one.
-            lookout.reading = 0;
+            lookout.reading.clear();
             lookout.updates.replies_dropped();
         }
         self.goals.reconnected();
@@ -928,7 +985,7 @@ impl Service {
             telling.note.abort();
         }
         let (told, mut taken) = tokio::sync::mpsc::channel(64);
-        let (done, mut results) = tokio::sync::mpsc::channel(64);
+        let (done, mut results) = tokio::sync::mpsc::channel::<(String, u64, Instant, Seen)>(64);
         // What the daemon answered a note or a status check: beside the
         // stream, so no call to it ever holds the events up.
         let (woken, mut woke) = tokio::sync::mpsc::channel(64);
@@ -1118,12 +1175,12 @@ impl Service {
                 Some(said) = from_sources.recv(), if self.live => {
                     self.said(said);
                 }
-                Some((lead, id, seen)) = results.recv() => {
+                Some((lead, id, started, seen)) = results.recv() => {
                     // From a lookout since deleted.
                     if let Some(lookout) = self.lookouts.get_mut(&lead)
                         && lookout.id == id
                     {
-                        lookout.reading = lookout.reading.saturating_sub(1);
+                        lookout.read(started);
                         lookout.heard(&seen);
                     }
                     touched = Some(vec![lead]);
@@ -1160,15 +1217,16 @@ impl Service {
                 // Words are read beside the stream, so a slow read never
                 // stalls it.
                 for seen in std::mem::take(&mut lookout.due) {
-                    let (client, done) = (client.clone(), done.clone());
+                    let (client, done) = (readers.next(), done.clone());
                     let (lead, id) = (lookout.lead.clone(), lookout.id);
-                    lookout.reading += 1;
+                    let started = Instant::now();
+                    *lookout.reading.entry(started).or_default() += 1;
                     if seen.reply {
                         lookout.updates.reading_reply(&seen.task, seen.turn);
                     }
                     tokio::spawn(async move {
                         let seen = read_event(&client, seen).await;
-                        let _ = done.send((lead, id, seen)).await;
+                        let _ = done.send((lead, id, started, seen)).await;
                     });
                 }
                 lookout.wake(&client, &woken);
@@ -1859,8 +1917,11 @@ struct Lookout {
     briefs: HashMap<String, i64>,
     /// Messages to read.
     due: Vec<Seen>,
-    /// Messages being read.
-    reading: usize,
+    /// Messages being read, by when each read started.
+    reading: std::collections::BTreeMap<Instant, usize>,
+    /// The longest a read took since the last note, which the log says
+    /// with the note.
+    slowest_read: Duration,
     /// The person wrote in a task: the note cuts into the subscriber's
     /// running turn.
     urgent: bool,
@@ -1929,7 +1990,8 @@ impl Lookout {
             noted: HashSet::new(),
             briefs: HashMap::new(),
             due: Vec::new(),
-            reading: 0,
+            reading: Default::default(),
+            slowest_read: Duration::ZERO,
             urgent: false,
             refused: None,
             since: None,
@@ -2196,6 +2258,7 @@ impl Lookout {
                     from: bot.to_owned(),
                     node: data["checkpoint"].as_i64(),
                     reply: true,
+                    completed: data["status"] == "completed",
                     brief: None,
                     text: String::new(),
                     asked,
@@ -2228,6 +2291,7 @@ impl Lookout {
             from: from.to_owned(),
             node,
             reply: false,
+            completed: false,
             brief: self.briefs.get(task).copied(),
             text: String::new(),
             asked: Asked::Known,
@@ -2342,12 +2406,23 @@ impl Lookout {
         }
     }
 
+    /// A read that started at `started` is done.
+    fn read(&mut self, started: Instant) {
+        self.slowest_read = self.slowest_read.max(started.elapsed());
+        if let Some(count) = self.reading.get_mut(&started) {
+            *count -= 1;
+            if *count == 0 {
+                self.reading.remove(&started);
+            }
+        }
+    }
+
     /// Whether anything it heard is not told yet: messages to read or
     /// being read, a turn held on a trigger or its goal's check, news, or
     /// a note the daemon has not answered.
     fn untold(&self) -> bool {
         !self.due.is_empty()
-            || self.reading > 0
+            || !self.reading.is_empty()
             || self.updates.goal_pending()
             || self.updates.holding()
             || self.updates.news()
@@ -2465,7 +2540,11 @@ impl Lookout {
                 match submitted {
                     Ok(()) => {
                         self.refused = None;
-                        self.since = None;
+                        // What a full note left out has settled already: it
+                        // goes as soon as the subscriber rests again.
+                        if told.more == 0 {
+                            self.since = None;
+                        }
                         // The person's words a bounded note left out still cut in.
                         self.urgent &= self.updates.quoting();
                         self.updates.sent(told);
@@ -2473,8 +2552,11 @@ impl Lookout {
                         if !self.updates.told_subs.is_empty() {
                             self.keep();
                         }
+                        let request_id = format!("lookout-{}", digest(&key.join(",")));
                         self.write(&json!({"at_ms": epoch_ms(), "lead": self.lead, "woke": key,
-                            "delivery": delivery}));
+                            "delivery": delivery, "request_id": request_id,
+                            "read_ms": self.slowest_read.as_millis()}));
+                        self.slowest_read = Duration::ZERO;
                     }
                     // The same news twice is one note.
                     Err(code) if code == "idempotency_conflict" => {
@@ -2576,8 +2658,12 @@ impl Lookout {
         }
         let urgent = self.urgent || self.updates.urgent().is_some();
         let steer = urgent && self.updates.busy();
+        // Only what came while the news settled is waited for: on a busy
+        // fleet some read is always under way, and what came after goes in
+        // the note after.
         let settled = self.since.is_some_and(|since| {
-            now >= since + SETTLE && (self.reading == 0 || now >= since + SETTLE_MAX)
+            let read = (self.reading.keys().next()).is_none_or(|first| *first >= since + SETTLE);
+            now >= since + SETTLE && (read || now >= since + SETTLE_MAX)
         });
         (steer || (settled && self.updates.due_at(now))).then_some(steer)
     }
@@ -3033,6 +3119,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_completed_turn_s_reply_is_read_in_one_request() {
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let kept = asked.clone();
+        let client = crate::tests::daemon_answering(move |request| {
+            kept.lock().unwrap().push(request["op"].as_str().unwrap_or_default().to_owned());
+            match (request["op"].as_str(), request["nodes"][0].as_i64()) {
+                (Some("history_nodes"), _) => {
+                    json!({"nodes": [{"node": 41, "turn": 4}, {"node": 40, "turn": 4}]})
+                }
+                (_, Some(42)) => json!({"items": [{"node": 42, "item": {"type": "message",
+                    "role": "assistant", "content": [{"type": "output_text", "text": "Fixed avg."}]}}]}),
+                _ => json!({"items": [{"node": 41, "item": {"type": "message",
+                    "role": "assistant", "content": [{"type": "output_text", "text": "Earlier."}]}}]}),
+            }
+        })
+        .await;
+        let ended = Seen {
+            reply: true,
+            completed: true,
+            node: Some(42),
+            asked: Asked::Known,
+            ..said(4, "calc.fix", "")
+        };
+        let read = read_event(&client, ended.clone()).await;
+        assert_eq!(read.text, "Fixed avg.");
+        assert_eq!(*asked.lock().unwrap(), ["history_items"]);
+        // A turn that failed may end anywhere: its turn's nodes are looked
+        // through, as before.
+        asked.lock().unwrap().clear();
+        let failed = Seen {
+            completed: false,
+            node: Some(41),
+            ..ended
+        };
+        assert_eq!(read_event(&client, failed).await.text, "Earlier.");
+        assert_eq!(*asked.lock().unwrap(), ["history_nodes", "history_items"]);
+    }
+
+    #[tokio::test]
     async fn a_long_ask_call_is_read_whole_for_its_lead() {
         let whole = json!({"question": "Ship?", "why": "x".repeat(3000), "recommended": 1,
             "reason": "r", "options": [{"label": "Yes", "explanation": "a"},
@@ -3094,6 +3219,7 @@ mod tests {
             from: from.into(),
             node: None,
             reply: false,
+            completed: false,
             brief: None,
             text: text.into(),
             asked: Asked::Known,
@@ -3190,9 +3316,13 @@ mod tests {
         ));
         assert_eq!(lookout.wake_due(now), None);
         assert_eq!(lookout.wake_due(now + SETTLE), Some(false));
-        lookout.reading = 1;
+        lookout.reading.insert(now, 1);
         assert_eq!(lookout.wake_due(now + SETTLE), None);
         assert_eq!(lookout.wake_due(now + SETTLE_MAX), Some(false));
+        // A read that started once the news settled waits for the next note.
+        lookout.reading.clear();
+        lookout.reading.insert(now + SETTLE, 1);
+        assert_eq!(lookout.wake_due(now + SETTLE), Some(false));
         // The person's words to a resting lead do not cut in either.
         let mut idle = seated("idle");
         idle.heard(&said(7, PERSON, "tabs"));

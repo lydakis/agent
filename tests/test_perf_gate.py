@@ -3,6 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from bench.lookout_scale import Bench
 from bench.perf_gate import compare
 
 
@@ -34,6 +35,40 @@ class PerfGateTests(unittest.TestCase):
         # One store job more a turn fails, whatever the timings.
         _, failed, _ = self.screen([footprint(1.0)], [footprint(1.0, jobs=4)])
         self.assertEqual(failed, ['footprint: begin rose from 3 to 4'])
+
+    def test_a_turn_no_note_told_fails_where_the_base_told_every_one(self):
+        def sonny(untold, p95):
+            return {'lookout': {'10x100': {'untold': untold, 'note_delay_ms_p95': p95,
+                                           'cpu_ms_per_1k_deltas': 10.0}}}
+        root = Path(tempfile.mkdtemp())
+        for side, run in (('base', sonny(0, 3000)), ('head', sonny(4, 1000))):
+            folder = root / f'sonny-{side}-0'
+            folder.mkdir()
+            (folder / 'result.json').write_text(json.dumps({'runs': [run]}))
+        _, failed, _ = compare(root)
+        # However much faster the head's notes are.
+        self.assertEqual(failed, ['sonny: lookout at 10x100 left 4 ended turns untold, '
+                                  'where the base told every one'])
+
+
+    def test_a_turn_counts_as_told_only_once_its_note_reaches_the_lead(self):
+        class Control:
+            def many(self, requests):
+                return [{'result': {'turns': replies[r[1]['bot']]}} for r in requests]
+        replies = {'t1': [{'turn': 1, 'finished_ms': 100}], 't2': [{'turn': 1, 'finished_ms': 100}],
+                   # Only the note about t1 became a turn of the lead's.
+                   'lead': [{'request_id': 'lookout-a', 'started_ms': 400}]}
+        bench = Bench.__new__(Bench)
+        bench.args = type('Args', (), {'tasks': 2})()
+        bench.control = Control()
+        bench.tasks = lambda: ['t1', 't2']
+        bench.leads = lambda: ['lead']
+        bench.log_lines = lambda: [
+            {'woke': ['t1/1/end'], 'lead': 'lead', 'request_id': 'lookout-a', 'at_ms': 200},
+            {'woke': ['t2/1/end'], 'lead': 'lead', 'request_id': 'lookout-b', 'at_ms': 250}]
+        notes = bench.note_delays(0)
+        self.assertEqual((notes['told'], notes['untold'], notes['notes_undelivered']), (1, 1, 1))
+        self.assertEqual((notes['submit_ms_p95'], notes['delay_ms_max']), (150, 300))
 
 
 if __name__ == '__main__':

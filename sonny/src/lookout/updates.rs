@@ -25,10 +25,10 @@ use std::{
 /// How long news waits on a lead its events say is busy before the
 /// daemon is asked whether it is.
 pub const DOUBT: Duration = Duration::from_secs(60);
-const WAKE_TASKS: usize = 32;
 /// About what one note may take, well under the daemon's 256 KiB prompt
 /// limit, which counts what it quotes too; a message counts as its quoted
-/// words and `LINE_BYTES`, and a turn as its line and reply as they read.
+/// words and its line at the longest (`said_bytes`), and a turn as its line
+/// and reply as they read.
 const NOTE_BYTES: usize = 192 * 1024;
 /// The most of the person's messages one note quotes, the most the daemon
 /// copies into one prompt.
@@ -1490,7 +1490,6 @@ impl Updates {
                         && replying(name, &news.theirs))
             });
         tasks.sort_by_key(|(_, news)| (!news.quotes(), news.said.is_empty() && news.act.is_none()));
-        let rest = tasks.split_off(tasks.len().min(WAKE_TASKS));
         let mut quoted = HashMap::new();
         let mut items: Vec<Line> = Vec::new();
         let mut sent = Vec::new();
@@ -1505,7 +1504,7 @@ impl Updates {
             let (mut kept, mut wait) = (Vec::new(), Vec::new());
             for message in std::mem::take(&mut news.said) {
                 let quote = usize::from(message.words.is_some());
-                let size = quote * message.bytes + LINE_BYTES;
+                let size = quote * message.bytes + said_bytes(&name, &message);
                 let first = items.is_empty() && kept.is_empty();
                 if wait.is_empty()
                     && quotes + quote <= NOTE_QUOTES
@@ -1577,7 +1576,6 @@ impl Updates {
             }
             sent.push((name, news));
         }
-        later.extend(rest);
         self.tasks = later;
         // What each subscription with a digest heard goes now, however soon:
         // its digest counts from this note once it lands.
@@ -1860,6 +1858,13 @@ fn ask_line(name: &str, asked: &Asked) -> Line {
         text,
         key: format!("{name}/{turn}/ask/{call}"),
     }
+}
+
+/// The most one message adds to the lines `said` writes for it: its task's
+/// name twice, its writer's, and `LINE_BYTES` for the rest. Where many
+/// messages share one line, their bounds add up to more than it takes.
+fn said_bytes(name: &str, message: &Said) -> usize {
+    2 * name.len() + message.from.len() + LINE_BYTES
 }
 
 /// What was written in a task, as the note says it: each of the person's
@@ -2530,6 +2535,36 @@ mod tests {
     }
 
     #[test]
+    fn long_names_count_as_a_note_writes_them() {
+        let mut updates = fleet();
+        let now = Instant::now();
+        let from = format!("shop.{}", "w".repeat(123));
+        let tasks: Vec<String> = (0..1000)
+            .map(|n| format!("shop.{}{n:04}", "t".repeat(118)))
+            .collect();
+        for (n, task) in tasks.iter().enumerate() {
+            let id = n as i64 + 10;
+            updates.event(
+                &ev(task, None, "created",
+                    json!({"bot_id": id, "status": "idle", "created_by": "shop.lead", "created_by_id": 1})),
+                now,
+            );
+            updates.watched.insert(task.clone());
+            updates.said(task, 1, &from, None);
+        }
+        let mut told = 0;
+        while told < tasks.len() {
+            let note = updates.take();
+            let size: usize = note.items.iter().map(|i| i.text.len() + 1).sum();
+            assert!(size <= NOTE_BYTES, "{size}");
+            assert!(!note.items.is_empty());
+            told += note.items.len();
+            updates.sent(note);
+        }
+        assert_eq!(told, tasks.len());
+    }
+
+    #[test]
     fn messages_past_one_note_s_bytes_wait_for_the_next() {
         let mut updates = fleet();
         let words = "x".repeat(super::super::QUOTE_CHARS);
@@ -2588,9 +2623,9 @@ mod tests {
     }
 
     #[test]
-    fn the_person_s_words_go_first_in_a_bounded_note() {
+    fn the_person_s_words_go_first_and_every_task_that_fits_goes_too() {
         let mut updates = fleet();
-        for n in 0..WAKE_TASKS + 8 {
+        for n in 0..100 {
             let name = format!("shop.t{n}");
             updates.seat(&json!({"name": name, "bot_id": 10 + n, "status": "idle"}));
             updates.watched.insert(name.clone());
@@ -2602,7 +2637,10 @@ mod tests {
             told.items[0].text,
             "- shop.fix: turn:shop.fix/2, the person wrote the words quoted from it below"
         );
-        assert_eq!(told.more, 9);
+        // A hundred tasks ending together go in one note: only its bytes
+        // and quotes bound it, so none waits for a note after it.
+        assert_eq!(told.items.len(), 101);
+        assert_eq!(told.more, 0);
         assert!(!updates.quoting());
     }
 
@@ -2610,7 +2648,7 @@ mod tests {
     fn turns_whose_replies_are_being_read_leave_the_note_to_others() {
         let mut updates = fleet();
         let lead = json!({"from": {"bot": "shop.lead"}});
-        for n in 0..WAKE_TASKS + 1 {
+        for n in 0..40 {
             let name = format!("shop.t{n}");
             updates.seat(&json!({"name": name, "bot_id": 10 + n, "status": "idle"}));
             updates.watched.insert(name.clone());
@@ -2622,7 +2660,7 @@ mod tests {
         let text = text(&told);
         assert!(text.contains("turn:shop.fix/2"), "{text}");
         assert!(!text.contains("shop.t0"), "{text}");
-        assert_eq!(told.more, WAKE_TASKS + 1);
+        assert_eq!(told.more, 40);
     }
 
     #[test]
