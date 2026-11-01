@@ -1488,8 +1488,12 @@ impl Updates {
                     waiting.asks = std::mem::take(&mut news.asks);
                 }
                 // Left for a reply or for room, it may go as it might have
-                // now; each piece of it keeps its urgency.
-                waiting.hold = super::activity::Hold::now();
+                // now, and still counts for the digests that heard it; each
+                // piece of it keeps its urgency.
+                waiting.hold = super::activity::Hold {
+                    now: true,
+                    windows: news.hold.windows.clone(),
+                };
                 later.push((name.clone(), waiting));
             }
             // A message that started a turn told below as asked by its

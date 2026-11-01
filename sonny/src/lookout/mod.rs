@@ -3387,6 +3387,20 @@ mod tests {
         assert_eq!(lookout.updates.urgent(), Some("tasks"));
         let told = lookout.updates.take();
         assert!(told.items[0].text.contains("turn:calc.fix/5 failed"));
+        // With a digest, what was left counts for it when it goes too.
+        lookout.subs[0].digest = Some("1h".into());
+        lookout.sync(&listed);
+        ended(&mut lookout, 8, "completed");
+        lookout.updates.reading_reply("calc.fix", 8);
+        lookout.heard(&said(9, PERSON, "go on"));
+        let told = lookout.updates.take();
+        lookout.updates.sent(told);
+        let first = lookout.updates.told_subs["tasks"];
+        lookout.updates.replied("calc.fix", 8, "done");
+        let later = Instant::now() + Duration::from_secs(1);
+        let told = lookout.updates.take_at(later);
+        assert!(told.items[0].text.contains("turn:calc.fix/8 completed"));
+        assert!(lookout.updates.told_subs["tasks"] > first);
     }
 
     #[test]

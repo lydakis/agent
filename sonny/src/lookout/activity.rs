@@ -79,6 +79,7 @@ pub struct Hold {
 
 impl Hold {
     /// As soon as the subscriber rests.
+    #[cfg(test)]
     pub fn now() -> Hold {
         Hold {
             now: true,
