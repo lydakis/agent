@@ -3469,6 +3469,9 @@ async fn deliver(
 /// The tag of a shadow copy's one gate, which nobody serves: no call of it
 /// should ever ask, and one that did lapses unanswered, denied.
 const SHADOW_TAG: &str = "shadow";
+/// How much of an agent's name its shadow copy's name keeps: with
+/// `.shadow-` and six hex digits after it, the daemon's 128 bytes.
+const SHADOW_SOURCE_MAX: usize = 128 - ".shadow-".len() - 6;
 /// The daemon's tools a shadow copy goes without: a shell and its input.
 const SHADOW_WITHHELD: [&str; 2] = ["shell", "write_stdin"];
 /// How long a call on that gate waits before it lapses.
@@ -3488,11 +3491,19 @@ pub fn shadow_source(bot: &str) -> Option<&str> {
         .then_some(source)
 }
 
+/// A new shadow copy's name for `bot`: its name, cut to what fits, then
+/// `.shadow-` and a stamp. What a copy is of is kept with its fire, not
+/// read back from the name.
 fn shadow_name(bot: &str) -> String {
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos() as u64);
-    format!("{bot}.shadow-{:x}", (stamp ^ sends()) % 0x100_0000)
+    let mut keep = bot.len().min(SHADOW_SOURCE_MAX);
+    while !bot.is_char_boundary(keep) {
+        keep -= 1;
+    }
+    let kept = bot[..keep].trim_end_matches('.');
+    format!("{kept}.shadow-{:x}", (stamp ^ sends()) % 0x100_0000)
 }
 
 /// The command rules a shadow copy goes by: the person's without their
@@ -6639,6 +6650,14 @@ pub(crate) mod tests {
         }
         let name = shadow_name("p.lead");
         assert_eq!(shadow_source(&name), Some("p.lead"), "{name}");
+        // A name near the daemon's limit is cut so its copy's still fits.
+        let long = format!("p.{}", "a".repeat(126));
+        let name = shadow_name(&long);
+        assert!(name.len() <= 128, "{}", name.len());
+        assert!(
+            shadow_source(&name).is_some_and(|of| long.starts_with(of)),
+            "{name}"
+        );
         // Its tools: the daemon's it has but a shell, whose commands reach
         // the daemon's socket, and of Sonny's only exec, within what it may
         // call.
