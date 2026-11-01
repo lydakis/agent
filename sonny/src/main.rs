@@ -4909,8 +4909,38 @@ impl App {
     /// in the conversation, goes to BOT (see `open_agent`), and
     /// `other/BOT`, a right click on either, the other way;
     /// `answer/N/ID` answers the question
-    /// call ID asked with its option N, while it is open.
+    /// call ID asked with its option N, while it is open; `react/NODE`, the
+    /// react mark under a reply, picks it for the next emoji, and
+    /// `unreact/NODE/EMOJI`, one of the person's reactions, takes it off.
     async fn press_row(&mut self, button: &str) {
+        // The react mark under a reply: picked, as `/react` picks one, for
+        // the emoji sent next.
+        if let Some(node) = button
+            .strip_prefix("react/")
+            .and_then(|node| node.parse::<i64>().ok())
+        {
+            match self.reply_first(node).await {
+                Ok(first) => {
+                    self.react_to = Some((node, first));
+                    self.notice = None;
+                }
+                Err(error) => self.notice = Some(error),
+            }
+        }
+        // One of the person's reactions clicked: taken off.
+        if let Some((node, emoji)) = button
+            .strip_prefix("unreact/")
+            .and_then(|rest| rest.split_once('/'))
+            .and_then(|(node, emoji)| Some((node.parse::<i64>().ok()?, emoji)))
+            && self.reactions.on(node).iter().any(|on| on == emoji)
+        {
+            match self.reply_first(node).await {
+                Ok(first) => {
+                    self.toggle_reaction((node, first), emoji).await;
+                }
+                Err(error) => self.notice = Some(error),
+            }
+        }
         if let Some(at) = button
             .strip_prefix("fold/")
             .and_then(|at| at.parse::<usize>().ok())
@@ -5473,6 +5503,7 @@ impl App {
         if let Some(row) = self.reacted_row(node) {
             self.commit_after(vec![row], false);
             self.mark_last(screen::Mark::Tag(screen::Tag::Reactions(node)));
+            self.mark_last(screen::Mark::Buttons(self.reacted_buttons(node)));
         }
     }
 
@@ -6476,6 +6507,7 @@ impl App {
             if let Some(row) = self.reacted_row(node) {
                 self.commit_after(vec![row], false);
                 self.mark_last(screen::Mark::Tag(screen::Tag::Reactions(node)));
+                self.mark_last(screen::Mark::Buttons(self.reacted_buttons(node)));
             }
         }
     }
@@ -10280,11 +10312,26 @@ impl App {
         (!on.is_empty()).then(|| transcript::reacted(&on.join(" ")))
     }
 
+    /// The buttons on [`App::reacted_row`]: a click on one of the
+    /// person's reactions takes it off, as sending it again does.
+    fn reacted_buttons(&self, node: i64) -> screen::Buttons {
+        transcript::reacted_spans(self.reactions.on(node))
+            .into_iter()
+            .map(|(from, to, emoji)| {
+                (
+                    from,
+                    to,
+                    format!("{}unreact/{node}/{emoji}", screen::BUTTON),
+                )
+            })
+            .collect()
+    }
+
     /// An emoji sent alone reacts to the reply `/react` picked, else to
     /// the bot's last: attached to the bot's next call, so it starts no
     /// turn. The same emoji again takes it off, which the bot is not told.
     async fn react(&mut self, emoji: String) {
-        let Some((node, first)) = self
+        let Some(picked) = self
             .react_to
             .take()
             .or_else(|| self.replies.last().cloned())
@@ -10292,16 +10339,24 @@ impl App {
             self.notice = Some("no reply to react to yet".into());
             return;
         };
+        if self.toggle_reaction(picked, &emoji).await {
+            self.input.clear();
+        }
+    }
+
+    /// `emoji` put on the reply at `node`, whose first line is `first`,
+    /// or taken off when it is there; whether it was.
+    async fn toggle_reaction(&mut self, (node, first): (i64, String), emoji: &str) -> bool {
         let last = self.replies.last().map(|(last, _)| *last) == Some(node);
-        let added = match self.reactions.toggle(node, &emoji) {
+        let added = match self.reactions.toggle(node, emoji) {
             Ok(added) => added,
             Err(error) => {
                 self.notice = Some(error);
-                return;
+                return false;
             }
         };
         if added {
-            let told = reactions::message(&emoji, (!last).then_some(first.as_str()));
+            let told = reactions::message(emoji, (!last).then_some(first.as_str()));
             let sent = self
                 .client
                 .request(
@@ -10311,12 +10366,11 @@ impl App {
                 )
                 .await;
             if let Err(error) = sent {
-                let _ = self.reactions.toggle(node, &emoji);
+                let _ = self.reactions.toggle(node, emoji);
                 self.notice = Some(error.to_string());
-                return;
+                return false;
             }
         }
-        self.input.clear();
         self.notice = None;
         // Under the reply, wherever it is in the conversation; else, as
         // when it is no longer there, a row of its own that says which.
@@ -10324,18 +10378,39 @@ impl App {
             self.end_live(Words::Reply);
         }
         let row = self.reacted_row(node);
-        if self.put_under(screen::Tag::End(node), screen::Tag::Reactions(node), row) {
-            return;
+        self.flush();
+        let (tag, buttons) = (screen::Tag::Reactions(node), self.reacted_buttons(node));
+        if (self.screen).put_under_with(screen::Tag::End(node), tag, row, buttons) {
+            return true;
         }
         // A reply still being written gets them under it once it is; one
         // not drawn here, once it is drawn.
         if (self.live.as_ref()).is_some_and(|live| live.node == Some(node)) {
-            return;
+            return true;
         }
         self.notice = Some(match added {
             true => format!("{emoji} on “{first}”"),
             false => format!("took back {emoji} on “{first}”"),
         });
+        true
+    }
+
+    /// The first line of the bot's reply at `node`, as `/react` offers it:
+    /// kept for its latest replies, else read again.
+    async fn reply_first(&self, node: i64) -> Result<String, String> {
+        if let Some((_, first)) = self.replies.iter().find(|(seen, _)| *seen == node) {
+            return Ok(first.clone());
+        }
+        let read = (self.client)
+            .request("history_items", json!({"bot": self.bot, "nodes": [node]}))
+            .await
+            .map_err(|error| error.to_string())?;
+        let said = text(&read["items"][0]["item"]);
+        let first = said
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or("");
+        Ok(transcript::cut(first.trim(), QUOTED))
     }
 
     /// A guess at the person's next message, after a turn of theirs ended
@@ -14927,6 +15002,51 @@ mod tests {
         app.submit().await;
         assert_eq!(words_sent(&sent.lock().unwrap()[3]), "👍 ship it");
         assert_eq!(sent.lock().unwrap()[3]["delivery"], "reject");
+    }
+
+    #[tokio::test]
+    async fn the_react_mark_picks_a_reply_and_a_click_on_a_reaction_takes_it_off() {
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = sent.clone();
+        let client = daemon_answering(move |asked| {
+            if asked["op"] == "submit" {
+                seen.lock().unwrap().push(asked.clone());
+            }
+            json!({"turn": 9})
+        })
+        .await;
+        let mut app = app(client);
+        app.any_history = true;
+        for (node, reply) in [(4, "Merged it."), (8, "Tagged 0.4.0.")] {
+            let lines = transcript::reply(reply, 80, std::path::Path::new("/"));
+            app.commit_said(node, lines);
+            app.saw_reply(node, reply);
+        }
+        app.flush();
+        // The mark under the older reply picks it, as /react does.
+        app.press_row("react/4").await;
+        assert_eq!(app.react_to, Some((4, "Merged it.".into())));
+        app.input.set("🎉");
+        app.submit().await;
+        assert_eq!(sent.lock().unwrap()[0]["prompt"], "> Merged it.\n\n🎉");
+        assert_eq!(app.reactions.on(4), ["🎉"]);
+        // Each of the person's reactions is a button on its row.
+        let buttons = app.reacted_buttons(4);
+        assert_eq!(buttons, [(2, 5, format!("{}unreact/4/🎉", screen::BUTTON))]);
+        // A click on it takes it off, telling the bot nothing, and leaves
+        // what the person was writing alone.
+        app.input.set("half a thought");
+        app.press_row("unreact/4/🎉").await;
+        assert!(app.reactions.on(4).is_empty());
+        assert_eq!(sent.lock().unwrap().len(), 1);
+        assert_eq!(app.input.trim(), "half a thought");
+        assert_eq!(
+            drawn(&mut app)[1..],
+            ["• Merged it.", "", "• Tagged 0.4.0."]
+        );
+        // One no longer on it does nothing.
+        app.press_row("unreact/4/🎉").await;
+        assert!(app.reactions.on(4).is_empty());
     }
 
     #[tokio::test]

@@ -235,10 +235,29 @@ pub struct Screen {
     /// The reply mark drawn last, over the gutter of the message under
     /// the mouse: its row and first column, and the message's node.
     reply: Option<(u16, u16, i64)>,
+    /// The react mark drawn last, where the reactions under the agent's
+    /// message under the mouse go: its row and column, and the node.
+    react: Option<(u16, u16, i64)>,
 }
 
 /// The mark a message's gutter shows under the mouse: a click answers it.
 pub const REPLY: &str = "↩";
+
+/// The mark under an agent's message under the mouse, where its reactions
+/// go: a click picks it for the emoji the person sends next.
+pub const REACT: &str = "☺";
+
+/// The message under the mouse.
+struct Hovered {
+    /// Its first row in `shown`.
+    first: usize,
+    /// Its node.
+    node: i64,
+    /// Its last row in `rows`, the one tagged [`Tag::End`].
+    end: usize,
+    /// It is the person's own, which the person does not react to.
+    mine: bool,
+}
 
 /// The place found is to be picked again, the rows having been drawn anew.
 const AGAIN: usize = usize::MAX;
@@ -372,16 +391,31 @@ impl Screen {
     /// tagged `under`, in place of the one there: reactions under their
     /// message. Whether `under` was found.
     pub fn put_under(&mut self, under: Tag, tag: Tag, line: Option<Line<'static>>) -> bool {
+        self.put_under_with(under, tag, line, Vec::new())
+    }
+
+    /// [`Screen::put_under`], with `buttons` on the row put.
+    pub fn put_under_with(
+        &mut self,
+        under: Tag,
+        tag: Tag,
+        line: Option<Line<'static>>,
+        buttons: Buttons,
+    ) -> bool {
         let Some(at) = self.tagged(under).map(|at| at + 1) else {
             return false;
         };
         let shown = self.shown_at(at);
         let there = (self.rows.get(at)).is_some_and(|row| row.tag == Some(tag));
         match (line, there) {
-            (Some(line), true) => self.rows[at].line = Arc::new(line),
+            (Some(line), true) => {
+                self.rows[at].line = Arc::new(line);
+                self.rows[at].buttons = buttons;
+            }
             (Some(line), false) => {
                 let mut row = Row::new(line);
                 row.tag = Some(tag);
+                row.buttons = buttons;
                 self.rows.insert(at, row);
                 self.grow_page(at - 1, 1);
             }
@@ -1406,7 +1440,11 @@ impl Screen {
         // The message under the mouse shows its reply mark in place of its
         // bullet, muted as the gutter's marks are.
         self.reply = None;
-        if let Some((at, node)) = self.hovered()
+        self.react = None;
+        let hovered = self.hovered();
+        if let Some(Hovered {
+            first: at, node, ..
+        }) = hovered
             && (top..bottom).contains(&at)
         {
             let y = area.y + (at - top) as u16;
@@ -1414,6 +1452,19 @@ impl Screen {
                 .set_symbol(REPLY)
                 .set_style(Style::new().add_modifier(Modifier::DIM));
             self.reply = Some((y, area.x, node));
+        }
+        // An agent's message under the mouse shows the react mark where
+        // its reactions go, after any there, muted as the reply mark is.
+        if let Some(hovered) = hovered.filter(|hovered| !hovered.mine)
+            && let Some((at, x)) = self.react_spot(&hovered)
+            && (top..bottom).contains(&at)
+            && x < area.width as usize
+        {
+            let (y, x) = (area.y + (at - top) as u16, area.x + x as u16);
+            buf[(x, y)]
+                .set_symbol(REACT)
+                .set_style(Style::new().add_modifier(Modifier::DIM));
+            self.react = Some((y, x, hovered.node));
         }
         if let Some(selection) = &self.selection {
             let (start, end) = self.extent(selection);
@@ -1437,12 +1488,13 @@ impl Screen {
         }
     }
 
-    /// The message under the mouse, by its rows in `shown`: where it opens
-    /// and its node. A message opens on a row that starts with the
-    /// agent's `• ` or the person's `› ` and ends on the row tagged
-    /// [`Tag::End`]; a row between another opening and that end (a call,
-    /// a note) belongs to no message.
-    fn hovered(&self) -> Option<(usize, i64)> {
+    /// The message under the mouse. A message opens on a row that starts
+    /// with the agent's `• ` or the person's `› ` and ends on the row
+    /// tagged [`Tag::End`]; a row between another opening and that end (a
+    /// call, a note) belongs to no message. The rows right under its end,
+    /// its reactions or the blank row after it, are its too, so the mouse
+    /// reaches the react mark drawn there.
+    fn hovered(&self) -> Option<Hovered> {
         let (column, row) = self.hover?;
         if !self.area.contains((column, row).into()) || self.selection.is_some() {
             return None;
@@ -1453,19 +1505,25 @@ impl Screen {
             .filter(|(_, shown)| shown.first)
             .map(|(at, _)| at)
             .collect();
-        let row = firsts
+        let mut row = firsts
             .partition_point(|&first| first <= at)
             .checked_sub(1)?;
-        let opens = |row: &Row| {
-            if row.opens {
-                return true;
-            }
-            let lead: String = (row.line.spans.iter())
+        let under = |row: &Row| matches!(row.tag, Some(Tag::Reactions(_) | Tag::Picked(_)));
+        let blank = |row: &Row| row.tag.is_none() && row.line.width() == 0;
+        let ends = |row: &Row| under(row) || matches!(row.tag, Some(Tag::End(_)));
+        if row > 0 && blank(&self.rows[row]) && ends(&self.rows[row - 1]) {
+            row -= 1;
+        }
+        while row > 0 && under(&self.rows[row]) {
+            row -= 1;
+        }
+        let lead = |row: &Row| -> String {
+            (row.line.spans.iter())
                 .flat_map(|span| span.content.chars())
                 .take(2)
-                .collect();
-            lead == "• " || lead == "› "
+                .collect()
         };
+        let opens = |row: &Row| row.opens || matches!(lead(row).as_str(), "• " | "› ");
         let mut end = None;
         for (k, candidate) in self.rows.iter().enumerate().skip(row) {
             if k > row && opens(candidate) {
@@ -1478,9 +1536,42 @@ impl Screen {
         }
         let (end, node) = end?;
         let start = (0..=end).rev().find(|&k| opens(&self.rows[k]))?;
-        match start <= row {
-            true => Some((*firsts.get(start)?, node)),
-            false => None,
+        if start > row {
+            return None;
+        }
+        Some(Hovered {
+            first: *firsts.get(start)?,
+            node,
+            end,
+            mine: lead(&self.rows[start]) == "› ",
+        })
+    }
+
+    /// Where the react mark of the agent's message `hovered` goes, as a
+    /// row in `shown` and a column: after the reactions under it when it
+    /// has some; else at their place on the blank row under it; else, with
+    /// no such row in the conversation yet, after its last words.
+    fn react_spot(&self, hovered: &Hovered) -> Option<(usize, usize)> {
+        let first = |row: usize| {
+            (self.shown.iter().enumerate())
+                .filter(|(_, shown)| shown.first)
+                .nth(row)
+                .map(|(at, _)| at)
+        };
+        match self.rows.get(hovered.end + 1) {
+            Some(row) if row.tag == Some(Tag::Reactions(hovered.node)) => {
+                Some((first(hovered.end + 1)?, row.line.width() + 1))
+            }
+            Some(row) if row.tag.is_none() && row.line.width() == 0 => {
+                Some((first(hovered.end + 1)?, 2))
+            }
+            Some(_) => None,
+            // The last row: its last shown line, past its words.
+            None => {
+                first(hovered.end)?;
+                let last = self.shown.last()?;
+                Some((self.shown.len() - 1, last.line.width() + 2))
+            }
         }
     }
 
@@ -1488,6 +1579,13 @@ impl Screen {
     fn reply_at(&self, column: u16, row: u16) -> Option<i64> {
         let (y, x, node) = self.reply?;
         (row == y && (x..x + 2).contains(&column)).then_some(node)
+    }
+
+    /// The node of the agent's message whose react mark is at a cell, if
+    /// one is: the cell either side of the mark too, as the reply mark's.
+    fn react_at(&self, column: u16, row: u16) -> Option<i64> {
+        let (y, x, node) = self.react?;
+        (row == y && (x.saturating_sub(1)..x + 2).contains(&column)).then_some(node)
     }
 
     /// The cells of the links drawn last, from `buf` they were drawn in,
@@ -1653,6 +1751,13 @@ impl Screen {
             {
                 self.selection = None;
                 return Some(Action::Open(format!("{BUTTON}reply/{node}")));
+            }
+            // The react mark: the message picked for the emoji sent next.
+            MouseEventKind::Down(MouseButton::Left)
+                if let Some(node) = self.react_at(event.column, event.row) =>
+            {
+                self.selection = None;
+                return Some(Action::Open(format!("{BUTTON}react/{node}")));
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 let spot = self.spot(event.column, event.row)?;
@@ -2102,6 +2207,88 @@ mod tests {
         screen.mouse(mouse(MouseEventKind::Moved, 3, 6));
         let buf = draw(&mut screen);
         assert!(row(&buf, 6).starts_with("↩ thanks"), "{:?}", row(&buf, 6));
+    }
+
+    #[test]
+    fn an_agent_s_message_under_the_mouse_shows_a_react_mark_where_its_reactions_go() {
+        let mut screen = Screen::default();
+        screen.push(vec![
+            Line::from("• The tests pass."),
+            Line::from("  Merged it."),
+        ]);
+        screen.mark_last(Mark::Tag(Tag::End(5)));
+        screen.push(vec![Line::default(), Line::from("› thanks")]);
+        screen.mark_last(Mark::Tag(Tag::End(6)));
+        screen.push(vec![Line::default(), Line::from("• Tagged it.")]);
+        screen.mark_last(Mark::Tag(Tag::End(7)));
+        let area = Rect::new(0, 0, 30, 8);
+        let draw = |screen: &mut Screen| {
+            let mut buf = Buffer::empty(area);
+            screen.render(area, &mut buf, |_| None);
+            buf
+        };
+        // Nothing at rest.
+        let buf = draw(&mut screen);
+        assert!((0..8).all(|y| !row(&buf, y).contains(REACT)));
+        // Over the message, the mark sits on the blank row under it, where
+        // its reactions would go.
+        screen.mouse(mouse(MouseEventKind::Moved, 6, 0));
+        let buf = draw(&mut screen);
+        assert_eq!(row(&buf, 2).trim_end(), format!("  {REACT}"));
+        // The mouse on its way down to it keeps it there, and a click
+        // picks the message.
+        screen.mouse(mouse(MouseEventKind::Moved, 2, 2));
+        let buf = draw(&mut screen);
+        assert!(row(&buf, 2).contains(REACT));
+        assert_eq!(
+            screen.mouse(mouse(MouseEventKind::Down(MouseButton::Left), 2, 2)),
+            Some(Action::Open(format!("{BUTTON}react/5")))
+        );
+        // The person's own message gets the reply mark only.
+        screen.mouse(mouse(MouseEventKind::Moved, 3, 3));
+        let buf = draw(&mut screen);
+        assert!(row(&buf, 3).starts_with(REPLY));
+        assert!((0..8).all(|y| !row(&buf, y).contains(REACT)));
+        // The newest, with no row under it yet: after its words.
+        screen.mouse(mouse(MouseEventKind::Moved, 4, 5));
+        let buf = draw(&mut screen);
+        assert_eq!(
+            row(&buf, 5).trim_end(),
+            format!("{REPLY} Tagged it.  {REACT}")
+        );
+        // With reactions under it, the mark goes after them.
+        let pill = Line::from(vec![Span::raw("  "), Span::raw(" 👍 ")]);
+        assert!(screen.put_under(Tag::End(5), Tag::Reactions(5), Some(pill)));
+        screen.mouse(mouse(MouseEventKind::Moved, 6, 2));
+        let buf = draw(&mut screen);
+        let under = row(&buf, 2);
+        assert!(
+            under.contains('👍') && under.trim_end().ends_with(REACT),
+            "{under:?}"
+        );
+        assert_eq!(buf[(7, 2)].symbol(), REACT);
+        // The reactions row is the message's too.
+        screen.mouse(mouse(MouseEventKind::Moved, 1, 2));
+        let buf = draw(&mut screen);
+        assert!(row(&buf, 0).starts_with(REPLY));
+    }
+
+    #[test]
+    fn a_click_on_a_button_put_under_a_message_opens_it() {
+        let mut screen = Screen::default();
+        screen.push(vec![Line::from("• Merged it.")]);
+        screen.mark_last(Mark::Tag(Tag::End(5)));
+        let pill = Line::from(vec![Span::raw("  "), Span::raw(" 👍 ")]);
+        let buttons = vec![(2, 5, format!("{BUTTON}unreact/5/👍"))];
+        assert!(screen.put_under_with(Tag::End(5), Tag::Reactions(5), Some(pill), buttons));
+        let area = Rect::new(0, 0, 30, 3);
+        let mut buf = Buffer::empty(area);
+        screen.render(area, &mut buf, |_| None);
+        screen.mouse(mouse(MouseEventKind::Down(MouseButton::Left), 3, 1));
+        assert_eq!(
+            screen.mouse(mouse(MouseEventKind::Up(MouseButton::Left), 3, 1)),
+            Some(Action::Open(format!("{BUTTON}unreact/5/👍")))
+        );
     }
 
     #[test]
