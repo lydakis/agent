@@ -161,8 +161,8 @@ identity is `bot_not_found`.
   `--idle-exit` and `--keep-warm`. The last three count whole seconds. The
   protocol keeps its own units (`timeout_ms`, `grace_ms`, `approval_hold_ms`,
   `keep_warm` seconds). `--approval-hold` is how long a new bot's gated calls
-  wait live for a verdict before the turn parks (default `2s`; `0` parks at
-  once). `--after` is an exclusive event cursor for `follow` and an exclusive
+  wait live for a verdict, and its terminal reads for output, before the turn
+  parks (default `2s`; `0` parks at once). `--after` is an exclusive event cursor for `follow` and an exclusive
   turn ID for `turns`. `--checkpoint` is a history node ID.
 - Listings read only what they print. `--limit N` stops `ls`, `turns` and
   `approvals` after N entries. `ls --name GLOB` keeps the bots whose name

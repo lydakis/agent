@@ -840,6 +840,11 @@ pub struct Waiting {
     /// and the pause is not charged as pacing.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub pulled: bool,
+    /// The wait is a terminal poll, an empty `write_stdin` past its hold:
+    /// `handles` names the terminal, and its result is the terminal's
+    /// output when it ends or its yield runs out.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub poll: bool,
 }
 /// A declined request's fallback model, as `provider/model`, and the credit
 /// its retry redeems.
@@ -6755,6 +6760,7 @@ impl Database {
             summary_retry_ms,
             fallback: None,
             pulled: false,
+            poll: false,
         };
         let tx = self.conn.savepoint()?;
         flush(&tx, turn, self.live.get(&turn))?;
@@ -6898,6 +6904,7 @@ impl Database {
             summary_retry_ms,
             fallback: None,
             pulled: false,
+            poll: false,
         };
         let tx = self.conn.savepoint()?;
         flush(&tx, turn, self.live.get(&turn))?;
@@ -8560,6 +8567,32 @@ impl Database {
         route: Option<&str>,
         summary_retry_ms: Option<u64>,
     ) -> Result<Value> {
+        self.suspend_wait(
+            turn,
+            call_id,
+            handles,
+            deadline_ms,
+            any,
+            pending,
+            route,
+            summary_retry_ms,
+            false,
+        )
+    }
+    /// `suspend`, for a terminal poll when `poll` is set.
+    #[allow(clippy::too_many_arguments)]
+    pub fn suspend_wait(
+        &mut self,
+        turn: i64,
+        call_id: &str,
+        handles: &[String],
+        deadline_ms: Option<u64>,
+        any: bool,
+        pending: &[ToolCall],
+        route: Option<&str>,
+        summary_retry_ms: Option<u64>,
+        poll: bool,
+    ) -> Result<Value> {
         let bot = self.active(turn)?;
         let executing: bool = self.conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM tools WHERE turn=? AND call_id=? AND status='executing')",
@@ -8588,6 +8621,7 @@ impl Database {
             summary_retry_ms,
             fallback: None,
             pulled: false,
+            poll,
         };
         let tx = self.conn.savepoint()?;
         // A verdict for a later call of the round waits in the store.
@@ -8645,6 +8679,7 @@ impl Database {
             summary_retry_ms,
             fallback,
             pulled: false,
+            poll: false,
         };
         let tx = self.conn.savepoint()?;
         flush(&tx, turn, self.live.get(&turn))?;
@@ -8725,6 +8760,7 @@ impl Database {
             summary_retry_ms: None,
             fallback: None,
             pulled: true,
+            poll: false,
         };
         let tx = self.conn.savepoint()?;
         flush(&tx, turn, self.live.get(&turn))?;

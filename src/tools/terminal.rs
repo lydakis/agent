@@ -24,7 +24,8 @@ use tokio::{
 pub const MAX_TERMINALS: usize = 16;
 /// How long a write waits for output by default: Codex's waits.
 const WRITE_YIELD_MS: u64 = 250;
-const POLL_YIELD_MS: u64 = 5_000;
+/// How long an empty `write_stdin` waits for its terminal by default.
+pub const POLL_YIELD_MS: u64 = 5_000;
 /// How long typed input may wait for a program that reads none.
 const INPUT_WAIT: Duration = Duration::from_secs(5);
 /// How long a start waits for a terminal it pruned to give up its slot,
@@ -147,7 +148,10 @@ fn least_used(
     owner: i64,
     share: usize,
 ) -> Option<Arc<Terminal>> {
-    let own = terminals.values().filter(|t| t.owner == owner);
+    // An ended terminal waiting for its result to be recorded runs nothing.
+    let own = terminals
+        .values()
+        .filter(|t| t.owner == owner && !*t.exited.borrow());
     if own.clone().count() < share {
         return None;
     }
@@ -564,17 +568,25 @@ impl Registry {
                     state.end = Some((end, rest));
                     last
                 };
-                registry
-                    .terminals
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .remove(&handle);
+                // The terminal stays in the registry, its end held, until
+                // its handle's result is recorded and `forget_terminal`
+                // lets it go: a parked poll that wakes between the two
+                // reads the end here.
                 let _ = exit.send(true);
                 let _ = done.send(Ok(last));
             });
         }
         terminal.settle(yield_ms).await;
         Ok(terminal.take(self, handle))
+    }
+
+    /// Let terminal `handle` go once its handle's result is recorded; it
+    /// ended before.
+    pub fn forget_terminal(&self, handle: i64) {
+        self.terminals
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&handle);
     }
 
     /// End `owner`'s least recently used terminal when it already runs its
@@ -616,6 +628,75 @@ impl Registry {
         kill: bool,
         sandbox: Option<Arc<Policy>>,
     ) -> Result<Outcome> {
+        let terminal = self.typed(owner, handle, sandbox)?;
+        let yield_ms = if kill {
+            terminal.kill();
+            MAX_YIELD_MS
+        } else if input.is_empty() {
+            yield_ms.unwrap_or(POLL_YIELD_MS)
+        } else if *terminal.exited.borrow() {
+            // An ended terminal takes no input: the write reports its end.
+            0
+        } else {
+            terminal.write(input.as_bytes()).await?;
+            yield_ms.unwrap_or(WRITE_YIELD_MS)
+        };
+        terminal.settle(yield_ms).await;
+        Ok(terminal.take(self, handle))
+    }
+
+    /// The first `hold_ms` of a poll of `owner`'s terminal `handle`: its
+    /// output, when it ends within them, or `None` with the output left
+    /// for the poll's end, so a longer poll can park its turn meanwhile.
+    pub async fn poll_hold(
+        &self,
+        owner: i64,
+        handle: i64,
+        hold_ms: u64,
+        sandbox: Option<Arc<Policy>>,
+    ) -> Result<Option<Outcome>> {
+        let terminal = self.typed(owner, handle, sandbox)?;
+        terminal.settle(hold_ms).await;
+        let ended = *terminal.exited.borrow();
+        Ok(ended.then(|| terminal.take(self, handle)))
+    }
+
+    /// A parked poll's result: the output of `owner`'s terminal `handle`
+    /// since the last read and, once it ended, how. `ended` is the handle's
+    /// result for a terminal that has gone.
+    pub fn poll_end(&self, owner: i64, handle: i64, ended: Option<&Value>) -> Result<Outcome> {
+        let terminal = self
+            .terminals
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&handle)
+            .filter(|terminal| terminal.owner == owner)
+            .cloned();
+        if let Some(terminal) = terminal {
+            return Ok(terminal.take(self, handle));
+        }
+        match ended {
+            Some(Value::Object(end)) if end.contains_key("exit_code") => {
+                let mut output = Value::Object(end.clone());
+                output["handle"] = format!("proc:{handle}").into();
+                Ok(Outcome {
+                    failed: end.get("exit_code") != Some(&json!(0)),
+                    ..Outcome::text(output.to_string())
+                })
+            }
+            _ => not_running(handle),
+        }
+    }
+
+    /// `owner`'s running terminal `handle`, which takes input only while
+    /// it runs in its bot's current sandbox; one whose sandbox changed is
+    /// ended.
+    fn typed(
+        &self,
+        owner: i64,
+        handle: i64,
+        sandbox: Option<Arc<Policy>>,
+    ) -> Result<Arc<Terminal>> {
         let terminal = self
             .terminals
             .lock()
@@ -624,12 +705,7 @@ impl Registry {
             .filter(|terminal| terminal.owner == owner)
             .cloned();
         let Some(terminal) = terminal else {
-            return fail_with(
-                "terminal_not_running",
-                format!(
-                    "proc:{handle} is no terminal of this agent's that still runs; wait on it for how it ended"
-                ),
-            );
+            return not_running(handle);
         };
         if terminal.sandbox != sandbox {
             terminal.kill();
@@ -640,18 +716,17 @@ impl Registry {
                 ),
             );
         }
-        let yield_ms = if kill {
-            terminal.kill();
-            MAX_YIELD_MS
-        } else if input.is_empty() {
-            yield_ms.unwrap_or(POLL_YIELD_MS)
-        } else {
-            terminal.write(input.as_bytes()).await?;
-            yield_ms.unwrap_or(WRITE_YIELD_MS)
-        };
-        terminal.settle(yield_ms).await;
-        Ok(terminal.take(self, handle))
+        Ok(terminal)
     }
+}
+
+fn not_running<T>(handle: i64) -> Result<T> {
+    fail_with(
+        "terminal_not_running",
+        format!(
+            "proc:{handle} is no terminal of this agent's that still runs; wait on it for how it ended"
+        ),
+    )
 }
 
 #[cfg(test)]
@@ -745,5 +820,49 @@ mod tests {
         let many = format!("{}\n", "\r".repeat(60_000));
         assert_eq!(lines(&many), "\n");
         assert_eq!(lines("a\rb\r\r\nc\r"), "a\rb\nc\r");
+    }
+
+    /// A terminal that ended stays readable until its handle's result is
+    /// recorded, so a parked poll that wakes in between reads its end
+    /// instead of finding it gone.
+    #[tokio::test]
+    async fn an_ended_terminal_reports_its_end_until_its_result_is_recorded() {
+        use super::Registry;
+        let registry = Registry::new("echo").unwrap();
+        let (done, recorded) = tokio::sync::oneshot::channel();
+        let started = registry
+            .terminal(
+                1,
+                7,
+                "printf hi; exit 3".into(),
+                std::env::temp_dir(),
+                5_000,
+                Vec::new(),
+                None,
+                done,
+            )
+            .await
+            .unwrap();
+        assert!(
+            started.output.contains("\"exit_code\":3"),
+            "{}",
+            started.output
+        );
+        let result = recorded.await.unwrap().unwrap();
+        assert!(result.output.contains("\"exit_code\":3"));
+        // Its result is on its way to the store: a poll still reads the end.
+        let read = registry.poll_end(1, 7, None).unwrap();
+        assert!(read.output.contains("\"exit_code\":3"), "{}", read.output);
+        // Another bot's poll does not.
+        assert!(registry.poll_end(2, 7, None).is_err());
+        // A write that finds it ended reports the end and types nothing.
+        let typed = registry
+            .write_stdin(1, 7, "x\n", None, false, None)
+            .await
+            .unwrap();
+        assert!(typed.output.contains("\"exit_code\":3"), "{}", typed.output);
+        // Once it is recorded, the terminal goes, and the result tells.
+        registry.forget_terminal(7);
+        assert!(registry.poll_end(1, 7, None).is_err());
     }
 }

@@ -29,6 +29,8 @@ mod picture;
 mod terminal;
 use files::read_bounded;
 pub use patch::Patch;
+#[cfg(unix)]
+pub use terminal::POLL_YIELD_MS;
 
 /// Model-facing text per tool result stream.
 pub const PREVIEW_BYTES: usize = 64 * 1024;
