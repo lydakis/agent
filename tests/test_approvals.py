@@ -166,13 +166,14 @@ class ApprovalTests(ModelFixture):
         # its sandbox whatever it is configured to.
         client = self.client('shell')
         bob = client.request('create', bot='Bob', workspace=str(tree))['result']['bot_id']
-        configured = client.request('configure', bot='Bob', sandbox='workspace-write',
-                                    writable=[str(repo / '.git')], network=True)['result']
+        configured = client.request('configure', bot='Bob', settings={
+            'sandbox': 'workspace-write', 'writable': [str(repo / '.git')], 'network': True})['result']
         self.assertEqual(configured['changed'], ['sandbox'])
         client.request('create', bot='Kid', workspace=str(tree), created_by='Bob', created_by_id=bob)
-        client.request('configure', bot='Kid', sandbox='danger-full-access')
+        client.request('configure', bot='Kid', settings={'sandbox': 'danger-full-access'})
         self.assertEqual(client.request('inspect', bot='Kid')['result']['settings']['sandbox'], 'workspace-write')
-        self.assertEqual(client.request('configure', bot='Bob', network=True)['error'], 'invalid_setting')
+        refused = client.request('configure', bot='Bob', settings={'sandbox': 'read-only', 'network': True})
+        self.assertEqual(refused['error'], 'invalid_setting')
         calls = [['shell', {'command': ' '.join(git) + ' commit -q --allow-empty -m two'}],
                  ['shell', {'command': f'echo exit 1 > {repo}/.git/hooks/pre-commit'}],
                  ['shell', {'command': f'echo "[core] hooksPath = /tmp" >> {repo}/.git/config'}],

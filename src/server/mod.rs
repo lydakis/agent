@@ -268,8 +268,9 @@ enum Command {
     },
     /// Change what a bot's client chose for it when it was made: its
     /// instructions, recomposed with the skills, memory and folder rules
-    /// added since, and its model (another of its family) and effort level.
-    /// Refused while a turn runs; the next turn uses them.
+    /// added since, its model (another of its family) and effort level, and
+    /// every other setting `create` takes, by the same names. Refused while
+    /// a turn runs; the next turn uses them.
     Configure {
         bot: String,
         /// The identity `bot` must hold; another is `bot_not_found`.
@@ -286,18 +287,18 @@ enum Command {
         /// The tools its client declares, replacing those it has; `[]`
         /// removes them.
         declare: Option<Vec<Declared>>,
-        /// Its command sandbox, replacing the one it has, as `create`'s
-        /// settings name it: with `writable`, `network` and `unix_sockets`,
-        /// which otherwise go back to none, off and none.
-        sandbox: Option<agent_runtime::sandbox::Mode>,
-        writable: Option<Vec<String>>,
-        network: Option<bool>,
-        /// Its prompt-cache lifetime, as `create`'s settings name it.
-        cache_ttl: Option<agent_runtime::store::CacheTtl>,
-        unix_sockets: Option<Vec<String>>,
-        /// The tier its calls are served at, as `create`'s settings name
-        /// it; `standard` goes back to none.
-        speed: Option<agent_runtime::provider::Speed>,
+        /// `create`'s settings, by its names: each one given replaces the
+        /// bot's, `null` puts it back to its default, and the rest stay.
+        /// `sandbox` given puts `writable`, `network` and `unix_sockets`
+        /// back to theirs unless they are given too.
+        settings: Option<serde_json::Map<String, Value>>,
+        /// As `create` takes them; `null` removes the bot's.
+        #[serde(default, deserialize_with = "present")]
+        fallback: Option<Option<String>>,
+        #[serde(default, deserialize_with = "present")]
+        compaction_instructions: Option<Option<String>>,
+        #[serde(default, deserialize_with = "present")]
+        compaction_model: Option<Option<String>>,
     },
     /// Summarize a bot's context with its compaction instructions before
     /// its next model call: a running turn's next round boundary, or an
@@ -3301,43 +3302,14 @@ impl Service {
                 approver,
                 approve_expire_ms,
                 declare,
-                sandbox,
-                writable,
-                network,
-                cache_ttl,
-                unix_sockets,
-                speed,
+                settings,
+                fallback,
+                compaction_instructions,
+                compaction_model,
             } => {
                 if effort.is_some() && model.is_none() {
                     return fail_with("invalid_effort", "effort goes with model");
                 }
-                let sandbox = match sandbox {
-                    Some(mode) => {
-                        let mut settings = Settings {
-                            sandbox: Some(mode),
-                            writable: writable.unwrap_or_default(),
-                            network: network.unwrap_or(false),
-                            unix_sockets: unix_sockets.unwrap_or_default(),
-                            ..Settings::default()
-                        };
-                        settings.validate()?;
-                        // Checking for a sandbox and resolving folders touch
-                        // the filesystem: off the runtime thread.
-                        let settings = tokio::task::spawn_blocking(move || {
-                            confine(&mut settings).map(|()| settings)
-                        })
-                        .await
-                        .map_err(|_| Error::new("sandbox_unavailable"))??;
-                        Some(settings)
-                    }
-                    None if writable.is_some() || network.is_some() || unix_sockets.is_some() => {
-                        return fail_with(
-                            "invalid_setting",
-                            "writable, network and unix_sockets go with sandbox",
-                        );
-                    }
-                    None => None,
-                };
                 let gate = match (&approve, &approver, approve_expire_ms) {
                     (None, None, None) => None,
                     (Some(tools), None, None) if tools.is_empty() => Some(None),
@@ -3348,11 +3320,19 @@ impl Service {
                         self.registry.tool_count() + MAX_DECLARED,
                     )?),
                 };
-                if instructions.as_ref().is_some_and(|i| i.len() > 64 * 1024) {
-                    return Err(Error::with(
-                        "instructions_limit",
-                        "instructions may be up to 65536 bytes",
-                    ));
+                for (text, what) in [
+                    (instructions.as_ref(), "instructions"),
+                    (
+                        compaction_instructions.as_ref().and_then(Option::as_ref),
+                        "compaction_instructions",
+                    ),
+                ] {
+                    if text.is_some_and(|text| text.len() > 64 * 1024) {
+                        return Err(Error::with(
+                            "instructions_limit",
+                            format!("{what} may be up to 65536 bytes"),
+                        ));
+                    }
                 }
                 if let Some(declare) = &declare {
                     validate_declared(declare)?;
@@ -3364,52 +3344,111 @@ impl Service {
                     )
                     .facts(json!({"running_turn":turn})));
                 }
-                // Another model of the bot's family: its history is kept in
-                // that family's encoding.
-                let model = match model {
-                    Some(reference) => {
-                        let (provider, name) = split_model(&reference)?;
-                        let served = self
-                            .providers
-                            .get(provider)
-                            .ok_or(Error::with("provider_unavailable", provider))?;
-                        let record = store
+                // The settings named, `sandbox` taking the rest of the
+                // sandbox with it, over the bot's own.
+                let mut named = Vec::new();
+                let mut changes = settings.unwrap_or_default();
+                // Named before a null drops one, so a reset of a setting
+                // that isn't one is refused like any other.
+                if let Some(unknown) = (changes.keys())
+                    .find(|key| !agent_runtime::store::SETTINGS.contains(&key.as_str()))
+                {
+                    return fail_with("invalid_setting", format!("unknown setting `{unknown}`"));
+                }
+                if changes.contains_key("sandbox") {
+                    for key in agent_runtime::store::SANDBOX {
+                        changes.entry(key).or_insert(Value::Null);
+                    }
+                }
+                named.extend(changes.keys().cloned());
+                let others = [compaction_model.as_ref(), fallback.as_ref()];
+                let record = match model.is_some()
+                    || !named.is_empty()
+                    || others.iter().any(|other| matches!(other, Some(Some(_))))
+                {
+                    true => Some(
+                        store
                             .op("inspect", {
                                 let bot = bot.clone();
                                 move |db| db.inspect(&bot)
                             })
-                            .await?;
-                        let family = record.family()?;
-                        if served.family() != family {
-                            return fail_with("provider_family_mismatch", reference.clone());
+                            .await?,
+                    ),
+                    false => None,
+                };
+                // What its settings will be, checked as `create` checks them,
+                // on the provider it will be on.
+                let given = match &record {
+                    Some(record) if !named.is_empty() => {
+                        let Value::Object(mut merged) = serde_json::to_value(&record.settings)?
+                        else {
+                            unreachable!("settings are an object");
+                        };
+                        for (key, value) in changes {
+                            match value {
+                                Value::Null => merged.remove(&key),
+                                value => merged.insert(key, value),
+                            };
                         }
-                        // The speed it will have, on the provider it moves to.
-                        let mut settings = record.settings.clone();
-                        settings.speed = speed.or(settings.speed);
-                        turn::shaped(served, &settings)?;
+                        let mut merged: Settings = serde_json::from_value(Value::Object(merged))
+                            .map_err(|error| Error::with("invalid_setting", error.to_string()))?;
+                        merged.validate()?;
+                        // Checking for a sandbox and resolving folders touch
+                        // the filesystem: off the runtime thread, and only
+                        // when the sandbox changes, so a folder gone since
+                        // fails no other setting.
+                        let sandboxed = (agent_runtime::store::SANDBOX.iter())
+                            .any(|key| named.iter().any(|name| name == key));
+                        if sandboxed {
+                            merged = tokio::task::spawn_blocking(move || {
+                                confine(&mut merged).map(|()| merged)
+                            })
+                            .await
+                            .map_err(|_| Error::new("sandbox_unavailable"))??;
+                        }
+                        Some(merged)
+                    }
+                    _ => None,
+                };
+                // Another model of the bot's family: its history is kept in
+                // that family's encoding. So must a summarizer or a fallback
+                // be, which are sent its items as they are.
+                let model = match &record {
+                    Some(record) => {
+                        let family = record.family()?;
+                        let reference = model.as_deref();
+                        let (provider, name) = match reference {
+                            Some(reference) => split_model(reference)?,
+                            None => (record.provider.as_str(), record.model.as_str()),
+                        };
+                        let served = self
+                            .providers
+                            .get(provider)
+                            .ok_or(Error::with("provider_unavailable", provider.to_owned()))?;
+                        if served.family() != family {
+                            return fail_with(
+                                "provider_family_mismatch",
+                                reference.unwrap_or(provider).to_owned(),
+                            );
+                        }
+                        turn::shaped(served, given.as_ref().unwrap_or(&record.settings))?;
                         if let Some(level) = &effort {
                             family.check_effort(level)?;
                         }
-                        Some((provider.to_owned(), name.to_owned()))
+                        for reference in others.into_iter().flatten().flatten() {
+                            let (other, _) = split_model(reference)?;
+                            let known = self
+                                .providers
+                                .get(other)
+                                .ok_or(Error::with("provider_unavailable", other.to_owned()))?;
+                            if known.family() != family {
+                                return fail_with("provider_family_mismatch", reference.clone());
+                            }
+                        }
+                        reference.map(|_| (provider.to_owned(), name.to_owned()))
                     }
                     None => None,
                 };
-                // A speed its own provider must serve.
-                if let (Some(speed), None) = (speed, &model) {
-                    let record = store
-                        .op("inspect", {
-                            let bot = bot.clone();
-                            move |db| db.inspect(&bot)
-                        })
-                        .await?;
-                    let served = self
-                        .providers
-                        .get(&record.provider)
-                        .ok_or(Error::with("provider_unavailable", record.provider.clone()))?;
-                    let mut settings = record.settings.clone();
-                    settings.speed = Some(speed);
-                    turn::shaped(served, &settings)?;
-                }
                 let answer = store
                     .op("configure", move |db| {
                         let id = db.identity(&bot, bot_id)?;
@@ -3421,44 +3460,46 @@ impl Service {
                             )
                             .facts(json!({"running_turn":turn})));
                         }
-                        let mut changed = Vec::new();
-                        // First: the one change that may be refused here.
+                        let mut changed: Vec<String> = Vec::new();
+                        // First: the changes that may be refused here.
                         if let Some(gate) = gate
                             && db.set_gate(&bot, Some(id), gate, declare.as_deref())?
                         {
-                            changed.push("gates");
+                            changed.push("gates".into());
+                        }
+                        if let Some(given) = &given {
+                            changed.extend(db.set_settings(&bot, Some(id), &named, given)?);
                         }
                         if let Some((provider, name)) = &model
                             && db.set_model(&bot, Some(id), provider, name, effort.as_deref())?
                         {
-                            changed.push("model");
+                            changed.push("model".into());
                         }
                         if let Some(instructions) = instructions
                             && db.set_instructions(&bot, Some(id), &instructions)?
                         {
-                            changed.push("instructions");
+                            changed.push("instructions".into());
                         }
                         if let Some(declare) = &declare
                             && db.set_declared(&bot, Some(id), declare)?
                         {
-                            changed.push("declared");
+                            changed.push("declared".into());
                         }
-                        if let Some(sandbox) = sandbox
-                            && db.set_sandbox(&bot, Some(id), sandbox)?
+                        if let Some(fallback) = &fallback
+                            && db.set_fallback(&bot, Some(id), fallback.as_deref())?
                         {
-                            changed.push("sandbox");
+                            changed.push("fallback".into());
                         }
-                        if let Some(ttl) = cache_ttl
-                            && db.set_cache_ttl(&bot, Some(id), ttl)?
-                        {
-                            changed.push("cache_ttl");
-                        }
-                        if let Some(speed) = speed
-                            && db.set_speed(&bot, Some(id), speed)?
-                        {
-                            changed.push("speed");
-                        }
-
+                        changed.extend(
+                            db.set_compaction(
+                                &bot,
+                                Some(id),
+                                compaction_instructions.as_ref().map(Option::as_deref),
+                                compaction_model.as_ref().map(Option::as_deref),
+                            )?
+                            .into_iter()
+                            .map(String::from),
+                        );
                         Ok(json!({"bot":bot,"bot_id":id,"changed":changed}))
                     })
                     .await?;

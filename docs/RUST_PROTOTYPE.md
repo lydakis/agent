@@ -1394,15 +1394,26 @@ since its history is kept in that family's encoding
 `approve: []` alone removes them, including the gates a bot took from the
 bot that made it: whoever configures a bot decides, as a person overriding
 one does, and bots it already made keep theirs. The gate is checked before
-anything is written. `sandbox`, with `writable`, `network` and
-`unix_sockets` (as `create`'s settings name them), replaces the bot's sandbox,
-and those left out go back to none, off and none; a bot another bot made keeps no weaker a sandbox than its
+anything is written. `settings` takes every setting `create`'s
+settings take, by the same names and with the same checks, against the
+bot's settings with them applied: each one given replaces the bot's,
+`null` puts it back to its default, and the rest stay (a name `create`
+doesn't take is `invalid_setting`). `sandbox` given puts `writable`,
+`network` and `unix_sockets` back to none, off and none unless they are
+given too; a bot another bot made keeps no weaker a sandbox than its
 creator's, as when it was made, and a bot's own socket may not configure
-at all. `cache_ttl` (`5m` or `1h`, as `create`'s settings name it) sets the
-bot's prompt-cache lifetime from its next model call, and `speed`
-(`standard`, `fast` or `ultrafast`) its speed tier, refused `invalid_speed`
-where the provider it is on, or moves to with `model`, does not serve it. It answers `{bot, bot_id, changed}`, `changed` naming the fields
-(`model`, `instructions`, `gates`, `declared`, `sandbox`, `cache_ttl`, `speed`) that differed; the same request again
+at all. `cache_ttl` takes effect from the bot's next model call, and
+`speed` is refused `invalid_speed` where the provider it is on, or moves
+to with `model`, does not serve it. `fallback`, `compaction_instructions`
+and `compaction_model` are taken as `create` takes them, the models of the
+bot's family, and `null` removes the bot's: with no compaction
+instructions it no longer compacts, and a summary it has stays. Since
+protocol 41 (the day-5 review) these are every setting `create` takes;
+before, `configure` named the sandbox's, `cache_ttl` and `speed` at its
+top level. It answers `{bot, bot_id, changed}`, `changed` naming the
+fields (`model`, `instructions`, `gates`, `declared`, `fallback`,
+`compaction_instructions`, `compaction_model`, and each setting by its
+name, the sandbox's four as `sandbox`) that differed; the same request again
 changes nothing, so a resend is harmless. A change is told to the bot's
 followers as a live `configured` event with the same fields, which is not
 kept, so a client that attaches later reads the bot as it is. It is refused with `bot_busy`

@@ -4063,10 +4063,27 @@ fn a_bot_keeps_its_settings_and_a_fork_copies_them() {
     assert_eq!(fork.settings, settings);
     // Back to standard, it holds no speed, as a bot that never chose one.
     use agent_runtime::provider::Speed;
-    assert!(db.set_speed("Fork", None, Speed::Standard).unwrap());
+    let speed = |speed| Settings {
+        speed: Some(speed),
+        ..Settings::default()
+    };
+    let named = ["speed".to_owned()];
+    assert_eq!(
+        db.set_settings("Fork", None, &named, &speed(Speed::Standard))
+            .unwrap(),
+        ["speed"]
+    );
     assert_eq!(db.inspect("Fork").unwrap().settings.speed, None);
-    assert!(!db.set_speed("Fork", None, Speed::Standard).unwrap());
-    assert!(db.set_speed("Fork", None, Speed::Ultrafast).unwrap());
+    assert!(
+        db.set_settings("Fork", None, &named, &speed(Speed::Standard))
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        db.set_settings("Fork", None, &named, &speed(Speed::Ultrafast))
+            .unwrap(),
+        ["speed"]
+    );
     assert_eq!(
         serde_json::to_value(db.inspect("Fork").unwrap()).unwrap()["settings"]["speed"],
         "ultrafast"

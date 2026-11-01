@@ -98,6 +98,8 @@ async fn serve(store: PathBuf, socket: PathBuf) -> Result<(), String> {
                 let bots = crate::lookout::all_bots(&client).await;
                 tokio::spawn(refresh_tools(client.clone(), bots));
             }
+            // For as long as this connection lasts.
+            let following = tokio::spawn(follow_config(client.clone()));
             let follow = json!({"bot": "*", "after": cursor, "kinds": KINDS});
             match client.request("follow", follow).await {
                 Ok(_) => {
@@ -117,6 +119,7 @@ async fn serve(store: PathBuf, socket: PathBuf) -> Result<(), String> {
                     json!({"event": "follow_refused", "error": error.code, "after": cursor})
                 ),
             }
+            following.abort();
         }
         if gone.get_or_insert_with(Instant::now).elapsed() >= GONE_AFTER {
             println!("{}", json!({"event": "daemon_gone"}));
@@ -211,9 +214,149 @@ async fn refresh_tools(client: Arc<Client>, bots: Vec<Value>) {
     }
 }
 
+/// How often the host looks at `config.toml`, and asks a busy agent
+/// again: an agent takes a change at the first idle point after.
+const CONFIG_EVERY: Duration = Duration::from_secs(5);
+
+/// Keep Sonny's agents on what `config.toml` gives an agent when it is
+/// made: each model's fallback and whether senders are named. Read at
+/// first and whenever the file changes; an agent at work is asked again
+/// until it is idle, since `configure` waits for the turn to end.
+async fn follow_config(client: Arc<Client>) {
+    let stamp = || {
+        let found = agent_client::config::path().and_then(|path| std::fs::metadata(path).ok());
+        found.map(|found| (found.len(), found.modified().ok()))
+    };
+    let mut seen = None;
+    let mut waiting: Vec<Value> = Vec::new();
+    loop {
+        let now = stamp();
+        if seen.as_ref() != Some(&now) {
+            seen = Some(now);
+            waiting = crate::lookout::all_bots(&client).await;
+        }
+        if !waiting.is_empty() {
+            match agent_client::config::load() {
+                Ok(config) => waiting = apply_config(&client, &config, waiting).await,
+                // Its next change is read again.
+                Err(error) => {
+                    println!("{}", json!({"event": "config_unread", "error": error}));
+                    waiting.clear();
+                }
+            }
+        }
+        tokio::time::sleep(CONFIG_EVERY).await;
+    }
+}
+
+/// Configure each of `bots` that `config` would make otherwise; those at
+/// work, to ask again.
+async fn apply_config(
+    client: &Client,
+    config: &agent_client::config::Config,
+    bots: Vec<Value>,
+) -> Vec<Value> {
+    let mut busy = Vec::new();
+    for bot in bots {
+        let Ok(record) = client
+            .request(
+                "inspect",
+                json!({"bot": bot["name"], "bot_id": bot["bot_id"]}),
+            )
+            .await
+        else {
+            continue;
+        };
+        let Some(mut fields) = configured(&record, config) else {
+            continue;
+        };
+        fields.insert("bot".into(), bot["name"].clone());
+        fields.insert("bot_id".into(), bot["bot_id"].clone());
+        match client.request("configure", Value::Object(fields)).await {
+            Ok(answer) => println!(
+                "{}",
+                json!({"event": "config_applied", "bot": bot["name"], "changed": answer["changed"]})
+            ),
+            Err(error) if error.code == "bot_busy" => busy.push(bot),
+            Err(error) => println!(
+                "{}",
+                json!({"event": "config_failed", "bot": bot["name"], "error": error.code})
+            ),
+        }
+    }
+    busy
+}
+
+/// The `configure` fields that bring one of Sonny's agents, as `inspect`
+/// gives it, to what `config` gives an agent on its model when it is made
+/// ([`crate::made`]); none when it is there, or isn't Sonny's.
+fn configured(
+    record: &Value,
+    config: &agent_client::config::Config,
+) -> Option<serde_json::Map<String, Value>> {
+    let declared = record["declared"].as_array()?;
+    if !declared
+        .iter()
+        .any(|tool| tool["answered_by"] == crate::served::TAG)
+    {
+        return None;
+    }
+    let model = format!(
+        "{}/{}",
+        record["provider"].as_str()?,
+        record["model"].as_str()?
+    );
+    let mut fields = serde_json::Map::new();
+    let fallback = config.fallbacks.get(&model);
+    if record["fallback"].as_str() != fallback.map(String::as_str) {
+        fields.insert("fallback".into(), json!(fallback));
+    }
+    let hidden = record["settings"]["hide_senders"]
+        .as_bool()
+        .unwrap_or(false);
+    if hidden != config.hide_senders {
+        let hide = config.hide_senders.then_some(true);
+        fields.insert("settings".into(), json!({"hide_senders": hide}));
+    }
+    (!fields.is_empty()).then_some(fields)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_agent_follows_what_config_gives_its_model() {
+        let mut config = agent_client::config::Config::default();
+        let agent = |fallback: Value, hidden: bool| {
+            json!({"provider": "anthropic", "model": "claude", "fallback": fallback,
+                "settings": {"hide_senders": hidden},
+                "declared": [{"name": "start_task", "answered_by": crate::served::TAG}]})
+        };
+        assert_eq!(configured(&agent(Value::Null, false), &config), None);
+        config
+            .fallbacks
+            .insert("anthropic/claude".into(), "anthropic/other".into());
+        config.hide_senders = true;
+        assert_eq!(
+            configured(&agent(Value::Null, false), &config).map(Value::Object),
+            Some(json!({"fallback": "anthropic/other", "settings": {"hide_senders": true}}))
+        );
+        assert_eq!(
+            configured(&agent(json!("anthropic/other"), true), &config),
+            None
+        );
+        // Taken out of the config, it goes from the agent too.
+        let config = agent_client::config::Config::default();
+        assert_eq!(
+            configured(&agent(json!("anthropic/other"), true), &config).map(Value::Object),
+            Some(json!({"fallback": null, "settings": {"hide_senders": null}}))
+        );
+        // Another client's bot is its own.
+        let mut other = agent(json!("x/y"), true);
+        other["declared"] = json!([]);
+        assert_eq!(configured(&other, &config), None);
+    }
 
     #[test]
     fn the_host_starts_where_it_stopped_or_else_where_the_lookout_did() {

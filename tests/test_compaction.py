@@ -93,7 +93,7 @@ class AnthropicCompactionTests(ModelFixture):
             turn = client.request('submit', bot='Bob', request_id=str(n), prompt=f'{n}:' + 'x' * 500)['result']['turn']
             self.assertEqual(client.finished(turn)['data']['status'], 'completed')
         self.assertIsNotNone(client.request('inspect', bot='Bob')['result']['compaction'])
-        self.assertEqual(client.request('configure', bot='Bob', cache_ttl='1h')['result']['changed'], ['cache_ttl'])
+        self.assertEqual(client.request('configure', bot='Bob', settings={'cache_ttl': '1h'})['result']['changed'], ['cache_ttl'])
         self.model.cache_control = {'type': 'ephemeral', 'ttl': '1h'}
         while not self.model.requests.empty():
             self.model.requests.get()
