@@ -4040,7 +4040,6 @@ impl App {
         self.margin = margin::Margin::load(self.reactions_key.as_deref());
         self.picked = reactions::Picked::load(self.reactions_key.as_deref());
         self.history().await;
-        self.welcome_above();
         // A turn already running: its clock, and any call it waits on.
         if let Some(turn) = self.running.as_ref().map(|r| r.turn) {
             status_report("working", &self.bot);
@@ -4769,10 +4768,7 @@ impl App {
                 self.commit_welcome();
                 self.history_since(first - 1, true).await;
             }
-            None => {
-                self.history().await;
-                self.welcome_above();
-            }
+            None => self.history().await,
         }
         Ok(())
     }
@@ -6175,27 +6171,6 @@ impl App {
         }
     }
 
-    /// The welcome over the newest page just read, known to start the
-    /// conversation only once it is.
-    fn welcome_above(&mut self) {
-        let (mut welcome, eyes) = self.welcome();
-        if !welcome.is_empty() {
-            if self.any_history {
-                welcome.push(Line::default());
-            }
-            self.any_history = true;
-            // What marks the history's rows moves down with them.
-            for (at, _) in &mut self.marks {
-                *at += welcome.len();
-            }
-            self.pending.splice(0..0, welcome);
-            if let Some(eyes) = eyes {
-                self.marks
-                    .push((eyes, screen::Mark::Tag(screen::Tag::Eyes)));
-            }
-        }
-    }
-
     /// The welcome written under what is waiting, its eyes' line marked.
     fn commit_welcome(&mut self) {
         let (welcome, eyes) = self.welcome();
@@ -6600,6 +6575,14 @@ impl App {
         self.seen_node = nodes.last().copied().unwrap_or(self.seen_node);
         if let Some(&first) = nodes.first() {
             self.first_node = Some(self.first_node.map_or(first, |n| n.min(first)));
+        }
+        // The newest page read on attaching, known only now to start the
+        // conversation or not: the welcome goes first, before any of it is
+        // written, so a row drawn again in place (a fold of calls, tasks
+        // started together, a reaction) does not leave it below the rows
+        // already drawn.
+        if !every {
+            self.commit_welcome();
         }
         let unpaired = (self.draw_nodes(&nodes, &turns, false, Vec::new(), caught_up)).await;
         if from_start {
@@ -15103,6 +15086,62 @@ mod tests {
         assert!(app.welcome().0.is_empty());
         app.zen = None;
         assert!(!app.welcome().0.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_welcome_heads_a_replayed_conversation_whatever_was_drawn_again_in_it() {
+        let say = |role: &str, kind: &str, text: &str| json!({"type": "message", "role": role, "content": [{"type": kind, "text": text}]});
+        // The bot's reaction is put under the message it reacts to, the
+        // rows written so far drawn first.
+        let items: Vec<(i64, Value)> = vec![
+            (1, say("user", "input_text", "Fix the rounding")),
+            (2, say("assistant", "output_text", "Rounding now.")),
+            (3, say("user", "input_text", "merged, thanks")),
+            (
+                4,
+                json!({"type": "function_call", "name": "react", "call_id": "c1",
+                "arguments": "{\"emoji\":\"👍\"}"}),
+            ),
+            (
+                5,
+                json!({"type": "function_call_output", "call_id": "c1", "output": "Done."}),
+            ),
+            (6, say("user", "input_text", "and the notes?")),
+        ];
+        let client = daemon_answering(move |asked| match asked["op"].as_str() {
+            Some("history_nodes") => json!({"nodes": items.iter().rev()
+                .map(|(node, _)| json!({"node": node, "turn": 1}))
+                .collect::<Vec<_>>(), "next_from": null}),
+            Some("prompts") => json!({"prompts": [{"turn": 1, "text": "Fix the rounding"}]}),
+            Some("history_items") => json!({"items": asked["nodes"].as_array().into_iter()
+                .flatten()
+                .filter_map(|node| items.iter().find(|(n, _)| Some(*n) == node.as_i64()))
+                .map(|(node, item)| json!({"node": node, "item": item}))
+                .collect::<Vec<_>>()}),
+            _ => json!({}),
+        })
+        .await;
+        let mut app = app(client);
+        app.width = 100;
+        app.welcome = true;
+        app.history().await;
+        let rows = drawn(&mut app);
+        let at = |text: &str| rows.iter().position(|row| row.contains(text));
+        let welcome = at("Welcome to Sonny").expect("a welcome");
+        let first = at("Fix the rounding").expect("the first message");
+        assert!(welcome < first, "{}", rows.join("\n"));
+        // Only the portrait is above it, and none of it is drawn further down.
+        assert!(
+            (rows[..welcome].iter()).all(|row| row.trim().is_empty() || row.contains(['▀', '▄'])),
+            "{}",
+            rows.join("\n")
+        );
+        assert!(
+            !rows[first..].iter().any(|row| row.contains(['▀', '▄'])),
+            "{}",
+            rows.join("\n")
+        );
+        assert!(rows[first..].iter().any(|row| row.contains("👍")));
     }
 
     #[tokio::test]
