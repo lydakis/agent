@@ -161,6 +161,8 @@ pub trait Backend: Send {
     ) -> Result<String, String> {
         self.split(anchor, "right", false, label, cwd, command, keep)
     }
+    /// Bring the block into view: its window made the one shown.
+    fn focus(&self, block: &Block) -> Result<(), String>;
     /// The block Sonny itself runs in, when in this home.
     fn own_block(&self) -> Option<String>;
     fn places(&self) -> Result<Places, String>;
@@ -576,6 +578,17 @@ impl Layout {
         self.backend.rename_window(window, name);
     }
 
+    /// Bring the bot's block into view where the person watches.
+    pub fn focus(&mut self, bot: &str) -> Result<(), String> {
+        let known = self.blocks.get(bot).cloned();
+        let listed = self.listed();
+        let block = (listed.iter())
+            .find(|b| Some(&b.id) == known.as_ref())
+            .or_else(|| listed.iter().find(|b| b.label == bot))
+            .ok_or_else(|| format!("{bot} has no tab in {}", self.home()))?;
+        self.backend.focus(block)
+    }
+
     /// Take on the block Sonny itself runs in, when in this home, named
     /// after the bot.
     pub fn adopt_own(&mut self, bot: &str) {
@@ -901,6 +914,7 @@ mod tests {
         /// While set, the blocks cannot be read.
         down: Arc<AtomicBool>,
         news: RefCell<Option<Watch>>,
+        focused: RefCell<Vec<String>>,
     }
 
     impl Fake {
@@ -989,6 +1003,10 @@ mod tests {
                 workspace: "w1".into(),
             }
         }
+        fn focus(&self, block: &Block) -> Result<(), String> {
+            self.focused.borrow_mut().push(block.id.clone());
+            Ok(())
+        }
         fn watch(&self) -> Option<Watch> {
             self.news.borrow_mut().take()
         }
@@ -1018,6 +1036,16 @@ mod tests {
             assert!(started.elapsed() < Duration::from_secs(5), "never heard");
             std::thread::sleep(Duration::from_millis(1));
         }
+    }
+
+    #[test]
+    fn a_task_is_brought_into_view_by_its_block() {
+        let fake = Fake::default();
+        fake.add("shop.fix", "w1");
+        let mut layout = Layout::new(Box::new(fake));
+        assert_eq!(layout.focus("shop.fix"), Ok(()));
+        let none = layout.focus("shop.gone");
+        assert_eq!(none, Err("shop.gone has no tab in Fake home".into()));
     }
 
     #[test]

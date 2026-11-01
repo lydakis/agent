@@ -1052,6 +1052,7 @@ async fn run() -> Result<(), String> {
     app.verbose = settings.verbose;
     app.zen = zen::focus(app.reactions_key.as_deref());
     app.margin_opens = settings.margin_opens;
+    app.agent_opens = settings.agent_opens;
     // A bot keeps the model it was made with; --model runs this window's
     // turns on another.
     if let Some(model) = options.model.as_ref().filter(|m| **m != app.model) {
@@ -2021,6 +2022,9 @@ struct App {
     /// The read under way, of the workspace named, and when the last one
     /// began: the branch can change under a running turn.
     place_job: Option<(String, tokio::task::JoinHandle<place::Place>)>,
+    /// The agent whose tab is being looked for, from a window with no
+    /// layout of its own, and the look.
+    tab_job: Option<(String, tokio::task::JoinHandle<Result<(), String>>)>,
     place_read: Option<(String, Instant)>,
     model: String,
     effort: Option<String>,
@@ -2222,6 +2226,8 @@ struct App {
     /// last looked at, and whether such a note opens it.
     margin_posted: u64,
     margin_opens: agent_client::config::MarginOpens,
+    /// Where a click on an agent's name takes the person.
+    agent_opens: agent_client::config::AgentOpens,
     /// The pane closed last, with its `/status` or `/background`, which
     /// Ctrl+] opens again.
     closed: Option<(pane::Pane, Option<Watch>)>,
@@ -2419,6 +2425,15 @@ struct App {
     suggestion: Option<String>,
 }
 
+/// What a job of the lead's layout has to say: a line in the lead's view,
+/// or, for something the person asked of it, a notice; or that an agent
+/// clicked has no tab, so it opens in the pane.
+enum Told {
+    Line(String),
+    Notice(String),
+    Beside(String),
+}
+
 /// The lead's tasks, laid out in the project's home in a multiplexer: a window for
 /// each task while it works, opened as its turn starts. It follows every
 /// bot on its own connection, so the lead's own view is not disturbed.
@@ -2427,8 +2442,8 @@ struct Fleet {
     /// the screen.
     layout: mux::Worker,
     /// What its jobs have to say in the lead's view, as they finish.
-    said: tokio::sync::mpsc::UnboundedReceiver<String>,
-    tell: tokio::sync::mpsc::UnboundedSender<String>,
+    said: tokio::sync::mpsc::UnboundedReceiver<Told>,
+    tell: tokio::sync::mpsc::UnboundedSender<Told>,
     client: Arc<Client>,
     events: Events,
     socket: PathBuf,
@@ -2808,10 +2823,25 @@ impl Fleet {
                 Err(error) => Some(error),
             };
             if let Some(said) = said.filter(|_| tell) {
-                let _ = told.send(said);
+                let _ = told.send(Told::Line(said));
             }
         });
         self.doing(bot, "working");
+    }
+
+    /// Bring the task's own tab into view in the multiplexer, as the
+    /// person asked; looked for on the worker, after every window opened
+    /// so far. With none, `beside` opens it in the pane, else says so.
+    fn go_to(&self, bot: &str, beside: bool) {
+        let (bot, told) = (bot.to_owned(), self.tell.clone());
+        self.layout.send(move |layout| {
+            if let Err(error) = layout.focus(&bot) {
+                let _ = told.send(match beside {
+                    true => Told::Beside(bot),
+                    false => Told::Notice(error),
+                });
+            }
+        });
     }
 
     /// Close the task's window, and every block it asked for.
@@ -3096,6 +3126,7 @@ impl App {
             workspace: record["workspace"].as_str().unwrap_or("").to_owned(),
             place: place::Place::default(),
             place_job: None,
+            tab_job: None,
             place_read: None,
             model,
             effort: record["effort"].as_str().map(str::to_owned),
@@ -3201,6 +3232,7 @@ impl App {
             pane_keys: false,
             margin_posted: 0,
             margin_opens: Default::default(),
+            agent_opens: Default::default(),
             pane_mouse: false,
             closed: None,
             composer_at: None,
@@ -3398,8 +3430,16 @@ impl App {
                     // What the layout's worker said, between the daemon's events.
                     let event = match news {
                         Ok(event) => event,
-                        Err(said) => {
+                        Err(Told::Line(said)) => {
                             self.fleet_said(said);
+                            continue;
+                        }
+                        Err(Told::Notice(notice)) => {
+                            self.notice = Some(notice);
+                            continue;
+                        }
+                        Err(Told::Beside(bot)) => {
+                            self.open_task(&bot);
                             continue;
                         }
                     };
@@ -3471,6 +3511,7 @@ impl App {
             self.shell_ran().await;
             self.listed();
             self.follow_place().await;
+            self.follow_tab().await;
             self.count_behind().await;
             self.read_tasks().await;
             self.read_running_tasks().await;
@@ -4568,6 +4609,59 @@ impl App {
         turn
     }
 
+    /// An agent named or picked: to its own tab, when the lead's layout
+    /// has one for it, or a look at it in the pane, as `[sonny]
+    /// agent_opens` says; `other`, a right click, the one it doesn't. With
+    /// no tab, it opens in the pane.
+    fn open_agent(&mut self, bot: &str, other: bool) {
+        use agent_client::config::AgentOpens;
+        let tab = (self.agent_opens == AgentOpens::Tab) != other;
+        match &self.fleet {
+            Some(fleet) if tab => fleet.go_to(bot, true),
+            // A task's window, or one in the pane, lays nothing out
+            // itself: its project's layout is found off the screen, and
+            // with no tab there the agent opens in the pane after all.
+            None if tab && self.tab_job.is_none() => {
+                let (client, socket, me) = (
+                    self.client.clone(),
+                    self.options.socket.clone(),
+                    self.bot.clone(),
+                );
+                let lead = self.project.clone();
+                let bot = bot.to_owned();
+                let job = tokio::spawn({
+                    let bot = bot.clone();
+                    async move {
+                        let project = match lead {
+                            Some(project) => project,
+                            None => project_of(&client, &me).await,
+                        };
+                        tokio::task::spawn_blocking(move || {
+                            mux::for_agent(&socket, &project, None)?.focus(&bot)
+                        })
+                        .await
+                        .map_err(|e| e.to_string())?
+                    }
+                });
+                self.tab_job = Some((bot, job));
+            }
+            _ => self.open_task(bot),
+        }
+    }
+
+    /// The tab looked for off the screen: with none, the agent opens in
+    /// the pane, as a click on it does where nothing is laid out.
+    async fn follow_tab(&mut self) {
+        if let Some((_, job)) = &self.tab_job
+            && job.is_finished()
+        {
+            let (bot, job) = self.tab_job.take().unwrap();
+            if !matches!(job.await, Ok(Ok(()))) {
+                self.open_task(&bot);
+            }
+        }
+    }
+
     /// The task `bot` opened in the pane: its own Sonny, to watch it and
     /// talk to it.
     fn open_task(&mut self, bot: &str) {
@@ -4578,8 +4672,9 @@ impl App {
         match self.embed(&name, &args) {
             // Its title's button opens it in the main view.
             Ok(()) => {
+                let tab = self.fleet.is_some();
                 if let Some(pane) = &mut self.pane {
-                    pane.as_agent(bot);
+                    pane.as_agent(bot, tab);
                 }
             }
             Err(error) => self.notice = Some(format!("could not open {name}: {error}")),
@@ -4647,7 +4742,9 @@ impl App {
     /// What a button clicked in the conversation does: `fold/N` opens or
     /// folds the calls folded as N; `said/NODE` opens or shuts the message
     /// between agents at NODE; `task/BOT`, and `agent/BOT` on BOT's name
-    /// in the conversation, opens BOT in the pane; `answer/N/ID` answers the question
+    /// in the conversation, goes to BOT (see `open_agent`), and
+    /// `other/BOT`, a right click on either, the other way;
+    /// `answer/N/ID` answers the question
     /// call ID asked with its option N, while it is open.
     async fn press_row(&mut self, button: &str) {
         if let Some(at) = button
@@ -4663,7 +4760,10 @@ impl App {
             }
         }
         if let Some(bot) = (button.strip_prefix("task/")).or(button.strip_prefix("agent/")) {
-            self.open_task(bot);
+            self.open_agent(bot, false);
+        }
+        if let Some(bot) = button.strip_prefix("other/") {
+            self.open_agent(bot, true);
         }
         if let Some(node) = button
             .strip_prefix("said/")
@@ -7898,6 +7998,14 @@ impl App {
             self.pressed.push(format!("main/{agent}"));
             return true;
         }
+        // Ctrl+T goes to its own tab in the multiplexer, as its name does.
+        if pane::to_tab(key)
+            && let Some(pane) = self.pane.as_ref().filter(|p| p.has_tab())
+            && let Some(agent) = pane.agent.clone()
+        {
+            self.pressed.push(format!("tab/{agent}"));
+            return true;
+        }
         // Ctrl+[ and Ctrl+] step the pane, but for a program that has them.
         let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
         let program = self.pane_keys && self.pane.as_ref().is_some_and(|p| p.program.is_some());
@@ -7942,7 +8050,8 @@ impl App {
                 };
                 if key.code == KeyCode::Enter {
                     if let Some(at) = pick {
-                        self.open_task(&bots[at]);
+                        let bot = bots[at].clone();
+                        self.open_agent(&bot, false);
                     }
                 } else if let Some(watch) = &mut self.watch {
                     watch.pick = pick;
@@ -8234,6 +8343,7 @@ impl App {
             ("ctrl+\\", "keys to the pane and back"),
             ("ctrl+[ ctrl+]", "hide the pane, show it again"),
             ("ctrl+g", "open the pane's agent in the main view"),
+            ("ctrl+t", "go to the pane's agent's own tab"),
             ("alt+t", "boost the next message; again for more"),
             ("ctrl+v", "paste a picture"),
             ("ctrl+c", "copy the selection, clear, or quit"),
@@ -8500,6 +8610,15 @@ impl App {
             "status" if self.options.side.is_none() => self.status().await,
             // An agent's title button: this window becomes its Sonny.
             "main" => self.switch_command(id).await,
+            // Its name: its own tab, where the lead's tasks are laid out.
+            "tab" => match &self.fleet {
+                Some(fleet) => fleet.go_to(id, false),
+                None => {
+                    self.notice = Some(format!(
+                        "{id} has no tab: this Sonny is not in Rex, Herdr or cmux"
+                    ))
+                }
+            },
             "background" if self.options.side.is_none() => self.background(),
             "status" | "background" => {}
             _ => self.press_row(what).await,
@@ -8972,6 +9091,7 @@ impl App {
             let settings = settings::Settings::load();
             self.sounds.chime = settings.chime;
             self.margin_opens = settings.margin_opens;
+            self.agent_opens = settings.agent_opens;
             if self.verbose != settings.verbose {
                 self.verbose = settings.verbose;
                 self.repaint = true;
@@ -12236,7 +12356,7 @@ mod tests {
                 .is_some_and(|n| n.starts_with("/switch NAME"))
         );
         let mut pane = pane::Pane::card("shop.lead", STATUS_KEYS);
-        pane.as_agent("shop.lead");
+        pane.as_agent("shop.lead", false);
         app.open_pane(pane);
         app.input.set("/switch");
         app.submit().await;

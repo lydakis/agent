@@ -308,6 +308,26 @@ impl Backend for Rex {
         Ok(block)
     }
 
+    /// Its window made the session's active one; Rex is not brought to
+    /// the front.
+    fn focus(&self, block: &Block) -> Result<(), String> {
+        let out = crate::mux::output(
+            Command::new(&self.bin)
+                .env_remove("REX_SESSION")
+                .env_remove("REX_BLOCK")
+                .args(&self.host)
+                .args(["focus", "-s", &self.session, &block.id]),
+        )
+        .map_err(|e| format!("rex: {e}"))?;
+        match out.status.success() {
+            true => Ok(()),
+            false => Err(format!(
+                "rex focus: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            )),
+        }
+    }
+
     fn own_block(&self) -> Option<String> {
         let mine = std::env::var("REX_BLOCK").ok().filter(|b| !b.is_empty())?;
         (self.blocks().ok()?.into_iter())
