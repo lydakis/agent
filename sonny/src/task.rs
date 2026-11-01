@@ -1290,11 +1290,17 @@ fn has_submodules(path: &Path) -> Result<bool, String> {
         &["--no-optional-locks", "ls-files", "--stage", "-z"],
         &[],
     )?;
+    // By the bytes of each name, which need not be UTF-8.
+    use std::os::unix::ffi::OsStrExt;
     Ok(staged
         .split(|byte| *byte == 0)
-        .filter_map(|entry| std::str::from_utf8(entry).ok()?.strip_prefix("160000 "))
-        .filter_map(|entry| Some(entry.split_once('\t')?.1))
-        .any(|name| path.join(name).join(".git").exists()))
+        .filter_map(|entry| entry.strip_prefix(b"160000 "))
+        .filter_map(|entry| Some(&entry[entry.iter().position(|byte| *byte == b'\t')? + 1..]))
+        .any(|name| {
+            path.join(std::ffi::OsStr::from_bytes(name))
+                .join(".git")
+                .exists()
+        }))
 }
 
 /// A worktree of `here`'s repository at `path` on the new `branch`, made
@@ -1845,6 +1851,32 @@ mod tests {
             git(&repo, args).unwrap();
         }
         repo
+    }
+
+    #[test]
+    fn a_submodule_is_found_whatever_bytes_its_name_has() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = std::env::temp_dir().join(format!("sonny-submodule-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let repo = repository(&dir);
+        assert!(!has_submodules(&repo).unwrap());
+        let head = git(&repo, &["rev-parse", "HEAD"]).unwrap();
+        let name = std::ffi::OsStr::from_bytes(b"sub-\xff");
+        let entry = format!("160000,{head},");
+        let mut entry = std::ffi::OsString::from(entry);
+        entry.push(name);
+        let added = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["update-index", "--add", "--cacheinfo"])
+            .arg(&entry)
+            .status()
+            .unwrap();
+        assert!(added.success());
+        assert!(!has_submodules(&repo).unwrap(), "not checked out");
+        std::fs::create_dir_all(repo.join(name).join(".git")).unwrap();
+        assert!(has_submodules(&repo).unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

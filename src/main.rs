@@ -176,8 +176,18 @@ fn sandboxed(args: &[String]) -> Result<i32> {
     let policy = Policy::new(Some(mode), None, &writable, false, &daemon)?
         .ok_or(Error::new("sandbox_unavailable"))?;
     let rest: Vec<&str> = rest.iter().map(String::as_str).collect();
-    let mut child = agent_runtime::sandbox::command(&policy, program, &rest, false)?;
-    let status = runtime()?.block_on(async move { child.status().await })?;
+    let status = runtime()?.block_on(async {
+        // What the sandbox holds in place stays held while the command
+        // runs, and what it left in place for it is gone before this exits,
+        // as for a bot's command.
+        let held = agent_runtime::sandbox::hold(&policy).await;
+        let status = match agent_runtime::sandbox::command(&policy, program, &rest, false) {
+            Ok(mut child) => child.status().await.map_err(Error::from),
+            Err(e) => Err(e),
+        };
+        held.release();
+        status
+    })?;
     // A command a signal ended exits as a shell reports it.
     Ok(status.code().unwrap_or_else(|| {
         use std::os::unix::process::ExitStatusExt;
