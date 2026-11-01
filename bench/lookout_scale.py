@@ -238,8 +238,8 @@ class Bench:
     def __init__(self, args):
         self.args = args
         root = Path(__file__).resolve().parents[1]
-        self.agent = root / '.local/target/release/agent'
-        self.sonny = root / '.local/target/release/sonny'
+        self.agent = Path(getattr(args, 'agent', None) or root / '.local/target/release/agent').resolve()
+        self.sonny = Path(getattr(args, 'sonny', None) or root / '.local/target/release/sonny').resolve()
         self.out = Path(args.out)
         self.out.mkdir(parents=True, exist_ok=True)
         self.home = self.out / 'home'
@@ -443,7 +443,7 @@ class Bench:
         self.create(names, tools=('echo', 'shell'), approve=['shell'], approver='auto')
         log = open(self.out / 'approver.out', 'w')
         process = subprocess.Popen(
-            [str(self.agent.parent / 'sonny'), 'approver', '--store', str(self.store), '--socket', str(self.socket),
+            [str(self.sonny), 'approver', '--store', str(self.store), '--socket', str(self.socket),
              '--judge', 'openai/synthetic-model'],
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=log, env=self.env, text=True,
             start_new_session=True)

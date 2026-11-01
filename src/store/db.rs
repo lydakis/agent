@@ -1995,6 +1995,7 @@ impl Database {
             CREATE INDEX IF NOT EXISTS processes_running ON processes(turn) WHERE status='running';
             CREATE INDEX IF NOT EXISTS bots_deleting ON bots(name) WHERE status='deleting';
             CREATE INDEX IF NOT EXISTS bots_running ON bots(name) WHERE running_turn IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS bots_maker ON bots(created_by_id, name) WHERE created_by_id IS NOT NULL;
             CREATE INDEX IF NOT EXISTS bots_expiring ON bots(expires_at) WHERE expires_at IS NOT NULL;")?;
         if version != Self::SCHEMA {
             tx.pragma_update(None, "user_version", Self::SCHEMA)?;
@@ -2701,13 +2702,16 @@ impl Database {
     /// A page of bots in name order after `after`. `name` keeps those whose
     /// name matches a GLOB pattern, which reads only its literal prefix's
     /// range of the name index; `active` keeps those with a turn running,
-    /// read from an index of only them.
+    /// read from an index of only them; `created_by` keeps those the bot
+    /// with that id made, read from an index by maker, so a page costs that
+    /// bot's own children whatever else the store holds.
     pub fn list(
         &self,
         after: Option<&str>,
         limit: usize,
         name: Option<&str>,
         active: bool,
+        created_by: Option<i64>,
     ) -> Result<Value> {
         if !(1..=256).contains(&limit) || after.is_some_and(|s| s.len() > 128) {
             return fail_with(
@@ -2721,11 +2725,27 @@ impl Database {
                 "name is a GLOB pattern of 1 to 256 bytes",
             );
         }
+        let after = after.unwrap_or("");
+        let limit_rows = (limit + 1) as i64;
+        // Fixed numbers, so bench.query_plans plans every variant: a
+        // maker without a name binds ?3 as NULL, which nothing reads.
         let glob = if name.is_some() {
             " AND name GLOB ?3"
         } else {
             ""
         };
+        let maker = if created_by.is_some() {
+            " AND created_by_id = ?4"
+        } else {
+            ""
+        };
+        let mut values: Vec<&dyn rusqlite::ToSql> = vec![&after, &limit_rows];
+        if name.is_some() || created_by.is_some() {
+            values.push(&name);
+        }
+        if created_by.is_some() {
+            values.push(&created_by);
+        }
         let running = if active {
             " AND running_turn IS NOT NULL"
         } else {
@@ -2734,14 +2754,9 @@ impl Database {
         let mut statement = self.conn.prepare_cached(&format!(
             "SELECT name,head,workspace,status,running_turn,provider,family,model,reasoning,budget_tokens,tokens_used,tools,
                     input_tokens,cached_input_tokens,id,created_by,created_by_id,gates,allowed,expire_ms,expires_at
-             FROM bots WHERE name > ?1{glob}{running} ORDER BY name LIMIT ?2"
+             FROM bots WHERE name > ?1{glob}{maker}{running} ORDER BY name LIMIT ?2"
         ))?;
-        let after = after.unwrap_or("");
-        let limit_rows = (limit + 1) as i64;
-        let mut rows = match name {
-            Some(pattern) => statement.query(params![after, limit_rows, pattern])?,
-            None => statement.query(params![after, limit_rows])?,
-        };
+        let mut rows = statement.query(values.as_slice())?;
         let mut bots = Vec::new();
         let mut bytes = 0;
         let mut more = false;

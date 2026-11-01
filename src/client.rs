@@ -84,6 +84,7 @@ struct Options {
     /// newest first.
     name: Option<String>,
     active: bool,
+    created_by: Option<String>,
     newest: bool,
     /// The most a listing prints.
     limit: Option<usize>,
@@ -167,6 +168,7 @@ fn parse(args: &[String]) -> Result<Options> {
         after: 0,
         name: None,
         active: false,
+        created_by: None,
         newest: false,
         limit: None,
         pretty: false,
@@ -267,6 +269,7 @@ fn parse(args: &[String]) -> Result<Options> {
                     }
                     "--tag" => options.tag = Some(value),
                     "--name" => options.name = Some(value),
+                    "--created-by" => options.created_by = Some(value),
                     "--limit" => {
                         options.limit = Some(
                             value
@@ -2296,13 +2299,20 @@ fn list(options: &Options) -> Result<i32> {
     let mut after = Value::Null;
     let mut left = options.limit.unwrap_or(usize::MAX);
     let mut first = true;
+    // The maker by its id, so a bot that reuses its name lists none of
+    // the earlier one's.
+    let created_by_id = match &options.created_by {
+        Some(bot) => Some(connection.request("inspect", json!({"bot":bot}))?["bot_id"].clone()),
+        None => None,
+    };
     if !options.pretty {
         say_raw!("[");
     }
     loop {
         let page = connection.request(
             "bots",
-            json!({"after":after,"limit":left.min(256),"name":options.name,"active":options.active}),
+            json!({"after":after,"limit":left.min(256),"name":options.name,"active":options.active,
+                "created_by_id":created_by_id}),
         )?;
         let bots = page["bots"]
             .as_array()
