@@ -137,6 +137,35 @@ passed on macOS, but that smoke run is not a second platform's performance matri
 Thread-counter assertions, JavaScript/Python syntax, local doc links, and diff
 checks passed locally. There are no Rust implementation changes in this slice.
 
+## Re-run, 2026-11-01
+
+`libfx` **0.0.16** (npm provenance: vercel-labs/fx main at
+`4e42e5f610658efb64445f5dd31d795c721a21ce`; native addon from the optional
+`@libfx/libfx-linux-x64-gnu` package, `88a3b4a8…`) against Agent at `afafeec`
+(main `70637f9`). Same matrix, on a shared 4-vCPU Intel Xeon (2.8 GHz) Linux
+6.18 VM with 16 GiB RAM, Node v22.23.4, 2026-11-01. Two things differ from the
+2026-09-12 screen above, so the two are not comparable: the Rust side is now
+the full daemon committing every turn to SQLite (`synchronous=FULL`), not the
+persistence-free benchmark mode, and the RSS guard is 2,048 MiB for both
+engines, because FX passed 512 MiB at 32 agents with 64 KiB.
+
+| Agents | New text per turn | Agent peak RSS, MiB | FX + Node peak RSS, MiB | Agent CPU, s | FX + Node CPU, s |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 4 KiB | 22.39 [22.38, 23.07] | 109.77 [107.71, 116.26] | 0.39 | 1.09 |
+| 1 | 64 KiB | 24.31 [24.27, 24.53] | 118.52 [118.33, 125.59] | 0.43 | 1.24 |
+| 8 | 4 KiB | 23.74 [23.62, 24.21] | 142.85 [142.45, 143.26] | 0.51 | 2.95 |
+| 8 | 64 KiB | 28.46 [28.30, 29.34] | 241.36 [235.78, 244.48] | 0.63 | 4.20 |
+| 32 | 4 KiB | 26.52 [26.34, 26.56] | 245.18 [242.12, 245.54] | 0.71 | 8.22 |
+| 32 | 64 KiB | 31.91 [31.83, 31.92] | 537.27 [535.02, 538.85] | 0.75 | 12.66 |
+
+Every measured run completed every turn, reached full provider concurrency and
+had no invalid request. FX's thread counts are unchanged (13, 27 and 75 at 1, 8
+and 32 agents). 0.0.16 fetches the model catalog once per turn, where 0.0.8
+fetched it once per agent (96 catalog GETs per 32-agent run, against 32). Its
+memory at 32 agents with 64 KiB doubled from 267.8 MiB on 0.0.8 (on another
+host), and its turn p99 there was 3,052 ms against Agent's 632 ms.
+Captures are in the ignored `.local/bench/harness-nov01-afafeec-fx/`.
+
 ## Reuse and possible contributions
 
 FX is open source under [Apache-2.0](https://github.com/vercel-labs/fx/blob/43c11dcc34a94a76df870af70bdb824579bf18a0/LICENSE).

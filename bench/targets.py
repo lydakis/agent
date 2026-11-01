@@ -16,7 +16,8 @@ def file_hash(path):
         return hashlib.file_digest(source, "sha256").hexdigest()
 
 
-CLAUDE_CODE_VERSION = '2.1.267'
+CLAUDE_CODE_VERSION = '2.1.316'
+PI_VERSION = '1.4.0'
 # Native wire protocol each engine speaks to the synthetic provider.
 PROTOCOLS = {'fx': 'gateway', 'claude-code': 'anthropic_messages'}
 
@@ -60,7 +61,7 @@ def engine_target(engine, root, binary=None):
             if not path.exists():
                 raise ValueError("install the pinned benchmark adapter dependencies first")
             version = json.loads(path.read_text())["version"]
-            if version != "0.85.1":
+            if version != PI_VERSION:
                 raise ValueError("Pi installed version differs from benchmark pin")
             metadata[package] = version
         metadata["dependency_lock_sha256"] = file_hash(root / "bench/adapters/pnpm-lock.yaml")
@@ -69,15 +70,18 @@ def engine_target(engine, root, binary=None):
         if not (package / 'package.json').exists():
             raise ValueError('install the pinned benchmark adapter dependencies first')
         version = json.loads((package / 'package.json').read_text())['version']
-        if version != '0.0.8':
+        if version != '0.0.16':
             raise ValueError('FX installed version differs from benchmark pin')
         arch = {'arm64': 'arm64', 'aarch64': 'arm64', 'x86_64': 'x64', 'AMD64': 'x64'}.get(platform.machine())
         system = {'Darwin': 'darwin', 'Linux': 'linux'}.get(platform.system())
-        addon = package / f'libfx.{system}-{arch}.node'
+        # Since 0.0.9 the addon ships in an optional per-platform package next
+        # to libfx (glibc only on Linux), which libfx's own loader imports.
+        flavour = {'darwin': '', 'linux': '-gnu'}.get(system, '')
+        addon = package.resolve().parent / '@libfx' / f'libfx-{system}-{arch}{flavour}' / 'libfx.node'
         if not addon.exists():
             raise ValueError('FX pinned native addon unavailable on this platform')
         metadata.update(libfx_version=version, backend='native',
-                        release_source_revision='43c11dcc34a94a76df870af70bdb824579bf18a0',
+                        release_source_revision='4e42e5f610658efb64445f5dd31d795c721a21ce',
                         native_addon_sha256=file_hash(addon),
                         sdk_sources_sha256={p.name: file_hash(p) for p in sorted(package.glob('*.js'))},
                         dependency_lock_sha256=file_hash(root / 'bench/adapters/pnpm-lock.yaml'))
@@ -135,11 +139,11 @@ def engine_target(engine, root, binary=None):
     return command, metadata, str(executable) if executable else None
 
 
-# npm @earendil-works/pi-durable 1.0.0: its SLSA provenance names tag v1.0.0 of
+# npm @earendil-works/pi-durable 1.4.0: its SLSA provenance names tag v1.4.0 of
 # github.com/earendil-works/pi at this commit (packages/durable).
-PI_DURABLE_PACKAGES = {"@earendil-works/pi-durable": "1.0.0", "@earendil-works/chord": "1.0.0",
-                       "pi-ai-durable": "1.0.0"}
-PI_DURABLE_SOURCE_REVISION = "a13d35a742c6ef8462812a28fbe1d8c8b7431c32"
+PI_DURABLE_PACKAGES = {"@earendil-works/pi-durable": PI_VERSION, "@earendil-works/chord": PI_VERSION,
+                       "pi-ai-durable": PI_VERSION}
+PI_DURABLE_SOURCE_REVISION = "4a080252f06caf63a525d7873c5d94d3c23887e0"
 
 
 def pi_durable_metadata(root):
@@ -167,9 +171,9 @@ def pi_durable_metadata(root):
     return metadata
 
 
-# Tag v1.18.32 at github.com/anomalyco/opencode (formerly sst/opencode).
-OPENCODE_VERSION = "1.18.32"
-OPENCODE_SOURCE_REVISION = "545f51d26cc39a907d2867492d498d9607ea5fa4"
+# Tag v1.19.5 at github.com/anomalyco/opencode (formerly sst/opencode).
+OPENCODE_VERSION = "1.19.5"
+OPENCODE_SOURCE_REVISION = "810c0eba1a7348036f8bdf61e6632d0c36c6876c"
 
 
 def opencode_executable(root):

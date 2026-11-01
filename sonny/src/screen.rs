@@ -586,6 +586,12 @@ impl Screen {
         self.back = back;
     }
 
+    /// The line and drawn rows above it that `show_row` asked for and the
+    /// next draw has yet to put in view.
+    pub fn going_to(&self) -> Option<(usize, usize)> {
+        self.go_to
+    }
+
     /// The oldest rows went to make room, and those above are not drawn.
     pub fn trimmed(&self) -> bool {
         self.trimmed

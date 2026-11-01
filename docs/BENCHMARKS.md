@@ -70,7 +70,8 @@ separate run, since profilers change execution cost and latency.
 ## Real-engine adapters
 
 Install Pi's pinned packages with Node.js 22.19 or later and pnpm. The Codex adapter
-uses an installed native executable; the validated version is `codex-cli 0.153.1`.
+uses an installed native executable; the validated version is `codex-cli 0.166.0`
+(0.153.1 before 2026-10-31).
 For npm installations the runner resolves the native executable inside that
 package, bypassing the launcher. Ambiguous layouts fail explicitly.
 
@@ -106,7 +107,8 @@ Reject a performance conclusion if fewer streams overlap than claimed. No result
 from this screen alone decides historical forks, recovery, or thousand-agent capacity.
 
 The Pi adapter creates multiple `Agent` instances in one Node process using the
-published `@earendil-works/pi-agent-core` and `pi-ai` 0.85.1 packages. It supplies
+published `@earendil-works/pi-agent-core` and `pi-ai` 1.4.0 packages (0.85.1
+before 2026-10-31; Pi's coding agent 1.4.0 runs on the same pi-agent-core). It supplies
 Pi's actual `openai-responses` stream function, not a replacement transport or
 model/tool loop. The Codex adapter is a Node JSON-RPC client controlling multiple
 threads on one native app-server. **Target RSS/CPU includes the adapter process**:
@@ -148,7 +150,11 @@ are separate evidence and must not be assumed identical to an installed binary.
 
 ## FX native embedded core
 
-Added 2026-09-12. `libfx` is pinned to 0.0.8 in the benchmark dependency lockfile.
+Added 2026-09-12. `libfx` is pinned to 0.0.16 in the benchmark dependency lockfile
+(0.0.8 until 2026-10-31). Since 0.0.9 its native addon ships in the optional
+`@libfx/libfx-<os>-<arch>` package (`-gnu` on Linux), which the runner hashes.
+0.0.16 fetches the model catalog once per turn, where 0.0.8 fetched it once per
+agent; the fixture counts each in `catalog_requests`.
 Install the locked benchmark dependencies and run:
 
 ```sh
@@ -199,16 +205,15 @@ Agent, Pi, Codex, opencode, and Claude Code on one Linux host.
 
 ## opencode adapter
 
-Added 2026-09-23. The pinned release is npm `opencode-ai` **1.18.32**, whose
-upstream tag `v1.18.32` is commit `545f51d26cc39a907d2867492d498d9607ea5fa4`
-in github.com/anomalyco/opencode (formerly sst/opencode). The native
-`opencode-linux-x64` executable from that release had SHA-256
-`513f500a1a5ea1dc7d865547ac87b32a8936334e8d5abd5b3ff585c45a170080` when installed
-on 2026-09-23. It is installed privately under the ignored `.local`, not in the
+Added 2026-09-23. The pinned release is npm `opencode-ai` **1.19.5** (since
+2026-10-31; 1.18.32 before), whose upstream tag `v1.19.5` is commit
+`810c0eba1a7348036f8bdf61e6632d0c36c6876c` in github.com/anomalyco/opencode
+(formerly sst/opencode). The runner records the native executable's SHA-256
+with every run. It is installed privately under the ignored `.local`, not in the
 adapter lockfile:
 
 ```sh
-npm install --prefix .local/opencode --ignore-scripts opencode-ai@1.18.32
+npm install --prefix .local/opencode --ignore-scripts opencode-ai@1.19.5
 AGENT_BENCH_TEST_OPENCODE=1 .local/venv/bin/python -m unittest discover -s tests -v
 .local/venv/bin/python -m bench run --engine opencode --out .local/bench/opencode
 .local/venv/bin/python -m bench.matrix --engines rust pi codex opencode --out .local/bench/opencode-matrix
@@ -314,11 +319,12 @@ had no invalid requests.
 
 ## Claude Code adapter
 
-Added 2026-09-23. Claude Code is pinned to **2.1.267** (the npm `stable` dist-tag
-that day) and installed under the ignored `.local`, not in the tracked lockfile:
+Added 2026-09-23. Claude Code is pinned to **2.1.316** (the npm `latest`
+dist-tag on 2026-10-31, the channel the CLI updates on by default; 2.1.267, the
+`stable` dist-tag on 2026-09-23, before) and installed under the ignored `.local`, not in the tracked lockfile:
 
 ```sh
-npm install --prefix .local/claude-code --save-exact @anthropic-ai/claude-code@2.1.267
+npm install --prefix .local/claude-code --save-exact @anthropic-ai/claude-code@2.1.316
 AGENT_BENCH_TEST_CLAUDE_CODE=1 .local/venv/bin/python -m unittest discover -s tests -v
 .local/venv/bin/python -m bench run --engine claude-code --out .local/bench/claude-code
 .local/venv/bin/python -m bench.matrix --engines rust claude-code --out .local/bench/claude-code-matrix
@@ -382,15 +388,17 @@ text and per-delta delays are identical to the Responses and Gateway fixtures.
 model calls, connected to external HTTPS hosts, and ran IDE-detection (`ps`),
 `rg`, and git probes. With them, every remaining request is:
 
-- One `HEAD /api/hello` per process: a connection warm-up the CLI fires when no
-  proxy is configured. The fixture answers `200` with an empty body and counts it
-  in `preconnect_requests`. It is excluded from `requests`/`completed_requests`
-  but its connection is included in `connections_used`, so Claude Code uses about
-  two connections per agent.
-- Three short-lived `git` processes per CLI process at startup (remote and
-  settings-tracking probes), which find no repository in the empty workspace.
-  They remain in the target tree and its CPU. Inside a repository the CLI ran
-  seven per process, including `status` and `log`.
+- One `HEAD /api/hello` per process on 2.1.267: a connection warm-up the CLI
+  fired when no proxy was configured. The fixture answers `200` with an empty
+  body and counts it in `preconnect_requests`. It is excluded from
+  `requests`/`completed_requests` but its connection is included in
+  `connections_used`, so 2.1.267 used about two connections per agent. 2.1.316
+  no longer sends it (retraced 2026-10-31): one loopback connection per agent.
+- Short-lived `git` processes per CLI process at startup, which find no
+  repository in the empty workspace: three on 2.1.267 (remote and
+  settings-tracking probes), one `ls-files` settings probe on 2.1.316. They
+  remain in the target tree and its CPU. Inside a repository 2.1.267 ran seven
+  per process, including `status` and `log`.
 
 No external connection and no read of the enclosing repository was observed
 with these settings. Any other request fails
@@ -715,12 +723,14 @@ concurrency. See [the recorded measurements](LIFECYCLE_MEASUREMENTS.md).
 
 Added 2026-10-02. `--engine pi-durable` runs the same lifecycle workload,
 provider, observer, sampling, and guards against npm
-`@earendil-works/pi-durable` **1.0.0** (source commit and source facts in
-[RUNTIMES.md](RUNTIMES.md#pi-durable-durable-harness-over-one-commit-line)).
-It is pinned with `@earendil-works/chord` 1.0.0 and its pi-ai 1.0.0
-dependency (installed under the alias `pi-ai-durable`, next to the 0.85.1
-packages of the ephemeral Pi adapter) in `bench/adapters/package.json` and the
-pnpm lockfile.
+`@earendil-works/pi-durable` **1.4.0** (since 2026-10-31; its provenance names
+tag v1.4.0, commit `4a080252f06caf63a525d7873c5d94d3c23887e0`). The source
+facts in [RUNTIMES.md](RUNTIMES.md#pi-durable-durable-harness-over-one-commit-line)
+were checked at 1.0.0. It is pinned with `@earendil-works/chord` 1.4.0 and its
+pi-ai 1.4.0 dependency (installed under the alias `pi-ai-durable`, the same
+version as the ephemeral Pi adapter's packages) in `bench/adapters/package.json`
+and the pnpm lockfile. Since 1.4.0 a tool's `execute` returns its text as
+`output`, not `content`.
 
 ```sh
 pnpm --dir bench/adapters install --frozen-lockfile --ignore-scripts
@@ -738,7 +748,7 @@ Agent's stdio daemon: `create`, `submit` (with a request ID), `resume`,
 Every bot's `watchEvents()` stream is written to stdout as it arrives, as
 Agent writes its events; a run fails unless that stream delivers each bot's
 final submission as done. **Node, the harness, and its tool processes are the
-charged target.** The model is pi-ai 1.0.0's own `openai-responses` API with a
+charged target.** The model is pi-ai's own `openai-responses` API with a
 custom provider pointed at the fixture: SSE, no SDK retries, durable retries
 off, compaction off, no prompt-cache retention. Echo is a defined tool; shell
 mode uses Pi's own `bash` tool in a `NodeExecutionEnv` rooted at the bot's

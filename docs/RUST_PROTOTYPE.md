@@ -397,7 +397,7 @@ keeps what it started with; the next start takes a change.
 | Flag | Bounds | Default |
 | --- | --- | --- |
 | `--max-processes` | Child processes running at once, foreground or background. Waiting never counts. | 64 per logical CPU |
-| `--max-lasting` | Processes that outlive their call, still running, daemon-wide: terminals and detached shell commands together. A terminal holds its slot until its whole session is gone, a detached command until it is reaped. Zero is unbounded. | 4 per logical CPU |
+| `--max-lasting` | Processes that outlive their call, still running, daemon-wide: terminals and detached shell commands together. A terminal holds its slot until its whole session is gone, a detached command until it and whatever it left running in its process group are gone. Zero is unbounded. | 4 per logical CPU |
 | `--max-active` | Turns with a live task: a model call in flight or a foreground tool. Parked turns never count. | 4,096 |
 | `--max-pending` | Submissions waiting to start: queued behind a bot's own work or ready for a slot, daemon-wide. A submission that would wait past the bound answers `pending_limit` and writes nothing; one that starts at once is never refused by it. | none |
 | `--max-pending-bytes` | UTF-8 bytes of those waiting submissions: their prompts and the words they quote, which wait with them. | none |
@@ -1820,6 +1820,23 @@ the turn's id and handle at once, and `wait`, `turns`, and
   never moves the retention boundary past itself. `interrupt` withdraws one
   that waits.
   `agent run --delivery attach` returns at once, inside a bot's shell too.
+  `wait_ms` (protocol 45) bounds the wait: 1 ms to 365 days
+  (`invalid_wait` otherwise), with `attach` only (`invalid_delivery`). Once
+  no call has taken the message in by then, it goes as a steer sent then
+  would: `queued` for a bot with a turn running or ready, which it joins at
+  the next boundary (waking one parked on `wait`, a foreground command it
+  runs moving to the background as for any steer) or runs after, and
+  `ready` to start a turn of its own on an idle bot. Its row becomes a
+  `steer` (a retry is still the `attach` it was, its `wait_ms` compared
+  like any field), it counts in `queued_turns` and the pending bounds from
+  then on, and its `queued` event says `lapsed: true`. A partial index on
+  the attached rows' due times (`turns.due_ms`, schema 76) gives the daemon
+  its next look, planned at start, so one that came due while no daemon ran
+  goes at once; a drain leaves the rest for the next daemon. Without
+  `wait_ms` it waits as long as it takes, as before; stores from before
+  schema 76 keep their waiting messages so. The daemon has no default: the
+  agent CLI and Sonny send `attach_wait` from `~/.agent/config.toml`,
+  default a day, `"0"` for none.
 
 A queued or ready turn that cannot start when its place comes (for example,
 the bot's budget is spent) finishes as `failed` with that
@@ -2434,8 +2451,14 @@ redaction; a command that wants its output redirects it to a file itself. No pro
 handle applies to it, so it outlives the turn and the daemon and is outside
 `--max-processes`; stopping it is the bot's job. What does bound it is
 `--max-lasting`, shared with terminals as a systemd slice holds a
-service's processes: each detached child retains a slot until its async
-waiter reaps it on exit, and a new detach or terminal refuses with
+service's processes: each detached command retains a slot until its async
+waiter has reaped it and nothing it left in its process group runs (a
+launcher that starts a service with `cmd &` and exits keeps the slot while
+the service runs, looked for each second; on Linux a member that has
+exited but is not reaped, as under an init that does not reap orphans, does
+not count, and since a walk of `/proc` is no one moment, a group whose
+members all look exited frees its slot only after three walks a second
+apart agree), and a new detach or terminal refuses with
 `lasting_limit`, naming how many terminals and detached commands hold the
 slots, while all are held. Nothing waits in line for one. It exists because Terminal-Bench
 tasks that leave a server for the grader failed when the server died with its
@@ -2624,8 +2647,20 @@ too, always.
 
 On Linux, bubblewrap makes an empty folder on the host to mount a missing
 `.git` read-only over; the daemon removes it once no running sandbox holds
-it, and a detached command holds it until it exits. A sandbox that needs
+it, and a detached command holds it until it and what it left in its group are gone. A sandbox that needs
 one being removed waits until it is gone.
+
+`agent sandbox [--writable PATH]... -- COMMAND [ARGS...]` runs one command
+in the same sandbox, with no daemon, as Codex's `codex sandbox` does:
+read-only with no `--writable`, else writing the folders named, `$TMPDIR` and
+`/tmp`, always with the network off. Off, it reaches no Unix socket either,
+so not the daemon's nor a bot's, which a bot's own sandbox hides by the
+daemon's knowledge of them and this one has no daemon to ask. The agent's
+home stays read-only, as `--protect-path` keeps it for a bot. It exits as its command does. It is for a client that runs a program
+where an agent may have written: git runs a repository's hooks and the
+programs its config names (an fsmonitor, a filter) even to list its files,
+so a repository an agent made would run what it left there as the person.
+Sonny runs its own git in such places this way (#597).
 
 ### Command rules
 

@@ -37,6 +37,14 @@ PAGE = os.sysconf('SC_PAGE_SIZE')
 
 # The model -----------------------------------------------------------------
 
+def fnv(text):
+    """FNV-1a, 64-bit, as the lookout keys its notes."""
+    value = 0xcbf29ce484222325
+    for byte in text.encode():
+        value = ((value ^ byte) * 0x100000001b3) & 0xffffffffffffffff
+    return f'{value:016x}'
+
+
 def user_text(request):
     users = [i for i in request.get('input', []) if i.get('role') == 'user']
     if not users:
@@ -59,10 +67,13 @@ async def respond(request, writer, judge_ms):
     elif re.match(r'stream:\d+:\d+', text) and not after_tool:
         count, ms = re.match(r'stream:(\d+):(\d+)', text).groups()
         deltas, gap = ['word '] * int(count), int(ms) / 1000
-    elif text.startswith('shell:') and not after_tool:
+    elif re.match(r'shell(@\d+)?:', text) and not after_tool:
+        # `shell@<ms>:` sets the command's timeout; plain `shell:` gives 5 s.
+        timeout, command = re.match(r'shell(?:@(\d+))?:(.*)', text, re.S).groups()
         deltas = []
         output = [{'type': 'function_call', 'name': 'shell', 'call_id': 'sh-1',
-                   'arguments': json.dumps({'command': text[6:], 'timeout_ms': 5000})}]
+                   'arguments': json.dumps({'command': command,
+                                            'timeout_ms': int(timeout or 5000)})}]
     if os.environ.get('LS_MODEL_LOG'):
         with open(os.environ['LS_MODEL_LOG'], 'a') as log:
             log.write(json.dumps({'text': text[:200], 'last': str(last)[:200],
@@ -298,6 +309,12 @@ class Bench:
         folder.mkdir(exist_ok=True)
         for p in range(self.args.projects):
             tasks = {'name': 'tasks', 'tasks_of': [f'p{p}.lead'], 'bots': [f'p{p}.*']}
+            # Benches that set up through this one may say nothing of rules.
+            if getattr(self.args, 'rules', False):
+                # Every event built and matched, none held or dropped: the
+                # rules' own cost, with the notes going as they would.
+                tasks['filter'] = {'type': [{'anything-but': 'note.changed'}]}
+                tasks['urgent'] = {'status': ['never']}
             (folder / f'p{p}.lead.json').write_text(json.dumps({'subscriptions': [tasks]}))
         # One finished turn each lead's messages to its tasks come from: what
         # a lead writes in its tasks is no news to it, only how they end.
@@ -349,8 +366,9 @@ class Bench:
         time.sleep(seconds)
         return {'lookout': sampler.done(), 'daemon': daemon.done()}
 
-    def load(self, seconds, with_lookout=True):
-        """Every task runs turns back to back for `seconds`."""
+    def load(self, seconds, with_lookout=True, rounds=None):
+        """Every task runs turns back to back for `seconds`, or for exactly
+        `rounds` rounds when given, so two builds face the same work."""
         self.phase = getattr(self, 'phase', 0) + 1
         count, ms = self.args.deltas, self.args.delta_ms
         tasks = self.tasks()
@@ -361,7 +379,7 @@ class Bench:
         stop = started + seconds
         # Rounds: every task runs one turn, then the next round starts once
         # all have ended.
-        while time.monotonic() < stop:
+        while (n < rounds) if rounds else (time.monotonic() < stop):
             batch = [('submit', {'bot': task, 'request_id': f'{self.phase}r{n}-{task}',
                                  'prompt': f'stream:{count}:{ms}', 'delivery': 'reject',
                                  'from': {'bot': task.split('.')[0] + '.lead',
@@ -371,7 +389,8 @@ class Bench:
             replies = self.control.many(batch)
             submitted += sum('result' in r for r in replies)
             time.sleep(count * ms / 1000 * .8)
-            while self.running_tasks() and time.monotonic() < stop + 600:
+            deadline = (time.monotonic() if rounds else stop) + 600
+            while self.running_tasks() and time.monotonic() < deadline:
                 time.sleep(.2)
         ran = time.monotonic() - started
         settle = time.monotonic()
@@ -400,37 +419,83 @@ class Bench:
         return stats.get('active_turns', 0) + stats.get('queued_turns', 0)
 
     def note_delays(self, since_ms):
-        """For each task turn that ended after `since_ms`: how long until a
-        lead's note naming it started."""
+        """For each task turn that ended after `since_ms`: the first note
+        that told it, from what the lookout logged of each note it sent.
+        A note's lines are keyed `task/turn/...` by the newest turn of each
+        task, and a task's turns that ended before a note are told by it as
+        one line with a count, so a turn is told by the first note after it
+        ended that names that task at that turn or later. Each told turn's
+        wait is split into its stages: ended to the note's submit (reading
+        the reply, settling, the lead resting) and submit to the lead's turn
+        starting, with the slowest reply read each note waited on."""
         tasks = self.tasks()
         ended = {}
         for task, reply in zip(tasks, self.control.many(
                 [('turns', {'bot': t, 'limit': 256}) for t in tasks])):
             for turn in reply.get('result', {}).get('turns', []):
                 if turn.get('finished_ms') and turn['finished_ms'] >= since_ms:
-                    ended[f'turn:{task}/{turn["turn"]}'] = turn['finished_ms']
-        mentions = {}
+                    ended[(task, turn['turn'])] = turn['finished_ms']
+        # When each note reached its lead: its own turn starting, or, for a
+        # note a busy lead took into its running turn (a steer, or an attach
+        # its next message carried), the moment that turn absorbed it.
+        started, delivered = {}, {'turn': 0, 'steered': 0}
         leads = self.leads()
-        notes = []
         for lead, reply in zip(leads, self.control.many(
-                [('turns', {'bot': l, 'limit': 256}) for l in leads])):
+                [('turns', {'bot': l, 'limit': 256, 'newest': True}) for l in leads])):
             for turn in reply.get('result', {}).get('turns', []):
-                if str(turn.get('request_id', '')).startswith('lookout-') and turn.get('started_ms'):
-                    notes.append((lead, turn['turn'], turn['started_ms']))
-        prompts = self.control.many([('prompts', {'bot': lead, 'turn': turn})
-                                     for lead, turn, _ in notes])
-        for (lead, turn, at), reply in zip(notes, prompts):
-            for prompt in reply.get('result', {}).get('prompts', []):
-                for handle in re.findall(r'turn:p\d+\.t\d+/\d+', prompt.get('text', '')):
-                    mentions.setdefault(handle, []).append(at)
-        # The first note after the turn ended.
-        told = {h: min((at for at in mentions.get(h, []) if at >= ended[h]), default=None)
-                for h in ended}
-        delays = sorted(told[h] - ended[h] for h in ended if told[h] is not None)
-        pct = lambda q: delays[min(len(delays) - 1, int(q * len(delays)))] if delays else None
-        return {'turns_ended': len(ended), 'told': len(delays), 'notes': len(notes),
-                'delay_ms_p50': pct(.5), 'delay_ms_p95': pct(.95),
-                'delay_ms_max': delays[-1] if delays else None}
+                if not str(turn.get('request_id', '')).startswith('lookout-'):
+                    continue
+                if turn.get('status') == 'steered' and turn.get('finished_ms'):
+                    started[(lead, turn['request_id'])] = turn['finished_ms']
+                    delivered['steered'] += 1
+                elif turn.get('started_ms'):
+                    started[(lead, turn['request_id'])] = turn['started_ms']
+                    delivered['turn'] += 1
+        # Each task's notes, oldest first: when sent, the newest turn named.
+        named = {}
+        notes = [line for line in self.log_lines() if isinstance(line.get('woke'), list)]
+        for note in notes:
+            # A lookout that logs no request id keys its note as the lead's
+            # turn does: FNV-1a of its lines' keys.
+            request_id = note.get('request_id') or f"lookout-{fnv(','.join(note['woke']))}"
+            begun = started.get((note['lead'], request_id))
+            for key in note['woke']:
+                task, _, rest = key.partition('/')
+                turn = rest.partition('/')[0]
+                if turn.isdigit():
+                    named.setdefault(task, []).append((note['at_ms'], int(turn), begun, note.get('read_ms')))
+        # A turn is told once a note naming it reaches its lead; a note sent
+        # but still queued tells nothing yet, though its submit is timed.
+        sent, begun, reads, untold = [], [], [], []
+        for (task, turn), finished in ended.items():
+            naming = [(at, start, read) for at, newest, start, read in named.get(task, [])
+                      if at >= finished and newest >= turn]
+            if naming:
+                at, _, read = min(naming, key=lambda note: note[0])
+                sent.append(at - finished)
+                if read is not None:
+                    reads.append(read)
+            reached = [start for _, start, _ in naming if start is not None]
+            if reached:
+                begun.append(min(reached) - finished)
+            else:
+                untold.append(finished)
+        now = int(time.time() * 1000)
+
+        def pct(values, q):
+            values = sorted(values)
+            return values[min(len(values) - 1, int(q * len(values)))] if values else None
+        return {'leads': len(leads), 'tasks': len(tasks), 'tasks_per_lead': self.args.tasks,
+                'turns_ended': len(ended), 'told': len(begun), 'untold': len(untold),
+                'oldest_untold_ms': now - min(untold) if untold else None,
+                'notes': len(notes), 'notes_delivered': delivered,
+                'notes_undelivered': sum(
+                    (note['lead'], note.get('request_id') or f"lookout-{fnv(','.join(note['woke']))}")
+                    not in started for note in notes),
+                'submit_ms_p50': pct(sent, .5), 'submit_ms_p95': pct(sent, .95),
+                'delay_ms_p50': pct(begun, .5), 'delay_ms_p95': pct(begun, .95),
+                'delay_ms_max': max(begun) if begun else None,
+                'read_ms_p95': pct(reads, .95)}
 
     def stop_lookout(self):
         if self.lookout and self.lookout.poll() is None:
@@ -503,6 +568,8 @@ def main():
     parser.add_argument('--idle-s', type=float, default=10)
     parser.add_argument('--phases', default='idle,baseline,load,restart')
     parser.add_argument('--gated', type=int, default=0)
+    parser.add_argument('--rules', action='store_true',
+                        help="give each lead's tasks subscription a filter and urgent that match as they would")
     parser.add_argument('--out')
     args = parser.parse_args()
     if args.model:

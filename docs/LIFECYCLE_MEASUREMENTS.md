@@ -265,3 +265,86 @@ The conclusions above hold. Agent's daemon peaked about 1 MiB higher than
 on 2026-10-02 (main moved from `0a6f2b2` to `b026767` in between, and the
 host differs); Pi Durable's shell peak varied most, 253.2 then 273.5 MiB.
 The summary change does not run in this workload, which never compacts.
+
+### Re-run, 2026-11-01
+
+The same seven commands on a shared 4-vCPU Intel Xeon (2.8 GHz) Linux 6.18
+VM with 16 GiB RAM, 2026-11-01 10:25–10:32 UTC. Agent at `afafeec` (main
+`70637f9` plus benchmark pins; release binary `a84decc9…`), after the
+2026-10-31 daemon work. Pi Durable, chord and pi-ai at **1.4.0** (was 1.0.0;
+provenance names tag v1.4.0, commit `4a080252`), Node v22.23.4 and its SQLite.
+Captures under the ignored `.local/bench/harness-nov01-afafeec-pi-durable/`.
+Every measured run completed all 96 turns with no invalid request.
+
+| Case | Engine, durability | Peak RSS, MiB | CPU s | Turn p50 / p99, ms | Restart to ready, ms | Resume, re-read, items, duplicate, fork (all 32), ms |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| Text | Agent, FULL | 26.7 (26.4–26.9) | 1.62 (1.57–1.62) | 535 / 620 | 332 (313–393) | 499 (459–510) |
+| Text | Pi Durable, FULL | 143.3 (141.4–143.5) | 4.25 (4.08–4.41) | 550 / 752 | 455 (380–458) | 447 (392–459) |
+| Echo round trip | Agent, FULL | 26.8 (26.5–26.9) | 2.11 (2.05–2.12) | 595 / 620 | 412 (394–494) | 864 (788–877) |
+| Echo round trip | Pi Durable, FULL | 154.7 (152.4–156.5) | 5.63 (5.26–5.84) | 746 / 1,007 | 403 (351–411) | 459 (415–606) |
+| Echo round trip | Pi Durable, NORMAL (package default) | 152.5 (152.4–154.2) | 5.77 (5.63–5.82) | 701 / 1,071 | 429 (371–472) | 467 (423–610) |
+| Shell round trip | Agent, FULL | 186.3 (185.6–186.6) | 1.92 (1.84–2.29) | 849 / 892 | 358 (293–532) | 705 (632–841) |
+| Shell round trip | Pi Durable, FULL | 208.4 (207.6–215.4) | 6.78 (6.44–7.19) | 1,129 / 1,405 | 551 (408–556) | 592 (552–615) |
+
+What changed:
+
+- **Agent's after-restart reads regressed, and the cause is the SQLite
+  bump.** The resume, re-read, items, duplicate and fork phase is now slower
+  for Agent than for Pi Durable in every case, where it was faster on
+  2026-10-09. Timing each request in that phase (echo case, three runs a
+  binary, binaries run interleaved on this host) puts nearly all of it in
+  the 384 per-item `history_items` reads: about 0.55 ms a call at `5d0991c`
+  (#542) and earlier, about 1.5 ms from `eb1ecb2` (#544, rusqlite 0.41.1,
+  bundled SQLite 3.53.2 to 3.54.1) on. Every later main tried, `f44b859`,
+  `5c8b044`, `d617c75` and `70637f9`, is equally slow, so the 2026-10-31
+  daemon work did not cause it. #544's own query change touches only items
+  that carry an image, which this workload never stores. The cause: with
+  SQLite 3.54.1, and rusqlite clearing bindings when a statement goes back
+  to its cache, cached joins were planned again on every reuse. #617 turns
+  on the query planner stability guarantee for store connections; the
+  [run after that fix](#re-run-after-the-sqlite-fix-2026-11-01) shows the
+  phase back below Pi Durable's.
+- **Pi Durable 1.4.0 overlaps fewer tool turns.** In the echo and shell cases
+  it reached 22 to 28 of 32 concurrent provider requests (1.0.0: all 32), so
+  each of those runs carries the "configured provider concurrency not
+  achieved" warning. Its text case reached all 32.
+- **Agent's shell peak is about 51 MiB higher than on 2026-10-09** (186.3
+  against 135.1 MiB), with text and echo up about 5 MiB. Not investigated;
+  the host differs too.
+- Both engines used more CPU than on 2026-10-09, Pi Durable about 1.7 to
+  1.9 times and Agent about 2.0 to 2.4 times. Part of that is likely the host, which
+  this run cannot separate.
+
+### Re-run after the SQLite fix, 2026-11-01
+
+The same seven commands on the same host class, 2026-11-01 14:32–14:38 UTC,
+at main `37ebb4d` (#617 merged; release binary `22a800ef…`), same Pi Durable
+1.4.0 and Node. Captures under the ignored
+`.local/bench/harness-nov01-37ebb4d-pi-durable/`. Every measured run completed
+all 96 turns with no invalid request.
+
+| Case | Engine, durability | Peak RSS, MiB | CPU s | Turn p50 / p99, ms | Restart to ready, ms | Resume, re-read, items, duplicate, fork (all 32), ms |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| Text | Agent, FULL | 26.0 (25.5–26.2) | 1.50 (1.40–1.52) | 534 / 549 | 288 (269–443) | 396 (323–412) |
+| Text | Pi Durable, FULL | 153.7 (152.8–154.5) | 4.61 (4.39–4.82) | 561 / 822 | 459 (418–492) | 508 (507–537) |
+| Echo round trip | Agent, FULL | 26.5 (26.5–26.7) | 1.58 (1.47–1.66) | 587 / 602 | 325 (295–334) | 430 (385–475) |
+| Echo round trip | Pi Durable, FULL | 164.7 (161.3–167.3) | 6.09 (5.46–6.17) | 750 / 1,062 | 395 (377–449) | 498 (452–551) |
+| Echo round trip | Pi Durable, NORMAL (package default) | 165.9 (164.3–167.4) | 5.21 (4.58–5.30) | 685 / 973 | 388 (380–471) | 404 (375–434) |
+| Shell round trip | Agent, FULL | 185.1 (184.9–185.1) | 1.58 (1.58–1.68) | 852 / 896 | 340 (271–358) | 451 (413–480) |
+| Shell round trip | Pi Durable, FULL | 208.1 (207.6–223.0) | 7.11 (6.25–7.24) | 1,173 / 1,519 | 456 (367–525) | 564 (510–580) |
+
+- **The after-restart phase is fixed.** Agent's echo case took 430 ms
+  against 864 ms at `70637f9`, and is below Pi Durable's in every matched
+  (FULL) case again. Timing each request (three echo runs) puts the 384
+  `history_items` reads at 0.45 to 0.83 ms a call, back to the
+  pre-#544 0.55 ms range.
+- Agent's CPU also fell, most in the tool cases (echo 2.11 to 1.58 s, shell
+  1.92 to 1.58 s), likely because tool turns read history the same way.
+- Pi Durable FULL again reached only 20 to 25 of 32 concurrent provider
+  requests in the echo and shell cases and carries the concurrency warning;
+  NORMAL reached 30 to 32. Agent reached 32 in every run.
+- Agent's shell peak stays at about 185 MiB, so the rise against 2026-10-09
+  is not from the SQLite change.
+- Pi Durable's numbers moved by up to 10% between the two runs today (echo
+  RSS 154.7 to 164.7 MiB) with no change on its side, so read differences
+  that small as host noise.

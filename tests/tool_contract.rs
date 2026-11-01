@@ -523,6 +523,108 @@ async fn detached_commands_are_bounded_and_reaped() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+#[tokio::test]
+async fn a_detached_command_keeps_its_place_while_what_it_left_runs() {
+    let tools = Registry::new("shell").unwrap().with_lasting_budget(1);
+    let dir = std::env::temp_dir().join(format!("agent-detach-family-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let detach = |command: &str| {
+        tools
+            .prepare(
+                "shell",
+                &json!({"command":command,"detach":true}).to_string(),
+            )
+            .unwrap()
+    };
+    // A process that has exited but is not reaped yet, as under an init that
+    // does not reap orphans, still answers a signal: on Linux it is gone.
+    fn alive(pid: i32) -> bool {
+        let signalled = unsafe { libc::kill(pid, 0) == 0 };
+        let zombie = cfg!(target_os = "linux")
+            && (std::fs::read_to_string(format!("/proc/{pid}/stat")).ok())
+                .and_then(|stat| Some(stat.rsplit_once(')')?.1.trim_start().starts_with('Z')))
+                .unwrap_or(false);
+        signalled && !zombie
+    }
+    async fn until(what: &str, mut done: impl FnMut() -> bool) {
+        for _ in 0..500 {
+            if done() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("{what}");
+    }
+    // A launcher that starts a service and exits, as `cmd &` does.
+    let launch = async |name: &str| {
+        let file = dir.join(name);
+        let output: Value = serde_json::from_str(
+            &tools
+                .execute(
+                    detach(&format!("sleep 30 & echo $! > {}", file.display())),
+                    &dir,
+                    &[],
+                    None,
+                )
+                .await
+                .unwrap()
+                .output,
+        )
+        .unwrap();
+        let launcher = output["pid"].as_i64().unwrap() as i32;
+        let mut service = None;
+        until("the service started", || {
+            service = (std::fs::read_to_string(&file).ok())
+                .and_then(|pid| pid.trim().parse::<i32>().ok());
+            service.is_some()
+        })
+        .await;
+        until("the launcher exited", || !alive(launcher)).await;
+        service.unwrap()
+    };
+    let refused = async || {
+        (tools.execute(detach("true"), &dir, &[], None).await)
+            .err()
+            .map(|error| error.code)
+    };
+    let service = launch("first.pid").await;
+    // The launcher is gone but its service runs: the bound still counts it.
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    assert!(alive(service));
+    assert_eq!(refused().await.as_deref(), Some("lasting_limit"));
+    // The service ends: its place is free within the second it is looked for,
+    // or, where nobody reaps it, once three looks a second apart agree.
+    unsafe {
+        libc::kill(service, libc::SIGKILL);
+    }
+    let mut free = false;
+    for _ in 0..60 {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        if refused().await.is_none() {
+            free = true;
+            break;
+        }
+    }
+    assert!(free, "the place was not released once the service ended");
+    // The pull cord ends what a launcher left, and frees its place too.
+    // The `true` that found the place free is reaped and gone by then.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let service = launch("second.pid").await;
+    assert_eq!(refused().await.as_deref(), Some("lasting_limit"));
+    tools.end_running();
+    until("the pull ended the service", || !alive(service)).await;
+    let mut free = false;
+    for _ in 0..60 {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        if refused().await.is_none() {
+            free = true;
+            break;
+        }
+    }
+    assert!(free, "the place was not released after the pull");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 /// Whether sandboxes run here. CI sets AGENT_TEST_SANDBOX, where one that
 /// can't is a failure; elsewhere the test says why it skipped.
 #[cfg(any(target_os = "linux", target_os = "macos"))]

@@ -2648,7 +2648,8 @@ fn sh(
 /// turn and the daemon. Its output is discarded: a log the daemon wrote would
 /// bypass credential redaction, so a command that wants one redirects itself.
 /// No process slot or handle applies to it, and only the pull cord kills its
-/// session. An async waiter reaps it on exit and releases its detached slot.
+/// session. An async waiter reaps it on exit; its detached slot is released
+/// once nothing it left in its group runs either.
 #[cfg(unix)]
 async fn detach(
     command: &str,
@@ -2710,12 +2711,31 @@ async fn detach(
                 true
             }
         };
-        drop((permit, held));
         // What it left running in its group, as `cmd &` leaves, is still
-        // the pull's to end: looked for each second until the group is
-        // empty. The kernel keeps a group's id from new processes while any
-        // member lives, so only that last second could see it reused.
-        while !pulled && signal(0) {
+        // the pull's to end, and still holds the command's place: looked
+        // for each second until the group is empty, so a launcher that
+        // starts a service and exits does not hand its slot to the next
+        // while the service runs. The kernel keeps a group's id from new
+        // processes while any member lives, so only that last second could
+        // see it reused.
+        let members = move || async move {
+            tokio::task::spawn_blocking(move || group_members(-group))
+                .await
+                .unwrap_or(Members::Gone)
+        };
+        // Where only exited members answer, a walk of /proc is no one
+        // moment and can miss a member forked while it read: three walks a
+        // second apart must agree that nothing runs.
+        let mut exited = 0;
+        while !pulled && exited < 3 {
+            match members().await {
+                Members::Gone => break,
+                Members::Running => exited = 0,
+                Members::Exited => exited += 1,
+            }
+            if exited == 3 {
+                break;
+            }
             tokio::select! {
                 Ok(()) = pulls.changed() => {
                     signal(libc::SIGKILL);
@@ -2724,11 +2744,93 @@ async fn detach(
                 () = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
             }
         }
-        drop(listening);
+        drop((permit, held, listening));
     });
     Ok(Outcome::text(
         json!({"detached":true,"pid":pid}).to_string(),
     ))
+}
+
+/// What is left of a detached command's process group.
+#[cfg(unix)]
+enum Members {
+    /// Nothing answers a signal.
+    Gone,
+    Running,
+    /// Only members that have exited were seen, though something answers.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    Exited,
+}
+
+/// What is left of a process group. A member that has exited still answers
+/// a signal until it is reaped, and an init that does not reap orphans, as
+/// some containers run, leaves it so for good: on Linux only a member that
+/// is not a zombie runs, and a process whose main thread has exited is a
+/// zombie only once its other threads have too. Elsewhere init reaps orphans.
+#[cfg(target_os = "linux")]
+fn group_members(group: i32) -> Members {
+    // SAFETY: kill with a negative pid and signal 0 only checks the group.
+    if unsafe { libc::kill(-group, 0) } != 0 {
+        return Members::Gone;
+    }
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Members::Running;
+    };
+    let running = entries.flatten().any(|entry| {
+        let name = entry.file_name();
+        let Some(pid) = name
+            .to_str()
+            .filter(|n| n.bytes().all(|b| b.is_ascii_digit()))
+        else {
+            return false;
+        };
+        let Some((state, pgrp)) = stat(&entry.path().join("stat")) else {
+            return false;
+        };
+        pgrp == Some(group) && (!exited(state) || threads_run(pid))
+    });
+    if running {
+        Members::Running
+    } else {
+        Members::Exited
+    }
+}
+/// The state and process group in a `/proc` stat file, `pid (comm) state
+/// ppid pgrp ...`. comm is the process's name, any bytes up to 15 of them:
+/// spaces, parens, and UTF-8 the kernel cut short included.
+#[cfg(target_os = "linux")]
+fn stat(path: &Path) -> Option<(u8, Option<i32>)> {
+    let stat = std::fs::read(path).ok()?;
+    let after = &stat[stat.iter().rposition(|&b| b == b')')? + 1..];
+    let mut fields = after
+        .split(u8::is_ascii_whitespace)
+        .filter(|field| !field.is_empty());
+    let state = *fields.next()?.first()?;
+    let pgrp = (fields.nth(1)).and_then(|pgrp| std::str::from_utf8(pgrp).ok()?.parse().ok());
+    Some((state, pgrp))
+}
+#[cfg(target_os = "linux")]
+fn exited(state: u8) -> bool {
+    matches!(state, b'Z' | b'X')
+}
+/// Whether any thread of a process whose main thread is a zombie still runs.
+#[cfg(target_os = "linux")]
+fn threads_run(pid: &str) -> bool {
+    let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
+        return false;
+    };
+    tasks
+        .flatten()
+        .any(|task| stat(&task.path().join("stat")).is_some_and(|(state, _)| !exited(state)))
+}
+#[cfg(all(unix, not(target_os = "linux")))]
+fn group_members(group: i32) -> Members {
+    // SAFETY: kill with a negative pid and signal 0 only checks the group.
+    if unsafe { libc::kill(-group, 0) == 0 } {
+        Members::Running
+    } else {
+        Members::Gone
+    }
 }
 
 /// End the pid namespace a sandboxed detached command runs in. bubblewrap,

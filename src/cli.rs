@@ -20,7 +20,7 @@ const COMMANDS: &[Command] = &[
         name: "run",
         about: "Send a prompt to a bot, or make one with --new; prints the turn as it runs",
         usage: "run [OPTIONS] [--] PROMPT...",
-        flags: "--bot --new --fork --allow --expires --detach --delivery --turn --model --workspace --effort --turn-budget-tokens --image --quote --agents --profile --request-id --bot-id --pretty --no-spawn",
+        flags: "--bot --new --fork --allow --expires --detach --delivery --attach-wait --turn --model --workspace --effort --turn-budget-tokens --image --quote --agents --profile --request-id --bot-id --pretty --no-spawn",
         settings: "--tools --instructions --instructions-file --budget-tokens --compaction-instructions --compaction-instructions-file --compaction-model --no-compaction --fallback --approval --approve --context-bytes --context-items --note-turns --compact-at --compact-keep --compact-tokens --max-rounds --keep-turns --approval-hold --max-output-tokens --keep-warm --cache-ttl --speed --sandbox --writable --network --hide-senders --unix-socket --outputs",
         startup: true,
     },
@@ -201,6 +201,14 @@ const COMMANDS: &[Command] = &[
         startup: true,
     },
     Command {
+        name: "sandbox",
+        about: "Run a command in a sandbox: read-only, or writing only the folders named",
+        usage: "sandbox [--writable PATH]... -- COMMAND [ARGS...]",
+        flags: "--writable",
+        settings: "",
+        startup: false,
+    },
+    Command {
         name: "serve",
         about: "Run the daemon in the foreground; other commands start it for you",
         usage: "serve --store PATH --provider SPEC... [OPTIONS]",
@@ -276,6 +284,10 @@ fn print_flags(flags: &str) {
             "--delivery" => (
                 "MODE",
                 "If the bot is busy: reject, queue, or steer; attach adds the message to its next model call without starting a turn; default AGENT_DELIVERY or reject",
+            ),
+            "--attach-wait" => (
+                "DURATION",
+                "With --delivery attach: how long it waits for a call before it goes as a steer, up to 365d; 0 as long as it takes; default attach_wait in config.toml, else 1d",
             ),
             "--all" => ("", "Follow every bot on one connection"),
             "--any" => ("", "Return when the first handle resolves"),
@@ -455,7 +467,7 @@ fn print_flags(flags: &str) {
             "--env" => ("KEY=VALUE", "A variable a companion gets; repeat for more"),
             "--writable" => (
                 "PATH",
-                "Another folder a workspace-write bot may change; repeat for more",
+                "Another folder a workspace-write bot, or a sandboxed command, may change; repeat for more",
             ),
             "--network" => ("", "A workspace-write bot's commands may use the network"),
             "--outputs" => (
@@ -561,25 +573,7 @@ pub fn duration_ms(flag: &str, value: &str) -> Result<u64> {
             format!("{flag} needs a duration such as 500ms, 30s, 5m, 1h or 7d"),
         )
     };
-    if value == "0" {
-        return Ok(0);
-    }
-    let unit = value
-        .find(|c: char| !c.is_ascii_digit())
-        .ok_or_else(refuse)?;
-    let scale = match &value[unit..] {
-        "ms" => 1,
-        "s" => 1000,
-        "m" => 60_000,
-        "h" => 3_600_000,
-        "d" => 86_400_000,
-        _ => return Err(refuse()),
-    };
-    value[..unit]
-        .parse::<u64>()
-        .ok()
-        .and_then(|n| n.checked_mul(scale))
-        .ok_or_else(refuse)
+    agent_client::config::duration_ms(value).ok_or_else(refuse)
 }
 
 /// `--max-load`: a load average, 0 or more, as uptime prints one.
@@ -616,7 +610,7 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
     let mut positional = 0;
     while let Some(arg) = iter.next() {
         if arg == "--" {
-            if matches!(c.name, "run" | "wait" | "companion") {
+            if matches!(c.name, "run" | "wait" | "companion" | "sandbox") {
                 out.push(arg);
             }
             for value in iter {
@@ -774,6 +768,10 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
         if positional != 1 {
             return fail_with("usage", "login needs a provider: chatgpt");
         }
+    } else if c.name == "sandbox" {
+        if positional == 0 {
+            return fail_with("usage", "sandbox needs a command after --");
+        }
     } else if !matches!(c.name, "run" | "wait" | "companion") && positional != 0 {
         return fail_with("usage", format!("{} takes no positional arguments", c.name));
     }
@@ -853,5 +851,51 @@ mod tests {
         }
         assert_eq!(duration_secs("--keep-warm", "4m").ok(), Some(240));
         assert!(duration_secs("--keep-warm", "1500ms").is_err());
+    }
+
+    #[test]
+    fn a_sandboxed_command_keeps_its_words_after_the_separator() {
+        let words = |args: &[&str]| args.iter().map(|a| a.to_string()).collect::<Vec<_>>();
+        let prepared = prepare(words(&[
+            "sandbox",
+            "--writable",
+            "/r",
+            "--",
+            "git",
+            "--no-pager",
+            "status",
+        ]))
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            prepared,
+            words(&[
+                "sandbox",
+                "--writable",
+                "/r",
+                "--",
+                "git",
+                "--no-pager",
+                "status"
+            ])
+        );
+        // Each folder named; no command is refused, as is another flag.
+        assert!(
+            prepare(words(&[
+                "sandbox",
+                "--writable",
+                "/a",
+                "--writable",
+                "/b",
+                "--",
+                "ls"
+            ]))
+            .is_ok()
+        );
+        assert!(prepare(words(&["sandbox", "--writable", "/a"])).is_err());
+        assert!(prepare(words(&["sandbox", "--"])).is_err());
+        assert!(prepare(words(&["sandbox", "--bot", "x", "--", "ls"])).is_err());
+        // With the network off, it reaches no socket, the daemon's least.
+        assert!(prepare(words(&["sandbox", "--network", "--", "ls"])).is_err());
     }
 }

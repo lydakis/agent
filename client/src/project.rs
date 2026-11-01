@@ -438,8 +438,12 @@ pub async fn create(
         let mut gate = gate.clone();
         if let Some(Value::Array(approve)) = gate.get_mut("approve") {
             approve.retain(|tool| tool.as_str().is_some_and(has));
+            // Nothing left to gate is no gate, which `create` takes as
+            // no fields: it refuses an empty `approve`.
             if approve.is_empty() {
+                gate.remove("approve");
                 gate.remove("approver");
+                gate.remove("approve_expire_ms");
             }
         }
         params.extend(gate);
@@ -754,6 +758,33 @@ mod tests {
             json!({"sandbox": "workspace-write", "network": true})
         );
         std::fs::remove_dir_all(dir.parent().unwrap()).unwrap();
+        // No gate, as Sonny's `full` row gives, or one left with no tool
+        // the lead has, is no gate fields: `create` refuses an empty
+        // `approve` with `invalid_gate`.
+        for gate in [
+            json!({"approve": []}),
+            json!({"approve": ["not_a_tool"], "approver": "auto"}),
+        ] {
+            let dir = root("ungated");
+            let daemon = Fake::default();
+            make(
+                &daemon,
+                &dir,
+                &json!({"instructions": "rules", "model": "alpha/role", "gate": gate,
+                        "settings": {"sandbox": "danger-full-access"}}),
+                &Picks::default(),
+            )
+            .unwrap();
+            let calls = daemon.calls.lock().unwrap().clone();
+            let create = &calls.iter().find(|(op, _)| op == "create").unwrap().1;
+            assert!(
+                ["approve", "approver", "approve_expire_ms"]
+                    .iter()
+                    .all(|field| create.get(*field).is_none()),
+                "{gate} sent {create}"
+            );
+            std::fs::remove_dir_all(dir.parent().unwrap()).unwrap();
+        }
     }
 
     #[test]

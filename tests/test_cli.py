@@ -343,6 +343,18 @@ class SocketAndCliTests(ModelFixture):
         usage = self.agent('run', '--store', str(self.store), '--bot', 'Bob', '--delivery', 'later', 'x', check=False)
         self.assertEqual(usage.returncode, 1)
         self.assertIn('invalid_delivery', usage.stderr + usage.stdout)
+        # An attached note waits only so long, then goes as a steer: on an
+        # idle bot, a turn of its own.
+        for flags in (['--attach-wait', '1h'], ['--delivery', 'attach', '--attach-wait', '30'],
+                      ['--delivery', 'attach', '--attach-wait', '366d']):
+            usage = self.agent('run', '--store', str(self.store), '--bot', 'Bob', *flags, 'x', check=False)
+            self.assertEqual(usage.returncode, 2, flags)
+            self.assertIn('attach-wait', usage.stderr + usage.stdout)
+        note = json.loads(self.agent('run', '--store', str(self.store), '--bot', 'Bob', '--delivery', 'attach',
+                                     '--attach-wait', '200ms', 'fyi').stdout)
+        self.assertEqual(note['status'], 'attached')
+        waited = json.loads(self.agent('wait', '--store', str(self.store), '--timeout', '10s', note['handle']).stdout)
+        self.assertEqual(waited['results'][note['handle']]['text'], 'reply:fyi')
         # The environment supplies a per-user default; the flag still wins.
         env = dict(clean_env(), AGENT_DELIVERY='queue')
         slow = json.loads(subprocess.run([*self.base, 'run', '--store', str(self.store), '--bot', 'Bob', '--detach', 'slow'],

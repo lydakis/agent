@@ -88,9 +88,9 @@ class AdapterTests(unittest.TestCase):
 
     def test_pinned_versions_and_source_revision_are_recorded(self):
         metadata = pi_durable_metadata(ROOT)
-        self.assertEqual(metadata['pi-durable'], '1.0.0')
-        self.assertEqual(metadata['pi-ai-durable'], '1.0.0')
-        self.assertEqual(metadata['pi_durable_source_revision'], 'a13d35a742c6ef8462812a28fbe1d8c8b7431c32')
+        self.assertEqual(metadata['pi-durable'], '1.4.0')
+        self.assertEqual(metadata['pi-ai-durable'], '1.4.0')
+        self.assertEqual(metadata['pi_durable_source_revision'], '4a080252f06caf63a525d7873c5d94d3c23887e0')
 
     def test_store_syncs_as_asked_and_reports_it(self):
         with tempfile.TemporaryDirectory(dir=ROOT / '.local') as directory:

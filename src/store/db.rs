@@ -8,7 +8,7 @@ use crate::{
     tools::{Declared, Outcome},
 };
 use bytes::Bytes;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, config::DbConfig, params};
 use serde::Serialize;
 use serde_json::{Value, json, value::RawValue};
 use std::{
@@ -733,6 +733,24 @@ pub struct TurnOptions {
     pub budget_tokens: Option<u64>,
     /// Pictures sent with the prompt, after its words in the user item.
     pub images: Vec<crate::codec::Image>,
+    /// With `attach`: the most milliseconds it waits for a call to take it
+    /// in before it is delivered as a steer; none waits for as long as it
+    /// takes.
+    pub wait_ms: Option<u64>,
+}
+/// An attached message whose wait ran out, delivered now as a steer.
+#[derive(Debug)]
+pub struct Lapsed {
+    pub bot: String,
+    pub turn: i64,
+    /// `queued` behind or beside the bot's running turn, or `ready` to
+    /// start a turn of its own.
+    pub status: &'static str,
+    /// The bot's running turn takes it at its next boundary.
+    pub joins: bool,
+    /// For such a steer, the bot's turn parked on a `wait`, which it
+    /// wakes, and the newest queued steer.
+    pub parked: Option<(i64, i64)>,
 }
 /// A turn whose words a prompt quotes: its prompt, or with `reply` the
 /// last message with text it ended with.
@@ -1505,6 +1523,27 @@ pub struct TurnContext {
 /// again. Every `prepare_cached` site fits, at a few KiB of SQLite memory
 /// each for the ones in use.
 const STATEMENTS: usize = 256;
+/// Plans that don't depend on bound values: SQLite's query planner
+/// stability guarantee. The store never runs ANALYZE, so no statistics
+/// could make a plan better for one value than another. Without it, SQLite
+/// 3.54 marks a join with an `x = ?` term to be planned again once its
+/// bindings are cleared, which the statement cache does each time a
+/// statement goes back: every reuse parsed the statement again, half a
+/// millisecond for `history_items`. The one plan that did read a value,
+/// a GLOB pattern's literal prefix bounding an index, is written out where
+/// a name is matched (`glob_prefix`).
+fn plan_stably(conn: &Connection) -> Result<()> {
+    conn.set_db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_QPSG, true)?;
+    Ok(())
+}
+/// The literal start of a GLOB pattern, before its first `*`, `?` or `[`:
+/// every name the pattern matches begins with it. A query bounds the name
+/// index with it, `name >= prefix AND name < prefix || x'ff'` (no UTF-8
+/// text holds the byte 0xff), as SQLite's own prefix optimization does
+/// when plans may read bound values.
+fn glob_prefix(pattern: &str) -> &str {
+    &pattern[..pattern.find(['*', '?', '[']).unwrap_or(pattern.len())]
+}
 pub struct Database {
     conn: Connection,
     /// Bounds on submissions waiting to start, turns and prompt bytes; zero
@@ -1811,7 +1850,7 @@ impl Database {
     /// Stored schema version, kept in `PRAGMA user_version`. Stores created
     /// before versioning and stores from newer binaries are rejected; an older
     /// versioned store is migrated forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 75;
+    pub const SCHEMA: i32 = 76;
     /// Verbatim user prompts a compaction keeps: per-prompt text, and the
     /// total text plus `(ordinal, String)` entry metadata. Empty entries cost
     /// space too, so the retained list cannot grow with conversation length.
@@ -1830,6 +1869,7 @@ impl Database {
     /// checkpoints the way the writer does.
     pub fn reader(conn: Connection) -> Result<Self> {
         conn.set_prepared_statement_cache_capacity(STATEMENTS);
+        plan_stably(&conn)?;
         conn.execute_batch(
             "PRAGMA query_only=ON; PRAGMA cache_size=-2048; PRAGMA checkpoint_fullfsync=ON;",
         )?;
@@ -1867,6 +1907,7 @@ impl Database {
         // fails with SQLITE_FULL when the disk is. In memory it is freed
         // when the job ends, bounded by the pages one job changes.
         conn.set_prepared_statement_cache_capacity(STATEMENTS);
+        plan_stably(&conn)?;
         conn.execute_batch(
             "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
             PRAGMA fullfsync=OFF; PRAGMA checkpoint_fullfsync=ON;
@@ -1991,6 +2032,7 @@ impl Database {
                 cached_input_tokens INTEGER NOT NULL DEFAULT 0,
                 from_bot TEXT, from_turn INTEGER, from_id INTEGER, origin TEXT, reasoning TEXT, inherited_reasoning TEXT,
                 bot_model TEXT, bot_reasoning TEXT, images TEXT, person TEXT, quotes TEXT, reply_node INTEGER,
+                wait_ms INTEGER, due_ms INTEGER,
                 UNIQUE(bot,request_id));
             CREATE INDEX IF NOT EXISTS turns_bot_id ON turns(bot,id);
             CREATE INDEX IF NOT EXISTS turns_started ON turns(bot,id) WHERE started_ms IS NOT NULL;
@@ -2047,6 +2089,7 @@ impl Database {
             CREATE INDEX IF NOT EXISTS turns_queued ON turns(bot,id) WHERE status='queued';
             CREATE INDEX IF NOT EXISTS turns_steers ON turns(bot,id) WHERE status='queued' AND delivery='steer';
             CREATE INDEX IF NOT EXISTS turns_attached ON turns(bot,id) WHERE status='attached';
+            CREATE INDEX IF NOT EXISTS turns_due ON turns(due_ms) WHERE status='attached' AND due_ms IS NOT NULL;
             CREATE INDEX IF NOT EXISTS turns_ready ON turns(id) WHERE status='ready';
             CREATE INDEX IF NOT EXISTS turns_ready_bot ON turns(bot) WHERE status='ready';
             CREATE INDEX IF NOT EXISTS processes_running ON processes(turn) WHERE status='running';
@@ -2851,12 +2894,18 @@ impl Database {
         }
         let after = after.unwrap_or("");
         let limit_rows = (limit + 1) as i64;
+        let prefix = name.map(glob_prefix);
         // Fixed numbers, so bench.query_plans plans every variant: a
-        // maker without a name binds ?3 as NULL, which nothing reads.
-        let glob = if name.is_some() {
-            " AND name GLOB ?3"
+        // maker without a name binds ?3 as NULL, and a name without a
+        // maker ?4, which nothing reads. A name filter starts the page at
+        // its prefix or just past `after`, whichever is later, and ends it
+        // where the prefix does: `after || char(1)` is the least name past
+        // `after`, since no name holds a byte below '-'. One bound each
+        // way, so the index range is the same whichever the planner reads.
+        let from = if name.is_some() {
+            "name >= max(?1 || char(1), ?5) AND name < ?5 || CAST(x'ff' AS TEXT) AND name GLOB ?3"
         } else {
-            ""
+            "name > ?1"
         };
         let maker = if created_by.is_some() {
             " AND created_by_id = ?4"
@@ -2866,9 +2915,10 @@ impl Database {
         let mut values: Vec<&dyn rusqlite::ToSql> = vec![&after, &limit_rows];
         if name.is_some() || created_by.is_some() {
             values.push(&name);
-        }
-        if created_by.is_some() {
             values.push(&created_by);
+        }
+        if name.is_some() {
+            values.push(&prefix);
         }
         let running = if active {
             " AND running_turn IS NOT NULL"
@@ -2878,7 +2928,7 @@ impl Database {
         let mut statement = self.conn.prepare_cached(&format!(
             "SELECT name,head,workspace,status,running_turn,provider,family,model,reasoning,budget_tokens,tokens_used,tools,
                     input_tokens,cached_input_tokens,id,created_by,created_by_id,gates,allowed,expire_ms,expires_at
-             FROM bots WHERE name > ?1{glob}{maker}{running} ORDER BY name LIMIT ?2"
+             FROM bots WHERE {from}{maker}{running} ORDER BY name LIMIT ?2"
         ))?;
         let mut rows = statement.query(values.as_slice())?;
         let mut bots = Vec::new();
@@ -5353,10 +5403,13 @@ impl Database {
         let bots: Vec<(String, i64)> = self
             .conn
             .prepare_cached(
-                "SELECT name,head FROM bots WHERE name GLOB ?1 AND head IS NOT NULL
-                    AND status!='deleting' ORDER BY id",
+                "SELECT name,head FROM bots WHERE name GLOB ?1
+                    AND name >= ?2 AND name < ?2 || CAST(x'ff' AS TEXT)
+                    AND head IS NOT NULL AND status!='deleting' ORDER BY id",
             )?
-            .query_map([pattern], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .query_map([pattern, glob_prefix(pattern)], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })?
             .collect::<rusqlite::Result<_>>()?;
         #[derive(Clone, Copy)]
         struct Node {
@@ -5566,7 +5619,7 @@ impl Database {
             .conn
             .query_row(
                 "SELECT id,prompt,status,workspace,model,delivery,expected_turn,prompt_node,from_bot,from_turn,origin,reasoning,budget_tokens,images,
-                    person,quotes
+                    person,quotes,wait_ms
                  FROM turns WHERE bot=? AND request_id=?",
                 params![name, request_id],
                 |r| {
@@ -5578,7 +5631,12 @@ impl Database {
                             workspace: r.get(3)?,
                             model: r.get(4)?,
                             effort: r.get(11)?,
-                            delivery: Delivery::parse(&r.get::<_, String>(5)?).unwrap_or_default(),
+                            // One whose wait ran out is a steer now, and
+                            // was sent as an attach: only an attach waits.
+                            delivery: match r.get::<_, Option<i64>>(16)? {
+                                Some(_) => Delivery::Attach,
+                                None => Delivery::parse(&r.get::<_, String>(5)?).unwrap_or_default(),
+                            },
                             expected_turn: r.get(6)?,
                             from: match (r.get::<_, Option<String>>(8)?, r.get(9)?) {
                                 (Some(bot), Some(turn)) => Some((bot, turn)),
@@ -5609,6 +5667,7 @@ impl Database {
                             budget_tokens: r.get::<_, Option<i64>>(12)?.map(|n| n as u64),
                             // Checked by their digest below.
                             images: Vec::new(),
+                            wait_ms: r.get::<_, Option<i64>>(16)?.map(|n| n as u64),
                         },
                         r.get(7)?,
                         r.get(13)?,
@@ -5645,6 +5704,7 @@ impl Database {
                 quotes,
                 budget_tokens,
                 images: _,
+                wait_ms,
             } = &saved_options;
             let images = saved_images.map(|kept| pictures_digest(&kept));
             let differs = [
@@ -5659,6 +5719,7 @@ impl Database {
                 ("person", *person != same.person),
                 ("quotes", *quotes != same.quotes),
                 ("budget_tokens", *budget_tokens != same.budget_tokens),
+                ("wait_ms", *wait_ms != same.wait_ms),
                 (
                     "images",
                     images != stored_images(&same.images)?.map(|json| pictures_digest(&json)),
@@ -5828,8 +5889,9 @@ impl Database {
             )?
             .query_row([], |r| r.get(0))?;
         tx.prepare_cached(
-            "INSERT INTO turns(id,bot,request_id,prompt,status,workspace,model,delivery,expected_turn,from_bot,from_turn,from_id,origin,reasoning,budget_tokens,images,person,quotes)
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO turns(id,bot,request_id,prompt,status,workspace,model,delivery,expected_turn,from_bot,from_turn,from_id,origin,reasoning,budget_tokens,images,person,quotes,
+                wait_ms,due_ms)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         )?.execute(
             // Queued work keeps the folder it was sent to even if the bot
             // moves before it starts; a steer without one joins any turn.
@@ -5838,7 +5900,9 @@ impl Database {
                 options.model, options.delivery.name(), options.expected_turn,
                 options.from.as_ref().map(|f| &f.0), options.from.as_ref().map(|f| f.1), from_id, options.origin,
                 options.effort, options.budget_tokens.map(|n| n as i64),
-                stored_images(&options.images)?, options.person, quotes],
+                stored_images(&options.images)?, options.person, quotes,
+                options.wait_ms.map(|n| n as i64),
+                options.wait_ms.map(|n| epoch_ms().saturating_add(n as i64))],
         )?;
         if moved {
             tx.prepare_cached("UPDATE bots SET workspace=? WHERE name=?")?
@@ -9897,6 +9961,144 @@ impl Database {
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?)
     }
+    /// When the first attached message that waits only so long is due, in
+    /// milliseconds since the Unix epoch. A bot being deleted has none: its
+    /// messages go with it, never as steers.
+    pub fn next_due(&self) -> Result<Option<i64>> {
+        Ok(self
+            .conn
+            .prepare_cached(
+                "SELECT MIN(t.due_ms) FROM turns t JOIN bots b ON b.name=t.bot
+                 WHERE t.status='attached' AND t.due_ms IS NOT NULL AND b.status!='deleting'",
+            )?
+            .query_row([], |r| r.get(0))?)
+    }
+    /// The bots with an attached message due by `now`, as `lapse` would
+    /// take up to `limit` of them.
+    pub fn due_bots(&self, now: i64, limit: usize) -> Result<Vec<String>> {
+        let mut bots: Vec<String> = self
+            .conn
+            .prepare_cached(
+                "SELECT t.bot FROM turns t JOIN bots b ON b.name=t.bot
+                 WHERE t.status='attached' AND t.due_ms<=?1 AND b.status!='deleting'
+                 ORDER BY t.due_ms,t.id LIMIT ?2",
+            )?
+            .query_map(params![now, limit as i64], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        bots.sort_unstable();
+        bots.dedup();
+        Ok(bots)
+    }
+    /// Deliver up to `limit` attached messages whose wait ran out by `now`,
+    /// oldest due first, each as a steer sent now would go: `queued` for a
+    /// bot with a turn running or ready, which takes it at its next
+    /// boundary or runs it after, and `ready` to start a turn of its own on
+    /// an idle bot. Each commits alone with its `queued` event, which says
+    /// `lapsed`, and counts against the pending bounds from then on.
+    pub fn lapse(&mut self, now: i64, limit: usize) -> Result<Vec<Lapsed>> {
+        let due: Vec<(i64, String)> = self
+            .conn
+            .prepare_cached(
+                "SELECT t.id,t.bot FROM turns t JOIN bots b ON b.name=t.bot
+                 WHERE t.status='attached' AND t.due_ms<=?1 AND b.status!='deleting'
+                 ORDER BY t.due_ms,t.id LIMIT ?2",
+            )?
+            .query_map(params![now, limit as i64], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        if due.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Where each goes, as of this look: the first on an idle bot starts
+        // its turn, the rest wait behind it.
+        let mut bots: HashMap<String, (Bot, bool)> = HashMap::new();
+        let mut planned = Vec::with_capacity(due.len());
+        for (turn, name) in due {
+            if !bots.contains_key(&name) {
+                let bot = self.inspect(&name)?;
+                let busy = bot.running_turn.is_some() || self.has_ready_turn(&name)?;
+                bots.insert(name.clone(), (bot, busy));
+            }
+            let (_, busy) = bots.get_mut(&name).expect("inserted above");
+            let status = if *busy { "queued" } else { "ready" };
+            *busy = true;
+            planned.push((turn, name, status));
+        }
+        // All or none, so a store that refuses the write leaves every one
+        // attached and due, for the next look.
+        let tx = self.conn.savepoint()?;
+        let mut waiting = 0;
+        for (turn, name, status) in &planned {
+            let bot = &bots[name].0;
+            type Row = (
+                String,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                Option<i64>,
+                Option<i64>,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                i64,
+            );
+            let (request_id, workspace, model, effort, from_bot, from_turn, from_id, origin, person, quotes, held): Row = tx
+                .prepare_cached(
+                    "UPDATE turns SET status=?2,delivery='steer' WHERE id=?1 AND status='attached'
+                     RETURNING request_id,workspace,model,reasoning,from_bot,from_turn,from_id,origin,person,quotes,
+                        length(CAST(prompt AS BLOB))+COALESCE(length(CAST(quotes AS BLOB)),0)",
+                )?
+                .query_row(params![turn, status], |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                        r.get(7)?,
+                        r.get(8)?,
+                        r.get(9)?,
+                        r.get(10)?,
+                    ))
+                })?;
+            waiting += held;
+            let model = model.unwrap_or_else(|| format!("{}/{}", bot.provider, bot.model));
+            let mut data = json!({"request_id":request_id,"status":status,"delivery":"steer",
+                "lapsed":true,"workspace":workspace.or(bot.workspace.clone()),"model":model,
+                "effort":effort.or(bot.effort.clone())});
+            sender_fields(
+                &mut data,
+                from_bot.as_deref().zip(from_turn),
+                from_id,
+                origin.as_deref(),
+                person.as_deref(),
+                quotes.as_deref(),
+                false,
+            );
+            event(&tx, name, Some(*turn), "queued", data)?;
+        }
+        tx.commit()?;
+        self.pending.0 += planned.len() as i64;
+        self.pending.1 += waiting;
+        let mut lapsed = Vec::with_capacity(planned.len());
+        for (turn, name, status) in planned {
+            let joins = status == "queued" && self.joining_steer(&name)?;
+            let parked = match joins {
+                true => self.steered_park(&name)?,
+                false => None,
+            };
+            lapsed.push(Lapsed {
+                bot: name,
+                turn,
+                status,
+                joins,
+                parked,
+            });
+        }
+        Ok(lapsed)
+    }
     /// Up to `limit` bots, by name and identity, whose idle time ran out by
     /// `now` and which `delete` would take: no turn running, waiting,
     /// queued or ready, and no command of theirs running. One still busy is
@@ -10664,7 +10866,7 @@ impl Database {
             }
         }
         let glob = match name {
-            Some(_) => " AND t.bot GLOB ?3",
+            Some(_) => " AND t.bot GLOB ?3 AND t.bot >= ?4 AND t.bot < ?4 || CAST(x'ff' AS TEXT)",
             None => "",
         };
         let mut statement = self.conn.prepare_cached(&format!(
@@ -10676,7 +10878,9 @@ impl Database {
         ))?;
         let width = bucket_ms.unwrap_or(i64::MAX);
         let mut rows = match name {
-            Some(pattern) => statement.query(params![since_ms, width, pattern])?,
+            Some(pattern) => {
+                statement.query(params![since_ms, width, pattern, glob_prefix(pattern)])?
+            }
             None => statement.query(params![since_ms, width])?,
         };
         let mut total = Spent::default();
@@ -12929,6 +13133,21 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
             conn.execute_batch("ALTER TABLE tools ADD COLUMN ruling TEXT;")?;
         }
     }
+    // 75 -> 76: an attached message may wait only so long. Those already
+    // waiting were sent with no limit and keep it.
+    if from < 76
+        && conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='turns')
+             AND NOT EXISTS(SELECT 1 FROM pragma_table_info('turns') WHERE name='due_ms')",
+            [],
+            |r| r.get::<_, bool>(0),
+        )?
+    {
+        conn.execute_batch(
+            "ALTER TABLE turns ADD COLUMN wait_ms INTEGER;
+             ALTER TABLE turns ADD COLUMN due_ms INTEGER;",
+        )?;
+    }
     Ok(())
 }
 /// 53 -> 54: a turn's denial count became a window of its last decided
@@ -13544,6 +13763,32 @@ mod tests {
         let mut shown: Vec<String> = resolved.into_iter().map(|(k, _)| k).collect();
         shown.sort();
         assert_eq!(shown, listed);
+    }
+
+    #[test]
+    fn a_cached_statement_is_not_planned_again_when_reused() {
+        let dir = std::env::temp_dir().join(format!("agent-plans-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.sqlite");
+        let mut writer = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        let mut reader = Database::reader(Connection::open(&path).unwrap()).unwrap();
+        for db in [&mut writer, &mut reader] {
+            let conn = db.connection();
+            // A join with a bound value, as `history_items` reads an item.
+            let sql = "SELECT n.id FROM nodes n LEFT JOIN declined d ON d.node=n.id WHERE n.id=?1";
+            for value in [1, 2, 3] {
+                let mut statement = conn.prepare_cached(sql).unwrap();
+                statement.query([value]).unwrap().next().unwrap();
+            }
+            let statement = conn.prepare_cached(sql).unwrap();
+            assert_eq!(
+                statement.get_status(rusqlite::StatementStatus::RePrepare),
+                0
+            );
+        }
+        drop((reader, writer));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

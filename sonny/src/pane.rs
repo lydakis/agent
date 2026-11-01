@@ -97,6 +97,10 @@ pub struct Pane {
     /// agent's own tab in the multiplexer.
     name_at: Option<(u16, u16)>,
     tab: bool,
+    /// A Markdown file's path and the width its rows were laid at, laid
+    /// again at the width it is drawn at whenever that changes, so a
+    /// table or a list is never wrapped into pieces as the pane narrows.
+    laid: Option<(PathBuf, usize)>,
 }
 
 /// The button beside an agent's name that opens it in the main view: the
@@ -161,6 +165,8 @@ impl Pane {
             None => preview(&path, width, line, &mut screen)?,
         };
         screen.show_row(target, ABOVE);
+        let laid =
+            (tree.is_none() && line.is_none() && is_markdown(&path)).then(|| (path.clone(), width));
         // Its escapes kept, as the path read back may hold `#` or `%`;
         // the line left off.
         let link = url.split('#').next().unwrap_or(url);
@@ -190,6 +196,7 @@ impl Pane {
             main_at: None,
             name_at: None,
             tab: false,
+            laid,
         })
     }
 
@@ -298,6 +305,7 @@ impl Pane {
             main_at: None,
             name_at: None,
             tab: false,
+            laid: None,
         }
     }
 
@@ -327,6 +335,7 @@ impl Pane {
             main_at: None,
             name_at: None,
             tab: false,
+            laid: None,
         }
     }
 
@@ -603,11 +612,57 @@ impl Pane {
                     },
                     false => rows,
                 };
+                self.lay(rows);
                 self.screen.render(rows, buf, file);
                 None
             }
         }
     }
+}
+
+impl Pane {
+    /// A Markdown file laid again at the width of `rows` when it was laid
+    /// at another, read anew, the view kept as far through it as it was.
+    fn lay(&mut self, rows: Rect) {
+        let width = rows.width as usize;
+        let Some((path, laid)) = &self.laid else {
+            return;
+        };
+        if *laid == width || width == 0 {
+            return;
+        }
+        let path = path.clone();
+        let height = rows.height as usize;
+        // Not drawn yet, the view asked for (the file's top, at opening)
+        // is where the new rows open; drawn, they open as far through.
+        let going_to = self.screen.going_to();
+        let before = self.screen.height(*laid).saturating_sub(height).max(1);
+        let through = 1.0 - self.screen.back().min(before) as f64 / before as f64;
+        let mut screen = Screen::default();
+        if preview(&path, width, None, &mut screen).is_err() {
+            // Gone or unreadable now: what was read stays as it was.
+            self.laid = None;
+            return;
+        }
+        match going_to {
+            Some((row, above)) => screen.show_row(row, above),
+            None => {
+                let after = screen.height(width).saturating_sub(height);
+                screen.hold(((1.0 - through) * after as f64).round() as usize);
+            }
+        }
+        self.screen = screen;
+        self.laid = Some((path, width));
+    }
+}
+
+/// Whether `path` is read as Markdown, whose tables and lists are laid
+/// out for the width they are drawn at.
+fn is_markdown(path: &Path) -> bool {
+    let extension = (path.extension().and_then(|e| e.to_str()))
+        .unwrap_or_default()
+        .to_lowercase();
+    matches!(extension.as_str(), "md" | "markdown" | "mdx")
 }
 
 /// The path and line a `file://` address names, its `%XX` escapes read.
@@ -1105,6 +1160,57 @@ mod tests {
         let text: String = cells.iter().map(|(_, _, c)| c.symbol()).collect();
         assert!(text.contains("日") && text.contains("本"));
         assert!(text.ends_with("s\x1b]8;;\x1b\\"), "{text:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_markdown_table_is_laid_again_at_the_width_it_is_drawn_at() {
+        let dir = std::env::temp_dir().join(format!("sonny-table-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a.md");
+        std::fs::write(
+            &file,
+            "| Time | Milestone |\n|---|---|\n| 02:29 | The question was accepted by the lead |\n",
+        )
+        .unwrap();
+        let url = format!("file://{}", file.display());
+        // Read for a wider pane than it is drawn in, as a pane opened
+        // before the window narrowed is.
+        let mut pane = Pane::preview(&url, &dir, 60).unwrap();
+        for width in [40, 30, 50] {
+            let shown = rows(&mut pane, width, 12);
+            let table: Vec<&String> = shown.iter().filter(|row| row.contains('│')).collect();
+            assert!(!table.is_empty(), "{shown:?}");
+            // Every row of the table is whole: it opens and closes on its
+            // own row, none wrapped into a piece of another.
+            for row in &table {
+                assert!(row.trim_start().starts_with('│'), "{width}: {shown:?}");
+                assert!(row.ends_with('│'), "{width}: {shown:?}");
+            }
+            assert!(shown.iter().any(|row| row.trim_start().starts_with('┌')));
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_tall_markdown_file_opens_at_its_top_whatever_width_it_is_drawn_at() {
+        let dir = std::env::temp_dir().join(format!("sonny-tall-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a.md");
+        let body: String = (0..60).map(|i| format!("Line {i}.\n\n")).collect();
+        std::fs::write(&file, format!("# Top\n\n{body}")).unwrap();
+        let url = format!("file://{}", file.display());
+        let mut pane = Pane::preview(&url, &dir, 60).unwrap();
+        let shown = rows(&mut pane, 40, 10);
+        assert!(shown.iter().any(|row| row.contains("# Top")), "{shown:?}");
+        // Scrolled to the end, a narrower width keeps it at the end.
+        pane.screen.latest();
+        rows(&mut pane, 40, 10);
+        let shown = rows(&mut pane, 30, 10);
+        assert!(
+            shown.iter().any(|row| row.contains("Line 59.")),
+            "{shown:?}"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

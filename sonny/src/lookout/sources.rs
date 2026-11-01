@@ -93,6 +93,7 @@ pub fn configured() -> Result<Vec<Source>, String> {
             command: String::new(),
             every: Some(COMMONS_EVERY.into()),
             digest: Some(config.commons_digest),
+            urgent: None,
         });
     }
     Ok(sources)
@@ -153,6 +154,8 @@ pub struct Event {
     pub url: Option<String>,
     /// It cuts into a subscriber's turn instead of waiting for it to end.
     pub urgent: bool,
+    /// The subscription whose `urgent` made it so, when its source did not.
+    pub urgent_by: Option<String>,
     /// How often at most a subscriber hears its source, as it was set
     /// when the event came.
     pub digest: Option<Duration>,
@@ -190,6 +193,7 @@ impl Event {
             from: from.map(|from| cut(&from, FIELD_CHARS)),
             url: url.map(|url| cut(&url, FIELD_CHARS)),
             urgent,
+            urgent_by: None,
             digest: None,
             fields: Arc::new(fields),
             told: Vec::new(),
@@ -245,10 +249,14 @@ impl Event {
 
     /// As the lookout keeps it while it waits to be told.
     pub fn to_json(&self) -> Value {
-        json!({"source": self.source, "id": self.id, "topic": self.topic, "text": self.text,
-            "from": self.from, "url": self.url, "urgent": self.urgent,
+        let mut kept = json!({"source": self.source, "id": self.id, "topic": self.topic,
+            "text": self.text, "from": self.from, "url": self.url, "urgent": self.urgent,
             "digest": self.digest.map(|d| d.as_secs()), "at_ms": self.at_ms as u64, "seq": self.seq,
-            "told": self.told, "fields": *self.fields})
+            "told": self.told, "fields": *self.fields});
+        if let Some(by) = &self.urgent_by {
+            kept["urgent_by"] = json!(by);
+        }
+        kept
     }
 
     pub fn from_json(value: &Value) -> Option<Event> {
@@ -261,6 +269,7 @@ impl Event {
             from: text("from"),
             url: text("url"),
             urgent: value["urgent"] == true,
+            urgent_by: text("urgent_by"),
             digest: value["digest"].as_u64().map(Duration::from_secs),
             fields: Arc::new(match &value["fields"] {
                 Value::Object(_) => value["fields"].clone(),
@@ -380,6 +389,15 @@ impl Runner {
                     continue;
                 }
             };
+            // A pattern that does not check would mark nothing as it says.
+            if let Some(Err(why)) = source.urgent.as_ref().map(super::pattern::check) {
+                println!(
+                    "{}",
+                    json!({"event": "source_refused", "source": source.name,
+                        "why": format!("sonny.sources.{}.urgent: {why}", source.name)})
+                );
+                continue;
+            }
             let dir = self.dir.join(&source.name);
             let sent = self.sent.clone();
             let shape = shape_file(&self.dir, &source.name);
@@ -512,6 +530,12 @@ async fn emit(
         return true;
     }
     event.digest = digest(source);
+    // What the person's settings mark urgent is, as if the source had.
+    if !event.urgent
+        && (source.urgent.as_ref()).is_some_and(|u| super::pattern::matches(u, &event.fields))
+    {
+        event.urgent = true;
+    }
     shape.saw(&event.fields);
     sent.send(Said::Event(Box::new(event))).await.is_ok()
 }
@@ -674,7 +698,11 @@ pub fn line(item: &Heard) -> String {
     if let Some(url) = &event.url {
         what.push_str(&format!(", {}", json!(url)));
     }
-    let urgent = if event.urgent { ", urgent" } else { "" };
+    let urgent = match (event.urgent, &event.urgent_by) {
+        (false, _) => String::new(),
+        (true, None) => ", urgent".to_owned(),
+        (true, Some(sub)) => format!(", urgent by your {sub}"),
+    };
     let others = match event.others() {
         Some(others) => format!(" {others}"),
         None => String::new(),
@@ -1065,6 +1093,7 @@ mod tests {
             command: "true".into(),
             every: every.map(str::to_owned),
             digest: None,
+            urgent: None,
         }
     }
 
@@ -1088,6 +1117,42 @@ mod tests {
         ] {
             assert!(every(&source(Some(bad))).is_err(), "{bad}");
         }
+    }
+
+    #[tokio::test]
+    async fn what_the_person_marks_urgent_is_as_if_the_source_had() {
+        let dir = std::env::temp_dir().join(format!("sources-urgent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let marked = Source {
+            urgent: Some(json!({"from": ["boss"]})),
+            ..source(None)
+        };
+        let (sent, mut got) = tokio::sync::mpsc::channel(4);
+        let (mut seen, mut shape) = (Seen::default(), Shape::read(dir.join("shape.json")));
+        for line in [
+            r#"{"text": "lunch?", "from": "ana"}"#,
+            r#"{"text": "call me", "from": "boss"}"#,
+        ] {
+            assert!(emit(&marked, line, &mut seen, &mut shape, &sent).await);
+        }
+        let mut events = Vec::new();
+        for _ in 0..2 {
+            let Some(Said::Event(event)) = got.recv().await else {
+                panic!("a command's source asks nothing back");
+            };
+            events.push(event);
+        }
+        let (lunch, call) = (&events[0], &events[1]);
+        assert!(!lunch.urgent && call.urgent && call.urgent_by.is_none());
+        // One that does not check is refused, as a bad `every` is.
+        let (sent, _got) = tokio::sync::mpsc::channel(4);
+        let mut runner = Runner::new(dir.clone(), sent);
+        runner.set(vec![Source {
+            urgent: Some(json!({"from": "boss"})),
+            ..source(None)
+        }]);
+        assert!(runner.running.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1329,6 +1394,7 @@ mod tests {
             from: from.map(str::to_owned),
             url: None,
             urgent,
+            urgent_by: None,
             digest: None,
             fields: Arc::new(json!({"text": text})),
             told: Vec::new(),
@@ -1384,6 +1450,7 @@ mod tests {
             command: command.into(),
             every: Some("1s".into()),
             digest: Some("5m".into()),
+            urgent: None,
         }]);
         let mut texts = Vec::new();
         while texts.len() < 3 {
