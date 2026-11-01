@@ -4872,8 +4872,8 @@ impl Database {
     }
 
     /// Page a reading view of provider items as JSONL by byte offset in that
-    /// view. Only reasoning.encrypted_content is omitted; stored items and
-    /// provider replay remain unchanged.
+    /// view. Only the opaque state a provider replays is omitted (see
+    /// `READING_ITEM`); stored items and provider replay remain unchanged.
     /// Pages end at UTF-8 boundaries and may split a JSON record. Concatenate
     /// their text before decoding; no content is replaced with previews.
     /// A bot's newest `limit` conversation turns, newest first, as its
@@ -11599,12 +11599,29 @@ fn keep_quotes(tx: &Connection, turn: i64, quotes: Option<&str>, node: i64) -> R
 /// of a user item or a tool's result without their bytes, each counted in
 /// `omitted_bytes` (a data URL keeps its media type). The model is sent
 /// them whole.
-/// An item as history reads show it: one line, without reasoning's
-/// encrypted content. Applied to `item`, which `PICTURELESS` provides.
+/// An item as history reads show it: one line, without the opaque state
+/// a provider hands back only to be replayed (reasoning's encrypted
+/// content; a thinking block's signature, a redacted one's data, a web
+/// search result's encrypted content). Applied to `item`, which
+/// `PICTURELESS` provides.
 const READING_ITEM: &str = "CASE
     WHEN json_extract(CAST(item AS TEXT),'$.type')='reasoning'
      AND json_type(CAST(item AS TEXT),'$.encrypted_content') IS NOT NULL
     THEN CAST(json_remove(CAST(item AS TEXT),'$.encrypted_content') AS BLOB)
+    WHEN json_extract(CAST(item AS TEXT),'$.role')='assistant'
+     AND json_type(CAST(item AS TEXT),'$.content')='array'
+     AND (instr(item,'\"signature\"')>0 OR instr(item,'\"redacted_thinking\"')>0
+          OR instr(item,'\"encrypted_content\"')>0)
+    THEN CAST(json_set(CAST(item AS TEXT),'$.content',json((SELECT json_group_array(CASE
+        WHEN json_extract(b.value,'$.type')='thinking' THEN json_remove(b.value,'$.signature')
+        WHEN json_extract(b.value,'$.type')='redacted_thinking' THEN json_remove(b.value,'$.data')
+        WHEN json_extract(b.value,'$.type')='web_search_tool_result'
+         AND json_type(b.value,'$.content')='array'
+        THEN json_set(b.value,'$.content',json((SELECT json_group_array(
+            json_remove(r.value,'$.encrypted_content'))
+            FROM json_each(b.value,'$.content') AS r)))
+        ELSE json(b.value) END)
+        FROM json_each(CAST(item AS TEXT),'$.content') AS b))) AS BLOB)
     WHEN instr(item,x'0a')=0 AND instr(item,x'0d')=0 THEN item
     ELSE CAST(json(CAST(item AS TEXT)) AS BLOB) END";
 /// Each subquery's array is passed through `json()`: a value's JSON subtype
@@ -13180,6 +13197,50 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_history_read_leaves_out_the_state_a_provider_replays() {
+        let conn = Connection::open_in_memory().unwrap();
+        let read = |item: &str| -> Value {
+            let text: String = conn
+                .query_row(
+                    &format!(
+                        "SELECT CAST({READING_ITEM} AS TEXT) FROM (SELECT CAST(?1 AS BLOB) AS item)"
+                    ),
+                    [item],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(!text.contains('\n'), "{text}");
+            serde_json::from_str(&text).unwrap()
+        };
+        let claude = json!({"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "plan", "signature": "sig".repeat(100)},
+            {"type": "redacted_thinking", "data": "opaque"},
+            {"type": "server_tool_use", "id": "s", "name": "web_search", "input": {"query": "q"}},
+            {"type": "web_search_tool_result", "tool_use_id": "s", "content": [
+                {"type": "web_search_result", "url": "https://example.test", "title": "T",
+                 "encrypted_content": "opaque"}]},
+            {"type": "text", "text": "a \"signature\" in words stays"}]});
+        assert_eq!(
+            read(&serde_json::to_string_pretty(&claude).unwrap()),
+            json!({"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "plan"},
+                {"type": "redacted_thinking"},
+                {"type": "server_tool_use", "id": "s", "name": "web_search", "input": {"query": "q"}},
+                {"type": "web_search_tool_result", "tool_use_id": "s", "content": [
+                    {"type": "web_search_result", "url": "https://example.test", "title": "T"}]},
+                {"type": "text", "text": "a \"signature\" in words stays"}]})
+        );
+        let reasoning = json!({"type": "reasoning", "summary": [], "encrypted_content": "x"});
+        assert_eq!(
+            read(&reasoning.to_string()),
+            json!({"type": "reasoning", "summary": []})
+        );
+        // Anything else reads as it is stored.
+        let user = json!({"role": "user", "content": [{"type": "text", "text": "\"signature\""}]});
+        assert_eq!(read(&user.to_string()), user);
+    }
 
     #[test]
     fn a_cut_patch_still_names_every_file_it_changes() {

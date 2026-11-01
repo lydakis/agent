@@ -520,7 +520,9 @@ once on a 401 or 403, which retries the call as `provider_login_refreshed`.
 A 401 or 403 whose `x-amzn-ErrorType` is one of the AWS SDKs' clock-skew
 codes (`RequestExpired`, `InvalidSignatureException` and the rest), as for
 a request signed before the machine slept, retries at once as
-`provider_signature_expired`, signed again with the time now.
+`provider_signature_expired`, signed again with the time now. So does any
+other 401 or 403 whose `Date` header is more than four minutes from when
+the request was signed, the AWS SDK for Java's skew rule.
 Bedrock URLs must be https; the key id, secret and session token are
 redacted from tool output and, from the environment, kept out of shells, as
 are the `AWS_PROFILE`, `AWS_DEFAULT_PROFILE`, `AWS_REGION` and
@@ -2101,10 +2103,12 @@ prompt nodes alone, so deleting the source bot does not remove a surviving
 fork's previews. Turn numbers are ordinals along the lineage
 (`turn_seq`, stored on each turn's first item and indexed), so a fork's numbering
 continues its source's. The `history` tool returns one turn's prompt, replies,
-tool calls, and results as provider JSONL with only the top-level
-`encrypted_content` field removed from reasoning items. Reasoning records and
-readable summaries remain, as do Anthropic thinking and signatures. Stored
-items, raw `history_items` reads, forks, and provider replay remain unchanged.
+tool calls, and results as provider JSONL without the opaque state a provider
+hands back only to be replayed: the top-level `encrypted_content` of reasoning
+items, a thinking block's `signature`, a redacted thinking block's `data`, and
+a web search result's `encrypted_content`. Reasoning records, readable
+summaries and thinking text remain. Stored items, raw `history_items` reads,
+forks, and provider replay remain unchanged.
 With `bot`, it reads another agent's turn the same way, numbered along that
 agent's lineage and as it stands, a running turn included; with `bot` and no
 `turn`, it lists that agent's newest 20 turns, newest first, each with its
