@@ -1001,12 +1001,7 @@ impl Service {
         // Only a lookout with no cursor yet reads it all, once: one a lag
         // cuts short goes on from where it got to.
         self.resume = self.floor().or(self.resume);
-        // A turn the listing shows ended, or never running, ended unseen.
-        let running: HashMap<&str, i64> = (bots.iter())
-            .filter_map(|bot| Some((bot["name"].as_str()?, bot["running_turn"].as_i64()?)))
-            .collect();
-        self.in_flight
-            .retain(|(bot, turn), _| running.get(bot.as_str()).is_some_and(|at| turn >= at));
+        self.ended_unseen(&bots);
         let replay = match self.started {
             true => self.replay,
             false => self.replay_floor(),
@@ -1346,6 +1341,24 @@ impl Service {
             }
             _ => None,
         }
+    }
+
+    /// Lets go of the turns under way that the listing shows ended, or
+    /// never running, unseen: but for one carrying another agent's
+    /// message, which may still wait in line, ready or held, and whose end
+    /// is to bounce. Its finish, if it came while the lookout was away, is
+    /// in the replay from its start.
+    fn ended_unseen(&mut self, bots: &[Value]) {
+        let running: HashMap<&str, i64> = (bots.iter())
+            .filter_map(|bot| Some((bot["name"].as_str()?, bot["running_turn"].as_i64()?)))
+            .collect();
+        let listed: HashSet<&str> = bots.iter().filter_map(|bot| bot["name"].as_str()).collect();
+        let senders = &self.senders;
+        self.in_flight
+            .retain(|key @ (bot, turn), _| match running.get(bot.as_str()) {
+                Some(at) => turn >= at,
+                None => listed.contains(bot.as_str()) && senders.contains_key(key),
+            });
     }
 
     /// Who to tell that a turn their message started or joined ended
@@ -4318,6 +4331,31 @@ mod tests {
             let told = service.bounced(&finished, true);
             assert_eq!(told.len(), usize::from(bounces));
         }
+    }
+
+    #[tokio::test]
+    async fn a_reconnect_keeps_the_start_of_a_message_still_waiting_in_line() {
+        let mut service = service(PathBuf::from("/nonexistent"), &[]);
+        let from = json!({"from": {"bot": "calc.lead", "turn": 1, "bot_id": 1}});
+        service.bounced(&ev("calc.fix", 4, "queued", from), true);
+        for key in [
+            ("calc.fix", 4),
+            ("calc.docs", 2),
+            ("shop.fix", 3),
+            ("gone", 5),
+        ] {
+            service.in_flight.insert((key.0.into(), key.1), 10);
+        }
+        // calc.fix runs nothing, its message still in line; calc.docs's
+        // turn and shop.fix's earlier one ended unseen; gone was deleted.
+        let bots = [
+            json!({"name": "calc.fix"}),
+            json!({"name": "calc.docs"}),
+            json!({"name": "shop.fix", "running_turn": 6}),
+        ];
+        service.ended_unseen(&bots);
+        let kept: HashSet<(String, i64)> = service.in_flight.keys().cloned().collect();
+        assert_eq!(kept, HashSet::from([("calc.fix".to_owned(), 4)]));
     }
 
     #[tokio::test]
