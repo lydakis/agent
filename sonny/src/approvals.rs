@@ -751,7 +751,7 @@ pub fn regate(record: &Value, mode: &str) -> Option<Map<String, Value>> {
     if let Some(workspace) = record["workspace"].as_str() {
         let sandbox = sandbox(mode, std::path::Path::new(workspace));
         confined = sandboxed_as(record, &sandbox);
-        fields.extend(sandbox);
+        fields.insert("settings".into(), Value::Object(sandbox));
     }
     (!has || !confined).then_some(fields)
 }
@@ -792,7 +792,7 @@ mod tests {
         let task = json!({"workspace": dir, "gates": [],
             "settings": {"sandbox": "workspace-write", "writable": [git], "network": true}});
         assert_eq!(
-            regate(&task, "full").unwrap()["sandbox"],
+            regate(&task, "full").unwrap()["settings"]["sandbox"],
             "danger-full-access"
         );
         let freed = json!({"workspace": dir, "gates": [],

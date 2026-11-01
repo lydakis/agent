@@ -3708,11 +3708,13 @@ impl App {
             asked["model"] = json!(model);
             asked["effort"] = json!(effort);
         }
+        // Its settings, by the names `create` gives them.
+        let mut settings = serde_json::Map::new();
         if let Some(ttl) = cache {
-            asked["cache_ttl"] = json!(ttl);
+            settings.insert("cache_ttl".into(), json!(ttl));
         }
         if let Some(speed) = pace {
-            asked["speed"] = json!(speed);
+            settings.insert("speed".into(), json!(speed));
         }
         if let (Some(mode), Value::Object(fields)) = (gating, &mut asked) {
             let declared = declare.as_ref().unwrap_or(&self.declared);
@@ -3723,7 +3725,10 @@ impl App {
             // An agent's sandbox goes with its row, a lead's, a task's or
             // a side chat's, which the daemon holds within its agent's.
             let workspace = std::path::Path::new(&self.workspace);
-            fields.extend(approvals::sandbox(mode, workspace));
+            settings.extend(approvals::sandbox(mode, workspace));
+        }
+        if !settings.is_empty() {
+            asked["settings"] = Value::Object(settings);
         }
         match self.client.request("configure", asked).await {
             Ok(_) => {
@@ -14986,7 +14991,7 @@ mod tests {
         assert!(app.configure().await);
         let sent = asked.lock().unwrap()[0].clone();
         assert_eq!(
-            (&sent["op"], &sent["cache_ttl"]),
+            (&sent["op"], &sent["settings"]["cache_ttl"]),
             (&json!("configure"), &json!("1h"))
         );
         assert!(app.cache.is_none());
@@ -15044,7 +15049,7 @@ mod tests {
         );
         assert_eq!(app.speed, None);
         let speeds: Vec<_> = (asked.lock().unwrap().iter())
-            .map(|sent| sent["speed"].clone())
+            .map(|sent| sent["settings"]["speed"].clone())
             .collect();
         assert_eq!(speeds, [json!("fast"), json!("standard")]);
         // Nothing to pick where the provider serves standard alone.

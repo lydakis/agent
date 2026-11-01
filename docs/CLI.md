@@ -388,7 +388,9 @@ so `--tools` while continuing one is a usage error.
 `run --fallback PROVIDER/MODEL` gives a new bot a model, in its family, that
 answers a request a safety classifier declined, that request alone; the next
 goes to the bot's own model. Without it the bot takes its model's entry in
-`[fallbacks]` in `~/.agent/config.toml`, if any:
+`[fallbacks]` in `~/.agent/config.toml`, if any (Sonny's agents follow
+that entry as it changes; a bot the CLI made keeps the one it took, and
+`configure` with `fallback` changes it):
 
 ```toml
 [fallbacks]

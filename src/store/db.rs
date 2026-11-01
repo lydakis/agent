@@ -457,6 +457,37 @@ impl Settings {
             .transpose()?)
     }
 }
+/// The settings that make a bot's sandbox, which change together.
+pub const SANDBOX: [&str; 4] = ["sandbox", "writable", "network", "unix_sockets"];
+/// Every setting's name, as `create` and `configure` take it.
+pub const SETTINGS: [&str; 19] = [
+    "context_bytes",
+    "context_items",
+    "note_turns",
+    "compact_at",
+    "compact_keep",
+    "compact_tokens",
+    "keep_turns",
+    "approval_hold_ms",
+    "max_output_tokens",
+    "keep_warm",
+    "cache_ttl",
+    "speed",
+    "sandbox",
+    "writable",
+    "network",
+    "outputs",
+    "hide_senders",
+    "max_rounds",
+    "unix_sockets",
+];
+/// Settings as their stored fields, those at their defaults left out.
+fn settings_map(settings: &Settings) -> Result<serde_json::Map<String, Value>> {
+    match serde_json::to_value(settings)? {
+        Value::Object(map) => Ok(map),
+        _ => Ok(serde_json::Map::new()),
+    }
+}
 fn resolved_settings<S: serde::Serializer>(
     settings: &Settings,
     serializer: S,
@@ -2617,86 +2648,117 @@ impl Database {
         )?;
         Ok(changed == 1)
     }
-    /// Replace a bot's sandbox with `sandbox`'s: its mode, the folders it
-    /// may write besides its own, whether it reaches the network and the
-    /// commands that run outside it. A bot another bot made
-    /// keeps no weaker a sandbox than its creator's, as when it was made.
-    /// Whether anything changed.
-    pub fn set_sandbox(
+    /// Replace the settings `named` with `given`'s, a setting `given`
+    /// leaves at its default going back to it, and keep the rest. A bot
+    /// another bot made keeps no weaker a sandbox than its creator's, as
+    /// when it was made. The settings that changed, by name, the sandbox
+    /// and the folders, network and sockets that go with it as `sandbox`.
+    pub fn set_settings(
         &mut self,
         name: &str,
         bot_id: Option<i64>,
-        sandbox: Settings,
-    ) -> Result<bool> {
+        named: &[String],
+        given: &Settings,
+    ) -> Result<Vec<String>> {
         let id = self.identity(name, bot_id)?;
         let bot = self.inspect(name)?;
-        let settings = Settings {
-            sandbox: sandbox.sandbox,
-            writable: sandbox.writable,
-            network: sandbox.network,
-            unix_sockets: sandbox.unix_sockets,
-            ..bot.settings
-        };
-        let creator = match bot.created_by_id {
-            Some(creator) => self
+        let before = settings_map(&bot.settings)?;
+        let wanted = settings_map(given)?;
+        let mut after = before.clone();
+        for key in named {
+            match wanted.get(key) {
+                Some(value) => after.insert(key.clone(), value.clone()),
+                None => after.remove(key),
+            };
+        }
+        let mut settings: Settings = serde_json::from_value(Value::Object(after))
+            .map_err(|error| Error::with("invalid_setting", error.to_string()))?;
+        settings.speed = settings
+            .speed
+            .filter(|speed| *speed != crate::provider::Speed::Standard);
+        let confining = named.iter().any(|key| SANDBOX.contains(&key.as_str()));
+        if confining && let Some(creator) = bot.created_by_id {
+            let creator = self
                 .conn
                 .query_row("SELECT settings FROM bots WHERE id=?", [creator], |r| {
                     r.get::<_, Option<String>>(0)
                 })
                 .optional()?
-                .map(|text| match text {
-                    Some(text) => serde_json::from_str(&text),
-                    None => Ok(Settings::default()),
-                })
-                .transpose()?,
-            None => None,
-        };
-        let settings = match &creator {
-            Some(creator) => settings.under(creator),
-            None => settings,
-        };
+                .flatten()
+                .map(|text| serde_json::from_str::<Settings>(&text))
+                .transpose()?;
+            if let Some(creator) = creator {
+                settings = settings.under(&creator);
+            }
+        }
         settings.validate()?;
+        let after = settings_map(&settings)?;
+        let mut changed = Vec::new();
+        for key in before.keys().chain(after.keys()) {
+            if before.get(key) == after.get(key) {
+                continue;
+            }
+            let key = match SANDBOX.contains(&key.as_str()) {
+                true => "sandbox",
+                false => key.as_str(),
+            };
+            if !changed.iter().any(|c| c == key) {
+                changed.push(key.to_owned());
+            }
+        }
+        if changed.is_empty() {
+            return Ok(changed);
+        }
         let stored = settings.stored()?;
-        let changed = self.conn.execute(
-            "UPDATE bots SET settings=? WHERE id=? AND settings IS NOT ?",
-            params![stored, id, stored],
-        )?;
-        Ok(changed == 1)
+        self.conn
+            .execute("UPDATE bots SET settings=? WHERE id=?", params![stored, id])?;
+        changed.sort();
+        Ok(changed)
     }
-    /// The tier the bot's calls are served at; whether that changed it.
-    /// Standard is stored as none, as a bot that never chose one has.
-    pub fn set_speed(
+    /// The model a declined request goes to, as `provider/model`, or none;
+    /// whether that changed it. The daemon has checked its family.
+    pub fn set_fallback(
         &mut self,
         name: &str,
         bot_id: Option<i64>,
-        speed: crate::provider::Speed,
+        fallback: Option<&str>,
     ) -> Result<bool> {
         let id = self.identity(name, bot_id)?;
-        let mut settings = self.inspect(name)?.settings;
-        settings.speed = Some(speed).filter(|speed| *speed != crate::provider::Speed::Standard);
-        let stored = settings.stored()?;
         let changed = self.conn.execute(
-            "UPDATE bots SET settings=? WHERE id=? AND settings IS NOT ?",
-            params![stored, id, stored],
+            "UPDATE bots SET fallback=? WHERE id=? AND fallback IS NOT ?",
+            params![fallback, id, fallback],
         )?;
         Ok(changed == 1)
     }
-    /// The bot's prompt-cache lifetime; whether that changed it.
-    pub fn set_cache_ttl(
+    /// How the bot summarizes its context: its compaction instructions, none
+    /// never compacting, or its summarizer, none being its own model; whether
+    /// that changed it. A summary it already has stays.
+    pub fn set_compaction(
         &mut self,
         name: &str,
         bot_id: Option<i64>,
-        ttl: CacheTtl,
-    ) -> Result<bool> {
+        instructions: Option<Option<&str>>,
+        model: Option<Option<&str>>,
+    ) -> Result<Vec<&'static str>> {
         let id = self.identity(name, bot_id)?;
-        let mut settings = self.inspect(name)?.settings;
-        settings.cache_ttl = Some(ttl);
-        let stored = settings.stored()?;
-        let changed = self.conn.execute(
-            "UPDATE bots SET settings=? WHERE id=? AND settings IS NOT ?",
-            params![stored, id, stored],
-        )?;
-        Ok(changed == 1)
+        let mut changed = Vec::new();
+        if let Some(instructions) = instructions
+            && self.conn.execute(
+                "UPDATE bots SET compaction_instructions=? WHERE id=? AND compaction_instructions IS NOT ?",
+                params![instructions, id, instructions],
+            )? == 1
+        {
+            changed.push("compaction_instructions");
+        }
+        if let Some(model) = model
+            && self.conn.execute(
+                "UPDATE bots SET compaction_model=? WHERE id=? AND compaction_model IS NOT ?",
+                params![model, id, model],
+            )? == 1
+        {
+            changed.push("compaction_model");
+        }
+        Ok(changed)
     }
     /// Bounded keyset pages. Full instructions remain available through inspect.
     /// A page of bots in name order after `after`. `name` keeps those whose
@@ -13299,6 +13361,41 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_setting_is_named() {
+        // Every field, so a new one doesn't compile until it is listed.
+        let all = Settings {
+            context_bytes: Some(1),
+            context_items: Some(1),
+            note_turns: Some(1),
+            compact_at: Some(1),
+            compact_keep: Some(1),
+            compact_tokens: Some(1),
+            keep_turns: Some(1),
+            approval_hold_ms: Some(1),
+            max_output_tokens: Some(1),
+            keep_warm: Some(1),
+            cache_ttl: Some(CacheTtl::Hour),
+            speed: Some(crate::provider::Speed::Fast),
+            sandbox: Some(crate::sandbox::Mode::ReadOnly),
+            writable: vec!["/".into()],
+            network: true,
+            outputs: Some("/".into()),
+            hide_senders: true,
+            max_rounds: Some(1),
+            unix_sockets: vec!["/".into()],
+        };
+        let mut names: Vec<String> = settings_map(&all)
+            .unwrap()
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        let mut listed = SETTINGS.map(String::from).to_vec();
+        names.sort();
+        listed.sort();
+        assert_eq!(names, listed);
+    }
 
     #[test]
     fn a_history_read_leaves_out_the_state_a_provider_replays() {
