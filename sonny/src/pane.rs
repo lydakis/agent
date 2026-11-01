@@ -15,9 +15,9 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::screen::Screen;
 
-/// The narrowest the conversation and the pane are side by side; a
-/// window narrower than both shows one of them at a time.
-pub const NARROWEST: u16 = 50;
+/// The key that moves the keys between the conversation and the pane, and
+/// in a window too narrow for both, which of them shows.
+pub const SWITCH: &str = "ctrl+\\";
 /// The narrowest the margin is shown by itself, beside a conversation
 /// that has all it is written at.
 pub const MARGIN: u16 = 40;
@@ -30,15 +30,13 @@ const MOST_LINES: usize = 9_000;
 const ABOVE: usize = 3;
 
 /// How wide the pane is in a window `width` columns wide, beside a
-/// conversation written at most `prose` wide: half the window, or more
-/// when the conversation has all it is written at beside it; and all of
-/// a window too narrow for both, where it is shown while keys go to it.
+/// conversation written at most `prose` wide, whatever it shows: what the
+/// conversation leaves when it keeps all it is written at, as the margin
+/// takes, so opening a file or a card never moves it. A window with less
+/// room than [`MARGIN`] beside it shows one at a time: all pane while the
+/// keys are in it, [`SWITCH`] back to the conversation.
 pub fn width(width: u16, prose: u16) -> u16 {
-    if width < 2 * NARROWEST + 1 {
-        return width;
-    }
-    let rest = width - 1;
-    (rest / 2).max(rest.saturating_sub(prose))
+    margin_width(width, prose).unwrap_or(width)
 }
 
 /// How wide the margin is by itself in a window `width` columns wide,
@@ -89,6 +87,9 @@ pub struct Pane {
     margin: bool,
     /// The margin is under it, which its title's arrow goes back to.
     pub over: bool,
+    /// It has the window to itself, the conversation a key away, as a
+    /// window too narrow for both shows one at a time.
+    pub alone: bool,
     /// The agent whose Sonny the program is, which the title's button
     /// opens in the main view; and that button's columns as last drawn.
     pub agent: Option<String>,
@@ -192,6 +193,7 @@ impl Pane {
             marks: Vec::new(),
             margin: false,
             over: false,
+            alone: false,
             agent: None,
             main_at: None,
             name_at: None,
@@ -311,6 +313,7 @@ impl Pane {
             marks: Vec::new(),
             margin: false,
             over: false,
+            alone: false,
             agent: None,
             main_at: None,
             name_at: None,
@@ -341,6 +344,7 @@ impl Pane {
             marks: Vec::new(),
             margin: false,
             over: false,
+            alone: false,
             agent: None,
             main_at: None,
             name_at: None,
@@ -489,9 +493,15 @@ impl Pane {
         if area.height == 0 {
             return None;
         }
+        // Alone, the way back to the conversation comes first after back,
+        // the last of the keys to go when the title runs out of room.
+        let own = match self.alone && !self.keys.contains(SWITCH) {
+            true => format!("{SWITCH} conversation · {}", self.keys),
+            false => self.keys.clone(),
+        };
         let mut keys = match focused {
-            true if self.goes_back() => format!("  ← back · {} ", self.keys),
-            true => format!("  {} ", self.keys),
+            true if self.goes_back() => format!("  ← back · {own} "),
+            true => format!("  {own} "),
             false => format!("  {switch} focus "),
         };
         let mut style = Style::new();
@@ -972,6 +982,24 @@ mod tests {
     }
 
     #[test]
+    fn a_pane_alone_says_how_to_get_back_to_the_conversation() {
+        let mut pane = Pane::card("status", "↑↓ pick · esc close");
+        pane.alone = true;
+        let head = rows(&mut pane, 70, 3).remove(0);
+        assert!(
+            head.ends_with("ctrl+\\ conversation · ↑↓ pick · esc close"),
+            "{head}"
+        );
+        // Narrow, the pick goes before the way back does.
+        let head = rows(&mut pane, 44, 3).remove(0);
+        assert!(head.ends_with("ctrl+\\ conversation · esc close"), "{head}");
+        // Beside the conversation it needs no saying.
+        pane.alone = false;
+        let head = rows(&mut pane, 70, 3).remove(0);
+        assert!(!head.contains("conversation"), "{head}");
+    }
+
+    #[test]
     fn a_cards_foot_stays_on_the_last_row_however_it_is_scrolled() {
         let mut pane = Pane::card("background", "esc close");
         let lines = (0..20).map(|i| Line::from(format!("row {i}"))).collect();
@@ -990,14 +1018,16 @@ mod tests {
     }
 
     #[test]
-    fn the_pane_takes_half_or_what_the_conversation_leaves() {
-        // Half, a column kept for the line between.
-        assert_eq!(width(161, 100), 80);
-        // A wide window: the conversation keeps its 100 columns.
+    fn the_pane_takes_what_the_conversation_leaves_or_the_window() {
+        // The conversation keeps its 100 columns, as beside the margin,
+        // a column kept for the line between.
         assert_eq!(width(260, 100), 159);
-        // Too narrow for both: all of it.
+        assert_eq!(width(161, 100), 60);
+        assert_eq!(width(141, 100), MARGIN);
+        assert_eq!(width(141, 100), margin_width(141, 100).unwrap());
+        // Less than the margin's room: one at a time, all of it.
+        assert_eq!(width(140, 100), 140);
         assert_eq!(width(100, 100), 100);
-        assert_eq!(width(101, 100), 50);
     }
 
     #[test]

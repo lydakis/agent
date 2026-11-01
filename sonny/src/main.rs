@@ -4874,7 +4874,7 @@ impl App {
         }
         program.env("TERM", "xterm-256color");
         let height = self.height.saturating_sub(2).max(2) as u16;
-        let width = match pane::width(self.full_width, PROSE as u16) {
+        let width = match pane::width(self.full_width, PROSE as u16 + GUTTER) {
             0 => 80,
             width => width,
         };
@@ -8869,7 +8869,7 @@ impl App {
     /// The file `link` names, read for the pane at its width.
     fn preview(&self, link: &str) -> Result<pane::Pane, String> {
         let workspace = std::path::Path::new(&self.workspace);
-        let width = pane::width(self.full_width, PROSE as u16).max(20) as usize;
+        let width = pane::width(self.full_width, PROSE as u16 + GUTTER).max(20) as usize;
         pane::Pane::preview(link, workspace, width)
     }
 
@@ -8924,10 +8924,9 @@ impl App {
         if open.is_margin() && (margin.is_none() || self.zen.is_some()) && !self.pane_keys {
             return (self.centred(area), None);
         }
-        let pane = match margin.filter(|_| open.is_margin()) {
-            Some(margin) => margin,
-            None => pane::width(area.width, prose),
-        };
+        // One width for all the pane shows: the conversation keeps its
+        // columns where the window has room, so nothing opening moves it.
+        let pane = pane::width(area.width, prose);
         if pane == area.width {
             return match self.pane_keys {
                 true => (Rect { width: 0, ..area }, Some(area)),
@@ -10860,7 +10859,7 @@ impl App {
         {
             let wide = match chat.width {
                 0 => size.width,
-                _ => pane::width(size.width, PROSE as u16),
+                _ => pane::width(size.width, PROSE as u16 + GUTTER),
             };
             let width = wide.saturating_sub(2) as usize;
             if let Some(view) = &mut watch.sky {
@@ -10984,6 +10983,7 @@ impl App {
                         .or_else(|| links::file_line(&workspace, word))
                         .or_else(|| self.names.borrow_mut().link(word))
                 };
+                open.alone = area.width == 0;
                 pane_cursor = open.render(at, frame.buffer_mut(), self.pane_keys, switch, file);
                 linked.extend(open.screen.link_cells(frame.buffer_mut()));
                 // The line between them, as a split's.
@@ -17483,10 +17483,20 @@ mod tests {
         assert_eq!((chat.width, margin.map(|m| m.width)), (100, Some(66)));
         let (chat, margin) = app.split(Rect::new(0, 0, 130, 40));
         assert_eq!((chat.width, margin), (130, None));
-        // Asked for with Tab, it takes its half as anything opened does.
+        // Asked for with Tab, it has the window to itself, as anything
+        // opened in a window too narrow for both does, the conversation
+        // a key away.
         app.pane_keys = true;
-        let (_, margin) = app.split(Rect::new(0, 0, 130, 40));
-        assert_eq!(margin.map(|m| m.width), Some(63));
+        let (chat, margin) = app.split(Rect::new(0, 0, 130, 40));
+        assert_eq!((chat.width, margin.map(|m| m.width)), (0, Some(130)));
+        // Anything else opened takes what the margin takes, beside the
+        // conversation's 100 where there is room for both.
+        app.open_pane(pane::Pane::card("status", "esc close"));
+        let (chat, pane) = app.split(Rect::new(0, 0, 170, 40));
+        assert_eq!((chat.width, pane.map(|m| m.width)), (100, Some(66)));
+        let (chat, pane) = app.split(Rect::new(0, 0, 130, 40));
+        assert_eq!((chat.width, pane.map(|m| m.width)), (0, Some(130)));
+        app.close_pane(false);
         // A note's marker clicked shows it there too.
         app.pane_keys = false;
         app.follow("sonny:note/repro");
