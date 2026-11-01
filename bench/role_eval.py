@@ -16,6 +16,14 @@ so far, so news arrives at fixed points in the conversation. Every message
 person would have seen: what started each lead turn and what the lead said
 and called.
 
+A fake HOME is not isolation (#521): a call that leaves the sandbox runs as
+the person. So a run's agents work in the `eval` permissions row: the
+sandbox writes their folders, the run's backups and origin, with the
+network (and so every Unix socket) off, and every call that would leave
+it comes to the eval, which allows only a plain call of Sonny's own
+`~/.agent/trigger` or `~/.agent/memory` and denies the rest. What changed
+in the real home during a run is listed in `outside.txt`.
+
 Arms differ only in the Sonny build: A from one checkout (today's role
 files), B from another (the proposed ones), each installing its own
 shipped lead.md and task.md into the fake HOME.
@@ -53,8 +61,11 @@ MODEL = 'chatgpt/gpt-6.1-sol'
 LOGIN = Path(os.environ.get('AGENT_CHATGPT_LOGIN') or Path.home() / '.agent/chatgpt.json')
 # The key variable each built-in provider reads.
 KEYS = {'openai': 'OPENAI_API_KEY', 'anthropic': 'ANTHROPIC_API_KEY'}
-# Unix socket paths are short on macOS: keep each run's root short.
-ROOT = Path('/tmp/role')
+# Each run's root, outside temporary storage: the sandbox writes /tmp and
+# $TMPDIR, where an agent could replace the run's copy of the build, its
+# sources' script or another run (#521). A long socket path falls back to
+# /tmp/agent-UID on its own.
+ROOT = Path.home() / '.role-eval'
 
 # --- the project ------------------------------------------------------------
 
@@ -269,6 +280,7 @@ def setup(root, bin_dir, model, spec=None):
     (root / 'source.py').write_text(SOURCE)
     (root / 'events.json').write_text(json.dumps(events(), indent=1))
     (root / 'step').write_text('0')
+    (root / 'backups').mkdir()
     # A copy of the build inside the run, so no path an agent is given
     # leads to the real home: agents that saw one wrote backups there.
     own = root / 'bin'
@@ -287,6 +299,19 @@ model = "{model}"
 [sonny]
 task_effort = "high"
 suggest = false
+default_permissions = "eval"
+
+# What the day's work writes beside the repository (the backup S1 asks
+# for, pushes to origin) written without asking, the network off so no
+# Unix socket is reached (Docker's would write anywhere), and every call
+# that would leave the sandbox put to the eval, which allows only the ones
+# whose effects stay in the run (#521). Not the whole run: its copy of the
+# build is in it.
+[sonny.permissions.eval]
+description = "The role eval: the run's backups and origin, no network, the eval approves"
+extends = "ask"
+network = false
+writable = ["{root}/backups", "{root}/origin.git"]
 
 [sonny.sources.chat]
 command = "{py} {root}/source.py {root} chat"
@@ -338,14 +363,193 @@ def land(root, env, author, message, files):
     return sh(['git', 'rev-parse', 'HEAD'], cwd=clone, env=env).stdout.strip()
 
 
+# The home of whoever runs the eval, which a run's own HOME stands in for:
+# nothing a run does may reach it (#521).
+REAL_HOME = Path.home().resolve()
+# What a call that leaves the sandbox may run: Sonny's own scripts, which
+# write only under the run's HOME, as `~/.agent/trigger add ...` adds a
+# trigger to the run's scheduler. Each verb names how many plain words it
+# takes, its flags (True when a flag takes a value) and whether free text
+# follows `--`. What runs a command or starts an agent is left out: a
+# trigger's `--if` runs in the scheduler, outside every sandbox, and
+# `--start` or `memory schedule` start an agent the eval never configured.
+SCOPE = {'--user': False, '--project': True}
+SCRIPTS = {
+    'trigger': {
+        'ls': (0, {'--after': True}, False),
+        'show': (1, {}, False),
+        'fire': (1, {}, False),
+        'rm': (1, {}, False),
+        'add': (0, {'--name': True, '--every': True, '--in': True, '--at': True, '--cron': True,
+                    '--bot': True, '--reply-to': True, '--runs': True,
+                    '--turn-budget-tokens': True, '--replace': False}, True),
+    },
+    'memory': {
+        'show': (0, SCOPE, False),
+        'read': (1, SCOPE, False),
+        'rm': (1, SCOPE, False),
+        'index': (0, SCOPE, False),
+        'check': (0, SCOPE, False),
+        'save': (1, {**SCOPE, '--type': True, '--description': True, '--source': True,
+                     '--confirmed': True, '--pushed-back': True, '--external': False}, True),
+    },
+}
+
+
+def plain(words, spec):
+    """Whether `words`, after a script's verb, are what `spec` allows."""
+    count, flags, text = spec
+    names = []
+    i = 0
+    while i < len(words):
+        word = words[i]
+        if word == '--':
+            return text and len(names) == count
+        if word.startswith('-'):
+            if word not in flags or (flags[word] and i + 1 == len(words)):
+                return False
+            i += 2 if flags[word] else 1
+        else:
+            names.append(word)
+            i += 1
+    return not text and len(names) == count
+
+
+# What a word may hold outside quotes: nothing Bash expands (braces, globs,
+# `~`, `$`, `!`), quotes with a backslash, or reads as an operator or a
+# comment. Bash would otherwise run other words than the ones checked.
+BARE = set('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_./:,@%+-')
+
+
+def words_of(text):
+    """The words Bash would run for `text`, or None when it would expand,
+    substitute or redirect anything in it, so no check of the words could
+    stand for what runs. Single quotes keep everything; double quotes keep
+    all but `$`, a backtick, a backslash and `!`."""
+    words, word, quoted = [], [], False
+    i = 0
+    while i < len(text):
+        c = text[i]
+        if c in ' \t':
+            if word or quoted:
+                words.append(''.join(word))
+            word, quoted = [], False
+            i += 1
+        elif c in '\'"':
+            close = text.find(c, i + 1)
+            if close < 0:
+                return None
+            inner = text[i + 1:close]
+            if c == '"' and set(inner) & set('$`\\!'):
+                return None
+            word.append(inner)
+            quoted = True
+            i = close + 1
+        elif c in BARE:
+            word.append(c)
+            i += 1
+        else:
+            return None
+    if word or quoted:
+        words.append(''.join(word))
+    return words
+
+
+# Sonny's own tools that wait on the eval in the `ask` row, and when a call
+# of each keeps its effects in the run. The day needs tasks, the lookout's
+# subscriptions and triggers. A start makes a worktree of the lead's
+# repository, whose .git every sandbox keeps read-only, and its setup runs
+# the lead's .agents/setup, read-only too, which the eval never writes. A
+# start at another `folder` is denied: Sonny runs git there outside the
+# sandbox, and a repository an agent made inside the lead's has hooks,
+# config and filters the agent wrote (#597). A trigger's `if` runs
+# outside every sandbox and its `start` makes an agent the eval never
+# configured. A new project, a pane's command, a script, a goal's check
+# and the browser run as the person.
+NATIVE = {
+    'start_task': lambda a: 'folder' not in a,
+    'remove_task': lambda a: True,
+    'subscriptions': lambda a: True,
+    'triggers': lambda a: not (isinstance(a.get('add'), dict) and {'if', 'start'} & set(a['add'])),
+}
+
+
+def determinable(home, request):
+    """Whether a call that would leave the sandbox is one whose effects stay
+    in the run, so the eval may allow it. A command's words can't say where
+    it writes (a script can build a path to the real home at run time), so
+    only one plain call of Sonny's own scripts is, with a verb and flags
+    that run nothing else: no shell operators, no expansions, no line
+    breaks. So is a call of the Sonny tools in NATIVE that keeps to the
+    run. Every other ask is denied; what the run's work needs is
+    writable without asking, and the sandbox is the boundary."""
+    if not request or request.get('arguments_cut') or request.get('arguments_omitted'):
+        return False
+    call = request.get('toolCall') or request
+    arguments = call.get('rawInput') if 'rawInput' in call else call.get('arguments')
+    if not isinstance(arguments, dict):
+        return False
+    if call.get('name') in NATIVE:
+        return NATIVE[call['name']](arguments)
+    if call.get('name') != 'shell':
+        return False
+    if set(arguments) - {'command', 'timeout_ms', 'sandbox_permissions', 'justification'}:
+        return False
+    command = arguments.get('command')
+    if not isinstance(command, str):
+        return False
+    # The script, written one of the ways that reach the run's own HOME.
+    program, _, rest = command.strip(' \t').partition(' ')
+    script = next((name for name in SCRIPTS
+                   for form in ('~/.agent/{name}', '$HOME/.agent/{name}', '"$HOME/.agent/{name}"',
+                                f'{home}/.agent/{{name}}', f"'{home}/.agent/{{name}}'")
+                   if program == form.format(name=name)), None)
+    words = words_of(rest)
+    if script is None or not words or words[0] not in SCRIPTS[script]:
+        return False
+    return plain(words[1:], SCRIPTS[script][words[0]])
+
+
+def changed_outside(since, root, limit=200):
+    """What changed in the real home after `since`, a few levels down and
+    past its hidden folders and Library, which other programs write all
+    day: a run should leave none of it (#521)."""
+    root = Path(root).resolve()
+    found = []
+    for top, dirs, files in os.walk(REAL_HOME):
+        top = Path(top)
+        depth = len(top.relative_to(REAL_HOME).parts)
+        dirs[:] = [d for d in dirs if not d.startswith('.') and d != 'Library'
+                   and not (top / d).resolve().is_relative_to(root) and depth < 3]
+        for name in files + dirs:
+            path = top / name
+            try:
+                if path.lstat().st_mtime > since:
+                    found.append(str(path))
+            except OSError:
+                continue
+            if len(found) >= limit:
+                return found
+    return found
+
+
 class Acp:
     """One `sonny acp` process, driven as T3 Code drives it, logging every
-    line it writes and allowing every call it asks the person about."""
+    line it writes, allowing a call it asks the person about only when its
+    effects stay in the run, and denying the rest."""
 
-    def __init__(self, sonny, env, cwd, log):
+    # Seconds between answering the tasks' calls while a request is out.
+    SERVE = 5
+
+    def __init__(self, sonny, env, cwd, log, home, tasks=None):
+        self.home = Path(home)
+        # Answers the calls tasks wait on, while a prompt is out too: a lead
+        # that waits on a task before it answers would otherwise wait out
+        # the prompt.
+        self.tasks = tasks or (lambda: None)
+        self.stderr = open(log.with_suffix('.stderr'), 'w')
         self.p = subprocess.Popen([str(sonny), 'acp'], env=env, cwd=cwd, stdin=subprocess.PIPE,
-                                  stdout=subprocess.PIPE, stderr=open(log.with_suffix('.stderr'), 'w'),
-                                  text=True)
+                                  stdout=subprocess.PIPE, stderr=self.stderr, text=True)
         self.log = open(log, 'a')
         self.lock = threading.Lock()
         self.answers, self.next = {}, 0
@@ -364,7 +568,12 @@ class Acp:
             self.log.flush()
             m = json.loads(line)
             if m.get('method') == 'session/request_permission':
-                self.write({'id': m['id'], 'result': {'outcome': {'outcome': 'selected', 'optionId': 'allow'}}})
+                params = m.get('params') or {}
+                # Without an allow, Sonny could not read the whole call.
+                offered = {o.get('optionId') for o in params.get('options', [])}
+                choice = 'allow' if 'allow' in offered and determinable(self.home, params) else 'deny'
+                self.log.write(json.dumps({'t': time.time(), 'answered': m['id'], 'choice': choice}) + '\n')
+                self.write({'id': m['id'], 'result': {'outcome': {'outcome': 'selected', 'optionId': choice}}})
             elif 'method' in m and 'id' in m:
                 self.write({'id': m['id'], 'error': {'code': -32601, 'message': 'not offered'}})
             elif 'id' in m:
@@ -378,9 +587,13 @@ class Acp:
         if not wait:
             return rid
         deadline = time.monotonic() + timeout
+        served = time.monotonic()
         while rid not in self.answers:
             if time.monotonic() > deadline or self.p.poll() is not None:
                 raise RuntimeError(f'{method}: no answer')
+            if time.monotonic() - served > self.SERVE:
+                self.tasks()
+                served = time.monotonic()
             time.sleep(.2)
         return self.answers[rid]
 
@@ -426,10 +639,11 @@ def until_subscribed(home, cap=10 * 60):
     return False
 
 
-def allow_waiting(env, agent):
-    """Allow every call a task waits on the person for. Only the lead's
-    session runs through `sonny acp`, which answers the lead's own; a
-    task's would otherwise park and stall the day."""
+def allow_waiting(env, agent, home):
+    """Answer every call a task waits on the person for: allowed when its
+    effects stay in the run, denied otherwise. Only the lead's session runs
+    through `sonny acp`, which answers the lead's own; a task's would
+    otherwise park and stall the day."""
     out = subprocess.run([str(agent), 'approvals'], env=env, capture_output=True, text=True).stdout
     try:
         calls = json.loads(out or '[]')
@@ -440,8 +654,9 @@ def allow_waiting(env, agent):
         if call.get('bot') == 'shop.lead' or (call.get('asked') is None and 'manual' not in gates):
             continue
         tag = ['--tag', 'manual'] if 'manual' in gates else []
+        choice = 'allow' if determinable(home, call) else 'deny'
         subprocess.run([str(agent), 'answer', '--bot', call['bot'], '--turn', str(call['turn']),
-                        '--call', call['call_id'], '--request', str(call['request']), *tag, 'allow'],
+                        '--call', call['call_id'], '--request', str(call['request']), *tag, choice],
                        env=env, capture_output=True)
 
 
@@ -452,7 +667,7 @@ def settle(env, agent, acp, quiet=60, cap=40 * 60):
     start = time.monotonic()
     calm = None
     while time.monotonic() - start < cap:
-        allow_waiting(env, agent)
+        allow_waiting(env, agent, acp.home)
         busy = active(env, agent)
         idle = not busy and time.monotonic() - acp.last > 10
         if idle:
@@ -466,8 +681,7 @@ def settle(env, agent, acp, quiet=60, cap=40 * 60):
 
 
 def run(arm, n, bins, model, spec=None):
-    # Short (macOS socket paths), and apart per model, so runs of two
-    # models at once never share a root.
+    # Apart per model, so runs of two models at once never share a root.
     # The day too, so a small day never clears a full day's run.
     root = ROOT / f'{zlib.crc32((model + DAY_NAME).encode()):08x}-{arm}{n}'
     home, repo, env, bin_dir = setup(root, Path(bins[arm]), model, spec)
@@ -479,6 +693,7 @@ def run(arm, n, bins, model, spec=None):
     # The build, so `blind` can hide it from the scorer.
     (out / 'bin.txt').write_text(bins[arm])
     log = out / 'acp.jsonl'
+    started = time.time()
     sh([str(agent), 'start', '--idle-exit', '0'], env=env)
     acp = None
     timeline = []
@@ -491,7 +706,7 @@ def run(arm, n, bins, model, spec=None):
         (root / 'step').write_text(str(step))
 
     try:
-        acp = Acp(sonny, env, repo, log)
+        acp = Acp(sonny, env, repo, log, home, lambda: allow_waiting(env, agent, home))
         acp.ask('initialize', {'protocolVersion': 2, 'clientCapabilities': {}, 'clientInfo': {'name': 'role-eval'}})
         session = acp.ask('session/new', {'cwd': str(repo), 'mcpServers': []})['result']['sessionId']
         for step, s in enumerate(DAY, 1):
@@ -553,6 +768,13 @@ def run(arm, n, bins, model, spec=None):
             main += [f'--- main:{path}', shown.stdout or '(none)']
         (out / 'main.txt').write_text('\n'.join(main) + '\n')
         messages(home, out)
+        # Nothing outside the run should have changed: what did is kept, and
+        # said, for whoever reads the run.
+        outside = changed_outside(started, root)
+        (out / 'outside.txt').write_text(''.join(f'{path}\n' for path in outside))
+        if outside:
+            print(f'{arm}{n}: {len(outside)} paths changed in the real home, see {out / "outside.txt"}',
+                  file=sys.stderr)
     transcript(out)
     return out
 
@@ -606,7 +828,10 @@ def transcript(out):
             if row['sent']['method'] == 'session/prompt':
                 begin('person', row['sent']['params']['prompt'][0]['text'])
             continue
-        m = row['m']
+        m = row.get('m')
+        # The eval's own answers to asks carry no message.
+        if m is None:
+            continue
         if m.get('method') != 'session/update':
             continue
         u = m['params']['update']
