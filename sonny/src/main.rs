@@ -61,6 +61,7 @@ mod reactions;
 mod recall;
 mod resolved;
 mod rex;
+mod rules;
 mod said;
 mod scheduler;
 mod screen;
@@ -830,6 +831,9 @@ fn main() -> std::process::ExitCode {
         Some((verb, rest)) if verb == tool_host::NAME => tool_host::run(rest),
         Some((verb, rest)) if verb == "approver" => approver::run(rest),
         Some((verb, rest)) if verb == "mcp" => mcp::cli(rest),
+        Some((verb, rest)) if verb == "rules" => {
+            return std::process::ExitCode::from(rules::cli(rest) as u8);
+        }
         Some((verb, rest)) if verb == "sky" => sky_cli(rest),
         // An agent's shell runs this, for zen it was asked for in words.
         Some((verb, rest)) if verb == "zen" => zen::cli(rest),
@@ -1239,6 +1243,10 @@ pub(crate) fn made(
     }
     if config.hide_senders {
         settings.insert("hide_senders".into(), json!(true));
+    }
+    // The command rules in ~/.agent/rules, which the daemon applies.
+    if let Some(rules) = rules::given() {
+        settings.insert("rules".into(), json!(rules));
     }
     asked["settings"] = Value::Object(settings);
     if let Some(fallback) = config.fallbacks.get(model) {

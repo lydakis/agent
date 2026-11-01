@@ -615,12 +615,19 @@ way `/react` does, and each note in the margin has its own `↩`.
   (`["docker", "compose"]`), and a call runs outside only when everything
   it runs is allowed, so `mcpx … | jq` still asks. A rule can also always
   ask (`"prompt"`) or never run a command (`"forbidden"`, with a
-  `justification` the agent is told); `agent rules check -- git push`
-  shows what the rules say. When you approve a plain command that asked
-  to leave, `a` (always allow `cargo test`) adds the rule, and every agent
-  takes it from its next turn. The rules hold for every folder, so a
+  `justification` the agent is told); `sonny rules check -- git push`
+  shows what the rules say. The files are Starlark, as Codex runs them,
+  so variables, loops and functions work, and `host_executable` names
+  where a program lives (`/usr/bin/git` runs as `git`); Codex's
+  `network_rule` is refused, since a sandbox's network is on or off. A
+  file that doesn't read keeps the rules last read, or, with none read
+  yet, has every command refused with where it went wrong. When you
+  approve a plain command that asked to leave, `a` (always allow `cargo test`) adds the rule, and every agent
+  takes it from its next turn: Sonny reads the folder again when a file
+  in it changes. The rules hold for every folder, so a
   program named from the folder it runs in (`./build.sh`) is never
-  offered. Agents can't write the rules folder from their sandbox. A
+  offered. Agents can't write the rules folder from their sandbox, and
+  an agent another made goes by its maker's rules. A
   `[sonny] unsandboxed` list from before moves into `default.rules` once.
 
   An agent that reaches the network reaches every Unix socket too, as

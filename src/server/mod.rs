@@ -820,9 +820,8 @@ pub struct Configuration {
     pub protected: Vec<String>,
     /// Names kept read-only at the top of every writable root that has them.
     pub protected_existing: Vec<String>,
-    /// The folder of command rules (`*.rules`), read as each turn starts;
-    /// none, no rules.
-    pub rules: Option<PathBuf>,
+    /// Paths kept read-only in every sandbox, and kept from being made.
+    pub protected_paths: Vec<PathBuf>,
 }
 
 /// `path` by its real path, or, while it doesn't exist, by the real path
@@ -1471,7 +1470,9 @@ pub async fn run(config: Configuration) -> Result<()> {
             std::path::absolute(path)?.to_string_lossy().into_owned(),
         ));
     }
-    let rules = config.rules.as_deref().map(real_or_named).transpose()?;
+    let protected_paths = (config.protected_paths.iter())
+        .map(|path| real_or_named(path))
+        .collect::<Result<Vec<_>>>()?;
     agent_runtime::sandbox::warm();
     let (sender, mut inbound) = session::channel_with(64, limits.input_bytes);
     let sessions_next = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
@@ -1495,9 +1496,9 @@ pub async fn run(config: Configuration) -> Result<()> {
         capabilities: None,
         protected: config.protected.clone(),
         protected_existing: config.protected_existing.clone(),
-        // By its real path once it exists, as a root is matched; a missing
-        // one by the real path of the folder it would be made in.
-        rules: rules.clone(),
+        // Each by its real path once it exists, as a root is matched; a
+        // missing one by the real path of the folder it would be made in.
+        protected_paths,
     };
     daemon.capabilities = daemon
         .socket
@@ -1517,7 +1518,6 @@ pub async fn run(config: Configuration) -> Result<()> {
         .with_credentials(credentials)
         .with_environment(environment)
         .with_daemon(daemon)
-        .with_rules(rules)
         .with_process_budget(limits.processes)
         .with_lasting_budget(limits.lasting);
     // Observation reads and replay pages share all but one reader, so turns'

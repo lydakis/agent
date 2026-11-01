@@ -249,6 +249,10 @@ pub struct Settings {
     /// ([`crate::sandbox::Policy::sockets`]).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unix_sockets: Vec<String>,
+    /// The command rules its shell calls go by, as its client read them
+    /// ([`crate::rules`]); a bot made by another goes by its creator's.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rules: Option<crate::rules::Policy>,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, Serialize)]
 pub enum CacheTtl {
@@ -258,6 +262,8 @@ pub enum CacheTtl {
     Hour,
 }
 const MIN_CONTEXT_BYTES: usize = 1024;
+/// The most a bot's command rules take as JSON.
+pub const RULES_JSON: usize = 256 << 10;
 /// The most a bot's `writable` folders, and its `unix_sockets`, each take
 /// as JSON, by their real paths, so a reply that repeats them has a bound.
 pub const FOLDERS_JSON: usize = 32 << 10;
@@ -317,9 +323,11 @@ impl Settings {
     /// makes: no weaker a sandbox than its creator's, as Codex's subagents
     /// inherit their parent's. A sandboxed creator's child takes the
     /// creator's sandbox and writable folders unless it names a stricter
-    /// sandbox, and reaches the network only if both do.
+    /// sandbox, and reaches the network only if both do. Every child goes
+    /// by its creator's command rules, so none is made to get past them.
     pub fn under(mut self, creator: &Settings) -> Settings {
         use crate::sandbox::Mode;
+        self.rules = creator.rules.clone();
         let sandboxed = |settings: &Settings| {
             matches!(
                 settings.sandbox,
@@ -413,6 +421,14 @@ impl Settings {
         {
             return refuse("unix_sockets names at most 64 absolute paths, 32 KiB in all");
         }
+        if let Some(rules) = &self.rules {
+            rules
+                .validate()
+                .map_err(|why| Error::with("invalid_setting", format!("rules: {why}")))?;
+            if crate::output::encoded_len(rules).unwrap_or(usize::MAX) > RULES_JSON {
+                return refuse("rules take at most 256 KiB as JSON");
+            }
+        }
         if self.writable.len() > 64
             || crate::output::encoded_len(&self.writable).unwrap_or(usize::MAX) > FOLDERS_JSON
         {
@@ -460,7 +476,7 @@ impl Settings {
 /// The settings that make a bot's sandbox, which change together.
 pub const SANDBOX: [&str; 4] = ["sandbox", "writable", "network", "unix_sockets"];
 /// Every setting's name, as `create` and `configure` take it.
-pub const SETTINGS: [&str; 19] = [
+pub const SETTINGS: [&str; 20] = [
     "context_bytes",
     "context_items",
     "note_turns",
@@ -480,6 +496,7 @@ pub const SETTINGS: [&str; 19] = [
     "hide_senders",
     "max_rounds",
     "unix_sockets",
+    "rules",
 ];
 /// Settings as their stored fields, those at their defaults left out.
 fn settings_map(settings: &Settings) -> Result<serde_json::Map<String, Value>> {
@@ -2676,6 +2693,12 @@ impl Database {
         settings.speed = settings
             .speed
             .filter(|speed| *speed != crate::provider::Speed::Standard);
+        if bot.created_by_id.is_some() && named.iter().any(|key| key == "rules") {
+            return fail_with(
+                "invalid_setting",
+                "rules: a bot made by another goes by its creator's rules",
+            );
+        }
         let confining = named.iter().any(|key| SANDBOX.contains(&key.as_str()));
         if confining && let Some(creator) = bot.created_by_id {
             let creator = self
@@ -2710,8 +2733,27 @@ impl Database {
             return Ok(changed);
         }
         let stored = settings.stored()?;
-        self.conn
-            .execute("UPDATE bots SET settings=? WHERE id=?", params![stored, id])?;
+        let tx = self.conn.savepoint()?;
+        tx.execute("UPDATE bots SET settings=? WHERE id=?", params![stored, id])?;
+        // The bots it made, and theirs, go by the same rules.
+        if changed.iter().any(|key| key == "rules") {
+            let rules = settings
+                .rules
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?;
+            tx.execute(
+                "WITH RECURSIVE kin(id) AS (
+                     SELECT id FROM bots WHERE created_by_id=?1
+                     UNION SELECT b.id FROM bots b JOIN kin ON b.created_by_id=kin.id)
+                 UPDATE bots SET settings=NULLIF(CASE WHEN ?2 IS NULL
+                     THEN json_remove(COALESCE(settings,'{}'),'$.rules')
+                     ELSE json_set(COALESCE(settings,'{}'),'$.rules',json(?2)) END,'{}')
+                 WHERE id IN kin",
+                params![id, rules],
+            )?;
+        }
+        tx.commit()?;
         changed.sort();
         Ok(changed)
     }
@@ -13385,6 +13427,10 @@ mod tests {
             hide_senders: true,
             max_rounds: Some(1),
             unix_sockets: vec!["/".into()],
+            rules: Some(crate::rules::Policy {
+                invalid: Some("x".into()),
+                ..Default::default()
+            }),
         };
         let mut names: Vec<String> = settings_map(&all)
             .unwrap()

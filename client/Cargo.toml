@@ -10,6 +10,8 @@ publish = false
 
 [dependencies]
 libc = "0.2"
+# Command rules as data (rules.rs), already built for the runtime.
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Reads a project's name from `.agents/project.toml`.
 toml = "0.9"

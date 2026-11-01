@@ -12,5 +12,6 @@ Apache License, Version 2.0:
   ported from codex-rs/linux-sandbox and codex-rs/sandboxing.
 - src/tools/web_run.md and src/tools/web_run.json, the `web.run` tool's
   description and schema, copied from codex-rs/ext/web-search.
-- The command rules that src/rules.rs reads: the `prefix_rule` language,
-  its matching and its decisions, ported from codex-rs/execpolicy.
+- Command rules: the `prefix_rule` and `host_executable` builtins that
+  sonny/src/rules.rs runs in Starlark as Codex does, and the matching and
+  decisions in client/src/rules.rs, ported from codex-rs/execpolicy.

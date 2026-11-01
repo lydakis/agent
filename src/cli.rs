@@ -201,18 +201,10 @@ const COMMANDS: &[Command] = &[
         startup: true,
     },
     Command {
-        name: "rules",
-        about: "What the command rules make of a command, read from their files with no daemon",
-        usage: "rules check [--rules DIR] [--] COMMAND...",
-        flags: "--rules --pretty",
-        settings: "",
-        startup: false,
-    },
-    Command {
         name: "serve",
         about: "Run the daemon in the foreground; other commands start it for you",
         usage: "serve --store PATH --provider SPEC... [OPTIONS]",
-        flags: "--shell-exclude --redact-field --redact-block --protect --protect-existing --rules",
+        flags: "--shell-exclude --redact-field --redact-block --protect --protect-existing --protect-path",
         settings: "",
         startup: true,
     },
@@ -400,9 +392,9 @@ fn print_flags(flags: &str) {
                 "LABEL",
                 "Redact the body of each PEM block whose header names LABEL, such as PRIVATE KEY, from tool output; repeatable",
             ),
-            "--rules" => (
-                "DIR",
-                "The folder of command rules, each *.rules file Codex's prefix_rule calls; default ~/.agent/rules",
+            "--protect-path" => (
+                "PATH",
+                "Keep PATH, by its absolute path, read-only in every sandbox, and from being made when missing; repeatable",
             ),
             "--protect" => (
                 "NAME",
@@ -611,7 +603,7 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
     let mut positional = 0;
     while let Some(arg) = iter.next() {
         if arg == "--" {
-            if matches!(c.name, "run" | "wait" | "companion" | "rules") {
+            if matches!(c.name, "run" | "wait" | "companion") {
                 out.push(arg);
             }
             for value in iter {
@@ -623,16 +615,6 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
         if matches!(arg.as_str(), "--help" | "-h") {
             help(Some(c.name))?;
             return Ok(None);
-        }
-        // The command `rules check` reads is all words, flags too.
-        if c.name == "rules" && positional == 1 && !arg.starts_with('-') {
-            out.push("--".to_owned());
-            out.push(arg);
-            for value in iter {
-                out.push(value);
-            }
-            positional = 2;
-            break;
         }
         if !arg.starts_with('-') || arg == "-" {
             positional += 1;
@@ -665,6 +647,7 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
                     | "--redact-block"
                     | "--protect"
                     | "--protect-existing"
+                    | "--protect-path"
             )
         {
             return fail_with("usage", format!("{flag} may only be specified once"));
@@ -777,10 +760,6 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
     } else if c.name == "login" {
         if positional != 1 {
             return fail_with("usage", "login needs a provider: chatgpt");
-        }
-    } else if c.name == "rules" {
-        if positional < 2 {
-            return fail_with("usage", "rules needs check COMMAND...");
         }
     } else if !matches!(c.name, "run" | "wait" | "companion") && positional != 0 {
         return fail_with("usage", format!("{} takes no positional arguments", c.name));
