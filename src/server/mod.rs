@@ -2597,11 +2597,18 @@ impl Service {
     /// as a turn of their own.
     async fn lapse(&mut self) -> Result<()> {
         let now = now_ms() as i64;
-        // Armed inside the job, as a steer's admission arms its turn.
-        let active: HashMap<String, Arc<std::sync::atomic::AtomicBool>> = self
-            .active
-            .iter()
-            .map(|(bot, active)| (bot.clone(), active.steers.clone()))
+        // Armed inside the job, as a steer's admission arms its turn: the
+        // running turns of the bots due, not the whole fleet's. One that
+        // comes due after this read is armed once the job is back.
+        let due = self
+            .store
+            .read("due_bots", move |db| db.due_bots(now, LAPSE_SWEEP))
+            .await?;
+        let active: HashMap<String, Arc<std::sync::atomic::AtomicBool>> = (due.into_iter())
+            .filter_map(|bot| {
+                let steers = self.active.get(&bot)?.steers.clone();
+                Some((bot, steers))
+            })
             .collect();
         // The next due is read on the writer, after every submission
         // queued before this look, so none is missed.

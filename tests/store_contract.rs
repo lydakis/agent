@@ -5395,6 +5395,26 @@ fn an_attached_message_that_waited_its_time_goes_as_a_steer_would() {
 }
 
 #[test]
+fn a_bot_being_deleted_has_no_message_coming_due() {
+    let mut db = db();
+    db.create("Gone", Some("/synthetic"), binding()).unwrap();
+    let capped = TurnOptions {
+        delivery: Delivery::Attach,
+        wait_ms: Some(1),
+        ..TurnOptions::default()
+    };
+    db.begin("Gone", "n1", "fyi", true, &capped, allow_provider)
+        .unwrap();
+    assert!(db.next_due().unwrap().is_some());
+    let (_, piece) = db.start_delete_bot("Gone", 1).unwrap();
+    assert_eq!(piece["done"], false, "still being deleted");
+    // Its note goes with it: nothing comes due that no look would take.
+    assert_eq!(db.next_due().unwrap(), None);
+    assert!(db.due_bots(i64::MAX, 64).unwrap().is_empty());
+    assert!(db.lapse(i64::MAX, 64).unwrap().is_empty());
+}
+
+#[test]
 fn an_attached_message_that_waited_its_time_joins_the_running_turn() {
     let mut db = db();
     db.create("Busy", Some("/synthetic"), binding()).unwrap();

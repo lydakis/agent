@@ -9929,14 +9929,29 @@ impl Database {
         )?)
     }
     /// When the first attached message that waits only so long is due, in
-    /// milliseconds since the Unix epoch.
+    /// milliseconds since the Unix epoch. A bot being deleted has none: its
+    /// messages go with it, never as steers.
     pub fn next_due(&self) -> Result<Option<i64>> {
         Ok(self
             .conn
             .prepare_cached(
-                "SELECT MIN(due_ms) FROM turns WHERE status='attached' AND due_ms IS NOT NULL",
+                "SELECT MIN(t.due_ms) FROM turns t JOIN bots b ON b.name=t.bot
+                 WHERE t.status='attached' AND t.due_ms IS NOT NULL AND b.status!='deleting'",
             )?
             .query_row([], |r| r.get(0))?)
+    }
+    /// The bots with an attached message due by `now`, as `lapse` would
+    /// take up to `limit` of them.
+    pub fn due_bots(&self, now: i64, limit: usize) -> Result<Vec<String>> {
+        Ok(self
+            .conn
+            .prepare_cached(
+                "SELECT DISTINCT bot FROM (SELECT t.bot FROM turns t JOIN bots b ON b.name=t.bot
+                 WHERE t.status='attached' AND t.due_ms<=?1 AND b.status!='deleting'
+                 ORDER BY t.due_ms,t.id LIMIT ?2)",
+            )?
+            .query_map(params![now, limit as i64], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?)
     }
     /// Deliver up to `limit` attached messages whose wait ran out by `now`,
     /// oldest due first, each as a steer sent now would go: `queued` for a
