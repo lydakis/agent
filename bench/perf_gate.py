@@ -63,7 +63,7 @@ TIMINGS = {
     'sonny': [*((f'lookout CPU per 1k deltas at {n}, ms', lambda r, n=n: r['lookout'][n]['cpu_ms_per_1k_deltas'])
                 for n in ('10', '100', '1000')),
               ('lookout seated at 1000, s', lambda r: r['lookout']['1000']['start']['seated_s']),
-              ('lookout note p95 at 1000, ms', lambda r: r['lookout']['1000']['note_delay_ms_p95'] or 0),
+              ('lookout note p95 at 1000, ms', lambda r: r['lookout']['1000']['note_delay_ms_p95']),
               ('quiet window CPU, ms/s', lambda r: r['window']['cpu_ms_per_s']),
               ('quiet window reads, KiB/s', lambda r: r['window']['read_kib_per_s']),
               ('quiet window requests, /s', lambda r: r['window']['requests_per_s']),
@@ -98,6 +98,11 @@ def compare(root):
                 was_all, now_all = [value(r) for r in base], [value(r) for r in head]
             except (KeyError, TypeError):
                 # A measure one side's runs lack, as a bench run smaller.
+                continue
+            if None in was_all + now_all:
+                # No note told on a side has no delay: say so, never read it as fast.
+                rows.append((name, label, 'none' if None in was_all else statistics.median(was_all),
+                             'none' if None in now_all else statistics.median(now_all), ''))
                 continue
             was, now = statistics.median(was_all), statistics.median(now_all)
             change = (now - was) / was if was else 0.0
