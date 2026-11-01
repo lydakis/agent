@@ -10856,6 +10856,10 @@ impl App {
     fn zen_view_changed(&mut self) {
         self.replies.clear();
         self.last_reply.clear();
+        // A list of the replies goes with them: its rows are of a view
+        // no longer drawn.
+        self.reacting = None;
+        self.quoting = false;
         self.repaint = true;
     }
 
@@ -11003,10 +11007,6 @@ impl App {
             Some(name) => name.clone(),
             None => new::task_name(&brief, taken),
         };
-        // What every task runs as says nothing more.
-        let every = (agent_client::project::read(dir))
-            .and_then(|info| project::task_profile(&info))
-            .unwrap_or_else(|_| "task".to_owned());
         // This lead's task, on this window's daemon, on the lead's model
         // and effort unless the project says the tasks' own, as a task
         // the lead starts from its shell has them.
@@ -11029,7 +11029,9 @@ impl App {
         let start = task::Start {
             name: short.clone(),
             brief,
-            profile: (profile.name != every).then(|| profile.name.clone()),
+            // Named even when every task runs as it, so its model and
+            // tools apply; its words are told once.
+            profile: Some(profile.name.clone()),
             setup: false,
             model: None,
             effort: None,
@@ -11535,11 +11537,11 @@ impl App {
             if let Some(list) = &self.reacting {
                 // Newest at the bottom, nearest the composer, as they read.
                 let items: Vec<list::Item> = (list.shown().into_iter())
-                    .map(|(at, found)| {
-                        let (node, said) = &self.replies[at.min(self.replies.len() - 1)];
+                    .filter_map(|(at, found)| {
+                        let (node, said) = self.replies.get(at)?;
                         let on = self.reactions.on(*node).join(" ");
                         let room = width.saturating_sub(10 + on.width());
-                        list::Item::new(transcript::cut(said, room), on).found(&found)
+                        Some(list::Item::new(transcript::cut(said, room), on).found(&found))
                     })
                     .collect();
                 over(
@@ -15651,6 +15653,14 @@ mod tests {
             app.reacting.as_ref().and_then(list::Picker::chosen),
             Some(1)
         );
+        // The replies going with a change of view take the list with them.
+        let replies = app.replies.clone();
+        app.zen_view_changed();
+        assert!(app.reacting.is_none());
+        drawn(&mut app);
+        app.replies = replies;
+        app.input.set("/react");
+        app.submit().await;
         app.key(Event::Key(KeyCode::Up.into())).await;
         app.key(Event::Key(KeyCode::Enter.into())).await;
         assert_eq!(app.react_to, Some((4, "Merged it.".into())));
