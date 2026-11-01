@@ -6827,6 +6827,41 @@ what is kept per bot); the screen's benches send no attach, so none of
 the new path runs in them beyond the submit field's parse. Sonny's rows
 moved within their noise too.
 
+## A resting bot hears its background commands end (#625)
+
+`processes` gains `told` and `bot`, and a partial index `processes_untold`
+on `(bot, id)` holds only the ended commands nothing collected or saw.
+`finish` and `process_finish`, store jobs that already run, look in that
+index for the bot (empty in the common case, so one probe) and, when it
+holds the bot's, read the first batch in order and queue one note with how
+each ended, never its output. A terminal's seen end
+is one more UPDATE inside the `tool_finish` op that records its result. No
+task, timer or per-bot memory is added; the run loop gains one `Notify` arm.
+
+The Perf workflow's matched screen, base `main` against this branch at
+5c9e615, on a GitHub runner:
+
+| Measure | Base | Head | Change |
+| --- | ---: | ---: | ---: |
+| Lone submit CPU, ms | 32.825 | 32.554 | -0.8% |
+| Burst submit p99, ms | 4.795 | 4.917 | +2.6% |
+| Release to terminal p99, ms | 10.543 | 10.288 | -2.4% |
+| Idle RSS, MiB | 19.965 | 20.674 | +3.6% |
+| Per idle bot, KiB | 1.696 | 1.326 | -21.8% |
+| RSS after a turn each, MiB | 30.145 | 30.395 | +0.8% |
+| Daemon CPU per turn, ms | 1.008 | 1.009 | +0.2% |
+| Lifecycle CPU, s | 0.825 | 0.805 | -2.4% |
+| Lifecycle p95 turn, ms | 579.087 | 579.7 | +0.1% |
+| Lifecycle peak RSS, MiB | 27.24 | 27.354 | +0.4% |
+
+Nothing moved past noise, and the gate counted no more store work per turn.
+Idle RSS and per idle bot moved in opposite directions within the footprint
+bench's spread from run to run, as #609 saw. The screen's benches run no
+background commands, so the new path costs them only the empty index probe
+at each finish. Sonny's rows moved within their noise too. The commit after
+5c9e615 reads only the fields that say how a command ended, in a bounded
+batch, so a note never loads a command's output.
+
 ## The lookout's notes at 1,000 tasks (#576)
 
 The lookout read every finished turn's reply on its one connection. The
