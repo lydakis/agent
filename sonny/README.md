@@ -679,8 +679,12 @@ way `/react` does, and each note in the margin has its own `↩`.
   task's window closes once its turn ends. New work sent to the task
   reopens it. Each agent's
   time is how long its running turn has been at it, or how long its last
-  turn took. An agent with automations or follows of its own
-  shows `↻ 2 automations` beside its model. A click on an agent's name goes
+  turn took. Beside its model each agent names the profile it runs
+  as, `lead` and `task` too, which the footer leaves out (it names a
+  profile only when it is not the seat's own): a lead's as its project
+  sets it, a task's as it was started, with `start_task`'s `profile` or
+  its project's default. An agent with
+  automations or follows of its own shows `↻ 2 automations` there too. A click on an agent's name goes
   to it as a click on a task in a roster does (below), and so does
   Enter on the agent ↑ and ↓ pick (`›`); ‹ in its title,
   or Ctrl+[ from the conversation, goes back to `/status`. It opens
@@ -688,6 +692,8 @@ way `/react` does, and each note in the margin has its own `↩`.
   `/status` and Enter open the task a reply just pointed you to.
 
   ![/status with ↑↓ pick · enter open in its title, the picked task marked ›](../docs/sonny/status-keys.png)
+
+  ![/status naming each agent's profile beside its model: superlead, task, reviewer](../docs/sonny/status-profile.png)
 
   ![A task opened from /status in the pane, its ‹ going back to /status](../docs/sonny/status-opens-agent.png)
 - `/background` (or `/triggers`, `/lookout`) lists, in the pane beside the

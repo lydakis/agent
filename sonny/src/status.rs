@@ -3,7 +3,7 @@
 //! by where they stand, as a thread list is: what needs the person, what
 //! works, what waits for review, what sits idle, and, folded away, what the
 //! lead marked resolved. Each row says what the agent is doing, for how
-//! long, on which model, its latest step, where it is in Rex, and what
+//! long, on which model and profile, its latest step, where it is in Rex, and what
 //! runs for it in the background.
 use ratatui::{
     style::{Color, Stylize},
@@ -25,6 +25,8 @@ pub struct Row {
     /// orders the rows.
     pub at: Option<u64>,
     pub model: String,
+    /// The profile it runs as, its seat's own too: `lead`, `superlead`.
+    pub profile: String,
     pub latest: String,
     /// Where it is in Rex: `tab 2`, `tab 1, split`, or empty.
     pub place: String,
@@ -197,8 +199,8 @@ pub fn card(
     (out, named)
 }
 
-/// One agent's lines: its mark, name, state and time; its model, place and
-/// pull request; its latest step.
+/// One agent's lines: its mark, name, state and time; its model, profile,
+/// place and pull request; its latest step.
 fn row_lines(row: &Row, width: usize) -> Vec<Line<'static>> {
     let mut out = Vec::new();
     // How long the running turn has been at it, or the last one took.
@@ -232,8 +234,13 @@ fn row_lines(row: &Row, width: usize) -> Vec<Line<'static>> {
         "" => String::new(),
         id => crate::models::named(id),
     };
+    let profile = match row.profile.as_str() {
+        "" => String::new(),
+        name => format!("{name} profile"),
+    };
     let facts: Vec<&str> = [
         model.as_str(),
+        profile.as_str(),
         row.place.as_str(),
         row.pr.as_str(),
         row.background.as_str(),
@@ -329,9 +336,13 @@ mod tests {
             ..Row::default()
         };
         let rows = [
-            row("lead", "working", Group::Working),
+            Row {
+                profile: "superlead".into(),
+                ..row("lead", "working", Group::Working)
+            },
             row("zero", "needs you", Group::NeedsYou),
             Row {
+                profile: "task".into(),
                 pr: "o/r#9".into(),
                 background: "↻ 1 automation".into(),
                 ..row("equal", "done", Group::Review)
@@ -348,14 +359,18 @@ mod tests {
         let folded = text(false);
         assert_eq!(folded[0], "calc · 3 tasks · 1 need you · 1 to review");
         assert_eq!(folded[1], " ● lead working · 42s");
-        assert_eq!(folded[2], "   GPT 6.1 Sol · chatgpt · tab 1");
+        // The profile is said even when it is the seat's own.
+        assert_eq!(
+            folded[2],
+            "   GPT 6.1 Sol · chatgpt · superlead profile · tab 1"
+        );
         assert_eq!(folded[4], "Needs you · 1");
         assert_eq!(folded[5], " ? zero needs you · 42s");
         assert_eq!(folded[8], "Ready for review · 1");
         assert_eq!(folded[9], " ◆ equal done · took 42s");
         assert_eq!(
             folded[10],
-            "   GPT 6.1 Sol · chatgpt · tab 1 · o/r#9 · ↻ 1 automation"
+            "   GPT 6.1 Sol · chatgpt · task profile · tab 1 · o/r#9 · ↻ 1 automation"
         );
         assert_eq!(folded.last().unwrap(), "1 resolved · r shows them");
         let (_, named) = card("calc", &rows, 100, false);
