@@ -4085,7 +4085,7 @@ fn a_bot_keeps_its_settings_and_a_fork_copies_them() {
         json!({"context_bytes":4096,"context_items":4096,"note_turns":48,"compact_at":75,
             "compact_keep":25,"compact_tokens":null,"keep_turns":1,"max_rounds":null,"approval_hold_ms":2000,"max_output_tokens":null,
             "keep_warm":0,"cache_ttl":"1h","speed":"fast","sandbox":null,"writable":[],"network":false,"outputs":null,"hide_senders":false,
-            "unix_sockets":[],"rules":null})
+            "quiet_background":false,"unix_sockets":[],"rules":null})
     );
     // Retention follows the bot's own setting.
     for n in 1..=3 {
@@ -15539,6 +15539,91 @@ fn a_background_command_no_wait_collected_is_told_once_its_bot_rests() {
         json!({"finished":{format!("proc:{late}"):{"error":"daemon_paused","detail":"stopped"}}})
     );
     assert!(!db.tell_finished("Bob").unwrap());
+}
+
+/// A turn of `bot` that starts a background command and ends: the
+/// command's id.
+fn started_in_background(db: &mut Database, bot: &str, id: &str) -> i64 {
+    let turn = (db.begin(
+        bot,
+        id,
+        "work",
+        true,
+        &TurnOptions::default(),
+        allow_provider,
+    ))
+    .unwrap()
+    .turn;
+    let process = db.process_start(turn, &format!("{id}-shell")).unwrap();
+    db.finish(turn, None).unwrap();
+    process
+}
+
+#[test]
+fn a_bot_whose_client_collects_results_itself_is_never_told() {
+    let mut db = db();
+    let mut quiet = binding();
+    quiet.settings.quiet_background = true;
+    db.create("Carol", Some("/synthetic"), quiet).unwrap();
+    let process = started_in_background(&mut db, "Carol", "c1");
+    db.process_finish(process, &json!({"exit_code":0}), &[], &[])
+        .unwrap();
+    assert!(!db.tell_finished("Carol").unwrap());
+    started_in_background(&mut db, "Carol", "c2");
+    assert_eq!(db.next_ready().unwrap(), None);
+}
+
+#[test]
+fn submissions_filling_the_pending_bounds_hold_back_no_note() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    db.create("Eve", Some("/synthetic"), binding()).unwrap();
+    let process = started_in_background(&mut db, "Bob", "b1");
+    db.set_pending_limits(1, 0);
+    let queue = TurnOptions {
+        delivery: Delivery::Queue,
+        ..TurnOptions::default()
+    };
+    db.begin("Eve", "e1", "later", false, &queue, allow_provider)
+        .unwrap();
+    let refused = db.begin("Eve", "e2", "more", false, &queue, allow_provider);
+    assert_eq!(refused.unwrap_err().code, "pending_limit");
+    db.process_finish(process, &json!({"exit_code":1}), &[], &[])
+        .unwrap();
+    assert!(db.tell_finished("Bob").unwrap(), "told past the bound");
+}
+
+#[test]
+fn retention_keeps_what_a_note_still_to_run_tells_of() {
+    let mut db = db();
+    let mut kept = binding();
+    kept.settings.keep_turns = Some(1);
+    db.create("Dan", Some("/synthetic"), kept).unwrap();
+    let process = started_in_background(&mut db, "Dan", "d1");
+    let next = (db.begin(
+        "Dan",
+        "d2",
+        "more",
+        true,
+        &TurnOptions::default(),
+        allow_provider,
+    ))
+    .unwrap()
+    .turn;
+    db.process_finish(process, &json!({"exit_code":0}), &[], &[])
+        .unwrap();
+    db.finish(next, None).unwrap();
+    db.retain("Dan", Some(next)).unwrap();
+    let gone = |db: &Database| db.unowned_process("Dan", &[process]).unwrap().is_some();
+    assert!(
+        !gone(&db),
+        "its result is there for the wait the note invites"
+    );
+    let (_, note) = db.next_ready().unwrap().unwrap();
+    db.start(note, allow_provider).unwrap();
+    db.finish(note, None).unwrap();
+    db.retain("Dan", Some(note)).unwrap();
+    assert!(gone(&db), "once the note ran, retention takes it");
 }
 
 #[test]

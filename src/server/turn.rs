@@ -3978,7 +3978,11 @@ impl Turn {
                     );
                     match self.run_tool(start, None, warm.as_deref_mut()).await? {
                         Ran::Done(Ok(outcome)) => self.seen(id, outcome).await?,
-                        Ran::Done(Err(error)) => failure(error),
+                        // A start that failed is its end, and the call says so.
+                        Ran::Done(Err(error)) => {
+                            self.store.op("saw_end", move |db| db.saw_end(id)).await?;
+                            failure(error)
+                        }
                         Ran::Lifted(_) => unreachable!("only a command moves to the background"),
                     }
                 }

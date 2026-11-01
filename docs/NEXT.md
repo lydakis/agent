@@ -717,7 +717,7 @@ bytes per parked turn versus per live process, on the lifecycle screen.
       every tool, not only the process bound. A `wait` among the calls,
       cancellation, and restart mid-batch need defined behavior.
     - Done in part (2026-11-01, schema 77): a command no wait collected
-      is told to its bot once it rests, as one steer from origin
+      is told to its bot once no turn of its runs, as one steer from origin
       `background` naming each handle and how it ended, the output left
       for `wait` ([RUST_PROTOTYPE.md](RUST_PROTOTYPE.md#deferred-tool-results)).
       Still open below: the result itself, mid-turn, in the call's place.

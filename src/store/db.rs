@@ -240,6 +240,10 @@ pub struct Settings {
     /// model without the line saying so after its words.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub hide_senders: bool,
+    /// Whether the end of a background command no wait collected is left
+    /// for a wait, untold: its client collects results itself.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub quiet_background: bool,
     /// Model calls one of its turns may make, the last with no tool call
     /// allowed; none bounds them only by the turn's token budget.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -465,7 +469,8 @@ impl Settings {
             "speed":self.speed().map_or("standard", crate::provider::Speed::name),
             "sandbox":self.sandbox,"writable":self.writable,"network":self.network,
             "outputs":self.outputs,
-            "hide_senders":self.hide_senders,"unix_sockets":self.unix_sockets,
+            "hide_senders":self.hide_senders,"quiet_background":self.quiet_background,
+            "unix_sockets":self.unix_sockets,
             "rules":self.rules})
     }
     fn stored(&self) -> Result<Option<String>> {
@@ -477,7 +482,7 @@ impl Settings {
 /// The settings that make a bot's sandbox, which change together.
 pub const SANDBOX: [&str; 4] = ["sandbox", "writable", "network", "unix_sockets"];
 /// Every setting's name, as `create` and `configure` take it.
-pub const SETTINGS: [&str; 20] = [
+pub const SETTINGS: [&str; 21] = [
     "context_bytes",
     "context_items",
     "note_turns",
@@ -495,6 +500,7 @@ pub const SETTINGS: [&str; 20] = [
     "network",
     "outputs",
     "hide_senders",
+    "quiet_background",
     "max_rounds",
     "unix_sockets",
     "rules",
@@ -808,6 +814,13 @@ impl Delivery {
 }
 /// The origin of the message that tells a bot its background commands
 /// ended.
+/// A bot's ended commands nothing collected or saw, read from the partial
+/// index, which holds only what is untold in the whole store, never
+/// through the bot's history.
+const UNTOLD: &str = "SELECT p.id,p.result FROM processes p INDEXED BY processes_untold
+     CROSS JOIN turns t ON t.id=p.turn
+     WHERE p.told IS NULL AND p.delivered IS NULL AND p.status<>'running' AND t.bot=?
+     ORDER BY p.id";
 pub const BACKGROUND_ORIGIN: &str = "background";
 /// How a background command ended, as its bot is told: its result without
 /// the output, which a `wait` on its handle reads.
@@ -9544,7 +9557,7 @@ impl Database {
         Ok(())
     }
     /// Tell `bot` of its background commands that ended with no wait
-    /// collecting them, once it rests: one steer, from the `background`
+    /// collecting them, once no turn of its is running: one steer, from the `background`
     /// origin, whose words are each command's handle and how it ended,
     /// its output left for a `wait` on the handle. A bot with a turn
     /// running hears at that turn's end, unless a wait collects them
@@ -9552,26 +9565,37 @@ impl Database {
     /// past the pending bounds) is told at a later end. Whether a turn is
     /// ready for a slot now.
     pub fn tell_finished(&mut self, bot: &str) -> Result<bool> {
-        let running: Option<Option<i64>> = self
+        let found: Option<(Option<i64>, Option<String>)> = self
             .conn
-            .prepare_cached("SELECT running_turn FROM bots WHERE name=?")?
-            .query_row([bot], |r| r.get(0))
+            .prepare_cached("SELECT running_turn,settings FROM bots WHERE name=?")?
+            .query_row([bot], |r| Ok((r.get(0)?, r.get(1)?)))
             .optional()?;
-        let Some(None) = running else {
+        let Some((None, settings)) = found else {
             return Ok(false);
+        };
+        let quiet = match settings {
+            Some(text) => serde_json::from_str::<Settings>(&text)?.quiet_background,
+            None => false,
         };
         let ended: Vec<(i64, Option<String>)> = self
             .conn
-            .prepare_cached(
-                "SELECT p.id,p.result FROM processes p JOIN turns t ON t.id=p.turn
-                 WHERE p.told IS NULL AND p.delivered IS NULL AND p.status<>'running' AND t.bot=?
-                 ORDER BY p.id",
-            )?
+            .prepare_cached(UNTOLD)?
             .query_map([bot], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<rusqlite::Result<_>>()?;
         let Some(&(first, _)) = ended.first() else {
             return Ok(false);
         };
+        let mut told = self
+            .conn
+            .prepare_cached("UPDATE processes SET told=? WHERE id=?")?;
+        // Its client collects them itself.
+        if quiet {
+            for (id, _) in &ended {
+                told.execute(params![0, id])?;
+            }
+            return Ok(false);
+        }
+        drop(told);
         let mut finished = serde_json::Map::new();
         for (id, result) in &ended {
             let result: Value = match result {
@@ -9586,14 +9610,20 @@ impl Database {
             origin: Some(BACKGROUND_ORIGIN.to_owned()),
             ..TurnOptions::default()
         };
-        let started = match self.begin(
+        // Not held to the bounds on submissions: the commands that ended
+        // bound it, as `--max-processes` bounds them, and a refusal would
+        // leave the bot untold until it next ended a turn.
+        let limits = std::mem::take(&mut self.pending_limits);
+        let begun = self.begin(
             bot,
             &format!("{BACKGROUND_ORIGIN}-{first}"),
             &prompt,
             false,
             &options,
             |_, _| Ok(()),
-        ) {
+        );
+        self.pending_limits = limits;
+        let started = match begun {
             Ok(started) => started,
             Err(error) if error.code == "storage_error" => return Err(error),
             Err(_) => return Ok(false),
@@ -10518,11 +10548,16 @@ impl Database {
         // A turn already pruned but still running a background process has
         // nothing left to drop until the process ends; passing over it lets
         // a piece that restarts from the oldest turn reach the turns after.
+        // A turn whose commands a note still to run tells of waits for it,
+        // so the wait the note invites finds their results.
         let turns: Vec<i64> = tx
             .prepare_cached(
                 "SELECT turn FROM retained_turns r WHERE bot=?1 AND turn<?2 AND turn IS NOT ?3 AND turn>?4
                  AND (EXISTS(SELECT 1 FROM events WHERE turn=r.turn)
                       OR NOT EXISTS(SELECT 1 FROM processes WHERE turn=r.turn AND status='running'))
+                 AND NOT EXISTS(SELECT 1 FROM processes p WHERE p.turn=r.turn AND p.told>0
+                      AND EXISTS(SELECT 1 FROM turns t WHERE t.id=p.told
+                                 AND t.status IN ('queued','ready','running')))
                  ORDER BY turn LIMIT ?5",
             )?
             .query_map(
@@ -13846,6 +13881,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn finding_what_to_tell_reads_only_the_untold() {
+        let db = Database::initialize(Connection::open_in_memory().unwrap()).unwrap();
+        let plan: Vec<String> = (db.conn.prepare(&format!("EXPLAIN QUERY PLAN {UNTOLD}")))
+            .unwrap()
+            .query_map(["Bob"], |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(plan[0].contains("processes_untold"), "{plan:?}");
+        assert!(
+            plan.iter().all(|step| !step.contains("turns_bot")),
+            "never through a bot's history: {plan:?}"
+        );
+    }
+
+    #[test]
     fn every_setting_is_named() {
         // Every field, so a new one doesn't compile until it is listed.
         let all = Settings {
@@ -13866,6 +13917,7 @@ mod tests {
             network: true,
             outputs: Some("/".into()),
             hide_senders: true,
+            quiet_background: true,
             max_rounds: Some(1),
             unix_sockets: vec!["/".into()],
             rules: Some(crate::rules::Policy {
