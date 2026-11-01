@@ -78,10 +78,18 @@ class WorkflowTests(ModelFixture):
         self.zen = self.home / '.agent/sonny/zen'
         self.zen.mkdir(parents=True)
         env = {**clean_env(), 'HOME': str(self.home), 'PATH': f'{bin}:{os.environ["PATH"]}'}
+        # The person's command rules, where the CLI tells the daemon they are.
+        self.rules = self.home / '.agent/rules'
         self.daemon = SocketClient(self.binary, self.path / 'state.sqlite', self.url, 'shell',
-                                   extra=PROTECTING, env=env)
+                                   extra=[*PROTECTING, '--rules', str(self.rules)], env=env)
         self.addCleanup(self.daemon.close)
         self.turns = 0
+
+    def allow_always(self, *words):
+        """An allow rule for `words`, as Sonny's "always allow" appends it."""
+        self.rules.mkdir(parents=True, exist_ok=True)
+        with open(self.rules / 'default.rules', 'a') as rules:
+            rules.write(f'prefix_rule(pattern={json.dumps(list(words))}, decision="allow")\n')
 
     def agent(self, settings, gated=True):
         name = f'bot{len(self.daemon.request("bots")["result"]["bots"])}'
@@ -151,9 +159,9 @@ class WorkflowTests(ModelFixture):
         self.assertFalse(asked)
         asked, output = self.runs(bot, 'mcpx', escalated=True, allow=True)
         self.assertTrue(asked)
-        # "Always allow mcpx" adds it to the commands that leave every
-        # sandbox; it never asks again.
-        self.daemon.request('configure', bot=bot, sandbox='read-only', unsandboxed=['mcpx'])
+        # "Always allow mcpx" adds an allow rule, as Sonny writes it; it
+        # never asks again.
+        self.allow_always('mcpx')
         asked, output = self.runs(bot, 'mcpx')
         self.assertEqual((asked, output['stdout'].strip()), (False, 'pong'))
 
@@ -185,7 +193,7 @@ class WorkflowTests(ModelFixture):
         self.assertTrue(asked)
         self.assertTrue(Path(f'{cache}-x').exists())
         # Allowed always, the same command runs without asking.
-        self.daemon.request('configure', bot=bot, sandbox='workspace-write', unsandboxed=['touch'])
+        self.allow_always('touch')
         asked, _ = self.runs(bot, f'touch {cache}-y')
         self.assertFalse(asked)
         self.assertTrue(Path(f'{cache}-y').exists())

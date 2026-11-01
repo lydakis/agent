@@ -938,6 +938,7 @@ async fn run() -> Result<(), String> {
     SIDE.store(options.side.is_some(), std::sync::atomic::Ordering::Relaxed);
     // Before any lead is made, so its instructions list the skills.
     skills::install_own();
+    approvals::at_start();
     trigger::at_start();
     home::at_start();
     boot::at_start();
@@ -7658,21 +7659,14 @@ impl App {
 
     /// Allows the waiting command, and every command it starts with from
     /// now, outside every agent's sandbox, as Codex's "don't ask again"
-    /// keeps a prefix rule: `[sonny] unsandboxed` holds it, and the lead
-    /// and the agents it made take it at once.
+    /// keeps a prefix rule: an allow rule in `~/.agent/rules`, which every
+    /// agent's next turn reads.
     async fn always(&mut self, prefix: &str) {
         if let Err(error) = approvals::allow_always(prefix) {
             self.notice = Some(format!("couldn't keep {prefix}: {error}"));
             return;
         }
         self.answer("allow", Some(prefix)).await;
-        // A row the person picked that waits for the turn to end is the
-        // one set, with the command let out.
-        if let Some(mode) = self.gating.or(self.mode) {
-            self.gating = Some(mode);
-            self.spread = Some((mode, Instant::now()));
-            self.configure().await;
-        }
     }
 
     /// `/compact`, once the person said yes.

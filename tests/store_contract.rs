@@ -899,7 +899,7 @@ fn a_sandboxed_bot_waits_for_a_verdict_only_on_an_escape() {
     let folder = std::path::Path::new("/synthetic");
     let gated: Vec<&str> = calls
         .iter()
-        .filter(|call| bot.gated(call, folder))
+        .filter(|call| bot.gated(call, folder, &Default::default()))
         .map(|call| call.call_id.as_str())
         .collect();
     assert_eq!(gated, ["up", "climbs", "outside"]);
@@ -3971,7 +3971,7 @@ fn a_bot_keeps_its_settings_and_a_fork_copies_them() {
         serde_json::to_value(&bob).unwrap()["settings"],
         json!({"context_bytes":4096,"context_items":4096,"note_turns":48,"compact_at":75,
             "compact_keep":25,"compact_tokens":null,"keep_turns":1,"max_rounds":null,"approval_hold_ms":2000,"max_output_tokens":null,
-            "keep_warm":0,"cache_ttl":"1h","speed":"fast","sandbox":null,"writable":[],"network":false,"outputs":null,"hide_senders":false,"unsandboxed":[],
+            "keep_warm":0,"cache_ttl":"1h","speed":"fast","sandbox":null,"writable":[],"network":false,"outputs":null,"hide_senders":false,
             "unix_sockets":[]})
     );
     // Retention follows the bot's own setting.
@@ -13429,8 +13429,12 @@ fn a_fork_narrows_what_it_may_call_and_never_widens() {
         custom: false,
     };
     let folder = std::path::Path::new("/synthetic");
-    assert!(db.inspect("Bob").unwrap().gated(&shell, folder));
-    assert!(!reader.gated(&shell, folder));
+    assert!(
+        db.inspect("Bob")
+            .unwrap()
+            .gated(&shell, folder, &Default::default())
+    );
+    assert!(!reader.gated(&shell, folder, &Default::default()));
     let (plain, _) = db.fork("Reader", "Plain", Fork::default()).unwrap();
     assert_eq!(plain.allowed.as_deref(), Some(&read[..]));
     assert_eq!(
@@ -14879,4 +14883,33 @@ fn a_page_of_pauses_fits_one_reply() {
         )
         .unwrap();
     assert_eq!(rest["pauses"][0]["id"], shown as i64 + 1);
+}
+
+#[test]
+fn a_bots_commands_let_out_of_its_sandbox_leave_its_settings_for_the_rules() {
+    let path =
+        std::env::temp_dir().join(format!("agent-unsandboxed-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    db.create("Ann", Some("/synthetic"), binding()).unwrap();
+    drop(db);
+    // As a store before schema 75 kept them.
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            r#"UPDATE bots SET settings='{"sandbox":"read-only","unsandboxed":["mcpx"]}' WHERE name='Bob';
+               UPDATE bots SET settings='{"unsandboxed":["mcpx"]}' WHERE name='Ann';
+               PRAGMA user_version=73;"#,
+        )
+        .unwrap();
+    let db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    let bob = db.inspect("Bob").unwrap();
+    assert_eq!(
+        bob.settings.sandbox,
+        Some(agent_runtime::sandbox::Mode::ReadOnly)
+    );
+    assert_eq!(db.inspect("Ann").unwrap().settings, Default::default());
+    drop(db);
+    std::fs::remove_file(path).unwrap();
 }
