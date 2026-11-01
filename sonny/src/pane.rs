@@ -94,6 +94,9 @@ pub struct Pane {
     /// The columns the switch key's hint was last drawn at on its title,
     /// which a click on takes the keys over, as the key does.
     switch_at: Option<(u16, u16)>,
+    /// The keys were here when it was last drawn: its switch hint went
+    /// back to the conversation then, and took them over while not.
+    focused: bool,
     /// The agent whose Sonny the program is, which the title's button
     /// opens in the main view; and that button's columns as last drawn.
     pub agent: Option<String>,
@@ -199,6 +202,7 @@ impl Pane {
             over: false,
             alone: false,
             switch_at: None,
+            focused: false,
             agent: None,
             main_at: None,
             name_at: None,
@@ -320,6 +324,7 @@ impl Pane {
             over: false,
             alone: false,
             switch_at: None,
+            focused: false,
             agent: None,
             main_at: None,
             name_at: None,
@@ -352,6 +357,7 @@ impl Pane {
             over: false,
             alone: false,
             switch_at: None,
+            focused: false,
             agent: None,
             main_at: None,
             name_at: None,
@@ -446,7 +452,13 @@ impl Pane {
         if let Some((from, to)) = self.switch_at
             && (from..to).contains(&column)
         {
-            return Some(format!("{}switch", crate::screen::BUTTON));
+            // Unfocused, the hint says `tab focus`: a click there gives
+            // the pane the keys, as a click anywhere on it already has.
+            let what = match self.focused {
+                true => "switch",
+                false => "focus",
+            };
+            return Some(format!("{}{what}", crate::screen::BUTTON));
         }
         let (_, buttons) = self.head.as_ref()?;
         (buttons.iter())
@@ -575,6 +587,7 @@ impl Pane {
         // keys end at the title's right edge.
         let from = area.x + (area.width as usize).saturating_sub(keys.width()) as u16;
         self.switch_at = switch_hint(&keys, focused, switch).map(|(a, b)| (from + a, from + b));
+        self.focused = focused;
         // Keys in their one grammar while they go here, else dim.
         let key_spans = match focused {
             true => crate::hint::spans(&keys),
@@ -1053,6 +1066,15 @@ mod tests {
         pane.alone = false;
         let head = rows(&mut pane, 70, 3).remove(0);
         assert!(!head.contains("conversation"), "{head}");
+        // Unfocused, its `tab focus` hint gives the pane the keys, never
+        // takes them away, though a click on the pane gave them first.
+        let mut buf = Buffer::empty(Rect::new(0, 0, 70, 3));
+        pane.render(Rect::new(0, 0, 70, 3), &mut buf, false, "tab", |_| None);
+        let column = 70 - "tab focus ".width() as u16;
+        assert_eq!(
+            pane.head_button(column).as_deref(),
+            Some(&*format!("{}focus", crate::screen::BUTTON))
+        );
     }
 
     #[test]

@@ -8738,6 +8738,8 @@ impl App {
             // away: the keys, and in a window with room for one, the view,
             // over to the other.
             "switch" if self.pane.is_some() => self.pane_keys = !self.pane_keys,
+            // An unfocused pane's `tab focus` hint: the keys to it.
+            "focus" if self.pane.is_some() => self.pane_keys = true,
             _ => self.pressed.push(what.to_owned()),
         }
     }
