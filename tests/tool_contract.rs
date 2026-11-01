@@ -468,7 +468,9 @@ async fn detached_commands_are_bounded_and_reaped() {
         .unwrap();
         pids.push(output["pid"].as_i64().unwrap() as i32);
     }
-    // Two running: the bound refuses a third, as a tool error the model sees.
+    // Two running, as `stats` counts them: the bound refuses a third, as a
+    // tool error the model sees.
+    assert_eq!((tools.lasting_running(), tools.terminals_running()), (2, 0));
     let error = tools
         .execute(detach("true"), &dir, &[], None)
         .await
@@ -501,21 +503,34 @@ async fn detached_commands_are_bounded_and_reaped() {
         .unwrap()
         .output;
     assert!(output.contains("\"detached\":true"), "{output}");
-    // Unbounded when asked.
+    // Unbounded when asked, and still counted.
     let free = Registry::new("shell").unwrap().with_lasting_budget(0);
+    let mut sleeping = Vec::new();
     for _ in 0..3 {
-        free.execute(
-            free.prepare(
-                "shell",
-                &json!({"command":"true","detach":true}).to_string(),
-            )
-            .unwrap(),
-            &dir,
-            &[],
-            None,
+        let output: Value = serde_json::from_str(
+            &free
+                .execute(
+                    free.prepare(
+                        "shell",
+                        &json!({"command":"exec sleep 30","detach":true}).to_string(),
+                    )
+                    .unwrap(),
+                    &dir,
+                    &[],
+                    None,
+                )
+                .await
+                .unwrap()
+                .output,
         )
-        .await
         .unwrap();
+        sleeping.push(output["pid"].as_i64().unwrap() as i32);
+    }
+    assert_eq!(free.lasting_running(), 3);
+    for pid in sleeping {
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+        }
     }
     unsafe {
         libc::kill(pids[1], libc::SIGKILL);
