@@ -379,7 +379,9 @@ impl Agent {
                 crate::skills::install_own();
                 crate::approvals::at_start();
                 crate::trigger::at_start();
-                crate::connect(&self.options).await.map(drop)
+                crate::connect(&self.options, crate::Asking::AtStart)
+                    .await
+                    .map(drop)
             })
             .await
             .map(drop)
