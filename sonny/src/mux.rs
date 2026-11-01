@@ -338,9 +338,14 @@ fn windows(file: &Path) -> Vec<Window> {
 
 /// Whether process `pid` still runs: one this user may not signal runs too.
 fn alive(pid: u32) -> bool {
+    // 0 is a window closed by the process that goes on as another Sonny,
+    // and `kill(0, …)` would ask about this process group instead.
     let Ok(pid) = libc::pid_t::try_from(pid) else {
         return false;
     };
+    if pid == 0 {
+        return false;
+    }
     // SAFETY: signal 0 checks the process without sending it anything,
     // and `kill` reads nothing of this process's memory.
     let signalled = unsafe { libc::kill(pid, 0) } == 0;
@@ -383,7 +388,25 @@ fn mark_in(file: &Path, me: Window, alive: impl Fn(u32) -> bool) {
         }
     }
     kept.insert(0, me);
-    let list: Vec<serde_json::Value> = (kept.iter())
+    write(file, &kept);
+}
+
+/// Notes that window `me` of the project closed, though its process goes
+/// on as another agent's Sonny (`exec` keeps the process): its place
+/// stays, as a closed window's.
+fn retire_in(file: &Path, me: u32) {
+    let mut windows = windows(file);
+    if !windows.iter().any(|window| window.pid == me) {
+        return;
+    }
+    for window in windows.iter_mut().filter(|window| window.pid == me) {
+        window.pid = 0;
+    }
+    write(file, &windows);
+}
+
+fn write(file: &Path, windows: &[Window]) {
+    let list: Vec<serde_json::Value> = (windows.iter())
         .map(|window| {
             serde_json::json!({
                 "pid": window.pid,
@@ -471,6 +494,12 @@ impl Marker {
             place,
         };
         mark_in(&self.file, me, alive);
+    }
+
+    /// This window is gone, though its process goes on as another
+    /// agent's Sonny, which marks itself.
+    pub fn retire(&self) {
+        retire_in(&self.file, std::process::id());
     }
 }
 
@@ -1490,6 +1519,26 @@ mod tests {
         task.used();
         let own = windows(&file).into_iter().find(|window| window.pid == me);
         assert_eq!(own.and_then(|window| window.place), Some(home));
+        let _ = std::fs::remove_file(&file);
+    }
+
+    /// `/switch` to another project keeps the process: the window it was
+    /// is closed for its old project, its place kept.
+    #[test]
+    fn a_window_switched_away_counts_as_closed() {
+        let file = std::env::temp_dir().join(format!("sonny-retire-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&file);
+        let me = std::process::id();
+        let bare = Window {
+            pid: me,
+            used_ms: 5,
+            place: None,
+        };
+        mark_in(&file, bare, |_| true);
+        assert_eq!(latest_in(&file, alive).map(|(_, open)| open), Some(true));
+        retire_in(&file, me);
+        let (window, open) = latest_in(&file, alive).unwrap();
+        assert_eq!((window.pid, window.place, open), (0, None, false));
         let _ = std::fs::remove_file(&file);
     }
 

@@ -1188,6 +1188,11 @@ async fn run() -> Result<(), String> {
     // `/lead NAME`: this window becomes that lead's Sonny, as if opened on it.
     if let (Ok(()), Some(other)) = (&result, app.switch_to.take()) {
         use std::os::unix::process::CommandExt;
+        // This process goes on as the other agent's Sonny: this window,
+        // as its project knows it, is closed.
+        if let Some(marker) = &app.marker {
+            marker.retire();
+        }
         let me = std::env::current_exe().map_err(|e| e.to_string())?;
         // Named by --agent, whatever folder this window is in.
         let mut args = reopen(&other).split_off(1);
