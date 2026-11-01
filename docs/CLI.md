@@ -52,6 +52,8 @@ a formula of the machine, as `processes = "cpus * 64"` or
 `load = "cpus * 2"`, the default for `--max-load`: while the machine's
 1-minute load average is over it, new commands wait for one of the
 daemon's to end, as `make -l` does, a turn held long parking until then.
+`stall_timeout = "15m"` sets how long a provider stream may send no
+content before it is retried (`--stall-timeout`, 10 minutes by default).
 A key it does not know, or a formula it cannot work out for this machine
 (one below 0 here included), is `config_invalid` when the file is read.
 `run` without `--bot` creates a fresh identity. `run --bot NAME` continues an
