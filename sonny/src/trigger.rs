@@ -1465,9 +1465,14 @@ pub const RESTORE_ORIGIN: &str = "sonny.restore";
 pub struct Restored {
     home: PathBuf,
     project: String,
-    note: String,
-    key: String,
+    /// Each note and the request id that makes it one turn, however often
+    /// it is sent.
+    notes: Vec<(String, String)>,
 }
+
+/// How much of a restored list one note carries: the daemon takes a
+/// message of at most 256 KiB, and a definition is at most 128 KiB.
+const RESTORED_PART: usize = 128 * 1024;
 
 /// What the first lead of `project` opened since a restore is to set up
 /// again; none once one was told, or when none of them were its.
@@ -1496,36 +1501,59 @@ pub(crate) fn restored_in(home: &Path, project: &str) -> Option<Restored> {
     if theirs.is_empty() {
         return None;
     }
-    let note = format!(
-        "{RESTORED}its triggers did not come back, since each was tied to an agent in the \
-         old machine's store, which a backup leaves out. These were this folder's, as the \
-         backup kept them, one a line:\n{}\nSet up again with the triggers tool the ones \
-         the person asked for that still have work to do, for the agents that do that work \
-         here now. Leave out what has run its course, such as a one-off whose time passed, \
-         and what an agent set only for its own work. Tell the person in a line what you \
-         set up and what you left out.",
-        theirs.join("\n")
-    );
-    let key = format!(
-        "sonny-restore-{}",
-        crate::project::fingerprint(&format!("{project}\n{note}"))
-    );
+    // In parts the daemon takes, each a turn of its own.
+    let mut parts: Vec<Vec<String>> = vec![];
+    let mut size = 0;
+    for row in theirs {
+        if parts.is_empty() || size + row.len() > RESTORED_PART {
+            parts.push(vec![]);
+            size = 0;
+        }
+        size += row.len() + 1;
+        parts.last_mut().expect("a part").push(row);
+    }
+    let count = parts.len();
+    let notes = (parts.iter().enumerate())
+        .map(|(at, rows)| {
+            let part = match count {
+                1 => String::new(),
+                _ => format!(" (part {} of {count})", at + 1),
+            };
+            let note = format!(
+                "{RESTORED}its triggers did not come back, since each was tied to an agent in \
+                 the old machine's store, which a backup leaves out. These were this folder's, \
+                 as the backup kept them, one a line{part}:\n{}\nSet up again with the triggers \
+                 tool the ones the person asked for that still have work to do, for the agents \
+                 that do that work here now. Leave out what has run its course, such as a \
+                 one-off whose time passed, and what an agent set only for its own work. Tell \
+                 the person in a line what you set up and what you left out.",
+                rows.join("\n")
+            );
+            let key = format!(
+                "sonny-restore-{}",
+                crate::project::fingerprint(&format!("{project}\n{note}"))
+            );
+            (note, key)
+        })
+        .collect();
     Some(Restored {
         home: home.to_owned(),
         project: project.to_owned(),
-        note,
-        key,
+        notes,
     })
 }
 
 impl Restored {
-    pub fn note(&self) -> &str {
-        &self.note
+    /// Each note, with the request id that makes the same note sent twice
+    /// one turn.
+    pub fn notes(&self) -> &[(String, String)] {
+        &self.notes
     }
 
-    /// The same note twice is one turn.
-    pub fn request_id(&self) -> &str {
-        &self.key
+    #[cfg(test)]
+    pub fn note(&self) -> String {
+        let notes: Vec<&str> = self.notes.iter().map(|(note, _)| note.as_str()).collect();
+        notes.join("\n")
     }
 
     /// Its lead was told: no other lead of the project is.
@@ -3441,6 +3469,8 @@ async fn deliver(
 /// The tag of a shadow copy's one gate, which nobody serves: no call of it
 /// should ever ask, and one that did lapses unanswered, denied.
 const SHADOW_TAG: &str = "shadow";
+/// The daemon's tools a shadow copy goes without: a shell and its input.
+const SHADOW_WITHHELD: [&str; 2] = ["shell", "write_stdin"];
 /// How long a call on that gate waits before it lapses.
 const SHADOW_LAPSE_MS: u64 = 60_000;
 /// How long a shadow copy left idle stays, should its fire stop before it
@@ -3478,10 +3508,12 @@ pub fn shadow_rules(
 }
 
 /// What a shadow copy of the agent `record` describes may call: the
-/// daemon's tools it has, which the read-only sandbox confines, and of
-/// Sonny's, only `exec`, whose calls of a server's tools that do not say
-/// they only read are refused. Asking the person, starting tasks, writing
-/// memory and the like are not among them.
+/// daemon's tools it has but a shell, which the read-only sandbox confines,
+/// and of Sonny's, only `exec`, whose calls of a server's tools that do not
+/// say they only read are refused. Asking the person, starting tasks,
+/// writing memory and the like are not among them. Nor is a shell: a
+/// command in it reaches the daemon's socket, which takes a message to
+/// another agent or a pause from a read-only agent too.
 fn shadow_tools(record: &Value) -> Vec<String> {
     let names = |list: &Value| -> Vec<String> {
         (list.as_array().into_iter().flatten())
@@ -3490,6 +3522,7 @@ fn shadow_tools(record: &Value) -> Vec<String> {
             .collect()
     };
     let mut tools = names(&record["tools"]);
+    tools.retain(|tool| !SHADOW_WITHHELD.contains(&tool.as_str()));
     let declared = record["declared"].as_array().into_iter().flatten();
     if declared
         .clone()
@@ -3662,6 +3695,12 @@ async fn shadow_run(
         let _ = std::fs::write(&ask.receipt, outcome.to_string());
     }
     outcome["reply"] = report(client, trigger, kept, (&name, id, turn), &of).await;
+    if let Some(ended) = outcome["reply"]
+        .as_object_mut()
+        .and_then(|r| r.remove("ended"))
+    {
+        outcome["ended"] = ended;
+    }
     if outcome["reply"]["outcome"] == "sent" {
         // Kept before the copy goes, so an ask cut short now ends as this
         // one did rather than as a copy that is not there.
@@ -3706,6 +3745,9 @@ async fn report(
         return json!({"outcome": "failed", "detail": "the turn did not end within a day"});
     }
     let status = result["status"].as_str().unwrap_or("ended");
+    // How the copy's turn ended, kept with the fire's outcome: once the copy
+    // goes its handle reads nothing.
+    let ended = json!({"status": status, "error": result["error"], "detail": result["detail"]});
     let cut = match result["text_truncated"] == true {
         true => " · cut short",
         false => "",
@@ -3725,14 +3767,16 @@ async fn report(
                 "prompt": prompt, "delivery": "queue", "from": {"bot": bot, "turn": turn}}),
         )
         .await;
-    match sent {
+    let mut reply = match sent {
         Ok(sent) => json!({"outcome": "sent", "bot": to, "turn": sent["turn"]}),
         Err(error) if error.code == "idempotency_conflict" => json!({"outcome": "sent", "bot": to}),
         Err(error) if error.code == "bot_not_found" => {
             json!({"outcome": "failed", "bot": to, "gone": true, "detail": error.to_string()})
         }
         Err(error) => json!({"outcome": "failed", "bot": to, "detail": error.to_string()}),
-    }
+    };
+    reply["ended"] = ended;
+    reply
 }
 
 /// Write what an ask sends into it, durably: beside the queue first, where
@@ -4142,6 +4186,15 @@ async fn reply(client: &Client, trigger: &Trigger, bot: &str, mut outcome: Value
 /// What a turn's `wait` result says: its text, else its error. A turn that
 /// ended saying nothing passes on nothing, not "null".
 /// The turn the last fire of `row` sent, by handle, when it sent one.
+/// How the turn `row`'s fire sent ended: as its outcome kept it, for a
+/// shadow fire, whose copy is gone; else as `ended` read it.
+fn ended_for<'a>(row: &'a Value, ended: &'a HashMap<String, Value>) -> Option<&'a Value> {
+    match &row["last"]["ended"] {
+        kept @ Value::Object(_) => sent(row).map(|_| kept),
+        _ => ended.get(&sent(row)?),
+    }
+}
+
 pub fn sent(row: &Value) -> Option<String> {
     let last = &row["last"];
     (last["outcome"] == "sent")
@@ -4184,7 +4237,7 @@ pub fn forget_done(places: &Places, store_id: &str, ended: &HashMap<String, Valu
         (row["name"] == name
             && row["store_id"] == store_id
             && row["last"]["reply"]["outcome"] != "failed"
-            && ended.get(&handle)?["status"] == "completed"
+            && ended_for(&row, ended)?["status"] == "completed"
             && !places.job(name).exists())
         .then_some(handle)
     };
@@ -4227,7 +4280,7 @@ pub fn forget_done(places: &Places, store_id: &str, ended: &HashMap<String, Valu
 /// so a fire that went out and whose turn then failed, as when the machine
 /// was offline or a login expired, reads so wherever its row is shown.
 pub fn with_turn(row: &mut Value, ended: &HashMap<String, Value>) {
-    let Some(result) = sent(row).and_then(|handle| ended.get(&handle)) else {
+    let Some(result) = ended_for(row, ended).cloned() else {
         return;
     };
     let status = result["status"].clone();
@@ -4661,7 +4714,8 @@ pub(crate) mod tests {
             "a lead's own look is its own"
         );
         assert!(!p.note().contains("q.check"), "another folder's");
-        assert!(p.request_id().starts_with("sonny-restore-"));
+        assert_eq!(p.notes().len(), 1);
+        assert!(p.notes()[0].1.starts_with("sonny-restore-"));
         assert!(restored_in(&home, "r").is_none(), "nothing of its own");
         p.told();
         assert!(
@@ -4693,6 +4747,20 @@ pub(crate) mod tests {
         assert_eq!(pending, ["shop.web.lead.next", "shop.web.deploy"]);
         let web = restored_in(&home, "shop.web").unwrap();
         assert!(web.note().contains("shop.web.deploy"), "{}", web.note());
+        // A list longer than one message takes goes in parts, each one the
+        // daemon takes, each its own turn.
+        let big: Vec<Value> = (0..20)
+            .map(|n| json!({"name": format!("r.job-{n}"), "bot": "r.job", "message": "x".repeat(16 * 1024)}))
+            .collect();
+        restore(&home, Some(serde_json::to_vec(&big).unwrap().as_slice())).unwrap();
+        let r = restored_in(&home, "r").unwrap();
+        assert_eq!(r.notes().len(), 3);
+        for (at, (note, key)) in r.notes().iter().enumerate() {
+            assert!(note.len() < 256 * 1024, "{}", note.len());
+            assert!(note.contains(&format!("(part {} of 3)", at + 1)));
+            assert!(r.notes()[..at].iter().all(|(_, other)| other != key));
+        }
+        assert_eq!(r.note().matches("\"name\":\"r.job-").count(), 20);
     }
 
     #[test]
@@ -6555,13 +6623,14 @@ pub(crate) mod tests {
         }
         let name = shadow_name("p.lead");
         assert_eq!(shadow_source(&name), Some("p.lead"), "{name}");
-        // Its tools: the daemon's it has, and of Sonny's only exec, within
-        // what it may call.
-        let record = json!({"tools": ["shell", "read", "write", "web_search"],
+        // Its tools: the daemon's it has but a shell, whose commands reach
+        // the daemon's socket, and of Sonny's only exec, within what it may
+        // call.
+        let record = json!({"tools": ["shell", "write_stdin", "read", "write", "web_search"],
             "declared": [{"name": "ask"}, {"name": "exec"}, {"name": "memory"}]});
         assert_eq!(
             shadow_tools(&record),
-            ["shell", "read", "write", "web_search", "exec"]
+            ["read", "write", "web_search", "exec"]
         );
         let narrowed = json!({"tools": ["shell", "read"], "allowed": ["read"],
             "declared": [{"name": "exec"}]});
@@ -6664,7 +6733,7 @@ pub(crate) mod tests {
         );
         let fork = &asked[1];
         assert_eq!(fork["source"], "p.fix-login");
-        assert_eq!(fork["allow"], json!(["shell", "read", "exec"]));
+        assert_eq!(fork["allow"], json!(["read", "exec"]));
         assert!(fork["created_by"].is_null(), "its rules are its own");
         let configure = &asked[2];
         assert_eq!(configure["bot_id"], 77);
@@ -6688,6 +6757,13 @@ pub(crate) mod tests {
         assert_eq!(request, "trigger_test-1_shadow.3.77.1");
         assert_eq!(fire_generation(request), None);
         assert_eq!(asked[6]["bot"], name.as_str());
+        // How its turn ended stays with the outcome, its copy gone: the row
+        // reads it there, not from a handle that reads nothing now.
+        assert_eq!(outcome["ended"]["status"], "completed");
+        assert!(outcome["reply"].get("ended").is_none());
+        let row = json!({"last": outcome});
+        let read = HashMap::new();
+        assert_eq!(ended_for(&row, &read).unwrap()["status"], "completed");
         // The ask kept what it sent before it went, and how it ended once
         // its report went, before its copy went.
         let (sent, _, record) = sent_for(&ask, &s).unwrap();

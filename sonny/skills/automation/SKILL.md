@@ -85,8 +85,9 @@ separate macOS user or a virtual machine, has to come from outside Agent.
 
 To move a job that runs elsewhere onto a trigger, add it with `shadow`
 first and leave the old job running: each fire goes to a read-only copy of
-the agent, which can read but not post, change files or ask the person, and
-its answer comes to you as a report of what it would have done. Compare a
+the agent, which can read files and call tools that only read, but not run
+commands, post, change files or ask the person, and its answer comes to you
+as a report of what it would have done. Compare a
 few reports with what the old job did, then `add` it again with `replace`
 and without `shadow`, and tell the person the old job can be stopped.
 

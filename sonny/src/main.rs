@@ -3805,15 +3805,24 @@ impl App {
     /// after any turn it runs, so it asks the person whether to bring it in.
     async fn tell_upgrades(&mut self) {
         if let Some(restored) = self.restored.take() {
-            let asked = json!({"bot": self.bot, "prompt": restored.note(),
-                "request_id": restored.request_id(), "delivery": "queue",
-                "origin": trigger::RESTORE_ORIGIN});
-            match self.client.request("submit", asked).await {
-                Ok(_) => restored.told(),
-                Err(error) if error.code == "idempotency_conflict" => restored.told(),
-                Err(error) => {
-                    self.notice = Some(format!("telling of the restored triggers: {error}"));
+            let mut all = true;
+            for (note, key) in restored.notes() {
+                let asked = json!({"bot": self.bot, "prompt": note, "request_id": key,
+                    "delivery": "queue", "origin": trigger::RESTORE_ORIGIN});
+                match self.client.request("submit", asked).await {
+                    Ok(_) => {}
+                    Err(error) if error.code == "idempotency_conflict" => {}
+                    Err(error) => {
+                        self.notice = Some(format!("telling of the restored triggers: {error}"));
+                        all = false;
+                        break;
+                    }
                 }
+            }
+            // Told once every part went; a part that went already is one
+            // turn when it goes again.
+            if all {
+                restored.told();
             }
         }
         let Some(upgrades) = self.upgrades.take() else {

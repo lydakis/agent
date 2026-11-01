@@ -58,9 +58,9 @@ Every reply is one JSON value on stdout; a failure is one
 onto a trigger. Each fire forks its agent where it is now (a `--start`
 trigger whose agent no fire made yet first makes that agent, as its first
 fire would, and sends it nothing)
-into `BOT.shadow-HEX`, a copy in the read-only sandbox (its commands reach no network), no
+into `BOT.shadow-HEX`, a copy in the read-only sandbox, with no shell, no
 gate a person or a model answers, the person's command rules without their
-`allow` rules (so a `prompt` rule refuses), and of Sonny's tools only
+`allow` rules, and of Sonny's tools only
 `exec`, whose MCP calls of a tool that does not say it only reads
 (`readOnlyHint`), or that its server's approval mode would ask about, are
 refused. So everything past reading is refused, never asked about. A copy
@@ -68,9 +68,10 @@ that cannot be confined is removed before it runs. Its answer goes to
 `--reply-to`, which defaults to the agent that added the trigger, else to
 the agent that added a `--start` one, else to the agent it copies, as
 `[trigger NAME · TIME · shadow run of BOT STATUS: ...]`, and the copy is
-removed once that went (or after a day idle). The copy's shell can still
-reach its own daemon socket, as every sandboxed agent's can, so it could
-message another agent, which reads it as the copy's words.
+removed once that went (or after a day idle). It has no shell because a
+sandboxed agent's commands still reach its daemon socket, which takes a
+message to another agent or a pause from a read-only agent too; so a dry run
+reads with the daemon's file tools and read-only MCP tools, not commands.
 
 **A broken `--if`.** A gate that cannot run, or runs past 60 s, fails the
 fire. The agent that hears of the trigger (`--reply-to`, else the agent
