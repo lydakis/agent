@@ -6698,6 +6698,29 @@ covers the lookout at 10, 100 and 1,000 subscribers and a sky replay of
 the hour at 512x, and like the daemon's timings it warns rather than
 fails.
 
+The Perf workflow's matched screen, base `main` against this branch at
+dfd5509, three alternating rounds each on a GitHub runner (medians):
+
+| Measure | Base | Head | Change |
+| --- | ---: | ---: | ---: |
+| Quiet window reads, KiB/s | 29.745 | 0.61 | -97.9% |
+| Quiet window requests, /s | 0.6 | 0.445 | -25.8% |
+| Quiet window CPU, ms/s | 4.12 | 3.705 | -10.1% |
+| Quiet window RSS, MiB | 20.2 | 18.7 | -7.4% |
+| Lookout CPU per 1k deltas at 1,000, ms | 10.46 | 10.26 | -1.9% |
+| Lookout note p95 at 1,000, ms | 12199.0 | 11627.5 | -4.7% |
+| Sky replay CPU per 1k lines, ms | 7.875 | 7.81 | -0.8% |
+| Sky replay RSS, MiB | 65.7 | 80.35 | +22.3% |
+| Daemon CPU per turn, ms | 1.198 | 1.164 | -2.8% |
+| Lone submit CPU, ms | 36.139 | 35.855 | -0.8% |
+| Burst submit p99, ms | 4.192 | 4.089 | -2.5% |
+
+The daemon's own timings did not move. The sky's peak RSS warned. A
+replay keeps the events it played to step back through, so its peak most
+likely follows how much history the fleet wrote in the screen's fixed
+time (this side's last round read 40,412 lines). Its CPU per line is
+unchanged, and nothing in this change touches the sky.
+
 The same run shows the next limit at 1,000 subscribers: of 5,000 task
 turns that ended, the leads' notes named 660 within the ten seconds after
 the load, at a p95 of 20 s. At 100 subscribers they named every one, at a
