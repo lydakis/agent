@@ -1284,7 +1284,11 @@ reads as a column rather than a band across the screen. `[sonny] text_width` (in
 sets another width, at least 40, the pane beside the conversation taking the rest; 0 lets the
 conversation fill the window, as Claude Code's does, and a file, a card or the margin then
 opens over it, Ctrl+\ flipping between the two, as in a window too narrow for both, and the
-margin waits for `/margin`. The composer sits on the same
+margin waits for `/margin`.
+
+![The same reply at text_width 100, the default, and 0, the window's whole width, in a 170-column window](../docs/sonny/text-width-0.png)
+
+The composer sits on the same
 tinted band as your messages, a row of it above and below the words, so it stays
 apart from the conversation in any theme and what you write looks as it will once
 sent; without colour (`NO_COLOR`) a rule above it does the same. The footer sits

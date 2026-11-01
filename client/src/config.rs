@@ -1517,6 +1517,8 @@ pub fn write(path: &Path, pairs: &[(&str, Option<toml::Value>)]) -> Result<(), S
     if text == before || (before.is_empty() && lines.is_empty()) {
         return Ok(());
     }
+    // A value every reader would refuse is refused here, the file kept.
+    parse(&text).map_err(|reason| format!("config_invalid: {}: {reason}", path.display()))?;
     replace(path, &text)
 }
 

@@ -587,6 +587,44 @@ mod tests {
     }
 
     #[test]
+    fn a_value_the_reader_refuses_is_said_and_not_written() {
+        let dir = std::env::temp_dir().join(format!("sonny-config-refused-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "[sonny]\ntext_width = 120\n").unwrap();
+        let mut view = View {
+            path: path.clone(),
+            values: Vec::new(),
+            pick: 0,
+            typing: None,
+            said: None,
+        };
+        view.values = view.read().unwrap();
+        view.pick = (SETTINGS.iter())
+            .position(|s| s.key == "sonny.text_width")
+            .unwrap();
+        press(&mut view, KeyCode::Enter);
+        for _ in 0..3 {
+            press(&mut view, KeyCode::Backspace);
+        }
+        press(&mut view, KeyCode::Char('2'));
+        press(&mut view, KeyCode::Char('0'));
+        press(&mut view, KeyCode::Enter);
+        assert!(
+            matches!(&view.said, Some(Err(e)) if e.contains("at least 40, not 20")),
+            "{:?}",
+            view.said
+        );
+        assert_eq!(view.values[view.pick].as_deref(), Some("120"));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "[sonny]\ntext_width = 120\n"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn values_step_through_the_default_and_names_are_typed() {
         let dir = std::env::temp_dir().join(format!("sonny-config-view-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
