@@ -1876,6 +1876,10 @@ struct Lookout {
     sending: Option<(updates::Told, Vec<String>, &'static str)>,
     /// What sources said, on its way in a note, until the daemon answers.
     sourcing: Option<(Vec<sources::Heard>, Vec<String>, &'static str)>,
+    /// When each subscription with a digest that note tells last told,
+    /// before it: told as it goes, as a task note's are, and put back if
+    /// it is not sent.
+    sourced_before: Vec<(String, Option<Instant>)>,
     /// The daemon is asked whether the subscriber rests: how many of its
     /// own events had come when it was asked. An answer after more came
     /// is older than what they said, and is let go.
@@ -1925,6 +1929,7 @@ impl Lookout {
             resend: Vec::new(),
             sending: None,
             sourcing: None,
+            sourced_before: Vec::new(),
             asking: None,
             own: 0,
             log: None,
@@ -2485,6 +2490,7 @@ impl Lookout {
                     // The same news twice is one note: the daemon took it
                     // before, so its sources were told then.
                     Err(code) if code != "idempotency_conflict" => {
+                        self.unsourced();
                         let mut back = sent;
                         back.append(&mut self.heard);
                         self.heard = back;
@@ -2497,13 +2503,9 @@ impl Lookout {
                     }
                     submitted => {
                         self.refused = None;
+                        self.sourced_before.clear();
                         for heard in &sent {
                             self.told_sources.insert(heard.event.source.clone(), now);
-                            for sub in &heard.subs {
-                                if self.sub_digest(sub).is_some() {
-                                    self.updates.told_subs.insert(sub.clone(), now);
-                                }
-                            }
                         }
                         if submitted.is_ok() {
                             self.write(&json!({"at_ms": epoch_ms(), "lead": self.lead,
@@ -2525,9 +2527,21 @@ impl Lookout {
             self.updates.unsent(told);
         }
         if let Some((mut sent, ..)) = self.sourcing.take() {
+            self.unsourced();
             sent.append(&mut self.heard);
             self.heard = sent;
             self.heard_since.get_or_insert(Instant::now());
+        }
+    }
+
+    /// The sources' note was not sent: its subscriptions' digests count
+    /// from the note before it.
+    fn unsourced(&mut self) {
+        for (sub, before) in self.sourced_before.drain(..).rev() {
+            match before {
+                Some(at) => self.updates.told_subs.insert(sub, at),
+                None => self.updates.told_subs.remove(&sub),
+            };
         }
     }
 
@@ -2849,6 +2863,18 @@ impl Lookout {
         let asked = json!({"bot": self.lead, "bot_id": self.updates.lead_id(), "prompt": prompt,
             "request_id": request_id, "delivery": delivery, "origin": sources::ORIGIN});
         self.heard_since = None;
+        // Its subscriptions' digests count from it as it goes, so news it
+        // holds waits for no other note meanwhile.
+        let now = Instant::now();
+        self.sourced_before.clear();
+        for heard in &sent {
+            for sub in &heard.subs {
+                if self.sub_digest(sub).is_some() {
+                    let before = self.updates.told_subs.insert(sub.clone(), now);
+                    self.sourced_before.push((sub.clone(), before));
+                }
+            }
+        }
         self.sourcing = Some((sent, key, delivery));
         self.keep();
         self.send(client, woken, asked, Answer::Sourced);
@@ -3255,8 +3281,12 @@ mod tests {
         assert!(lookout.updates.news_ready(later));
         // The person's words wait for no digest, and take the rest along.
         lookout.heard(&said(6, PERSON, "use tabs"));
-        assert!(lookout.updates.news_ready(now));
-        let told = lookout.updates.take_at(now);
+        let (first, soon) = (
+            lookout.updates.told_subs["tasks"],
+            now + Duration::from_secs(1),
+        );
+        assert!(lookout.updates.news_ready(soon));
+        let told = lookout.updates.take_at(soon);
         let texts: Vec<&str> = told.items.iter().map(|l| l.text.as_str()).collect();
         assert!(
             texts
@@ -3265,10 +3295,14 @@ mod tests {
             "{texts:?}"
         );
         assert!(told.items.iter().any(|l| l.quote.is_some()));
-        // What the digest held went with them: its time starts again.
-        let first = lookout.updates.told_subs["tasks"];
+        // What the digest held went with them: its time starts again from
+        // this note as it goes, and from the one before if it is not sent.
+        assert_eq!(lookout.updates.told_subs["tasks"], soon);
+        lookout.updates.unsent(told);
+        assert_eq!(lookout.updates.told_subs["tasks"], first);
+        let told = lookout.updates.take_at(soon);
         lookout.updates.sent(told);
-        assert!(lookout.updates.told_subs["tasks"] > first);
+        assert_eq!(lookout.updates.told_subs["tasks"], soon);
     }
 
     #[test]
@@ -3353,6 +3387,40 @@ mod tests {
         assert_eq!(lookout.updates.urgent(), Some("tasks"));
         let told = lookout.updates.take();
         assert!(told.items[0].text.contains("turn:calc.fix/5 failed"));
+    }
+
+    #[test]
+    fn an_urgent_turn_left_for_the_next_note_stays_urgent() {
+        let mut lookout = seated("running");
+        lookout.subs[0].urgent = Some(json!({"status": ["failed"]}));
+        let listed = lookout.updates.listed();
+        lookout.sync(&listed);
+        ended(&mut lookout, 5, "failed");
+        // The person's words fill the note: the failure waits for the next.
+        lookout.heard(&said(6, PERSON, &"word ".repeat(40_000)));
+        let told = lookout.updates.take();
+        assert!(told.items.iter().all(|l| !l.text.contains("failed")));
+        assert_eq!(lookout.updates.urgent(), Some("tasks"));
+    }
+
+    #[test]
+    fn a_task_note_and_a_sources_note_never_both_slip_one_digest() {
+        let mut lookout = seated("idle");
+        lookout.subs[0].digest = Some("1h".into());
+        lookout.subs[0].sources = vec!["slack".into()];
+        let listed = lookout.updates.listed();
+        lookout.sync(&listed);
+        let now = Instant::now();
+        ended(&mut lookout, 4, "completed");
+        lookout.heard_from(&slack("lunch?", false));
+        assert!(lookout.ready(&lookout.heard[0], now));
+        // The task note under way counts for the digest as it goes.
+        let told = lookout.updates.take_at(now);
+        assert_eq!(told.items.len(), 1);
+        assert!(!lookout.ready(&lookout.heard[0], now));
+        // Not sent, it counts from the note before.
+        lookout.updates.unsent(told);
+        assert!(lookout.ready(&lookout.heard[0], now));
     }
 
     #[test]

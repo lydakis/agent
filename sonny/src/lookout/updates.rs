@@ -260,6 +260,10 @@ pub struct Updates {
     /// When a note last told news a subscription's digest held, which
     /// that digest counts from: its sources' and its bots' alike.
     pub told_subs: HashMap<String, Instant>,
+    /// What `told_subs` said of each subscription the note under way
+    /// tells, before it: told as it goes, so news it holds waits for no
+    /// second note in the meantime, and put back if it is not sent.
+    told_before: Vec<(String, Option<Instant>)>,
     /// Bots with subscriptions of their own, this lead among them: no
     /// one's tasks here. One set every lookout shares, so the lookouts
     /// hold it once, not each a copy of all the others.
@@ -415,6 +419,7 @@ impl Updates {
             memory,
             rules: HashMap::new(),
             told_subs: HashMap::new(),
+            told_before: Vec::new(),
             subscribers: Arc::default(),
             watched: HashSet::new(),
             named: HashSet::new(),
@@ -1445,14 +1450,6 @@ impl Updates {
             if replying(&news.theirs) {
                 held.theirs = news.theirs.take();
             }
-            // It may go as it might now, and what of it was urgent still is.
-            if held != News::default() {
-                held.hold = super::activity::Hold::now();
-                held.urgent = [&held.act, &held.theirs]
-                    .into_iter()
-                    .flatten()
-                    .find_map(|t| t.urgent.clone());
-            }
             // How its turns end, each with its reply, as they will read: the
             // first thing a note tells always fits; past that, turns that do
             // not wait for the next note.
@@ -1475,6 +1472,18 @@ impl Updates {
                     waiting.notes = std::mem::take(&mut news.notes);
                     waiting.asks = std::mem::take(&mut news.asks);
                 }
+                // Left for a reply or for room, it may go as it might have
+                // now, and what of it was urgent still is: a turn's own
+                // urgency, else its task's for what else did not fit.
+                waiting.hold = super::activity::Hold::now();
+                let others = !(waiting.said.is_empty()
+                    && waiting.notes.is_empty()
+                    && waiting.asks.is_empty());
+                waiting.urgent = [&waiting.act, &waiting.theirs]
+                    .into_iter()
+                    .flatten()
+                    .find_map(|t| t.urgent.clone())
+                    .or_else(|| news.urgent.clone().filter(|_| others));
                 later.push((name.clone(), waiting));
             }
             // A message that started a turn told below as asked by its
@@ -1495,6 +1504,14 @@ impl Updates {
         }
         later.extend(rest);
         self.tasks = later;
+        // What each subscription with a digest heard goes now, however soon:
+        // its digest counts from this note.
+        for (_, news) in &sent {
+            for (sub, _) in &news.hold.windows {
+                let before = self.told_subs.insert(sub.clone(), now);
+                self.told_before.push((sub.clone(), before));
+            }
+        }
         // The person's own turns come last, under a line of their own.
         items.sort_by_key(|item| item.theirs);
         let (memory, seen) = match self.memory_news() {
@@ -1512,14 +1529,7 @@ impl Updates {
 
     /// The note was sent: what it said of memory has been told.
     pub fn sent(&mut self, told: Told) {
-        // What a digest's subscription heard was told, however soon: its
-        // digest counts from now.
-        let now = Instant::now();
-        for (_, news) in &told.sent {
-            for (sub, _) in &news.hold.windows {
-                self.told_subs.insert(sub.clone(), now);
-            }
-        }
+        self.told_before.clear();
         if let Some(seen) = told.seen {
             self.memory_seen = Some(seen);
         }
@@ -1539,6 +1549,13 @@ impl Updates {
 
     /// The note could not be sent: its news comes first next time.
     pub fn unsent(&mut self, told: Told) {
+        // Its digests count from the note before it.
+        for (sub, before) in self.told_before.drain(..).rev() {
+            match before {
+                Some(at) => self.told_subs.insert(sub, at),
+                None => self.told_subs.remove(&sub),
+            };
+        }
         let later = std::mem::replace(&mut self.tasks, told.sent);
         for (name, news) in later {
             match self.tasks.iter_mut().find(|(task, _)| *task == name) {
