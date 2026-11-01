@@ -271,11 +271,20 @@ fn spread(
     lead: usize,
     buttons: &Buttons,
 ) -> Vec<Buttons> {
+    if buttons.is_empty() {
+        return vec![Vec::new(); rows.len()];
+    }
     let text: Vec<char> = (line.spans.iter())
         .flat_map(|span| span.content.chars())
         .collect();
-    let column =
-        |upto: usize| -> usize { text[..upto].iter().map(|c| c.width().unwrap_or(0)).sum() };
+    // Where each character starts, counted once: no row scans the ones
+    // before it again.
+    let mut columns = Vec::with_capacity(text.len() + 1);
+    columns.push(0);
+    for c in &text {
+        columns.push(columns.last().copied().unwrap_or(0) + c.width().unwrap_or(0));
+    }
+    let column = |upto: usize| columns[upto];
     let mut at = 0;
     (rows.iter().enumerate())
         .map(|(n, row)| {
