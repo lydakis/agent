@@ -1809,8 +1809,9 @@ impl View {
                 // star pulses, and nothing flies.
                 if live && origin == "goal" && from != End::Person {
                     let agent = &mut self.agents[at];
-                    (agent.lit, agent.heated, agent.flash) = (Some(now), Some(now), None);
+                    // Cooled to now first, as a message's heat is.
                     agent.heat = agent.warmth(now) + 1.0;
+                    (agent.lit, agent.heated, agent.flash) = (Some(now), Some(now), None);
                     let said = format!("{} keeps at its goal", self.short(at));
                     self.say(now, said, None, &[at]);
                     return;
