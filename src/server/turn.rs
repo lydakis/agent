@@ -2172,20 +2172,21 @@ impl Turn {
             // provider, set up again only by a restart, which tries it at
             // once: held there, keeping what its park kept. A park on a
             // call the model made has that call's continuation to keep,
-            // which a park at a model call cannot: it ends, as before.
-            if let Some(waiting) = &self.resumed {
-                if waiting.paced_since_ms.is_none() {
-                    return Err(error);
-                }
-                if let Some(route) = &waiting.route {
-                    let _ = accounting.route.set(route.clone());
-                }
-                accounting.summary_retry_at = waiting.summary_retry_ms.unwrap_or(0);
-                accounting.held_since = waiting.held_since_ms;
-                accounting.call_fallback = waiting.fallback.clone();
-                accounting.compaction = waiting.compaction;
-                accounting.copied = waiting.copied.clone().filter(|_| waiting.compaction);
+            // which a park at a model call cannot, and a turn that starts
+            // here was let in by a start that found the provider: those
+            // end, as before.
+            let Some(waiting) = (self.resumed.as_ref()).filter(|w| w.paced_since_ms.is_some())
+            else {
+                return Err(error);
+            };
+            if let Some(route) = &waiting.route {
+                let _ = accounting.route.set(route.clone());
             }
+            accounting.summary_retry_at = waiting.summary_retry_ms.unwrap_or(0);
+            accounting.held_since = waiting.held_since_ms;
+            accounting.call_fallback = waiting.fallback.clone();
+            accounting.compaction = waiting.compaction;
+            accounting.copied = waiting.copied.clone().filter(|_| waiting.compaction);
             accounting.hold(&error);
             return Ok(Round::Paced(accounting.parked_until));
         };
