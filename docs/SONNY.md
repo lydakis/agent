@@ -376,11 +376,13 @@ as a link to the new folder, so what chose it just before the move (an
 that finds neither between the move and the link is told
 `automations_moved` and tries again. A restore's list for leads not yet
 opened, `~/.agent/sonny/restored-triggers.json`, becomes
-`restored-automations.json` when next read, and a backup's `triggers.json`
-is read when the copy has no `automations.json` and goes at its next sync.
-Sonny's start
-removes its old `~/.agent/trigger` script (upgrade migration
-`automations-folder`, retired at 0.10.0). Prompts sent before still carry
+`restored-automations.json` with the move. Both run once, through the
+upgrade migration `automations-folder` (recorded in
+`~/.agent/sonny/migrated`, retired at 0.10.0); a backup's sync while the
+move waits backs up the old folder's automations. A backup's
+`triggers.json` is read when the copy has no `automations.json` and goes
+at its next sync. Sonny's start removes its old `~/.agent/trigger` script
+(migration `automation-script`, retired at 0.10.0). Prompts sent before still carry
 `origin: "trigger"`, which Sonny reads as an automation's.
 
 Earlier apps called these schedules (`me.lydakis.agent.schedule.NAME`).

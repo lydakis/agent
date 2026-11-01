@@ -77,15 +77,19 @@ pub const MIGRATIONS: &[Migration] = &[
         id: crate::commons::POSTERS,
         retire: "0.10.0",
     },
-    // `~/.agent/triggers` becomes `~/.agent/automations`, Sonny's old
-    // `~/.agent/trigger` script goes, a restore's `restored-triggers.json`
-    // becomes `restored-automations.json` and the backup's `triggers.json`
-    // `automations.json`; run where they are read
-    // (`trigger::Places::moved`, `skills::install_own`) rather than through
-    // [`once`], since the script and the scheduler read the folder without
-    // Sonny's start (0.8.0).
+    // `~/.agent/triggers` becomes `~/.agent/automations`, and a restore's
+    // `restored-triggers.json` `restored-automations.json`, through
+    // [`once`] wherever the folder is found (`trigger::Places::moved`),
+    // since the script and the scheduler read it without Sonny's start
+    // (0.8.0).
     Migration {
-        id: "automations-folder",
+        id: crate::trigger::MOVED,
+        retire: "0.10.0",
+    },
+    // Sonny's old `~/.agent/trigger` script goes, once
+    // `~/.agent/automation` is written (0.8.0).
+    Migration {
+        id: crate::skills::SCRIPT,
         retire: "0.10.0",
     },
     // `[sonny] unsandboxed` becomes allow rules in ~/.agent/rules (0.8.0).

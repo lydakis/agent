@@ -33,9 +33,9 @@ const SKIP: [&str; 5] = [".git", ".lock", ".reads", ".cleanup", ".DS_Store"];
 /// machine's store, they are set up again by each folder's lead after a
 /// restore, never by Sonny.
 const AUTOMATIONS: &str = "automations.json";
-/// Its name before 0.8.0: read when the copy has no other, and removed by
-/// the next sync, which writes the list under its new name (upgrade
-/// migration `automations-folder`).
+/// Its name before 0.8.0, as a backup made then holds it: read when the
+/// copy has no other, and removed by the next sync, which writes the list
+/// under its new name. It goes with upgrade migration `automations-folder`.
 const TRIGGERS: &str = "triggers.json";
 pub const USAGE: &str = "usage: home sync | home status\n       setup backup [URL]";
 
@@ -380,7 +380,7 @@ fn keep_triggers(places: &Places) -> Result<(), String> {
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.to_string()),
         _ => {}
     }
-    let mut list = crate::trigger::backed_up(&crate::trigger::Places::under(&places.home));
+    let mut list = crate::trigger::backed_up(&crate::trigger::Places::moved(&places.home, false));
     // What a restore brought for leads not opened since stays backed up,
     // under any trigger of the same name set up here since.
     for row in crate::trigger::pending_restored(&places.home) {
@@ -1067,6 +1067,7 @@ mod tests {
             sonny.join("restored-triggers.json"),
         )
         .unwrap();
+        let _ = std::fs::remove_file(sonny.join("migrated"));
         let restored = crate::trigger::restored_in(&second.home, "p").unwrap();
         assert!(restored.note().contains("p.digest"), "{}", restored.note());
         // Its sync before the lead opens keeps what the lead is yet to set

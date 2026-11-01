@@ -109,6 +109,10 @@ impl Scheduler {
     }
 }
 
+/// The upgrade migration that moves `~/.agent/triggers` to
+/// `~/.agent/automations`.
+pub(crate) const MOVED: &str = "automations-folder";
+
 /// Where triggers live, `~/.agent/automations`: `jobs` holds their
 /// definitions, and `state` what each one's fires did, their queues of
 /// asks, and the scheduler's own files.
@@ -124,30 +128,46 @@ impl Places {
         Ok(Self::moved(Path::new(&home), false))
     }
     /// The places under `home`, with `~/.agent/triggers`, as the folder was
-    /// named before 0.8.0, moved to its place first (upgrade migration
-    /// `automations-folder`). It moves only while nothing works in it: no
-    /// change to its files, no fire running, and no scheduler but the
-    /// caller, when `scheduling` says the caller is its scheduler. Else
-    /// this caller works in the old folder, as what works there does, and
-    /// the scheduler moves it once its fires are done. A folder made in
-    /// its place since is left as it is.
+    /// named before 0.8.0, moved to its place first, and a restore's list
+    /// renamed with it (upgrade migration `automations-folder`, through
+    /// [`crate::upgrade::once`] here, since the script and the scheduler
+    /// read the folder without Sonny's start). It moves only while nothing
+    /// works in it: no change to its files, no fire running, and no
+    /// scheduler but the caller, when `scheduling` says the caller is its
+    /// scheduler. Else this caller works in the old folder, as what works
+    /// there does, and the scheduler moves it once its fires are done. A
+    /// folder made in its place since is left as it is.
     pub(crate) fn moved(home: &Path, scheduling: bool) -> Self {
         let places = Self::under(home);
         let old = Self::at(home.join(".agent/triggers"));
-        if places.state.exists() || !old.state.is_dir() {
+        // Nothing to move, and its record would make a HOME gone again.
+        if !home.join(".agent").is_dir() {
             return places;
         }
-        match old.quiet(scheduling) {
-            Some(_held) if std::fs::rename(&old.state, &places.state).is_ok() => {
+        let record = home.join(".agent/sonny/migrated");
+        let done = crate::upgrade::once(&record, MOVED, || {
+            if !places.state.exists() && old.state.is_dir() {
+                let Some(_held) = old.quiet(scheduling) else {
+                    return false;
+                };
+                if std::fs::rename(&old.state, &places.state).is_err() {
+                    return false;
+                }
                 // What chose the old folder before the move, such as an
                 // add still asking its daemon, writes once it takes the
                 // files' lock, held here until this link is there: it
                 // reaches the new folder through it.
                 let _ = std::os::unix::fs::symlink("automations", &old.state);
-                places
             }
-            _ => old,
-        }
+            // For leads not opened since a restore before 0.8.0.
+            let list = home.join(".agent/sonny/restored-automations.json");
+            let before = home.join(".agent/sonny/restored-triggers.json");
+            if !list.exists() && before.exists() {
+                let _ = std::fs::rename(&before, &list);
+            }
+            true
+        });
+        if done { places } else { old }
     }
     /// Locks on everything that works in this folder: its files' lock, its
     /// scheduler's unless the caller is that scheduler, and each running
@@ -1449,14 +1469,9 @@ impl Trigger {
 /// Where a restore leaves the backup's list of triggers, and which
 /// projects' leads were handed theirs, a line each.
 fn restored_list(home: &Path) -> PathBuf {
-    let list = home.join(".agent/sonny/restored-automations.json");
-    // Its name before 0.8.0, for leads not opened since a restore then
-    // (upgrade migration `automations-folder`).
-    let old = home.join(".agent/sonny/restored-triggers.json");
-    if !list.exists() && old.exists() {
-        let _ = std::fs::rename(&old, &list);
-    }
-    list
+    // Its name before 0.8.0 moves with the folder.
+    let _ = Places::moved(home, false);
+    home.join(".agent/sonny/restored-automations.json")
 }
 
 fn restored_told(home: &Path) -> PathBuf {
@@ -6438,11 +6453,16 @@ pub(crate) mod tests {
         };
         // A fire of the old Sonny still running there: everything stays
         // in the old folder until it is done, its scheduler too.
+        let sonny = w.root.join(".agent/sonny");
+        std::fs::create_dir_all(&sonny).unwrap();
+        std::fs::write(sonny.join("restored-triggers.json"), "[]").unwrap();
         let fire = hold(old.join(".scheduler/p.x.lock"));
         for scheduling in [false, true] {
             assert_eq!(Places::moved(&w.root, scheduling).state, old);
         }
         assert!(!w.places.state.exists());
+        let record = sonny.join("migrated");
+        assert!(!crate::upgrade::lines(&record).contains(&MOVED.to_owned()));
         drop(fire);
         // Its scheduler, still running: only that scheduler moves it.
         let scheduler = hold(old.join(".scheduler/scheduler"));
@@ -6450,6 +6470,9 @@ pub(crate) mod tests {
         assert_eq!(Places::moved(&w.root, true).state, w.places.state);
         drop(scheduler);
         assert!(w.places.jobs.join("p.x.json").exists());
+        assert!(crate::upgrade::lines(&record).contains(&MOVED.to_owned()));
+        assert!(sonny.join("restored-automations.json").exists());
+        assert!(!sonny.join("restored-triggers.json").exists());
         // What chose the old folder before the move reaches the new one
         // through a link.
         let before = Places::at(old.clone());
