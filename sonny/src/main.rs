@@ -983,13 +983,13 @@ fn sky_cli(args: &[String]) -> Result<(), String> {
             _ => return Err(USAGE.into()),
         }
     }
-    let (_, socket) = daemon_paths(store, socket)?;
+    let (store, socket) = daemon_paths(store, socket)?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(1)
         .enable_all()
         .build()
         .map_err(|e| e.to_string())?;
-    sky::watch(&runtime, socket, centre, replay)
+    sky::watch(&runtime, socket, store, centre, replay)
 }
 
 async fn run() -> Result<(), String> {
@@ -3087,10 +3087,7 @@ impl Fleet {
     /// reopened, as `/status` files it.
     fn open_ask(&self, bot: &str, seen: needs::Seen) -> Option<String> {
         let running = self.activity.get(bot) == Some(&"working");
-        let resolved = bot != self.lead
-            && (seen.itself
-                || resolved::holds(resolved::read(&self.store, bot), seen.turn, running));
-        seen.ask.filter(|_| !resolved)
+        seen.open(&self.store, bot, running)
     }
 
     /// What a read elsewhere found of what waits on the person, in place of
@@ -5027,9 +5024,7 @@ impl App {
                             }
                         };
                         // One the lead resolved set its question aside.
-                        let resolved = seen.itself
-                            || resolved::holds(resolved::read(&store, &bot), Some(last), false);
-                        needs.asked(&bot, seen.ask.filter(|_| !resolved));
+                        needs.asked(&bot, seen.open(&store, &bot, false));
                         ended.push(bot.clone());
                     }
                     read.push(bot.clone());
@@ -7624,7 +7619,7 @@ impl App {
             background: None,
             usage: None,
             commons: None,
-            sky: Some(sky::View::open(self.options.socket.clone())),
+            sky: Some(sky::View::open(self.options.socket.clone(), self.store())),
             picked: None,
             pick: None,
         });

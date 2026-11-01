@@ -68,6 +68,19 @@ pub struct Seen {
     pub turn: Option<i64>,
 }
 
+impl Seen {
+    /// The question still open, as every surface reads it: none for a task
+    /// resolved, by its own call in the turn read or by its lead's mark kept
+    /// beside `store` that no later turn reopened while nothing `running`.
+    /// A lead is never resolved.
+    pub fn open(self, store: &std::path::Path, bot: &str, running: bool) -> Option<String> {
+        let resolved = !crate::project::is_lead(bot)
+            && (self.itself
+                || crate::resolved::holds(crate::resolved::read(store, bot), self.turn, running));
+        self.ask.filter(|_| !resolved)
+    }
+}
+
 /// How many of an agent's newest nodes are read for its open question.
 const SCANNED: usize = 400;
 

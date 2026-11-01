@@ -392,6 +392,9 @@ impl Agent {
 pub struct View {
     /// The daemon's socket, to follow it again after a pause.
     socket: PathBuf,
+    /// The daemon's store, beside which leads keep the tasks they
+    /// resolved, whose questions are set aside.
+    resolved: PathBuf,
     feed: mpsc::UnboundedReceiver<Feed>,
     task: tokio::task::JoinHandle<()>,
     agents: Vec<Agent>,
@@ -772,10 +775,12 @@ impl Drop for View {
 }
 
 impl View {
-    pub fn open(socket: PathBuf) -> Self {
+    pub fn open(socket: PathBuf, store: PathBuf) -> Self {
         let (send, feed) = mpsc::unbounded_channel();
         let task = tokio::spawn(follow(socket.clone(), send));
-        Self::with(socket, feed, task)
+        let mut view = Self::with(socket, feed, task);
+        view.resolved = store;
+        view
     }
 
     fn with(
@@ -804,6 +809,7 @@ impl View {
         let heir = fresh.then(|| (kept.by.clone(), ago(kept.since_ms)));
         Self {
             socket,
+            resolved: PathBuf::new(),
             feed,
             task,
             agents: Vec::new(),
@@ -1043,7 +1049,9 @@ impl View {
                     if let Some(at) = self.agent(&name)
                         && !self.agents[at].waits.unsure(&name)
                     {
-                        self.agents[at].waits.asked(&name, seen.ask);
+                        let running = self.agents[at].running.is_some();
+                        let ask = seen.open(&self.resolved, &name, running);
+                        self.agents[at].waits.asked(&name, ask);
                     }
                 }
                 Feed::Asked(_, None) => {}
@@ -4513,6 +4521,7 @@ pub const REPLAY_KEYS: &str = "space pause · ←→ step · [ ] speed · esc li
 pub fn watch(
     runtime: &tokio::runtime::Runtime,
     socket: PathBuf,
+    store: PathBuf,
     centre: Option<String>,
     replay: Option<i64>,
 ) -> Result<(), String> {
@@ -4521,7 +4530,7 @@ pub fn watch(
         terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
     };
     let _inside = runtime.enter();
-    let mut view = View::open(socket);
+    let mut view = View::open(socket, store);
     view.centre_on(centre);
     if replay.is_some() {
         view.replay(replay);
@@ -7074,6 +7083,41 @@ mod tests {
         assert_eq!(state(&view, "shop.login"), Some(State::Working));
         assert_eq!(state(&view, "shop.cart"), Some(State::Working));
         assert_eq!(state(&view, "shop.lead"), None);
+    }
+
+    #[tokio::test]
+    async fn a_question_its_lead_resolved_does_not_need_the_person() {
+        let (mut view, send) = view();
+        let dir = std::env::temp_dir().join(format!("sonny-sky-resolved-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("store.resolved")).unwrap();
+        std::fs::write(dir.join("store.resolved/shop.cart.json"), r#"{"turn": 5}"#).unwrap();
+        view.resolved = dir.join("store");
+        send.send(Feed::Roll(vec![
+            json!({"name": "shop.lead"}),
+            json!({"name": "shop.cart", "created_by": "shop.lead"}),
+            json!({"name": "shop.login", "created_by": "shop.lead"}),
+        ]))
+        .unwrap();
+        let seen = |turn: i64| crate::needs::Seen {
+            ask: Some("q1".into()),
+            itself: false,
+            turn: Some(turn),
+        };
+        // Its lead resolved the cart past the turn that asked; the login
+        // still asks, as does the cart once a later turn reopens it.
+        send.send(Feed::Asked("shop.cart".into(), Some(seen(4))))
+            .unwrap();
+        send.send(Feed::Asked("shop.login".into(), Some(seen(4))))
+            .unwrap();
+        view.drain();
+        let state = |view: &View, name: &str| view.agents[view.index[name]].state();
+        assert_ne!(state(&view, "shop.cart"), Some(State::NeedsYou));
+        assert_eq!(state(&view, "shop.login"), Some(State::NeedsYou));
+        send.send(Feed::Asked("shop.cart".into(), Some(seen(6))))
+            .unwrap();
+        view.drain();
+        assert_eq!(state(&view, "shop.cart"), Some(State::NeedsYou));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]
