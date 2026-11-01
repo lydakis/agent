@@ -1874,8 +1874,15 @@ mod tests {
             .unwrap();
         assert!(added.success());
         assert!(!has_submodules(&repo).unwrap(), "not checked out");
-        std::fs::create_dir_all(repo.join(name).join(".git")).unwrap();
-        assert!(has_submodules(&repo).unwrap());
+        match std::fs::create_dir_all(repo.join(name).join(".git")) {
+            // A file system that keeps names as UTF-8 (macOS's) holds no
+            // such submodule to lose.
+            Err(e) if e.raw_os_error() == Some(libc::EILSEQ) => {}
+            made => {
+                made.unwrap();
+                assert!(has_submodules(&repo).unwrap());
+            }
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
