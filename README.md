@@ -203,9 +203,10 @@ the last through scripts that call many tools and return only what they print.
 
 ### When to use Sonny
 
-For one quick task, Claude Code or Codex is faster: you ask, you watch, you
-get the result back. Use them for that. They keep your attention on one
-task; Sonny lets you spend less attention across many. It is for the work
+For one quick task, use Claude Code or Codex: you ask, you watch, and the
+answer comes straight back, with no lead between you and the work. That is a
+recommendation from using both, not a measured comparison. They keep your
+attention on one task; Sonny lets you spend less attention across many. It is for the work
 you don't want to watch closely: five things rather than one, each needing a
 question answered or a decision now and then, while mail, chat and other
 people keep adding to it.
