@@ -813,22 +813,21 @@ impl Delivery {
     }
 }
 /// A bot's ended commands nothing collected or saw, read from the partial
-/// index, which holds only what is untold in the whole store, never
-/// through the bot's history: the first ?2, with only how each ended
-/// (the fields of `ended_as`), never its output.
+/// index, which holds only what is untold in the whole store, keyed by
+/// bot and id: the first ?2 in order, read where they sit and no further,
+/// never through the bot's history or other bots' commands. Only how each
+/// ended (the fields of `ended_as`), never its output.
 const UNTOLD: &str = "SELECT p.id,p.result->'$.exit_code',p.result->'$.success',
      p.result->'$.timed_out',p.result->'$.signal',p.result->'$.wall_time_ms',
      p.result->'$.error',substr(p.result->>'$.detail',1,97)
      FROM processes p INDEXED BY processes_untold
-     CROSS JOIN turns t ON t.id=p.turn
-     WHERE p.told IS NULL AND p.delivered IS NULL AND p.status<>'running' AND t.bot=?1
+     WHERE p.bot=?1 AND p.told IS NULL AND p.delivered IS NULL AND p.status<>'running'
      ORDER BY p.id LIMIT ?2";
 /// Marks every one of a bot's untold ended commands as having nothing to
 /// tell, through the same index.
 const UNTELLING: &str = "UPDATE processes SET told=0 WHERE id IN (
      SELECT p.id FROM processes p INDEXED BY processes_untold
-     CROSS JOIN turns t ON t.id=p.turn
-     WHERE p.told IS NULL AND p.delivered IS NULL AND p.status<>'running' AND t.bot=?1)";
+     WHERE p.bot=?1 AND p.told IS NULL AND p.delivered IS NULL AND p.status<>'running')";
 /// The origin of the message that tells a bot its background commands
 /// ended.
 pub const BACKGROUND_ORIGIN: &str = "background";
@@ -2129,9 +2128,9 @@ impl Database {
             CREATE INDEX IF NOT EXISTS answers_waiting ON answers(tag,id) WHERE output IS NULL;
             CREATE INDEX IF NOT EXISTS answers_paused ON answers(turn) WHERE paused_ms IS NOT NULL;
             CREATE TABLE IF NOT EXISTS processes(id INTEGER PRIMARY KEY AUTOINCREMENT, turn INTEGER NOT NULL REFERENCES turns(id),
-                call_id TEXT NOT NULL, status TEXT NOT NULL, result TEXT, delivered INTEGER, told INTEGER);
+                call_id TEXT NOT NULL, status TEXT NOT NULL, result TEXT, delivered INTEGER, told INTEGER, bot TEXT);
             CREATE INDEX IF NOT EXISTS processes_turn ON processes(turn);
-            CREATE INDEX IF NOT EXISTS processes_untold ON processes(turn)
+            CREATE INDEX IF NOT EXISTS processes_untold ON processes(bot,id)
                 WHERE told IS NULL AND delivered IS NULL AND status<>'running';
             CREATE TABLE IF NOT EXISTS artifacts(turn INTEGER NOT NULL REFERENCES turns(id), call_id TEXT NOT NULL,
                 stream TEXT NOT NULL, data BLOB NOT NULL, raw_bytes INTEGER NOT NULL DEFAULT 0, file TEXT,
@@ -2225,8 +2224,8 @@ impl Database {
         let untold: Vec<String> = db
             .conn
             .prepare(
-                "SELECT DISTINCT t.bot FROM processes p JOIN turns t ON t.id=p.turn
-                 WHERE p.told IS NULL AND p.delivered IS NULL AND p.status<>'running'",
+                "SELECT DISTINCT bot FROM processes INDEXED BY processes_untold
+                 WHERE told IS NULL AND delivered IS NULL AND status<>'running'",
             )?
             .query_map([], |r| r.get(0))?
             .collect::<rusqlite::Result<_>>()?;
@@ -9542,10 +9541,14 @@ impl Database {
     /// Register a background command. Ids are unique for the store's lifetime,
     /// so a handle never resolves to a later command after a restart.
     pub fn process_start(&mut self, turn: i64, call_id: &str) -> Result<i64> {
-        self.conn.execute(
-            "INSERT INTO processes(turn,call_id,status) VALUES (?,?,'running')",
+        if self.conn.execute(
+            "INSERT INTO processes(turn,bot,call_id,status)
+             SELECT id,bot,?2,'running' FROM turns WHERE id=?1",
             params![turn, call_id],
-        )?;
+        )? != 1
+        {
+            return fail("turn_not_found");
+        }
         Ok(self.conn.last_insert_rowid())
     }
     /// The outcome and its overflow become visible in one transaction.
@@ -10621,7 +10624,7 @@ impl Database {
                  AND NOT EXISTS(SELECT 1 FROM processes p WHERE p.turn=r.turn AND p.told>0
                       AND EXISTS(SELECT 1 FROM turns t WHERE t.id=p.told
                                  AND t.status IN ('queued','ready','running')))
-                 AND NOT EXISTS(SELECT 1 FROM processes p INDEXED BY processes_untold WHERE p.turn=r.turn
+                 AND NOT EXISTS(SELECT 1 FROM processes p WHERE p.turn=r.turn
                       AND p.told IS NULL AND p.delivered IS NULL AND p.status<>'running')
                  ORDER BY turn LIMIT ?5",
             )?
@@ -13374,6 +13377,22 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
              UPDATE processes SET told=0 WHERE status<>'running';",
         )?;
     }
+    // A command's bot keys the untold index; those still running are the
+    // only ones whose end can be told.
+    if from < 77
+        && conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='processes')
+             AND NOT EXISTS(SELECT 1 FROM pragma_table_info('processes') WHERE name='bot')",
+            [],
+            |r| r.get::<_, bool>(0),
+        )?
+    {
+        conn.execute_batch(
+            "ALTER TABLE processes ADD COLUMN bot TEXT;
+             UPDATE processes SET bot=(SELECT bot FROM turns WHERE turns.id=processes.turn)
+              WHERE status='running';",
+        )?;
+    }
     Ok(())
 }
 /// 53 -> 54: a turn's denial count became a window of its last decided
@@ -13954,10 +13973,40 @@ mod tests {
             .unwrap()
             .collect::<rusqlite::Result<_>>()
             .unwrap();
-        assert!(plan[0].contains("processes_untold"), "{plan:?}");
+        assert!(plan[0].contains("processes_untold (bot=?)"), "{plan:?}");
         assert!(
-            plan.iter().all(|step| !step.contains("turns_bot")),
-            "never through a bot's history: {plan:?}"
+            plan.iter()
+                .all(|step| !step.contains("turns") && !step.contains("TEMP B-TREE")),
+            "never through a bot's history, nor sorted: {plan:?}"
+        );
+        // A batch stops where it ends, however many are untold, the bot's
+        // own or others'.
+        let steps = |untold: i64| {
+            let conn = Connection::open_in_memory().unwrap();
+            let db = Database::initialize(conn).unwrap();
+            db.conn.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+            for bot in ["Ann", "Bob", "Cy"] {
+                db.conn
+                    .execute(
+                        "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<?2)
+                         INSERT INTO processes(turn,bot,call_id,status,result)
+                         SELECT 1,?1,'c'||i,'finished','{\"exit_code\":0}' FROM n",
+                        params![bot, untold],
+                    )
+                    .unwrap();
+            }
+            let mut statement = db.conn.prepare(UNTOLD).unwrap();
+            let read = statement
+                .query_map(params!["Bob", 4], |r| r.get::<_, i64>(0))
+                .unwrap()
+                .count();
+            assert_eq!(read, 4);
+            statement.get_status(rusqlite::StatementStatus::VmStep)
+        };
+        let (few, many) = (steps(10), steps(10_000));
+        assert!(
+            many <= few + 8,
+            "{few} steps for 10 untold, {many} for 10,000"
         );
     }
 

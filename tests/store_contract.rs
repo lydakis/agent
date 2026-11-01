@@ -15761,7 +15761,7 @@ fn schema_76_tells_no_bot_of_commands_that_ended_before() {
         .unwrap()
         .execute_batch(
             "DROP INDEX processes_untold; ALTER TABLE processes DROP COLUMN told;
-             PRAGMA user_version=76;",
+             ALTER TABLE processes DROP COLUMN bot; PRAGMA user_version=76;",
         )
         .unwrap();
     let db = Database::initialize(Connection::open(&path).unwrap()).unwrap();

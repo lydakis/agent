@@ -6829,11 +6829,12 @@ moved within their noise too.
 
 ## A resting bot hears its background commands end (#625)
 
-`processes` gains `told`, and a partial index `processes_untold` holds only
-the ended commands nothing collected or saw, store-wide. `finish` and
-`process_finish`, store jobs that already run, look in that index for the
-bot (empty in the common case, so one probe) and, when it holds the bot's,
-queue one note with how each ended, never its output. A terminal's seen end
+`processes` gains `told` and `bot`, and a partial index `processes_untold`
+on `(bot, id)` holds only the ended commands nothing collected or saw.
+`finish` and `process_finish`, store jobs that already run, look in that
+index for the bot (empty in the common case, so one probe) and, when it
+holds the bot's, read the first batch in order and queue one note with how
+each ended, never its output. A terminal's seen end
 is one more UPDATE inside the `tool_finish` op that records its result. No
 task, timer or per-bot memory is added; the run loop gains one `Notify` arm.
 
