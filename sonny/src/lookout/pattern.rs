@@ -17,7 +17,8 @@
 //! `"$or": [pattern, ...]` beside the fields matches when any of those
 //! patterns does. Nothing in a pattern runs: it is data, matched against
 //! data, held to a size, and it only ever narrows what is heard.
-use serde_json::Value;
+use serde_json::{Number, Value};
+use std::cmp::Ordering;
 
 /// The most a pattern may say, as compact JSON.
 pub const PATTERN_BYTES: usize = 4 * 1024;
@@ -136,7 +137,7 @@ fn matcher(value: &Value, at: &str) -> Result<(), String> {
 }
 
 /// The comparisons a `numeric` list makes, as (operator, number).
-fn numeric(terms: &[Value]) -> Result<Vec<(&str, f64)>, String> {
+fn numeric(terms: &[Value]) -> Result<Vec<(&str, &Number)>, String> {
     if terms.is_empty() || terms.len() > 4 || !terms.len().is_multiple_of(2) {
         return Err("one or two comparisons".into());
     }
@@ -146,7 +147,7 @@ fn numeric(terms: &[Value]) -> Result<Vec<(&str, f64)>, String> {
                 .filter(|op| ["=", "<", "<=", ">", ">="].contains(op))
                 .ok_or("an operator is =, <, <=, > or >=")?;
             let n = pair[1]
-                .as_f64()
+                .as_number()
                 .ok_or("each operator is followed by a number")?;
             Ok((op, n))
         })
@@ -209,15 +210,20 @@ fn one(wanted: &Value, got: &Value) -> bool {
             text.is_some_and(|t| t.to_lowercase() == s.to_lowercase())
         }
         ("numeric", Value::Array(terms)) => {
-            let (Some(n), Ok(terms)) = (got.as_f64(), numeric(terms)) else {
+            let (Some(n), Ok(terms)) = (got.as_number(), numeric(terms)) else {
                 return false;
             };
-            terms.iter().all(|(op, bound)| match *op {
-                "=" => n == *bound,
-                "<" => n < *bound,
-                "<=" => n <= *bound,
-                ">" => n > *bound,
-                _ => n >= *bound,
+            terms.iter().all(|(op, bound)| {
+                let Some(order) = compare(n, bound) else {
+                    return false;
+                };
+                match *op {
+                    "=" => order.is_eq(),
+                    "<" => order.is_lt(),
+                    "<=" => order.is_le(),
+                    ">" => order.is_gt(),
+                    _ => order.is_ge(),
+                }
             })
         }
         ("anything-but", Value::Array(list)) => !list.iter().any(|v| equal(v, got)),
@@ -233,16 +239,45 @@ fn equal(wanted: &Value, got: &Value) -> bool {
     let (Value::Number(a), Value::Number(b)) = (wanted, got) else {
         return wanted == got;
     };
-    if let (Some(a), Some(b)) = (a.as_i64(), b.as_i64()) {
-        return a == b;
+    compare(a, b).is_some_and(Ordering::is_eq)
+}
+
+/// How two numbers compare, exactly: whole numbers as whole numbers, past
+/// the 2^53 a float holds them to, as sequence IDs and nanosecond times
+/// run, and a whole number against a fraction without rounding either.
+fn compare(a: &Number, b: &Number) -> Option<Ordering> {
+    match (whole(a), whole(b)) {
+        (Some(a), Some(b)) => Some(a.cmp(&b)),
+        (Some(a), None) => fraction_against(b.as_f64()?, a).map(Ordering::reverse),
+        (None, Some(b)) => fraction_against(a.as_f64()?, b),
+        (None, None) => a.as_f64()?.partial_cmp(&b.as_f64()?),
     }
-    if let (Some(a), Some(b)) = (a.as_u64(), b.as_u64()) {
-        return a == b;
+}
+
+/// A number JSON holds as a whole one, i64 or u64, widened so both fit.
+fn whole(n: &Number) -> Option<i128> {
+    (n.as_i64().map(i128::from)).or_else(|| n.as_u64().map(i128::from))
+}
+
+/// How a float compares with a whole number, exactly: its whole part
+/// first, then whether a fraction is left.
+fn fraction_against(f: f64, whole: i128) -> Option<Ordering> {
+    if f.is_nan() {
+        return None;
     }
-    // A whole number and a fraction, or one past i64 against a negative.
-    match (a.is_f64() || b.is_f64(), a.as_f64(), b.as_f64()) {
-        (true, Some(a), Some(b)) => a == b,
-        _ => false,
+    // Past any i64 or u64, it is past the whole number too.
+    const BEYOND: f64 = 18_446_744_073_709_551_616.0; // 2^64
+    if f >= BEYOND {
+        return Some(Ordering::Greater);
+    }
+    if f <= -BEYOND {
+        return Some(Ordering::Less);
+    }
+    let truncated = f.trunc();
+    // Exact: a float under 2^64 in size has a whole part that fits i128.
+    match (truncated as i128).cmp(&whole) {
+        Ordering::Equal => (f - truncated).partial_cmp(&0.0),
+        order => Some(order),
     }
 }
 
@@ -350,6 +385,48 @@ mod tests {
         assert!(hears(json!({"nope": [{"exists": false}]})));
         assert!(!hears(json!({"author": [{"exists": false}]})));
         assert!(!hears(json!({"nope": [{"exists": true}]})));
+    }
+
+    #[test]
+    fn numbers_past_a_float_s_precision_compare_exactly() {
+        let event = json!({"seq": 9_007_199_254_740_993_u64, "ns": 18_446_744_073_709_551_615_u64,
+            "neg": -9_007_199_254_740_993_i64, "half": 2.5});
+        let hears = |pattern: Value| {
+            check(&pattern).unwrap();
+            matches(&pattern, &event)
+        };
+        // 2^53 + 1, which a float reads as 2^53.
+        assert!(hears(
+            json!({"seq": [{"numeric": [">", 9_007_199_254_740_992_u64]}]})
+        ));
+        assert!(!hears(
+            json!({"seq": [{"numeric": ["=", 9_007_199_254_740_992_u64]}]})
+        ));
+        assert!(hears(
+            json!({"seq": [{"numeric": ["=", 9_007_199_254_740_993_u64]}]})
+        ));
+        assert!(!hears(
+            json!({"seq": [{"numeric": ["<", 9_007_199_254_740_993_u64]}]})
+        ));
+        assert!(!hears(json!({"seq": [9_007_199_254_740_992_u64]})));
+        // u64's top, and a negative past 2^53.
+        assert!(hears(
+            json!({"ns": [{"numeric": [">", 18_446_744_073_709_551_614_u64]}]})
+        ));
+        assert!(hears(
+            json!({"neg": [{"numeric": ["<", -9_007_199_254_740_992_i64]}]})
+        ));
+        assert!(hears(json!({"ns": [{"numeric": [">", -1]}]})));
+        // A float against a whole number neither rounds: 2^53 as a float
+        // is under 2^53 + 1, and 2.5 is over 2 and under 3.
+        assert!(hears(
+            json!({"seq": [{"numeric": [">", 9_007_199_254_740_992.0]}]})
+        ));
+        assert!(!hears(json!({"seq": [9_007_199_254_740_992.0]})));
+        assert!(hears(json!({"half": [{"numeric": [">", 2, "<", 3]}]})));
+        assert!(hears(json!({"half": [{"numeric": ["=", 2.5]}]})));
+        assert!(hears(json!({"ns": [{"numeric": ["<", 1e30]}]})));
+        assert!(hears(json!({"neg": [{"numeric": [">", -1e30]}]})));
     }
 
     #[test]
