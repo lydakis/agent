@@ -1397,7 +1397,10 @@ mod tests {
         ];
         let built = |name: &str| lineage(&root, name, &shipped).unwrap();
         assert_eq!(built("deeper"), ["deeper", "my-lead", "lead", "lead"]);
-        assert_eq!(built("superlead"), ["superlead", "superlead", "lead", "lead"]);
+        assert_eq!(
+            built("superlead"),
+            ["superlead", "superlead", "lead", "lead"]
+        );
         assert_eq!(built("reviewer"), ["reviewer"]);
         assert!(built("nobody").is_empty());
         // The Profiles index an agent reads still leaves the lead's out.
