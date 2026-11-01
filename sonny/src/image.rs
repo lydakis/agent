@@ -520,6 +520,12 @@ pub fn bigger(path: &std::path::Path) -> Result<std::path::PathBuf, String> {
     if matches!(kind, Kind::Picture | Kind::Page) {
         return Ok(path.to_owned());
     }
+    // Only a regular file, and only so much of it: a pipe could wait
+    // forever for a writer.
+    let meta = std::fs::metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    if !meta.is_file() || meta.len() > MOST_BYTES {
+        return Err(format!("{} is not a drawing Sonny reads", path.display()));
+    }
     let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let svg = match kind {
         Kind::Mermaid => crate::mermaid::svg(&text)?,

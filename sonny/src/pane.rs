@@ -185,7 +185,8 @@ impl Pane {
         // Its escapes kept, as the path read back may hold `#` or `%`;
         // the line left off.
         let link = url.split('#').next().unwrap_or(url);
-        let bigger = (tree.is_none() && is_drawing(&path)).then(|| path.clone());
+        // A pipe named `.svg` is no drawing: reading it could wait forever.
+        let bigger = (path.is_file() && is_drawing(&path)).then(|| path.clone());
         Ok(Self {
             title,
             link: Some(link.to_owned()),
@@ -1237,13 +1238,17 @@ mod tests {
     fn a_pipe_is_not_read() {
         let dir = std::env::temp_dir().join(format!("sonny-fifo-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let fifo = dir.join("pipe");
+        let fifo = dir.join("pipe.svg");
         let made = std::process::Command::new("mkfifo").arg(&fifo).status();
         if made.is_ok_and(|s| s.success()) {
             // Opening it would wait for a writer that never comes.
             let mut pane = Pane::preview(&format!("file://{}", fifo.display()), &dir, 60).unwrap();
             let shown = rows(&mut pane, 60, 3);
             assert!(shown[2].contains("not a file a preview reads"), "{shown:?}");
+            // Nor is it opened bigger, which would read it.
+            assert_eq!(pane.bigger(), None);
+            assert!(!shown[0].contains("open bigger"), "{shown:?}");
+            assert!(crate::image::bigger(&fifo).is_err());
         }
         std::fs::remove_dir_all(&dir).unwrap();
     }
