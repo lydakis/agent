@@ -14886,6 +14886,50 @@ fn a_page_of_pauses_fits_one_reply() {
 }
 
 #[test]
+fn a_planned_call_keeps_what_the_rules_made_of_it() {
+    use agent_runtime::rules::{Policy, Rules, Ruling};
+    let mut db = db();
+    let turn = gated_turn(&mut db, None);
+    let mut policy = Policy::default();
+    policy
+        .parse(
+            "test.rules",
+            "prefix_rule(pattern = [\"rm\"], decision = \"forbidden\")\n\
+             prefix_rule(pattern = [\"git\"], decision = \"prompt\")",
+        )
+        .unwrap();
+    let rules = Rules::new(policy);
+    let (rm, rm_call) = shell_call("fc_1", "c1", "rm -rf x");
+    let (git, git_call) = shell_call("fc_2", "c2", "git push");
+    let (ls, ls_call) = shell_call("fc_3", "c3", "ls");
+    let calls = [rm_call.clone(), git_call.clone(), ls_call.clone()];
+    db.append_under(turn, vec![rm, git, ls], &calls, None, &rules)
+        .unwrap();
+    // Read back with no rules at all, as after a restart that changed them.
+    let ruled = db.rulings(turn).unwrap();
+    let bot = db.inspect("Bob").unwrap();
+    assert_eq!(
+        bot.ruling(&rm_call, &ruled),
+        Ok(Ruling::Forbidden(
+            "the rule at test.rules:1 names `rm`".into()
+        ))
+    );
+    assert!(matches!(
+        bot.ruling(&git_call, &ruled),
+        Ok(Ruling::Prompt(_))
+    ));
+    assert_eq!(bot.ruling(&ls_call, &ruled), Ok(Ruling::None));
+    // The prompt one was announced, so its run waits on it.
+    let workspace = std::path::Path::new("/synthetic");
+    assert!(bot.gated(&git_call, workspace, &ruled));
+    let page = db.approvals(Some("Bob"), None, 0, None, 64).unwrap();
+    let announced: Vec<_> = (page["approvals"].as_array().unwrap().iter())
+        .map(|a| a["call_id"].clone())
+        .collect();
+    assert!(announced.contains(&json!("c2")));
+}
+
+#[test]
 fn a_bots_commands_let_out_of_its_sandbox_leave_its_settings_for_the_rules() {
     let path =
         std::env::temp_dir().join(format!("agent-unsandboxed-{}.sqlite", std::process::id()));
@@ -14911,5 +14955,10 @@ fn a_bots_commands_let_out_of_its_sandbox_leave_its_settings_for_the_rules() {
     );
     assert_eq!(db.inspect("Ann").unwrap().settings, Default::default());
     drop(db);
+    // Its planned calls keep their rulings from now on.
+    Connection::open(&path)
+        .unwrap()
+        .prepare("SELECT ruling FROM tools")
+        .unwrap();
     std::fs::remove_file(path).unwrap();
 }

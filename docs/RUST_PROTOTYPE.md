@@ -2657,16 +2657,21 @@ is then decided by the rule that matches:
 - With no match the call goes as the [sandbox](#sandbox) says.
 
 The command is found on the daemon's `PATH`, so an allowed command is
-only as trusted as the folders there. A turn reads the rules once, when
-its first round begins, so a round's announcement and its run agree; the
-folder is read again when a file in it changes, and a turn started after
-that takes the new rules. A file that can't be read or parsed, before
+only as trusted as the folders there. A turn reads the rules once, off
+the runtime thread, when its first round begins, and each call a round
+plans keeps what they made of it, which its run reads: a call runs as its
+round was announced, also after a park or a restart and whatever the
+rules say by then. The folder is read again when a file in it changes,
+and a turn started after that takes the new rules. A file that can't be read or parsed, before
 any has been, fails every shell call with `rules_invalid`, naming the file
 and line, where Codex would refuse to start; after that, the last rules
 read stay until the folder reads again. `agent rules check -- COMMAND...`
 prints what the rules decide about a command, or what is wrong with them.
 The rules folder is read-only inside every sandbox and, when missing,
-may not be made there, so no bot writes its own rules; one inside a
+may not be made there, so no bot writes its own rules. A rules file that
+is a symlink, or has another hard link, is `rules_invalid`, since the
+sandbox keeps the folder read-only and not what such a file also is
+elsewhere. A rules folder inside a
 writable folder that is a symlink refuses the call with
 `sandbox_unavailable`. Sonny's
 "always allow" on an approval prompt adds an `allow` rule to
