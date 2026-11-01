@@ -370,7 +370,15 @@ fn sync_once(places: &Places, env: Option<&[(OsString, OsString)]>) -> Result<Va
 /// when it changed, and gone with the last of them.
 fn keep_triggers(places: &Places) -> Result<(), String> {
     let held = places.repo.join(TRIGGERS);
-    let list = crate::trigger::backed_up(&crate::trigger::Places::under(&places.home));
+    let mut list = crate::trigger::backed_up(&crate::trigger::Places::under(&places.home));
+    // What a restore brought for leads not opened since stays backed up,
+    // under any trigger of the same name set up here since.
+    for row in crate::trigger::pending_restored(&places.home) {
+        if !list.iter().any(|kept| kept["name"] == row["name"]) {
+            list.push(row);
+        }
+    }
+    list.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
     if list.is_empty() {
         return match std::fs::remove_file(&held) {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.to_string()),
@@ -1040,6 +1048,16 @@ mod tests {
         assert!(adopt(&second, &url, None).unwrap());
         let restored = crate::trigger::restored_in(&second.home, "p").unwrap();
         assert!(restored.note().contains("p.digest"), "{}", restored.note());
+        // Its sync before the lead opens keeps what the lead is yet to set
+        // up, and once the lead was handed it, only what is set up here.
+        sh(&second.repo, &["config", "user.email", "t@example.com"]);
+        sh(&second.repo, &["config", "user.name", "T"]);
+        sync(&second, None).unwrap();
+        let kept = std::fs::read_to_string(second.repo.join(TRIGGERS)).unwrap();
+        assert!(kept.contains("\"name\": \"p.digest\""), "{kept}");
+        restored.told();
+        sync(&second, None).unwrap();
+        assert!(!second.repo.join(TRIGGERS).exists());
         // The last one gone, the list goes too.
         std::fs::remove_file(&job).unwrap();
         sync(&first, None).unwrap();

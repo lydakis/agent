@@ -56,7 +56,8 @@ Every reply is one JSON value on stdout; a failure is one
 
 **Shadow runs.** `--shadow` is a dry run, for moving a job from elsewhere
 onto a trigger. Each fire forks its agent where it is now (a `--start`
-trigger whose agent no fire made yet makes one as its first fire would)
+trigger whose agent no fire made yet first makes that agent, as its first
+fire would, and sends it nothing)
 into `BOT.shadow-HEX`, a copy in the read-only sandbox (its commands reach no network), no
 gate a person or a model answers, the person's command rules without their
 `allow` rules (so a `prompt` rule refuses), and of Sonny's tools only

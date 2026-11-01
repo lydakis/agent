@@ -1403,6 +1403,25 @@ pub fn restore(home: &Path, held: Option<&[u8]>) -> Result<(), String> {
     }
 }
 
+/// What a restore brought that no lead was handed yet: the rows of the
+/// folders whose lead has not opened since, which a backup keeps until it
+/// has, so a sync before then does not lose them.
+pub fn pending_restored(home: &Path) -> Vec<Value> {
+    let told = crate::upgrade::lines(&restored_told(home));
+    let list = std::fs::read(restored_list(home)).ok();
+    let list: Vec<Value> = (list.as_deref())
+        .and_then(|list| serde_json::from_slice(list).ok())
+        .unwrap_or_default();
+    (list.into_iter())
+        .filter(|row| {
+            let bot = row["bot"].as_str().unwrap_or_default();
+            !told
+                .iter()
+                .any(|project| bot.starts_with(&format!("{project}.")))
+        })
+        .collect()
+}
+
 /// How the note a restore leaves a lead starts.
 pub const RESTORED: &str = "Sonny restored this home from its backup: ";
 
@@ -3335,12 +3354,15 @@ async fn deliver(
     // short, or the trigger that replaced this one, sends it again as it
     // was, and its answer to where it was to go under the same request id,
     // which the daemon takes once.
-    if let Some((sent, sender)) = ask.and_then(|ask| sent_for(ask, trigger)) {
+    if let Some((sent, sender, of)) = ask.and_then(|ask| sent_for(ask, trigger)) {
+        if let Some(of) = of {
+            return shadow_run(client, &sender, kept, sent, &of, ask).await;
+        }
         let bot = sent["bot"].as_str().unwrap_or_default().to_owned();
         return submit(client, &sender, &bot, sent, false, ask).await;
     }
     if trigger.shadow {
-        return shadow(client, trigger, kept, why, ask).await;
+        return shadow(client, places, trigger, kept, why, ask).await;
     }
     let prompt = format!(
         "[trigger {} · {} · {why}]\n{}",
@@ -3496,49 +3518,6 @@ async fn fork_shadow(client: &Client, bot: &str, id: i64) -> Result<(String, i64
     Ok((name, shadow))
 }
 
-/// A shadow copy for a `--start` trigger whose agent no fire made yet:
-/// made as its first fire would make it, confined.
-async fn start_shadow(client: &Client, trigger: &Trigger) -> Result<(String, i64), Value> {
-    let failed = |detail: String| json!({"outcome": "failed", "detail": detail});
-    let (
-        Target::Start {
-            name,
-            model,
-            effort,
-            ..
-        },
-        Some(dir),
-    ) = (&trigger.target, &trigger.dir)
-    else {
-        return Err(failed("invalid_trigger: not a --start trigger".into()));
-    };
-    let shadow = shadow_name(name);
-    let instructions = crate::project::plain(dir).map_err(failed)?;
-    let mut asked = json!({"bot": shadow, "workspace": dir, "model": model, "effort": effort,
-        "instructions": instructions, "request_id": shadow});
-    crate::made(client, &mut asked, model, dir).map_err(failed)?;
-    // Made unconfined by nobody: the copy's own fields come next, and
-    // until then it has run nothing.
-    if let Value::Object(fields) = &mut asked {
-        for key in ["approve", "approver", "approve_expire_ms"] {
-            fields.remove(key);
-        }
-    }
-    asked["settings"]["sandbox"] = json!("read-only");
-    asked["settings"]["rules"] = json!(shadow_rules(crate::rules::given().as_ref()));
-    let made = client.request("create", asked).await;
-    let id = made.map_err(|e| failed(coded(e)))?["bot_id"]
-        .as_i64()
-        .unwrap_or_default();
-    let record = (client
-        .request("inspect", json!({"bot": shadow, "bot_id": id}))
-        .await)
-        .map_err(|e| failed(coded(e)))?;
-    let tools = shadow_tools(&record);
-    confine(client, &shadow, id, &tools).await?;
-    Ok((shadow, id))
-}
-
 /// Make `name` a shadow copy, or remove it: a copy that could not be
 /// confined never runs.
 async fn confine(client: &Client, name: &str, id: i64, tools: &[String]) -> Result<(), Value> {
@@ -3561,37 +3540,71 @@ async fn confine(client: &Client, name: &str, id: i64, tools: &[String]) -> Resu
 /// is passed on.
 async fn shadow(
     client: &Client,
+    places: &Places,
     trigger: &Trigger,
-    kept: &Kept,
+    kept: &mut Kept,
     why: &str,
     ask: Option<&Asked>,
 ) -> Value {
-    let source = match (&trigger.target, kept.started_id) {
-        (Target::Bot { name, id }, _) => Some((name.as_str(), *id)),
-        (Target::Start { name, .. }, Some(id)) => Some((name.as_str(), id)),
-        (Target::Start { .. }, None) => None,
+    // A `--start` trigger's agent no fire made yet is made as its first
+    // fire would make it, and sent nothing: the copy is of it, so it has
+    // the same expiry and the same tools as any other copy.
+    let (bot, id) = match (&trigger.target, kept.started_id) {
+        (Target::Bot { name, id }, _) => (name.as_str(), *id),
+        (Target::Start { name, .. }, Some(id)) => (name.as_str(), id),
+        (Target::Start { name, .. }, None) => match start(client, trigger).await {
+            Ok(id) => {
+                kept.started_id = Some(id);
+                made(places, trigger, id);
+                (name.as_str(), id)
+            }
+            Err(error) => return unmade(error),
+        },
     };
-    let made = match source {
-        Some((bot, id)) => fork_shadow(client, bot, id).await,
-        None => start_shadow(client, trigger).await,
-    };
-    let (name, id) = match made {
+    let (name, shadow) = match fork_shadow(client, bot, id).await {
         Ok(made) => made,
         Err(outcome) => return outcome,
     };
-    let of = source.map_or(trigger.bot(), |(bot, _)| bot);
     let prompt = format!(
         "[trigger {} · {} · {why} · shadow run]\nThis is a shadow run: you are a read-only \
-         copy of {of}, and every call past reading is refused, not asked about. Do the work \
+         copy of {bot}, and every call past reading is refused, not asked about. Do the work \
          below as far as reading goes, then end with what you would have done: each change, \
          message or post, with what it would have said.\n\n{}",
         trigger.name,
         stamp(now()),
         trigger.message
     );
-    let asking = json!({"bot": name, "bot_id": id, "request_id": request_id(trigger, id, ask),
+    let asking = json!({"bot": name, "bot_id": shadow, "request_id": request_id(trigger, shadow, ask),
         "prompt": prompt, "delivery": "reject", "origin": "trigger",
         "budget_tokens": trigger.turn_budget_tokens});
+    if let Some(ask) = ask {
+        // As any ask keeps what it sent: one cut short goes on with this
+        // copy and this request, which the daemon takes once, and does not
+        // make another copy to do the work again.
+        let sent = json!({"store_id": trigger.store_id, "generation": trigger.generation,
+            "reply_to": trigger.reply_to, "shadow_of": bot, "submit": asking});
+        if let Err(error) = keep_sent(places, trigger, ask, &sent) {
+            let _ = client
+                .request("delete", json!({"bot": name, "bot_id": shadow}))
+                .await;
+            return json!({"outcome": "failed", "detail": error});
+        }
+    }
+    shadow_run(client, trigger, kept, asking, bot, ask).await
+}
+
+/// Send a shadow copy its turn, and pass its answer on as a report; the
+/// copy goes once its report went.
+async fn shadow_run(
+    client: &Client,
+    trigger: &Trigger,
+    kept: &Kept,
+    asking: Value,
+    of: &str,
+    ask: Option<&Asked>,
+) -> Value {
+    let name = asking["bot"].as_str().unwrap_or_default().to_owned();
+    let id = asking["bot_id"].as_i64().unwrap_or_default();
     let turn = match client.request("submit", asking).await {
         Ok(turn) => turn["turn"].as_i64().unwrap_or_default(),
         Err(error) => {
@@ -3695,8 +3708,8 @@ fn keep_sent(places: &Places, trigger: &Trigger, ask: &Asked, sent: &Value) -> R
 /// The request an ask sent before, to send again, and the trigger that sent
 /// it, whose generation and `--reply-to` its answer goes under: only to the
 /// store it went to, since one that replaced its trigger on another store
-/// sends its own.
-fn sent_for(ask: &Asked, trigger: &Trigger) -> Option<(Value, Trigger)> {
+/// sends its own. A shadow fire's also names the agent its copy is of.
+fn sent_for(ask: &Asked, trigger: &Trigger) -> Option<(Value, Trigger, Option<String>)> {
     let sent = std::fs::read(&ask.path)
         .ok()
         .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
@@ -3710,7 +3723,8 @@ fn sent_for(ask: &Asked, trigger: &Trigger) -> Option<(Value, Trigger)> {
         reply_to: serde_json::from_value(sent["reply_to"].clone()).ok()?,
         ..trigger.clone()
     };
-    Some((submit.clone(), sender))
+    let of = sent["shadow_of"].as_str().map(str::to_owned);
+    Some((submit.clone(), sender, of))
 }
 
 /// Send a fire's turn, and its answer on to `--reply-to`.
@@ -3827,11 +3841,12 @@ enum GateNews {
 }
 
 impl GateNews {
-    /// What `said` is news of after `before`. A break told already is
-    /// not told again; one not told yet (its note did not go) is.
+    /// What `said` is news of after `before`, whose `told` says a break
+    /// was told and no note since said it works again. A break told
+    /// already is not told again; one not told yet (its note did not go)
+    /// is, and so is a recovery whose note did not go.
     fn of(before: &Value, said: &Result<Result<(), String>, String>) -> Option<Self> {
-        let broken = before["gate"] == "failed";
-        let told = broken && before["told"] == true;
+        let told = before["told"] == true;
         match said {
             Err(why) => (!told).then(|| Self::Broke(why.clone())),
             Ok(_) => told.then_some(Self::Works),
@@ -4351,9 +4366,19 @@ fn fire(places: &Places, trigger: &Trigger, ask: Option<&Asked>) {
     let news = said
         .as_ref()
         .and_then(|said| GateNews::of(&kept.checked, said));
+    // Whether the break stays told and not yet told over: a recovery whose
+    // note did not go is told on the next check that works.
     let told = match &news {
-        Some(news) => tell_gate(trigger, &kept, news),
+        Some(news @ GateNews::Broke(_)) => tell_gate(trigger, &kept, news),
+        Some(news @ GateNews::Works) => !tell_gate(trigger, &kept, news),
         None => kept.checked["told"] == true,
+    };
+    let checked = |gate: &str, detail: Option<&String>| {
+        let mut checked = checked(gate, detail);
+        if told {
+            checked["told"] = json!(true);
+        }
+        checked
     };
     match said {
         None => {}
@@ -4379,7 +4404,6 @@ fn fire(places: &Places, trigger: &Trigger, ask: Option<&Asked>) {
         }
         Some(Err(broken)) => {
             kept.checked = checked("failed", Some(&broken));
-            kept.checked["told"] = json!(told);
             let failed = named(json!({"outcome": "failed", "detail": broken}));
             settle(places, trigger, &failed, &kept);
             return;
@@ -4626,6 +4650,10 @@ pub(crate) mod tests {
         assert_eq!(GateNews::of(&untold, &yes), None);
         assert_eq!(GateNews::of(&went, &yes), None);
         assert_eq!(GateNews::of(&never, &no), None);
+        // A recovery whose note did not go stays owed on a check that went.
+        let owed = json!({"gate": "go", "told": true});
+        assert_eq!(GateNews::of(&owed, &yes), Some(GateNews::Works));
+        assert_eq!(GateNews::of(&owed, &broke), None, "the break was heard of");
         let s = trigger();
         let prompt = GateNews::Broke("--if: ran past 60s".into()).prompt(&s);
         assert!(prompt.starts_with("[trigger p.fix-login · "), "{prompt}");
@@ -6533,7 +6561,18 @@ pub(crate) mod tests {
             reply_to: Some(("p.lead".into(), 3)),
             ..trigger()
         };
-        let outcome = shadow(&client, &s, &Kept::default(), "every 30m", None).await;
+        let w = World::new("shadow-fire");
+        // A fire someone asked for, as `fire NAME` takes one.
+        let taking = w.places.taking(&s.name);
+        std::fs::create_dir_all(&taking).unwrap();
+        let ask = Asked {
+            kind: Ask::Fire,
+            path: taking.join("1"),
+            receipt: w.places.receipt(&s.name, "1"),
+        };
+        std::fs::write(&ask.path, "").unwrap();
+        let mut kept = Kept::default();
+        let outcome = shadow(&client, &w.places, &s, &mut kept, "every 30m", Some(&ask)).await;
         let name = outcome["shadow"].as_str().unwrap().to_owned();
         assert_eq!(shadow_source(&name), Some("p.fix-login"));
         assert_eq!(outcome["outcome"], "sent");
@@ -6542,7 +6581,8 @@ pub(crate) mod tests {
             outcome["reply"],
             json!({"outcome": "sent", "bot": "p.lead", "turn": 12})
         );
-        let asked = asked.lock().unwrap().clone();
+        let log = asked.clone();
+        let asked = log.lock().unwrap().clone();
         let ops: Vec<&str> = asked.iter().map(|r| r["op"].as_str().unwrap()).collect();
         assert_eq!(
             ops,
@@ -6582,6 +6622,22 @@ pub(crate) mod tests {
         assert_eq!(request, "trigger_test-1_shadow.3.77.1");
         assert_eq!(fire_generation(request), None);
         assert_eq!(asked[6]["bot"], name.as_str());
+        // The ask kept what it sent before it went: one cut short goes on
+        // with the same copy and request, and makes no other copy.
+        let (sent, _, of) = sent_for(&ask, &s).unwrap();
+        assert_eq!(of.as_deref(), Some("p.fix-login"));
+        assert_eq!(sent["request_id"], asked[3]["request_id"]);
+        assert_eq!(sent["bot"], name.as_str());
+        let again = deliver(&client, &w.places, &s, &mut kept, "every 30m", Some(&ask)).await;
+        assert_eq!(again["shadow"], name.as_str());
+        let resent = log.lock().unwrap()[7..].to_vec();
+        let ops: Vec<&str> = resent.iter().map(|r| r["op"].as_str().unwrap()).collect();
+        assert_eq!(ops, ["submit", "wait", "submit", "delete"]);
+        assert_eq!(
+            resent[0]["request_id"], asked[3]["request_id"],
+            "the same request, which the daemon takes once"
+        );
+        assert_eq!(resent[2]["request_id"], report["request_id"]);
     }
 
     #[tokio::test]
@@ -6602,7 +6658,8 @@ pub(crate) mod tests {
             shadow: true,
             ..trigger()
         };
-        let outcome = shadow(&client, &s, &Kept::default(), "fired", None).await;
+        let w = World::new("shadow-unconfined");
+        let outcome = shadow(&client, &w.places, &s, &mut Kept::default(), "fired", None).await;
         assert_eq!(outcome["outcome"], "failed");
         let ops: Vec<String> = (asked.lock().unwrap().iter())
             .map(|r| r["op"].as_str().unwrap().to_owned())
