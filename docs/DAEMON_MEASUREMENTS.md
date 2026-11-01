@@ -6759,3 +6759,36 @@ per bot (the gate's state is one per daemon). The later commits on this
 branch (the batch held whole, forbidden commands refused before the
 gate, the gate's waiters in order) change only which branch a call
 takes, not what runs on the hot path.
+
+### The load gate on a busy machine
+
+The screen above runs with no gate, so it says only that the check is
+cheap. `bench/load_gate.py` turns the gate on. Sixteen workers on a
+4-CPU box each run 15 turns back to back, and each turn runs one shell
+command of fixed CPU work (`sum(range(2e7))`, about half a CPU second).
+Every half second, a probe measures three things:
+
+- a turn with no command (submit to end);
+- a turn whose command is `true`, which the gate holds like any other;
+- a `bots` request.
+
+Each run starts once the 1-minute load is under 1. All runs use the same
+build.
+
+| Measure | No gate | `--max-load 4` (CPUs) | `--max-load 8` (CPUs × 2, the CLI's default) |
+| --- | ---: | ---: | ---: |
+| Work's wall time, s | 36.4 | 62.9 | 36.3 |
+| Work commands running, mean | 15.1 | 6.8 | 15.0 |
+| 1-minute load, max | 7.29 | 4.7 | 7.45 |
+| `true` command, p50 / p95 ms | 89 / 134 | 74 / 8,049 | 80 / 124 |
+| Turn with no command, p50 / p95 ms | 45 / 72 | 30 / 54 | 37 / 67 |
+| `bots` request, p95 ms | 11.6 | 15.9 | 15.1 |
+| Daemon CPU, s | 3.61 | 3.59 | 3.50 |
+
+Results:
+
+- **The gate costs the daemon nothing.** Its CPU is the same in every run. The storage writer spends about 2.4 s of it, the runtime 1.0 s and the readers 0.2 s, and the gate's thread spends none.
+- **At the CPU count, the gate holds the machine's load where it was set.** Turns that run no command get faster (p50 45 → 30 ms). The cost is that the same work takes 1.7× as long. The 1-minute average trails what runs now, so the gate stays shut a while after the machine has room, as make's `-l` does. Short commands wait behind it (p95 8 s).
+- **At the default of twice the CPUs, the gate never shut** in this 36-second burst, because the 1-minute load peaked at 7.45. It acts only on overload that lasts.
+
+An earlier version of the screen polled `wait` every 20 ms per worker. That polling cost the daemon more than the gate did, and the cost grew with the longer gated runs. The screen now waits on each worker's own connection.
