@@ -536,7 +536,7 @@ impl View {
             ));
             out.push(
                 Line::from(
-                    "An agent adds an automation with its triggers tool, and a follow with its subscriptions tool.",
+                    "An agent adds an automation with its automations tool, and a follow with its subscriptions tool.",
                 )
                 .dim(),
             );

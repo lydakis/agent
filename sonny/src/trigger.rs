@@ -8,20 +8,20 @@
 //! changing or removing one is a file and nothing the system registers.
 //! The daemon has no clock or watcher of its own.
 //!
-//! A trigger is one definition, `~/.agent/triggers/jobs/NAME.json`: the
+//! A trigger is one definition, `~/.agent/automations/jobs/NAME.json`: the
 //! program its fire runs (this executable with `--trigger-fire` and
 //! everything the fire needs as its arguments), the environment it runs
 //! with, its calendar entries and the path it watches. The scheduler runs
 //! it as launchd runs a job: one fire of a trigger at a time, again while
 //! its queue of asks holds one. What its fires did and leave for the next
 //! (messages sent, the agent it started, the commit it saw) is
-//! `~/.agent/triggers/NAME.json`. A fire messages the agent the trigger was
+//! `~/.agent/automations/NAME.json`. A fire messages the agent the trigger was
 //! made for, pinned by its id, or starts the agent it names the first time
 //! and messages that one after; never a working agent, for a repeating
 //! trigger: that time is skipped. A deleted agent takes its triggers with
 //! it.
 //!
-//! `~/.agent/trigger`, a script Sonny writes, is how agents and people
+//! `~/.agent/automation`, a script Sonny writes, is how agents and people
 //! add, list, fire and remove them.
 use agent_client::Client;
 use serde_json::{Value, json};
@@ -31,8 +31,21 @@ use std::{
     time::Duration,
 };
 
-/// What `~/.agent/trigger` runs: `sonny trigger ARGS`.
-pub const VERB: &str = "trigger";
+/// What `~/.agent/automation` runs: `sonny automation ARGS`.
+pub const VERB: &str = "automation";
+/// The `when` of an automation that only runs when asked to.
+pub const ON_DEMAND: &str = "on demand";
+/// Why an automation ran when asked to, as its message's first line says.
+const RUN_NOW: &str = "run now";
+/// What prompts an automation sends say they are from (`origin`).
+pub const ORIGIN: &str = "automation";
+/// What they said before 0.8.0, when automations were triggers: the
+/// store keeps what it was sent, so history still reads it.
+pub const OLD_ORIGIN: &str = "trigger";
+/// Whether `origin` is an automation's.
+pub fn sent_it(origin: &str) -> bool {
+    origin == ORIGIN || origin == OLD_ORIGIN
+}
 /// What a trigger's job runs.
 pub const FIRE_FLAG: &str = "--trigger-fire";
 /// How each trigger's own launchd label and systemd unit name started,
@@ -59,7 +72,7 @@ const REPLY_WAIT_MS: u64 = 86_400_000;
 /// How long `fire` waits for launchd's run of the job to say what came of
 /// it: its gate's whole time, and then some for the send.
 const FIRE_WAIT: Duration = Duration::from_secs(90);
-pub const USAGE: &str = "usage: trigger add [--name NAME] [WHEN] [--bot NAME | --start NAME --model PROVIDER/MODEL [--effort LEVEL]] [--reply-to BOT] [--if CMD] [--runs N] [--turn-budget-tokens N] [--shadow] [--replace] -- MESSAGE\n         WHEN: --every N{m,h,d} | --in N{m,h} | --at 'YYYY-MM-DD HH:MM' | --cron 'MIN HOUR DAY MONTH WEEKDAY' | --file PATH | --commit REPO; none: only fire runs it\n       trigger ls [--after NAME]\n       trigger show NAME\n       trigger fire NAME\n       trigger rm NAME";
+pub const USAGE: &str = "usage: automation add [--name NAME] [WHEN] [--bot NAME | --start NAME --model PROVIDER/MODEL [--effort LEVEL]] [--reply-to BOT] [--if CMD] [--runs N] [--turn-budget-tokens N] [--shadow] [--replace] -- MESSAGE\n         WHEN: --every N{m,h,d} | --in N{m,h} | --at 'YYYY-MM-DD HH:MM' | --cron 'MIN HOUR DAY MONTH WEEKDAY' | --file PATH | --commit REPO; none: only run runs it\n       automation ls [--after NAME]\n       automation show NAME\n       automation run NAME\n       automation rm NAME";
 
 /// The system's own scheduler, which keeps Sonny's one job.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -96,7 +109,7 @@ impl Scheduler {
     }
 }
 
-/// Where triggers live, `~/.agent/triggers`: `jobs` holds their
+/// Where triggers live, `~/.agent/automations`: `jobs` holds their
 /// definitions, and `state` what each one's fires did, their queues of
 /// asks, and the scheduler's own files.
 #[derive(Clone)]
@@ -107,12 +120,25 @@ pub struct Places {
 
 impl Places {
     pub fn home() -> Result<Self, String> {
-        let home = std::env::var_os("HOME").ok_or("no HOME for triggers")?;
-        Ok(Self::under(Path::new(&home)))
+        let home = std::env::var_os("HOME").ok_or("no HOME for automations")?;
+        let places = Self::under(Path::new(&home));
+        places.moved_from_triggers(Path::new(&home));
+        Ok(places)
+    }
+    /// `~/.agent/triggers`, as the folder was named before 0.8.0, moved to
+    /// its place: whatever runs first, Sonny, its scheduler or the script,
+    /// moves it, before anything is read or written there. A folder made
+    /// in its place since is left as it is (upgrade migration
+    /// `automations-folder`).
+    fn moved_from_triggers(&self, home: &Path) {
+        let old = home.join(".agent/triggers");
+        if !self.state.exists() && old.is_dir() {
+            let _ = std::fs::rename(&old, &self.state);
+        }
     }
     /// Under the HOME `home`.
     pub(crate) fn under(home: &Path) -> Self {
-        let state = home.join(".agent/triggers");
+        let state = home.join(".agent/automations");
         Self {
             jobs: state.join("jobs"),
             state,
@@ -406,7 +432,7 @@ impl Trigger {
 
     /// Read back from a fire's arguments, after the flag.
     fn parse(args: &[String]) -> Result<Self, String> {
-        let bad = |what: &str| format!("invalid_trigger: {what}");
+        let bad = |what: &str| format!("invalid_automation: {what}");
         let mut v = std::collections::HashMap::<&str, &String>::new();
         let mut iter = args.iter();
         let message = loop {
@@ -523,7 +549,7 @@ impl Trigger {
     }
 
     /// The first field another trigger of its name differs in, to name in
-    /// `trigger_exists`. Its generation and first time are when it was
+    /// `automation_exists`. Its generation and first time are when it was
     /// made, not what it is.
     fn differs(&self, other: &Self) -> Option<&'static str> {
         let (target, mine) = match (&self.target, &other.target) {
@@ -1270,14 +1296,14 @@ fn read_record(path: &Path) -> Result<String, String> {
         .and_then(|file| file.take(MAX_RECORD + 1).read_to_string(&mut text))
         .map_err(|e| format!("unreadable: {e}"))?;
     if text.len() as u64 > MAX_RECORD {
-        return Err("unreadable: trigger record too large".into());
+        return Err("unreadable: automation record too large".into());
     }
     Ok(text)
 }
 
 fn read_trigger(path: &Path) -> Read {
     read_record(path).and_then(|text| {
-        read_job(&text).ok_or_else(|| "unreadable: not a trigger's definition".into())
+        read_job(&text).ok_or_else(|| "unreadable: not an automation's definition".into())
     })
 }
 
@@ -1338,7 +1364,7 @@ pub fn list(places: &Places, after: Option<&str>) -> Value {
     }
     let next = more.then(|| names.last().cloned()).flatten();
     let rows: Vec<_> = names.into_iter().map(|name| row(places, &name)).collect();
-    json!({"triggers": rows, "next_after": next})
+    json!({"automations": rows, "next_after": next})
 }
 
 /// What a backup keeps of this HOME's triggers: each one's definition as
@@ -1376,7 +1402,7 @@ impl Trigger {
 /// Where a restore leaves the backup's list of triggers, and which
 /// projects' leads were handed theirs, a line each.
 fn restored_list(home: &Path) -> PathBuf {
-    home.join(".agent/sonny/restored-triggers.json")
+    home.join(".agent/sonny/restored-automations.json")
 }
 
 fn restored_told(home: &Path) -> PathBuf {
@@ -1520,9 +1546,9 @@ pub(crate) fn restored_in(home: &Path, project: &str) -> Option<Restored> {
                 _ => format!(" (part {} of {count})", at + 1),
             };
             let note = format!(
-                "{RESTORED}its triggers did not come back, since each was tied to an agent in \
+                "{RESTORED}its automations did not come back, since each was tied to an agent in \
                  the old machine's store, which a backup leaves out. These were this folder's, \
-                 as the backup kept them, one a line{part}:\n{}\nSet up again with the triggers \
+                 as the backup kept them, one a line{part}:\n{}\nSet up again with the automations \
                  tool the ones the person asked for that still have work to do, for the agents \
                  that do that work here now. Leave out what has run its course, such as a \
                  one-off whose time passed, and what an agent set only for its own work. Tell \
@@ -1727,7 +1753,7 @@ fn valid_name(name: &str) -> Result<(), String> {
 
 /// Write the trigger's definition and ring the scheduler. A trigger of that
 /// name already there is left as it is: the same one is returned, to say
-/// so, and another is `trigger_exists`, naming the first field that differs.
+/// so, and another is `automation_exists`, naming the first field that differs.
 pub fn install(
     places: &Places,
     app: &Path,
@@ -1753,7 +1779,7 @@ pub fn install(
     let file = format!("{}.json", trigger.name);
     if let Some(other) = taken(&places.jobs, &file).or_else(|| taken(&places.state, &file)) {
         return Err(format!(
-            "name_taken: {}: trigger {other} differs only in case; pass --name",
+            "name_taken: {}: automation {other} differs only in case; pass --name",
             trigger.name
         ));
     }
@@ -1762,7 +1788,7 @@ pub fn install(
         Ok(text) => {
             let (there, there_app) = read_job(&text).ok_or_else(|| {
                 format!(
-                    "trigger_exists: definition: {} is there but cannot be read; rm it first",
+                    "automation_exists: definition: {} is there but cannot be read; rm it first",
                     trigger.name
                 )
             })?;
@@ -1810,7 +1836,7 @@ pub fn install(
                     Ok(None)
                 }
                 Some(field) => Err(format!(
-                    "trigger_exists: {field}: {} is a trigger with another {field}; pass --replace, rm it first, or pass another --name",
+                    "automation_exists: {field}: {} is an automation with another {field}; pass --replace, rm it first, or pass another --name",
                     trigger.name
                 )),
             };
@@ -1836,7 +1862,7 @@ fn swap(path: &Path, old: Option<&str>, text: &str, ring: Ring) -> Result<(), St
     // Check the serialized bytes once, before touching the job or its files.
     if text.len() as u64 > MAX_RECORD {
         return Err(format!(
-            "invalid_trigger: its definition exceeds {MAX_RECORD} bytes; narrow --cron or shorten the message"
+            "invalid_automation: its definition exceeds {MAX_RECORD} bytes; narrow --cron or shorten the message"
         ));
     }
     replace(path, text)?;
@@ -1916,7 +1942,7 @@ pub fn remove(places: &Places, name: &str) -> Result<(), String> {
     let _lock = Lock::take(places)?;
     match retire(places, name, false)? {
         true => Ok(()),
-        false => Err(format!("trigger_not_found: {name}")),
+        false => Err(format!("automation_not_found: {name}")),
     }
 }
 
@@ -1929,7 +1955,7 @@ pub fn fire_now(places: &Places, name: &str, ring: Ring) -> Result<String, Strin
     let file = {
         let _lock = Lock::take(places)?;
         if !stored(&places.job(name)) {
-            return Err(format!("trigger_not_found: {name}"));
+            return Err(format!("automation_not_found: {name}"));
         }
         ask(places, name, Ask::Fire)?
     };
@@ -1944,7 +1970,7 @@ pub fn fire_now(places: &Places, name: &str, ring: Ring) -> Result<String, Strin
 fn fired(places: &Places, name: &str, file: &str, wait: Duration) -> Value {
     let until = std::time::Instant::now() + wait;
     let came = |outcome: &Value| {
-        let mut came = json!({"name": name, "fired": true});
+        let mut came = json!({"name": name, "ran": true});
         for key in ["outcome", "turn", "handle", "detail"] {
             if !outcome[key].is_null() {
                 came[key] = outcome[key].clone();
@@ -1971,7 +1997,7 @@ fn fired(places: &Places, name: &str, file: &str, wait: Duration) -> Value {
             break came(&received);
         }
         if std::time::Instant::now() > until {
-            break json!({"name": name, "fired": true, "pending": true});
+            break json!({"name": name, "ran": true, "pending": true});
         }
         std::thread::sleep(Duration::from_millis(100));
     };
@@ -2383,7 +2409,7 @@ struct Add {
 }
 
 fn parse_add(args: &[String], now: i64) -> Result<Add, String> {
-    let bad = |what: String| format!("invalid_trigger: {what}\n{USAGE}");
+    let bad = |what: String| format!("invalid_automation: {what}\n{USAGE}");
     let mut v = std::collections::HashMap::<String, String>::new();
     let (mut when, mut commit, mut replace, mut shadow) = (None, None, false, false);
     let mut iter = args.iter();
@@ -2468,7 +2494,7 @@ fn parse_add(args: &[String], now: i64) -> Result<Add, String> {
     }
     if message.len() > MAX_MESSAGE {
         return Err(format!(
-            "invalid_trigger: a message is at most {MAX_MESSAGE} bytes"
+            "invalid_automation: a message is at most {MAX_MESSAGE} bytes"
         ));
     }
     // XML 1.0 has no place for other control characters.
@@ -2478,12 +2504,12 @@ fn parse_add(args: &[String], now: i64) -> Result<Add, String> {
     };
     let gate = take("--if");
     if control(&message) || gate.as_deref().is_some_and(control) {
-        return Err("invalid_trigger: the message or --if has control characters".into());
+        return Err("invalid_automation: the message or --if has control characters".into());
     }
     Ok(Add {
         name: take("--name"),
         when: when.unwrap_or(When {
-            text: "fire".into(),
+            text: ON_DEMAND.into(),
             entries: Vec::new(),
             not_before: None,
             at: None,
@@ -2531,7 +2557,7 @@ fn coded(error: agent_client::Error) -> String {
 }
 
 /// One error shape, `{"error": CODE, "detail": ...}`, from the
-/// `CODE: detail` this module's errors are; `trigger_exists` also names the
+/// `CODE: detail` this module's errors are; `automation_exists` also names the
 /// `field` that differs.
 pub(crate) fn error_json(message: &str) -> Value {
     let (code, detail) = match message.split_once(": ") {
@@ -2540,10 +2566,10 @@ pub(crate) fn error_json(message: &str) -> Value {
         {
             (code, detail)
         }
-        _ => ("trigger_failed", message),
+        _ => ("automation_failed", message),
     };
     match detail.split_once(": ") {
-        Some((field, detail)) if code == "trigger_exists" => {
+        Some((field, detail)) if code == "automation_exists" => {
             json!({"error": code, "field": field, "detail": detail})
         }
         _ => json!({"error": code, "detail": detail}),
@@ -2812,7 +2838,7 @@ fn orphaned() -> bool {
     })
 }
 
-/// `sonny trigger add|ls|show|fire|rm`, as `~/.agent/trigger` runs it.
+/// `sonny automation add|ls|show|run|rm`, as `~/.agent/automation` runs it.
 pub fn cli(args: &[String]) -> i32 {
     let done = match Places::home().and_then(|places| match args.split_first() {
         Some((verb, rest)) if verb == "ls" => match rest {
@@ -2824,7 +2850,7 @@ pub fn cli(args: &[String]) -> i32 {
             remove(&places, name).map(|()| json!({"removed": name}))
         }
         Some((verb, [name])) if verb == "show" => Ok(one(&places, name).unwrap_or(Value::Null)),
-        Some((verb, [name])) if verb == "fire" => {
+        Some((verb, [name])) if verb == "run" => {
             fire_now(&places, name, &ring).map(|file| fired(&places, name, &file, FIRE_WAIT))
         }
         Some((verb, rest)) if verb == "add" => add(&places, rest),
@@ -2852,11 +2878,11 @@ pub fn tool(arguments: &Value) -> Result<Value, String> {
     if let Some(name) = named("remove") {
         return remove(&places, name).map(|()| json!({"removed": name}));
     }
-    if let Some(name) = named("fire") {
+    if let Some(name) = named("run") {
         return fire_now(&places, name, &ring).map(|file| fired(&places, name, &file, FIRE_WAIT));
     }
     if let Some(name) = named("show") {
-        return one(&places, name).ok_or_else(|| format!("trigger_not_found: {name}"));
+        return one(&places, name).ok_or_else(|| format!("automation_not_found: {name}"));
     }
     Ok(list(&places, None))
 }
@@ -2938,7 +2964,7 @@ fn watches_itself(places: &Places, store: Option<&Path>, watch: &Path) -> Result
     let (real_watch, state) = (lower(real(watch)), lower(real(&places.state)));
     if real_watch == state || real_watch.starts_with(&format!("{state}/")) {
         return Err(format!(
-            "invalid_file: {}: the triggers' own folder changes on every fire; watch another path",
+            "invalid_file: {}: the automations' own folder changes on every run; watch another path",
             watch.display()
         ));
     }
@@ -2995,7 +3021,7 @@ fn add(places: &Places, args: &[String]) -> Result<Value, String> {
         (Some(bot), Some(id)) => Some((
             bot,
             id.parse::<i64>()
-                .map_err(|_| "invalid_trigger: AGENT_BOT_ID is not an id")?,
+                .map_err(|_| "invalid_automation: AGENT_BOT_ID is not an id")?,
         )),
         _ => None,
     };
@@ -3018,7 +3044,7 @@ fn add(places: &Places, args: &[String]) -> Result<Value, String> {
         .or_else(|| asked.start.as_ref().map(|s| s.0.clone()))
         .or_else(|| asked.bot.clone())
         .or_else(|| shell.as_ref().map(|s| s.0.clone()))
-        .ok_or("invalid_trigger: --bot NAME or --start NAME, or run it from an agent's shell")?;
+        .ok_or("invalid_automation: --bot NAME or --start NAME, or run it from an agent's shell")?;
     let (target, reply_to, store_id) = runtime()?.block_on(async {
         let client = connect(&socket, &daemon).await?;
         let resolved = async {
@@ -3069,7 +3095,7 @@ fn add(places: &Places, args: &[String]) -> Result<Value, String> {
                     }
                 }
                 (None, None, None) => {
-                    return Err("invalid_trigger: --bot NAME or --start NAME, or run it from an agent's shell".into());
+                    return Err("invalid_automation: --bot NAME or --start NAME, or run it from an agent's shell".into());
                 }
             };
             let reply_to = match &asked.reply_to {
@@ -3315,12 +3341,12 @@ async fn start(client: &Client, trigger: &Trigger) -> Result<i64, String> {
         by,
     } = &trigger.target
     else {
-        return Err("invalid_trigger: not a --start trigger".into());
+        return Err("invalid_automation: not a --start automation".into());
     };
     let dir = trigger
         .dir
         .as_ref()
-        .ok_or("invalid_trigger: --start has no folder")?;
+        .ok_or("invalid_automation: --start has no folder")?;
     let instructions = crate::project::plain(dir)?;
     let mut asked = json!({"bot": name, "workspace": dir, "model": model, "effort": effort,
         "instructions": instructions,
@@ -3422,7 +3448,7 @@ async fn deliver(
         return shadow(client, places, trigger, kept, why, ask).await;
     }
     let prompt = format!(
-        "[trigger {} · {} · {why}]\n{}",
+        "[automation {} · {} · {why}]\n{}",
         trigger.name,
         stamp(now()),
         trigger.message
@@ -3452,7 +3478,7 @@ async fn deliver(
         "reject"
     };
     let asking = json!({"bot": bot, "bot_id": id, "request_id": request_id(trigger, id, ask),
-        "prompt": prompt, "delivery": delivery, "origin": "trigger",
+        "prompt": prompt, "delivery": delivery, "origin": ORIGIN,
         "budget_tokens": trigger.turn_budget_tokens});
     if let Some(ask) = ask {
         let sent = json!({"store_id": trigger.store_id, "generation": trigger.generation,
@@ -3639,7 +3665,7 @@ async fn shadow(
         Err(outcome) => return outcome,
     };
     let prompt = format!(
-        "[trigger {} · {} · {why} · shadow run]\nThis is a shadow run: you are a read-only \
+        "[automation {} · {} · {why} · shadow run]\nThis is a shadow run: you are a read-only \
          copy of {bot}, and every call past reading is refused, not asked about. Do the work \
          below as far as reading goes, then end with what you would have done: each change, \
          message or post, with what it would have said.\n\n{}",
@@ -3648,7 +3674,7 @@ async fn shadow(
         trigger.message
     );
     let asking = json!({"bot": name, "bot_id": shadow, "request_id": request_id(trigger, shadow, ask),
-        "prompt": prompt, "delivery": "reject", "origin": "trigger",
+        "prompt": prompt, "delivery": "reject", "origin": ORIGIN,
         "budget_tokens": trigger.turn_budget_tokens});
     let sent = json!({"store_id": trigger.store_id, "generation": trigger.generation,
         "reply_to": trigger.reply_to, "shadow_of": bot, "submit": asking});
@@ -3764,7 +3790,7 @@ async fn report(
         false => "",
     };
     let prompt = format!(
-        "[trigger {} · {} · shadow run of {of} {status}{cut}: a read-only copy, so nothing \
+        "[automation {} · {} · shadow run of {of} {status}{cut}: a read-only copy, so nothing \
          past reading was done]\n{}",
         trigger.name,
         stamp(now()),
@@ -3896,7 +3922,7 @@ async fn missed(client: &Client, trigger: &Trigger, (bot, id): (&str, i64), outc
     };
     let detail = outcome["detail"].as_str().unwrap_or("no reason given");
     let prompt = format!(
-        "[trigger {} · {} · {} not sent to {bot}: {detail}]",
+        "[automation {} · {} · {} not sent to {bot}: {detail}]",
         trigger.name,
         stamp(now()),
         trigger.when
@@ -3925,7 +3951,7 @@ async fn note(
         .request(
             "submit",
             json!({"bot": to, "bot_id": to_id, "request_id": request, "prompt": prompt,
-                "delivery": "attach", "origin": "trigger", "wait_ms": attach_wait()}),
+                "delivery": "attach", "origin": ORIGIN, "wait_ms": attach_wait()}),
         )
         .await
         .map(drop)
@@ -3959,12 +3985,12 @@ impl GateNews {
         let (name, at) = (&trigger.name, stamp(now()));
         match self {
             Self::Broke(why) => format!(
-                "[trigger {name} · {at} · its --if could not run, so {} sends nothing to {} \
+                "[automation {name} · {at} · its --if could not run, so {} sends nothing to {} \
                  until it can: {why}. Told once; the next note says it works again.]",
                 trigger.when,
                 trigger.bot()
             ),
-            Self::Works => format!("[trigger {name} · {at} · its --if works again]"),
+            Self::Works => format!("[automation {name} · {at} · its --if works again]"),
         }
     }
 }
@@ -4039,7 +4065,7 @@ pub async fn tell_failed(
     );
     let mut submit = json!({"bot": to,
         "request_id": format!("trigger_{generation}_failed.{bot}.{turn}"),
-        "prompt": prompt, "delivery": "attach", "origin": "trigger", "wait_ms": attach_wait()});
+        "prompt": prompt, "delivery": "attach", "origin": ORIGIN, "wait_ms": attach_wait()});
     // By its id too, as every delivery of a trigger's: a name used again
     // is not who it was for.
     if let Some(id) = to_id {
@@ -4069,7 +4095,7 @@ fn failed_note(
         None => (bot, bot_id),
     };
     let prompt = format!(
-        "[trigger {} · {} · turn {turn} it sent {bot} failed: {error}]",
+        "[automation {} · {} · turn {turn} it sent {bot} failed: {error}]",
         name.unwrap_or("(ended)"),
         stamp(now())
     );
@@ -4166,7 +4192,7 @@ async fn reply(client: &Client, trigger: &Trigger, bot: &str, mut outcome: Value
         ""
     };
     let prompt = format!(
-        "[trigger {} · {} · {bot} turn {turn} {status}{cut}]\n{answer}",
+        "[automation {} · {} · {bot} turn {turn} {status}{cut}]\n{answer}",
         trigger.name,
         stamp(now())
     );
@@ -4410,7 +4436,7 @@ fn fire(places: &Places, trigger: &Trigger, ask: Option<&Asked>) {
             return;
         }
         let outcome = with_daemon(trigger, async |client| {
-            deliver(client, places, trigger, &mut kept, "fired", Some(ask)).await
+            deliver(client, places, trigger, &mut kept, RUN_NOW, Some(ask)).await
         });
         let (Ok(outcome) | Err(outcome)) = outcome;
         settle(places, trigger, &named(outcome), &kept);
@@ -4442,7 +4468,7 @@ fn fire(places: &Places, trigger: &Trigger, ask: Option<&Asked>) {
         }
     }
     let mut why = match asked {
-        true => "fired".to_owned(),
+        true => RUN_NOW.to_owned(),
         false => trigger.when.clone(),
     };
     // Any write to the HEAD log wakes it; only another commit is news.
@@ -4671,10 +4697,10 @@ pub(crate) mod tests {
         assert_eq!(submit["bot"], "calc.lead");
         assert_eq!(submit["bot_id"], 5);
         assert_eq!(submit["delivery"], "attach");
-        assert_eq!(submit["origin"], "trigger");
+        assert_eq!(submit["origin"], "automation");
         assert_eq!(submit["request_id"], "trigger_1-2_failed.calc.lead.4");
         let prompt = submit["prompt"].as_str().unwrap();
-        assert!(prompt.starts_with("[trigger (ended) · "), "{prompt}");
+        assert!(prompt.starts_with("[automation (ended) · "), "{prompt}");
         assert!(prompt.ends_with(" · turn 4 it sent calc.lead failed: provider_error]"));
     }
 
@@ -4817,7 +4843,7 @@ pub(crate) mod tests {
         assert_eq!(GateNews::of(&owed, &broke), None, "the break was heard of");
         let s = trigger();
         let prompt = GateNews::Broke("--if: ran past 60s".into()).prompt(&s);
-        assert!(prompt.starts_with("[trigger p.fix-login · "), "{prompt}");
+        assert!(prompt.starts_with("[automation p.fix-login · "), "{prompt}");
         assert!(
             prompt.contains(" · its --if could not run, so every 30m sends nothing to p.fix-login until it can: --if: ran past 60s. "),
             "{prompt}"
@@ -4873,7 +4899,7 @@ pub(crate) mod tests {
             &client,
             &s,
             ("p.lead", 3),
-            "[trigger p.fix-login · its --if works again]",
+            "[automation p.fix-login · its --if works again]",
         )
         .await
         .unwrap();
@@ -4883,7 +4909,7 @@ pub(crate) mod tests {
             (&json!("p.lead"), &json!(3))
         );
         assert_eq!(submit["delivery"], "attach");
-        assert_eq!(submit["origin"], "trigger");
+        assert_eq!(submit["origin"], "automation");
         let request = submit["request_id"].as_str().unwrap();
         assert!(request.starts_with("trigger_test-1_missed.3."), "{request}");
         assert_eq!(fire_generation(request), None);
@@ -4911,7 +4937,7 @@ pub(crate) mod tests {
             "provider_error",
         );
         assert_eq!((to.as_str(), to_id), ("p.lead", Some(7)));
-        assert!(prompt.starts_with("[trigger p.digest · "), "{prompt}");
+        assert!(prompt.starts_with("[automation p.digest · "), "{prompt}");
         // One no agent made, or no longer found: the agent the fire sent.
         let (to, to_id, prompt) = failed_note(
             Some(&w.places),
@@ -4921,7 +4947,7 @@ pub(crate) mod tests {
             "provider_error",
         );
         assert_eq!((to.as_str(), to_id), ("p.fix-login", Some(12)));
-        assert!(prompt.starts_with("[trigger (ended) · "), "{prompt}");
+        assert!(prompt.starts_with("[automation (ended) · "), "{prompt}");
     }
 
     #[test]
@@ -5293,7 +5319,7 @@ pub(crate) mod tests {
         fn ring(&self) -> Result<(), String> {
             self.rings.set(self.rings.get() + 1);
             match self.refuse.get() {
-                true => Err("triggers_unsupported: no scheduler here".into()),
+                true => Err("automations_unsupported: no scheduler here".into()),
                 false => Ok(()),
             }
         }
@@ -5345,7 +5371,7 @@ pub(crate) mod tests {
             std::fs::read_to_string(self.places.job(name)).unwrap()
         }
         fn rows(&self) -> Vec<Value> {
-            list(&self.places, None)["triggers"]
+            list(&self.places, None)["automations"]
                 .as_array()
                 .unwrap()
                 .clone()
@@ -5493,8 +5519,8 @@ pub(crate) mod tests {
         let refused = w.install(&other).unwrap_err();
         assert_eq!(
             error_json(&refused),
-            json!({"error": "trigger_exists", "field": "message",
-                "detail": "p.fix-login is a trigger with another message; pass --replace, rm it first, or pass another --name"})
+            json!({"error": "automation_exists", "field": "message",
+                "detail": "p.fix-login is an automation with another message; pass --replace, rm it first, or pass another --name"})
         );
         let to_start = Trigger {
             target: Target::Start {
@@ -5508,7 +5534,7 @@ pub(crate) mod tests {
         assert!(
             w.install(&to_start)
                 .unwrap_err()
-                .starts_with("trigger_exists: bot:")
+                .starts_with("automation_exists: bot:")
         );
         assert_eq!(
             w.plist(&s.name),
@@ -5526,14 +5552,14 @@ pub(crate) mod tests {
         };
         let taken = w.install(&cased).unwrap_err();
         assert!(
-            taken.starts_with("name_taken: P.Fix-Login: trigger p.fix-login"),
+            taken.starts_with("name_taken: P.Fix-Login: automation p.fix-login"),
             "{taken}"
         );
         // Nor does `rm` of that other case reach it, even where the folder would alias it.
         assert!(
             w.remove("P.Fix-Login")
                 .unwrap_err()
-                .starts_with("trigger_not_found")
+                .starts_with("automation_not_found")
         );
         // A move of Sonny is written into every trigger.
         refresh(&w.places, Path::new("/B/agent-app"));
@@ -5565,7 +5591,7 @@ pub(crate) mod tests {
         let app = Path::new("/A/agent-app");
         assert!(definition(app, &s, &broad, &[]).len() as u64 > MAX_RECORD);
         let refused = install(&w.places, app, &s, &broad, &[], false, &|| w.fake.ring());
-        assert!(refused.unwrap_err().starts_with("invalid_trigger:"));
+        assert!(refused.unwrap_err().starts_with("invalid_automation:"));
         assert_eq!(w.state(&s.name), (false, false));
         assert_eq!(w.fake.rings.get(), 0);
         // A large readable one still lists and follows an app move. The
@@ -5633,20 +5659,23 @@ pub(crate) mod tests {
             .unwrap();
         }
         let first = list(&w.places, None);
-        assert_eq!(first["triggers"].as_array().unwrap().len(), PAGE_SIZE);
+        assert_eq!(first["automations"].as_array().unwrap().len(), PAGE_SIZE);
         let second = list(&w.places, first["next_after"].as_str());
-        assert_eq!(second["triggers"].as_array().unwrap().len(), 3);
+        assert_eq!(second["automations"].as_array().unwrap().len(), 3);
         assert!(second["next_after"].is_null());
         let before = first["next_after"].as_str().unwrap();
         assert!(
-            second["triggers"]
+            second["automations"]
                 .as_array()
                 .unwrap()
                 .iter()
                 .all(|r| r["name"].as_str().unwrap() > before)
         );
         // One row by name, past the first page too; none for a name not there.
-        assert_eq!(one(&w.places, "task-065").unwrap(), second["triggers"][2]);
+        assert_eq!(
+            one(&w.places, "task-065").unwrap(),
+            second["automations"][2]
+        );
         assert!(one(&w.places, "task-999").is_none());
         assert!(one(&w.places, "../x").is_none());
     }
@@ -5733,7 +5762,7 @@ pub(crate) mod tests {
         assert!(
             w.install(&s)
                 .unwrap_err()
-                .starts_with("triggers_unsupported")
+                .starts_with("automations_unsupported")
         );
         assert_eq!(w.state(&s.name), (false, false));
         w.fake.refuse.set(false);
@@ -5756,7 +5785,7 @@ pub(crate) mod tests {
         assert!(
             w.install(&odd)
                 .unwrap_err()
-                .starts_with("trigger_exists: definition:")
+                .starts_with("automation_exists: definition:")
         );
         std::fs::remove_file(w.places.job(&odd.name)).unwrap();
         // Nor may a name differing only in case take an ended one's result.
@@ -5939,7 +5968,7 @@ pub(crate) mod tests {
         assert!(
             fire_now(&w.places, &s.name, &|| w.fake.ring())
                 .unwrap_err()
-                .starts_with("trigger_not_found")
+                .starts_with("automation_not_found")
         );
         w.install(&s).unwrap();
         let asks = w.places.asks(&s.name);
@@ -5998,7 +6027,7 @@ pub(crate) mod tests {
         let first = fire_now(&w.places, &s.name, &|| w.fake.ring()).unwrap();
         assert_eq!(
             wait(&first),
-            json!({"name": s.name, "fired": true, "pending": true})
+            json!({"name": s.name, "ran": true, "pending": true})
         );
         // Sent, its answer still on its way to `--reply-to`, or the trigger
         // it ended gone: its receipt says, once.
@@ -6007,7 +6036,7 @@ pub(crate) mod tests {
         std::fs::write(&receipt, sent.to_string()).unwrap();
         assert_eq!(
             wait(&first),
-            json!({"name": s.name, "fired": true, "outcome": "sent", "turn": 7,
+            json!({"name": s.name, "ran": true, "outcome": "sent", "turn": 7,
                 "handle": "turn:p.fix-login/7"})
         );
         assert!(!receipt.exists());
@@ -6024,7 +6053,7 @@ pub(crate) mod tests {
         );
         assert_eq!(
             wait(&second),
-            json!({"name": s.name, "fired": true, "outcome": "skipped", "detail": "bot_busy"})
+            json!({"name": s.name, "ran": true, "outcome": "skipped", "detail": "bot_busy"})
         );
         assert_eq!(wait("another")["pending"], true);
         // Two settled before the first one's `fire` looked: each finds its own.
@@ -6052,7 +6081,7 @@ pub(crate) mod tests {
         noted(&w.places, &s, &kept);
         assert_eq!(
             wait(&third),
-            json!({"name": s.name, "fired": true, "outcome": "declined",
+            json!({"name": s.name, "ran": true, "outcome": "declined",
                 "detail": "--if: exit status: 1"})
         );
     }
@@ -6115,7 +6144,7 @@ pub(crate) mod tests {
         assert!(
             add(&other, false)
                 .unwrap_err()
-                .starts_with("trigger_exists")
+                .starts_with("automation_exists")
         );
         assert!(keeps_seen(&w.places, &other), "a commit since is news");
         assert_eq!(add(&other, true).unwrap(), None);
@@ -6331,21 +6360,38 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn the_triggers_folder_moves_to_automations_once() {
+        let w = World::new("moved");
+        let old = w.root.join(".agent/triggers");
+        std::fs::create_dir_all(old.join("jobs")).unwrap();
+        std::fs::write(old.join("jobs/p.x.json"), "{}").unwrap();
+        w.places.moved_from_triggers(&w.root);
+        assert!(!old.exists());
+        assert!(w.places.jobs.join("p.x.json").exists());
+        // One made in its place since stays as it is.
+        std::fs::create_dir_all(old.join("jobs")).unwrap();
+        w.places.moved_from_triggers(&w.root);
+        assert!(old.exists() && w.places.jobs.join("p.x.json").exists());
+        // Prompts from before the rename are still an automation's.
+        assert!(sent_it("trigger") && sent_it(ORIGIN) && !sent_it("commons"));
+    }
+
+    #[test]
     fn a_file_trigger_cannot_watch_the_triggers_own_folder() {
         let w = World::new("own-state");
         std::fs::create_dir_all(&w.places.state).unwrap();
         for own in [
             w.places.state.clone(),
             w.places.last("p.x"),
-            w.root.join(".agent/Triggers/p.x.json"),
-            w.root.join(".agent/./triggers/new/file"),
+            w.root.join(".agent/Automations/p.x.json"),
+            w.root.join(".agent/./automations/new/file"),
         ] {
             let refused = watches_itself(&w.places, None, &own).unwrap_err();
             assert!(refused.starts_with("invalid_file:"), "{own:?}: {refused}");
         }
         std::os::unix::fs::symlink(&w.places.state, w.root.join("link")).unwrap();
         assert!(watches_itself(&w.places, None, &w.root.join("link/p.x.json")).is_err());
-        for other in [w.root.join(".agent"), w.root.join(".agent/triggers-not")] {
+        for other in [w.root.join(".agent"), w.root.join(".agent/automations-not")] {
             assert_eq!(watches_itself(&w.places, None, &other), Ok(()), "{other:?}");
         }
         // Nor its daemon's store, or what SQLite keeps beside it.
@@ -6500,7 +6546,7 @@ pub(crate) mod tests {
         assert!(
             w.remove(&s.name)
                 .unwrap_err()
-                .starts_with("trigger_not_found")
+                .starts_with("automation_not_found")
         );
         // Its queue alone, or its result alone, is what is left of it.
         queues(&w.places.asks(&s.name)).unwrap();
@@ -6572,12 +6618,12 @@ pub(crate) mod tests {
     #[test]
     fn errors_have_one_shape() {
         assert_eq!(
-            error_json("trigger_not_found: x"),
-            json!({"error": "trigger_not_found", "detail": "x"})
+            error_json("automation_not_found: x"),
+            json!({"error": "automation_not_found", "detail": "x"})
         );
         assert_eq!(
             error_json("/a/b: no such file"),
-            json!({"error": "trigger_failed", "detail": "/a/b: no such file"})
+            json!({"error": "automation_failed", "detail": "/a/b: no such file"})
         );
         assert_eq!(error_json("usage: trigger ls")["error"], "usage");
         // A daemon's code is kept, with or without a detail.
@@ -6883,7 +6929,7 @@ pub(crate) mod tests {
                 started.turn_budget_tokens,
                 started.when.text.as_str()
             ),
-            (Some("p.lead"), Some(3), Some(50_000), "fire")
+            (Some("p.lead"), Some(3), Some(50_000), ON_DEMAND)
         );
         let watched = parse_add(&words("--file notes.md -- x"), now).unwrap();
         assert_eq!(
@@ -6908,7 +6954,7 @@ pub(crate) mod tests {
             assert!(
                 parse_add(&words(bad), now)
                     .unwrap_err()
-                    .starts_with("invalid_trigger:"),
+                    .starts_with("invalid_automation:"),
                 "{bad}"
             );
         }

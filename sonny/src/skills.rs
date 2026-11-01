@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 /// the superlead's, which a project opts into), the memory, plan, zen,
 /// coordination, commons and automation skills, the nightly cleanup's,
 /// agent-browser's own when it is installed, and `~/.agent/memory` and
-/// `~/.agent/trigger`, which run this Sonny. Written at each start, so they
+/// `~/.agent/automation`, which run this Sonny. Written at each start, so they
 /// lead to this copy.
 pub fn install_own() {
     for (name, text) in crate::project::builtins() {
@@ -57,6 +57,14 @@ pub fn install_own() {
         if let Err(error) = write_runner(&state.join(name), usage, &sonny, name) {
             eprintln!("sonny: {error}");
         }
+    }
+    // The script `~/.agent/automation` was `~/.agent/trigger` before 0.8.0
+    // (upgrade migration `automations-folder`): Sonny's own goes.
+    let old = state.join("trigger");
+    if std::fs::read_to_string(&old).is_ok_and(|text| {
+        text.starts_with("#!/bin/sh\n# usage: trigger add") && text.ends_with(" trigger \"$@\"\n")
+    }) {
+        let _ = std::fs::remove_file(&old);
     }
     // An older Sonny's `~/.agent/project`, for what the new_project tool
     // does now.

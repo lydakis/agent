@@ -17,8 +17,8 @@ from tests.test_runtime import ModelFixture
 
 ROOT = Path(__file__).resolve().parent.parent
 SONNY = next((p for p in (ROOT / '.local/target/debug/sonny', ROOT / '.local/target/release/sonny') if p.exists()), None)
-# What a fire puts before the message: `[trigger NAME · YYYY-MM-DD HH:MM · why]`.
-LINE = r'\[trigger {} · \d{{4}}-\d\d-\d\d \d\d:\d\d · {}\]\n'
+# What a fire puts before the message: `[automation NAME · YYYY-MM-DD HH:MM · why]`.
+LINE = r'\[automation {} · \d{{4}}-\d\d-\d\d \d\d:\d\d · {}\]\n'
 SCHEDULER = 'me.lydakis.agent.scheduler.'
 
 
@@ -33,7 +33,7 @@ def home_tag(home):
 
 def job(home, name):
     """Where a trigger's definition is under `home`: one file Sonny's scheduler reads."""
-    return home / '.agent/triggers/jobs' / f'{name}.json'
+    return home / '.agent/automations/jobs' / f'{name}.json'
 
 
 def definition(args):
@@ -103,7 +103,7 @@ class TriggerFireTests(ModelFixture):
             return subprocess.Popen(args, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         result = subprocess.run(args, env=env, capture_output=True, text=True, timeout=60)
         self.assertEqual(result.returncode, 0, result.stderr)
-        last = self.home / '.agent/triggers' / f'{name}.json'
+        last = self.home / '.agent/automations' / f'{name}.json'
         return json.loads(last.read_text()) if last.exists() else None
 
     def write_trigger(self, name, message, target=None, when='every 30m', extra=(), at=None, app=SONNY, socket=None,
@@ -140,12 +140,12 @@ class TriggerFireTests(ModelFixture):
         try:
             turn = sent['last']['turn']
             prompts = connection.request('prompts', bot='p.task', turn=turn)['result']['prompts']
-            self.assertEqual(prompts[0]['origin'], 'trigger')
+            self.assertEqual(prompts[0]['origin'], 'automation')
             events = connection.request('events', bot='p.task', after=0, limit=256)['result']['events']
             accepted = next(e['data'] for e in events if e['event'] == 'accepted' and e['turn'] == turn)
-            self.assertEqual(accepted['origin'], 'trigger')
+            self.assertEqual(accepted['origin'], 'automation')
             item = connection.request('history_items', bot='p.task', nodes=[accepted['node']])['result']['items'][0]
-            self.assertEqual(item['origin'], 'trigger')
+            self.assertEqual(item['origin'], 'automation')
         finally:
             connection.close()
         # A working bot is not interrupted: the fire waits behind its work,
@@ -174,7 +174,7 @@ class TriggerFireTests(ModelFixture):
         for told in turns[-2:]:
             self.assertIn(told['status'], ('attached', 'steered'))
             self.assertRegex(told['prompt_preview'],
-                             r'^\[trigger p\.task · .* · every 30m not sent to p\.task: bot_busy')
+                             r'^\[automation p\.task · .* · every 30m not sent to p\.task: bot_busy')
         self.assertEqual(len(turns), 6)
 
     def test_a_recurring_fire_waits_for_its_first_interval(self):
@@ -187,7 +187,7 @@ class TriggerFireTests(ModelFixture):
         old = self.bot_id('p.task')
         self.agent('rm', '--store', str(self.store), '--bot', 'p.task')
         self.agent('run', *self.common, '--new', '--bot', 'p.task', 'again')
-        result = subprocess.run([str(SONNY), 'trigger', 'add', '--every', '30m', '--', 'x'],
+        result = subprocess.run([str(SONNY), 'automation', 'add', '--every', '30m', '--', 'x'],
             env={**clean_env(), 'HOME': str(self.home), 'AGENT_STORE': str(self.store),
                  'AGENT_BOT': 'p.task', 'AGENT_BOT_ID': str(old)},
             capture_output=True, text=True, timeout=30)
@@ -285,7 +285,7 @@ class TriggerFireTests(ModelFixture):
         path = job(self.home, 'p.task')
         args = program(path.read_text())
         path.write_text(definition(['g2' if a == 'g1' else a for a in args]))
-        last = self.home / '.agent/triggers/p.task.json'
+        last = self.home / '.agent/automations/p.task.json'
         last.unlink()
         result = subprocess.run(args, env={**clean_env(), 'HOME': str(self.home)}, capture_output=True, text=True,
                                 timeout=60)
@@ -297,7 +297,7 @@ class TriggerFireTests(ModelFixture):
         self.agent('run', *self.common, '--new', '--bot', 'p.lead', 'hello')
         self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
         lead = self.bot_id('p.lead')
-        taking = self.home / '.agent/triggers/p.task.taking'
+        taking = self.home / '.agent/automations/p.task.taking'
         taking.mkdir(parents=True)
         (taking / '100.1.1').write_text('')
         sent = self.fire('p.task', 'first', generation='g1', extra=['--reply-to', 'p.lead', '--reply-to-id', str(lead)])
@@ -315,11 +315,11 @@ class TriggerFireTests(ModelFixture):
         # and its answer where it went, under the ids they went under, which
         # the daemon takes once; not the new message under the new generation.
         submit = {'bot': 'p.task', 'bot_id': self.bot_id('p.task'), 'request_id': turn['request_id'],
-                  'prompt': prompt, 'delivery': 'queue', 'origin': 'trigger', 'budget_tokens': None}
+                  'prompt': prompt, 'delivery': 'queue', 'origin': 'automation', 'budget_tokens': None}
         kept = {'store_id': self.store_identity(), 'generation': 'g1', 'reply_to': ['p.lead', lead], 'submit': submit}
         (taking / '100.1.1').write_text(json.dumps(kept))
         # Cut short before it settled: the row has no result of it.
-        row = self.home / '.agent/triggers/p.task.json'
+        row = self.home / '.agent/automations/p.task.json'
         row.write_text(json.dumps({**json.loads(row.read_text()), 'last': None, 'sent': 0}))
         # Its `--if` said go once already: one that would say no now is not asked.
         again = self.fire('p.task', 'second', generation='g2', extra=['--if', 'exit 1', '--dir', str(self.path)])
@@ -339,7 +339,7 @@ class TriggerFireTests(ModelFixture):
         self.assertEqual(own['last']['outcome'], 'sent', own)
         self.settle('p.task')
         self.assertEqual(len(self.turns('p.task')), 3)
-        self.assertRegex(self.turns('p.task')[-1]['prompt_preview'], LINE.format('p.task', 'fired') + 'third$')
+        self.assertRegex(self.turns('p.task')[-1]['prompt_preview'], LINE.format('p.task', 'run now') + 'third$')
         self.assertEqual(len(self.turns('p.lead')), answers)
 
     def test_a_start_trigger_makes_its_agent_once_and_messages_it_after(self):
@@ -384,7 +384,7 @@ class TriggerFireTests(ModelFixture):
         self.assertEqual(len(self.turns('p.review')), 2)
         # A fire cut short after the daemon made the agent, before its id was
         # kept, asks again under the trigger's request id and gets that agent.
-        last = self.home / '.agent/triggers/p.review.json'
+        last = self.home / '.agent/automations/p.review.json'
         kept = json.loads(last.read_text())
         del kept['started_id']
         last.write_text(json.dumps(kept))
@@ -596,8 +596,8 @@ class TriggerFireTests(ModelFixture):
         # Run now while the repository is away sends, and keeps the commit last seen.
         moved = self.path / 'away'
         repo.rename(moved)
-        (self.home / '.agent/triggers/p.task.asks').mkdir(parents=True, exist_ok=True)
-        (self.home / '.agent/triggers/p.task.asks/1').write_text('')
+        (self.home / '.agent/automations/p.task.asks').mkdir(parents=True, exist_ok=True)
+        (self.home / '.agent/automations/p.task.asks/1').write_text('')
         asked = self.fire('p.task', 'Look at it.', when=when, extra=extra, generation='g')
         self.assertEqual(asked['last']['outcome'], 'sent', asked)
         self.assertEqual(asked['head'], news['head'])
@@ -631,7 +631,7 @@ class TriggerFireTests(ModelFixture):
 
     def test_a_file_trigger_whose_path_became_its_own_state_ends_saying_why(self):
         self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
-        state = self.home / '.agent/triggers'
+        state = self.home / '.agent/automations'
         state.mkdir(parents=True)
         # Made for a folder a link pointed elsewhere; the link now points at the triggers' own.
         link = self.path / 'watched'
@@ -652,7 +652,7 @@ class TriggerFireTests(ModelFixture):
         self.agent('run', '--store', str(self.store), '--bot', 'p.task',
                    f"shell:HOME='{self.home}' XDG_RUNTIME_DIR='{runtime}' '{SONNY}' trigger add --every 30m -- check"
                    f" > '{out}' 2>&1")
-        self.assertEqual(json.loads(out.read_text())['error'], 'triggers_unsupported')
+        self.assertEqual(json.loads(out.read_text())['error'], 'automations_unsupported')
         self.assertEqual(jobs(self.home), [])
 
     def scheduler(self, env):
@@ -691,7 +691,7 @@ class TriggerFireTests(ModelFixture):
         self.assertEqual(left.returncode, 0)
 
         def trigger(*args, ok=True):
-            result = subprocess.run([str(sonny), 'trigger', *args], env=env, capture_output=True, text=True,
+            result = subprocess.run([str(sonny), 'automation', *args], env=env, capture_output=True, text=True,
                                     timeout=120, cwd=self.path)
             if ok:
                 self.assertEqual(result.returncode, 0, result.stderr)
@@ -702,7 +702,7 @@ class TriggerFireTests(ModelFixture):
         self.assertTrue(job(self.home, name).exists())
         self.assertTrue(self.until(lambda: len(self.turns('p.task')) == 2, 150), 'the scheduler did not fire it')
         self.assertTrue(self.until(lambda: not job(self.home, name).exists(), 30), 'it did not end itself')
-        ended = json.loads(trigger('ls').stdout)['triggers']
+        ended = json.loads(trigger('ls').stdout)['automations']
         self.assertEqual([(r['name'], r['ended'], r['last']['outcome']) for r in ended], [(name, True, 'sent')])
         # A file trigger: a write to the file fires it; the same add again is that trigger.
         watched = self.path / 'notes.md'
@@ -716,11 +716,11 @@ class TriggerFireTests(ModelFixture):
         self.settle('p.task')
         # Fire by name, with the daemon stopped: the fire starts it, and it outlives the fire.
         self.agent('shutdown', '--store', str(self.store))
-        fired = json.loads(trigger('fire', name).stdout)
-        self.assertEqual((fired['name'], fired['fired'], fired['outcome']), (name, True, 'sent'), fired)
+        fired = json.loads(trigger('run', name).stdout)
+        self.assertEqual((fired['name'], fired['ran'], fired['outcome']), (name, True, 'sent'), fired)
         self.assertTrue(self.until(lambda: len(self.turns('p.task')) == 4, 60), 'fire did not run it')
         self.assertEqual(fired['handle'], f"turn:p.task/{self.turns('p.task')[-1]['turn']}")
-        self.assertTrue(self.turns('p.task')[-1]['prompt_preview'].startswith(f'[trigger {name} · '))
+        self.assertTrue(self.turns('p.task')[-1]['prompt_preview'].startswith(f'[automation {name} · '))
         # A trigger that recurs leaves the scheduler as it was: nothing for the system to tell anyone about.
         trigger('add', '--bot', 'p.task', '--name', 'p.next', '--every', '30m', '--', 'look')
         trigger('add', '--bot', 'p.task', '--name', 'p.next', '--every', '30m', '--replace', '--', 'look again')
@@ -728,7 +728,7 @@ class TriggerFireTests(ModelFixture):
         trigger('rm', name)
         trigger('rm', 'p.next')
         self.assertEqual(jobs(self.home), [])
-        self.assertEqual(json.loads(trigger('rm', name, ok=False).stderr)['error'], 'trigger_not_found')
+        self.assertEqual(json.loads(trigger('rm', name, ok=False).stderr)['error'], 'automation_not_found')
         self.assertIsNone(running.poll())
 
     def test_a_scheduler_whose_home_is_gone_lets_its_job_go(self):
@@ -746,7 +746,7 @@ class TriggerFireTests(ModelFixture):
         job_file.write_text('# a scheduler job\n')
         self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
         running = self.scheduler(env)
-        added = subprocess.run([str(SONNY), 'trigger', 'add', '--bot', 'p.task', '--name', 'ztest-gone',
+        added = subprocess.run([str(SONNY), 'automation', 'add', '--bot', 'p.task', '--name', 'ztest-gone',
                                 '--every', '30m', '--', 'nobody home'], env=env, capture_output=True, text=True,
                                timeout=120)
         self.assertEqual(added.returncode, 0, added.stderr)
@@ -792,7 +792,7 @@ class TriggerFireTests(ModelFixture):
         self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
 
         def trigger(*args):
-            result = subprocess.run([str(SONNY), 'trigger', *args], env=env, capture_output=True, text=True,
+            result = subprocess.run([str(SONNY), 'automation', *args], env=env, capture_output=True, text=True,
                                     timeout=120, cwd=self.path)
             self.assertEqual(result.returncode, 0, result.stderr)
             return result

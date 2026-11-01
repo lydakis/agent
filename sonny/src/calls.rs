@@ -118,7 +118,12 @@ pub fn said(command: &str, output: &str, failed: bool) -> Option<Said> {
         "$AGENT_BIN" | "${AGENT_BIN}" | "agent" => agent(args, stdin, printed, failed),
         "$REX" | "${REX}" | "rex" => rex(args, printed, failed),
         "memory" if program.contains(".agent/memory") => Some(memory(args, printed, failed)),
-        "trigger" if program.contains(".agent/trigger") => trigger(args, printed, failed),
+        // `trigger`, as the script was named before 0.8.0, in history.
+        "automation" | "trigger"
+            if program.contains(".agent/automation") || program.contains(".agent/trigger") =>
+        {
+            automation(args, printed, failed)
+        }
         "sonny" if args.first().is_some_and(|a| a == "agent") => {
             agent(&args[1..], stdin, printed, failed)
         }
@@ -283,8 +288,8 @@ fn memory(words: &[String], output: &str, failed: bool) -> Said {
     }
 }
 
-/// The app's trigger script: a job scheduled, fired or removed.
-fn trigger(words: &[String], output: &str, failed: bool) -> Option<Said> {
+/// The app's automation script: one scheduled, run or removed.
+fn automation(words: &[String], output: &str, failed: bool) -> Option<Said> {
     let (verb, rest) = words.split_first()?;
     let args = Args::new(rest);
     let reply: Value = serde_json::from_str(output.trim()).unwrap_or(Value::Null);
@@ -326,7 +331,7 @@ fn trigger(words: &[String], output: &str, failed: bool) -> Option<Said> {
             }
         }
         "rm" => said.verb = "Removed the automation".into(),
-        "fire" => said.verb = "Ran the automation".into(),
+        "run" | "fire" => said.verb = "Ran the automation".into(),
         "ls" => said.verb = "Listed the automations".into(),
         _ => return None,
     }
@@ -801,15 +806,16 @@ pub fn declared(name: &str, arguments: &Value, failed: bool) -> Option<Said> {
                 _ => said("Read memory", ""),
             },
         ),
-        crate::served::TRIGGERS => Some(
+        // `triggers` and its `fire`, as before 0.8.0, in history.
+        crate::served::AUTOMATIONS | "triggers" => Some(
             match (
                 arguments["add"].is_object(),
                 field("remove"),
-                field("fire"),
+                field("run").or(field("fire")),
                 field("show"),
             ) {
                 (true, ..) => {
-                    // As the trigger script's add says it.
+                    // As the automation script's add says it.
                     let add = &arguments["add"];
                     let name = (add["name"].as_str())
                         .or(add["start"]["name"].as_str())
@@ -1185,16 +1191,16 @@ Keep the rest.'"#,
             ("Read from memory", "flow")
         );
         let refused = said_or_none(
-            r#"~/.agent/trigger add --bot shop.lead --cron '0 9 * * 1' -- Brief me"#,
-            r#"{"error":"triggers_unsupported","detail":"needs macOS"}"#,
+            r#"~/.agent/automation add --bot shop.lead --cron '0 9 * * 1' -- Brief me"#,
+            r#"{"error":"automations_unsupported","detail":"needs macOS"}"#,
         );
         assert_eq!(refused.verb, "Scheduled");
         assert_eq!(refused.what, "shop.lead · cron 0 9 * * 1");
         assert!(refused.failed);
         let under: Vec<String> = refused.under.iter().map(text).collect();
-        assert_eq!(under, ["Brief me", "needs macOS (triggers_unsupported)"]);
+        assert_eq!(under, ["Brief me", "needs macOS (automations_unsupported)"]);
         let removed = said_or_none(
-            r#""$HOME/.agent/trigger" rm watch"#,
+            r#""$HOME/.agent/automation" rm watch"#,
             r#"{"removed":"watch"}"#,
         );
         assert_eq!(

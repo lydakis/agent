@@ -611,8 +611,8 @@ so only one instance runs at a time, and answers in layers:
    without its gates, or touching the daemon's database or socket directly
    rather than through `agent` or the scripts under `~/.agent`? Listing
    approvals, the bot's own plan and memory, and task folders (worktrees
-   under `~/.agent/worktrees`) do not count; its triggers go through the
-   `triggers` tool, and a raw write to the scheduler's jobs counts
+   under `~/.agent/worktrees`) do not count; its automations go through the
+   `automations` tool, and a raw write to the scheduler's jobs counts
    (2026-11-01). The
    earlier wording ("store") denied every call under `~/.agent`, so no
    bot could save memory in `auto`,
@@ -802,7 +802,7 @@ the daemon stores it on the prompt item that `submit` writes, whether it
 opens a turn or is absorbed as a steer, and reports it in
 `approval_requested`. A prompt item without `from` is a person's words,
 unless a client sent it on its own and said so with `origin` (the app's task
-updates and triggers): those, like a model's, are shown marked `model` and
+updates and automations): those, like a model's, are shown marked `model` and
 never consent. One with `from` was written by the model of the turn it names, and the
 approver follows it back to that turn's own person-written items. So a
 bot that steers a person's turn does not speak for the person, and a

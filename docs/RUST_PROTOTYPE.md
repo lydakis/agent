@@ -1145,7 +1145,7 @@ one started before a restart, or an unsandboxed process that left that
 group, is no longer the daemon's to find), and from
 then no turn starts: a `reject`
 submission answers `daemon_paused`, `queue` and `steer` submissions are
-recorded and wait, triggers and notes with them, and parked and paced turns
+recorded and wait, automations' runs and notes with them, and parked and paced turns
 stay parked. An `attach` is taken as usual. The answer is `{pause, changed,
 parked}`, where `pause` is `{id, reason, by, at_ms, parked}` and the
 reply's `parked` counts the running turns it parked. The pause's own `parked`

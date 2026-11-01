@@ -62,7 +62,8 @@ pub struct Migration {
     pub retire: &'static str,
 }
 
-/// Every migration [`once`] runs, so none outlives its release.
+/// Every migration, through [`once`] or where it is read, so none outlives
+/// its release.
 pub const MIGRATIONS: &[Migration] = &[
     // Each trigger's own LaunchAgent or unit, and the backup's and
     // start-at-login's, become Sonny's scheduler's (0.8.0).
@@ -74,6 +75,15 @@ pub const MIGRATIONS: &[Migration] = &[
     // (0.8.0).
     Migration {
         id: crate::commons::POSTERS,
+        retire: "0.10.0",
+    },
+    // `~/.agent/triggers` becomes `~/.agent/automations`, and Sonny's old
+    // `~/.agent/trigger` script goes; run where they are read
+    // (`trigger::Places::home`, `skills::install_own`) rather than through
+    // [`once`], since the script and the scheduler read the folder without
+    // Sonny's start (0.8.0).
+    Migration {
+        id: "automations-folder",
         retire: "0.10.0",
     },
     // `[sonny] unsandboxed` becomes allow rules in ~/.agent/rules (0.8.0).

@@ -1412,7 +1412,7 @@ mod tests {
         let base = std::env::temp_dir().join(format!("agent-sandbox-home-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let home = base.join(".agent");
-        std::fs::create_dir_all(home.join("triggers/jobs")).unwrap();
+        std::fs::create_dir_all(home.join("automations/jobs")).unwrap();
         std::fs::create_dir_all(home.join("sonny/zen")).unwrap();
         std::fs::write(home.join("config.toml"), "").unwrap();
         let base = std::fs::canonicalize(&base).unwrap();
@@ -1432,7 +1432,7 @@ mod tests {
         .unwrap()
         .unwrap();
         assert!(policy.can_write(&base.join("notes.txt")));
-        assert!(!policy.can_write(&home.join("triggers/jobs/nightly.json")));
+        assert!(!policy.can_write(&home.join("automations/jobs/nightly.json")));
         assert!(!policy.can_write(&home.join("config.toml")));
         assert!(!policy.can_write(&home.join("env")));
         assert!(policy.can_write(&zen.join("key")));
