@@ -78,6 +78,7 @@ mod stamp;
 mod started;
 mod status;
 mod suggest;
+mod switch;
 mod t3;
 mod table;
 mod task;
@@ -239,6 +240,8 @@ struct Options {
     /// Drawn in another Sonny's pane: the terminal's tab is that Sonny's,
     /// so this one claims nothing of it.
     embedded: bool,
+    /// Where the window this one replaced (`/switch`) was, as JSON.
+    window_place: Option<String>,
     /// Which of the folder's leads to open, with no `--agent`.
     lead: project::Pick,
 }
@@ -282,7 +285,7 @@ async fn show(
             "{side:?} is not a side: right, left, above, below or float"
         ));
     }
-    let (socket, project) = agents_project(caller).await?;
+    let (socket, project, chain) = agents_project(caller).await?;
     let me = std::env::current_exe().map_err(|e| e.to_string())?;
     if split.is_none()
         && let Some(other) = project::lead_project(bot).filter(|p| *p != project)
@@ -291,12 +294,15 @@ async fn show(
         let (home, opened) = open_lead(&socket, store.as_deref(), other, bot, &project, &me)?;
         return Ok(json!({"bot": bot, "in": home, "opened": opened}));
     }
-    let mut layout = mux::for_agent(&socket, &project, None)?;
+    let mut layout = mux::for_agent(&socket, &project, &chain, None)?;
+    // Opened in this home, the agent's window knows it is there.
     let command = [
         me.to_string_lossy().into_owned(),
         "--socket".into(),
         socket.to_string_lossy().into_owned(),
         "--no-sound".into(),
+        "--window-place".into(),
+        mux::Place::encode(&Some(layout.kept())),
         "--agent".into(),
         bot.to_owned(),
     ];
@@ -329,7 +335,7 @@ fn open_lead(
     like: &str,
     me: &std::path::Path,
 ) -> Result<(String, bool), String> {
-    let mut layout = mux::for_agent(socket, project, Some(like))?;
+    let mut layout = mux::for_agent(socket, project, &[bot.to_owned()], Some(like))?;
     let bot = bot.to_owned();
     let mut command = vec![me.to_string_lossy().into_owned()];
     if let Some(store) = store {
@@ -349,16 +355,43 @@ fn open_lead(
     Ok((layout.home(), opened))
 }
 
-/// The daemon's socket and the project `bot` belongs to, for a call of
-/// `bot`'s.
-async fn agents_project(bot: &str) -> Result<(PathBuf, String), String> {
+/// The daemon's socket, the project `bot` belongs to, and `bot` with the
+/// agents that made it, up to the first lead, for a call of `bot`'s.
+async fn agents_project(bot: &str) -> Result<(PathBuf, String, Vec<String>), String> {
     let socket = std::env::var_os("AGENT_SOCKET")
         .map(PathBuf::from)
         .ok_or("AGENT_SOCKET is not set")?;
     let socket = std::path::absolute(socket).map_err(|e| e.to_string())?;
     let client = Client::connect(&socket).await.map_err(|e| e.to_string())?.0;
     let project = project_of(&client, bot).await;
-    Ok((socket, project))
+    let chain = makers(&client, bot).await;
+    Ok((socket, project, chain))
+}
+
+/// `bot`, then the agent that made it, and so on to the first lead or an
+/// agent no agent made: whose windows an agent acts in ([`mux::latest_for`]).
+async fn makers(client: &Client, bot: &str) -> Vec<String> {
+    let mut chain = vec![bot.to_owned()];
+    // A chain of makers is short; the cap only stops a loop.
+    while chain.len() < 16 && !project::is_lead(&chain[chain.len() - 1]) {
+        let at = &chain[chain.len() - 1];
+        let page = (client
+            .request("bots", json!({"name": at, "limit": 1}))
+            .await)
+            .unwrap_or_default();
+        let row = &page["bots"][0];
+        let Some(by) = row["created_by"]
+            .as_str()
+            .filter(|by| !by.is_empty() && row["name"] == at.as_str())
+        else {
+            break;
+        };
+        if chain.iter().any(|seen| seen == by) {
+            break;
+        }
+        chain.push(by.to_owned());
+    }
+    chain
 }
 
 /// A `run_in_pane` call of `owner`'s: run a command it wants watched (a
@@ -383,8 +416,8 @@ async fn run_in_pane(
     if !cwd.is_absolute() || !cwd.is_dir() {
         return Err(format!("{} is not a folder", cwd.display()));
     }
-    let (socket, project) = agents_project(owner).await?;
-    let mut layout = mux::for_agent(&socket, &project, None)?;
+    let (socket, project, chain) = agents_project(owner).await?;
+    let mut layout = mux::for_agent(&socket, &project, &chain, None)?;
     let command = ["sh".to_owned(), "-c".to_owned(), command.to_owned()];
     let block = layout.split(owner, name, cwd, &command, split.as_deref())?;
     Ok(json!({"block": block, "label": format!("{owner}/{name}"), "in": layout.home()}))
@@ -702,6 +735,7 @@ fn parse() -> Result<Options, String> {
         (None, None, None, false, None, None);
     let (mut layout, mut rex_host, mut sound) = (true, None, true);
     let (mut side, mut embedded) = (None, false);
+    let mut window_place = None;
     let mut lead = project::Pick::Last;
     let mut args = args.peekable();
     while let Some(arg) = args.next() {
@@ -726,6 +760,8 @@ fn parse() -> Result<Options, String> {
             "--side" => side = Some(value()?.parse().map_err(|_| usage())?),
             // Unlisted: how a task opens in the pane.
             "--embedded" => embedded = true,
+            // Unlisted: how `/switch` hands the window's place on.
+            "--window-place" => window_place = Some(value()?),
             _ => return Err(usage()),
         }
     }
@@ -742,6 +778,7 @@ fn parse() -> Result<Options, String> {
         sound,
         side,
         embedded,
+        window_place,
         lead,
     })
 }
@@ -756,7 +793,7 @@ fn reopen(bot: &str) -> Vec<String> {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--new" => {}
-            "--workspace" | "--lead" | "--agent" => {
+            "--workspace" | "--lead" | "--agent" | "--window-place" => {
                 args.next();
             }
             "--new-lead" => {
@@ -1075,6 +1112,27 @@ async fn run() -> Result<(), String> {
             app.notice = fleet.note.clone();
         }
     }
+    // The person's window of an agent, wherever it is: while it is the one
+    // used last of those showing the agent, the agent and what it made open
+    // where it is, or nowhere when it is in no multiplexer, never in
+    // another terminal's.
+    if options.side.is_none() && !options.embedded {
+        app.marker = match &project {
+            Some(project) => {
+                let place = app.fleet.as_ref().map(|fleet| fleet.place.clone());
+                mux::Marker::lead(&options.socket, project, &name, place)
+            }
+            None => {
+                let project = project_of(&app.client, &name).await;
+                let here = options.layout && mux::inside(options.rex_host.as_deref());
+                let given = options.window_place.as_deref().and_then(mux::Place::decode);
+                mux::Marker::agent(&options.socket, &project, &name, here, given)
+            }
+        };
+        if let Some(marker) = &mut app.marker {
+            marker.used();
+        }
+    }
     if let Some(above) = above
         && app.notice.is_none()
     {
@@ -1169,6 +1227,14 @@ async fn run() -> Result<(), String> {
     // `/lead NAME`: this window becomes that lead's Sonny, as if opened on it.
     if let (Ok(()), Some(other)) = (&result, app.switch_to.take()) {
         use std::os::unix::process::CommandExt;
+        // This process goes on as the other agent's Sonny, in this same
+        // terminal: this window, as its project knows it, is closed, and
+        // where it is goes on to the next.
+        let mut place = None;
+        if let Some(marker) = &app.marker {
+            marker.retire();
+            place = marker.known();
+        }
         let me = std::env::current_exe().map_err(|e| e.to_string())?;
         // Named by --agent, whatever folder this window is in.
         let mut args = reopen(&other).split_off(1);
@@ -1178,10 +1244,25 @@ async fn run() -> Result<(), String> {
         if !args.iter().any(|arg| arg == "--agent") {
             args.extend(["--agent".into(), other.clone()]);
         }
+        if let Some(place) = place {
+            args.extend(["--window-place".into(), mux::Place::encode(&place)]);
+        }
         let error = std::process::Command::new(me).args(&args).exec();
         return Err(format!("could not open {other}: {error}"));
     }
     result
+}
+
+/// Whether `event` is the person using this window: a key, a click, a
+/// paste, or the window coming to the front.
+fn used(event: &Event) -> bool {
+    use ratatui::crossterm::event::MouseEventKind;
+    match event {
+        Event::Key(key) => key.kind != KeyEventKind::Release,
+        Event::Mouse(mouse) => matches!(mouse.kind, MouseEventKind::Down(_)),
+        Event::Paste(_) | Event::FocusGained => true,
+        _ => false,
+    }
 }
 
 /// A new bot in the folder, with the instructions the app would give it.
@@ -1851,7 +1932,7 @@ fn hold(unsent: &mut Vec<String>, record: String) {
 /// The slash commands, as the menu lists them: name and what it does.
 /// `/agents` and `/ps` also open `/status`, `/triggers` and `/lookout`
 /// open `/background`, and `/settings` opens `/config`, unlisted.
-const COMMANDS: [(&str, &str); 28] = [
+const COMMANDS: [(&str, &str); 27] = [
     ("/side", "Start a side chat with a copy of this agent"),
     ("/model", "Pick the model and effort"),
     (
@@ -1872,10 +1953,9 @@ const COMMANDS: [(&str, &str); 28] = [
         "Reload the lead's instructions from its folder",
     ),
     ("/status", "Show this project's agents"),
-    ("/lead", "Open another of the folder's leads, or make one"),
     (
         "/switch",
-        "Open any agent in this window, or the one beside it",
+        "Open any agent in this window, or make the folder a new lead",
     ),
     (
         "/goal",
@@ -2116,6 +2196,9 @@ struct App {
     switch_to: Option<String>,
     started: Instant,
     fleet: Option<Fleet>,
+    /// This window, noted as the one the person uses each time they do,
+    /// so that its project's agents open where they look.
+    marker: Option<mux::Marker>,
     /// Layout notes waiting for the lead's running calls to be shown.
     held: Vec<Line<'static>>,
     /// The newest history item drawn on attach.
@@ -2152,6 +2235,9 @@ struct App {
     reactions: reactions::Reactions,
     /// The slash commands the person ran, for the menu to rank.
     picks: fuzzy::Picks,
+    /// Whether picks are kept in the person's file, as they are once the
+    /// screen is up: `/switch` reads the agents they picked from it.
+    picks_kept: bool,
     /// `/compact` asks before it compacts: Enter says yes.
     confirming: bool,
     /// The bot's latest replies, by node, with their first lines: what
@@ -2328,6 +2414,8 @@ struct App {
     retry: Option<Instant>,
     /// `/model`, open over the composer.
     picker: Option<models::Picker>,
+    /// `/switch`'s list of every agent, open over the composer.
+    agents: Option<switch::Picker>,
     /// Ctrl+R: the prompts sent before, narrowed by what is typed.
     searching: Option<Search>,
     /// `/config`, open over the composer.
@@ -2473,6 +2561,8 @@ struct Fleet {
     command: Vec<String>,
     /// Said once in the status row when tasks open where this pane is not.
     note: Option<String>,
+    /// Where its home is, kept for this window while the person uses it.
+    place: mux::Place,
     /// What each bot is doing, as its window says.
     doing: HashMap<String, &'static str>,
     /// The name each window was given, kept by the worker.
@@ -2777,7 +2867,14 @@ fn fleet_follow() -> Value {
 
 impl Fleet {
     async fn start(options: &Options, project: &str, lead: &str) -> Option<Self> {
-        let layout = mux::here(&options.socket, project, options.rex_host.as_deref())?;
+        let layout = mux::here(project, options.rex_host.as_deref())?;
+        let place = layout.kept();
+        // This window is the one used now, before its tasks open.
+        if let Some(mut marker) =
+            mux::Marker::lead(&options.socket, project, lead, Some(place.clone()))
+        {
+            marker.used();
+        }
         let (client, mut events) = Client::connect(&options.socket).await.ok()?;
         client.request("follow", fleet_follow()).await.ok()?;
         caught_up(&mut events).await;
@@ -2813,6 +2910,7 @@ impl Fleet {
             leads: Default::default(),
             command,
             note,
+            place,
             doing: HashMap::new(),
             named: Default::default(),
             alerts: Vec::new(),
@@ -2901,7 +2999,13 @@ impl Fleet {
     /// What a task's window runs, and its name while it is `doing` so.
     fn window(&self, bot: &str, doing: &str) -> (Vec<String>, String) {
         let mut command = self.command.clone();
-        command.extend(["--agent".into(), bot.into()]);
+        // Opened in this window's home, the task's window knows it is there.
+        command.extend([
+            "--window-place".into(),
+            mux::Place::encode(&Some(self.place.clone())),
+            "--agent".into(),
+            bot.into(),
+        ]);
         (command, format!("{} · {doing}", self.short(bot)))
     }
 
@@ -2917,8 +3021,8 @@ impl Fleet {
         (self.windows.clone(), room)
     }
 
-    /// Open the task's window, unless it has one or it was closed for
-    /// room. With `tell`, the lead's view hears where it opened, when not
+    /// Open the task's window, unless it has one, it was closed for room,
+    /// or the person uses another of the project's windows now. With `tell`, the lead's view hears where it opened, when not
     /// beside it, or why it did not; windows closed for room are said in
     /// the status row.
     fn show(&mut self, bot: &str, tell: bool) {
@@ -2930,7 +3034,15 @@ impl Fleet {
         );
         let told = self.tell.clone();
         let (windows, mut room) = self.room();
+        let (socket, project) = (self.socket.clone(), self.project.clone());
+        let (place, lead) = (self.place.clone(), self.lead.clone());
         self.layout.send(move |layout| {
+            // Typed in elsewhere since, the person is in another of the
+            // project's windows, outside this home: the task's window
+            // opens in none.
+            if !mux::mine(&socket, &project, &lead, &place) {
+                return;
+            }
             room.most = windows.lock().map_or(0, |mut windows| windows.most());
             let said = match layout.show_task(&bot_name, &name, &command, &room, false) {
                 Ok(mux::Shown::Opened(closed)) => {
@@ -3316,6 +3428,7 @@ impl App {
             switch_to: None,
             started: Instant::now(),
             fleet: None,
+            marker: None,
             held: Vec::new(),
             seen_node: 0,
             turn_model: None,
@@ -3337,6 +3450,7 @@ impl App {
             pictures: Vec::new(),
             reactions: reactions::Reactions::default(),
             picks: fuzzy::Picks::default(),
+            picks_kept: false,
             confirming: false,
             replies: Vec::new(),
             quoting: false,
@@ -3413,6 +3527,7 @@ impl App {
             searching: None,
             config: None,
             listing: None,
+            agents: None,
             switch: None,
             cache: None,
             pace: None,
@@ -3461,6 +3576,7 @@ impl App {
         self.width = terminal.size().map(|s| s.width as usize).unwrap_or(80);
         self.reactions = reactions::Reactions::load(self.reactions_key.as_deref());
         self.picks = fuzzy::Picks::load("commands");
+        self.picks_kept = true;
         // The newest prompts' pictures, up to as much as one message
         // may carry.
         self.recall = recall::Recall::load(attach::MOST_BYTES);
@@ -4056,6 +4172,12 @@ impl App {
         }
         self.speed = speed(record);
         self.mode = approvals::mode(record);
+    }
+
+    /// Whether a pick list is open over the composer: `/model`'s or
+    /// `/switch`'s.
+    fn listing_open(&self) -> bool {
+        self.picker.is_some() || self.agents.is_some()
     }
 
     /// `/model`'s listing, once it arrives: the picker opens on it.
@@ -4801,7 +4923,7 @@ impl App {
                             None => project_of(&client, &me).await,
                         };
                         tokio::task::spawn_blocking(move || {
-                            mux::for_agent(&socket, &project, None)?.focus(&bot)
+                            mux::for_agent(&socket, &project, &[me], None)?.focus(&bot)
                         })
                         .await
                         .map_err(|e| e.to_string())?
@@ -8393,6 +8515,7 @@ impl App {
                 || key.code == KeyCode::Tab
                     && self.input.is_empty()
                     && self.picker.is_none()
+                    && self.agents.is_none()
                     && self.searching.is_none()
                     && self.config.is_none()
                     && self.choosing.is_none()
@@ -8438,7 +8561,7 @@ impl App {
             // Over the composer, not over a list open on it.
             KeyCode::Char('f')
                 if ctrl
-                    && self.picker.is_none()
+                    && !self.listing_open()
                     && self.config.is_none()
                     && self.choosing.is_none()
                     && self.reacting.is_none() =>
@@ -8466,7 +8589,7 @@ impl App {
             // over it drawn on the way, and End back to the newest.
             KeyCode::Home | KeyCode::End
                 if self.input.is_empty()
-                    && self.picker.is_none()
+                    && !self.listing_open()
                     && self.choosing.is_none()
                     && self.reacting.is_none() =>
             {
@@ -9041,6 +9164,18 @@ impl App {
     }
 
     async fn key(&mut self, mut event: Event) {
+        // A key, a click, a paste or the window coming to the front: the
+        // person is here, not in another terminal's Sonny.
+        if let Some(marker) = &mut self.marker
+            && used(&event)
+        {
+            // Typing marks at most once a second; anything else (Enter
+            // included) at once, as it may follow a visit elsewhere.
+            match &event {
+                Event::Key(key) if key.code != KeyCode::Enter => marker.used(),
+                _ => marker.used_now(),
+            }
+        }
         // The terminal may no longer show what was drawn: a multiplexer
         // sizes a pane down and back to have its program draw it whole
         // again (Herdr, tmux and screen do), a window can be resized and
@@ -9286,6 +9421,38 @@ impl App {
         }
         if self.searching.is_some() {
             self.search_event(event);
+            return;
+        }
+        if let Some(agents) = &mut self.agents {
+            match event {
+                Event::Key(key) if key.kind != KeyEventKind::Release => match key.code {
+                    KeyCode::Up => agents.up(),
+                    KeyCode::Down => agents.down(),
+                    KeyCode::Backspace => {
+                        let mut filter = agents.filter.clone();
+                        filter.pop();
+                        agents.narrow(filter);
+                    }
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        self.agents = None
+                    }
+                    KeyCode::Char(c) => agents.narrow(format!("{}{c}", agents.filter)),
+                    KeyCode::Esc => self.agents = None,
+                    KeyCode::Enter => {
+                        if let Some(chosen) = agents.chosen() {
+                            if let switch::Chosen::Agent(bot) = &chosen {
+                                agents.picked(bot);
+                            }
+                            self.agents = None;
+                            self.switch_picked(chosen).await;
+                        }
+                    }
+                    _ => {}
+                },
+                Event::Paste(text) => agents.narrow(format!("{}{text}", agents.filter)),
+                Event::Resize(width, _) => self.width = width as usize,
+                _ => {}
+            }
             return;
         }
         if let Some(picker) = &mut self.picker {
@@ -10379,7 +10546,7 @@ impl App {
     /// The guess, while the composer shows it: empty, with nothing running
     /// and nothing open over it.
     fn suggested(&self) -> Option<&suggest::Guess> {
-        let open = self.picker.is_some()
+        let open = self.listing_open()
             || self.confirming
             || self.choosing.is_some()
             || self.approving.is_some()
@@ -10523,9 +10690,14 @@ impl App {
         }
     }
 
-    /// `/lead`: the folder's leads; `/lead NAME` opens this window on one,
-    /// and `/lead new [NAME]` makes one and opens it.
+    /// `/lead`, unlisted, is `/switch`; `/lead NAME` opens this window on
+    /// one of the folder's leads, and `/lead new [NAME]` makes one and
+    /// opens it, as the list's last row does.
     async fn lead_command(&mut self, rest: &str) {
+        if rest.is_empty() {
+            self.switch_command("").await;
+            return;
+        }
         let Some(project) = self.project.clone().filter(|_| self.options.side.is_none()) else {
             self.notice = Some("/lead is for a folder's lead, not this agent".into());
             return;
@@ -10533,32 +10705,12 @@ impl App {
         let dir = std::path::PathBuf::from(&self.workspace);
         let mut words = rest.split_whitespace();
         let pick = match (words.next(), words.next(), words.next()) {
-            (None, ..) => None,
-            (Some("new"), name, None) => Some(project::Pick::New(name.map(str::to_owned))),
-            (Some(name), None, _) => Some(project::Pick::Named(name.to_owned())),
+            (Some("new"), name, None) => project::Pick::New(name.map(str::to_owned)),
+            (Some(name), None, _) => project::Pick::Named(name.to_owned()),
             _ => {
-                self.notice = Some("/lead, /lead NAME or /lead new [NAME]".into());
+                self.notice = Some("/lead NAME or /lead new [NAME]; /switch lists them".into());
                 return;
             }
-        };
-        let Some(pick) = pick else {
-            self.notice = Some(match project::leads(&self.client, &project, &dir).await {
-                Ok(leads) => {
-                    let names: Vec<String> = (leads.iter())
-                        .filter_map(|lead| lead["name"].as_str())
-                        .map(|name| match name == self.bot {
-                            true => format!("{} (this one)", project::lead_short(name)),
-                            false => project::lead_short(name).to_owned(),
-                        })
-                        .collect();
-                    format!(
-                        "{project}'s leads here: {}; /lead NAME opens one, /lead new [NAME] makes one",
-                        names.join(", ")
-                    )
-                }
-                Err(error) => error,
-            });
-            return;
         };
         if let project::Pick::Named(name) = &pick
             && project::lead_bot(&project, name) == self.bot
@@ -10622,27 +10774,19 @@ impl App {
     /// `/switch NAME`: this window becomes NAME's Sonny, whatever agent it
     /// is (a lead, a task, one the person made), as `sonny --agent NAME`
     /// opens it; a name of this project's may leave out the project.
-    /// `/switch` alone opens the agent beside the conversation, or the one
-    /// `/status` has picked, closing the pane.
+    /// `/switch` alone lists every agent to pick from, the one beside the
+    /// conversation picked, and a name found in none lists those it
+    /// narrows to.
     async fn switch_command(&mut self, name: &str) {
         if self.options.side.is_some() || self.options.embedded {
             self.notice = Some("/switch is for the main window; this one is beside it".into());
             return;
         }
-        let name = match name {
-            "" => match self.beside() {
-                Some(bot) => bot,
-                None => {
-                    self.notice = Some(
-                        "/switch NAME, or open an agent beside the conversation (/status) first"
-                            .into(),
-                    );
-                    return;
-                }
-            },
-            name => name.to_owned(),
-        };
-        let mut names = vec![name.clone()];
+        if name.is_empty() {
+            self.list_agents("").await;
+            return;
+        }
+        let mut names = vec![name.to_owned()];
         if let Some(project) = &self.project
             && !name.contains('.')
         {
@@ -10666,7 +10810,69 @@ impl App {
                 }
             }
         }
-        self.notice = Some(format!("no agent named {name}"));
+        self.list_agents(name).await;
+    }
+
+    /// Every agent, listed over the composer to pick one, narrowed by
+    /// `typed`.
+    async fn list_agents(&mut self, typed: &str) {
+        let mut bots = Vec::new();
+        let mut after = Value::Null;
+        loop {
+            let asked = json!({"limit": 256, "after": after});
+            let page = match self.client.request("bots", asked).await {
+                Ok(page) => page,
+                Err(error) => {
+                    self.notice = Some(error.to_string());
+                    return;
+                }
+            };
+            bots.extend(page["bots"].as_array().cloned().unwrap_or_default());
+            after = page["next_after"].clone();
+            if after.is_null() {
+                break;
+            }
+        }
+        let beside = self.beside();
+        let mut picker = switch::Picker::new(
+            &bots,
+            &self.bot,
+            self.project.as_deref(),
+            &self.workspace,
+            beside.as_deref(),
+            match self.picks_kept {
+                true => fuzzy::Picks::load("agents"),
+                false => fuzzy::Picks::default(),
+            },
+        );
+        if !typed.is_empty() {
+            picker.narrow(typed.to_owned());
+        }
+        self.agents = Some(picker);
+    }
+
+    /// Takes the row picked in `/switch`'s list: an agent opens in this
+    /// window, and a new lead is made in the folder first.
+    async fn switch_picked(&mut self, chosen: switch::Chosen) {
+        match chosen {
+            switch::Chosen::Agent(bot) if bot == self.bot => {
+                self.notice = Some(format!("this window is {bot}'s already"));
+            }
+            switch::Chosen::Agent(bot) => {
+                self.switch_to = Some(bot);
+                self.quit = true;
+            }
+            switch::Chosen::Lead(name) => {
+                let dir = std::path::PathBuf::from(&self.workspace);
+                match project::open(&self.client, &dir, None, &project::Pick::New(name)).await {
+                    Ok(lead) => {
+                        self.switch_to = Some(lead.bot);
+                        self.quit = true;
+                    }
+                    Err(error) => self.notice = Some(error),
+                }
+            }
+        }
     }
 
     /// The agent beside the conversation: one open in the pane, else the
@@ -11224,6 +11430,51 @@ impl App {
                 frame.render_widget(Paragraph::new(keys), footer);
                 return;
             }
+            if let Some(agents) = &self.agents {
+                let at = agents.at();
+                let rows = agents.rows();
+                let new = matches!(rows.get(at), Some(switch::Row::Lead(_)));
+                let items: Vec<list::Item> = (rows.into_iter())
+                    .map(|row| match row {
+                        switch::Row::Agent(agent, found) => {
+                            list::Item::new(agent.name.clone(), agent.about.clone())
+                                .current(agent.name == agents.current)
+                                .found(&found.at)
+                        }
+                        switch::Row::Lead(name) => {
+                            let name = match name {
+                                Some(name) => format!("new lead {name}"),
+                                None => "new lead".to_owned(),
+                            };
+                            list::Item::new(name, "made in this folder")
+                        }
+                    })
+                    .collect();
+                let room = composer.y as usize;
+                over(frame, list::lines(&items, at, width, room), composer);
+                let line = if agents.filter.is_empty() {
+                    Line::from(vec![
+                        Span::raw("› ").bold(),
+                        Span::raw("type to narrow").dim(),
+                    ])
+                } else {
+                    Line::from(vec![
+                        Span::raw("› ").bold(),
+                        Span::raw(agents.filter.clone()),
+                    ])
+                };
+                frame.render_widget(Paragraph::new(line), composer);
+                frame.set_cursor_position((
+                    composer.x + 2 + agents.filter.width() as u16,
+                    composer.y,
+                ));
+                let keys = match new {
+                    true => "  ↑↓ pick · enter make · esc close",
+                    false => "  ↑↓ pick · enter switch · esc close",
+                };
+                frame.render_widget(Paragraph::new(Line::from(hint::spans(keys))), footer);
+                return;
+            }
             if let Some(picker) = &self.picker {
                 let at = picker.at();
                 let items: Vec<list::Item> = (picker.found().into_iter())
@@ -11341,7 +11592,7 @@ impl App {
     fn answering_over(&self, width: usize) -> Option<Line<'static>> {
         let ask = self.asking().filter(|_| !self.input.is_empty())?;
         let open = [
-            self.picker.is_some(),
+            self.listing_open(),
             self.config.is_some(),
             self.finding.is_some(),
         ];
@@ -11437,7 +11688,7 @@ impl App {
         let keep = match self.confirming
             || self.choosing.is_some()
             || self.approving.is_some()
-            || self.picker.is_some()
+            || self.listing_open()
             || self.config.is_some()
             || self.reacting.is_some()
             || self.finding.is_some()
@@ -12470,6 +12721,7 @@ mod tests {
             sound: false,
             side: None,
             embedded: false,
+            window_place: None,
             lead: project::Pick::Last,
         };
         App::new(client, "b", &json!({"name": "b"}), options)
@@ -12560,50 +12812,77 @@ mod tests {
 
     #[tokio::test]
     async fn switch_opens_any_agent_here_or_the_one_beside() {
-        let client = daemon_answering(|asked| match asked["bot"].as_str() {
-            Some("shop.fix" | "shop.lead") => json!({"name": asked["bot"]}),
-            _ => json!({"error": "bot_not_found", "detail": "no such bot"}),
-        })
-        .await;
+        let client =
+            daemon_answering(
+                |asked| match (asked["op"].as_str(), asked["bot"].as_str()) {
+                    (Some("bots"), _) => json!({"bots": [
+                {"name": "b", "workspace": "/w/shop"},
+                {"name": "shop.fix", "workspace": "/w/shop/fix", "running_turn": 4},
+                {"name": "shop.lead", "workspace": "/w/shop"},
+            ], "next_after": null}),
+                    (_, Some("shop.fix" | "shop.lead")) => json!({"name": asked["bot"]}),
+                    _ => json!({"error": "bot_not_found", "detail": "no such bot"}),
+                },
+            )
+            .await;
         let mut app = app(client);
         app.project = Some("shop".into());
+        app.workspace = "/w/shop".into();
         // By its whole name, or its name in this window's project.
         app.input.set("/switch fix");
         app.submit().await;
         assert_eq!(app.switch_to.as_deref(), Some("shop.fix"));
         assert!(app.quit);
         (app.switch_to, app.quit) = (None, false);
-        app.input.set("/switch nobody");
-        app.submit().await;
-        assert_eq!(app.notice.as_deref(), Some("no agent named nobody"));
-        assert!(!app.quit);
         app.input.set("/switch b");
         app.submit().await;
         assert_eq!(app.notice.as_deref(), Some("this window is b's already"));
-        // Alone, the agent open beside the conversation, as its title's
-        // button does.
-        app.input.set("/switch");
+        // A name found in none lists what it narrows to: here, only a new
+        // lead of that name.
+        app.notice = None;
+        app.input.set("/switch nobody");
         app.submit().await;
-        assert!(
-            app.notice
-                .as_deref()
-                .is_some_and(|n| n.starts_with("/switch NAME"))
+        let agents = app.agents.as_ref().expect("the list is open");
+        assert_eq!(agents.filter, "nobody");
+        assert_eq!(
+            agents.chosen(),
+            Some(switch::Chosen::Lead(Some("nobody".into())))
         );
-        let mut pane = pane::Pane::card("shop.lead", STATUS_KEYS);
-        pane.as_agent("shop.lead", false);
-        app.open_pane(pane);
+        assert!(!app.quit);
+        app.key(Event::Key(KeyCode::Esc.into())).await;
+        assert!(app.agents.is_none());
+        // Alone, every agent, the folder's lead first; the first that is
+        // not this window picked.
         app.input.set("/switch");
         app.submit().await;
-        assert_eq!(app.switch_to.as_deref(), Some("shop.lead"));
-        // Ctrl+G too, wherever the keys are.
-        app.switch_to = None;
+        assert_eq!(
+            app.agents.as_ref().and_then(|a| a.chosen()),
+            Some(switch::Chosen::Agent("shop.lead".into()))
+        );
+        app.key(Event::Key(KeyCode::Down.into())).await;
+        app.key(Event::Key(KeyCode::Enter.into())).await;
+        assert_eq!(app.switch_to.as_deref(), Some("shop.fix"));
+        (app.switch_to, app.quit) = (None, false);
+        // The agent open beside the conversation is picked to start, and
+        // `/lead` alone is `/switch`.
+        let mut pane = pane::Pane::card("shop.fix", STATUS_KEYS);
+        pane.as_agent("shop.fix", false);
+        app.open_pane(pane);
+        app.input.set("/lead");
+        app.submit().await;
+        assert_eq!(
+            app.agents.as_ref().and_then(|a| a.chosen()),
+            Some(switch::Chosen::Agent("shop.fix".into()))
+        );
+        app.agents = None;
+        // Ctrl+G opens the pane's agent at once, wherever the keys are.
         let ctrl_g = event::KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL);
         app.key(Event::Key(ctrl_g)).await;
-        assert_eq!(app.switch_to.as_deref(), Some("shop.lead"));
+        assert_eq!(app.switch_to.as_deref(), Some("shop.fix"));
         // A window drawn beside another keeps to its agent.
         (app.switch_to, app.quit) = (None, false);
         app.options.embedded = true;
-        app.input.set("/switch shop.fix");
+        app.input.set("/switch shop.lead");
         app.submit().await;
         assert!(app.switch_to.is_none());
     }
