@@ -124,6 +124,18 @@ class Screen:
             last = now
         return round(time.monotonic() - started - .5, 2)
 
+    def check(self, when):
+        """Refuse the run unless the program is still up and has drawn:
+        an exited window costs nothing and would read as a fast one."""
+        try:
+            ended = os.waitpid(self.pid, os.WNOHANG)[0]
+        except ChildProcessError:
+            ended = True
+        if ended or not self.drawn:
+            tail = self.last[-600:].decode(errors='replace')
+            state = 'exited' if ended else 'drew nothing'
+            raise RuntimeError(f'{state} {when}; last of its screen:\n{tail}')
+
     def close(self):
         try:
             os.kill(self.pid, signal.SIGTERM)
@@ -175,11 +187,13 @@ def window(args, bench):
         opened = screen.settle()
         # What it reads as it opens is done before the window is counted.
         time.sleep(2)
+        screen.check('as the window opened')
         ops, sent, read = tap.counts()
         drawn = screen.drawn
         sampler = Sampler(screen.pid)
         load = bench.load(args.idle_s, with_lookout=False)
         stats = sampler.done()
+        screen.check('while the fleet ran')
         after_ops, after_sent, after_read = tap.counts()
         seconds = stats['seconds']
         asked = {op: n - ops.get(op, 0) for op, n in after_ops.items() if n - ops.get(op, 0)}
@@ -203,12 +217,14 @@ def sky(args, bench):
     try:
         sampler = Sampler(screen.pid)
         time.sleep(1)
+        screen.check('as the replay opened')
         # 8x, doubled six times.
         for _ in range(6):
             os.write(screen.fd, b']')
             time.sleep(.05)
         time.sleep(3600 / 512 + 2)
         stats = sampler.done()
+        screen.check('during the replay')
         (bench.out / 'sky.screen').write_bytes(screen.last)
         return {'cpu_s': stats['cpu_s'], 'peak_rss_mib': stats['peak_rss_mib'],
                 'seconds': stats['seconds'], 'drawn_kib': round(screen.drawn / 1024, 1)}
