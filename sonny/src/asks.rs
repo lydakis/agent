@@ -1519,7 +1519,7 @@ mod tests {
             Some(true)
         );
         // An automation's, another agent's or a reaction are not the person.
-        let automation = json!({"node": 8, "from": null, "origin": "trigger",
+        let automation = json!({"node": 8, "from": null, "origin": "automation",
             "item": {"role": "user", "content": [{"type": "input_text", "text": "look"}]}});
         let agent = json!({"node": 7, "from": "shop.lead", "origin": null,
             "item": {"role": "user", "content": [{"type": "input_text", "text": "carry on"}]}});

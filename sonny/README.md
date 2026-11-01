@@ -162,9 +162,9 @@ login on a Mac (a LaunchAgent) and with the user manager elsewhere (a
 systemd user service wanted by `default.target`, which starts at boot once
 the user lingers: Sonny runs `loginctl enable-linger`, and says when that
 needs `sudo`), runs `sonny boot` when it starts, which starts the daemon as
-a trigger's fire does, with the login shell's environment. The daemon
+an automation's run does, with the login shell's environment. The daemon
 brings back the companions it keeps, the lookout and the tool host among
-them. Turning it off leaves the scheduler for triggers, and a running
+them. Turning it off leaves the scheduler for automations, and a running
 daemon running.
 
 A lead's transcript starts with a welcome, as Claude Code's does: Sonny,
@@ -180,7 +180,7 @@ Sonny's two roles are normal profiles the person can read and edit in
 ([agents/lead.md](agents/lead.md)), the lead's role, and `task.md`
 ([agents/task.md](agents/task.md)), what every other agent Sonny starts
 is told after its instructions and any role (`--profile`) it starts in:
-tasks, a trigger's agents and `sonny --new` bots. Sonny writes both at
+tasks, an automation's agents and `sonny --new` bots. Sonny writes both at
 each start, as it writes its skills: it rewrites a file when its text
 changes, and writes it again once it is deleted, but never over an edit,
 since it notes a fingerprint of what it wrote in `~/.agent/sonny/agents`,
@@ -748,7 +748,7 @@ way `/react` does, and each note in the margin has its own `↩`.
   lookout and the tool host.
 
   ![/status: a red ✗ notes-sync keeps restarting · exits 1 · 4 restarts, its log, then 2 skills to fix, muted](../docs/sonny/status-alerts.png)
-- `/background` (or `/triggers`, `/lookout`) lists, in the pane beside the
+- `/background` (or `/automations`, `/lookout`) lists, in the pane beside the
   conversation, what runs for the project's agents with
   no one typing: the automations that wake them, with
   when each runs, its message and what its last run did, and the
@@ -763,9 +763,9 @@ way `/react` does, and each note in the margin has its own `↩`.
   nightly memory cleanup could not read. Your own agents' failures, such as
   the memory cleanup's, show in every window. The footer then says
   `✗ 1 failed` with a red `✗`, left of the `↻`, and a click on either opens
-  `/background`. An agent sees the same in its `triggers` tool, whose rows
+  `/background`. An agent sees the same in its `automations` tool, whose rows
   say how the turn their last run sent ended. Automations and follows are
-  what the agents' `triggers` and `subscriptions` tools make.
+  what the agents' `automations` and `subscriptions` tools make.
 
   ![/background listing a nightly run whose turn failed offline and a server the cleanup could not read](../docs/sonny/background-failed.png)
   ![The footer: ✗ 1 failed with a red ✗, left of ↻ 3](../docs/sonny/footer-failed.png)
@@ -860,7 +860,7 @@ way `/react` does, and each note in the margin has its own `↩`.
   a replay shows the one that was up at its time.
   `[sonny]` sets `sky_haikus` (0 for none), `sky_haiku_window`,
   `sky_haiku_margin` and `sky_haiku_hold`.
-  An agent with a schedule (a trigger that wakes it) carries a short tick
+  An agent with a schedule (an automation that wakes it) carries a short tick
   just outside its star, out from the middle (inward at the pane's edge),
   plain once its next run is near (a tenth of the gap between runs, at
   least a minute). When an
@@ -945,7 +945,7 @@ way `/react` does, and each note in the margin has its own `↩`.
   what they will need next, and say plainly, as soon as they see it, what
   they missed, a better way of working or a mistake, coaching a habit
   once it repeats (in `lead.md`, and in `task.md` for the rest). A lead
-  also starts, or sets up with a trigger, what the person said they will
+  also starts, or sets up with an automation, what the person said they will
   do when nothing owns it, as far as their memory says they want. Both
   files say to save what the person corrected and what they welcomed, and
   that their memory overrides the files' defaults; so
@@ -1067,7 +1067,7 @@ every Sonny window closed; a call nobody answers in time ends as
 verdict wherever the agent's other calls do (`/permissions`): a start runs
 the folder's setup script, a new project makes a lead, a removal can drop
 work, a subscription sends other bots' words to the subscriber's judge,
-a pane runs a command outside the agent's sandbox, and a trigger runs as
+a pane runs a command outside the agent's sandbox, and an automation runs as
 you, from Sonny's scheduler, outside any sandbox. An agent whose
 gate Sonny did not set, as another client's, goes without these until the
 person picks a row in `/permissions`. An agent of Sonny's reaches Sonny only through these tools: none
@@ -1095,11 +1095,11 @@ the file plain and a default muted, so what you changed stands out.
 At each start Sonny writes what every agent leans on: the
 `memory`, `memory-cleanup`, `plan` and `automation` skills, as normal skills
 in `~/.agents/skills` (replacing links the Agent app left there), and
-`~/.agent/memory` and `~/.agent/trigger`, scripts that run this Sonny as
+`~/.agent/memory` and `~/.agent/automation`, scripts that run this Sonny as
 `sonny memory ...` (facts saved for later agents, in `~/.agents/memory`)
-and `sonny trigger ...` (jobs that wake an agent, which Sonny's scheduler
+and `sonny automation ...` (jobs that wake an agent, which Sonny's scheduler
 runs), which other harnesses and scripts run too; Sonny's own agents use the
-`memory` and `triggers` tools instead, which the tool host answers outside
+`memory` and `automations` tools instead, which the tool host answers outside
 their sandbox. A skill Sonny wrote is rewritten when Sonny's
 text changes, until you edit it: from then on it is yours, and Sonny leaves
 it alone, offering its new text through the first bot you open after an
@@ -1121,7 +1121,7 @@ The actions in `sonny.browser_confirm` (`eval`, `download`, `upload` and
 `state` by default), signing in from agent-browser's vault, and every
 call of an agent kept off the network wait for the agent's approvals,
 like any call that leaves its sandbox.
-[docs/SONNY.md](../docs/SONNY.md) has the details of triggers, memory,
+[docs/SONNY.md](../docs/SONNY.md) has the details of automations, memory,
 skills and MCP.
 Sonny starts its lookout, `sonny lookout`, when it opens a project: one
 for the daemon, watching for every bot that subscribed, and Sonny
@@ -1155,7 +1155,7 @@ turn's `Worked for …` line.
 
 The view is clean by default: the bot's words, and only the calls that
 move the work on, said as what they did (a task started, messaged or
-waited for, a question to you, the plan, memory, a trigger, a window
+waited for, a question to you, the plan, memory, an automation, a window
 opened). Commands, reads and edits are left out: agents are people you
 talk to, and the clean view shows what they say and what reaches you, not
 the work inside their turn. `/verbose` draws every

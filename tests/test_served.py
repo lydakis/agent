@@ -723,16 +723,16 @@ class ServedToolTests(ModelFixture):
     @unittest.skipIf(sys.platform == 'darwin', "launchd runs Sonny's scheduler on a Mac")
     def test_a_trigger_with_no_systemd_running_is_refused_and_says_why(self):
         self.daemon.request('create', bot='calc.lead', workspace=str(self.path), model='openai/synthetic-model',
-                            instructions='Lead.', declare=[declared('triggers')])
+                            instructions='Lead.', declare=[declared('automations')])
         # A runtime folder no user manager serves.
         runtime = self.path / 'runtime'
         runtime.mkdir()
         self.host(XDG_RUNTIME_DIR=str(runtime))
-        refused = json.loads(self.call('calc.lead', 'triggers', {'add': {'every': '30m', 'message': 'Check.'}}))
-        self.assertEqual(refused['error'], 'trigger_refused')
-        self.assertIn('triggers_unsupported', refused['detail'])
+        refused = json.loads(self.call('calc.lead', 'automations', {'add': {'every': '30m', 'message': 'Check.'}}))
+        self.assertEqual(refused['error'], 'automation_refused')
+        self.assertIn('automations_unsupported', refused['detail'])
         self.assertEqual(list((self.path / '.config/systemd/user').glob('*.service')), [])
-        self.assertEqual(list((self.path / '.agent/triggers/jobs').glob('*.json')), [])
+        self.assertEqual(list((self.path / '.agent/automations/jobs').glob('*.json')), [])
 
     def test_a_lookout_another_build_started_gives_way(self):
         old = self.lookout()

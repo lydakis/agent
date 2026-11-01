@@ -10,12 +10,12 @@
 //! `~/.agent/memory`, a script Sonny writes, shows the indexes, reads,
 //! saves, removes, indexes and checks facts; the `memory` skill Sonny
 //! installs says what to save. A read is recorded beside the facts, so the
-//! cleanup can find facts no agent has opened in a while. `schedule` adds a nightly trigger, through
-//! `~/.agent/trigger`, whose agent follows the `memory-cleanup` skill
+//! cleanup can find facts no agent has opened in a while. `schedule` adds a nightly automation, through
+//! `~/.agent/automation`, whose agent follows the `memory-cleanup` skill
 //! between `cleanup start` and `cleanup finish`, which commit to a local
 //! git repository in `~/.agents/memory` and revert a cleanup that removed too
 //! many facts, keeping what other agents saved while it ran; `changed` gates
-//! the trigger so a quiet night costs no turn.
+//! the automation so a quiet night costs no turn.
 use serde_json::{Value, json};
 use std::{
     io::Read,
@@ -931,7 +931,7 @@ fn unread(root: &Path) -> Result<Vec<Value>, String> {
 }
 
 /// Whether anything was saved or removed since the last cleanup, or a
-/// cleanup is open, for a trigger's `--if`: exit 0 when so, else
+/// cleanup is open, for an automation's `--if`: exit 0 when so, else
 /// `unchanged` and exit 1.
 fn changed(root: &Path) -> Result<Value, String> {
     // A cleanup cut short counts too, so the next night finishes it.
@@ -1211,8 +1211,8 @@ fn cleanup_finish(root: &Path) -> Result<Value, String> {
     )
 }
 
-/// The trigger that runs the cleanup each night: an agent of its own,
-/// started on the first fire in the memory folder, woken only when
+/// The automation that runs the cleanup each night: an agent of its own,
+/// started on the first run in the memory folder, woken only when
 /// `changed` says so, and each turn capped.
 fn schedule_args(script: &Path, args: &[String]) -> Result<Vec<String>, String> {
     let usage = || format!("usage: {USAGE}");
@@ -1264,12 +1264,12 @@ const AGENT: &str = "memory-cleanup";
 
 fn schedule(home: &Path, args: &[String]) -> Result<Value, String> {
     let add = schedule_args(&home.join(".agent/memory"), args)?;
-    // The agent the trigger starts works in the memory folder.
+    // The agent the automation starts works in the memory folder.
     let root = home.join(".agents/memory");
     repo(&root)?;
     std::env::set_current_dir(&root)
         .map_err(|e| format!("memory_failed: {}: {e}", root.display()))?;
-    add_trigger(&home.join(".agent/trigger"), &add).map_err(|error| match error.split_once(':') {
+    add_automation(&home.join(".agent/automation"), &add).map_err(|error| match error.split_once(':') {
         Some(("bot_exists", _)) => format!(
             "bot_exists: {AGENT} is an agent already: schedule without --model to keep it, or remove it with agent rm --bot {AGENT} to start it on another model"
         ),
@@ -1280,12 +1280,12 @@ fn schedule(home: &Path, args: &[String]) -> Result<Value, String> {
     })
 }
 
-/// `~/.agent/trigger add ARGS`, run in this folder with this shell's
+/// `~/.agent/automation add ARGS`, run in this folder with this shell's
 /// daemon and agent: its JSON line, or its error as `CODE: detail`.
-fn add_trigger(script: &Path, args: &[String]) -> Result<Value, String> {
+fn add_automation(script: &Path, args: &[String]) -> Result<Value, String> {
     if !script.is_file() {
         return Err(format!(
-            "triggers_unsupported: {} is not there to add the nightly cleanup",
+            "automations_unsupported: {} is not there to add the nightly cleanup",
             script.display()
         ));
     }
@@ -1303,7 +1303,7 @@ fn add_trigger(script: &Path, args: &[String]) -> Result<Value, String> {
     Err(match (error["error"].as_str(), error["detail"].as_str()) {
         (Some(code), Some(detail)) => format!("{code}: {detail}"),
         _ => format!(
-            "trigger_failed: {}",
+            "automation_failed: {}",
             String::from_utf8_lossy(&out.stderr).trim()
         ),
     })
@@ -2293,7 +2293,7 @@ mod tests {
     }
 
     #[test]
-    fn the_schedule_is_a_gated_capped_trigger_that_starts_or_keeps_its_own_agent() {
+    fn the_schedule_is_a_gated_capped_automation_that_starts_or_keeps_its_own_agent() {
         let script = Path::new("/Users/g/.agent/memory");
         let line = |rest: &[&str]| schedule_args(script, &args(rest));
         let add = line(&["--model", "openai/mini"]).unwrap();

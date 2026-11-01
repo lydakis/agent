@@ -1201,7 +1201,7 @@ pub fn relays(text: &str, from: Option<&str>) -> bool {
 pub fn from_outside(origin: Option<&str>) -> &'static str {
     match origin.unwrap_or("").split('.').next() {
         Some("lookout") => "a follow",
-        Some("trigger") => "an automation",
+        Some("automation" | "trigger") => "an automation",
         Some("commons") => "the commons",
         Some("goal") => "a goal",
         Some("margin") => "a margin note",
@@ -3188,7 +3188,7 @@ mod tests {
 
     #[test]
     fn a_trigger_and_a_memory_save_read_as_what_they_did() {
-        let command = r#"git worktree list; "$HOME/.agent/trigger" add --name watch --every 10m -- 'Check the tasks, then report'; "$HOME/.agent/memory" save flow --type project --description d --source s -- 'text'"#;
+        let command = r#"git worktree list; "$HOME/.agent/automation" add --name watch --every 10m -- 'Check the tasks, then report'; "$HOME/.agent/memory" save flow --type project --description d --source s -- 'text'"#;
         let output = "/repo d7e2b9e [main]\n\
             {\"name\":\"watch\",\"when\":\"every 10m\"}\n\
             {\"duplicate\":false,\"saved\":\"flow\",\"replaced\":false,\"path\":\"/m/flow.md\"}\n";
@@ -3610,9 +3610,11 @@ mod tests {
         );
         assert!(clean("memory", serde_json::json!({}), "{}").is_empty());
         let scheduled = text(&super::clean(
-            "triggers",
+            "automations",
             &serde_json::json!({"add": {"every": "30m", "message": "Check the queue."}}),
-            Some(r#"{"error":"trigger_refused","detail":"triggers_unsupported: only macOS"}"#),
+            Some(
+                r#"{"error":"automation_refused","detail":"automations_unsupported: only macOS"}"#,
+            ),
             true,
             "/w",
             80,
@@ -3621,7 +3623,7 @@ mod tests {
             scheduled,
             [
                 "✗ Couldn't schedule every 30m",
-                "  └ triggers_unsupported: only macOS",
+                "  └ automations_unsupported: only macOS",
                 "    Check the queue."
             ]
         );

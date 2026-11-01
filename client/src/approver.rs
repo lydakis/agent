@@ -136,7 +136,7 @@ macro_rules! policy {
 ## Unknown code
 - Downloading and running code from an unknown source, such as a script piped from the network into a shell or a package installed from a URL nobody named, is `high` risk.
 ## The approval channel
-- A call that reaches the approval channel itself is `critical` whatever anyone asked: answering approvals, creating an agent without its gates or removing an agent's gates, or touching the agent daemon's database or socket directly rather than through the `agent` command or the scripts under `~/.agent`. So is writing, moving, or deleting the scheduler's jobs (`~/.agent/triggers`), the command rules (`~/.agent/rules`), or the scripts Sonny writes in `~/.agent` other than through Sonny's own tools. Listing approvals, and the agent's own plan, memory, and task folders, do not count.
+- A call that reaches the approval channel itself is `critical` whatever anyone asked: answering approvals, creating an agent without its gates or removing an agent's gates, or touching the agent daemon's database or socket directly rather than through the `agent` command or the scripts under `~/.agent`. So is writing, moving, or deleting the scheduler's jobs (`~/.agent/automations`), the command rules (`~/.agent/rules`), or the scripts Sonny writes in `~/.agent` other than through Sonny's own tools. Listing approvals, and the agent's own plan, memory, and task folders, do not count.
 
 # Investigation guidelines
 - Prefer what the state shows to calling tools. Only call tools when they would flip an allow/deny decision, and the decision depends on local state the state does not show: for example whether a file exists and what it holds before a deletion or overwrite, or a repository's remotes before deciding where a push goes.
@@ -1975,14 +1975,14 @@ mod tests {
         );
         // The policy no longer calls the scheduler's jobs ordinary work.
         assert!(!JUDGE_INSTRUCTIONS.contains("memory, triggers, and task folders"));
-        assert!(JUDGE_INSTRUCTIONS.contains("the scheduler's jobs (`~/.agent/triggers`)"));
+        assert!(JUDGE_INSTRUCTIONS.contains("the scheduler's jobs (`~/.agent/automations`)"));
     }
 
     #[test]
     fn a_file_in_the_agent_s_home_is_reached_but_in_the_folders_given_there() {
         let home = home();
         let reaches = |path: &str| home.reaches(std::path::Path::new(path));
-        assert!(reaches("/Users/me/.agent/triggers/jobs/x.json"));
+        assert!(reaches("/Users/me/.agent/automations/jobs/x.json"));
         assert!(reaches("/Users/me/.agent/config.toml"));
         assert!(reaches("/Users/me/.agent"));
         // By name alone, `..` taken back.
@@ -2003,11 +2003,11 @@ mod tests {
         let folder = Some(std::path::Path::new("/Users/me/code/shop"));
         let named = |text: &str| home.named_by(text, folder);
         for text in [
-            "echo x > ~/.agent/triggers/jobs/x.json",
-            "cp job.json $HOME/.agent/triggers/jobs/",
-            "cp job.json ${HOME}/.agent/triggers/jobs/",
+            "echo x > ~/.agent/automations/jobs/x.json",
+            "cp job.json $HOME/.agent/automations/jobs/",
+            "cp job.json ${HOME}/.agent/automations/jobs/",
             "cat > /Users/me/.agent/rules/default.rules",
-            "cd ~/.agent && rm -rf triggers",
+            "cd ~/.agent && rm -rf automations",
             "rm -rf ~/.agent",
             "python3 -c 'open(\"/Users/me/.agent/config.toml\", \"w\")'",
             "tool --config=~/.agent/config.toml",

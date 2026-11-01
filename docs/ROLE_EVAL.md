@@ -12,16 +12,16 @@ This eval is how a cut proves that shorter text works as well.
 Each run gets its own HOME, copy of the build, daemon, socket and git repository (`shop`, with
 a bare `origin`) under `~/.role-eval/<model hash>-<arm><n>`, outside `/tmp` and `$TMPDIR`, which every sandbox may write. A lead is driven through
 `sonny acp` the way T3 Code drives one, so the lookout, the tool host,
-Sonny's tools and the tasks are all real. A fake HOME is not isolation, because a call that leaves the sandbox runs as the person (#521). So agents run in an `eval` permissions row: the sandbox writes their folders and the run's `backups` and `origin.git`, with the network off. Every call that would leave the sandbox comes to the eval: the lead's through ACP and a task's through `agent answer`. The eval allows only a plain call of `~/.agent/trigger` or `~/.agent/memory` whose verb and flags run nothing else (no trigger `--if` or `--start`, no `memory schedule`, nothing Bash would expand), and the Sonny tools the day needs when they keep to the run (tasks started in the lead's repository, not another `folder`, subscriptions, triggers without `if` or `start`), and denies the rest. Each run lists what changed in the real home in `outside.txt`. Two sources, `chat`
+Sonny's tools and the tasks are all real. A fake HOME is not isolation, because a call that leaves the sandbox runs as the person (#521). So agents run in an `eval` permissions row: the sandbox writes their folders and the run's `backups` and `origin.git`, with the network off. Every call that would leave the sandbox comes to the eval: the lead's through ACP and a task's through `agent answer`. The eval allows only a plain call of `~/.agent/automation` or `~/.agent/memory` whose verb and flags run nothing else (no automation `--if` or `--start`, no `memory schedule`, nothing Bash would expand), and the Sonny tools the day needs when they keep to the run (tasks started in the lead's repository, not another `folder`, subscriptions, automations without `if` or `start`), and denies the rest. Each run lists what changed in the real home in `outside.txt`. Two sources, `chat`
 and `mail`, release fixed events at each step. They include news that bears
 on the work and news that doesn't. A step can also push a teammate's commit
 to `origin`, the way a change merged elsewhere arrives, whatever the review
 system. The person's words at each step are in
 `STEPS`. A step settles once no agent has a turn running and the lead has
-been quiet for a minute. A run's triggers live under its own HOME, fired by
+been quiet for a minute. A run's automations live under its own HOME, run by
 that HOME's own scheduler, one job in the user's launchd or systemd under a
 label tagged with that HOME (#453), so they never touch the user's own; each
-run still removes its triggers when it ends, and the scheduler of a run that
+run still removes its automations when it ends, and the scheduler of a run that
 stopped early lets its job go once the run's HOME is gone (`launchctl list |
 grep me.lydakis.agent.scheduler` on a Mac lists them).
 

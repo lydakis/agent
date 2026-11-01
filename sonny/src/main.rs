@@ -297,7 +297,7 @@ fn usage() -> String {
      for the project's agents, /lead for the folder's leads.\n\
      Agents start tasks, put windows and panes where the person looks, make projects\n\
      and follow agents in the lookout with tools Sonny gives them, which its tool host answers.\n\
-     sonny memory ... and sonny trigger ... are what ~/.agent/memory and ~/.agent/trigger\n\
+     sonny memory ... and sonny automation ... are what ~/.agent/memory and ~/.agent/automation\n\
      run, which Sonny writes at each start.\n\
      sonny sky draws every agent on the daemon lighting up as they talk, as /sky does,\n\
      on its own in the whole terminal; --center NAME puts an agent in the middle, and\n\
@@ -2039,7 +2039,7 @@ fn hold(unsent: &mut Vec<String>, record: String) {
 }
 
 /// The slash commands, as the menu lists them: name and what it does.
-/// `/agents` and `/ps` also open `/status`, `/triggers` and `/lookout`
+/// `/agents` and `/ps` also open `/status`, `/automations` and `/lookout`
 /// open `/background`, and `/settings` opens `/config`, unlisted.
 const COMMANDS: [(&str, &str); 27] = [
     ("/side", "Start a side chat with a copy of this agent"),
@@ -4239,7 +4239,7 @@ impl App {
                     Ok(_) => {}
                     Err(error) if error.code == "idempotency_conflict" => {}
                     Err(error) => {
-                        self.notice = Some(format!("telling of the restored triggers: {error}"));
+                        self.notice = Some(format!("telling of the restored automations: {error}"));
                         all = false;
                         break;
                     }
@@ -10334,7 +10334,7 @@ impl App {
             }
             return;
         }
-        if matches!(prompt.as_str(), "/background" | "/triggers" | "/lookout") {
+        if matches!(prompt.as_str(), "/background" | "/automations" | "/lookout") {
             self.input.clear();
             if self.options.side.is_some() {
                 self.notice = Some("/background is for the agent itself, not a side chat".into());
@@ -16738,7 +16738,7 @@ mod tests {
 
     #[tokio::test]
     async fn words_attached_to_a_call_hang_under_what_it_carried() {
-        let note = "[trigger nightly · 15:02 · not sent to tally.lead: busy]";
+        let note = "[automation nightly · 15:02 · not sent to tally.lead: busy]";
         let client = daemon_answering(move |asked| {
             let node = asked["nodes"][0].as_i64().unwrap_or(0);
             match asked["op"].as_str() {
@@ -16788,7 +16788,7 @@ mod tests {
             [
                 "  📎 2 attached notes · an automation, calc.add ▾",
                 "    📎 From an automation ▾",
-                "      [trigger nightly · 15:02 · not sent to tally.lead: busy]",
+                "      [automation nightly · 15:02 · not sent to tally.lead: busy]",
                 "    📎 From calc.add ▸",
             ]
         );
