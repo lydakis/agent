@@ -126,6 +126,24 @@ class ConfinedTests(unittest.TestCase):
                        "~/.agent/trigger rm 'unclosed",
                        'git push origin main']:
             self.assertFalse(role_eval.determinable(home, shell(denied)), denied)
+        # Sonny's own tools the day needs, with what stays in the run.
+        native = lambda name, arguments: {'toolCall': {'name': name, 'rawInput': arguments}}
+        for name, arguments in [('start_task', {'name': 'export', 'brief': 'b', 'setup': True}),
+                                ('start_task', {'name': 'x', 'brief': 'b', 'folder': 'shop/sub'}),
+                                ('remove_task', {'task': 'export'}),
+                                ('subscriptions', {'add': {'name': 'news', 'sources': ['chat']}}),
+                                ('triggers', {'add': {'every': '10m', 'message': 'check'}}),
+                                ('triggers', {'remove': 'watch'})]:
+            self.assertTrue(role_eval.determinable(home, native(name, arguments)), (name, arguments))
+        for name, arguments in [('start_task', {'name': 'x', 'brief': 'b', 'folder': '/Users/me'}),
+                                ('start_task', {'name': 'x', 'brief': 'b', 'folder': '../..'}),
+                                ('start_task', {'name': 'x', 'brief': 'b', 'folder': '~/x'}),
+                                ('triggers', {'add': {'every': '10m', 'if': 'touch /x', 'message': 'm'}}),
+                                ('triggers', {'add': {'start': {'name': 'n', 'model': 'm'}, 'message': 'm'}}),
+                                ('new_project', {'folder': '/Users/me/x'}),
+                                ('run_in_pane', {'command': 'ls'}),
+                                ('goal', {}), ('browser', {})]:
+            self.assertFalse(role_eval.determinable(home, native(name, arguments)), (name, arguments))
         # Not a shell call, or not seen whole.
         self.assertFalse(role_eval.determinable(home, {'name': 'write', 'arguments': {'path': '/x', 'content': ''}}))
         self.assertFalse(role_eval.determinable(home, shell('~/.agent/trigger ls', arguments_cut=['command'])))

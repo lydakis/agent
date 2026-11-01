@@ -455,19 +455,45 @@ def words_of(text):
     return words
 
 
+def inside(folder):
+    """Whether a task's `folder` stays in the lead's: relative, not climbing."""
+    return folder is None or (isinstance(folder, str) and not folder.startswith(('/', '~'))
+                              and '..' not in Path(folder).parts)
+
+
+# Sonny's own tools that wait on the eval in the `ask` row, and when a call
+# of each keeps its effects in the run. The day needs tasks, the lookout's
+# subscriptions and triggers. A start's setup runs the lead's folder's
+# .agents/setup, which every sandbox keeps read-only, so only the eval
+# could have written one, and it writes none. A trigger's `if` runs outside every sandbox and its
+# `start` makes an agent the eval never configured. A new project, a pane's
+# command, a script, a goal's check and the browser run as the person.
+NATIVE = {
+    'start_task': lambda a: inside(a.get('folder')),
+    'remove_task': lambda a: True,
+    'subscriptions': lambda a: True,
+    'triggers': lambda a: not (isinstance(a.get('add'), dict) and {'if', 'start'} & set(a['add'])),
+}
+
+
 def determinable(home, request):
     """Whether a call that would leave the sandbox is one whose effects stay
     in the run, so the eval may allow it. A command's words can't say where
     it writes (a script can build a path to the real home at run time), so
     only one plain call of Sonny's own scripts is, with a verb and flags
     that run nothing else: no shell operators, no expansions, no line
-    breaks. Every other ask is denied; what the run's work needs is
+    breaks. So is a call of the Sonny tools in NATIVE that keeps to the
+    run. Every other ask is denied; what the run's work needs is
     writable without asking, and the sandbox is the boundary."""
     if not request or request.get('arguments_cut') or request.get('arguments_omitted'):
         return False
     call = request.get('toolCall') or request
     arguments = call.get('rawInput') if 'rawInput' in call else call.get('arguments')
-    if call.get('name') != 'shell' or not isinstance(arguments, dict):
+    if not isinstance(arguments, dict):
+        return False
+    if call.get('name') in NATIVE:
+        return NATIVE[call['name']](arguments)
+    if call.get('name') != 'shell':
         return False
     if set(arguments) - {'command', 'timeout_ms', 'sandbox_permissions', 'justification'}:
         return False
