@@ -1417,7 +1417,12 @@ Protocol version 12 lets `bots` filter on the daemon side: `name` keeps the
 bots whose name matches a SQLite GLOB pattern (1 to 256 bytes; case-sensitive
 like names), read from the name index's range for the pattern's literal
 prefix, and `active: true` keeps those with a turn running, read from a partial
-index of only them (`bots_running`). Filtered pages page and bound like any
+index of only them (`bots_running`). Protocol 39 adds `created_by_id`, which
+keeps the bots the bot with that id made, read from a partial index by maker
+and name (`bots_maker`), so a client watching its own children reads only
+them however many other bots the store holds; it combines with `name` and
+`active`. An id, not a name, so a maker that reuses an earlier one's name
+sees none of that one's. Filtered pages page and bound like any
 other. `bots` and `turns` run on the store's reader connections, beside the
 service loop ([observation reads](#observation-reads)), so a listing never
 waits behind, or holds up, the writer or another client.

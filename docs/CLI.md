@@ -167,8 +167,10 @@ identity is `bot_not_found`.
 - Listings read only what they print. `--limit N` stops `ls`, `turns` and
   `approvals` after N entries. `ls --name GLOB` keeps the bots whose name
   matches (`'project.*'`, `'*.lead'`; SQLite GLOB, case-sensitive) and
-  `ls --active` those with a turn running; the daemon filters, so neither
-  pages through every bot. `turns --newest` lists newest first, read from the
+  `ls --active` those with a turn running, and `ls --created-by BOT` those
+  that bot made (by its id, so a later bot of the same name lists none of
+  an earlier one's); the daemon filters, so none of them pages through
+  every bot. `turns --newest` lists newest first, read from the
   end, so `turns --bot NAME --newest --limit 3` is a bot's last three turns.
 - `usage` prints what the bots' turns spent as one JSON object: tokens in
   all, by bot (the `--limit` that spent most, 64 by default, the rest summed),

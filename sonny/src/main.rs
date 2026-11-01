@@ -2085,6 +2085,9 @@ struct App {
     /// Where the person's reactions to the bot are kept, once its id is
     /// known.
     reactions_key: Option<String>,
+    /// This agent's store-wide id, which the bots it made carry as
+    /// `created_by_id`.
+    bot_id: Option<i64>,
     /// Esc set the questions aside: what is typed is a message of its own.
     chatting: bool,
     /// The waiting call whose whole command was last written out.
@@ -3159,6 +3162,7 @@ impl App {
             focus: None,
             aside: Vec::new(),
             sent_answers: Vec::new(),
+            bot_id: record["bot_id"].as_i64(),
             reactions_key: record["bot_id"].as_i64().map(|id| {
                 let store =
                     std::fs::canonicalize(&options.store).unwrap_or_else(|_| options.store.clone());
@@ -5494,6 +5498,7 @@ impl App {
     /// seconds where no windows for the project's agents say it.
     async fn read_running_tasks(&mut self) {
         if self.fleet.is_some()
+            || self.bot_id.is_none()
             || (self.tasks_running_read).is_some_and(|at| at.elapsed() < Duration::from_secs(3))
         {
             return;
@@ -5503,14 +5508,14 @@ impl App {
         let mut running = std::collections::HashSet::new();
         let mut after = Value::Null;
         loop {
-            let asked = json!({"active": true, "limit": 256, "after": after});
+            let asked = json!({"active": true, "created_by_id": self.bot_id,
+                "limit": 256, "after": after});
             let Ok(page) = self.client.request("bots", asked).await else {
                 return;
             };
             running.extend(
                 (page["bots"].as_array().into_iter().flatten())
                     // Its side chats lapse, and are no tasks.
-                    .filter(|bot| bot["created_by"] == self.bot.as_str())
                     .filter(|bot| bot["expire_ms"].is_null())
                     .filter_map(|bot| bot["name"].as_str().map(str::to_owned)),
             );
