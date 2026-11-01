@@ -98,8 +98,6 @@ const CORD_PULSE: Duration = Duration::from_millis(2400);
 const TALKS: usize = 96;
 /// How long a schedule's tick flashes as it fires.
 const TICK_FLASH: Duration = Duration::from_millis(1500);
-/// Calls kept waiting on a reviewer at most; past it, all are let go.
-const REVIEWED: usize = 4096;
 /// What was said and called, kept an hour for the counts.
 const HOUR: Duration = Duration::from_secs(3600);
 /// The haiku's first row under the key hints: twice the blank that keeps
@@ -492,9 +490,6 @@ pub struct View {
     /// `triggers` calls under way, by agent, turn and call: a call id is
     /// unique only within its turn.
     bookings: HashMap<(String, i64, String), Booking>,
-    /// Calls waiting on a reviewer such as `auto`, by agent, turn and call:
-    /// the reviewer's tag.
-    reviewed: HashSet<(String, i64, String)>,
     told: HashMap<String, Instant>,
 }
 
@@ -851,7 +846,6 @@ impl View {
             booked: None,
             booking: false,
             bookings: HashMap::new(),
-            reviewed: HashSet::new(),
             told: HashMap::new(),
         }
     }
@@ -900,7 +894,6 @@ impl View {
     /// Let go of every agent and what they did, to draw them again.
     fn forget(&mut self) {
         self.bookings.clear();
-        self.reviewed.clear();
         self.agents.clear();
         self.index.clear();
         self.said.clear();
@@ -1924,18 +1917,11 @@ impl View {
                 for call in data["calls"].as_array().into_iter().flatten() {
                     let gates = call["gates"].as_array().map_or(&[][..], Vec::as_slice);
                     let manual = gates.iter().any(|g| g == "manual");
-                    let reviewed = gates.iter().any(|g| g.is_string() && g != "manual");
                     let Some(id) = call["call_id"].as_str() else {
                         continue;
                     };
                     if manual {
                         self.agents[at].held.insert(id.to_owned());
-                    }
-                    if reviewed {
-                        if self.reviewed.len() >= REVIEWED {
-                            self.reviewed.clear();
-                        }
-                        self.reviewed.insert((name.to_owned(), turn, id.to_owned()));
                     }
                 }
                 self.waits(at, waiting, now);
@@ -1944,9 +1930,8 @@ impl View {
                 let waiting = self.agents[at].state() == Some(State::NeedsYou);
                 if let Some(id) = data["call_id"].as_str() {
                     self.agents[at].held.insert(id.to_owned());
-                    // A reviewer handed the call to the person.
-                    let key = (name.to_owned(), turn, id.to_owned());
-                    if self.reviewed.remove(&key) {
+                    // A reviewer's gate handed the call to the person.
+                    if data["tag"].as_str().is_some_and(|tag| tag != "manual") {
                         self.verdict(at, NEEDS, now);
                     }
                 }
@@ -1958,8 +1943,7 @@ impl View {
                     self.agents[at].held.remove(id);
                     // A step of a call, such as an MCP call inside `exec`,
                     // its reviewer refused.
-                    let key = (name.to_owned(), turn, id.to_owned());
-                    if self.reviewed.remove(&key) {
+                    if kind == "step_decided" {
                         self.denied(at, data, now);
                     }
                 }
@@ -1967,10 +1951,8 @@ impl View {
             "tool_completed" if live => {
                 if let Some(id) = data["call_id"].as_str() {
                     self.agents[at].held.remove(id);
+                    self.denied(at, data, now);
                     let key = (name.to_owned(), turn, id.to_owned());
-                    if self.reviewed.remove(&key) {
-                        self.denied(at, data, now);
-                    }
                     if let Some(booking) = self.bookings.remove(&key)
                         && data["failed"] != true
                         && data["denied"] != true
@@ -6406,14 +6388,6 @@ mod tests {
             json!({"call_id": "c1", "name": "shell"}),
         ))
         .unwrap();
-        // The same id in another turn is another call.
-        send.send(live(
-            "tool_completed",
-            2,
-            json!({"call_id": "c2", "name": "shell", "denied": true,
-                "approvals": [{"tag": "auto", "allow": false}]}),
-        ))
-        .unwrap();
         // The person's own no is the person's, not the reviewer's, even on
         // a call the reviewer allowed first.
         send.send(live(
@@ -6448,6 +6422,14 @@ mod tests {
                 "approvals": [{"tag": "auto", "allow": false}]}),
         ))
         .unwrap();
+        // One asked before the sky opened: its verdicts still name who.
+        send.send(live(
+            "tool_completed",
+            1,
+            json!({"call_id": "c6", "name": "web", "denied": true,
+                "approvals": [{"tag": "auto", "allow": false}]}),
+        ))
+        .unwrap();
         send.send(live(
             "approval_asked",
             1,
@@ -6465,6 +6447,7 @@ mod tests {
             [
                 (End::Rim(lead), End::Agent(lead), Some(FAILED)),
                 (End::Rim(lead), End::Agent(lead), Some(FAILED)),
+                (End::Rim(lead), End::Agent(lead), Some(FAILED)),
                 (End::Rim(lead), End::Agent(lead), Some(NEEDS)),
             ]
         );
@@ -6476,13 +6459,13 @@ mod tests {
                 "? shop lead waits for you",
                 "✗ auto denied shop lead's shell",
                 "✗ auto denied shop lead's github.search",
+                "✗ auto denied shop lead's web",
                 "? shop lead waits for you",
             ]
         );
         assert_eq!(view.ticker[1].hue, Some(FAILED));
-        // Not counted as messages, and none left waiting.
+        // Not counted as messages.
         assert!(view.recent.is_empty());
-        assert!(view.reviewed.is_empty());
     }
 
     #[tokio::test]
