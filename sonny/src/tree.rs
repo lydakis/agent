@@ -227,14 +227,22 @@ fn git_marks(root: &Path) -> HashMap<PathBuf, Mark> {
         return HashMap::new();
     };
     let top = PathBuf::from(String::from_utf8_lossy(&top).trim_end_matches('\n'));
-    let Some(status) = git(&[
-        "status",
-        "--porcelain",
-        "-z",
-        "--ignored=matching",
-        "--",
-        ".",
-    ]) else {
+    // In a read-only sandbox: git runs the repository's fsmonitor and
+    // filters to say what changed, which an agent may have written (#597).
+    let Ok(status) = crate::task::confined_bytes(
+        root,
+        &[
+            "--no-optional-locks",
+            "status",
+            "--porcelain",
+            "-z",
+            "--ignored=matching",
+            "--",
+            ".",
+        ],
+        &[],
+        false,
+    ) else {
         return HashMap::new();
     };
     marks(&top, &status)

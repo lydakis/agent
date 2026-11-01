@@ -49,21 +49,21 @@ fn seed_with(
 /// node_modules, among the ignored folders and one level inside them (a
 /// `.local/target`). Never a Python environment, which names its own path.
 fn folders(top: &Path) -> Vec<PathBuf> {
-    let Ok(listed) = Command::new("git")
-        .arg("-C")
-        .arg(top)
-        .args([
+    // In a read-only sandbox, as every listing of a checkout Sonny makes:
+    // git runs the repository's fsmonitor to list it (#597).
+    let Ok(listed) = crate::task::confined_bytes(
+        top,
+        &[
             "ls-files",
             "-z",
             "--others",
             "--ignored",
             "--exclude-standard",
             "--directory",
-        ])
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-    else {
+        ],
+        &[],
+        false,
+    ) else {
         return Vec::new();
     };
     let folder = |path: &Path| {
@@ -73,7 +73,7 @@ fn folders(top: &Path) -> Vec<PathBuf> {
                 || path.file_name().is_some_and(|name| name == "node_modules"))
     };
     let mut found = Vec::new();
-    for entry in listed.stdout.split(|byte| *byte == 0) {
+    for entry in listed.split(|byte| *byte == 0) {
         // Folders are the entries that end in a slash.
         let Some(dir) = std::str::from_utf8(entry)
             .ok()
@@ -101,17 +101,10 @@ fn folders(top: &Path) -> Vec<PathBuf> {
 /// output cloned beside it.
 fn touch_tracked(dir: &Path) {
     use std::os::unix::ffi::OsStrExt;
-    let Ok(listed) = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(["ls-files", "-z"])
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-    else {
+    let Ok(listed) = crate::task::confined_bytes(dir, &["ls-files", "-z"], &[], false) else {
         return;
     };
-    for file in listed.stdout.split(|byte| *byte == 0) {
+    for file in listed.split(|byte| *byte == 0) {
         if file.is_empty() {
             continue;
         }

@@ -169,6 +169,17 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
     // fork's are.
     let mut helped = None;
     let mut written = source.is_some();
+    // The lead's mode, whose sandbox the task works in and Sonny's git for
+    // it runs in: its network, or `None` with no sandbox.
+    let mode = lead_mode(&agent, starter).unwrap_or_else(crate::approvals::default);
+    let fields = crate::approvals::sandbox(mode, here);
+    let network = (fields.get("sandbox").and_then(Value::as_str) != Some("danger-full-access"))
+        .then(|| {
+            fields
+                .get("network")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        });
     let mut place = match &source {
         Some(source) => forked(&agent, name, source)?,
         None if info["threads_in"] == "project" => in_place(here, name),
@@ -181,7 +192,7 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
                 helped = worktree_of(&at, task);
                 written = true;
             }
-            worktree(&at, name, base.as_deref().unwrap_or("HEAD"))?
+            worktree(&at, name, base.as_deref().unwrap_or("HEAD"), network)?
         }
     };
     // A worktree's files come from commits a task can write, which may
@@ -385,7 +396,6 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
     // committing to its repository and running the commands the config
     // lets out of it, or, in `full`, unconfined, as nothing would answer a
     // call that asks to leave.
-    let mode = lead_mode(&agent, starter).unwrap_or_else(crate::approvals::default);
     for (key, value) in crate::approvals::sandbox(mode, &place.dir) {
         let flag = format!("--{key}");
         match value {
@@ -1074,6 +1084,17 @@ fn inside(here: &Path, folder: &str) -> Result<PathBuf, String> {
     Ok(real)
 }
 
+/// The git folder of the repository `dir` is in, by its real path, which
+/// its linked worktrees share.
+fn common_dir(dir: &Path) -> Option<PathBuf> {
+    git(
+        dir,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )
+    .ok()
+    .and_then(|dir| std::fs::canonicalize(dir).ok())
+}
+
 /// The checkout to run git in for the worktree `path`: `here`'s own, when
 /// `path` is a worktree of its repository.
 fn repository_of(here: &Path, path: &Path) -> Option<PathBuf> {
@@ -1186,7 +1207,10 @@ fn own_folder(here: &Path, name: &str) -> Result<Place, String> {
 
 /// A git worktree on branch agent/NAME at the last commit, in the lead's
 /// subfolder of it. Outside git, the lead's folder, which the task shares.
-fn worktree(here: &Path, name: &str, base: &str) -> Result<Place, String> {
+///
+/// `network` is the lead's sandbox's, which git runs in, or `None` for a
+/// lead with no sandbox.
+fn worktree(here: &Path, name: &str, base: &str, network: Option<bool>) -> Result<Place, String> {
     if git(here, &["rev-parse", "--show-toplevel"]).is_err() {
         return Ok(Place {
             note: Some(format!(
@@ -1215,15 +1239,32 @@ fn worktree(here: &Path, name: &str, base: &str) -> Result<Place, String> {
         Undo::Nothing
     } else {
         let target = path.to_string_lossy();
-        git(
-            here,
-            &["worktree", "add", "-q", "-b", &branch, &target, base],
-        )?;
-        Undo::Worktree {
+        let args = ["worktree", "add", "-q", "-b", &branch, &target, base];
+        let undo = Undo::Worktree {
             here: here.to_owned(),
             path: path.clone(),
             branch: branch.clone(),
+        };
+        match network {
+            // Checking out runs the repository's hooks and filters, which a
+            // repository an agent made inside the lead's folder holds as the
+            // agent wrote them: in the lead's sandbox, writing only the
+            // repository's git folder and the new worktree, made empty.
+            Some(network) => {
+                let made = (std::fs::create_dir_all(&path).map_err(|e| e.to_string()))
+                    .and_then(|()| common_dir(here).ok_or("no git folder".to_owned()))
+                    .and_then(|common| confined(here, &args, &[&common, &path], network));
+                if let Err(e) = made {
+                    self::undo(&undo);
+                    let _ = std::fs::remove_dir_all(&path);
+                    return Err(e);
+                }
+            }
+            None => {
+                git(here, &args)?;
+            }
         }
+        undo
     };
     let dir = within(&path, Path::new(prefix.trim_end_matches('/')));
     Ok(Place {
@@ -1410,6 +1451,95 @@ pub fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
+/// git in `dir`, a repository an agent may have written, run as an
+/// agent's command is: git runs a repository's hooks and the programs its
+/// config names (an fsmonitor, a filter), even to list its files, so in a
+/// sandbox writing only `writable` (none: read-only), on the network only
+/// with `network`, as Codex's agents run git (#597). As Sonny itself on a
+/// machine with no sandbox, where no agent is confined either.
+pub fn confined(
+    dir: &Path,
+    args: &[&str],
+    writable: &[&Path],
+    network: bool,
+) -> Result<String, String> {
+    let out = confined_bytes(dir, args, writable, network)?;
+    Ok(String::from_utf8_lossy(&out).trim().to_owned())
+}
+
+/// [`confined`]'s output as git wrote it, for output split on NULs.
+pub fn confined_bytes(
+    dir: &Path,
+    args: &[&str],
+    writable: &[&Path],
+    network: bool,
+) -> Result<Vec<u8>, String> {
+    confined_in(sandboxer(), dir, args, writable, network)
+}
+
+/// [`confined_bytes`] with Agent's binary `agent` running the sandbox, or
+/// none.
+fn confined_in(
+    agent: Option<&Path>,
+    dir: &Path,
+    args: &[&str],
+    writable: &[&Path],
+    network: bool,
+) -> Result<Vec<u8>, String> {
+    let git = crate::snapshot::git_program();
+    let mut command = match agent {
+        Some(agent) => {
+            let mut command = Command::new(agent);
+            command.arg("sandbox");
+            for path in writable {
+                command.arg("--writable").arg(path);
+            }
+            if network {
+                command.arg("--network");
+            }
+            command.arg("--").arg(git);
+            command
+        }
+        None => Command::new(git),
+    };
+    command
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::null());
+    // None of the keys Agent keeps, as a bot's shell has none.
+    for key in kept_keys() {
+        command.env_remove(key);
+    }
+    let output = command.output().map_err(|e| format!("running git: {e}"))?;
+    if !output.status.success() {
+        let said = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("git {}: {}", args.join(" "), said.trim()));
+    }
+    Ok(output.stdout)
+}
+
+/// Agent's binary, when it runs a sandbox on this machine, found once: one
+/// that ran git in it, which says its version.
+fn sandboxer() -> Option<&'static Path> {
+    static FOUND: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    FOUND
+        .get_or_init(|| {
+            let agent = crate::agent_bin()?;
+            Command::new(&agent)
+                .args(["sandbox", "--"])
+                .arg(crate::snapshot::git_program())
+                .arg("--version")
+                .stdin(Stdio::null())
+                .stderr(Stdio::null())
+                .output()
+                .is_ok_and(|out| out.status.success() && out.stdout.starts_with(b"git version"))
+                .then_some(agent)
+        })
+        .as_deref()
+}
+
 /// The folder in `copy` at `prefix`, without the trailing slash an empty
 /// one would add.
 fn within(copy: &Path, prefix: &Path) -> PathBuf {
@@ -1532,7 +1662,18 @@ pub fn remove(here: &Path, name: &str, discard: bool) -> Result<String, String> 
     let kept = || -> Result<(), String> {
         if !discard
             && let Some((_, path)) = &worktree
-            && !git(path, &["status", "--porcelain", "--untracked-files=all"])?.is_empty()
+            && !confined(
+                path,
+                &[
+                    "--no-optional-locks",
+                    "status",
+                    "--porcelain",
+                    "--untracked-files=all",
+                ],
+                &[],
+                false,
+            )?
+            .is_empty()
         {
             return Err(format!(
                 "{name}'s worktree has uncommitted changes; commit them, or with discard, it is \
@@ -1566,13 +1707,12 @@ pub fn remove(here: &Path, name: &str, discard: bool) -> Result<String, String> 
         kept().map_err(|e| format!("{name}'s bot was removed, but {e}"))?;
     }
     if let Some((repo, path)) = &worktree {
+        // Checked for changes above, in the sandbox: git's own check would
+        // run the repository's fsmonitor and filters as the person, so it
+        // is skipped (`--force`, which still keeps a locked worktree), and
+        // no hook runs.
         let path = path.to_string_lossy();
-        let mut args = vec!["worktree", "remove"];
-        if discard {
-            args.push("--force");
-        }
-        args.push(&path);
-        git(repo, &args)?;
+        crate::snapshot::plain(repo, &["worktree", "remove", "--force", &path])?;
         if let Ok(record) = record_of(name) {
             let _ = std::fs::remove_file(record);
         }
@@ -1587,7 +1727,7 @@ pub fn remove(here: &Path, name: &str, discard: bool) -> Result<String, String> 
             .ok()
             .and_then(|top| std::fs::canonicalize(top).ok())
             .is_some_and(|top| &top == repo);
-        if git(repo, &["branch", delete, &branch]).is_err() {
+        if crate::snapshot::plain(repo, &["branch", delete, &branch]).is_err() {
             return Ok(match ours {
                 true => format!(
                     "Removed {name}. {branch} is kept, since it has commits not merged here; \
@@ -1614,6 +1754,88 @@ pub fn remove(here: &Path, name: &str, discard: bool) -> Result<String, String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Agent's binary built beside these tests, when it runs a sandbox
+    /// here, and a folder beside it outside temporary storage, which every
+    /// writable sandbox may write.
+    fn sandbox_here(name: &str) -> Option<(PathBuf, PathBuf)> {
+        let built = std::env::current_exe().ok()?.parent()?.parent()?.to_owned();
+        let agent = built.join("agent");
+        let runs = Command::new(&agent)
+            .args(["sandbox", "--", "true"])
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+        let temporary = std::fs::canonicalize(std::env::temp_dir()).ok()?;
+        let built = std::fs::canonicalize(&built).ok()?;
+        if !runs || built.starts_with(&temporary) || built.starts_with("/tmp") {
+            eprintln!("skipped: no sandbox here, or the build is in temporary storage");
+            return None;
+        }
+        let dir = built.join(format!("sonny-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).ok()?;
+        Some((agent, std::fs::canonicalize(&dir).ok()?))
+    }
+
+    fn repository(dir: &Path) -> PathBuf {
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(repo.join("a.txt"), "a\n").unwrap();
+        for args in [
+            &["init", "-q", "-b", "main"][..],
+            &["add", "a.txt"],
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-q",
+                "-m",
+                "a",
+            ],
+        ] {
+            git(&repo, args).unwrap();
+        }
+        repo
+    }
+
+    #[test]
+    fn what_an_agent_left_in_a_repository_runs_only_in_the_sandbox() {
+        let Some((agent, dir)) = sandbox_here("confined") else {
+            return;
+        };
+        let repo = repository(&dir);
+        let marker = dir.join("ran");
+        // An fsmonitor runs to list the files, even for `status`.
+        let command = format!("touch {}; false", marker.display());
+        git(&repo, &["config", "core.fsmonitor", &command]).unwrap();
+        let status = ["--no-optional-locks", "status", "--porcelain"];
+        git(&repo, &status).unwrap();
+        assert!(marker.exists(), "git runs it as Sonny");
+        std::fs::remove_file(&marker).unwrap();
+        confined_in(Some(&agent), &repo, &status, &[], false).unwrap();
+        assert!(!marker.exists(), "the sandbox keeps it from writing");
+        git(&repo, &["config", "--unset", "core.fsmonitor"]).unwrap();
+
+        // A hook runs on a worktree's checkout, writing only the worktree
+        // and the repository's git folder.
+        let hook = repo.join(".git/hooks/post-checkout");
+        std::fs::write(&hook, format!("#!/bin/sh\ntouch {}\n", marker.display())).unwrap();
+        std::fs::set_permissions(&hook, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        let tree = dir.join("tree");
+        std::fs::create_dir(&tree).unwrap();
+        let common = common_dir(&repo).unwrap();
+        let target = tree.to_string_lossy();
+        let args = ["worktree", "add", "-q", "-b", "agent/t", &target, "HEAD"];
+        // The hook's write fails, so git says the checkout failed.
+        let _ = confined_in(Some(&agent), &repo, &args, &[&common, &tree], false);
+        assert!(tree.join("a.txt").is_file(), "the worktree is checked out");
+        assert!(!marker.exists(), "the hook ran in the sandbox");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn a_lead_s_tasks_still_there_are_those_it_made_itself() {
