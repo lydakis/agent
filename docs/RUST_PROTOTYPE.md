@@ -2454,7 +2454,11 @@ handle applies to it, so it outlives the turn and the daemon and is outside
 service's processes: each detached command retains a slot until its async
 waiter has reaped it and nothing it left in its process group runs (a
 launcher that starts a service with `cmd &` and exits keeps the slot while
-the service runs, looked for each second), and a new detach or terminal refuses with
+the service runs, looked for each second; on Linux a member that has
+exited but is not reaped, as under an init that does not reap orphans, does
+not count, and since a walk of `/proc` is no one moment, a group whose
+members all look exited frees its slot only after three walks a second
+apart agree), and a new detach or terminal refuses with
 `lasting_limit`, naming how many terminals and detached commands hold the
 slots, while all are held. Nothing waits in line for one. It exists because Terminal-Bench
 tasks that leave a server for the grader failed when the server died with its

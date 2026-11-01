@@ -2718,12 +2718,21 @@ async fn detach(
         // while the service runs. The kernel keeps a group's id from new
         // processes while any member lives, so only that last second could
         // see it reused.
-        let runs = move || async move {
-            tokio::task::spawn_blocking(move || group_runs(-group))
+        let members = move || async move {
+            tokio::task::spawn_blocking(move || group_members(-group))
                 .await
-                .unwrap_or(false)
+                .unwrap_or(Members::Gone)
         };
-        while !pulled && runs().await {
+        // Where only exited members answer, a walk of /proc is no one
+        // moment and can miss a member forked while it read: three walks a
+        // second apart must agree that nothing runs.
+        let mut exited = if pulled { 3 } else { 0 };
+        while exited < 3 {
+            match members().await {
+                Members::Gone => break,
+                Members::Running => exited = 0,
+                Members::Exited => exited += 1,
+            }
             tokio::select! {
                 Ok(()) = pulls.changed() => {
                     signal(libc::SIGKILL);
@@ -2739,22 +2748,32 @@ async fn detach(
     ))
 }
 
-/// Whether anything in a process group still runs. A member that has exited
-/// still answers a signal until it is reaped, and an init that does not reap
-/// orphans, as some containers run, leaves it so for good: on Linux only a
-/// member that is not a zombie counts, and a process whose main thread has
-/// exited is a zombie only once its other threads have too. Elsewhere init
-/// reaps orphans.
+/// What is left of a detached command's process group.
+#[cfg(unix)]
+enum Members {
+    /// Nothing answers a signal.
+    Gone,
+    Running,
+    /// Only members that have exited were seen, though something answers.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    Exited,
+}
+
+/// What is left of a process group. A member that has exited still answers
+/// a signal until it is reaped, and an init that does not reap orphans, as
+/// some containers run, leaves it so for good: on Linux only a member that
+/// is not a zombie runs, and a process whose main thread has exited is a
+/// zombie only once its other threads have too. Elsewhere init reaps orphans.
 #[cfg(target_os = "linux")]
-fn group_runs(group: i32) -> bool {
+fn group_members(group: i32) -> Members {
     // SAFETY: kill with a negative pid and signal 0 only checks the group.
     if unsafe { libc::kill(-group, 0) } != 0 {
-        return false;
+        return Members::Gone;
     }
     let Ok(entries) = std::fs::read_dir("/proc") else {
-        return true;
+        return Members::Running;
     };
-    entries.flatten().any(|entry| {
+    let running = entries.flatten().any(|entry| {
         let name = entry.file_name();
         let Some(pid) = name
             .to_str()
@@ -2766,7 +2785,12 @@ fn group_runs(group: i32) -> bool {
             return false;
         };
         pgrp == Some(group) && (!exited(state) || threads_run(pid))
-    })
+    });
+    if running {
+        Members::Running
+    } else {
+        Members::Exited
+    }
 }
 /// The state and process group in a `/proc` stat file, `pid (comm) state
 /// ppid pgrp ...`. comm is the process's name, any bytes up to 15 of them:
@@ -2797,9 +2821,13 @@ fn threads_run(pid: &str) -> bool {
         .any(|task| stat(&task.path().join("stat")).is_some_and(|(state, _)| !exited(state)))
 }
 #[cfg(all(unix, not(target_os = "linux")))]
-fn group_runs(group: i32) -> bool {
+fn group_members(group: i32) -> Members {
     // SAFETY: kill with a negative pid and signal 0 only checks the group.
-    unsafe { libc::kill(-group, 0) == 0 }
+    if unsafe { libc::kill(-group, 0) == 0 } {
+        Members::Running
+    } else {
+        Members::Gone
+    }
 }
 
 /// End the pid namespace a sandboxed detached command runs in. bubblewrap,

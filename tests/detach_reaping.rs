@@ -73,8 +73,9 @@ async fn refused(tools: &Registry, dir: &Path) -> Option<String> {
         .map(|error| error.code)
 }
 
+/// Within the three seconds of agreeing walks an exited-only group takes.
 async fn frees(tools: &Registry, dir: &Path) -> bool {
-    for _ in 0..30 {
+    for _ in 0..60 {
         tokio::time::sleep(Duration::from_millis(100)).await;
         if refused(tools, dir).await.is_none() {
             return true;
