@@ -482,8 +482,15 @@ class Acp:
     line it writes, allowing a call it asks the person about only when its
     effects stay in the run, and denying the rest."""
 
-    def __init__(self, sonny, env, cwd, log, home):
+    # Seconds between answering the tasks' calls while a request is out.
+    SERVE = 5
+
+    def __init__(self, sonny, env, cwd, log, home, tasks=None):
         self.home = Path(home)
+        # Answers the calls tasks wait on, while a prompt is out too: a lead
+        # that waits on a task before it answers would otherwise wait out
+        # the prompt.
+        self.tasks = tasks or (lambda: None)
         self.p = subprocess.Popen([str(sonny), 'acp'], env=env, cwd=cwd, stdin=subprocess.PIPE,
                                   stdout=subprocess.PIPE, stderr=open(log.with_suffix('.stderr'), 'w'),
                                   text=True)
@@ -524,9 +531,13 @@ class Acp:
         if not wait:
             return rid
         deadline = time.monotonic() + timeout
+        served = time.monotonic()
         while rid not in self.answers:
             if time.monotonic() > deadline or self.p.poll() is not None:
                 raise RuntimeError(f'{method}: no answer')
+            if time.monotonic() - served > self.SERVE:
+                self.tasks()
+                served = time.monotonic()
             time.sleep(.2)
         return self.answers[rid]
 
@@ -639,7 +650,7 @@ def run(arm, n, bins, model, spec=None):
         (root / 'step').write_text(str(step))
 
     try:
-        acp = Acp(sonny, env, repo, log, home)
+        acp = Acp(sonny, env, repo, log, home, lambda: allow_waiting(env, agent, home))
         acp.ask('initialize', {'protocolVersion': 2, 'clientCapabilities': {}, 'clientInfo': {'name': 'role-eval'}})
         session = acp.ask('session/new', {'cwd': str(repo), 'mcpServers': []})['result']['sessionId']
         for step, s in enumerate(DAY, 1):

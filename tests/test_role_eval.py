@@ -119,6 +119,24 @@ class ConfinedTests(unittest.TestCase):
         self.assertFalse(role_eval.determinable(home, shell('~/.agent/trigger ls', arguments_cut=['command'])))
         self.assertFalse(role_eval.determinable(home, shell('~/.agent/trigger ls', arguments_omitted=1)))
 
+    def test_tasks_calls_are_answered_while_the_leads_prompt_is_out(self):
+        # A lead waiting on a task before it answers would otherwise wait
+        # out the prompt while the task waits on the eval.
+        with tempfile.TemporaryDirectory() as tmp:
+            sonny = Path(tmp) / 'sonny'
+            sonny.write_text('#!/bin/sh\nexec cat >/dev/null\n')
+            sonny.chmod(0o755)
+            served = []
+            with mock.patch.object(role_eval.Acp, 'SERVE', 0.1):
+                acp = role_eval.Acp(sonny, dict(os.environ), tmp, Path(tmp) / 'acp.jsonl', tmp,
+                                    lambda: served.append(1))
+                try:
+                    with self.assertRaises(RuntimeError):
+                        acp.ask('session/prompt', {}, timeout=1)
+                finally:
+                    acp.close()
+            self.assertTrue(served)
+
     def test_runs_live_outside_what_the_sandbox_always_writes(self):
         # /tmp and $TMPDIR are writable in every sandbox: a run there could
         # have its copy of the build replaced.
