@@ -24,6 +24,7 @@ mod cmux;
 mod commons;
 mod config;
 mod declared;
+mod desktop;
 mod diff;
 mod embed;
 mod exec;
