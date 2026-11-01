@@ -1256,7 +1256,7 @@ pub(crate) fn made(
     let tools: Vec<String> = tools.into_iter().map(String::from).collect();
     let tools = approvals::gateable(&tools, &declare);
     if let Value::Object(fields) = asked {
-        fields.extend(approvals::gate(mode, &tools));
+        fields.extend(approvals::create_gate(mode, &tools));
     }
     Ok(())
 }

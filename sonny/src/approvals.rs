@@ -362,6 +362,22 @@ pub fn gate(name: &str, tools: &[String]) -> Map<String, Value> {
     }
 }
 
+/// [`gate`]'s fields for `create`, where no gate is no fields: an empty
+/// `approve` is how `configure` takes a gate off, and `create`, with no
+/// gate to take off, refuses one (`invalid_gate`). So a lead made in
+/// `full`, or in a row of the person's that no one approves for, starts.
+pub fn create_gate(name: &str, tools: &[String]) -> Map<String, Value> {
+    let mut fields = gate(name, tools);
+    if fields
+        .get("approve")
+        .and_then(Value::as_array)
+        .is_some_and(Vec::is_empty)
+    {
+        fields.remove("approve");
+    }
+    fields
+}
+
 /// The sandbox fields, as `configure` takes them and `create`'s settings
 /// hold them, for an agent in the row `name` working in `workspace`. The
 /// commands let out of it are the daemon's command rules'. A row's repositories are the folder's own and each
@@ -899,6 +915,12 @@ mod tests {
         let reader: Vec<String> = ["read", "wait"].map(String::from).to_vec();
         assert_eq!(Value::Object(gate("auto", &reader)), json!({"approve": []}));
         assert!(gate("auto", &tools).get("approve_expire_ms").is_none());
+        // `create` refuses the empty `approve` that takes a gate off, so a
+        // lead made ungated, in `full` or with nothing to gate, sends none.
+        assert_eq!(create_gate("full", &tools), Map::new());
+        assert_eq!(create_gate("auto", &reader), Map::new());
+        assert_eq!(create_gate("auto", &tools), gate("auto", &tools));
+        assert_eq!(create_gate("ask", &tools), gate("ask", &tools));
         // An auto gate that still lapses is set again, a made bot's too.
         let lapsing = json!({"gates": [{"tag": "auto", "tools": ["shell"], "expire_ms": 45000}]});
         assert_eq!(refresh(&lapsing), Some("auto"));
