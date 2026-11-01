@@ -921,6 +921,10 @@ pub struct Waiting {
     /// the call is tried again at `deadline_ms`, with a fresh retry budget.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocked: Option<Blocked>,
+    /// When the run of holds this call is in began, kept across the
+    /// ordinary retries between them, so the next hold waits longer still.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held_since_ms: Option<u64>,
     /// The wait is a terminal poll, an empty `write_stdin` past its hold:
     /// `handles` names the terminal, and its result is the terminal's
     /// output when it ends or its yield runs out.
@@ -7150,6 +7154,7 @@ impl Database {
             fallback: None,
             halt: None,
             blocked: None,
+            held_since_ms: None,
             poll: false,
             load: false,
             rulings: BTreeMap::new(),
@@ -7213,6 +7218,7 @@ impl Database {
             fallback: None,
             halt: None,
             blocked: None,
+            held_since_ms: None,
             poll: false,
             load: true,
             rulings: BTreeMap::new(),
@@ -7369,6 +7375,7 @@ impl Database {
             fallback: None,
             halt: None,
             blocked: None,
+            held_since_ms: None,
             poll: false,
             load: false,
             rulings: BTreeMap::new(),
@@ -9089,6 +9096,7 @@ impl Database {
             fallback: None,
             halt: None,
             blocked: None,
+            held_since_ms: None,
             poll,
             load: false,
             rulings: BTreeMap::new(),
@@ -9126,6 +9134,7 @@ impl Database {
         summary_retry_ms: Option<u64>,
         fallback: Option<ParkedFallback>,
         blocked: Option<Blocked>,
+        held_since_ms: Option<u64>,
     ) -> Result<Value> {
         let bot = self.active(turn)?;
         if bot.status != "running" {
@@ -9154,6 +9163,7 @@ impl Database {
             summary_retry_ms,
             fallback,
             halt: None,
+            held_since_ms: blocked.as_ref().map(|b| b.since_ms).or(held_since_ms),
             blocked,
             poll: false,
             load: false,
@@ -9245,6 +9255,7 @@ impl Database {
             fallback: None,
             halt: Some(stop),
             blocked: None,
+            held_since_ms: None,
             poll: false,
             load: false,
             rulings: BTreeMap::new(),

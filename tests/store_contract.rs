@@ -3135,6 +3135,7 @@ fn a_turn_held_on_its_call_says_so_and_is_woken_to_try_again() {
             None,
             None,
             Some(blocked),
+            None,
         )
         .unwrap();
     assert_eq!(entry["event"], "turn_paced");
@@ -3153,6 +3154,50 @@ fn a_turn_held_on_its_call_says_so_and_is_woken_to_try_again() {
     );
     let waiting = db.waiting_turns().unwrap();
     assert_eq!(waiting[0].blocked.as_ref().map(|b| b.since_ms), Some(5));
+    assert_eq!(waiting[0].held_since_ms, Some(5));
+}
+
+#[test]
+fn an_ordinary_retry_between_holds_keeps_when_they_began() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let turn = db
+        .begin(
+            "Bob",
+            "r1",
+            "go",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let entry = db
+        .suspend_paced(
+            turn,
+            99,
+            1,
+            0,
+            0,
+            0,
+            0,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(5),
+        )
+        .unwrap();
+    // A retry the provider asked for, not a hold: nothing says held.
+    assert!(entry["data"].get("blocked").is_none());
+    assert!(db.held().unwrap().is_empty());
+    let waiting = db.waiting_turns().unwrap();
+    assert_eq!(
+        (waiting[0].blocked.clone(), waiting[0].held_since_ms),
+        (None, Some(5))
+    );
 }
 
 #[test]

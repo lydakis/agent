@@ -6619,8 +6619,10 @@ mod tests {
         let bob = running(&store, &["Bob".into()]).await[0].1;
         store
             .call(move |db| {
-                db.suspend_paced(bob, 0, 0, 0, 0, 0, 0, false, None, None, None, None, None)
-                    .map(|_| ())
+                db.suspend_paced(
+                    bob, 0, 0, 0, 0, 0, 0, false, None, None, None, None, None, None,
+                )
+                .map(|_| ())
             })
             .await
             .unwrap();

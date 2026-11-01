@@ -617,6 +617,7 @@ impl Turn {
             let copied = accounting.copied.take().filter(|_| compaction);
             let route = accounting.route.get().cloned();
             let blocked = accounting.blocked.take();
+            let held_since = accounting.held_since;
             // Commit the park and its accounting together, outside cancellation.
             self.store
                 .op("suspend_paced", move |db| {
@@ -634,6 +635,7 @@ impl Turn {
                         summary_retry_ms,
                         fallback,
                         blocked,
+                        held_since,
                     )
                     .map(|_| ())
                 })
@@ -2164,10 +2166,12 @@ impl Turn {
         record.effort = context.effort.clone();
         record.turn_budget = context.budget;
         let (provider, model) = split_model(&context.model)?;
-        let provider = self
-            .providers
-            .get(provider)
-            .ok_or(Error::with("provider_unavailable", provider))?;
+        let Some(provider) = self.providers.get(provider) else {
+            // A held turn this daemon resumed without its provider, set up
+            // again only by a restart, which tries it at once: still held.
+            accounting.hold(&Error::with("provider_unavailable", provider));
+            return Ok(Round::Paced(accounting.parked_until));
+        };
         // The daemon runs whatever provider set started it; the one thing a
         // conversation needs is that its provider speaks the bot's encoding.
         if provider.family() != record.family()? {
@@ -2219,7 +2223,7 @@ impl Turn {
             };
             // Only a pool park continues the same model call's retry budget.
             // A held turn's run of holds goes on until a call is answered.
-            accounting.held_since = waiting.blocked.as_ref().map(|b| b.since_ms);
+            accounting.held_since = waiting.held_since_ms;
             if waiting.paced_since_ms.is_some() {
                 accounting.call_attempts = waiting.call_attempts;
                 accounting.call_spent_ms = waiting.call_spent_ms;
