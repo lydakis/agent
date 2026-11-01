@@ -6499,6 +6499,38 @@ bot that had ever run a sandboxed command kept a listening socket and an
 accept task until the bot was deleted. Now only bots in use, or within
 30 s of their last use, keep one.
 
+## Terminal polls park their turn (#567)
+
+A terminal read longer than the bot's `approval_hold_ms` now waits live
+only for the hold. After that its turn parks on the terminal's handle,
+as `wait` parks, and resumes when the command ends or the read's time
+runs out. A parked read holds no task and no active slot. It costs one
+`suspend` and one resume, the same store jobs a parked `wait` takes,
+and only reads past the hold pay them. Every other call's path differs
+by one match guard. The Perf workflow's matched screen, base main
+64590ae against the PR head a0e37bc, on the GitHub runner (2026-11-01):
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 46.041 | 45.811 | -0.5% |
+| admission | burst submit p99, ms | 6.561 | 6.348 | -3.2% |
+| completion | release to terminal p99, ms | 17.35 | 17.782 | +2.5% |
+| footprint | idle RSS, MiB | 20.23 | 20.07 | -0.8% |
+| footprint | per idle bot, KiB | 1.426 | 1.578 | +10.7% |
+| footprint | RSS after a turn each, MiB | 27.936 | 27.734 | -0.7% |
+| footprint | CPU per turn, ms | 1.623 | 1.611 | -0.7% |
+| lifecycle | CPU, s | 1.395 | 1.39 | -0.4% |
+| lifecycle | p95 turn, ms | 586.408 | 585.136 | -0.2% |
+| lifecycle | peak RSS, MiB | 26.924 | 27.072 | +0.6% |
+
+Store jobs per turn held at about 7.5. These benches make no terminal
+calls. The per-idle-bot figure moves by 150 bytes, inside the range
+the head's own runs spread over (1.36 to 1.76 KiB), and the change
+adds no per-bot state. What the change is for is slots: before it, a
+bot polling a long build held an active slot and a task for every
+second it waited. Now, past the hold, it holds a `waiting` row. The
+head after a0e37bc changes only tests.
+
 ## A planned stop parks running turns (#565)
 
 A turn now reads the daemon's stopping flag, one relaxed atomic load, at
