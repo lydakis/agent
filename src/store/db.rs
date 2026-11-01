@@ -812,30 +812,42 @@ impl Delivery {
         }
     }
 }
-/// The origin of the message that tells a bot its background commands
-/// ended.
 /// A bot's ended commands nothing collected or saw, read from the partial
 /// index, which holds only what is untold in the whole store, never
-/// through the bot's history.
-const UNTOLD: &str = "SELECT p.id,p.result FROM processes p INDEXED BY processes_untold
+/// through the bot's history: the first ?2, with only how each ended
+/// (the fields of `ended_as`), never its output.
+const UNTOLD: &str = "SELECT p.id,p.result->'$.exit_code',p.result->'$.success',
+     p.result->'$.timed_out',p.result->'$.signal',p.result->'$.wall_time_ms',
+     p.result->'$.error',substr(p.result->>'$.detail',1,97)
+     FROM processes p INDEXED BY processes_untold
      CROSS JOIN turns t ON t.id=p.turn
-     WHERE p.told IS NULL AND p.delivered IS NULL AND p.status<>'running' AND t.bot=?
-     ORDER BY p.id";
+     WHERE p.told IS NULL AND p.delivered IS NULL AND p.status<>'running' AND t.bot=?1
+     ORDER BY p.id LIMIT ?2";
+/// Marks every one of a bot's untold ended commands as having nothing to
+/// tell, through the same index.
+const UNTELLING: &str = "UPDATE processes SET told=0 WHERE id IN (
+     SELECT p.id FROM processes p INDEXED BY processes_untold
+     CROSS JOIN turns t ON t.id=p.turn
+     WHERE p.told IS NULL AND p.delivered IS NULL AND p.status<>'running' AND t.bot=?1)";
+/// The origin of the message that tells a bot its background commands
+/// ended.
 pub const BACKGROUND_ORIGIN: &str = "background";
 /// How a background command ended, as its bot is told: its result without
 /// the output, which a `wait` on its handle reads.
+/// The fields of a result that say how its command ended, in the order
+/// `UNTOLD` reads them.
+const ENDED: [&str; 7] = [
+    "exit_code",
+    "success",
+    "timed_out",
+    "signal",
+    "wall_time_ms",
+    "error",
+    "detail",
+];
 fn ended_as(result: &Value) -> Value {
-    const KEPT: [&str; 7] = [
-        "exit_code",
-        "success",
-        "timed_out",
-        "signal",
-        "wall_time_ms",
-        "error",
-        "detail",
-    ];
     let mut ended = serde_json::Map::new();
-    for key in KEPT {
+    for key in ENDED {
         if let Some(value) = result.get(key) {
             ended.insert(key.to_owned(), value.clone());
         }
@@ -9588,45 +9600,71 @@ impl Database {
             Some(text) => serde_json::from_str(&text)?,
             None => Settings::default(),
         };
-        let ended: Vec<(i64, Option<String>)> = self
+        // Its client collects them itself.
+        if settings.quiet_background {
+            self.conn.prepare_cached(UNTELLING)?.execute([bot])?;
+            return Ok(false);
+        }
+        // A note takes at most an eighth of the bot's context, so it always
+        // fits; what is left goes in the next, once that one's turn ends.
+        // An entry takes at least 12 bytes, which bounds how many are read.
+        let room = settings.context_bytes() / 8;
+        let ended: Vec<(i64, Value)> = self
             .conn
             .prepare_cached(UNTOLD)?
-            .query_map([bot], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .query_map(params![bot, (room / 12 + 1) as i64], |r| {
+                let mut fields = serde_json::Map::new();
+                for (n, key) in ENDED.iter().enumerate() {
+                    let field: Option<String> = r.get(n + 1)?;
+                    if let Some(field) = field {
+                        let value = if *key == "detail" {
+                            Value::String(field)
+                        } else {
+                            serde_json::from_str(&field).unwrap_or(Value::Null)
+                        };
+                        fields.insert((*key).to_owned(), value);
+                    }
+                }
+                Ok((r.get(0)?, ended_as(&Value::Object(fields))))
+            })?
             .collect::<rusqlite::Result<_>>()?;
         let Some(&(first, _)) = ended.first() else {
             return Ok(false);
         };
-        let mut told = self
-            .conn
-            .prepare_cached("UPDATE processes SET told=? WHERE id=?")?;
-        // Its client collects them itself.
-        if settings.quiet_background {
-            for (id, _) in &ended {
-                told.execute(params![0, id])?;
+        // The note and its marks commit together, also where no store job's
+        // transaction holds them, as when the store opens.
+        self.conn.execute_batch("SAVEPOINT tell_finished")?;
+        match self.tell(bot, room, first, ended) {
+            Ok(ready) => {
+                self.conn.execute_batch("RELEASE tell_finished")?;
+                Ok(ready)
             }
-            return Ok(false);
+            Err(error) => {
+                self.conn
+                    .execute_batch("ROLLBACK TO tell_finished; RELEASE tell_finished")?;
+                Err(error)
+            }
         }
-        drop(told);
-        // A note takes at most an eighth of the bot's context, so it always
-        // fits; what is left goes in the next, once that one's turn ends.
-        let room = settings.context_bytes() / 8;
+    }
+    fn tell(
+        &mut self,
+        bot: &str,
+        room: usize,
+        first: i64,
+        ended: Vec<(i64, Value)>,
+    ) -> Result<bool> {
         let mut finished = serde_json::Map::new();
         let mut batch = Vec::new();
         let mut size = 0;
-        for (id, result) in &ended {
-            let result: Value = match result {
-                Some(result) => serde_json::from_str(result)?,
-                None => Value::Null,
-            };
+        for (id, ended) in ended {
             let handle = format!("proc:{id}");
-            let ended = ended_as(&result);
             let entry = handle.len() + ended.to_string().len() + 4;
             if !batch.is_empty() && size + entry > room {
                 break;
             }
             size += entry;
             finished.insert(handle, ended);
-            batch.push(*id);
+            batch.push(id);
         }
         let prompt = json!({"finished": finished}).to_string();
         let options = TurnOptions {
@@ -10573,7 +10611,8 @@ impl Database {
         // nothing left to drop until the process ends; passing over it lets
         // a piece that restarts from the oldest turn reach the turns after.
         // A turn whose commands a note still to run tells of waits for it,
-        // so the wait the note invites finds their results.
+        // so the wait the note invites finds their results, and so does one
+        // whose ended commands no note has told yet.
         let turns: Vec<i64> = tx
             .prepare_cached(
                 "SELECT turn FROM retained_turns r WHERE bot=?1 AND turn<?2 AND turn IS NOT ?3 AND turn>?4
@@ -10582,6 +10621,8 @@ impl Database {
                  AND NOT EXISTS(SELECT 1 FROM processes p WHERE p.turn=r.turn AND p.told>0
                       AND EXISTS(SELECT 1 FROM turns t WHERE t.id=p.told
                                  AND t.status IN ('queued','ready','running')))
+                 AND NOT EXISTS(SELECT 1 FROM processes p INDEXED BY processes_untold WHERE p.turn=r.turn
+                      AND p.told IS NULL AND p.delivered IS NULL AND p.status<>'running')
                  ORDER BY turn LIMIT ?5",
             )?
             .query_map(
@@ -13909,7 +13950,7 @@ mod tests {
         let db = Database::initialize(Connection::open_in_memory().unwrap()).unwrap();
         let plan: Vec<String> = (db.conn.prepare(&format!("EXPLAIN QUERY PLAN {UNTOLD}")))
             .unwrap()
-            .query_map(["Bob"], |r| r.get::<_, String>(3))
+            .query_map(params!["Bob", 1], |r| r.get::<_, String>(3))
             .unwrap()
             .collect::<rusqlite::Result<_>>()
             .unwrap();

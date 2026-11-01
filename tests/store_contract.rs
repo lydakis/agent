@@ -7800,6 +7800,8 @@ fn completion_retention_passes_turns_whose_processes_still_run() {
     // A process that ends makes its turn prunable again.
     db.process_finish(processes[0], &json!({"stdout":"done"}), &[], &[])
         .unwrap();
+    // Once Bob has been told of it.
+    hear_out(&mut db, "Bob");
     db.prune_except("Bob", 1, None).unwrap();
     assert!(db.process_result(processes[0]).unwrap().is_none());
 }
@@ -8031,7 +8033,9 @@ fn retention_keeps_running_processes_until_their_results_commit() {
         db.process_result(process).unwrap().unwrap().1.unwrap()["stdout"],
         "done"
     );
-    // Late artifacts and completed process rows are removed on the next prune.
+    // Late artifacts and completed process rows are removed on the next
+    // prune after Bob has been told of the command's end.
+    hear_out(&mut db, "Bob");
     db.prune("Bob", 1).unwrap();
     assert!(db.process_result(process).unwrap().is_none());
     assert!(db.artifact_page("Bob", turn, "bg", "stdout", 0, 4).is_err());
@@ -15543,6 +15547,15 @@ fn a_background_command_no_wait_collected_is_told_once_its_bot_rests() {
 
 /// A turn of `bot` that starts a background command and ends: the
 /// command's id.
+/// Tell the resting bot of its ended commands and run every note.
+fn hear_out(db: &mut Database, bot: &str) {
+    db.tell_finished(bot).unwrap();
+    while let Some((_, note)) = db.next_ready().unwrap() {
+        db.start(note, allow_provider).unwrap();
+        db.finish(note, None).unwrap();
+    }
+}
+
 fn started_in_background(db: &mut Database, bot: &str, id: &str) -> i64 {
     let turn = (db.begin(
         bot,
@@ -15672,6 +15685,50 @@ fn retention_keeps_what_a_note_still_to_run_tells_of() {
     db.finish(note, None).unwrap();
     db.retain("Dan", Some(note)).unwrap();
     assert!(gone(&db), "once the note ran, retention takes it");
+}
+
+#[test]
+fn retention_keeps_ended_commands_a_later_note_is_still_to_tell() {
+    let mut db = db();
+    let mut kept = binding();
+    kept.settings.keep_turns = Some(1);
+    kept.settings.context_bytes = Some(1024);
+    db.create("Gus", Some("/synthetic"), kept).unwrap();
+    // Two turns each leave a command running; both end during a third.
+    let first = started_in_background(&mut db, "Gus", "g1");
+    let second = started_in_background(&mut db, "Gus", "g2");
+    let third = (db.begin(
+        "Gus",
+        "g3",
+        "more",
+        true,
+        &TurnOptions::default(),
+        allow_provider,
+    ))
+    .unwrap()
+    .turn;
+    let long = "why ".repeat(100);
+    for id in [first, second] {
+        db.process_finish(id, &json!({"error":"process_lost","detail":long}), &[], &[])
+            .unwrap();
+    }
+    db.finish(third, None).unwrap();
+    db.retain("Gus", Some(third)).unwrap();
+    // Only one fits a note: the other waits for the next, with its result.
+    let gone = |db: &Database, id: i64| db.unowned_process("Gus", &[id]).unwrap().is_some();
+    assert!(!gone(&db, first) && !gone(&db, second));
+    let mut heard = Vec::new();
+    while let Some((_, note)) = db.next_ready().unwrap() {
+        let prompts = db.prompts("Gus", note, 4096).unwrap();
+        let words: Value =
+            serde_json::from_str(prompts["prompts"][0]["text"].as_str().unwrap()).unwrap();
+        heard.extend(words["finished"].as_object().unwrap().keys().cloned());
+        db.start(note, allow_provider).unwrap();
+        db.finish(note, None).unwrap();
+        db.retain("Gus", Some(note)).unwrap();
+    }
+    assert_eq!(heard, [format!("proc:{first}"), format!("proc:{second}")]);
+    assert!(gone(&db, first) && gone(&db, second), "told, then taken");
 }
 
 #[test]
