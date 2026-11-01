@@ -1925,12 +1925,15 @@ text("done");"#;
             ]
         );
         assert_eq!(asked[1]["arguments"], json!({"ms": 10}));
-        // With no gate to ask, every call runs.
+        // With no gate to ask, every call runs. Its time is not what this
+        // run checks: 300 ms can go waiting for one of the tool host's
+        // script slots, shared with every other test running at once.
+        let roomy = script.replace("\"timeout_ms\": 300", "\"timeout_ms\": 30000");
         let said = run(
             &hub,
             Some(&dir),
             "shop.lead",
-            script,
+            &roomy,
             Duration::from_secs(30),
             None,
         )

@@ -1053,6 +1053,7 @@ async fn run() -> Result<(), String> {
     app.verbose = settings.verbose;
     app.zen = zen::focus(app.reactions_key.as_deref());
     app.margin_opens = settings.margin_opens;
+    app.agent_opens = settings.agent_opens;
     // A bot keeps the model it was made with; --model runs this window's
     // turns on another.
     if let Some(model) = options.model.as_ref().filter(|m| **m != app.model) {
@@ -1977,6 +1978,40 @@ struct Watch {
     pick: Option<usize>,
 }
 
+/// Ctrl+R's search of the prompts sent before.
+struct Search {
+    /// Each prompt once, newest first: how far back, and its words on one
+    /// line.
+    prompts: Vec<(usize, String)>,
+    typed: String,
+    /// The prompts that match what is typed, best first, newest first
+    /// among equals: their place in `prompts`, and the chars matched.
+    found: Vec<(usize, Vec<usize>)>,
+    pick: usize,
+}
+
+impl Search {
+    fn new(prompts: Vec<(usize, String)>) -> Self {
+        let mut search = Self {
+            prompts,
+            typed: String::new(),
+            found: Vec::new(),
+            pick: 0,
+        };
+        search.narrow();
+        search
+    }
+
+    /// The matches for what is typed now, the best picked.
+    fn narrow(&mut self) {
+        let texts = self.prompts.iter().map(|(_, text)| text.as_str());
+        self.found = (fuzzy::rank(texts, &self.typed, |_| 0.0).into_iter())
+            .map(|(at, found)| (at, found.at))
+            .collect();
+        self.pick = 0;
+    }
+}
+
 struct App {
     client: Arc<Client>,
     bot: String,
@@ -1988,6 +2023,9 @@ struct App {
     /// The read under way, of the workspace named, and when the last one
     /// began: the branch can change under a running turn.
     place_job: Option<(String, tokio::task::JoinHandle<place::Place>)>,
+    /// The agent whose tab is being looked for, from a window with no
+    /// layout of its own, and the look.
+    tab_job: Option<(String, tokio::task::JoinHandle<Result<(), String>>)>,
     place_read: Option<(String, Instant)>,
     model: String,
     effort: Option<String>,
@@ -2189,6 +2227,8 @@ struct App {
     /// last looked at, and whether such a note opens it.
     margin_posted: u64,
     margin_opens: agent_client::config::MarginOpens,
+    /// Where a click on an agent's name takes the person.
+    agent_opens: agent_client::config::AgentOpens,
     /// The pane closed last, with its `/status` or `/background`, which
     /// Ctrl+] opens again.
     closed: Option<(pane::Pane, Option<Watch>)>,
@@ -2277,6 +2317,8 @@ struct App {
     retry: Option<Instant>,
     /// `/model`, open over the composer.
     picker: Option<models::Picker>,
+    /// Ctrl+R: the prompts sent before, narrowed by what is typed.
+    searching: Option<Search>,
     /// `/config`, open over the composer.
     config: Option<config::View>,
     /// The model listing `/model` waits on.
@@ -2384,6 +2426,15 @@ struct App {
     suggestion: Option<String>,
 }
 
+/// What a job of the lead's layout has to say: a line in the lead's view,
+/// or, for something the person asked of it, a notice; or that an agent
+/// clicked has no tab, so it opens in the pane.
+enum Told {
+    Line(String),
+    Notice(String),
+    Beside(String),
+}
+
 /// The lead's tasks, laid out in the project's home in a multiplexer: a window for
 /// each task while it works, opened as its turn starts. It follows every
 /// bot on its own connection, so the lead's own view is not disturbed.
@@ -2392,8 +2443,8 @@ struct Fleet {
     /// the screen.
     layout: mux::Worker,
     /// What its jobs have to say in the lead's view, as they finish.
-    said: tokio::sync::mpsc::UnboundedReceiver<String>,
-    tell: tokio::sync::mpsc::UnboundedSender<String>,
+    said: tokio::sync::mpsc::UnboundedReceiver<Told>,
+    tell: tokio::sync::mpsc::UnboundedSender<Told>,
     client: Arc<Client>,
     events: Events,
     socket: PathBuf,
@@ -2773,10 +2824,25 @@ impl Fleet {
                 Err(error) => Some(error),
             };
             if let Some(said) = said.filter(|_| tell) {
-                let _ = told.send(said);
+                let _ = told.send(Told::Line(said));
             }
         });
         self.doing(bot, "working");
+    }
+
+    /// Bring the task's own tab into view in the multiplexer, as the
+    /// person asked; looked for on the worker, after every window opened
+    /// so far. With none, `beside` opens it in the pane, else says so.
+    fn go_to(&self, bot: &str, beside: bool) {
+        let (bot, told) = (bot.to_owned(), self.tell.clone());
+        self.layout.send(move |layout| {
+            if let Err(error) = layout.focus(&bot) {
+                let _ = told.send(match beside {
+                    true => Told::Beside(bot),
+                    false => Told::Notice(error),
+                });
+            }
+        });
     }
 
     /// Close the task's window, and every block it asked for.
@@ -3061,6 +3127,7 @@ impl App {
             workspace: record["workspace"].as_str().unwrap_or("").to_owned(),
             place: place::Place::default(),
             place_job: None,
+            tab_job: None,
             place_read: None,
             model,
             effort: record["effort"].as_str().map(str::to_owned),
@@ -3166,6 +3233,7 @@ impl App {
             pane_keys: false,
             margin_posted: 0,
             margin_opens: Default::default(),
+            agent_opens: Default::default(),
             pane_mouse: false,
             closed: None,
             composer_at: None,
@@ -3202,6 +3270,7 @@ impl App {
             lead: String::new(),
             retry: None,
             picker: None,
+            searching: None,
             config: None,
             listing: None,
             switch: None,
@@ -3362,8 +3431,16 @@ impl App {
                     // What the layout's worker said, between the daemon's events.
                     let event = match news {
                         Ok(event) => event,
-                        Err(said) => {
+                        Err(Told::Line(said)) => {
                             self.fleet_said(said);
+                            continue;
+                        }
+                        Err(Told::Notice(notice)) => {
+                            self.notice = Some(notice);
+                            continue;
+                        }
+                        Err(Told::Beside(bot)) => {
+                            self.open_task(&bot);
                             continue;
                         }
                     };
@@ -3435,6 +3512,7 @@ impl App {
             self.shell_ran().await;
             self.listed();
             self.follow_place().await;
+            self.follow_tab().await;
             self.count_behind().await;
             self.read_tasks().await;
             self.read_running_tasks().await;
@@ -4532,6 +4610,59 @@ impl App {
         turn
     }
 
+    /// An agent named or picked: to its own tab, when the lead's layout
+    /// has one for it, or a look at it in the pane, as `[sonny]
+    /// agent_opens` says; `other`, a right click, the one it doesn't. With
+    /// no tab, it opens in the pane.
+    fn open_agent(&mut self, bot: &str, other: bool) {
+        use agent_client::config::AgentOpens;
+        let tab = (self.agent_opens == AgentOpens::Tab) != other;
+        match &self.fleet {
+            Some(fleet) if tab => fleet.go_to(bot, true),
+            // A task's window, or one in the pane, lays nothing out
+            // itself: its project's layout is found off the screen, and
+            // with no tab there the agent opens in the pane after all.
+            None if tab && self.tab_job.is_none() => {
+                let (client, socket, me) = (
+                    self.client.clone(),
+                    self.options.socket.clone(),
+                    self.bot.clone(),
+                );
+                let lead = self.project.clone();
+                let bot = bot.to_owned();
+                let job = tokio::spawn({
+                    let bot = bot.clone();
+                    async move {
+                        let project = match lead {
+                            Some(project) => project,
+                            None => project_of(&client, &me).await,
+                        };
+                        tokio::task::spawn_blocking(move || {
+                            mux::for_agent(&socket, &project, None)?.focus(&bot)
+                        })
+                        .await
+                        .map_err(|e| e.to_string())?
+                    }
+                });
+                self.tab_job = Some((bot, job));
+            }
+            _ => self.open_task(bot),
+        }
+    }
+
+    /// The tab looked for off the screen: with none, the agent opens in
+    /// the pane, as a click on it does where nothing is laid out.
+    async fn follow_tab(&mut self) {
+        if let Some((_, job)) = &self.tab_job
+            && job.is_finished()
+        {
+            let (bot, job) = self.tab_job.take().unwrap();
+            if !matches!(job.await, Ok(Ok(()))) {
+                self.open_task(&bot);
+            }
+        }
+    }
+
     /// The task `bot` opened in the pane: its own Sonny, to watch it and
     /// talk to it.
     fn open_task(&mut self, bot: &str) {
@@ -4542,8 +4673,9 @@ impl App {
         match self.embed(&name, &args) {
             // Its title's button opens it in the main view.
             Ok(()) => {
+                let tab = self.fleet.is_some();
                 if let Some(pane) = &mut self.pane {
-                    pane.as_agent(bot);
+                    pane.as_agent(bot, tab);
                 }
             }
             Err(error) => self.notice = Some(format!("could not open {name}: {error}")),
@@ -4611,7 +4743,9 @@ impl App {
     /// What a button clicked in the conversation does: `fold/N` opens or
     /// folds the calls folded as N; `said/NODE` opens or shuts the message
     /// between agents at NODE; `task/BOT`, and `agent/BOT` on BOT's name
-    /// in the conversation, opens BOT in the pane; `answer/N/ID` answers the question
+    /// in the conversation, goes to BOT (see `open_agent`), and
+    /// `other/BOT`, a right click on either, the other way;
+    /// `answer/N/ID` answers the question
     /// call ID asked with its option N, while it is open.
     async fn press_row(&mut self, button: &str) {
         if let Some(at) = button
@@ -4627,7 +4761,10 @@ impl App {
             }
         }
         if let Some(bot) = (button.strip_prefix("task/")).or(button.strip_prefix("agent/")) {
-            self.open_task(bot);
+            self.open_agent(bot, false);
+        }
+        if let Some(bot) = button.strip_prefix("other/") {
+            self.open_agent(bot, true);
         }
         if let Some(node) = button
             .strip_prefix("said/")
@@ -7855,6 +7992,14 @@ impl App {
             self.pressed.push(format!("main/{agent}"));
             return true;
         }
+        // Ctrl+T goes to its own tab in the multiplexer, as its name does.
+        if pane::to_tab(key)
+            && let Some(pane) = self.pane.as_ref().filter(|p| p.has_tab())
+            && let Some(agent) = pane.agent.clone()
+        {
+            self.pressed.push(format!("tab/{agent}"));
+            return true;
+        }
         // Ctrl+[ and Ctrl+] step the pane, but for a program that has them.
         let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
         let program = self.pane_keys && self.pane.as_ref().is_some_and(|p| p.program.is_some());
@@ -7899,7 +8044,8 @@ impl App {
                 };
                 if key.code == KeyCode::Enter {
                     if let Some(at) = pick {
-                        self.open_task(&bots[at]);
+                        let bot = bots[at].clone();
+                        self.open_agent(&bot, false);
                     }
                 } else if let Some(watch) = &mut self.watch {
                     watch.pick = pick;
@@ -8069,6 +8215,7 @@ impl App {
                 || key.code == KeyCode::Tab
                     && self.input.is_empty()
                     && self.picker.is_none()
+                    && self.searching.is_none()
                     && self.config.is_none()
                     && self.choosing.is_none()
                     && self.reacting.is_none()
@@ -8177,6 +8324,7 @@ impl App {
             ("enter", "send, or steer the running turn"),
             ("tab", "queue for after the running turn"),
             ("↑↓", "earlier prompts, past the first or last row"),
+            ("ctrl+r", "find an earlier prompt"),
             ("shift+enter", "new line (alt+enter, ctrl+j)"),
             ("esc", "interrupt, or stop a ! command"),
             ("/", "commands"),
@@ -8189,6 +8337,7 @@ impl App {
             ("ctrl+\\", "keys to the pane and back"),
             ("ctrl+[ ctrl+]", "hide the pane, show it again"),
             ("ctrl+g", "open the pane's agent in the main view"),
+            ("ctrl+t", "go to the pane's agent's own tab"),
             ("alt+t", "boost the next message; again for more"),
             ("ctrl+v", "paste a picture"),
             ("ctrl+c", "copy the selection, clear, or quit"),
@@ -8455,6 +8604,15 @@ impl App {
             "status" if self.options.side.is_none() => self.status().await,
             // An agent's title button: this window becomes its Sonny.
             "main" => self.switch_command(id).await,
+            // Its name: its own tab, where the lead's tasks are laid out.
+            "tab" => match &self.fleet {
+                Some(fleet) => fleet.go_to(id, false),
+                None => {
+                    self.notice = Some(format!(
+                        "{id} has no tab: this Sonny is not in Rex, Herdr or cmux"
+                    ))
+                }
+            },
             "background" if self.options.side.is_none() => self.background(),
             "status" | "background" => {}
             _ => self.press_row(what).await,
@@ -8927,10 +9085,15 @@ impl App {
             let settings = settings::Settings::load();
             self.sounds.chime = settings.chime;
             self.margin_opens = settings.margin_opens;
+            self.agent_opens = settings.agent_opens;
             if self.verbose != settings.verbose {
                 self.verbose = settings.verbose;
                 self.repaint = true;
             }
+            return;
+        }
+        if self.searching.is_some() {
+            self.search_event(event);
             return;
         }
         if let Some(picker) = &mut self.picker {
@@ -9064,6 +9227,9 @@ impl App {
                     {
                         self.always(&prefix).await;
                     }
+                    // The prompts sent before, found by typing, as a shell's
+                    // and Claude Code's Ctrl+R.
+                    KeyCode::Char('r') if ctrl => self.search(),
                     KeyCode::Char('a') if ctrl => self.input.home(),
                     KeyCode::Char('e') if ctrl => self.input.end(),
                     KeyCode::Char('b') if ctrl => self.input.left(),
@@ -9178,6 +9344,70 @@ impl App {
                     _ => {}
                 }
             }
+            _ => {}
+        }
+    }
+
+    /// Ctrl+R: the list of prompts sent before over the composer.
+    fn search(&mut self) {
+        let prompts = (self.recall.all().into_iter())
+            .map(|(back, text)| (back, text.replace('\n', " ")))
+            .collect();
+        self.searching = Some(Search::new(prompts));
+    }
+
+    /// A key or paste while searching: typing narrows, ↑↓ (and Ctrl+R
+    /// again, as a shell's goes further back) pick, Enter or Tab puts the
+    /// pick in the composer to edit, Esc leaves the composer as it was.
+    fn search_event(&mut self, event: Event) {
+        let Some(search) = &mut self.searching else {
+            return;
+        };
+        let count = search.found.len();
+        let step = |pick: usize, down: bool| match (count, down) {
+            (0, _) => 0,
+            (_, true) => (pick + 1) % count,
+            (_, false) => (pick + count - 1) % count,
+        };
+        match event {
+            Event::Key(key) if key.kind != KeyEventKind::Release => {
+                let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                match key.code {
+                    KeyCode::Up => search.pick = step(search.pick, false),
+                    KeyCode::Down => search.pick = step(search.pick, true),
+                    KeyCode::Char('r') if ctrl => search.pick = step(search.pick, true),
+                    KeyCode::Esc => self.searching = None,
+                    KeyCode::Char('c' | 'g') if ctrl => self.searching = None,
+                    KeyCode::Enter | KeyCode::Tab => {
+                        let back =
+                            (search.found.get(search.pick)).map(|(at, _)| search.prompts[*at].0);
+                        self.searching = None;
+                        if let Some(back) = back
+                            && let Some(text) =
+                                self.recall.jump(back, &self.input, &mut self.pictures)
+                        {
+                            self.input.set(&text);
+                        }
+                    }
+                    KeyCode::Backspace => {
+                        search.typed.pop();
+                        search.narrow();
+                    }
+                    KeyCode::Char(c) if !ctrl => {
+                        search.typed.push(c);
+                        search.narrow();
+                    }
+                    _ => {}
+                }
+            }
+            Event::Paste(text) => {
+                // A line ends as the composer's paste reads it, CR or
+                // CRLF too, and shows as a space, as in the list.
+                let text = text.replace("\r\n", " ").replace(['\r', '\n'], " ");
+                search.typed.push_str(&text);
+                search.narrow();
+            }
+            Event::Resize(width, _) => self.width = width as usize,
             _ => {}
         }
     }
@@ -9966,7 +10196,8 @@ impl App {
             || self.approving.is_some()
             || self.reacting.is_some()
             || self.finding.is_some()
-            || self.react_to.is_some();
+            || self.react_to.is_some()
+            || self.searching.is_some();
         let shows = self.input.is_empty()
             && self.running.is_none()
             && self.asks.is_empty()
@@ -10759,6 +10990,46 @@ impl App {
                     frame.set_cursor_position((composer.x + column, composer.y));
                 }
                 frame.render_widget(Paragraph::new(view.keys()), footer);
+                return;
+            }
+            if let Some(search) = &self.searching {
+                let found = &search.found;
+                let room = composer.y as usize;
+                let items: Vec<list::Item> = (found.iter())
+                    .map(|(at, found)| {
+                        let text = &search.prompts[*at].1;
+                        list::Item::new(transcript::cut(text, width.saturating_sub(6)), "")
+                            .found(found)
+                    })
+                    .collect();
+                let mut rows = list::lines(&items, search.pick, width, room);
+                if items.is_empty() && room > 1 {
+                    rows.push(
+                        Line::from(match search.prompts.is_empty() {
+                            true => "    no prompts sent yet",
+                            false => "    no prompt matches",
+                        })
+                        .dim(),
+                    );
+                }
+                over(frame, rows, composer);
+                let line = match search.typed.is_empty() {
+                    true => Line::from(vec![
+                        Span::raw("› ").bold(),
+                        Span::raw("type to find a prompt").dim(),
+                    ]),
+                    false => Line::from(vec![
+                        Span::raw("› ").bold(),
+                        Span::raw(search.typed.clone()),
+                    ]),
+                };
+                frame.render_widget(Paragraph::new(line), composer);
+                frame.set_cursor_position((
+                    composer.x + 2 + search.typed.width() as u16,
+                    composer.y,
+                ));
+                let keys = Line::from(hint::spans("  ↑↓ pick · enter edit · esc cancel"));
+                frame.render_widget(Paragraph::new(keys), footer);
                 return;
             }
             if let Some(picker) = &self.picker {
@@ -12079,7 +12350,7 @@ mod tests {
                 .is_some_and(|n| n.starts_with("/switch NAME"))
         );
         let mut pane = pane::Pane::card("shop.lead", STATUS_KEYS);
-        pane.as_agent("shop.lead");
+        pane.as_agent("shop.lead", false);
         app.open_pane(pane);
         app.input.set("/switch");
         app.submit().await;
@@ -16128,6 +16399,69 @@ mod tests {
         app.submit().await;
         app.key(key(KeyCode::Up)).await;
         assert_eq!(&*app.input, "ship it");
+    }
+
+    #[tokio::test]
+    async fn ctrl_r_finds_a_prompt_sent_before_and_leaves_it_to_edit() {
+        let mut app = app(daemon_answering(|_| json!({})).await);
+        for prompt in ["fix the rounding", "tag 0.2\nand push", "fix the readme"] {
+            app.recall.sent(prompt, Vec::new(), 0);
+        }
+        let key = |code| Event::Key(event::KeyEvent::new(code, KeyModifiers::NONE));
+        let ctrl = |c| {
+            Event::Key(event::KeyEvent::new(
+                KeyCode::Char(c),
+                KeyModifiers::CONTROL,
+            ))
+        };
+        app.input.set("draft");
+        app.key(ctrl('r')).await;
+        let shown = |app: &App| {
+            let search = app.searching.as_ref().unwrap();
+            (search.found.iter())
+                .map(|(at, _)| search.prompts[*at].1.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            shown(&app),
+            ["fix the readme", "tag 0.2 and push", "fix the rounding"],
+            "newest first, a prompt's lines on one"
+        );
+        for c in "fix".chars() {
+            app.key(key(KeyCode::Char(c))).await;
+        }
+        assert_eq!(shown(&app), ["fix the readme", "fix the rounding"]);
+        assert_eq!(&*app.input, "draft", "typing goes to the search");
+        // Ctrl+R again goes further back, as a shell's does.
+        app.key(ctrl('r')).await;
+        app.key(key(KeyCode::Enter)).await;
+        assert!(app.searching.is_none());
+        assert_eq!(&*app.input, "fix the rounding", "put in to edit, not sent");
+        // Up and Down go on from it; past the newest, the draft.
+        app.key(key(KeyCode::Down)).await;
+        assert_eq!(&*app.input, "tag 0.2\nand push");
+        app.key(key(KeyCode::Down)).await;
+        app.key(key(KeyCode::Down)).await;
+        assert_eq!(&*app.input, "draft");
+        // Esc leaves the composer as it was.
+        app.key(ctrl('r')).await;
+        app.key(key(KeyCode::Char('z'))).await;
+        assert!(shown(&app).is_empty());
+        app.key(key(KeyCode::Esc)).await;
+        assert!(app.searching.is_none());
+        assert_eq!(&*app.input, "draft");
+        // A paste's lines, however they end, are the prompt's.
+        app.key(ctrl('r')).await;
+        app.key(Event::Paste("0.2\r\nand".into())).await;
+        assert_eq!(shown(&app), ["tag 0.2 and push"]);
+        app.key(key(KeyCode::Esc)).await;
+        // Tab picks from the search, not the guess at the next message.
+        app.input.clear();
+        app.suggestion = Some("run the tests".into());
+        app.key(ctrl('r')).await;
+        app.key(key(KeyCode::Tab)).await;
+        assert!(app.searching.is_none());
+        assert_eq!(&*app.input, "fix the readme");
     }
 
     #[tokio::test]
