@@ -6672,6 +6672,7 @@ inline, so it measures the cost the change adds to every tool result: one
 The per-idle-bot figure is about a tenth of a KiB on a 1.4 KiB measure,
 which is within that figure's spread between runs; this change adds no
 per-bot state.
+
 ## A quiet lead's window reads only its own tasks (bots by maker)
 
 `bench.sonny_screen` opens one quiet lead's Sonny in an 80x24 terminal. A
