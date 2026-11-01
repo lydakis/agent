@@ -921,6 +921,17 @@ impl Updates {
         Some((heard.hold, heard.urgent))
     }
 
+    /// Whether a turn of `name`'s that ended `status` reaches the
+    /// subscriber as news: what its subscriptions' filters hear of it.
+    pub fn hears_end(&self, name: &str, turn: i64, status: &str) -> bool {
+        (self.gate(
+            name,
+            false,
+            || json!({"type": "turn.ended", "turn": turn, "status": status, "theirs": false}),
+        ))
+        .is_some()
+    }
+
     /// Whether a task's news may be told now: urgent, or no digest holds
     /// it: some piece goes as it comes, or one of the digests that heard
     /// it allows. A digest whose note is on its way allows nothing yet.
