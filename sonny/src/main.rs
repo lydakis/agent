@@ -3191,9 +3191,11 @@ impl Fleet {
     /// Open the task's window, unless it has one, it was closed for room,
     /// or the person uses another of the project's windows now. With `tell`, the lead's view hears where it opened, when not
     /// beside it, or why it did not; windows closed for room are said in
-    /// the status row.
+    /// the status row. A task that needs the person has its window, as
+    /// [`Fleet::needs_window`] opens it.
     fn show(&mut self, bot: &str, tell: bool) {
-        let doing = match self.needs.waits(bot) {
+        let needs = self.needs.waits(bot);
+        let doing = match needs {
             true => "needs you",
             false => "working",
         };
@@ -3215,7 +3217,7 @@ impl Fleet {
                 return;
             }
             room.most = windows.lock().map_or(0, |mut windows| windows.most());
-            let said = match layout.show_task(&bot_name, &name, &command, &room, false) {
+            let said = match layout.show_task(&bot_name, &name, &command, &room, needs) {
                 Ok(mux::Shown::Opened(closed)) => {
                     if !closed.is_empty() {
                         let _ =
@@ -3235,6 +3237,34 @@ impl Fleet {
             }
         });
         self.doing(bot, "working");
+    }
+
+    /// A task that came to need the person, its window set aside for
+    /// room, has it open again, as what needs them keeps its window: it
+    /// closes the window they used least recently for room, never one
+    /// they have not looked at yet nor one that needs them, and with no
+    /// other passes the limit. The person's focus stays where it is.
+    fn needs_window(&self, bot: &str) {
+        let (command, name) = self.window(bot, "needs you");
+        let (windows, mut room) = self.room();
+        let (bot, told) = (bot.to_owned(), self.tell.clone());
+        let (socket, project) = (self.socket.clone(), self.project.clone());
+        let (place, lead) = (self.place.clone(), self.lead.clone());
+        self.layout.send(move |layout| {
+            if !layout.aside(&bot) || !mux::mine(&socket, &project, &lead, &place) {
+                return;
+            }
+            room.most = windows.lock().map_or(0, |mut windows| windows.most());
+            match layout.show_task(&bot, &name, &command, &room, true) {
+                Ok(mux::Shown::Opened(closed)) if !closed.is_empty() => {
+                    let _ = told.send(Told::Notice(made_room(&closed, &room.project, room.most)));
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    let _ = told.send(Told::Notice(error));
+                }
+            }
+        });
     }
 
     /// Bring the task's own tab into view in the multiplexer, as the
@@ -3413,6 +3443,9 @@ impl Fleet {
         };
         if self.doing.get(bot) != Some(&doing) {
             self.doing.insert(bot.to_owned(), doing);
+            if doing == "needs you" && bot != self.lead && self.lineage.contains(bot) {
+                self.needs_window(bot);
+            }
             self.name_windows();
             let short = self.short(bot).to_owned();
             let alert = match doing {
@@ -8055,6 +8088,10 @@ impl App {
                     format!("tab {tab}, {side} {}", short(other, &project, &lead))
                 }
                 Some((tab, None)) => format!("tab {tab}"),
+                // Its window waits for room, until a click on the row.
+                None if (self.fleet.as_ref()).is_some_and(|fleet| fleet.layout.aside(name)) => {
+                    "window set aside for room".into()
+                }
                 None => String::new(),
             };
             // This window's turns run on its own model, when it has one.
@@ -17315,6 +17352,79 @@ mod tests {
         ));
         assert_eq!(fleet.doing["calc.fix"], "working");
         assert_eq!(app.agents(), (1, 2));
+    }
+
+    #[tokio::test]
+    async fn a_task_set_aside_for_room_says_so_and_opens_once_it_needs_you() {
+        let (client, events) = daemon_with_events(json!({}), |asked| {
+            match asked["op"].as_str().unwrap_or("") {
+                "bots" => json!({"bots": [
+                    {"name": "calc.lead", "bot_id": 1, "head": 1},
+                    {"name": "calc.a", "bot_id": 2, "created_by": "calc.lead",
+                        "running_turn": 1, "head": 2},
+                    {"name": "calc.b", "bot_id": 3, "created_by": "calc.lead",
+                        "running_turn": 1, "head": 3},
+                ], "next_after": null}),
+                "approvals" => json!({"approvals": []}),
+                "turns" => json!({"turns": []}),
+                "history_nodes" => json!({"nodes": []}),
+                "history_items" => json!({"items": []}),
+                _ => json!({}),
+            }
+        })
+        .await;
+        let mut fleet = Fleet::in_memory(client.clone(), events, "calc", "calc.lead");
+        // One task window at most, as `/config` says.
+        let read = (agent_client::config::path().as_ref())
+            .and_then(|path| std::fs::metadata(path).ok())
+            .and_then(|file| file.modified().ok());
+        fleet.windows = Arc::new(std::sync::Mutex::new(TaskWindows {
+            read: Some(read),
+            most: 1,
+        }));
+        let event = |bot: &str, kind: &str, data: Value| json!({"event": kind, "bot": bot, "turn": 1, "data": data});
+        let windowed = |fleet: &Fleet| {
+            let (sent, got) = std::sync::mpsc::channel();
+            fleet.layout.send(move |layout| {
+                let labels: Vec<String> = (layout.windows().into_iter())
+                    .flat_map(|(_, labels)| labels)
+                    .collect();
+                let _ = sent.send(labels);
+            });
+            got.recv().unwrap()
+        };
+        for bot in ["calc.a", "calc.b"] {
+            fleet.lineage.insert(bot.into());
+            fleet.event(&event(bot, "accepted", json!({})));
+        }
+        // The first fills the room; the person has not looked at it, so the
+        // second's window waits for room.
+        fleet.layout.settle();
+        assert!(windowed(&fleet).contains(&"calc.a".to_owned()));
+        assert!(!windowed(&fleet).contains(&"calc.b".to_owned()));
+        assert!(fleet.layout.aside("calc.b"));
+        // Its /status row says so.
+        let mut app = app(client);
+        app.bot = "calc.lead".into();
+        app.fleet = Some(fleet);
+        let (_, rows) = app.status_rows().await.unwrap();
+        let place = |rows: &[status::Row], bot: &str| {
+            (rows.iter())
+                .find(|row| row.bot == bot)
+                .map(|row| row.place.clone())
+                .unwrap()
+        };
+        assert_eq!(place(&rows, "calc.b"), "window set aside for room");
+        assert_ne!(place(&rows, "calc.a"), "window set aside for room");
+        // A call of its held for the person: what needs them keeps its
+        // window, so it opens, past the limit, and the new one stays.
+        let fleet = app.fleet.as_mut().unwrap();
+        fleet.event(&event("calc.b", "approval_asked", json!({"call_id": "c1"})));
+        assert_eq!(fleet.doing["calc.b"], "needs you");
+        fleet.layout.settle();
+        let shown = windowed(fleet);
+        assert!(shown.contains(&"calc.a".to_owned()) && shown.contains(&"calc.b".to_owned()));
+        assert!(!fleet.layout.aside("calc.b"));
     }
 
     #[tokio::test]
