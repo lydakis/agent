@@ -1112,7 +1112,7 @@ before it ran. The model reads it only once the turn continues, so it also
 says that work has since resumed and the turn goes on: read as a pause still
 holding, the older wording made resumed models report and stop. The daemon
 reruns none, and the model decides what to redo, as Codex answers the calls an
-interrupt cut off; what to do about one is the client's to tell it. The pause ends
+interrupt cut off; any advice about one is the client's to give. The pause ends
 every background command (whose handle then answers `daemon_paused`, saying
 the same), terminal, and detached command this
 daemon started (the process group each leads, with what it left running
