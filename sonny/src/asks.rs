@@ -375,7 +375,7 @@ pub struct Card {
 /// callout's does: a shape of its own without color too.
 pub fn card(ask: &Ask, width: usize) -> Card {
     // Prose reads at most so wide, as a reply does, labels too.
-    let width = width.min(crate::PROSE);
+    let width = width.min(crate::measure());
     let mut options = Vec::new();
     let indent = || Span::raw(BAR).dim();
     // What the agent wrote reads as its Markdown, as a reply does; the

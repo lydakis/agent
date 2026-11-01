@@ -1700,7 +1700,7 @@ pub fn reply(text: &str, width: usize, folder: &std::path::Path) -> Vec<Line<'st
 /// by `markdown` (the folder its pictures are in, whether a document),
 /// its first row after the first of `leads` and the rest after the
 /// other, in place of the two columns every row of it starts with.
-/// Prose reads at most [`crate::PROSE`] wide on any surface, however
+/// Prose reads at most [`crate::measure`] wide on any surface, however
 /// wide the surface is; code and files shown as themselves go wider.
 pub fn markdown(
     markdown: &mut Markdown,
@@ -1708,7 +1708,7 @@ pub fn markdown(
     width: usize,
     (first, rest): (Line<'static>, Line<'static>),
 ) -> Vec<Line<'static>> {
-    let width = width.min(crate::PROSE);
+    let width = width.min(crate::measure());
     let wide = first.width().max(rest.width());
     let inner = (width + 2).saturating_sub(wide).max(10);
     let mut rows = Vec::new();
@@ -3255,7 +3255,7 @@ mod tests {
         let leads = (Line::from("  "), Line::from("  "));
         let rows = markdown(&mut Markdown::in_folder(folder), &said, 180, leads);
         assert!(rows.len() > 1);
-        assert!(rows.iter().all(|row| row.width() <= crate::PROSE));
+        assert!(rows.iter().all(|row| row.width() <= crate::measure()));
     }
 
     #[test]
