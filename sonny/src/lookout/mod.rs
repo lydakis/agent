@@ -1557,23 +1557,8 @@ impl Service {
     fn said(&mut self, said: sources::Said) {
         match said {
             sources::Said::Event(event) => {
-                // A topic one of a subscriber's tasks holds by name goes to
-                // that task, in its place: a lead that hears the whole
-                // source leaves what its task owns to it.
-                let owners: Vec<String> = match event.topic {
-                    Some(_) => (self.lookouts.iter())
-                        .filter(|(_, lookout)| lookout.owns(&event))
-                        .map(|(name, _)| name.clone())
-                        .collect(),
-                    None => Vec::new(),
-                };
-                for (name, lookout) in self.lookouts.iter_mut() {
-                    let left = !lookout.owns(&event)
-                        && (owners.iter())
-                            .any(|owner| owner != name && lookout.lineage.contains(owner));
-                    if !left {
-                        lookout.heard_from(&event);
-                    }
+                for lookout in self.lookouts.values_mut() {
+                    lookout.heard_from(&event);
                 }
             }
             sources::Said::Kept(kept) => {
@@ -2849,19 +2834,6 @@ impl Lookout {
         self.resend = heard("sending");
         self.heard_since = (!self.heard.is_empty() || !self.resend.is_empty()).then_some(now);
         self.rehear();
-    }
-
-    /// Whether a subscription of its names the event's source and topic,
-    /// and hears it: the topic is its own.
-    fn owns(&self, event: &sources::Event) -> bool {
-        let Some(topic) = event.topic.as_deref() else {
-            return false;
-        };
-        (self.subs.iter()).any(|sub| {
-            sub.hears(event)
-                && (sub.sources.iter())
-                    .any(|name| sources::named(name) == (event.source.as_str(), Some(topic)))
-        })
     }
 
     /// A source's event, held for the next note when a subscription
@@ -4817,52 +4789,6 @@ mod tests {
         let mut sub = sub(name, &[], &[]);
         sub.sources = vec!["slack".into()];
         sub
-    }
-
-    #[test]
-    fn a_topic_a_task_owns_goes_to_the_task_in_place_of_its_lead() {
-        let dir = std::env::temp_dir().join(format!("lookout-owned-{}", std::process::id()));
-        let mut service = service(dir.clone(), &[]);
-        // The lead hears the whole source; its task owns one topic of it.
-        let mut lead = lookout();
-        lead.subs.push(hears("chat"));
-        let mut task = Lookout::new("calc.fix");
-        let mut owned = sub("pr", &[], &[]);
-        owned.sources = vec!["slack:pr-7".into()];
-        task.subs.push(owned);
-        // Another lead's line is not the task's.
-        let mut other = Lookout::new("shop.lead");
-        other.subs.push(hears("chat"));
-        for lookout in [lead, task, other] {
-            service.lookouts.insert(lookout.lead.clone(), lookout);
-        }
-        let on = |topic: Option<&str>, text: &str| sources::Event {
-            topic: topic.map(Into::into),
-            ..slack(text, false)
-        };
-        service.said(sources::Said::Event(Box::new(on(
-            Some("pr-7"),
-            "ci failed",
-        ))));
-        service.said(sources::Said::Event(Box::new(on(Some("pr-8"), "review"))));
-        service.said(sources::Said::Event(Box::new(on(None, "lunch?"))));
-        let heard = |service: &Service, name: &str| -> Vec<String> {
-            (service.lookouts[name].heard.iter())
-                .map(|heard| heard.event.text.clone())
-                .collect()
-        };
-        assert_eq!(heard(&service, "calc.fix"), ["ci failed"]);
-        assert_eq!(heard(&service, "calc.lead"), ["review", "lunch?"]);
-        assert_eq!(
-            heard(&service, "shop.lead"),
-            ["ci failed", "review", "lunch?"]
-        );
-        // The task gone, its topic is its lead's again.
-        service.lookouts.remove("calc.fix");
-        (service.lookouts.get_mut("calc.lead").unwrap().lineage).remove("calc.fix");
-        service.said(sources::Said::Event(Box::new(on(Some("pr-7"), "merged"))));
-        assert_eq!(heard(&service, "calc.lead"), ["review", "lunch?", "merged"]);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
