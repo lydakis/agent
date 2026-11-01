@@ -5,7 +5,7 @@
 //! closes with its owner. `Layout` keeps what Sonny does there; a `Backend`
 //! says how, in its multiplexer's CLI.
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     io::{BufRead, BufReader, Read, Write},
     os::unix::net::UnixStream,
     path::{Path, PathBuf},
@@ -15,7 +15,7 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc,
     },
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 /// How long a multiplexer's CLI may take to answer: one whose server has
@@ -105,6 +105,39 @@ pub enum Placement {
         side: String,
         beside: String,
     },
+}
+
+/// How many of a project's task windows a lead keeps open, as VS Code's
+/// `workbench.editor.limit` keeps editors: past `most`, opening one closes
+/// the window the person used least recently. A window whose task needs
+/// the person or failed, or that holds blocks its task asked for (a dev
+/// server it runs), is never closed for room, as VS Code keeps a dirty
+/// editor; with no other, the limit is passed.
+pub struct Room {
+    /// Task windows at most, 0 for no limit.
+    pub most: usize,
+    /// The project whose tasks' windows count: `shop.fix` for `shop`.
+    pub project: String,
+    /// Tasks whose window stays, by name.
+    pub keep: HashSet<String>,
+    /// When the person last used a task's window there, as its own Sonny
+    /// saw it.
+    pub used: Used,
+}
+
+/// When the person last used a task's window, by its task.
+pub type Used = Arc<dyn Fn(&str) -> Option<SystemTime> + Send + Sync>;
+
+/// What [`Layout::show_task`] did.
+#[derive(Debug, PartialEq)]
+pub enum Shown {
+    /// The task had a window already.
+    Had,
+    /// The task's window was closed for room, and opens again only when
+    /// the person asks for it.
+    Aside,
+    /// A window opened, closing these tasks' for room.
+    Opened(Vec<String>),
 }
 
 /// Where each block sits, by label: its window, counted from 1, and in a
@@ -330,6 +363,10 @@ pub struct Layout {
     placed: Option<(u64, Places)>,
     news: Arc<News>,
     following: Arc<Mutex<Following>>,
+    /// When Sonny last opened or brought each task's window into view.
+    used: HashMap<String, SystemTime>,
+    /// Tasks whose window was closed for room ([`Room`]).
+    aside: HashSet<String>,
 }
 
 impl Drop for Layout {
@@ -358,6 +395,8 @@ impl Layout {
             placed: None,
             news: Arc::default(),
             following: Arc::default(),
+            used: HashMap::new(),
+            aside: HashSet::new(),
         }
     }
 
@@ -510,6 +549,82 @@ impl Layout {
         Ok(true)
     }
 
+    /// A window for the task running `command`, named `name`, as
+    /// [`show`](Self::show) opens one, within `room`. A task whose window
+    /// was closed for room stays without one until `asked`: the person
+    /// asked to see it.
+    pub fn show_task(
+        &mut self,
+        bot: &str,
+        name: &str,
+        command: &[String],
+        room: &Room,
+        asked: bool,
+    ) -> Result<Shown, String> {
+        let listed = self.listed();
+        if let Some(block) = self.blocks.get(bot)
+            && listed.iter().any(|b| &b.id == block)
+        {
+            return Ok(Shown::Had);
+        }
+        if self.adopt(bot, &listed) {
+            return Ok(Shown::Had);
+        }
+        if self.aside.contains(bot) && !asked {
+            return Ok(Shown::Aside);
+        }
+        let closed = self.make_room(bot, &listed, room);
+        self.place(bot, name, command, &Placement::Window)?;
+        self.aside.remove(bot);
+        self.used.insert(bot.to_owned(), SystemTime::now());
+        Ok(Shown::Opened(closed))
+    }
+
+    /// Whether the task's window was closed for room.
+    pub fn aside(&self, bot: &str) -> bool {
+        self.aside.contains(bot)
+    }
+
+    /// Close the windows the person used least recently, so that one more
+    /// for `bot` keeps the project's within `room`. Returns their tasks.
+    fn make_room(&mut self, bot: &str, listed: &[Block], room: &Room) -> Vec<String> {
+        if room.most == 0 {
+            return Vec::new();
+        }
+        let tasks = format!("{}.", room.project);
+        let owners: HashSet<&str> = (listed.iter())
+            .filter_map(|b| b.label.split_once('/').map(|(owner, _)| owner))
+            .collect();
+        let mut windows: Vec<&str> = (listed.iter())
+            .map(|b| b.label.as_str())
+            .filter(|label| {
+                label.starts_with(&tasks)
+                    && !label.contains('/')
+                    && !crate::project::is_lead(label)
+                    && *label != bot
+            })
+            .collect();
+        windows.sort_unstable();
+        windows.dedup();
+        let over = (windows.len() + 1).saturating_sub(room.most);
+        let mut spare: Vec<(SystemTime, &str)> = (windows.into_iter())
+            .filter(|label| !room.keep.contains(*label) && !owners.contains(label))
+            .map(|label| {
+                let used = self.used.get(label).copied().max((room.used)(label));
+                (used.unwrap_or(SystemTime::UNIX_EPOCH), label)
+            })
+            .collect();
+        spare.sort_unstable();
+        let closed: Vec<String> = (spare.into_iter().take(over))
+            .map(|(_, label)| label.to_owned())
+            .collect();
+        for bot in &closed {
+            self.close(bot);
+            self.aside.insert(bot.clone());
+        }
+        closed
+    }
+
     /// Open the task's block where asked, closing any it had.
     pub fn place(
         &mut self,
@@ -586,7 +701,9 @@ impl Layout {
             .find(|b| Some(&b.id) == known.as_ref())
             .or_else(|| listed.iter().find(|b| b.label == bot))
             .ok_or_else(|| format!("{bot} has no tab in {}", self.home()))?;
-        self.backend.focus(block)
+        self.backend.focus(block)?;
+        self.used.insert(bot.to_owned(), SystemTime::now());
+        Ok(())
     }
 
     /// Take on the block Sonny itself runs in, when in this home, named
@@ -659,6 +776,8 @@ impl Layout {
     /// done or its bot is deleted.
     pub fn close(&mut self, bot: &str) {
         let known = self.blocks.remove(bot);
+        self.used.remove(bot);
+        self.aside.remove(bot);
         let owned = format!("{bot}/");
         for block in self.listed().into_iter().filter(|b| {
             b.label == bot || b.label.starts_with(&owned) || Some(&b.id) == known.as_ref()
@@ -1010,6 +1129,86 @@ mod tests {
         fn watch(&self) -> Option<Watch> {
             self.news.borrow_mut().take()
         }
+    }
+
+    #[test]
+    fn past_its_room_a_task_window_closes_the_one_used_least_recently() {
+        let fake = Fake::default();
+        fake.add("shop.lead", "lead");
+        let mut layout = Layout::new(Box::new(fake));
+        let at = |secs| SystemTime::UNIX_EPOCH + Duration::from_secs(secs);
+        // As each window's own Sonny marked it: `b` was used last, `a`
+        // before it, `c` never.
+        let room = |most, keep: &[&str]| Room {
+            most,
+            project: "shop".into(),
+            keep: keep.iter().map(|k| k.to_string()).collect(),
+            used: Arc::new(move |bot: &str| match bot {
+                "shop.a" => Some(at(20)),
+                "shop.b" => Some(at(30)),
+                _ => None,
+            }),
+        };
+        let open = |layout: &mut Layout, bot: &str, room: &Room, asked| {
+            layout.show_task(bot, bot, &[], room, asked).unwrap()
+        };
+        let labels = |layout: &mut Layout| -> Vec<String> {
+            let mut labels: Vec<String> = (layout.windows().into_iter())
+                .flat_map(|(_, labels)| labels)
+                .collect();
+            labels.sort();
+            labels
+        };
+        let three = room(3, &[]);
+        for bot in ["shop.a", "shop.b", "shop.c"] {
+            assert_eq!(open(&mut layout, bot, &three, false), Shown::Opened(vec![]));
+        }
+        assert_eq!(open(&mut layout, "shop.a", &three, false), Shown::Had);
+        // Sonny opened every one just now, later than any mark; one the
+        // person brought into view since counts from then.
+        layout.used.clear();
+        layout.focus("shop.c").unwrap();
+        // The lead's own window never counts and never closes.
+        assert_eq!(
+            open(&mut layout, "shop.d", &three, false),
+            Shown::Opened(vec!["shop.a".into()])
+        );
+        assert_eq!(
+            labels(&mut layout),
+            ["shop.b", "shop.c", "shop.d", "shop.lead"]
+        );
+        // Closed for room, it stays closed as its task works on...
+        assert_eq!(open(&mut layout, "shop.a", &three, false), Shown::Aside);
+        assert!(layout.aside("shop.a"));
+        // ...until the person asks for it. What needs them keeps its
+        // window, and so does one running a block it asked for.
+        layout
+            .split("shop.b", "dev", Path::new("/"), &[], Some("right"))
+            .unwrap();
+        layout.used.remove("shop.d");
+        assert_eq!(
+            open(&mut layout, "shop.a", &room(3, &["shop.d"]), true),
+            Shown::Opened(vec!["shop.c".into()])
+        );
+        assert!(!layout.aside("shop.a"));
+        // With none to close, the room is passed rather than refused.
+        let full = room(2, &["shop.a", "shop.d"]);
+        assert_eq!(
+            open(&mut layout, "shop.e", &full, false),
+            Shown::Opened(vec![])
+        );
+        // A limit of 0 is none.
+        assert_eq!(
+            open(&mut layout, "shop.f", &room(0, &[]), false),
+            Shown::Opened(vec![])
+        );
+        // A task closed as done is no longer set aside.
+        layout.close("shop.c");
+        assert!(!layout.aside("shop.c"));
+        assert_eq!(
+            open(&mut layout, "shop.c", &room(0, &[]), false),
+            Shown::Opened(vec![])
+        );
     }
 
     #[test]

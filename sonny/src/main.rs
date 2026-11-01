@@ -90,6 +90,7 @@ mod tree;
 mod trigger;
 mod upgrade;
 mod usage;
+mod used;
 mod user_shell;
 mod zen;
 
@@ -2034,6 +2035,9 @@ struct App {
     /// The agent whose tab is being looked for, from a window with no
     /// layout of its own, and the look.
     tab_job: Option<(String, tokio::task::JoinHandle<Result<(), String>>)>,
+    /// When the person last used this window, for a lead that keeps only
+    /// so many task windows open.
+    window_used: used::Marks,
     place_read: Option<(String, Instant)>,
     model: String,
     effort: Option<String>,
@@ -2492,6 +2496,46 @@ struct Fleet {
     /// Tasks' turns that resolved them: their window closes once the turn
     /// completes.
     resolving: resolved::Own,
+    /// `[sonny] task_windows`, read on the worker as the file changes.
+    windows: Arc<std::sync::Mutex<TaskWindows>>,
+}
+
+/// `[sonny] task_windows` as the config file last said it, read again
+/// only once the file changed, so that a change in `/config` from any
+/// window holds from the next task window on.
+#[derive(Default)]
+struct TaskWindows {
+    read: Option<Option<std::time::SystemTime>>,
+    most: usize,
+}
+
+impl TaskWindows {
+    fn most(&mut self) -> usize {
+        let path = agent_client::config::path();
+        let changed = (path.as_ref())
+            .and_then(|path| std::fs::metadata(path).ok())
+            .and_then(|file| file.modified().ok());
+        if self.read != Some(changed) {
+            self.read = Some(changed);
+            self.most = agent_client::config::load()
+                .map_or(agent_client::config::Sonny::default().task_windows, |c| {
+                    c.sonny.task_windows
+                }) as usize;
+        }
+        self.most
+    }
+}
+
+/// The status row's word on task windows closed for room.
+fn made_room(closed: &[String], project: &str, most: usize) -> String {
+    let tasks = format!("{project}.");
+    let names: Vec<&str> = (closed.iter())
+        .map(|bot| bot.strip_prefix(&tasks).unwrap_or(bot))
+        .collect();
+    format!(
+        "closed {}'s window for room ({most} task windows at most, in /config); /status opens it again",
+        names.join(", ")
+    )
 }
 
 /// A lead as the person tells it apart: `shop lead` for the folder's
@@ -2740,6 +2784,7 @@ impl Fleet {
             waits: Default::default(),
             returned: Vec::new(),
             resolving: Default::default(),
+            windows: Default::default(),
         };
         let own = lead.to_owned();
         fleet.layout.send(move |layout| layout.adopt_own(&own));
@@ -2816,21 +2861,52 @@ impl Fleet {
         self.name_windows();
     }
 
-    /// Open the task's window, unless it has one. With `tell`, the lead's
-    /// view hears where it opened, when not beside it, or why it did not.
-    fn show(&mut self, bot: &str, tell: bool) {
+    /// What a task's window runs, and its name while it is `doing` so.
+    fn window(&self, bot: &str, doing: &str) -> (Vec<String>, String) {
         let mut command = self.command.clone();
         command.extend(["--agent".into(), bot.into()]);
-        let name = format!("{} · working", self.short(bot));
+        (command, format!("{} · {doing}", self.short(bot)))
+    }
+
+    /// The room the project's task windows have, its limit read on the
+    /// worker: what needs the person or failed keeps its window.
+    fn room(&self) -> (Arc<std::sync::Mutex<TaskWindows>>, mux::Room) {
+        let keep = (self.doing.iter())
+            .filter(|(_, doing)| matches!(**doing, "needs you" | "failed"))
+            .map(|(bot, _)| bot.clone())
+            .collect();
+        let room = mux::Room {
+            most: 0,
+            project: self.project.clone(),
+            keep,
+            used: Arc::new(used::when),
+        };
+        (self.windows.clone(), room)
+    }
+
+    /// Open the task's window, unless it has one or it was closed for
+    /// room. With `tell`, the lead's view hears where it opened, when not
+    /// beside it, or why it did not; windows closed for room are said in
+    /// the status row.
+    fn show(&mut self, bot: &str, tell: bool) {
+        let (command, name) = self.window(bot, "working");
         let (bot_name, home, here) = (
             bot.to_owned(),
             self.layout.home().to_owned(),
             self.layout.here(),
         );
         let told = self.tell.clone();
+        let (windows, mut room) = self.room();
         self.layout.send(move |layout| {
-            let said = match layout.show(&bot_name, &name, &command) {
-                Ok(true) if !here => Some(format!("{bot_name} is in {home}")),
+            room.most = windows.lock().map_or(0, |mut windows| windows.most());
+            let said = match layout.show_task(&bot_name, &name, &command, &room, false) {
+                Ok(mux::Shown::Opened(closed)) => {
+                    if !closed.is_empty() {
+                        let _ =
+                            told.send(Told::Notice(made_room(&closed, &room.project, room.most)));
+                    }
+                    (!here).then(|| format!("{bot_name} is in {home}"))
+                }
                 Ok(_) => None,
                 Err(error) => Some(error),
             };
@@ -2843,10 +2919,28 @@ impl Fleet {
 
     /// Bring the task's own tab into view in the multiplexer, as the
     /// person asked; looked for on the worker, after every window opened
-    /// so far. With none, `beside` opens it in the pane, else says so.
-    fn go_to(&self, bot: &str, beside: bool) {
+    /// so far, and opened again when it was closed for room. With none,
+    /// `beside` opens it in the pane, else says so.
+    fn go_to(&mut self, bot: &str, beside: bool) {
+        let doing = self.doing.get(bot).copied().unwrap_or("idle");
+        let (command, name) = self.window(bot, doing);
+        let (windows, mut room) = self.room();
         let (bot, told) = (bot.to_owned(), self.tell.clone());
         self.layout.send(move |layout| {
+            if layout.aside(&bot) {
+                room.most = windows.lock().map_or(0, |mut windows| windows.most());
+                match layout.show_task(&bot, &name, &command, &room, true) {
+                    Ok(mux::Shown::Opened(closed)) if !closed.is_empty() => {
+                        let _ =
+                            told.send(Told::Notice(made_room(&closed, &room.project, room.most)));
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        let _ = told.send(Told::Notice(error));
+                        return;
+                    }
+                }
+            }
             if let Err(error) = layout.focus(&bot) {
                 let _ = told.send(match beside {
                     true => Told::Beside(bot),
@@ -3114,6 +3208,8 @@ impl Fleet {
             }
             "deleted" => {
                 self.close(bot);
+                let gone = bot.to_owned();
+                self.layout.send(move |_| used::forget(&gone));
                 self.lineage.remove(bot);
                 self.doing.remove(bot);
                 None
@@ -3139,6 +3235,7 @@ impl App {
             place: place::Place::default(),
             place_job: None,
             tab_job: None,
+            window_used: Default::default(),
             place_read: None,
             model,
             effort: record["effort"].as_str().map(str::to_owned),
@@ -4634,7 +4731,7 @@ impl App {
     fn open_agent(&mut self, bot: &str, other: bool) {
         use agent_client::config::AgentOpens;
         let tab = (self.agent_opens == AgentOpens::Tab) != other;
-        match &self.fleet {
+        match &mut self.fleet {
             Some(fleet) if tab => fleet.go_to(bot, true),
             // A task's window, or one in the pane, lays nothing out
             // itself: its project's layout is found off the screen, and
@@ -8623,7 +8720,7 @@ impl App {
             // An agent's title button: this window becomes its Sonny.
             "main" => self.switch_command(id).await,
             // Its name: its own tab, where the lead's tasks are laid out.
-            "tab" => match &self.fleet {
+            "tab" => match &mut self.fleet {
                 Some(fleet) => fleet.go_to(id, false),
                 None => {
                     self.notice = Some(format!(
@@ -8889,6 +8986,21 @@ impl App {
         // back between two draws, and a terminal regains focus after the
         // display slept. Every cell is written again then, as vim and
         // ncurses programs do on each resize, and on Ctrl-L as a shell does.
+        // The person focused, typed or clicked here: this window is used.
+        if matches!(
+            &event,
+            Event::FocusGained
+                | Event::Key(KeyEvent {
+                    kind: KeyEventKind::Press,
+                    ..
+                })
+                | Event::Mouse(event::MouseEvent {
+                    kind: event::MouseEventKind::Down(_),
+                    ..
+                })
+        ) {
+            self.window_used.used(&self.bot);
+        }
         match &event {
             Event::Resize(..) => self.stale = true,
             Event::FocusGained => {
