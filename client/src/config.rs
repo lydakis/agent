@@ -14,6 +14,7 @@
 //! processes = "cpus * 64"       # commands running at once, the default
 //! load = "cpus * 2"             # new commands wait while the load average is this, the default; 0 no gate
 //! input_bytes = "memory / 16"   # also lasting, active, connecting, pending, pending_bytes, readers
+//! stall_timeout = "10m"         # a provider stream with no content this long is retried, the default
 //!
 //! [fallbacks]                   # the model a declined request goes to, by model
 //! "anthropic/claude-opus-5-5" = "anthropic/claude-opus-4-8"
@@ -176,6 +177,12 @@ pub fn machine() -> (f64, f64) {
     (cpus as f64, memory)
 }
 
+/// The `[daemon]` keys that are durations, as the `agent serve` flag each
+/// sets takes them, with the least and most it takes in milliseconds: none
+/// given is the daemon's own default.
+pub const DAEMON_DURATIONS: [(&str, &str, u64, u64); 1] =
+    [("stall_timeout", "--stall-timeout", 1000, 86_400_000)];
+
 /// A `[daemon]` value worked out: a number, or `cpus` and `memory` (bytes)
 /// with numbers, `KiB` `MiB` `GiB`, `+ - * /`, parentheses, and
 /// `min(a, b)` and `max(a, b)`, as `"cpus * 64"` or `"max(memory / 16,
@@ -305,6 +312,11 @@ pub fn formula(key: &str, text: &str, cpus: f64, memory: f64) -> Result<f64, Str
 pub fn daemon_flags(daemon: &BTreeMap<String, String>) -> Result<Vec<(String, String)>, String> {
     let (cpus, memory) = machine();
     let mut flags = Vec::new();
+    for (key, flag, ..) in DAEMON_DURATIONS {
+        if let Some(text) = daemon.get(key) {
+            flags.push((flag.to_owned(), text.clone()));
+        }
+    }
     for (key, flag, default) in DAEMON_LIMITS {
         let Some(text) = daemon.get(key).map(String::as_str).or(default) else {
             continue;
@@ -959,6 +971,24 @@ fn parse(text: &str) -> Result<Config, String> {
             .ok_or_else(|| format!("unknown key {name}"))?;
         if name == "daemon" {
             for (key, value) in section {
+                if let Some((_, _, least, most)) =
+                    DAEMON_DURATIONS.iter().find(|(known, ..)| known == key)
+                {
+                    let refuse = || {
+                        format!(
+                            "daemon.{key} is a duration in whole seconds from {}s to {}s, as \"10m\"",
+                            least / 1000,
+                            most / 1000
+                        )
+                    };
+                    let text = value.as_str().ok_or_else(refuse)?;
+                    match duration_ms(text) {
+                        Some(ms) if ms % 1000 == 0 && (*least..=*most).contains(&ms) => {}
+                        _ => return Err(refuse()),
+                    }
+                    config.daemon.insert(key.clone(), text.to_owned());
+                    continue;
+                }
                 if !DAEMON_LIMITS.iter().any(|(known, ..)| known == key) {
                     return Err(format!("unknown key daemon.{key}"));
                 }
@@ -1588,6 +1618,23 @@ mod tests {
                 .unwrap_err()
                 .contains("daemon.processes")
         );
+        // A duration goes to its flag as written, checked when read.
+        let stall = parse("[daemon]\nstall_timeout = \"15m\"\n").unwrap();
+        let flags = daemon_flags(&stall.daemon).unwrap();
+        assert!(flags.contains(&("--stall-timeout".into(), "15m".into())));
+        for bad in ["600", "1500ms", "0", "2d", "\"soon\""] {
+            let text = match bad.starts_with('"') {
+                true => bad.to_owned(),
+                false if bad.chars().all(|c| c.is_ascii_digit()) => bad.to_owned(),
+                false => format!("\"{bad}\""),
+            };
+            assert!(
+                parse(&format!("[daemon]\nstall_timeout = {text}\n"))
+                    .unwrap_err()
+                    .contains("daemon.stall_timeout"),
+                "{bad}"
+            );
+        }
         // A formula is checked for this machine: one below 0 here is refused
         // when the file is read, not when a daemon starts.
         let over = machine().0 as u64 + 1;

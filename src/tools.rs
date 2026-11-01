@@ -47,6 +47,9 @@ const WRITE_BYTES: usize = 1024 * 1024;
 const DEFAULT_SHELL_TIMEOUT_MS: u64 = 120_000;
 const MAX_SHELL_TIMEOUT_MS: u64 = 600_000;
 const MAX_WAIT_TIMEOUT_MS: u64 = 86_400_000;
+/// A background command holds no turn while it runs, so it may run as long
+/// as a `wait` on it may last.
+const MAX_BACKGROUND_TIMEOUT_MS: u64 = MAX_WAIT_TIMEOUT_MS;
 /// Simultaneously running child processes, foreground or background.
 pub const DEFAULT_PROCESS_BUDGET: usize = 64;
 /// Processes that outlive their call, terminals and detached commands,
@@ -120,9 +123,9 @@ impl Tool {
                 "properties":{"text":{"type":"string"}},"required":["text"],"additionalProperties":false}),
             ),
             Tool::Shell => (
-                "Run a noninteractive bash command (sh where bash is not installed) in the workspace. stdout and stderr are returned separately; each is truncated to a head and tail beyond 64 KiB, with up to 1 MiB of it retained: past that, its first and last 512 KiB, and the command keeps running. Default timeout 120 s, maximum 600 s; a command that times out returns its output so far with timed_out. Every result reports wall_time_ms. Commands run with no terminal: TERM=dumb, NO_COLOR=1, and cat as the pager; AI_AGENT=agent tells tools an agent runs them. When the command returns or times out, every process it started is killed, so `cmd &` does not outlive it. With background=true the command is started and a proc handle is returned immediately; collect its result later with wait. A steer that arrives while a command runs moves it to the background: the result is its proc handle with steered=true, and the command keeps running. A background command runs until it exits, times out, or the daemon stops. With detach=true the command starts in its own session and its pid is returned at once; nothing tracks it and only a daemon pause kills it, so it outlives the turn and the daemon. Its output is discarded unless the command redirects it to a file. With tty=true it runs in a terminal, for a REPL or a program that prompts: the result is what it wrote within yield_time_ms (default 1000) and, while it runs, a proc handle for write_stdin.",
+                "Run a noninteractive bash command (sh where bash is not installed) in the workspace. stdout and stderr are returned separately; each is truncated to a head and tail beyond 64 KiB, with up to 1 MiB of it retained: past that, its first and last 512 KiB, and the command keeps running. Default timeout 120 s, maximum 600 s, or a day with background=true; a command that times out returns its output so far with timed_out. Every result reports wall_time_ms. Commands run with no terminal: TERM=dumb, NO_COLOR=1, and cat as the pager; AI_AGENT=agent tells tools an agent runs them. When the command returns or times out, every process it started is killed, so `cmd &` does not outlive it. With background=true the command is started and a proc handle is returned immediately; collect its result later with wait. A steer that arrives while a command runs moves it to the background: the result is its proc handle with steered=true, and the command keeps running. A background command runs until it exits, times out, or the daemon stops. With detach=true the command starts in its own session and its pid is returned at once; nothing tracks it and only a daemon pause kills it, so it outlives the turn and the daemon. Its output is discarded unless the command redirects it to a file. With tty=true it runs in a terminal, for a REPL or a program that prompts: the result is what it wrote within yield_time_ms (default 1000) and, while it runs, a proc handle for write_stdin.",
                 json!({"type":"object","properties":{"command":{"type":"string"},
-                "timeout_ms":{"type":"integer","minimum":1,"maximum":MAX_SHELL_TIMEOUT_MS},
+                "timeout_ms":{"type":"integer","minimum":1,"maximum":MAX_BACKGROUND_TIMEOUT_MS},
                 "background":{"type":"boolean"},"detach":{"type":"boolean"},"tty":{"type":"boolean"},
                 "yield_time_ms":{"type":"integer","minimum":0,"maximum":MAX_YIELD_MS}},
                 "required":["command"],"additionalProperties":false}),
@@ -1620,13 +1623,21 @@ impl Registry {
                     Some("command is over 16 KiB".to_owned())
                 } else if args.command.contains('\0') {
                     Some("command contains a NUL byte".to_owned())
-                } else if let Some(timeout_ms) = args
-                    .timeout_ms
-                    .filter(|t| !(1..=MAX_SHELL_TIMEOUT_MS).contains(t))
-                {
-                    Some(format!(
-                        "timeout_ms is {timeout_ms}; it runs from 1 to {MAX_SHELL_TIMEOUT_MS}"
-                    ))
+                } else if let Some(timeout_ms) = args.timeout_ms.filter(|t| {
+                    let most = match args.background {
+                        true => MAX_BACKGROUND_TIMEOUT_MS,
+                        false => MAX_SHELL_TIMEOUT_MS,
+                    };
+                    !(1..=most).contains(t)
+                }) {
+                    Some(match args.background {
+                        true => format!(
+                            "timeout_ms is {timeout_ms}; with background it runs from 1 to {MAX_BACKGROUND_TIMEOUT_MS}"
+                        ),
+                        false => format!(
+                            "timeout_ms is {timeout_ms}; it runs from 1 to {MAX_SHELL_TIMEOUT_MS}, or {MAX_BACKGROUND_TIMEOUT_MS} with background"
+                        ),
+                    })
                 } else if args.detach && args.background {
                     Some("detach and background cannot both be set".to_owned())
                 } else if args.tty && (args.detach || args.background || args.timeout_ms.is_some())
@@ -3204,7 +3215,20 @@ mod tests {
         };
         assert_eq!(
             detail(r#"{"command":"true","timeout_ms":900000}"#),
-            "timeout_ms is 900000; it runs from 1 to 600000"
+            "timeout_ms is 900000; it runs from 1 to 600000, or 86400000 with background"
+        );
+        // A background command may run as long as a wait on it may last.
+        assert!(
+            shell
+                .prepare(
+                    "shell",
+                    r#"{"command":"true","timeout_ms":3600000,"background":true}"#
+                )
+                .is_ok()
+        );
+        assert_eq!(
+            detail(r#"{"command":"true","timeout_ms":86400001,"background":true}"#),
+            "timeout_ms is 86400001; with background it runs from 1 to 86400000"
         );
         assert_eq!(detail(r#"{"command":""}"#), "command is empty");
         assert_eq!(
