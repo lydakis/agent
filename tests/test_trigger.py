@@ -650,7 +650,7 @@ class TriggerFireTests(ModelFixture):
         runtime = self.path / 'runtime'
         runtime.mkdir()
         self.agent('run', '--store', str(self.store), '--bot', 'p.task',
-                   f"shell:HOME='{self.home}' XDG_RUNTIME_DIR='{runtime}' '{SONNY}' trigger add --every 30m -- check"
+                   f"shell:HOME='{self.home}' XDG_RUNTIME_DIR='{runtime}' '{SONNY}' automation add --every 30m -- check"
                    f" > '{out}' 2>&1")
         self.assertEqual(json.loads(out.read_text())['error'], 'automations_unsupported')
         self.assertEqual(jobs(self.home), [])
