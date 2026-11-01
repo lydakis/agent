@@ -85,7 +85,8 @@ class ConfinedTests(unittest.TestCase):
         shell = lambda command, **more: {'name': 'shell', 'arguments': {'command': command}, **more}
         for allowed in ['~/.agent/trigger add --bot shop.lead --every 10m -- "Check the tasks"',
                         '"$HOME/.agent/trigger" rm watch',
-                        f'{home}/.agent/memory save flow --type project -- \'text\'']:
+                        f'{home}/.agent/memory save flow --type project -- \'text\'',
+                        "~/.agent/trigger add --bot shop.lead --cron '*/5 * * * *' -- 'Is it {done}? Yes!'"]:
             self.assertTrue(role_eval.determinable(home, shell(allowed)), allowed)
         # The ACP shape of the same call.
         acp = {'toolCall': {'name': 'shell', 'rawInput': {'command': '~/.agent/trigger ls'}}}
@@ -112,6 +113,17 @@ class ConfinedTests(unittest.TestCase):
                        '~/.agent/memory cleanup start',
                        '~/.agent/memory save flow --type -- text',
                        '~/.agent/memory',
+                       # What Bash would expand into other words than the ones checked.
+                       "~/.agent/trigger add --name {watch,--if,'touch /x'} --bot shop.lead --in 1m -- ping",
+                       '~/.agent/trigger rm w*',
+                       '~/.agent/trigger rm w?',
+                       '~/.agent/trigger rm [w]',
+                       '~/.agent/trigger rm ~/x',
+                       '~/.agent/trigger rm \\-\\-if',
+                       '~/.agent/trigger add --bot shop.lead --in 1m -- "!!"',
+                       '~/.agent/trigger add --bot shop.lead --in 1m -- "a\\"b"',
+                       '~/.agent/trigger rm watch # x',
+                       "~/.agent/trigger rm 'unclosed",
                        'git push origin main']:
             self.assertFalse(role_eval.determinable(home, shell(denied)), denied)
         # Not a shell call, or not seen whole.

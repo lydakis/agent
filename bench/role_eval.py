@@ -46,7 +46,6 @@ import json
 import os
 import random
 import re
-import shlex
 import shutil
 import sqlite3
 import subprocess
@@ -416,6 +415,46 @@ def plain(words, spec):
     return not text and len(names) == count
 
 
+# What a word may hold outside quotes: nothing Bash expands (braces, globs,
+# `~`, `$`, `!`), quotes with a backslash, or reads as an operator or a
+# comment. Bash would otherwise run other words than the ones checked.
+BARE = set('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_./:,@%+-')
+
+
+def words_of(text):
+    """The words Bash would run for `text`, or None when it would expand,
+    substitute or redirect anything in it, so no check of the words could
+    stand for what runs. Single quotes keep everything; double quotes keep
+    all but `$`, a backtick, a backslash and `!`."""
+    words, word, quoted = [], [], False
+    i = 0
+    while i < len(text):
+        c = text[i]
+        if c in ' \t':
+            if word or quoted:
+                words.append(''.join(word))
+            word, quoted = [], False
+            i += 1
+        elif c in '\'"':
+            close = text.find(c, i + 1)
+            if close < 0:
+                return None
+            inner = text[i + 1:close]
+            if c == '"' and set(inner) & set('$`\\!'):
+                return None
+            word.append(inner)
+            quoted = True
+            i = close + 1
+        elif c in BARE:
+            word.append(c)
+            i += 1
+        else:
+            return None
+    if word or quoted:
+        words.append(''.join(word))
+    return words
+
+
 def determinable(home, request):
     """Whether a call that would leave the sandbox is one whose effects stay
     in the run, so the eval may allow it. A command's words can't say where
@@ -433,25 +472,18 @@ def determinable(home, request):
     if set(arguments) - {'command', 'timeout_ms', 'sandbox_permissions', 'justification'}:
         return False
     command = arguments.get('command')
-    if not isinstance(command, str) or '\n' in command or '`' in command:
+    if not isinstance(command, str):
         return False
-    try:
-        lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
-        lexer.whitespace_split = True
-        words = list(lexer)
-    except ValueError:
-        return False
-    if not words or any(set(word) <= set('();<>|&') for word in words):
-        return False
-    program, rest = words[0], words[1:]
-    if any('$' in word for word in rest):
-        return False
+    # The script, written one of the ways that reach the run's own HOME.
+    program, _, rest = command.strip(' \t').partition(' ')
     script = next((name for name in SCRIPTS
-                   for form in ('~/.agent/{name}', '$HOME/.agent/{name}', f'{home}/.agent/{{name}}')
+                   for form in ('~/.agent/{name}', '$HOME/.agent/{name}', '"$HOME/.agent/{name}"',
+                                f'{home}/.agent/{{name}}', f"'{home}/.agent/{{name}}'")
                    if program == form.format(name=name)), None)
-    if script is None or not rest or rest[0] not in SCRIPTS[script]:
+    words = words_of(rest)
+    if script is None or not words or words[0] not in SCRIPTS[script]:
         return False
-    return plain(rest[1:], SCRIPTS[script][rest[0]])
+    return plain(words[1:], SCRIPTS[script][words[0]])
 
 
 def changed_outside(since, root, limit=200):
@@ -491,9 +523,9 @@ class Acp:
         # that waits on a task before it answers would otherwise wait out
         # the prompt.
         self.tasks = tasks or (lambda: None)
+        self.stderr = open(log.with_suffix('.stderr'), 'w')
         self.p = subprocess.Popen([str(sonny), 'acp'], env=env, cwd=cwd, stdin=subprocess.PIPE,
-                                  stdout=subprocess.PIPE, stderr=open(log.with_suffix('.stderr'), 'w'),
-                                  text=True)
+                                  stdout=subprocess.PIPE, stderr=self.stderr, text=True)
         self.log = open(log, 'a')
         self.lock = threading.Lock()
         self.answers, self.next = {}, 0
