@@ -246,24 +246,25 @@ show a lightweight runtime, not coding-agent capacity at that scale.
 
 The same synthetic conversation work through five harnesses, 32 agents at once,
 each doing three turns that add 64 KiB of text and stream back 5 KiB
-([full screen](docs/HARNESS_MEASUREMENTS.md), 2026-10-30, 4-vCPU Linux VM,
-medians of three runs; Agent at main `2182b4a`, the 0.7.0 code).
+([full screen](docs/HARNESS_MEASUREMENTS.md), 2026-11-01, 4-vCPU Linux VM,
+medians of three runs; Agent at main `70637f9`, every other harness at its
+newest release that day).
 
 | Harness | Peak memory | CPU time | Turn p99 |
 | --- | ---: | ---: | ---: |
-| Agent | 29 MiB | 0.7 s | 0.60 s |
-| Pi 0.85.1 | 172 MiB | 1.8 s | 0.77 s |
-| Codex 0.153.1 | 301 MiB | 35.5 s | 9.0 s* |
-| opencode 1.18.32 | 991 MiB | 19.8 s | 4.7 s |
-| Claude Code 2.1.267 | 7,348 MiB | 32.7 s | 2.8 s* |
+| Agent | 30 MiB | 0.8 s | 0.63 s |
+| Pi 1.4.0 | 155 MiB | 2.0 s | 0.75 s |
+| Codex 0.166.0 | 368 MiB | 9.3 s | 1.4 s* |
+| opencode 1.19.5 | 869 MiB | 13.8 s | 3.6 s |
+| Claude Code 2.1.316 | 6,257 MiB | 36.8 s | 2.4 s* |
 
 Read this as an exploratory screen, not a ranking. The harnesses do different
 amounts of work: Agent commits every turn to SQLite, opencode keeps its own
 store, and the others hold conversations in memory; no tools were called.
 Claude Code runs one process per agent, and its memory is summed across those
 processes. Turn time includes 0.5 s of scripted streaming.
-\* Codex reached only 8 to 10 of the 32 concurrent streams on this machine, and
-Claude Code 26 to 31. On this shared VM the other harnesses' numbers drift by
+\* Codex reached 30 to 32 of the 32 concurrent streams on this machine, and
+Claude Code 26 to 28. On this shared VM the other harnesses' numbers drift by
 up to about 20% between screens with the same binaries, so compare harnesses
 within one screen, not across screens.
 
