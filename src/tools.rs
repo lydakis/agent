@@ -2762,22 +2762,29 @@ fn group_runs(group: i32) -> bool {
         else {
             return false;
         };
-        // `pid (comm) state ppid pgrp ...`; comm may hold spaces and parens.
-        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        let Some((state, pgrp)) = stat(&entry.path().join("stat")) else {
             return false;
         };
-        let mut fields = stat
-            .rsplit_once(')')
-            .map_or("", |(_, rest)| rest)
-            .split_whitespace();
-        let state = fields.next();
-        let pgrp = fields.nth(1).and_then(|pgrp| pgrp.parse::<i32>().ok());
         pgrp == Some(group) && (!exited(state) || threads_run(pid))
     })
 }
+/// The state and process group in a `/proc` stat file, `pid (comm) state
+/// ppid pgrp ...`. comm is the process's name, any bytes up to 15 of them:
+/// spaces, parens, and UTF-8 the kernel cut short included.
 #[cfg(target_os = "linux")]
-fn exited(state: Option<&str>) -> bool {
-    matches!(state, Some("Z" | "X"))
+fn stat(path: &Path) -> Option<(u8, Option<i32>)> {
+    let stat = std::fs::read(path).ok()?;
+    let after = &stat[stat.iter().rposition(|&b| b == b')')? + 1..];
+    let mut fields = after
+        .split(u8::is_ascii_whitespace)
+        .filter(|field| !field.is_empty());
+    let state = *fields.next()?.first()?;
+    let pgrp = (fields.nth(1)).and_then(|pgrp| std::str::from_utf8(pgrp).ok()?.parse().ok());
+    Some((state, pgrp))
+}
+#[cfg(target_os = "linux")]
+fn exited(state: u8) -> bool {
+    matches!(state, b'Z' | b'X')
 }
 /// Whether any thread of a process whose main thread is a zombie still runs.
 #[cfg(target_os = "linux")]
@@ -2785,14 +2792,9 @@ fn threads_run(pid: &str) -> bool {
     let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
         return false;
     };
-    tasks.flatten().any(|task| {
-        std::fs::read_to_string(task.path().join("stat")).is_ok_and(|stat| {
-            !exited(
-                stat.rsplit_once(')')
-                    .and_then(|(_, rest)| rest.split_whitespace().next()),
-            )
-        })
-    })
+    tasks
+        .flatten()
+        .any(|task| stat(&task.path().join("stat")).is_some_and(|(state, _)| !exited(state)))
 }
 #[cfg(all(unix, not(target_os = "linux")))]
 fn group_runs(group: i32) -> bool {

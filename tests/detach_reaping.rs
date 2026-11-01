@@ -10,8 +10,12 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 fn state(pid: i32) -> Option<char> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    stat.rsplit_once(')')?.1.trim_start().chars().next()
+    let stat = std::fs::read(format!("/proc/{pid}/stat")).ok()?;
+    let after = &stat[stat.iter().rposition(|&b| b == b')')? + 1..];
+    after
+        .iter()
+        .find(|b| !b.is_ascii_whitespace())
+        .map(|&b| b as char)
 }
 
 async fn until(what: &str, mut done: impl FnMut() -> bool) {
@@ -132,6 +136,34 @@ async fn a_service_whose_main_thread_exited_keeps_its_place() {
         state(service) == Some('Z')
     })
     .await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(
+        refused(&tools, &dir).await.as_deref(),
+        Some("lasting_limit")
+    );
+    unsafe { libc::kill(service, libc::SIGKILL) };
+    assert!(
+        frees(&tools, &dir).await,
+        "the place was not freed once it ended"
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// A service whose name the kernel cuts mid-character, so `/proc` shows it
+/// in bytes that are not UTF-8, still runs and keeps its place.
+#[tokio::test]
+async fn a_service_whose_name_is_not_utf8_keeps_its_place() {
+    let (tools, dir) = setup("detach-name");
+    // Fourteen bytes and a two-byte é: the kernel keeps 15 of the 16.
+    let name = dir.join("abcdefghijklmn\u{e9}");
+    let sleep = ["/bin/sleep", "/usr/bin/sleep"]
+        .into_iter()
+        .find(|path| Path::new(path).exists())
+        .unwrap();
+    std::os::unix::fs::symlink(sleep, &name).unwrap();
+    let service = launch(&tools, &dir, &format!("'{}' 30", name.display())).await;
+    let comm = std::fs::read(format!("/proc/{service}/comm")).unwrap();
+    assert!(std::str::from_utf8(&comm).is_err(), "{comm:?}");
     tokio::time::sleep(Duration::from_millis(1500)).await;
     assert_eq!(
         refused(&tools, &dir).await.as_deref(),
