@@ -7256,7 +7256,16 @@ fn history_normalizes_multiline_items_without_changing_fields_or_replay() {
             .collect();
         assert_eq!(records.len(), 2);
         assert_eq!(completed_items, 2);
-        assert_eq!(records[1], serde_json::from_str::<Value>(item).unwrap());
+        // The view leaves out only what a provider replays: a thinking
+        // block's signature and a redacted one's data. A top-level field of
+        // that name on anything else stays.
+        let mut read = serde_json::from_str::<Value>(item).unwrap();
+        if family == Family::Anthropic {
+            let content = read["content"].as_array_mut().unwrap();
+            content[0].as_object_mut().unwrap().remove("signature");
+            content[1].as_object_mut().unwrap().remove("data");
+        }
+        assert_eq!(records[1], read);
         if !item.contains(['\r', '\n']) {
             assert_eq!(joined.lines().nth(1).unwrap(), item);
         }

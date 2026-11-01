@@ -1253,6 +1253,7 @@ async fn a_terminal_takes_typed_input_and_reports_its_end() {
         network: false,
         socket: None,
         capability: None,
+        listening: None,
         helper: None,
         sockets: Vec::new(),
     });

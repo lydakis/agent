@@ -4288,7 +4288,7 @@ impl Turn {
             // The bot's own socket, so its commands may use the daemon as
             // far as a sandboxed bot may; opened first, so its folder is
             // there to be kept read-only.
-            let capability = daemon.capability(bot)?;
+            let (capability, listening) = daemon.capability(bot)?.unzip();
             let policy = Policy::new(
                 settings.sandbox,
                 Some(&root),
@@ -4298,6 +4298,7 @@ impl Turn {
             )?;
             Ok(policy.map(|policy| Policy {
                 capability,
+                listening,
                 ..policy.with_sockets(&settings.unix_sockets)
             }))
         })
