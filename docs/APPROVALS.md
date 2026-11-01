@@ -610,8 +610,10 @@ so only one instance runs at a time, and answers in layers:
    the approval channel itself, answering approvals, creating a bot
    without its gates, or touching the daemon's database or socket directly
    rather than through `agent` or the scripts under `~/.agent`? Listing
-   approvals, managing the bot's own triggers, plan and memory, and task
-   folders (worktrees under `~/.agent/worktrees`) do not count. The
+   approvals, the bot's own plan and memory, and task folders (worktrees
+   under `~/.agent/worktrees`) do not count; its triggers go through the
+   `triggers` tool, and a raw write to the scheduler's jobs counts
+   (2026-11-01). The
    earlier wording ("store") denied every call under `~/.agent`, so no
    bot could save memory in `auto`,
    and the 2026-10-26 graft session was denied `agent approvals`, its own
@@ -1042,6 +1044,27 @@ as one.
   inherit its sandbox and its gates, submits only as itself, and cannot
   write the store. The roadmap still leaves process isolation beyond
   that, a container or VM, to the host (NEXT.md).
+- **The agent's home is the person's call, never the judge's** (2026-11-01).
+  `--protect-path ~/.agent` keeps it read-only inside every sandbox, but an
+  escalated command runs unconfined, and the Monday rehearsal had the judge
+  allow one that wrote `~/.agent/triggers/jobs/x`, a job the scheduler runs
+  as the person: the policy called triggers under `~/.agent` ordinary work,
+  from before agents had the `triggers` tool. The policy now rates the
+  scheduler's jobs, the command rules and Sonny's scripts there as the
+  approval channel (`critical`), and changing `config.toml` or `env`
+  directly as persistent weakening. And Sonny's approver never allows a
+  call that reaches `~/.agent` outside the folders the agent was given
+  there (a task's worktree, the zen folder) on the judge's word: a write,
+  edit or patch by the path it resolves to, a command that would run
+  outside the sandbox by any path word holding `.agent` (`~`, `$HOME` and
+  `${HOME}` read as the home). What the judge would allow waits for the
+  person, as a call too long to show does; a denial stays one. Codex's
+  guardian may approve writes to `~/.codex`; Claude Code routes writes to
+  its own paths to its classifier, except under `--restricted`, where only
+  the person may allow them, which is what this follows. The command check
+  reads words, so one that spells the name another way is left to the
+  judge, and a command an allow rule lets out is not reviewed at all, as in
+  Codex.
 - **What it is good for.** Catching the overeager or mistaken action a
   person would have stopped: the deleted branch, the force push, the token
   pasted into a request. Anthropic reports its pipeline let 17% of real
