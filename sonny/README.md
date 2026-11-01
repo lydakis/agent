@@ -520,8 +520,10 @@ agent then does. Esc stops a command still running.
 
 An emoji sent alone is a reaction, not a message: it goes under the
 agent's last reply and is attached to the agent's next call, so it starts
-no turn. `/react` picks an older reply, and sending an emoji already on a
-reply takes it off. The agent reacts too, with a `react` tool Sonny
+no turn. To react to an older reply, point at it: a muted `☺` shows
+under it, where its reactions go, and a click picks it for the emoji you
+send next. `/react` picks one from the keys. Sending an emoji already on a
+reply takes it off, and so does a click on it. The agent reacts too, with a `react` tool Sonny
 declares on it: 👍 or 🎉 under
 your message when that is all it needs, or 👀 while it looks, taken off
 once it answers. Every reaction sits right under the message it is on,
@@ -532,6 +534,8 @@ one of its tasks, with its name (`👀 calc.lead`) under the agent's own.
 ![The agent's 🎉 under a message, and a 👍 on its reply](../docs/sonny/reactions.png)
 
 ![/react picking an older reply](../docs/sonny/reactions-picker.png)
+
+![☺ under the reply under the mouse, after its 👍](../docs/sonny/react-mark.png)
 
 To answer one message, point at it: its bullet turns into `↩`, and a
 click quotes it into the composer (`> ` before each line, six lines at
