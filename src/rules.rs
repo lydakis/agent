@@ -369,8 +369,12 @@ fn files(folder: &Path) -> Result<Vec<PathBuf>> {
         if path.extension().is_none_or(|ext| ext != "rules") {
             continue;
         }
-        let Ok(found) = std::fs::symlink_metadata(&path) else {
-            continue;
+        // A file gone since the listing is not one, but one that can't be
+        // looked at is no rule at all: refused, so it is not read as none.
+        let found = match std::fs::symlink_metadata(&path) {
+            Ok(found) => found,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(invalid(format!("{}: {error}", path.display()))),
         };
         // The sandbox keeps the folder read-only, not what a link in it
         // names, nor another name for the same file: a bot could write one
@@ -1188,6 +1192,26 @@ prefix_rule(pattern = [r"a\b", "\101\n"], decision = "allow",)
             std::fs::hard_link(&elsewhere, dir.join("c.rules")).unwrap();
             assert_eq!(Policy::load(&dir).unwrap_err().code, "rules_invalid");
             std::fs::remove_file(&elsewhere).unwrap();
+            std::fs::remove_file(dir.join("c.rules")).unwrap();
+        }
+        // A folder that lists but can't be looked into is refused, not read
+        // as no rules: the rules last read stay. Root looks in regardless.
+        #[cfg(unix)]
+        // SAFETY: geteuid takes nothing and always succeeds.
+        if unsafe { libc::geteuid() } != 0 {
+            use std::os::unix::fs::PermissionsExt;
+            let forbid = "prefix_rule(pattern = [\"rm\"], decision = \"forbidden\")";
+            std::fs::write(dir.join("b.rules"), forbid).unwrap();
+            assert!(matches!(
+                folder.current().rule("rm x"),
+                Ok(Ruling::Forbidden(_))
+            ));
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o644)).unwrap();
+            let refused = Policy::load(&dir).unwrap_err().code;
+            let kept = folder.current().rule("rm x");
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+            assert_eq!(refused, "rules_invalid");
+            assert!(matches!(kept, Ok(Ruling::Forbidden(_))));
         }
         std::fs::remove_dir_all(&dir).unwrap();
     }

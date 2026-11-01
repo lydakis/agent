@@ -831,6 +831,10 @@ pub struct Waiting {
     /// output when it ends or its yield runs out.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub poll: bool,
+    /// What the command rules made of the calls still to run, as their
+    /// round was announced, by call id: read from them as the park resumes.
+    #[serde(skip)]
+    pub rulings: BTreeMap<String, String>,
 }
 /// A declined request's fallback model, as `provider/model`, and the credit
 /// its retry redeems.
@@ -854,6 +858,14 @@ pub struct CopiedCall {
     pub prefix: Option<(String, usize)>,
 }
 impl Waiting {
+    /// The calls still to run as their round's announcement ruled them.
+    pub fn rules(&self) -> Rules {
+        Rules::recorded(
+            (self.rulings.iter())
+                .map(|(id, stored)| (id.clone(), Ruling::read(stored)))
+                .collect(),
+        )
+    }
     fn paced_elapsed_ms(&self) -> i64 {
         self.paced_since_ms
             .filter(|_| self.halt.is_none())
@@ -6604,20 +6616,13 @@ impl Database {
     /// commit and a denial is its result, so a verdict adds no commit.
     /// What the command rules made of each of the turn's calls still to
     /// run, as their rounds were announced.
-    pub fn rulings(&self, turn: i64) -> Result<Rules> {
+    fn rulings(&self, turn: i64) -> Result<BTreeMap<String, String>> {
         let mut statement = self.conn.prepare_cached(
             "SELECT call_id,ruling FROM tools WHERE turn=? AND ruling IS NOT NULL
              AND status IN ('planned','executing')",
         )?;
-        let rows = statement.query_map([turn], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-        })?;
-        let mut rulings = HashMap::new();
-        for row in rows {
-            let (call_id, stored) = row?;
-            rulings.insert(call_id, Ruling::read(&stored));
-        }
-        Ok(Rules::recorded(rulings))
+        let rows = statement.query_map([turn], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
     pub fn approval_start(&mut self, turn: i64, call: &ToolCall, now_ms: u64) -> Result<Gated> {
         let mut bot = self.active(turn)?;
@@ -6791,6 +6796,7 @@ impl Database {
             fallback: None,
             halt: None,
             poll: false,
+            rulings: BTreeMap::new(),
         };
         let tx = self.conn.savepoint()?;
         flush(&tx, turn, self.live.get(&turn))?;
@@ -6935,6 +6941,7 @@ impl Database {
             fallback: None,
             halt: None,
             poll: false,
+            rulings: BTreeMap::new(),
         };
         let tx = self.conn.savepoint()?;
         flush(&tx, turn, self.live.get(&turn))?;
@@ -8652,6 +8659,7 @@ impl Database {
             fallback: None,
             halt: None,
             poll,
+            rulings: BTreeMap::new(),
         };
         let tx = self.conn.savepoint()?;
         // A verdict for a later call of the round waits in the store.
@@ -8710,6 +8718,7 @@ impl Database {
             fallback,
             halt: None,
             poll: false,
+            rulings: BTreeMap::new(),
         };
         let tx = self.conn.savepoint()?;
         flush(&tx, turn, self.live.get(&turn))?;
@@ -8798,6 +8807,7 @@ impl Database {
             fallback: None,
             halt: Some(stop),
             poll: false,
+            rulings: BTreeMap::new(),
         };
         let tx = self.conn.savepoint()?;
         flush(&tx, turn, self.live.get(&turn))?;
@@ -9043,7 +9053,7 @@ impl Database {
     /// Bring a parked turn back to running; the caller then records the wait
     /// result. Also answers whether a steer queued while it was parked.
     pub fn resume(&mut self, turn: i64) -> Result<(Waiting, Value, bool)> {
-        let waiting = self.waiting(turn)?.ok_or(Error::new("turn_not_waiting"))?;
+        let mut waiting = self.waiting(turn)?.ok_or(Error::new("turn_not_waiting"))?;
         let bot = self.active(turn)?;
         if bot.status != "waiting" && bot.status != "paced" {
             return fail("turn_not_waiting");
@@ -9058,6 +9068,7 @@ impl Database {
         let cursor = event(&tx, &bot.name, Some(turn), "turn_resumed", data.clone())?;
         tx.commit()?;
         let steers = self.steers_waiting(&bot.name)?;
+        waiting.rulings = self.rulings(turn)?;
         Ok((
             waiting,
             entry(cursor, &bot.name, Some(turn), "turn_resumed", data),

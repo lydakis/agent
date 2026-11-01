@@ -14905,8 +14905,19 @@ fn a_planned_call_keeps_what_the_rules_made_of_it() {
     let calls = [rm_call.clone(), git_call.clone(), ls_call.clone()];
     db.append_under(turn, vec![rm, git, ls], &calls, None, &rules)
         .unwrap();
-    // Read back with no rules at all, as after a restart that changed them.
-    let ruled = db.rulings(turn).unwrap();
+    // The prompt one is announced.
+    let page = db.approvals(Some("Bob"), None, 0, None, 64).unwrap();
+    let announced: Vec<_> = (page["approvals"].as_array().unwrap().iter())
+        .map(|a| a["call_id"].clone())
+        .collect();
+    assert!(announced.contains(&json!("c2")));
+    // Parked on the prompt one and resumed, the park reads them back with
+    // no rules at all, as after a restart that changed them.
+    db.suspend_approval(turn, &calls[1..], 0, None, None)
+        .unwrap()
+        .expect("parked");
+    let (waiting, _, _) = db.resume(turn).unwrap();
+    let ruled = waiting.rules();
     let bot = db.inspect("Bob").unwrap();
     assert_eq!(
         bot.ruling(&rm_call, &ruled),
@@ -14919,14 +14930,9 @@ fn a_planned_call_keeps_what_the_rules_made_of_it() {
         Ok(Ruling::Prompt(_))
     ));
     assert_eq!(bot.ruling(&ls_call, &ruled), Ok(Ruling::None));
-    // The prompt one was announced, so its run waits on it.
+    // It was announced, so its run waits on it.
     let workspace = std::path::Path::new("/synthetic");
     assert!(bot.gated(&git_call, workspace, &ruled));
-    let page = db.approvals(Some("Bob"), None, 0, None, 64).unwrap();
-    let announced: Vec<_> = (page["approvals"].as_array().unwrap().iter())
-        .map(|a| a["call_id"].clone())
-        .collect();
-    assert!(announced.contains(&json!("c2")));
 }
 
 #[test]

@@ -198,9 +198,9 @@ pub struct Turn {
     /// rules its calls by them, so one that announces a call and the run
     /// that starts it agree.
     pub rules: std::sync::OnceLock<Arc<agent_runtime::rules::Rules>>,
-    /// What the rules made of the calls being run, as their round's
-    /// announcement recorded it: read again as each run of calls starts.
-    pub ruled: std::sync::Mutex<Arc<agent_runtime::rules::Rules>>,
+    /// While a resumed park's calls run, what the rules made of them as
+    /// their round was announced; otherwise the turn's own `rules`.
+    pub ruled: std::sync::Mutex<Option<Arc<agent_runtime::rules::Rules>>>,
     /// The turn's model's context window, as the turn starts.
     pub window: std::sync::OnceLock<u64>,
     /// The park this task continues, already claimed by the service: record
@@ -788,7 +788,16 @@ impl Turn {
     }
     /// The rulings of the calls being run ([`Turn::ruled`]).
     fn ruled(&self) -> Arc<agent_runtime::rules::Rules> {
-        self.ruled.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        let ruled = self.ruled.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        ruled.unwrap_or_else(|| {
+            self.rules
+                .get()
+                .expect("rounds read the rules first")
+                .clone()
+        })
+    }
+    fn set_ruled(&self, ruled: Option<Arc<agent_runtime::rules::Rules>>) {
+        *self.ruled.lock().unwrap_or_else(|e| e.into_inner()) = ruled;
     }
     /// The configured envelope bounds input. Completion headroom is a soft
     /// compaction trigger, not a tax on every request's usable history.
@@ -2281,8 +2290,10 @@ impl Turn {
                         })
                         .await?;
                 }
-                // Calls that followed in the same model response.
-                if let Some(stop) = self
+                // Calls that followed in the same model response, run as
+                // their round was announced, whatever the rules say now.
+                self.set_ruled(Some(Arc::new(waiting.rules())));
+                let stop = self
                     .execute_calls(
                         waiting.pending.clone(),
                         (provider, model),
@@ -2294,8 +2305,9 @@ impl Turn {
                         accounting.route.get().map(String::as_str),
                         accounting.summary_retry(),
                     )
-                    .await?
-                {
+                    .await;
+                self.set_ruled(None);
+                if let Some(stop) = stop? {
                     return Ok(stop.round());
                 }
             }
@@ -3733,9 +3745,6 @@ impl Turn {
         summary_retry_ms: Option<u64>,
     ) -> Result<Option<Stop>> {
         let (turn, allowed) = (self.turn, record.callable());
-        // As announced, whatever the rules say now.
-        let ruled = self.store.op("rulings", move |db| db.rulings(turn)).await?;
-        *self.ruled.lock().unwrap_or_else(|e| e.into_inner()) = Arc::new(ruled);
         let mut calls = calls.into_iter();
         while let Some(call) = calls.next() {
             // Nor any tool: the calls not yet started are answered as not
