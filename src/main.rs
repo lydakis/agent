@@ -162,7 +162,12 @@ fn sandboxed(args: &[String]) -> Result<i32> {
         }
     }
     agent_runtime::sandbox::available()?;
+    // What a daemon this CLI starts keeps read-only in every root: a
+    // checkout's git folder, agents' settings, cloud keys.
+    let names = |names: &[&str]| names.iter().map(|name| name.to_string()).collect();
     let daemon = Daemon {
+        protected: names(&agent_client::PROTECTED),
+        protected_existing: names(&agent_client::PROTECTED_EXISTING),
         protected_paths: agent_client::config::home()
             .and_then(|home| std::fs::canonicalize(home).ok())
             .into_iter()
