@@ -1384,13 +1384,14 @@ fn cache_to_take(bot: &Value) -> Option<&'static str> {
 /// A link, file or page, opened as the system opens it, by the first of
 /// the openers the `open` crate knows that is installed; with none, the
 /// link goes on the clipboard instead, as a login that can't open a
-/// browser prints its URL. Over SSH with no display to open on and no
-/// `BROWSER`, the opener would start on the remote machine's screen, so
-/// the link is copied straight away, as `gh` and other CLIs print it.
+/// browser prints its URL. Where nothing can show it (no display to open
+/// on and no `BROWSER`), an opener would start and fail out of sight, so
+/// the link is copied straight away and said so, as `gh` and other CLIs
+/// print it: a click never does nothing.
 fn open(target: &str) -> Result<(), String> {
-    if remote_without_display(&|key| std::env::var_os(key)) {
+    if nowhere_to_open(&|key| std::env::var_os(key), cfg!(target_os = "macos")) {
         term::copy(target);
-        return Err(format!("over SSH, nothing opens here; copied {target}"));
+        return Err(format!("nothing opens on this machine; copied {target}"));
     }
     open::that_detached(target).map_err(|error| {
         term::copy(target);
@@ -1398,14 +1399,21 @@ fn open(target: &str) -> Result<(), String> {
     })
 }
 
-/// In an SSH session with no X or Wayland display (forwarded or local)
-/// and no `BROWSER` of the person's to open with.
-fn remote_without_display(var: &dyn Fn(&str) -> Option<std::ffi::OsString>) -> bool {
+/// Whether nothing on this machine can show what is opened. On Linux: no
+/// X or Wayland display and no `BROWSER`, whether or not this is an SSH
+/// session, since a multiplexer's server (Herdr, tmux) outlives the SSH
+/// session that started it and its panes lose the SSH variables; WSL opens
+/// on Windows. On macOS: an SSH session with none of them, as `open` would
+/// show it on that Mac's own screen.
+fn nowhere_to_open(var: &dyn Fn(&str) -> Option<std::ffi::OsString>, mac: bool) -> bool {
     let set = |key: &str| var(key).is_some_and(|value| !value.is_empty());
-    (set("SSH_CONNECTION") || set("SSH_TTY"))
-        && !["DISPLAY", "WAYLAND_DISPLAY", "BROWSER"]
-            .iter()
-            .any(|key| set(key))
+    let display = ["DISPLAY", "WAYLAND_DISPLAY", "BROWSER"]
+        .iter()
+        .any(|key| set(key));
+    match mac {
+        true => (set("SSH_CONNECTION") || set("SSH_TTY")) && !display,
+        false => !display && !set("WSL_DISTRO_NAME"),
+    }
 }
 
 /// The composer's edge: the band the person's messages sit on, from the
@@ -12881,31 +12889,46 @@ mod tests {
     }
 
     #[test]
-    fn over_ssh_with_nothing_to_open_on_a_link_is_copied() {
-        let with = |vars: &[(&str, &str)]| {
+    fn with_nothing_to_open_on_a_link_is_copied() {
+        let with = |mac: bool, vars: &[(&str, &str)]| {
             let vars: Vec<(String, String)> = vars
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect();
-            remote_without_display(&move |key| {
-                vars.iter().find(|(k, _)| k == key).map(|(_, v)| v.into())
-            })
+            nowhere_to_open(
+                &move |key| vars.iter().find(|(k, _)| k == key).map(|(_, v)| v.into()),
+                mac,
+            )
         };
-        assert!(!with(&[]), "a local terminal opens");
-        assert!(with(&[("SSH_CONNECTION", "1.2.3.4 5 6.7.8.9 22")]));
-        assert!(with(&[("SSH_TTY", "/dev/pts/1"), ("DISPLAY", "")]));
-        assert!(!with(&[
-            ("SSH_CONNECTION", "c"),
-            ("DISPLAY", "localhost:10.0")
-        ]));
-        assert!(!with(&[
-            ("SSH_CONNECTION", "c"),
-            ("WAYLAND_DISPLAY", "wayland-0")
-        ]));
-        assert!(!with(&[
-            ("SSH_CONNECTION", "c"),
-            ("BROWSER", "open-on-client")
-        ]));
+        // A Mac opens on its own screen, unless reached over SSH.
+        assert!(!with(true, &[]), "a local terminal opens");
+        assert!(with(true, &[("SSH_CONNECTION", "1.2.3.4 5 6.7.8.9 22")]));
+        assert!(with(true, &[("SSH_TTY", "/dev/pts/1"), ("DISPLAY", "")]));
+        assert!(!with(
+            true,
+            &[("SSH_CONNECTION", "c"), ("BROWSER", "open-on-client")]
+        ));
+        // Linux opens where there is a display, SSH or not.
+        assert!(!with(false, &[("DISPLAY", ":0")]));
+        assert!(!with(
+            false,
+            &[("SSH_CONNECTION", "c"), ("DISPLAY", "localhost:10.0")]
+        ));
+        assert!(!with(
+            false,
+            &[("SSH_CONNECTION", "c"), ("WAYLAND_DISPLAY", "wayland-0")]
+        ));
+        assert!(!with(
+            false,
+            &[("SSH_CONNECTION", "c"), ("BROWSER", "open-on-client")]
+        ));
+        assert!(with(false, &[("SSH_CONNECTION", "c")]));
+        // A multiplexer's server outlived the SSH session: no SSH
+        // variables, and still no screen to open on.
+        assert!(with(false, &[]), "a headless box opens nothing");
+        assert!(with(false, &[("DISPLAY", "")]));
+        // WSL opens on Windows.
+        assert!(!with(false, &[("WSL_DISTRO_NAME", "Ubuntu")]));
     }
 
     #[test]
