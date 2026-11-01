@@ -196,7 +196,12 @@ enum Feed {
     Past(Value),
     /// The calls waiting for the person when the past was read, each with
     /// its agent: what is answered after, live events let go.
-    Held(Vec<(String, String)>),
+    Held(Vec<crate::needs::Held>),
+    /// Where to ask for an agent's questions to be read, with the turn
+    /// that ended unsure of them.
+    Scans(mpsc::UnboundedSender<(String, Option<i64>)>),
+    /// An agent's history read for its questions: none when it could not be.
+    Asked(String, Option<crate::needs::Seen>),
     Live(Value),
     /// An agent's model, read again after it was configured.
     Model(String, String),
@@ -313,10 +318,9 @@ struct Agent {
     heated: Option<Instant>,
     /// The burst's colour: the message's.
     flash: Option<Color>,
-    /// It asked the person something, not yet answered.
-    asking: bool,
-    /// Its calls that wait for the person's approval.
-    held: HashSet<String>,
+    /// What of its waits on the person, as every surface reads it: its
+    /// calls held for their approval and the question it has open.
+    waits: crate::needs::Needs,
     /// Its last turn failed.
     failed: bool,
     /// The last it said or was told, for the list.
@@ -349,7 +353,7 @@ impl Agent {
     }
 
     fn state(&self) -> Option<State> {
-        if self.asking || !self.held.is_empty() {
+        if self.waits.waits(&self.name) {
             Some(State::NeedsYou)
         } else if self.running.is_some() {
             Some(State::Working)
@@ -424,6 +428,8 @@ pub struct View {
     order: Vec<(usize, usize)>,
     live: bool,
     paused: bool,
+    /// Where the follow reads agents' questions, once it says.
+    scans: Option<mpsc::UnboundedSender<(String, Option<i64>)>>,
     /// What each mark, colour and shape means, and the counts, in the
     /// chat log's place.
     pub legend: bool,
@@ -817,6 +823,7 @@ impl View {
             order: Vec::new(),
             live: false,
             paused: false,
+            scans: None,
             legend: false,
             zen: false,
             models: false,
@@ -855,6 +862,7 @@ impl View {
     pub fn pause(&mut self) {
         self.paused = true;
         self.task.abort();
+        self.scans = None;
     }
 
     /// Follow again after a pause, from a fresh listing; a replay reads
@@ -869,6 +877,7 @@ impl View {
 
     fn restart(&mut self) {
         self.task.abort();
+        self.scans = None;
         let (send, feed) = mpsc::unbounded_channel();
         self.feed = feed;
         self.task = match &mut self.replay {
@@ -1008,16 +1017,47 @@ impl View {
                     }
                 }
                 Feed::Past(event) => self.event(&event, now, false),
+                // What the daemon lists, in place of what each agent held;
+                // and each agent has its questions read, as asked before
+                // the sky opened.
                 Feed::Held(calls) => {
-                    for (bot, call) in calls {
-                        if let Some(at) = self.agent(&bot) {
-                            self.agents[at].held.insert(call);
+                    let mut by: HashMap<String, Vec<crate::needs::Held>> = HashMap::new();
+                    for held in calls {
+                        by.entry(held.0.clone()).or_default().push(held);
+                    }
+                    for agent in &mut self.agents {
+                        let held = by.remove(&agent.name).unwrap_or_default();
+                        let name = agent.name.clone();
+                        agent.waits.held(held, |bot| bot == name);
+                        if !agent.gone
+                            && let Some(scans) = &self.scans
+                        {
+                            let _ = scans.send((name, None));
                         }
                     }
                 }
+                Feed::Scans(scans) => self.scans = Some(scans),
+                // Read as of when it was asked: what an event since left
+                // unsure is read again when its turn ends.
+                Feed::Asked(name, Some(seen)) => {
+                    if let Some(at) = self.agent(&name)
+                        && !self.agents[at].waits.unsure(&name)
+                    {
+                        self.agents[at].waits.asked(&name, seen.ask);
+                    }
+                }
+                Feed::Asked(_, None) => {}
                 Feed::Live(event) => {
                     self.live = true;
                     self.event(&event, now, true);
+                    // A turn that ended unsure of its questions is read.
+                    if let Some(at) = event["bot"].as_str().and_then(|bot| self.agent(bot)) {
+                        for due in self.agents[at].waits.due() {
+                            if let Some(scans) = &self.scans {
+                                let _ = scans.send(due);
+                            }
+                        }
+                    }
                 }
                 Feed::Model(name, model) => {
                     // A replay seats agents again on a step back, from its
@@ -1737,6 +1777,12 @@ impl View {
             return;
         }
         let turn = event["turn"].as_i64().unwrap_or(-1);
+        // What waits on the person, as every surface reads it: a copy's
+        // asks and approvals are its own.
+        let waiting = self.agents[at].state() == Some(State::NeedsYou);
+        if own && live {
+            self.agents[at].waits.event(event);
+        }
         match event["event"].as_str().unwrap_or("") {
             kind @ ("queued" | "accepted" | "steered") => {
                 let sent_turn = match kind {
@@ -1753,18 +1799,6 @@ impl View {
                     agent.sender = Some(from);
                     // A new turn tries again what failed.
                     agent.failed = false;
-                }
-                // What it asked is answered by the one it asked: the person,
-                // or the agent that made it. A copy's prompt answers none of
-                // its agent's questions.
-                if kind != "queued" && live && own {
-                    let maker = self.agents[at]
-                        .made_by
-                        .as_deref()
-                        .and_then(|by| self.agent(by));
-                    if from == End::Person || matches!(from, End::Agent(by) if Some(by) == maker) {
-                        self.agents[at].asking = false;
-                    }
                 }
                 // A queued prompt sparks when sent; its start, or the steer
                 // taking it, is the same message and ends the watch for it.
@@ -1863,11 +1897,6 @@ impl View {
                 let tool = data["name"].as_str().unwrap_or("");
                 // A call approved starts; a copy's calls are lent as a
                 // twinkle, its asks and approvals staying its own.
-                if let Some(call) = data["call_id"].as_str()
-                    && own
-                {
-                    self.agents[at].held.remove(call);
-                }
                 self.agents[at].twinkle = Some((now, TOOL, Work::of(tool)));
                 if let Some(then) = self.then(now) {
                     self.calls.push_back(then);
@@ -1885,12 +1914,9 @@ impl View {
                     let key = (name.to_owned(), turn, call.to_owned());
                     self.bookings.insert(key, booking);
                 }
-                if tool == crate::asks::TOOL && own {
-                    if self.agents[at].state() != Some(State::NeedsYou) {
-                        let said = format!("? {} asks you", self.short(at));
-                        self.say(now, said, Some(NEEDS), &[at]);
-                    }
-                    self.agents[at].asking = true;
+                if tool == crate::asks::TOOL && own && !waiting {
+                    let said = format!("? {} asks you", self.short(at));
+                    self.say(now, said, Some(NEEDS), &[at]);
                 }
                 if tool == "commons" && posted(&data["arguments"]) {
                     // As far as the post reaches: who has read the thread
@@ -1913,45 +1939,21 @@ impl View {
             }
             // A call waits for the person: one gated for them, or one the
             // reviewer handed them.
-            "approval_requested" if live => {
-                let waiting = self.agents[at].state() == Some(State::NeedsYou);
-                for call in data["calls"].as_array().into_iter().flatten() {
-                    let gates = call["gates"].as_array().map_or(&[][..], Vec::as_slice);
-                    let manual = gates.iter().any(|g| g == "manual");
-                    let Some(id) = call["call_id"].as_str() else {
-                        continue;
-                    };
-                    if manual {
-                        self.agents[at].held.insert(id.to_owned());
-                    }
-                }
-                self.waits(at, waiting, now);
-            }
+            "approval_requested" if live => self.waits(at, waiting, now),
             "approval_asked" if live => {
-                let waiting = self.agents[at].state() == Some(State::NeedsYou);
-                if let Some(id) = data["call_id"].as_str() {
-                    self.agents[at].held.insert(id.to_owned());
-                    // A reviewer's gate handed the call to the person.
-                    if data["tag"].as_str().is_some_and(|tag| tag != "manual") {
-                        self.verdict(at, NEEDS, now);
-                    }
+                // A reviewer's gate handed the call to the person.
+                if data["call_id"].is_string()
+                    && data["tag"].as_str().is_some_and(|t| t != "manual")
+                {
+                    self.verdict(at, NEEDS, now);
                 }
                 self.waits(at, waiting, now);
             }
-            // Each answer lets go of its call alone.
-            "step_decided" | "turn_resumed" if live => {
-                if let Some(id) = data["call_id"].as_str() {
-                    self.agents[at].held.remove(id);
-                    // A step of a call, such as an MCP call inside `exec`,
-                    // its reviewer refused.
-                    if kind == "step_decided" {
-                        self.denied(at, data, now);
-                    }
-                }
-            }
+            // A step of a call, such as an MCP call inside `exec`, its
+            // reviewer refused.
+            "step_decided" if live && data["call_id"].is_string() => self.denied(at, data, now),
             "tool_completed" if live => {
                 if let Some(id) = data["call_id"].as_str() {
-                    self.agents[at].held.remove(id);
                     self.denied(at, data, now);
                     let key = (name.to_owned(), turn, id.to_owned());
                     if let Some(booking) = self.bookings.remove(&key)
@@ -1975,7 +1977,6 @@ impl View {
             {
                 let agent = &mut self.agents[at];
                 agent.running = None;
-                agent.held.clear();
                 // Its last turn's end, past or live, says whether it failed;
                 // one that ended with nothing to say ended as it should.
                 agent.failed = data["status"] == "failed" && data["error"] != "empty_completion";
@@ -4645,6 +4646,21 @@ async fn follow(socket: PathBuf, send: mpsc::UnboundedSender<Feed>) {
     {
         return;
     }
+    // Agents' questions are read beside the follow, one at a time, as the
+    // view asks: it ends with the view's asking.
+    let (scans, mut asked) = mpsc::unbounded_channel::<(String, Option<i64>)>();
+    if send.send(Feed::Scans(scans)).is_err() {
+        return;
+    }
+    let (reader, told) = (client.clone(), send.clone());
+    tokio::spawn(async move {
+        while let Some((bot, turn)) = asked.recv().await {
+            let seen = crate::needs::scan(&reader, &bot, turn).await;
+            if told.send(Feed::Asked(bot, seen)).is_err() {
+                return;
+            }
+        }
+    });
     // A cord already pulled when the sky opens hangs, without its drop;
     // `paused` and `resumed` notices tell of what comes after.
     if !client.paused().is_null()
@@ -4678,7 +4694,7 @@ async fn follow(socket: PathBuf, send: mpsc::UnboundedSender<Feed>) {
     }
     // What waits for the person now; the live replay from the past's end
     // brings what changed since.
-    match held(&client).await {
+    match crate::needs::listing(&client, None).await {
         Ok(calls) => {
             if send.send(Feed::Held(calls)).is_err() {
                 return;
@@ -5000,37 +5016,6 @@ async fn roll(client: &Client, send: &mpsc::UnboundedSender<Feed>) -> bool {
             None => return send.send(Feed::Roll(bots)).is_ok(),
         }
     }
-}
-
-/// The calls a person must answer, as the conversation reads them: every
-/// one gated `manual`, and those the approver serving `auto` handed over.
-/// Each tag's listing reads only the calls still waiting on it.
-async fn held(client: &Client) -> agent_client::Result<Vec<(String, String)>> {
-    let mut calls = Vec::new();
-    for tag in ["manual", "auto"] {
-        let mut after = 0;
-        loop {
-            let page = client
-                .request(
-                    "approvals",
-                    json!({"tag": tag, "after": after, "limit": 256}),
-                )
-                .await?;
-            for call in page["approvals"].as_array().into_iter().flatten() {
-                if tag == "auto" && call["asked"].is_null() {
-                    continue;
-                }
-                if let (Some(bot), Some(id)) = (call["bot"].as_str(), call["call_id"].as_str()) {
-                    calls.push((bot.to_owned(), id.to_owned()));
-                }
-            }
-            match page["next_after"].as_i64() {
-                Some(next) => after = next,
-                None => break,
-            }
-        }
-    }
-    Ok(calls)
 }
 
 #[cfg(test)]
@@ -6668,22 +6653,23 @@ mod tests {
         .unwrap();
         view.drain();
         let lead = view.index["shop.lead"];
-        assert!(view.agents[lead].asking);
+        let asking = |view: &View| view.agents[lead].state() == Some(State::NeedsYou);
+        assert!(asking(&view));
         send.send(Feed::Live(
             json!({"event": "accepted", "bot": "shop.lead.side",
             "turn": 1, "data": {}}),
         ))
         .unwrap();
         view.drain();
-        assert!(view.agents[lead].asking, "a copy's prompt answers nothing");
-        view.agents[lead].asking = false;
+        assert!(asking(&view), "a copy's prompt answers nothing");
+        view.agents[lead].waits.asked("shop.lead", None);
         send.send(Feed::Live(
             json!({"event": "tool_started", "bot": "shop.lead.side",
             "turn": 1, "data": {"name": crate::asks::TOOL, "call_id": "c2"}}),
         ))
         .unwrap();
         view.drain();
-        assert!(!view.agents[lead].asking, "a copy's ask is its own");
+        assert!(!asking(&view), "a copy's ask is its own");
         assert!(view.agents[lead].twinkle.is_some());
         // The lead is removed and its name taken by someone else.
         send.send(Feed::Live(json!({"event": "deleted", "bot": "shop.lead"})))
@@ -6900,6 +6886,8 @@ mod tests {
                 Feed::Ready => "ready".into(),
                 Feed::Past(_)
                 | Feed::Held(_)
+                | Feed::Scans(_)
+                | Feed::Asked(..)
                 | Feed::Down(_)
                 | Feed::Model(..)
                 | Feed::Tape(_)
@@ -7105,7 +7093,7 @@ mod tests {
             "turn": 1, "data": {"status": "failed", "error": "provider_error"}}),
         ))
         .unwrap();
-        send.send(Feed::Held(vec![("shop.cart".into(), "c0".into())]))
+        send.send(Feed::Held(vec![("shop.cart".into(), 7, "c0".into())]))
             .unwrap();
         let live = |bot: &str, kind: &str, turn: i64, data: Value| {
             Feed::Live(json!({"event": kind, "bot": bot, "turn": turn, "data": data}))
@@ -7155,8 +7143,9 @@ mod tests {
         assert_eq!(state(&view, "shop.lead"), Some(State::NeedsYou));
         assert_eq!(state(&view, "shop.login"), Some(State::NeedsYou));
 
-        // The last call answered, the waiting one started, and the lead
-        // that made it answers what it asked.
+        // The last call answered, the waiting one started; the lead that
+        // made the task passes a word on, which answers nothing, as the
+        // task's own window and /status read it: the person's own does.
         for feed in [
             live("shop.lead", "step_decided", 3, json!({"call_id": "b"})),
             live(
@@ -7177,6 +7166,10 @@ mod tests {
         view.drain();
         assert_eq!(state(&view, "shop.lead"), Some(State::Working));
         assert_eq!(state(&view, "shop.cart"), Some(State::Working));
+        assert_eq!(state(&view, "shop.login"), Some(State::NeedsYou));
+        send.send(live("shop.login", "steered", 4, json!({})))
+            .unwrap();
+        view.drain();
         assert_eq!(state(&view, "shop.login"), Some(State::Working));
     }
 
