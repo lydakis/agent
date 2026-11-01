@@ -9972,12 +9972,30 @@ impl Database {
             )?
             .query_map(params![now, limit as i64], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<rusqlite::Result<_>>()?;
-        let mut lapsed = Vec::with_capacity(due.len());
+        if due.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Where each goes, as of this look: the first on an idle bot starts
+        // its turn, the rest wait behind it.
+        let mut bots: HashMap<String, (Bot, bool)> = HashMap::new();
+        let mut planned = Vec::with_capacity(due.len());
         for (turn, name) in due {
-            let bot = self.inspect(&name)?;
-            let busy = bot.running_turn.is_some() || self.has_ready_turn(&name)?;
-            let status = if busy { "queued" } else { "ready" };
-            let tx = self.conn.savepoint()?;
+            if !bots.contains_key(&name) {
+                let bot = self.inspect(&name)?;
+                let busy = bot.running_turn.is_some() || self.has_ready_turn(&name)?;
+                bots.insert(name.clone(), (bot, busy));
+            }
+            let (_, busy) = bots.get_mut(&name).expect("inserted above");
+            let status = if *busy { "queued" } else { "ready" };
+            *busy = true;
+            planned.push((turn, name, status));
+        }
+        // All or none, so a store that refuses the write leaves every one
+        // attached and due, for the next look.
+        let tx = self.conn.savepoint()?;
+        let mut waiting = 0;
+        for (turn, name, status) in &planned {
+            let bot = &bots[name].0;
             type Row = (
                 String,
                 Option<String>,
@@ -9991,7 +10009,7 @@ impl Database {
                 Option<String>,
                 i64,
             );
-            let (request_id, workspace, model, effort, from_bot, from_turn, from_id, origin, person, quotes, waiting): Row = tx
+            let (request_id, workspace, model, effort, from_bot, from_turn, from_id, origin, person, quotes, held): Row = tx
                 .prepare_cached(
                     "UPDATE turns SET status=?2,delivery='steer' WHERE id=?1 AND status='attached'
                      RETURNING request_id,workspace,model,reasoning,from_bot,from_turn,from_id,origin,person,quotes,
@@ -10012,6 +10030,7 @@ impl Database {
                         r.get(10)?,
                     ))
                 })?;
+            waiting += held;
             let model = model.unwrap_or_else(|| format!("{}/{}", bot.provider, bot.model));
             let mut data = json!({"request_id":request_id,"status":status,"delivery":"steer",
                 "lapsed":true,"workspace":workspace.or(bot.workspace.clone()),"model":model,
@@ -10025,11 +10044,14 @@ impl Database {
                 quotes.as_deref(),
                 false,
             );
-            event(&tx, &name, Some(turn), "queued", data)?;
-            tx.commit()?;
-            self.pending.0 += 1;
-            self.pending.1 += waiting;
-            let joins = busy && self.joining_steer(&name)?;
+            event(&tx, name, Some(*turn), "queued", data)?;
+        }
+        tx.commit()?;
+        self.pending.0 += planned.len() as i64;
+        self.pending.1 += waiting;
+        let mut lapsed = Vec::with_capacity(planned.len());
+        for (turn, name, status) in planned {
+            let joins = status == "queued" && self.joining_steer(&name)?;
             let parked = match joins {
                 true => self.steered_park(&name)?,
                 false => None,

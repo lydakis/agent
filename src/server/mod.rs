@@ -1816,7 +1816,15 @@ pub async fn run(config: Configuration) -> Result<()> {
                 // Attached messages that waited as long as they may go as
                 // steers. A drain leaves them for the next daemon.
                 _ = tokio::time::sleep_until(lapses.unwrap_or_else(tokio::time::Instant::now)), if lapses.is_some() && !service.draining() => {
-                    service.lapse().await?;
+                    // A store refusing writes leaves them attached and due,
+                    // looked at again after a backoff, as ready turns are.
+                    match service.lapse().await {
+                        Err(error) if error.code == "storage_error" => {
+                            let delay = service.storage_retry();
+                            service.lapses = Some(tokio::time::Instant::now() + delay);
+                        }
+                        lapsed => lapsed?,
+                    }
                 }
                 // A parked turn's time comes due (a pool reopens, a gate lapses,
                 // a lost wake-up is retried): resume it like any parked turn,
