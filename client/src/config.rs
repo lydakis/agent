@@ -774,6 +774,14 @@ pub fn path() -> Option<PathBuf> {
     std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".agent/config.toml"))
 }
 
+/// The agent's own home, `~/.agent`: its settings, keys, schedules, rules
+/// and Sonny's files, read as the person's and some run outside the
+/// sandbox. A bot whose folder holds it (Sonny opened in HOME) may write
+/// there only what it is given by name, as Codex keeps `~/.codex`.
+pub fn home() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".agent"))
+}
+
 /// The person's command rules, `~/.agent/rules`: each `*.rules` file in it
 /// holds Codex's `prefix_rule` calls, which every agent's commands follow.
 pub fn rules() -> Option<PathBuf> {

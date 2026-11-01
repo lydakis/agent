@@ -1154,10 +1154,13 @@ pub fn news(home: &Path, cursor: &Path) -> Vec<String> {
     let entries = std::fs::read_dir(&dir).into_iter().flatten().flatten();
     for entry in entries {
         let file = entry.path();
+        // Only a thread the commons could have made: a stray file's name
+        // would reach an agent's note as its topic.
         let Some(thread) = (file.extension().is_some_and(|e| e == "jsonl"))
             .then(|| file.file_stem())
             .flatten()
             .and_then(|stem| stem.to_str())
+            .filter(|name| valid_name(name).is_ok())
             .map(str::to_owned)
         else {
             continue;
@@ -1270,6 +1273,7 @@ fn subscribe_all(home: &Path, store: &Path, bots: &HashMap<String, Option<i64>>)
             .then(|| file.file_stem())
             .flatten()
             .and_then(|stem| stem.to_str())
+            .filter(|name| valid_name(name).is_ok())
         else {
             continue;
         };

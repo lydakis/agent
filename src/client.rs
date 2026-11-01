@@ -947,6 +947,11 @@ fn connect_or_start(options: &Options) -> Result<Connection> {
     if let Some(rules) = agent_client::config::rules() {
         command.arg("--protect-path").arg(rules);
     }
+    // And the scheduler runs its jobs from here, unsandboxed; the settings
+    // say how every bot is sandboxed.
+    if let Some(home) = agent_client::config::home() {
+        command.arg("--protect-path").arg(home);
+    }
     for pattern in config()?.shell_environment_policy.excludes() {
         command.arg("--shell-exclude").arg(pattern);
     }

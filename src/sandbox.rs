@@ -1388,6 +1388,41 @@ mod tests {
         }
     }
 
+    /// A bot whose folder holds the agent's home (Sonny opened in HOME)
+    /// leaves it alone, the scheduler's jobs and the settings with it, but
+    /// for a folder in it the bot was given by name.
+    #[test]
+    fn a_protected_home_stays_read_only_but_for_a_folder_given_in_it() {
+        let base = std::env::temp_dir().join(format!("agent-sandbox-home-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let home = base.join(".agent");
+        std::fs::create_dir_all(home.join("triggers/jobs")).unwrap();
+        std::fs::create_dir_all(home.join("sonny/zen")).unwrap();
+        std::fs::write(home.join("config.toml"), "").unwrap();
+        let base = std::fs::canonicalize(&base).unwrap();
+        let home = base.join(".agent");
+        let zen = home.join("sonny/zen");
+        let daemon = Daemon {
+            protected_paths: vec![home.clone()],
+            ..protecting()
+        };
+        let policy = Policy::new(
+            Some(Mode::WorkspaceWrite),
+            Some(&base),
+            &[zen.to_str().unwrap().to_owned()],
+            false,
+            &daemon,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(policy.can_write(&base.join("notes.txt")));
+        assert!(!policy.can_write(&home.join("triggers/jobs/nightly.json")));
+        assert!(!policy.can_write(&home.join("config.toml")));
+        assert!(!policy.can_write(&home.join("env")));
+        assert!(policy.can_write(&zen.join("key")));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn a_call_escapes_by_asking_or_by_writing_outside_its_roots() {
         let root = Path::new("/work/project");
