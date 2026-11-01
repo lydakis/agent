@@ -385,9 +385,10 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
     let flags: Vec<&String> = flags.iter().collect();
     let flags = with_defaults(&info, &flags, lead_picks, config.sonny.task_effort);
     let flags: Vec<&String> = flags.iter().collect();
-    // Roles are the lead's project's, which `info` names, even for a task
-    // told the rules of a folder inside it.
-    let roles = if at != here { here } else { &place.told };
+    // Roles are the lead's project's, which `info` names, as its files are
+    // now: the ones the lead or the person picked from, even uncommitted,
+    // never a worktree's copy as of its last commit, nor a folder inside.
+    let roles = here;
     // A fork's instructions are its source's, kept by the daemon; a role
     // named now may not be in the files it gets back.
     let composed = match &source {

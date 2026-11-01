@@ -82,35 +82,23 @@ pub fn places(dir: &Path) -> Vec<Place> {
 /// each by name.
 pub fn profiles(dir: &Path, default: &str) -> Result<Vec<Profile>, String> {
     let files = agent_client::policy::profiles(dir).map_err(|e| format!("{}: {e}", e.code()))?;
-    let mut all: Vec<(String, String, Option<String>)> = (files.into_iter())
-        .map(|(entry, base)| (entry.name, entry.summary, base))
+    let mut all: Vec<(String, String)> = (files.into_iter())
+        .map(|entry| (entry.name, entry.summary))
         .collect();
     for (name, text) in crate::project::BUILTINS {
-        if !all.iter().any(|(have, ..)| have == name) {
+        if !all.iter().any(|(have, _)| have == name) {
             let (front, _) = agent_client::policy::front_matter(text);
-            all.push((
-                name.to_owned(),
-                front.description.unwrap_or_default(),
-                front.extends,
-            ));
+            all.push((name.to_owned(), front.description.unwrap_or_default()));
         }
     }
-    // A lead's role is `lead` or one built on it, however far down.
+    // A lead's role is `lead` or one built on it, however far down, as the
+    // role is put together when the agent starts.
     let leads = |name: &str| {
-        let mut at = name.to_owned();
-        for _ in 0..8 {
-            if at == "lead" {
-                return true;
-            }
-            match all.iter().find(|(have, ..)| *have == at) {
-                Some((_, _, Some(base))) if *base != at => at = base.clone(),
-                _ => return false,
-            }
-        }
-        false
+        agent_client::policy::lineage(dir, name, &crate::project::BUILTINS)
+            .is_ok_and(|built| built.iter().any(|base| base == "lead"))
     };
     let mut listed: Vec<Profile> = (all.iter())
-        .map(|(name, about, _)| Profile {
+        .map(|(name, about)| Profile {
             name: name.clone(),
             about: about.clone(),
             lead: name == default || leads(name),
@@ -356,6 +344,12 @@ mod tests {
         std::fs::write(
             agents.join("careful.md"),
             "---\nextends: task\n---\nSlowly.\n",
+        )
+        .unwrap();
+        // Built on the shipped superlead it shadows, so a lead's still.
+        std::fs::write(
+            agents.join("superlead.md"),
+            "---\nextends: superlead\n---\nAnd this.\n",
         )
         .unwrap();
         let listed = profiles(&dir, "lead").unwrap();
