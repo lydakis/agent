@@ -540,6 +540,7 @@ impl Drop for Queued {
         }
     }
 }
+#[derive(Clone)]
 struct Credential {
     name: String,
     value: String,
@@ -547,11 +548,14 @@ struct Credential {
 
 /// Values that never appear in tool output and never reach a shell's
 /// environment. Shared, so a login re-read while the daemon runs is
-/// redacted from then on; earlier values stay listed.
+/// redacted from then on; earlier values stay listed. Readers take the
+/// current set and let the lock go, so a scan of a large output on a
+/// blocking thread never holds up a refresh on the runtime's; a change
+/// copies the set if a scan still reads it.
 #[derive(Clone, Default)]
-pub struct Credentials(Arc<std::sync::RwLock<CredentialSet>>);
+pub struct Credentials(Arc<std::sync::RwLock<Arc<CredentialSet>>>);
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct CredentialSet {
     /// Longer values first, so a shorter old token cannot mask only a prefix
     /// of a new token. Refreshes pay for insertion; tool output stays sorted.
@@ -602,7 +606,8 @@ impl Credentials {
         if value.is_empty() {
             return;
         }
-        let mut set = self.0.write().unwrap_or_else(|e| e.into_inner());
+        let mut guard = self.0.write().unwrap_or_else(|e| e.into_inner());
+        let set = Arc::make_mut(&mut guard);
         if set
             .values
             .iter()
@@ -625,27 +630,29 @@ impl Credentials {
     /// Keep a variable out of shell environments without a value to
     /// redact: configuration the daemon read for itself.
     pub fn withhold(&self, name: &str) {
-        let mut set = self.0.write().unwrap_or_else(|e| e.into_inner());
+        let mut guard = self.0.write().unwrap_or_else(|e| e.into_inner());
+        let set = Arc::make_mut(&mut guard);
         if !set.names.iter().any(|existing| existing == name) {
             set.names.push(name.to_owned());
         }
     }
     pub fn names(&self) -> Vec<String> {
-        self.0
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .names
-            .clone()
+        self.current().names.clone()
+    }
+    /// The set as it is now, the lock held only to take it.
+    fn current(&self) -> Arc<CredentialSet> {
+        self.0.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
     /// Also redact the values after these field names, matched as a name's
     /// end, and the bodies of PEM blocks whose header names one of `blocks`.
     pub fn redact_also(&self, fields: &[String], blocks: &[String]) {
-        let mut set = self.0.write().unwrap_or_else(|e| e.into_inner());
+        let mut guard = self.0.write().unwrap_or_else(|e| e.into_inner());
+        let set = Arc::make_mut(&mut guard);
         set.fields = fields.iter().map(|field| field_key(field)).collect();
         set.blocks = blocks.to_vec();
     }
     pub fn redact(&self, mut text: String) -> String {
-        let set = self.0.read().unwrap_or_else(|e| e.into_inner());
+        let set = self.current();
         for credential in &set.values {
             if text.contains(&credential.value) {
                 text = text.replace(&credential.value, REDACTED);
@@ -664,7 +671,7 @@ impl Credentials {
     /// would carry: what a stream holds back until it can redact. What it
     /// shows never ends inside a whole credential.
     pub fn unfinished(&self, text: &[u8]) -> usize {
-        let set = self.0.read().unwrap_or_else(|e| e.into_inner());
+        let set = self.current();
         let values = || {
             set.values
                 .iter()
@@ -700,7 +707,7 @@ impl Credentials {
     /// not started: a name, or a name and its separator. They are shown,
     /// and kept so the next text is redacted as read after them.
     pub fn opening(&self, text: &[u8]) -> usize {
-        let set = self.0.read().unwrap_or_else(|e| e.into_inner());
+        let set = self.current();
         let open = open_field(text, &set.fields);
         open.name - open.value
     }
@@ -2028,24 +2035,28 @@ impl Registry {
     ) -> impl Future<Output = Result<Outcome>> + Send + 'static {
         let registry = self.clone();
         async move {
-            // Held until the command and the sandbox around it are gone,
-            // and taken before the slot, so no slot waits on it.
-            let _held = crate::sandbox::hold_for(sandbox.as_deref()).await;
-            let _slot = registry
-                .slots
-                .acquire()
-                .await
-                .map_err(|_| Error::new("tool_scheduler_closed"))?;
-            let _ = started.send(());
-            let (stdout, stderr, exit, elapsed) = shell(
-                &command,
-                &workspace,
-                Duration::from_millis(timeout_ms),
-                &registry,
-                &environment,
-                sandbox.as_deref(),
-            )
-            .await?;
+            let (stdout, stderr, exit, elapsed) = {
+                // Held until the command and the sandbox around it are
+                // gone, and taken before the slot, so no slot waits on it.
+                // Both go before the output is redacted, so a result
+                // waiting for that holds no process budget.
+                let _held = crate::sandbox::hold_for(sandbox.as_deref()).await;
+                let _slot = registry
+                    .slots
+                    .acquire()
+                    .await
+                    .map_err(|_| Error::new("tool_scheduler_closed"))?;
+                let _ = started.send(());
+                shell(
+                    &command,
+                    &workspace,
+                    Duration::from_millis(timeout_ms),
+                    &registry,
+                    &environment,
+                    sandbox.as_deref(),
+                )
+                .await?
+            };
             let bytes = stdout.len() + stderr.len();
             registry
                 .off_runtime(bytes, move |registry| {
@@ -2083,17 +2094,21 @@ impl Registry {
                     None => registry.slots.clone().acquire_owned().await,
                 };
                 drop(queued);
-                let _slot = slot.map_err(|_| Error::new("tool_scheduler_closed"))?;
-                let _held = crate::sandbox::hold_for(sandbox.as_deref()).await;
-                let (stdout, stderr, exit, elapsed) = shell(
-                    &command,
-                    &workspace,
-                    Duration::from_millis(timeout_ms),
-                    &registry,
-                    &environment,
-                    sandbox.as_deref(),
-                )
-                .await?;
+                // The slot and the sandbox's hold go once the command is
+                // done, before its output is redacted.
+                let (stdout, stderr, exit, elapsed) = {
+                    let _slot = slot.map_err(|_| Error::new("tool_scheduler_closed"))?;
+                    let _held = crate::sandbox::hold_for(sandbox.as_deref()).await;
+                    shell(
+                        &command,
+                        &workspace,
+                        Duration::from_millis(timeout_ms),
+                        &registry,
+                        &environment,
+                        sandbox.as_deref(),
+                    )
+                    .await?
+                };
                 let bytes = stdout.len() + stderr.len();
                 registry
                     .off_runtime(bytes, move |registry| {
