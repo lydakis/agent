@@ -1079,7 +1079,8 @@ continues it, as capacity allows and with no `resume`: `turn_paced` says
 `waiting_on`. The reply it was writing is dropped and asked for again then.
 Each call it had not answered gets `{error: "daemon_shutdown", detail}`,
 saying the stop cut it off before its result was recorded (it may have had
-effects) or came before it ran, and none is run again; the first's
+effects) or came before it ran, that nothing has run it again, and that the
+daemon has since started again and the turn goes on; the first's
 `tool_completed` says `outcome_unknown`, the second's `cancelled`, as a pause
 says them. A call waiting for its verdict as the drain begins does not
 start, even if allowed then, and a model call that failed sends no retry:
@@ -1106,10 +1107,14 @@ as a closed pool parks it (`turn_paced` with `paused: true`; status `paced`),
 to continue on `resume`. The reply it was writing is dropped and asked for
 again then. Each call the turn had not answered gets a result, `{error:
 "daemon_paused", detail, pause}` (`pause` is `{reason, by, at_ms}`), saying the pause stopped it before its result
-was recorded (it may have had effects) or came before it ran, and none is run
-again: the model decides what to redo, as Codex answers the calls an interrupt
-cut off. The pause ends every background command (whose handle then answers
-`daemon_paused`, saying the same), terminal, and detached command this
+was recorded (it may have had effects; nothing has run it again) or came
+before it ran. The model reads it only once the turn continues, so it also
+says that work has since resumed and the turn goes on: read as a pause still
+holding, the older wording made resumed models report and stop. The daemon
+reruns none, and the model decides what to redo, as Codex answers the calls an
+interrupt cut off; any advice about one is the client's to give. The pause ends
+every background command (whose handle then answers `daemon_paused`, saying
+the same), terminal, and detached command this
 daemon started (the process group each leads, with what it left running
 there after it exited, and on Linux a sandboxed one's whole pid namespace;
 one started before a restart, or an unsandboxed process that left that

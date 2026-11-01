@@ -1682,6 +1682,7 @@ class RuntimeTests(ModelFixture):
         for output in outputs.values():
             self.assertEqual(output['error'], 'daemon_shutdown')
             self.assertIn('did not run', output['detail'])
+            self.assertIn('The daemon has since started again', output['detail'])
         self.assertFalse((self.path / 'ran').exists())
 
     def test_a_drain_lets_a_running_command_finish_then_parks_before_the_next_call(self):
@@ -1894,12 +1895,13 @@ class RuntimeTests(ModelFixture):
             self.model.requests.get_nowait()
         client.request('resume')
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
-        # The model reads why, and the command did not run again.
+        # The model reads why, and that work has resumed; the command did not
+        # run again.
         request = self.model.requests.get(timeout=3)
         output = json.loads(next(i for i in request['input'] if i.get('type') == 'function_call_output'
                                  and i['call_id'] == 'slow-1')['output'])
         self.assertEqual(output['error'], 'daemon_paused')
-        self.assertIn('not run again', output['detail'])
+        self.assertIn('Work has since resumed and this turn goes on', output['detail'])
         self.assertEqual(output['pause']['reason'], 'the loop is sending mail')
         self.assertEqual(marker.read_text(), 'x\n')
 

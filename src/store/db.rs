@@ -9090,17 +9090,21 @@ impl Database {
         };
         let tx = self.conn.savepoint()?;
         flush(&tx, turn, self.live.get(&turn))?;
+        // The model reads these only once its turn continues, after the
+        // resume or the next start, so they say the halt is over; read as
+        // a halt still holding, they made models report and stop. Facts
+        // only: what to do about a cut call is the client's to say.
         let (head, mut entries) = close_unanswered(&tx, &bot, turn, bot.head, |executing| {
             let result = match (stop, executing) {
                 (Halt::Pause, true) => json!({"error":"daemon_paused","detail":
-                    "the pause stopped this call before its result was recorded; it may have had effects. It is not run again",
+                    "the pause stopped this call before its result was recorded, so it may have had effects; nothing has run it again. Work has since resumed and this turn goes on",
                     "pause":pause}),
                 (Halt::Pause, false) => json!({"error":"daemon_paused","detail":
-                    "the pause came before this call ran; it did not run","pause":pause}),
+                    "the pause came before this call ran, so it did not run. Work has since resumed and this turn goes on","pause":pause}),
                 (Halt::Shutdown, true) => json!({"error":"daemon_shutdown","detail":
-                    "the daemon stopped this call before its result was recorded; it may have had effects. It is not run again"}),
+                    "the daemon stopped this call before its result was recorded, so it may have had effects; nothing has run it again. The daemon has since started again and this turn goes on"}),
                 (Halt::Shutdown, false) => json!({"error":"daemon_shutdown","detail":
-                    "the daemon stopped before this call ran; it did not run"}),
+                    "the daemon stopped before this call ran, so it did not run. The daemon has since started again and this turn goes on"}),
             };
             // A call cut off while it ran may have had effects: its event
             // says the outcome is unknown, as its result does.
