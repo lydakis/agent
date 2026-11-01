@@ -6701,9 +6701,13 @@ impl App {
             }
             "turn_paced" => {
                 if let Some(running) = &mut self.running {
-                    running.phase = match data["paused"] == true {
-                        true => "Paused",
-                        false => "Rate limited",
+                    running.phase = if data["paused"] == true {
+                        "Paused"
+                    } else if data["stopped"] == true {
+                        // The daemon stopped; its next start continues it.
+                        "Stopped"
+                    } else {
+                        "Rate limited"
                     }
                     .into();
                 }

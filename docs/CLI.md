@@ -237,13 +237,16 @@ return arrays. Every command prints its reply: `interrupt` the turn view,
 daemon is gone. Every client command takes `--pretty`; `serve` runs until
 stopped and prints no reply to render.
 `shutdown` returns once the daemon process has exited and its store is closed.
-`shutdown --grace DURATION` first lets running turns finish for up to that long
-while starting none; turns still running then end `interrupted` with
-`daemon_shutdown`. A daemon whose ready line announces an older protocol than
+`shutdown --grace DURATION` first drains for up to that long: nothing starts,
+and each running turn parks at its next boundary, once its model's answer and
+the calls already running have committed, or finishes if that answer ends it.
+Turns still running at exit, and every running turn without `--grace`, park
+with their unanswered calls answered `daemon_shutdown`; the next start
+continues them. A daemon whose ready line announces an older protocol than
 this `agent`'s cannot be asked in this protocol, so `shutdown` sends SIGTERM to
 the process that ready line names (a process already gone counts as stopped)
-and waits for it the same way: its running
-turns end interrupted and the store keeps every chat. That is how an upgrade on
+and waits for it the same way: the older daemon's running
+turns end interrupted (from protocol 36 they park) and the store keeps every chat. That is how an upgrade on
 a machine replaces the daemon an older `agent` started. A newer daemon is left
 running and `shutdown` fails with `daemon_protocol_mismatch`.
 
@@ -326,8 +329,8 @@ protocol, `start` still prints its ready line and then fails with
 one. An older one that names its pid is replaced instead, by every command
 that may start the daemon (not with `--no-spawn`, and not from inside a bot's
 turn, where `AGENT_BOT_ID` is set, since that turn is one it would wait on):
-it is asked to shut down with a 2-minute grace, so running turns may finish
-while none starts, or sent SIGTERM when it refuses that request, as daemons
+it is asked to shut down with a 2-minute grace, so running turns park at their
+next boundary while none starts, or sent SIGTERM when it refuses that request, as daemons
 before 0.6.0 do; once it exits, this `agent`'s daemon starts on the same
 socket and upgrades the store. Sonny starts the daemon this way, so opening it
 after an upgrade replaces the old daemon, and it says so first. `stats` starts it as `start` does, so it answers on a fresh install;

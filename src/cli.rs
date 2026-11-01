@@ -170,7 +170,7 @@ const COMMANDS: &[Command] = &[
     },
     Command {
         name: "shutdown",
-        about: "Stop the daemon once running turns end or the grace passes",
+        about: "Stop the daemon; running turns park and the next start continues them",
         usage: "shutdown [--grace DURATION]",
         flags: "--grace --pretty",
         settings: "",

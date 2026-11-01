@@ -18,7 +18,7 @@ use agent_runtime::{
     provider::{Chain, Delta, Items, Provider, Report, Request as ModelRequest, ToolCall},
     sandbox::Policy,
     store::{
-        Bot, CallAnswer, ContextPrefix, ContextUsage, Database, ElisionPlan, Gated, Pulled,
+        Bot, CallAnswer, ContextPrefix, ContextUsage, Database, ElisionPlan, Gated, Halt, Halted,
         Settings, Slot, Store, Strip, TURN_VIEW_ACCOUNTING, Waiting, Window, unserved,
     },
     tools::{Files, Outcome, POLL_YIELD_MS, Prepared, ReadSource, Registry},
@@ -41,7 +41,12 @@ use tokio::sync::{Notify, mpsc, oneshot, watch};
 /// The error a cancelled turn ends with, sent on its cancel channel: a
 /// client's interrupt, or the daemon shutting down around it.
 pub const INTERRUPTED: &str = "cancelled";
+/// The daemon stopping around a running turn, which parks it for the next
+/// start rather than ending it.
 pub const SHUTDOWN: &str = "daemon_shutdown";
+/// The daemon stopping on a fatal error around a running turn, which ends
+/// it as a crash would: only a planned stop parks a turn.
+pub const DIED: &str = "process_interrupted";
 /// A running turn's end when the daemon is paused.
 pub const PAUSED: &str = "daemon_paused";
 /// Attempts per model call before its failure is the turn's failure, and the
@@ -209,6 +214,10 @@ pub struct Turn {
     pub read_results: std::sync::Mutex<Vec<i64>>,
     /// What summaries held and spent beside the turn's own accounting.
     pub side: SideCounts,
+    /// Set by the service when the daemon stops taking work: the turn
+    /// starts no model call or tool call after it and parks at its next
+    /// boundary, for the next start to continue.
+    pub stopping: Arc<AtomicBool>,
 }
 
 /// A steer waiting for the running turn's next boundary. Armed by `steer`
@@ -408,6 +417,8 @@ enum Round {
     Paced(u64),
     /// Parked on a verdict whose gate lapses at the given time.
     Lapses(u64),
+    /// The daemon is stopping: park here, with nothing in flight.
+    Drained,
 }
 /// How long an answered call holds its turn's slot for the answer before
 /// it parks, at most: the bot's approval hold, when that is shorter.
@@ -420,12 +431,15 @@ enum Stop {
     Parked,
     /// Parked on a verdict or a wait; the service wakes it when a gate lapses.
     Lapses(u64),
+    /// The daemon is stopping: the calls left in the round do not start.
+    Drained,
 }
 impl Stop {
     fn round(self) -> Round {
         match self {
             Stop::Parked => Round::Parked,
             Stop::Lapses(at) => Round::Lapses(at),
+            Stop::Drained => Round::Drained,
         }
     }
 }
@@ -522,16 +536,28 @@ impl Turn {
         let mut landed = None;
         // Cancelling mid-job loses nothing: a job the worker has taken runs
         // to its commit, and the worker publishes whatever committed.
-        // The pull cord parks the turn rather than ending it.
-        let mut pulled = false;
+        // The pull cord parks the turn rather than ending it, and so does
+        // the daemon stopping: the next start continues it.
+        let mut stopped = None;
         let mut result = tokio::select! {
             biased;
             code = interrupt => {
-                pulled = code == PAUSED;
+                stopped = match code {
+                    PAUSED => Some(Halt::Pause),
+                    SHUTDOWN => Some(Halt::Shutdown),
+                    _ => None,
+                };
                 fail(code)
             }
             result = self.rounds(&mut accounting, &mut landed) => result,
         };
+        // Drained at a boundary, or before a model call's retry: parked as
+        // a stop parks it, with nothing left uncertain.
+        if matches!(&result, Ok(Round::Drained))
+            || matches!(&result, Err(error) if error.code == SHUTDOWN)
+        {
+            (stopped, result) = (Some(Halt::Shutdown), fail(SHUTDOWN));
+        }
         // The rounds future is gone, so cancellation cannot discard this flush.
         // A refresh it had already sent is billed: record what it cost.
         if let Some(Ok((usage, sent_at))) = settle(&mut accounting.refresh).await
@@ -580,22 +606,23 @@ impl Turn {
                     .map(|_| ())
                 })
                 .await
-        } else if pulled {
+        } else if let Some(stop) = stopped {
             let route = accounting.route.get().cloned();
             let parked = self
                 .store
-                .op("suspend_pulled", move |db| {
-                    db.suspend_pulled(turn, retries, paced_ms, summary_ms, route.as_deref())
+                .op("suspend_halted", move |db| {
+                    db.suspend_halted(turn, stop, retries, paced_ms, summary_ms, route.as_deref())
                 })
                 .await;
             // Parked: nothing more to commit, and the service keeps a
-            // wake-up that holds until `resume`. A park of the turn's own
-            // that committed as the pull cancelled it keeps its wake-ups,
-            // registered here as the rounds would have. A park that could
-            // not be written ends the turn as the pull used to.
+            // wake-up that holds until `resume`, or the next start finds it.
+            // A park of the turn's own that committed as the pull cancelled
+            // it keeps its wake-ups, registered here as the rounds would
+            // have. A park that could not be written ends the turn as the
+            // pull or the stop used to.
             match parked {
-                Ok(Pulled::Parked(_)) => result = Ok(Round::Paced(0)),
-                Ok(Pulled::Already(waiting, lapse)) => {
+                Ok(Halted::Parked(_)) => result = Ok(Round::Paced(0)),
+                Ok(Halted::Already(waiting, lapse)) => {
                     result = Ok(self.rejoin(*waiting, lapse).await);
                 }
                 Err(_) => {}
@@ -615,10 +642,12 @@ impl Turn {
         }
         // An interrupt may arrive while the non-cancellable flush is pending.
         // Honor it before retiring a parked task whose receiver is still live.
-        // A pull leaves a park as it is: the pause holds its wake-up.
+        // A pull or a stop leaves a park as it is: the pause holds its
+        // wake-up, and the next start finds it.
         if result.is_ok()
             && let Some(code) = *cancelled.borrow()
             && code != PAUSED
+            && code != SHUTDOWN
         {
             result = fail(code);
         }
@@ -628,6 +657,8 @@ impl Turn {
             // The park is committed; the service only keeps its wake-up.
             Ok(Round::Lapses(at)) => return Exit::Paced(at),
             Ok(Round::Finished) => None,
+            // Drained became a stop's park above; this is never reached.
+            Ok(Round::Drained) => Some(Error::new(SHUTDOWN)),
             Err(error) => {
                 self.handles.forget(Waiter::Turn(self.turn));
                 Some(error)
@@ -1641,6 +1672,16 @@ impl Turn {
                     completion
                 }
                 Ok(None) => return Ok(Summary::Parked(accounting.parked_until)),
+                // A stopping daemon sent no request: a summary at the
+                // boundary parks the turn, planned again when it continues;
+                // one beside the turn's call is left for a later boundary.
+                Err(error) if error.code == SHUTDOWN => {
+                    accounting.copied = None;
+                    return match accounting.beside {
+                        true => Ok(Summary::Skipped),
+                        false => Err(error),
+                    };
+                }
                 Err(error) => {
                     accounting.copied = None;
                     self.hub
@@ -2278,6 +2319,11 @@ impl Turn {
                 })
         });
         while model_rounds < self.settings().max_rounds() {
+            // A stopping daemon starts no call: the turn parks here, every
+            // result so far committed, and the next start continues it.
+            if self.stopping.load(Relaxed) {
+                return Ok(Round::Drained);
+            }
             // A refresh the last call left in flight ends here: the next call
             // reads the cache itself, and the budget counts what it billed.
             self.settle_refresh(&mut record, accounting).await?;
@@ -2487,6 +2533,11 @@ impl Turn {
                 },
                 Err(error) => return Err(error),
             };
+            // Nor after this boundary's own steps: a summary that ran
+            // while the stop began is kept, and its call does not start.
+            if self.stopping.load(Relaxed) {
+                return Ok(Round::Drained);
+            }
             self.bind_thinking(&mut record, &mut context, (provider, model))
                 .await?;
             // This call's view replaces the last one's, which goes before
@@ -2961,6 +3012,11 @@ impl Turn {
         };
         let mut tool_calls = tool_calls;
         loop {
+            // A stopping daemon sends no request, first or retry, and the
+            // turn parks as at a boundary.
+            if self.stopping.load(Relaxed) {
+                return Err(Error::new(SHUTDOWN));
+            }
             // A billed attempt that failed counts as a round: the retry that
             // is the turn's last allowed call goes without calls, as that
             // call would have.
@@ -3396,6 +3452,11 @@ impl Turn {
                 if self.side.replaced.load(Relaxed) {
                     return Ok(call.await);
                 }
+                // Nor once the daemon is stopping: no call after this one
+                // would read it, and the drain sends no new request.
+                if self.stopping.load(Relaxed) {
+                    return Ok(call.await);
+                }
                 *warm.pending = Some(self.refresh(warm));
             }
             let refreshed = {
@@ -3455,6 +3516,15 @@ impl Turn {
                     result = &mut run => return Ok(Ran::Done(result)),
                     () = &mut lifted => return Ok(Ran::Lifted(run)),
                     () = tokio::time::sleep_until(warm.read_at + warm.after) => {}
+                }
+                // A stopping daemon sends no new refresh: the next call that
+                // would read the cache waits for the next start.
+                if self.stopping.load(Relaxed) {
+                    return Ok(tokio::select! {
+                        biased;
+                        result = &mut run => Ran::Done(result),
+                        () = &mut lifted => Ran::Lifted(run),
+                    });
                 }
                 *warm.pending = Some(self.refresh(warm));
             }
@@ -3634,6 +3704,11 @@ impl Turn {
         let (turn, allowed) = (self.turn, record.callable());
         let mut calls = calls.into_iter();
         while let Some(call) = calls.next() {
+            // Nor any tool: the calls not yet started are answered as not
+            // run when the turn parks.
+            if self.stopping.load(Relaxed) {
+                return Ok(Some(Stop::Drained));
+            }
             // Calls in a row that only read or run commands, none of them
             // gated, run together, as Codex runs them.
             if let Some(first) = self.parallel(record, &call, workspace)
@@ -4165,6 +4240,15 @@ impl Turn {
         environment: &[(String, String)],
         sandbox: Result<Option<Arc<Policy>>>,
     ) -> (String, Result<Outcome>) {
+        // A batch wider than its width starts its later calls as earlier
+        // ones finish; once the daemon is stopping, those do not run.
+        if self.stopping.load(Relaxed) {
+            let stopped = Error::with(
+                SHUTDOWN,
+                "the daemon stopped before this call ran; it did not run",
+            );
+            return (call_id, Ok(failure(stopped)));
+        }
         let sandbox = match sandbox {
             Ok(sandbox) => sandbox,
             Err(error) => return (call_id, Ok(failure(error))),
@@ -4339,6 +4423,11 @@ impl Turn {
             let (notify, lapse) = match first.take() {
                 Some(first) => first,
                 None => {
+                    // A drain that began while this waited for its verdict
+                    // starts nothing: the call is answered as not run.
+                    if self.stopping.load(Relaxed) {
+                        return Ok(Approval::Stop(Stop::Drained));
+                    }
                     // The job reads the clock when it judges, and the lapse
                     // is measured from a fresh read, so time spent queued for
                     // the worker moves neither.
@@ -5981,6 +6070,7 @@ mod tests {
             tokens: Arc::default(),
             read_results: Default::default(),
             side: Default::default(),
+            stopping: Arc::default(),
         };
         let running = tokio::spawn(async move { task.execute(cancelled).await });
         let last = steers[31];
@@ -5996,8 +6086,9 @@ mod tests {
         })
         .await
         .unwrap();
-        // Cancelled by shutdown: the turn ends with the error its cause names.
-        cancel.send(Some(SHUTDOWN)).unwrap();
+        // Cancelled by an interrupt: the turn ends with the error its cause
+        // names. (Shutdown parks the turn instead of ending it.)
+        cancel.send(Some(INTERRUPTED)).unwrap();
         drop(output);
         let drain = tokio::spawn(async move {
             let mut bytes = Vec::new();
@@ -6008,7 +6099,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(matches!(exit, Exit::Finished(Some(error)) if error.code == SHUTDOWN));
+        assert!(matches!(exit, Exit::Finished(Some(error)) if error.code == INTERRUPTED));
         // The worker publishes every committed batch regardless of the task;
         // ending the store ends the stream once all of it is delivered.
         drop(store);
@@ -6071,6 +6162,122 @@ mod tests {
         cursors.dedup();
         assert_eq!(cursors.len(), events.len(), "and exactly once");
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_stopping_daemon_parks_the_turn_before_its_next_call() {
+        use agent_runtime::{
+            codec::Family,
+            provider::Transport,
+            store::{Binding, TurnOptions},
+        };
+        let dir = std::env::temp_dir().join(format!("agent-drain-park-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (store, publications) = Store::open(&dir.join("state.sqlite")).await.unwrap();
+        let turn = store
+            .op("create", |db| {
+                db.create(
+                    "Bob",
+                    Some("/synthetic"),
+                    Binding {
+                        provider: "openai",
+                        family: Family::Responses,
+                        model: "synthetic",
+                        instructions: "",
+                        effort: None,
+                        budget_tokens: None,
+                        tools: &[],
+                        created_by: None,
+                        created_by_id: None,
+                        compaction_instructions: None,
+                        compaction_model: None,
+                        fallback: None,
+                        gate: None,
+                        settings: Default::default(),
+                        declared: None,
+                        request_id: None,
+                    },
+                )?;
+                Ok(db
+                    .begin(
+                        "Bob",
+                        "first",
+                        "work",
+                        true,
+                        &TurnOptions::default(),
+                        |_, _| Ok(()),
+                    )?
+                    .turn)
+            })
+            .await
+            .unwrap();
+        let handles = Handles::new(mpsc::unbounded_channel().0);
+        let publisher = tokio::spawn(crate::server::publish(
+            publications,
+            Hub::default(),
+            handles.clone(),
+        ));
+        let (_cancel, cancelled) = watch::channel(None);
+        // Nothing listens there: the turn must park before any call.
+        let task = Turn {
+            identity: 0,
+            bot: "Bob".into(),
+            turn,
+            store: store.clone(),
+            providers: Arc::new(HashMap::from([(
+                "openai".into(),
+                Provider::new(
+                    Transport::new(1, 1).unwrap(),
+                    Family::Responses,
+                    "http://127.0.0.1:9/v1",
+                    None,
+                )
+                .unwrap(),
+            )])),
+            registry: Registry::new("echo").unwrap(),
+            hub: Hub::default(),
+            handles,
+            background_failures: mpsc::unbounded_channel().0,
+            settings: Default::default(),
+            window: Default::default(),
+            resumed: None,
+            steers: Arc::default(),
+            compact: Arc::default(),
+            lift: Arc::default(),
+            tokens: Arc::default(),
+            read_results: Default::default(),
+            side: Default::default(),
+            stopping: Arc::new(AtomicBool::new(true)),
+        };
+        let exit = tokio::time::timeout(Duration::from_secs(5), task.execute(cancelled))
+            .await
+            .unwrap();
+        assert!(matches!(exit, Exit::Paced(0)));
+        let (status, waiting) = store
+            .op("parked", move |db| {
+                let waiting = db.waiting_turns()?.into_iter().find(|w| w.turn == turn);
+                Ok((db.turn_status("Bob", turn)?, waiting.unwrap()))
+            })
+            .await
+            .unwrap();
+        assert_eq!(status, "paced");
+        assert_eq!(waiting.halt, Some(Halt::Shutdown));
+        assert_eq!(waiting.deadline_ms, None);
+        let paced = store
+            .op("events", move |db| db.events("Bob", 0, 64))
+            .await
+            .unwrap();
+        let paced = paced["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["event"] == "turn_paced")
+            .unwrap()
+            .clone();
+        assert_eq!(paced["data"], json!({"resume_at_ms":null,"stopped":true}));
+        drop(store);
+        let _ = tokio::time::timeout(Duration::from_secs(2), publisher).await;
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
