@@ -280,10 +280,12 @@ same way. Each task the lead (or one of its tasks) starts gets a window (a
 Herdr tab; in cmux a tab in the lead's pane) there running Sonny on that
 task, without taking focus, its block (pane, cmux tab) labelled with the
 task's name. In Rex, each window reports OSC 7501 status, so Rex
-shows which task is working, waiting on an approval or done. In Herdr, Sonny
+shows which task is working, waiting on you (an approval, or a question it
+asked) or done, as its tab and `/status` say. In Herdr, Sonny
 supports Herdr the way its own agents do: each Sonny reports its bot through
 `herdr pane report-agent`, so the agent panel lists it as `Sonny: NAME`
-(working, idle, or blocked on an approval), the workspace rolls that up and
+(working, idle, or blocked on your approval or on your answer to a question
+it asked), the workspace rolls that up and
 notifies, `herdr agent wait` and `herdr agent prompt` reach it by name
 (`shop-fix-cart` for `shop.fix-cart`), and after a Herdr restart the pane runs
 `sonny` on the same bot again (when `sonny` is on the PATH; Herdr before
@@ -293,7 +295,7 @@ Herdr pane is not listed, one in a remote machine Herdr itself connects to is.
 The daemon Sonny starts, and the lookout and approver it keeps, run in a session of their own,
 so closing their pane or stopping Herdr leaves them and their turns running.
 In cmux, which reads OSC 7501 and OSC 777 itself, the workspace's sidebar row
-shows which task is working, waiting on an approval or done, and a
+shows which task is working, waiting on you or done, and a
 notification rings the tab it came from. Each Sonny gives its tab a resume
 command (`cmux surface resume set`, shown as `Sonny: NAME`), so after cmux
 relaunches the tab runs `sonny` on the same bot again, once you allow

@@ -34,13 +34,13 @@ fn in_dir(dir: &str, bot: &str) -> Option<PathBuf> {
     Some(PathBuf::from(home).join(".agent/sonny").join(dir).join(bot))
 }
 
-/// This window's agent's status, as reported to the multiplexer: `error`
-/// and `blocked` hold its window, any other but `clear` (the window
+/// This window's agent's status, as reported to the multiplexer: `error`,
+/// `blocked` and `asking` hold its window, any other but `clear` (the window
 /// closing, which leaves the file as it was for the next) lets it go.
 pub fn reported(bot: &str, state: &str) {
     if state != "clear" {
         hold(bot, true, |held| {
-            held.status = matches!(state, "error" | "blocked")
+            held.status = matches!(state, "error" | "blocked" | "asking")
         });
     }
 }
