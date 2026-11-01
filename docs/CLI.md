@@ -201,7 +201,10 @@ tries its held turns at once.
   `ls --active` those with a turn running, and `ls --created-by BOT` those
   that bot made (by its id, so a later bot of the same name lists none of
   an earlier one's); the daemon filters, so none of them pages through
-  every bot. `turns --newest` lists newest first, read from the
+  every bot. `run --new --created-by BOT` makes the new bot BOT's, as a
+  client that starts a bot for one of its agents says (Sonny's `/new`),
+  while the prompt stays the person's; in an agent's shell a bot is made
+  only by that agent. `turns --newest` lists newest first, read from the
   end, so `turns --bot NAME --newest --limit 3` is a bot's last three turns.
 - `usage` prints what the bots' turns spent as one JSON object: tokens in
   all, by bot (the `--limit` that spent most, 64 by default, the rest summed),

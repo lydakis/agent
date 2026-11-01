@@ -8,15 +8,15 @@
 //! job, written once and never changed while Sonny stays where it is: a
 //! LaunchAgent run at login and kept alive on a Mac, a user service on
 //! Linux. It runs `sonny scheduler`, which is cron for triggers: it reads
-//! their definitions from `~/.agent/triggers/jobs`, and runs each one's
+//! their definitions from `~/.agent/automations/jobs`, and runs each one's
 //! fire as launchd ran it, when one of its calendar times comes (once for
 //! any number missed while the machine slept or the scheduler was not
 //! running), when the path it watches changes, and while its queue of
 //! asks holds one. One fire of a trigger at a time, also across a restart
 //! of the scheduler: a fire holds a lock on its own file in
-//! `~/.agent/triggers/.scheduler` while it runs.
+//! `~/.agent/automations/.scheduler` while it runs.
 //!
-//! A write to its doorbell (`~/.agent/triggers/.ring`, a FIFO) has it look
+//! A write to its doorbell (`~/.agent/automations/.ring`, a FIFO) has it look
 //! again at once: Sonny rings it when a definition or a queue changes, and
 //! a fire when it ends. Else it looks at least every minute, and at a
 //! watched path every two seconds. It sleeps until the next calendar time,
@@ -98,7 +98,7 @@ pub fn definition(
                 })
                 .collect();
             format!(
-                "# Sonny's scheduler, which fires its triggers.\n[Unit]\nDescription=Sonny's scheduler\n\n[Service]\n{} {VERB}\n{environment}Restart=on-failure\nRestartSec=10\n# A fire it started runs to its end.\nKillMode=process\n\n[Install]\nWantedBy=default.target\n",
+                "# Sonny's scheduler, which runs its automations.\n[Unit]\nDescription=Sonny's scheduler\n\n[Service]\n{} {VERB}\n{environment}Restart=on-failure\nRestartSec=10\n# A fire it started runs to its end.\nKillMode=process\n\n[Install]\nWantedBy=default.target\n",
                 program(scheduler, Path::new(&*sonny)),
             )
         }
@@ -134,7 +134,7 @@ pub fn ensure() -> Result<(), String> {
     // the backup, start-at-login): one writes the job, the others find it.
     static ENSURING: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _one = ENSURING.lock().unwrap_or_else(|e| e.into_inner());
-    let home = PathBuf::from(std::env::var_os("HOME").ok_or("no HOME for triggers")?);
+    let home = PathBuf::from(std::env::var_os("HOME").ok_or("no HOME for automations")?);
     let scheduler = Scheduler::here();
     if scheduler == Scheduler::Systemd {
         UserManager::find()?;
@@ -208,7 +208,7 @@ impl UserManager {
         match runtime.join("systemd/private").exists() {
             true => Ok(Self { runtime }),
             false => Err(format!(
-                "triggers_unsupported: triggers on Linux use systemd's user manager, which is not running here ({} has no systemd/private)",
+                "automations_unsupported: automations on Linux use systemd's user manager, which is not running here ({} has no systemd/private)",
                 runtime.display()
             )),
         }
@@ -245,7 +245,7 @@ fn launchd_domain() -> String {
 /// `launchctl ARGS`.
 fn launchctl(args: &[&str]) -> Result<(), String> {
     if !cfg!(target_os = "macos") {
-        return Err("triggers_unsupported: launchd is macOS's".into());
+        return Err("automations_unsupported: launchd is macOS's".into());
     }
     let out = std::process::Command::new("/bin/launchctl")
         .args(args)
@@ -573,7 +573,7 @@ fn back_off(f: &mut Followed, now: std::time::Instant, most: Duration) {
 /// gone or another scheduler runs for it.
 pub fn run() -> i32 {
     let Ok(places) = Places::home() else {
-        eprintln!("{}", trigger::error_json("no HOME for triggers"));
+        eprintln!("{}", trigger::error_json("no HOME for automations"));
         return 1;
     };
     // Before anything is made under HOME, which would make HOME again:
@@ -622,9 +622,13 @@ pub fn run() -> i32 {
         // So does a new one when the time zone changed, as the C library
         // keeps the zone it read at the start: its calendar times are
         // worked out again from the times kept, as at any start.
+        // Or the folder of triggers from before 0.8.0, which it works in
+        // while a fire of the old Sonny ran there, moved now that none
+        // does: the new one schedules from its new place.
         if every_minute
             && let Some(me) = &me
-            && identity(me).is_some_and(|now| Some(now) != born || zone() != zoned)
+            && (identity(me).is_some_and(|now| Some(now) != born || zone() != zoned)
+                || moved(&places))
         {
             use std::os::unix::process::CommandExt;
             let error = std::process::Command::new(me).arg(VERB).exec();
@@ -969,6 +973,17 @@ fn let_job_go() -> i32 {
         &label(&home),
     );
     0
+}
+
+/// Whether `places`, the folder of triggers from before 0.8.0 this
+/// scheduler works in, moved to its new place just now.
+fn moved(places: &Places) -> bool {
+    let Some(home) = std::env::var_os("HOME") else {
+        return false;
+    };
+    let home = Path::new(&home);
+    places.state != Places::under(home).state
+        && Places::moved(home, true).state == Places::under(home).state
 }
 
 /// Whether HOME is gone, as a test's or an eval's is.

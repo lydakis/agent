@@ -375,7 +375,7 @@ pub struct Card {
 /// callout's does: a shape of its own without color too.
 pub fn card(ask: &Ask, width: usize) -> Card {
     // Prose reads at most so wide, as a reply does, labels too.
-    let width = width.min(crate::PROSE);
+    let width = width.min(crate::measure());
     let mut options = Vec::new();
     let indent = || Span::raw(BAR).dim();
     // What the agent wrote reads as its Markdown, as a reply does; the
@@ -1519,7 +1519,7 @@ mod tests {
             Some(true)
         );
         // An automation's, another agent's or a reaction are not the person.
-        let automation = json!({"node": 8, "from": null, "origin": "trigger",
+        let automation = json!({"node": 8, "from": null, "origin": "automation",
             "item": {"role": "user", "content": [{"type": "input_text", "text": "look"}]}});
         let agent = json!({"node": 7, "from": "shop.lead", "origin": null,
             "item": {"role": "user", "content": [{"type": "input_text", "text": "carry on"}]}});

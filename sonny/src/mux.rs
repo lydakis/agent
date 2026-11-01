@@ -117,7 +117,7 @@ pub enum Placement {
 /// own, as a VS Code editor never does, and closing it would take new
 /// work out of view before they saw it. It stays, and while only such
 /// windows could make room a new task's window does not open, until the
-/// person asks for it.
+/// person asks for it or its task comes to need them.
 pub struct Room {
     /// Task windows at most, 0 for no limit.
     pub most: usize,
@@ -916,6 +916,12 @@ impl Layout {
         Ok(Shown::Opened(closed))
     }
 
+    /// The tasks whose window this layout set aside, and where a lead
+    /// keeps them across a restart, for [`Worker::aside`].
+    fn asides(&self) -> (HashSet<String>, Option<Aside>) {
+        (self.aside.clone(), self.kept.clone())
+    }
+
     /// Whether the task's window was closed for room.
     pub fn aside(&self, bot: &str) -> bool {
         self.aside.contains(bot) || self.kept.as_ref().is_some_and(|kept| (kept.was)(bot))
@@ -1190,6 +1196,9 @@ pub struct Worker {
     home: String,
     here: bool,
     places: Arc<Mutex<Places>>,
+    /// The tasks whose window was set aside for room, as the last batch
+    /// of work left them.
+    aside: Arc<Mutex<(HashSet<String>, Option<Aside>)>>,
 }
 
 impl Worker {
@@ -1197,6 +1206,8 @@ impl Worker {
         let (work, queue) = mpsc::channel::<Work>();
         let places = Arc::new(Mutex::new(Places::new()));
         let kept = places.clone();
+        let aside = Arc::new(Mutex::new(layout.asides()));
+        let asides = aside.clone();
         let (home, here) = (layout.home(), layout.here());
         std::thread::spawn(move || {
             let mut layout = layout;
@@ -1219,6 +1230,9 @@ impl Worker {
                         *places = read;
                     }
                 }
+                if let Ok(mut aside) = asides.lock() {
+                    *aside = layout.asides();
+                }
             }
         });
         Self {
@@ -1226,7 +1240,16 @@ impl Worker {
             home,
             here,
             places,
+            aside,
         }
+    }
+
+    /// Whether the task's window was set aside for room, as the work sent
+    /// so far left it: closed for room, or not opened for want of it.
+    pub fn aside(&self, bot: &str) -> bool {
+        self.aside.lock().is_ok_and(|aside| {
+            aside.0.contains(bot) || aside.1.as_ref().is_some_and(|kept| (kept.was)(bot))
+        })
     }
 
     /// Run `job` on the layout, after those sent before it.
@@ -1243,6 +1266,26 @@ impl Worker {
     pub fn places(&self) -> Places {
         let _ = self.work.send(Work::Places);
         self.places.lock().map(|p| p.clone()).unwrap_or_default()
+    }
+
+    /// Where each block sits now, read after every job sent so far, for
+    /// a view that opens: what was last read may be from long before,
+    /// with windows closed and opened since. Waits at most `limit`, for
+    /// a multiplexer slow to answer, and then gives what was last read.
+    pub async fn places_now(&self, limit: Duration) -> Places {
+        let (read, now) = tokio::sync::oneshot::channel();
+        let kept = self.places.clone();
+        let _ = self.work.send(Work::Job(Box::new(move |layout| {
+            let places = layout.places();
+            if let Ok(mut kept) = kept.lock() {
+                *kept = places.clone();
+            }
+            let _ = read.send(places);
+        })));
+        match tokio::time::timeout(limit, now).await {
+            Ok(Ok(places)) => places,
+            _ => self.places.lock().map(|p| p.clone()).unwrap_or_default(),
+        }
     }
 
     pub fn home(&self) -> &str {
@@ -1449,6 +1492,9 @@ mod tests {
         focused: RefCell<Vec<String>>,
         /// Each block a tab of its own, as cmux's tabs share a pane.
         pub(super) own_tabs: bool,
+        /// Where each block sits read as its window's number, in order;
+        /// else nowhere.
+        numbered: bool,
     }
 
     impl Fake {
@@ -1536,7 +1582,15 @@ mod tests {
             self.own.clone()
         }
         fn places(&self) -> Result<Places, String> {
-            Ok(Places::new())
+            let mut places = Places::new();
+            let mut windows: Vec<String> = Vec::new();
+            for block in self.blocks.borrow().iter().filter(|_| self.numbered) {
+                if !windows.contains(&block.window) {
+                    windows.push(block.window.clone());
+                }
+                places.insert(block.label.clone(), (windows.len(), None));
+            }
+            Ok(places)
         }
         fn place(&self) -> Place {
             Place::Herdr {
@@ -1991,6 +2045,48 @@ mod tests {
         worker.settle();
         // Only the last naming ran, after the task's window was opened.
         assert_eq!(*named.lock().unwrap(), [(2, 1)]);
+    }
+
+    #[tokio::test]
+    async fn a_view_that_opens_reads_where_the_windows_sit_now() {
+        let fake = Fake {
+            numbered: true,
+            ..Fake::default()
+        };
+        fake.add("shop.a", "a");
+        fake.add("shop.b", "b");
+        let worker = Worker::new(Layout::new(Box::new(fake)));
+        let limit = Duration::from_secs(10);
+        let tab = |places: &Places, bot: &str| places.get(bot).map(|(tab, _)| *tab);
+        let read = worker.places_now(limit).await;
+        assert_eq!(
+            (tab(&read, "shop.a"), tab(&read, "shop.b")),
+            (Some(1), Some(2))
+        );
+        // `shop.a`'s window closed for room and `shop.c`'s opened.
+        let sonny = ["sonny".to_owned()];
+        worker.send(move |layout| {
+            layout.close("shop.a");
+            layout.show("shop.c", "c", &sonny).unwrap();
+        });
+        // What was last read still has the closed window and not the new.
+        let kept = worker.places();
+        assert_eq!(
+            (tab(&kept, "shop.a"), tab(&kept, "shop.c")),
+            (Some(1), None)
+        );
+        // Read now, after the jobs before it: as the windows are.
+        let now = worker.places_now(limit).await;
+        assert_eq!(
+            (
+                tab(&now, "shop.a"),
+                tab(&now, "shop.b"),
+                tab(&now, "shop.c")
+            ),
+            (None, Some(1), Some(2))
+        );
+        // And kept for the views that read it after.
+        assert_eq!(worker.places(), now);
     }
 
     #[test]

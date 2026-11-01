@@ -56,7 +56,7 @@ fn short(key: &str) -> &str {
 }
 
 /// Every key `agent_client::config` reads.
-pub const SETTINGS: [Setting; 30] = [
+pub const SETTINGS: [Setting; 31] = [
     Setting {
         key: "model",
         about: "a new agent's model, when none is named (provider/model)",
@@ -134,6 +134,12 @@ pub const SETTINGS: [Setting; 30] = [
         about: "every tool call drawn, or the clean view: replies, tasks, questions and the plan",
         values: SWITCH,
         default: "false",
+    },
+    Setting {
+        key: "sonny.text_width",
+        about: "the widest the conversation is written, in columns, however wide the window, the pane beside it taking the rest; 0 for the window's whole width, shared half and half with an open pane",
+        values: &[],
+        default: "100",
     },
     Setting {
         key: "sonny.margin_opens",
@@ -567,7 +573,8 @@ mod tests {
         for (at, setting) in SETTINGS.iter().enumerate() {
             view.pick = at;
             let named = match (number(setting), span(setting)) {
-                (true, _) => "7",
+                // Wide enough for a text width.
+                (true, _) => "70",
                 (_, true) => "15m",
                 _ => "a/b",
             };
@@ -576,6 +583,44 @@ mod tests {
             assert!(matches!(view.said, Some(Ok(_))), "{:?}", view.said);
             assert_eq!(view.values[at].as_deref(), Some(value));
         }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_value_the_reader_refuses_is_said_and_not_written() {
+        let dir = std::env::temp_dir().join(format!("sonny-config-refused-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "[sonny]\ntext_width = 120\n").unwrap();
+        let mut view = View {
+            path: path.clone(),
+            values: Vec::new(),
+            pick: 0,
+            typing: None,
+            said: None,
+        };
+        view.values = view.read().unwrap();
+        view.pick = (SETTINGS.iter())
+            .position(|s| s.key == "sonny.text_width")
+            .unwrap();
+        press(&mut view, KeyCode::Enter);
+        for _ in 0..3 {
+            press(&mut view, KeyCode::Backspace);
+        }
+        press(&mut view, KeyCode::Char('2'));
+        press(&mut view, KeyCode::Char('0'));
+        press(&mut view, KeyCode::Enter);
+        assert!(
+            matches!(&view.said, Some(Err(e)) if e.contains("at least 40, not 20")),
+            "{:?}",
+            view.said
+        );
+        assert_eq!(view.values[view.pick].as_deref(), Some("120"));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "[sonny]\ntext_width = 120\n"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

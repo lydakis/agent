@@ -909,6 +909,29 @@ class SocketAndCliTests(ModelFixture):
         again = self.agent('run', *self.again, '--profile', 'reviewer', '--bot', 'Rev', 'hello', check=False)
         self.assertEqual(again.returncode, 2)
 
+    def test_a_client_makes_a_bot_for_another_while_the_prompt_stays_its_own(self):
+        # As Sonny's /new starts a task for the lead in its window: the task
+        # is the lead's, by its id, and what it was told has no bot author.
+        self.agent('run', *self.common, '--new', '--bot', 'p.lead', 'hello')
+        self.agent('run', *self.common, '--new', '--created-by', 'p.lead', '--bot', 'p.fix', 'fix it')
+        by_name = {b['name']: b for b in json.loads(self.agent('ls', '--store', str(self.store)).stdout)}
+        self.assertEqual(by_name['p.fix']['created_by'], 'p.lead')
+        self.assertEqual(by_name['p.fix']['created_by_id'], by_name['p.lead']['bot_id'])
+        events = [json.loads(line) for line in
+                  self.agent('follow', '--store', str(self.store), '--bot', 'p.fix').stdout.splitlines()]
+        accepted = next(e for e in events if e['event'] == 'accepted')
+        self.assertIsNone(accepted['data'].get('from'))
+        self.assertEqual(json.loads(self.agent('ls', '--store', str(self.store), '--created-by', 'p.lead').stdout)
+                         [0]['name'], 'p.fix')
+        # Only a new bot is made by someone.
+        again = self.agent('run', *self.again, '--created-by', 'p.lead', '--bot', 'p.fix', 'more', check=False)
+        self.assertEqual(again.returncode, 2)
+        self.assertIn('--created-by', again.stderr)
+        # An unknown maker is an error, and nothing is made.
+        nobody = self.agent('run', *self.common, '--new', '--created-by', 'p.gone', '--bot', 'p.x', 'hi', check=False)
+        self.assertNotEqual(nobody.returncode, 0)
+        self.assertNotIn('p.x', [b['name'] for b in json.loads(self.agent('ls', '--store', str(self.store)).stdout)])
+
     def test_delegation_through_the_same_daemon_and_follow_replay(self):
         # The daemon exports AGENT_BIN and AGENT_STORE to shell children, so a bot
         # can delegate without knowing where the binary or store lives.

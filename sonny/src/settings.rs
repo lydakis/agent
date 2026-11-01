@@ -1,6 +1,7 @@
-//! What the person set in Sonny, kept for every folder it opens: the chime
-//! and the view in `~/.agent/config.toml`'s `[sonny]`, as `/config` shows
-//! them. A missing or unreadable file is the defaults.
+//! What the person set in Sonny, kept for every folder it opens: the
+//! chime, the view and the text's width in `~/.agent/config.toml`'s
+//! `[sonny]`, as `/config` shows them. A missing or unreadable file is the
+//! defaults.
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Settings {
@@ -9,6 +10,9 @@ pub struct Settings {
     /// Whether every tool call is drawn, or only the bot's words and the
     /// calls that move the work on (the clean view, the default).
     pub verbose: bool,
+    /// The widest the conversation is written; 0 for the window's whole
+    /// width.
+    pub text_width: u64,
     /// When a note opens the margin; `/config` changes it.
     pub margin_opens: agent_client::config::MarginOpens,
     /// Where a click on an agent's name takes the person.
@@ -31,6 +35,7 @@ impl Settings {
         Settings {
             chime: sonny.chime,
             verbose: sonny.verbose,
+            text_width: sonny.text_width,
             margin_opens: sonny.margin_opens,
             agent_opens: sonny.agent_opens,
         }

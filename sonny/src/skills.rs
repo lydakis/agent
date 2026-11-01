@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 /// the superlead's, which a project opts into), the memory, plan, zen,
 /// coordination, commons and automation skills, the nightly cleanup's,
 /// agent-browser's own when it is installed, and `~/.agent/memory` and
-/// `~/.agent/trigger`, which run this Sonny. Written at each start, so they
+/// `~/.agent/automation`, which run this Sonny. Written at each start, so they
 /// lead to this copy.
 pub fn install_own() {
     for (name, text) in crate::project::builtins() {
@@ -58,6 +58,18 @@ pub fn install_own() {
             eprintln!("sonny: {error}");
         }
     }
+    // The script `~/.agent/automation` was `~/.agent/trigger` before 0.8.0:
+    // Sonny's own goes, once its successor is written.
+    crate::upgrade::once(&state.join("sonny/migrated"), SCRIPT, || {
+        let old = state.join("trigger");
+        if std::fs::read_to_string(&old).is_ok_and(|text| {
+            text.starts_with("#!/bin/sh\n# usage: trigger add")
+                && text.ends_with(" trigger \"$@\"\n")
+        }) {
+            let _ = std::fs::remove_file(&old);
+        }
+        true
+    });
     // An older Sonny's `~/.agent/project`, for what the new_project tool
     // does now.
     let project = state.join("project");
@@ -347,6 +359,10 @@ impl Kind {
         }
     }
 }
+
+/// The upgrade migration that removes Sonny's old `~/.agent/trigger`
+/// script.
+pub(crate) const SCRIPT: &str = "automation-script";
 
 /// How Sonny's note to a bot of its upgrade starts; the transcript shows
 /// it as one quiet row.

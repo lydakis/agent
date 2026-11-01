@@ -144,7 +144,8 @@ pub fn lead_bot(project: &str, name: &str) -> String {
     }
 }
 
-/// The short name of a lead, as `/lead` takes it: `lead` for the first.
+/// The short name of a lead, as `/switch` and `/new` take it: `lead` for
+/// the first.
 pub fn lead_short(bot: &str) -> &str {
     match bot.ends_with(".lead") {
         true => "lead",
@@ -191,6 +192,13 @@ pub enum Pick {
     /// A new thread's in T3 Code: the folder's first lead when it has none
     /// yet, else a new one named after the person's first words to it.
     Thread(String),
+    /// One `/new` makes: named so, else after the person's first words to
+    /// it, in the role `profile`, else the project's.
+    Made {
+        name: Option<String>,
+        words: String,
+        profile: Option<String>,
+    },
 }
 
 /// Where Sonny notes which lead of a folder the person last wrote to, in
@@ -281,24 +289,36 @@ fn default_name(dir: &Path) -> Result<String, String> {
     Ok(info["name"].as_str().unwrap_or("project").to_owned())
 }
 
-/// The lead's role: the profile its project is set to, `lead` unless
-/// set otherwise, the folder's or the person's, else Sonny's.
-fn role(dir: &Path) -> Result<agent_client::policy::Profile, String> {
-    let info = agent_client::project::read(dir)?;
-    profile(dir, &lead_profile(&info)?)
+/// The role `/new` made the lead `bot` in, noted beside the store `store`
+/// as a task's is; none for another lead, which runs as its project's.
+pub fn chosen(store: &Path, bot: &str) -> Option<String> {
+    is_lead(bot)
+        .then(|| crate::task::noted_profile(store, bot))
+        .flatten()
+}
+
+/// The lead's role: `chosen`, the profile `/new` made it in, else the one
+/// its project is set to, `lead` unless set otherwise; the folder's or the
+/// person's file, else Sonny's.
+fn role(dir: &Path, chosen: Option<&str>) -> Result<agent_client::policy::Profile, String> {
+    match chosen {
+        Some(name) => profile(dir, name),
+        None => profile(dir, &lead_profile(&agent_client::project::read(dir)?)?),
+    }
 }
 
 /// A lead's instructions as Sonny composes them for `dir` now: its role,
 /// the folder's rules, skills and memory, then the project's task rule.
 /// Rex is the rex-windows skill's to
 /// explain, so they read the same in any client.
-pub fn instructions(dir: &Path) -> Result<String, String> {
-    compose(dir).map(|(text, _)| text)
+pub fn instructions(dir: &Path, chosen: Option<&str>) -> Result<String, String> {
+    compose(dir, chosen).map(|(text, _)| text)
 }
 
-/// The instructions and the names of the skills they list.
-fn compose(dir: &Path) -> Result<(String, Vec<String>), String> {
-    let (composed, skills) = folder(dir, &role(dir)?)?;
+/// The instructions and the names of the skills they list, for a lead in
+/// the role `chosen` or its project's.
+fn compose(dir: &Path, chosen: Option<&str>) -> Result<(String, Vec<String>), String> {
+    let (composed, skills) = folder(dir, &role(dir, chosen)?)?;
     let info = agent_client::project::read(dir)?;
     let rule = agent_client::project::rule(&info);
     Ok((format!("{composed}\n\n{rule}"), skills))
@@ -377,8 +397,14 @@ impl Instructions {
 /// Whether a lead's instructions may follow the folder: only when Sonny
 /// wrote what they hold (or saw a client compose it), so instructions the
 /// person set some other way are never overwritten.
-pub fn review(dir: &Path, bot: &Value, lead: &str, new: bool) -> Result<Instructions, String> {
-    let (composed, skills) = compose(dir)?;
+pub fn review(
+    dir: &Path,
+    bot: &Value,
+    lead: &str,
+    new: bool,
+    chosen: Option<&str>,
+) -> Result<Instructions, String> {
+    let (composed, skills) = compose(dir, chosen)?;
     let current = bot["instructions"].as_str().unwrap_or_default();
     Ok(if current == composed {
         wrote(lead, current);
@@ -554,6 +580,10 @@ pub async fn open(
     let dir = folder_of(&dir.canonicalize().map_err(|e| e.to_string())?)?;
     let project = default_name(&dir)?;
     let first = format!("{project}.lead");
+    let chosen = match pick {
+        Pick::Made { profile, .. } => profile.as_deref(),
+        _ => None,
+    };
     let found = find(client, &first).await?;
     if let Some(found) = &found {
         let there = found["workspace"].as_str().unwrap_or("");
@@ -592,7 +622,7 @@ pub async fn open(
                 return Err(format!("lead_missing: {project} has no lead {name} yet"));
             }
         }
-        create(client, &dir, model, None).await?;
+        create(client, &dir, model, None, chosen).await?;
         return Ok(Lead {
             project,
             bot: first,
@@ -616,14 +646,14 @@ pub async fn open(
             }
             if find(client, &bot).await?.is_some() {
                 return Err(format!(
-                    "lead_exists: {bot} is there already; /lead {} opens it",
+                    "lead_exists: {bot} is there already; /switch {} opens it",
                     lead_short(&bot)
                 ));
             }
             // Made by another thread since the look above: theirs.
-            if !create(client, &dir, model, Some(&bot)).await? {
+            if !create(client, &dir, model, Some(&bot), chosen).await? {
                 return Err(format!(
-                    "lead_exists: {bot} is there already; /lead {} opens it",
+                    "lead_exists: {bot} is there already; /switch {} opens it",
                     lead_short(&bot)
                 ));
             }
@@ -685,7 +715,7 @@ pub async fn open(
             let bot = lead_bot(&project, name);
             if bot != first && find(client, &bot).await?.is_none() {
                 return Err(format!(
-                    "lead_missing: {project} has no lead {name}; /lead new {name} makes it"
+                    "lead_missing: {project} has no lead {name}; /new {name} makes it"
                 ));
             }
             bot
@@ -693,6 +723,14 @@ pub async fn open(
         Pick::New(Some(name)) => return make(lead_bot(&project, name)).await,
         Pick::New(None) => return fresh(String::new(), None).await,
         Pick::Thread(words) => {
+            let stem = lead_name_from(words);
+            let bot = lead_bot(&project, &stem);
+            return fresh(stem, Some(bot)).await;
+        }
+        Pick::Made {
+            name: Some(name), ..
+        } => return make(lead_bot(&project, name)).await,
+        Pick::Made { words, .. } => {
             let stem = lead_name_from(words);
             let bot = lead_bot(&project, &stem);
             return fresh(stem, Some(bot)).await;
@@ -837,8 +875,9 @@ async fn create(
     dir: &Path,
     model: Option<&str>,
     bot: Option<&str>,
+    chosen: Option<&str>,
 ) -> Result<bool, String> {
-    let role = role(dir)?;
+    let role = role(dir, chosen)?;
     let info = agent_client::project::read(dir)?;
     // A project file that names a model keeps it; otherwise asked for,
     // the role's, AGENT_MODEL's, the config's `model`, then the newest
@@ -946,7 +985,7 @@ pub async fn add(caller: &str, arguments: &Value) -> Result<Value, String> {
     let (client, _events) = Client::connect(&socket)
         .await
         .map_err(|e| format!("{}: {}", e.code, e.detail.unwrap_or_default()))?;
-    let mut made = make(&client, &dir, &role(&dir)?, &picks, None).await;
+    let mut made = make(&client, &dir, &role(&dir, None)?, &picks, None).await;
     if let Ok(made) = &mut made {
         // Composed from its folder, so the lead follows the folder's
         // changes as one Sonny opened there does, when it opens.
@@ -1149,13 +1188,17 @@ mod tests {
         )
         .unwrap();
         // Named but not written: the lead is not made without it.
-        assert!(role(&dir).unwrap_err().starts_with("profile_not_found: "));
+        assert!(
+            role(&dir, None)
+                .unwrap_err()
+                .starts_with("profile_not_found: ")
+        );
         std::fs::write(
             dir.join(".agents/agents/my-lead.md"),
             "---\nextends: lead\n---\nReview each change before it lands.\n",
         )
         .unwrap();
-        let lead = role(&dir).unwrap();
+        let lead = role(&dir, None).unwrap();
         assert_eq!(lead.name, "my-lead");
         // The lead's text, the person's or Sonny's, comes first, and the
         // skills it loads come last.
@@ -1168,7 +1211,7 @@ mod tests {
         let (base, coordination) = base.split_once(skill).unwrap();
         assert!(lead.body.starts_with(base));
         assert!(lead.body.ends_with(coordination));
-        let text = instructions(&dir).unwrap();
+        let text = instructions(&dir, None).unwrap();
         assert!(text.contains("# Role: my-lead\n\n"), "{text}");
         // A variant of the lead is no role to start a peer in.
         assert!(!text.contains("- my-lead:"));
@@ -1178,11 +1221,11 @@ mod tests {
             "name = \"top\"\nprofile = \"superlead\"\n",
         )
         .unwrap();
-        let lead = role(&dir).unwrap();
+        let lead = role(&dir, None).unwrap();
         assert!(lead.body.starts_with(base));
         assert!(lead.body.contains("you lead their leads"));
         assert!(lead.body.ends_with(coordination));
-        assert!(!instructions(&dir).unwrap().contains("- superlead:"));
+        assert!(!instructions(&dir, None).unwrap().contains("- superlead:"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1321,7 +1364,7 @@ mod tests {
         let lead = format!("kept-test-{}", std::process::id());
         let missing = |instructions: &str| {
             let bot = serde_json::json!({ "instructions": instructions });
-            match review(&dir, &bot, &lead, false).unwrap() {
+            match review(&dir, &bot, &lead, false, None).unwrap() {
                 Instructions::Kept { missing } => missing,
                 other => panic!("kept, not {other:?}"),
             }

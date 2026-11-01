@@ -84,12 +84,12 @@ struct Turn {
 }
 
 impl Turn {
-    /// A trigger's run that went well: news only once its reply has words.
+    /// An automation's run that went well: news only once its reply has words.
     /// One that failed, was stopped, resolved its task or ended a goal is
     /// news however it replied.
     fn run(&self) -> bool {
         self.status == "completed"
-            && self.by.as_deref() == Some("trigger")
+            && self.by.as_deref().is_some_and(crate::trigger::sent_it)
             && !self.resolved
             && self.goal.is_none()
     }
@@ -1170,7 +1170,14 @@ impl Updates {
             APPROVAL | QUIET => None,
             _ if from.as_deref() == Some(self.lead.as_str()) => Some("you".to_owned()),
             _ if from.is_none() && origin.as_deref() == Some(UNKNOWN) => None,
-            _ => Some(from.or(origin).unwrap_or_else(|| "the person".into())),
+            // An automation's turn from before 0.8.0 says `trigger`.
+            _ => Some(
+                from.or(origin.map(|origin| match crate::trigger::sent_it(&origin) {
+                    true => crate::trigger::ORIGIN.to_owned(),
+                    false => origin,
+                }))
+                .unwrap_or_else(|| "the person".into()),
+            ),
         }
     }
 
@@ -2193,19 +2200,26 @@ mod tests {
     }
 
     #[test]
-    fn a_trigger_s_run_that_went_well_and_said_nothing_is_no_news() {
+    fn an_automation_s_run_that_went_well_and_said_nothing_is_no_news() {
         let mut updates = fleet();
-        let trigger = || json!({"origin": "trigger"});
+        let trigger = || json!({"origin": "automation"});
         turn(&mut updates, "shop.fix", 4, trigger(), "completed");
         updates.reading_reply("shop.fix", 4);
-        turn(&mut updates, "shop.docs", 2, trigger(), "failed");
+        // One from before 0.8.0 says `trigger`, and reads as the same.
+        turn(
+            &mut updates,
+            "shop.docs",
+            2,
+            json!({"origin": "trigger"}),
+            "failed",
+        );
         updates.reading_reply("shop.docs", 2);
         updates.replied("shop.fix", 4, "  \n");
         updates.replied("shop.docs", 2, "");
         // One that went wrong is told, words or none.
         assert_eq!(
             text(&updates.take()),
-            "- shop.docs: turn:shop.docs/2 failed, asked by trigger"
+            "- shop.docs: turn:shop.docs/2 failed, asked by automation"
         );
         // One with words is told with them.
         turn(&mut updates, "shop.fix", 5, trigger(), "completed");
@@ -2216,7 +2230,7 @@ mod tests {
     #[test]
     fn two_quiet_runs_that_ended_before_their_replies_were_read_are_no_news() {
         let mut updates = fleet();
-        let trigger = || json!({"origin": "trigger"});
+        let trigger = || json!({"origin": "automation"});
         turn(&mut updates, "shop.fix", 4, trigger(), "completed");
         turn(&mut updates, "shop.fix", 5, trigger(), "completed");
         // Both ended before either reply was read, each held apart.

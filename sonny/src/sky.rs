@@ -1859,7 +1859,7 @@ impl View {
                     return;
                 }
                 // A schedule woke it: in from the edge, its tick flashing.
-                if live && origin == "trigger" {
+                if live && crate::trigger::sent_it(origin) {
                     self.agents[at].fired = Some(now);
                 }
                 if live {
@@ -1914,7 +1914,7 @@ impl View {
                     self.title.note(now, &by);
                 }
                 // A schedule asked for is told once the call is done.
-                if tool == crate::served::TRIGGERS
+                if tool == crate::served::AUTOMATIONS
                     && own
                     && let Some(call) = data["call_id"].as_str()
                     && let Some(booking) = booking(&data["arguments"], name)
@@ -4805,7 +4805,7 @@ fn slim(mut event: Value) -> Value {
     {
         // A schedule's call keeps what the sky tells of it: for whom, how
         // often, its name; not its message.
-        let kept = (data.get("name") == Some(&json!(crate::served::TRIGGERS)))
+        let kept = (data.get("name") == Some(&json!(crate::served::AUTOMATIONS)))
             .then(|| data.get("arguments").and_then(Value::as_str))
             .flatten()
             .and_then(|text| serde_json::from_str::<Value>(text).ok())
@@ -4848,7 +4848,7 @@ fn booking(arguments: &Value, by: &str) -> Option<Booking> {
         Some((kind, value)) => format!("{kind} {value}"),
         None if text("file").is_some() => "file".into(),
         None if text("commit").is_some() => "commit".into(),
-        None => "fire".into(),
+        None => crate::trigger::ON_DEMAND.into(),
     };
     Some(Booking {
         name: text("name").unwrap_or(&bot).to_owned(),
@@ -5679,7 +5679,7 @@ mod tests {
             let arguments = json!({"add": add}).to_string();
             live(
                 "tool_started",
-                json!({"name": "triggers", "call_id": call, "arguments": arguments}),
+                json!({"name": "automations", "call_id": call, "arguments": arguments}),
             )
         };
         send.send(add(
@@ -5807,7 +5807,7 @@ mod tests {
             "if": "test -f x", "start": {"name": "n", "model": "m"}}})
         .to_string();
         let call = json!({"event": "tool_started", "bot": "a", "written_ms": 1,
-            "data": {"name": "triggers", "arguments": arguments}});
+            "data": {"name": "automations", "arguments": arguments}});
         let kept = slim(call)["data"]["arguments"].as_str().unwrap().to_owned();
         let kept: Value = serde_json::from_str(&kept).unwrap();
         assert_eq!(
@@ -6338,7 +6338,7 @@ mod tests {
         // A schedule: in from the edge, its tick flashing.
         send.send(Feed::Live(
             json!({"event": "accepted", "bot": "shop.lead", "turn": 1,
-            "data": {"origin": "trigger"}}),
+            "data": {"origin": "automation"}}),
         ))
         .unwrap();
         view.drain();

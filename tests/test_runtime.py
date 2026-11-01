@@ -128,8 +128,8 @@ class Model(http.server.BaseHTTPRequestHandler):
             texts = [i['content'][0]['text'] for i in request['input'] if i.get('role') == 'user']
             # A `steer:` message joins the running task, which its prompt drives.
             user = next((t for t in reversed(texts) if not t.startswith('steer:')), texts[-1])
-            # A trigger's message comes after its one-line header.
-            if user.startswith('[trigger ') and '\n' in user:
+            # An automation's message comes after its one-line header.
+            if user.startswith('[automation ') and '\n' in user:
                 user = user.split('\n', 1)[1]
             # Sonny's message ends with a line naming when it was sent.
             user = SENT.sub('', user)

@@ -116,7 +116,7 @@ pub fn announce(bot: &str, resume: Vec<String>) {
 }
 
 /// Tell Herdr the bot's state, as `status_report` names it: `working`,
-/// `blocked` (on the person), `idle`, `done` or `error` (both ready for
+/// `blocked` (on the person's approval), `asking` (on their answer), `idle`, `done` or `error` (both ready for
 /// input), or `clear` as Sonny quits. In the background, so Herdr never
 /// slows Sonny down, except for the last, which Sonny waits on briefly.
 pub fn report(state: &str) {
@@ -138,6 +138,7 @@ impl Presence {
         }
         let semantic = match state {
             "working" | "blocked" => state,
+            "asking" => "blocked",
             _ => "idle",
         };
         let mut args: Vec<String> = ["pane", "report-agent", &self.pane, "--state", semantic]
@@ -145,8 +146,10 @@ impl Presence {
             .chain(common)
             .map(str::to_owned)
             .collect();
-        if semantic == "blocked" {
-            args.extend(["--message".into(), "waiting for your approval".into()]);
+        match state {
+            "blocked" => args.extend(["--message".into(), "waiting for your approval".into()]),
+            "asking" => args.extend(["--message".into(), "waiting for your answer".into()]),
+            _ => {}
         }
         args.extend(["--agent-session-id".into(), self.bot.clone()]);
         let display = [
@@ -1000,7 +1003,7 @@ if out is not None:
             seq: AtomicU64::new(0),
             named: AtomicBool::new(false),
         }));
-        for state in ["working", "blocked", "done"] {
+        for state in ["working", "blocked", "asking", "done"] {
             me.report(state).unwrap().join().unwrap();
         }
         assert!(me.report("clear").is_none());
@@ -1022,6 +1025,7 @@ if out is not None:
                 "report-agent working",
                 "report-metadata",
                 "rename",
+                "report-agent blocked",
                 "report-agent blocked",
                 "report-agent idle",
                 "release-agent",
@@ -1045,6 +1049,11 @@ if out is not None:
         assert_eq!(
             flag(&calls[3], "--message").as_deref(),
             Some("waiting for your approval")
+        );
+        // A question open waits on the person too, for their answer.
+        assert_eq!(
+            flag(&calls[4], "--message").as_deref(),
+            Some("waiting for your answer")
         );
         // Every report is numbered above the one before it.
         let seqs: Vec<u64> = (calls.iter())
