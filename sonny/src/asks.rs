@@ -2,9 +2,12 @@
 //! on it, which the daemon records, and Sonny draws the question in the
 //! conversation where it was asked: why it is asked, each option with what
 //! picking it means, the one the lead recommends and why, and what the
-//! agent does while nobody answers. What the person types next answers
-//! it, and goes to the lead as their next message. The open questions are
-//! read from the history Sonny replays: its `ask` calls not yet answered.
+//! agent does while nobody answers. A pick (a click on an option, or its
+//! number typed) answers it, and goes to the lead as their next message.
+//! Words the person types are their own, never framed as an answer: they
+//! may be meant for anything, and the agent reads whether they answer, as
+//! a reply under a card in a chat is read. The open questions are read
+//! from the history Sonny replays: its `ask` calls not yet answered.
 //!
 //! Silence counts as a yes only where the agent says a step can be undone,
 //! as an Apache project's lazy consensus passes what is easy to revert once
@@ -106,8 +109,9 @@ pub fn tool() -> Value {
             with what happens if they pick it, the one you recommend and why, and what you do until \
             they answer. Options without what they mean are useless to the person, so say what each \
             one does to their goal. Ask once, one decision per call, and do not repeat it in your \
-            reply. Their answer comes as their next message, starting \"You asked:\" and your \
-            question. Say in if_unanswered what you do until then. go_now goes on with the option \
+            reply. A pick comes as their next message, starting \"You asked:\" and your \
+            question; words they write instead come as they wrote them, so read whether they \
+            answer it. Say in if_unanswered what you do until then. go_now goes on with the option \
             you recommend at once, for a step you can undo once they have seen it. go_later goes \
             on with it once the wait passes with no word from them, for a step you can undo but \
             would rather they saw first. wait does nothing they have not picked: anything that goes \
@@ -330,6 +334,13 @@ pub fn close(asks: &mut Vec<Ask>, text: &str) -> bool {
     let at =
         answered(text).and_then(|question| asks.iter().position(|ask| ask.question == question));
     at.map(|at| asks.remove(at)).is_some()
+}
+
+/// Whether what is typed picks one of `ask`'s options: its number alone.
+/// Only a pick answers a question from the composer; words are the
+/// person's own.
+pub fn picks(ask: &Ask, typed: &str) -> bool {
+    (typed.trim().parse::<usize>()).is_ok_and(|n| (1..=ask.options.len()).contains(&n))
 }
 
 /// The person's message answering `ask`: an option's number stands for
@@ -840,7 +851,7 @@ pub fn hint(ask: &Ask, at: usize, of: usize, width: usize) -> Vec<Span<'static>>
     if of > 1 {
         keys.push("↑↓ switch".into());
     }
-    keys.push("esc write instead".into());
+    keys.push("esc set aside".into());
     let keys = keys.join(" · ");
     let words = match ask.options.len() {
         0 if ask.command.is_some() => " say how it went ·",
@@ -1037,11 +1048,11 @@ mod tests {
         let ask = call("c1", &keep_api()).unwrap();
         assert_eq!(
             text(&hint(&ask, 0, 1, 80)),
-            "Answer “Keep the old API?”: 1–2 pick · esc write instead"
+            "Answer “Keep the old API?”: 1–2 pick · esc set aside"
         );
         assert_eq!(
             text(&hint(&ask, 1, 2, 80)),
-            "Answer “Keep the old API?” (2 of 2): 1–2 pick · ↑↓ switch · esc write instead"
+            "Answer “Keep the old API?” (2 of 2): 1–2 pick · ↑↓ switch · esc set aside"
         );
         assert!(text(&hint(&ask, 0, 1, 50)).contains('…'));
         // The question muted, the keys in the one grammar.
@@ -1061,7 +1072,7 @@ mod tests {
         let open = call("c2", &json!({"question": "Why?"})).unwrap();
         assert_eq!(
             text(&hint(&open, 0, 1, 80)),
-            "Answer “Why?”: type your answer · esc write instead"
+            "Answer “Why?”: type your answer · esc set aside"
         );
         // Over what is typed, the row the sent answer will have.
         assert_eq!(
@@ -1346,7 +1357,7 @@ mod tests {
             .collect();
         assert_eq!(
             hint,
-            "Answer “Sign in to the package registry”: say how it went · esc write instead"
+            "Answer “Sign in to the package registry”: say how it went · esc set aside"
         );
     }
 

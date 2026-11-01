@@ -1309,21 +1309,18 @@ impl Registry {
     /// daemon-wide; ended ones stop counting. Zero removes the bound.
     pub fn with_lasting_budget(mut self, budget: usize) -> Self {
         self.lasting_budget = budget.min(Semaphore::MAX_PERMITS);
-        self.lasting_slots = Arc::new(Semaphore::new(self.lasting_budget));
+        // Unbounded, every one still holds a permit, so `stats` counts them.
+        self.lasting_slots = Arc::new(Semaphore::new(match self.lasting_budget {
+            0 => Semaphore::MAX_PERMITS,
+            budget => budget,
+        }));
         self
     }
     /// A lasting process's permit, or `lasting_limit` naming what holds
     /// them all. Nothing waits for one: a turn is never left in a line.
     fn lasting(&self) -> Result<Option<tokio::sync::OwnedSemaphorePermit>> {
-        if self.lasting_budget == 0 {
-            return Ok(None);
-        }
         self.lasting_slots.clone().try_acquire_owned().map(Some).map_err(|_| {
-            let held = self.lasting_budget - self.lasting_slots.available_permits();
-            #[cfg(unix)]
-            let terminals = self.terminals.lock().unwrap_or_else(|e| e.into_inner()).len();
-            #[cfg(not(unix))]
-            let terminals = 0;
+            let (held, terminals) = (self.lasting_running(), self.terminals_running());
             Error::with(
                 "lasting_limit",
                 format!(
@@ -1376,6 +1373,32 @@ impl Registry {
     pub fn with_load_readings(mut self, readings: watch::Receiver<bool>) -> Self {
         self.load = Some(readings);
         self
+    }
+    /// Terminals and detached commands running now, together: the lasting
+    /// slots in use, whatever `--max-lasting` bounds them at.
+    pub fn lasting_running(&self) -> usize {
+        let bound = match self.lasting_budget {
+            0 => Semaphore::MAX_PERMITS,
+            budget => budget,
+        };
+        bound.saturating_sub(self.lasting_slots.available_permits())
+    }
+    /// Terminals running now, of the lasting slots in use.
+    pub fn terminals_running(&self) -> usize {
+        #[cfg(unix)]
+        return self
+            .terminals
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len();
+        #[cfg(not(unix))]
+        0
+    }
+    /// Whether the load gate is shut, the load at its limit or over it, as
+    /// last read; none without a gate. Shut, it holds new commands back
+    /// only while one of the daemon's runs.
+    pub fn load_shut(&self) -> Option<bool> {
+        self.load.as_ref().map(|open| !*open.borrow())
     }
     /// Commands of the daemon's running now.
     pub fn running(&self) -> usize {

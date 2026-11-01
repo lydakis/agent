@@ -276,7 +276,7 @@ struct Given<'a> {
 async fn apply_config(client: &Client, given: &Given<'_>, bots: Vec<Value>) -> Vec<Value> {
     let mut busy = Vec::new();
     for bot in bots {
-        let Ok(record) = client
+        let Ok(mut record) = client
             .request(
                 "inspect",
                 json!({"bot": bot["name"], "bot_id": bot["bot_id"]}),
@@ -285,6 +285,7 @@ async fn apply_config(client: &Client, given: &Given<'_>, bots: Vec<Value>) -> V
         else {
             continue;
         };
+        record["name"] = bot["name"].clone();
         let Some(mut fields) = configured(&record, given) else {
             continue;
         };
@@ -336,7 +337,14 @@ fn configured(record: &Value, given: &Given<'_>) -> Option<serde_json::Map<Strin
         let hide = given.config.hide_senders.then_some(true);
         settings.insert("hide_senders".into(), json!(hide));
     }
-    let rules = json!(given.rules);
+    // A trigger's shadow copy keeps the rules it was made with: the
+    // person's, without what they let run outside the sandbox.
+    let shadow =
+        (record["name"].as_str()).is_some_and(|name| crate::trigger::shadow_source(name).is_some());
+    let rules = match shadow {
+        true => json!(crate::trigger::shadow_rules(given.rules)),
+        false => json!(given.rules),
+    };
     let creator = record["created_by_id"].as_i64();
     let own = creator.is_none_or(|creator| !given.live.contains(&creator));
     if own && record["settings"]["rules"] != rules {
