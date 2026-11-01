@@ -7,7 +7,7 @@ use std::io::{BufRead, Read};
 use std::sync::{Arc, Mutex};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, BufReader},
-    sync::{Notify, Semaphore},
+    sync::{Notify, OwnedSemaphorePermit, Semaphore},
 };
 
 // Keep requests inline in the input queue instead of allocating a box for
@@ -17,13 +17,15 @@ pub enum Inbound {
     /// A connection, the sandboxed bot whose own socket it came in on, and
     /// the process at its other end, where the system says.
     Open(u64, Output, Option<i64>, Option<u32>),
-    Request(u64, Result<Request>),
+    /// A request, with the input credit its line took, which goes back
+    /// once the service has taken the request up.
+    Request(u64, Result<Request>, Credit),
     Closed(u64),
 }
 impl Inbound {
     fn session(&self) -> u64 {
         match self {
-            Inbound::Open(id, ..) | Inbound::Request(id, _) | Inbound::Closed(id) => *id,
+            Inbound::Open(id, ..) | Inbound::Request(id, ..) | Inbound::Closed(id) => *id,
         }
     }
 }
@@ -36,8 +38,16 @@ impl Inbound {
 /// together, and each reads at most an eighth of it ahead, so a few
 /// pipelining sessions never fill it for the rest; a reader waits for room
 /// in the order it asked.
+#[cfg(test)]
 pub fn channel(capacity: usize) -> (Sender, Receiver) {
+    channel_with(capacity, 0)
+}
+
+/// `channel`, with `input_bytes` of request lines read ahead at most, or no
+/// bound for 0; see `Credits`.
+pub fn channel_with(capacity: usize, input_bytes: usize) -> (Sender, Receiver) {
     let shared = Arc::new(Shared {
+        credits: Credits::new(input_bytes),
         queues: Mutex::new(Queues::default()),
         room: Semaphore::new(capacity),
         share: capacity.div_ceil(8),
@@ -49,6 +59,7 @@ pub fn channel(capacity: usize) -> (Sender, Receiver) {
 }
 
 struct Shared {
+    credits: Credits,
     queues: Mutex<Queues>,
     room: Semaphore,
     /// The most one session reads ahead.
@@ -76,6 +87,104 @@ struct Queues {
     /// counts: those it read ahead before it was parked.
     uncharged: HashMap<u64, usize>,
     senders: usize,
+}
+
+/// How much of a request line is read on its first credit.
+const SMALL: usize = 4 * 1024;
+
+/// The bytes of request lines every session together has read and the
+/// service has not yet taken up, bounded as an HTTP/2 flow-control window
+/// bounds what a peer sends ahead: a reader takes credit before it reads,
+/// and the request gives it back when the service has taken it up. A line
+/// is read first on credit for 4 KiB; one that goes on gives that back and
+/// waits for credit for the longest a line may be, at once, so readers
+/// never each hold part of what they need while all wait for the rest, and
+/// gives back what it did not use once it ends. An eighth of the budget is
+/// kept for lines that end within their first 4 KiB, so interrupts,
+/// renewals and status reads get in while long submits wait. A connection
+/// waiting for its next line holds none.
+struct Credits(Option<Pools>);
+struct Pools {
+    main: Arc<Semaphore>,
+    reserve: Arc<Semaphore>,
+}
+
+/// The credit one line holds.
+#[derive(Default)]
+pub struct Credit(Option<OwnedSemaphorePermit>);
+impl std::fmt::Debug for Credit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let bytes = self.0.as_ref().map_or(0, OwnedSemaphorePermit::num_permits);
+        write!(f, "Credit({bytes} bytes)")
+    }
+}
+impl Credit {
+    /// Keep credit for `bytes`, the line as read, and give back the rest.
+    fn trim(&mut self, bytes: usize) {
+        if let Some(permit) = &mut self.0
+            && permit.num_permits() > bytes.max(1)
+        {
+            self.0 = permit.split(bytes.max(1));
+        }
+    }
+}
+
+/// The default budget: a sixteenth of physical memory, at least 64 MiB.
+pub fn default_input_bytes() -> usize {
+    // SAFETY: sysconf reads system constants.
+    let (pages, size) = unsafe {
+        (
+            libc::sysconf(libc::_SC_PHYS_PAGES),
+            libc::sysconf(libc::_SC_PAGESIZE),
+        )
+    };
+    let memory = usize::try_from(pages)
+        .unwrap_or(0)
+        .saturating_mul(usize::try_from(size).unwrap_or(0));
+    (memory / 16).max(64 << 20)
+}
+
+impl Credits {
+    /// `budget` bytes, or none for 0. The reserve comes out of it, and the
+    /// rest always holds one line of the most a line may be.
+    fn new(budget: usize) -> Credits {
+        if budget == 0 {
+            return Credits(None);
+        }
+        let reserve = (budget / 8).max(SMALL);
+        let main = budget.saturating_sub(reserve).max(LINE_LIMIT + 1);
+        Credits(Some(Pools {
+            main: Arc::new(Semaphore::new(main)),
+            reserve: Arc::new(Semaphore::new(reserve)),
+        }))
+    }
+
+    /// Credit for the rest of a line that `credit` holds `read` bytes of:
+    /// how many more bytes may be read. Its first 4 KiB come from the
+    /// budget or, when that is spent, the reserve; a line that goes on
+    /// gives them back and waits on the budget alone for the longest line.
+    async fn next(&self, credit: &mut Credit, read: usize) -> usize {
+        let Some(pools) = &self.0 else {
+            return LINE_LIMIT + 1 - read;
+        };
+        if read == 0 {
+            let (main, reserve) = (pools.main.clone(), pools.reserve.clone());
+            credit.0 = tokio::select! {
+                biased;
+                Ok(permit) = main.acquire_many_owned(SMALL as u32) => Some(permit),
+                Ok(permit) = reserve.acquire_many_owned(SMALL as u32) => Some(permit),
+            };
+            return SMALL;
+        }
+        credit.0 = None;
+        credit.0 = pools
+            .main
+            .clone()
+            .acquire_many_owned((LINE_LIMIT + 1) as u32)
+            .await
+            .ok();
+        LINE_LIMIT + 1 - read
+    }
 }
 
 /// The service loop is gone: nothing more is taken.
@@ -131,6 +240,66 @@ impl Sender {
         }
         self.0.arrived.notify_one();
         Ok(())
+    }
+    /// Read one request line from `reader` under input credit: `None` at
+    /// the connection's end, otherwise the line, whole when it ends in a
+    /// newline within `LINE_LIMIT`, and the credit it holds.
+    async fn read_line<R: tokio::io::AsyncBufRead + Unpin>(
+        &self,
+        reader: &mut R,
+    ) -> Option<(std::io::Result<Vec<u8>>, Credit)> {
+        // No credit is held for a line that has not begun.
+        match reader.fill_buf().await {
+            Ok([]) => return None,
+            Ok(_) => {}
+            Err(error) => return Some((Err(error), Credit::default())),
+        }
+        let (mut line, mut credit) = (Vec::new(), Credit::default());
+        loop {
+            let piece = self.0.credits.next(&mut credit, line.len()).await;
+            let room = piece.min(LINE_LIMIT + 1 - line.len());
+            match (&mut *reader)
+                .take(room as u64)
+                .read_until(b'\n', &mut line)
+                .await
+            {
+                Err(error) => return Some((Err(error), credit)),
+                Ok(n) if n == 0 || line.ends_with(b"\n") || line.len() > LINE_LIMIT => {
+                    credit.trim(line.len());
+                    return Some((Ok(line), credit));
+                }
+                Ok(_) => {}
+            }
+        }
+    }
+    /// `read_line` from a thread outside the runtime, which `runtime`
+    /// serves.
+    fn blocking_read_line(
+        &self,
+        runtime: &tokio::runtime::Handle,
+        reader: &mut impl BufRead,
+    ) -> Option<(std::io::Result<Vec<u8>>, Credit)> {
+        match reader.fill_buf() {
+            Ok([]) => return None,
+            Ok(_) => {}
+            Err(error) => return Some((Err(error), Credit::default())),
+        }
+        let (mut line, mut credit) = (Vec::new(), Credit::default());
+        loop {
+            let piece = runtime.block_on(self.0.credits.next(&mut credit, line.len()));
+            let room = piece.min(LINE_LIMIT + 1 - line.len());
+            match (&mut *reader)
+                .take(room as u64)
+                .read_until(b'\n', &mut line)
+            {
+                Err(error) => return Some((Err(error), credit)),
+                Ok(n) if n == 0 || line.ends_with(b"\n") || line.len() > LINE_LIMIT => {
+                    credit.trim(line.len());
+                    return Some((Ok(line), credit));
+                }
+                Ok(_) => {}
+            }
+        }
     }
     /// `send` from a thread outside the runtime, which `runtime` serves.
     pub fn blocking_send(
@@ -275,17 +444,13 @@ pub fn stdio_reader(sender: Sender) {
     std::thread::spawn(move || {
         let stdin = std::io::stdin();
         let mut reader = stdin.lock();
-        loop {
-            let mut line = Vec::new();
-            let result = (&mut reader)
-                .take(LINE_LIMIT as u64 + 1)
-                .read_until(b'\n', &mut line);
+        while let Some((result, credit)) = sender.blocking_read_line(&runtime, &mut reader) {
             match result {
-                Ok(0) => break,
-                Ok(_) if line.len() <= LINE_LIMIT && line.ends_with(b"\n") => {
+                Ok(line) if line.len() <= LINE_LIMIT && line.ends_with(b"\n") => {
                     let request = parse(&line);
+                    drop(line);
                     if sender
-                        .blocking_send(&runtime, Inbound::Request(0, request))
+                        .blocking_send(&runtime, Inbound::Request(0, request, credit))
                         .is_err()
                     {
                         break;
@@ -294,7 +459,7 @@ pub fn stdio_reader(sender: Sender) {
                 _ => {
                     let _ = sender.blocking_send(
                         &runtime,
-                        Inbound::Request(0, fail("input_line_limit_or_truncation")),
+                        Inbound::Request(0, fail("input_line_limit_or_truncation"), credit),
                     );
                     break;
                 }
@@ -362,16 +527,11 @@ pub async fn socket_reader(
     sender: Sender,
     renewals: Option<(Hub, Output)>,
 ) {
-    loop {
-        let mut line = Vec::new();
-        let result = (&mut reader)
-            .take(LINE_LIMIT as u64 + 1)
-            .read_until(b'\n', &mut line)
-            .await;
+    while let Some((result, credit)) = sender.read_line(&mut reader).await {
         match result {
-            Ok(0) => break,
-            Ok(_) if line.len() <= LINE_LIMIT && line.ends_with(b"\n") => {
+            Ok(line) if line.len() <= LINE_LIMIT && line.ends_with(b"\n") => {
                 let request = parse(&line);
+                drop(line);
                 // A renewal touches only the hub, so it is answered here and
                 // not behind the session's other requests: a holder with
                 // thousands of calls in flight keeps its tag (Kafka's
@@ -385,13 +545,21 @@ pub async fn socket_reader(
                     }
                     continue;
                 }
-                if sender.send(Inbound::Request(id, request)).await.is_err() {
+                if sender
+                    .send(Inbound::Request(id, request, credit))
+                    .await
+                    .is_err()
+                {
                     break;
                 }
             }
             _ => {
                 let _ = sender
-                    .send(Inbound::Request(id, fail("input_line_limit_or_truncation")))
+                    .send(Inbound::Request(
+                        id,
+                        fail("input_line_limit_or_truncation"),
+                        credit,
+                    ))
                     .await;
                 break;
             }
@@ -553,6 +721,91 @@ mod tests {
         let (sender, inbound) = channel(1);
         drop(inbound);
         assert!(sender.send(Inbound::Closed(1)).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn long_lines_wait_for_credit_and_short_ones_get_in_on_the_reserve() {
+        use tokio::io::AsyncWriteExt;
+        // The least a budget holds: one longest line, and a reserve.
+        let (sender, mut inbound) = channel_with(64, 1 << 20);
+        let mut writers = Vec::new();
+        for session in 1..=3 {
+            let (daemon, client) = tokio::net::UnixStream::pair().unwrap();
+            let (read, _) = daemon.into_split();
+            tokio::spawn(socket_reader(
+                session,
+                BufReader::new(read),
+                sender.clone(),
+                None,
+            ));
+            writers.push(Some(client.into_split().1));
+        }
+        let mut send = |session: usize, bytes: usize| {
+            let mut line = br#"{"id":1,"op":"bots"}"#.to_vec();
+            line.resize(bytes - 1, b' ');
+            line.push(b'\n');
+            let mut write = writers[session - 1].take().unwrap();
+            tokio::spawn(async move { write.write_all(&line).await.map(|_| write) })
+        };
+        let quick = std::time::Duration::from_millis(300);
+        // The first long line takes nearly all of the budget, and the
+        // service holds it while it serves it.
+        let _first = send(1, LINE_LIMIT);
+        let held = inbound.recv().await.unwrap();
+        assert_eq!(held.session(), 1);
+        // Another long line waits for credit, and a short one does not.
+        let _second = send(2, 1 << 20);
+        tokio::time::sleep(quick).await;
+        let _third = send(3, 64);
+        let next = tokio::time::timeout(quick * 10, inbound.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(next.session(), 3);
+        assert!(tokio::time::timeout(quick, inbound.recv()).await.is_err());
+        // The first given back, the second gets in.
+        drop(held);
+        let next = tokio::time::timeout(quick * 10, inbound.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(next.session(), 2);
+    }
+
+    #[tokio::test]
+    async fn long_lines_past_the_budget_together_all_get_in() {
+        use tokio::io::AsyncWriteExt;
+        // Eight lines of 2 MiB, against a budget for about four: none may
+        // hold part of its credit while waiting for the rest.
+        let (sender, mut inbound) = channel_with(64, 1 << 20);
+        let mut writes = Vec::new();
+        for session in 1..=8 {
+            let (daemon, client) = tokio::net::UnixStream::pair().unwrap();
+            let (read, _) = daemon.into_split();
+            tokio::spawn(socket_reader(
+                session,
+                BufReader::new(read),
+                sender.clone(),
+                None,
+            ));
+            let mut line = br#"{"id":1,"op":"bots"}"#.to_vec();
+            line.resize((2 << 20) - 1, b' ');
+            line.push(b'\n');
+            let (_, mut write) = client.into_split();
+            writes.push(tokio::spawn(async move {
+                write.write_all(&line).await.map(|_| write)
+            }));
+        }
+        let mut sessions = Vec::new();
+        for _ in 0..8 {
+            let taken = tokio::time::timeout(std::time::Duration::from_secs(10), inbound.recv())
+                .await
+                .expect("a line waited forever for credit")
+                .unwrap();
+            sessions.push(taken.session());
+        }
+        sessions.sort();
+        assert_eq!(sessions, (1..=8).collect::<Vec<_>>());
     }
 
     #[tokio::test]

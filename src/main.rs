@@ -138,6 +138,7 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
     let mut max_connecting = None;
     let mut max_pending = None;
     let mut max_pending_bytes = None;
+    let mut max_input_bytes = None;
     let mut max_readers = None;
     let mut idle_exit = None;
     let mut stall_timeout = None;
@@ -175,6 +176,7 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
             | "--max-connecting"
             | "--max-pending"
             | "--max-pending-bytes"
+            | "--max-input-bytes"
             | "--max-readers" => {
                 let parsed: usize = value
                     .parse()
@@ -185,6 +187,7 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
                     "--max-active" => max_active = Some(parsed),
                     "--max-pending" => max_pending = Some(parsed),
                     "--max-pending-bytes" => max_pending_bytes = Some(parsed),
+                    "--max-input-bytes" => max_input_bytes = Some(parsed),
                     "--max-readers" if parsed == 0 => {
                         return fail_with("usage", "--max-readers needs at least 1");
                     }
@@ -214,6 +217,7 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
         max_connecting,
         max_pending,
         max_pending_bytes,
+        max_input_bytes,
         max_readers,
         stall_timeout,
         idle_exit,
