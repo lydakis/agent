@@ -1334,7 +1334,26 @@ fn add_confined(
     crate::snapshot::plain(here, &add)?;
     let own = crate::snapshot::plain(path, &["rev-parse", "--absolute-git-dir"])?;
     let own = std::fs::canonicalize(own.trim()).map_err(|e| format!("{own}: {e}"))?;
-    confined_in(agent, path, &["checkout", "-f", "-q"], &[path, &own]).map(drop)
+    // The folders a sandbox keeps read-only at its top, agents' settings,
+    // that the commit holds: git writes them as the commit has them, which
+    // a repository's hook or filter could write too, as it could any
+    // tracked file. Not `.git`, Sonny's own link to the worktree's folder.
+    let mut tracked = Vec::new();
+    for name in agent_client::PROTECTED
+        .iter()
+        .filter(|name| **name != ".git")
+    {
+        let listed =
+            crate::snapshot::plain(path, &["ls-tree", "-d", "--name-only", "HEAD", "--", name])?;
+        if listed.lines().any(|line| line == *name) {
+            let folder = path.join(name);
+            std::fs::create_dir_all(&folder).map_err(|e| format!("{}: {e}", folder.display()))?;
+            tracked.push(folder);
+        }
+    }
+    let mut writable = vec![path, own.as_path()];
+    writable.extend(tracked.iter().map(PathBuf::as_path));
+    confined_in(agent, path, &["checkout", "-f", "-q"], &writable).map(drop)
 }
 
 /// Whether `dir` is in a worktree Sonny made a task.
@@ -1919,9 +1938,26 @@ mod tests {
         assert!(tree.join("a.txt").is_file(), "the worktree is checked out");
         assert!(!marker.exists(), "the hook ran in the sandbox");
         std::fs::remove_file(&hook).unwrap();
+        // Agents' settings the commit holds are checked out, though every
+        // sandbox keeps them read-only at its top.
+        std::fs::create_dir_all(repo.join(".agents")).unwrap();
+        std::fs::write(repo.join(".agents/AGENTS.md"), "x\n").unwrap();
+        git(&repo, &["add", ".agents"]).unwrap();
+        let commit = [
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "-m",
+            "b",
+        ];
+        git(&repo, &commit).unwrap();
         let other = dir.join("other");
         add_confined(Some(&agent), &repo, "agent/u", &other, "HEAD").unwrap();
         assert!(other.join("a.txt").is_file());
+        assert!(other.join(".agents/AGENTS.md").is_file());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

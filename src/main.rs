@@ -168,8 +168,18 @@ fn sandboxed(args: &[String]) -> Result<i32> {
     let daemon = Daemon {
         protected: names(&agent_client::PROTECTED),
         protected_existing: names(&agent_client::PROTECTED_EXISTING),
+        // By its real path, which the sandbox sees, kept when it is not
+        // there yet as well, so it may not be made.
         protected_paths: agent_client::config::home()
-            .and_then(|home| std::fs::canonicalize(home).ok())
+            .and_then(|home| {
+                std::fs::canonicalize(&home).ok().or_else(|| {
+                    Some(
+                        std::fs::canonicalize(home.parent()?)
+                            .ok()?
+                            .join(home.file_name()?),
+                    )
+                })
+            })
             .into_iter()
             .collect(),
         ..Daemon::default()
