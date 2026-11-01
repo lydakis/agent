@@ -106,7 +106,13 @@ identity is `bot_not_found`.
   turn stays queued and runs separately with those choices.
   `attach` adds a message that needs no reply to the bot's next model call,
   mid-turn or in its next turn, without starting a turn; `run` prints the
-  submission and returns at once.
+  submission and returns at once. It waits at most a day: if no call has
+  taken it in by then it goes as a steer, joining the running turn or
+  starting one, so a bot that stays idle still hears it.
+  `--attach-wait DURATION` sets that wait (`30m`, `1h`, `7d`, up to `365d`);
+  `0` waits as long as it takes. Without the flag, `attach_wait` in
+  `~/.agent/config.toml` applies, then `1d`. Like the mode, the CLI always
+  sends the wait it resolved; the daemon keeps no default.
 - `run --turn-budget-tokens N` caps this turn's input plus output tokens,
   beside the bot's lifetime `--budget-tokens`. The turn fails with
   `turn_budget_exhausted` before a call once it has spent N; the cap is

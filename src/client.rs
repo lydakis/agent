@@ -118,6 +118,9 @@ struct Options {
     full: bool,
     /// `run --delivery`: what to do when the bot is busy.
     delivery: Option<String>,
+    /// `run --attach-wait`: how long an attached message waits, in
+    /// milliseconds; 0 as long as it takes.
+    attach_wait_ms: Option<u64>,
     /// A new bot's approval mode and gated tools.
     approval: Option<String>,
     approve: Option<String>,
@@ -191,6 +194,7 @@ fn parse(args: &[String]) -> Result<Options> {
         any: false,
         full: false,
         delivery: std::env::var("AGENT_DELIVERY").ok(),
+        attach_wait_ms: None,
         approval: std::env::var("AGENT_APPROVAL")
             .ok()
             .filter(|mode| !mode.is_empty()),
@@ -304,6 +308,13 @@ fn parse(args: &[String]) -> Result<Options> {
                     "--source" => options.source = Some(value),
                     "--fork" => options.fork = Some(value),
                     "--expires" => options.expire_ms = Some(crate::cli::duration_ms(flag, &value)?),
+                    "--attach-wait" => {
+                        let ms = crate::cli::duration_ms(flag, &value)?;
+                        if ms > agent_client::config::MAX_ATTACH_WAIT_MS {
+                            return fail_with("usage", "--attach-wait is at most 365d");
+                        }
+                        options.attach_wait_ms = Some(ms);
+                    }
                     "--checkpoint" => {
                         options.checkpoint =
                             Some(value.parse().map_err(|_| {
@@ -1605,6 +1616,17 @@ fn run(options: &Options) -> Result<i32> {
         .iter()
         .map(|path| image(path))
         .collect::<Result<Vec<_>>>()?;
+    let delivery = options.delivery.as_deref().unwrap_or("reject");
+    if options.attach_wait_ms.is_some() && delivery != "attach" {
+        return fail_with("usage", "--attach-wait needs --delivery attach");
+    }
+    // How long an attached message waits is the client's to say, as its
+    // delivery is: the flag, then config.toml, then a day.
+    let wait_ms = match (delivery, options.attach_wait_ms) {
+        ("attach", Some(ms)) => Some(ms).filter(|&ms| ms > 0),
+        ("attach", None) => config()?.attach_wait(),
+        _ => None,
+    };
     let submitted = connection
         .request(
             "submit",
@@ -1613,9 +1635,9 @@ fn run(options: &Options) -> Result<i32> {
                 "workspace":options.workspace.as_ref().and(workspace.as_ref()),
                 "model":if created { Value::Null } else { json!(options.model) },
                 "effort":if created { Value::Null } else { json!(options.effort) },
-                "delivery":options.delivery.as_deref().unwrap_or("reject"),"expected_turn":options.turn,"from":from,
+                "delivery":delivery,"expected_turn":options.turn,"from":from,
                 "quotes":(!options.quotes.is_empty()).then_some(&options.quotes),
-                "budget_tokens":options.turn_budget_tokens}),
+                "budget_tokens":options.turn_budget_tokens,"wait_ms":wait_ms}),
         )
         .map_err(|error| ways_past_busy(&bot, error))?;
     // An attached message has no turn of its own to follow.

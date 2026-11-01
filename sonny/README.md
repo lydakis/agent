@@ -463,6 +463,17 @@ that ended on a question, so watching a task costs nothing.
 drops it, and Tab does what it does otherwise while none shows. Every Sonny
 has it, so a side chat or a task opened in the pane does too.
 
+A busy lead holds more than its last reply, so a guess may come from news
+you missed: another agent, the margin, the commons, or a reply of its own
+you scrolled past. Such a guess says where from after the key, dim, as in
+`› check pricing's failing test  tab  ↳ shop.pricing`; Tab takes only the
+words. The copy names the source from a fixed set (`earlier`, `margin`,
+`commons`, or an agent's name, which Sonny looks up), so a guess about the
+reply you are reading, or a source it made up, shows none, and a window
+too narrow for the whole guess and its source leaves the source out.
+
+![A guess from a task's news, its source after the key](../docs/sonny/suggest-origin.png)
+
 ![The guess, dim in the empty composer after a reply](../docs/sonny/suggest-shown.png)
 
 ![Tab took it into the composer, unsent](../docs/sonny/suggest-taken.png)
@@ -679,8 +690,12 @@ way `/react` does, and each note in the margin has its own `↩`.
   task's window closes once its turn ends. New work sent to the task
   reopens it. Each agent's
   time is how long its running turn has been at it, or how long its last
-  turn took. An agent with automations or follows of its own
-  shows `↻ 2 automations` beside its model. A click on an agent's name goes
+  turn took. Beside its model each agent names the profile it runs
+  as, `lead` and `task` too, which the footer leaves out (it names a
+  profile only when it is not the seat's own): a lead's as its project
+  sets it, a task's as it was started, with `start_task`'s `profile` or
+  its project's default. An agent with
+  automations or follows of its own shows `↻ 2 automations` there too. A click on an agent's name goes
   to it as a click on a task in a roster does (below), and so does
   Enter on the agent ↑ and ↓ pick (`›`); ‹ in its title,
   or Ctrl+[ from the conversation, goes back to `/status`. It opens
@@ -688,6 +703,8 @@ way `/react` does, and each note in the margin has its own `↩`.
   `/status` and Enter open the task a reply just pointed you to.
 
   ![/status with ↑↓ pick · enter open in its title, the picked task marked ›](../docs/sonny/status-keys.png)
+
+  ![/status naming each agent's profile beside its model: superlead, task, reviewer](../docs/sonny/status-profile.png)
 
   ![A task opened from /status in the pane, its ‹ going back to /status](../docs/sonny/status-opens-agent.png)
 - `/background` (or `/triggers`, `/lookout`) lists, in the pane beside the
@@ -1112,7 +1129,10 @@ agent busy or from another agent, are no message: once the agent reads
 them they hang right under what that call carried, your message or the
 step it joined, as `📎 From an automation ▸`, and a click opens them the
 same way. Nothing says such words are waiting: they ask nothing of you, so
-they turn up only once the agent has read them. A turn that ends
+they turn up only once the agent has read them. None waits more than a
+day (`attach_wait` in `config.toml`): one no call took in by then reaches
+the agent as a message of its own. Your reactions and the margin notes you
+close wait for your next word instead, which is what they are about. A turn that ends
 with the model saying nothing (`empty_completion`) ends quietly, not as a
 failure.
 
