@@ -1146,12 +1146,45 @@ pub async fn tell(home: &Path, replied: &Value, author: &str, tell: &Value) -> V
     told
 }
 
+/// What one look at the commons found: its lines, and how far each
+/// thread is read once they are kept. The cursor moves only when the
+/// lookout says so (`mark_read`), once whoever hears the lines holds them
+/// on disk: a crash before then reads them again, never past them.
+#[derive(Default)]
+pub struct News {
+    pub lines: Vec<String>,
+    /// The cursor's file and what it holds after this look; none when
+    /// nothing changed.
+    read: Option<(PathBuf, serde_json::Map<String, Value>)>,
+}
+
+impl News {
+    /// Moves the cursor past these lines: whether it moved, or had no
+    /// need to. A cursor that did not move reads them again next look.
+    pub fn mark_read(self) -> bool {
+        let Some((path, read)) = self.read else {
+            return true;
+        };
+        let Some(cursor) = path.parent() else {
+            return false;
+        };
+        std::fs::create_dir_all(cursor).is_ok()
+            && agent_client::files::replace_mode(
+                &path,
+                Value::Object(read).to_string().as_bytes(),
+                0o600,
+            )
+            .is_ok()
+    }
+}
+
 /// What the commons source says: a line for each post since the last
 /// look, as a source's command would print it, its thread the topic.
 /// `cursor` is the source's own folder, where how far each thread was
 /// read is kept; the first look reads none, so an upgrade or a new
-/// store is not told the commons' past.
-pub fn news(home: &Path, cursor: &Path) -> Vec<String> {
+/// store is not told the commons' past. The cursor stays where it was
+/// until the news is marked read (`News::mark_read`).
+pub fn news(home: &Path, cursor: &Path) -> News {
     let dir = dir(home);
     let path = cursor.join("read.json");
     let first = !path.exists();
@@ -1224,13 +1257,10 @@ pub fn news(home: &Path, cursor: &Path) -> Vec<String> {
         );
         changed = true;
     }
-    if changed && std::fs::create_dir_all(cursor).is_ok() {
-        let partial = path.with_extension("json.partial");
-        if std::fs::write(&partial, Value::Object(read).to_string()).is_ok() {
-            let _ = std::fs::rename(&partial, &path);
-        }
+    News {
+        lines,
+        read: changed.then_some((path, read)),
     }
-    lines
 }
 
 /// Subscribes `bot` to the posts of `thread`, as posting in it does,
@@ -1575,6 +1605,36 @@ mod tests {
         home
     }
 
+    /// The lines a look at the commons found, marked read.
+    fn look(home: &Path, cursor: &Path) -> Vec<String> {
+        let news = news(home, cursor);
+        let lines = news.lines.clone();
+        assert!(news.mark_read());
+        lines
+    }
+
+    #[test]
+    fn news_not_marked_read_is_read_again() {
+        let home = home("unmarked");
+        let cursor = home.join("cursor");
+        let post = |by: &str, arguments: Value| call(&home, by, None, None, &arguments).unwrap();
+        post(
+            "a.x",
+            json!({"post": {"name": "t", "title": "T", "text": "x"}}),
+        );
+        assert!(look(&home, &cursor).is_empty());
+        post("b.y", json!({"reply": {"thread": "t", "text": "y"}}));
+        post("c.z", json!({"reply": {"thread": "t", "text": "z"}}));
+        // Read, then lost before anyone kept it: the cursor stayed, so the
+        // next look finds the same posts.
+        let lost = news(&home, &cursor).lines;
+        assert_eq!(lost.len(), 2);
+        assert_eq!(news(&home, &cursor).lines, lost);
+        assert_eq!(look(&home, &cursor), lost);
+        assert!(look(&home, &cursor).is_empty());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
     #[test]
     fn the_commons_source_tells_each_new_post_once_with_its_thread() {
         let home = home("news");
@@ -1585,7 +1645,7 @@ mod tests {
             json!({"post": {"name": "old", "title": "Before", "text": "past"}}),
         );
         // The first look tells none of the past.
-        assert!(news(&home, &cursor).is_empty());
+        assert!(look(&home, &cursor).is_empty());
         post(
             "b.y",
             json!({"reply": {"thread": "old", "text": "and now"}}),
@@ -1594,7 +1654,7 @@ mod tests {
             "c.z",
             json!({"post": {"name": "new", "title": "Fresh", "text": "hello"}}),
         );
-        let mut lines: Vec<Value> = (news(&home, &cursor).iter())
+        let mut lines: Vec<Value> = (look(&home, &cursor).iter())
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
         lines.sort_by_key(|line| line["id"].as_str().unwrap().to_owned());
@@ -1607,7 +1667,7 @@ mod tests {
                     "text": "reply in old, \"Before\": and now"}),
             ]
         );
-        assert!(news(&home, &cursor).is_empty());
+        assert!(look(&home, &cursor).is_empty());
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -1623,33 +1683,33 @@ mod tests {
         );
         let golden = json!({"thread": "t", "at": now(), "bot": "a.x", "golden": true, "turns": []});
         assert!(keep(&dir, &[golden], 1));
-        assert!(news(&home, &cursor).is_empty());
+        assert!(look(&home, &cursor).is_empty());
         post("b.y", json!({"reply": {"thread": "t", "text": "y"}}));
         // a.x holds a golden ticket: the reply waits on its waking, and the
         // ones after it with it.
         assert_eq!(json_file(&dir.join(WOKEN))["t/1"]["bots"], Value::Null);
-        assert!(news(&home, &cursor).is_empty());
+        assert!(look(&home, &cursor).is_empty());
         post("c.z", json!({"reply": {"thread": "t", "text": "z"}}));
         let marked = |at: i64, bots: Value| {
             let mark = json!({"t/1": {"at": at, "bots": bots}, "t/2": {"at": now(), "bots": []}});
             std::fs::write(dir.join(WOKEN), mark.to_string()).unwrap();
         };
         marked(now(), Value::Null);
-        assert!(news(&home, &cursor).is_empty());
+        assert!(look(&home, &cursor).is_empty());
         marked(now(), json!(["a.x"]));
-        let lines: Vec<Value> = (news(&home, &cursor).iter())
+        let lines: Vec<Value> = (look(&home, &cursor).iter())
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
         assert_eq!(lines[0]["id"], "t/1");
         assert_eq!(lines[0]["told"], json!(["a.x"]));
         assert_eq!(lines[1]["id"], "t/2");
         assert_eq!(lines[1]["told"], json!([]));
-        assert!(news(&home, &cursor).is_empty());
+        assert!(look(&home, &cursor).is_empty());
         // A waking that never says how it went holds the reply a minute.
         post("d.w", json!({"reply": {"thread": "t", "text": "w"}}));
         let mark = json!({"t/3": {"at": now() - WAKING, "bots": null}});
         std::fs::write(dir.join(WOKEN), mark.to_string()).unwrap();
-        assert_eq!(news(&home, &cursor).len(), 1);
+        assert_eq!(look(&home, &cursor).len(), 1);
         let _ = std::fs::remove_dir_all(&home);
     }
 
