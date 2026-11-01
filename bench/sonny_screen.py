@@ -160,8 +160,13 @@ def lookout(args, subscribers, out):
         out=str(out / f'lookout-{subscribers}')))
     bench.setup()
     result = {'start': bench.start_lookout('start')}
+    if bench.lookout.poll() is not None:
+        raise RuntimeError(f'the lookout over {subscribers} exited as it started')
     since = int(time.time() * 1000)
     load = bench.load(args.load_s)
+    # A lookout that died tells no one and costs nothing: refuse the run.
+    if not load['lookout_alive']:
+        raise RuntimeError(f'the lookout over {subscribers} exited under load')
     notes = bench.note_delays(since)
     deltas = load['submitted_turns'] * args.deltas
     result.update({
@@ -245,7 +250,8 @@ def main():
     parser.add_argument('--settle', type=float, default=10)
     parser.add_argument('--out', required=True)
     args = parser.parse_args()
-    out = Path(args.out)
+    # Absolute: the bots' workspaces must be, and the screens change folder.
+    out = Path(args.out).resolve()
     out.mkdir(parents=True, exist_ok=True)
     sizes = [int(n) for n in args.subscribers.split(',')]
     run = {'lookout': {}}

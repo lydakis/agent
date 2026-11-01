@@ -16079,6 +16079,8 @@ mod tests {
     async fn the_footer_counts_tasks_at_work_whose_rosters_are_not_drawn() {
         let client = daemon_answering(|asked| {
             assert_eq!(asked["active"], true);
+            // The daemon keeps to this agent's own tasks.
+            assert_eq!(asked["created_by_id"], 7);
             // Two pages of them.
             match asked["after"].as_str() {
                 None => json!({"next_after": "calc.ask", "bots": [
@@ -16087,13 +16089,13 @@ mod tests {
                 // A side chat of its own is no task.
                 Some(_) => json!({"next_after": null, "bots": [
                     {"name": "calc.mul", "created_by": "calc"},
-                    {"name": "calc.side", "created_by": "calc", "expire_ms": 60000},
-                    {"name": "other.fix", "created_by": "other"}]}),
+                    {"name": "calc.side", "created_by": "calc", "expire_ms": 60000}]}),
             }
         })
         .await;
         let mut app = app(client);
         app.bot = "calc".into();
+        app.bot_id = Some(7);
         // Only one roster still drawn: its task needs the person.
         app.tasks.insert(
             0,
