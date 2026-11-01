@@ -525,8 +525,13 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
             .clone()
             .or_else(|| crate::project::task_profile(&info).ok()),
     };
-    if let (Some(profile), Some(store)) = (profile, &store) {
-        let _ = note_profile(store, name, &profile);
+    if let Some(store) = &store {
+        match profile {
+            Some(profile) => {
+                let _ = note_profile(store, name, &profile);
+            }
+            None => forget_profile(store, name),
+        }
     }
     let mut said = vec![format!(
         "Started {name}: {}",
@@ -551,6 +556,12 @@ fn profile_file(store: &Path, task: &str) -> PathBuf {
     let mut dir = store.into_os_string();
     dir.push(".profiles");
     PathBuf::from(dir).join(task)
+}
+
+/// Forget the profile noted for `task`: one made since under its name runs
+/// as its project says, not as the agent it replaces did.
+pub fn forget_profile(store: &Path, task: &str) {
+    let _ = std::fs::remove_file(profile_file(store, task));
 }
 
 pub fn note_profile(store: &Path, task: &str, profile: &str) -> std::io::Result<()> {
@@ -2232,6 +2243,16 @@ mod tests {
             started_on(&start),
             Some(agent_client::socket::canonical_store(&store).unwrap())
         );
+        // One made later under the same name in its project's role keeps
+        // nothing of the note the one before it had.
+        note_profile(&store, "shop.fix", "reviewer").unwrap();
+        assert_eq!(
+            noted_profile(&store, "shop.fix").as_deref(),
+            Some("reviewer")
+        );
+        forget_profile(&store, "shop.fix");
+        assert_eq!(noted_profile(&store, "shop.fix"), None);
+        forget_profile(&store, "shop.fix");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

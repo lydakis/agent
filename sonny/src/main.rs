@@ -11309,10 +11309,18 @@ impl App {
                 };
                 match project::open(&self.client, &dir, None, &pick).await {
                     Ok(lead) => {
-                        if let Some(chosen) = &chosen
-                            && let Err(error) = task::note_profile(&self.store(), &lead.bot, chosen)
-                        {
-                            self.notice = Some(format!("{} runs as {chosen}: {error}", lead.bot));
+                        // One made in the project's role keeps no note an
+                        // agent of its name before it left.
+                        match &chosen {
+                            Some(chosen) => {
+                                if let Err(error) =
+                                    task::note_profile(&self.store(), &lead.bot, chosen)
+                                {
+                                    self.notice =
+                                        Some(format!("{} runs as {chosen}: {error}", lead.bot));
+                                }
+                            }
+                            None => task::forget_profile(&self.store(), &lead.bot),
                         }
                         self.send_after = Some(file);
                         Ok(lead.bot)
