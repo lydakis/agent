@@ -137,7 +137,7 @@ pub const SETTINGS: [Setting; 31] = [
     },
     Setting {
         key: "sonny.text_width",
-        about: "the widest the conversation is written, in columns, however wide the window, the pane beside it taking the rest; 0 for the window's whole width, a pane then opening over it",
+        about: "the widest the conversation is written, in columns, however wide the window, the pane beside it taking the rest; 0 for the window's whole width, shared half and half with an open pane",
         values: &[],
         default: "100",
     },

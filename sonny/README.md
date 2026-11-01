@@ -1282,9 +1282,9 @@ Sonny owns the whole screen, as Codex does; there is no inline mode.
 The conversation and the composer keep to a column 100 wide, however wide the window, so a reply
 reads as a column rather than a band across the screen. `[sonny] text_width` (in `/config`)
 sets another width, at least 40, the pane beside the conversation taking the rest; 0 lets the
-conversation fill the window, as Claude Code's does, and a file, a card or the margin then
-opens over it, Ctrl+\ flipping between the two, as in a window too narrow for both, and the
-margin waits for `/margin`.
+conversation fill the window, as Claude Code's does, and the margin, a file or a card then
+shares the window with it half and half (in a window under 81 columns, one at a time, Ctrl+\
+flipping between the two).
 
 ![A reply at text_width = 0 filling a 170-column window, as Claude Code's does](../docs/sonny/text-width-0.png)
 

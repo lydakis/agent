@@ -172,9 +172,8 @@ const REFERENCE_PAGES: usize = 25;
 static MEASURE: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(agent_client::config::TEXT_WIDTH as usize);
 /// The measure of a conversation that fills the window: wider than any
-/// window, so the pane beside it never has room and opens over it, as in a
-/// narrow window, and small enough that a column or two added to it is
-/// still a terminal's width.
+/// window, and small enough that a column or two added to it is still a
+/// terminal's width. Beside the pane it keeps half the window ([`kept`]).
 const WHOLE: usize = u16::MAX as usize / 2;
 
 /// The widest the conversation is written; [`MEASURE`].
@@ -187,6 +186,22 @@ fn measure() -> usize {
 fn set_measure(text_width: u64) -> bool {
     let measure = measure_of(text_width);
     MEASURE.swap(measure, std::sync::atomic::Ordering::Relaxed) != measure
+}
+
+/// The columns the conversation keeps beside the pane in a window
+/// `window` wide, its gutter with them: its measure where it has one;
+/// half the window when it fills the window (`text_width = 0`), so an
+/// open pane and the conversation share it evenly.
+fn kept(window: u16) -> u16 {
+    kept_at(window, measure())
+}
+
+/// [`kept`] at `measure`.
+fn kept_at(window: u16, measure: usize) -> u16 {
+    match measure {
+        WHOLE => window / 2,
+        measure => measure as u16 + GUTTER,
+    }
 }
 
 /// The measure `[sonny] text_width` names.
@@ -5260,7 +5275,7 @@ impl App {
         }
         program.env("TERM", "xterm-256color");
         let height = self.height.saturating_sub(2).max(2) as u16;
-        let width = match pane::width(self.full_width, measure() as u16 + GUTTER) {
+        let width = match pane::width(self.full_width, kept(self.full_width)) {
             0 => 80,
             width => width,
         };
@@ -9339,7 +9354,7 @@ impl App {
     /// The file `link` names, read for the pane at its width.
     fn preview(&self, link: &str) -> Result<pane::Pane, String> {
         let workspace = std::path::Path::new(&self.workspace);
-        let width = pane::width(self.full_width, measure() as u16 + GUTTER).max(20) as usize;
+        let width = pane::width(self.full_width, kept(self.full_width)).max(20) as usize;
         pane::Pane::preview(link, workspace, width)
     }
 
@@ -9389,7 +9404,7 @@ impl App {
         };
         // The margin where the conversation leaves room for it, or while
         // the keys are in it; out of the way otherwise, and in zen.
-        let prose = measure() as u16 + GUTTER;
+        let prose = kept(area.width);
         let margin = pane::margin_width(area.width, prose);
         if open.is_margin() && (margin.is_none() || self.zen.is_some()) && !self.pane_keys {
             return (self.centred(area), None);
@@ -11445,7 +11460,7 @@ impl App {
         let beside = !self.margin.closed()
             && self.zen.is_none()
             && opened
-            && pane::margin_width(size.width, measure() as u16 + GUTTER).is_some();
+            && pane::margin_width(size.width, kept(size.width)).is_some();
         self.fold_notes(beside);
         let below = VIEWPORT - 2 + live_rows + composer_rows.len() as u16;
         let workspace = std::path::PathBuf::from(&self.workspace);
@@ -11468,7 +11483,7 @@ impl App {
         {
             let wide = match chat.width {
                 0 => size.width,
-                _ => pane::width(size.width, measure() as u16 + GUTTER),
+                _ => pane::width(size.width, kept(size.width)),
             };
             // The sky fills the pane, however wide; the other cards are
             // prose, read at the conversation's measure.
@@ -12399,7 +12414,7 @@ impl App {
         }
         // The pane folded away where the window has room for one of the
         // two: its key and its name, a click flipping over to it.
-        let room = pane::width(self.full_width, measure() as u16 + GUTTER);
+        let room = pane::width(self.full_width, kept(self.full_width));
         if let Some(open) = &self.pane
             && !open.is_margin()
             && !self.pane_keys
@@ -18580,15 +18595,32 @@ mod tests {
         let wide = measure_of(140) as u16 + GUTTER;
         assert_eq!(pane::margin_width(300, wide), Some(157));
         assert_eq!(pane::width(160, wide), 160);
-        // The window's whole width: no window has room for a pane beside
-        // it, so one opens over it, and a column added to it still fits.
-        let whole = measure_of(0);
-        assert!(whole >= u16::MAX as usize / 2);
-        let whole = whole as u16 + GUTTER;
-        for window in [80, 400, 2_000] {
-            assert_eq!(pane::margin_width(window, whole), None);
-            assert_eq!(pane::width(window, whole), window);
-        }
+        // The window's whole width, wider than any window and a column
+        // added to it still fits.
+        assert_eq!(measure_of(0), WHOLE);
+        assert!(WHOLE >= u16::MAX as usize / 2 && WHOLE as u16 + GUTTER > WHOLE as u16);
+    }
+
+    #[test]
+    fn a_conversation_that_fills_the_window_shares_it_evenly_with_the_pane() {
+        // What `split` lays out: the pane's columns, its line among them,
+        // and the conversation's, short of its gutter.
+        let split = |window: u16| {
+            let pane = pane::width(window, kept_at(window, WHOLE));
+            match pane == window {
+                true => None,
+                false => Some(((window - pane - 1).saturating_sub(GUTTER), pane - 1)),
+            }
+        };
+        // Half each, the line and its gutters between them.
+        assert_eq!(split(170), Some((83, 83)));
+        assert_eq!(split(400), Some((198, 198)));
+        // Too narrow for two halves of the margin's least, one at a time.
+        assert_eq!(split(82), Some((39, 39)));
+        assert_eq!(split(81), Some((38, 39)));
+        assert_eq!(split(80), None);
+        // A measure of its own is kept as before.
+        assert_eq!(kept_at(170, 100), 102);
     }
 
     #[tokio::test]
