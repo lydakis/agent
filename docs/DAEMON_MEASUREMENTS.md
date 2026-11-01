@@ -6874,8 +6874,15 @@ of such a statement parsed and planned it again. `history_items` read
 each item that way: 384 of 384 calls planned again, at about half a
 millisecond each for its picture-stripping query. Both store connections
 now turn on SQLite's query planner stability guarantee (QPSG), so a plan
-no longer depends on bound values. The store never runs ANALYZE, so a
-bound value had no statistics to improve a plan with.
+no longer depends on bound values. The store never runs ANALYZE, so no
+statistics could make a plan better for one value than another.
+
+One plan did read a value: a GLOB pattern's literal prefix (`lead-*`)
+bounded the name index, in `list`, history search and `usage`. Those
+queries now write the bound out, `name >= prefix AND name < prefix ||
+x'ff'`, so the plan keeps the range whatever the planner reads. On
+100,010 names, a `m-*` page of five took 200,046 VM steps under the
+guarantee without the bound, and 65 with it, against 47 before.
 
 `bench.lifecycle` at concurrency 32 (three turns, 384 `history_items`
 calls), timing each request from the client. Three runs each, alternated

@@ -1524,14 +1524,25 @@ pub struct TurnContext {
 /// each for the ones in use.
 const STATEMENTS: usize = 256;
 /// Plans that don't depend on bound values: SQLite's query planner
-/// stability guarantee. The store never runs ANALYZE, so a bound value
-/// can't improve a plan. Without it, SQLite 3.54 marks a join with an
-/// `x = ?` term to be planned again once its bindings are cleared, which
-/// the statement cache does each time a statement goes back: every reuse
-/// parsed the statement again, half a millisecond for `history_items`.
+/// stability guarantee. The store never runs ANALYZE, so no statistics
+/// could make a plan better for one value than another. Without it, SQLite
+/// 3.54 marks a join with an `x = ?` term to be planned again once its
+/// bindings are cleared, which the statement cache does each time a
+/// statement goes back: every reuse parsed the statement again, half a
+/// millisecond for `history_items`. The one plan that did read a value,
+/// a GLOB pattern's literal prefix bounding an index, is written out where
+/// a name is matched (`glob_prefix`).
 fn plan_stably(conn: &Connection) -> Result<()> {
     conn.set_db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_QPSG, true)?;
     Ok(())
+}
+/// The literal start of a GLOB pattern, before its first `*`, `?` or `[`:
+/// every name the pattern matches begins with it. A query bounds the name
+/// index with it, `name >= prefix AND name < prefix || x'ff'` (no UTF-8
+/// text holds the byte 0xff), as SQLite's own prefix optimization does
+/// when plans may read bound values.
+fn glob_prefix(pattern: &str) -> &str {
+    &pattern[..pattern.find(['*', '?', '[']).unwrap_or(pattern.len())]
 }
 pub struct Database {
     conn: Connection,
@@ -2883,12 +2894,18 @@ impl Database {
         }
         let after = after.unwrap_or("");
         let limit_rows = (limit + 1) as i64;
+        let prefix = name.map(glob_prefix);
         // Fixed numbers, so bench.query_plans plans every variant: a
-        // maker without a name binds ?3 as NULL, which nothing reads.
-        let glob = if name.is_some() {
-            " AND name GLOB ?3"
+        // maker without a name binds ?3 as NULL, and a name without a
+        // maker ?4, which nothing reads. A name filter starts the page at
+        // its prefix or just past `after`, whichever is later, and ends it
+        // where the prefix does: `after || char(1)` is the least name past
+        // `after`, since no name holds a byte below '-'. One bound each
+        // way, so the index range is the same whichever the planner reads.
+        let from = if name.is_some() {
+            "name >= max(?1 || char(1), ?5) AND name < ?5 || CAST(x'ff' AS TEXT) AND name GLOB ?3"
         } else {
-            ""
+            "name > ?1"
         };
         let maker = if created_by.is_some() {
             " AND created_by_id = ?4"
@@ -2898,9 +2915,10 @@ impl Database {
         let mut values: Vec<&dyn rusqlite::ToSql> = vec![&after, &limit_rows];
         if name.is_some() || created_by.is_some() {
             values.push(&name);
-        }
-        if created_by.is_some() {
             values.push(&created_by);
+        }
+        if name.is_some() {
+            values.push(&prefix);
         }
         let running = if active {
             " AND running_turn IS NOT NULL"
@@ -2910,7 +2928,7 @@ impl Database {
         let mut statement = self.conn.prepare_cached(&format!(
             "SELECT name,head,workspace,status,running_turn,provider,family,model,reasoning,budget_tokens,tokens_used,tools,
                     input_tokens,cached_input_tokens,id,created_by,created_by_id,gates,allowed,expire_ms,expires_at
-             FROM bots WHERE name > ?1{glob}{maker}{running} ORDER BY name LIMIT ?2"
+             FROM bots WHERE {from}{maker}{running} ORDER BY name LIMIT ?2"
         ))?;
         let mut rows = statement.query(values.as_slice())?;
         let mut bots = Vec::new();
@@ -5385,10 +5403,13 @@ impl Database {
         let bots: Vec<(String, i64)> = self
             .conn
             .prepare_cached(
-                "SELECT name,head FROM bots WHERE name GLOB ?1 AND head IS NOT NULL
-                    AND status!='deleting' ORDER BY id",
+                "SELECT name,head FROM bots WHERE name GLOB ?1
+                    AND name >= ?2 AND name < ?2 || CAST(x'ff' AS TEXT)
+                    AND head IS NOT NULL AND status!='deleting' ORDER BY id",
             )?
-            .query_map([pattern], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .query_map([pattern, glob_prefix(pattern)], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })?
             .collect::<rusqlite::Result<_>>()?;
         #[derive(Clone, Copy)]
         struct Node {
@@ -10845,7 +10866,7 @@ impl Database {
             }
         }
         let glob = match name {
-            Some(_) => " AND t.bot GLOB ?3",
+            Some(_) => " AND t.bot GLOB ?3 AND t.bot >= ?4 AND t.bot < ?4 || CAST(x'ff' AS TEXT)",
             None => "",
         };
         let mut statement = self.conn.prepare_cached(&format!(
@@ -10857,7 +10878,9 @@ impl Database {
         ))?;
         let width = bucket_ms.unwrap_or(i64::MAX);
         let mut rows = match name {
-            Some(pattern) => statement.query(params![since_ms, width, pattern])?,
+            Some(pattern) => {
+                statement.query(params![since_ms, width, pattern, glob_prefix(pattern)])?
+            }
             None => statement.query(params![since_ms, width])?,
         };
         let mut total = Spent::default();
