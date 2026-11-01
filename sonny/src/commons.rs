@@ -908,6 +908,24 @@ pub fn audience(home: &Path, thread: &str, author: &str) -> usize {
         .map_or(0, |by| by.keys().filter(|bot| *bot != author).count())
 }
 
+/// Who started `thread`, and their bot id when the post kept one: who
+/// its invites come from. Its first line only, which never changes, so a
+/// later post never renames it and a long thread costs no more than a
+/// short one. None for no such thread.
+pub fn starter(home: &Path, thread: &str) -> Option<(String, Option<i64>)> {
+    use std::io::{BufRead, Read};
+    valid_name(thread).ok()?;
+    let file = std::fs::File::open(dir(home).join(format!("{thread}.jsonl"))).ok()?;
+    let mut first = String::new();
+    // A post is a line; one past a megabyte is no post the tool wrote.
+    std::io::BufReader::new(file.take(1 << 20))
+        .read_line(&mut first)
+        .ok()?;
+    let post: Value = serde_json::from_str(first.trim()).ok()?;
+    let by = post["by"].as_str()?.to_owned();
+    Some((by, post["by_id"].as_i64()))
+}
+
 /// A thread as the tool shows it, read by no one yet.
 fn thread(dir: &Path, name: &str) -> Result<Value, String> {
     valid_name(name)?;
@@ -1624,6 +1642,28 @@ mod tests {
         assert_eq!(news(&home, &cursor).lines, lost);
         assert_eq!(look(&home, &cursor), lost);
         assert!(look(&home, &cursor).is_empty());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_thread_s_starter_stays_its_starter_whoever_replies() {
+        let home = home("starter");
+        let post = |by: &str, id: i64, arguments: Value| {
+            call(&home, by, Some(id), None, &arguments).unwrap()
+        };
+        post(
+            "a.x",
+            4,
+            json!({"post": {"name": "plan", "title": "The plan", "text": "first"}}),
+        );
+        post(
+            "b.y",
+            5,
+            json!({"reply": {"thread": "plan", "text": "second"}}),
+        );
+        assert_eq!(starter(&home, "plan"), Some(("a.x".into(), Some(4))));
+        assert_eq!(starter(&home, "nothing"), None);
+        assert_eq!(starter(&home, "../escape"), None);
         let _ = std::fs::remove_dir_all(&home);
     }
 

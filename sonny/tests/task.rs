@@ -178,6 +178,18 @@ impl Lab {
         self.scratch.join("state.sqlite")
     }
 
+    /// The profile Sonny noted the task `task` started as, beside the
+    /// store.
+    fn profile(&self, task: &str) -> Option<String> {
+        let store = std::fs::canonicalize(&self.scratch)
+            .unwrap()
+            .join("state.sqlite");
+        let file = PathBuf::from(format!("{}.profiles", store.display())).join(task);
+        std::fs::read_to_string(file)
+            .ok()
+            .map(|text| text.trim().to_owned())
+    }
+
     /// Where the store's snapshots are kept: under the FNV-1a hash of its
     /// path, as snapshot.rs names it.
     fn refs(&self) -> String {
@@ -235,6 +247,9 @@ fn a_task_starts_in_a_worktree_of_its_own_by_default() {
         lab.git(&worktree, &["branch", "--show-current"]),
         "agent/demo.fix"
     );
+    // Noted as running what the project tells every task, for /status
+    // and the footer, which nothing the daemon keeps names.
+    assert_eq!(lab.profile("demo.fix").as_deref(), Some("task"));
 }
 
 #[test]
@@ -910,6 +925,7 @@ fn a_task_given_a_repository_in_the_lead_s_folder_gets_a_worktree_of_it() {
     let told = lab.ran().join("\n");
     assert!(told.contains("Work as the workspace's worker."), "{told}");
     assert!(told.contains("Build with the workspace tool."), "{told}");
+    assert_eq!(lab.profile("demo.role").as_deref(), Some("worker"));
     let (ok, err) = lab.tool(
         &ws,
         "remove_task",

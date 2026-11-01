@@ -238,7 +238,9 @@ any of its items does. A value is a string, number, boolean or null to
 equal, or `{"prefix": S}`, `{"suffix": S}`, `{"wildcard": S}` (`*` any run
 of characters), `{"equals-ignore-case": S}`, `{"anything-but": V}` (a
 value, a list of them, or one of the string matchers), `{"numeric": [">",
-0, "<=", 5]}` or `{"exists": true}` / `{"exists": false}`. `"$or": [P1,
+0, "<=", 5]}` (whole numbers compared exactly, past the 2^53 a float
+holds, as sequence IDs and nanosecond times run) or `{"exists": true}` /
+`{"exists": false}`. `"$or": [P1,
 P2]` beside the fields takes either pattern. A plain-text line is the
 event `{"text": LINE}`. A filter is at most 4 KiB, 256 values and 6 levels
 deep; nothing in it runs, and it only ever narrows what is heard.
@@ -248,9 +250,17 @@ for the subscriber, so an event no subscription hears wakes no one.
 
 So an agent knows what it may filter on, the lookout keeps each source's
 shape: the fields its last 200 events had (an object's own fields named
-with dots, as `meta.team`), their kinds and a recent example, in
-`STORE.sources/.shapes/NAME.json`. Every `subscriptions` call's answer
-lists the sources under `sources`, each with its shape:
+with dots, as `meta.team`), their kinds, and its last 8 events cut short
+(strings at 120 characters, lists at 8 items), in
+`STORE.sources/.shapes/NAME.json`, written by a thread of its own so a
+source whose fields keep changing never holds up the lookout. Every
+`subscriptions` call's answer lists the sources under `sources`, each
+with its shape. A field shows an example only from the newest of those
+events one of the caller's subscriptions hears, by source, topic and
+filter (a filter is not trusted with an event that was cut), so no agent
+reads a post from a thread or filter it does not follow; when any example
+shows, `examples` says they come from outside, as a note from sources
+does:
 
 ```
 {"name": "cr", "events": 41, "fields": {"author": "string, as \"ana\"", "paths": "list of strings, as [\"src/billing/tax.rs\"]", "text": "string, as \"CR-12: tidy…\""}}
