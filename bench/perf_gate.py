@@ -68,7 +68,8 @@ TIMINGS = {
               ('quiet window reads, KiB/s', lambda r: r['window']['read_kib_per_s']),
               ('quiet window requests, /s', lambda r: r['window']['requests_per_s']),
               ('quiet window RSS, MiB', lambda r: r['window']['peak_rss_mib']),
-              ('sky replay CPU, s', lambda r: r['sky']['cpu_s']),
+              # Per line the daemon sent, as its hour differs with its speed.
+              ('sky replay CPU per 1k lines, ms', lambda r: r['sky']['cpu_ms_per_1k_lines']),
               ('sky replay RSS, MiB', lambda r: r['sky']['peak_rss_mib'])],
     'lifecycle': [('CPU, s', lambda r: r['target_observed_cpu_seconds']),
                   ('p95 turn, ms', lambda r: r['turn_ms']['p95']),

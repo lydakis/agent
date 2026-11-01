@@ -42,11 +42,11 @@ from bench.lookout_scale import Bench, Sampler, cpu_seconds
 
 class Tap:
     """A socket in front of the daemon's that counts what its clients ask
-    for, by op, and the bytes the daemon sends back."""
+    for, by op, and the bytes and lines the daemon sends back."""
 
     def __init__(self, daemon, path):
         self.daemon, self.path = str(daemon), str(path)
-        self.ops, self.sent, self.read = {}, 0, 0
+        self.ops, self.sent, self.read, self.lines = {}, 0, 0, 0
         self.ready = threading.Event()
         self.loop = asyncio.new_event_loop()
         threading.Thread(target=self.serve, daemon=True).start()
@@ -70,6 +70,7 @@ class Tap:
                                 log.write(line.decode(errors='replace')[:300])
                     else:
                         self.read += len(line)
+                        self.lines += 1
                     writer.write(line)
                     await writer.drain()
             except (ConnectionError, asyncio.LimitOverrunError, ValueError):
@@ -250,10 +251,13 @@ def window(args, bench):
 
 def sky(args, bench):
     """`sonny sky --replay 1h` over everything the fleet said, at its
-    fastest speed (512x), until the replay has played the whole hour."""
-    env = {**bench.env, 'TERM': 'xterm-256color'}
+    fastest speed (512x), until the replay has played the whole hour.
+    The fleet's hour differs as fast as the daemon ran it, so its cost is
+    per thousand lines the daemon sent: each event is one."""
+    tap = Tap(bench.socket, bench.tmp / 'sky-tap.sock')
+    env = {**bench.env, 'TERM': 'xterm-256color', 'AGENT_SOCKET': str(tap.path)}
     screen = Screen([str(bench.sonny), 'sky', '--replay', '1h', '--store', str(bench.store),
-                     '--socket', str(bench.socket)], env, bench.out, columns=160, rows=48)
+                     '--socket', tap.path], env, bench.out, columns=160, rows=48)
     try:
         sampler = Sampler(screen.pid)
         # The replay's footer says it is reading until the hour is in.
@@ -269,7 +273,11 @@ def sky(args, bench):
         stats = sampler.done()
         screen.check('during the replay')
         (bench.out / 'sky.screen').write_text('\n'.join(screen.shown()))
-        return {'cpu_s': stats['cpu_s'], 'peak_rss_mib': stats['peak_rss_mib'],
+        lines = tap.lines
+        if not lines:
+            raise RuntimeError('the replay read nothing from the daemon')
+        return {'cpu_s': stats['cpu_s'], 'peak_rss_mib': stats['peak_rss_mib'], 'lines': lines,
+                'cpu_ms_per_1k_lines': round(1000 * stats['cpu_s'] / lines * 1000, 2),
                 'seconds': stats['seconds'], 'ready_s': ready, 'played_s': played,
                 'drawn_kib': round(screen.drawn / 1024, 1)}
     finally:
