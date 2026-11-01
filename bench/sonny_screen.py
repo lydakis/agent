@@ -11,8 +11,9 @@ Sonny's three paths that grow with the fleet:
   fleet's tasks run turns it has nothing to do with. Its CPU, its RSS, and
   what it asks the daemon for and reads back, counted on a socket that
   passes everything through to the daemon.
-- sky: `sonny sky --replay 1h` over everything the fleet said, played at
-  its fastest speed until the whole hour has played: its CPU and RSS.
+- sky: `sonny sky --replay 1h` over everything the fleet said, from its
+  start, through reading the hour in, to its fastest speed catching up
+  with now: its CPU and RSS.
 
 A bench that times Sonny on a shared runner only warns; bench.perf_gate
 compares two of these runs.
@@ -33,6 +34,8 @@ import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
+
+import pyte
 
 from bench.lookout_scale import Bench, Sampler, cpu_seconds
 
@@ -89,6 +92,14 @@ class Tap:
         return dict(self.ops), self.sent, self.read
 
 
+class Terminal(pyte.Screen):
+    """pyte's screen, taking the private status queries Sonny's terminal
+    library asks as it starts; nothing is answered, as before."""
+
+    def report_device_status(self, *args, **kwargs):
+        pass
+
+
 class Screen:
     """A program in a pseudo-terminal of a fixed size, its output drained
     and counted so it never blocks on a full terminal."""
@@ -100,6 +111,9 @@ class Screen:
             os.execve(argv[0], argv, env)
         fcntl.ioctl(self.fd, termios.TIOCSWINSZ, struct.pack('HHHH', rows, columns, 0, 0))
         self.drawn, self.last = 0, b''
+        # What the terminal shows, for waiting on what the program says.
+        self.screen = Terminal(columns, rows)
+        self.stream, self.lock = pyte.ByteStream(self.screen), threading.Lock()
         threading.Thread(target=self.drain, daemon=True).start()
 
     def drain(self):
@@ -112,6 +126,27 @@ class Screen:
                 return
             self.drawn += len(chunk)
             self.last = (self.last + chunk)[-4096:]
+            with self.lock:
+                try:
+                    self.stream.feed(chunk)
+                except Exception:  # noqa: BLE001 - a sequence pyte cannot take
+                    # Never stop draining: start reading the screen afresh.
+                    self.stream = pyte.ByteStream(self.screen)
+
+    def shown(self):
+        with self.lock:
+            return list(self.screen.display)
+
+    def wait(self, what, until, limit):
+        """Seconds until a line on the screen satisfies `until`; past
+        `limit`, or once the program exits, the run is refused."""
+        started = time.monotonic()
+        while time.monotonic() - started < limit:
+            if any(until(line) for line in self.shown()):
+                return round(time.monotonic() - started, 2)
+            self.check(f'waiting for {what}', drawn=False)
+            time.sleep(.05)
+        raise RuntimeError(f'no {what} in {limit} s; the screen:\n' + '\n'.join(self.shown()))
 
     def settle(self, quiet=.02, limit=120):
         """Seconds until a half-second passes with under `quiet` CPU seconds."""
@@ -124,14 +159,14 @@ class Screen:
             last = now
         return round(time.monotonic() - started - .5, 2)
 
-    def check(self, when):
+    def check(self, when, drawn=True):
         """Refuse the run unless the program is still up and has drawn:
         an exited window costs nothing and would read as a fast one."""
         try:
             ended = os.waitpid(self.pid, os.WNOHANG)[0]
         except ChildProcessError:
             ended = True
-        if ended or not self.drawn:
+        if ended or (drawn and not self.drawn):
             tail = self.last[-600:].decode(errors='replace')
             state = 'exited' if ended else 'drew nothing'
             raise RuntimeError(f'{state} {when}; last of its screen:\n{tail}')
@@ -221,18 +256,22 @@ def sky(args, bench):
                      '--socket', str(bench.socket)], env, bench.out, columns=160, rows=48)
     try:
         sampler = Sampler(screen.pid)
-        time.sleep(1)
-        screen.check('as the replay opened')
+        # The replay's footer says it is reading until the hour is in.
+        ready = screen.wait('replay ready', lambda line: 'replay' in line and '×' in line, 600)
         # 8x, doubled six times.
         for _ in range(6):
             os.write(screen.fd, b']')
             time.sleep(.05)
-        time.sleep(3600 / 512 + 2)
+        # It played the whole hour once, at 512x, it has caught up with now.
+        played = screen.wait('replay caught up',
+                             lambda line: '512×  now' in line,
+                             3600 / 512 * 4 + 60)
         stats = sampler.done()
         screen.check('during the replay')
-        (bench.out / 'sky.screen').write_bytes(screen.last)
+        (bench.out / 'sky.screen').write_text('\n'.join(screen.shown()))
         return {'cpu_s': stats['cpu_s'], 'peak_rss_mib': stats['peak_rss_mib'],
-                'seconds': stats['seconds'], 'drawn_kib': round(screen.drawn / 1024, 1)}
+                'seconds': stats['seconds'], 'ready_s': ready, 'played_s': played,
+                'drawn_kib': round(screen.drawn / 1024, 1)}
     finally:
         screen.close()
 
