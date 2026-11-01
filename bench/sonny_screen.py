@@ -220,6 +220,7 @@ def lookout(args, shape, out):
         'note_delay_ms_p95': notes['delay_ms_p95'], 'note_submit_ms_p95': notes['submit_ms_p95'],
         'reply_read_ms_p95': notes['read_ms_p95'], 'notes': notes['notes'],
         'told': notes['told'], 'untold': notes['untold'],
+        'notes_delivered': notes['notes_delivered'], 'notes_undelivered': notes['notes_undelivered'],
         'oldest_untold_ms': notes['oldest_untold_ms'], 'turns_ended': notes['turns_ended'],
         'told_share': round(notes['told'] / notes['turns_ended'], 3) if notes['turns_ended'] else None})
     return bench, result

@@ -429,13 +429,22 @@ class Bench:
             for turn in reply.get('result', {}).get('turns', []):
                 if turn.get('finished_ms') and turn['finished_ms'] >= since_ms:
                     ended[(task, turn['turn'])] = turn['finished_ms']
-        started = {}
+        # When each note reached its lead: its own turn starting, or, for a
+        # note a busy lead took into its running turn (a steer, or an attach
+        # its next message carried), the moment that turn absorbed it.
+        started, delivered = {}, {'turn': 0, 'steered': 0}
         leads = self.leads()
         for lead, reply in zip(leads, self.control.many(
                 [('turns', {'bot': l, 'limit': 256, 'newest': True}) for l in leads])):
             for turn in reply.get('result', {}).get('turns', []):
-                if str(turn.get('request_id', '')).startswith('lookout-') and turn.get('started_ms'):
+                if not str(turn.get('request_id', '')).startswith('lookout-'):
+                    continue
+                if turn.get('status') == 'steered' and turn.get('finished_ms'):
+                    started[(lead, turn['request_id'])] = turn['finished_ms']
+                    delivered['steered'] += 1
+                elif turn.get('started_ms'):
                     started[(lead, turn['request_id'])] = turn['started_ms']
+                    delivered['turn'] += 1
         # Each task's notes, oldest first: when sent, the newest turn named.
         named = {}
         notes = [line for line in self.log_lines() if isinstance(line.get('woke'), list)]
@@ -471,7 +480,10 @@ class Bench:
         return {'leads': len(leads), 'tasks': len(tasks), 'tasks_per_lead': self.args.tasks,
                 'turns_ended': len(ended), 'told': len(sent), 'untold': len(untold),
                 'oldest_untold_ms': now - min(untold) if untold else None,
-                'notes': len(notes),
+                'notes': len(notes), 'notes_delivered': delivered,
+                'notes_undelivered': sum(
+                    (note['lead'], note.get('request_id') or f"lookout-{fnv(','.join(note['woke']))}")
+                    not in started for note in notes),
                 'submit_ms_p50': pct(sent, .5), 'submit_ms_p95': pct(sent, .95),
                 'delay_ms_p50': pct(begun, .5), 'delay_ms_p95': pct(begun, .95),
                 'delay_ms_max': max(begun) if begun else None,

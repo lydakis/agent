@@ -6843,8 +6843,12 @@ The screen is repaired too. Shapes are leads × tasks per lead (`10x100` is
 ten leads of a hundred tasks), and the load is a fixed number of rounds
 (every task one turn each), so both builds face the same turns. A turn
 counts as told by the first note at or after its end that names its task
-at that turn or later, read from the lookout's own log. The gate now fails
-a head that leaves turns untold where its base told them all.
+at that turn or later, read from the lookout's own log. A note reaches
+its lead when its own turn starts or, for a note a busy lead took into its
+running turn (a steer, or an attach its next message carried), when that
+turn absorbed it; the screen reports how many notes went each way and how
+many never reached their lead. The gate now fails a head that leaves turns
+untold where its base told them all.
 
 One 4-CPU box, base `main` against this branch, four rounds of 1,000
 turns each:
@@ -6857,3 +6861,5 @@ turns each:
 | 100 × 10 | head | 3.7 | 0 | 400 | 17.8 | |
 
 What it costs: reading concurrently takes more of the daemon. In a second pair of runs split by thread, the readers took 6.9 s on base and 13.4 s on head, and the storage writer took 9.6 s and 12.8 s. That stretched the tasks' own rounds by about 45% on this CPU-bound box, where the synthetic model streams from the same four CPUs; real tasks mostly wait on their model. A build of the head with one connection (cap and settle changes kept) sat between the two: p95 13.4 s and 20.9 s of daemon CPU. The pool is what brings the notes in on time.
+
+A rerun on today's `main` with the delivery count (same shapes, four rounds) told all 4,000 turns in each shape, with note p95 2.9 s at 10 × 100 and 4.2 s at 100 × 10. Every note reached its lead, all of them as a turn of their own: the screen's leads are idle between notes, so none was absorbed.
