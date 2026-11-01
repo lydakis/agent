@@ -699,7 +699,8 @@ pub enum Whole<'a> {
 /// Answer the `exec` call `bot` of another machine made over a link, as
 /// `answer` does, with the whole of an output cut to its budget handed
 /// back with the answer, for that machine to save as `named`, since no
-/// file here is that agent's.
+/// file here is that agent's. What it stores is kept under `space`, a
+/// folder of its own apart from this machine's agents.
 pub async fn lent(
     hub: &Hub,
     bot: &str,
@@ -707,6 +708,7 @@ pub async fn lent(
     left: Duration,
     steps: Steps,
     named: Option<&Path>,
+    space: &Path,
 ) -> Result<Value, String> {
     let servers = agent_client::config::load()?.sonny.mcp_servers;
     hub.configure(&servers).await;
@@ -715,7 +717,7 @@ pub async fn lent(
         Some(named) => Whole::Sent(named, &cut),
         None => Whole::Saved(None),
     };
-    let dir = home_dir();
+    let dir = home_dir().map(|dir| dir.join("linked").join(space));
     let answer = run_keeping(hub, dir.as_deref(), &whole, bot, input, left, Some(steps)).await?;
     Ok(json!({"answer": answer, "whole": cut.into_inner().unwrap()}))
 }

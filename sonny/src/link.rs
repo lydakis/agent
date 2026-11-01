@@ -1046,7 +1046,13 @@ async fn lend(
             let input = payload["input"].as_str().unwrap_or_default();
             let bot = format!("{key}.{}", payload["bot"].as_str().unwrap_or_default());
             let named = payload["whole"].as_str().map(Path::new);
-            crate::exec::lent(hub, &bot, input, left, steps, named)
+            // Kept apart from this machine's agents, and by the store there
+            // too, since two stores may each have an agent of one name.
+            let store: String = (payload["store"].as_str().unwrap_or_default().chars())
+                .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+                .collect();
+            let space = Path::new(key).join(store);
+            crate::exec::lent(hub, &bot, input, left, steps, named, &space)
                 .await
                 .map_err(|e| ("exec_refused", e))
         }

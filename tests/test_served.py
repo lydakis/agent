@@ -823,6 +823,11 @@ os.execvpe('sh', ['sh', '-c', command], {{**os.environ, 'HOME': {json.dumps(str(
         self.assertTrue(whole.is_relative_to(self.path / '.agent/sonny/exec/output'), whole)
         self.assertIn('line 25', whole.read_text())
         self.assertFalse((laptop / '.agent/sonny/exec/output').exists())
+        # What it stores there is its own, apart from the laptop's agents.
+        self.call('calc.lead', 'exec', '// @exec: {"machine": "laptop"}\nstore("k", 1);', wait=30)
+        kept = list((laptop / '.agent/sonny/exec/linked/box').glob('*/store/box.calc.lead.json'))
+        self.assertEqual(len(kept), 1, list((laptop / '.agent/sonny/exec').rglob('*')))
+        self.assertFalse((laptop / '.agent/sonny/exec/store').exists())
         unknown = json.loads(self.call('calc.lead', 'exec', '// @exec: {"machine": "pc"}\ntext(1);'))
         self.assertEqual(unknown['error'], 'no_machine')
         self.assertIn('only laptop', unknown['detail'])
