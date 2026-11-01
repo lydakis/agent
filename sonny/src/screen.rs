@@ -1614,9 +1614,10 @@ impl Screen {
     }
 
     /// Where the react mark of the agent's message `hovered` goes, as a
-    /// row in `shown` and a column: after the reactions under it when it
-    /// has some; else at their place on the blank row under it; else, with
-    /// no such row in the conversation yet, after its last words.
+    /// row in `shown` and a column: a space past the pill of its reactions
+    /// when it has some; else on the blank row under it, in the column a
+    /// first reaction's emoji takes inside its pill; else, with no such row
+    /// in the conversation yet, after its last words.
     fn react_spot(&self, hovered: &Hovered) -> Option<(usize, usize)> {
         let first = |row: usize| {
             (self.shown.iter().enumerate())
@@ -1636,7 +1637,7 @@ impl Screen {
                 Some((at, self.shown[at].line.width() + 1))
             }
             Some(row) if row.tag.is_none() && row.line.width() == 0 => {
-                Some((first(hovered.end + 1)?, 2))
+                Some((first(hovered.end + 1)?, 3))
             }
             Some(_) => None,
             // The last row: its last shown line, past its words.
@@ -2306,14 +2307,14 @@ mod tests {
         // its reactions would go.
         screen.mouse(mouse(MouseEventKind::Moved, 6, 0));
         let buf = draw(&mut screen);
-        assert_eq!(row(&buf, 2).trim_end(), format!("  {REACT}"));
+        assert_eq!(row(&buf, 2).trim_end(), format!("   {REACT}"));
         // The mouse on its way down to it keeps it there, and a click
         // picks the message.
-        screen.mouse(mouse(MouseEventKind::Moved, 2, 2));
+        screen.mouse(mouse(MouseEventKind::Moved, 3, 2));
         let buf = draw(&mut screen);
         assert!(row(&buf, 2).contains(REACT));
         assert_eq!(
-            screen.mouse(mouse(MouseEventKind::Down(MouseButton::Left), 2, 2)),
+            screen.mouse(mouse(MouseEventKind::Down(MouseButton::Left), 3, 2)),
             Some(Action::Open(format!("{BUTTON}react/5")))
         );
         // The person's own message gets the reply mark only.
@@ -2338,6 +2339,7 @@ mod tests {
             under.contains('👍') && under.trim_end().ends_with(REACT),
             "{under:?}"
         );
+        // A space past the pill.
         assert_eq!(buf[(7, 2)].symbol(), REACT);
         // The reactions row is the message's too.
         screen.mouse(mouse(MouseEventKind::Moved, 1, 2));
