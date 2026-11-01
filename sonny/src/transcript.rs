@@ -1207,6 +1207,7 @@ pub fn from_outside(origin: Option<&str>) -> &'static str {
         Some("margin") => "a margin note",
         Some("tasks") => "a task",
         Some("judge") => "a judge",
+        Some("background") => "a background command",
         _ => "outside",
     }
 }

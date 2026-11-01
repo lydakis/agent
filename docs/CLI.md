@@ -208,7 +208,7 @@ identity is `bot_not_found`.
   `--note-turns`, `--compact-at`, `--compact-keep`, `--compact-tokens`, `--keep-turns`,
   `--approval-hold`, `--max-output-tokens`, `--keep-warm`, `--cache-ttl`,
   `--sandbox`, `--writable` (repeatable, made absolute from the current
-  folder), `--network`, `--hide-senders`, `--unix-socket` (repeatable: an
+  folder), `--network`, `--hide-senders`, `--quiet-background`, `--unix-socket` (repeatable: an
   absolute socket, or folder of them, its commands reach) and `--outputs` (made absolute; a new
   bot gets `outputs` beside the store without it); they are not daemon options,
   and an existing bot keeps its own (see [bot settings](RUST_PROTOTYPE.md#bot-settings)).
