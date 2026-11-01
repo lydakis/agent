@@ -524,7 +524,10 @@ way `/react` does, and each note in the margin has its own `↩`.
   `judge.model`, the profiles), empty for its default; ⌫
   takes a key back to its default. Each change is written at once, the
   file's comments and order kept, and a file that does not read is
-  refused by name, as every reader refuses it.
+  refused by name, as every reader refuses it. What the file gives an
+  agent when it is made, its model's `[fallbacks]` entry and `senders`,
+  every agent Sonny made takes within seconds of the file changing, or,
+  at work, once its turn ends.
 
   ![/config over the composer, side_chat set to fork](../docs/sonny/config.png)
 - `/model` picks the lead's model, from every model its provider family

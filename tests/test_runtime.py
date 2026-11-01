@@ -1135,9 +1135,9 @@ class AnthropicRuntimeTests(unittest.TestCase):
     def test_configure_moves_a_bot_to_the_hour_long_cache(self):
         client, model, path = self.start()
         client.request('create', bot='Bob', workspace=str(path), effort='low')
-        moved = client.request('configure', bot='Bob', cache_ttl='1h')['result']
+        moved = client.request('configure', bot='Bob', settings={'cache_ttl': '1h'})['result']
         self.assertEqual(moved['changed'], ['cache_ttl'])
-        self.assertEqual(client.request('configure', bot='Bob', cache_ttl='1h')['result']['changed'], [])
+        self.assertEqual(client.request('configure', bot='Bob', settings={'cache_ttl': '1h'})['result']['changed'], [])
         self.assertEqual(client.request('inspect', bot='Bob')['result']['settings']['cache_ttl'], '1h')
         # Its next call marks the cache for an hour.
         model.cache_control = {'type': 'ephemeral', 'ttl': '1h'}
@@ -1149,16 +1149,16 @@ class AnthropicRuntimeTests(unittest.TestCase):
         client.request('create', bot='Bob', workspace=str(path), effort='low')
         self.assertEqual(client.request('inspect', bot='Bob')['result']['settings']['speed'], 'standard')
         # The Claude API serves fast alone; the refusal names what it serves.
-        refused = client.request('configure', bot='Bob', speed='ultrafast')
+        refused = client.request('configure', bot='Bob', settings={'speed': 'ultrafast'})
         self.assertEqual(refused['error'], 'invalid_speed')
         self.assertEqual(refused['speeds'], ['fast'])
-        self.assertEqual(client.request('configure', bot='Bob', speed='fast')['result']['changed'], ['speed'])
-        self.assertEqual(client.request('configure', bot='Bob', speed='fast')['result']['changed'], [])
+        self.assertEqual(client.request('configure', bot='Bob', settings={'speed': 'fast'})['result']['changed'], ['speed'])
+        self.assertEqual(client.request('configure', bot='Bob', settings={'speed': 'fast'})['result']['changed'], [])
         turn = client.request('submit', bot='Bob', request_id='f1', prompt='hello')['result']['turn']
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
         self.assertEqual(model.requests.get(timeout=5)['speed'], 'fast')
         # Back to standard, its calls name no speed.
-        self.assertEqual(client.request('configure', bot='Bob', speed='standard')['result']['changed'], ['speed'])
+        self.assertEqual(client.request('configure', bot='Bob', settings={'speed': 'standard'})['result']['changed'], ['speed'])
         turn = client.request('submit', bot='Bob', request_id='f2', prompt='hello')['result']['turn']
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
         self.assertNotIn('speed', model.requests.get(timeout=5))
@@ -1257,6 +1257,48 @@ class AnthropicRuntimeTests(unittest.TestCase):
         # A fallback is a known provider's model in the bot's family.
         self.assertEqual(client.request('create', bot='Bad', workspace=str(path),
                                         fallback='openai/x')['error'], 'provider_unavailable')
+
+    def test_configure_takes_every_setting_create_takes(self):
+        client, model, path = self.start()
+        client.request('create', bot='Bob', workspace=str(path), effort='low')
+        configure = lambda **fields: client.request('configure', bot='Bob', **fields)
+        inspect = lambda: client.request('inspect', bot='Bob')['result']
+        # A fallback given later answers the next declined request.
+        self.assertEqual(configure(fallback='anthropic/synthetic-claude-2')['result']['changed'], ['fallback'])
+        turn = client.request('submit', bot='Bob', request_id='f1', prompt='refuse:all')['result']['turn']
+        self.assertEqual(client.finished(turn)['data']['error'], 'provider_refusal')
+        self.assertEqual([model.requests.get(timeout=1)['model'] for _ in range(2)],
+                         ['synthetic-claude', 'synthetic-claude-2'])
+        self.assertEqual(configure(fallback=None)['result']['changed'], ['fallback'])
+        self.assertIsNone(inspect().get('fallback'))
+        self.assertEqual(configure(fallback='openai/x')['error'], 'provider_unavailable')
+        # Compaction, as create takes it, and null takes it away.
+        changed = configure(compaction_instructions='Summarize.',
+                            compaction_model='anthropic/synthetic-claude-2')['result']['changed']
+        self.assertEqual(changed, ['compaction_instructions', 'compaction_model'])
+        self.assertEqual(inspect()['compaction_model'], 'anthropic/synthetic-claude-2')
+        self.assertEqual(configure(compaction_model=None)['result']['changed'], ['compaction_model'])
+        self.assertEqual(configure(compaction_instructions='x' * 65537)['error'], 'instructions_limit')
+        # Settings by create's names: each given replaces, null resets, the rest stay.
+        changed = configure(settings={'context_items': 8, 'keep_turns': 3, 'max_output_tokens': 4096})
+        self.assertEqual(changed['result']['changed'], ['context_items', 'keep_turns', 'max_output_tokens'])
+        settings = inspect()['settings']
+        self.assertEqual((settings['context_items'], settings['keep_turns'], settings['max_output_tokens']),
+                         (8, 3, 4096))
+        self.assertEqual(configure(settings={'keep_turns': None})['result']['changed'], ['keep_turns'])
+        settings = inspect()['settings']
+        self.assertEqual((settings['context_items'], settings.get('keep_turns')), (8, None))
+        self.assertEqual(configure(settings={'context_items': 8})['result']['changed'], [])
+        # Create's checks, before anything is written.
+        for refused in ({'colour': 'red'}, {'compact_keep': 99}, {'context_items': 1}):
+            with self.subTest(settings=refused):
+                self.assertEqual(configure(settings=refused, fallback='anthropic/synthetic-claude-2')['error'],
+                                 'invalid_setting')
+        self.assertIsNone(inspect().get('fallback'))
+        # Its next turn runs with them.
+        turn = client.request('submit', bot='Bob', request_id='f2', prompt='hello')['result']['turn']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        self.assertEqual(model.requests.get(timeout=5)['max_tokens'], 4096)
 
     def test_what_a_declined_request_added_goes_on_as_a_note(self):
         client, model, path = self.start()

@@ -1626,7 +1626,10 @@ async fn setup_lead(
             mode,
             &approvals::gateable(&tools, declared),
         ));
-        fields.extend(approvals::sandbox(mode, Path::new(&workspace)));
+        fields.insert(
+            "settings".into(),
+            Value::Object(approvals::sandbox(mode, Path::new(&workspace))),
+        );
     }
     // A lead at work keeps its setup until the next thread finds it idle.
     if asked.as_object().is_some_and(|fields| fields.len() > 1) {
