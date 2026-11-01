@@ -37,6 +37,7 @@ mod home;
 mod html;
 mod image;
 mod js;
+mod link;
 mod links;
 mod list;
 mod login;
@@ -893,6 +894,7 @@ fn main() -> std::process::ExitCode {
         Some((verb, rest)) if verb == tool_host::NAME => tool_host::run(rest),
         Some((verb, rest)) if verb == "approver" => approver::run(rest),
         Some((verb, rest)) if verb == "mcp" => mcp::cli(rest),
+        Some((verb, rest)) if verb == "link" => link::cli(rest),
         Some((verb, rest)) if verb == "rules" => {
             return std::process::ExitCode::from(rules::cli(rest) as u8);
         }
@@ -1390,8 +1392,18 @@ fn cache_to_take(bot: &Value) -> Option<&'static str> {
 /// print it: a click never does nothing.
 fn open(target: &str) -> Result<(), String> {
     if nowhere_to_open(&|key| std::env::var_os(key), cfg!(target_os = "macos")) {
+        // On a machine linked here that is connected, as the person's Mac.
+        let linked = link::open(target);
+        if linked.is_ok() {
+            return Ok(());
+        }
         term::copy(target);
-        return Err(format!("nothing opens on this machine; copied {target}"));
+        return Err(match linked {
+            Err(why) if link::machines().iter().any(|machine| machine.open) => {
+                format!("{why}; copied {target}")
+            }
+            _ => format!("nothing opens on this machine; copied {target}"),
+        });
     }
     open::that_detached(target).map_err(|error| {
         term::copy(target);

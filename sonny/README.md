@@ -930,6 +930,12 @@ way `/react` does, and each note in the margin has its own `↩`.
   ![An exec call drawn as one line with what its script printed](../docs/sonny/exec-script.png)
 
   ![/mcp in the pane](../docs/sonny/pane-mcp.png)
+- `sonny link HOST`, run on your Mac, lends it to a box's agents over SSH
+  while it is connected: `browser` with `machine: "mac"` drives the Mac's
+  browser signed in as you, an `exec` script whose options line names
+  `mac` runs against the Mac's MCP servers, and a link or picture box Sonny
+  cannot open opens on the Mac. What they ask to confirm is asked in your
+  box window ([docs/SONNY.md](../docs/SONNY.md#links)).
 - Every task works in a git worktree of its own, at the last commit on
   the branch `agent/NAME`, so only the lead works in the folder; outside
   git, tasks work in the lead's folder. The lead starts each task with its

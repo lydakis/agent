@@ -65,6 +65,10 @@
 //! [sonny.mcp_servers.linear]    # an MCP server Sonny's agents reach
 //! url = "https://mcp.linear.app/mcp"
 //! bearer_token_env_var = "LINEAR_TOKEN"
+//! [sonny.links.devbox]          # this machine lends its browser, MCP servers and screen to devbox's agents
+//! host = "me@devbox"            # what ssh dials
+//! machine = "mac"               # what the agents there call this machine, mac by default
+//! browser_profile = "Default"   # the Chrome profile their browser starts from, Default by default; "" a fresh one
 //! [sonny.sources.slack]         # what Sonny's lookout runs for news
 //! command = "~/bin/slack-poll"  # run with sh -c; each line it prints is one event
 //! every = "1m"                  # how long after it exits it runs again
@@ -468,7 +472,31 @@ pub struct Sonny {
     /// The agent-browser action categories that the `browser` tool puts
     /// to the agent's gate before they run.
     pub browser_confirm: Vec<String>,
+    /// The machines this one links to over SSH, by name, whose agents
+    /// may use this machine's browser, MCP servers and screen.
+    pub links: BTreeMap<String, Link>,
 }
+
+/// A link, `[sonny.links.NAME]`: this machine dials `host` over SSH and
+/// answers the browser, `exec` and opens the agents there ask of it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Link {
+    /// What `ssh` dials: an alias from `~/.ssh/config`, or `user@host`.
+    pub host: String,
+    /// What the agents there call this machine, `mac` by default.
+    pub machine: String,
+    /// Sonny on that host, when its login shell does not find `sonny`.
+    pub command: Option<String>,
+    /// The Chrome profile their browser starts from, as agent-browser's
+    /// `--profile` takes it: `Default`, the default, signed in as the
+    /// person is here; empty for a fresh browser.
+    pub browser_profile: String,
+}
+
+/// What the agents over a link call this machine unless it says.
+pub const LINK_MACHINE: &str = "mac";
+/// The Chrome profile a link's browsers start from unless it says.
+pub const LINK_BROWSER_PROFILE: &str = "Default";
 
 /// The agent-browser action categories its `browser` tool confirms unless
 /// the config says otherwise: agent-browser's own destructive ones, and
@@ -532,6 +560,7 @@ impl Default for Sonny {
             agent_opens: AgentOpens::default(),
             sources: Vec::new(),
             browser_confirm: BROWSER_CONFIRM.map(str::to_owned).to_vec(),
+            links: BTreeMap::new(),
         }
     }
 }
@@ -695,6 +724,50 @@ impl ApprovalMode {
             Self::Approve => false,
         }
     }
+}
+
+/// The link `[sonny.links.NAME]` describes.
+fn link(name: &str, value: &toml::Value) -> Result<Link, String> {
+    let at = format!("sonny.links.{name}");
+    if !named(name) {
+        return Err(format!("{at}: a name is 1 to 64 letters, digits, _ or -"));
+    }
+    let table = value
+        .as_table()
+        .ok_or_else(|| format!("{at} must be a table"))?;
+    let mut link = Link {
+        machine: LINK_MACHINE.to_owned(),
+        browser_profile: LINK_BROWSER_PROFILE.to_owned(),
+        ..Link::default()
+    };
+    for (key, value) in table {
+        let text = string(&format!("{at}.{key}"), value)?;
+        match key.as_str() {
+            "host" => link.host = text,
+            "machine" => link.machine = text,
+            "command" => link.command = Some(text),
+            "browser_profile" => link.browser_profile = text,
+            _ => return Err(format!("unknown key {at}.{key}")),
+        }
+    }
+    // A host that starts with `-` would be one of ssh's options.
+    if link.host.is_empty() || link.host.starts_with('-') || link.host.contains(char::is_whitespace)
+    {
+        return Err(format!("{at}.host is the host ssh dials, as box or me@box"));
+    }
+    if !named(&link.machine) {
+        return Err(format!("{at}.machine is 1 to 64 letters, digits, _ or -"));
+    }
+    Ok(link)
+}
+
+/// Whether `name` is 1 to 64 letters, digits, `_` or `-`.
+pub fn named(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
 const MCP_KEYS: [&str; 15] = [
@@ -1052,6 +1125,16 @@ fn parse(text: &str) -> Result<Config, String> {
                 for (server, value) in servers {
                     let parsed = mcp_server(server, value)?;
                     config.sonny.mcp_servers.insert(server.clone(), parsed);
+                }
+                continue;
+            }
+            if (name.as_str(), key.as_str()) == ("sonny", "links") {
+                let links = value.as_table().ok_or("sonny.links must be a table")?;
+                for (link, value) in links {
+                    config
+                        .sonny
+                        .links
+                        .insert(link.clone(), self::link(link, value)?);
                 }
                 continue;
             }
