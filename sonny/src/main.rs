@@ -294,11 +294,14 @@ async fn show(
         return Ok(json!({"bot": bot, "in": home, "opened": opened}));
     }
     let mut layout = mux::for_agent(&socket, &project, None)?;
+    // Opened in this home, the agent's window knows it is there.
     let command = [
         me.to_string_lossy().into_owned(),
         "--socket".into(),
         socket.to_string_lossy().into_owned(),
         "--no-sound".into(),
+        "--window-place".into(),
+        mux::Place::encode(&Some(layout.kept())),
         "--agent".into(),
         bot.to_owned(),
     ];
@@ -2886,7 +2889,13 @@ impl Fleet {
     /// view hears where it opened, when not beside it, or why it did not.
     fn show(&mut self, bot: &str, tell: bool) {
         let mut command = self.command.clone();
-        command.extend(["--agent".into(), bot.into()]);
+        // Opened in this window's home, the task's window knows it is there.
+        command.extend([
+            "--window-place".into(),
+            mux::Place::encode(&Some(self.place.clone())),
+            "--agent".into(),
+            bot.into(),
+        ]);
         let name = format!("{} · working", self.short(bot));
         let (bot_name, home, here) = (
             bot.to_owned(),

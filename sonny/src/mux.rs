@@ -511,12 +511,16 @@ impl Marker {
     /// at once, as the person may have just come back from another window.
     pub fn used_now(&mut self) {
         self.last = Some(Instant::now());
-        // An agent's window opened in a multiplexer was opened in the home
-        // of the window used last that is in one: that home is its own
-        // from then on, wherever the person goes after.
+        // An agent's window Sonny opens is told its home; one opened by
+        // hand in a multiplexer was most likely opened in the home of the
+        // window used last that is in one, open or since closed. That home
+        // is its own from then on, wherever the person goes after.
         if self.follows {
-            let opened_in = (windows(&self.file).into_iter())
-                .find(|window| window.place.is_some() && alive(window.pid));
+            let windows = windows(&self.file);
+            let opened_in = (windows.iter())
+                .find(|window| window.place.is_some() && alive(window.pid))
+                .or_else(|| windows.iter().find(|window| window.place.is_some()))
+                .cloned();
             let Some(window) = opened_in else {
                 return;
             };
