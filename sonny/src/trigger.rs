@@ -4454,6 +4454,11 @@ fn fire(places: &Places, trigger: &Trigger, ask: Option<&Asked>) {
     // A gate that says no costs this process and nothing else, and its row
     // says when it last looked; a one-off had its one time, and ends saying
     // so. One that could not say is a failed fire, shown as one.
+    // A check is work too: while the daemon is paused it waits for the
+    // resume, as the turn a fire sends then waits for it.
+    if trigger.gate.is_some() {
+        until_resumed(trigger);
+    }
     let said = trigger
         .gate
         .as_deref()
@@ -4556,6 +4561,17 @@ fn looked(places: &Places, trigger: &Trigger, seen: &Seen) {
 
 /// `f` with the trigger's daemon; why not, as a failed outcome, when it
 /// cannot be reached or serves another store.
+/// How often a fire waiting out a pause looks again.
+const PAUSE_LOOK: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Wait while `trigger`'s daemon is paused. A daemon that does not answer
+/// is not paused here: the check then runs and says what it finds.
+fn until_resumed(trigger: &Trigger) {
+    while with_daemon(trigger, async |client| client.paused().is_object()) == Ok(true) {
+        std::thread::sleep(PAUSE_LOOK);
+    }
+}
+
 fn with_daemon<T>(trigger: &Trigger, f: impl AsyncFnOnce(&Client) -> T) -> Result<T, Value> {
     let failed = |detail: String| json!({"outcome": "failed", "detail": detail});
     let runtime = runtime().map_err(failed)?;

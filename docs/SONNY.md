@@ -78,7 +78,9 @@ fire. The agent that hears of the trigger (`--reply-to`, else the agent
 that added a `--start` trigger, else the agent it messages) is told once
 when it breaks, and once when it works again, as alerts fire on a change
 of state rather than on every check; the row's `checked.told` keeps
-whether the break was told.
+whether the break was told. While the daemon is paused (`/pause`), a gate
+does not run: its fire waits for the resume, as the turn a fire sends then
+waits for it.
 
 **When.** `--every` counts from the next whole minute in minutes that
 divide an hour, hours that divide a day, or `1d`, and waits at least one

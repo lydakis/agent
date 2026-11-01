@@ -532,6 +532,23 @@ class TriggerFireTests(ModelFixture):
         self.assertEqual(len(notes), 2, notes)
         self.assertRegex(notes[1]['prompt_preview'], r' · its --if works again\]$')
 
+    def test_a_gate_waits_out_a_pause_before_it_runs(self):
+        self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
+        ran = self.path / 'gate-ran'
+        connection = Connection(str(self.store) + '.sock')
+        try:
+            connection.request('pause', reason='rehearsal')
+            fire = self.fire('p.task', 'x', extra=['--if', f'touch {ran}; exit 1', '--dir', str(self.path)],
+                             wait=False)
+            time.sleep(3)
+            self.assertFalse(ran.exists(), 'a check is work, held while paused')
+            self.assertIsNone(fire.poll())
+            connection.request('resume')
+            self.assertEqual(fire.wait(timeout=60), 0)
+            self.assertTrue(ran.exists())
+        finally:
+            connection.close()
+
     def test_a_gate_that_says_no_costs_no_turn(self):
         self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
         # Its row says when it looked and why it said no, with no result yet.
