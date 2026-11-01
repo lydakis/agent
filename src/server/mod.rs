@@ -1829,6 +1829,10 @@ pub async fn run(config: Configuration) -> Result<()> {
                 _ = std::future::ready(()), if service.ready_hint && ready_retry.is_none() && service.has_capacity() => {
                     service.dispatch_ready().await?;
                 }
+                // A bot at rest told that its background command ended.
+                () = service.handles.readied() => {
+                    service.ready_hint = true;
+                }
                 _ = tokio::time::sleep_until(ready_retry.unwrap_or_else(tokio::time::Instant::now)), if ready_retry.is_some() => {
                     service.ready_retry_at = None;
                 }

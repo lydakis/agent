@@ -922,14 +922,16 @@ impl Updates {
     }
 
     /// Whether a turn of `name`'s that ended `status` reaches the
-    /// subscriber as news: what its subscriptions' filters hear of it.
+    /// subscriber as news: one of its tasks, whose end its subscriptions'
+    /// filters hear.
     pub fn hears_end(&self, name: &str, turn: i64, status: &str) -> bool {
-        (self.gate(
-            name,
-            false,
-            || json!({"type": "turn.ended", "turn": turn, "status": status, "theirs": false}),
-        ))
-        .is_some()
+        self.task(name)
+            && (self.gate(
+                name,
+                false,
+                || json!({"type": "turn.ended", "turn": turn, "status": status, "theirs": false}),
+            ))
+            .is_some()
     }
 
     /// Whether a task's news may be told now: urgent, or no digest holds

@@ -246,6 +246,10 @@ pub struct Settings {
     /// once. Unset, `HOLD_MS`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hold_ms: Option<u64>,
+    /// Whether the end of a background command no wait collected is left
+    /// for a wait, untold: its client collects results itself.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub quiet_background: bool,
     /// Model calls one of its turns may make, the last with no tool call
     /// allowed; none bounds them only by the turn's token budget.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -484,7 +488,8 @@ impl Settings {
             "speed":self.speed().map_or("standard", crate::provider::Speed::name),
             "sandbox":self.sandbox,"writable":self.writable,"network":self.network,
             "outputs":self.outputs,
-            "hide_senders":self.hide_senders,"hold_ms":self.hold_ms(),
+            "hide_senders":self.hide_senders,"quiet_background":self.quiet_background,
+            "hold_ms":self.hold_ms(),
             "unix_sockets":self.unix_sockets,
             "rules":self.rules})
     }
@@ -497,7 +502,7 @@ impl Settings {
 /// The settings that make a bot's sandbox, which change together.
 pub const SANDBOX: [&str; 4] = ["sandbox", "writable", "network", "unix_sockets"];
 /// Every setting's name, as `create` and `configure` take it.
-pub const SETTINGS: [&str; 21] = [
+pub const SETTINGS: [&str; 22] = [
     "context_bytes",
     "context_items",
     "note_turns",
@@ -515,6 +520,7 @@ pub const SETTINGS: [&str; 21] = [
     "network",
     "outputs",
     "hide_senders",
+    "quiet_background",
     "hold_ms",
     "max_rounds",
     "unix_sockets",
@@ -826,6 +832,58 @@ impl Delivery {
             Self::Attach => "attach",
         }
     }
+}
+/// A bot's ended commands nothing collected or saw, read from the partial
+/// index, which holds only what is untold in the whole store, keyed by
+/// bot and id: the first ?2 in order, read where they sit and no further,
+/// never through the bot's history or other bots' commands. Only how each
+/// ended (the fields of `ended_as`), never its output.
+const UNTOLD: &str = "SELECT p.id,p.result->'$.exit_code',p.result->'$.success',
+     p.result->'$.timed_out',p.result->'$.signal',p.result->'$.wall_time_ms',
+     p.result->'$.error',substr(p.result->>'$.detail',1,97)
+     FROM processes p INDEXED BY processes_untold
+     WHERE p.bot=?1 AND p.told IS NULL AND p.delivered IS NULL AND p.status<>'running'
+     ORDER BY p.id LIMIT ?2";
+/// Marks every one of a bot's untold ended commands as having nothing to
+/// tell, through the same index.
+const UNTELLING: &str = "UPDATE processes SET told=0 WHERE id IN (
+     SELECT p.id FROM processes p INDEXED BY processes_untold
+     WHERE p.bot=?1 AND p.told IS NULL AND p.delivered IS NULL AND p.status<>'running')";
+/// The origin of the message that tells a bot its background commands
+/// ended.
+pub const BACKGROUND_ORIGIN: &str = "background";
+/// How a background command ended, as its bot is told: its result without
+/// the output, which a `wait` on its handle reads.
+/// The fields of a result that say how its command ended, in the order
+/// `UNTOLD` reads them.
+const ENDED: [&str; 7] = [
+    "exit_code",
+    "success",
+    "timed_out",
+    "signal",
+    "wall_time_ms",
+    "error",
+    "detail",
+];
+fn ended_as(result: &Value) -> Value {
+    let mut ended = serde_json::Map::new();
+    for key in ENDED {
+        if let Some(value) = result.get(key) {
+            ended.insert(key.to_owned(), value.clone());
+        }
+    }
+    // Why it failed, in a line: the rest is the handle's.
+    if let Some(Value::String(detail)) = ended.get_mut("detail")
+        && detail.len() > 96
+    {
+        let cut = (0..=96)
+            .rev()
+            .find(|&i| detail.is_char_boundary(i))
+            .unwrap_or(0);
+        detail.truncate(cut);
+        detail.push('…');
+    }
+    Value::Object(ended)
 }
 /// What the storage worker hands to the publisher after each job, in commit
 /// order: every durable event committed past its watermark, how far that
@@ -2142,8 +2200,10 @@ impl Database {
             CREATE INDEX IF NOT EXISTS answers_waiting ON answers(tag,id) WHERE output IS NULL;
             CREATE INDEX IF NOT EXISTS answers_paused ON answers(turn) WHERE paused_ms IS NOT NULL;
             CREATE TABLE IF NOT EXISTS processes(id INTEGER PRIMARY KEY AUTOINCREMENT, turn INTEGER NOT NULL REFERENCES turns(id),
-                call_id TEXT NOT NULL, status TEXT NOT NULL, result TEXT, delivered INTEGER);
+                call_id TEXT NOT NULL, status TEXT NOT NULL, result TEXT, delivered INTEGER, told INTEGER, bot TEXT);
             CREATE INDEX IF NOT EXISTS processes_turn ON processes(turn);
+            CREATE INDEX IF NOT EXISTS processes_untold ON processes(bot,id)
+                WHERE told IS NULL AND delivered IS NULL AND status<>'running';
             CREATE TABLE IF NOT EXISTS artifacts(turn INTEGER NOT NULL REFERENCES turns(id), call_id TEXT NOT NULL,
                 stream TEXT NOT NULL, data BLOB NOT NULL, raw_bytes INTEGER NOT NULL DEFAULT 0, file TEXT,
                 PRIMARY KEY(turn,call_id,stream));
@@ -2232,6 +2292,19 @@ impl Database {
                 GROUP BY t.bot)",
             [],
         )?;
+        // A command that ended with the daemon, or while it was down, is
+        // told to an idle bot now; a parked turn's bot hears at its end.
+        let untold: Vec<String> = db
+            .conn
+            .prepare(
+                "SELECT DISTINCT bot FROM processes INDEXED BY processes_untold
+                 WHERE told IS NULL AND delivered IS NULL AND status<>'running'",
+            )?
+            .query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        for bot in untold {
+            db.tell_finished(&bot)?;
+        }
         db.recount_pending()?;
         Ok(db)
     }
@@ -9041,6 +9114,8 @@ impl Database {
         self.approvals -= unstarted;
         self.forget_live(turn);
         entries.push(entry(cursor, &bot.name, Some(turn), "turn_finished", data));
+        // What its background commands did while it ran, uncollected.
+        self.tell_finished(&bot.name)?;
         Ok(entries)
     }
     fn waiting(&self, turn: i64) -> Result<Option<Waiting>> {
@@ -9292,17 +9367,21 @@ impl Database {
         };
         let tx = self.conn.savepoint()?;
         flush(&tx, turn, self.live.get(&turn))?;
+        // The model reads these only once its turn continues, after the
+        // resume or the next start, so they say the halt is over; read as
+        // a halt still holding, they made models report and stop. Facts
+        // only: what to do about a cut call is the client's to say.
         let (head, mut entries) = close_unanswered(&tx, &bot, turn, bot.head, |executing| {
             let result = match (stop, executing) {
                 (Halt::Pause, true) => json!({"error":"daemon_paused","detail":
-                    "the pause stopped this call before its result was recorded; it may have had effects. It is not run again",
+                    "the pause stopped this call before its result was recorded, so it may have had effects; nothing has run it again. Work has since resumed and this turn goes on",
                     "pause":pause}),
                 (Halt::Pause, false) => json!({"error":"daemon_paused","detail":
-                    "the pause came before this call ran; it did not run","pause":pause}),
+                    "the pause came before this call ran, so it did not run. Work has since resumed and this turn goes on","pause":pause}),
                 (Halt::Shutdown, true) => json!({"error":"daemon_shutdown","detail":
-                    "the daemon stopped this call before its result was recorded; it may have had effects. It is not run again"}),
+                    "the daemon stopped this call before its result was recorded, so it may have had effects; nothing has run it again. The daemon has since started again and this turn goes on"}),
                 (Halt::Shutdown, false) => json!({"error":"daemon_shutdown","detail":
-                    "the daemon stopped before this call ran; it did not run"}),
+                    "the daemon stopped before this call ran, so it did not run. The daemon has since started again and this turn goes on"}),
             };
             // A call cut off while it ran may have had effects: its event
             // says the outcome is unknown, as its result does.
@@ -9668,10 +9747,14 @@ impl Database {
     /// Register a background command. Ids are unique for the store's lifetime,
     /// so a handle never resolves to a later command after a restart.
     pub fn process_start(&mut self, turn: i64, call_id: &str) -> Result<i64> {
-        self.conn.execute(
-            "INSERT INTO processes(turn,call_id,status) VALUES (?,?,'running')",
+        if self.conn.execute(
+            "INSERT INTO processes(turn,bot,call_id,status)
+             SELECT id,bot,?2,'running' FROM turns WHERE id=?1",
             params![turn, call_id],
-        )?;
+        )? != 1
+        {
+            return fail("turn_not_found");
+        }
         Ok(self.conn.last_insert_rowid())
     }
     /// The outcome and its overflow become visible in one transaction.
@@ -9703,6 +9786,133 @@ impl Database {
             }
         }
         tx.commit()?;
+        Ok(())
+    }
+    /// Tell `bot` of its background commands that ended with no wait
+    /// collecting them, once no turn of its is running: one steer, from the `background`
+    /// origin, whose words are each command's handle and how it ended,
+    /// its output left for a `wait` on the handle. A bot with a turn
+    /// running hears at that turn's end, unless a wait collects them
+    /// first. A bot that takes no work now (being deleted, out of budget,
+    /// past the pending bounds) is told at a later end. Whether a turn is
+    /// ready for a slot now.
+    pub fn tell_finished(&mut self, bot: &str) -> Result<bool> {
+        let found: Option<(Option<i64>, Option<String>)> = self
+            .conn
+            .prepare_cached("SELECT running_turn,settings FROM bots WHERE name=?")?
+            .query_row([bot], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()?;
+        let Some((None, settings)) = found else {
+            return Ok(false);
+        };
+        let settings: Settings = match settings {
+            Some(text) => serde_json::from_str(&text)?,
+            None => Settings::default(),
+        };
+        // Its client collects them itself.
+        if settings.quiet_background {
+            self.conn.prepare_cached(UNTELLING)?.execute([bot])?;
+            return Ok(false);
+        }
+        // A note takes at most an eighth of the bot's context, so it always
+        // fits; what is left goes in the next, once that one's turn ends.
+        // An entry takes at least 12 bytes, which bounds how many are read.
+        let room = settings.context_bytes() / 8;
+        let ended: Vec<(i64, Value)> = self
+            .conn
+            .prepare_cached(UNTOLD)?
+            .query_map(params![bot, (room / 12 + 1) as i64], |r| {
+                let mut fields = serde_json::Map::new();
+                for (n, key) in ENDED.iter().enumerate() {
+                    let field: Option<String> = r.get(n + 1)?;
+                    if let Some(field) = field {
+                        let value = if *key == "detail" {
+                            Value::String(field)
+                        } else {
+                            serde_json::from_str(&field).unwrap_or(Value::Null)
+                        };
+                        fields.insert((*key).to_owned(), value);
+                    }
+                }
+                Ok((r.get(0)?, ended_as(&Value::Object(fields))))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        let Some(&(first, _)) = ended.first() else {
+            return Ok(false);
+        };
+        // The note and its marks commit together, also where no store job's
+        // transaction holds them, as when the store opens.
+        self.conn.execute_batch("SAVEPOINT tell_finished")?;
+        match self.tell(bot, room, first, ended) {
+            Ok(ready) => {
+                self.conn.execute_batch("RELEASE tell_finished")?;
+                Ok(ready)
+            }
+            Err(error) => {
+                self.conn
+                    .execute_batch("ROLLBACK TO tell_finished; RELEASE tell_finished")?;
+                Err(error)
+            }
+        }
+    }
+    fn tell(
+        &mut self,
+        bot: &str,
+        room: usize,
+        first: i64,
+        ended: Vec<(i64, Value)>,
+    ) -> Result<bool> {
+        let mut finished = serde_json::Map::new();
+        let mut batch = Vec::new();
+        let mut size = 0;
+        for (id, ended) in ended {
+            let handle = format!("proc:{id}");
+            let entry = handle.len() + ended.to_string().len() + 4;
+            if !batch.is_empty() && size + entry > room {
+                break;
+            }
+            size += entry;
+            finished.insert(handle, ended);
+            batch.push(id);
+        }
+        let prompt = json!({"finished": finished}).to_string();
+        let options = TurnOptions {
+            delivery: Delivery::Steer,
+            origin: Some(BACKGROUND_ORIGIN.to_owned()),
+            ..TurnOptions::default()
+        };
+        // Not held to the bounds on submissions: the commands that ended
+        // bound it, as `--max-processes` bounds them, and a refusal would
+        // leave the bot untold until it next ended a turn.
+        let limits = std::mem::take(&mut self.pending_limits);
+        let begun = self.begin(
+            bot,
+            &format!("{BACKGROUND_ORIGIN}-{first}"),
+            &prompt,
+            false,
+            &options,
+            |_, _| Ok(()),
+        );
+        self.pending_limits = limits;
+        let started = match begun {
+            Ok(started) => started,
+            Err(error) if error.code == "storage_error" => return Err(error),
+            Err(_) => return Ok(false),
+        };
+        let mut told = self
+            .conn
+            .prepare_cached("UPDATE processes SET told=? WHERE id=?")?;
+        for id in &batch {
+            told.execute(params![started.turn, id])?;
+        }
+        Ok(started.status == "ready")
+    }
+    /// The bot saw how terminal `id` ended, in what a write or a poll
+    /// returned: nothing is told of it later.
+    pub fn saw_end(&mut self, id: i64) -> Result<()> {
+        self.conn
+            .prepare_cached("UPDATE processes SET told=0 WHERE id=? AND told IS NULL")?
+            .execute([id])?;
         Ok(())
     }
     /// Why a bot may not wait on one of these background commands, if it
@@ -10609,11 +10819,19 @@ impl Database {
         // A turn already pruned but still running a background process has
         // nothing left to drop until the process ends; passing over it lets
         // a piece that restarts from the oldest turn reach the turns after.
+        // A turn whose commands a note still to run tells of waits for it,
+        // so the wait the note invites finds their results, and so does one
+        // whose ended commands no note has told yet.
         let turns: Vec<i64> = tx
             .prepare_cached(
                 "SELECT turn FROM retained_turns r WHERE bot=?1 AND turn<?2 AND turn IS NOT ?3 AND turn>?4
                  AND (EXISTS(SELECT 1 FROM events WHERE turn=r.turn)
                       OR NOT EXISTS(SELECT 1 FROM processes WHERE turn=r.turn AND status='running'))
+                 AND NOT EXISTS(SELECT 1 FROM processes p WHERE p.turn=r.turn AND p.told>0
+                      AND EXISTS(SELECT 1 FROM turns t WHERE t.id=p.told
+                                 AND t.status IN ('queued','ready','running')))
+                 AND NOT EXISTS(SELECT 1 FROM processes p WHERE p.turn=r.turn
+                      AND p.told IS NULL AND p.delivered IS NULL AND p.status<>'running')
                  ORDER BY turn LIMIT ?5",
             )?
             .query_map(
@@ -13358,6 +13576,37 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
              ALTER TABLE turns ADD COLUMN due_ms INTEGER;",
         )?;
     }
+    // 76 -> 77: a background command's end is told to its bot when no
+    // wait collected it. Those that ended before were never going to be.
+    if from < 77
+        && conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='processes')
+             AND NOT EXISTS(SELECT 1 FROM pragma_table_info('processes') WHERE name='told')",
+            [],
+            |r| r.get::<_, bool>(0),
+        )?
+    {
+        conn.execute_batch(
+            "ALTER TABLE processes ADD COLUMN told INTEGER;
+             UPDATE processes SET told=0 WHERE status<>'running';",
+        )?;
+    }
+    // A command's bot keys the untold index; those still running are the
+    // only ones whose end can be told.
+    if from < 77
+        && conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='processes')
+             AND NOT EXISTS(SELECT 1 FROM pragma_table_info('processes') WHERE name='bot')",
+            [],
+            |r| r.get::<_, bool>(0),
+        )?
+    {
+        conn.execute_batch(
+            "ALTER TABLE processes ADD COLUMN bot TEXT;
+             UPDATE processes SET bot=(SELECT bot FROM turns WHERE turns.id=processes.turn)
+              WHERE status='running';",
+        )?;
+    }
     // Schema 78: a turn refused at its start for a cause a person can fix
     // keeps its place in line, held on that cause.
     if from < 78
@@ -13942,6 +14191,52 @@ mod tests {
     use super::*;
 
     #[test]
+    fn finding_what_to_tell_reads_only_the_untold() {
+        let db = Database::initialize(Connection::open_in_memory().unwrap()).unwrap();
+        let plan: Vec<String> = (db.conn.prepare(&format!("EXPLAIN QUERY PLAN {UNTOLD}")))
+            .unwrap()
+            .query_map(params!["Bob", 1], |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(plan[0].contains("processes_untold (bot=?)"), "{plan:?}");
+        assert!(
+            plan.iter()
+                .all(|step| !step.contains("turns") && !step.contains("TEMP B-TREE")),
+            "never through a bot's history, nor sorted: {plan:?}"
+        );
+        // A batch stops where it ends, however many are untold, the bot's
+        // own or others'.
+        let steps = |untold: i64| {
+            let conn = Connection::open_in_memory().unwrap();
+            let db = Database::initialize(conn).unwrap();
+            db.conn.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+            for bot in ["Ann", "Bob", "Cy"] {
+                db.conn
+                    .execute(
+                        "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<?2)
+                         INSERT INTO processes(turn,bot,call_id,status,result)
+                         SELECT 1,?1,'c'||i,'finished','{\"exit_code\":0}' FROM n",
+                        params![bot, untold],
+                    )
+                    .unwrap();
+            }
+            let mut statement = db.conn.prepare(UNTOLD).unwrap();
+            let read = statement
+                .query_map(params!["Bob", 4], |r| r.get::<_, i64>(0))
+                .unwrap()
+                .count();
+            assert_eq!(read, 4);
+            statement.get_status(rusqlite::StatementStatus::VmStep)
+        };
+        let (few, many) = (steps(10), steps(10_000));
+        assert!(
+            many <= few + 8,
+            "{few} steps for 10 untold, {many} for 10,000"
+        );
+    }
+
+    #[test]
     fn every_setting_is_named() {
         // Every field, so a new one doesn't compile until it is listed.
         let all = Settings {
@@ -13963,6 +14258,7 @@ mod tests {
             outputs: Some("/".into()),
             hide_senders: true,
             hold_ms: Some(1),
+            quiet_background: true,
             max_rounds: Some(1),
             unix_sockets: vec!["/".into()],
             rules: Some(crate::rules::Policy {

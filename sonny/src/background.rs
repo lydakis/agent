@@ -577,10 +577,9 @@ impl View {
         // The pick has a column of its own, as the composer's `› ` does,
         // so it never touches the row's mark; what follows lines up under
         // the name.
-        let pick = match picked {
-            true => Span::raw("› ").bold(),
-            false => Span::raw("  "),
-        };
+        // A column before the mark, as the picker's rows have, so the
+        // pick reverses from the mark on.
+        let pick = Span::raw("  ");
         // Sonny's one mark for what failed, as `/status` shows a task.
         let mark = match item.kind {
             _ if item.failed.is_some() => Span::raw("✗ ").fg(Color::Red),
@@ -588,10 +587,7 @@ impl View {
             Kind::Subscription => Span::raw("◎ ").dim(),
             Kind::Server => Span::raw("  "),
         };
-        let name = match picked {
-            true => Span::raw(item.name.clone()).bold().reversed(),
-            false => Span::raw(item.name.clone()).bold(),
-        };
+        let name = Span::raw(item.name.clone()).bold();
         let mut spans = vec![pick, mark, name];
         match item.kind {
             Kind::Trigger => {
@@ -605,12 +601,12 @@ impl View {
                 spans.push(Span::raw(" could not be read by the nightly memory cleanup").dim());
             }
         }
-        out.extend(crate::transcript::wrap(
-            Line::from(spans),
-            width,
-            Span::raw(""),
-            Span::raw(INDENT),
-        ));
+        let mut first =
+            crate::transcript::wrap(Line::from(spans), width, Span::raw(""), Span::raw(INDENT));
+        if picked && let Some(row) = first.first_mut() {
+            crate::list::pick(row);
+        }
+        out.extend(first);
         if let Some(why) = &item.failed {
             out.extend(crate::transcript::wrap(
                 Line::from(why.clone()),
@@ -644,16 +640,24 @@ impl View {
 
     /// The line under the card: what was done, the removal to confirm, or
     /// the keys the picked row takes.
-    pub fn footer(&self) -> Line<'static> {
-        if let Some(notice) = &self.notice {
-            return Line::from(format!("  {notice}"));
-        }
+    pub fn footer(&self) -> Option<Line<'static>> {
         if let Some((_, _, name)) = &self.confirm {
-            return Line::from(vec![
-                Span::raw("  d again removes "),
+            return Some(Line::from(vec![
+                Span::raw("Remove "),
                 Span::raw(name.clone()).bold(),
-                Span::raw(" · any other key keeps it").dim(),
-            ]);
+                Span::raw("? It can't be undone.").dim(),
+            ]));
+        }
+        self.notice
+            .as_ref()
+            .map(|notice| Line::from(notice.clone()))
+    }
+
+    /// What the keys do, as the pane's title says it: the picked row's,
+    /// or the removal's while it waits to be confirmed.
+    pub fn keys(&self) -> String {
+        if self.confirm.is_some() {
+            return "d remove · esc keep".into();
         }
         let mut keys = Vec::new();
         if self.items.len() > 1 {
@@ -665,7 +669,7 @@ impl View {
             _ => {}
         }
         keys.push("esc close");
-        Line::from(crate::hint::spans(&format!("  {}", keys.join(" · "))))
+        keys.join(" · ")
     }
 }
 
@@ -933,13 +937,14 @@ mod tests {
         );
         assert_eq!(
             lines[7],
-            "› ✗ chat could not be read by the nightly memory cleanup"
+            "  ✗ chat could not be read by the nightly memory cleanup "
         );
         assert_eq!(at, 7);
         assert_eq!(lines[8], "    chat server: auth_expired");
         assert_eq!(lines[9], "    memory fact unreadable-chat");
         assert_eq!(lines[11], "Automations · 1");
-        assert_eq!(view.footer().to_string(), "  ↑↓ pick · esc close");
+        assert_eq!(view.keys(), "↑↓ pick · esc close");
+        assert_eq!(view.footer(), None);
         let press = |view: &mut View, code| view.key(KeyEvent::new(code, KeyModifiers::NONE));
         press(&mut view, KeyCode::Char('d'));
         assert_eq!(view.confirm, None);
@@ -981,7 +986,7 @@ mod tests {
         let lines = text(&view);
         assert_eq!(lines[0], "calc · in the background");
         assert_eq!(lines[3], "Automations · 1");
-        assert_eq!(lines[4], "› ↻ nightly every 1d → lead");
+        assert_eq!(lines[4], "  ↻ nightly every 1d → lead ");
         assert_eq!(lines[5], "    sent 2");
         assert_eq!(lines[6], "    └ Read preferences.md");
         assert_eq!(lines[8], "Follows · 1");

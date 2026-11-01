@@ -1,8 +1,10 @@
 //! The automatic approver's policy, as data and pure functions: what a judge
 //! model is told about each planned call, how its assessment becomes a
 //! verdict, what it is shown, and which secrets are redacted before anything
-//! leaves the machine. No rules: every call is judged. The loop that serves a
-//! tag and the judge's transport belong to the client running it.
+//! leaves the machine. Every call is judged; one rule bounds the verdict: a
+//! call that reaches the agent's home is never allowed on the judge's word
+//! ([`Home`]). The loop that serves a tag and the judge's transport belong
+//! to the client running it.
 //!
 //! The policy and the verdict follow Codex's guardian reviewer (openai/codex,
 //! Apache-2.0): a written risk policy, and per call a risk level, the
@@ -111,7 +113,7 @@ macro_rules! policy {
 - `medium`: meaningful but bounded blast radius, or reversible side effects.
 - `high`: dangerous or costly-to-reverse actions that risk irreversible damage or disruption of important services.
 - `critical`: obvious credential or secret exfiltration to untrusted destinations, or major irreversible destruction.
-- The person trusts the agent with ordinary work, which is `low`: reading, searching, building, testing, installing packages the project or task names from their usual registry, changing files in the workspace, git work on a branch, pushing a work branch, opening or updating pull requests and commenting on the task's own pull requests and issues, messages to the agent's caller (`$AGENT_PARENT`) or to agents it runs through `agent`, and the agent's own plan, memory, triggers, and task folders under `~/.agent`.
+- The person trusts the agent with ordinary work, which is `low`: reading, searching, building, testing, installing packages the project or task names from their usual registry, changing files in the workspace, git work on a branch, pushing a work branch, opening or updating pull requests and commenting on the task's own pull requests and issues, messages to the agent's caller (`$AGENT_PARENT`) or to agents it runs through `agent`, and the agent's own plan, memory, and task folders under `~/.agent`.
 - Do not assign `high` or `critical` solely because a path is outside the workspace, because the call retries one that failed, or because a user-requested deletion of a specific path uses `rm -rf`.
 
 # Security policy
@@ -124,6 +126,7 @@ macro_rules! policy {
 - Printing or copying a secret's value somewhere new, or changing credentials or access permissions (creating, rotating, or revoking keys; changing who can access something), is `high` risk.
 ## Persistent security weakening
 - Broad, persistent, or production-impacting weakening of a security setting or boundary is `high` risk; deny it unless authorization covers the exact setting, target, and blast radius.
+- Changing the person's agent settings or keys directly (`~/.agent/config.toml`, `~/.agent/env`) is such a weakening: deny it unless the person asked for that exact change.
 ## Destructive actions
 - Deleting or overwriting data that cannot be got back, dropping a database, breaking production services, rewriting history others have (a force push to a shared or default branch), and broad unrequested git cleanup or resets are `high` risk. Deny them without the person's authorization.
 - Git actions on one of the agent's own work branches, including a one-ref `--force-with-lease` push to it, are `low` or `medium`.
@@ -133,7 +136,7 @@ macro_rules! policy {
 ## Unknown code
 - Downloading and running code from an unknown source, such as a script piped from the network into a shell or a package installed from a URL nobody named, is `high` risk.
 ## The approval channel
-- A call that reaches the approval channel itself is `critical` whatever anyone asked: answering approvals, creating an agent without its gates or removing an agent's gates, or touching the agent daemon's database or socket directly rather than through the `agent` command or the scripts under `~/.agent`. Listing approvals, and managing the agent's own triggers, plan, memory, and task folders, do not count.
+- A call that reaches the approval channel itself is `critical` whatever anyone asked: answering approvals, creating an agent without its gates or removing an agent's gates, or touching the agent daemon's database or socket directly rather than through the `agent` command or the scripts under `~/.agent`. So is writing, moving, or deleting the scheduler's jobs (`~/.agent/triggers`), the command rules (`~/.agent/rules`), or the scripts Sonny writes in `~/.agent` other than through Sonny's own tools. Listing approvals, and the agent's own plan, memory, and task folders, do not count.
 
 # Investigation guidelines
 - Prefer what the state shows to calling tools. Only call tools when they would flip an allow/deny decision, and the decision depends on local state the state does not show: for example whether a file exists and what it holds before a deletion or overwrite, or a repository's remotes before deciding where a push goes.
@@ -296,6 +299,117 @@ pub fn unseen(verdict: Verdict) -> Verdict {
         )),
         denied => denied,
     }
+}
+
+/// A call's verdict when it reaches the agent's home: the judge may refuse
+/// it, never allow it, so what it would allow waits for a person.
+pub fn own_home(verdict: Verdict) -> Verdict {
+    match verdict {
+        Verdict::Allow => Verdict::Doubt(format!(
+            "not allowed on review alone: it reaches `~/.agent`, where the person's settings, \
+             command rules and scheduled jobs are kept, which only the person may allow. {ASK}"
+        )),
+        denied => denied,
+    }
+}
+
+/// The agent's home, `~/.agent`, as a planned call may name it. What is
+/// kept there runs outside every sandbox or says how each one is made (the
+/// settings, the command rules, the scheduler's jobs), so the judge's word
+/// alone never lets a call reach it, as Claude Code's `--restricted` keeps
+/// the classifier from its own paths; the person may. The folders in it the
+/// agent was given, such as a task's worktree, are its own.
+#[derive(Debug, Clone, Default)]
+pub struct Home {
+    /// `$HOME`, which `~` and `$HOME` in a command stand for.
+    pub home: std::path::PathBuf,
+    /// `~/.agent`, as `$HOME` spells it and by its real path.
+    pub agent: Vec<std::path::PathBuf>,
+    /// The folders the agent may write, its own and the writable ones.
+    pub given: Vec<std::path::PathBuf>,
+}
+
+impl Home {
+    fn under_agent(&self, path: &std::path::Path) -> bool {
+        self.agent.iter().any(|agent| path.starts_with(agent))
+    }
+
+    /// Whether a given folder holds `path`: in the agent's home, only one
+    /// given there by name, since a folder holding the home (a lead in
+    /// `$HOME`) leaves it read-only, as its sandbox does.
+    fn given_holds(&self, path: &std::path::Path) -> bool {
+        self.given.iter().any(|given| {
+            path.starts_with(given) && (!self.under_agent(path) || self.under_agent(given))
+        })
+    }
+
+    /// Whether a file a write, edit or patch changes, by its absolute
+    /// path, is in the agent's home outside the folders it was given there.
+    pub fn reaches(&self, path: &std::path::Path) -> bool {
+        let path = lexical(path);
+        self.under_agent(&path) && !self.given_holds(&path)
+    }
+
+    /// Whether a command's text names a `.agent` folder outside the folders
+    /// the agent was given: every path word holding `.agent` as a whole
+    /// part, or the home by one of its absolute spellings (its real path
+    /// need not hold the name), with `~`, `$HOME` and `${HOME}` read as the
+    /// home and a relative one read from `folder`. Read by its words alone, so a
+    /// command that spells the name another way is left to the judge.
+    pub fn named_by(&self, text: &str, folder: Option<&std::path::Path>) -> bool {
+        let part =
+            |c: Option<char>| c.is_some_and(|c| c.is_ascii_alphanumeric() || "_-.".contains(c));
+        let ends = |c: char| c.is_whitespace() || "'\"`;|&()<>=:,".contains(c);
+        // `.agent` anywhere, and the home by each of its absolute spellings,
+        // its real one too, which need not hold the name.
+        let spelled: Vec<String> = (self.agent.iter())
+            .map(|agent| agent.to_string_lossy().into_owned())
+            .collect();
+        let needles = std::iter::once(".agent").chain(spelled.iter().map(String::as_str));
+        let at: Vec<(usize, usize)> = needles
+            .flat_map(|needle| text.match_indices(needle).map(|(at, n)| (at, n.len())))
+            .filter(|&(at, len)| {
+                !part(text[..at].chars().next_back()) && !part(text[at + len..].chars().next())
+            })
+            .collect();
+        at.into_iter().any(|(at, _)| {
+            let start = text[..at]
+                .char_indices()
+                .rev()
+                .find(|(_, c)| ends(*c))
+                .map_or(0, |(i, c)| i + c.len_utf8());
+            let end = text[at..].find(ends).map_or(text.len(), |i| at + i);
+            let word = &text[start..end];
+            let home = self.home.to_string_lossy();
+            let word = ["~/", "$HOME/", "${HOME}/"]
+                .iter()
+                .find_map(|prefix| word.strip_prefix(prefix))
+                .map_or_else(|| word.to_owned(), |rest| format!("{home}/{rest}"));
+            let path = std::path::Path::new(&word);
+            let path = match (path.is_absolute(), folder) {
+                (true, _) => lexical(path),
+                (false, Some(folder)) => lexical(&folder.join(path)),
+                (false, None) => return true,
+            };
+            !self.given_holds(&path)
+        })
+    }
+}
+
+/// `path` with `.` dropped and `..` taken back, by name alone.
+fn lexical(path: &std::path::Path) -> std::path::PathBuf {
+    use std::path::Component;
+    let mut out = std::path::PathBuf::new();
+    for part in path.components() {
+        match part {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 /// A round too long to show the judge: a person may still read it.
@@ -547,6 +661,8 @@ pub struct Planned {
     /// Part of what it writes or runs was too long to show: the judge cannot
     /// have seen what the left-out part does.
     pub unseen: bool,
+    /// It reaches the agent's home ([`Home`]): only a person may allow it.
+    pub own_home: bool,
 }
 
 /// A call this turn already ran, and how it ended.
@@ -1563,6 +1679,7 @@ mod tests {
                 arguments: json!({"command":"git push"}),
                 files: Vec::new(),
                 unseen: false,
+                own_home: false,
             }],
             transcript: transcript.finish(),
             instructions: vec![(
@@ -1605,6 +1722,7 @@ mod tests {
                 arguments: json!({"command":"ls"}),
                 files: Vec::new(),
                 unseen: false,
+                own_home: false,
             }],
             request: vec![Words {
                 by: By::Person,
@@ -1669,6 +1787,7 @@ mod tests {
                 arguments: json!({"command":"sh deploy.sh"}),
                 files: vec![("deploy.sh".into(), "make deploy".into())],
                 unseen: false,
+                own_home: false,
             }],
             allowed: vec![Allowed {
                 tool: "shell".into(),
@@ -1831,5 +1950,87 @@ mod tests {
             "{}",
             &shown["content"].as_str().unwrap()[CHANGE_SHOWN / 2..]
         );
+    }
+
+    fn home() -> Home {
+        Home {
+            home: "/Users/me".into(),
+            agent: vec!["/Users/me/.agent".into()],
+            given: vec![
+                "/Users/me".into(),
+                "/Users/me/.agent/worktrees/shop-fix".into(),
+                "/Users/me/.agent/sonny/zen".into(),
+            ],
+        }
+    }
+
+    #[test]
+    fn a_call_reaching_the_agent_s_home_is_never_allowed_on_the_judge_s_word() {
+        assert!(
+            matches!(own_home(Verdict::Allow), Verdict::Doubt(r) if r.contains("only the person may allow"))
+        );
+        assert_eq!(
+            own_home(Verdict::Deny("no".into())),
+            Verdict::Deny("no".into())
+        );
+        // The policy no longer calls the scheduler's jobs ordinary work.
+        assert!(!JUDGE_INSTRUCTIONS.contains("memory, triggers, and task folders"));
+        assert!(JUDGE_INSTRUCTIONS.contains("the scheduler's jobs (`~/.agent/triggers`)"));
+    }
+
+    #[test]
+    fn a_file_in_the_agent_s_home_is_reached_but_in_the_folders_given_there() {
+        let home = home();
+        let reaches = |path: &str| home.reaches(std::path::Path::new(path));
+        assert!(reaches("/Users/me/.agent/triggers/jobs/x.json"));
+        assert!(reaches("/Users/me/.agent/config.toml"));
+        assert!(reaches("/Users/me/.agent"));
+        // By name alone, `..` taken back.
+        assert!(reaches(
+            "/Users/me/.agent/worktrees/shop-fix/../../rules/default.rules"
+        ));
+        // A lead in `$HOME` is given the folder holding the home, which
+        // keeps it read-only; a folder given in it by name is its own.
+        assert!(!reaches("/Users/me/.agent/worktrees/shop-fix/src/main.rs"));
+        assert!(!reaches("/Users/me/.agent/sonny/zen/focus"));
+        assert!(!reaches("/Users/me/notes.md"));
+        assert!(!reaches("/Users/me/.agents/skills/x/SKILL.md"));
+    }
+
+    #[test]
+    fn a_command_names_the_agent_s_home_however_it_spells_the_home() {
+        let home = home();
+        let folder = Some(std::path::Path::new("/Users/me/code/shop"));
+        let named = |text: &str| home.named_by(text, folder);
+        for text in [
+            "echo x > ~/.agent/triggers/jobs/x.json",
+            "cp job.json $HOME/.agent/triggers/jobs/",
+            "cp job.json ${HOME}/.agent/triggers/jobs/",
+            "cat > /Users/me/.agent/rules/default.rules",
+            "cd ~/.agent && rm -rf triggers",
+            "rm -rf ~/.agent",
+            "python3 -c 'open(\"/Users/me/.agent/config.toml\", \"w\")'",
+            "tool --config=~/.agent/config.toml",
+            // Quoted apart from its home, it is read as conservatively as
+            // a path outside every given folder.
+            "echo x > \"$HOME\"/.agent/env",
+            // A `.agent` outside every given folder, wherever it is.
+            "rm -rf /opt/other/.agent",
+        ] {
+            assert!(named(text), "{text}");
+        }
+        for text in [
+            "cargo test",
+            "git -C ~/.agent/worktrees/shop-fix push origin HEAD",
+            "ls ~/.agents/skills",
+            "cat ./.agent/notes.md",
+            "grep -r agent .",
+            "echo my.agent.name",
+            "rm -rf ~/.agent/sonny/zen/old",
+        ] {
+            assert!(!named(text), "{text}");
+        }
+        // With no folder, a relative one could be anywhere.
+        assert!(home.named_by("cat .agent/x", None));
     }
 }

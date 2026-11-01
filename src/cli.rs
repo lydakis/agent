@@ -21,7 +21,7 @@ const COMMANDS: &[Command] = &[
         about: "Send a prompt to a bot, or make one with --new; prints the turn as it runs",
         usage: "run [OPTIONS] [--] PROMPT...",
         flags: "--bot --new --fork --allow --expires --detach --delivery --attach-wait --turn --model --workspace --effort --turn-budget-tokens --image --quote --agents --profile --request-id --bot-id --pretty --no-spawn",
-        settings: "--tools --instructions --instructions-file --budget-tokens --compaction-instructions --compaction-instructions-file --compaction-model --no-compaction --fallback --approval --approve --context-bytes --context-items --note-turns --compact-at --compact-keep --compact-tokens --max-rounds --keep-turns --approval-hold --max-output-tokens --keep-warm --cache-ttl --speed --sandbox --writable --network --hide-senders --hold --unix-socket --outputs",
+        settings: "--tools --instructions --instructions-file --budget-tokens --compaction-instructions --compaction-instructions-file --compaction-model --no-compaction --fallback --approval --approve --context-bytes --context-items --note-turns --compact-at --compact-keep --compact-tokens --max-rounds --keep-turns --approval-hold --max-output-tokens --keep-warm --cache-ttl --speed --sandbox --writable --network --hide-senders --quiet-background --hold --unix-socket --outputs",
         startup: true,
     },
     Command {
@@ -494,6 +494,10 @@ fn print_flags(flags: &str) {
                 "",
                 "A new bot's model reads what other bots and clients send it with no line naming the sender",
             ),
+            "--quiet-background" => (
+                "",
+                "A new bot is not told when a background command no wait collected ends",
+            ),
             "--hold" => (
                 "DURATION",
                 "How long a new bot's turn waits on a cause a person can fix (a sign-in, a usage limit, a provider down) before it fails; up to 365d, 0 fails at once; default hold in config.toml, else 5d",
@@ -696,6 +700,7 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
                 | "--agents"
                 | "--network"
                 | "--hide-senders"
+                | "--quiet-background"
                 | "--discover"
         ) {
             if inline.is_some() {
@@ -830,6 +835,7 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
             "--writable",
             "--network",
             "--hide-senders",
+            "--quiet-background",
             "--hold",
             "--unix-socket",
             "--approval",

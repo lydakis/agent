@@ -1207,6 +1207,7 @@ pub fn from_outside(origin: Option<&str>) -> &'static str {
         Some("margin") => "a margin note",
         Some("tasks") => "a task",
         Some("judge") => "a judge",
+        Some("background") => "a background command",
         _ => "outside",
     }
 }
@@ -2439,6 +2440,20 @@ pub fn capped(
     if wrapped.len() > rows {
         wrapped.truncate(rows);
         if let Some(last) = wrapped.last_mut() {
+            // A row's trailing space may hang past the edge; the `…` takes
+            // its place rather than going past it.
+            while last.spans.len() > 1
+                && last
+                    .spans
+                    .last()
+                    .is_some_and(|s| s.content.trim_end().is_empty())
+            {
+                last.spans.pop();
+            }
+            if let Some(span) = last.spans.last_mut() {
+                let kept = span.content.trim_end().len();
+                span.content.to_mut().truncate(kept);
+            }
             last.spans.push(Span::styled("…", style));
         }
     }
@@ -2779,6 +2794,17 @@ pub fn elapsed(seconds: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_capped_line_ends_in_its_ellipsis_within_its_width() {
+        // A word ending exactly at the edge leaves its space hanging past
+        // it; the `…` must not go after that space onto a row of its own.
+        let text = format!("{} {} tail of the line", "a".repeat(20), "b".repeat(19));
+        let rows = capped(Line::from(text), 41, Span::raw(""), 1);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].width() <= 41, "{:?}", rows[0]);
+        assert!(rows[0].to_string().ends_with("b…"), "{}", rows[0]);
+    }
+
     use super::*;
 
     fn text(lines: &[Line]) -> Vec<String> {

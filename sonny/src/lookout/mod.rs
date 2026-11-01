@@ -2279,11 +2279,13 @@ impl Lookout {
     /// subscriber, whose words are no news to it.
     fn author(&self, data: &Value) -> Option<String> {
         // A lookout's own note to a lead another subscriber watches, a
-        // goal's next turn, or a trigger's fire: how the turn ends alone is
-        // news (a trigger's run that went well and said nothing is none).
+        // goal's next turn, a trigger's fire, or the daemon telling a bot
+        // its background command ended: how the turn ends alone is news (a
+        // trigger's run that went well and said nothing is none).
         if (data["request_id"].as_str())
             .is_some_and(|id| id.starts_with("lookout-") || id.starts_with(goals::REQUEST))
-            || (data["origin"] == "trigger" && data["from"]["bot"].is_null())
+            || (matches!(data["origin"].as_str(), Some("trigger" | "background"))
+                && data["from"]["bot"].is_null())
         {
             return None;
         }

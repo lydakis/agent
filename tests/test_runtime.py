@@ -1691,6 +1691,7 @@ class RuntimeTests(ModelFixture):
         for output in outputs.values():
             self.assertEqual(output['error'], 'daemon_shutdown')
             self.assertIn('did not run', output['detail'])
+            self.assertIn('The daemon has since started again', output['detail'])
         self.assertFalse((self.path / 'ran').exists())
 
     def test_a_drain_lets_a_running_command_finish_then_parks_before_the_next_call(self):
@@ -1903,12 +1904,13 @@ class RuntimeTests(ModelFixture):
             self.model.requests.get_nowait()
         client.request('resume')
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
-        # The model reads why, and the command did not run again.
+        # The model reads why, and that work has resumed; the command did not
+        # run again.
         request = self.model.requests.get(timeout=3)
         output = json.loads(next(i for i in request['input'] if i.get('type') == 'function_call_output'
                                  and i['call_id'] == 'slow-1')['output'])
         self.assertEqual(output['error'], 'daemon_paused')
-        self.assertIn('not run again', output['detail'])
+        self.assertIn('Work has since resumed and this turn goes on', output['detail'])
         self.assertEqual(output['pause']['reason'], 'the loop is sending mail')
         self.assertEqual(marker.read_text(), 'x\n')
 
@@ -1926,6 +1928,31 @@ class RuntimeTests(ModelFixture):
         while client.request('stats')['result']['running_processes'] and time.monotonic() < deadline:
             time.sleep(.05)
         self.assertEqual(client.request('stats')['result']['running_processes'], 0)
+
+    def test_a_background_command_no_wait_collected_is_told_once_the_bot_rests(self):
+        client = self.client('shell')
+        self.addCleanup(lambda: client.close(kill=True))
+        client.request('create', bot='Bob', workspace=str(self.path))
+        turn = client.request('submit', bot='Bob', request_id='background',
+                              prompt='bg:sleep .5; echo done; exit 3')['result']['turn']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        # It ends while Bob rests: the daemon starts a turn to tell him.
+        told = client.receive(lambda m: m.get('event') == 'queued'
+                              and m.get('data', {}).get('origin') == 'background', 10)
+        self.assertEqual(told['data']['delivery'], 'steer')
+        self.assertEqual(client.finished(told['turn'])['data']['status'], 'completed')
+        prompts = client.request('prompts', bot='Bob', turn=told['turn'], bytes=4096)['result']
+        words = json.loads(prompts['prompts'][0]['text'])
+        [(handle, ended)] = words['finished'].items()
+        self.assertTrue(handle.startswith('proc:'))
+        self.assertEqual((ended['exit_code'], ended['success']), (3, False))
+        self.assertNotIn('stdout', ended, 'the output is left for a wait')
+        # Its output is still the handle's, and it is told once.
+        waited = client.request('wait', handles=[handle], timeout_ms=0)['result']
+        self.assertEqual(waited['results'][handle]['stdout'], 'done\n')
+        time.sleep(.5)
+        turns = client.request('turns', bot='Bob', after=0, limit=8)['result']['turns']
+        self.assertEqual(len(turns), 2)
 
     def test_a_pause_ends_the_detached_commands_agents_started(self):
         client = self.client('shell')
@@ -2945,6 +2972,11 @@ class RuntimeTests(ModelFixture):
         (self.path / 'release').touch()
         waited = client.request('wait', handles=[handle], timeout_ms=3000)['result']['results']
         self.assertEqual(waited[handle]['stdout'], 'done')
+        # It ended while Bob rested, before that wait: Bob is told in a turn
+        # of its own, which runs before he can go.
+        told = client.receive(lambda m: m.get('event') == 'queued'
+                              and m.get('data', {}).get('origin') == 'background', 10)
+        client.finished(told['turn'])
         self.assertIn('result', client.request('delete', bot='Bob'))
         client.request('shutdown')
         client.close()

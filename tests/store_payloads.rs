@@ -325,12 +325,11 @@ fn large_artifacts_remain_exact_after_reopen_and_background_completion() {
                 .unwrap(),
             "     4\té\0🙂 record\n     5\té\0🙂 record\n[showing lines 4-5 of 60000]\n"
         );
-        let next = db
-            .begin("bot", "next", "", true, &TurnOptions::default(), |_, _| {
-                Ok(())
-            })
-            .unwrap()
-            .turn;
+        // The background command no wait collected was told in a turn of
+        // its own once the bot rested.
+        let (_, next) = db.next_ready().unwrap().unwrap();
+        assert!(next > turn);
+        db.start(next, |_, _| Ok(())).unwrap();
         db.finish(next, None).unwrap();
         db.prune("bot", 1).unwrap();
         assert_eq!(
