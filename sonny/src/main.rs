@@ -2494,6 +2494,18 @@ struct Fleet {
     resolving: resolved::Own,
 }
 
+/// The profile an agent in `folder` runs as: a lead's as its project or
+/// the config sets it, a task's as the project it was made from does;
+/// none for an agent that is neither.
+fn seat_profile(lead: bool, folder: &std::path::Path) -> Option<String> {
+    let info = |dir: &std::path::Path| agent_client::project::read(dir).ok();
+    match (lead, task::source_folder(folder)) {
+        (true, _) => info(folder).and_then(|info| project::lead_profile(&info).ok()),
+        (false, Some(source)) => info(&source).and_then(|info| project::task_profile(&info).ok()),
+        (false, None) => None,
+    }
+}
+
 /// A lead as the person tells it apart: `shop lead` for the folder's
 /// first, `shop lead billing` for `shop.lead.billing`.
 fn lead_title(project: &str, bot: &str) -> String {
@@ -7349,6 +7361,9 @@ impl App {
             .as_millis() as u64;
         let store = self.store();
         let mut rows = Vec::new();
+        // Each folder's project file read once a refresh: a project's tasks
+        // share it.
+        let mut profiles: HashMap<(bool, String), Option<String>> = HashMap::new();
         // With other leads in the folder, their tasks are theirs: each
         // lead shows as a row of its own.
         let shared = lead != format!("{project}.lead")
@@ -7495,6 +7510,20 @@ impl App {
                     bot["model"].as_str().unwrap_or("?")
                 ),
             };
+            // The profile it runs as, said even when it is its seat's own,
+            // which the footer leaves out.
+            let seat = (
+                project::is_lead(name),
+                bot["workspace"].as_str().unwrap_or("").to_owned(),
+            );
+            let profile = profiles
+                .entry(seat.clone())
+                .or_insert_with(|| match seat.1.as_str() {
+                    "" => None,
+                    folder => seat_profile(seat.0, std::path::Path::new(folder)),
+                })
+                .clone()
+                .unwrap_or_default();
             rows.push(status::Row {
                 name: short(name, &project, &lead),
                 bot: name.to_owned(),
@@ -7503,6 +7532,7 @@ impl App {
                 seconds,
                 at,
                 model,
+                profile,
                 latest: step,
                 place,
                 pr: pr.unwrap_or_default(),
@@ -11400,9 +11430,8 @@ impl App {
     }
 
     /// The profile the agent runs as, when it isn't its seat's own: a
-    /// lead's other than `lead`, a task's other than `task`, as its
-    /// project or the config sets them. Read again only for another agent
-    /// or folder.
+    /// lead's other than `lead`, a task's other than `task`. Read again
+    /// only for another agent or folder.
     fn profile(&self) -> Option<String> {
         let key = (self.bot.clone(), self.workspace.clone());
         if let Some((read, profile)) = &*self.profile.borrow()
@@ -11410,16 +11439,9 @@ impl App {
         {
             return profile.clone();
         }
-        let here = std::path::Path::new(&self.workspace);
-        let info = |dir: &std::path::Path| agent_client::project::read(dir).ok();
-        let profile = match (&self.project, task::source_folder(here)) {
-            (Some(_), _) => (info(here).and_then(|info| project::lead_profile(&info).ok()))
-                .filter(|profile| profile != "lead"),
-            (None, Some(source)) => (info(&source))
-                .and_then(|info| project::task_profile(&info).ok())
-                .filter(|profile| profile != "task"),
-            (None, None) => None,
-        };
+        let lead = self.project.is_some();
+        let profile = seat_profile(lead, std::path::Path::new(&self.workspace))
+            .filter(|profile| profile != if lead { "lead" } else { "task" });
         *self.profile.borrow_mut() = Some((key, profile.clone()));
         profile
     }
@@ -12746,6 +12768,48 @@ mod tests {
         moved.store(true, Ordering::SeqCst);
         app.status_rows().await.unwrap();
         assert_eq!(histories.load(Ordering::SeqCst), 259);
+    }
+
+    #[tokio::test]
+    async fn status_names_each_agents_profile_even_its_seats_own() {
+        let dir = std::env::temp_dir().join(format!("sonny-status-profile-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join(".agents")).unwrap();
+        std::fs::write(
+            dir.join(".agents/project.toml"),
+            "name = \"shop\"\nprofile = \"superlead\"\n",
+        )
+        .unwrap();
+        let folder = dir.to_string_lossy().into_owned();
+        let client =
+            daemon_answering(
+                move |asked| match asked["op"].as_str().unwrap_or_default() {
+                    "bots" => json!({"bots": [
+                {"name": "shop.lead", "bot_id": 1, "head": 1, "workspace": folder,
+                    "status": "idle", "running_turn": null},
+                {"name": "shop.fix", "bot_id": 2, "head": 1,
+                    "status": "idle", "running_turn": null},
+            ], "next_after": null}),
+                    "turns" => json!({"turns": [], "next_before": null}),
+                    "history_nodes" => json!({"nodes": [], "next_from": null}),
+                    "history_items" => json!({"items": []}),
+                    _ => json!({"error": {"code": "unexpected", "message": asked.to_string()}}),
+                },
+            )
+            .await;
+        let mut app = app(client);
+        app.bot = "shop.lead".into();
+        let (_, rows) = app.status_rows().await.unwrap();
+        let profile = |bot: &str| {
+            rows.iter()
+                .find(|row| row.bot == bot)
+                .unwrap()
+                .profile
+                .clone()
+        };
+        assert_eq!(profile("shop.lead"), "superlead");
+        // Nowhere to read it from: nothing said rather than a guess.
+        assert_eq!(profile("shop.fix"), "");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[tokio::test]

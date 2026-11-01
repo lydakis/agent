@@ -666,8 +666,10 @@ way `/react` does, and each note in the margin has its own `↩`.
   task's window closes once its turn ends. New work sent to the task
   reopens it. Each agent's
   time is how long its running turn has been at it, or how long its last
-  turn took. An agent with automations or follows of its own
-  shows `↻ 2 automations` beside its model. A click on an agent's name goes
+  turn took. Beside its model each agent names the profile it runs
+  as, `lead` and `task` too, which the footer leaves out (it names a
+  profile only when it is not the seat's own). An agent with
+  automations or follows of its own shows `↻ 2 automations` there too. A click on an agent's name goes
   to it as a click on a task in a roster does (below), and so does
   Enter on the agent ↑ and ↓ pick (`›`); ‹ in its title,
   or Ctrl+[ from the conversation, goes back to `/status`. It opens
