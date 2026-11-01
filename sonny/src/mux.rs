@@ -174,6 +174,12 @@ pub trait Backend: Send {
     /// The home's blocks, in the multiplexer's order, or why they could
     /// not be read.
     fn blocks(&self) -> Result<Vec<Block>, String>;
+    /// What a [`window`](Self::window) opened `block` in, which counts and
+    /// closes as one against a lead's [`Room`]: its window, where a window
+    /// holds blocks side by side (Rex's windows, Herdr's tabs).
+    fn tab(&self, block: &Block) -> String {
+        block.window.clone()
+    }
     fn close_block(&self, block: &str);
     fn rename_block(&self, block: &str, label: &str);
     fn rename_window(&self, window: &str, name: &str);
@@ -648,19 +654,17 @@ impl Layout {
         // lead is the lead's).
         let mut windows: Vec<(&str, Vec<&str>)> = Vec::new();
         let mut others: HashSet<&str> = HashSet::new();
-        for block in listed {
+        let tabs: Vec<String> = listed.iter().map(|block| self.backend.tab(block)).collect();
+        for (block, tab) in listed.iter().zip(&tabs) {
             let owner =
                 (block.label.split_once('/')).map_or(block.label.as_str(), |(owner, _)| owner);
             if !task(owner) {
-                others.insert(&block.window);
+                others.insert(tab);
                 continue;
             }
-            match windows
-                .iter_mut()
-                .find(|(window, _)| *window == block.window)
-            {
+            match windows.iter_mut().find(|(window, _)| *window == tab) {
                 Some((_, labels)) => labels.push(owner),
-                None => windows.push((&block.window, vec![owner])),
+                None => windows.push((tab, vec![owner])),
             }
         }
         windows.retain(|(window, _)| !others.contains(window));
@@ -1116,6 +1120,8 @@ mod tests {
         down: Arc<AtomicBool>,
         news: RefCell<Option<Watch>>,
         focused: RefCell<Vec<String>>,
+        /// Each block a tab of its own, as cmux's tabs share a pane.
+        pub(super) own_tabs: bool,
     }
 
     impl Fake {
@@ -1133,6 +1139,12 @@ mod tests {
     impl Backend for Fake {
         fn home(&self) -> String {
             "Fake home".into()
+        }
+        fn tab(&self, block: &Block) -> String {
+            match self.own_tabs {
+                true => block.id.clone(),
+                false => block.window.clone(),
+            }
         }
         fn here(&self) -> bool {
             true
@@ -1342,6 +1354,33 @@ mod tests {
         assert_eq!(
             layout
                 .show_task("shop.b", "shop.b", &[], &room, true)
+                .unwrap(),
+            Shown::Opened(vec!["shop.a".into()])
+        );
+    }
+
+    #[test]
+    fn tabs_that_share_the_lead_s_pane_each_count_as_a_window() {
+        // As cmux opens a task's tab in the lead's pane.
+        let fake = Fake {
+            own_tabs: true,
+            ..Fake::default()
+        };
+        for label in ["shop.lead", "shop.a", "shop.b"] {
+            fake.add(label, "pane");
+        }
+        let mut layout = Layout::new(Box::new(fake));
+        let room = Room {
+            most: 2,
+            project: "shop".into(),
+            mine: ["shop.a", "shop.b", "shop.c"].map(String::from).into(),
+            keep: HashSet::new(),
+            used: Arc::new(|bot: &str| (bot == "shop.b").then(SystemTime::now)),
+            held: Arc::new(|_: &str| false),
+        };
+        assert_eq!(
+            layout
+                .show_task("shop.c", "shop.c", &[], &room, false)
                 .unwrap(),
             Shown::Opened(vec!["shop.a".into()])
         );

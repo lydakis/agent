@@ -338,6 +338,11 @@ impl Backend for Cmux {
             .collect())
     }
 
+    /// A task's window is a tab of its own, though tabs share a pane.
+    fn tab(&self, block: &Block) -> String {
+        block.id.clone()
+    }
+
     fn close_block(&self, block: &str) {
         let _ = self.call(
             "surface.close",
