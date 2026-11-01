@@ -5005,6 +5005,7 @@ impl App {
         }
         let (mut read, mut ended) = (Vec::new(), Vec::new());
         let mut states = HashMap::new();
+        let store = self.store();
         for bot in bots {
             let read_turns = self
                 .client
@@ -5025,7 +5026,10 @@ impl App {
                                 seen
                             }
                         };
-                        needs.asked(&bot, seen.ask.filter(|_| !seen.itself));
+                        // One the lead resolved set its question aside.
+                        let resolved = seen.itself
+                            || resolved::holds(resolved::read(&store, &bot), Some(last), false);
+                        needs.asked(&bot, seen.ask.filter(|_| !resolved));
                         ended.push(bot.clone());
                     }
                     read.push(bot.clone());
@@ -17147,6 +17151,9 @@ mod tests {
                     json!({"nodes": [{"node": 7, "turn": 2}]})
                 }
                 "history_nodes" => json!({"nodes": []}),
+                "turns" if bot == "calc.ask" || bot == "calc.new" => {
+                    json!({"turns": [{"turn": 2, "status": "completed"}]})
+                }
                 "history_items" => json!({"items": [{"node": 7, "item": {
                     "type": "function_call", "name": "ask", "call_id": "q1",
                     "arguments": asked.to_string()}}]}),
@@ -17193,7 +17200,7 @@ mod tests {
     #[tokio::test]
     async fn a_resolved_tasks_old_question_stays_set_aside_after_a_restart() {
         let (client, events) = project_waiting().await;
-        let mut fleet = Fleet::in_memory(client, events, "calc", "calc.lead");
+        let mut fleet = Fleet::in_memory(client.clone(), events, "calc", "calc.lead");
         let dir = std::env::temp_dir().join(unique("sonny-resolved-needs"));
         fleet.store = dir.join("store");
         // The lead resolved it past the turn that asked.
@@ -17208,6 +17215,25 @@ mod tests {
             fleet.doing["calc.new"], "needs you",
             "one not resolved still asks"
         );
+        // The lead's roster, read again now and then, agrees.
+        let mut app = app(client);
+        app.bot = "calc.lead".into();
+        app.options.store = dir.join("store");
+        app.fleet = Some(fleet);
+        for name in ["ask", "new"] {
+            let arguments = json!({"name": name, "brief": format!("Ask {name}")});
+            let output = format!("turn:calc.{name}/2");
+            app.commit_call("c", served::START, &arguments, &output, false);
+        }
+        app.read_tasks().await;
+        let states: HashMap<_, _> = (app.tasks.values().flatten())
+            .map(|task| (task.bot.as_str(), task.state.as_str()))
+            .collect();
+        assert_eq!(states["calc.ask"], "done");
+        assert_eq!(states["calc.new"], "needs you");
+        let fleet = app.fleet.as_ref().unwrap();
+        assert_eq!(fleet.doing["calc.ask"], "idle");
+        assert_eq!(fleet.doing["calc.new"], "needs you");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
