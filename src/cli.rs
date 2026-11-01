@@ -2,7 +2,7 @@
 use agent_runtime::{Error, Result, fail_with};
 
 const CONNECTION: &str = "--store --socket";
-const STARTUP: &str = "--provider --max-processes --max-lasting --max-active --max-connecting --max-pending --max-pending-bytes --max-input-bytes --max-readers --stall-timeout --idle-exit";
+const STARTUP: &str = "--provider --max-processes --max-lasting --max-active --max-connecting --max-pending --max-pending-bytes --max-input-bytes --max-readers --max-load --stall-timeout --idle-exit";
 
 struct Command {
     name: &'static str,
@@ -359,6 +359,10 @@ fn print_flags(flags: &str) {
                 "Request bytes read ahead of the service; default memory/16; 0 is unbounded",
             ),
             "--max-readers" => ("N", "Store reader connections; default one per CPU"),
+            "--max-load" => (
+                "LOAD",
+                "New commands wait while the 1-minute load average is this or more and one is running; 0 is no gate",
+            ),
             "--max-output-tokens" => (
                 "N",
                 "A new bot's output token cap per model call; default the model's limit",
@@ -575,6 +579,15 @@ pub fn duration_ms(flag: &str, value: &str) -> Result<u64> {
         .ok()
         .and_then(|n| n.checked_mul(scale))
         .ok_or_else(refuse)
+}
+
+/// `--max-load`: a load average, 0 or more, as uptime prints one.
+pub fn load(value: &str) -> Result<f64> {
+    value
+        .parse::<f64>()
+        .ok()
+        .filter(|load| load.is_finite() && *load >= 0.0)
+        .ok_or_else(|| Error::with("usage", "--max-load needs a load average, 0 or more"))
 }
 
 /// A duration flag the daemon counts in whole seconds.

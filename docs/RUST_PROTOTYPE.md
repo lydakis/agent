@@ -383,9 +383,16 @@ into the async runtime. Byte-oriented protocol pages continue to use SQL slicing
 
 ## Limits
 
-Three daemon limits are flags on `serve`, forwarded by the client that starts
+The daemon's limits are flags on `serve`, forwarded by the client that starts
 the daemon, and reported in the `ready` event as `limits`. Zero removes a
-bound; the operating system is then the only limit.
+bound; the operating system is then the only limit. The agent CLI starts a
+daemon with what `[daemon]` in `~/.agent/config.toml` gives, worked out for
+the machine, where its own command line gives none: each key is a flag's
+name without `--max-` and with `_` for `-` (`processes`, `input_bytes`,
+`load`, ...), and its value a number or a formula of `cpus` and `memory`
+(bytes), as `"cpus * 64"` or `"max(memory / 16, 64 MiB)"`, with `+ - * /`,
+parentheses, `min` and `max`, and `KiB`, `MiB` and `GiB`. A running daemon
+keeps what it started with; the next start takes a change.
 
 | Flag | Bounds | Default |
 | --- | --- | --- |
@@ -396,6 +403,7 @@ bound; the operating system is then the only limit.
 | `--max-pending-bytes` | UTF-8 bytes of those waiting submissions: their prompts and the words they quote, which wait with them. | none |
 | `--max-input-bytes` | Bytes of request lines every session together has read and the daemon has not yet taken up. A line is read on credit for its first 4 KiB, and one that goes on waits for credit for the longest line (8 MiB) at once and gives back what it did not use, so readers never each hold part of what they need; an eighth of the bound is kept for lines that end within 4 KiB, so interrupts, renewals and status reads get in while long submits wait. At least one longest line and its reserve. Zero is unbounded. | a sixteenth of physical memory, at least 64 MiB |
 | `--max-readers` | Store reader connections, each on its own thread, for the reads clients ask for that decide nothing ([observation reads](#observation-reads)), which take all but one, and for turns' own reads. At least 1. | one per logical CPU |
+| `--max-load` | The 1-minute load average at which new foreground and background commands wait while one of the daemon's is running, as make's `-l`: never while none is, so a loaded machine slows the fleet and never stops it, and `--max-processes` stays the bound behind it. One thread reads the load each second; waiters hold no slot. A fraction is kept. Zero is no gate. Reported in `ready` as `limits.load`, `null` for none (protocol PROTOCOL_LOAD). | none (the agent CLI passes `cpus * 2`) |
 | `--max-connecting` | Provider requests awaiting response headers, a Bedrock Runtime call's body digest included. Established streams are not capped. Both providers hold headers until the first token, so a permit is held for the whole time to first token; a bound of N caps throughput at N calls per first-token latency. | none |
 | `--stall-timeout` | How long an established provider stream may go without a content frame before the attempt fails as `provider_stream_stalled` and is retried. Keepalives do not count. Whole seconds, `1s` to `24h`. | `2m` |
 | `--idle-exit` | How long, in whole seconds, before a socket daemon with no sessions, no live turns, and no running background commands exits. Parked turns are durable and resume on the next start; the client restarts the daemon on demand. | none |

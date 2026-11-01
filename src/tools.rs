@@ -484,6 +484,9 @@ pub struct Registry {
     /// gone and with each detached child until its wait completes.
     lasting_slots: Arc<Semaphore>,
     lasting_budget: usize,
+    /// Whether the machine's load lets a new command start, as make's
+    /// `-l`; see `admitted`. None is no gate.
+    load: Option<watch::Receiver<bool>>,
     /// Running terminals, by proc handle, each its bot's own.
     #[cfg(unix)]
     terminals: terminal::Terminals,
@@ -1212,6 +1215,7 @@ impl Registry {
             tools,
             slots: Arc::new(Semaphore::new(DEFAULT_PROCESS_BUDGET)),
             budget: DEFAULT_PROCESS_BUDGET,
+            load: None,
             pending: Arc::default(),
             lasting_slots: Arc::new(Semaphore::new(default_lasting())),
             lasting_budget: default_lasting(),
@@ -1329,6 +1333,58 @@ impl Registry {
         }));
         self
     }
+    /// Hold new commands back while the 1-minute load average is at
+    /// `limit` or over it and one of the daemon's commands is running, as
+    /// make's `-l` holds jobs: never while none is, so a busy machine
+    /// slows the fleet and never stops it, and the process budget stays
+    /// the bound behind it. One thread reads the load each second for
+    /// every waiter, which holds nothing as it waits. Zero is no gate.
+    pub fn with_load_gate(mut self, limit: f64) -> Self {
+        if !(limit > 0.0 && limit.is_finite()) {
+            self.load = None;
+            return self;
+        }
+        let (gate, open) = watch::channel(true);
+        let started = std::thread::Builder::new()
+            .name("load-gate".into())
+            .spawn(move || {
+                // Every waiter is woken each second the gate is shut, to
+                // look again at whether a command is still running.
+                while !gate.is_closed() {
+                    std::thread::sleep(Duration::from_secs(1));
+                    let below = load_average().is_none_or(|load| load < limit);
+                    gate.send_modify(|open| *open = below);
+                }
+            });
+        self.load = started.is_ok().then_some(open);
+        self
+    }
+    /// Commands of the daemon's running now.
+    fn running(&self) -> usize {
+        let bound = match self.budget {
+            0 => Semaphore::MAX_PERMITS,
+            budget => budget,
+        };
+        bound.saturating_sub(self.slots.available_permits())
+    }
+    /// Whether the load gate lets a command start now.
+    fn admits(&self) -> bool {
+        self.load
+            .as_ref()
+            .is_none_or(|open| *open.borrow() || self.running() == 0)
+    }
+    /// Wait until the load gate lets a command start; see `with_load_gate`.
+    async fn admitted(&self) {
+        let Some(open) = &self.load else {
+            return;
+        };
+        let mut open = open.clone();
+        while !*open.borrow_and_update() && self.running() > 0 {
+            if open.changed().await.is_err() {
+                return;
+            }
+        }
+    }
     /// How many of one bot's calls may run together: `cap` at most, and
     /// no more than half the process budget, so one bot's wide round
     /// leaves room for the others.
@@ -1346,7 +1402,9 @@ impl Registry {
         // A free slot is taken here, not in the task, so the line counts
         // only commands that truly wait; the semaphore is fair, so this
         // never overtakes a waiter.
-        if let Ok(permit) = self.slots.clone().try_acquire_owned() {
+        if self.admits()
+            && let Ok(permit) = self.slots.clone().try_acquire_owned()
+        {
             return Ok(Queued {
                 permit: Some(permit),
                 pending: None,
@@ -2040,6 +2098,7 @@ impl Registry {
                 // gone, and taken before the slot, so no slot waits on it.
                 // Both go before the output is redacted, so a result
                 // waiting for that holds no process budget.
+                registry.admitted().await;
                 let _held = crate::sandbox::hold_for(sandbox.as_deref()).await;
                 let _slot = registry
                     .slots
@@ -2091,7 +2150,10 @@ impl Registry {
             let result = async {
                 let slot = match queued.permit.take() {
                     Some(permit) => Ok(permit),
-                    None => registry.slots.clone().acquire_owned().await,
+                    None => {
+                        registry.admitted().await;
+                        registry.slots.clone().acquire_owned().await
+                    }
                 };
                 drop(queued);
                 // The slot and the sandbox's hold go once the command is
@@ -2329,6 +2391,14 @@ fn truncate(text: &str, dropped: u64) -> String {
         "{head}\n[... {omitted} bytes omitted; {retained}: see this result's artifacts and read them with the read tool ...]\n{}",
         &text[tail_start..]
     )
+}
+
+/// The machine's 1-minute load average, as uptime reports it.
+fn load_average() -> Option<f64> {
+    let mut load = [0.0f64; 1];
+    // SAFETY: getloadavg writes at most the one sample asked for.
+    let read = unsafe { libc::getloadavg(load.as_mut_ptr(), 1) };
+    (read == 1).then_some(load[0])
 }
 
 /// Output up to this many bytes is redacted on the runtime's thread: about
@@ -2756,6 +2826,43 @@ mod tests {
         assert!(!name_matches("AWS_*", "MY_AWS_PROFILE"));
         assert!(!name_matches("A?S", "AS"));
         assert!(!name_matches("*_KEY", "OPENAI_API_KEYS"));
+    }
+    #[tokio::test]
+    async fn a_shut_load_gate_holds_new_commands_only_while_one_runs() {
+        let (gate, open) = watch::channel(false);
+        let mut registry = Registry::new("shell").unwrap().with_process_budget(4);
+        registry.load = Some(open);
+        // With none running, a command starts however loaded the machine.
+        assert!(registry.admits());
+        registry.admitted().await;
+        let running = registry.slots.clone().try_acquire_owned().unwrap();
+        assert!(!registry.admits());
+        // Nor is a background command's slot taken for it at once.
+        assert!(registry.queue().unwrap().permit.is_none());
+        let waiting = tokio::spawn({
+            let registry = registry.clone();
+            async move { registry.admitted().await }
+        });
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished());
+        // The running one ends: at the next look, the waiter goes.
+        drop(running);
+        gate.send_modify(|_| {});
+        tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .unwrap()
+            .unwrap();
+        // The load falls: anything goes, alongside what runs.
+        let _running = registry.slots.clone().try_acquire_owned().unwrap();
+        gate.send_replace(true);
+        assert!(registry.admits());
+        registry.admitted().await;
+    }
+    #[test]
+    fn a_load_gate_of_zero_is_none() {
+        let registry = Registry::new("shell").unwrap().with_load_gate(0.0);
+        assert!(registry.load.is_none());
+        assert!(load_average().is_some_and(|load| load >= 0.0));
     }
     #[test]
     fn one_bot_runs_at_most_half_the_process_budget_at_once() {

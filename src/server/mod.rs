@@ -800,6 +800,9 @@ pub struct Configuration {
     /// Store reader connections serving observation reads; one per
     /// logical CPU by default.
     pub max_readers: Option<usize>,
+    /// The 1-minute load average at which new commands wait while one is
+    /// running, as make's `-l`; none by default.
+    pub max_load: Option<f64>,
     /// Seconds an established provider stream may go without a content
     /// frame before the attempt fails and is retried; default 120.
     pub stall_timeout: Option<u64>,
@@ -833,6 +836,8 @@ pub struct Limits {
     /// Store reader connections; observation reads take all but one, which
     /// is kept for turns' own reads.
     pub readers: usize,
+    /// The load average new commands wait under; zero is no gate.
+    pub load: f64,
     /// HTTP/2 connections per provider, enough for `active` turns to stream
     /// at once at the providers' advertised streams per connection.
     pub connections: usize,
@@ -858,6 +863,7 @@ impl Limits {
                 .max_readers
                 .unwrap_or_else(agent_runtime::store::default_readers)
                 .max(1),
+            load: config.max_load.unwrap_or(0.0),
             connections: if active == 0 {
                 64
             } else {
@@ -1495,7 +1501,8 @@ pub async fn run(config: Configuration) -> Result<()> {
         .with_environment(environment)
         .with_daemon(daemon)
         .with_process_budget(limits.processes)
-        .with_lasting_budget(limits.lasting);
+        .with_lasting_budget(limits.lasting)
+        .with_load_gate(limits.load);
     // Observation reads and replay pages share all but one reader, so turns'
     // own reads always find one.
     let lane = lane::Lane::new(limits.readers.saturating_sub(1), deliver);
@@ -1510,6 +1517,7 @@ pub async fn run(config: Configuration) -> Result<()> {
         "limits":{"processes":limits.processes,"lasting":limits.lasting,"active":limits.active,"connecting":limits.connecting,
             "pending":limits.pending,"pending_bytes":limits.pending_bytes,"input_bytes":limits.input_bytes,
             "readers":limits.readers,"connections":limits.connections,
+            "load":(limits.load > 0.0).then_some(limits.load),
             "idle_exit_seconds":config.idle_exit,
             "stall_timeout_seconds":stall_timeout.as_secs()},
         "schema":agent_runtime::store::Database::SCHEMA,
@@ -5098,6 +5106,7 @@ mod tests {
                 pending_bytes: 0,
                 input_bytes: 0,
                 readers: 1,
+                load: 0.0,
                 processes: 16,
                 lasting: 16,
                 active: 1024,
@@ -5301,6 +5310,7 @@ mod tests {
                 pending_bytes: 0,
                 input_bytes: 0,
                 readers: 1,
+                load: 0.0,
                 processes: 16,
                 lasting: 16,
                 active: 1024,
@@ -5520,6 +5530,7 @@ mod tests {
                 pending_bytes: 0,
                 input_bytes: 0,
                 readers: 1,
+                load: 0.0,
                 processes: 16,
                 lasting: 16,
                 active: 1024,
@@ -5766,6 +5777,7 @@ mod tests {
                 pending_bytes: 0,
                 input_bytes: 0,
                 readers: 1,
+                load: 0.0,
                 processes: 16,
                 lasting: 16,
                 active: 1024,

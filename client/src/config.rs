@@ -9,6 +9,11 @@
 //! web_search = "disabled"       # "live", the default, lets new agents search and fetch
 //! senders = "hidden"            # "shown", the default, labels what agents send
 //!
+//! [daemon]                      # what the agent CLI starts the daemon with; restart it to apply
+//! processes = "cpus * 64"       # commands running at once, the default
+//! load = "cpus * 2"             # new commands wait while the load average is this, the default; 0 no gate
+//! input_bytes = "memory / 16"   # also lasting, active, connecting, pending, pending_bytes, readers
+//!
 //! [fallbacks]                   # the model a declined request goes to, by model
 //! "anthropic/claude-opus-5-5" = "anthropic/claude-opus-4-8"
 //!
@@ -93,6 +98,186 @@ pub struct Config {
     pub judge: Judge,
     pub shell_environment_policy: ShellEnvironmentPolicy,
     pub sonny: Sonny,
+    /// `[daemon]`: each limit the agent CLI starts a daemon with, by key,
+    /// as the formula the file gives; see `DAEMON_LIMITS` and `formula`.
+    pub daemon: BTreeMap<String, String>,
+}
+
+/// The `[daemon]` keys, the `agent serve` flag each sets, and the formula
+/// the agent CLI starts a daemon with when the file gives none: none is
+/// the daemon's own default. A count rounds down; `load` keeps its
+/// fraction.
+pub const DAEMON_LIMITS: [(&str, &str, Option<&str>); 9] = [
+    ("processes", "--max-processes", None),
+    ("lasting", "--max-lasting", None),
+    ("active", "--max-active", None),
+    ("connecting", "--max-connecting", None),
+    ("pending", "--max-pending", None),
+    ("pending_bytes", "--max-pending-bytes", None),
+    ("input_bytes", "--max-input-bytes", None),
+    ("readers", "--max-readers", None),
+    // As make -l: a busy machine's new commands wait while one runs.
+    ("load", "--max-load", Some("cpus * 2")),
+];
+
+/// The machine a formula is worked out for: its logical CPUs and its
+/// physical memory in bytes.
+pub fn machine() -> (f64, f64) {
+    let cpus = std::thread::available_parallelism().map_or(4, |n| n.get());
+    // SAFETY: sysconf reads system constants.
+    let (pages, size) = unsafe {
+        (
+            libc::sysconf(libc::_SC_PHYS_PAGES),
+            libc::sysconf(libc::_SC_PAGESIZE),
+        )
+    };
+    let memory = (pages.max(0) as f64) * (size.max(0) as f64);
+    (cpus as f64, memory)
+}
+
+/// A `[daemon]` value worked out: a number, or `cpus` and `memory` (bytes)
+/// with numbers, `KiB` `MiB` `GiB`, `+ - * /`, parentheses, and
+/// `min(a, b)` and `max(a, b)`, as `"cpus * 64"` or `"max(memory / 16,
+/// 64 MiB)"`. `key` names it in the error. The result is 0 or more.
+pub fn formula(key: &str, text: &str, cpus: f64, memory: f64) -> Result<f64, String> {
+    struct Parser<'a> {
+        text: &'a [u8],
+        at: usize,
+        cpus: f64,
+        memory: f64,
+    }
+    impl Parser<'_> {
+        fn space(&mut self) {
+            while self.text.get(self.at).is_some_and(u8::is_ascii_whitespace) {
+                self.at += 1;
+            }
+        }
+        fn eat(&mut self, byte: u8) -> bool {
+            self.space();
+            let found = self.text.get(self.at) == Some(&byte);
+            self.at += usize::from(found);
+            found
+        }
+        fn word(&mut self) -> &str {
+            self.space();
+            let start = self.at;
+            while self.text.get(self.at).is_some_and(u8::is_ascii_alphabetic) {
+                self.at += 1;
+            }
+            std::str::from_utf8(&self.text[start..self.at]).unwrap_or("")
+        }
+        fn sum(&mut self) -> Option<f64> {
+            let mut value = self.product()?;
+            loop {
+                if self.eat(b'+') {
+                    value += self.product()?;
+                } else if self.eat(b'-') {
+                    value -= self.product()?;
+                } else {
+                    return Some(value);
+                }
+            }
+        }
+        fn product(&mut self) -> Option<f64> {
+            let mut value = self.term()?;
+            loop {
+                if self.eat(b'*') {
+                    value *= self.term()?;
+                } else if self.eat(b'/') {
+                    let by = self.term()?;
+                    value = (by != 0.0).then(|| value / by)?;
+                } else {
+                    return Some(value);
+                }
+            }
+        }
+        fn term(&mut self) -> Option<f64> {
+            if self.eat(b'(') {
+                let value = self.sum()?;
+                return self.eat(b')').then_some(value);
+            }
+            self.space();
+            let start = self.at;
+            while self
+                .text
+                .get(self.at)
+                .is_some_and(|b| b.is_ascii_digit() || *b == b'.')
+            {
+                self.at += 1;
+            }
+            if self.at > start {
+                let number: f64 = std::str::from_utf8(&self.text[start..self.at])
+                    .ok()?
+                    .parse()
+                    .ok()?;
+                let mark = self.at;
+                let scale = match self.word() {
+                    "KiB" => 1024.0,
+                    "MiB" => 1024.0 * 1024.0,
+                    "GiB" => 1024.0 * 1024.0 * 1024.0,
+                    "" => 1.0,
+                    _ => {
+                        self.at = mark;
+                        return None;
+                    }
+                };
+                return Some(number * scale);
+            }
+            match self.word() {
+                "cpus" => Some(self.cpus),
+                "memory" => Some(self.memory),
+                pick @ ("min" | "max") => {
+                    let pick = pick == "min";
+                    if !self.eat(b'(') {
+                        return None;
+                    }
+                    let a = self.sum()?;
+                    if !self.eat(b',') {
+                        return None;
+                    }
+                    let b = self.sum()?;
+                    self.eat(b')')
+                        .then(|| if pick { a.min(b) } else { a.max(b) })
+                }
+                _ => None,
+            }
+        }
+    }
+    let mut parser = Parser {
+        text: text.as_bytes(),
+        at: 0,
+        cpus,
+        memory,
+    };
+    let value = parser.sum();
+    parser.space();
+    match value {
+        Some(value) if parser.at == text.len() && value.is_finite() && value >= 0.0 => Ok(value),
+        _ => Err(format!(
+            "daemon.{key} is a number or a formula of cpus and memory, as \"cpus * 64\", 0 or more, not {text:?}"
+        )),
+    }
+}
+
+/// Each `[daemon]` limit as the `agent serve` flag and value it starts a
+/// daemon with, worked out for this machine, the defaults included.
+pub fn daemon_flags(daemon: &BTreeMap<String, String>) -> Result<Vec<(String, String)>, String> {
+    let (cpus, memory) = machine();
+    let mut flags = Vec::new();
+    for (key, flag, default) in DAEMON_LIMITS {
+        let Some(text) = daemon.get(key).map(String::as_str).or(default) else {
+            continue;
+        };
+        let value = formula(key, text, cpus, memory)?;
+        flags.push((
+            flag.to_owned(),
+            match key {
+                "load" => format!("{}", (value * 100.0).round() / 100.0),
+                _ => format!("{}", value.floor() as u64),
+            },
+        ));
+    }
+    Ok(flags)
 }
 
 /// What Codex's default excludes leave out when they apply.
@@ -662,6 +847,27 @@ fn parse(text: &str) -> Result<Config, String> {
         let section = value
             .as_table()
             .ok_or_else(|| format!("unknown key {name}"))?;
+        if name == "daemon" {
+            for (key, value) in section {
+                if !DAEMON_LIMITS.iter().any(|(known, ..)| known == key) {
+                    return Err(format!("unknown key daemon.{key}"));
+                }
+                let text = match value {
+                    toml::Value::Integer(n) if *n >= 0 => n.to_string(),
+                    toml::Value::Float(n) if *n >= 0.0 && n.is_finite() => n.to_string(),
+                    toml::Value::String(text) => text.clone(),
+                    _ => {
+                        return Err(format!(
+                            "daemon.{key} must be a number 0 or more, or a formula as \"cpus * 64\""
+                        ));
+                    }
+                };
+                // Worked out once here so a mistake is refused by name.
+                formula(key, &text, 64.0, 64.0 * 1024.0 * 1024.0 * 1024.0)?;
+                config.daemon.insert(key.clone(), text);
+            }
+            continue;
+        }
         let keys: &[&str] = match name.as_str() {
             "judge" => &["model", "effort"],
             "shell_environment_policy" => &["ignore_default_excludes", "exclude"],
@@ -1203,6 +1409,57 @@ fn replace(path: &Path, text: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn daemon_limits_are_numbers_or_formulas_of_the_machine() {
+        let gib = 1024.0 * 1024.0 * 1024.0;
+        let at = |text| formula("x", text, 8.0, 16.0 * gib);
+        assert_eq!(at("64"), Ok(64.0));
+        assert_eq!(at("cpus * 64"), Ok(512.0));
+        assert_eq!(at("cpus*2 + 1"), Ok(17.0));
+        assert_eq!(at("(cpus + 2) * 2"), Ok(20.0));
+        assert_eq!(at("memory / 16"), Ok(gib));
+        assert_eq!(at("max(memory / 1024, 64 MiB)"), Ok(64.0 * 1024.0 * 1024.0));
+        assert_eq!(at("min(cpus, 4)"), Ok(4.0));
+        assert_eq!(at("1.5"), Ok(1.5));
+        for bad in [
+            "",
+            "cpus *",
+            "cores * 2",
+            "1 / 0",
+            "4 - cpus",
+            "64 MB",
+            "(cpus",
+            "cpus 2",
+        ] {
+            assert!(at(bad).unwrap_err().contains("daemon.x"), "{bad}");
+        }
+        let config = parse("[daemon]\nprocesses = \"cpus * 8\"\nload = 0\nreaders = 3\n").unwrap();
+        assert_eq!(config.daemon["processes"], "cpus * 8");
+        assert_eq!(config.daemon["load"], "0");
+        let flags = daemon_flags(&config.daemon).unwrap();
+        let cpus = machine().0 as u64;
+        assert!(flags.contains(&("--max-processes".into(), (cpus * 8).to_string())));
+        assert!(flags.contains(&("--max-readers".into(), "3".into())));
+        assert!(flags.contains(&("--max-load".into(), "0".into())));
+        // With none given, only the gate's default is passed.
+        let flags = daemon_flags(&BTreeMap::new()).unwrap();
+        assert_eq!(flags, [("--max-load".to_owned(), (cpus * 2).to_string())]);
+        assert_eq!(
+            parse("[daemon]\nprocess = 4\n").unwrap_err(),
+            "unknown key daemon.process"
+        );
+        assert!(
+            parse("[daemon]\nprocesses = \"lots\"\n")
+                .unwrap_err()
+                .contains("daemon.processes")
+        );
+        assert!(
+            parse("[daemon]\nprocesses = -1\n")
+                .unwrap_err()
+                .contains("daemon.processes")
+        );
+    }
 
     #[test]
     fn the_file_sets_what_it_names_and_refuses_the_rest() {
