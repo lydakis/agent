@@ -1213,6 +1213,18 @@ async fn a_terminal_takes_typed_input_and_reports_its_end() {
     let end: Value = serde_json::from_str(&end.await.unwrap().unwrap().output).unwrap();
     assert_eq!(end["exit_code"], 3);
     assert!(end.get("handle").is_none());
+    // Until its handle's result is recorded, a read still finds its end;
+    // then the terminal goes.
+    let read: Value = serde_json::from_str(
+        &tools
+            .write_stdin(1, 1, "", None, false, None)
+            .await
+            .unwrap()
+            .output,
+    )
+    .unwrap();
+    assert_eq!(read["exit_code"], 3);
+    tools.forget_terminal(1);
     let error = tools
         .write_stdin(1, 1, "", None, false, None)
         .await
@@ -1404,6 +1416,7 @@ async fn terminals_hold_a_lasting_permit_and_end_their_whole_session() {
     let first: Value =
         serde_json::from_str(&ends.remove(0).await.unwrap().unwrap().output).unwrap();
     assert_eq!(first["signal"], libc::SIGKILL);
+    tools.forget_terminal(1);
     let error = tools
         .write_stdin(1, 1, "", None, false, None)
         .await
