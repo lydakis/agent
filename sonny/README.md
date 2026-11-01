@@ -730,6 +730,18 @@ way `/react` does, and each note in the margin has its own `↩`.
   ![/status naming each agent's profile beside its model: superlead, task, reviewer](../docs/sonny/status-profile.png)
 
   ![A task opened from /status in the pane, its ‹ going back to /status](../docs/sonny/status-opens-agent.png)
+
+  Under the lookout's line, `/status` says what is wrong around the
+  agents: a companion of the daemon that keeps restarting (down and waiting
+  for its next start, or up for less than a minute after a restart), with a
+  red `✗`, how it exits and its log; and, muted, the skills agents are
+  offered whose front matter has no `description` or one that never says
+  when to use the skill, since that line is all an agent reads before it
+  opens one. Each Sonny start keeps the approver again on its own binary
+  and build, with the judge it has, so an upgrade restarts it with the
+  lookout and the tool host.
+
+  ![/status: a red ✗ notes-sync keeps restarting · exits 1 · 4 restarts, its log, then 2 skills to fix, muted](../docs/sonny/status-alerts.png)
 - `/background` (or `/triggers`, `/lookout`) lists, in the pane beside the
   conversation, what runs for the project's agents with
   no one typing: the automations that wake them, with
@@ -1001,6 +1013,18 @@ way `/react` does, and each note in the margin has its own `↩`.
   (`shop.wire asks you`), the task's row reads `needs you`, and a click on
   it opens the task in the pane, where an option's click answers the task
   itself.
+- **Steps only you can take:** when an agent needs something only you can
+  do, such as signing in or a command that needs your own terminal and
+  keyboard (`ssh -t`, a password prompt), it asks with `ask` too, with no
+  options and the exact line to run as `command`. The card shows that line
+  at the text's own weight under `Run this in your own terminal; a click
+  copies it.`, and a click on it copies it. Such an ask always waits
+  (`Waits for you to run it; a reminder at 21:30.`), and what you type next
+  says how it went. A task asking this way reads `needs you` like any
+  other, and its lead hears the line to run. Agents no longer send such
+  commands to a pane, where they sat unnoticed.
+
+  ![An action card: Sign in to the package registry, why, then npm login --auth-type=web under Run this in your own terminal; a click copies it.](../docs/sonny/action-card.png)
 
   ![Two open decisions, their bars whole after the window narrowed, and the composer answering the first of two](../docs/sonny/ask-several.png)
 

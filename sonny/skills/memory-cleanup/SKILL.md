@@ -1,6 +1,6 @@
 ---
 name: memory-cleanup
-description: The nightly memory cleanup. Merge duplicate facts, drop superseded ones, save what the person said that no agent saved, and note habits that keep costing them, between cleanup start and cleanup finish
+description: The nightly memory cleanup. When it runs, merge duplicate facts, drop superseded ones, save what the person said that no agent saved, and note habits that keep costing them, between cleanup start and cleanup finish
 ---
 
 # Memory cleanup
