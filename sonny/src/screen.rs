@@ -262,6 +262,54 @@ struct Hovered {
 /// The place found is to be picked again, the rows having been drawn anew.
 const AGAIN: usize = usize::MAX;
 
+/// A row's `buttons`, by the columns of `line` as written, laid on the
+/// `rows` it wrapped into, each past the first after a lead `lead` wide:
+/// a button the wrap split goes on with its part on each.
+fn spread(
+    line: &Line,
+    rows: &[Arc<Line<'static>>],
+    lead: usize,
+    buttons: &Buttons,
+) -> Vec<Buttons> {
+    let text: Vec<char> = (line.spans.iter())
+        .flat_map(|span| span.content.chars())
+        .collect();
+    let column =
+        |upto: usize| -> usize { text[..upto].iter().map(|c| c.width().unwrap_or(0)).sum() };
+    let mut at = 0;
+    (rows.iter().enumerate())
+        .map(|(n, row)| {
+            let lead = if n == 0 { 0 } else { lead };
+            // The row's own words, past its lead, as they are in `line`.
+            let mut skipped = 0;
+            let words: Vec<char> = (row.spans.iter())
+                .flat_map(|span| span.content.chars())
+                .skip_while(|c| {
+                    let skip = skipped < lead;
+                    skipped += c.width().unwrap_or(0);
+                    skip
+                })
+                .collect();
+            if words.first().is_some_and(|c| !c.is_whitespace()) {
+                while text.get(at).is_some_and(|c| c.is_whitespace()) {
+                    at += 1;
+                }
+            }
+            let from = column(at);
+            at = (at + words.len()).min(text.len());
+            let to = column(at);
+            (buttons.iter())
+                .filter(|(start, end, _)| (*start as usize) < to && (*end as usize) > from)
+                .map(|(start, end, url)| {
+                    let start = (*start as usize).max(from) - from + lead;
+                    let end = (*end as usize).min(to) - from + lead;
+                    (start as u16, end as u16, url.clone())
+                })
+                .collect()
+        })
+        .collect()
+}
+
 /// The newest of `hits` that starts above `bottom`, else the newest.
 fn nearest(hits: &[(Spot, Spot)], bottom: usize) -> usize {
     (hits.iter())
@@ -999,19 +1047,25 @@ impl Screen {
                 !span.content.is_empty() && span.content.chars().all(|c| c == '─')
             });
             let link = row.link.clone();
-            let buttons = row.buttons.clone();
-            let rows = match line.width() <= width || picture {
-                true => vec![line],
+            let (rows, buttons) = match line.width() <= width || picture {
+                true => (vec![line], vec![row.buttons.clone()]),
                 false => {
                     let rest = row.rest.clone().unwrap_or(Line::from("    "));
-                    let line = Arc::unwrap_or_clone(line);
-                    (crate::transcript::wrap_lines(line, width, Line::default(), rest))
-                        .into_iter()
-                        .map(Arc::new)
-                        .collect()
+                    let lead = rest.width();
+                    let rows: Vec<Arc<Line<'static>>> = (crate::transcript::wrap_lines(
+                        (*line).clone(),
+                        width,
+                        Line::default(),
+                        rest,
+                    ))
+                    .into_iter()
+                    .map(Arc::new)
+                    .collect();
+                    let buttons = spread(&line, &rows, lead, &row.buttons);
+                    (rows, buttons)
                 }
             };
-            for (at, line) in rows.into_iter().enumerate() {
+            for (at, (line, buttons)) in rows.into_iter().zip(buttons).enumerate() {
                 let joins = crate::transcript::lead(&line);
                 let opens = crate::transcript::opens(&line).unwrap_or(0);
                 let first = at == 0;
@@ -1021,10 +1075,7 @@ impl Screen {
                     joins,
                     opens,
                     first,
-                    buttons: match first {
-                        true => buttons.clone(),
-                        false => Vec::new(),
-                    },
+                    buttons,
                 });
             }
         }
@@ -2288,6 +2339,44 @@ mod tests {
         assert_eq!(
             screen.mouse(mouse(MouseEventKind::Up(MouseButton::Left), 3, 1)),
             Some(Action::Open(format!("{BUTTON}unreact/5/👍")))
+        );
+    }
+
+    #[test]
+    fn buttons_on_a_row_wrapped_go_with_their_words() {
+        let mut screen = Screen::default();
+        screen.push(vec![Line::from("• Merged it.")]);
+        screen.mark_last(Mark::Tag(Tag::End(5)));
+        // Four buttons, each on a word, on a row too wide for the pane.
+        let words = ["alpha", "beta", "gamma", "delta"];
+        let mut buttons = Vec::new();
+        let mut x = 2u16;
+        for word in words {
+            buttons.push((x, x + word.len() as u16, format!("{BUTTON}w/{word}")));
+            x += word.len() as u16 + 1;
+        }
+        let line = Line::from(format!("  {}", words.join(" ")));
+        assert!(screen.put_under_with(Tag::End(5), Tag::Reactions(5), Some(line), buttons));
+        let area = Rect::new(0, 0, 16, 4);
+        let mut buf = Buffer::empty(area);
+        screen.render(area, &mut buf, |_| None);
+        let click = |screen: &mut Screen, x: u16, y: u16| {
+            screen.mouse(mouse(MouseEventKind::Down(MouseButton::Left), x, y));
+            screen.mouse(mouse(MouseEventKind::Up(MouseButton::Left), x, y))
+        };
+        let rows: Vec<String> = (0..4).map(|y| row(&buf, y).trim_end().to_owned()).collect();
+        assert_eq!(rows[1..3], ["  alpha beta", "    gamma delta"], "{rows:?}");
+        assert_eq!(
+            click(&mut screen, 8, 1),
+            Some(Action::Open(format!("{BUTTON}w/beta")))
+        );
+        assert_eq!(
+            click(&mut screen, 5, 2),
+            Some(Action::Open(format!("{BUTTON}w/gamma")))
+        );
+        assert_eq!(
+            click(&mut screen, 12, 2),
+            Some(Action::Open(format!("{BUTTON}w/delta")))
         );
     }
 
