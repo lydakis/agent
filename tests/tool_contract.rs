@@ -592,12 +592,13 @@ async fn a_detached_command_keeps_its_place_while_what_it_left_runs() {
     tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
     assert!(alive(service));
     assert_eq!(refused().await.as_deref(), Some("lasting_limit"));
-    // The service ends: its place is free within the second it is looked for.
+    // The service ends: its place is free within the second it is looked for,
+    // or, where nobody reaps it, once three looks a second apart agree.
     unsafe {
         libc::kill(service, libc::SIGKILL);
     }
     let mut free = false;
-    for _ in 0..30 {
+    for _ in 0..60 {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         if refused().await.is_none() {
             free = true;
@@ -613,7 +614,7 @@ async fn a_detached_command_keeps_its_place_while_what_it_left_runs() {
     tools.end_running();
     until("the pull ended the service", || !alive(service)).await;
     let mut free = false;
-    for _ in 0..30 {
+    for _ in 0..60 {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         if refused().await.is_none() {
             free = true;

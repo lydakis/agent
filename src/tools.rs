@@ -2726,12 +2726,15 @@ async fn detach(
         // Where only exited members answer, a walk of /proc is no one
         // moment and can miss a member forked while it read: three walks a
         // second apart must agree that nothing runs.
-        let mut exited = if pulled { 3 } else { 0 };
-        while exited < 3 {
+        let mut exited = 0;
+        while !pulled && exited < 3 {
             match members().await {
                 Members::Gone => break,
                 Members::Running => exited = 0,
                 Members::Exited => exited += 1,
+            }
+            if exited == 3 {
+                break;
             }
             tokio::select! {
                 Ok(()) = pulls.changed() => {
