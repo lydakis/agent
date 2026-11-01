@@ -2727,16 +2727,24 @@ impl Database {
         }
         let after = after.unwrap_or("");
         let limit_rows = (limit + 1) as i64;
+        // Fixed numbers, so bench.query_plans plans every variant: a
+        // maker without a name binds ?3 as NULL, which nothing reads.
+        let glob = if name.is_some() {
+            " AND name GLOB ?3"
+        } else {
+            ""
+        };
+        let maker = if created_by.is_some() {
+            " AND created_by_id = ?4"
+        } else {
+            ""
+        };
         let mut values: Vec<&dyn rusqlite::ToSql> = vec![&after, &limit_rows];
-        let mut glob = String::new();
-        if let Some(pattern) = &name {
-            values.push(pattern);
-            glob = format!(" AND name GLOB ?{}", values.len());
+        if name.is_some() || created_by.is_some() {
+            values.push(&name);
         }
-        let mut maker = String::new();
-        if let Some(id) = &created_by {
-            values.push(id);
-            maker = format!(" AND created_by_id = ?{}", values.len());
+        if created_by.is_some() {
+            values.push(&created_by);
         }
         let running = if active {
             " AND running_turn IS NOT NULL"
