@@ -759,20 +759,19 @@ class ServedToolTests(ModelFixture):
         self.host()
         self.assertTrue(json.loads(self.call('calc.lead', 'memory', {'user': True})))
 
-
     def linked(self, approval_mode='auto'):
-        """A Mac, its own daemon and tool host in a home of its own, linked
-        to this machine, the box, by a stand-in for ssh that runs the
-        command it is given here, in the box's home. Its MCP server
-        `test` is lent to the box's agents."""
-        mac = self.path / 'mac'
-        (mac / '.agent').mkdir(parents=True)
+        """A laptop, its own daemon and tool host in a home of its own,
+        linked to this machine, the box, by a stand-in for ssh that runs
+        the command it is given here, in the box's home. Its MCP server
+        `test` is there for the box's agents."""
+        laptop = self.path / 'laptop'
+        (laptop / '.agent').mkdir(parents=True)
         server = Path(__file__).with_name('mcp_server.py')
-        (mac / '.agent/config.toml').write_text(
-            f'[sonny.links.box]\nhost = "box"\ncommand = {json.dumps(str(self.sonny))}\n\n'
+        (laptop / '.agent/config.toml').write_text(
+            f'[sonny.links.box]\nhost = "box"\nmachine = "laptop"\ncommand = {json.dumps(str(self.sonny))}\n\n'
             f'[sonny.mcp_servers.test]\ncommand = {json.dumps(sys.executable)}\nargs = [{json.dumps(str(server))}]\n'
             f'default_tools_approval_mode = "{approval_mode}"\n'
-            f'env = {{ MCP_STARTS = {json.dumps(str(mac / "starts"))} }}\n')
+            f'env = {{ MCP_STARTS = {json.dumps(str(laptop / "starts"))} }}\n')
         ssh = self.path / 'ssh'
         ssh.write_text(f"""#!{sys.executable}
 import os, subprocess, sys
@@ -782,53 +781,53 @@ assert host == 'box', host
 os.execvpe('sh', ['sh', '-c', command], {{**os.environ, 'HOME': {json.dumps(str(self.path))}}})
 """)
         ssh.chmod(0o755)
-        lender = SocketClient(self.binary, mac / 'state.sqlite', self.url, 'echo')
+        lender = SocketClient(self.binary, laptop / 'state.sqlite', self.url, 'echo')
         self.addCleanup(lender.close)
-        env = {**clean_env(), 'HOME': str(mac), 'AGENT_BIN': str(self.binary), 'SONNY_LINK_SSH': str(ssh)}
-        host = subprocess.Popen([str(self.sonny), 'tool-host', '--store', str(mac / 'state.sqlite'),
+        env = {**clean_env(), 'HOME': str(laptop), 'AGENT_BIN': str(self.binary), 'SONNY_LINK_SSH': str(ssh)}
+        host = subprocess.Popen([str(self.sonny), 'tool-host', '--store', str(laptop / 'state.sqlite'),
                                  '--socket', str(lender.socket_path)], env=env, stdout=subprocess.PIPE, text=True)
         self.addCleanup(lambda: (host.kill(), host.wait(timeout=5), host.stdout.close()))
         self.assertEqual(json.loads(host.stdout.readline())['event'], 'serving')
-        lent = self.path / '.agent/links/mac.json'
+        lent = self.path / '.agent/links/laptop.json'
         deadline = time.monotonic() + 20
         while not lent.exists():
-            self.assertLess(time.monotonic(), deadline, 'the Mac never linked')
+            self.assertLess(time.monotonic(), deadline, 'the laptop never linked')
             time.sleep(.05)
-        return mac, host
+        return laptop, host
 
-    def test_a_box_agent_s_script_runs_on_the_linked_mac_against_its_servers(self):
-        mac, lender = self.linked()
+    def test_a_box_agent_s_script_runs_on_the_linked_machine_against_its_servers(self):
+        laptop, lender = self.linked()
         listed = subprocess.run([str(self.sonny), 'link'], env={**clean_env(), 'HOME': str(self.path)},
                                 check=True, capture_output=True, text=True).stdout
-        self.assertIn('mac  linked here · connected · 1 MCP servers, opens', listed)
-        # The box has no server of its own: the tool is there for the Mac's.
+        self.assertIn('laptop  linked here · connected · 1 MCP servers, opens', listed)
+        # The box has no server of its own: the tool is there for the laptop's.
         script = json.loads(subprocess.run([str(self.sonny), 'mcp', 'tool'], env={**clean_env(), 'HOME': str(self.path)},
                                            check=True, capture_output=True, text=True).stdout)
-        self.assertIn('# On mac', script['description'])
+        self.assertIn('# On laptop', script['description'])
         self.assertIn('## test', script['description'])
         self.daemon.request('create', bot='calc.lead', workspace=str(self.path), model='openai/synthetic-model',
                             instructions='Lead.', declare=[script])
         self.host()
-        said = self.call('calc.lead', 'exec', '// @exec: {"machine": "mac"}\n'
+        said = self.call('calc.lead', 'exec', '// @exec: {"machine": "laptop"}\n'
                          'const r = await tools.mcp__test__echo({text: "hi"});\ntext(r.content[0].text);', wait=30)
         self.assertTrue(said.endswith('MCP calls: test 1\nOutput:\nhi'), said)
-        # It ran there: the Mac started its server.
-        self.assertEqual(len((mac / 'starts').read_text().splitlines()), 1)
+        # It ran there: the laptop started its server.
+        self.assertEqual(len((laptop / 'starts').read_text().splitlines()), 1)
         unknown = json.loads(self.call('calc.lead', 'exec', '// @exec: {"machine": "pc"}\ntext(1);'))
         self.assertEqual(unknown['error'], 'no_machine')
-        self.assertIn('only mac', unknown['detail'])
-        # The Mac gone, its socket goes with it, and the call says so at once.
+        self.assertIn('only laptop', unknown['detail'])
+        # The laptop gone, its socket goes with it, and the call says so at once.
         lender.kill()
         lender.wait(timeout=5)
         deadline = time.monotonic() + 10
-        while (self.path / '.agent/links/mac.sock').exists():
-            self.assertLess(time.monotonic(), deadline, 'the link outlived the Mac')
+        while (self.path / '.agent/links/laptop.sock').exists():
+            self.assertLess(time.monotonic(), deadline, 'the link outlived the laptop')
             time.sleep(.05)
-        gone = json.loads(self.call('calc.lead', 'exec', '// @exec: {"machine": "mac"}\ntext(1);'))
+        gone = json.loads(self.call('calc.lead', 'exec', '// @exec: {"machine": "laptop"}\ntext(1);'))
         self.assertEqual(gone['error'], 'not_connected')
-        self.assertIn('mac is not connected; it was last connected', gone['detail'])
+        self.assertIn('laptop is not connected; it was last connected', gone['detail'])
 
-    def test_a_call_on_the_mac_that_asks_first_asks_the_box_agent_s_gate(self):
+    def test_a_call_on_the_linked_machine_that_asks_first_asks_the_box_agent_s_gate(self):
         self.linked(approval_mode='prompt')
         script = json.loads(subprocess.run([str(self.sonny), 'mcp', 'tool'], env={**clean_env(), 'HOME': str(self.path)},
                                            check=True, capture_output=True, text=True).stdout)
@@ -836,11 +835,11 @@ os.execvpe('sh', ['sh', '-c', command], {{**os.environ, 'HOME': {json.dumps(str(
                             instructions='Lead.', declare=[script], approve=['exec'], approver='manual')
         self.host()
         for decision, said in (('deny', 'was not approved'), ('allow', 'Output:\nhi')):
-            self.script.append(('exec', '// @exec: {"machine": "mac"}\n'
+            self.script.append(('exec', '// @exec: {"machine": "laptop"}\n'
                                 'const r = await tools.mcp__test__echo({text: "hi"}).catch(e => ({content: [{text: e.message}]}));\n'
                                 'text(r.content[0].text);'))
             self.model.call_script = self.script
-            turn = self.daemon.request('submit', bot='calc.lead', request_id=f'mac-{decision}',
+            turn = self.daemon.request('submit', bot='calc.lead', request_id=f'linked-{decision}',
                                        prompt='script')['result']['turn']
             deadline = time.monotonic() + 30
             while not (asked := self.daemon.request('approvals', bot='calc.lead')['result']['approvals']):
@@ -855,7 +854,7 @@ os.execvpe('sh', ['sh', '-c', command], {{**os.environ, 'HOME': {json.dumps(str(
         self.linked()
         import socket as sockets
         with sockets.socket(sockets.AF_UNIX) as conn:
-            conn.connect(str(self.path / '.agent/links/mac.sock'))
+            conn.connect(str(self.path / '.agent/links/laptop.sock'))
             reader = conn.makefile('r')
             challenge = json.loads(reader.readline())['challenge']
             # As a sandboxed command would: it names the file but cannot write it.

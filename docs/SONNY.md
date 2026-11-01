@@ -947,9 +947,11 @@ the turn already ran.
 
 ## Links
 
-A link lends one machine's browser, MCP servers and opens to the agents
-of another, over SSH, so agents on a box can use the person's Mac while it
-is connected ([link.rs](../sonny/src/link.rs)). Run on the Mac:
+A link lets the agents of a host use another machine's browser, MCP servers
+and opens over SSH while that machine is connected. Typically the host is
+a box you work on, and the linked machine is your laptop, where you are
+signed in to everything ([link.rs](../sonny/src/link.rs)). Either end can
+run macOS or Linux. On the machine to link:
 
 ```sh
 sonny link devbox          # or me@devbox.example.com; --machine NAME, --name NAME
@@ -958,57 +960,61 @@ sonny link off devbox
 ```
 
 `sonny link HOST` finds Sonny on the host (installing this version with
-`install.sh` when it is not there), writes `[sonny.links.NAME]` to
-`~/.agent/config.toml`, and turns on `start_at_boot`, so the Mac's daemon,
-and with it the link, comes back at login:
+`install.sh` when it isn't there), writes `[sonny.links.NAME]` to
+`~/.agent/config.toml`, and turns on `start_at_boot`, so this machine's
+daemon, and with it the link, comes back at login:
 
 ```toml
 [sonny.links.devbox]
 host = "devbox"                 # what ssh dials
-machine = "mac"                 # what the agents there call this machine, mac by default
+machine = "laptop"              # what the agents there call this machine; its hostname by default
 command = "/home/me/.local/bin/sonny"   # Sonny there, as setup found it
 browser_profile = "Default"     # the Chrome profile their browser starts from; "" a fresh one
 ```
 
-The machine that lends dials. Its tool host keeps
-`ssh -T HOST sonny link serve MACHINE` running, dialed again after a
-second when it drops, then longer while it keeps failing, up to a minute.
-That way the box needs no port, no forwarding and no sshd setting, and the
-Mac is never reached from outside. On the box, `sonny link serve` listens
-on `~/.agent/links/MACHINE.sock`. It keeps what the Mac lends in
-`MACHINE.json`, which stays there while the Mac is away so that agents'
-tools don't change, and the last time it heard from the Mac in
-`MACHINE.seen`. It exits after 45 quiet seconds (a Mac asleep never says
-it is going), removing its socket.
+The linked machine dials. Its tool host keeps
+`ssh -T HOST sonny link serve MACHINE` running and dials again after a
+second when it drops, waiting longer each time it keeps failing, up to a
+minute. The host needs no open port, no forwarding and no sshd setting, and
+nothing reaches the linked machine from outside. On the host,
+`sonny link serve` listens on `~/.agent/links/MACHINE.sock`. It keeps what
+the machine offers in `MACHINE.json` and the last time the machine was
+heard from in `MACHINE.seen`. `MACHINE.json` stays while the machine is
+away, so agents' tools don't change. `sonny link serve` exits after 45
+quiet seconds (a machine asleep never says it is going) and removes its
+socket.
 
-Agents see the machine by name:
+The host's agents see each linked machine by name:
 
-- `browser` takes `machine`, which runs the commands in the Mac's agent-browser,
-  in a browser started from the Mac's signed-in Chrome profile (agent-browser
-  copies it, so the person's own Chrome is untouched). There, no path is the
-  agent's: a pathless screenshot comes back as a picture, and other files are refused.
-- `exec` lists each machine's servers under `# On mac`. A script whose
-  options line says `// @exec: {"machine": "mac"}` runs on the Mac, against
-  its servers alone.
-- When no display can open a link or a picture opened bigger, box Sonny
-  sends it to a connected machine: an http(s) address opens in its browser,
-  and a viewer's file (a picture, PDF or plain text, up to 32 MB) is kept in
-  `~/.agent/sonny/links/opened`, marked as downloaded, and opened.
+- `browser` takes `machine`. The commands run in that machine's
+  agent-browser, in a browser started from its signed-in Chrome profile
+  (agent-browser copies the profile, so the person's own Chrome is left
+  alone). Paths there don't belong to the agent: a screenshot with no path
+  comes back as a picture, and other files are refused.
+- `exec` lists each machine's servers under `# On NAME`. A script whose
+  options line says `// @exec: {"machine": "NAME"}` runs on that machine,
+  against its servers alone.
+- When no display can open a link or a picture you opened bigger, the
+  host's Sonny sends it to a connected machine. An http(s) address opens
+  in its browser. A viewer's file (a picture, a PDF or plain text, up to
+  32 MB) is kept in `~/.agent/sonny/links/opened`, marked as downloaded,
+  and opened.
 
 What a call asks to confirm (an MCP call its server's `approval_mode` asks
-for, an action in `browser_confirm`) comes back up the link to the calling
-agent's gate on the box. You see it in box Sonny, where you are working.
-The Mac's own settings decide what it confirms. When a machine is asleep,
-a call comes back at once, or within 3 seconds, as `not_connected`, with
-when it was last connected.
+about, an action in `browser_confirm`) comes back over the link to the
+calling agent's gate on the host, so you see it in the host's Sonny, where
+you are working. The linked machine's own settings decide what it
+confirms. A call to a machine that is asleep returns `not_connected` at
+once, or within 3 seconds, with when it was last connected.
 
 An agent's sandbox reaches Unix sockets once it reaches the network, so the
-socket alone proves nothing. Each connection must first create a file
-the server names in `~/.agent/links/.proof`, which no sandboxed command can
-write. Only the person's own programs (the tool host and Sonny's window)
-send calls, and every call is gated as the agent's own calls are. Both ends
-speak link protocol 1, and a Mac speaking another is refused with a reason,
-so run Sonny from the same commit on both.
+socket alone proves nothing. Before a connection may send a call, it must
+create a file the server names in `~/.agent/links/.proof`, which no
+sandboxed command can write. That leaves only the person's own programs
+(the tool host and Sonny's window) able to send calls, and every call goes
+through its agent's gate like the agent's other calls. Both ends speak link
+protocol 1. A machine speaking another protocol is refused, with a reason
+that names both, so run Sonny from the same commit on both ends.
 
 ## Checks
 

@@ -65,9 +65,9 @@
 //! [sonny.mcp_servers.linear]    # an MCP server Sonny's agents reach
 //! url = "https://mcp.linear.app/mcp"
 //! bearer_token_env_var = "LINEAR_TOKEN"
-//! [sonny.links.devbox]          # this machine lends its browser, MCP servers and screen to devbox's agents
+//! [sonny.links.devbox]          # devbox's agents use this machine's browser, MCP servers and opens while it is connected
 //! host = "me@devbox"            # what ssh dials
-//! machine = "mac"               # what the agents there call this machine, mac by default
+//! machine = "laptop"            # what the agents there call this machine, its hostname by default
 //! browser_profile = "Default"   # the Chrome profile their browser starts from, Default by default; "" a fresh one
 //! [sonny.sources.slack]         # what Sonny's lookout runs for news
 //! command = "~/bin/slack-poll"  # run with sh -c; each line it prints is one event
@@ -472,8 +472,8 @@ pub struct Sonny {
     /// The agent-browser action categories that the `browser` tool puts
     /// to the agent's gate before they run.
     pub browser_confirm: Vec<String>,
-    /// The machines this one links to over SSH, by name, whose agents
-    /// may use this machine's browser, MCP servers and screen.
+    /// The hosts this machine is linked to over SSH, by name, whose agents
+    /// may use this machine's browser, MCP servers and opens.
     pub links: BTreeMap<String, Link>,
 }
 
@@ -483,7 +483,7 @@ pub struct Sonny {
 pub struct Link {
     /// What `ssh` dials: an alias from `~/.ssh/config`, or `user@host`.
     pub host: String,
-    /// What the agents there call this machine, `mac` by default.
+    /// What the agents there call this machine; empty, its hostname.
     pub machine: String,
     /// Sonny on that host, when its login shell does not find `sonny`.
     pub command: Option<String>,
@@ -493,8 +493,6 @@ pub struct Link {
     pub browser_profile: String,
 }
 
-/// What the agents over a link call this machine unless it says.
-pub const LINK_MACHINE: &str = "mac";
 /// The Chrome profile a link's browsers start from unless it says.
 pub const LINK_BROWSER_PROFILE: &str = "Default";
 
@@ -736,7 +734,6 @@ fn link(name: &str, value: &toml::Value) -> Result<Link, String> {
         .as_table()
         .ok_or_else(|| format!("{at} must be a table"))?;
     let mut link = Link {
-        machine: LINK_MACHINE.to_owned(),
         browser_profile: LINK_BROWSER_PROFILE.to_owned(),
         ..Link::default()
     };
@@ -755,7 +752,7 @@ fn link(name: &str, value: &toml::Value) -> Result<Link, String> {
     {
         return Err(format!("{at}.host is the host ssh dials, as box or me@box"));
     }
-    if !named(&link.machine) {
+    if !link.machine.is_empty() && !named(&link.machine) {
         return Err(format!("{at}.machine is 1 to 64 letters, digits, _ or -"));
     }
     Ok(link)

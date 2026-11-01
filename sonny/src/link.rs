@@ -1,9 +1,9 @@
-//! Links: this machine's browser, MCP servers and opens lent to the agents
-//! of another over SSH, as `[sonny.links.NAME]` says. The machine that
-//! lends dials: its tool host keeps `ssh HOST sonny link serve MACHINE`
-//! running and answers what comes down it, so the machine that borrows
-//! needs no port, no forwarding and no setting of its sshd, and nothing of
-//! it is left when the lender sleeps.
+//! Links: this machine's browser, MCP servers and opens, used by the agents
+//! of a host over SSH, as `[sonny.links.NAME]` says. The linked machine
+//! dials: its tool host keeps `ssh HOST sonny link serve MACHINE` running
+//! and answers what comes down it, so the host needs no port, no
+//! forwarding and no setting of its sshd, and nothing of the link is left
+//! there when the machine sleeps.
 //!
 //! There, `sonny link serve` listens on `~/.agent/links/MACHINE.sock` for
 //! that machine's tool host and window. An agent's sandbox reaches Unix
@@ -34,7 +34,7 @@ pub const PROTOCOL: u64 = 1;
 /// connected, and a connection to prove itself.
 const ACK: Duration = Duration::from_secs(3);
 /// How often the lender says it is there, and how long the other end
-/// waits without a word before it lets go: a Mac asleep never says so.
+/// waits without a word before it lets go: a machine asleep never says so.
 const PING: Duration = Duration::from_secs(15);
 const SILENT: Duration = Duration::from_secs(45);
 /// The waits between dials, doubled from the first while each fails soon,
@@ -718,9 +718,31 @@ fn stood(key: &str, link: &agent_client::config::Link, connected: bool, error: O
     if private(&dir).is_err() {
         return;
     }
-    let said = json!({"host": link.host, "machine": link.machine, "connected": connected,
+    let said = json!({"host": link.host, "machine": machine_of(link), "connected": connected,
         "at": now_ms(), "error": error});
     let _ = replace(&dir.join(format!("{key}.json")), &said.to_string());
+}
+
+/// What the agents over `link` call this machine: its own `machine`, else
+/// this machine's hostname, as `laptop` of `Laptop.local`.
+pub fn machine_of(link: &agent_client::config::Link) -> String {
+    match link.machine.is_empty() {
+        true => this_machine(),
+        false => link.machine.clone(),
+    }
+}
+
+/// This machine's hostname, made a name: its first word, lowercase.
+fn this_machine() -> String {
+    let mut bytes = [0u8; 256];
+    // SAFETY: the buffer is as long as said, and gethostname writes within it.
+    let read = unsafe { libc::gethostname(bytes.as_mut_ptr().cast(), bytes.len()) };
+    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    let host = match read {
+        0 => String::from_utf8_lossy(&bytes[..end]).into_owned(),
+        _ => String::new(),
+    };
+    name_of(&host.to_lowercase())
 }
 
 /// The words of a remote command, each quoted for the shell there.
@@ -762,7 +784,7 @@ async fn dial(
     hub: &crate::mcp::Hub,
 ) -> Result<(), String> {
     let sonny = link.command.as_deref().unwrap_or("sonny");
-    let remote = format!("{} link serve {}", quoted(sonny), quoted(&link.machine));
+    let remote = format!("{} link serve {}", quoted(sonny), quoted(&machine_of(link)));
     let mut child = ssh(link)
         .arg(remote)
         .stdin(std::process::Stdio::piped())
@@ -969,8 +991,8 @@ fn opened(payload: &Value) -> Result<String, String> {
 // ---- `sonny link` ----
 
 const USAGE: &str = "usage:
-  sonny link HOST [--machine NAME] [--name NAME]   lend this machine to HOST's agents
-  sonny link off NAME                              stop lending it
+  sonny link HOST [--machine NAME] [--name NAME]   link this machine to HOST, for its agents to use
+  sonny link off NAME                              take the link away
   sonny link                                       the links, and the machines linked here";
 
 /// `sonny link ...`.
@@ -1031,7 +1053,7 @@ fn setup(host: &str, rest: &[String]) -> Result<(), String> {
         }
     }
     let name = name.unwrap_or_else(|| name_of(host));
-    let machine = machine.unwrap_or_else(|| agent_client::config::LINK_MACHINE.to_owned());
+    let machine = machine.unwrap_or_else(this_machine);
     if !agent_client::config::named(&name) || !agent_client::config::named(&machine) {
         return Err("a name is 1 to 64 letters, digits, _ or -".into());
     }
@@ -1094,7 +1116,7 @@ fn setup(host: &str, rest: &[String]) -> Result<(), String> {
     agent_client::config::set_table(&path, &format!("sonny.links.{name}"), Some(&table))?;
     println!("{host} runs {there}");
     println!(
-        "Linked. While this machine's daemon runs, {host}'s agents can use its browser, its MCP servers and opens as `{machine}`."
+        "Linked. While this machine's daemon runs, {host}'s agents can use its browser, its MCP servers and opens, as the machine `{machine}`."
     );
     if !crate::boot::on() {
         agent_client::config::write(
@@ -1119,7 +1141,8 @@ fn off_link(name: &str) -> Result<(), String> {
         .ok_or(format!("no link {name}"))?;
     agent_client::config::set_table(&path, &format!("sonny.links.{key}"), None)?;
     let sonny = link.command.as_deref().unwrap_or("sonny");
-    let forget = format!("{} link forget {}", quoted(sonny), quoted(&link.machine));
+    let machine = machine_of(link);
+    let forget = format!("{} link forget {}", quoted(sonny), quoted(&machine));
     let told = std::process::Command::new("ssh")
         .args([
             "-o",
@@ -1137,12 +1160,12 @@ fn off_link(name: &str) -> Result<(), String> {
     }
     match told {
         true => println!(
-            "{key} is off; {}'s agents no longer see {}",
-            link.host, link.machine
+            "{key} is off; {}'s agents no longer see {machine}",
+            link.host
         ),
         false => println!(
-            "{key} is off; {} was not reached, so its agents see {} until it is: `sonny link forget {}` there",
-            link.host, link.machine, link.machine
+            "{key} is off; {} was not reached, so its agents see {machine} until it is: `sonny link forget {machine}` there",
+            link.host
         ),
     }
     Ok(())
@@ -1175,8 +1198,9 @@ fn list() {
             _ => "not connected yet".to_owned(),
         };
         println!(
-            "{key}  lends this machine to {} as {} · {how}",
-            link.host, link.machine
+            "{key}  this machine, linked to {} as {} · {how}",
+            link.host,
+            machine_of(link)
         );
     }
     for machine in machines() {
@@ -1214,6 +1238,7 @@ mod tests {
 
     #[test]
     fn a_host_s_link_is_named_by_its_first_word() {
+        assert!(agent_client::config::named(&this_machine()));
         assert_eq!(name_of("box"), "box");
         assert_eq!(name_of("me@devbox.example.com"), "devbox");
         assert_eq!(name_of("me@10.0.0.2"), "10");

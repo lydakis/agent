@@ -1392,7 +1392,7 @@ fn cache_to_take(bot: &Value) -> Option<&'static str> {
 /// print it: a click never does nothing.
 fn open(target: &str) -> Result<(), String> {
     if nowhere_to_open(&|key| std::env::var_os(key), cfg!(target_os = "macos")) {
-        // On a machine linked here that is connected, as the person's Mac.
+        // On a machine linked here that is connected, as the person's laptop.
         let linked = link::open(target);
         if linked.is_ok() {
             return Ok(());
