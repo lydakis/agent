@@ -205,6 +205,29 @@ produce handles, and one consumes them:
   anything is pending or errored. Inside a shell tool that command is refused,
   because a blocked client would hold a process-budget unit.
 
+A command no wait collected is told to the bot that started it once no turn
+of the bot's is running: at once when the command ends with none running, or at
+the end of the turn that was running while it did. The daemon submits one `steer` from
+origin `background` whose words are JSON, each such command's handle and how
+it ended (`exit_code`, `success`, `timed_out`, `signal`, `wall_time_ms`, or
+`error` and `detail`), and nothing of its output, which a `wait` on the handle
+reads: `{"finished":{"proc:7":{"exit_code":0,"success":true,"wall_time_ms":5012}}}`.
+It is queued behind any work the bot has, so a turn that starts takes it at its
+first boundary. A command a wait delivered is never told, nor a terminal whose
+end a `write_stdin` (or the call that started it) returned. Each is told once:
+`processes.told` holds the steer's turn (0 for one the bot saw end, and for
+every command that ended before schema 77). A bot that takes no work when
+its commands end (being deleted, out of budget, past the pending bounds) is
+told at its next turn's end. Commands lost to a restart are told the same way
+once the daemon is back, and so are those the pull cord ended, after the pause
+lifts. Unlike a client's message, the steer moves no running command to the
+background and wakes no parked wait: a running turn hears at its end, and a
+wait takes its result earlier. A bot whose client collects results itself sets
+`quiet_background` and is never told. A note waiting to run keeps the commands
+it tells of from retention until it has run, and is not held to the bounds on
+pending submissions, since the commands that ended bound it. Claude Code tells its model the same way when a
+background shell ends; Codex leaves it to the model to poll.
+
 A peer handle resolves from the daemon's own `turn_finished` for that turn and
 reports its status, checkpoint, error, and final assistant text (up to 16 KiB);
 a client's `wait` gets the whole turn view (below) with them, and a model's
@@ -446,6 +469,7 @@ keep-warm when it sets any of them.
 | `writable` (`--writable`, repeatable) | Absolute folders a `workspace-write` bot may write besides its own; each must exist and is stored by its real path. At most 64, 32 KiB as JSON. | none |
 | `network` (`--network`) | A `workspace-write` bot's commands may use the network. | off |
 | `hide_senders` (`--hide-senders`) | Its model reads what other bots and clients send it without the line naming the sender (see [fleet controllers](#fleet-controllers)); `senders = "hidden"` in `~/.agent/config.toml` sets it on the bots the CLI and Sonny make. | off |
+| `quiet_background` (`--quiet-background`) | The end of a background command no wait collected is left for a wait, untold (see [deferred tool results](#deferred-tool-results)): for a client that collects results itself. Protocol 46. | off |
 | `outputs` (`--outputs`) | An absolute folder that holds each tool output stream cut for the model whole, one file per stream, in place of the store's copy (see [retained outputs](#retained-outputs)). The daemon makes it, owner-only, and writes there only while the bot's sandbox cannot write it; otherwise the stream stays in the store. `agent run --new` and Sonny name `outputs` beside the store unless told otherwise. | none |
 | `unix_sockets` (`--unix-socket`, repeatable) | Absolute Unix sockets, or folders of them, the only ones a sandboxed bot's commands reach, such as a Docker or SSH agent socket (see [sandbox](#sandbox)). Each is stored by its real path while it exists. At most 64. | none |
 | `rules` (none) | The bot's [command rules](#command-rules), as its client read them: `prefix_rules`, `host_executables`, or `invalid` with why they couldn't be read. A bot another made takes its creator's, always. At most 256 KiB as JSON. | none |

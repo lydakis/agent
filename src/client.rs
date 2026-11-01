@@ -238,6 +238,12 @@ fn parse(args: &[String]) -> Result<Options> {
                     .insert("hide_senders".to_owned(), json!(true));
                 options.settings_flags.push("--hide-senders".to_owned());
             }
+            "--quiet-background" => {
+                options
+                    .settings
+                    .insert("quiet_background".to_owned(), json!(true));
+                options.settings_flags.push("--quiet-background".to_owned());
+            }
             "--" => options.positional.extend(iter.by_ref().cloned()),
             flag if flag.starts_with("--") => {
                 let value = iter
