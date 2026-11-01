@@ -181,6 +181,11 @@ pub fn declare(record: &Value, role: Role) -> Option<Value> {
 /// of `depth`, where it stands in its lead's line ([`line`]); and a tool
 /// Sonny gates is gated as the bot's mode gates the rest.
 pub fn refresh(record: &Value, depth: u64) -> Option<Map<String, Value>> {
+    // A trigger's shadow copy keeps the few tools it was made with, and
+    // no gate a person answers.
+    if (record["name"].as_str()).is_some_and(|name| crate::trigger::shadow_source(name).is_some()) {
+        return None;
+    }
     // Sonny's own by a tool its lookout answers, not by a name another
     // client's tool could share.
     let declared = record["declared"].as_array()?;

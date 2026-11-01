@@ -59,7 +59,7 @@ const REPLY_WAIT_MS: u64 = 86_400_000;
 /// How long `fire` waits for launchd's run of the job to say what came of
 /// it: its gate's whole time, and then some for the send.
 const FIRE_WAIT: Duration = Duration::from_secs(90);
-pub const USAGE: &str = "usage: trigger add [--name NAME] [WHEN] [--bot NAME | --start NAME --model PROVIDER/MODEL [--effort LEVEL]] [--reply-to BOT] [--if CMD] [--runs N] [--turn-budget-tokens N] [--replace] -- MESSAGE\n         WHEN: --every N{m,h,d} | --in N{m,h} | --at 'YYYY-MM-DD HH:MM' | --cron 'MIN HOUR DAY MONTH WEEKDAY' | --file PATH | --commit REPO; none: only fire runs it\n       trigger ls [--after NAME]\n       trigger show NAME\n       trigger fire NAME\n       trigger rm NAME";
+pub const USAGE: &str = "usage: trigger add [--name NAME] [WHEN] [--bot NAME | --start NAME --model PROVIDER/MODEL [--effort LEVEL]] [--reply-to BOT] [--if CMD] [--runs N] [--turn-budget-tokens N] [--shadow] [--replace] -- MESSAGE\n         WHEN: --every N{m,h,d} | --in N{m,h} | --at 'YYYY-MM-DD HH:MM' | --cron 'MIN HOUR DAY MONTH WEEKDAY' | --file PATH | --commit REPO; none: only fire runs it\n       trigger ls [--after NAME]\n       trigger show NAME\n       trigger fire NAME\n       trigger rm NAME";
 
 /// The system's own scheduler, which keeps Sonny's one job.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -315,6 +315,9 @@ pub struct Trigger {
     /// on that socket serving another store is not its daemon.
     pub store_id: String,
     pub message: String,
+    /// Each fire goes to a read-only copy of its agent instead, whose
+    /// answer is a report for whoever hears of the trigger: a dry run.
+    pub shadow: bool,
 }
 
 impl Trigger {
@@ -394,6 +397,9 @@ impl Trigger {
             pair("--socket", path(socket));
         }
         pair("--store-id", self.store_id.clone());
+        if self.shadow {
+            pair("--shadow", "1".into());
+        }
         args.extend(["--".into(), self.message.clone()]);
         args
     }
@@ -413,7 +419,7 @@ impl Trigger {
             let value = iter
                 .next()
                 .ok_or_else(|| bad(&format!("{flag} needs a value")))?;
-            const FLAGS: [&str; 22] = [
+            const FLAGS: [&str; 23] = [
                 "--name",
                 "--generation",
                 "--bot",
@@ -436,6 +442,7 @@ impl Trigger {
                 "--file",
                 "--store",
                 "--socket",
+                "--shadow",
             ];
             let known = FLAGS
                 .iter()
@@ -492,6 +499,7 @@ impl Trigger {
             daemon,
             store_id: need("--store-id")?,
             message,
+            shadow: text("--shadow").is_some(),
         })
     }
 
@@ -510,7 +518,8 @@ impl Trigger {
             "reply_to": self.reply_to.as_ref().map(|r| &r.0), "if": self.gate, "runs": self.runs,
             "turn_budget_tokens": self.turn_budget_tokens,
             "sent": state["sent"].as_u64().unwrap_or(0), "message": self.message,
-            "once": self.at.is_some(), "last": state["last"], "checked": state["checked"]})
+            "once": self.at.is_some(), "shadow": self.shadow, "last": state["last"],
+            "checked": state["checked"]})
     }
 
     /// The first field another trigger of its name differs in, to name in
@@ -537,6 +546,7 @@ impl Trigger {
             ("dir", self.dir == other.dir),
             ("daemon", self.daemon == other.daemon),
             ("store_id", self.store_id == other.store_id),
+            ("shadow", self.shadow == other.shadow),
         ]
         .into_iter()
         .find(|(_, same)| !same)
@@ -1359,7 +1369,7 @@ impl Trigger {
             "by": by, "reply_to": self.reply_to.as_ref().map(|(to, _)| to), "if": self.gate,
             "runs": self.runs, "turn_budget_tokens": self.turn_budget_tokens,
             "once": self.at.is_some(), "commit": self.commit, "file": self.file,
-            "dir": self.dir, "message": self.message})
+            "dir": self.dir, "shadow": self.shadow, "message": self.message})
     }
 }
 
@@ -2291,6 +2301,7 @@ struct Add {
     gate: Option<String>,
     runs: Option<u64>,
     turn_budget_tokens: Option<u64>,
+    shadow: bool,
     replace: bool,
     message: String,
 }
@@ -2298,7 +2309,7 @@ struct Add {
 fn parse_add(args: &[String], now: i64) -> Result<Add, String> {
     let bad = |what: String| format!("invalid_trigger: {what}\n{USAGE}");
     let mut v = std::collections::HashMap::<String, String>::new();
-    let (mut when, mut commit, mut replace) = (None, None, false);
+    let (mut when, mut commit, mut replace, mut shadow) = (None, None, false, false);
     let mut iter = args.iter();
     let message = loop {
         let Some(flag) = iter.next() else {
@@ -2309,6 +2320,10 @@ fn parse_add(args: &[String], now: i64) -> Result<Add, String> {
         }
         if flag == "--replace" {
             replace = true;
+            continue;
+        }
+        if flag == "--shadow" {
+            shadow = true;
             continue;
         }
         let value = iter
@@ -2405,6 +2420,7 @@ fn parse_add(args: &[String], now: i64) -> Result<Add, String> {
         gate,
         runs,
         turn_budget_tokens,
+        shadow,
         replace,
         message,
     })
@@ -2809,6 +2825,9 @@ fn add_args(asked: &Value) -> Vec<String> {
     if asked["replace"] == true {
         args.push("--replace".to_owned());
     }
+    if asked["shadow"] == true {
+        args.push("--shadow".to_owned());
+    }
     let message = asked["message"].as_str().unwrap_or_default();
     args.extend(["--".to_owned(), message.to_owned()]);
     args
@@ -2979,6 +2998,8 @@ fn add(places: &Places, args: &[String]) -> Result<Value, String> {
             };
             let reply_to = match &asked.reply_to {
                 Some(bot) => Some((bot.clone(), bot_id(&client, bot).await?)),
+                // A shadow run's report is for the agent that set it up.
+                None if asked.shadow => shell.clone(),
                 None => None,
             };
             let store_id = client
@@ -3023,6 +3044,7 @@ fn add(places: &Places, args: &[String]) -> Result<Value, String> {
         daemon,
         store_id,
         message: asked.message,
+        shadow: asked.shadow,
     };
     // Where HEAD is now is seen, a repository with no commit yet too: only
     // a commit after it fires. It is read before launchd watches; one made
@@ -3317,6 +3339,9 @@ async fn deliver(
         let bot = sent["bot"].as_str().unwrap_or_default().to_owned();
         return submit(client, &sender, &bot, sent, false, ask).await;
     }
+    if trigger.shadow {
+        return shadow(client, trigger, kept, why, ask).await;
+    }
     let prompt = format!(
         "[trigger {} · {} · {why}]\n{}",
         trigger.name,
@@ -3360,6 +3385,295 @@ async fn deliver(
         }
     }
     submit(client, trigger, bot, asking, started, ask).await
+}
+
+/// The tag of a shadow copy's one gate, which nobody serves: no call of it
+/// should ever ask, and one that did lapses unanswered, denied.
+const SHADOW_TAG: &str = "shadow";
+/// How long a call on that gate waits before it lapses.
+const SHADOW_LAPSE_MS: u64 = 60_000;
+/// How long a shadow copy left idle stays, should its fire stop before it
+/// removes it.
+const SHADOW_EXPIRE_MS: u64 = 86_400_000;
+
+/// The agent a shadow copy copies, when `bot` is named as one: its name,
+/// `.shadow-` and up to six hex digits, as a side chat is named. A name
+/// alone only ever takes power away (see [`crate::exec`]), so an agent
+/// named so by anyone else does itself no good.
+pub fn shadow_source(bot: &str) -> Option<&str> {
+    let (source, stamp) = bot.rsplit_once(".shadow-")?;
+    let hex = |b: u8| b.is_ascii_digit() || (b'a'..=b'f').contains(&b);
+    (!source.is_empty() && (1..=6).contains(&stamp.len()) && stamp.bytes().all(hex))
+        .then_some(source)
+}
+
+fn shadow_name(bot: &str) -> String {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as u64);
+    format!("{bot}.shadow-{:x}", (stamp ^ sends()) % 0x100_0000)
+}
+
+/// The command rules a shadow copy goes by: the person's without their
+/// `allow` rules, which run a command outside the sandbox unasked. A
+/// `prompt` rule, with no gate to ask, refuses; a `forbidden` one still
+/// refuses.
+pub fn shadow_rules(
+    rules: Option<&agent_client::rules::Policy>,
+) -> Option<agent_client::rules::Policy> {
+    let mut rules = rules?.clone();
+    (rules.prefix_rules).retain(|rule| rule.decision != agent_client::rules::Decision::Allow);
+    Some(rules).filter(|rules| *rules != agent_client::rules::Policy::default())
+}
+
+/// What a shadow copy of the agent `record` describes may call: the
+/// daemon's tools it has, which the read-only sandbox confines, and of
+/// Sonny's, only `exec`, whose calls of a server's tools that do not say
+/// they only read are refused. Asking the person, starting tasks, writing
+/// memory and the like are not among them.
+fn shadow_tools(record: &Value) -> Vec<String> {
+    let names = |list: &Value| -> Vec<String> {
+        (list.as_array().into_iter().flatten())
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect()
+    };
+    let mut tools = names(&record["tools"]);
+    let declared = record["declared"].as_array().into_iter().flatten();
+    if declared
+        .clone()
+        .any(|tool| tool["name"] == crate::exec::NAME)
+    {
+        tools.push(crate::exec::NAME.to_owned());
+    }
+    if let Some(allowed) = record["allowed"].as_array() {
+        let allowed = names(&Value::Array(allowed.clone()));
+        tools.retain(|tool| allowed.contains(tool));
+    }
+    tools
+}
+
+/// The `configure` fields that make `name` a shadow copy: read-only, with
+/// no gate but the one `exec` needs to run at all, whose calls never ask
+/// it, and the person's command rules without their `allow`s.
+fn shadow_fields(name: &str, id: i64, tools: &[String]) -> Value {
+    let rules = shadow_rules(crate::rules::given().as_ref());
+    let mut fields = json!({"bot": name, "bot_id": id,
+        "settings": {"sandbox": "read-only", "rules": rules}});
+    match tools.iter().any(|tool| tool == crate::exec::NAME) {
+        true => {
+            fields["approve"] = json!([crate::exec::NAME]);
+            fields["approver"] = json!(SHADOW_TAG);
+            fields["approve_expire_ms"] = json!(SHADOW_LAPSE_MS);
+        }
+        false => fields["approve"] = json!([]),
+    }
+    fields
+}
+
+/// A shadow copy of `bot` where it is now, confined; its name and id.
+async fn fork_shadow(client: &Client, bot: &str, id: i64) -> Result<(String, i64), Value> {
+    let failed = |error: agent_client::Error| match error.code.as_str() {
+        "bot_not_found" => json!({"outcome": "gone", "detail": error.to_string()}),
+        _ => json!({"outcome": "failed", "detail": error.to_string()}),
+    };
+    let record = (client
+        .request("inspect", json!({"bot": bot, "bot_id": id}))
+        .await)
+        .map_err(failed)?;
+    let name = shadow_name(bot);
+    let tools = shadow_tools(&record);
+    let forked = client
+        .request(
+            "fork",
+            json!({"source": bot, "bot": name, "allow": tools, "expire_ms": SHADOW_EXPIRE_MS,
+                "request_id": name}),
+        )
+        .await
+        .map_err(failed)?;
+    let shadow = forked["bot_id"].as_i64().unwrap_or_default();
+    confine(client, &name, shadow, &tools).await?;
+    Ok((name, shadow))
+}
+
+/// A shadow copy for a `--start` trigger whose agent no fire made yet:
+/// made as its first fire would make it, confined.
+async fn start_shadow(client: &Client, trigger: &Trigger) -> Result<(String, i64), Value> {
+    let failed = |detail: String| json!({"outcome": "failed", "detail": detail});
+    let (
+        Target::Start {
+            name,
+            model,
+            effort,
+            ..
+        },
+        Some(dir),
+    ) = (&trigger.target, &trigger.dir)
+    else {
+        return Err(failed("invalid_trigger: not a --start trigger".into()));
+    };
+    let shadow = shadow_name(name);
+    let instructions = crate::project::plain(dir).map_err(failed)?;
+    let mut asked = json!({"bot": shadow, "workspace": dir, "model": model, "effort": effort,
+        "instructions": instructions, "request_id": shadow});
+    crate::made(client, &mut asked, model, dir).map_err(failed)?;
+    // Made unconfined by nobody: the copy's own fields come next, and
+    // until then it has run nothing.
+    if let Value::Object(fields) = &mut asked {
+        for key in ["approve", "approver", "approve_expire_ms"] {
+            fields.remove(key);
+        }
+    }
+    asked["settings"]["sandbox"] = json!("read-only");
+    asked["settings"]["rules"] = json!(shadow_rules(crate::rules::given().as_ref()));
+    let made = client.request("create", asked).await;
+    let id = made.map_err(|e| failed(coded(e)))?["bot_id"]
+        .as_i64()
+        .unwrap_or_default();
+    let record = (client
+        .request("inspect", json!({"bot": shadow, "bot_id": id}))
+        .await)
+        .map_err(|e| failed(coded(e)))?;
+    let tools = shadow_tools(&record);
+    confine(client, &shadow, id, &tools).await?;
+    Ok((shadow, id))
+}
+
+/// Make `name` a shadow copy, or remove it: a copy that could not be
+/// confined never runs.
+async fn confine(client: &Client, name: &str, id: i64, tools: &[String]) -> Result<(), Value> {
+    let configured = client
+        .request("configure", shadow_fields(name, id, tools))
+        .await;
+    if let Err(error) = configured {
+        let _ = client
+            .request("delete", json!({"bot": name, "bot_id": id}))
+            .await;
+        return Err(json!({"outcome": "failed", "detail": format!("shadow: {error}")}));
+    }
+    Ok(())
+}
+
+/// A `--shadow` fire: the message goes to a read-only copy of the agent,
+/// where every call past reading is refused, never asked about, and the
+/// copy's answer goes to whoever hears of the trigger as a report, to set
+/// beside what the job it stands in for did. The copy goes once its report
+/// is passed on.
+async fn shadow(
+    client: &Client,
+    trigger: &Trigger,
+    kept: &Kept,
+    why: &str,
+    ask: Option<&Asked>,
+) -> Value {
+    let source = match (&trigger.target, kept.started_id) {
+        (Target::Bot { name, id }, _) => Some((name.as_str(), *id)),
+        (Target::Start { name, .. }, Some(id)) => Some((name.as_str(), id)),
+        (Target::Start { .. }, None) => None,
+    };
+    let made = match source {
+        Some((bot, id)) => fork_shadow(client, bot, id).await,
+        None => start_shadow(client, trigger).await,
+    };
+    let (name, id) = match made {
+        Ok(made) => made,
+        Err(outcome) => return outcome,
+    };
+    let of = source.map_or(trigger.bot(), |(bot, _)| bot);
+    let prompt = format!(
+        "[trigger {} · {} · {why} · shadow run]\nThis is a shadow run: you are a read-only \
+         copy of {of}, and every call past reading is refused, not asked about. Do the work \
+         below as far as reading goes, then end with what you would have done: each change, \
+         message or post, with what it would have said.\n\n{}",
+        trigger.name,
+        stamp(now()),
+        trigger.message
+    );
+    let asking = json!({"bot": name, "bot_id": id, "request_id": request_id(trigger, id, ask),
+        "prompt": prompt, "delivery": "reject", "origin": "trigger",
+        "budget_tokens": trigger.turn_budget_tokens});
+    let turn = match client.request("submit", asking).await {
+        Ok(turn) => turn["turn"].as_i64().unwrap_or_default(),
+        Err(error) => {
+            let _ = client
+                .request("delete", json!({"bot": name, "bot_id": id}))
+                .await;
+            return json!({"outcome": "failed", "detail": format!("shadow: {error}")});
+        }
+    };
+    let mut outcome = json!({"outcome": "sent", "turn": turn, "shadow": name,
+        "handle": format!("turn:{name}/{turn}")});
+    if let Some(ask) = ask.filter(|a| a.kind == Ask::Fire) {
+        let _ = std::fs::write(&ask.receipt, outcome.to_string());
+    }
+    outcome["reply"] = report(client, trigger, kept, (&name, id, turn), of).await;
+    if outcome["reply"]["outcome"] == "sent" {
+        let _ = client
+            .request("delete", json!({"bot": name, "bot_id": id}))
+            .await;
+    }
+    outcome
+}
+
+/// Who a shadow run's report goes to: the trigger's `--reply-to`, else the
+/// agent that added a `--start` trigger, else the agent it copies.
+fn reported_to(trigger: &Trigger, kept: &Kept) -> Option<(String, i64)> {
+    gate_told(trigger, kept)
+}
+
+/// Pass a shadow run's answer on, once its turn ends, as a report.
+async fn report(
+    client: &Client,
+    trigger: &Trigger,
+    kept: &Kept,
+    (bot, id, turn): (&str, i64, i64),
+    of: &str,
+) -> Value {
+    let Some((to, to_id)) = reported_to(trigger, kept) else {
+        return json!({"outcome": "failed", "detail": "no agent to report to"});
+    };
+    let handle = format!("turn:{bot}/{turn}");
+    let waited = client
+        .request(
+            "wait",
+            json!({"handles": [handle], "timeout_ms": REPLY_WAIT_MS}),
+        )
+        .await;
+    let result = match waited {
+        Ok(waited) => waited["results"][&handle].clone(),
+        Err(error) => return json!({"outcome": "failed", "detail": error.to_string()}),
+    };
+    if result["pending"] == true || result.is_null() {
+        return json!({"outcome": "failed", "detail": "the turn did not end within a day"});
+    }
+    let status = result["status"].as_str().unwrap_or("ended");
+    let cut = match result["text_truncated"] == true {
+        true => " · cut short",
+        false => "",
+    };
+    let prompt = format!(
+        "[trigger {} · {} · shadow run of {of} {status}{cut}: a read-only copy, so nothing \
+         past reading was done]\n{}",
+        trigger.name,
+        stamp(now()),
+        answer(&result)
+    );
+    let sent = client
+        .request(
+            "submit",
+            json!({"bot": to, "bot_id": to_id,
+                "request_id": format!("{}shadow.{to_id}.{id}.{turn}", sent_by(trigger)),
+                "prompt": prompt, "delivery": "queue", "from": {"bot": bot, "turn": turn}}),
+        )
+        .await;
+    match sent {
+        Ok(sent) => json!({"outcome": "sent", "bot": to, "turn": sent["turn"]}),
+        Err(error) if error.code == "idempotency_conflict" => json!({"outcome": "sent", "bot": to}),
+        Err(error) if error.code == "bot_not_found" => {
+            json!({"outcome": "failed", "bot": to, "gone": true, "detail": error.to_string()})
+        }
+        Err(error) => json!({"outcome": "failed", "bot": to, "detail": error.to_string()}),
+    }
 }
 
 /// Write what an ask sends into it, durably: beside the queue first, where
@@ -3580,7 +3894,7 @@ fn attach_wait() -> Option<u64> {
 pub fn fire_generation(request_id: &str) -> Option<&str> {
     let (generation, rest) = request_id.strip_prefix("trigger_")?.split_once('_')?;
     let own = !rest.contains(".to.")
-        && !["reply.", "missed.", "failed."]
+        && !["reply.", "missed.", "failed.", "shadow."]
             .iter()
             .any(|note| rest.starts_with(note));
     own.then_some(generation)
@@ -4260,7 +4574,7 @@ pub(crate) mod tests {
                 "start": {"model": "openai/gpt", "effort": "low"}, "by": "p.lead",
                 "reply_to": null, "if": "test -s inbox", "runs": null,
                 "turn_budget_tokens": null, "once": false, "commit": null, "file": null,
-                "dir": "/work/p", "message": digest.message}),
+                "dir": "/work/p", "shadow": false, "message": digest.message}),
             "what it did and its daemon's ids stay out"
         );
 
@@ -4606,6 +4920,7 @@ pub(crate) mod tests {
             },
             store_id: "00ab".into(),
             message: "Check the PR's CI & reviews; <fix> what's \"red\".\nThen say so.".into(),
+            shadow: false,
         }
     }
 
@@ -4670,6 +4985,12 @@ pub(crate) mod tests {
             ..s.clone()
         };
         assert_eq!(Trigger::parse(&once.args()[1..]).unwrap(), once);
+        let shadowed = Trigger {
+            shadow: true,
+            ..s.clone()
+        };
+        assert_eq!(Trigger::parse(&shadowed.args()[1..]).unwrap(), shadowed);
+        assert_eq!(shadowed.differs(&s), Some("shadow"));
         // Everything else a trigger may carry comes back as it went.
         let full = Trigger {
             target: Target::Start {
@@ -6120,6 +6441,173 @@ pub(crate) mod tests {
             (None, None, "every 30m")
         );
         assert!(parse_add(&add_args(&json!({"every": "7m", "message": "go"})), now).is_err());
+        assert!(!mine.shadow);
+        let shadowed = json!({"every": "30m", "shadow": true, "message": "go"});
+        assert!(parse_add(&add_args(&shadowed), now).unwrap().shadow);
+    }
+
+    #[test]
+    fn a_shadow_copy_is_named_for_its_agent_and_keeps_only_what_reads() {
+        assert_eq!(shadow_source("p.lead.shadow-1a2b3c"), Some("p.lead"));
+        assert_eq!(shadow_source("p.digest.shadow-f"), Some("p.digest"));
+        for not in [
+            "p.lead",
+            "p.shadow-free",
+            ".shadow-1a",
+            "p.shadow-1a2b3c4",
+            "p.shadow-",
+        ] {
+            assert_eq!(shadow_source(not), None, "{not}");
+        }
+        let name = shadow_name("p.lead");
+        assert_eq!(shadow_source(&name), Some("p.lead"), "{name}");
+        // Its tools: the daemon's it has, and of Sonny's only exec, within
+        // what it may call.
+        let record = json!({"tools": ["shell", "read", "write", "web_search"],
+            "declared": [{"name": "ask"}, {"name": "exec"}, {"name": "memory"}]});
+        assert_eq!(
+            shadow_tools(&record),
+            ["shell", "read", "write", "web_search", "exec"]
+        );
+        let narrowed = json!({"tools": ["shell", "read"], "allowed": ["read"],
+            "declared": [{"name": "exec"}]});
+        assert_eq!(shadow_tools(&narrowed), ["read"]);
+        // Its gate holds exec only, which nobody serves and which lapses.
+        let tools: Vec<String> = ["read", "exec"].map(String::from).to_vec();
+        let fields = shadow_fields("p.lead.shadow-1", 9, &tools);
+        assert_eq!(fields["settings"]["sandbox"], "read-only");
+        assert_eq!(
+            (
+                &fields["approve"],
+                &fields["approver"],
+                &fields["approve_expire_ms"]
+            ),
+            (&json!(["exec"]), &json!("shadow"), &json!(SHADOW_LAPSE_MS))
+        );
+        let reads = shadow_fields("p.lead.shadow-1", 9, &["read".to_owned()]);
+        assert_eq!(reads["approve"], json!([]));
+        assert!(reads.get("approver").is_none());
+        // The person's rules, without what they let run outside.
+        let rules: agent_client::rules::Policy = serde_json::from_value(json!({
+            "prefix_rules": [
+                {"pattern": ["mcpx"], "decision": "allow"},
+                {"pattern": ["git", "push"], "decision": "prompt"},
+                {"pattern": ["rm"], "decision": "forbidden"}]
+        }))
+        .unwrap();
+        let kept = shadow_rules(Some(&rules)).unwrap();
+        let decisions: Vec<_> = kept.prefix_rules.iter().map(|r| r.decision).collect();
+        use agent_client::rules::Decision;
+        assert_eq!(decisions, [Decision::Prompt, Decision::Forbidden]);
+        let only_allows: agent_client::rules::Policy = serde_json::from_value(json!({
+            "prefix_rules": [{"pattern": ["mcpx"], "decision": "allow"}]
+        }))
+        .unwrap();
+        assert_eq!(shadow_rules(Some(&only_allows)), None);
+        assert_eq!(shadow_rules(None), None);
+    }
+
+    #[tokio::test]
+    async fn a_shadow_fire_goes_to_a_read_only_copy_and_reports_what_it_would_do() {
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = asked.clone();
+        let client = crate::tests::daemon_answering(move |request| {
+            seen.lock().unwrap().push(request.clone());
+            match request["op"].as_str() {
+                Some("inspect") => json!({"tools": ["shell", "read"],
+                    "declared": [{"name": "exec"}, {"name": "ask"}]}),
+                Some("fork") => json!({"bot_id": 77, "head": 4}),
+                Some("submit") if request["bot_id"] == 77 => json!({"turn": 1}),
+                Some("submit") => json!({"turn": 12}),
+                Some("wait") => {
+                    let handle = request["handles"][0].as_str().unwrap().to_owned();
+                    json!({"results": {handle: {"status": "completed",
+                        "text": "Would post: 3 new issues."}}})
+                }
+                _ => json!({}),
+            }
+        })
+        .await;
+        let s = Trigger {
+            shadow: true,
+            reply_to: Some(("p.lead".into(), 3)),
+            ..trigger()
+        };
+        let outcome = shadow(&client, &s, &Kept::default(), "every 30m", None).await;
+        let name = outcome["shadow"].as_str().unwrap().to_owned();
+        assert_eq!(shadow_source(&name), Some("p.fix-login"));
+        assert_eq!(outcome["outcome"], "sent");
+        assert_eq!(outcome["handle"], format!("turn:{name}/1"));
+        assert_eq!(
+            outcome["reply"],
+            json!({"outcome": "sent", "bot": "p.lead", "turn": 12})
+        );
+        let asked = asked.lock().unwrap().clone();
+        let ops: Vec<&str> = asked.iter().map(|r| r["op"].as_str().unwrap()).collect();
+        assert_eq!(
+            ops,
+            [
+                "inspect",
+                "fork",
+                "configure",
+                "submit",
+                "wait",
+                "submit",
+                "delete"
+            ]
+        );
+        let fork = &asked[1];
+        assert_eq!(fork["source"], "p.fix-login");
+        assert_eq!(fork["allow"], json!(["shell", "read", "exec"]));
+        assert!(fork["created_by"].is_null(), "its rules are its own");
+        let configure = &asked[2];
+        assert_eq!(configure["bot_id"], 77);
+        assert_eq!(configure["settings"]["sandbox"], "read-only");
+        assert_eq!(configure["approver"], "shadow");
+        let run = asked[3]["prompt"].as_str().unwrap();
+        assert!(run.contains(" · every 30m · shadow run]\nThis is a shadow run: you are a read-only copy of p.fix-login"), "{run}");
+        assert!(run.ends_with(&s.message));
+        let report = &asked[5];
+        assert_eq!(
+            (&report["bot"], &report["bot_id"]),
+            (&json!("p.lead"), &json!(3))
+        );
+        let said = report["prompt"].as_str().unwrap();
+        assert!(
+            said.contains(" · shadow run of p.fix-login completed: a read-only copy"),
+            "{said}"
+        );
+        assert!(said.ends_with("\nWould post: 3 new issues."), "{said}");
+        let request = report["request_id"].as_str().unwrap();
+        assert_eq!(request, "trigger_test-1_shadow.3.77.1");
+        assert_eq!(fire_generation(request), None);
+        assert_eq!(asked[6]["bot"], name.as_str());
+    }
+
+    #[tokio::test]
+    async fn a_shadow_that_cannot_be_confined_is_removed_before_it_runs() {
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = asked.clone();
+        let client = crate::tests::daemon_answering(move |request| {
+            seen.lock().unwrap().push(request.clone());
+            match request["op"].as_str() {
+                Some("inspect") => json!({"tools": ["shell"]}),
+                Some("fork") => json!({"bot_id": 77}),
+                Some("configure") => json!({"error": "invalid_setting", "detail": "no"}),
+                _ => json!({}),
+            }
+        })
+        .await;
+        let s = Trigger {
+            shadow: true,
+            ..trigger()
+        };
+        let outcome = shadow(&client, &s, &Kept::default(), "fired", None).await;
+        assert_eq!(outcome["outcome"], "failed");
+        let ops: Vec<String> = (asked.lock().unwrap().iter())
+            .map(|r| r["op"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(ops, ["inspect", "fork", "configure", "delete"]);
     }
 
     #[test]

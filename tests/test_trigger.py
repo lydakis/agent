@@ -445,6 +445,26 @@ class TriggerFireTests(ModelFixture):
         finally:
             connection.close()
 
+    def test_a_shadow_fire_reports_from_a_read_only_copy_that_then_goes(self):
+        self.agent('run', *self.common, '--new', '--bot', 'p.lead', 'hello')
+        self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
+        lead = self.bot_id('p.lead')
+        sent = self.fire('p.task', 'Post the digest.',
+                         extra=['--shadow', '1', '--reply-to', 'p.lead', '--reply-to-id', str(lead)])
+        last = sent['last']
+        self.assertEqual((last['outcome'], last['reply']['outcome']), ('sent', 'sent'), sent)
+        copy = last['shadow']
+        self.assertRegex(copy, r'^p\.task\.shadow-[0-9a-f]{1,6}$')
+        self.assertEqual(last['handle'], f'turn:{copy}/{last["turn"]}')
+        # The agent it copies did nothing; the copy is gone once its report went.
+        self.assertEqual(len(self.turns('p.task')), 1)
+        names = [b['name'] for b in json.loads(self.agent('ls', '--store', str(self.store)).stdout)]
+        self.assertNotIn(copy, names)
+        self.settle('p.lead')
+        report = self.turns('p.lead')[-1]
+        self.assertRegex(report['prompt_preview'], '^' + LINE.format(
+            'p.task', 'shadow run of p.task completed: a read-only copy, so nothing past reading was done'))
+
     def test_a_trigger_at_its_run_limit_sends_nothing_more(self):
         self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
         first = self.fire('p.task', 'once', extra=['--runs', '1'], generation='g1')
@@ -474,7 +494,21 @@ class TriggerFireTests(ModelFixture):
         failed = self.fire('p.task', 'x', extra=['--if', 'true', '--dir', str(gone)])
         self.assertEqual(failed['last']['outcome'], 'failed', failed)
         self.assertIn('--if', failed['last']['detail'])
-        self.assertEqual(len(self.turns('p.task')), 1)
+        # No turn ran; the agent has one note, attached to its next call.
+        notes = [t for t in self.turns('p.task') if t['turn'] > 1]
+        self.assertEqual([t['status'] for t in notes], ['attached'], notes)
+        self.assertIn('its --if could not run', notes[0]['prompt_preview'])
+        self.assertTrue(failed['checked']['told'], failed)
+        # Told once: the next failure adds nothing; working again is one more note.
+        generation = failed['generation']
+        self.fire('p.task', 'x', extra=['--if', 'true', '--dir', str(gone)], generation=generation)
+        self.assertEqual(len(self.turns('p.task')), 2)
+        gone.mkdir()
+        works = self.fire('p.task', 'x', extra=['--if', 'exit 1', '--dir', str(gone)], generation=generation)
+        self.assertEqual(works['checked']['gate'], 'no', works)
+        notes = [t for t in self.turns('p.task') if t['turn'] > 1]
+        self.assertEqual(len(notes), 2, notes)
+        self.assertRegex(notes[1]['prompt_preview'], r' · its --if works again\]$')
 
     def test_a_gate_that_says_no_costs_no_turn(self):
         self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
