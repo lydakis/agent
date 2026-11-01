@@ -404,10 +404,10 @@ pub struct Daemon {
     /// The store's path; it and the files SQLite keeps beside it stay
     /// read-only in every root.
     pub store: Option<PathBuf>,
-    /// The command rules' folder, read-only in every root and, when
-    /// missing, not to be made: a bot that wrote a rule could allow itself
-    /// out.
-    pub rules: Option<PathBuf>,
+    /// Paths read-only in every root and, when missing, not to be made,
+    /// such as the files a client reads its bots' command rules from: a
+    /// bot that wrote a rule could allow itself out (`--protect-path`).
+    pub protected_paths: Vec<PathBuf>,
     pub socket: Option<PathBuf>,
     /// The agent binary, which a confined write runs in.
     pub helper: Option<PathBuf>,
@@ -573,13 +573,15 @@ fn root(path: &Path, daemon: &Daemon) -> Result<Root> {
     {
         read_only.extend(store_files(store).filter(|file| file.exists()));
     }
-    if let Some(rules) = &daemon.rules
-        && rules.starts_with(path)
+    for kept in daemon
+        .protected_paths
+        .iter()
+        .filter(|kept| kept.starts_with(path))
     {
-        match std::fs::symlink_metadata(rules) {
-            Ok(found) if found.file_type().is_symlink() => return linked(rules),
-            Ok(_) => read_only.push(rules.clone()),
-            Err(_) => missing.push(rules.clone()),
+        match std::fs::symlink_metadata(kept) {
+            Ok(found) if found.file_type().is_symlink() => return linked(kept),
+            Ok(_) => read_only.push(kept.clone()),
+            Err(_) => missing.push(kept.clone()),
         }
     }
     // A socket the bot could rename or link would be reachable by its new

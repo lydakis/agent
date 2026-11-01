@@ -2,7 +2,7 @@
 
 Agent uses flat verbs: `run`, `follow`, `fork`, `interrupt`, `wait`, `ls`,
 `inspect`, `turns`, `usage`, `rm`, `prune`, `approvals`, `answer`, `models`, `companion`, `start`, `stats`,
-`rules`, `shutdown`, and `serve`. All named
+`shutdown`, and `serve`. All named
 bots use the same commands. There is no parent/child command hierarchy.
 
 Use `agent --help`, `agent COMMAND --help`, or `agent help COMMAND` for help;
@@ -41,12 +41,11 @@ LABEL. A client that starts a daemon passes `agent_client::SECRET_FIELDS`
 Likewise `serve --protect NAME` keeps NAME at the top of a sandboxed bot's
 writable folders read-only and from being made, and `--protect-existing NAME`
 keeps it read-only where it exists; a client passes `.git`, `.agents` and
-`.codex`, and `.aws` where it exists. `serve --rules DIR` reads the
-[command rules](RUST_PROTOTYPE.md#command-rules) in DIR's `*.rules` files,
-which a client passes as `~/.agent/rules`, and
-`rules check [--rules DIR] -- COMMAND...` prints what they decide about a
-command without a daemon: `{"decision", "matched"}`, with no `decision`
-when no rule matches, or `rules_invalid` with the file and line.
+`.codex`, and `.aws` where it exists. `serve --protect-path PATH`
+keeps PATH, by its absolute path, read-only in every sandbox and from being
+made there; the CLI passes `~/.agent/rules`, where Sonny reads the
+[command rules](RUST_PROTOTYPE.md#command-rules) it gives its bots, so no
+bot writes its own.
 `run` without `--bot` creates a fresh identity. `run --bot NAME` continues an
 existing bot; add `--new` to create that name. A prompt of `-` reads stdin.
 

@@ -125,16 +125,19 @@ vulnerability, whether or not the code's own documentation agrees.
   `require_escalated`, a write outside the writable folders) waits on the
   bot's approval gate and runs unconfined only when allowed. With no gate
   it is refused. A command runs outside without asking only when an
-  `allow` command rule in `~/.agent/rules` matches every command in a
+  `allow` command rule, which the bot's client gives it (Sonny's are in
+  `~/.agent/rules`), matches every command in a
   plain script; any script with substitution, redirection or an unmatched
   command stays inside. A `forbidden` rule refuses a command even when it
   escalates, and a `prompt` rule makes it wait on the gate, or refuses it
   without one, even when the sandbox would confine it. The rules folder
-  is read-only inside every sandbox, so no bot widens its own rules; a
-  rules file that fails to parse at start refuses every command.
+  is read-only inside every sandbox (`serve --protect-path`), so no bot
+  widens its own rules; rules its client couldn't read refuse every
+  command.
 - A bot made or forked by a sandboxed bot inherits its creator's sandbox
   and writable folders, may only narrow them, reaches the network only if
-  both do. Command rules are the same for every bot.
+  both do. It goes by its creator's command rules, and can't be given
+  others.
 - A bot made with `danger-full-access`, or with no `sandbox`, runs
   unconfined with the caller's full permissions. That is the daemon's
   default; Sonny's default is a sandbox.

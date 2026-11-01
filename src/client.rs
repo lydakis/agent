@@ -920,8 +920,9 @@ fn connect_or_start(options: &Options) -> Result<Connection> {
     for name in agent_client::PROTECTED_EXISTING {
         command.arg("--protect-existing").arg(name);
     }
+    // Sonny reads its bots' command rules from here.
     if let Some(rules) = agent_client::config::rules() {
-        command.arg("--rules").arg(rules);
+        command.arg("--protect-path").arg(rules);
     }
     for pattern in config()?.shell_environment_policy.excludes() {
         command.arg("--shell-exclude").arg(pattern);
@@ -1176,9 +1177,6 @@ fn unique(prefix: &str) -> String {
 
 pub fn main(args: Vec<String>) -> Result<i32> {
     let command = args[0].as_str();
-    if command == "rules" {
-        return rules(&args[1..]);
-    }
     let mut options = parse(&args[1..])?;
     options.command = command.to_owned();
     if std::env::var("AGENT_SHELL_CONTEXT").as_deref() == Ok("1")
@@ -2025,70 +2023,6 @@ fn whole_arguments(connection: &mut Connection, calls: &mut [Value]) -> Result<(
 }
 
 /// `companion add`, `rm` or `ls`: what the daemon keeps running beside it.
-/// `rules check COMMAND...`: what the rules in their folder make of the
-/// command, its words read as one shell script, as a shell call's command
-/// is; read from the files, with no daemon, as `codex execpolicy check`
-/// reads them. Exits 1 when the files don't read.
-/// `rules check [--rules DIR] [--pretty] [--] COMMAND...`: what the rules
-/// say of one command, its words as given, as `codex execpolicy check`
-/// reads them. It needs no store or daemon, so it reads its own flags.
-fn rules(args: &[String]) -> Result<i32> {
-    let (mut folder, mut pretty, mut words) = (None, false, Vec::new());
-    let mut iter = args.iter();
-    while let Some(arg) = iter.next() {
-        match arg.as_str() {
-            // The CLI puts `--` before the command, so its own flags are
-            // its words.
-            "--" => words.extend(iter.by_ref().cloned()),
-            "--pretty" => pretty = true,
-            "--rules" => {
-                let value = iter
-                    .next()
-                    .ok_or(Error::with("usage", "--rules needs a value"))?;
-                folder = Some(PathBuf::from(value));
-            }
-            _ => match arg.strip_prefix("--rules=") {
-                Some(value) => folder = Some(PathBuf::from(value)),
-                None => words.push(arg.clone()),
-            },
-        }
-    }
-    let command = match words.split_first() {
-        Some((check, command)) if check == "check" => command,
-        _ => return fail_with("usage", "rules needs check COMMAND..."),
-    };
-    if command.is_empty() {
-        return fail_with("usage", "rules check needs a command");
-    }
-    let folder = match folder {
-        Some(folder) => folder,
-        None => agent_client::config::rules().ok_or(Error::with("usage", "set --rules or HOME"))?,
-    };
-    let policy = agent_runtime::rules::Policy::load(&folder)?;
-    let verdict = policy.check_command(command);
-    if pretty {
-        match verdict.decision {
-            Some(decision) => say!("{}", json!(decision).as_str().unwrap_or_default()),
-            None => say!("no rule matches"),
-        }
-        for matched in &verdict.matched {
-            let decision = json!(matched.decision);
-            say!(
-                "  {} {} ({})",
-                decision.as_str().unwrap_or_default(),
-                matched.prefix.join(" "),
-                matched.rule
-            );
-            if let Some(why) = &matched.justification {
-                say!("    {why}");
-            }
-        }
-    } else {
-        say!("{}", json!(verdict));
-    }
-    Ok(0)
-}
-
 fn companion(options: &Options) -> Result<i32> {
     let usage = || {
         fail_with(
