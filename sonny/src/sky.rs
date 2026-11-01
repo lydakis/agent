@@ -2258,8 +2258,11 @@ impl View {
         if origin == "commons"
             && let Some(thread) = commons_invite(data["request_id"].as_str().unwrap_or(""))
             && let Some(home) = std::env::var_os("HOME")
-            && let Some(by) = crate::commons::starter(std::path::Path::new(&home), thread)
-            && let Some(by) = self.agent(&by).filter(|&by| by != at)
+            && let Some((by, id)) = crate::commons::starter(std::path::Path::new(&home), thread)
+            && let Some(by) = (self.agent(&by)).filter(|&by| {
+                by != at
+                    && (id.is_none() || self.agents[by].id.is_none_or(|known| Some(known) == id))
+            })
         {
             return End::Agent(by);
         }
