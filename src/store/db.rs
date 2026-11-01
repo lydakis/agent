@@ -459,6 +459,28 @@ impl Settings {
 }
 /// The settings that make a bot's sandbox, which change together.
 pub const SANDBOX: [&str; 4] = ["sandbox", "writable", "network", "unix_sockets"];
+/// Every setting's name, as `create` and `configure` take it.
+pub const SETTINGS: [&str; 19] = [
+    "context_bytes",
+    "context_items",
+    "note_turns",
+    "compact_at",
+    "compact_keep",
+    "compact_tokens",
+    "keep_turns",
+    "approval_hold_ms",
+    "max_output_tokens",
+    "keep_warm",
+    "cache_ttl",
+    "speed",
+    "sandbox",
+    "writable",
+    "network",
+    "outputs",
+    "hide_senders",
+    "max_rounds",
+    "unix_sockets",
+];
 /// Settings as their stored fields, those at their defaults left out.
 fn settings_map(settings: &Settings) -> Result<serde_json::Map<String, Value>> {
     match serde_json::to_value(settings)? {
@@ -13324,6 +13346,41 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_setting_is_named() {
+        // Every field, so a new one doesn't compile until it is listed.
+        let all = Settings {
+            context_bytes: Some(1),
+            context_items: Some(1),
+            note_turns: Some(1),
+            compact_at: Some(1),
+            compact_keep: Some(1),
+            compact_tokens: Some(1),
+            keep_turns: Some(1),
+            approval_hold_ms: Some(1),
+            max_output_tokens: Some(1),
+            keep_warm: Some(1),
+            cache_ttl: Some(CacheTtl::Hour),
+            speed: Some(crate::provider::Speed::Fast),
+            sandbox: Some(crate::sandbox::Mode::ReadOnly),
+            writable: vec!["/".into()],
+            network: true,
+            outputs: Some("/".into()),
+            hide_senders: true,
+            max_rounds: Some(1),
+            unix_sockets: vec!["/".into()],
+        };
+        let mut names: Vec<String> = settings_map(&all)
+            .unwrap()
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        let mut listed = SETTINGS.map(String::from).to_vec();
+        names.sort();
+        listed.sort();
+        assert_eq!(names, listed);
+    }
 
     #[test]
     fn a_history_read_leaves_out_the_state_a_provider_replays() {

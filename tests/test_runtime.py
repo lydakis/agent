@@ -1290,7 +1290,7 @@ class AnthropicRuntimeTests(unittest.TestCase):
         self.assertEqual((settings['context_items'], settings.get('keep_turns')), (8, None))
         self.assertEqual(configure(settings={'context_items': 8})['result']['changed'], [])
         # Create's checks, before anything is written.
-        for refused in ({'colour': 'red'}, {'compact_keep': 99}, {'context_items': 1}):
+        for refused in ({'colour': 'red'}, {'colour': None}, {'compact_keep': 99}, {'context_items': 1}):
             with self.subTest(settings=refused):
                 self.assertEqual(configure(settings=refused, fallback='anthropic/synthetic-claude-2')['error'],
                                  'invalid_setting')
@@ -1299,6 +1299,13 @@ class AnthropicRuntimeTests(unittest.TestCase):
         turn = client.request('submit', bot='Bob', request_id='f2', prompt='hello')['result']['turn']
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
         self.assertEqual(model.requests.get(timeout=5)['max_tokens'], 4096)
+        # A writable folder gone since fails only a change to the sandbox.
+        if shutil.which('bwrap') or sys.platform == 'darwin':
+            gone = Path(tempfile.mkdtemp(dir=path))
+            configure(settings={'sandbox': 'workspace-write', 'writable': [str(gone)]})
+            gone.rmdir()
+            self.assertEqual(configure(settings={'keep_turns': 2})['result']['changed'], ['keep_turns'])
+            self.assertEqual(configure(settings={'network': True})['error'], 'path_not_found')
 
     def test_what_a_declined_request_added_goes_on_as_a_note(self):
         client, model, path = self.start()

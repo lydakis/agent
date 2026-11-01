@@ -3292,6 +3292,13 @@ impl Service {
                 // sandbox with it, over the bot's own.
                 let mut named = Vec::new();
                 let mut changes = settings.unwrap_or_default();
+                // Named before a null drops one, so a reset of a setting
+                // that isn't one is refused like any other.
+                if let Some(unknown) = (changes.keys())
+                    .find(|key| !agent_runtime::store::SETTINGS.contains(&key.as_str()))
+                {
+                    return fail_with("invalid_setting", format!("unknown setting `{unknown}`"));
+                }
                 if changes.contains_key("sandbox") {
                     for key in agent_runtime::store::SANDBOX {
                         changes.entry(key).or_insert(Value::Null);
@@ -3331,12 +3338,18 @@ impl Service {
                             .map_err(|error| Error::with("invalid_setting", error.to_string()))?;
                         merged.validate()?;
                         // Checking for a sandbox and resolving folders touch
-                        // the filesystem: off the runtime thread.
-                        let merged = tokio::task::spawn_blocking(move || {
-                            confine(&mut merged).map(|()| merged)
-                        })
-                        .await
-                        .map_err(|_| Error::new("sandbox_unavailable"))??;
+                        // the filesystem: off the runtime thread, and only
+                        // when the sandbox changes, so a folder gone since
+                        // fails no other setting.
+                        let sandboxed = (agent_runtime::store::SANDBOX.iter())
+                            .any(|key| named.iter().any(|name| name == key));
+                        if sandboxed {
+                            merged = tokio::task::spawn_blocking(move || {
+                                confine(&mut merged).map(|()| merged)
+                            })
+                            .await
+                            .map_err(|_| Error::new("sandbox_unavailable"))??;
+                        }
                         Some(merged)
                     }
                     _ => None,
