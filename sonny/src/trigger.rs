@@ -138,7 +138,14 @@ impl Places {
             return places;
         }
         match old.quiet(scheduling) {
-            Some(_held) if std::fs::rename(&old.state, &places.state).is_ok() => places,
+            Some(_held) if std::fs::rename(&old.state, &places.state).is_ok() => {
+                // What chose the old folder before the move, such as an
+                // add still asking its daemon, writes once it takes the
+                // files' lock, held here until this link is there: it
+                // reaches the new folder through it.
+                let _ = std::os::unix::fs::symlink("automations", &old.state);
+                places
+            }
             _ => old,
         }
     }
@@ -1939,6 +1946,15 @@ impl Lock {
     }
 
     fn flock(places: &Places, how: libc::c_int) -> Result<Self, String> {
+        // The folder from before 0.8.0, gone between its move and its
+        // link: made again here, it would keep what is written in it from
+        // every other process.
+        if places.state.ends_with(".agent/triggers") && places.state.symlink_metadata().is_err() {
+            return Err(format!(
+                "automations_moved: {} moved to automations just now; try again",
+                places.state.display()
+            ));
+        }
         std::fs::create_dir_all(&places.state)
             .map_err(|e| format!("{}: {e}", places.state.display()))?;
         let path = places.state.join(".lock");
@@ -6426,12 +6442,22 @@ pub(crate) mod tests {
         assert_eq!(Places::moved(&w.root, false).state, old);
         assert_eq!(Places::moved(&w.root, true).state, w.places.state);
         drop(scheduler);
-        assert!(!old.exists());
         assert!(w.places.jobs.join("p.x.json").exists());
+        // What chose the old folder before the move reaches the new one
+        // through a link.
+        let before = Places::at(old.clone());
+        assert!(old.symlink_metadata().unwrap().file_type().is_symlink());
+        drop(Lock::take(&before).unwrap());
+        assert!(before.job("p.x").exists());
+        // Between the move and the link, it is told to try again rather
+        // than make the old folder again.
+        std::fs::remove_file(&old).unwrap();
+        assert!(Lock::take(&before).is_err_and(|e| e.starts_with("automations_moved:")));
+        assert!(!old.exists());
         // One made in its place since stays as it is.
         std::fs::create_dir_all(old.join("jobs")).unwrap();
         assert_eq!(Places::moved(&w.root, false).state, w.places.state);
-        assert!(old.exists() && w.places.jobs.join("p.x.json").exists());
+        assert!(old.is_dir() && w.places.jobs.join("p.x.json").exists());
         // Prompts from before the rename are still an automation's.
         assert!(sent_it("trigger") && sent_it(ORIGIN) && !sent_it("commons"));
     }

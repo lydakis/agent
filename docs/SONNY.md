@@ -370,7 +370,11 @@ script of 0.8.0 to look moves `~/.agent/triggers` to
 nothing works in it: no change to its files, no fire running (a fire of the
 old Sonny keeps its paths to its end) and no other scheduler. Until then
 each works in the old folder, and the scheduler moves it within a minute of
-the last fire ending, then runs again from the new one. Sonny's start
+the last fire ending, then runs again from the new one. The old path stays
+as a link to the new folder, so what chose it just before the move (an
+`add` still asking its daemon, say) writes where everything else reads; one
+that finds neither between the move and the link is told
+`automations_moved` and tries again. Sonny's start
 removes its old `~/.agent/trigger` script (upgrade migration
 `automations-folder`, retired at 0.10.0). Prompts sent before still carry
 `origin: "trigger"`, which Sonny reads as an automation's.
