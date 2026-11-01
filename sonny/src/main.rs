@@ -7970,15 +7970,16 @@ impl App {
         Some(Latest {
             ask: asks::open(&flat),
             pr,
-            step: Self::step(items),
+            step: Self::step(&entries),
         })
     }
 
-    /// The newest of `items` that reads as a step, as a line.
-    fn step(items: Vec<Value>) -> String {
-        for item in items {
+    /// The newest of history `entries` that reads as a step, as a line.
+    fn step(entries: &[Value]) -> String {
+        for entry in entries {
+            let item = &entry["item"];
             match (item["type"].as_str(), item["role"].as_str()) {
-                (_, Some("assistant")) => return status::plain_line(&text(&item)),
+                (_, Some("assistant")) => return status::plain_line(&text(item)),
                 (Some("function_call"), _) => {
                     let arguments: Value = item["arguments"]
                         .as_str()
@@ -7994,7 +7995,18 @@ impl App {
                     };
                 }
                 (_, Some("user")) => {
-                    let text = text(&item);
+                    let text = text(item);
+                    let from = transcript::sender(
+                        entry["from"]["bot"].as_str(),
+                        entry["origin"].as_str(),
+                        entry["person"].as_str(),
+                    );
+                    // Words the person did not write (an automation's, an
+                    // agent's) read as the conversation's row reads them,
+                    // never as something the person asked.
+                    if transcript::relays(&text, from.as_deref()) {
+                        return transcript::relayed_head(&text, from.as_deref());
+                    }
                     return match user_shell::read(&text) {
                         Some(ran) => format!("ran: ! {}", first_line(&ran.command)),
                         None => format!("asked: {}", first_line(&text)),
@@ -13840,6 +13852,83 @@ mod tests {
             app.latest("halves").await.ask.as_deref(),
             Some("Tag 0.4.1?")
         );
+    }
+
+    /// A trigger's fire, the turn it started and its answer, as the
+    /// daemon keeps them: the fire's words are the automation's, so they
+    /// draw as a notification row, never as the person's message, and
+    /// `/status` does not say the person asked them.
+    async fn fired_daemon() -> Arc<Client> {
+        let fire = "[trigger morning · 2026-11-01 09:00 · cron 0 9 * * *]\nBrief me on the night";
+        let entries = json!([
+            {"node": 2, "item": {"type": "message", "role": "assistant",
+                "content": [{"type": "output_text", "text": "Nothing broke overnight."}]}},
+            {"node": 1, "origin": "trigger", "item": {"type": "message", "role": "user",
+                "content": [{"type": "input_text", "text": fire}]}},
+        ]);
+        daemon_answering(move |asked| match asked["op"].as_str() {
+            Some("history_nodes") => json!({"nodes": [{"node": 2, "turn": 1},
+                {"node": 1, "turn": 1}], "next_from": null}),
+            Some("history_items") => json!({"items": entries.as_array().into_iter().flatten()
+                .filter(|entry| asked["nodes"].as_array().into_iter().flatten()
+                    .any(|node| *node == entry["node"]))
+                .cloned()
+                .collect::<Vec<_>>()}),
+            _ => json!({}),
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_triggers_fire_draws_as_a_notification_not_the_persons_message() {
+        let mut app = app(fired_daemon().await);
+        app.width = 100;
+        app.history().await;
+        let rows = drawn(&mut app);
+        assert!(
+            rows.iter()
+                .any(|row| row.trim() == "↳ From an automation ▸"),
+            "{rows:?}"
+        );
+        assert!(
+            !rows
+                .iter()
+                .any(|row| row.contains("Brief me") || row.contains("[trigger")),
+            "the fire's words stay shut in its row: {rows:?}"
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("Nothing broke overnight."))
+        );
+    }
+
+    #[tokio::test]
+    async fn status_never_says_the_person_asked_what_a_trigger_sent() {
+        let entries = json!([
+            {"node": 1, "origin": "trigger", "item": {"type": "message", "role": "user",
+                "content": [{"type": "input_text",
+                    "text": "[trigger morning · 2026-11-01 09:00 · cron 0 9 * * *]\nBrief me"}]}},
+        ]);
+        let from_bot = json!([
+            {"node": 1, "from": {"bot": "shop.fix", "turn": 2}, "item": {"type": "message",
+                "role": "user", "content": [{"type": "input_text", "text": "Done: tests pass"}]}},
+        ]);
+        let mine = json!([
+            {"node": 1, "item": {"type": "message", "role": "user",
+                "content": [{"type": "input_text", "text": "Fix the rounding"}]}},
+        ]);
+        for (entries, step) in [
+            (entries, "From an automation"),
+            (from_bot, "From shop.fix"),
+            (mine, "asked: Fix the rounding"),
+        ] {
+            let client = daemon_answering(move |asked| match asked["op"].as_str() {
+                Some("history_nodes") => json!({"nodes": [{"node": 1}], "next_from": null}),
+                _ => json!({"items": entries.clone()}),
+            })
+            .await;
+            assert_eq!(app(client).latest("shop.lead").await.step, step);
+        }
     }
 
     /// A conversation of four turns: the person's, one another agent's
