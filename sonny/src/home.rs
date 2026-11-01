@@ -1052,6 +1052,10 @@ mod tests {
         // up, and once the lead was handed it, only what is set up here.
         sh(&second.repo, &["config", "user.email", "t@example.com"]);
         sh(&second.repo, &["config", "user.name", "T"]);
+        // Its own remote, so the first machine's pushes below still go.
+        sh(&root, &["init", "--quiet", "--bare", "remote-two.git"]);
+        let two = root.join("remote-two.git").to_string_lossy().into_owned();
+        sh(&second.repo, &["remote", "set-url", "origin", &two]);
         sync(&second, None).unwrap();
         let kept = std::fs::read_to_string(second.repo.join(TRIGGERS)).unwrap();
         assert!(kept.contains("\"name\": \"p.digest\""), "{kept}");
