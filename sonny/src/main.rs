@@ -2494,20 +2494,23 @@ struct Fleet {
     resolving: resolved::Own,
 }
 
-/// The profile an agent in `folder` runs as: a lead's as its project or
-/// the config sets it, a task's as the project it was made from does;
-/// none for an agent that is neither.
-fn seat_profile(lead: bool, folder: &std::path::Path) -> Option<String> {
-    let info = |dir: &std::path::Path| agent_client::project::read(dir).ok();
-    match (lead, task::source_folder(folder)) {
-        (true, _) => info(folder).and_then(|info| project::lead_profile(&info).ok()),
-        (false, Some(source)) => info(&source).and_then(|info| project::task_profile(&info).ok()),
-        (false, None) => None,
+/// The profile an agent runs as: a lead's as the project in its `folder`
+/// or the config sets it; a task's as Sonny noted it when it started the
+/// task, which then had its own or its project's; none for another.
+fn seat_profile(
+    store: &std::path::Path,
+    bot: &str,
+    lead: bool,
+    folder: &std::path::Path,
+) -> Option<String> {
+    match lead {
+        true => agent_client::project::read(folder)
+            .ok()
+            .and_then(|info| project::lead_profile(&info).ok()),
+        false => task::noted_profile(store, bot),
     }
 }
 
-/// A lead as the person tells it apart: `shop lead` for the folder's
-/// first, `shop lead billing` for `shop.lead.billing`.
 fn lead_title(project: &str, bot: &str) -> String {
     match bot.ends_with(".lead") {
         true => format!("{project} lead"),
@@ -7361,9 +7364,9 @@ impl App {
             .as_millis() as u64;
         let store = self.store();
         let mut rows = Vec::new();
-        // Each folder's project file read once a refresh: a project's tasks
-        // share it.
-        let mut profiles: HashMap<(bool, String), Option<String>> = HashMap::new();
+        // Each lead's project file read once a refresh; a task's profile
+        // is the one noted when it started.
+        let mut profiles: HashMap<String, Option<String>> = HashMap::new();
         // With other leads in the folder, their tasks are theirs: each
         // lead shows as a row of its own.
         let shared = lead != format!("{project}.lead")
@@ -7512,18 +7515,21 @@ impl App {
             };
             // The profile it runs as, said even when it is its seat's own,
             // which the footer leaves out.
-            let seat = (
-                project::is_lead(name),
-                bot["workspace"].as_str().unwrap_or("").to_owned(),
-            );
-            let profile = profiles
-                .entry(seat.clone())
-                .or_insert_with(|| match seat.1.as_str() {
-                    "" => None,
-                    folder => seat_profile(seat.0, std::path::Path::new(folder)),
-                })
-                .clone()
-                .unwrap_or_default();
+            let profile = match project::is_lead(name) {
+                true => {
+                    let folder = bot["workspace"].as_str().unwrap_or("").to_owned();
+                    (profiles.entry(folder))
+                        .or_insert_with_key(|folder| match folder.as_str() {
+                            "" => None,
+                            folder => {
+                                seat_profile(&store, name, true, std::path::Path::new(folder))
+                            }
+                        })
+                        .clone()
+                }
+                false => seat_profile(&store, name, false, std::path::Path::new("")),
+            }
+            .unwrap_or_default();
             rows.push(status::Row {
                 name: short(name, &project, &lead),
                 bot: name.to_owned(),
@@ -11440,7 +11446,8 @@ impl App {
             return profile.clone();
         }
         let lead = self.project.is_some();
-        let profile = seat_profile(lead, std::path::Path::new(&self.workspace))
+        let here = std::path::Path::new(&self.workspace);
+        let profile = seat_profile(&self.store(), &self.bot, lead, here)
             .filter(|profile| profile != if lead { "lead" } else { "task" });
         *self.profile.borrow_mut() = Some((key, profile.clone()));
         profile
@@ -12788,6 +12795,8 @@ mod tests {
                     "status": "idle", "running_turn": null},
                 {"name": "shop.fix", "bot_id": 2, "head": 1,
                     "status": "idle", "running_turn": null},
+                {"name": "shop.old", "bot_id": 3, "head": 1,
+                    "status": "idle", "running_turn": null},
             ], "next_after": null}),
                     "turns" => json!({"turns": [], "next_before": null}),
                     "history_nodes" => json!({"nodes": [], "next_from": null}),
@@ -12798,6 +12807,10 @@ mod tests {
             .await;
         let mut app = app(client);
         app.bot = "shop.lead".into();
+        app.options.store = dir.join("store");
+        // A task runs as the profile it was started with, whatever its
+        // project tells tasks by default.
+        task::note_profile(&app.store(), "shop.fix", "reviewer").unwrap();
         let (_, rows) = app.status_rows().await.unwrap();
         let profile = |bot: &str| {
             rows.iter()
@@ -12807,8 +12820,9 @@ mod tests {
                 .clone()
         };
         assert_eq!(profile("shop.lead"), "superlead");
-        // Nowhere to read it from: nothing said rather than a guess.
-        assert_eq!(profile("shop.fix"), "");
+        assert_eq!(profile("shop.fix"), "reviewer");
+        // Not started by Sonny: nothing said rather than a guess.
+        assert_eq!(profile("shop.old"), "");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -14530,6 +14544,20 @@ mod tests {
         let text = app.footer_line(140).to_string();
         assert!(
             text.contains(&format!(" {} · superlead · ", models::label(&app.model))),
+            "{text}"
+        );
+        // A task, as Sonny noted it when it started it: named only when
+        // it is not `task`.
+        app.options.store = dir.join("store");
+        app.project = None;
+        app.bot = "top.fix".into();
+        task::note_profile(&app.store(), "top.fix", "task").unwrap();
+        assert!(!app.footer_line(140).to_string().contains("task ·"));
+        app.bot = "top.check".into();
+        task::note_profile(&app.store(), "top.check", "reviewer").unwrap();
+        let text = app.footer_line(140).to_string();
+        assert!(
+            text.contains(&format!(" {} · reviewer · ", models::label(&app.model))),
             "{text}"
         );
         std::fs::remove_dir_all(&dir).unwrap();

@@ -668,7 +668,9 @@ way `/react` does, and each note in the margin has its own `↩`.
   time is how long its running turn has been at it, or how long its last
   turn took. Beside its model each agent names the profile it runs
   as, `lead` and `task` too, which the footer leaves out (it names a
-  profile only when it is not the seat's own). An agent with
+  profile only when it is not the seat's own): a lead's as its project
+  sets it, a task's as it was started, with `start_task`'s `profile` or
+  its project's default. An agent with
   automations or follows of its own shows `↻ 2 automations` there too. A click on an agent's name goes
   to it as a click on a task in a roster does (below), and so does
   Enter on the agent ↑ and ↓ pick (`›`); ‹ in its title,
