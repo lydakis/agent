@@ -438,7 +438,6 @@ keep-warm when it sets any of them.
 | `network` (`--network`) | A `workspace-write` bot's commands may use the network. | off |
 | `hide_senders` (`--hide-senders`) | Its model reads what other bots and clients send it without the line naming the sender (see [fleet controllers](#fleet-controllers)); `senders = "hidden"` in `~/.agent/config.toml` sets it on the bots the CLI and Sonny make. | off |
 | `outputs` (`--outputs`) | An absolute folder that holds each tool output stream cut for the model whole, one file per stream, in place of the store's copy (see [retained outputs](#retained-outputs)). The daemon makes it, owner-only, and writes there only while the bot's sandbox cannot write it; otherwise the stream stays in the store. `agent run --new` and Sonny name `outputs` beside the store unless told otherwise. | none |
-| `unsandboxed` (`--unsandboxed`, repeatable) | Commands a sandboxed bot runs outside its sandbox without asking, each by its first words, such as `mcpx` or `docker compose` (see [sandbox](#sandbox)). At most 64, each at most 1 KiB. | none |
 | `unix_sockets` (`--unix-socket`, repeatable) | Absolute Unix sockets, or folders of them, the only ones a sandboxed bot's commands reach, such as a Docker or SSH agent socket (see [sandbox](#sandbox)). Each is stored by its real path while it exists. At most 64. | none |
 
 Provider requests multiplex over HTTP/2, and one connection carries at most
@@ -1387,9 +1386,9 @@ since its history is kept in that family's encoding
 `approve: []` alone removes them, including the gates a bot took from the
 bot that made it: whoever configures a bot decides, as a person overriding
 one does, and bots it already made keep theirs. The gate is checked before
-anything is written. `sandbox`, with `writable`, `network`, `unsandboxed` and
+anything is written. `sandbox`, with `writable`, `network` and
 `unix_sockets` (as `create`'s settings name them), replaces the bot's sandbox,
-and those left out go back to none, off, none and none; a bot another bot made keeps no weaker a sandbox than its
+and those left out go back to none, off and none; a bot another bot made keeps no weaker a sandbox than its
 creator's, as when it was made, and a bot's own socket may not configure
 at all. `cache_ttl` (`5m` or `1h`, as `create`'s settings name it) sets the
 bot's prompt-cache lifetime from its next model call, and `speed`
@@ -2592,32 +2591,106 @@ a policy that never asks, a command asking to escalate is refused with
 from its arguments and the folders' names alone, so the round that announces
 it and the run that starts it agree.
 
-A command its client trusts runs outside the sandbox without asking, as a
-Codex rule that allows a command prefix runs it: a shell call that doesn't
-ask to escalate, whose script runs nothing but commands that begin with the
-words of one of the bot's `unsandboxed` entries. So a tool with a daemon of
-its own, such as mcpx, which keeps its lock and socket under
-`~/.local/state` and starts its daemon on first use, works from a sandboxed
-bot once it is named: started in a sandbox, the daemon would keep the
-sandbox's limits, and on Linux die with the command. Only a plain script is
-read, as Codex reads one: words, quoted or not, in commands joined by `&&`,
-`||`, `;`, `|` or a newline. A script with anything that could run something
-else (`$`, a backquote, a redirection, parentheses, `&` alone, a comment)
-runs in the sandbox, and so does one with any other command in it, such as
-`mcpx … | jq`; it can still ask to escalate. The command is found on the
-daemon's `PATH`, so an `unsandboxed` command is only as trusted as the
-folders there.
+Which commands run outside the sandbox without asking, which always ask,
+and which never run is the person's to say, in [command rules](#command-rules).
 
 A bot that a sandboxed bot makes (its `created_by`), or forks, takes the
 creator's sandbox and `writable` folders unless it names a stricter sandbox,
 and reaches the network only if both do, as Codex's subagents inherit their
-parent's sandbox. It runs outside the sandbox only commands its creator
-does.
+parent's sandbox. Command rules are the daemon's, so they hold for every
+bot alike.
 
 On Linux, bubblewrap makes an empty folder on the host to mount a missing
 `.git` read-only over; the daemon removes it once no running sandbox holds
 it, and a detached command holds it until it exits. A sandbox that needs
 one being removed waits until it is gone.
+
+### Command rules
+
+Command rules are Codex's: files of `prefix_rule` calls, matched and
+decided as Codex's execpolicy does (see NOTICE), that say which commands
+run outside a sandbox without asking, which always ask, and which never
+run. Codex's files are Starlark; the daemon reads the calls they hold,
+with literal arguments (strings, lists, `None`, `True`, `False`) and
+comments, as Codex documents them and writes "don't ask again", and
+refuses anything else Starlark has, a variable or a loop, as
+`rules_invalid` rather than carry a language runtime. The daemon
+reads every `*.rules` file in the folder it was started with as
+`serve --rules DIR`, in name order; the CLI passes `~/.agent/rules`, so
+Sonny's leads and every bot the CLI starts share one set. Without
+`--rules` there are none.
+
+```python
+prefix_rule(
+    pattern = ["rm", ["-rf", "-fr"]],
+    decision = "forbidden",
+    justification = "Move it to the trash instead.",
+    match = ["rm -rf build"],
+    not_match = ["rm build"],
+)
+prefix_rule(pattern = ["mcpx"], decision = "allow")
+prefix_rule(pattern = ["git", "push"], decision = "prompt")
+```
+
+A pattern is a command's first words; a list in it is a choice of words.
+`decision` is `allow` (the default), `prompt` or `forbidden`, and the
+optional `justification` is said to the model when the rule refuses.
+`match` and `not_match` are examples the file is checked against when it
+is read: an example the rule does not decide as it says makes the file
+invalid. `host_executable` is read and has no effect yet; `network_rule`
+is refused, since a sandbox's network is on or off. Each command of a
+plain script is checked (words, quoted or not, joined by `&&`, `||`, `;`,
+`|` or a newline, as [sandbox](#sandbox) reads them), and the strictest
+decision wins, as in Codex: a script runs outside only when every command
+in it is allowed. A script that isn't plain, with `$`, a backquote, a
+redirection, parentheses, `&` alone or a comment, matches no rule.
+
+A shell call of the daemon's own `shell` tool, on a sandboxed bot or not,
+is then decided by the rule that matches:
+
+- **`forbidden`** never runs, even when it asks to escalate, and is never
+  gated: the call fails `command_forbidden` with the justification, or
+  with the file and line of the rule and the prefix it names.
+- **`prompt`** waits on the bot's gate (see [tool approval](#tool-approval)),
+  also when the sandbox would confine it, and allowed runs where it asked
+  to: confined unless it escalated. With no gate there is no one to ask,
+  so it fails `command_needs_approval`, as Codex refuses a prompt under
+  approval `never`.
+- **`allow`** runs outside the sandbox without asking, whether or not it
+  asked to escalate. So a tool with a daemon of its own, such as mcpx,
+  which keeps its lock and socket under `~/.local/state` and starts its
+  daemon on first use, works from a sandboxed bot: started in a sandbox,
+  the daemon would keep the sandbox's limits, and on Linux die with the
+  command.
+- With no match the call goes as the [sandbox](#sandbox) says.
+
+The command is found on the daemon's `PATH`, so an allowed command is
+only as trusted as the folders there. A turn reads the rules once, off
+the runtime thread, when its first round begins, and each call a round
+plans keeps what they made of it, which a parked turn reads back as it
+resumes: a call runs as its round was announced, also after a park or a
+restart and whatever the rules say by then. The folder is read again
+when a file in it changes, and a turn started after that takes the new
+rules. A file that can't be looked at, read or parsed, before any has
+been, fails every shell call with `rules_invalid`, naming the file
+and line, where Codex would refuse to start; after that, the last rules
+read stay until the folder reads again. `agent rules check -- COMMAND...`
+prints what the rules decide about a command, or what is wrong with them.
+The rules folder is read-only inside every sandbox and, when missing,
+may not be made there, so no bot writes its own rules. A rules file that
+is a symlink, or has another hard link, is `rules_invalid`, since the
+sandbox keeps the folder read-only and not what such a file also is
+elsewhere. A rules folder inside a
+writable folder that is a symlink refuses the call with
+`sandbox_unavailable`. Sonny's
+"always allow" on an approval prompt adds an `allow` rule to
+`default.rules`, as Codex's "don't ask again" does.
+
+Protocol 39 replaces the bot setting `unsandboxed`, a sandboxed bot's
+list of command prefixes run outside it, with these rules, which hold for
+every bot and can ask or refuse as well as allow. A store from before
+schema 75 drops the setting from its bots; Sonny moves its own
+`[sonny] unsandboxed` list into `allow` rules in `default.rules` once.
 
 ### Declared tools
 

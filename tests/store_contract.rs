@@ -899,7 +899,7 @@ fn a_sandboxed_bot_waits_for_a_verdict_only_on_an_escape() {
     let folder = std::path::Path::new("/synthetic");
     let gated: Vec<&str> = calls
         .iter()
-        .filter(|call| bot.gated(call, folder))
+        .filter(|call| bot.gated(call, folder, &Default::default()))
         .map(|call| call.call_id.as_str())
         .collect();
     assert_eq!(gated, ["up", "climbs", "outside"]);
@@ -3971,7 +3971,7 @@ fn a_bot_keeps_its_settings_and_a_fork_copies_them() {
         serde_json::to_value(&bob).unwrap()["settings"],
         json!({"context_bytes":4096,"context_items":4096,"note_turns":48,"compact_at":75,
             "compact_keep":25,"compact_tokens":null,"keep_turns":1,"max_rounds":null,"approval_hold_ms":2000,"max_output_tokens":null,
-            "keep_warm":0,"cache_ttl":"1h","speed":"fast","sandbox":null,"writable":[],"network":false,"outputs":null,"hide_senders":false,"unsandboxed":[],
+            "keep_warm":0,"cache_ttl":"1h","speed":"fast","sandbox":null,"writable":[],"network":false,"outputs":null,"hide_senders":false,
             "unix_sockets":[]})
     );
     // Retention follows the bot's own setting.
@@ -13518,8 +13518,12 @@ fn a_fork_narrows_what_it_may_call_and_never_widens() {
         custom: false,
     };
     let folder = std::path::Path::new("/synthetic");
-    assert!(db.inspect("Bob").unwrap().gated(&shell, folder));
-    assert!(!reader.gated(&shell, folder));
+    assert!(
+        db.inspect("Bob")
+            .unwrap()
+            .gated(&shell, folder, &Default::default())
+    );
+    assert!(!reader.gated(&shell, folder, &Default::default()));
     let (plain, _) = db.fork("Reader", "Plain", Fork::default()).unwrap();
     assert_eq!(plain.allowed.as_deref(), Some(&read[..]));
     assert_eq!(
@@ -14968,4 +14972,88 @@ fn a_page_of_pauses_fits_one_reply() {
         )
         .unwrap();
     assert_eq!(rest["pauses"][0]["id"], shown as i64 + 1);
+}
+
+#[test]
+fn a_planned_call_keeps_what_the_rules_made_of_it() {
+    use agent_runtime::rules::{Policy, Rules, Ruling};
+    let mut db = db();
+    let turn = gated_turn(&mut db, None);
+    let mut policy = Policy::default();
+    policy
+        .parse(
+            "test.rules",
+            "prefix_rule(pattern = [\"rm\"], decision = \"forbidden\")\n\
+             prefix_rule(pattern = [\"git\"], decision = \"prompt\")",
+        )
+        .unwrap();
+    let rules = Rules::new(policy);
+    let (rm, rm_call) = shell_call("fc_1", "c1", "rm -rf x");
+    let (git, git_call) = shell_call("fc_2", "c2", "git push");
+    let (ls, ls_call) = shell_call("fc_3", "c3", "ls");
+    let calls = [rm_call.clone(), git_call.clone(), ls_call.clone()];
+    db.append_under(turn, vec![rm, git, ls], &calls, None, &rules)
+        .unwrap();
+    // The prompt one is announced.
+    let page = db.approvals(Some("Bob"), None, 0, None, 64).unwrap();
+    let announced: Vec<_> = (page["approvals"].as_array().unwrap().iter())
+        .map(|a| a["call_id"].clone())
+        .collect();
+    assert!(announced.contains(&json!("c2")));
+    // Parked on the prompt one and resumed, the park reads them back with
+    // no rules at all, as after a restart that changed them.
+    db.suspend_approval(turn, &calls[1..], 0, None, None)
+        .unwrap()
+        .expect("parked");
+    let (waiting, _, _) = db.resume(turn).unwrap();
+    let ruled = waiting.rules();
+    let bot = db.inspect("Bob").unwrap();
+    assert_eq!(
+        bot.ruling(&rm_call, &ruled),
+        Ok(Ruling::Forbidden(
+            "the rule at test.rules:1 names `rm`".into()
+        ))
+    );
+    assert!(matches!(
+        bot.ruling(&git_call, &ruled),
+        Ok(Ruling::Prompt(_))
+    ));
+    assert_eq!(bot.ruling(&ls_call, &ruled), Ok(Ruling::None));
+    // It was announced, so its run waits on it.
+    let workspace = std::path::Path::new("/synthetic");
+    assert!(bot.gated(&git_call, workspace, &ruled));
+}
+
+#[test]
+fn a_bots_commands_let_out_of_its_sandbox_leave_its_settings_for_the_rules() {
+    let path =
+        std::env::temp_dir().join(format!("agent-unsandboxed-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    db.create("Ann", Some("/synthetic"), binding()).unwrap();
+    drop(db);
+    // As a store before schema 75 kept them.
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            r#"UPDATE bots SET settings='{"sandbox":"read-only","unsandboxed":["mcpx"]}' WHERE name='Bob';
+               UPDATE bots SET settings='{"unsandboxed":["mcpx"]}' WHERE name='Ann';
+               PRAGMA user_version=73;"#,
+        )
+        .unwrap();
+    let db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    let bob = db.inspect("Bob").unwrap();
+    assert_eq!(
+        bob.settings.sandbox,
+        Some(agent_runtime::sandbox::Mode::ReadOnly)
+    );
+    assert_eq!(db.inspect("Ann").unwrap().settings, Default::default());
+    drop(db);
+    // Its planned calls keep their rulings from now on.
+    Connection::open(&path)
+        .unwrap()
+        .prepare("SELECT ruling FROM tools")
+        .unwrap();
+    std::fs::remove_file(path).unwrap();
 }

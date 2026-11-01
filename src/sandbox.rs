@@ -299,36 +299,9 @@ pub fn escapes(
     }
 }
 
-/// Whether `command` runs nothing but commands `unsandboxed` lets out of
-/// the sandbox, as a Codex rule that allows a command prefix lets it out
-/// without asking: each entry is a prefix of words, such as `mcpx` or
-/// `docker compose`. Such a command, as a tool with a daemon of its own
-/// needs, runs where the bot's client trusted it to. Only a plain script
-/// is read, as Codex reads one: words, quoted or not, in commands joined by
-/// `&&`, `||`, `;`, `|` or a newline, every one of them a match. Anything
-/// that could run something else (an expansion, a substitution, a
-/// redirection, a subshell, a command in the background) and anything
-/// ill-formed is no match, and the command stays in the sandbox.
-pub fn unsandboxed(unsandboxed: &[String], command: &str) -> bool {
-    let Some(commands) = commands(command) else {
-        return false;
-    };
-    let prefixes: Vec<Vec<&str>> = unsandboxed
-        .iter()
-        .map(|prefix| prefix.split_whitespace().collect())
-        .filter(|words: &Vec<&str>| !words.is_empty())
-        .collect();
-    !commands.is_empty()
-        && commands.iter().all(|words| {
-            prefixes.iter().any(|prefix| {
-                words.len() >= prefix.len() && words.iter().zip(prefix).all(|(a, b)| a == b)
-            })
-        })
-}
-
 /// The words of each command in a plain script, as bash reads them; `None`
 /// for anything else.
-fn commands(script: &str) -> Option<Vec<Vec<String>>> {
+pub(crate) fn commands(script: &str) -> Option<Vec<Vec<String>>> {
     let mut commands = Vec::new();
     let mut words = Vec::new();
     let mut word: Option<String> = None;
@@ -431,6 +404,10 @@ pub struct Daemon {
     /// The store's path; it and the files SQLite keeps beside it stay
     /// read-only in every root.
     pub store: Option<PathBuf>,
+    /// The command rules' folder, read-only in every root and, when
+    /// missing, not to be made: a bot that wrote a rule could allow itself
+    /// out.
+    pub rules: Option<PathBuf>,
     pub socket: Option<PathBuf>,
     /// The agent binary, which a confined write runs in.
     pub helper: Option<PathBuf>,
@@ -595,6 +572,15 @@ fn root(path: &Path, daemon: &Daemon) -> Result<Root> {
         && store.starts_with(path)
     {
         read_only.extend(store_files(store).filter(|file| file.exists()));
+    }
+    if let Some(rules) = &daemon.rules
+        && rules.starts_with(path)
+    {
+        match std::fs::symlink_metadata(rules) {
+            Ok(found) if found.file_type().is_symlink() => return linked(rules),
+            Ok(_) => read_only.push(rules.clone()),
+            Err(_) => missing.push(rules.clone()),
+        }
     }
     // A socket the bot could rename or link would be reachable by its new
     // name, past a rule that names the old one; and one bot could put its
@@ -1398,51 +1384,6 @@ mod tests {
             protected_existing: agent_client::PROTECTED_EXISTING.map(String::from).to_vec(),
             ..Daemon::default()
         }
-    }
-
-    #[test]
-    fn only_a_plain_script_of_allowed_commands_leaves_the_sandbox() {
-        let allowed = ["mcpx".to_owned(), "docker  compose".to_owned()];
-        for command in [
-            "mcpx",
-            "mcpx github search_issues --query 'is:open label:\"bug\"'",
-            "mcpx a && mcpx b || mcpx c; mcpx d | mcpx e\nmcpx f",
-            "'mcpx' \"x y\" a\\ b \\\n  --flag=1 2>x#y",
-            "docker compose up",
-            "mcpx a;;",
-        ] {
-            let command = command.replace("2>x#y", "x#y");
-            assert!(unsandboxed(&allowed, &command), "{command}");
-        }
-        for command in [
-            "",
-            "  ;",
-            "mcpx a | jq .",
-            "docker ps",
-            "docker",
-            "mcpxx a",
-            "/usr/bin/mcpx a",
-            "PATH=. mcpx a",
-            "mcpx a & evil",
-            "mcpx a |& evil",
-            "mcpx $(evil)",
-            "mcpx `evil`",
-            "mcpx \"$(evil)\"",
-            "mcpx \"`evil`\"",
-            "mcpx $HOME",
-            "mcpx > ~/.zshrc",
-            "mcpx < input",
-            "mcpx <(evil)",
-            "(mcpx a)",
-            "mcpx a # ; evil",
-            "mcpx 'unclosed",
-            "mcpx \"unclosed",
-            "mcpx a\\",
-        ] {
-            assert!(!unsandboxed(&allowed, command), "{command}");
-        }
-        assert!(!unsandboxed(&[], "mcpx a"));
-        assert!(!unsandboxed(&[" ".to_owned()], "mcpx a"));
     }
 
     #[test]

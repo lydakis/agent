@@ -76,6 +76,11 @@ pub const MIGRATIONS: &[Migration] = &[
         id: crate::commons::POSTERS,
         retire: "0.10.0",
     },
+    // `[sonny] unsandboxed` becomes allow rules in ~/.agent/rules (0.8.0).
+    Migration {
+        id: crate::approvals::UNSANDBOXED_RULES,
+        retire: "0.10.0",
+    },
 ];
 
 /// `run` once for each `record`: a file of the ids done, a line each,
