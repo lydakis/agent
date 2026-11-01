@@ -1089,7 +1089,10 @@ agent busy or from another agent, are no message: once the agent reads
 them they hang right under what that call carried, your message or the
 step it joined, as `📎 From an automation ▸`, and a click opens them the
 same way. Nothing says such words are waiting: they ask nothing of you, so
-they turn up only once the agent has read them. A turn that ends
+they turn up only once the agent has read them. None waits more than a
+day (`attach_wait` in `config.toml`): one no call took in by then reaches
+the agent as a message of its own. Your reactions and the margin notes you
+close wait for your next word instead, which is what they are about. A turn that ends
 with the model saying nothing (`empty_completion`) ends quietly, not as a
 failure.
 

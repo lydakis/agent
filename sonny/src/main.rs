@@ -6512,9 +6512,13 @@ impl App {
                     self.answered(&text(item), item["from"].as_str());
                 }
             }
+            // An attached note whose wait ran out goes as a steer: the
+            // sender's, nothing the person put in line.
+            "queued" if data["lapsed"] == true => {}
             "queued" => self.notice = Some(format!("queued behind turn {}", data["behind"])),
             // Nothing until a call takes it in: it asks nothing of the
             // person, so nothing says it waits.
+            "attached" => {}
             "text_delta" => {
                 self.thought.clear();
                 // Words nobody reads in zen.
@@ -14358,6 +14362,15 @@ mod tests {
             "no clip, no count"
         );
         assert!(drawn(&mut app).iter().all(|row| !row.contains('📎')));
+        // Nor once its wait runs out and it goes as a steer: the sender's
+        // words, nothing the person put in line.
+        app.daemon(turn_event(
+            "queued",
+            5,
+            json!({"status": "ready", "delivery": "steer", "lapsed": true}),
+        ))
+        .await;
+        assert_eq!(app.notice, None, "nothing the person queued");
     }
 
     #[tokio::test]

@@ -62,6 +62,11 @@ const MAX_EXPIRE_MS: u64 = 7 * 24 * 3600 * 1000;
 const EXPIRY_RETRY: Duration = Duration::from_secs(60);
 /// Deletions one look starts at most; the rest wait for the next.
 const EXPIRY_SWEEP: usize = 16;
+/// The longest an attached message may wait for a call before it goes as a
+/// steer: a year, as the clients' `attach_wait` bounds it.
+const MAX_WAIT_MS: u64 = agent_client::config::MAX_ATTACH_WAIT_MS;
+/// Attached messages one look delivers at most; the rest follow at once.
+const LAPSE_SWEEP: usize = 64;
 
 /// Bytes and packets sent to one session.
 #[derive(Clone, Copy, Default)]
@@ -412,6 +417,9 @@ enum Command {
         /// Pictures sent with the prompt, each a media type and base64;
         /// absent or null is none.
         images: Option<Vec<agent_runtime::codec::Image>>,
+        /// With `attach`: the most milliseconds it waits for a call to take
+        /// it in before it goes as a steer; absent waits as long as it takes.
+        wait_ms: Option<u64>,
     },
     Interrupt {
         bot: String,
@@ -1181,6 +1189,9 @@ struct Service {
     /// When to look for idle bots whose time ran out: never later than the
     /// earliest one's, and sooner is harmless.
     expiry: Option<tokio::time::Instant>,
+    /// When to look for attached messages whose wait ran out, kept as
+    /// `expiry` is.
+    lapses: Option<tokio::time::Instant>,
 }
 
 /// Parked turns' wake times, at most one per turn: a turn that parks again
@@ -1729,9 +1740,12 @@ pub async fn run(config: Configuration) -> Result<()> {
         ready_retry_at: None,
         unpublished: std::collections::VecDeque::new(),
         expiry: None,
+        lapses: None,
     };
     // Forks whose time ran out while no daemon ran are deleted at once.
     service.plan_expiry(Duration::ZERO).await?;
+    // So are attached messages that waited out a stop delivered.
+    service.plan_lapses().await?;
     let idle_exit = config
         .idle_exit
         .filter(|_| config.socket.is_some())
@@ -1755,6 +1769,7 @@ pub async fn run(config: Configuration) -> Result<()> {
             let (wake_due, wake_delay) = (service.wakes.next().is_some(), service.wake_delay());
             let ready_retry = service.ready_retry_at;
             let expiry = service.expiry;
+            let lapses = service.lapses;
             tokio::select! {
                 _ = stdout_closed.wait_for(|closed| *closed), if stdio_owner => return fail("output_closed"),
                 Some(error) = failures.recv() => return Err(error),
@@ -1797,6 +1812,11 @@ pub async fn run(config: Configuration) -> Result<()> {
                 // client's request, so a client that stopped leaves none.
                 _ = tokio::time::sleep_until(expiry.unwrap_or_else(tokio::time::Instant::now)), if expiry.is_some() && !service.draining() => {
                     service.expire().await?;
+                }
+                // Attached messages that waited as long as they may go as
+                // steers. A drain leaves them for the next daemon.
+                _ = tokio::time::sleep_until(lapses.unwrap_or_else(tokio::time::Instant::now)), if lapses.is_some() && !service.draining() => {
+                    service.lapse().await?;
                 }
                 // A parked turn's time comes due (a pool reopens, a gate lapses,
                 // a lost wake-up is retried): resume it like any parked turn,
@@ -2552,6 +2572,69 @@ impl Service {
             "duplicate":!started.fresh,"status":started.status,"cursor":cursor,
             "handle":format!("turn:{bot}/{}", started.turn)}),
         )
+    }
+
+    /// Look for attached messages due no later than `at`.
+    fn lapse_by(&mut self, at: tokio::time::Instant) {
+        self.lapses = Some(self.lapses.map_or(at, |due| due.min(at)));
+    }
+
+    /// When the store's first attached message with a wait is due.
+    async fn plan_lapses(&mut self) -> Result<()> {
+        let next = self.store.read("next_due", |db| db.next_due()).await?;
+        self.lapses_at(next, now_ms());
+        Ok(())
+    }
+    fn lapses_at(&mut self, next: Option<i64>, wall: u64) {
+        let now = tokio::time::Instant::now();
+        self.lapses =
+            next.map(|at| now + Duration::from_millis((at.max(0) as u64).saturating_sub(wall)));
+    }
+
+    /// Deliver the attached messages whose wait ran out as steers sent now
+    /// would go: into a running turn at its next boundary, waking one
+    /// parked on `wait` and moving a command it runs to the background, or
+    /// as a turn of their own.
+    async fn lapse(&mut self) -> Result<()> {
+        let now = now_ms() as i64;
+        // Armed inside the job, as a steer's admission arms its turn.
+        let active: HashMap<String, Arc<std::sync::atomic::AtomicBool>> = self
+            .active
+            .iter()
+            .map(|(bot, active)| (bot.clone(), active.steers.clone()))
+            .collect();
+        // The next due is read on the writer, after every submission
+        // queued before this look, so none is missed.
+        let (lapsed, next) = self
+            .store
+            .op("lapse", move |db| {
+                let lapsed = db.lapse(now, LAPSE_SWEEP)?;
+                for lapse in &lapsed {
+                    if let Some(steers) = active.get(&lapse.bot) {
+                        steers.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+                Ok((lapsed, db.next_due()?))
+            })
+            .await?;
+        for lapse in lapsed {
+            if let Some(active) = self.active.get(&lapse.bot) {
+                active
+                    .steers
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                if lapse.joins {
+                    active.lift.arm();
+                }
+            }
+            if let Some((parked, steer)) = lapse.parked {
+                self.wake_for_steer(lapse.bot.clone(), parked, steer);
+            }
+            if lapse.status == "ready" {
+                self.ready_hint = true;
+            }
+        }
+        self.lapses_at(next, now as u64);
+        Ok(())
     }
 
     /// Look for idle bots whose time ran out no later than `at`.
@@ -4347,6 +4430,7 @@ impl Service {
                 quotes,
                 budget_tokens,
                 images,
+                wait_ms,
             } => {
                 name("request_id", &request_id)?;
                 let images = images_checked(
@@ -4426,6 +4510,18 @@ impl Service {
                         "attach joins the bot's next model call, so it takes no workspace, model, effort or budget_tokens",
                     );
                 }
+                if wait_ms.is_some() && delivery != Delivery::Attach {
+                    return fail_with(
+                        "invalid_delivery",
+                        "wait_ms is how long an attached message waits, so it needs delivery attach",
+                    );
+                }
+                if wait_ms.is_some_and(|n| n == 0 || n > MAX_WAIT_MS) {
+                    return fail_with(
+                        "invalid_wait",
+                        format!("wait_ms must be from 1 to {MAX_WAIT_MS}"),
+                    );
+                }
                 if budget_tokens.is_some_and(|n| n == 0 || n > i64::MAX as u64) {
                     return fail_with(
                         "invalid_budget",
@@ -4446,6 +4542,7 @@ impl Service {
                     quotes,
                     budget_tokens,
                     images,
+                    wait_ms,
                 };
                 // A slot is promised before the commit that may take it, so
                 // admissions queued together cannot start more turns than
@@ -4486,6 +4583,11 @@ impl Service {
                         return Err(error);
                     }
                 };
+                // Sooner than its due is harmless: a retry's look finds
+                // nothing and plans the next.
+                if let Some(wait) = wait_ms {
+                    self.lapse_by(tokio::time::Instant::now() + Duration::from_millis(wait));
+                }
                 self.admissions.push_back(Admission {
                     session,
                     output: output.clone(),
@@ -5255,6 +5357,7 @@ mod tests {
             admissions: std::collections::VecDeque::new(),
             unpublished: std::collections::VecDeque::new(),
             expiry: None,
+            lapses: None,
             reserved: 0,
             storage_backoff: Duration::ZERO,
             ready_retry_at: None,
@@ -5459,6 +5562,7 @@ mod tests {
             admissions: std::collections::VecDeque::new(),
             unpublished: std::collections::VecDeque::new(),
             expiry: None,
+            lapses: None,
             reserved: 0,
             storage_backoff: Duration::ZERO,
             ready_retry_at: None,
@@ -5683,6 +5787,7 @@ mod tests {
             admissions: std::collections::VecDeque::new(),
             unpublished: std::collections::VecDeque::new(),
             expiry: None,
+            lapses: None,
             reserved: 0,
             storage_backoff: Duration::ZERO,
             ready_retry_at: None,
@@ -5770,6 +5875,7 @@ mod tests {
             quotes: None,
             budget_tokens: None,
             images: None,
+            wait_ms: None,
         }
     }
     /// Take requests the way the run loop does: an admission with room joins
@@ -5915,6 +6021,7 @@ mod tests {
             admissions: std::collections::VecDeque::new(),
             unpublished: std::collections::VecDeque::new(),
             expiry: None,
+            lapses: None,
             reserved: 0,
             storage_backoff: Duration::ZERO,
             ready_retry_at: None,

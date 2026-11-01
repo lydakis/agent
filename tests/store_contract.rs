@@ -166,6 +166,7 @@ fn historical_fork_and_exact_resume_preserve_independent_lineage() {
         quotes: Vec::new(),
         budget_tokens: None,
         images: Vec::new(),
+        wait_ms: None,
     };
     let alt = db
         .begin("Alternative", "r1", "different", true, &branch, |_, _| {
@@ -2949,6 +2950,48 @@ fn schema_69_finds_each_finished_turns_reply() {
 }
 
 #[test]
+fn schema_75_keeps_waiting_notes_waiting_with_no_limit() {
+    let path = std::env::temp_dir().join(format!(
+        "agent-schema75-attached-{}.sqlite",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let attach = TurnOptions {
+        delivery: Delivery::Attach,
+        ..TurnOptions::default()
+    };
+    {
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        db.create("Bob", Some("/synthetic"), binding()).unwrap();
+        db.begin("Bob", "n1", "fyi", true, &attach, allow_provider)
+            .unwrap();
+    }
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            "DROP INDEX turns_due; ALTER TABLE turns DROP COLUMN due_ms;
+             ALTER TABLE turns DROP COLUMN wait_ms; PRAGMA user_version=75;",
+        )
+        .unwrap();
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    assert_eq!(
+        db.next_due().unwrap(),
+        None,
+        "sent with no limit, it keeps none"
+    );
+    assert!(db.lapse(i64::MAX, 64).unwrap().is_empty());
+    let capped = TurnOptions {
+        wait_ms: Some(60_000),
+        ..attach
+    };
+    db.begin("Bob", "n2", "fyi", true, &capped, allow_provider)
+        .unwrap();
+    assert!(db.next_due().unwrap().is_some());
+    drop(db);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn schema_70_finds_each_attached_message_from_its_event() {
     let path = std::env::temp_dir().join(format!(
         "agent-schema70-attached-{}.sqlite",
@@ -5016,6 +5059,7 @@ fn turn_options_are_recorded_and_part_of_idempotency() {
         quotes: Vec::new(),
         budget_tokens: None,
         images: Vec::new(),
+        wait_ms: None,
     };
     let started = db
         .begin("Bob", "r1", "work", true, &options, allow_provider)
@@ -5148,6 +5192,7 @@ fn a_bot_without_a_default_workspace_needs_one_per_submission() {
         quotes: Vec::new(),
         budget_tokens: None,
         images: Vec::new(),
+        wait_ms: None,
     };
     let turn = db
         .begin("Nomad", "r1", "work", true, &options, allow_provider)
@@ -5273,6 +5318,137 @@ fn an_attached_message_says_it_rode_along_where_a_steer_does_not() {
         .map(|item| &item["attached"])
         .collect();
     assert_eq!(attached, [&json!(true), &json!(true), &Value::Null]);
+}
+
+#[test]
+fn an_attached_message_that_waited_its_time_goes_as_a_steer_would() {
+    let mut db = db();
+    db.create("Idle", Some("/synthetic"), binding()).unwrap();
+    let capped = |wait_ms| TurnOptions {
+        delivery: Delivery::Attach,
+        origin: Some("lookout".into()),
+        wait_ms,
+        ..TurnOptions::default()
+    };
+    let hour = Some(3_600_000);
+    let first = db
+        .begin("Idle", "n1", "fyi", true, &capped(hour), allow_provider)
+        .unwrap();
+    let second = db
+        .begin("Idle", "n2", "also", true, &capped(hour), allow_provider)
+        .unwrap();
+    // One sent with no limit waits as long as it takes.
+    let open = db
+        .begin(
+            "Idle",
+            "n3",
+            "whenever",
+            true,
+            &capped(None),
+            allow_provider,
+        )
+        .unwrap();
+    assert_eq!(db.pending().unwrap().0, 0, "a waiting note is no work");
+    let due = db.next_due().unwrap().expect("a capped note is due");
+    assert!(
+        db.lapse(due - 1, 64).unwrap().is_empty(),
+        "not before its time"
+    );
+    let lapsed = db.lapse(due + 3_600_000, 64).unwrap();
+    let seen: Vec<(i64, &str, bool)> = (lapsed.iter())
+        .map(|l| (l.turn, l.status, l.joins))
+        .collect();
+    // The first starts a turn of its own on the idle bot; the next waits
+    // behind it, for its first boundary.
+    assert_eq!(
+        seen,
+        [(first.turn, "ready", false), (second.turn, "queued", false)]
+    );
+    assert_eq!(db.next_due().unwrap(), None);
+    assert!(db.lapse(i64::MAX, 64).unwrap().is_empty(), "{}", open.turn);
+    assert_eq!(db.pending().unwrap().0, 2, "both are work now");
+    assert_eq!(db.next_ready().unwrap(), Some(("Idle".into(), first.turn)));
+    let events = db.events("Idle", 0, 256).unwrap();
+    let said: Vec<&Value> = (events["events"].as_array().unwrap().iter())
+        .filter(|e| e["event"] == "queued")
+        .map(|e| &e["data"])
+        .collect();
+    assert_eq!(said.len(), 2);
+    assert_eq!(said[0]["lapsed"], true);
+    assert_eq!(said[0]["delivery"], "steer");
+    assert_eq!(said[0]["status"], "ready");
+    assert_eq!(said[0]["origin"], "lookout");
+    // A retry is the attach it was sent as, and its wait is part of it.
+    let again = db
+        .begin("Idle", "n1", "fyi", true, &capped(hour), allow_provider)
+        .unwrap();
+    assert!(!again.fresh);
+    let other = db
+        .begin("Idle", "n1", "fyi", true, &capped(Some(1)), allow_provider)
+        .unwrap_err();
+    assert_eq!(other.code, "idempotency_conflict");
+    assert_eq!(other.facts.unwrap()["field"], "wait_ms");
+    // It starts as a turn of its own, the next one's message joining it.
+    let (started, steers) = db.start(first.turn, allow_provider).unwrap();
+    assert_eq!(started["event"], "accepted");
+    assert!(steers, "the second waits for the turn's first boundary");
+}
+
+#[test]
+fn an_attached_message_that_waited_its_time_joins_the_running_turn() {
+    let mut db = db();
+    db.create("Busy", Some("/synthetic"), binding()).unwrap();
+    let turn = db
+        .begin(
+            "Busy",
+            "r1",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let note = db
+        .begin(
+            "Busy",
+            "n1",
+            "fyi",
+            true,
+            &TurnOptions {
+                delivery: Delivery::Attach,
+                wait_ms: Some(1),
+                ..TurnOptions::default()
+            },
+            allow_provider,
+        )
+        .unwrap();
+    let lapsed = db.lapse(i64::MAX, 64).unwrap();
+    assert_eq!(lapsed.len(), 1);
+    assert_eq!((lapsed[0].status, lapsed[0].joins), ("queued", true));
+    // A reply that ends the turn's calls, which an attached note never
+    // extends, still takes it in: it is a steer now.
+    let absorbed = db
+        .absorb(
+            turn,
+            None,
+            8 << 20,
+            4096,
+            ContextUsage::default(),
+            false,
+            false,
+        )
+        .unwrap();
+    assert_eq!(absorbed.outcomes[0].0, note.turn);
+    let steered = (absorbed.entries.iter())
+        .find(|e| e["event"] == "steered")
+        .unwrap();
+    assert_eq!(
+        steered["data"]["attached"],
+        Value::Null,
+        "it came as a steer"
+    );
+    assert_eq!(db.pending().unwrap().0, 0);
 }
 
 #[test]
@@ -6156,6 +6332,7 @@ fn forks_start_at_any_answered_message_and_default_to_the_head() {
                 quotes: Vec::new(),
                 budget_tokens: None,
                 images: Vec::new(),
+                wait_ms: None,
             },
             allow_provider,
         )

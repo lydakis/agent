@@ -20,7 +20,7 @@ const COMMANDS: &[Command] = &[
         name: "run",
         about: "Send a prompt to a bot, or make one with --new; prints the turn as it runs",
         usage: "run [OPTIONS] [--] PROMPT...",
-        flags: "--bot --new --fork --allow --expires --detach --delivery --turn --model --workspace --effort --turn-budget-tokens --image --quote --agents --profile --request-id --bot-id --pretty --no-spawn",
+        flags: "--bot --new --fork --allow --expires --detach --delivery --attach-wait --turn --model --workspace --effort --turn-budget-tokens --image --quote --agents --profile --request-id --bot-id --pretty --no-spawn",
         settings: "--tools --instructions --instructions-file --budget-tokens --compaction-instructions --compaction-instructions-file --compaction-model --no-compaction --fallback --approval --approve --context-bytes --context-items --note-turns --compact-at --compact-keep --compact-tokens --max-rounds --keep-turns --approval-hold --max-output-tokens --keep-warm --cache-ttl --speed --sandbox --writable --network --hide-senders --unix-socket --outputs",
         startup: true,
     },
@@ -276,6 +276,10 @@ fn print_flags(flags: &str) {
             "--delivery" => (
                 "MODE",
                 "If the bot is busy: reject, queue, or steer; attach adds the message to its next model call without starting a turn; default AGENT_DELIVERY or reject",
+            ),
+            "--attach-wait" => (
+                "DURATION",
+                "With --delivery attach: how long it waits for a call before it goes as a steer, up to 365d; 0 as long as it takes; default attach_wait in config.toml, else 1d",
             ),
             "--all" => ("", "Follow every bot on one connection"),
             "--any" => ("", "Return when the first handle resolves"),
@@ -561,25 +565,7 @@ pub fn duration_ms(flag: &str, value: &str) -> Result<u64> {
             format!("{flag} needs a duration such as 500ms, 30s, 5m, 1h or 7d"),
         )
     };
-    if value == "0" {
-        return Ok(0);
-    }
-    let unit = value
-        .find(|c: char| !c.is_ascii_digit())
-        .ok_or_else(refuse)?;
-    let scale = match &value[unit..] {
-        "ms" => 1,
-        "s" => 1000,
-        "m" => 60_000,
-        "h" => 3_600_000,
-        "d" => 86_400_000,
-        _ => return Err(refuse()),
-    };
-    value[..unit]
-        .parse::<u64>()
-        .ok()
-        .and_then(|n| n.checked_mul(scale))
-        .ok_or_else(refuse)
+    agent_client::config::duration_ms(value).ok_or_else(refuse)
 }
 
 /// `--max-load`: a load average, 0 or more, as uptime prints one.

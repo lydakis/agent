@@ -733,6 +733,24 @@ pub struct TurnOptions {
     pub budget_tokens: Option<u64>,
     /// Pictures sent with the prompt, after its words in the user item.
     pub images: Vec<crate::codec::Image>,
+    /// With `attach`: the most milliseconds it waits for a call to take it
+    /// in before it is delivered as a steer; none waits for as long as it
+    /// takes.
+    pub wait_ms: Option<u64>,
+}
+/// An attached message whose wait ran out, delivered now as a steer.
+#[derive(Debug)]
+pub struct Lapsed {
+    pub bot: String,
+    pub turn: i64,
+    /// `queued` behind or beside the bot's running turn, or `ready` to
+    /// start a turn of its own.
+    pub status: &'static str,
+    /// The bot's running turn takes it at its next boundary.
+    pub joins: bool,
+    /// For such a steer, the bot's turn parked on a `wait`, which it
+    /// wakes, and the newest queued steer.
+    pub parked: Option<(i64, i64)>,
 }
 /// A turn whose words a prompt quotes: its prompt, or with `reply` the
 /// last message with text it ended with.
@@ -1811,7 +1829,7 @@ impl Database {
     /// Stored schema version, kept in `PRAGMA user_version`. Stores created
     /// before versioning and stores from newer binaries are rejected; an older
     /// versioned store is migrated forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 75;
+    pub const SCHEMA: i32 = 76;
     /// Verbatim user prompts a compaction keeps: per-prompt text, and the
     /// total text plus `(ordinal, String)` entry metadata. Empty entries cost
     /// space too, so the retained list cannot grow with conversation length.
@@ -1991,6 +2009,7 @@ impl Database {
                 cached_input_tokens INTEGER NOT NULL DEFAULT 0,
                 from_bot TEXT, from_turn INTEGER, from_id INTEGER, origin TEXT, reasoning TEXT, inherited_reasoning TEXT,
                 bot_model TEXT, bot_reasoning TEXT, images TEXT, person TEXT, quotes TEXT, reply_node INTEGER,
+                wait_ms INTEGER, due_ms INTEGER,
                 UNIQUE(bot,request_id));
             CREATE INDEX IF NOT EXISTS turns_bot_id ON turns(bot,id);
             CREATE INDEX IF NOT EXISTS turns_started ON turns(bot,id) WHERE started_ms IS NOT NULL;
@@ -2047,6 +2066,7 @@ impl Database {
             CREATE INDEX IF NOT EXISTS turns_queued ON turns(bot,id) WHERE status='queued';
             CREATE INDEX IF NOT EXISTS turns_steers ON turns(bot,id) WHERE status='queued' AND delivery='steer';
             CREATE INDEX IF NOT EXISTS turns_attached ON turns(bot,id) WHERE status='attached';
+            CREATE INDEX IF NOT EXISTS turns_due ON turns(due_ms) WHERE status='attached' AND due_ms IS NOT NULL;
             CREATE INDEX IF NOT EXISTS turns_ready ON turns(id) WHERE status='ready';
             CREATE INDEX IF NOT EXISTS turns_ready_bot ON turns(bot) WHERE status='ready';
             CREATE INDEX IF NOT EXISTS processes_running ON processes(turn) WHERE status='running';
@@ -5566,7 +5586,7 @@ impl Database {
             .conn
             .query_row(
                 "SELECT id,prompt,status,workspace,model,delivery,expected_turn,prompt_node,from_bot,from_turn,origin,reasoning,budget_tokens,images,
-                    person,quotes
+                    person,quotes,wait_ms
                  FROM turns WHERE bot=? AND request_id=?",
                 params![name, request_id],
                 |r| {
@@ -5578,7 +5598,12 @@ impl Database {
                             workspace: r.get(3)?,
                             model: r.get(4)?,
                             effort: r.get(11)?,
-                            delivery: Delivery::parse(&r.get::<_, String>(5)?).unwrap_or_default(),
+                            // One whose wait ran out is a steer now, and
+                            // was sent as an attach: only an attach waits.
+                            delivery: match r.get::<_, Option<i64>>(16)? {
+                                Some(_) => Delivery::Attach,
+                                None => Delivery::parse(&r.get::<_, String>(5)?).unwrap_or_default(),
+                            },
                             expected_turn: r.get(6)?,
                             from: match (r.get::<_, Option<String>>(8)?, r.get(9)?) {
                                 (Some(bot), Some(turn)) => Some((bot, turn)),
@@ -5609,6 +5634,7 @@ impl Database {
                             budget_tokens: r.get::<_, Option<i64>>(12)?.map(|n| n as u64),
                             // Checked by their digest below.
                             images: Vec::new(),
+                            wait_ms: r.get::<_, Option<i64>>(16)?.map(|n| n as u64),
                         },
                         r.get(7)?,
                         r.get(13)?,
@@ -5645,6 +5671,7 @@ impl Database {
                 quotes,
                 budget_tokens,
                 images: _,
+                wait_ms,
             } = &saved_options;
             let images = saved_images.map(|kept| pictures_digest(&kept));
             let differs = [
@@ -5659,6 +5686,7 @@ impl Database {
                 ("person", *person != same.person),
                 ("quotes", *quotes != same.quotes),
                 ("budget_tokens", *budget_tokens != same.budget_tokens),
+                ("wait_ms", *wait_ms != same.wait_ms),
                 (
                     "images",
                     images != stored_images(&same.images)?.map(|json| pictures_digest(&json)),
@@ -5828,8 +5856,9 @@ impl Database {
             )?
             .query_row([], |r| r.get(0))?;
         tx.prepare_cached(
-            "INSERT INTO turns(id,bot,request_id,prompt,status,workspace,model,delivery,expected_turn,from_bot,from_turn,from_id,origin,reasoning,budget_tokens,images,person,quotes)
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO turns(id,bot,request_id,prompt,status,workspace,model,delivery,expected_turn,from_bot,from_turn,from_id,origin,reasoning,budget_tokens,images,person,quotes,
+                wait_ms,due_ms)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         )?.execute(
             // Queued work keeps the folder it was sent to even if the bot
             // moves before it starts; a steer without one joins any turn.
@@ -5838,7 +5867,9 @@ impl Database {
                 options.model, options.delivery.name(), options.expected_turn,
                 options.from.as_ref().map(|f| &f.0), options.from.as_ref().map(|f| f.1), from_id, options.origin,
                 options.effort, options.budget_tokens.map(|n| n as i64),
-                stored_images(&options.images)?, options.person, quotes],
+                stored_images(&options.images)?, options.person, quotes,
+                options.wait_ms.map(|n| n as i64),
+                options.wait_ms.map(|n| epoch_ms().saturating_add(n as i64))],
         )?;
         if moved {
             tx.prepare_cached("UPDATE bots SET workspace=? WHERE name=?")?
@@ -9897,6 +9928,104 @@ impl Database {
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?)
     }
+    /// When the first attached message that waits only so long is due, in
+    /// milliseconds since the Unix epoch.
+    pub fn next_due(&self) -> Result<Option<i64>> {
+        Ok(self
+            .conn
+            .prepare_cached(
+                "SELECT MIN(due_ms) FROM turns WHERE status='attached' AND due_ms IS NOT NULL",
+            )?
+            .query_row([], |r| r.get(0))?)
+    }
+    /// Deliver up to `limit` attached messages whose wait ran out by `now`,
+    /// oldest due first, each as a steer sent now would go: `queued` for a
+    /// bot with a turn running or ready, which takes it at its next
+    /// boundary or runs it after, and `ready` to start a turn of its own on
+    /// an idle bot. Each commits alone with its `queued` event, which says
+    /// `lapsed`, and counts against the pending bounds from then on.
+    pub fn lapse(&mut self, now: i64, limit: usize) -> Result<Vec<Lapsed>> {
+        let due: Vec<(i64, String)> = self
+            .conn
+            .prepare_cached(
+                "SELECT t.id,t.bot FROM turns t JOIN bots b ON b.name=t.bot
+                 WHERE t.status='attached' AND t.due_ms<=?1 AND b.status!='deleting'
+                 ORDER BY t.due_ms,t.id LIMIT ?2",
+            )?
+            .query_map(params![now, limit as i64], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        let mut lapsed = Vec::with_capacity(due.len());
+        for (turn, name) in due {
+            let bot = self.inspect(&name)?;
+            let busy = bot.running_turn.is_some() || self.has_ready_turn(&name)?;
+            let status = if busy { "queued" } else { "ready" };
+            let tx = self.conn.savepoint()?;
+            type Row = (
+                String,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                Option<i64>,
+                Option<i64>,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                i64,
+            );
+            let (request_id, workspace, model, effort, from_bot, from_turn, from_id, origin, person, quotes, waiting): Row = tx
+                .prepare_cached(
+                    "UPDATE turns SET status=?2,delivery='steer' WHERE id=?1 AND status='attached'
+                     RETURNING request_id,workspace,model,reasoning,from_bot,from_turn,from_id,origin,person,quotes,
+                        length(CAST(prompt AS BLOB))+COALESCE(length(CAST(quotes AS BLOB)),0)",
+                )?
+                .query_row(params![turn, status], |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                        r.get(7)?,
+                        r.get(8)?,
+                        r.get(9)?,
+                        r.get(10)?,
+                    ))
+                })?;
+            let model = model.unwrap_or_else(|| format!("{}/{}", bot.provider, bot.model));
+            let mut data = json!({"request_id":request_id,"status":status,"delivery":"steer",
+                "lapsed":true,"workspace":workspace.or(bot.workspace.clone()),"model":model,
+                "effort":effort.or(bot.effort.clone())});
+            sender_fields(
+                &mut data,
+                from_bot.as_deref().zip(from_turn),
+                from_id,
+                origin.as_deref(),
+                person.as_deref(),
+                quotes.as_deref(),
+                false,
+            );
+            event(&tx, &name, Some(turn), "queued", data)?;
+            tx.commit()?;
+            self.pending.0 += 1;
+            self.pending.1 += waiting;
+            let joins = busy && self.joining_steer(&name)?;
+            let parked = match joins {
+                true => self.steered_park(&name)?,
+                false => None,
+            };
+            lapsed.push(Lapsed {
+                bot: name,
+                turn,
+                status,
+                joins,
+                parked,
+            });
+        }
+        Ok(lapsed)
+    }
     /// Up to `limit` bots, by name and identity, whose idle time ran out by
     /// `now` and which `delete` would take: no turn running, waiting,
     /// queued or ready, and no command of theirs running. One still busy is
@@ -12928,6 +13057,21 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
         )? {
             conn.execute_batch("ALTER TABLE tools ADD COLUMN ruling TEXT;")?;
         }
+    }
+    // 75 -> 76: an attached message may wait only so long. Those already
+    // waiting were sent with no limit and keep it.
+    if from < 76
+        && conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='turns')
+             AND NOT EXISTS(SELECT 1 FROM pragma_table_info('turns') WHERE name='due_ms')",
+            [],
+            |r| r.get::<_, bool>(0),
+        )?
+    {
+        conn.execute_batch(
+            "ALTER TABLE turns ADD COLUMN wait_ms INTEGER;
+             ALTER TABLE turns ADD COLUMN due_ms INTEGER;",
+        )?;
     }
     Ok(())
 }

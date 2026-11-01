@@ -3335,9 +3335,17 @@ async fn missed(client: &Client, trigger: &Trigger, (bot, id): (&str, i64), outc
         .request(
             "submit",
             json!({"bot": to, "bot_id": to_id, "request_id": request, "prompt": prompt,
-                "delivery": "attach", "origin": "trigger"}),
+                "delivery": "attach", "origin": "trigger", "wait_ms": attach_wait()}),
         )
         .await;
+}
+
+/// How long a trigger's note waits for a call before it goes as a steer:
+/// the person's `attach_wait`, a day unless config.toml says otherwise.
+fn attach_wait() -> Option<u64> {
+    agent_client::config::load()
+        .unwrap_or_default()
+        .attach_wait()
 }
 
 /// The generation of the trigger whose fire sent a turn with `request_id`:
@@ -3375,7 +3383,7 @@ pub async fn tell_failed(
     );
     let mut submit = json!({"bot": to,
         "request_id": format!("trigger_{generation}_failed.{bot}.{turn}"),
-        "prompt": prompt, "delivery": "attach", "origin": "trigger"});
+        "prompt": prompt, "delivery": "attach", "origin": "trigger", "wait_ms": attach_wait()});
     // By its id too, as every delivery of a trigger's: a name used again
     // is not who it was for.
     if let Some(id) = to_id {
