@@ -118,15 +118,24 @@ pub struct Room {
     pub most: usize,
     /// The project whose tasks' windows count: `shop.fix` for `shop`.
     pub project: String,
+    /// The lead's own tasks: only their windows count and close, as
+    /// another lead of the folder shares the home and keeps its own.
+    pub mine: HashSet<String>,
     /// Tasks whose window stays, by name.
     pub keep: HashSet<String>,
     /// When the person last used a task's window there, as its own Sonny
     /// saw it.
     pub used: Used,
+    /// Whether a task's window says its task failed or needs the person,
+    /// as its own Sonny last reported: it stays, also when the lead started
+    /// again since and has not heard so itself.
+    pub held: Held,
 }
 
 /// When the person last used a task's window, by its task.
 pub type Used = Arc<dyn Fn(&str) -> Option<SystemTime> + Send + Sync>;
+/// Whether a task's window holds its place, by its task.
+pub type Held = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
 /// What [`Layout::show_task`] did.
 #[derive(Debug, PartialEq)]
@@ -601,6 +610,7 @@ impl Layout {
                 label.starts_with(&tasks)
                     && !label.contains('/')
                     && !crate::project::is_lead(label)
+                    && room.mine.contains(*label)
                     && *label != bot
             })
             .collect();
@@ -608,7 +618,9 @@ impl Layout {
         windows.dedup();
         let over = (windows.len() + 1).saturating_sub(room.most);
         let mut spare: Vec<(SystemTime, &str)> = (windows.into_iter())
-            .filter(|label| !room.keep.contains(*label) && !owners.contains(label))
+            .filter(|label| {
+                !room.keep.contains(*label) && !owners.contains(label) && !(room.held)(label)
+            })
             .map(|label| {
                 let used = self.used.get(label).copied().max((room.used)(label));
                 (used.unwrap_or(SystemTime::UNIX_EPOCH), label)
@@ -1017,6 +1029,17 @@ pub fn install_skill(host: Option<&str>) {
     }
 }
 
+/// A layout on a multiplexer in memory holding `blocks`, by label and
+/// window, for another module's tests.
+#[cfg(test)]
+pub fn in_memory(blocks: &[(&str, &str)]) -> Layout {
+    let fake = tests::Fake::default();
+    for (label, window) in blocks {
+        fake.add(label, window);
+    }
+    Layout::new(Box::new(fake))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1024,7 +1047,7 @@ mod tests {
 
     /// A multiplexer in memory: its blocks, and Sonny's own.
     #[derive(Default)]
-    struct Fake {
+    pub(super) struct Fake {
         blocks: RefCell<Vec<Block>>,
         own: Option<String>,
         made: bool,
@@ -1037,7 +1060,7 @@ mod tests {
     }
 
     impl Fake {
-        fn add(&self, label: &str, window: &str) -> String {
+        pub(super) fn add(&self, label: &str, window: &str) -> String {
             let id = format!("b{}", self.blocks.borrow().len() + 1);
             self.blocks.borrow_mut().push(Block {
                 id: id.clone(),
@@ -1135,6 +1158,9 @@ mod tests {
     fn past_its_room_a_task_window_closes_the_one_used_least_recently() {
         let fake = Fake::default();
         fake.add("shop.lead", "lead");
+        // Another lead's task window, never used: not this lead's to count
+        // or close.
+        fake.add("shop.other", "other");
         let mut layout = Layout::new(Box::new(fake));
         let at = |secs| SystemTime::UNIX_EPOCH + Duration::from_secs(secs);
         // As each window's own Sonny marked it: `b` was used last, `a`
@@ -1142,12 +1168,15 @@ mod tests {
         let room = |most, keep: &[&str]| Room {
             most,
             project: "shop".into(),
+            // `shop.other` is another lead's of the folder.
+            mine: ["a", "b", "c", "d", "e", "f"].map(|t| format!("shop.{t}")).into(),
             keep: keep.iter().map(|k| k.to_string()).collect(),
             used: Arc::new(move |bot: &str| match bot {
                 "shop.a" => Some(at(20)),
                 "shop.b" => Some(at(30)),
                 _ => None,
             }),
+            held: Arc::new(|_: &str| false),
         };
         let open = |layout: &mut Layout, bot: &str, room: &Room, asked| {
             layout.show_task(bot, bot, &[], room, asked).unwrap()
@@ -1175,7 +1204,7 @@ mod tests {
         );
         assert_eq!(
             labels(&mut layout),
-            ["shop.b", "shop.c", "shop.d", "shop.lead"]
+            ["shop.b", "shop.c", "shop.d", "shop.lead", "shop.other"]
         );
         // Closed for room, it stays closed as its task works on...
         assert_eq!(open(&mut layout, "shop.a", &three, false), Shown::Aside);
@@ -1197,6 +1226,8 @@ mod tests {
             open(&mut layout, "shop.e", &full, false),
             Shown::Opened(vec![])
         );
+        // A window that says its task failed, as its own Sonny reported,
+        // stays though the lead never heard so itself.
         // A limit of 0 is none.
         assert_eq!(
             open(&mut layout, "shop.f", &room(0, &[]), false),
@@ -1208,6 +1239,34 @@ mod tests {
         assert_eq!(
             open(&mut layout, "shop.c", &room(0, &[]), false),
             Shown::Opened(vec![])
+        );
+    }
+
+    #[test]
+    fn a_window_that_says_its_task_failed_keeps_its_place() {
+        let fake = Fake::default();
+        fake.add("shop.lead", "lead");
+        let mut layout = Layout::new(Box::new(fake));
+        // As the windows' own Sonny reported: `a` failed, which this lead,
+        // started again since, has not heard itself.
+        let room = Room {
+            most: 2,
+            project: "shop".into(),
+            mine: ["shop.a", "shop.b", "shop.c"].map(String::from).into(),
+            keep: HashSet::new(),
+            used: Arc::new(|_: &str| None),
+            held: Arc::new(|bot: &str| bot == "shop.a"),
+        };
+        for bot in ["shop.a", "shop.b"] {
+            assert_eq!(
+                layout.show_task(bot, bot, &[], &room, false).unwrap(),
+                Shown::Opened(vec![])
+            );
+        }
+        layout.used.clear();
+        assert_eq!(
+            layout.show_task("shop.c", "shop.c", &[], &room, false).unwrap(),
+            Shown::Opened(vec!["shop.b".into()])
         );
     }
 

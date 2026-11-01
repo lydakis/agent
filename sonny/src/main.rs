@@ -1411,6 +1411,7 @@ fn status_report(state: &str, bot: &str) {
         return;
     }
     herdr::report(state);
+    used::reported(bot, state);
     if state == "clear" {
         cmux::release();
     }
@@ -2538,6 +2539,30 @@ fn made_room(closed: &[String], project: &str, most: usize) -> String {
     )
 }
 
+/// What a lead may close for room in its multiplexer: only its own tasks'
+/// windows (another lead of the folder keeps its own there), none whose
+/// task it heard failed or need the person, and none whose window says so
+/// (`held`), as its own Sonny knows its questions and keeps that across
+/// either one starting again.
+fn room_for(
+    project: &str,
+    lineage: &std::collections::HashSet<String>,
+    doing: &HashMap<String, &'static str>,
+    held: mux::Held,
+) -> mux::Room {
+    mux::Room {
+        most: 0,
+        project: project.to_owned(),
+        mine: lineage.iter().chain(doing.keys()).cloned().collect(),
+        keep: (doing.iter())
+            .filter(|(_, doing)| matches!(**doing, "needs you" | "failed"))
+            .map(|(bot, _)| bot.clone())
+            .collect(),
+        used: Arc::new(used::when),
+        held,
+    }
+}
+
 /// A lead as the person tells it apart: `shop lead` for the folder's
 /// first, `shop lead billing` for `shop.lead.billing`.
 fn lead_title(project: &str, bot: &str) -> String {
@@ -2871,16 +2896,7 @@ impl Fleet {
     /// The room the project's task windows have, its limit read on the
     /// worker: what needs the person or failed keeps its window.
     fn room(&self) -> (Arc<std::sync::Mutex<TaskWindows>>, mux::Room) {
-        let keep = (self.doing.iter())
-            .filter(|(_, doing)| matches!(**doing, "needs you" | "failed"))
-            .map(|(bot, _)| bot.clone())
-            .collect();
-        let room = mux::Room {
-            most: 0,
-            project: self.project.clone(),
-            keep,
-            used: Arc::new(used::when),
-        };
+        let room = room_for(&self.project, &self.lineage, &self.doing, Arc::new(used::held));
         (self.windows.clone(), room)
     }
 
@@ -10695,6 +10711,9 @@ impl App {
     }
 
     fn frame(&mut self, terminal: &mut Tui) -> std::io::Result<()> {
+        // A question open here holds this window's place in its lead's
+        // multiplexer, as the person still has it to answer.
+        used::asking(&self.bot, !self.asks.is_empty());
         self.show_asked();
         self.margin_back();
         // /status beside the conversation, gone once the pane is.
@@ -12083,6 +12102,45 @@ fn zen_notice(on: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_lead_makes_room_only_from_its_own_windows_that_nothing_holds() {
+        // Two leads share the folder's multiplexer home: `shop.x` is the
+        // other's. This lead heard `shop.a` fail; `shop.c`'s window has a
+        // question open, which only that window's Sonny knows.
+        let mut layout = mux::in_memory(&[
+            ("shop.lead", "lead"),
+            ("shop.x", "x"),
+            ("shop.a", "a"),
+            ("shop.b", "b"),
+            ("shop.c", "c"),
+        ]);
+        let lineage: std::collections::HashSet<String> =
+            ["shop.lead", "shop.a", "shop.b", "shop.c", "shop.d"].map(String::from).into();
+        let doing: HashMap<String, &'static str> =
+            [("shop.a".to_owned(), "failed"), ("shop.b".to_owned(), "done")].into();
+        let room = mux::Room {
+            most: 3,
+            ..room_for("shop", &lineage, &doing, Arc::new(|bot: &str| bot == "shop.c"))
+        };
+        // Its three windows are full: the one nothing holds closes, never
+        // the other lead's, the failed one or the one asking.
+        assert_eq!(
+            layout.show_task("shop.d", "d", &[], &room, false).unwrap(),
+            mux::Shown::Opened(vec!["shop.b".into()])
+        );
+        // One more closes the only window left that nothing holds, however
+        // lately it opened.
+        let more: std::collections::HashSet<String> = lineage.iter().cloned().chain(["shop.e".into()]).collect();
+        let room = mux::Room {
+            most: 3,
+            ..room_for("shop", &more, &doing, Arc::new(|bot: &str| bot == "shop.c"))
+        };
+        assert_eq!(
+            layout.show_task("shop.e", "e", &[], &room, false).unwrap(),
+            mux::Shown::Opened(vec!["shop.d".into()])
+        );
+    }
 
     #[test]
     fn a_message_is_drawn_without_the_time_it_was_sent() {
