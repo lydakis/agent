@@ -145,6 +145,7 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
     let mut shell_excludes = Vec::new();
     let (mut redact_fields, mut redact_blocks) = (Vec::new(), Vec::new());
     let (mut protected, mut protected_existing) = (Vec::new(), Vec::new());
+    let mut rules = None;
     let mut iter = args.iter();
     while let Some(flag) = iter.next() {
         let value = iter
@@ -169,6 +170,7 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
                 return fail_with("usage", format!("{flag} needs a name in a folder"));
             }
             "--protect" => protected.push(value.clone()),
+            "--rules" => rules = Some(value.into()),
             "--protect-existing" => protected_existing.push(value.clone()),
             "--max-processes"
             | "--max-lasting"
@@ -226,5 +228,6 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
         redact_blocks,
         protected,
         protected_existing,
+        rules,
     })
 }

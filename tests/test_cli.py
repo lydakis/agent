@@ -555,7 +555,7 @@ class SocketAndCliTests(ModelFixture):
 
     def test_help_and_invalid_flags_do_not_start_a_daemon(self):
         for args in [('--help',), ('-h',), ('help', 'run')]+[(c, '--help') for c in
-                ('run', 'follow', 'fork', 'interrupt', 'ls', 'inspect', 'turns', 'wait', 'rm', 'prune', 'models', 'stats', 'shutdown', 'serve')]:
+                ('run', 'follow', 'fork', 'interrupt', 'ls', 'inspect', 'turns', 'wait', 'rm', 'prune', 'models', 'stats', 'rules', 'shutdown', 'serve')]:
             with self.subTest(args=args):
                 result = self.agent(*args)
                 self.assertIn('Usage:', result.stdout)
@@ -594,6 +594,31 @@ class SocketAndCliTests(ModelFixture):
                 self.assertEqual(result.returncode, 2, result.stderr)
                 self.assertEqual(result.stdout, '')
         self.assertFalse(self.store.exists())
+        self.assertFalse(self.socket.exists())
+
+    def test_rules_check_says_what_the_rules_decide_without_a_daemon(self):
+        rules = self.path/'rules'
+        rules.mkdir()
+        (rules/'default.rules').write_text(
+            '# Mine.\n'
+            'prefix_rule(pattern=["rm", ["-rf", "-fr"]], decision="forbidden",\n'
+            '            justification="Use the trash.", match=["rm -rf x"])\n'
+            'prefix_rule(pattern=["git", "push"], decision="prompt")\n')
+        check = lambda *words: json.loads(self.agent('rules', 'check', '--rules', str(rules), *words).stdout)
+        self.assertEqual(check('rm', '-rf', 'build'), {'decision': 'forbidden', 'matched': [
+            {'decision': 'forbidden', 'justification': 'Use the trash.', 'prefix': ['rm', '-rf'],
+             'rule': f'{rules}/default.rules:2'}]})
+        # A command's own flags are its words, not the CLI's.
+        self.assertEqual(check('git', 'push', '--force')['decision'], 'prompt')
+        self.assertEqual(check('--', 'ls', '--pretty'), {'matched': []})
+        pretty = self.agent('rules', 'check', '--rules', str(rules), '--pretty', 'git', 'push').stdout
+        self.assertEqual(pretty, f'prompt\n  prompt git push ({rules}/default.rules:4)\n')
+        (rules/'later.rules').write_text('for tool in ["ruff"]:\n    prefix_rule(pattern=[tool])\n')
+        broken = self.agent('rules', 'check', '--rules', str(rules), 'ls', check=False)
+        self.assertEqual(broken.returncode, 1)
+        self.assertEqual(broken.stdout, '')
+        self.assertEqual(json.loads(broken.stderr)['error'], 'rules_invalid')
+        self.assertIn(f'{rules}/later.rules:1: ', json.loads(broken.stderr)['detail'])
         self.assertFalse(self.socket.exists())
 
     def test_a_side_question_asks_a_copy_that_is_deleted_once_idle(self):

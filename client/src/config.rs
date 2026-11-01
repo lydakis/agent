@@ -42,7 +42,6 @@
 //! sky_haiku_margin = 50         # how much busier, in percent, a challenger must be to take the title
 //! sky_haiku_hold = 10           # minutes the title is held before it can pass
 //! tool_processes = 8            # processes Sonny runs for agents at once in all: tool calls 3/4, goal checks 1/4; 0, the default, four times the CPUs
-//! unsandboxed = ["mcpx"]        # commands run outside agents' sandboxes
 //! default_permissions = "strict"   # the /permissions row a new lead starts in, auto by default
 //! browser_confirm = ["eval"]    # agent-browser actions the agent's gate approves; eval, download, upload and state by default
 //!
@@ -158,9 +157,9 @@ pub struct Sonny {
     /// The profile every other agent Sonny starts is told, in place of
     /// `task`.
     pub task_profile: Option<String>,
-    /// Commands, by their first words, that its sandboxed agents run
-    /// outside their sandboxes without asking, as Codex's rules that allow
-    /// a command prefix do: a tool with a daemon of its own, such as mcpx.
+    /// What `[sonny] unsandboxed` named before command rules took its
+    /// place: read only so Sonny can move it into them (upgrade migration
+    /// `unsandboxed-rules`, retired with it).
     pub unsandboxed: Vec<String>,
     /// The `/permissions` row a new lead starts in; unset, `auto`.
     pub default_permissions: Option<String>,
@@ -587,6 +586,48 @@ fn mcp_server(name: &str, value: &toml::Value) -> Result<McpServer, String> {
 
 pub fn path() -> Option<PathBuf> {
     std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".agent/config.toml"))
+}
+
+/// The person's command rules, `~/.agent/rules`: each `*.rules` file in it
+/// holds Codex's `prefix_rule` calls, which every agent's commands follow.
+pub fn rules() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".agent/rules"))
+}
+
+/// Allows every command that starts with `words`, in `folder`'s
+/// `default.rules`, as Codex's "don't ask again" appends its rule: one
+/// line, `prefix_rule(pattern=[...], decision="allow")`. False when the
+/// file holds that rule already.
+pub fn allow_rule(folder: &Path, words: &[String]) -> Result<bool, String> {
+    use std::io::Write;
+    if words.is_empty() || words.iter().any(|word| word.is_empty()) {
+        return Err("a rule needs words".into());
+    }
+    let pattern = serde_json::to_string(words).map_err(|e| e.to_string())?;
+    let rule = format!("prefix_rule(pattern={pattern}, decision=\"allow\")");
+    let path = folder.join("default.rules");
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(format!("{}: {error}", path.display())),
+    };
+    if text.lines().any(|line| line.trim() == rule) {
+        return Ok(false);
+    }
+    std::fs::create_dir_all(folder).map_err(|e| format!("{}: {e}", folder.display()))?;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    // One write, so a line another writer appends lands whole beside it.
+    let line = match text.is_empty() || text.ends_with('\n') {
+        true => format!("{rule}\n"),
+        false => format!("\n{rule}\n"),
+    };
+    file.write_all(line.as_bytes())
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(true)
 }
 
 /// The person's settings: the defaults with no HOME or no file.

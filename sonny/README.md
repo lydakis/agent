@@ -605,14 +605,20 @@ way `/react` does, and each note in the margin has its own `↩`.
   opens it. On Linux sandboxes need bubblewrap.
 
   A tool that keeps a daemon of its own, such as mcpx, can't run inside a
-  sandbox: `[sonny] unsandboxed = ["mcpx"]` has every agent run it outside
-  without asking, as a Codex rule that allows a command does. Each entry
-  is a command's first words (`"docker compose"`), and a call runs outside
-  only when everything it runs is named, so `mcpx … | jq` still asks.
-  When you approve a plain command that asked to leave, `a` (always allow
-  `cargo test`) adds its first words to the list, and the lead and its
-  agents take it at once. The list holds for every folder, so a program
-  named from the folder it runs in (`./build.sh`) is never offered.
+  sandbox: a command rule in `~/.agent/rules/default.rules`,
+  `prefix_rule(pattern = ["mcpx"], decision = "allow")`, has every agent
+  run it outside without asking, as Codex's rules do (Codex's own rules
+  files work unchanged). A rule names a command's first words
+  (`["docker", "compose"]`), and a call runs outside only when everything
+  it runs is allowed, so `mcpx … | jq` still asks. A rule can also always
+  ask (`"prompt"`) or never run a command (`"forbidden"`, with a
+  `justification` the agent is told); `agent rules check -- git push`
+  shows what the rules say. When you approve a plain command that asked
+  to leave, `a` (always allow `cargo test`) adds the rule, and every agent
+  takes it from its next turn. The rules hold for every folder, so a
+  program named from the folder it runs in (`./build.sh`) is never
+  offered. Agents can't write the rules folder from their sandbox. A
+  `[sonny] unsandboxed` list from before moves into `default.rules` once.
 
   An agent that reaches the network reaches every Unix socket too, as
   Codex's full network does, so MCPX, Docker and ssh-agent just work; and
