@@ -191,7 +191,12 @@ fn start() -> Value {
                 "reason": {"type": "string", "minLength": 1,
                     "description": "Why this is work none of your tasks still there should take, when you \
                         have any: a task given more work keeps what it learned. Without it, a start while \
-                        you have tasks is refused with the list of them."}
+                        you have tasks is refused with the list of them."},
+                "subscribe": {"type": "array", "minItems": 1, "maxItems": 16,
+                    "items": {"type": "string", "minLength": 3},
+                    "description": "Topics of the person's sources the task owns, as NAME:TOPIC (a pull \
+                        request, a chat thread): what is said on them goes to the task, in place of you, \
+                        as its subscription owned says; ask the task when you need to know."}
             },
             "required": ["name", "brief"],
             "additionalProperties": false
@@ -268,10 +273,11 @@ fn subscriptions() -> Value {
             The person's own words cut into your running turn; the rest waits until your turn ends. Each \
             watches the tasks of a bot (every agent it or its tasks made) or bots by name. It also hears the \
             sources the person set up outside (a chat, a mailbox, a feed), each by name, in a note starting \
-            \"From your sources\": every event, at once when the source marks it urgent, or one topic of a \
+            \"From your sources\": every event, at once when the source says it steers, or one topic of a \
             source as NAME:TOPIC, or only those its filter matches. The commons is a source too, each thread \
             a topic: posting in a thread subscribes you to it as commons.THREAD, and removing that leaves it. \
-            Add one, or remove one by name; with neither, or after either, the result lists them all, with \
+            Add steer yourself for what you own; a filter or a digest only when the person asks for one: \
+            what a filter leaves out you never hear, and a digest makes you late. Add one, or remove one by name; with neither, or after either, the result lists them all, with \
             the sources there are and the fields their events lately had, to filter on. Adding one again \
             changes nothing; one by a name in use that differs is refused with the field, so remove it first.",
         "parameters": {
@@ -308,9 +314,9 @@ fn subscriptions() -> Value {
                                 its sources' own digest: the first after a quiet spell at once, the rest in one \
                                 note. The person's words, a question to them and an approval only they can give \
                                 never wait for it."},
-                        "urgent": {"type": "object",
-                            "description": "What it hears that this matches, a pattern as filter's, cuts into \
-                                your running turn and waits for no digest, as the person's words do. As \
+                        "steer": {"type": "object",
+                            "description": "What it hears that this matches, a pattern as filter's, is a steer: \
+                                it cuts into your running turn and waits for no digest, as the person's words do. As \
                                 {\"type\": [\"turn.ended\"], \"status\": [\"failed\"]}."}
                     },
                     "required": ["name"],
@@ -565,6 +571,55 @@ fn run() -> Value {
 /// An answer: the call's result, or an error as the daemon carries it.
 type Answer = Result<String, (&'static str, String)>;
 
+/// The name of the subscription a task owns its topics by.
+pub const OWNED: &str = "owned";
+
+/// The topics a start's `subscribe` names, each `NAME:TOPIC` of a source
+/// the person set up.
+fn owned(topics: &Value) -> Result<crate::lookout::subs::Sub, String> {
+    let names = crate::lookout::sources::names();
+    let mut sources = Vec::new();
+    for topic in topics.as_array().into_iter().flatten() {
+        let topic = topic.as_str().unwrap_or_default();
+        match crate::lookout::sources::named(topic) {
+            (source, Some(_)) if names.iter().any(|name| name == source) => {
+                sources.push(topic.to_owned())
+            }
+            (_, Some(_)) => {
+                let there = match names.is_empty() {
+                    true => "none".to_owned(),
+                    false => names.join(", "),
+                };
+                return Err(format!(
+                    "no source for {topic:?}; the sources there are {there}"
+                ));
+            }
+            (_, None) => {
+                return Err(format!(
+                    "{topic:?} names no topic: a task owns one topic of a source, as NAME:TOPIC"
+                ));
+            }
+        }
+    }
+    Ok(crate::lookout::subs::Sub {
+        name: OWNED.into(),
+        tasks_of: Vec::new(),
+        bots: Vec::new(),
+        sources,
+        filter: None,
+        digest: None,
+        steer: None,
+        owner: None,
+    })
+}
+
+/// Subscribe a task just started to the topics it owns.
+fn subscribe_owner(task: &str, sub: crate::lookout::subs::Sub) -> Result<(), String> {
+    let (store, _) = crate::daemon_paths(None, None)?;
+    let names = crate::lookout::sources::names();
+    crate::lookout::subs::change(&store, task, Some(&sub.to_json()), None, &names).map(|_| ())
+}
+
 /// `sonny tool NAME`, as the tool host runs it for one call: the arguments
 /// on stdin, in the calling agent's folder and with its shell's variables.
 /// Prints the answer as one JSON line, `{"output": ...}` or
@@ -655,8 +710,26 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                 // A task's own helper builds on its work.
                 builds_on: (!line.role.lead).then(|| caller.clone()),
             };
+            // The topics it owns are checked before anything is made.
+            let owned = match arguments.get("subscribe") {
+                None => None,
+                Some(topics) => Some(owned(topics).map_err(|e| ("task_not_started", e))?),
+            };
             let started = crate::task::start(&line.folder, &line.project, &caller, &start)
                 .map_err(|e| ("task_not_started", e))?;
+            let started = match owned {
+                None => started,
+                Some(owned) => {
+                    let task = crate::task::named(&line.project, &start.name);
+                    match subscribe_owner(&task, owned) {
+                        Ok(()) => started,
+                        Err(e) => format!(
+                            "{started}\n\nIts subscription {OWNED} was not made, so what is said on \
+                             its topics still comes to you: {e}"
+                        ),
+                    }
+                }
+            };
             // What the lead's gone tasks left, which only it can clear.
             let left = match line.role.lead {
                 true => crate::task::left_behind(&line.folder, &line.project),

@@ -94,9 +94,34 @@ Its output sits under `.local/role-eval/<model>/small/`. Score:
 
 and note the step's `took` in timeline.json, the seconds it kept agents busy.
 
+## The burst
+
+`--day burst` (DeepSeek Harness's super-agent case) tells a fresh lead the
+person is away for half an hour and to handle what comes in, then sends
+300 messages from two sources, `chat` and `ci`: ten waves of 30, two
+minutes apart on the clock whether the lead is busy or not. Twenty of them
+are real asks, two a wave in a shuffled order that stays the same from run
+to run: twelve need code, five a quick look, three the person's call. The rest is chatter and CI
+builds passing. Past 64 waiting, the oldest of a subscriber's news goes
+untold, so a lead that does the work itself loses asks while it works; one
+that delegates stays free. Halfway through, the person asks a one-line
+question, and at the end comes back to ask what needs them. Its output sits
+under `.local/role-eval/<model>/burst/`. Score:
+
+| Id | Counts when the lead |
+| --- | --- |
+| B1 | sends each of the twelve code asks to a task, one point each (calls count); also count the ones it changed code for itself, lower is better |
+| B3 | answers each of the five quick looks itself, with no task for it, one point each |
+| B4 | brings each of the three calls only the person can make to them by the end, one point each |
+| B5 | on the person's return, says what needs them and what is in flight, with no ask missing |
+| L1 | answers the mid-burst question (five minutes, going by the code) in its reply; note `answered` in timeline.json, the seconds until it did |
+
+Also count asks that were never mentioned or acted on, and replies about
+noise (Noise, above).
+
 ## Cost
 
 One run of the day uses about 2M input tokens, mostly cache reads, across
 the lead and its tasks. On `anthropic/claude-opus-5-5` that is about $2-4 a
-run, so 2 arms × 3 runs cost about $12-24. Runs on the ChatGPT plan cost
-nothing.
+run, so 2 arms × 3 runs cost about $12-24. A burst run starts up to twelve tasks, so it
+costs more than the day. Runs on the ChatGPT plan cost nothing.

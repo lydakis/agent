@@ -28,7 +28,7 @@ pub struct Sub {
     pub digest: Option<String>,
     /// An event pattern for what it hears that cuts into a busy
     /// subscriber's turn and skips any digest, as the person's words do.
-    pub urgent: Option<Value>,
+    pub steer: Option<Value>,
     /// The bot it was made for, by ID, when Sonny made it on the bot's
     /// behalf: another bot that takes the name does not hold it.
     pub owner: Option<i64>,
@@ -51,7 +51,7 @@ impl Sub {
             sources: Vec::new(),
             filter: None,
             digest: None,
-            urgent: None,
+            steer: None,
             owner: None,
         }
     }
@@ -67,7 +67,7 @@ impl Sub {
             sources: vec![format!("{COMMONS_SOURCE}:{thread}")],
             filter: None,
             digest: None,
-            urgent: None,
+            steer: None,
             owner,
         }
     }
@@ -111,16 +111,16 @@ impl Sub {
         if let Some(digest) = &self.digest {
             out["digest"] = json!(digest);
         }
-        if let Some(urgent) = &self.urgent {
-            out["urgent"] = urgent.clone();
+        if let Some(steer) = &self.steer {
+            out["steer"] = steer.clone();
         }
         out
     }
 
     /// Whether it says more than what it watches: a filter, a digest or
-    /// what is urgent. One that says none costs the lookout nothing more.
+    /// what steers. One that says none costs the lookout nothing more.
     pub fn rules(&self) -> bool {
-        self.filter.is_some() || self.digest.is_some() || self.urgent.is_some()
+        self.filter.is_some() || self.digest.is_some() || self.steer.is_some()
     }
 
     /// Its digest as a span; none unset or `0`.
@@ -156,9 +156,9 @@ impl Sub {
             digest: (value["digest"].as_str())
                 .filter(|d| agent_client::config::span("digest", d).is_ok())
                 .map(str::to_owned),
-            // One that does not check is never urgent.
-            urgent: (value.get("urgent"))
-                .filter(|urgent| !urgent.is_null() && super::pattern::check(urgent).is_ok())
+            // One that does not check never steers.
+            steer: (value.get("steer"))
+                .filter(|steer| !steer.is_null() && super::pattern::check(steer).is_ok())
                 .cloned(),
             owner: value["bot_id"].as_i64(),
         })
@@ -178,12 +178,12 @@ impl Sub {
             Some(digest) => format!(" at most every {digest}"),
             None => String::new(),
         };
-        let urgent = match &self.urgent {
-            Some(urgent) => format!(", urgent when {urgent}"),
+        let steer = match &self.steer {
+            Some(steer) => format!(", steers when {steer}"),
             None => String::new(),
         };
         format!(
-            "{} · {}{filter}{digest}{urgent}",
+            "{} · {}{filter}{digest}{steer}",
             self.name,
             watched.join(", ")
         )
@@ -197,11 +197,154 @@ impl Sub {
             ("sources", self.sources != other.sources),
             ("filter", self.filter != other.filter),
             ("digest", self.digest != other.digest),
-            ("urgent", self.urgent != other.urgent),
+            ("steer", self.steer != other.steer),
         ]
         .into_iter()
         .find_map(|(field, differs)| differs.then_some(field))
     }
+}
+
+/// The upgrade migration that names what cuts in `steer` (0.8.0): a
+/// source's `urgent` in the person's config and in subscriptions, and
+/// `[sonny] commons_digest`, which becomes the commons source's `digest`.
+pub const STEER: &str = "lookout-steer";
+
+/// At start, once, before the config is read: its `urgent` keys and
+/// `commons_digest` as they are named now.
+pub fn at_start() {
+    let (Some(home), Some(path)) = (
+        std::env::var_os("HOME").map(PathBuf::from),
+        agent_client::config::path(),
+    ) else {
+        return;
+    };
+    // No config, nothing to move: and nothing made, not even a HOME gone.
+    if !path.exists() {
+        return;
+    }
+    crate::upgrade::once(&home.join(".agent/sonny/migrated"), STEER, || {
+        config_steers(&path)
+    });
+}
+
+/// Each subscription file of `store` with `urgent` named `steer`, once
+/// for the store, before the lookout reads them.
+pub fn steer_files(store: &Path) {
+    let mut record = store.as_os_str().to_owned();
+    record.push(".migrated");
+    crate::upgrade::once(Path::new(&record), STEER, || files_steer(store));
+}
+
+/// The config at `path` with `urgent` under a source named `steer`, and
+/// `[sonny] commons_digest` moved to `[sonny.sources.commons] digest`,
+/// each line kept as the person wrote it otherwise. Whether it is done.
+fn config_steers(path: &Path) -> bool {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) => return e.kind() == std::io::ErrorKind::NotFound,
+    };
+    match steers(&text) {
+        None => true,
+        Some(moved) => {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(path).map_or(0o600, |m| m.permissions().mode() & 0o777);
+            agent_client::files::replace_mode(path, moved.as_bytes(), mode).is_ok()
+        }
+    }
+}
+
+/// `text` as [`config_steers`] writes it: none when there is nothing to
+/// move.
+fn steers(text: &str) -> Option<String> {
+    let header = |line: &str| {
+        let line = line.trim();
+        (line.starts_with('[') && !line.starts_with("[["))
+            .then(|| line.trim_matches(['[', ']']).trim().to_owned())
+    };
+    let key = |line: &str| line.split_once('=').map(|(key, _)| key.trim().to_owned());
+    let mut table = String::new();
+    let mut lines: Vec<String> = Vec::new();
+    let mut digest = None;
+    let mut changed = false;
+    for line in text.lines() {
+        if let Some(name) = header(line) {
+            table = name;
+        } else if table.starts_with("sonny.sources.") && key(line).as_deref() == Some("urgent") {
+            let at = line.find("urgent").unwrap_or(0);
+            lines.push(format!(
+                "{}steer{}",
+                &line[..at],
+                &line[at + "urgent".len()..]
+            ));
+            changed = true;
+            continue;
+        } else if table == "sonny" && key(line).as_deref() == Some("commons_digest") {
+            digest = line
+                .split_once('=')
+                .map(|(_, value)| value.trim().to_owned());
+            changed = true;
+            continue;
+        }
+        lines.push(line.to_owned());
+    }
+    if let Some(digest) = digest {
+        let commons =
+            (lines.iter()).position(|l| header(l).as_deref() == Some("sonny.sources.commons"));
+        match commons {
+            Some(at) => lines.insert(at + 1, format!("digest = {digest}")),
+            None => {
+                if lines.last().is_some_and(|l| !l.trim().is_empty()) {
+                    lines.push(String::new());
+                }
+                lines.push("[sonny.sources.commons]".into());
+                lines.push(format!("digest = {digest}"));
+            }
+        }
+    }
+    changed.then(|| {
+        let mut moved = lines.join("\n");
+        moved.push('\n');
+        moved
+    })
+}
+
+/// Every subscription file beside `store` with `urgent` named `steer`:
+/// whether each that had one was written.
+fn files_steer(store: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir(store)) else {
+        return true;
+    };
+    let _held = match held(store) {
+        Ok(held) => held,
+        Err(_) => return false,
+    };
+    let mut all = true;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_none_or(|e| e != "json") {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(mut value) = serde_json::from_str::<Value>(&text) else {
+            continue;
+        };
+        let mut moved = false;
+        for sub in (value["subscriptions"].as_array_mut().into_iter()).flatten() {
+            if let Some(object) = sub.as_object_mut()
+                && let Some(urgent) = object.remove("urgent")
+            {
+                object.insert("steer".into(), urgent);
+                moved = true;
+            }
+        }
+        if moved {
+            let partial = path.with_extension(format!("json.{}.partial", std::process::id()));
+            all &= super::write_moved(&partial, &path, &format!("{value:#}\n")).is_ok();
+        }
+    }
+    all
 }
 
 /// Whether `glob` (`*` for any run of characters) matches all of `name`.
@@ -427,7 +570,7 @@ pub fn change(
             .collect();
         let patterns = [
             (&sub.filter, "the filter hears"),
-            (&sub.urgent, "urgent matches"),
+            (&sub.steer, "steer matches"),
         ];
         let unseen: Vec<String> = (patterns.into_iter())
             .filter_map(|(pattern, what)| {
@@ -533,11 +676,11 @@ fn parse(value: &Value) -> Result<Sub, String> {
         }
         Some(_) => return Err("digest is a span, as 30s, 15m or 1h".into()),
     };
-    let urgent = match value.get("urgent") {
+    let steer = match value.get("steer") {
         None | Some(Value::Null) => None,
-        Some(urgent) => {
-            super::pattern::check(urgent).map_err(|e| format!("urgent: {e}"))?;
-            Some(urgent.clone())
+        Some(steer) => {
+            super::pattern::check(steer).map_err(|e| format!("steer: {e}"))?;
+            Some(steer.clone())
         }
     };
     let sub = Sub {
@@ -547,7 +690,7 @@ fn parse(value: &Value) -> Result<Sub, String> {
         sources: strings("sources"),
         filter,
         digest,
-        urgent,
+        steer,
         owner: None,
     };
     if sub.tasks_of.is_empty() && sub.bots.is_empty() && sub.sources.is_empty() {
@@ -559,6 +702,38 @@ fn parse(value: &Value) -> Result<Sub, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_steer_migration_renames_urgent_and_moves_the_commons_digest() {
+        let text = "model = \"m\"\n\n[sonny]\ncommons_digest = \"30m\"\ntheme = \"dark\"\n\n[sonny.sources.github]\ncommand = \"gh\"\nurgent = \"review_requested\" # mine\n";
+        assert_eq!(
+            steers(text).unwrap(),
+            "model = \"m\"\n\n[sonny]\ntheme = \"dark\"\n\n[sonny.sources.github]\ncommand = \"gh\"\nsteer = \"review_requested\" # mine\n\n[sonny.sources.commons]\ndigest = \"30m\"\n"
+        );
+        let beside = "[sonny]\ncommons_digest = \"0\"\n[sonny.sources.commons]\nurgent = \"*\"\n";
+        assert_eq!(
+            steers(beside).unwrap(),
+            "[sonny]\n[sonny.sources.commons]\ndigest = \"0\"\nsteer = \"*\"\n"
+        );
+        // What another table names `urgent` is its own.
+        assert_eq!(steers("[other]\nurgent = 1\n"), None);
+        assert_eq!(steers(""), None);
+    }
+
+    #[test]
+    fn the_steer_migration_renames_urgent_in_each_subscription_file() {
+        let store = std::env::temp_dir().join(format!("sonny-steer-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(dir(&store));
+        std::fs::create_dir_all(dir(&store)).unwrap();
+        let path = dir(&store).join("b.json");
+        let old = json!({"subscriptions": [{"name": "pr", "source": "github:1", "urgent": "*"}]});
+        std::fs::write(&path, old.to_string()).unwrap();
+        assert!(files_steer(&store));
+        let now: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(now["subscriptions"][0]["steer"], "*");
+        assert!(now["subscriptions"][0].get("urgent").is_none());
+        let _ = std::fs::remove_dir_all(dir(&store));
+    }
 
     #[test]
     fn a_file_it_cannot_read_is_never_written_over() {
@@ -654,7 +829,7 @@ mod tests {
             "no recent event of its bots had paths: the filter hears none until one does"
         );
         let failed = json!({"name": "f", "bots": ["a"], "digest": "1h",
-            "filter": {"type": ["turn.ended"]}, "urgent": {"status": ["failed"]}});
+            "filter": {"type": ["turn.ended"]}, "steer": {"status": ["failed"]}});
         let added = add(failed).unwrap();
         assert!(added.get("unseen").is_none(), "{added}");
         let sub = read(&store, "shop.lead")
@@ -667,14 +842,14 @@ mod tests {
         );
         assert_eq!(
             sub.describe(),
-            r#"f · bots a where {"type":["turn.ended"]} at most every 1h, urgent when {"status":["failed"]}"#
+            r#"f · bots a where {"type":["turn.ended"]} at most every 1h, steers when {"status":["failed"]}"#
         );
         let late = json!({"name": "f", "bots": ["a"], "digest": "2h",
-            "filter": {"type": ["turn.ended"]}, "urgent": {"status": ["failed"]}});
+            "filter": {"type": ["turn.ended"]}, "steer": {"status": ["failed"]}});
         assert!(add(late).unwrap_err().contains("another digest"));
         assert!(add(json!({"name": "d", "bots": ["a"], "digest": "soon"})).is_err());
-        let wrong = json!({"name": "u", "bots": ["a"], "urgent": {"status": "failed"}});
-        assert!(add(wrong).unwrap_err().starts_with("urgent: "));
+        let wrong = json!({"name": "u", "bots": ["a"], "steer": {"status": "failed"}});
+        assert!(add(wrong).unwrap_err().starts_with("steer: "));
         // Checked as a filter is.
         let bad = json!({"name": "b", "sources": ["cr"], "filter": {"paths": "src/"}});
         assert!(add(bad).unwrap_err().contains("list of values"));

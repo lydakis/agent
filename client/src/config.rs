@@ -41,7 +41,6 @@
 //! commons = false               # agents go without the commons, on by default
 //! commons_invites = 3           # least threads a day that send invites (more with the square root of the week's agents), 0 none; answers add up to as many again
 //! commons_invite_tokens = 1000000  # what an invite pays for in its thread
-//! commons_digest = "1h"         # an agent hears its commons threads at most this often, unless asked sooner; 0 at once
 //! ask_wait_minutes = 60         # how long an unanswered ask waits to go ahead or remind; 0 never
 //! task_windows = 64            # task windows a lead keeps open, 32 by default; past it the least recently used closes, never one not looked at yet; 0 no limit
 //! task_depth = 3                # generations of tasks below a lead, 2 by default (tasks' own start none); 0 no end
@@ -69,7 +68,9 @@
 //! command = "~/bin/slack-poll"  # run with sh -c; each line it prints is one event
 //! every = "1m"                  # how long after it exits it runs again
 //! digest = "15m"                # a subscriber hears it at most this often; unset, as it comes
-//! urgent = { from = ["boss"] }  # what cuts into a busy subscriber's turn, as a filter is written
+//! steer = { from = ["boss"] }   # what cuts into a busy subscriber's turn, as a filter is written
+//! [sonny.sources.commons]       # Sonny's own source: the commons threads an agent posted in
+//! digest = "15m"                # the default; 0 at once. Takes digest and steer alone
 //! ```
 //!
 //! Each unset value is the model's own, or, for a task, its lead's.
@@ -433,10 +434,9 @@ pub struct Sonny {
     pub commons_invites: u64,
     /// The tokens an invite pays for in its thread.
     pub commons_invite_tokens: u64,
-    /// How often at most an agent hears of new posts in its commons
-    /// threads, as a `digest` of the commons source: `1h`, or `0` for as
-    /// they come.
-    pub commons_digest: String,
+    /// The commons as a source, `[sonny.sources.commons]`: its `digest`
+    /// and `steer`, as the person's sources take them; it has no command.
+    pub commons_source: Source,
     /// How long an `ask` the person has not answered waits, in minutes,
     /// before its agent goes on with what it recommended, where it said
     /// it could, or is reminded of it; 0 lets every ask wait for them.
@@ -476,8 +476,8 @@ pub struct Sonny {
 pub const BROWSER_CONFIRM: [&str; 4] = ["eval", "download", "upload", "state"];
 
 /// How often at most an agent hears of its commons threads, unless the
-/// config says otherwise: an hour, as Slack's slowest email batching.
-pub const COMMONS_DIGEST: &str = "1h";
+/// config says otherwise: fifteen minutes, Slack's default email batching.
+pub const COMMONS_DIGEST: &str = "15m";
 
 /// The name of the source Sonny's lookout makes of the commons.
 pub const COMMONS_SOURCE: &str = "commons";
@@ -516,7 +516,7 @@ impl Default for Sonny {
             commons: true,
             commons_invites: 3,
             commons_invite_tokens: 1_000_000,
-            commons_digest: COMMONS_DIGEST.to_owned(),
+            commons_source: commons_source(),
             ask_wait_minutes: 60,
             task_windows: 32,
             task_depth: 2,
@@ -615,11 +615,11 @@ pub struct Source {
     /// unset, a minute.
     pub every: Option<String>,
     /// How often at most a subscriber hears it, as `every` is written,
-    /// unless an event is urgent; unset or `0`, as events come.
+    /// unless an event steers; unset or `0`, as events come.
     pub digest: Option<String>,
     /// An event pattern, as a subscription's filter is written: an event
-    /// it matches is urgent, as one the command marks so.
-    pub urgent: Option<serde_json::Value>,
+    /// it matches steers, as one the command marks so does.
+    pub steer: Option<serde_json::Value>,
 }
 
 /// An MCP server, under Codex's key names for `[mcp_servers.NAME]`: a
@@ -1029,7 +1029,6 @@ fn parse(text: &str) -> Result<Config, String> {
                 "commons",
                 "commons_invites",
                 "commons_invite_tokens",
-                "commons_digest",
                 "ask_wait_minutes",
                 "task_windows",
                 "task_depth",
@@ -1056,7 +1055,7 @@ fn parse(text: &str) -> Result<Config, String> {
                 continue;
             }
             if (name.as_str(), key.as_str()) == ("sonny", "sources") {
-                config.sonny.sources = sources(value)?;
+                (config.sonny.sources, config.sonny.commons_source) = sources(value)?;
                 continue;
             }
             if (name.as_str(), key.as_str()) == ("sonny", "permissions") {
@@ -1154,11 +1153,6 @@ fn parse(text: &str) -> Result<Config, String> {
                     "fork" => SideChat::Fork,
                     other => return Err(format!("sonny.side_chat is answer or fork, not {other}")),
                 };
-                continue;
-            }
-            if key == "commons_digest" {
-                span(&format!("{name}.{key}"), &value)?;
-                config.sonny.commons_digest = value;
                 continue;
             }
             if key == "margin_opens" {
@@ -1314,10 +1308,24 @@ fn permissions(value: &toml::Value) -> Result<BTreeMap<String, Permissions>, Str
     Ok(rows)
 }
 
-/// `[sonny.sources.NAME]` tables, each with a `command` and maybe `every`.
-fn sources(value: &toml::Value) -> Result<Vec<Source>, String> {
+/// The commons as a source, as it is unless the config sets it: how often
+/// it looks is Sonny's.
+fn commons_source() -> Source {
+    Source {
+        name: COMMONS_SOURCE.into(),
+        command: String::new(),
+        every: None,
+        digest: Some(COMMONS_DIGEST.into()),
+        steer: None,
+    }
+}
+
+/// `[sonny.sources.NAME]` tables, each with a `command` and maybe `every`,
+/// and the commons' own, with no command.
+fn sources(value: &toml::Value) -> Result<(Vec<Source>, Source), String> {
     let table = (value.as_table()).ok_or("sonny.sources must be a table of sources")?;
     let mut sources = Vec::new();
+    let mut commons = commons_source();
     for (name, source) in table {
         let key = |field: &str| format!("sonny.sources.{name}.{field}");
         if name.is_empty()
@@ -1328,19 +1336,22 @@ fn sources(value: &toml::Value) -> Result<Vec<Source>, String> {
                 "sonny.sources.{name}: a source's name is 1 to 64 of A-Z a-z 0-9 _ -"
             ));
         }
-        if name == COMMONS_SOURCE {
-            return Err(format!(
-                "sonny.sources.{name}: the commons is a source of Sonny's own; name yours another way"
-            ));
-        }
         let fields =
             (source.as_table()).ok_or_else(|| format!("sonny.sources.{name} must be a table"))?;
         let mut command = None;
         let mut every = None;
         let mut digest = None;
-        let mut urgent = None;
+        let mut steer = None;
+        let own = name == COMMONS_SOURCE;
         for (field, value) in fields {
             match field.as_str() {
+                "command" | "every" if own => {
+                    return Err(format!(
+                        "{}: the commons is a source of Sonny's own, which takes digest and steer alone; \
+                         name yours another way",
+                        key(field)
+                    ));
+                }
                 "command" => command = Some(string(&key(field), value)?),
                 "every" => every = Some(string(&key(field), value)?),
                 "digest" => {
@@ -1348,27 +1359,32 @@ fn sources(value: &toml::Value) -> Result<Vec<Source>, String> {
                     span(&key(field), &value)?;
                     digest = Some(value);
                 }
-                "urgent" => {
+                "steer" => {
                     if !value.is_table() {
                         return Err(format!(
                             "{} is an event pattern, as {{ from = [\"ana\"] }}",
                             key(field)
                         ));
                     }
-                    urgent = Some(serde_json::to_value(value).map_err(|e| e.to_string())?);
+                    steer = Some(serde_json::to_value(value).map_err(|e| e.to_string())?);
                 }
                 _ => return Err(format!("unknown key {}", key(field))),
             }
+        }
+        if own {
+            commons.digest = digest.or(commons.digest);
+            commons.steer = steer;
+            continue;
         }
         sources.push(Source {
             name: name.clone(),
             command: command.ok_or_else(|| format!("{} is missing", key("command")))?,
             every,
             digest,
-            urgent,
+            steer,
         });
     }
-    Ok(sources)
+    Ok((sources, commons))
 }
 
 fn string(key: &str, value: &toml::Value) -> Result<String, String> {
@@ -1401,7 +1417,7 @@ pub fn write(path: &Path, pairs: &[(&str, Option<toml::Value>)]) -> Result<(), S
     };
     let mut lines: Vec<String> = text.lines().map(str::to_owned).collect();
     for (key, value) in pairs {
-        let (table, name) = key.split_once('.').unwrap_or(("", key));
+        let (table, name) = key.rsplit_once('.').unwrap_or(("", key));
         let at = |line: &str| {
             line.trim_start().strip_prefix('[').map(|h| {
                 h.trim_start_matches('[')
@@ -1474,13 +1490,9 @@ pub fn write(path: &Path, pairs: &[(&str, Option<toml::Value>)]) -> Result<(), S
     // not one the lines above find: it is refused, not left as it was.
     let table: toml::Table = text.parse().unwrap_or_default();
     for (key, value) in pairs {
-        let (name, inner) = key
-            .split_once('.')
-            .map_or((*key, None), |(t, k)| (t, Some(k)));
-        let found = match inner {
-            Some(inner) => table.get(name).and_then(|t| t.get(inner)),
-            None => table.get(name),
-        };
+        let mut keys = key.split('.');
+        let first = table.get(keys.next().unwrap_or_default());
+        let found = keys.try_fold(first, |at, key| Some(at?.get(key))).flatten();
         if found != value.as_ref() {
             return Err(format!(
                 "config_unwritable: {}: {key} is written in a form only an editor can change",
@@ -2018,15 +2030,26 @@ mod tests {
             .map(|s| s.digest.as_deref())
             .collect();
         assert_eq!(digests, [None, Some("15m")]);
-        let urgent = parse(
-            "[sonny.sources.slack]\ncommand = \"x\"\nurgent = { from = [\"boss\"], text = [{ \"prefix\" = \"[prod]\" }] }\n",
+        let steer = parse(
+            "[sonny.sources.slack]\ncommand = \"x\"\nsteer = { from = [\"boss\"], text = [{ \"prefix\" = \"[prod]\" }] }\n",
         )
         .unwrap();
         assert_eq!(
-            urgent.sonny.sources[0].urgent,
+            steer.sonny.sources[0].steer,
             Some(serde_json::json!({"from": ["boss"], "text": [{"prefix": "[prod]"}]}))
         );
-        assert_eq!(config.sonny.sources[0].urgent, None);
+        assert_eq!(config.sonny.sources[0].steer, None);
+        // The commons is a source of Sonny's own, set as any other.
+        assert_eq!(config.sonny.commons_source.digest.as_deref(), Some("15m"));
+        let commons =
+            parse("[sonny.sources.commons]\ndigest = \"0\"\nsteer = { from = [\"ana\"] }\n")
+                .unwrap();
+        assert!(commons.sonny.sources.is_empty());
+        assert_eq!(commons.sonny.commons_source.digest.as_deref(), Some("0"));
+        assert_eq!(
+            commons.sonny.commons_source.steer,
+            Some(serde_json::json!({"from": ["ana"]}))
+        );
         let named: Vec<(&str, &str, Option<&str>)> = (config.sonny.sources.iter())
             .map(|s| (s.name.as_str(), s.command.as_str(), s.every.as_deref()))
             .collect();
@@ -2047,16 +2070,20 @@ mod tests {
                 "sonny.sources.slack.digest is a number and s, m or h, as 30s or 5m, not \"1d\"",
             ),
             (
-                "[sonny.sources.slack]\ncommand = \"x\"\nurgent = \"always\"",
-                "sonny.sources.slack.urgent is an event pattern, as { from = [\"ana\"] }",
+                "[sonny.sources.slack]\ncommand = \"x\"\nsteer = \"always\"",
+                "sonny.sources.slack.steer is an event pattern, as { from = [\"ana\"] }",
             ),
             (
                 "[sonny.sources.commons]\ncommand = \"x\"",
-                "sonny.sources.commons: the commons is a source of Sonny's own; name yours another way",
+                "sonny.sources.commons.command: the commons is a source of Sonny's own, which takes digest and steer alone; name yours another way",
             ),
             (
-                "[sonny]\ncommons_digest = \"an hour\"",
-                "sonny.commons_digest is a number and s, m or h, as 30s or 5m, not \"an hour\"",
+                "[sonny.sources.commons]\ndigest = \"an hour\"",
+                "sonny.sources.commons.digest is a number and s, m or h, as 30s or 5m, not \"an hour\"",
+            ),
+            (
+                "[sonny]\ncommons_digest = \"1h\"",
+                "unknown key sonny.commons_digest",
             ),
             (
                 "[sonny.sources.slack]\ncommand = \"x\"\nargs = \"y\"",

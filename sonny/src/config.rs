@@ -44,7 +44,7 @@ fn span(setting: &Setting) -> bool {
 pub fn height() -> usize {
     let mut tables: Vec<&str> = SETTINGS
         .iter()
-        .map(|s| s.key.split_once('.').map_or("", |(table, _)| table))
+        .map(|s| s.key.rsplit_once('.').map_or("", |(table, _)| table))
         .collect();
     tables.dedup();
     1 + tables.len() + SETTINGS.len()
@@ -52,7 +52,7 @@ pub fn height() -> usize {
 
 /// A key without its table, which its heading names.
 fn short(key: &str) -> &str {
-    key.split_once('.').map_or(key, |(_, key)| key)
+    key.rsplit_once('.').map_or(key, |(_, key)| key)
 }
 
 /// Every key `agent_client::config` reads.
@@ -178,12 +178,6 @@ pub const SETTINGS: [Setting; 30] = [
         default: "1000000",
     },
     Setting {
-        key: "sonny.commons_digest",
-        about: "how often at most an agent hears of new posts in the commons threads it posted in, as 30s, 15m or 1h; 0 for as they come",
-        values: &[],
-        default: "1h",
-    },
-    Setting {
         key: "sonny.ask_wait_minutes",
         about: "minutes an unanswered question waits before its agent goes on with what it recommended, where it said it could, or is reminded; 0 waits for you always",
         values: &[],
@@ -236,6 +230,12 @@ pub const SETTINGS: [Setting; 30] = [
         about: "processes Sonny runs for agents at once in all: the tool host's tool calls take three quarters, the lookout's goal checks a quarter, each at least one, and each agent at most half of either; 0 for four times the CPUs",
         values: &[],
         default: "0",
+    },
+    Setting {
+        key: "sonny.sources.commons.digest",
+        about: "how often at most an agent hears of new posts in the commons threads it posted in, as 30s, 15m or 1h; 0 for as they come. The commons is a source, so steer sets what cuts in, as for yours",
+        values: &[],
+        default: "15m",
     },
 ];
 
@@ -309,10 +309,10 @@ impl View {
         Ok(SETTINGS
             .iter()
             .map(|setting| {
-                let value = match setting.key.split_once('.') {
-                    Some((name, key)) => table.get(name).and_then(|t| t.get(key)),
-                    None => table.get(setting.key),
-                };
+                // A key under a table, a table's within another's too.
+                let mut path = setting.key.split('.');
+                let first = table.get(path.next().unwrap_or_default());
+                let value = path.try_fold(first, |at, key| Some(at?.get(key))).flatten();
                 value.and_then(|v| match v {
                     toml::Value::Boolean(on) => Some(on.to_string()),
                     toml::Value::Integer(n) => Some(n.to_string()),
@@ -445,7 +445,7 @@ impl View {
         let mut picked = 0;
         let mut table = "";
         for (i, (setting, value)) in SETTINGS.iter().zip(&self.values).enumerate() {
-            let (this, _) = setting.key.split_once('.').unwrap_or(("", setting.key));
+            let (this, _) = setting.key.rsplit_once('.').unwrap_or(("", setting.key));
             if this != table || i == 0 {
                 table = this;
                 let name = match this {

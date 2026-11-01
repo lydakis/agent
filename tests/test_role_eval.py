@@ -45,6 +45,36 @@ class SetupTests(unittest.TestCase):
             self.assertIn(f'| {plant} |', rubric)
 
 
+    def test_every_planted_burst_ask_is_scored(self):
+        rubric = (Path(__file__).resolve().parents[1] / 'docs/ROLE_EVAL.md').read_text()
+        plants = [s['plant'] for s in role_eval.BURST if s.get('plant')]
+        plants += [e[3] for s in role_eval.BURST for e in s.get('events', []) if len(e) > 3]
+        for plant in plants:
+            self.assertIn(f'| {plant.split()[0]} |', rubric)
+
+    def test_the_burst_is_three_hundred_messages_with_twenty_asks_none_lost_by_the_source(self):
+        events = [e for s in role_eval.BURST for e in s.get('events', [])]
+        self.assertEqual(len(events), 300)
+        self.assertEqual(sum(len(e) > 3 for e in events), 20)
+        self.assertEqual({e[0] for e in events}, {'chat', 'ci'})
+        # A wave fits in what a subscriber holds (64), and every ID stays in
+        # what a source remembers (1024), so only a busy lead loses news.
+        self.assertLessEqual(max(len(s.get('events', [])) for s in role_eval.BURST), 64)
+        self.assertEqual(role_eval.BURST, role_eval.burst(), 'the same burst every run')
+
+    def test_a_lead_is_subscribed_once_it_hears_every_source_of_the_day(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(role_eval, 'DAY', role_eval.BURST):
+            home = Path(tmp)
+            folder = home / '.agent/state.sqlite.lookout'
+            folder.mkdir(parents=True)
+            subs = [{'name': 'chat', 'sources': ['chat']}]
+            (folder / 'shop.lead.json').write_text(json.dumps({'subscriptions': subs}))
+            self.assertFalse(role_eval.subscribed(home))
+            subs.append({'name': 'ci', 'sources': ['ci:main']})
+            (folder / 'shop.lead.json').write_text(json.dumps({'subscriptions': subs}))
+            self.assertTrue(role_eval.subscribed(home))
+
+
 class BlindTests(unittest.TestCase):
     def run_dir(self, runs, name, build, rows):
         out = runs / name

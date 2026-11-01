@@ -314,7 +314,7 @@ class Bench:
                 # Every event built and matched, none held or dropped: the
                 # rules' own cost, with the notes going as they would.
                 tasks['filter'] = {'type': [{'anything-but': 'note.changed'}]}
-                tasks['urgent'] = {'status': ['never']}
+                tasks['steer'] = {'status': ['never']}
             (folder / f'p{p}.lead.json').write_text(json.dumps({'subscriptions': [tasks]}))
         # One finished turn each lead's messages to its tasks come from: what
         # a lead writes in its tasks is no news to it, only how they end.
@@ -569,7 +569,7 @@ def main():
     parser.add_argument('--phases', default='idle,baseline,load,restart')
     parser.add_argument('--gated', type=int, default=0)
     parser.add_argument('--rules', action='store_true',
-                        help="give each lead's tasks subscription a filter and urgent that match as they would")
+                        help="give each lead's tasks subscription a filter and steer that match as they would")
     parser.add_argument('--out')
     args = parser.parse_args()
     if args.model:

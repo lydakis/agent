@@ -275,7 +275,7 @@ class LookoutTests(ModelFixture):
         # ID, which it prints again on its next run.
         poller = self.path / 'poll.sh'
         poller.write_text('echo "lunch?"\n'
-                          'echo \'{"text": "deploy failed on prod", "id": "d1", "from": "ci", "urgent": true}\'\n'
+                          'echo \'{"text": "deploy failed on prod", "id": "d1", "from": "ci", "steer": true}\'\n'
                           'echo \'{"text": "deploy failed on prod", "id": "d1", "from": "ci"}\'\n'
                           'echo "$SONNY_SOURCE" > "$SONNY_SOURCE_DIR/ran"\n')
         (self.path / '.agent').mkdir(exist_ok=True)
@@ -291,7 +291,7 @@ class LookoutTests(ModelFixture):
         self.assertIsNotNone(prompt, 'the subscriber never heard its source')
         # Not the person's words: the approver reads the origin.
         self.assertEqual(prompt['origin'], 'lookout.sources')
-        self.assertIn('- chat, from "ci" (for your all, deploys, urgent): "deploy failed on prod"', prompt['text'])
+        self.assertIn('- chat, from "ci" (for your all, deploys, as a steer): "deploy failed on prod"', prompt['text'])
         self.assertIsNotNone(self.note_for('reviewer', starting='From your sources: ', having='"lunch?"'))
         # An event printed again by its ID is told once.
         time.sleep(3)
