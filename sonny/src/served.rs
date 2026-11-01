@@ -34,6 +34,7 @@ pub const COMMONS: &str = "commons";
 pub const GOAL: &str = "goal";
 pub const EXEC: &str = crate::exec::NAME;
 pub const BROWSER: &str = crate::browser::NAME;
+pub const DESKTOP: &str = crate::desktop::NAME;
 
 /// The tools whose calls wait for a verdict wherever the agent's other
 /// calls do: a start runs the folder's setup script and a new project its
@@ -41,8 +42,9 @@ pub const BROWSER: &str = crate::browser::NAME;
 /// drop work, a subscription sends other bots' words to the subscriber's
 /// judge, a trigger is a job that runs as the person, its `if`
 /// command outside any sandbox, a script calls MCP servers, which run
-/// as the person too, and so does a goal's check and the browser.
-pub const GATED: [&str; 9] = [
+/// as the person too, and so does a goal's check, the browser and the
+/// desktop.
+pub const GATED: [&str; 10] = [
     START,
     REMOVE,
     PROJECT,
@@ -52,6 +54,7 @@ pub const GATED: [&str; 9] = [
     EXEC,
     GOAL,
     BROWSER,
+    DESKTOP,
 ];
 
 /// The most of what a call printed that its result holds, under the
@@ -134,6 +137,7 @@ pub fn tools(role: Role) -> Vec<Value> {
     tools.push(crate::lookout::goals::tool(GOAL, TAG));
     tools.extend(crate::exec::tool());
     tools.extend(crate::browser::tool());
+    tools.extend(crate::desktop::tool());
     tools
 }
 
@@ -1036,6 +1040,7 @@ async fn serve(store: PathBuf, socket: PathBuf, nudge: Arc<Notify>, serving: Ser
                                 // In the host, where the servers stay up.
                                 Some(EXEC) => script(&hub, &client, &call).await,
                                 Some(BROWSER) => browse(&client, &call).await,
+                                Some(DESKTOP) => desktop(&client, &call).await,
                                 _ => answer(&client, &call, &me, &store, &socket)
                                     .await
                                     .map(Value::String),
@@ -1173,6 +1178,24 @@ async fn browse(client: &Arc<Client>, call: &Value) -> Result<Value, (&'static s
     }
 }
 
+/// Answer a `desktop` call in the host, with the agent's gate judging what
+/// acts on the desktop.
+async fn desktop(client: &Arc<Client>, call: &Value) -> Result<Value, (&'static str, String)> {
+    let bot = str_of(&call["bot"]);
+    unreviewed(client, &bot, &Value::Null, DESKTOP).await?;
+    let steps = crate::exec::Steps::new(
+        client.clone(),
+        bot,
+        call["turn"].as_i64().unwrap_or(0),
+        str_of(&call["call_id"]),
+    );
+    let left = left(call).min(crate::desktop::TIMEOUT);
+    match tokio::time::timeout(left, crate::desktop::answer(call, steps)).await {
+        Ok(answer) => answer,
+        Err(_) => Err(("timed_out", "the desktop's commands ran out of time".into())),
+    }
+}
+
 /// Refuses `tool`, one Sonny gates, to `bot` when it acts outside a
 /// sandbox no one reviews calls from. The sandbox is read from `inspect`,
 /// which a `bots` listing leaves out; `bot_id`, when given, pins the bot.
@@ -1245,7 +1268,9 @@ fn outside(item: &Value) -> bool {
                     call["namespace"] == "web"
                         || matches!(
                             call["name"].as_str(),
-                            Some("web_fetch" | "web_search" | crate::exec::NAME | BROWSER)
+                            Some(
+                                "web_fetch" | "web_search" | crate::exec::NAME | BROWSER | DESKTOP
+                            )
                         )
                 }
                 _ => false,
@@ -1552,10 +1577,10 @@ mod tests {
     #[test]
     fn a_lead_answers_more_than_its_tasks_and_keeps_its_own() {
         // `exec` comes and goes with the person's MCP servers, and
-        // `browser` with agent-browser.
+        // `browser` with agent-browser, and `desktop` with agent-desktop.
         let names = |tools: Vec<Value>| -> Vec<String> {
             (tools.iter().map(|t| str_of(&t["name"])))
-                .filter(|name| name != EXEC && name != BROWSER)
+                .filter(|name| name != EXEC && name != BROWSER && name != DESKTOP)
                 .collect()
         };
         let every = [SUBSCRIPTIONS, SHOW, RUN, AUTOMATIONS, MEMORY, COMMONS, GOAL];
@@ -1572,11 +1597,12 @@ mod tests {
         {
             assert_eq!(tool["answered_by"], TAG);
             // A lead's own are not its tasks', in a line one deep.
-            // The browser, when there, is every agent's as well.
+            // The browser and the desktop, when there, are every agent's
+            // as well.
             let name = str_of(&tool["name"]);
             assert_eq!(
                 tool.get("inherit").is_some(),
-                !(every.contains(&name.as_str()) || name == BROWSER)
+                !(every.contains(&name.as_str()) || name == BROWSER || name == DESKTOP)
             );
         }
         assert_eq!(project_of("shop.web.lead"), "shop.web");

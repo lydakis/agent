@@ -742,6 +742,11 @@ pub async fn model(client: &Client) -> Result<String, String> {
     {
         println!("{DIM}Chrome not downloaded: {error}{RESET}");
     }
+    if let Err(error) = desktop()
+        && error != "setup cancelled"
+    {
+        println!("{DIM}agent-desktop not installed: {error}{RESET}");
+    }
     summary(&model, &file, &brought, backed);
     Ok(model)
 }
@@ -799,6 +804,40 @@ fn chrome() -> Result<(), String> {
         true => Ok(()),
         false => Err(format!("`agent-browser install` {ran}")),
     }
+}
+
+/// agent-desktop, through which agents use this computer's desktop,
+/// offered where there is one and npm can install it; an answer other
+/// than yes skips it. The permissions it needs are asked for by the agent
+/// that first uses it, from where it runs.
+fn desktop() -> Result<(), String> {
+    if on_path("agent-desktop") || !on_path("npm") || !desktop_shows() {
+        return Ok(());
+    }
+    println!(
+        "\nAgents can see and use this computer's apps with agent-desktop, through the\naccessibility tree, asking you before they click or type."
+    );
+    let answer = line("Install it with npm now? [Y/n] ")?;
+    if !matches!(answer.to_ascii_lowercase().as_str(), "" | "y" | "yes") {
+        return Ok(());
+    }
+    let ran = std::process::Command::new("npm")
+        .args(["install", "-g", "agent-desktop"])
+        .status()
+        .map_err(|e| e.to_string())?;
+    match ran.success() {
+        true => Ok(()),
+        false => Err(format!("`npm install -g agent-desktop` {ran}")),
+    }
+}
+
+/// Whether this machine shows a desktop agent-desktop could use: any but
+/// Linux, and Linux in a graphical session.
+pub fn desktop_shows() -> bool {
+    std::env::consts::OS != "linux"
+        || ["DISPLAY", "WAYLAND_DISPLAY"]
+            .iter()
+            .any(|name| std::env::var_os(name).is_some_and(|value| !value.is_empty()))
 }
 
 /// Whether agent-browser finds a Chrome, by its own check; `None` when it
@@ -952,6 +991,13 @@ fn missing_tools() -> Vec<String> {
         ));
     } else if has_chrome() == Some(false) {
         missing.push("Chrome, which agent-browser drives: `agent-browser install`".into());
+    }
+    // npm's only, and only where there is a desktop to use.
+    if desktop_shows() && !on_path("agent-desktop") {
+        missing.push(
+            "agent-desktop, which agents use this computer's apps with: `npm install -g agent-desktop`"
+                .into(),
+        );
     }
     missing
 }
