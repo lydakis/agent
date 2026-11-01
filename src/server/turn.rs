@@ -3755,30 +3755,42 @@ impl Turn {
             if self.stopping.load(Relaxed) {
                 return Ok(Some(Stop::Drained));
             }
+            // Calls in a row that only read or run commands, none of them
+            // gated, run together, as Codex runs them.
+            let together = match self.parallel(record, &call, workspace) {
+                Some(first)
+                    if (calls.as_slice().first())
+                        .is_some_and(|next| self.parallel(record, next, workspace).is_some()) =>
+                {
+                    let mut batch = vec![(call.clone(), first)];
+                    for next in calls.as_slice() {
+                        let Some(prepared) = self.parallel(record, next, workspace) else {
+                            break;
+                        };
+                        batch.push((next.clone(), prepared));
+                    }
+                    Some(batch)
+                }
+                _ => None,
+            };
             // A command the machine's load holds back waits for it parked,
-            // before it or the calls after it start.
-            if self.load_holds(record, &call)
+            // before it, the calls it starts with, or those after start: a
+            // batch is let in or held whole.
+            let starting: Vec<&ToolCall> = match &together {
+                Some(batch) => batch.iter().map(|(call, _)| call).collect(),
+                None => vec![&call],
+            };
+            if let Some(held) = starting.iter().find(|call| self.load_holds(record, call))
                 && let Some(stop) = self
-                    .await_load(&call, &calls, route, summary_retry_ms)
+                    .await_load(&held.call_id, &call, &calls, route, summary_retry_ms)
                     .await?
             {
                 return Ok(Some(stop));
             }
-            // Calls in a row that only read or run commands, none of them
-            // gated, run together, as Codex runs them.
-            if let Some(first) = self.parallel(record, &call, workspace)
-                && calls
-                    .as_slice()
-                    .first()
-                    .is_some_and(|next| self.parallel(record, next, workspace).is_some())
-            {
-                let mut batch = vec![(call, first)];
-                while let Some(prepared) = calls
-                    .as_slice()
-                    .first()
-                    .and_then(|next| self.parallel(record, next, workspace))
-                {
-                    batch.push((calls.next().expect("a next call"), prepared));
+            if let Some(batch) = together {
+                // The batch's first is `call`; the rest leave the round now.
+                for _ in 1..batch.len() {
+                    calls.next();
                 }
                 self.execute_parallel(batch, record, workspace, environment, warm.as_deref_mut())
                     .await?;
@@ -4585,13 +4597,14 @@ impl Turn {
             )
     }
 
-    /// Wait for the load gate to let `call` start: live until its next
-    /// readings (a second apart) have passed, then parked as a verdict
-    /// waits, holding no task and no slot, with the call and the rest of
-    /// its round not started. The daemon wakes the turn at the gate's
+    /// Wait for the load gate to let `held` start, a command among `call`
+    /// and those starting with it: live until its next readings (a second
+    /// apart) have passed, then parked as a verdict waits, holding no task
+    /// and no slot, with `call` and the rest of its round not started. The daemon wakes the turn at the gate's
     /// first reading that lets a command start. None: run it now.
     async fn await_load(
         &self,
+        held: &str,
         call: &ToolCall,
         calls: &std::vec::IntoIter<ToolCall>,
         route: Option<&str>,
@@ -4619,11 +4632,19 @@ impl Turn {
         let pending: Vec<ToolCall> = std::iter::once(call.clone())
             .chain(calls.as_slice().iter().cloned())
             .collect();
-        let route = route.map(str::to_owned);
+        let (held, route) = (held.to_owned(), route.map(str::to_owned));
         let parked = self
             .store
             .op("suspend_load", move |db| {
-                db.suspend_load(turn, &pending, now_ms(), route.as_deref(), summary_retry_ms)
+                let at = now_ms();
+                db.suspend_load(
+                    turn,
+                    &held,
+                    &pending,
+                    at,
+                    route.as_deref(),
+                    summary_retry_ms,
+                )
             })
             .await?;
         self.registry.note_load_park();
@@ -6422,6 +6443,167 @@ mod tests {
         assert_eq!(paced["data"], json!({"resume_at_ms":null,"stopped":true}));
         drop(store);
         let _ = tokio::time::timeout(Duration::from_secs(2), publisher).await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_shut_load_gate_holds_a_batch_whole_when_a_later_call_is_a_command() {
+        use agent_runtime::{
+            codec::Family,
+            provider::Transport,
+            store::{Binding, TurnOptions},
+        };
+        let dir = std::env::temp_dir().join(format!("agent-load-batch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("notes.txt"), "hello").unwrap();
+        let (store, _publications) = Store::open(&dir.join("state.sqlite")).await.unwrap();
+        let tools = ["shell".to_owned(), "read".to_owned()];
+        let calls: Vec<ToolCall> = [
+            ("read", "read-1", json!({"path": dir.join("notes.txt")})),
+            ("shell", "shell-1", json!({"command": "true"})),
+        ]
+        .into_iter()
+        .map(|(name, id, arguments)| ToolCall {
+            custom: false,
+            name: name.into(),
+            call_id: id.into(),
+            arguments: arguments.to_string(),
+        })
+        .collect();
+        let round = calls.clone();
+        let workspace = dir.clone();
+        let (turn, record) = store
+            .op("create", move |db| {
+                db.create(
+                    "Bob",
+                    workspace.to_str(),
+                    Binding {
+                        provider: "openai",
+                        family: Family::Responses,
+                        model: "synthetic",
+                        instructions: "",
+                        effort: None,
+                        budget_tokens: None,
+                        tools: &tools,
+                        created_by: None,
+                        created_by_id: None,
+                        compaction_instructions: None,
+                        compaction_model: None,
+                        fallback: None,
+                        gate: None,
+                        settings: Default::default(),
+                        declared: None,
+                        request_id: None,
+                    },
+                )?;
+                let turn = (db.begin(
+                    "Bob",
+                    "first",
+                    "work",
+                    true,
+                    &TurnOptions::default(),
+                    |_, _| Ok(()),
+                )?)
+                .turn;
+                let items = (round.iter())
+                    .map(|call| {
+                        serde_json::to_vec(&json!({"type":"function_call","call_id":call.call_id,
+                            "name":call.name,"arguments":call.arguments}))
+                        .unwrap()
+                        .into()
+                    })
+                    .collect();
+                db.append(turn, items, &round, None)?;
+                Ok((turn, db.inspect("Bob")?))
+            })
+            .await
+            .unwrap();
+        // The machine is loaded and one of the daemon's commands runs.
+        let (_gate, readings) = watch::channel(false);
+        let registry = (Registry::new("shell,read").unwrap())
+            .with_process_budget(4)
+            .with_load_readings(readings);
+        let (started, running) = tokio::sync::oneshot::channel();
+        let busy = tokio::spawn(registry.foreground(
+            "sleep 30".into(),
+            dir.clone(),
+            60_000,
+            Vec::new(),
+            None,
+            started,
+        ));
+        running.await.unwrap();
+        assert!(!registry.admits());
+        let provider = Provider::new(
+            Transport::new(1, 1).unwrap(),
+            Family::Responses,
+            "http://127.0.0.1:9/v1",
+            None,
+        )
+        .unwrap();
+        let task = Turn {
+            identity: 0,
+            bot: "Bob".into(),
+            turn,
+            store: store.clone(),
+            providers: Arc::default(),
+            registry: registry.clone(),
+            hub: Hub::default(),
+            handles: Handles::new(mpsc::unbounded_channel().0),
+            background_failures: mpsc::unbounded_channel().0,
+            settings: Default::default(),
+            rules: Default::default(),
+            ruled: Default::default(),
+            window: Default::default(),
+            resumed: None,
+            steers: Arc::default(),
+            compact: Arc::default(),
+            lift: Arc::default(),
+            tokens: Arc::default(),
+            read_results: Default::default(),
+            side: Default::default(),
+            stopping: Arc::new(AtomicBool::new(false)),
+        };
+        let _ = task.rules.set(Arc::default());
+        let _ = task.settings.set(record.settings.clone());
+        // The read first would run with the command beside it: the gate
+        // holds both, neither started, and names the command it holds.
+        let stop = tokio::time::timeout(
+            Duration::from_secs(10),
+            task.execute_calls(
+                calls.clone(),
+                (&provider, "synthetic"),
+                None,
+                &dir,
+                &[],
+                &record,
+                None,
+                None,
+                None,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(matches!(stop, Some(Stop::Parked)));
+        let (waiting, started) = store
+            .op("parked", move |db| {
+                let waiting = db.waiting_turns()?.into_iter().find(|w| w.turn == turn);
+                let events = db.events("Bob", 0, 64)?;
+                let started = (events["events"].as_array().unwrap().iter())
+                    .filter(|e| e["event"] == "tool_started")
+                    .count();
+                Ok((waiting.unwrap(), started))
+            })
+            .await
+            .unwrap();
+        assert!(waiting.load);
+        assert_eq!(waiting.call_id, "shell-1");
+        assert_eq!(waiting.pending, calls);
+        assert_eq!(started, 0);
+        busy.abort();
+        drop(store);
         let _ = std::fs::remove_dir_all(dir);
     }
 

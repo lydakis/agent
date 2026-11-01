@@ -6836,22 +6836,25 @@ impl Database {
         self.forget_live(turn);
         Ok(Some(deadline_ms))
     }
-    /// Park a running turn before its next call, a command the daemon's
-    /// load gate held back: the call and the rest of its round wait in
-    /// `pending`, none of them started. Woken at the round's first lapse,
-    /// as a verdict park is, so a later gated call's expiry still ends the
-    /// turn. None when that lapse has passed: the turn goes on and meets
-    /// it.
+    /// Park a running turn before its next calls, when the daemon's load
+    /// gate holds back `held`, a command among them: they and the rest of
+    /// the round wait in `pending`, none of them started. Woken at the
+    /// round's first lapse, as a verdict park is, so a later gated call's
+    /// expiry still ends the turn. None when that lapse has passed: the
+    /// turn goes on and meets it.
     pub fn suspend_load(
         &mut self,
         turn: i64,
+        held: &str,
         pending: &[ToolCall],
         now_ms: u64,
         route: Option<&str>,
         summary_retry_ms: Option<u64>,
     ) -> Result<Option<Option<u64>>> {
         let bot = self.active(turn)?;
-        let call = pending.first().ok_or(Error::new("invalid_tool_state"))?;
+        let call = (pending.iter())
+            .find(|call| call.call_id == held)
+            .ok_or(Error::new("invalid_tool_state"))?;
         if bot.status != "running" {
             return fail("invalid_tool_state");
         }

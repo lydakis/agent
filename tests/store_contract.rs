@@ -1118,7 +1118,7 @@ fn a_turn_parks_on_the_load_gate_before_its_command_and_wakes_to_run_it() {
     assert!(db.load_parked().unwrap().is_empty());
     // Parked before s1, which has not started, with s2 after it.
     assert_eq!(
-        db.suspend_load(turn, &round, epoch_now(), None, None)
+        db.suspend_load(turn, &round[0].call_id, &round, epoch_now(), None, None)
             .unwrap(),
         Some(None)
     );

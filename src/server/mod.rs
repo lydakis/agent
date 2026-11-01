@@ -7628,7 +7628,7 @@ mod tests {
                         "name":call.name,"call_id":call.call_id,"arguments":call.arguments}))?
                     .into();
                     db.append(turn, vec![item], std::slice::from_ref(&call), None)?;
-                    db.suspend_load(turn, &[call], now_ms(), None, None)
+                    db.suspend_load(turn, "shell-1", &[call], now_ms(), None, None)
                         .map(|_| ())
                 })
                 .await
@@ -7683,7 +7683,7 @@ mod tests {
                     call_id: "shell-2".into(),
                     arguments: r#"{"command":"true"}"#.into(),
                 };
-                db.suspend_load(ann, &[call], now_ms(), None, None)
+                db.suspend_load(ann, "shell-2", &[call], now_ms(), None, None)
                     .map(|_| ())
             })
             .await
