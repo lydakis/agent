@@ -287,15 +287,13 @@ enum Command {
         /// removes them.
         declare: Option<Vec<Declared>>,
         /// Its command sandbox, replacing the one it has, as `create`'s
-        /// settings name it: with `writable`, `network`, `unsandboxed` and
-        /// `unix_sockets`, which otherwise go back to none, off, none and
-        /// none.
+        /// settings name it: with `writable`, `network` and `unix_sockets`,
+        /// which otherwise go back to none, off and none.
         sandbox: Option<agent_runtime::sandbox::Mode>,
         writable: Option<Vec<String>>,
         network: Option<bool>,
         /// Its prompt-cache lifetime, as `create`'s settings name it.
         cache_ttl: Option<agent_runtime::store::CacheTtl>,
-        unsandboxed: Option<Vec<String>>,
         unix_sockets: Option<Vec<String>>,
         /// The tier its calls are served at, as `create`'s settings name
         /// it; `standard` goes back to none.
@@ -570,13 +568,15 @@ enum Command {
     /// list. Asked when requested and kept five minutes; nothing runs on it.
     ProviderModels,
     /// A page of bots in name order: with `name`, those matching a GLOB
-    /// pattern; with `active`, those with a turn running.
+    /// pattern; with `active`, those with a turn running; with
+    /// `created_by_id`, those the bot with that id made.
     Bots {
         after: Option<String>,
         limit: Option<usize>,
         name: Option<String>,
         #[serde(default)]
         active: bool,
+        created_by_id: Option<i64>,
     },
     /// Stop the daemon. With `grace_ms`, it first drains for up to that
     /// long: nothing starts, and each running turn parks at its next
@@ -822,6 +822,24 @@ pub struct Configuration {
     pub protected: Vec<String>,
     /// Names kept read-only at the top of every writable root that has them.
     pub protected_existing: Vec<String>,
+    /// The folder of command rules (`*.rules`), read as each turn starts;
+    /// none, no rules.
+    pub rules: Option<PathBuf>,
+}
+
+/// `path` by its real path, or, while it doesn't exist, by the real path
+/// of the folder that would hold it.
+fn real_or_named(path: &Path) -> Result<PathBuf> {
+    let path = std::path::absolute(path)?;
+    if let Ok(real) = std::fs::canonicalize(&path) {
+        return Ok(real);
+    }
+    Ok(match (path.parent(), path.file_name()) {
+        (Some(folder), Some(name)) => {
+            std::fs::canonicalize(folder).map_or_else(|_| path.clone(), |folder| folder.join(name))
+        }
+        _ => path,
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -1458,6 +1476,7 @@ pub async fn run(config: Configuration) -> Result<()> {
             std::path::absolute(path)?.to_string_lossy().into_owned(),
         ));
     }
+    let rules = config.rules.as_deref().map(real_or_named).transpose()?;
     agent_runtime::sandbox::warm();
     let (sender, mut inbound) = session::channel_with(64, limits.input_bytes);
     let sessions_next = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
@@ -1481,6 +1500,9 @@ pub async fn run(config: Configuration) -> Result<()> {
         capabilities: None,
         protected: config.protected.clone(),
         protected_existing: config.protected_existing.clone(),
+        // By its real path once it exists, as a root is matched; a missing
+        // one by the real path of the folder it would be made in.
+        rules: rules.clone(),
     };
     daemon.capabilities = daemon
         .socket
@@ -1500,6 +1522,7 @@ pub async fn run(config: Configuration) -> Result<()> {
         .with_credentials(credentials)
         .with_environment(environment)
         .with_daemon(daemon)
+        .with_rules(rules)
         .with_process_budget(limits.processes)
         .with_lasting_budget(limits.lasting)
         .with_load_gate(limits.load);
@@ -2846,6 +2869,8 @@ impl Service {
             handles: self.handles.clone(),
             background_failures: self.background_failures.clone(),
             settings: Default::default(),
+            rules: Default::default(),
+            ruled: Default::default(),
             window: Default::default(),
             resumed,
             steers,
@@ -3234,7 +3259,6 @@ impl Service {
                 writable,
                 network,
                 cache_ttl,
-                unsandboxed,
                 unix_sockets,
                 speed,
             } => {
@@ -3247,7 +3271,6 @@ impl Service {
                             sandbox: Some(mode),
                             writable: writable.unwrap_or_default(),
                             network: network.unwrap_or(false),
-                            unsandboxed: unsandboxed.unwrap_or_default(),
                             unix_sockets: unix_sockets.unwrap_or_default(),
                             ..Settings::default()
                         };
@@ -3261,14 +3284,10 @@ impl Service {
                         .map_err(|_| Error::new("sandbox_unavailable"))??;
                         Some(settings)
                     }
-                    None if writable.is_some()
-                        || network.is_some()
-                        || unsandboxed.is_some()
-                        || unix_sockets.is_some() =>
-                    {
+                    None if writable.is_some() || network.is_some() || unix_sockets.is_some() => {
                         return fail_with(
                             "invalid_setting",
-                            "writable, network, unsandboxed and unix_sockets go with sandbox",
+                            "writable, network and unix_sockets go with sandbox",
                         );
                     }
                     None => None,
@@ -4002,6 +4021,7 @@ impl Service {
                 limit,
                 name,
                 active,
+                created_by_id,
             } => {
                 let reader = store.reader();
                 self.observe(session, output, id, async move {
@@ -4011,6 +4031,7 @@ impl Service {
                             limit.unwrap_or(64),
                             name.as_deref(),
                             active,
+                            created_by_id,
                         )
                     }))
                     .await

@@ -1,4 +1,5 @@
 use super::artifact;
+use crate::rules::{Rules, Ruling};
 use crate::{
     Error, Result,
     codec::Family,
@@ -243,11 +244,6 @@ pub struct Settings {
     /// allowed; none bounds them only by the turn's token budget.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_rounds: Option<usize>,
-    /// Command prefixes, each of words, that run outside the sandbox
-    /// without asking, as a Codex rule that allows a prefix runs it
-    /// ([`crate::sandbox::unsandboxed`]).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub unsandboxed: Vec<String>,
     /// Unix sockets, or folders of them, the only ones a sandbox's commands
     /// reach, each an absolute path
     /// ([`crate::sandbox::Policy::sockets`]).
@@ -321,8 +317,7 @@ impl Settings {
     /// makes: no weaker a sandbox than its creator's, as Codex's subagents
     /// inherit their parent's. A sandboxed creator's child takes the
     /// creator's sandbox and writable folders unless it names a stricter
-    /// sandbox, and reaches the network only if both do; it runs outside
-    /// the sandbox only commands its creator does.
+    /// sandbox, and reaches the network only if both do.
     pub fn under(mut self, creator: &Settings) -> Settings {
         use crate::sandbox::Mode;
         let sandboxed = |settings: &Settings| {
@@ -337,11 +332,8 @@ impl Settings {
         if !sandboxed(&self) {
             self.writable = creator.writable.clone();
             self.network = creator.network;
-            self.unsandboxed = creator.unsandboxed.clone();
             self.unix_sockets = creator.unix_sockets.clone();
         }
-        self.unsandboxed
-            .retain(|prefix| creator.unsandboxed.contains(prefix));
         self.unix_sockets
             .retain(|path| creator.unix_sockets.contains(path));
         self.sandbox = Mode::stricter(self.sandbox, creator.sandbox);
@@ -411,9 +403,6 @@ impl Settings {
             self.sandbox,
             Some(crate::sandbox::Mode::ReadOnly | crate::sandbox::Mode::WorkspaceWrite)
         );
-        if !sandboxed && !self.unsandboxed.is_empty() {
-            return refuse("unsandboxed goes with sandbox read-only or workspace-write");
-        }
         if !sandboxed && !self.unix_sockets.is_empty() {
             return refuse("unix_sockets goes with sandbox read-only or workspace-write");
         }
@@ -423,14 +412,6 @@ impl Settings {
                 .any(|path| !std::path::Path::new(path).is_absolute() || path.len() > 4096)
         {
             return refuse("unix_sockets names at most 64 absolute paths, 32 KiB in all");
-        }
-        if self.unsandboxed.len() > 64
-            || self
-                .unsandboxed
-                .iter()
-                .any(|prefix| prefix.split_whitespace().next().is_none() || prefix.len() > 1024)
-        {
-            return refuse("unsandboxed names at most 64 commands, each words of at most 1 KiB");
         }
         if self.writable.len() > 64
             || crate::output::encoded_len(&self.writable).unwrap_or(usize::MAX) > FOLDERS_JSON
@@ -468,8 +449,7 @@ impl Settings {
             "speed":self.speed().map_or("standard", crate::provider::Speed::name),
             "sandbox":self.sandbox,"writable":self.writable,"network":self.network,
             "outputs":self.outputs,
-            "hide_senders":self.hide_senders,"unsandboxed":self.unsandboxed,
-            "unix_sockets":self.unix_sockets})
+            "hide_senders":self.hide_senders,"unix_sockets":self.unix_sockets})
     }
     fn stored(&self) -> Result<Option<String>> {
         Ok((*self != Self::default())
@@ -521,15 +501,35 @@ impl Bot {
         )
     }
     /// Whether this call, of the daemon's tool or a declared one, waits
-    /// for a verdict, run in the turn's `workspace`. A call the bot may not
-    /// make is refused, never announced, and one its sandbox confines runs
-    /// without a verdict: only an escape is gated, as in Codex. A call
-    /// whose steps go to the gate one by one waits for none as a whole.
-    pub fn gated(&self, call: &ToolCall, workspace: &std::path::Path) -> bool {
+    /// for a verdict, run in the turn's `workspace` under `rules`. A call
+    /// the bot may not make is refused, never announced, and one its
+    /// sandbox confines runs without a verdict: only an escape is gated,
+    /// as in Codex. A command a rule asks about waits, sandbox or not; one
+    /// a rule allows or forbids doesn't. A call whose steps go to the gate
+    /// one by one waits for none as a whole.
+    pub fn gated(&self, call: &ToolCall, workspace: &std::path::Path, rules: &Rules) -> bool {
         gated(&self.gates, &call.name)
             && self.may_call(&call.name)
             && !self.declared(&call.name).is_some_and(|tool| tool.steps)
-            && !self.confines(call, workspace)
+            && match self.ruling(call, rules) {
+                Ok(Ruling::Prompt(_)) => true,
+                Ok(Ruling::None) => !self.confines(call, workspace),
+                Ok(Ruling::Allow | Ruling::Forbidden(_)) | Err(_) => false,
+            }
+    }
+    /// What `rules` make of this call: only the daemon's own `shell` is
+    /// ruled, by its command, never a declared tool of that name.
+    pub fn ruling(&self, call: &ToolCall, rules: &Rules) -> Result<Ruling> {
+        if call.name != "shell" || self.declared(&call.name).is_some() {
+            return Ok(Ruling::None);
+        }
+        let Ok(arguments) = serde_json::from_str::<Value>(&call.arguments) else {
+            return Ok(Ruling::None);
+        };
+        match arguments["command"].as_str() {
+            Some(command) => rules.rule_call(&call.call_id, command),
+            None => Ok(Ruling::None),
+        }
     }
     /// Whether the bot's commands run in a sandbox.
     pub fn sandboxed(&self) -> bool {
@@ -538,21 +538,6 @@ impl Bot {
             self.settings.sandbox,
             Some(Mode::ReadOnly | Mode::WorkspaceWrite)
         )
-    }
-    /// Whether this call is a command the bot's client lets run outside its
-    /// sandbox without asking: one the bot doesn't ask to escalate, which
-    /// runs nothing but its `unsandboxed` commands.
-    pub fn unsandboxed(&self, call: &ToolCall) -> bool {
-        if call.name != "shell" || self.settings.unsandboxed.is_empty() || !self.sandboxed() {
-            return false;
-        }
-        let Ok(arguments) = serde_json::from_str::<Value>(&call.arguments) else {
-            return false;
-        };
-        arguments["sandbox_permissions"] != "require_escalated"
-            && arguments["command"].as_str().is_some_and(|command| {
-                crate::sandbox::unsandboxed(&self.settings.unsandboxed, command)
-            })
     }
     /// Whether this call runs inside the bot's sandbox: the bot has one, the
     /// tool is one a sandbox holds, and the call doesn't ask to leave it.
@@ -846,6 +831,10 @@ pub struct Waiting {
     /// output when it ends or its yield runs out.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub poll: bool,
+    /// What the command rules made of the calls still to run, as their
+    /// round was announced, by call id: read from them as the park resumes.
+    #[serde(skip)]
+    pub rulings: BTreeMap<String, String>,
 }
 /// A declined request's fallback model, as `provider/model`, and the credit
 /// its retry redeems.
@@ -869,6 +858,14 @@ pub struct CopiedCall {
     pub prefix: Option<(String, usize)>,
 }
 impl Waiting {
+    /// The calls still to run as their round's announcement ruled them.
+    pub fn rules(&self) -> Rules {
+        Rules::recorded(
+            (self.rulings.iter())
+                .map(|(id, stored)| (id.clone(), Ruling::read(stored)))
+                .collect(),
+        )
+    }
     fn paced_elapsed_ms(&self) -> i64 {
         self.paced_since_ms
             .filter(|_| self.halt.is_none())
@@ -1757,7 +1754,7 @@ impl Database {
     /// Stored schema version, kept in `PRAGMA user_version`. Stores created
     /// before versioning and stores from newer binaries are rejected; an older
     /// versioned store is migrated forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 74;
+    pub const SCHEMA: i32 = 75;
     /// Verbatim user prompts a compaction keeps: per-prompt text, and the
     /// total text plus `(ordinal, String)` entry metadata. Empty entries cost
     /// space too, so the retained list cannot grow with conversation length.
@@ -1956,7 +1953,7 @@ impl Database {
             CREATE UNIQUE INDEX IF NOT EXISTS pauses_held ON pauses(ifnull(resumed_ms,0))
                 WHERE resumed_ms IS NULL;
             CREATE TABLE IF NOT EXISTS tools(turn INTEGER NOT NULL REFERENCES turns(id), call_id TEXT NOT NULL,
-                status TEXT NOT NULL, custom INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(turn,call_id));
+                status TEXT NOT NULL, custom INTEGER NOT NULL DEFAULT 0, ruling TEXT, PRIMARY KEY(turn,call_id));
             CREATE TABLE IF NOT EXISTS approvals(id INTEGER PRIMARY KEY AUTOINCREMENT, turn INTEGER NOT NULL REFERENCES turns(id),
                 call_id TEXT NOT NULL, name TEXT NOT NULL, node INTEGER NOT NULL, request INTEGER NOT NULL,
                 announced_ms INTEGER NOT NULL, gates TEXT NOT NULL, verdicts TEXT, arguments TEXT NOT NULL, asked TEXT,
@@ -1998,6 +1995,7 @@ impl Database {
             CREATE INDEX IF NOT EXISTS processes_running ON processes(turn) WHERE status='running';
             CREATE INDEX IF NOT EXISTS bots_deleting ON bots(name) WHERE status='deleting';
             CREATE INDEX IF NOT EXISTS bots_running ON bots(name) WHERE running_turn IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS bots_maker ON bots(created_by_id, name) WHERE created_by_id IS NOT NULL;
             CREATE INDEX IF NOT EXISTS bots_expiring ON bots(expires_at) WHERE expires_at IS NOT NULL;")?;
         if version != Self::SCHEMA {
             tx.pragma_update(None, "user_version", Self::SCHEMA)?;
@@ -2636,7 +2634,6 @@ impl Database {
             sandbox: sandbox.sandbox,
             writable: sandbox.writable,
             network: sandbox.network,
-            unsandboxed: sandbox.unsandboxed,
             unix_sockets: sandbox.unix_sockets,
             ..bot.settings
         };
@@ -2705,13 +2702,16 @@ impl Database {
     /// A page of bots in name order after `after`. `name` keeps those whose
     /// name matches a GLOB pattern, which reads only its literal prefix's
     /// range of the name index; `active` keeps those with a turn running,
-    /// read from an index of only them.
+    /// read from an index of only them; `created_by` keeps those the bot
+    /// with that id made, read from an index by maker, so a page costs that
+    /// bot's own children whatever else the store holds.
     pub fn list(
         &self,
         after: Option<&str>,
         limit: usize,
         name: Option<&str>,
         active: bool,
+        created_by: Option<i64>,
     ) -> Result<Value> {
         if !(1..=256).contains(&limit) || after.is_some_and(|s| s.len() > 128) {
             return fail_with(
@@ -2725,11 +2725,27 @@ impl Database {
                 "name is a GLOB pattern of 1 to 256 bytes",
             );
         }
+        let after = after.unwrap_or("");
+        let limit_rows = (limit + 1) as i64;
+        // Fixed numbers, so bench.query_plans plans every variant: a
+        // maker without a name binds ?3 as NULL, which nothing reads.
         let glob = if name.is_some() {
             " AND name GLOB ?3"
         } else {
             ""
         };
+        let maker = if created_by.is_some() {
+            " AND created_by_id = ?4"
+        } else {
+            ""
+        };
+        let mut values: Vec<&dyn rusqlite::ToSql> = vec![&after, &limit_rows];
+        if name.is_some() || created_by.is_some() {
+            values.push(&name);
+        }
+        if created_by.is_some() {
+            values.push(&created_by);
+        }
         let running = if active {
             " AND running_turn IS NOT NULL"
         } else {
@@ -2738,14 +2754,9 @@ impl Database {
         let mut statement = self.conn.prepare_cached(&format!(
             "SELECT name,head,workspace,status,running_turn,provider,family,model,reasoning,budget_tokens,tokens_used,tools,
                     input_tokens,cached_input_tokens,id,created_by,created_by_id,gates,allowed,expire_ms,expires_at
-             FROM bots WHERE name > ?1{glob}{running} ORDER BY name LIMIT ?2"
+             FROM bots WHERE name > ?1{glob}{maker}{running} ORDER BY name LIMIT ?2"
         ))?;
-        let after = after.unwrap_or("");
-        let limit_rows = (limit + 1) as i64;
-        let mut rows = match name {
-            Some(pattern) => statement.query(params![after, limit_rows, pattern])?,
-            None => statement.query(params![after, limit_rows])?,
-        };
+        let mut rows = statement.query(values.as_slice())?;
         let mut bots = Vec::new();
         let mut bytes = 0;
         let mut more = false;
@@ -6149,12 +6160,24 @@ impl Database {
         }
         Ok(absorbed)
     }
+    /// A round's items and calls, with no command rules.
     pub fn append(
         &mut self,
         turn: i64,
         items: Vec<Bytes>,
         calls: &[ToolCall],
         usage: Option<&Usage>,
+    ) -> Result<Vec<Value>> {
+        self.append_under(turn, items, calls, usage, &Rules::default())
+    }
+    /// A round's items and calls, under the `rules` its turn runs with.
+    pub fn append_under(
+        &mut self,
+        turn: i64,
+        items: Vec<Bytes>,
+        calls: &[ToolCall],
+        usage: Option<&Usage>,
+        rules: &Rules,
     ) -> Result<Vec<Value>> {
         let bot = self.active(turn)?;
         // A gated round notes which item plans each call. Whether a
@@ -6173,7 +6196,7 @@ impl Database {
         let tx = self.conn.savepoint()?;
         let mut head = bot.head;
         let mut entries = Vec::new();
-        let gated = calls.iter().any(|call| bot.gated(call, workspace));
+        let gated = calls.iter().any(|call| bot.gated(call, workspace, rules));
         let mut planned = HashMap::new();
         let last_reasoning = items.last().is_some_and(|item| {
             serde_json::from_slice::<Kind>(item).is_ok_and(|k| k.kind == "reasoning")
@@ -6196,13 +6219,16 @@ impl Database {
         // A turn keys its calls by id. The provider checks one response's ids;
         // one that reuses an id from an earlier round of the turn is refused
         // the same way, and the round commits nothing.
+        // Each keeps what the command rules made of it, which its run reads:
+        // the rules may change before it runs.
         for call in calls {
+            let ruling = Ruling::stored(&bot.ruling(call, rules));
             let planned = tx
                 .prepare_cached(
-                    "INSERT INTO tools(turn,call_id,status,custom) VALUES (?,?,'planned',?)
+                    "INSERT INTO tools(turn,call_id,status,custom,ruling) VALUES (?,?,'planned',?,?)
                      ON CONFLICT DO NOTHING",
                 )?
-                .execute(params![turn, call.call_id, call.custom])?;
+                .execute(params![turn, call.call_id, call.custom, ruling])?;
             if planned == 0 {
                 return Err(Error::new("invalid_tool_call_id"));
             }
@@ -6215,7 +6241,10 @@ impl Database {
             let announced_ms = epoch_ms();
             let mut announced = Vec::new();
             let mut judged = Vec::new();
-            for call in calls.iter().filter(|call| bot.gated(call, workspace)) {
+            for call in calls
+                .iter()
+                .filter(|call| bot.gated(call, workspace, rules))
+            {
                 let gates: Vec<CallGate> = bot
                     .gates
                     .iter()
@@ -6600,6 +6629,16 @@ impl Database {
     /// Start a gated call once every gate allowed it, record its denial, or
     /// say what it still waits for. Allows ride the call's `tool_start`
     /// commit and a denial is its result, so a verdict adds no commit.
+    /// What the command rules made of each of the turn's calls still to
+    /// run, as their rounds were announced.
+    fn rulings(&self, turn: i64) -> Result<BTreeMap<String, String>> {
+        let mut statement = self.conn.prepare_cached(
+            "SELECT call_id,ruling FROM tools WHERE turn=? AND ruling IS NOT NULL
+             AND status IN ('planned','executing')",
+        )?;
+        let rows = statement.query_map([turn], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
     pub fn approval_start(&mut self, turn: i64, call: &ToolCall, now_ms: u64) -> Result<Gated> {
         let mut bot = self.active(turn)?;
         let request = self
@@ -6772,6 +6811,7 @@ impl Database {
             fallback: None,
             halt: None,
             poll: false,
+            rulings: BTreeMap::new(),
         };
         let tx = self.conn.savepoint()?;
         flush(&tx, turn, self.live.get(&turn))?;
@@ -6916,6 +6956,7 @@ impl Database {
             fallback: None,
             halt: None,
             poll: false,
+            rulings: BTreeMap::new(),
         };
         let tx = self.conn.savepoint()?;
         flush(&tx, turn, self.live.get(&turn))?;
@@ -8633,6 +8674,7 @@ impl Database {
             fallback: None,
             halt: None,
             poll,
+            rulings: BTreeMap::new(),
         };
         let tx = self.conn.savepoint()?;
         // A verdict for a later call of the round waits in the store.
@@ -8691,6 +8733,7 @@ impl Database {
             fallback,
             halt: None,
             poll: false,
+            rulings: BTreeMap::new(),
         };
         let tx = self.conn.savepoint()?;
         flush(&tx, turn, self.live.get(&turn))?;
@@ -8779,6 +8822,7 @@ impl Database {
             fallback: None,
             halt: Some(stop),
             poll: false,
+            rulings: BTreeMap::new(),
         };
         let tx = self.conn.savepoint()?;
         flush(&tx, turn, self.live.get(&turn))?;
@@ -9024,7 +9068,7 @@ impl Database {
     /// Bring a parked turn back to running; the caller then records the wait
     /// result. Also answers whether a steer queued while it was parked.
     pub fn resume(&mut self, turn: i64) -> Result<(Waiting, Value, bool)> {
-        let waiting = self.waiting(turn)?.ok_or(Error::new("turn_not_waiting"))?;
+        let mut waiting = self.waiting(turn)?.ok_or(Error::new("turn_not_waiting"))?;
         let bot = self.active(turn)?;
         if bot.status != "waiting" && bot.status != "paced" {
             return fail("turn_not_waiting");
@@ -9039,6 +9083,7 @@ impl Database {
         let cursor = event(&tx, &bot.name, Some(turn), "turn_resumed", data.clone())?;
         tx.commit()?;
         let steers = self.steers_waiting(&bot.name)?;
+        waiting.rulings = self.rulings(turn)?;
         Ok((
             waiting,
             entry(cursor, &bot.name, Some(turn), "turn_resumed", data),
@@ -12665,6 +12710,24 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
              WHERE json_extract(waiting,'$.pulled')=1",
             [],
         )?;
+    }
+    // 74 -> 75: a bot's commands that ran outside its sandbox are the
+    // command rules' now, which every bot shares; the setting goes.
+    if from < 75 {
+        conn.execute(
+            "UPDATE bots SET settings=json_remove(settings,'$.unsandboxed')
+             WHERE json_extract(settings,'$.unsandboxed') IS NOT NULL",
+            [],
+        )?;
+        // A planned call keeps what the rules made of it as it was planned.
+        if conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='tools')
+             AND NOT EXISTS(SELECT 1 FROM pragma_table_info('tools') WHERE name='ruling')",
+            [],
+            |r| r.get::<_, bool>(0),
+        )? {
+            conn.execute_batch("ALTER TABLE tools ADD COLUMN ruling TEXT;")?;
+        }
     }
     Ok(())
 }

@@ -402,14 +402,24 @@ class ApprovalTests(ModelFixture):
         self.assertEqual(list(outside.iterdir()), [])
 
     @unittest.skipUnless(shutil.which('bwrap') or sys.platform == 'darwin', 'sandboxes need bubblewrap')
-    def test_a_command_its_client_trusts_runs_outside_the_sandbox_without_asking(self):
+    def test_command_rules_let_a_command_out_ask_about_it_or_forbid_it(self):
         (ROOT / '.local').mkdir(exist_ok=True)
         outside = Path(tempfile.mkdtemp(dir=ROOT / '.local'))
         self.addCleanup(shutil.rmtree, outside)
-        client = self.gated(settings={'sandbox': 'workspace-write', 'unsandboxed': ['touch']})
-        self.assertEqual(client.request('inspect', bot='Bob')['result']['settings']['unsandboxed'], ['touch'])
-        # Alone, and beside a command that runs anything else, which stays
-        # in the sandbox; neither asks.
+        rules = self.path / 'rules'
+        rules.mkdir()
+        (rules / 'default.rules').write_text(
+            'prefix_rule(pattern=["touch"], decision="allow")\n'
+            'prefix_rule(pattern=["rm", ["-rf", "-fr"]], decision="forbidden",\n'
+            '            justification="Move it to the trash instead.", match=["rm -rf x"])\n'
+            'prefix_rule(pattern=["cp"], decision="prompt")\n')
+        client = self.gated(settings={'sandbox': 'workspace-write'}, extra=('--rules', str(rules)))
+        # The setting the rules took the place of is gone.
+        self.assertNotIn('unsandboxed', client.request('inspect', bot='Bob')['result']['settings'])
+        self.assertIn('error', client.request('create', bot='Old', workspace=str(self.path),
+                                              settings={'sandbox': 'read-only', 'unsandboxed': ['touch']}))
+        # Allowed, alone or beside another allowed one, it runs outside the
+        # sandbox without asking; beside a command no rule names, it stays in.
         for request_id, calls in [('alone', [['shell', {'command': f'touch {outside}/alone'}]]),
                                   ('together', [['shell', {'command': f"touch '{outside}/one' && touch {outside}/two"}],
                                                 ['shell', {'command': f'touch {outside}/three && true'}]])]:
@@ -419,19 +429,48 @@ class ApprovalTests(ModelFixture):
             self.assertEqual(self.events(client, turn, 'approval_requested'), [])
         self.assertEqual(sorted(path.name for path in outside.iterdir()), ['alone', 'one', 'two'])
         self.assertNotEqual(self.tool_output(client, 'shell-2')[1]['exit_code'], 0)
-        # Only with a sandbox; configure replaces the list, and a bot the
-        # bot makes runs outside only what its creator does.
-        self.assertEqual(client.request('configure', bot='Bob', unsandboxed=['touch'])['error'], 'invalid_setting')
-        self.assertEqual(client.request('configure', bot='Bob', sandbox='danger-full-access',
-                                        unsandboxed=['touch'])['error'], 'invalid_setting')
-        configured = client.request('configure', bot='Bob', sandbox='workspace-write',
-                                    unsandboxed=['touch', 'mcpx'])['result']
-        self.assertEqual(configured['changed'], ['sandbox'])
-        bob = client.request('inspect', bot='Bob')['result']
-        kid = client.request('create', bot='Kid', workspace=str(self.path), created_by='Bob',
-                             created_by_id=bob['bot_id'],
-                             settings={'sandbox': 'read-only', 'unsandboxed': ['mcpx', 'rm']})['result']
-        self.assertEqual((kid['settings']['sandbox'], kid['settings']['unsandboxed']), ('read-only', ['mcpx']))
+        # Forbidden, it is refused with the rule's reason, even asking to
+        # leave the sandbox, and never asked about.
+        (outside / 'keep').mkdir()
+        calls = [['shell', {'command': f'rm -rf {outside}/keep'}],
+                 ['shell', {'command': f'rm -fr {outside}/keep', 'sandbox_permissions': 'require_escalated',
+                            'justification': 'clean up'}]]
+        turn = client.request('submit', bot='Bob', request_id='forbidden',
+                              prompt='calls:' + json.dumps(calls))['result']['turn']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        self.assertEqual(self.events(client, turn, 'approval_requested'), [])
+        for call_id in ('shell-1', 'shell-2'):
+            output = self.tool_output(client, call_id)[1]
+            self.assertEqual((output['error'], output['detail']),
+                             ('command_forbidden', 'Move it to the trash instead.'))
+        self.assertTrue((outside / 'keep').exists())
+        # One a rule asks about waits for the gate though the sandbox would
+        # hold it, and once allowed runs where it asked to: in the sandbox.
+        turn = client.request('submit', bot='Bob', request_id='prompt',
+                              prompt=f'shell:cp /dev/null {outside}/asked')['result']['turn']
+        self.assertEqual([call['call_id'] for call in self.announced(client, turn)], ['shell-1'])
+        self.answer(client, turn, 'shell-1')
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        self.assertFalse((outside / 'asked').exists())
+        # With no gate to ask, it is refused, as Codex refuses it under a
+        # policy that never asks.
+        client.request('create', bot='Solo', workspace=str(self.path), settings={'sandbox': 'workspace-write'})
+        turn = client.request('submit', bot='Solo', request_id='solo',
+                              prompt=f'shell:cp /dev/null {self.path}/copied')['result']['turn']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        output = self.tool_output(client, 'shell-1', bot='Solo')[1]
+        self.assertEqual((output['error'], output['detail']),
+                         ('command_needs_approval',
+                          f'the rule at {os.path.realpath(rules)}/default.rules:4 names `cp`'))
+        self.assertFalse((self.path / 'copied').exists())
+        # A rule written now holds from the next turn on.
+        with open(rules / 'default.rules', 'a') as file:
+            file.write('prefix_rule(pattern=["mkdir"], decision="forbidden")\n')
+        turn = client.request('submit', bot='Solo', request_id='later',
+                              prompt=f'shell:mkdir {self.path}/made')['result']['turn']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        self.assertEqual(self.tool_output(client, 'shell-1', bot='Solo')[1]['error'], 'command_forbidden')
+        self.assertFalse((self.path / 'made').exists())
 
     def test_a_denial_is_the_result_and_the_turn_goes_on(self):
         client = self.gated()

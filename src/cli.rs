@@ -21,7 +21,7 @@ const COMMANDS: &[Command] = &[
         about: "Send a prompt to a bot, or make one with --new; prints the turn as it runs",
         usage: "run [OPTIONS] [--] PROMPT...",
         flags: "--bot --new --fork --allow --expires --detach --delivery --turn --model --workspace --effort --turn-budget-tokens --image --quote --agents --profile --request-id --bot-id --pretty --no-spawn",
-        settings: "--tools --instructions --instructions-file --budget-tokens --compaction-instructions --compaction-instructions-file --compaction-model --no-compaction --fallback --approval --approve --context-bytes --context-items --note-turns --compact-at --compact-keep --compact-tokens --max-rounds --keep-turns --approval-hold --max-output-tokens --keep-warm --cache-ttl --speed --sandbox --writable --network --hide-senders --unsandboxed --unix-socket --outputs",
+        settings: "--tools --instructions --instructions-file --budget-tokens --compaction-instructions --compaction-instructions-file --compaction-model --no-compaction --fallback --approval --approve --context-bytes --context-items --note-turns --compact-at --compact-keep --compact-tokens --max-rounds --keep-turns --approval-hold --max-output-tokens --keep-warm --cache-ttl --speed --sandbox --writable --network --hide-senders --unix-socket --outputs",
         startup: true,
     },
     Command {
@@ -51,8 +51,8 @@ const COMMANDS: &[Command] = &[
     Command {
         name: "ls",
         about: "List the bots",
-        usage: "ls [--name GLOB] [--active] [--limit N]",
-        flags: "--name --active --limit --pretty",
+        usage: "ls [--name GLOB] [--active] [--created-by BOT] [--limit N]",
+        flags: "--name --active --created-by --limit --pretty",
         settings: "",
         startup: false,
     },
@@ -201,10 +201,18 @@ const COMMANDS: &[Command] = &[
         startup: true,
     },
     Command {
+        name: "rules",
+        about: "What the command rules make of a command, read from their files with no daemon",
+        usage: "rules check [--rules DIR] [--] COMMAND...",
+        flags: "--rules --pretty",
+        settings: "",
+        startup: false,
+    },
+    Command {
         name: "serve",
         about: "Run the daemon in the foreground; other commands start it for you",
         usage: "serve --store PATH --provider SPEC... [OPTIONS]",
-        flags: "--shell-exclude --redact-field --redact-block --protect --protect-existing",
+        flags: "--shell-exclude --redact-field --redact-block --protect --protect-existing --rules",
         settings: "",
         startup: true,
     },
@@ -396,6 +404,10 @@ fn print_flags(flags: &str) {
                 "LABEL",
                 "Redact the body of each PEM block whose header names LABEL, such as PRIVATE KEY, from tool output; repeatable",
             ),
+            "--rules" => (
+                "DIR",
+                "The folder of command rules, each *.rules file Codex's prefix_rule calls; default ~/.agent/rules",
+            ),
             "--protect" => (
                 "NAME",
                 "Keep NAME at the top of each sandboxed bot's writable folders read-only, and from being made when missing; repeatable",
@@ -462,10 +474,6 @@ fn print_flags(flags: &str) {
                 "",
                 "A new bot's model reads what other bots and clients send it with no line naming the sender",
             ),
-            "--unsandboxed" => (
-                "COMMAND",
-                "A command, by its first words, a sandboxed bot runs outside its sandbox without asking; repeat for more",
-            ),
             "--unix-socket" => (
                 "PATH",
                 "A Unix socket, or a folder of them, the only ones a sandboxed bot's commands reach; repeat for more",
@@ -493,6 +501,7 @@ fn print_flags(flags: &str) {
                 "Only bots whose name matches, as SQLite GLOB: * any run, ? one byte, [..] a set",
             ),
             "--active" => ("", "Only bots with a turn running"),
+            "--created-by" => ("BOT", "Only bots this bot made"),
             "--newest" => ("", "Newest first, read from the end"),
             "--limit" => ("N", "List at most N"),
             "--since" => (
@@ -615,7 +624,7 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
     let mut positional = 0;
     while let Some(arg) = iter.next() {
         if arg == "--" {
-            if matches!(c.name, "run" | "wait" | "companion") {
+            if matches!(c.name, "run" | "wait" | "companion" | "rules") {
                 out.push(arg);
             }
             for value in iter {
@@ -627,6 +636,16 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
         if matches!(arg.as_str(), "--help" | "-h") {
             help(Some(c.name))?;
             return Ok(None);
+        }
+        // The command `rules check` reads is all words, flags too.
+        if c.name == "rules" && positional == 1 && !arg.starts_with('-') {
+            out.push("--".to_owned());
+            out.push(arg);
+            for value in iter {
+                out.push(value);
+            }
+            positional = 2;
+            break;
         }
         if !arg.starts_with('-') || arg == "-" {
             positional += 1;
@@ -652,7 +671,6 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
                     | "--image"
                     | "--quote"
                     | "--writable"
-                    | "--unsandboxed"
                     | "--unix-socket"
                     | "--env"
                     | "--shell-exclude"
@@ -773,6 +791,10 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
         if positional != 1 {
             return fail_with("usage", "login needs a provider: chatgpt");
         }
+    } else if c.name == "rules" {
+        if positional < 2 {
+            return fail_with("usage", "rules needs check COMMAND...");
+        }
     } else if !matches!(c.name, "run" | "wait" | "companion") && positional != 0 {
         return fail_with("usage", format!("{} takes no positional arguments", c.name));
     }
@@ -811,7 +833,6 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
             "--writable",
             "--network",
             "--hide-senders",
-            "--unsandboxed",
             "--unix-socket",
             "--approval",
             "--approve",

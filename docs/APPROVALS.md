@@ -9,7 +9,11 @@ decided that `auto` means a model decides every gated call, with no rules
 in front of it: an approver that answers by rules alone is manual mode with
 a program in the person's place, and rules for manual mode are a later
 option (NEXT.md item 45). The rules layer this note first proposed, and the
-daemon checks that only it needed, are gone from `auto`.
+daemon checks that only it needed, are gone from `auto`. On 2026-11-01
+the person's own command rules came in, as Codex's execpolicy writes them
+([command rules](RUST_PROTOTYPE.md#command-rules)): they sit in front of
+every approver, so a `forbidden` or `allow` command never reaches one,
+and a `prompt` command waits on the gate even inside the sandbox.
 Code facts in the sections below are from lydakis/agent at b07080c, before
 any of it was built. Peer facts were read on 2026-09-26 from the pages
 linked in each section; blog claims are marked as claims. The latency figure

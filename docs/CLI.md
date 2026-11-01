@@ -2,7 +2,7 @@
 
 Agent uses flat verbs: `run`, `follow`, `fork`, `interrupt`, `wait`, `ls`,
 `inspect`, `turns`, `usage`, `rm`, `prune`, `approvals`, `answer`, `models`, `companion`, `start`, `stats`,
-`shutdown`, and `serve`. All named
+`rules`, `shutdown`, and `serve`. All named
 bots use the same commands. There is no parent/child command hierarchy.
 
 Use `agent --help`, `agent COMMAND --help`, or `agent help COMMAND` for help;
@@ -41,7 +41,12 @@ LABEL. A client that starts a daemon passes `agent_client::SECRET_FIELDS`
 Likewise `serve --protect NAME` keeps NAME at the top of a sandboxed bot's
 writable folders read-only and from being made, and `--protect-existing NAME`
 keeps it read-only where it exists; a client passes `.git`, `.agents` and
-`.codex`, and `.aws` where it exists.
+`.codex`, and `.aws` where it exists. `serve --rules DIR` reads the
+[command rules](RUST_PROTOTYPE.md#command-rules) in DIR's `*.rules` files,
+which a client passes as `~/.agent/rules`, and
+`rules check [--rules DIR] -- COMMAND...` prints what they decide about a
+command without a daemon: `{"decision", "matched"}`, with no `decision`
+when no rule matches, or `rules_invalid` with the file and line.
 `run` without `--bot` creates a fresh identity. `run --bot NAME` continues an
 existing bot; add `--new` to create that name. A prompt of `-` reads stdin.
 
@@ -167,8 +172,10 @@ identity is `bot_not_found`.
 - Listings read only what they print. `--limit N` stops `ls`, `turns` and
   `approvals` after N entries. `ls --name GLOB` keeps the bots whose name
   matches (`'project.*'`, `'*.lead'`; SQLite GLOB, case-sensitive) and
-  `ls --active` those with a turn running; the daemon filters, so neither
-  pages through every bot. `turns --newest` lists newest first, read from the
+  `ls --active` those with a turn running, and `ls --created-by BOT` those
+  that bot made (by its id, so a later bot of the same name lists none of
+  an earlier one's); the daemon filters, so none of them pages through
+  every bot. `turns --newest` lists newest first, read from the
   end, so `turns --bot NAME --newest --limit 3` is a bot's last three turns.
 - `usage` prints what the bots' turns spent as one JSON object: tokens in
   all, by bot (the `--limit` that spent most, 64 by default, the rest summed),
@@ -183,8 +190,7 @@ identity is `bot_not_found`.
   `--note-turns`, `--compact-at`, `--compact-keep`, `--compact-tokens`, `--keep-turns`,
   `--approval-hold`, `--max-output-tokens`, `--keep-warm`, `--cache-ttl`,
   `--sandbox`, `--writable` (repeatable, made absolute from the current
-  folder), `--network`, `--hide-senders`, `--unsandboxed` (repeatable: a
-  command's first words, such as `mcpx`), `--unix-socket` (repeatable: an
+  folder), `--network`, `--hide-senders`, `--unix-socket` (repeatable: an
   absolute socket, or folder of them, its commands reach) and `--outputs` (made absolute; a new
   bot gets `outputs` beside the store without it); they are not daemon options,
   and an existing bot keeps its own (see [bot settings](RUST_PROTOTYPE.md#bot-settings)).

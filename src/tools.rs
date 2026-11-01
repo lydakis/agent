@@ -500,6 +500,8 @@ pub struct Registry {
     environment: Arc<Vec<(String, String)>>,
     /// What the daemon keeps that a sandbox leaves alone or lets through.
     daemon: Arc<Daemon>,
+    /// The command rules' folder, read again as its files change.
+    rules: Arc<crate::rules::Folder>,
     /// Request encodings per (family, selection); see `encoded`.
     encodings: Encodings,
     /// Bytes of tool output being redacted off the runtime at once; see
@@ -1226,6 +1228,7 @@ impl Registry {
             credentials: Credentials::default(),
             environment: Arc::new(Vec::new()),
             daemon: Arc::default(),
+            rules: Arc::default(),
             encodings: Arc::default(),
             heavy: Arc::new(Semaphore::new(heavy_bytes())),
         })
@@ -1445,6 +1448,16 @@ impl Registry {
     }
     pub fn daemon(&self) -> &Daemon {
         &self.daemon
+    }
+    /// The command rules in `folder`, which a sandbox keeps read-only.
+    pub fn with_rules(mut self, folder: Option<std::path::PathBuf>) -> Self {
+        self.rules = Arc::new(crate::rules::Folder::new(folder));
+        self
+    }
+    /// The command rules' folder, which reads them as it holds them now
+    /// (off the runtime thread: it reads the filesystem).
+    pub fn rules_folder(&self) -> Arc<crate::rules::Folder> {
+        self.rules.clone()
     }
     pub fn names(&self) -> Vec<&'static str> {
         self.tools.iter().map(|t| t.name()).collect()
