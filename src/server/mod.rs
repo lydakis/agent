@@ -3828,6 +3828,15 @@ impl Service {
                     "running_processes": running,
                     "queued_processes": self.registry.pending(),
                     "process_limit": self.limits.processes,
+                    // Terminals and detached commands, which --max-lasting
+                    // bounds together (0 for none).
+                    "lasting_processes": self.registry.lasting_running(),
+                    "lasting_terminals": self.registry.terminals_running(),
+                    "lasting_limit": self.limits.lasting,
+                    // Shut while the load is at the limit or over it,
+                    // when it holds new commands back as one runs.
+                    "load_gate": self.registry.load_shut()
+                        .map(|shut| json!({"limit": self.limits.load, "shut": shut})),
                     "transport": {"in_flight_by_shard": self.transport.loads()},
                     "providers": providers,
                     "store": store.stats(),

@@ -112,7 +112,12 @@ pub enum Placement {
 /// the window the person used least recently. A window whose task needs
 /// the person or failed, or that holds blocks its task asked for (a dev
 /// server it runs), is never closed for room, as VS Code keeps a dirty
-/// editor; with no other, the limit is passed.
+/// editor; with no other, the limit is passed. A window the person has
+/// not used yet is not one they used least recently: it opened on its
+/// own, as a VS Code editor never does, and closing it would take new
+/// work out of view before they saw it. It stays, and while only such
+/// windows could make room a new task's window does not open, until the
+/// person asks for it.
 pub struct Room {
     /// Task windows at most, 0 for no limit.
     pub most: usize,
@@ -158,6 +163,9 @@ pub enum Shown {
     Aside,
     /// A window opened, closing these tasks' for room.
     Opened(Vec<String>),
+    /// No window opened: only windows the person has not used yet could
+    /// have made room. It opens when the person asks for it.
+    NoRoom,
 }
 
 /// Where each block sits, by label: its window, counted from 1, and in a
@@ -899,10 +907,12 @@ impl Layout {
         if self.aside(bot) && !asked {
             return Ok(Shown::Aside);
         }
-        let closed = self.make_room(bot, &listed, room);
+        let Some(closed) = self.make_room(bot, &listed, room, asked) else {
+            self.set_aside(bot, true);
+            return Ok(Shown::NoRoom);
+        };
         self.place(bot, name, command, &Placement::Window)?;
         self.set_aside(bot, false);
-        self.used.insert(bot.to_owned(), SystemTime::now());
         Ok(Shown::Opened(closed))
     }
 
@@ -913,10 +923,18 @@ impl Layout {
 
     /// Close the windows the person used least recently, so that one more
     /// for `bot` keeps the project's within `room`. A window counts once,
-    /// with every task placed in it, and closes whole. Returns their tasks.
-    fn make_room(&mut self, bot: &str, listed: &[Block], room: &Room) -> Vec<String> {
+    /// with every task placed in it, and closes whole. Returns their tasks;
+    /// or none, closing nothing, when windows the person has not used yet
+    /// stand in the way of the room and they did not ask for this one.
+    fn make_room(
+        &mut self,
+        bot: &str,
+        listed: &[Block],
+        room: &Room,
+        asked: bool,
+    ) -> Option<Vec<String>> {
         if room.most == 0 {
-            return Vec::new();
+            return Some(Vec::new());
         }
         let tasks = format!("{}.", room.project);
         let owners: HashSet<&str> = (listed.iter())
@@ -953,19 +971,28 @@ impl Layout {
             labels.dedup();
         }
         let over = (windows.len() + 1).saturating_sub(room.most);
-        let mut spare: Vec<(SystemTime, Vec<&str>)> = (windows.into_iter())
-            .filter(|(_, labels)| {
-                labels.iter().all(|label| {
-                    !room.keep.contains(*label) && !owners.contains(label) && !(room.held)(label)
-                })
-            })
-            .map(|(_, labels)| {
-                let used = (labels.iter())
-                    .filter_map(|label| self.used.get(*label).copied().max((room.used)(label)))
-                    .max();
-                (used.unwrap_or(SystemTime::UNIX_EPOCH), labels)
-            })
-            .collect();
+        if over == 0 {
+            return Some(Vec::new());
+        }
+        let (mut spare, mut unseen) = (Vec::<(SystemTime, Vec<&str>)>::new(), false);
+        for (_, labels) in windows {
+            let holds = |label: &&str| {
+                room.keep.contains(*label) || owners.contains(label) || (room.held)(label)
+            };
+            if labels.iter().any(holds) {
+                continue;
+            }
+            let used = (labels.iter())
+                .filter_map(|label| self.used.get(*label).copied().max((room.used)(label)))
+                .max();
+            match used {
+                Some(used) => spare.push((used, labels)),
+                None => unseen = true,
+            }
+        }
+        if spare.len() < over && unseen && !asked {
+            return None;
+        }
         spare.sort_unstable();
         let mut closed: Vec<String> = (spare.into_iter().take(over))
             .flat_map(|(_, labels)| labels)
@@ -977,7 +1004,7 @@ impl Layout {
             self.close(bot);
             self.set_aside(bot, true);
         }
-        closed
+        Some(closed)
     }
 
     /// Open the task's block where asked, closing any it had.
@@ -1566,9 +1593,8 @@ mod tests {
             assert_eq!(open(&mut layout, bot, &three, false), Shown::Opened(vec![]));
         }
         assert_eq!(open(&mut layout, "shop.a", &three, false), Shown::Had);
-        // Sonny opened every one just now, later than any mark; one the
-        // person brought into view since counts from then.
-        layout.used.clear();
+        // Opening one is no use of it; one the person brought into view
+        // counts from then.
         layout.focus("shop.c").unwrap();
         // The lead's own window never counts and never closes.
         assert_eq!(
@@ -1587,7 +1613,6 @@ mod tests {
         layout
             .split("shop.b", "dev", Path::new("/"), &[], Some("right"))
             .unwrap();
-        layout.used.remove("shop.d");
         assert_eq!(
             open(&mut layout, "shop.a", &room(3, &["shop.d"]), true),
             Shown::Opened(vec!["shop.c".into()])
@@ -1627,7 +1652,12 @@ mod tests {
                 .map(String::from)
                 .into(),
             keep: HashSet::new(),
-            used: Arc::new(|bot: &str| (bot == "shop.a").then(SystemTime::now)),
+            // `b`'s window was used before `a`'s, `c` placed in it never.
+            used: Arc::new(|bot: &str| match bot {
+                "shop.a" => Some(SystemTime::UNIX_EPOCH + Duration::from_secs(20)),
+                "shop.b" => Some(SystemTime::UNIX_EPOCH + Duration::from_secs(10)),
+                _ => None,
+            }),
             held: Arc::new(|_: &str| false),
         };
         for bot in ["shop.a", "shop.b"] {
@@ -1639,7 +1669,6 @@ mod tests {
             beside: "shop.b".into(),
         };
         layout.place("shop.c", "shop.c", &[], &beside).unwrap();
-        layout.used.clear();
         // One more is over: the window used longest ago goes, both its tasks.
         assert_eq!(
             layout
@@ -1650,7 +1679,6 @@ mod tests {
         // A window one of whose tasks failed stays whole.
         room.most = 1;
         room.held = Arc::new(|bot: &str| bot == "shop.d");
-        layout.used.clear();
         assert_eq!(
             layout
                 .show_task("shop.b", "shop.b", &[], &room, true)
@@ -1675,7 +1703,10 @@ mod tests {
             project: "shop".into(),
             mine: ["shop.a", "shop.b", "shop.c"].map(String::from).into(),
             keep: HashSet::new(),
-            used: Arc::new(|bot: &str| (bot == "shop.b").then(SystemTime::now)),
+            used: Arc::new(|bot: &str| match bot {
+                "shop.b" => Some(SystemTime::now()),
+                _ => Some(SystemTime::UNIX_EPOCH),
+            }),
             held: Arc::new(|_: &str| false),
         };
         assert_eq!(
@@ -1707,7 +1738,7 @@ mod tests {
             project: "shop".into(),
             mine: ["shop.a", "shop.b"].map(String::from).into(),
             keep: HashSet::new(),
-            used: Arc::new(|_: &str| None),
+            used: Arc::new(|_: &str| Some(SystemTime::UNIX_EPOCH)),
             held: Arc::new(|_: &str| false),
         };
         let fake = Fake::default();
@@ -1748,7 +1779,7 @@ mod tests {
             project: "shop".into(),
             mine: ["shop.a", "shop.b", "shop.c"].map(String::from).into(),
             keep: HashSet::new(),
-            used: Arc::new(|_: &str| None),
+            used: Arc::new(|_: &str| Some(SystemTime::UNIX_EPOCH)),
             held: Arc::new(|bot: &str| bot == "shop.a"),
         };
         for bot in ["shop.a", "shop.b"] {
@@ -1757,13 +1788,62 @@ mod tests {
                 Shown::Opened(vec![])
             );
         }
-        layout.used.clear();
         assert_eq!(
             layout
                 .show_task("shop.c", "shop.c", &[], &room, false)
                 .unwrap(),
             Shown::Opened(vec!["shop.b".into()])
         );
+    }
+
+    #[test]
+    fn a_window_the_person_has_not_used_yet_is_not_closed_for_room() {
+        let fake = Fake::default();
+        fake.add("shop.lead", "lead");
+        let mut layout = Layout::new(Box::new(fake));
+        let seen: Arc<Mutex<HashSet<String>>> = Arc::default();
+        let marks = seen.clone();
+        let room = Room {
+            most: 2,
+            project: "shop".into(),
+            mine: ["a", "b", "c", "d"].map(|t| format!("shop.{t}")).into(),
+            keep: HashSet::new(),
+            // As each window's own Sonny marks it once the person looks.
+            used: Arc::new(move |bot: &str| {
+                (marks.lock().unwrap().contains(bot)).then_some(SystemTime::UNIX_EPOCH)
+            }),
+            held: Arc::new(|_: &str| false),
+        };
+        // Tasks started at once: the first two fill the room, and the
+        // third, with only windows nobody has looked at to close, waits
+        // for the person, rather than closing new work seconds after it
+        // opened.
+        for bot in ["shop.a", "shop.b"] {
+            assert_eq!(
+                layout.show_task(bot, bot, &[], &room, false).unwrap(),
+                Shown::Opened(vec![])
+            );
+        }
+        assert_eq!(
+            layout.show_task("shop.c", "c", &[], &room, false).unwrap(),
+            Shown::NoRoom
+        );
+        assert!(layout.aside("shop.c"));
+        assert_eq!(layout.windows().len(), 3);
+        // Once the person has looked at one, it is theirs to close for
+        // the next.
+        seen.lock().unwrap().insert("shop.a".into());
+        assert_eq!(
+            layout.show_task("shop.d", "d", &[], &room, false).unwrap(),
+            Shown::Opened(vec!["shop.a".into()])
+        );
+        // Asked for, the waiting one opens, past the room if it must.
+        assert_eq!(
+            layout.show_task("shop.c", "c", &[], &room, true).unwrap(),
+            Shown::Opened(vec![])
+        );
+        assert!(!layout.aside("shop.c"));
+        assert_eq!(layout.windows().len(), 4);
     }
 
     #[test]

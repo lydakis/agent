@@ -2658,6 +2658,15 @@ fn made_room(closed: &[String], project: &str, most: usize) -> String {
     )
 }
 
+/// The status row's word on a task window that waits for room: the ones
+/// open are all new to the person.
+fn no_room(bot: &str, project: &str, most: usize) -> String {
+    let name = bot.strip_prefix(&format!("{project}.")).unwrap_or(bot);
+    format!(
+        "{name} opened no window: {most} task windows at most (in /config) and you have not looked at those open yet; /status opens it"
+    )
+}
+
 /// What a lead may close for room in its multiplexer: only its own tasks'
 /// windows (another lead of the folder keeps its own there), none whose
 /// task it heard failed or need the person, and none whose window says so
@@ -3085,6 +3094,10 @@ impl Fleet {
                             told.send(Told::Notice(made_room(&closed, &room.project, room.most)));
                     }
                     (!here).then(|| format!("{bot_name} is in {home}"))
+                }
+                Ok(mux::Shown::NoRoom) => {
+                    let _ = told.send(Told::Notice(no_room(&bot_name, &room.project, room.most)));
+                    None
                 }
                 Ok(_) => None,
                 Err(error) => Some(error),
@@ -10270,9 +10283,15 @@ impl App {
             self.side(question.trim().to_owned(), &pictures).await;
             return;
         }
-        // What is typed answers the lead's first open question, and goes
-        // with it; the question closes once the daemon has the answer.
-        let answering = self.asking().cloned();
+        // An option's number picks it on the open question in focus, and
+        // the question closes once the daemon has the answer. Words go as
+        // the person wrote them, answering nothing by themselves: one typed
+        // while a question was open may be meant for anything, and the
+        // agent reads whether it answers, as a reply to a card in a chat
+        // is read.
+        let answering = (self.asking())
+            .filter(|ask| asks::picks(ask, &prompt))
+            .cloned();
         let prompt = match &answering {
             Some(ask) => asks::answer(ask, &prompt),
             None => prompt,
@@ -11777,10 +11796,10 @@ impl App {
         Ok(())
     }
 
-    /// The row over what is typed while it answers a question: which,
-    /// and which of those open.
+    /// The row over what is typed while it picks an option of a
+    /// question: which, and which of those open.
     fn answering_over(&self, width: usize) -> Option<Line<'static>> {
-        let ask = self.asking().filter(|_| !self.input.is_empty())?;
+        let ask = self.asking().filter(|ask| asks::picks(ask, &self.input))?;
         let open = [
             self.listing_open(),
             self.config.is_some(),
@@ -12612,8 +12631,11 @@ mod tests {
             ("shop.b".to_owned(), "done"),
         ]
         .into();
+        // The person has looked at every window.
+        let seen: mux::Used = Arc::new(|_: &str| Some(std::time::SystemTime::UNIX_EPOCH));
         let room = mux::Room {
             most: 3,
+            used: seen.clone(),
             ..room_for(
                 "shop",
                 &lineage,
@@ -12628,11 +12650,12 @@ mod tests {
             mux::Shown::Opened(vec!["shop.b".into()])
         );
         // One more closes the only window left that nothing holds, however
-        // lately it opened.
+        // lately it opened, once the person has looked at it.
         let more: std::collections::HashSet<String> =
             lineage.iter().cloned().chain(["shop.e".into()]).collect();
         let room = mux::Room {
             most: 3,
+            used: seen,
             ..room_for("shop", &more, &doing, Arc::new(|bot: &str| bot == "shop.c"))
         };
         assert_eq!(
@@ -13816,7 +13839,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn what_is_typed_answers_the_leads_first_question_unless_set_aside() {
+    async fn only_a_pick_answers_the_leads_question_and_words_are_the_persons_own() {
         let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen = sent.clone();
         let client = daemon_answering(move |asked| {
@@ -13847,9 +13870,10 @@ mod tests {
         app.submit().await;
         // Its answer landing leaves the other question asked the same open.
         app.answered("You asked: Keep the old API?\n\nDrop it", None);
-        // Esc sets the rest aside: the next message is the person's own.
-        app.chatting = true;
+        // Words typed while one is open are the person's own, sent as they
+        // wrote them: no question is named over them, nor answered.
         app.input.set("how is it going?");
+        assert!(app.answering_over(80).is_none());
         app.submit().await;
         assert_eq!(
             *sent.lock().unwrap(),
@@ -13862,9 +13886,8 @@ mod tests {
             app.asks,
             [ask("c2", "Tag it?"), ask("c3", "Keep the old API?")]
         );
-        // Down picks the next to answer; what is typed then answers it,
-        // named over the words as the sent answer will be.
-        app.chatting = false;
+        // Down picks the next to answer; an option's number then picks on
+        // it, named over it as the sent answer will be.
         app.step_ask(true);
         assert_eq!(app.asking().map(|a| a.id.as_str()), Some("c3"));
         app.input.set("1");
