@@ -135,6 +135,10 @@ struct News {
     theirs: Option<Turn>,
     notes: Vec<Noted>,
     asks: Vec<Asked>,
+    /// When it may be told, as the subscriptions that heard it say.
+    hold: super::activity::Hold,
+    /// The subscription whose `urgent` matched some of it.
+    urgent: Option<String>,
 }
 
 impl News {
@@ -186,6 +190,8 @@ impl News {
         if self.asks.len() > ASKS {
             self.asks.drain(..self.asks.len() - ASKS);
         }
+        self.hold = std::mem::take(&mut self.hold).merge(news.hold);
+        self.urgent = self.urgent.take().or(news.urgent);
     }
 
     /// It holds the person's words.
@@ -242,6 +248,13 @@ pub struct Updates {
     /// The memory folders whose facts are news: the person's and the
     /// project's, as the subscriber's own memory indexes name them.
     memory: Vec<PathBuf>,
+    /// What the subscriptions that watch a bot say of its events, for each
+    /// bot one with a filter, a digest or `urgent` watches: none for the
+    /// rest, whose news goes as it always did.
+    pub rules: HashMap<String, Arc<[super::activity::Rule]>>,
+    /// When a note last told news a subscription's digest held, which
+    /// that digest counts from: its sources' and its bots' alike.
+    pub told_subs: HashMap<String, Instant>,
     /// Bots with subscriptions of their own, this lead among them: no
     /// one's tasks here. One set every lookout shares, so the lookouts
     /// hold it once, not each a copy of all the others.
@@ -312,6 +325,36 @@ struct Forward {
 
 /// A reply cut to `REPLY_CHARS`, and further while it reads past
 /// `REPLY_BYTES`.
+/// A turn's end, a wait for approval or a silence, as the subscriptions
+/// that watch its bot read it.
+fn turn_event(t: &Turn, theirs: bool) -> Value {
+    let kind = match t.status.as_str() {
+        APPROVAL => "approval.waiting",
+        QUIET => "turn.silent",
+        _ => "turn.ended",
+    };
+    let mut event = json!({"type": kind, "turn": t.turn, "theirs": theirs});
+    if kind == "turn.ended" {
+        event["status"] = json!(t.status);
+        event["resolved"] = json!(t.resolved);
+        if let Some(goal) = &t.goal {
+            event["goal"] = json!(goal);
+        }
+    }
+    if let Some(by) = &t.by {
+        event["by"] = json!(by_field(by));
+    }
+    event
+}
+
+/// Who wrote or asked, as an event names them: the person as `person`.
+fn by_field(by: &str) -> &str {
+    match by {
+        "the person" => "person",
+        by => by,
+    }
+}
+
 fn quotable(text: &str) -> String {
     let mut max = REPLY_CHARS;
     let mut reply = super::cut(text, max);
@@ -360,6 +403,8 @@ impl Updates {
         Self {
             lead: lead.to_owned(),
             memory,
+            rules: HashMap::new(),
+            told_subs: HashMap::new(),
             subscribers: Arc::default(),
             watched: HashSet::new(),
             named: HashSet::new(),
@@ -593,15 +638,22 @@ impl Updates {
                     && self.live
                 {
                     let call = call.1.clone();
-                    self.news_of(name).merge(News {
-                        notes: vec![Noted {
-                            turn,
-                            id,
-                            removed,
-                            call,
-                        }],
-                        ..News::default()
+                    let gated = self.gate(name, false, || {
+                        json!({"type": "note.changed", "turn": turn, "id": id, "removed": removed})
                     });
+                    if let Some((hold, urgent)) = gated {
+                        self.news_of(name).merge(News {
+                            notes: vec![Noted {
+                                turn,
+                                id,
+                                removed,
+                                call,
+                            }],
+                            hold,
+                            urgent,
+                            ..News::default()
+                        });
+                    }
                 }
                 if let Some(asked) = self.ask_calls.remove(&call)
                     && let Some(turn) = turn
@@ -609,16 +661,25 @@ impl Updates {
                     && data["denied"] != true
                     && self.live
                 {
-                    self.news_of(name).merge(News {
-                        asks: vec![Asked {
-                            turn,
-                            call: call.1,
-                            question: asked.question,
-                            options: asked.options.into_iter().map(|c| c.label).collect(),
-                            recommended: asked.recommended,
-                        }],
-                        ..News::default()
+                    let options: Vec<String> = asked.options.into_iter().map(|c| c.label).collect();
+                    let gated = self.gate(name, true, || {
+                        json!({"type": "ask.posted", "turn": turn, "question": asked.question,
+                            "options": options})
                     });
+                    if let Some((hold, urgent)) = gated {
+                        self.news_of(name).merge(News {
+                            asks: vec![Asked {
+                                turn,
+                                call: call.1,
+                                question: asked.question,
+                                options,
+                                recommended: asked.recommended,
+                            }],
+                            hold,
+                            urgent,
+                            ..News::default()
+                        });
+                    }
                 }
             }
             "turn_resumed" => {
@@ -755,6 +816,16 @@ impl Updates {
         let line = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
         let bytes = words.map_or(0, str::len);
         let words = words.map(|words| line(&super::cut(&line(words), super::QUOTE_CHARS)));
+        let gated = self.gate(name, words.is_some(), || {
+            let mut event = json!({"type": "message.written", "turn": turn, "by": by_field(from)});
+            if let Some(words) = &words {
+                event["text"] = json!(words);
+            }
+            event
+        });
+        let Some((hold, urgent)) = gated else {
+            return false;
+        };
         let said = Said {
             turn,
             from: from.to_owned(),
@@ -763,9 +834,63 @@ impl Updates {
         };
         self.news_of(name).merge(News {
             said: vec![said],
+            hold,
+            urgent,
             ..News::default()
         });
         true
+    }
+
+    /// What the subscriptions that watch `name` make of one of its events,
+    /// `event` built only for a bot one with a filter, a digest or `urgent`
+    /// watches: none when no filter hears it. Every other bot's news goes
+    /// as it always went.
+    fn gate(
+        &self,
+        name: &str,
+        skips: bool,
+        event: impl FnOnce() -> Value,
+    ) -> Option<(super::activity::Hold, Option<String>)> {
+        let Some(rules) = self.rules.get(name) else {
+            return Some((super::activity::Hold::Unset, None));
+        };
+        let mut event = event();
+        event["bot"] = json!(name);
+        if let Some(maker) = self.bots.get(name).and_then(|bot| bot.parent.as_deref()) {
+            event["maker"] = json!(maker);
+        }
+        let heard = super::activity::hear(rules, &event, skips)?;
+        Some((heard.hold, heard.urgent))
+    }
+
+    /// Whether a task's news may be told now: urgent, or no digest holds it.
+    fn ready(&self, news: &News, now: Instant) -> bool {
+        news.urgent.is_some()
+            || match &news.hold {
+                super::activity::Hold::Window(sub, digest) => {
+                    (self.told_subs.get(sub)).is_none_or(|at| now >= *at + *digest)
+                }
+                _ => true,
+            }
+    }
+
+    /// Whether there is news a note may tell now.
+    pub fn news_ready(&self, now: Instant) -> bool {
+        self.live && self.tasks.iter().any(|(_, news)| self.ready(news, now))
+    }
+
+    /// Whether the lead is to hear now: there is news it may hear and it
+    /// rests.
+    pub fn due_at(&self, now: Instant) -> bool {
+        self.news_ready(now) && self.idle()
+    }
+
+    /// The subscription whose `urgent` matched news not told yet.
+    pub fn urgent(&self) -> Option<&str> {
+        if !self.live {
+            return None;
+        }
+        (self.tasks.iter()).find_map(|(_, news)| news.urgent.as_deref())
     }
 
     /// What a task replied, ending a turn: told with that turn's news,
@@ -850,18 +975,29 @@ impl Updates {
             return;
         }
         // The person's own completed turn is theirs, as when it was seen.
-        news.merge(
-            match told.by.as_deref() == Some("the person") && status == "completed" {
-                true => News {
-                    theirs: Some(told),
-                    ..News::default()
-                },
-                false => News {
-                    act: Some(told),
-                    ..News::default()
-                },
+        let theirs = told.by.as_deref() == Some("the person") && status == "completed";
+        let gated = self.gate(name, false, || turn_event(&told, theirs));
+        let news = &mut self.tasks[at].1;
+        let Some((hold, urgent)) = gated else {
+            if news.empty() {
+                self.tasks.remove(at);
+            }
+            return;
+        };
+        news.merge(match theirs {
+            true => News {
+                theirs: Some(told),
+                hold,
+                urgent,
+                ..News::default()
             },
-        );
+            false => News {
+                act: Some(told),
+                hold,
+                urgent,
+                ..News::default()
+            },
+        });
     }
 
     /// The reply of a turn could not be read: its end is told without it.
@@ -960,13 +1096,32 @@ impl Updates {
     fn put(&mut self, name: &str, turn: Turn, answered: bool) {
         let theirs =
             turn.by.as_deref() == Some("the person") && !answered && turn.status == "completed";
+        let skips = turn.status == APPROVAL;
+        let Some((hold, urgent)) = self.gate(name, skips, || turn_event(&turn, theirs)) else {
+            // What it answers, a wait for approval or a silence, is no
+            // news any more either.
+            if let Some(at) = self.tasks.iter().position(|(task, _)| task == name) {
+                let news = &mut self.tasks[at].1;
+                if answered && news.act.as_ref().is_some_and(|t| t.turn == turn.turn) {
+                    news.act = None;
+                }
+                if news.empty() {
+                    self.tasks.remove(at);
+                }
+            }
+            return;
+        };
         self.news_of(name).merge(match theirs {
             true => News {
                 theirs: Some(turn),
+                hold,
+                urgent,
                 ..News::default()
             },
             false => News {
                 act: Some(turn),
+                hold,
+                urgent,
                 ..News::default()
             },
         });
@@ -1110,6 +1265,7 @@ impl Updates {
     }
 
     /// Whether the lead is to hear now: there is news and it rests.
+    #[cfg(test)]
     pub fn due(&self) -> bool {
         self.news() && self.idle()
     }
@@ -1184,7 +1340,13 @@ impl Updates {
 
     /// The news for the next note, taken: every task's, those with the
     /// person's words first, then those with news to act on.
+    #[cfg(test)]
     pub fn take(&mut self) -> Told {
+        self.take_at(Instant::now())
+    }
+
+    /// `take`, as of `now`: news a digest still holds waits too.
+    pub fn take_at(&mut self, now: Instant) -> Told {
         // A task whose only news is a turn whose reply is still being read
         // has nothing for this note, so it leaves its place to one that has.
         let replying = |name: &String, t: &Option<Turn>| {
@@ -1193,12 +1355,13 @@ impl Updates {
         let (held, mut tasks): (Vec<_>, Vec<_>) = std::mem::take(&mut self.tasks)
             .into_iter()
             .partition(|(name, news)| {
-                news.said.is_empty()
-                    && news.notes.is_empty()
-                    && news.asks.is_empty()
-                    && (news.act.is_some() || news.theirs.is_some())
-                    && replying(name, &news.act)
-                    && replying(name, &news.theirs)
+                !self.ready(news, now)
+                    || (news.said.is_empty()
+                        && news.notes.is_empty()
+                        && news.asks.is_empty()
+                        && (news.act.is_some() || news.theirs.is_some())
+                        && replying(name, &news.act)
+                        && replying(name, &news.theirs))
             });
         tasks.sort_by_key(|(_, news)| (!news.quotes(), news.said.is_empty() && news.act.is_none()));
         let rest = tasks.split_off(tasks.len().min(WAKE_TASKS));
@@ -1301,6 +1464,13 @@ impl Updates {
 
     /// The note was sent: what it said of memory has been told.
     pub fn sent(&mut self, told: Told) {
+        // What a digest held was told: the digest counts from now.
+        let now = Instant::now();
+        for (_, news) in &told.sent {
+            if let super::activity::Hold::Window(sub, _) = &news.hold {
+                self.told_subs.insert(sub.clone(), now);
+            }
+        }
         if let Some(seen) = told.seen {
             self.memory_seen = Some(seen);
         }

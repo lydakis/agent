@@ -133,6 +133,20 @@ and `sources` every event of the sources the person set up, by name
 (below). A subscription needs one of them, and may have several. A glob
 never names a side chat, nor a bot that deletes itself once idle.
 
+Three more fields say how it hears what it watches, its bots and its
+sources alike (Filters, Digests and Urgent, below): `filter`, which of
+their events it hears; `digest`, how often at most it tells them; and
+`urgent`, which of them cut into the subscriber's running turn. A
+subscription with none of them is heard as it always was, and costs the
+lookout nothing more: no event is built for the bots it watches.
+
+```
+{"add": {"name": "api", "bots": ["api.lead"],
+         "filter": {"type": ["turn.ended"], "$or": [{"status": ["failed"]}, {"resolved": [true]}]}}}
+{"add": {"name": "leads", "bots": ["*.lead"], "digest": "1h"}}
+{"add": {"name": "migration", "tasks_of": ["shop.migrate"], "urgent": {"status": ["failed"]}}}
+```
+
 A call changes only the calling bot's own subscriptions. `add` under a
 name already taken does nothing when it says the same and is refused when
 it does not, so remove it first. Each subscriber's are one file,
@@ -176,9 +190,19 @@ of its topics as `NAME:TOPIC`:
 ```
 
 Every event its sources print is told, unless the subscription has a
-filter. The person's command decides what cannot wait: an event it marks
-`"urgent": true` cuts into a busy subscriber's turn; the rest wait for it
-to rest. Naming a source the settings do not have is refused, with the
+filter. The person decides what cannot wait: an event the command marks
+`"urgent": true`, or one the source's `urgent` pattern in the settings
+matches, cuts into a busy subscriber's turn; so does one a subscription's
+own `urgent` matches (Urgent, below). The rest wait for it to rest.
+
+```toml
+[sonny.sources.slack]
+command = "~/bin/slack-poll"
+urgent = { from = ["boss"] }   # an event pattern, as a filter is written
+```
+
+A pattern that does not check keeps the source from starting, said in
+`STORE.lookout.log` as a bad `every` is. Naming a source the settings do not have is refused, with the
 ones they have. An event `from` the subscriber itself is not news to it,
 nor is one whose `told` lists it: a source that told some subscribers
 another way names them there. What waits to be told, and when each source
@@ -197,6 +221,10 @@ command = "~/bin/slack-poll"
 digest = "15m"   # 30s, 15m, 1h; unset or 0, as events come
 ```
 
+A subscription's own `digest` takes its sources' place for what it
+hears, counted from the note that last told what it held (Digests,
+below); one with none goes by the source's.
+
 Sonny makes one source of its own, `commons`, while agents have the
 commons: it reads `~/.agents/commons` every 10 seconds in the lookout,
 and each new post is an event, its thread the topic, its author `from`,
@@ -212,7 +240,10 @@ invites, as the commons' own wakes do not.
 ### Filters
 
 An event's line may carry any other fields beside `text`, and a
-subscription's `filter` hears only the events whose fields match it. A CR
+subscription's `filter` hears only the events whose fields match it. The
+bots it watches have events too (Task updates, below), so one filter reads
+both: a subscription that names bots and sources hears, of each, what its
+filter matches. A CR
 poller that prints
 
 ```
@@ -299,7 +330,61 @@ those with subscriptions of their own:
 
 A turn the subscriber waits on is not news, nor its own forks. A note goes
 as soon as the subscriber rests, or at once when the person wrote in a
-task while it works; memory alone never sends one. News settles for 2
+task while it works; memory alone never sends one.
+
+### As events
+
+For a subscription's `filter`, `digest` and `urgent`, each piece of news
+is an event with a `type` and fields, as a source's are, and the
+`subscriptions` tool describes them:
+
+| `type` | When | Fields beside `type`, `bot` (where), `maker` (who made that bot) and `turn` |
+| --- | --- | --- |
+| `message.written` | someone other than the subscriber writes in a watched bot | `by` (`person`, an agent's name, a program), `text` (the person's words) |
+| `turn.ended` | a turn that is news ends | `by` (who asked: `you`, `person`, an agent's name, `trigger`), `status`, `resolved`, `goal`, `theirs` |
+| `approval.waiting` | an approval only the person can give has waited | |
+| `ask.posted` | a task asked the person with `ask` | `question`, `options` |
+| `turn.silent` | a running turn printed nothing for 30 minutes | |
+| `note.changed` | a task changed or took away a margin note | `id`, `removed` |
+
+What changed in memory is the subscriber's own news, of no watched bot,
+and no subscription filters it. The rules on what is news at all, a turn
+the subscriber waits on, its own forks, turns a lookout's note started,
+come first; a filter only narrows what is left. Each event is matched as
+it comes, before it folds into its task's news (one line a task, its
+latest turn of each kind with a count), so the fold loses nothing a
+filter reads. A subscription with none of the three builds no event: the
+lookout works out once, when subscriptions change, which bots any watch,
+and every other bot's news goes as it always went.
+
+### Digests
+
+A subscription's `digest`, as `15m` or `1h`, says how often at most it
+tells what it hears, as a source's does: the first after a quiet spell is
+told once the subscriber rests, as news always was, and what comes after
+waits until the digest has passed since the note that last told what it
+held, then goes in one note. A task's news heard by a subscription with no
+digest goes as it comes, and takes the rest of that task's news along.
+The person's words, a question to them and an approval only they can give
+never wait for one: a digest never holds what only the person can
+unblock. What a digest holds is untold news, so the cursor waits for it
+(One lookout a daemon) and a restart loses none of it; when each
+subscription's digest last told is kept with what sources hold, in
+`STORE.sources/.held/BOT.json`.
+
+### Urgent
+
+A subscription's `urgent`, a pattern as a filter is written, marks what it
+hears that it matches: that cuts into the subscriber's running turn, as
+the person's words do, and waits for no digest. The note then ends "This
+cuts into your turn because your subscription NAME marks it urgent: act on
+it where it changes what you or a task is doing, then carry on with your
+turn.", and a source's line says `urgent by your NAME`. The person's own
+words in a task are always urgent, whatever any subscription says.
+`/background` lists each subscription with its filter, digest and
+`urgent`. A steer joins the running turn and starts none, so what it
+interrupts makes no news of its own for another subscriber: urgent
+subscriptions on each other cannot wake each other in a loop. News settles for 2
 seconds first, and up to 15 while a message's words are still being read,
 so turns that end together go in one note. When a note has waited a minute for a subscriber the events
 say is busy, the lookout asks the daemon, so a missed event never holds

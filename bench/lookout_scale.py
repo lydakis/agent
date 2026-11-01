@@ -298,6 +298,11 @@ class Bench:
         folder.mkdir(exist_ok=True)
         for p in range(self.args.projects):
             tasks = {'name': 'tasks', 'tasks_of': [f'p{p}.lead'], 'bots': [f'p{p}.*']}
+            if self.args.rules:
+                # Every event built and matched, none held or dropped: the
+                # rules' own cost, with the notes going as they would.
+                tasks['filter'] = {'type': [{'anything-but': 'note.changed'}]}
+                tasks['urgent'] = {'status': ['never']}
             (folder / f'p{p}.lead.json').write_text(json.dumps({'subscriptions': [tasks]}))
         # One finished turn each lead's messages to its tasks come from: what
         # a lead writes in its tasks is no news to it, only how they end.
@@ -503,6 +508,8 @@ def main():
     parser.add_argument('--idle-s', type=float, default=10)
     parser.add_argument('--phases', default='idle,baseline,load,restart')
     parser.add_argument('--gated', type=int, default=0)
+    parser.add_argument('--rules', action='store_true',
+                        help="give each lead's tasks subscription a filter and urgent that match as they would")
     parser.add_argument('--out')
     args = parser.parse_args()
     if args.model:
