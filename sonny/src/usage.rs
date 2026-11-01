@@ -362,18 +362,18 @@ impl View {
         out.extend(self.bars("By model", &models, &total, width));
         // What Sonny's own features started, by the origin it gave their
         // turns; one with none was a prompt, a person's or an agent's.
-        let origins: Vec<Row> = usage["origins"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .map(|o| {
-                (
-                    o["origin"].as_str().unwrap_or("prompts").to_owned(),
-                    String::new(),
-                    Spent::of(o),
-                )
-            })
-            .collect();
+        // An automation's turns from before 0.8.0 say `trigger`: one row.
+        let mut origins: Vec<Row> = Vec::new();
+        for o in usage["origins"].as_array().into_iter().flatten() {
+            let origin = match o["origin"].as_str() {
+                Some(origin) if crate::trigger::sent_it(origin) => crate::trigger::ORIGIN,
+                origin => origin.unwrap_or("prompts"),
+            };
+            match origins.iter_mut().find(|(name, _, _)| name == origin) {
+                Some((_, _, spent)) => spent.add(Spent::of(o)),
+                None => origins.push((origin.to_owned(), String::new(), Spent::of(o))),
+            }
+        }
         if origins.iter().any(|(origin, _, _)| origin != "prompts") {
             out.push(Line::default());
             out.extend(self.bars("By what started it", &origins, &total, width));

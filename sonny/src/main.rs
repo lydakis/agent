@@ -52,6 +52,7 @@ mod mermaid;
 mod models;
 mod mux;
 mod needs;
+mod new;
 mod pane;
 mod picker;
 mod place;
@@ -165,11 +166,52 @@ const WALKED_PAGES: usize = 32;
 /// where a note the margin shows of it starts.
 const REFERENCE_PAGES: usize = 25;
 /// The widest the conversation is written, however wide the window: a
-/// reply reads as a column, not a band across the screen. Prose reads
-/// best at 45 to 90 characters a line, but replies carry code, paths and
-/// tables too, which most style guides keep within 100 (rustfmt's own
-/// width), so they stay whole at 100 and prose stays near the measure.
-const PROSE: usize = 100;
+/// reply reads as a column, not a band across the screen.
+/// `[sonny] text_width` sets it, 100 by default
+/// ([`agent_client::config::TEXT_WIDTH`] says why); 0 lets it fill the
+/// window, as Claude Code's does.
+static MEASURE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(agent_client::config::TEXT_WIDTH as usize);
+/// The measure of a conversation that fills the window: wider than any
+/// window, and small enough that a column or two added to it is still a
+/// terminal's width. Beside the pane it keeps half the window ([`kept`]).
+const WHOLE: usize = u16::MAX as usize / 2;
+
+/// The widest the conversation is written; [`MEASURE`].
+fn measure() -> usize {
+    MEASURE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The measure as `[sonny] text_width` sets it: 0 the window's whole width.
+/// Whether it changed.
+fn set_measure(text_width: u64) -> bool {
+    let measure = measure_of(text_width);
+    MEASURE.swap(measure, std::sync::atomic::Ordering::Relaxed) != measure
+}
+
+/// The columns the conversation keeps beside the pane in a window
+/// `window` wide, its gutter with them: its measure where it has one;
+/// half the window when it fills the window (`text_width = 0`), so an
+/// open pane and the conversation share it evenly.
+fn kept(window: u16) -> u16 {
+    kept_at(window, measure())
+}
+
+/// [`kept`] at `measure`.
+fn kept_at(window: u16, measure: usize) -> u16 {
+    match measure {
+        WHOLE => window / 2,
+        measure => measure as u16 + GUTTER,
+    }
+}
+
+/// The measure `[sonny] text_width` names.
+fn measure_of(text_width: u64) -> usize {
+    match text_width {
+        0 => WHOLE,
+        width => usize::try_from(width).unwrap_or(WHOLE).min(WHOLE),
+    }
+}
 
 /// The blank columns between the conversation and the line beside it,
 /// matched on the pane's side, as the conversation's own rows open.
@@ -245,6 +287,10 @@ struct Options {
     window_place: Option<String>,
     /// Which of the folder's leads to open, with no `--agent`.
     lead: project::Pick,
+    /// The file holding the person's first message to the agent `/new`
+    /// made, sent once this window is set up: a file, as a message can
+    /// be longer than one argument may.
+    send: Option<PathBuf>,
 }
 
 fn usage() -> String {
@@ -253,10 +299,10 @@ fn usage() -> String {
      With no --agent, the folder's lead you last wrote to, its first made with --model the\n\
      first time; --lead opens another of the folder's leads, --new-lead makes one. Its\n\
      tasks open beside it in Rex, Herdr or cmux, each in a git worktree of its own. Type /status\n\
-     for the project's agents, /lead for the folder's leads.\n\
+     for the project's agents, /switch to open any agent, /new to start one.\n\
      Agents start tasks, put windows and panes where the person looks, make projects\n\
      and follow agents in the lookout with tools Sonny gives them, which its tool host answers.\n\
-     sonny memory ... and sonny trigger ... are what ~/.agent/memory and ~/.agent/trigger\n\
+     sonny memory ... and sonny automation ... are what ~/.agent/memory and ~/.agent/automation\n\
      run, which Sonny writes at each start.\n\
      sonny sky draws every agent on the daemon lighting up as they talk, as /sky does,\n\
      on its own in the whole terminal; --center NAME puts an agent in the middle, and\n\
@@ -595,32 +641,64 @@ async fn keep(
         .map_err(|e| format!("{name}: {e}"))
 }
 
+/// Whether [`connect`] may ask the person for a provider when the daemon
+/// will not start without one.
+#[derive(Clone, Copy, PartialEq)]
+enum Asking {
+    /// Sonny's start, before its screen is up: the first run's setup, when
+    /// there is a terminal to ask in.
+    AtStart,
+    /// The screen is up and the daemon went away: a daemon that stopped is
+    /// never a first run, so nothing is asked over the screen and no
+    /// setting is written; the person runs `sonny setup` to change one.
+    Never,
+}
+
 /// The daemon, started the way the CLI starts it when it is not running.
-/// With no provider set anywhere, the person is asked for one first, and a
-/// first model list is written once it runs.
-async fn connect(options: &Options) -> Result<(Arc<Client>, agent_client::Events), String> {
-    if let Ok(connected) = Client::connect(&options.socket).await {
+/// At start, with no provider set anywhere, the person is asked for one
+/// first, and a first model list is written once it runs.
+async fn connect(
+    options: &Options,
+    asking: Asking,
+) -> Result<(Arc<Client>, agent_client::Events), String> {
+    let start = || start_daemon(&options.store, &options.socket, false);
+    connect_starting(&options.socket, asking, start).await
+}
+
+/// [`connect`], with `start` starting the daemon.
+async fn connect_starting(
+    socket: &Path,
+    asking: Asking,
+    start: impl Fn() -> Result<(), NotStarted>,
+) -> Result<(Arc<Client>, agent_client::Events), String> {
+    if let Ok(connected) = Client::connect(socket).await {
         return Ok(connected);
     }
-    match start_daemon(&options.store, &options.socket, false) {
+    match start() {
         Err(failed) if failed.code.as_deref() == Some("provider_required") => {
+            if asking == Asking::Never {
+                return Err(NO_PROVIDER.to_owned());
+            }
             if !setup::interactive() {
                 return Err(format!("{failed}; run sonny in a terminal to choose one"));
             }
             let bin = agent_bin().ok_or("Agent's binary was not found; set AGENT_BIN")?;
             setup::provider(&bin, false)?;
-            start_daemon(&options.store, &options.socket, false).map_err(|e| e.to_string())?;
+            start().map_err(|e| e.to_string())?;
         }
         started => started.map_err(|e| e.to_string())?,
     }
-    let connected = Client::connect(&options.socket)
-        .await
-        .map_err(|e| e.to_string())?;
+    let connected = Client::connect(socket).await.map_err(|e| e.to_string())?;
     if let Some(path) = agent_client::models::path().filter(|path| !path.exists()) {
         tokio::spawn(first_models(connected.0.clone(), path));
     }
     Ok(connected)
 }
+
+/// Why a daemon that stopped is not started again: it has no provider,
+/// which only setup sets.
+const NO_PROVIDER: &str =
+    "the daemon has no provider to start with; run `sonny setup` in another terminal";
 
 /// Whether `error` met a daemon on an older protocol than this Sonny's,
 /// one `agent start` replaces.
@@ -759,7 +837,7 @@ fn parse() -> Result<Options, String> {
         (None, None, None, false, None, None);
     let (mut layout, mut rex_host, mut sound) = (true, None, true);
     let (mut side, mut embedded) = (None, false);
-    let mut window_place = None;
+    let (mut window_place, mut send) = (None, None);
     let mut lead = project::Pick::Last;
     let mut args = args.peekable();
     while let Some(arg) = args.next() {
@@ -786,6 +864,8 @@ fn parse() -> Result<Options, String> {
             "--embedded" => embedded = true,
             // Unlisted: how `/switch` hands the window's place on.
             "--window-place" => window_place = Some(value()?),
+            // Unlisted: how `/new` hands the agent it made its first message.
+            "--send-file" => send = Some(PathBuf::from(value()?)),
             _ => return Err(usage()),
         }
     }
@@ -804,6 +884,7 @@ fn parse() -> Result<Options, String> {
         embedded,
         window_place,
         lead,
+        send,
     })
 }
 
@@ -817,7 +898,7 @@ fn reopen(bot: &str) -> Vec<String> {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--new" => {}
-            "--workspace" | "--lead" | "--agent" | "--window-place" => {
+            "--workspace" | "--lead" | "--agent" | "--window-place" | "--send-file" => {
                 args.next();
             }
             "--new-lead" => {
@@ -1025,7 +1106,7 @@ async fn run() -> Result<(), String> {
                     "sonny: the running daemon is older than this Sonny; it stops once its running turns end (at most 2 minutes), then this one starts"
                 );
             }
-            connect(&options).await?
+            connect(&options, Asking::AtStart).await?
         }
     };
     trigger::restamp_at_start(client.identity(), client.store());
@@ -1120,6 +1201,7 @@ async fn run() -> Result<(), String> {
     let settings = settings::Settings::load();
     app.sounds.chime = settings.chime;
     app.verbose = settings.verbose;
+    set_measure(settings.text_width);
     app.zen = zen::focus(app.reactions_key.as_deref());
     app.margin_opens = settings.margin_opens;
     app.agent_opens = settings.agent_opens;
@@ -1187,7 +1269,8 @@ async fn run() -> Result<(), String> {
             .as_deref()
             .or(bot["workspace"].as_str().map(std::path::Path::new))
     {
-        match project::review(dir, &bot, &app.lead, fresh) {
+        let chosen = project::chosen(&app.options.store, &name);
+        match project::review(dir, &bot, &app.lead, fresh, chosen.as_deref()) {
             Ok(project::Instructions::Stale(text)) => app.instruct = Some(text),
             Ok(project::Instructions::Current) => {}
             Ok(project::Instructions::Kept { missing }) => {
@@ -1254,7 +1337,8 @@ async fn run() -> Result<(), String> {
     let _ = execute!(std::io::stdout(), DisableBracketedPaste);
     let _ = disable_raw_mode();
     status_report("clear", &name);
-    // `/lead NAME`: this window becomes that lead's Sonny, as if opened on it.
+    // `/switch NAME` or `/new`: this window becomes that agent's Sonny, as
+    // if opened on it.
     if let (Ok(()), Some(other)) = (&result, app.switch_to.take()) {
         use std::os::unix::process::CommandExt;
         // This process goes on as the other agent's Sonny, in this same
@@ -1277,10 +1361,42 @@ async fn run() -> Result<(), String> {
         if let Some(place) = place {
             args.extend(["--window-place".into(), mux::Place::encode(&place)]);
         }
+        let first = app.send_after.take();
+        if let Some(first) = &first {
+            args.extend(["--send-file".into(), first.display().to_string()]);
+        }
         let error = std::process::Command::new(me).args(&args).exec();
+        if let Some(first) = &first {
+            let _ = std::fs::remove_file(first);
+        }
         return Err(format!("could not open {other}: {error}"));
     }
     result
+}
+
+/// Keeps `brief`, a new lead's first message, in a file of the person's
+/// own beside `store` for its window to send: its path.
+fn first_message(store: &std::path::Path, brief: &str) -> Result<PathBuf, String> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let nanos = (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH))
+        .map_or(0, |since| since.as_nanos());
+    let mut path = store.as_os_str().to_owned();
+    path.push(format!(".first-{}-{nanos}", std::process::id()));
+    let path = PathBuf::from(path);
+    let written = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+        .and_then(|mut file| file.write_all(brief.as_bytes()));
+    match written {
+        Ok(()) => Ok(path),
+        Err(error) => {
+            let _ = std::fs::remove_file(&path);
+            Err(format!("{}: {error}", path.display()))
+        }
+    }
 }
 
 /// Whether `event` is the person using this window: a key, a click, a
@@ -1426,7 +1542,7 @@ fn nowhere_to_open(var: &dyn Fn(&str) -> Option<std::ffi::OsString>, mac: bool) 
 /// middle of it, and the composer's limits show in any theme. Without
 /// colour (`NO_COLOR`) a muted rule above it.
 fn edge(frame: &mut ratatui::Frame, gap: Rect, composer: Rect, pad: Rect) {
-    let width = composer.width.min(PROSE as u16);
+    let width = composer.width.min(measure() as u16);
     if look::no_color() {
         let rule = Line::from("─".repeat(width as usize)).dim();
         frame.render_widget(Paragraph::new(rule), Rect { width, ..gap });
@@ -1519,10 +1635,82 @@ pub fn side_copy(record: &Value) -> Option<&str> {
     (record["created_by"] == source && record["expire_ms"].is_u64()).then_some(source)
 }
 
+/// How long `/status` waits, as it opens, for where the windows sit now.
+const PLACES_NOW: Duration = Duration::from_millis(500);
+
+/// What this window last said its agent is doing, and whether a question
+/// the agent put to the person is open here: the bot, the state, and the
+/// question.
+static REPORTED: std::sync::Mutex<Option<(String, String, bool)>> = std::sync::Mutex::new(None);
+
+/// What the multiplexer is told: a question open says the agent needs the
+/// person (`asking`), as its tab, `/status` and the footer say
+/// ([`needs`]), whatever its turn does; a call waiting on their approval
+/// says so first (`blocked`), and a window closing says nothing more.
+fn shown_status(state: &str, asking: bool) -> &str {
+    match state {
+        "blocked" | "clear" => state,
+        _ if asking => "asking",
+        _ => state,
+    }
+}
+
+/// The agent's state, as its turns and calls go: said to the multiplexer
+/// with any question still open here.
+fn status_report(state: &str, bot: &str) {
+    let asking = match REPORTED.lock() {
+        Ok(mut reported) => {
+            let asking = (reported.as_ref()).is_some_and(|(of, _, asking)| of == bot && *asking);
+            *reported = Some((bot.to_owned(), state.to_owned(), asking));
+            asking
+        }
+        Err(_) => false,
+    };
+    report_status(shown_status(state, asking), bot);
+}
+
+/// Whether a question the agent put to the person is open in this window,
+/// as each frame finds: said to the multiplexer once it changes.
+fn status_asking(bot: &str, open: bool) {
+    let Some(state) = REPORTED
+        .lock()
+        .ok()
+        .and_then(|mut reported| asked_now(&mut reported, bot, open))
+    else {
+        return;
+    };
+    report_status(shown_status(&state, open), bot);
+}
+
+/// What to say again now that a question is `open` here or not: the
+/// agent's state last said, when that changes what the multiplexer is
+/// told. Nothing before the agent's state was first said, which says the
+/// question with it, nor once its window closed.
+fn asked_now(
+    reported: &mut Option<(String, String, bool)>,
+    bot: &str,
+    open: bool,
+) -> Option<String> {
+    match reported.as_mut() {
+        Some((of, state, asking)) if of == bot => {
+            if *asking == open {
+                return None;
+            }
+            *asking = open;
+            (!state.is_empty() && state != "clear").then(|| state.clone())
+        }
+        _ => {
+            *reported = Some((bot.to_owned(), String::new(), open));
+            None
+        }
+    }
+}
+
 /// Program status (OSC 7501), so a terminal or multiplexer that reads it
 /// (Ghostty, Rex, cmux) can mark this pane working, blocked or done; and
-/// the same to Herdr, which takes it from its own CLI instead.
-fn status_report(state: &str, bot: &str) {
+/// the same to Herdr, which takes it from its own CLI instead. `asking`
+/// is blocked on the person's answer, not their approval.
+fn report_status(state: &str, bot: &str) {
     use base64::Engine;
     // A side chat borrows its agent's pane, which keeps saying what the
     // agent itself is doing.
@@ -1534,10 +1722,13 @@ fn status_report(state: &str, bot: &str) {
     if state == "clear" {
         cmux::release();
     }
-    let mut body = format!("state={state}");
-    if state == "blocked" {
-        body.push_str(":kind=permission");
-    }
+    // OSC 7501 says why a program is blocked: on an approval, or on an
+    // answer the person types.
+    let mut body = match state {
+        "blocked" => "state=blocked:kind=permission".to_owned(),
+        "asking" => "state=blocked:kind=question".to_owned(),
+        _ => format!("state={state}"),
+    };
     if state != "clear" {
         let title = base64::engine::general_purpose::STANDARD.encode(bot);
         body.push_str(&format!(":app=agent:title={title}"));
@@ -1548,7 +1739,7 @@ fn status_report(state: &str, bot: &str) {
     // its project, and what it is doing.
     let name = bot.split_once('.').map_or(bot, |(_, name)| name);
     let doing = match state {
-        "blocked" => "needs you",
+        "blocked" | "asking" => "needs you",
         "error" => "failed",
         "clear" => "",
         other => other,
@@ -1870,6 +2061,17 @@ fn approval(denial: &Denial) -> String {
 /// read; a longer one is approved in words.
 const RETRY_ROWS: usize = 500;
 
+/// Why the reviewer denied a call, as `/retry` lists it: its reason's
+/// `Reason:` line, else its first.
+fn denied_why(denied: &Denial) -> String {
+    (denied.reason.lines())
+        .find(|line| line.trim_start().starts_with("Reason:"))
+        .or_else(|| denied.reason.lines().next())
+        .unwrap_or("")
+        .trim()
+        .to_owned()
+}
+
 /// A denied call written out whole before its retry is approved: a
 /// command as it would run with every other argument after it, anything
 /// else as its arguments.
@@ -1968,9 +2170,9 @@ fn hold(unsent: &mut Vec<String>, record: String) {
 }
 
 /// The slash commands, as the menu lists them: name and what it does.
-/// `/agents` and `/ps` also open `/status`, `/triggers` and `/lookout`
+/// `/agents` and `/ps` also open `/status`, `/automations` and `/lookout`
 /// open `/background`, and `/settings` opens `/config`, unlisted.
-const COMMANDS: [(&str, &str); 27] = [
+const COMMANDS: [(&str, &str); 28] = [
     ("/side", "Start a side chat with a copy of this agent"),
     ("/model", "Pick the model and effort"),
     (
@@ -1991,9 +2193,10 @@ const COMMANDS: [(&str, &str); 27] = [
         "Reload the lead's instructions from its folder",
     ),
     ("/status", "Show this project's agents"),
+    ("/switch", "Open any agent in this window"),
     (
-        "/switch",
-        "Open any agent in this window, or make the folder a new lead",
+        "/new",
+        "Start an agent here: a lead or a task, in the profile you pick",
     ),
     (
         "/goal",
@@ -2205,8 +2408,8 @@ struct App {
     /// The pause that holds every agent, if one does, as the daemon told.
     paused: Option<Value>,
     quit: bool,
-    /// Another lead of the folder, which this window opens on instead once
-    /// it quits: `/lead NAME`.
+    /// Another agent, which this window opens on instead once it quits:
+    /// `/switch NAME`, or one `/new` made.
     switch_to: Option<String>,
     started: Instant,
     fleet: Option<Fleet>,
@@ -2257,8 +2460,10 @@ struct App {
     /// The bot's latest replies, by node, with their first lines: what
     /// `/react` offers, newest last.
     replies: Vec<(i64, String)>,
-    /// `/react`'s list is open, at this reply from the newest.
-    reacting: Option<usize>,
+    /// `/react`'s list of the replies, open over the composer, with the
+    /// replies as they were when it opened: one that comes or goes while
+    /// it is open moves no row onto another reply.
+    reacting: Option<(Vec<(i64, String)>, list::Picker)>,
     /// The list is `/reply`'s: the pick is quoted, not reacted to.
     quoting: bool,
     /// What Ctrl+F looks for on the full screen, while it does.
@@ -2433,6 +2638,11 @@ struct App {
     picker: Option<models::Picker>,
     /// `/switch`'s list of every agent, open over the composer.
     agents: Option<switch::Picker>,
+    /// `/new`, its lists over the composer, then its first message in it.
+    making: Option<new::Making>,
+    /// The file with the first message for the agent this window becomes,
+    /// which its window sends once set up.
+    send_after: Option<PathBuf>,
     /// Ctrl+R: the prompts sent before, narrowed by what is typed.
     searching: Option<Search>,
     /// `/config`, open over the composer.
@@ -2453,8 +2663,8 @@ struct App {
     declared: Value,
     /// Its permissions row, when it is one of Sonny's.
     mode: Option<&'static str>,
-    /// `/permissions` or `/fast`, open over the composer: the row picked.
-    choosing: Option<(Choice, usize)>,
+    /// `/permissions` or `/fast`, open over the composer.
+    choosing: Option<(Choice, list::Picker)>,
     /// The rows `/permissions` lists, as the config had them when it opened.
     rows: Vec<approvals::Mode>,
     /// Calls the approver serving `auto` is reviewing in this turn.
@@ -2462,8 +2672,10 @@ struct App {
     /// Calls it denied while Sonny watched, newest last: what `/retry`
     /// offers to retry once.
     denials: Vec<Denial>,
-    /// `/retry`, open over the composer: the denial picked.
-    approving: Option<usize>,
+    /// `/retry`'s list of the denials, open over the composer, with the
+    /// denials as they were when it opened: one that comes or ages out
+    /// while it is open moves no row onto another call.
+    approving: Option<(Vec<Denial>, list::Picker)>,
     /// The denied call written out whole for the person to read, which a
     /// second Enter then approves.
     approve_shown: Option<String>,
@@ -2695,9 +2907,12 @@ fn seat_profile(
     folder: &std::path::Path,
 ) -> Option<String> {
     match lead {
-        true => agent_client::project::read(folder)
-            .ok()
-            .and_then(|info| project::lead_profile(&info).ok()),
+        // One `/new` made in a role of its own runs as that.
+        true => project::chosen(store, bot).or_else(|| {
+            agent_client::project::read(folder)
+                .ok()
+                .and_then(|info| project::lead_profile(&info).ok())
+        }),
         false => task::noted_profile(store, bot),
     }
 }
@@ -3771,6 +3986,8 @@ impl App {
             config: None,
             listing: None,
             agents: None,
+            making: None,
+            send_after: None,
             switch: None,
             cache: None,
             pace: None,
@@ -3826,7 +4043,6 @@ impl App {
         self.margin = margin::Margin::load(self.reactions_key.as_deref());
         self.picked = reactions::Picked::load(self.reactions_key.as_deref());
         self.history().await;
-        self.welcome_above();
         // A turn already running: its clock, and any call it waits on.
         if let Some(turn) = self.running.as_ref().map(|r| r.turn) {
             status_report("working", &self.bot);
@@ -3872,6 +4088,23 @@ impl App {
         }
         self.configure().await;
         self.tell_upgrades().await;
+        // The first message `/new` was given, sent as the person wrote it:
+        // a message as it is, never a command or a shell line typed anew.
+        if let Some(file) = self.options.send.take() {
+            let first = std::fs::read_to_string(&file);
+            let _ = std::fs::remove_file(&file);
+            match first {
+                Ok(first) => {
+                    if let Err(error) = self.send(first.clone(), None, false, false, &[]).await {
+                        self.input.set(&first);
+                        self.notice = Some(error);
+                    }
+                }
+                Err(error) => {
+                    self.notice = Some(format!("the first message, {}: {error}", file.display()))
+                }
+            }
+        }
         let (keys_tx, mut keys) = tokio::sync::mpsc::unbounded_channel();
         // Poll, not a bare read, so the reader ends with the client.
         std::thread::spawn(move || {
@@ -4168,7 +4401,7 @@ impl App {
                     Ok(_) => {}
                     Err(error) if error.code == "idempotency_conflict" => {}
                     Err(error) => {
-                        self.notice = Some(format!("telling of the restored triggers: {error}"));
+                        self.notice = Some(format!("telling of the restored automations: {error}"));
                         all = false;
                         break;
                     }
@@ -4393,6 +4626,11 @@ impl App {
             .collect()
     }
 
+    /// A call the reviewer denied, as `/retry` lists it.
+    fn denied_what(&self, denied: &Denial) -> String {
+        transcript::action(&denied.name, &denied.arguments, &self.workspace)
+    }
+
     /// Serves the bot at `speed` from now, or from when no turn runs.
     async fn pace_at(&mut self, speed: &'static str) {
         let now = (self.pace).unwrap_or(self.speed.as_deref().unwrap_or("standard"));
@@ -4444,7 +4682,17 @@ impl App {
     /// Whether a pick list is open over the composer: `/model`'s or
     /// `/switch`'s.
     fn listing_open(&self) -> bool {
-        self.picker.is_some() || self.agents.is_some()
+        self.picker.is_some() || self.agents.is_some() || self.new_listing()
+    }
+
+    /// Whether one of `/new`'s lists is open: its profiles or places.
+    fn new_listing(&self) -> bool {
+        (self.making.as_ref()).is_some_and(|making| !matches!(making.step, new::Step::Brief))
+    }
+
+    /// Whether `/new`'s first message is being written in the composer.
+    fn new_brief(&self) -> bool {
+        (self.making.as_ref()).is_some_and(|making| matches!(making.step, new::Step::Brief))
     }
 
     /// `/model`'s listing, once it arrives: the picker opens on it.
@@ -4523,10 +4771,7 @@ impl App {
                 self.commit_welcome();
                 self.history_since(first - 1, true).await;
             }
-            None => {
-                self.history().await;
-                self.welcome_above();
-            }
+            None => self.history().await,
         }
         Ok(())
     }
@@ -4713,7 +4958,7 @@ impl App {
     /// or began. Tried again every two seconds until it works.
     async fn reattach(&mut self, events: &mut Events) {
         let lead = async {
-            let (client, mut fresh) = connect(&self.options).await?;
+            let (client, mut fresh) = connect(&self.options, Asking::Never).await?;
             client
                 .request("follow", json!({"bot": self.bot, "after": 0}))
                 .await
@@ -4728,9 +4973,13 @@ impl App {
             Ok::<_, String>((client, fresh, record, caught))
         };
         if self.down {
-            let Ok((client, fresh, record, caught)) = lead.await else {
-                self.retry = Some(Instant::now() + Duration::from_secs(2));
-                return;
+            let (client, fresh, record, caught) = match lead.await {
+                Ok(back) => back,
+                Err(error) => {
+                    self.notice = Some(format!("reconnecting to the daemon: {error}"));
+                    self.retry = Some(Instant::now() + Duration::from_secs(2));
+                    return;
+                }
             };
             self.paused = caught.paused(&client);
             self.client = client;
@@ -5277,7 +5526,7 @@ impl App {
         }
         program.env("TERM", "xterm-256color");
         let height = self.height.saturating_sub(2).max(2) as u16;
-        let width = match pane::width(self.full_width, PROSE as u16 + GUTTER) {
+        let width = match pane::width(self.full_width, kept(self.full_width)) {
             0 => 80,
             width => width,
         };
@@ -5925,27 +6174,6 @@ impl App {
         }
     }
 
-    /// The welcome over the newest page just read, known to start the
-    /// conversation only once it is.
-    fn welcome_above(&mut self) {
-        let (mut welcome, eyes) = self.welcome();
-        if !welcome.is_empty() {
-            if self.any_history {
-                welcome.push(Line::default());
-            }
-            self.any_history = true;
-            // What marks the history's rows moves down with them.
-            for (at, _) in &mut self.marks {
-                *at += welcome.len();
-            }
-            self.pending.splice(0..0, welcome);
-            if let Some(eyes) = eyes {
-                self.marks
-                    .push((eyes, screen::Mark::Tag(screen::Tag::Eyes)));
-            }
-        }
-    }
-
     /// The welcome written under what is waiting, its eyes' line marked.
     fn commit_welcome(&mut self) {
         let (welcome, eyes) = self.welcome();
@@ -5963,7 +6191,12 @@ impl App {
     /// the line the eyes are on.
     fn welcome(&self) -> (Vec<Line<'static>>, Option<usize>) {
         match self.welcome && self.older.is_none() && self.zen.is_none() {
-            true => banner::welcome(&tilde(&self.workspace), &self.model, self.width),
+            true => banner::welcome(
+                &tilde(&self.workspace),
+                &self.model,
+                project::is_lead(&self.bot),
+                self.width,
+            ),
             false => (Vec::new(), None),
         }
     }
@@ -6345,6 +6578,14 @@ impl App {
         self.seen_node = nodes.last().copied().unwrap_or(self.seen_node);
         if let Some(&first) = nodes.first() {
             self.first_node = Some(self.first_node.map_or(first, |n| n.min(first)));
+        }
+        // The newest page read on attaching, known only now to start the
+        // conversation or not: the welcome goes first, before any of it is
+        // written, so a row drawn again in place (a fold of calls, tasks
+        // started together, a reaction) does not leave it below the rows
+        // already drawn.
+        if !every {
+            self.commit_welcome();
         }
         let unpaired = (self.draw_nodes(&nodes, &turns, false, Vec::new(), caught_up)).await;
         if from_start {
@@ -7588,6 +7829,11 @@ impl App {
     /// The project's agents on one card, from the daemon and Rex alone,
     /// in the pane beside the conversation, live until Esc.
     async fn status(&mut self) {
+        // Where each task's window sits as of now, not as when the card was
+        // last open: windows closed for room and opened since included.
+        if let Some(fleet) = &self.fleet {
+            fleet.layout.places_now(PLACES_NOW).await;
+        }
         let (project, rows) = match self.status_rows().await {
             Ok(read) => read,
             Err(error) => {
@@ -8116,8 +8362,10 @@ impl App {
             };
             // The profile it runs as, said even when it is its seat's own,
             // which the footer leaves out.
+            // A folder's own lead profile is read once; a lead made in a
+            // role of its own by `/new` keeps that.
             let profile = match project::is_lead(name) {
-                true => {
+                true => project::chosen(&store, name).or_else(|| {
                     let folder = bot["workspace"].as_str().unwrap_or("").to_owned();
                     (profiles.entry(folder))
                         .or_insert_with_key(|folder| match folder.as_str() {
@@ -8127,7 +8375,7 @@ impl App {
                             }
                         })
                         .clone()
-                }
+                }),
                 false => seat_profile(&store, name, false, std::path::Path::new("")),
             }
             .unwrap_or_default();
@@ -8466,10 +8714,12 @@ impl App {
     /// starts with `/`, best first, with where the letters typed are in
     /// each: the person's own picks rank first among equal matches.
     fn menu(&self) -> Vec<(&'static str, &'static str, Vec<usize>)> {
-        // A command brought back with Up is walked past, not picked.
+        // A command brought back with Up is walked past, not picked; a
+        // new agent's first message is words as written.
         if !self.input.starts_with('/')
             || self.input.contains(char::is_whitespace)
             || self.recall.showing(&self.input)
+            || self.new_brief()
         {
             return Vec::new();
         }
@@ -9360,7 +9610,7 @@ impl App {
     /// The file `link` names, read for the pane at its width.
     fn preview(&self, link: &str) -> Result<pane::Pane, String> {
         let workspace = std::path::Path::new(&self.workspace);
-        let width = pane::width(self.full_width, PROSE as u16 + GUTTER).max(20) as usize;
+        let width = pane::width(self.full_width, kept(self.full_width)).max(20) as usize;
         pane::Pane::preview(link, workspace, width)
     }
 
@@ -9410,7 +9660,7 @@ impl App {
         };
         // The margin where the conversation leaves room for it, or while
         // the keys are in it; out of the way otherwise, and in zen.
-        let prose = PROSE as u16 + GUTTER;
+        let prose = kept(area.width);
         let margin = pane::margin_width(area.width, prose);
         if open.is_margin() && (margin.is_none() || self.zen.is_some()) && !self.pane_keys {
             return (self.centred(area), None);
@@ -9442,7 +9692,7 @@ impl App {
     /// The conversation alone in the window: in zen, its column in the
     /// middle, as a reader centres a page; else where it is, on the left.
     fn centred(&self, area: Rect) -> Rect {
-        let column = PROSE as u16;
+        let column = measure() as u16;
         match self.zen {
             Some(_) if area.width > column => Rect {
                 x: area.x + (area.width - column) / 2,
@@ -9460,7 +9710,7 @@ impl App {
 
     /// The width the conversation is written at.
     fn prose(&self) -> usize {
-        self.width.min(PROSE)
+        self.width.min(measure())
     }
 
     /// `text` put on the clipboard, and said so.
@@ -9633,93 +9883,68 @@ impl App {
             }
             return;
         }
-        if let Some(pick) = &mut self.reacting {
-            if let Event::Key(key) = event
-                && key.kind != KeyEventKind::Release
-            {
-                let count = self.replies.len().max(1);
-                match key.code {
-                    KeyCode::Up => *pick = (*pick + 1) % count,
-                    KeyCode::Down => *pick = (*pick + count - 1) % count,
-                    KeyCode::Enter => {
-                        let at = self.replies.len().saturating_sub(1 + *pick);
-                        let picked = self.replies.get(at).cloned();
-                        self.reacting = None;
-                        match std::mem::take(&mut self.quoting) {
-                            true => {
-                                if let Some((node, _)) = picked {
-                                    self.pressed.push(format!("reply/{node}"));
-                                }
+        if let Some((replies, list)) = &mut self.reacting {
+            match list.event(&event) {
+                list::Act::Take(at) => {
+                    let picked = replies.get(at).cloned();
+                    self.reacting = None;
+                    match std::mem::take(&mut self.quoting) {
+                        true => {
+                            if let Some((node, _)) = picked {
+                                self.pressed.push(format!("reply/{node}"));
                             }
-                            false => self.react_to = picked,
                         }
+                        false => self.react_to = picked,
                     }
-                    KeyCode::Esc => self.reacting = None,
-                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        self.reacting = None
-                    }
-                    _ => {}
                 }
+                list::Act::Close => self.reacting = None,
+                list::Act::Stay | list::Act::Other => {}
             }
             return;
         }
-        if let Some(pick) = &mut self.approving {
-            if let Event::Key(key) = event
-                && key.kind != KeyEventKind::Release
-            {
-                let count = self.denials.len().max(1);
-                match key.code {
-                    KeyCode::Up => *pick = (*pick + count - 1) % count,
-                    KeyCode::Down => *pick = (*pick + 1) % count,
-                    KeyCode::Enter => {
-                        let at = *pick;
-                        // The person approves only what they have read:
-                        // the whole call first, then a second Enter.
-                        if let Some(denied) = self.denials.get(at)
-                            && self.approve_shown.as_deref() != Some(denied.call_id.as_str())
-                        {
-                            let lines = retry_shown(denied);
-                            // Past what the screen keeps, the start would
-                            // scroll away unread.
-                            if lines.len() > RETRY_ROWS {
-                                self.notice = Some(format!(
-                                    "{} lines is too long to read here: say in a message what to retry",
-                                    lines.len() - 1
-                                ));
-                                return;
-                            }
-                            self.approve_shown = Some(denied.call_id.clone());
-                            self.commit(lines);
-                            self.notice = Some("enter again to approve this exact call".into());
+        if let Some((denials, list)) = &mut self.approving {
+            match list.event(&event) {
+                list::Act::Take(at) => {
+                    let Some(denied) = denials.get(at).cloned() else {
+                        return;
+                    };
+                    // The person approves only what they have read:
+                    // the whole call first, then a second Enter.
+                    if self.approve_shown.as_deref() != Some(denied.call_id.as_str()) {
+                        let lines = retry_shown(&denied);
+                        // Past what the screen keeps, the start would
+                        // scroll away unread.
+                        if lines.len() > RETRY_ROWS {
+                            self.notice = Some(format!(
+                                "{} lines is too long to read here: say in a message what to retry",
+                                lines.len() - 1
+                            ));
                             return;
                         }
-                        self.approving = None;
-                        self.approve_shown = None;
-                        if at < self.denials.len() {
-                            let denied = self.denials.remove(at);
-                            self.notice = Some(
-                                match self.send(approval(&denied), None, false, false, &[]).await {
-                                    Ok(()) => {
-                                        "approved one retry; the retry is still reviewed".into()
-                                    }
-                                    Err(error) => {
-                                        self.denials.insert(at, denied);
-                                        error
-                                    }
-                                },
-                            );
-                        }
+                        self.approve_shown = Some(denied.call_id.clone());
+                        self.commit(lines);
+                        self.notice = Some("enter again to approve this exact call".into());
+                        return;
                     }
-                    KeyCode::Esc => {
-                        self.approving = None;
-                        self.approve_shown = None;
-                    }
-                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        self.approving = None;
-                        self.approve_shown = None;
-                    }
-                    _ => {}
+                    self.approving = None;
+                    self.approve_shown = None;
+                    let kept = self.denials.clone();
+                    self.denials.retain(|d| d.call_id != denied.call_id);
+                    self.notice = Some(
+                        match self.send(approval(&denied), None, false, false, &[]).await {
+                            Ok(()) => "approved one retry; the retry is still reviewed".into(),
+                            Err(error) => {
+                                self.denials = kept;
+                                error
+                            }
+                        },
+                    );
                 }
+                list::Act::Close => {
+                    self.approving = None;
+                    self.approve_shown = None;
+                }
+                list::Act::Stay | list::Act::Other => {}
             }
             return;
         }
@@ -9736,50 +9961,39 @@ impl App {
             }
             return;
         }
-        if let Some((choice, mut pick)) = self.choosing {
-            if let Event::Key(key) = event
-                && key.kind != KeyEventKind::Release
-            {
-                let count = match choice {
-                    Choice::Permissions => self.rows.len(),
-                    Choice::Speed => self.speed_rows().len(),
-                };
-                // Another client may have moved the bot to a provider
-                // that serves fewer tiers since the list opened.
-                pick = pick.min(count - 1);
-                match key.code {
-                    KeyCode::Up => pick = (pick + count - 1) % count,
-                    KeyCode::Down => pick = (pick + 1) % count,
-                    KeyCode::Enter => {
-                        self.choosing = None;
-                        match choice {
-                            Choice::Permissions => {
-                                let mode = self.rows[pick].name;
-                                // Set again even when it is the row the agent
-                                // has, as the config may have changed it since;
-                                // the agents the lead made take it too.
-                                self.spread = Some((mode, Instant::now()));
-                                self.gating = Some(mode);
-                                self.configure().await;
-                                if self.gating.is_some() {
-                                    self.notice = Some("applies when idle".into());
-                                }
+        if let Some((choice, list)) = &mut self.choosing {
+            let choice = *choice;
+            match list.event(&event) {
+                list::Act::Take(at) => {
+                    self.choosing = None;
+                    match choice {
+                        Choice::Permissions => {
+                            let Some(mode) = self.rows.get(at).map(|mode| mode.name) else {
+                                return;
+                            };
+                            // Set again even when it is the row the agent
+                            // has, as the config may have changed it since;
+                            // the agents the lead made take it too.
+                            self.spread = Some((mode, Instant::now()));
+                            self.gating = Some(mode);
+                            self.configure().await;
+                            if self.gating.is_some() {
+                                self.notice = Some("applies when idle".into());
                             }
-                            Choice::Speed => self.pace_at(self.speed_rows()[pick].0).await,
                         }
-                        return;
+                        // Another client may have moved the bot to a
+                        // provider that serves fewer tiers since the list
+                        // opened: its last row, rather than one gone.
+                        Choice::Speed => {
+                            let rows = self.speed_rows();
+                            if let Some((speed, _)) = rows.get(at.min(rows.len() - 1)) {
+                                self.pace_at(speed).await;
+                            }
+                        }
                     }
-                    KeyCode::Esc => {
-                        self.choosing = None;
-                        return;
-                    }
-                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        self.choosing = None;
-                        return;
-                    }
-                    _ => {}
                 }
-                self.choosing = Some((choice, pick));
+                list::Act::Close => self.choosing = None,
+                list::Act::Stay | list::Act::Other => {}
             }
             return;
         }
@@ -9789,7 +10003,8 @@ impl App {
             } else if let config::Key::Close = view.event(&event) {
                 self.config = None;
             }
-            // The chime and the view as the file now has them.
+            // The chime, the view and the text's width as the file now
+            // has them; a new width written again as a resize is.
             let settings = settings::Settings::load();
             self.sounds.chime = settings.chime;
             self.margin_opens = settings.margin_opens;
@@ -9798,41 +10013,41 @@ impl App {
                 self.verbose = settings.verbose;
                 self.repaint = true;
             }
+            if set_measure(settings.text_width) {
+                self.repaint = true;
+                self.stale = true;
+            }
             return;
         }
         if self.searching.is_some() {
             self.search_event(event);
             return;
         }
+        if self.new_listing()
+            && let Some(making) = &mut self.making
+        {
+            if let Event::Resize(width, _) = event {
+                self.width = width as usize;
+            } else if making.event(&event) == new::Done::Close {
+                self.making = None;
+            }
+            return;
+        }
         if let Some(agents) = &mut self.agents {
-            match event {
-                Event::Key(key) if key.kind != KeyEventKind::Release => match key.code {
-                    KeyCode::Up => agents.up(),
-                    KeyCode::Down => agents.down(),
-                    KeyCode::Backspace => {
-                        let mut filter = agents.filter.clone();
-                        filter.pop();
-                        agents.narrow(filter);
+            if let Event::Resize(width, _) = event {
+                self.width = width as usize;
+                return;
+            }
+            match agents.event(&event) {
+                list::Act::Close => self.agents = None,
+                list::Act::Take(_) => {
+                    let chosen = agents.chosen();
+                    self.agents = None;
+                    if let Some(bot) = chosen {
+                        self.switch_picked(bot);
                     }
-                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        self.agents = None
-                    }
-                    KeyCode::Char(c) => agents.narrow(format!("{}{c}", agents.filter)),
-                    KeyCode::Esc => self.agents = None,
-                    KeyCode::Enter => {
-                        if let Some(chosen) = agents.chosen() {
-                            if let switch::Chosen::Agent(bot) = &chosen {
-                                agents.picked(bot);
-                            }
-                            self.agents = None;
-                            self.switch_picked(chosen).await;
-                        }
-                    }
-                    _ => {}
-                },
-                Event::Paste(text) => agents.narrow(format!("{}{text}", agents.filter)),
-                Event::Resize(width, _) => self.width = width as usize,
-                _ => {}
+                }
+                list::Act::Stay | list::Act::Other => {}
             }
             return;
         }
@@ -9932,7 +10147,9 @@ impl App {
                 let alt = key.modifiers.contains(KeyModifiers::ALT);
                 match key.code {
                     KeyCode::Char('c') if ctrl => {
-                        if self.input.is_empty() {
+                        if self.input.is_empty() && self.making.is_some() {
+                            self.making = None;
+                        } else if self.input.is_empty() {
                             self.quit = true;
                         } else {
                             self.discard();
@@ -9945,7 +10162,8 @@ impl App {
                             && !alt
                             && !self.approvals.is_empty()
                             && self.paused.is_none()
-                            && self.input.is_empty() =>
+                            && self.input.is_empty()
+                            && !self.new_brief() =>
                     {
                         // A call whose whole arguments could not be read
                         // can only be denied.
@@ -9962,6 +10180,7 @@ impl App {
                             && !alt
                             && self.paused.is_none()
                             && self.input.is_empty()
+                            && !self.new_brief()
                             && let Some(prefix) =
                                 self.approvals.first().and_then(approvals::always) =>
                     {
@@ -10055,6 +10274,13 @@ impl App {
                     // Codex queues; Enter steers.
                     KeyCode::Tab if self.running.is_some() => self.submit_as(true).await,
                     KeyCode::Esc if self.react_to.is_some() => self.react_to = None,
+                    // `/new`'s first message: back to its last list, the
+                    // words kept for when it comes back.
+                    KeyCode::Esc if self.new_brief() => {
+                        if let Some(making) = &mut self.making {
+                            making.back();
+                        }
+                    }
                     // As Codex's bottom pane does, Esc closes what is open
                     // over the composer before it stops anything: an open
                     // question is set aside first, as its hint says.
@@ -10199,8 +10425,23 @@ impl App {
         self.recall.sent(&prompt, attached, bytes);
         // A command run, so the menu ranks it first next time.
         let word = prompt.split_whitespace().next().unwrap_or_default();
-        if COMMANDS.iter().any(|(name, _)| *name == word) {
+        if COMMANDS.iter().any(|(name, _)| *name == word) && !self.new_brief() {
             self.picks.pick_now(word);
+        }
+        // `/new`'s first message starts the agent it makes.
+        if self.new_brief()
+            && let Some(mut making) = self.making.take()
+        {
+            // Words only: neither a task's start nor the new window's first
+            // send carries a picture, which the agent is shown once it runs.
+            if self.placed(&prompt).is_empty() {
+                self.make_new(making, prompt).await;
+            } else {
+                making.failed =
+                    Some("a new agent starts from words; send the picture once it runs".into());
+                self.making = Some(making);
+            }
+            return;
         }
         if let Some(command) = prompt.strip_prefix('!') {
             let command = command.trim();
@@ -10254,7 +10495,7 @@ impl App {
             }
             return;
         }
-        if matches!(prompt.as_str(), "/background" | "/triggers" | "/lookout") {
+        if matches!(prompt.as_str(), "/background" | "/automations" | "/lookout") {
             self.input.clear();
             if self.options.side.is_some() {
                 self.notice = Some("/background is for the agent itself, not a side chat".into());
@@ -10306,7 +10547,10 @@ impl App {
             // On the pick still waiting for the turn to end, if there is one.
             let now = (self.pace).unwrap_or(self.speed.as_deref().unwrap_or("standard"));
             let at = rows.iter().position(|(speed, _)| *speed == now);
-            self.choosing = Some((Choice::Speed, at.unwrap_or(0)));
+            let rows = (self.speed_rows().into_iter())
+                .map(|(speed, about)| (speed.to_owned(), about.to_owned()))
+                .collect();
+            self.choosing = Some((Choice::Speed, list::Picker::new(rows, at.unwrap_or(0))));
             return;
         }
         if prompt == "/model" {
@@ -10327,7 +10571,8 @@ impl App {
                 self.notice = Some("only a folder's lead takes its folder's instructions".into());
                 return;
             }
-            match project::instructions(std::path::Path::new(&self.workspace)) {
+            let chosen = project::chosen(&self.options.store, &self.bot);
+            match project::instructions(std::path::Path::new(&self.workspace), chosen.as_deref()) {
                 Ok(text) => {
                     self.instruct = Some(text);
                     if self.configure().await {
@@ -10384,7 +10629,12 @@ impl App {
                     false => "no reply to react to yet".into(),
                 });
             } else {
-                self.reacting = Some(0);
+                // Found by what they say; reactions are no part of a reply.
+                let rows = (self.replies.iter())
+                    .map(|(_, said)| (said.clone(), String::new()))
+                    .collect();
+                let list = list::Picker::new(rows, self.replies.len() - 1);
+                self.reacting = Some((self.replies.clone(), list));
             }
             return;
         }
@@ -10392,7 +10642,13 @@ impl App {
             self.input.clear();
             match self.denials.len() {
                 0 => self.notice = Some("no recent reviewer denials".into()),
-                newest => self.approving = Some(newest - 1),
+                newest => {
+                    let rows = (self.denials.iter())
+                        .map(|denied| (self.denied_what(denied), denied_why(denied)))
+                        .collect();
+                    let list = list::Picker::new(rows, newest - 1);
+                    self.approving = Some((self.denials.clone(), list));
+                }
             }
             return;
         }
@@ -10401,12 +10657,13 @@ impl App {
             let current = self.gating.or(self.mode);
             // Read now, so a row just added to the config is there.
             self.rows = approvals::modes();
-            self.choosing = Some((
-                Choice::Permissions,
-                (self.rows.iter())
-                    .position(|mode| Some(mode.name) == current)
-                    .unwrap_or(0),
-            ));
+            let at = (self.rows.iter())
+                .position(|mode| Some(mode.name) == current)
+                .unwrap_or(0);
+            let rows = (self.rows.iter())
+                .map(|mode| (mode.label.clone(), mode.about.clone()))
+                .collect();
+            self.choosing = Some((Choice::Permissions, list::Picker::new(rows, at)));
             return;
         }
         if prompt == "/copy" {
@@ -10462,11 +10719,11 @@ impl App {
             return;
         }
         if let Some(rest) = prompt
-            .strip_prefix("/lead")
+            .strip_prefix("/new")
             .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
         {
             self.input.clear();
-            self.lead_command(rest.trim()).await;
+            self.new_command(rest.trim());
             return;
         }
         if let Some(rest) = prompt
@@ -10983,6 +11240,7 @@ impl App {
             || self.reacting.is_some()
             || self.finding.is_some()
             || self.react_to.is_some()
+            || self.making.is_some()
             || self.searching.is_some();
         let shows = self.input.is_empty()
             && self.running.is_none()
@@ -11121,43 +11379,6 @@ impl App {
         }
     }
 
-    /// `/lead`, unlisted, is `/switch`; `/lead NAME` opens this window on
-    /// one of the folder's leads, and `/lead new [NAME]` makes one and
-    /// opens it, as the list's last row does.
-    async fn lead_command(&mut self, rest: &str) {
-        if rest.is_empty() {
-            self.switch_command("").await;
-            return;
-        }
-        let Some(project) = self.project.clone().filter(|_| self.options.side.is_none()) else {
-            self.notice = Some("/lead is for a folder's lead, not this agent".into());
-            return;
-        };
-        let dir = std::path::PathBuf::from(&self.workspace);
-        let mut words = rest.split_whitespace();
-        let pick = match (words.next(), words.next(), words.next()) {
-            (Some("new"), name, None) => project::Pick::New(name.map(str::to_owned)),
-            (Some(name), None, _) => project::Pick::Named(name.to_owned()),
-            _ => {
-                self.notice = Some("/lead NAME or /lead new [NAME]; /switch lists them".into());
-                return;
-            }
-        };
-        if let project::Pick::Named(name) = &pick
-            && project::lead_bot(&project, name) == self.bot
-        {
-            self.notice = Some(format!("this window is the {name} lead already"));
-            return;
-        }
-        match project::open(&self.client, &dir, None, &pick).await {
-            Ok(lead) => {
-                self.switch_to = Some(lead.bot);
-                self.quit = true;
-            }
-            Err(error) => self.notice = Some(error),
-        }
-    }
-
     /// This agent's zen as its file now says, set elsewhere: drawn again
     /// in the other view when it starts or ends, and told.
     fn zen_taken_up(&mut self) {
@@ -11174,6 +11395,10 @@ impl App {
     fn zen_view_changed(&mut self) {
         self.replies.clear();
         self.last_reply.clear();
+        // A list of the replies goes with them: its rows are of a view
+        // no longer drawn.
+        self.reacting = None;
+        self.quoting = false;
         self.repaint = true;
     }
 
@@ -11199,6 +11424,205 @@ impl App {
         // Drawn again in the other view; a new focus redraws nothing.
         if changed {
             self.zen_view_changed();
+        }
+    }
+
+    /// `/new [NAME]`: an agent started from this lead's folder, its profile
+    /// and place picked over the composer and its first message written in
+    /// it; NAME, else that message, names it.
+    fn new_command(&mut self, name: &str) {
+        if self.options.side.is_some() || self.options.embedded {
+            self.notice = Some("/new is for the main window; this one is beside it".into());
+            return;
+        }
+        if self.project.is_none() || !project::is_lead(&self.bot) {
+            self.notice = Some("/new starts agents from a folder's lead; /switch to one".into());
+            return;
+        }
+        let name = Some(name.trim()).filter(|name| !name.is_empty());
+        if let Some(name) = name
+            && (!project::lead_named(name) || name == "lead")
+        {
+            self.notice = Some(
+                "a new agent's name is lowercase letters, digits and hyphens, at most 32, \
+                 as billing or fix-login"
+                    .into(),
+            );
+            return;
+        }
+        let dir = std::path::Path::new(&self.workspace);
+        let default = (agent_client::project::read(dir))
+            .and_then(|info| project::lead_profile(&info))
+            .unwrap_or_else(|_| "lead".to_owned());
+        match new::profiles(dir, &default) {
+            Ok(profiles) => {
+                self.making = Some(new::Making::new(
+                    name.map(str::to_owned),
+                    profiles,
+                    new::places(dir),
+                ));
+            }
+            Err(error) => self.notice = Some(error),
+        }
+    }
+
+    /// Makes what `/new` asked for, `brief` its first message: a lead of
+    /// this folder, or a task of this lead's in the place picked; this
+    /// window then becomes it. One that cannot be made leaves `/new` open
+    /// on its message, with why.
+    async fn make_new(&mut self, making: new::Making, brief: String) {
+        let (profile, place) = making.chosen();
+        let (profile, place) = (profile.clone(), place);
+        let dir = std::path::PathBuf::from(&self.workspace);
+        let Some(project) = self.project.clone() else {
+            return;
+        };
+        let made = match place {
+            None => 'lead: {
+                // Its own window sends the first message, as the person
+                // wrote it, from a file kept before anything is made.
+                let file = match first_message(&self.store(), &brief) {
+                    Ok(file) => file,
+                    Err(error) => break 'lead Err(error),
+                };
+                // The project's own role is noted nowhere, so the lead
+                // follows the project when it changes.
+                let chosen = (!profile.default).then(|| profile.name.clone());
+                let pick = project::Pick::Made {
+                    name: making.name.clone(),
+                    words: brief.clone(),
+                    profile: chosen.clone(),
+                };
+                match project::open(&self.client, &dir, None, &pick).await {
+                    Ok(lead) => {
+                        // One made in the project's role keeps no note an
+                        // agent of its name before it left.
+                        match &chosen {
+                            Some(chosen) => {
+                                if let Err(error) =
+                                    task::note_profile(&self.store(), &lead.bot, chosen)
+                                {
+                                    self.notice =
+                                        Some(format!("{} runs as {chosen}: {error}", lead.bot));
+                                }
+                            }
+                            None => task::forget_profile(&self.store(), &lead.bot),
+                        }
+                        self.send_after = Some(file);
+                        Ok(lead.bot)
+                    }
+                    Err(error) => {
+                        let _ = std::fs::remove_file(&file);
+                        Err(error)
+                    }
+                }
+            }
+            Some(place) => {
+                self.start_new(&project, &dir, &profile, place, &making, brief)
+                    .await
+            }
+        };
+        match made {
+            Ok(bot) => {
+                self.input.clear();
+                self.switch_to = Some(bot);
+                self.quit = true;
+            }
+            Err(error) => {
+                let mut making = making;
+                making.failed = Some(error);
+                self.making = Some(making);
+            }
+        }
+    }
+
+    /// Starts a task of this lead's in `place`, in `profile`, told `brief`:
+    /// its whole name.
+    async fn start_new(
+        &mut self,
+        project: &str,
+        dir: &std::path::Path,
+        profile: &new::Profile,
+        place: new::Place,
+        making: &new::Making,
+        brief: String,
+    ) -> Result<String, String> {
+        let names = self.bot_names().await?;
+        let taken = |short: &str| {
+            names
+                .iter()
+                .any(|name| *name == format!("{project}.{short}"))
+        };
+        let short = match &making.name {
+            Some(name) if taken(name) => {
+                return Err(format!(
+                    "{project}.{name} is there already; /switch {name} opens it"
+                ));
+            }
+            Some(name) => name.clone(),
+            None => new::task_name(&brief, taken),
+        };
+        // This lead's task, on this window's daemon, on the lead's model
+        // and effort unless the project says the tasks' own, as a task
+        // the lead starts from its shell has them.
+        let mut env = vec![
+            (
+                "AGENT_SOCKET".to_owned(),
+                self.options.socket.display().to_string(),
+            ),
+            (
+                "AGENT_STORE".to_owned(),
+                self.options.store.display().to_string(),
+            ),
+        ];
+        if !self.model.is_empty() {
+            env.push(("AGENT_MODEL".to_owned(), self.model.clone()));
+        }
+        if let Some(effort) = &self.effort {
+            env.push(("AGENT_EFFORT".to_owned(), effort.clone()));
+        }
+        let start = task::Start {
+            name: short.clone(),
+            brief,
+            // Named even when every task runs as it, so its model and
+            // tools apply; its words are told once.
+            profile: Some(profile.name.clone()),
+            setup: false,
+            model: None,
+            effort: None,
+            own_folder: place == new::Place::Empty,
+            here: place == new::Place::Here,
+            folder: None,
+            from: None,
+            turn: None,
+            builds_on: None,
+            env,
+            made_by: Some(self.bot.clone()),
+        };
+        let (here, project, starter) = (dir.to_owned(), project.to_owned(), self.bot.clone());
+        tokio::task::spawn_blocking(move || {
+            task::start(&here, &project, &starter, &start).map(|_| format!("{project}.{short}"))
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    /// Every agent's name on this daemon.
+    async fn bot_names(&self) -> Result<Vec<String>, String> {
+        let mut names = Vec::new();
+        let mut after = Value::Null;
+        loop {
+            let asked = json!({"limit": 256, "after": after});
+            let page = (self.client.request("bots", asked).await).map_err(|e| e.to_string())?;
+            for bot in page["bots"].as_array().into_iter().flatten() {
+                if let Some(name) = bot["name"].as_str() {
+                    names.push(name.to_owned());
+                }
+            }
+            after = page["next_after"].clone();
+            if after.is_null() {
+                return Ok(names);
+            }
         }
     }
 
@@ -11282,28 +11706,14 @@ impl App {
         self.agents = Some(picker);
     }
 
-    /// Takes the row picked in `/switch`'s list: an agent opens in this
-    /// window, and a new lead is made in the folder first.
-    async fn switch_picked(&mut self, chosen: switch::Chosen) {
-        match chosen {
-            switch::Chosen::Agent(bot) if bot == self.bot => {
-                self.notice = Some(format!("this window is {bot}'s already"));
-            }
-            switch::Chosen::Agent(bot) => {
-                self.switch_to = Some(bot);
-                self.quit = true;
-            }
-            switch::Chosen::Lead(name) => {
-                let dir = std::path::PathBuf::from(&self.workspace);
-                match project::open(&self.client, &dir, None, &project::Pick::New(name)).await {
-                    Ok(lead) => {
-                        self.switch_to = Some(lead.bot);
-                        self.quit = true;
-                    }
-                    Err(error) => self.notice = Some(error),
-                }
-            }
+    /// Takes the agent picked in `/switch`'s list: it opens in this window.
+    fn switch_picked(&mut self, bot: String) {
+        if bot == self.bot {
+            self.notice = Some(format!("this window is {bot}'s already"));
+            return;
         }
+        self.switch_to = Some(bot);
+        self.quit = true;
     }
 
     /// The agent beside the conversation: one open in the pane, else the
@@ -11394,6 +11804,7 @@ impl App {
         // A question open here holds this window's place in its lead's
         // multiplexer, as the person still has it to answer.
         used::asking(&self.bot, !self.asks.is_empty());
+        status_asking(&self.bot, !self.asks.is_empty());
         self.show_asked();
         self.margin_back();
         // /status beside the conversation, gone once the pane is.
@@ -11418,12 +11829,14 @@ impl App {
         } as usize;
         self.width = width;
         self.height = terminal.size()?.height as usize;
-        let (composer_rows, (cursor_row, cursor_col)) = self.composer(width.min(PROSE));
+        let (composer_rows, (cursor_row, cursor_col)) = self.composer(width.min(measure()));
         // A short pane keeps the rows around the cursor, where typing goes on.
         let room = (terminal.size()?.height as usize).saturating_sub(VIEWPORT as usize - 1);
         // What is typed to answer a question has the question over it,
         // as a reply in a chat has what it replies to.
-        let heading = self.answering_over(width.min(PROSE)).filter(|_| room > 1);
+        let heading = self
+            .answering_over(width.min(measure()))
+            .filter(|_| room > 1);
         let text_room = room - usize::from(heading.is_some());
         let (mut composer_rows, mut cursor_row) =
             window(composer_rows, cursor_row, text_room.max(1));
@@ -11431,7 +11844,7 @@ impl App {
         let first_row = match &self.composing {
             Some((_, (_, first, _))) => Some(*first),
             None => (!self.input.is_empty()).then(|| {
-                let layout = self.input.layout(width.min(PROSE));
+                let layout = self.input.layout(width.min(measure()));
                 self.input.cursor(&layout).0 - cursor_row
             }),
         };
@@ -11443,7 +11856,7 @@ impl App {
         let mut counter_at = Vec::new();
         // The reply's open line, wrapped as it will be written: it grows
         // here row by row until its newline writes it into the history.
-        let mut open_rows = self.open_rows(width.min(PROSE));
+        let mut open_rows = self.open_rows(width.min(measure()));
         // Then what was sent and has not landed, kept in view below it.
         open_rows.extend(self.staged_rows(width));
         open_rows.extend(self.shell_rows(width));
@@ -11459,7 +11872,7 @@ impl App {
         let beside = !self.margin.closed()
             && self.zen.is_none()
             && opened
-            && pane::margin_width(size.width, PROSE as u16 + GUTTER).is_some();
+            && pane::margin_width(size.width, kept(size.width)).is_some();
         self.fold_notes(beside);
         let below = VIEWPORT - 2 + live_rows + composer_rows.len() as u16;
         let workspace = std::path::PathBuf::from(&self.workspace);
@@ -11467,7 +11880,7 @@ impl App {
             && self.pane.as_ref().is_some_and(pane::Pane::is_margin)
         {
             let live = self.running.as_ref().map(|running| running.turn);
-            let width = (at.width.saturating_sub(1) as usize).min(PROSE);
+            let width = (at.width.saturating_sub(1) as usize).min(measure());
             let (lines, marks) = self.margin.lines(width, &workspace, live);
             let glance = self.glance().line();
             if let Some(pane) = &mut self.pane {
@@ -11482,12 +11895,12 @@ impl App {
         {
             let wide = match chat.width {
                 0 => size.width,
-                _ => pane::width(size.width, PROSE as u16 + GUTTER),
+                _ => pane::width(size.width, kept(size.width)),
             };
             // The sky fills the pane, however wide; the other cards are
             // prose, read at the conversation's measure.
             let full = wide.saturating_sub(2) as usize;
-            let width = full.min(PROSE);
+            let width = full.min(measure());
             pane.prose = watch.sky.is_none();
             if let Some(view) = &mut watch.sky {
                 let width = full;
@@ -11632,7 +12045,7 @@ impl App {
                 return;
             }
             let room = area.height.saturating_sub(below);
-            let column = area.width.min(PROSE as u16);
+            let column = area.width.min(measure() as u16);
             let rows = self.screen.height(column as usize).min(room as usize);
             // `/config` lists every setting over the rows above.
             let rows = match &self.config {
@@ -11685,89 +12098,87 @@ impl App {
                 frame.render_widget(Paragraph::new(keys), footer);
                 return;
             }
-            if let Some(pick) = self.reacting {
-                // Newest at the bottom, nearest the composer, as they read;
-                // the pick counts from the newest.
-                let items: Vec<list::Item> = (self.replies.iter())
-                    .map(|(node, said)| {
+            if let Some((replies, list)) = &self.reacting {
+                // Newest at the bottom, nearest the composer, as they read.
+                let items: Vec<list::Item> = (list.shown().into_iter())
+                    .filter_map(|(at, found)| {
+                        let (node, said) = replies.get(at)?;
                         let on = self.reactions.on(*node).join(" ");
                         let room = width.saturating_sub(10 + on.width());
-                        list::Item::new(transcript::cut(said, room), on)
+                        Some(list::Item::new(transcript::cut(said, room), on).found(&found))
                     })
                     .collect();
-                let pick = items.len().saturating_sub(pick + 1);
                 over(
                     frame,
-                    list::lines(&items, pick, width, composer.y as usize),
+                    list::lines(&items, list.at(), width, composer.y as usize),
                     composer,
                 );
                 let (asked, keys) = match self.quoting {
                     true => (
-                        "which reply to answer",
+                        "which reply to answer? type to narrow",
                         "  ↑↓ pick · enter quote · esc close",
                     ),
                     false => (
-                        "which reply to react to",
+                        "which reply to react to? type to narrow",
                         "  ↑↓ pick · enter react · esc close",
                     ),
                 };
-                let line = Line::from(vec![Span::raw("› ").bold(), Span::raw(asked).dim()]);
+                let (line, cursor) = list.line(asked);
                 frame.render_widget(Paragraph::new(line), composer);
+                frame.set_cursor_position((composer.x + cursor, composer.y));
                 let keys = Line::from(hint::spans(keys));
                 frame.render_widget(Paragraph::new(keys), footer);
                 return;
             }
-            if let Some(pick) = self.approving {
+            if let Some((denials, list)) = &self.approving {
                 // Newest last, as they happened; the reason stays in view
                 // before a retry is approved.
                 let room = (composer.width as usize).saturating_sub(8);
-                let items: Vec<list::Item> = (self.denials.iter())
-                    .map(|denied| {
-                        let what =
-                            transcript::action(&denied.name, &denied.arguments, &self.workspace);
-                        let why = denied
-                            .reason
-                            .lines()
-                            .find(|line| line.trim_start().starts_with("Reason:"))
-                            .or_else(|| denied.reason.lines().next())
-                            .unwrap_or("")
-                            .trim()
-                            .to_owned();
-                        list::Item::new(transcript::cut(&what, room / 2), why)
+                let items: Vec<list::Item> = (list.shown().into_iter())
+                    .filter_map(|(at, found)| {
+                        let denied = denials.get(at)?;
+                        let what = self.denied_what(denied);
+                        Some(
+                            list::Item::new(transcript::cut(&what, room / 2), denied_why(denied))
+                                .found(&found),
+                        )
                     })
                     .collect();
                 over(
                     frame,
-                    list::lines(&items, pick, width, composer.y as usize),
+                    list::lines(&items, list.at(), width, composer.y as usize),
                     composer,
                 );
-                let line = Line::from(vec![
-                    Span::raw("› ").bold(),
-                    Span::raw("reviewer denials: approve one retry").dim(),
-                ]);
+                let (line, cursor) = list.line("reviewer denials: approve one retry");
                 frame.render_widget(Paragraph::new(line), composer);
+                frame.set_cursor_position((composer.x + cursor, composer.y));
                 let keys = Line::from(hint::spans(
                     "  ↑↓ pick · enter read, again approve one retry · esc close",
                 ));
                 frame.render_widget(Paragraph::new(keys), footer);
                 return;
             }
-            if let Some((Choice::Speed, pick)) = self.choosing {
+            if let Some((Choice::Speed, list)) = &self.choosing {
                 let now = self.speed.as_deref().unwrap_or("standard");
-                let items: Vec<list::Item> = (self.speed_rows().into_iter())
-                    .map(|(speed, about)| list::Item::new(speed, about).current(speed == now))
+                let rows = self.speed_rows();
+                let items: Vec<list::Item> = (list.shown().into_iter())
+                    .filter_map(|(at, found)| {
+                        let (speed, about) = rows.get(at)?;
+                        Some(
+                            list::Item::new(*speed, *about)
+                                .current(*speed == now)
+                                .found(&found),
+                        )
+                    })
                     .collect();
-                let pick = pick.min(items.len() - 1);
                 over(
                     frame,
-                    list::lines(&items, pick, width, composer.y as usize),
+                    list::lines(&items, list.at(), width, composer.y as usize),
                     composer,
                 );
-                let line = Line::from(vec![
-                    Span::raw("› ").bold(),
-                    Span::raw("speed for this agent").dim(),
-                ]);
+                let (line, cursor) = list.line("speed for this agent");
                 frame.render_widget(Paragraph::new(line), composer);
+                frame.set_cursor_position((composer.x + cursor, composer.y));
                 let keys = Line::from(hint::spans("  ↑↓ pick · enter choose · esc close"));
                 frame.render_widget(Paragraph::new(keys), footer);
                 return;
@@ -11788,23 +12199,25 @@ impl App {
                 frame.render_widget(Paragraph::new(keys), footer);
                 return;
             }
-            if let Some((_, pick)) = self.choosing {
-                let items: Vec<list::Item> = (self.rows.iter())
-                    .map(|mode| {
-                        list::Item::new(&mode.label, &mode.about)
-                            .current(Some(mode.name) == self.mode)
+            if let Some((_, list)) = &self.choosing {
+                let items: Vec<list::Item> = (list.shown().into_iter())
+                    .filter_map(|(at, found)| {
+                        let mode = self.rows.get(at)?;
+                        Some(
+                            list::Item::new(&mode.label, &mode.about)
+                                .current(Some(mode.name) == self.mode)
+                                .found(&found),
+                        )
                     })
                     .collect();
                 over(
                     frame,
-                    list::lines(&items, pick, width, composer.y as usize),
+                    list::lines(&items, list.at(), width, composer.y as usize),
                     composer,
                 );
-                let line = Line::from(vec![
-                    Span::raw("› ").bold(),
-                    Span::raw("permissions for this agent and those it makes").dim(),
-                ]);
+                let (line, cursor) = list.line("permissions for this agent and those it makes");
                 frame.render_widget(Paragraph::new(line), composer);
+                frame.set_cursor_position((composer.x + cursor, composer.y));
                 let keys = Line::from(hint::spans("  ↑↓ pick · enter choose · esc close"));
                 frame.render_widget(Paragraph::new(keys), footer);
                 return;
@@ -11867,48 +12280,36 @@ impl App {
                 frame.render_widget(Paragraph::new(keys), footer);
                 return;
             }
+            if let Some((items, list)) = (self.making.as_ref()).and_then(new::Making::listed)
+                && let Some(making) = &self.making
+            {
+                let room = composer.y as usize;
+                over(frame, list::lines(&items, list.at(), width, room), composer);
+                let (line, cursor) = list.line(&making.asked());
+                frame.render_widget(Paragraph::new(line), composer);
+                frame.set_cursor_position((composer.x + cursor, composer.y));
+                let keys = Line::from(hint::spans(making.keys()));
+                frame.render_widget(Paragraph::new(keys), footer);
+                return;
+            }
             if let Some(agents) = &self.agents {
-                let at = agents.at();
-                let rows = agents.rows();
-                let new = matches!(rows.get(at), Some(switch::Row::Lead(_)));
-                let items: Vec<list::Item> = (rows.into_iter())
-                    .map(|row| match row {
-                        switch::Row::Agent(agent, found) => {
-                            list::Item::new(agent.name.clone(), agent.about.clone())
-                                .current(agent.name == agents.current)
-                                .found(&found.at)
-                        }
-                        switch::Row::Lead(name) => {
-                            let name = match name {
-                                Some(name) => format!("new lead {name}"),
-                                None => "new lead".to_owned(),
-                            };
-                            list::Item::new(name, "made in this folder")
-                        }
+                let items: Vec<list::Item> = (agents.rows().into_iter())
+                    .map(|(agent, found)| {
+                        list::Item::new(agent.name.clone(), agent.about.clone())
+                            .current(agent.name == agents.current)
+                            .found(&found)
                     })
                     .collect();
                 let room = composer.y as usize;
-                over(frame, list::lines(&items, at, width, room), composer);
-                let line = if agents.filter.is_empty() {
-                    Line::from(vec![
-                        Span::raw("› ").bold(),
-                        Span::raw("type to narrow").dim(),
-                    ])
-                } else {
-                    Line::from(vec![
-                        Span::raw("› ").bold(),
-                        Span::raw(agents.filter.clone()),
-                    ])
-                };
+                over(
+                    frame,
+                    list::lines(&items, agents.at(), width, room),
+                    composer,
+                );
+                let (line, cursor) = agents.line("type to narrow");
                 frame.render_widget(Paragraph::new(line), composer);
-                frame.set_cursor_position((
-                    composer.x + 2 + agents.filter.width() as u16,
-                    composer.y,
-                ));
-                let keys = match new {
-                    true => "  ↑↓ pick · enter make · esc close",
-                    false => "  ↑↓ pick · enter switch · esc close",
-                };
+                frame.set_cursor_position((composer.x + cursor, composer.y));
+                let keys = "  ↑↓ pick · enter switch · esc close";
                 frame.render_widget(Paragraph::new(Line::from(hint::spans(keys))), footer);
                 return;
             }
@@ -11973,7 +12374,7 @@ impl App {
                 },
                 None => composer,
             };
-            composer_at = first_row.map(|first| (text, first, width.min(PROSE)));
+            composer_at = first_row.map(|first| (text, first, width.min(measure())));
             // Keys in the pane: no cursor where they do not go.
             if !self.pane_keys {
                 frame.set_cursor_position((
@@ -11987,7 +12388,7 @@ impl App {
             // composer has them, saying what Enter does with the pick.
             let (line, opens) = match menu_keys(&menu, self.pick, &self.input) {
                 Some(keys) => (Line::from(hint::spans(keys)), Vec::new()),
-                None => self.footer(width.min(PROSE)),
+                None => self.footer(width.min(measure())),
             };
             frame.render_widget(Paragraph::new(line), footer);
             counter_at = (opens.into_iter())
@@ -12027,6 +12428,19 @@ impl App {
     /// The row over what is typed while it picks an option of a
     /// question: which, and which of those open.
     fn answering_over(&self, width: usize) -> Option<Line<'static>> {
+        // `/new`'s first message has what it starts over it.
+        if self.new_brief()
+            && let Some(making) = &self.making
+        {
+            // Set in as an answer's question is, under the prompt's mark.
+            let room = width.saturating_sub(2);
+            return Some(match &making.failed {
+                Some(failed) => {
+                    Line::from(format!("  {}", transcript::cut(failed, room))).fg(Color::Red)
+                }
+                None => Line::from(format!("  {}", transcript::cut(&making.heading(), room))).dim(),
+            });
+        }
         let ask = self.asking().filter(|ask| asks::picks(ask, &self.input))?;
         let open = [
             self.listing_open(),
@@ -12097,6 +12511,7 @@ impl App {
                     self.asks.len(),
                     width.saturating_sub(prompt::LEAD),
                 ),
+                _ if self.new_brief() => said("What should it do?", "enter start · esc back"),
                 _ if self.react_to.is_some() => said("An emoji for that reply", "esc cancel"),
                 _ if !self.asks.is_empty() => said("A message of your own", "esc answer"),
                 Some(_) => vec![Span::raw(format!("Steer {name}")).dim()],
@@ -12112,6 +12527,7 @@ impl App {
             if answering.is_none()
                 && self.asks.is_empty()
                 && self.react_to.is_none()
+                && !self.new_brief()
                 && self.approvals.is_empty()
             {
                 spans.push(Span::raw(" · ").dim());
@@ -12413,7 +12829,7 @@ impl App {
         }
         // The pane folded away where the window has room for one of the
         // two: its key and its name, a click flipping over to it.
-        let room = pane::width(self.full_width, PROSE as u16 + GUTTER);
+        let room = pane::width(self.full_width, kept(self.full_width));
         if let Some(open) = &self.pane
             && !open.is_margin()
             && !self.pane_keys
@@ -12640,7 +13056,7 @@ fn short(bot: &str, project: &str, lead: &str) -> String {
     if bot == lead {
         return "lead".into();
     }
-    // Another lead of the same folder, by the name /lead takes.
+    // Another lead of the same folder, by the name /switch takes.
     if project::lead_project(bot) == Some(project) {
         return match bot.ends_with(".lead") {
             true => "first lead".into(),
@@ -12859,6 +13275,38 @@ fn zen_notice(on: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_question_open_says_the_agent_needs_you_to_its_multiplexer() {
+        // As its tab, `/status` and the footer say: an approval waiting
+        // says so first, and a closing window says nothing more.
+        assert_eq!(shown_status("done", true), "asking");
+        assert_eq!(shown_status("idle", true), "asking");
+        assert_eq!(shown_status("working", true), "asking");
+        assert_eq!(shown_status("error", true), "asking");
+        assert_eq!(shown_status("blocked", true), "blocked");
+        assert_eq!(shown_status("clear", true), "clear");
+        assert_eq!(shown_status("done", false), "done");
+        // A question found open before anything was said waits for the
+        // state, which says it.
+        let mut reported = None;
+        assert_eq!(asked_now(&mut reported, "shop.a", true), None);
+        // The turn ended on the question: said again once it opens and
+        // once it closes, and not with every frame between.
+        reported = Some(("shop.a".into(), "done".into(), false));
+        assert_eq!(
+            asked_now(&mut reported, "shop.a", true).as_deref(),
+            Some("done")
+        );
+        assert_eq!(asked_now(&mut reported, "shop.a", true), None);
+        assert_eq!(
+            asked_now(&mut reported, "shop.a", false).as_deref(),
+            Some("done")
+        );
+        // A closed window says nothing more.
+        reported = Some(("shop.a".into(), "clear".into(), false));
+        assert_eq!(asked_now(&mut reported, "shop.a", true), None);
+    }
 
     #[test]
     fn a_lead_makes_room_only_from_its_own_windows_that_nothing_holds() {
@@ -13215,6 +13663,7 @@ mod tests {
             embedded: false,
             window_place: None,
             lead: project::Pick::Last,
+            send: None,
         };
         App::new(client, "b", &json!({"name": "b"}), options)
     }
@@ -13302,6 +13751,137 @@ mod tests {
         assert!(app.boost.is_none() && app.notice.is_none());
     }
 
+    #[test]
+    fn a_new_leads_first_message_is_kept_in_a_file_of_the_persons_own() {
+        use std::os::unix::fs::PermissionsExt;
+        let store = std::env::temp_dir().join(format!("sonny-first-{}", std::process::id()));
+        // Longer than one argument may be.
+        let brief = "x".repeat(200_000);
+        let file = first_message(&store, &brief).unwrap();
+        assert!(
+            file.display()
+                .to_string()
+                .starts_with(&store.display().to_string())
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), brief);
+        let mode = std::fs::metadata(&file).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        std::fs::remove_file(&file).unwrap();
+    }
+
+    #[tokio::test]
+    async fn new_asks_the_profile_then_where_a_worker_works_then_its_first_message() {
+        let client = daemon_answering(|_| json!({})).await;
+        let mut app = app(client);
+        let key = |code: KeyCode| Event::Key(event::KeyEvent::new(code, KeyModifiers::NONE));
+        // Only a lead's window starts agents from its folder.
+        app.input.set("/new");
+        app.submit().await;
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("/new starts agents from a folder's lead; /switch to one")
+        );
+        let dir = std::env::temp_dir().join(format!("sonny-new-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".agents/agents")).unwrap();
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        std::fs::write(
+            dir.join(".agents/agents/reviewer.md"),
+            "---\ndescription: Reviews a change\n---\nYou review.\n",
+        )
+        .unwrap();
+        app.bot = "shop.lead".into();
+        app.project = Some("shop".into());
+        app.workspace = dir.display().to_string();
+        app.input.set("/new Fix.It");
+        app.submit().await;
+        assert!(
+            app.notice
+                .as_deref()
+                .unwrap()
+                .starts_with("a new agent's name")
+        );
+        assert!(app.making.is_none());
+        // The profiles first, the project's lead first and marked.
+        app.input.set("/new");
+        app.submit().await;
+        let (items, _) = app.making.as_ref().and_then(new::Making::listed).unwrap();
+        assert_eq!((items[0].name.as_str(), items[0].current), ("lead", true));
+        assert!(items.iter().any(|item| item.name == "reviewer"));
+        assert!(app.listing_open() && app.suggested().is_none());
+        for c in "rev".chars() {
+            app.key(key(KeyCode::Char(c))).await;
+        }
+        app.key(key(KeyCode::Enter)).await;
+        // In git: a worktree first, then this folder or an empty one. (The
+        // folder is a checkout of its own: outside one, any sandbox running
+        // meanwhile holds a placeholder /tmp/.git that makes it /tmp's.)
+        let (items, _) = app.making.as_ref().and_then(new::Making::listed).unwrap();
+        let places: Vec<&str> = items.iter().map(|item| item.name.as_str()).collect();
+        assert_eq!(places, ["worktree", "this folder", "empty folder"]);
+        app.key(key(KeyCode::Down)).await;
+        app.key(key(KeyCode::Enter)).await;
+        // Then its first message, in the composer, under what it starts.
+        assert!(app.new_brief() && !app.listing_open());
+        assert_eq!(
+            app.answering_over(80).unwrap().to_string(),
+            "  new reviewer in this folder · named from your words"
+        );
+        let (rows, _) = app.composer(80);
+        assert!(
+            rows[0].to_string().contains("What should it do?"),
+            "{rows:?}"
+        );
+        // Words as written: no command offered for a slash.
+        app.input.set("/com");
+        assert!(app.menu().is_empty());
+        app.input.clear();
+        // The lead's approval keys are letters of the message here.
+        app.approvals
+            .push(json!({"name": "shell", "arguments": {"command": "ls"}}));
+        app.key(key(KeyCode::Char('y'))).await;
+        assert_eq!((app.input.trim(), app.approvals.len()), ("y", 1));
+        app.approvals.clear();
+        app.input.clear();
+        // A picture is refused, nothing made and the message kept.
+        app.attach(Ok(attach::Picture {
+            media_type: "image/png",
+            data: vec![1],
+        }));
+        app.input.set("look at [Image #1]");
+        app.submit().await;
+        let making = app.making.as_mut().unwrap();
+        assert!(making.failed.take().unwrap().contains("picture"));
+        assert!(app.new_brief() && app.input.trim().contains("look at"));
+        app.discard();
+        // Esc goes back a step at a time, then closes.
+        app.key(key(KeyCode::Esc)).await;
+        assert!(app.new_listing());
+        app.key(key(KeyCode::Esc)).await;
+        app.key(key(KeyCode::Esc)).await;
+        assert!(app.making.is_none());
+        // A lead goes straight to its message; Ctrl+C there closes /new,
+        // not the window.
+        app.input.set("/new");
+        app.submit().await;
+        app.key(key(KeyCode::Enter)).await;
+        assert_eq!(
+            app.answering_over(80).unwrap().to_string(),
+            "  new lead in this folder · named from your words"
+        );
+        // A send that started nothing says why where the heading was, even
+        // with the lead busy, and keeps the message to try again.
+        app.making.as_mut().unwrap().failed = Some("x did not start".into());
+        assert_eq!(
+            app.answering_over(80).unwrap().to_string(),
+            "  x did not start"
+        );
+        let ctrl_c = event::KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        app.key(Event::Key(ctrl_c)).await;
+        assert!(app.making.is_none() && !app.quit);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn switch_opens_any_agent_here_or_the_one_beside() {
         let client =
@@ -13329,18 +13909,15 @@ mod tests {
         app.input.set("/switch b");
         app.submit().await;
         assert_eq!(app.notice.as_deref(), Some("this window is b's already"));
-        // A name found in none lists what it narrows to: here, only a new
-        // lead of that name.
+        // A name found in none lists what it narrows to: here, nothing.
         app.notice = None;
         app.input.set("/switch nobody");
         app.submit().await;
         let agents = app.agents.as_ref().expect("the list is open");
-        assert_eq!(agents.filter, "nobody");
-        assert_eq!(
-            agents.chosen(),
-            Some(switch::Chosen::Lead(Some("nobody".into())))
-        );
-        assert!(!app.quit);
+        assert_eq!(agents.filter(), "nobody");
+        assert_eq!(agents.chosen(), None);
+        app.key(Event::Key(KeyCode::Enter.into())).await;
+        assert!(!app.quit && app.agents.is_some(), "Enter takes nothing");
         app.key(Event::Key(KeyCode::Esc.into())).await;
         assert!(app.agents.is_none());
         // Alone, every agent, the folder's lead first; the first that is
@@ -13348,23 +13925,22 @@ mod tests {
         app.input.set("/switch");
         app.submit().await;
         assert_eq!(
-            app.agents.as_ref().and_then(|a| a.chosen()),
-            Some(switch::Chosen::Agent("shop.lead".into()))
+            app.agents.as_ref().and_then(|a| a.chosen()).as_deref(),
+            Some("shop.lead")
         );
         app.key(Event::Key(KeyCode::Down.into())).await;
         app.key(Event::Key(KeyCode::Enter.into())).await;
         assert_eq!(app.switch_to.as_deref(), Some("shop.fix"));
         (app.switch_to, app.quit) = (None, false);
-        // The agent open beside the conversation is picked to start, and
-        // `/lead` alone is `/switch`.
+        // The agent open beside the conversation is picked to start.
         let mut pane = pane::Pane::card("shop.fix", STATUS_KEYS);
         pane.as_agent("shop.fix", false);
         app.open_pane(pane);
-        app.input.set("/lead");
+        app.input.set("/switch");
         app.submit().await;
         assert_eq!(
-            app.agents.as_ref().and_then(|a| a.chosen()),
-            Some(switch::Chosen::Agent("shop.fix".into()))
+            app.agents.as_ref().and_then(|a| a.chosen()).as_deref(),
+            Some("shop.fix")
         );
         app.agents = None;
         // Ctrl+G opens the pane's agent at once, wherever the keys are.
@@ -13806,6 +14382,10 @@ mod tests {
                     "bots" => json!({"bots": [
                 {"name": "shop.lead", "bot_id": 1, "head": 1, "workspace": folder,
                     "status": "idle", "running_turn": null},
+                {"name": "shop.lead.rex", "bot_id": 4, "head": 1, "workspace": folder,
+                    "status": "idle", "running_turn": null},
+                {"name": "shop.lead.ada", "bot_id": 5, "head": 1, "workspace": folder,
+                    "status": "idle", "running_turn": null},
                 {"name": "shop.fix", "bot_id": 2, "head": 1,
                     "status": "idle", "running_turn": null},
                 {"name": "shop.old", "bot_id": 3, "head": 1,
@@ -13824,6 +14404,9 @@ mod tests {
         // A task runs as the profile it was started with, whatever its
         // project tells tasks by default.
         task::note_profile(&app.store(), "shop.fix", "reviewer").unwrap();
+        // A lead `/new` made in a role of its own keeps it beside the
+        // folder's other leads, whichever is listed first.
+        task::note_profile(&app.store(), "shop.lead.rex", "lead").unwrap();
         let (_, rows) = app.status_rows().await.unwrap();
         let profile = |bot: &str| {
             rows.iter()
@@ -13833,6 +14416,8 @@ mod tests {
                 .clone()
         };
         assert_eq!(profile("shop.lead"), "superlead");
+        assert_eq!(profile("shop.lead.rex"), "lead");
+        assert_eq!(profile("shop.lead.ada"), "superlead");
         assert_eq!(profile("shop.fix"), "reviewer");
         // Not started by Sonny: nothing said rather than a guess.
         assert_eq!(profile("shop.old"), "");
@@ -14507,6 +15092,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_welcome_heads_a_replayed_conversation_whatever_was_drawn_again_in_it() {
+        let say = |role: &str, kind: &str, text: &str| json!({"type": "message", "role": role, "content": [{"type": kind, "text": text}]});
+        // The bot's reaction is put under the message it reacts to, the
+        // rows written so far drawn first.
+        let items: Vec<(i64, Value)> = vec![
+            (1, say("user", "input_text", "Fix the rounding")),
+            (2, say("assistant", "output_text", "Rounding now.")),
+            (3, say("user", "input_text", "merged, thanks")),
+            (
+                4,
+                json!({"type": "function_call", "name": "react", "call_id": "c1",
+                "arguments": "{\"emoji\":\"👍\"}"}),
+            ),
+            (
+                5,
+                json!({"type": "function_call_output", "call_id": "c1", "output": "Done."}),
+            ),
+            (6, say("user", "input_text", "and the notes?")),
+        ];
+        let client = daemon_answering(move |asked| match asked["op"].as_str() {
+            Some("history_nodes") => json!({"nodes": items.iter().rev()
+                .map(|(node, _)| json!({"node": node, "turn": 1}))
+                .collect::<Vec<_>>(), "next_from": null}),
+            Some("prompts") => json!({"prompts": [{"turn": 1, "text": "Fix the rounding"}]}),
+            Some("history_items") => json!({"items": asked["nodes"].as_array().into_iter()
+                .flatten()
+                .filter_map(|node| items.iter().find(|(n, _)| Some(*n) == node.as_i64()))
+                .map(|(node, item)| json!({"node": node, "item": item}))
+                .collect::<Vec<_>>()}),
+            _ => json!({}),
+        })
+        .await;
+        let mut app = app(client);
+        app.width = 100;
+        app.welcome = true;
+        app.history().await;
+        let rows = drawn(&mut app);
+        let at = |text: &str| rows.iter().position(|row| row.contains(text));
+        let welcome = at("Welcome to Sonny").expect("a welcome");
+        let first = at("Fix the rounding").expect("the first message");
+        assert!(welcome < first, "{}", rows.join("\n"));
+        // Only the portrait is above it, and none of it is drawn further down.
+        assert!(
+            (rows[..welcome].iter()).all(|row| row.trim().is_empty() || row.contains(['▀', '▄'])),
+            "{}",
+            rows.join("\n")
+        );
+        assert!(
+            !rows[first..].iter().any(|row| row.contains(['▀', '▄'])),
+            "{}",
+            rows.join("\n")
+        );
+        assert!(rows[first..].iter().any(|row| row.contains("👍")));
+    }
+
+    #[tokio::test]
     async fn in_zen_no_guess_at_the_next_message_is_made() {
         let mut app = app_in_zen(zen_daemon().await);
         app.suggest();
@@ -14932,11 +15573,25 @@ mod tests {
         app.running = None;
         app.input.set("/retry");
         app.submit().await;
-        assert_eq!(app.approving, Some(0));
+        assert_eq!(
+            app.approving.as_ref().and_then(|(_, list)| list.chosen()),
+            Some(0)
+        );
+        // A denial that comes while it is open moves no row onto another.
+        let other = Denial {
+            call_id: "c0".into(),
+            name: "shell".into(),
+            arguments: json!({"command": "ls"}),
+            reason: "No.".into(),
+        };
+        app.denials.insert(0, other.clone());
         let enter = || Event::Key(event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         // The first Enter writes the whole call out; nothing is sent yet.
         app.key(enter()).await;
-        assert_eq!(app.approving, Some(0));
+        assert_eq!(
+            app.approving.as_ref().and_then(|(_, list)| list.chosen()),
+            Some(0)
+        );
         assert!(sent.lock().unwrap().is_empty());
         let rows: Vec<String> = app.pending.iter().map(|l| l.to_string()).collect();
         assert!(
@@ -14947,7 +15602,9 @@ mod tests {
             "{rows:?}"
         );
         app.key(enter()).await;
-        assert!(app.approving.is_none() && app.denials.is_empty());
+        assert!(app.approving.is_none());
+        assert_eq!(app.denials, [other]);
+        app.denials.clear();
         let prompt = sent.lock().unwrap()[0].as_str().unwrap().to_owned();
         assert!(prompt.starts_with(
             "I approve one retry of the action the reviewer denied: shell {\"command\":\"git push --force origin main\"}"
@@ -15792,10 +16449,27 @@ mod tests {
         // An older reply, picked with /react: quoted, so the bot knows.
         app.input.set("/react");
         app.submit().await;
-        assert_eq!(app.reacting, Some(0));
+        // The newest picked to start.
+        assert_eq!(
+            app.reacting.as_ref().and_then(|(_, list)| list.chosen()),
+            Some(1)
+        );
+        // The replies going with a change of view take the list with them.
+        let replies = app.replies.clone();
+        app.zen_view_changed();
+        assert!(app.reacting.is_none());
+        drawn(&mut app);
+        app.replies = replies.clone();
+        app.input.set("/react");
+        app.submit().await;
+        // Replies that come and go while it is open, as the oldest does
+        // past the limit, move no row onto another.
+        app.saw_reply(11, "Later.");
+        app.replies.remove(0);
         app.key(Event::Key(KeyCode::Up.into())).await;
         app.key(Event::Key(KeyCode::Enter.into())).await;
         assert_eq!(app.react_to, Some((4, "Merged it.".into())));
+        app.replies = replies;
         app.input.set("🎉");
         app.submit().await;
         assert_eq!(sent.lock().unwrap()[1]["prompt"], "> Merged it.\n\n🎉");
@@ -16326,7 +17000,7 @@ mod tests {
         app.input.set("/fast");
         app.submit().await;
         // Standard and the one tier Anthropic serves, standard in effect.
-        assert!(app.choosing == Some((Choice::Speed, 0)));
+        assert!(matches!(&app.choosing, Some((Choice::Speed, list)) if list.chosen() == Some(0)));
         assert_eq!(
             app.speed_rows(),
             [
@@ -16347,7 +17021,7 @@ mod tests {
         // It opens again on what is in effect.
         app.input.set("/fast");
         app.submit().await;
-        assert!(app.choosing == Some((Choice::Speed, 1)));
+        assert!(matches!(&app.choosing, Some((Choice::Speed, list)) if list.chosen() == Some(1)));
         // Enter on it changes nothing; Esc closes the list.
         app.key(key(KeyCode::Enter)).await;
         assert_eq!(asked.lock().unwrap().len(), 1);
@@ -16384,7 +17058,7 @@ mod tests {
         // takes its last row rather than one that is gone.
         app.input.set("/fast");
         app.submit().await;
-        assert!(app.choosing == Some((Choice::Speed, 2)));
+        assert!(matches!(&app.choosing, Some((Choice::Speed, list)) if list.chosen() == Some(2)));
         app.model = "anthropic/claude-opus-5-5".into();
         app.key(key(KeyCode::Enter)).await;
         assert!(app.choosing.is_none());
@@ -16656,7 +17330,7 @@ mod tests {
 
     #[tokio::test]
     async fn words_attached_to_a_call_hang_under_what_it_carried() {
-        let note = "[trigger nightly · 15:02 · not sent to tally.lead: busy]";
+        let note = "[automation nightly · 15:02 · not sent to tally.lead: busy]";
         let client = daemon_answering(move |asked| {
             let node = asked["nodes"][0].as_i64().unwrap_or(0);
             match asked["op"].as_str() {
@@ -16706,7 +17380,7 @@ mod tests {
             [
                 "  📎 2 attached notes · an automation, calc.add ▾",
                 "    📎 From an automation ▾",
-                "      [trigger nightly · 15:02 · not sent to tally.lead: busy]",
+                "      [automation nightly · 15:02 · not sent to tally.lead: busy]",
                 "    📎 From calc.add ▸",
             ]
         );
@@ -17277,6 +17951,25 @@ mod tests {
             app.notice.as_deref(),
             Some("that question was answered already")
         );
+    }
+
+    /// A daemon that stopped and will not start again for want of a
+    /// provider leaves the screen reconnecting: no first-run picker over
+    /// it, so no setting is rewritten.
+    #[tokio::test]
+    async fn a_stopped_daemon_without_a_provider_asks_nothing_on_reconnect() {
+        let socket = std::env::temp_dir().join(format!("sonny-gone-{}.sock", std::process::id()));
+        let starts = std::cell::Cell::new(0);
+        let start = || {
+            starts.set(starts.get() + 1);
+            Err(NotStarted {
+                code: Some("provider_required".into()),
+                reason: "no provider".into(),
+            })
+        };
+        let refused = connect_starting(&socket, Asking::Never, start).await;
+        assert_eq!(refused.err().as_deref(), Some(NO_PROVIDER));
+        assert_eq!(starts.get(), 1, "tried once, never again after a setup");
     }
 
     #[tokio::test]
@@ -18673,6 +19366,41 @@ mod tests {
         app.refold = true;
         app.fold_notes(false);
         assert!(app.plans.is_empty());
+    }
+
+    #[test]
+    fn the_text_width_sets_the_conversations_measure_and_0_fills_the_window() {
+        assert_eq!(measure_of(agent_client::config::TEXT_WIDTH), 100);
+        // A wider text keeps its columns, the margin taking the rest.
+        let wide = measure_of(140) as u16 + GUTTER;
+        assert_eq!(pane::margin_width(300, wide), Some(157));
+        assert_eq!(pane::width(160, wide), 160);
+        // The window's whole width, wider than any window and a column
+        // added to it still fits.
+        assert_eq!(measure_of(0), WHOLE);
+        assert!(WHOLE >= u16::MAX as usize / 2 && WHOLE as u16 + GUTTER > WHOLE as u16);
+    }
+
+    #[test]
+    fn a_conversation_that_fills_the_window_shares_it_evenly_with_the_pane() {
+        // What `split` lays out: the pane's columns, its line among them,
+        // and the conversation's, short of its gutter.
+        let split = |window: u16| {
+            let pane = pane::width(window, kept_at(window, WHOLE));
+            match pane == window {
+                true => None,
+                false => Some(((window - pane - 1).saturating_sub(GUTTER), pane - 1)),
+            }
+        };
+        // Half each, the line and its gutters between them.
+        assert_eq!(split(170), Some((83, 83)));
+        assert_eq!(split(400), Some((198, 198)));
+        // Too narrow for two halves of the margin's least, one at a time.
+        assert_eq!(split(82), Some((39, 39)));
+        assert_eq!(split(81), Some((38, 39)));
+        assert_eq!(split(80), None);
+        // A measure of its own is kept as before.
+        assert_eq!(kept_at(170, 100), 102);
     }
 
     #[tokio::test]

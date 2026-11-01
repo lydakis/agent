@@ -2158,12 +2158,14 @@ impl Lookout {
     /// subscriber, whose words are no news to it.
     fn author(&self, data: &Value) -> Option<String> {
         // A lookout's own note to a lead another subscriber watches, a
-        // goal's next turn, a trigger's fire, or the daemon telling a bot
-        // its background command ended: how the turn ends alone is news (a
-        // trigger's run that went well and said nothing is none).
+        // goal's next turn, an automation's run, or the daemon telling a
+        // bot its background command ended: how the turn ends alone is news
+        // (an automation's run that went well and said nothing is none).
         if (data["request_id"].as_str())
             .is_some_and(|id| id.starts_with("lookout-") || id.starts_with(goals::REQUEST))
-            || (matches!(data["origin"].as_str(), Some("trigger" | "background"))
+            || (data["origin"]
+                .as_str()
+                .is_some_and(|origin| crate::trigger::sent_it(origin) || origin == "background")
                 && data["from"]["bot"].is_null())
         {
             return None;
@@ -3731,9 +3733,9 @@ mod tests {
     }
 
     #[test]
-    fn a_trigger_s_words_are_no_news_only_how_its_turn_ends() {
+    fn an_automation_s_words_are_no_news_only_how_its_turn_ends() {
         let mut lookout = seated("idle");
-        let fire = json!({"origin": "trigger", "request_id": "trigger_7_1"});
+        let fire = json!({"origin": "automation", "request_id": "trigger_7_1"});
         lookout.event(&ev("calc.fix", 4, "accepted", fire.clone()));
         lookout.event(&ev("calc.fix", 5, "queued", fire));
         assert!(lookout.due.is_empty());

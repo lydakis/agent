@@ -10,10 +10,16 @@ use ratatui::{
     text::{Line, Span},
 };
 
-/// The welcome for the lead in `folder`, on `model`, at `width` columns:
-/// the portrait beside its words, or, too narrow for the picture, the
-/// words alone. With the portrait, which of its lines the eyes are on.
-pub fn welcome(folder: &str, model: &str, width: usize) -> (Vec<Line<'static>>, Option<usize>) {
+/// The welcome for the agent in `folder`, a lead or a task, on `model`, at
+/// `width` columns: the portrait beside its words, or, too narrow for the
+/// picture, the words alone. With the portrait, which of its lines the eyes
+/// are on.
+pub fn welcome(
+    folder: &str,
+    model: &str,
+    lead: bool,
+    width: usize,
+) -> (Vec<Line<'static>>, Option<usize>) {
     let version = env!("CARGO_PKG_VERSION");
     let accent = Style::new().fg(Color::Cyan);
     let art = pixels(&PORTRAIT, &PORTRAIT_COLORS);
@@ -23,14 +29,30 @@ pub fn welcome(folder: &str, model: &str, width: usize) -> (Vec<Line<'static>>, 
             format!("  {version}").dim(),
         ]),
         Line::default(),
-        Line::from("This folder's lead. Ask for anything:".dim()),
-        Line::from("it plans, starts tasks in their own copies,".dim()),
-        Line::from("and tells you when they need you.".dim()),
-        Line::default(),
-        Line::from(format!("{folder} · {}", crate::models::named(model)).dim()),
-        Line::default(),
-        hints(accent),
     ];
+    let what = match lead {
+        true => [
+            "This folder's lead. Ask for anything:",
+            "it plans, starts tasks in their own copies,",
+            "and tells you when they need you.",
+        ],
+        false => [
+            "A task of this folder's lead. Steer it here:",
+            "it works on what it was asked and tells",
+            "its lead what it found.",
+        ],
+    };
+    let words = [
+        words,
+        what.map(|line| Line::from(line.dim())).to_vec(),
+        vec![
+            Line::default(),
+            Line::from(format!("{folder} · {}", crate::models::named(model)).dim()),
+            Line::default(),
+            hints(accent),
+        ],
+    ]
+    .concat();
     let art_width = art.first().map_or(0, Line::width);
     let words_width = words.iter().map(Line::width).max().unwrap_or(0);
     // The portrait is its colors; with NO_COLOR it would be a smudge.
@@ -457,11 +479,17 @@ mod tests {
                 assert_ne!(PORTRAIT[row].as_bytes()[column as usize], b'.');
             }
         }
-        let (lines, eyes) = welcome("~/x", "m", 200);
+        let (lines, eyes) = welcome("~/x", "m", true, 200);
         let eyes = eyes.unwrap();
         let line = lines[eyes].to_string();
         assert_eq!(line.chars().nth(2 + EYE_COLUMNS[0] as usize), Some('▀'));
-        assert_eq!(welcome("~/x", "m", 20).1, None);
+        assert_eq!(welcome("~/x", "m", true, 20).1, None);
+        // A task's window says what a task is, not what a lead is.
+        let (task, _) = welcome("~/x", "m", false, 20);
+        assert_eq!(
+            task[2].to_string(),
+            "A task of this folder's lead. Steer it here:"
+        );
     }
 
     #[test]

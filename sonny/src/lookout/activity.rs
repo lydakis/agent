@@ -19,7 +19,7 @@ pub const FIELDS: [(&str, &str); 14] = [
     ("maker", "string, the bot that made that bot"),
     (
         "by",
-        "string, who wrote the message or asked for the turn: \"you\", \"person\", an agent's name, \"trigger\" or a client",
+        "string, who wrote the message or asked for the turn: \"you\", \"person\", an agent's name, \"automation\" or a client",
     ),
     ("turn", "number, the turn's number in its bot"),
     (

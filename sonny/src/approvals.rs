@@ -1258,7 +1258,7 @@ mod tests {
             "new_project",
             "subscriptions",
             "run_in_pane",
-            "triggers",
+            "automations",
             "goal"
         ]);
         // The browser, there when agent-browser is, reaches outside.

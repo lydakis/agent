@@ -114,47 +114,47 @@ class ConfinedTests(unittest.TestCase):
     def test_only_a_plain_call_of_sonnys_scripts_is_allowed(self):
         home = role_eval.ROOT / 'A1/h'
         shell = lambda command, **more: {'name': 'shell', 'arguments': {'command': command}, **more}
-        for allowed in ['~/.agent/trigger add --bot shop.lead --every 10m -- "Check the tasks"',
-                        '"$HOME/.agent/trigger" rm watch',
+        for allowed in ['~/.agent/automation add --bot shop.lead --every 10m -- "Check the tasks"',
+                        '"$HOME/.agent/automation" rm watch',
                         f'{home}/.agent/memory save flow --type project -- \'text\'',
-                        "~/.agent/trigger add --bot shop.lead --cron '*/5 * * * *' -- 'Is it {done}? Yes!'"]:
+                        "~/.agent/automation add --bot shop.lead --cron '*/5 * * * *' -- 'Is it {done}? Yes!'"]:
             self.assertTrue(role_eval.determinable(home, shell(allowed)), allowed)
         # The ACP shape of the same call.
-        acp = {'toolCall': {'name': 'shell', 'rawInput': {'command': '~/.agent/trigger ls'}}}
+        acp = {'toolCall': {'name': 'shell', 'rawInput': {'command': '~/.agent/automation ls'}}}
         self.assertTrue(role_eval.determinable(home, acp))
         for denied in ['mkdir -p ~/Backups/shop',
                        'cd /Users && mkdir -p me/Backups/shop',
                        'python3 -c "import pwd,os; os.makedirs(pwd.getpwuid(os.getuid()).pw_dir + \'/x\')"',
-                       '~/.agent/trigger ls; rm -rf ~/x',
-                       '~/.agent/trigger ls && touch /x',
-                       '~/.agent/trigger add -- "$(touch /x)"',
-                       '~/.agent/trigger add -- `touch /x`',
-                       '~/.agent/trigger ls > /Users/me/x',
-                       '~/.agent/trigger ls\ntouch /x',
-                       'FOO=1 ~/.agent/trigger ls',
+                       '~/.agent/automation ls; rm -rf ~/x',
+                       '~/.agent/automation ls && touch /x',
+                       '~/.agent/automation add -- "$(touch /x)"',
+                       '~/.agent/automation add -- `touch /x`',
+                       '~/.agent/automation ls > /Users/me/x',
+                       '~/.agent/automation ls\ntouch /x',
+                       'FOO=1 ~/.agent/automation ls',
                        # What runs a command or starts an agent outside the eval's row.
-                       "~/.agent/trigger add --bot shop.lead --every 10m --if 'touch /x' -- ping",
-                       '~/.agent/trigger add --if=true --bot shop.lead -- ping',
-                       '~/.agent/trigger add --start helper --model chatgpt/x --in 5m -- go',
-                       '~/.agent/trigger add --bot shop.lead --every 10m',
-                       '~/.agent/trigger fire watch --if true',
-                       '~/.agent/trigger rm',
-                       '~/.agent/trigger edit watch',
+                       "~/.agent/automation add --bot shop.lead --every 10m --if 'touch /x' -- ping",
+                       '~/.agent/automation add --if=true --bot shop.lead -- ping',
+                       '~/.agent/automation add --start helper --model chatgpt/x --in 5m -- go',
+                       '~/.agent/automation add --bot shop.lead --every 10m',
+                       '~/.agent/automation run watch --if true',
+                       '~/.agent/automation rm',
+                       '~/.agent/automation edit watch',
                        '~/.agent/memory schedule --model chatgpt/x',
                        '~/.agent/memory cleanup start',
                        '~/.agent/memory save flow --type -- text',
                        '~/.agent/memory',
                        # What Bash would expand into other words than the ones checked.
-                       "~/.agent/trigger add --name {watch,--if,'touch /x'} --bot shop.lead --in 1m -- ping",
-                       '~/.agent/trigger rm w*',
-                       '~/.agent/trigger rm w?',
-                       '~/.agent/trigger rm [w]',
-                       '~/.agent/trigger rm ~/x',
-                       '~/.agent/trigger rm \\-\\-if',
-                       '~/.agent/trigger add --bot shop.lead --in 1m -- "!!"',
-                       '~/.agent/trigger add --bot shop.lead --in 1m -- "a\\"b"',
-                       '~/.agent/trigger rm watch # x',
-                       "~/.agent/trigger rm 'unclosed",
+                       "~/.agent/automation add --name {watch,--if,'touch /x'} --bot shop.lead --in 1m -- ping",
+                       '~/.agent/automation rm w*',
+                       '~/.agent/automation rm w?',
+                       '~/.agent/automation rm [w]',
+                       '~/.agent/automation rm ~/x',
+                       '~/.agent/automation rm \\-\\-if',
+                       '~/.agent/automation add --bot shop.lead --in 1m -- "!!"',
+                       '~/.agent/automation add --bot shop.lead --in 1m -- "a\\"b"',
+                       '~/.agent/automation rm watch # x',
+                       "~/.agent/automation rm 'unclosed",
                        'git push origin main']:
             self.assertFalse(role_eval.determinable(home, shell(denied)), denied)
         # Sonny's own tools the day needs, with what stays in the run.
@@ -163,23 +163,23 @@ class ConfinedTests(unittest.TestCase):
                                 ('start_task', {'name': 'x', 'brief': 'b', 'own_folder': True}),
                                 ('remove_task', {'task': 'export'}),
                                 ('subscriptions', {'add': {'name': 'news', 'sources': ['chat']}}),
-                                ('triggers', {'add': {'every': '10m', 'message': 'check'}}),
-                                ('triggers', {'remove': 'watch'})]:
+                                ('automations', {'add': {'every': '10m', 'message': 'check'}}),
+                                ('automations', {'remove': 'watch'})]:
             self.assertTrue(role_eval.determinable(home, native(name, arguments)), (name, arguments))
         for name, arguments in [('start_task', {'name': 'x', 'brief': 'b', 'folder': 'nested'}),
                                 ('start_task', {'name': 'x', 'brief': 'b', 'folder': '/Users/me'}),
                                 ('start_task', {'name': 'x', 'brief': 'b', 'folder': '../..'}),
                                 ('start_task', {'name': 'x', 'brief': 'b', 'folder': '~/x'}),
-                                ('triggers', {'add': {'every': '10m', 'if': 'touch /x', 'message': 'm'}}),
-                                ('triggers', {'add': {'start': {'name': 'n', 'model': 'm'}, 'message': 'm'}}),
+                                ('automations', {'add': {'every': '10m', 'if': 'touch /x', 'message': 'm'}}),
+                                ('automations', {'add': {'start': {'name': 'n', 'model': 'm'}, 'message': 'm'}}),
                                 ('new_project', {'folder': '/Users/me/x'}),
                                 ('run_in_pane', {'command': 'ls'}),
                                 ('goal', {}), ('browser', {})]:
             self.assertFalse(role_eval.determinable(home, native(name, arguments)), (name, arguments))
         # Not a shell call, or not seen whole.
         self.assertFalse(role_eval.determinable(home, {'name': 'write', 'arguments': {'path': '/x', 'content': ''}}))
-        self.assertFalse(role_eval.determinable(home, shell('~/.agent/trigger ls', arguments_cut=['command'])))
-        self.assertFalse(role_eval.determinable(home, shell('~/.agent/trigger ls', arguments_omitted=1)))
+        self.assertFalse(role_eval.determinable(home, shell('~/.agent/automation ls', arguments_cut=['command'])))
+        self.assertFalse(role_eval.determinable(home, shell('~/.agent/automation ls', arguments_omitted=1)))
 
     def test_tasks_calls_are_answered_while_the_leads_prompt_is_out(self):
         # A lead waiting on a task before it answers would otherwise wait

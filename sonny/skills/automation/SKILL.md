@@ -5,7 +5,7 @@ description: Set up or run a recurring job (a daily brief, a digest, a monitor t
 
 # Recurring jobs
 
-A recurring job is one agent woken by a trigger with the same message each
+A recurring job is one agent woken by an automation with the same message each
 time. Each wake is a new turn in its own conversation. Over many runs that
 conversation is compacted, and a summary is not exact about ids and times, so
 the job keeps its state in files in its folder and reads them each run.
@@ -13,13 +13,13 @@ the job keeps its state in files in its folder and reads them each run.
 ## Setting one up
 
 Give the job its own agent and folder, created with `--agents` so it reads
-the folder's rules and skills, then add a trigger for it with the
-triggers tool: `add` with `bot` NAME, `cron` 'MIN HOUR DAY MONTH WEEKDAY'
-and `message` MESSAGE. Triggers need the system's scheduler to keep the time:
+the folder's rules and skills, then add an automation for it with the
+automations tool: `add` with `bot` NAME, `cron` 'MIN HOUR DAY MONTH WEEKDAY'
+and `message` MESSAGE. Automations need the system's scheduler to keep the time:
 launchd on macOS, systemd's user manager on Linux. Without one `add` is
-refused with `triggers_unsupported`, so say so rather than presenting a job
-as set up. Without the triggers tool, outside
-Sonny, `"$HOME/.agent/trigger" add` takes the same fields as flags
+refused with `automations_unsupported`, so say so rather than presenting a job
+as set up. Without the automations tool, outside
+Sonny, `"$HOME/.agent/automation" add` takes the same fields as flags
 (`--bot NAME --cron '...' -- MESSAGE`).
 
 MESSAGE names the folder and says to read and follow this file by its
@@ -70,7 +70,7 @@ time, so anything there when a run starts was left by a run cut off before
 its `mv`; empty it first.
 
 Agent cannot give one job its own credentials: every agent's shell sees
-the daemon's environment and your files, and a trigger passes only `HOME`
+the daemon's environment and your files, and an automation passes only `HOME`
 and `SHELL`. So wherever the job only reads, use credentials that can only
 read, such as a read-only token, knowing other agents can use them too.
 Leaving write tools out of its list does not make it read-only either: its
@@ -83,22 +83,24 @@ the last line of this skill is advice to the model, not a wall. Before
 watching such a source, tell the person, and say that isolation, such as a
 separate macOS user or a virtual machine, has to come from outside Agent.
 
-To move a job that runs elsewhere onto a trigger, add it with `shadow`
-first and leave the old job running: each fire goes to a read-only copy of
+To move a job that runs elsewhere onto an automation, add it with `shadow`
+first and leave the old job running: each run goes to a read-only copy of
 the agent, which can read files and call tools that only read, but not run
 commands, post, change files or ask the person, and its answer comes to you
 as a report of what it would have done. Compare a
 few reports with what the old job did, then `add` it again with `replace`
 and without `shadow`, and tell the person the old job can be stopped.
 
-To change a trigger, `add` it again with its `name`, the new definition and
+To change an automation, `add` it again with its `name`, the new definition and
 `replace`: it is changed in place and keeps its last result, where `remove`
-and a new `add` would lose it. `fire` NAME runs it now, waits for the run,
+and a new `add` would lose it. `run` NAME runs it now, waits for the run,
 and returns its `outcome` and the `handle` of the turn it sent, to pass to
 `wait`; it says `pending` when the run has not said within 90 seconds.
 
-A trigger's `turn_budget_tokens` caps each run on its own, and a run past
-it fails with `turn_budget_exhausted`.
+An automation's `turn_budget_tokens` caps each run on its own, and a run past
+it fails with `turn_budget_exhausted`. It counts every request's input, the
+agent's history included, so a cap below that history fails every run
+before it starts: set one only when the person asks for a spending limit.
 
 ## Monitors
 
@@ -109,7 +111,7 @@ the lead sets it up and handles what it reports. Its `preferences.md` names
 the lead as the destination and, when the person wants one, a destination
 for urgent items, such as a direct message to the person.
 
-Run it often and gate each fire: `add` with `bot` NAME, `every` `10m`,
+Run it often and gate each run: `add` with `bot` NAME, `every` `10m`,
 `if` `cd FOLDER && ! ./quiet` and `message` MESSAGE. The `if` command runs
 in your own folder, hence the `cd`.
 
@@ -117,16 +119,16 @@ in your own folder, hence the `cd`.
 instead, for example `*/10 8-18 * * 1-5` for every 10 minutes from 8:00 to
 18:50, Monday to Friday.
 
-Any exit but 0 from `if` skips the fire with no model call, and one that
-runs past a minute is a failed fire that the triggers list shows. Each
-trigger's row there has `checked`: when its `if` last ran and what it said
-(`go`, `no` or `failed`), so a skipped fire shows there too. Write `quiet`
+Any exit but 0 from `if` skips the run with no model call, and one that
+runs past a minute is a failed run that the automations list shows. Each
+automation's row there has `checked`: when its `if` last ran and what it said
+(`go`, `no` or `failed`), so a skipped run shows there too. Write `quiet`
 at setup: a short script that only reads, and exits 0 only when it found
 that no source has anything past its bookmark and the newest run record is
 under an hour old. The `!` makes that a skip, and makes anything else a
-fire, so a check that cannot tell, from a missing tool, an expired token or
+run, so a check that cannot tell, from a missing tool, an expired token or
 a source that errors, wakes the job to fail and say so instead of passing
-for a quiet day. A gate that runs past its minute is a failed fire with no
+for a quiet day. A gate that runs past its minute is a failed run with no
 turn: the job hears of it once, and once when the gate works again, and
 misses every run in between. So give every request in `quiet` a time limit
 well inside it, such as `curl --max-time 20`: a source that hangs then
@@ -184,7 +186,7 @@ failed, was stopped or replied words (step 10):
    may miss recent posts, leave the run open, do not post this run, and
    tell the person which post needs checking.
 3. **Find now.** The message carries no time. Run `date` and use the local
-   date and time; a run that fires late, after the computer slept, is still
+   date and time; a run that starts late, after the computer slept, is still
    about today.
 4. **Read each source from its bookmark,** not from a fixed window like "the
    last 24 hours": a window misses items after a late run and repeats them

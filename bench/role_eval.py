@@ -22,7 +22,7 @@ the person. So a run's agents work in the `eval` permissions row: the
 sandbox writes their folders, the run's backups and origin, with the
 network (and so every Unix socket) off, and every call that would leave
 it comes to the eval, which allows only a plain call of Sonny's own
-`~/.agent/trigger` or `~/.agent/memory` and denies the rest. What changed
+`~/.agent/automation` or `~/.agent/memory` and denies the rest. What changed
 in the real home during a run is listed in `outside.txt`.
 
 Arms differ only in the Sonny build: A from one checkout (today's role
@@ -319,7 +319,21 @@ def burst():
 
 BURST = burst()
 
-DAYS = {'full': STEPS, 'small': SMALL, 'burst': BURST}
+# Setting up, listing, running and removing a scheduled check: what the
+# lead calls and the words it uses for it with the person.
+AUTOMATION = [
+    {'say': "Every weekday at 9 in the morning, look at this repo's branches and tell me which have "
+            "commits that aren't on main yet. Can you set that up?",
+     'plant': 'A1 the lead schedules a weekday-9 check for itself and says so in a line'},
+    {'say': "What have you got scheduled right now?",
+     'plant': 'A2 the lead lists what it has scheduled'},
+    {'say': "Run that branch check now so I can see what it says.",
+     'plant': 'A3 the lead runs it at once rather than doing the check by hand'},
+    {'say': "Thanks, I don't need it anymore. Take it off.",
+     'plant': 'A4 the lead removes it'},
+]
+
+DAYS = {'full': STEPS, 'small': SMALL, 'burst': BURST, 'automation': AUTOMATION}
 DAY, DAY_NAME = STEPS, ''  # the day a run plays, set by --day
 
 SOURCE = r'''import json, sys
@@ -448,18 +462,18 @@ def land(root, env, author, message, files):
 # nothing a run does may reach it (#521).
 REAL_HOME = Path.home().resolve()
 # What a call that leaves the sandbox may run: Sonny's own scripts, which
-# write only under the run's HOME, as `~/.agent/trigger add ...` adds a
-# trigger to the run's scheduler. Each verb names how many plain words it
+# write only under the run's HOME, as `~/.agent/automation add ...` adds an
+# automation to the run's scheduler. Each verb names how many plain words it
 # takes, its flags (True when a flag takes a value) and whether free text
-# follows `--`. What runs a command or starts an agent is left out: a
-# trigger's `--if` runs in the scheduler, outside every sandbox, and
+# follows `--`. What runs a command or starts an agent is left out: an
+# automation's `--if` runs in the scheduler, outside every sandbox, and
 # `--start` or `memory schedule` start an agent the eval never configured.
 SCOPE = {'--user': False, '--project': True}
 SCRIPTS = {
-    'trigger': {
+    'automation': {
         'ls': (0, {'--after': True}, False),
         'show': (1, {}, False),
-        'fire': (1, {}, False),
+        'run': (1, {}, False),
         'rm': (1, {}, False),
         'add': (0, {'--name': True, '--every': True, '--in': True, '--at': True, '--cron': True,
                     '--bot': True, '--reply-to': True, '--runs': True,
@@ -475,6 +489,9 @@ SCRIPTS = {
                      '--confirmed': True, '--pushed-back': True, '--external': False}, True),
     },
 }
+# The script's name and `run` before 0.8.0, so an arm of an older build
+# compares.
+SCRIPTS['trigger'] = {('fire' if verb == 'run' else verb): spec for verb, spec in SCRIPTS['automation'].items()}
 
 
 def plain(words, spec):
@@ -538,12 +555,12 @@ def words_of(text):
 
 # Sonny's own tools that wait on the eval in the `ask` row, and when a call
 # of each keeps its effects in the run. The day needs tasks, the lookout's
-# subscriptions and triggers. A start makes a worktree of the lead's
+# subscriptions and automations. A start makes a worktree of the lead's
 # repository, whose .git every sandbox keeps read-only, and its setup runs
 # the lead's .agents/setup, read-only too, which the eval never writes. A
 # start at another `folder` is denied: Sonny runs git there outside the
 # sandbox, and a repository an agent made inside the lead's has hooks,
-# config and filters the agent wrote (#597). A trigger's `if` runs
+# config and filters the agent wrote (#597). An automation's `if` runs
 # outside every sandbox and its `start` makes an agent the eval never
 # configured. A new project, a pane's command, a script, a goal's check
 # and the browser run as the person.
@@ -551,8 +568,10 @@ NATIVE = {
     'start_task': lambda a: 'folder' not in a,
     'remove_task': lambda a: True,
     'subscriptions': lambda a: True,
-    'triggers': lambda a: not (isinstance(a.get('add'), dict) and {'if', 'start'} & set(a['add'])),
+    'automations': lambda a: not (isinstance(a.get('add'), dict) and {'if', 'start'} & set(a['add'])),
 }
+# Builds before 0.8.0 named them triggers, so an arm of one compares.
+NATIVE['triggers'] = NATIVE['automations']
 
 
 def determinable(home, request):
@@ -867,12 +886,17 @@ def run(arm, n, bins, model, spec=None):
         (out / 'bots.txt').write_text(bots.stdout)
         if acp:
             acp.close()
-        # A trigger is loaded in the user's own scheduler whatever HOME made
-        # it, under that HOME's own label (#453): take the run's out before
-        # its HOME goes, rather than leave each to unload itself at its fire.
-        listed = subprocess.run([str(sonny), 'trigger', 'ls'], env=env, capture_output=True, text=True)
-        for t in json.loads(listed.stdout or '{}').get('triggers', []):
-            subprocess.run([str(sonny), 'trigger', 'rm', t['name']], env=env, capture_output=True)
+        # An automation is loaded in the user's own scheduler whatever HOME
+        # made it, under that HOME's own label (#453): take the run's out
+        # before its HOME goes, rather than leave each to unload itself at
+        # its run.
+        # A build before 0.8.0 names them triggers.
+        for verb, key in (('automation', 'automations'), ('trigger', 'triggers')):
+            listed = subprocess.run([str(sonny), verb, 'ls'], env=env, capture_output=True, text=True)
+            if listed.returncode == 0:
+                for t in json.loads(listed.stdout or '{}').get(key, []):
+                    subprocess.run([str(sonny), verb, 'rm', t['name']], env=env, capture_output=True)
+                break
         subprocess.run([str(agent), 'shutdown'], env=env, capture_output=True)
         # Saved facts; `~/.agent/memory` is the memory script, not a folder.
         if (home / '.agents/memory').is_dir():

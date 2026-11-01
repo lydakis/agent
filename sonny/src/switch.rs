@@ -1,12 +1,11 @@
 //! `/switch`: every agent in one list over the composer, found by typing as
-//! every list is ([`crate::fuzzy`]), the pick opened in this window. The
-//! folder's leads come first, then the project's other agents, then other
-//! projects' leads, then the rest; the one this window is marked, and the
-//! one beside the conversation is picked to start. A last row makes a new
-//! lead in the folder, named by what was typed when it can name one. Like
-//! Claude Code's and Codex's `/resume`, one list to search rather than a
-//! command for each kind of agent.
-use crate::fuzzy::{Found, Picks, order};
+//! every list is ([`crate::list::Picker`]), the pick opened in this window.
+//! The folder's leads come first, then the project's other agents, then
+//! other projects' leads, then the rest; the one this window is marked, and
+//! the one beside the conversation is picked to start. Like Claude Code's
+//! and Codex's `/resume`, one list to search rather than a command for each
+//! kind of agent; `/new` makes one.
+use crate::fuzzy::Picks;
 use serde_json::Value;
 
 /// One agent, as listed.
@@ -16,37 +15,17 @@ pub struct Agent {
     pub about: String,
 }
 
-/// What Enter takes.
-#[derive(Debug, PartialEq)]
-pub enum Chosen {
-    Agent(String),
-    /// A new lead of the folder, by its short name, else numbered.
-    Lead(Option<String>),
-}
-
 pub struct Picker {
     agents: Vec<Agent>,
-    /// Typed to narrow the list.
-    pub filter: String,
-    pick: usize,
+    list: crate::list::Picker,
     /// The agent this window is.
     pub current: String,
-    /// The folder's project, when this window is its lead's: a new lead
-    /// can be made there.
-    project: Option<String>,
-    picks: Picks,
-}
-
-/// A row shown: an agent, or the new lead.
-pub enum Row<'a> {
-    Agent(&'a Agent, Found),
-    Lead(Option<String>),
 }
 
 impl Picker {
     /// The agents in `bots` (the daemon's `bots` rows), ordered for a
-    /// window of `current` in folder `workspace`, a lead of `project` or of
-    /// none; `beside` picked when listed.
+    /// window of `current` in folder `workspace`, of project `project` or
+    /// of none; `beside` picked when listed.
     pub fn new(
         bots: &[Value],
         current: &str,
@@ -106,76 +85,70 @@ impl Picker {
             .position(|agent| Some(agent.name.as_str()) == beside)
             .or_else(|| agents.iter().position(|agent| agent.name != current))
             .unwrap_or(0);
+        // Found by name only: what an agent is doing is no name of it.
+        let names = (agents.iter())
+            .map(|agent| (agent.name.clone(), String::new()))
+            .collect();
         Self {
+            list: crate::list::Picker::new(names, pick).weighed(picks),
             agents,
-            filter: String::new(),
-            pick,
             current: current.to_owned(),
-            project: project.map(str::to_owned),
-            picks,
         }
     }
 
-    /// The rows the filter leaves, best first, then the new lead's.
-    pub fn rows(&self) -> Vec<Row<'_>> {
-        let found = (self.agents.iter()).map(|agent| crate::fuzzy::find(&agent.name, &self.filter));
-        let typed = !self.filter.is_empty();
-        let mut rows: Vec<Row> = order(found, |at| match typed {
-            true => self.picks.weight_now(&self.agents[at].name),
-            false => 0.0,
-        })
-        .into_iter()
-        .map(|(at, found)| Row::Agent(&self.agents[at], found))
-        .collect();
-        if let Some(project) = &self.project {
-            // Named by what was typed when no lead has that name yet.
-            let name = Some(self.filter.trim())
-                .filter(|name| crate::project::lead_named(name))
-                .filter(|name| {
-                    let bot = crate::project::lead_bot(project, name);
-                    !self.agents.iter().any(|agent| agent.name == bot)
-                })
-                .map(str::to_owned);
-            rows.push(Row::Lead(name));
-        }
-        rows
+    /// What is typed to narrow the list.
+    #[cfg(test)]
+    pub fn filter(&self) -> &str {
+        &self.list.filter
+    }
+
+    /// The agents typing leaves, best first, each with the chars of its
+    /// name typed.
+    pub fn rows(&self) -> Vec<(&Agent, Vec<usize>)> {
+        (self.list.shown().into_iter())
+            .map(|(at, found)| (&self.agents[at], found))
+            .collect()
     }
 
     /// Where the pick is among `rows()`.
     pub fn at(&self) -> usize {
-        self.pick.min(self.rows().len().saturating_sub(1))
-    }
-
-    pub fn up(&mut self) {
-        let len = self.rows().len().max(1);
-        self.pick = (self.at() + len - 1) % len;
-    }
-
-    pub fn down(&mut self) {
-        let len = self.rows().len().max(1);
-        self.pick = (self.at() + 1) % len;
+        self.list.at()
     }
 
     /// Narrowed to what is typed, the best row picked that is not this
     /// window's own agent.
     pub fn narrow(&mut self, filter: String) {
-        self.filter = filter;
-        self.pick = (self.rows().iter())
-            .position(|row| !matches!(row, Row::Agent(agent, _) if agent.name == self.current))
-            .unwrap_or(0);
+        self.list.narrow(filter);
+        if !self.list.filter.is_empty()
+            && let Some(at) = (self.rows().iter()).position(|(agent, _)| agent.name != self.current)
+        {
+            self.list.pick_at(at);
+        }
     }
 
-    /// The row picked, when there is one.
-    pub fn chosen(&self) -> Option<Chosen> {
-        Some(match self.rows().into_iter().nth(self.at())? {
-            Row::Agent(agent, _) => Chosen::Agent(agent.name.clone()),
-            Row::Lead(name) => Chosen::Lead(name),
-        })
+    /// What `event` does, typing narrowing as [`Picker::narrow`] does; an
+    /// agent taken is noted so it ranks first next time.
+    pub fn event(&mut self, event: &ratatui::crossterm::event::Event) -> crate::list::Act {
+        let before = self.list.filter.clone();
+        let act = self.list.event(event);
+        if self.list.filter != before {
+            let filter = self.list.filter.clone();
+            self.narrow(filter);
+        }
+        if let crate::list::Act::Take(_) = act {
+            self.list.took();
+        }
+        act
     }
 
-    /// Notes that `name` was picked, so it ranks first next time.
-    pub fn picked(&mut self, name: &str) {
-        self.picks.pick_now(name);
+    /// The composer's line while the list is open, and its cursor.
+    pub fn line(&self, asked: &str) -> (ratatui::text::Line<'static>, u16) {
+        self.list.line(asked)
+    }
+
+    /// The agent picked, when typing leaves any.
+    pub fn chosen(&self) -> Option<String> {
+        Some(self.agents[self.list.chosen()?].name.clone())
     }
 }
 
@@ -197,10 +170,7 @@ mod tests {
 
     fn names(picker: &Picker) -> Vec<String> {
         (picker.rows().into_iter())
-            .map(|row| match row {
-                Row::Agent(agent, _) => agent.name.clone(),
-                Row::Lead(name) => format!("new {}", name.unwrap_or_default()),
-            })
+            .map(|(agent, _)| agent.name.clone())
             .collect()
     }
 
@@ -221,12 +191,11 @@ mod tests {
                 "shop.lead.web",
                 "shop.fix",
                 "blog.lead",
-                "notes",
-                "new "
+                "notes"
             ]
         );
         // The first that is not this window is picked.
-        assert_eq!(picker.chosen(), Some(Chosen::Agent("shop.lead.web".into())));
+        assert_eq!(picker.chosen().as_deref(), Some("shop.lead.web"));
         let about: Vec<&str> = picker.agents.iter().map(|a| a.about.as_str()).collect();
         assert_eq!(about, ["", "", "working", "/w/blog", "/w/notes"]);
     }
@@ -241,30 +210,25 @@ mod tests {
             Some("shop.fix"),
             Picks::default(),
         );
-        assert_eq!(picker.chosen(), Some(Chosen::Agent("shop.fix".into())));
+        assert_eq!(picker.chosen().as_deref(), Some("shop.fix"));
         // Narrowed, the best that is not this window is picked.
         picker.narrow("lead".into());
-        assert_eq!(picker.chosen(), Some(Chosen::Agent("shop.lead.web".into())));
+        assert_eq!(picker.chosen().as_deref(), Some("shop.lead.web"));
         picker.narrow("blog".into());
-        assert_eq!(names(&picker), ["blog.lead", "new blog"]);
-        assert_eq!(picker.chosen(), Some(Chosen::Agent("blog.lead".into())));
-        picker.up();
-        assert_eq!(picker.chosen(), Some(Chosen::Lead(Some("blog".into()))));
-        // A lead's name already taken names no new one.
-        picker.narrow("web".into());
-        assert_eq!(names(&picker), ["shop.lead.web", "new "]);
-        // Nothing found: the new lead, named so, is the only row.
+        assert_eq!(names(&picker), ["blog.lead"]);
+        assert_eq!(picker.chosen().as_deref(), Some("blog.lead"));
+        // Nothing found: nothing to take.
         picker.narrow("zz9".into());
-        assert_eq!(names(&picker), ["new zz9"]);
-        // A name no lead can have makes one numbered.
-        picker.narrow("zz.9".into());
-        assert_eq!(picker.chosen(), Some(Chosen::Lead(None)));
+        assert!(names(&picker).is_empty() && picker.chosen().is_none());
+        // Back to nothing typed, the agent beside again.
+        picker.narrow(String::new());
+        assert_eq!(picker.chosen().as_deref(), Some("shop.fix"));
     }
 
     #[test]
-    fn a_window_of_no_folders_lead_makes_no_lead() {
+    fn a_window_of_no_folders_lead_lists_every_agent() {
         let picker = Picker::new(&bots(), "notes", None, "/w/notes", None, Picks::default());
-        assert!(!names(&picker).iter().any(|name| name.starts_with("new")));
         assert_eq!(names(&picker)[0], "blog.lead");
+        assert_eq!(names(&picker).len(), 5);
     }
 }

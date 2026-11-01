@@ -80,6 +80,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
         embedded: false,
         window_place: None,
         lead: project::Pick::Last,
+        send: None,
     };
     let agent = Arc::new(Agent {
         out: Arc::new(Out::default()),
@@ -379,7 +380,9 @@ impl Agent {
                 crate::skills::install_own();
                 crate::approvals::at_start();
                 crate::trigger::at_start();
-                crate::connect(&self.options).await.map(drop)
+                crate::connect(&self.options, crate::Asking::AtStart)
+                    .await
+                    .map(drop)
             })
             .await
             .map(drop)
@@ -884,7 +887,8 @@ impl Session {
                 self.state.lock().await.prompt = Some((id.clone(), None));
             }
             // A new thread is a new lead of its folder, named after these
-            // words, unless they are `/lead NAME`, which opens one there.
+            // words, unless they are `/switch NAME`, which opens one there,
+            // or `/new [NAME]`, which makes one so named.
             let chosen = lead_asked(&text);
             let pick = chosen
                 .clone()
@@ -1596,9 +1600,13 @@ async fn setup_lead(
         .unwrap_or_default()
         .to_owned();
     let mut asked = json!({"bot": lead.bot});
-    if let Ok(project::Instructions::Stale(text)) =
-        project::review(Path::new(&workspace), &record, &key, lead.new)
-    {
+    if let Ok(project::Instructions::Stale(text)) = project::review(
+        Path::new(&workspace),
+        &record,
+        &key,
+        lead.new,
+        project::chosen(&agent.options.store, &lead.bot).as_deref(),
+    ) {
         asked["instructions"] = json!(text);
     }
     let declare = declared::declare(&record, crate::served::Role::of(0));
@@ -1766,14 +1774,15 @@ async fn open_task(
     }
 }
 
-/// The lead a thread's first words ask for: `/lead NAME` one of the
-/// folder's, `/lead new [NAME]` a new one.
+/// The lead a thread's first words ask for, as Sonny's commands say it:
+/// `/switch NAME` one of the folder's, `/new [NAME]` a new one.
 fn lead_asked(text: &str) -> Option<project::Pick> {
-    let rest = text.trim().strip_prefix("/lead")?;
+    let text = text.trim();
+    let (command, rest) = text.split_once(char::is_whitespace).unwrap_or((text, ""));
     let mut words = rest.split_whitespace();
-    match (words.next()?, words.next(), words.next()) {
-        ("new", name, None) => Some(project::Pick::New(name.map(str::to_owned))),
-        (name, None, _) => Some(project::Pick::Named(name.to_owned())),
+    match (command, words.next(), words.next()) {
+        ("/new", name, None) => Some(project::Pick::New(name.map(str::to_owned))),
+        ("/switch", Some(name), None) => Some(project::Pick::Named(name.to_owned())),
         _ => None,
     }
 }
