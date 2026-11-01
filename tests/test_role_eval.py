@@ -129,13 +129,14 @@ class ConfinedTests(unittest.TestCase):
         # Sonny's own tools the day needs, with what stays in the run.
         native = lambda name, arguments: {'toolCall': {'name': name, 'rawInput': arguments}}
         for name, arguments in [('start_task', {'name': 'export', 'brief': 'b', 'setup': True}),
-                                ('start_task', {'name': 'x', 'brief': 'b', 'folder': 'shop/sub'}),
+                                ('start_task', {'name': 'x', 'brief': 'b', 'own_folder': True}),
                                 ('remove_task', {'task': 'export'}),
                                 ('subscriptions', {'add': {'name': 'news', 'sources': ['chat']}}),
                                 ('triggers', {'add': {'every': '10m', 'message': 'check'}}),
                                 ('triggers', {'remove': 'watch'})]:
             self.assertTrue(role_eval.determinable(home, native(name, arguments)), (name, arguments))
-        for name, arguments in [('start_task', {'name': 'x', 'brief': 'b', 'folder': '/Users/me'}),
+        for name, arguments in [('start_task', {'name': 'x', 'brief': 'b', 'folder': 'nested'}),
+                                ('start_task', {'name': 'x', 'brief': 'b', 'folder': '/Users/me'}),
                                 ('start_task', {'name': 'x', 'brief': 'b', 'folder': '../..'}),
                                 ('start_task', {'name': 'x', 'brief': 'b', 'folder': '~/x'}),
                                 ('triggers', {'add': {'every': '10m', 'if': 'touch /x', 'message': 'm'}}),

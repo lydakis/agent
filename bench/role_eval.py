@@ -455,21 +455,19 @@ def words_of(text):
     return words
 
 
-def inside(folder):
-    """Whether a task's `folder` stays in the lead's: relative, not climbing."""
-    return folder is None or (isinstance(folder, str) and not folder.startswith(('/', '~'))
-                              and '..' not in Path(folder).parts)
-
-
 # Sonny's own tools that wait on the eval in the `ask` row, and when a call
 # of each keeps its effects in the run. The day needs tasks, the lookout's
-# subscriptions and triggers. A start's setup runs the lead's folder's
-# .agents/setup, which every sandbox keeps read-only, so only the eval
-# could have written one, and it writes none. A trigger's `if` runs outside every sandbox and its
-# `start` makes an agent the eval never configured. A new project, a pane's
-# command, a script, a goal's check and the browser run as the person.
+# subscriptions and triggers. A start makes a worktree of the lead's
+# repository, whose .git every sandbox keeps read-only, and its setup runs
+# the lead's .agents/setup, read-only too, which the eval never writes. A
+# start at another `folder` is denied: Sonny runs git there outside the
+# sandbox, and a repository an agent made inside the lead's has hooks,
+# config and filters the agent wrote (#597). A trigger's `if` runs
+# outside every sandbox and its `start` makes an agent the eval never
+# configured. A new project, a pane's command, a script, a goal's check
+# and the browser run as the person.
 NATIVE = {
-    'start_task': lambda a: inside(a.get('folder')),
+    'start_task': lambda a: 'folder' not in a,
     'remove_task': lambda a: True,
     'subscriptions': lambda a: True,
     'triggers': lambda a: not (isinstance(a.get('add'), dict) and {'if', 'start'} & set(a['add'])),
