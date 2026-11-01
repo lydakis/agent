@@ -245,9 +245,10 @@ struct Options {
     window_place: Option<String>,
     /// Which of the folder's leads to open, with no `--agent`.
     lead: project::Pick,
-    /// The person's first message to the agent `/new` made, sent once
-    /// this window is set up.
-    send: Option<String>,
+    /// The file holding the person's first message to the agent `/new`
+    /// made, sent once this window is set up: a file, as a message can
+    /// be longer than one argument may.
+    send: Option<PathBuf>,
 }
 
 fn usage() -> String {
@@ -767,7 +768,7 @@ fn parse() -> Result<Options, String> {
             // Unlisted: how `/switch` hands the window's place on.
             "--window-place" => window_place = Some(value()?),
             // Unlisted: how `/new` hands the agent it made its first message.
-            "--send" => send = Some(value()?),
+            "--send-file" => send = Some(PathBuf::from(value()?)),
             _ => return Err(usage()),
         }
     }
@@ -800,7 +801,7 @@ fn reopen(bot: &str) -> Vec<String> {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--new" => {}
-            "--workspace" | "--lead" | "--agent" | "--window-place" | "--send" => {
+            "--workspace" | "--lead" | "--agent" | "--window-place" | "--send-file" => {
                 args.next();
             }
             "--new-lead" => {
@@ -1256,13 +1257,42 @@ async fn run() -> Result<(), String> {
         if let Some(place) = place {
             args.extend(["--window-place".into(), mux::Place::encode(&place)]);
         }
-        if let Some(first) = app.send_after.take() {
-            args.extend(["--send".into(), first]);
+        let first = app.send_after.take();
+        if let Some(first) = &first {
+            args.extend(["--send-file".into(), first.display().to_string()]);
         }
         let error = std::process::Command::new(me).args(&args).exec();
+        if let Some(first) = &first {
+            let _ = std::fs::remove_file(first);
+        }
         return Err(format!("could not open {other}: {error}"));
     }
     result
+}
+
+/// Keeps `brief`, a new lead's first message, in a file of the person's
+/// own beside `store` for its window to send: its path.
+fn first_message(store: &std::path::Path, brief: &str) -> Result<PathBuf, String> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let nanos = (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH))
+        .map_or(0, |since| since.as_nanos());
+    let mut path = store.as_os_str().to_owned();
+    path.push(format!(".first-{}-{nanos}", std::process::id()));
+    let path = PathBuf::from(path);
+    let written = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+        .and_then(|mut file| file.write_all(brief.as_bytes()));
+    match written {
+        Ok(()) => Ok(path),
+        Err(error) => {
+            let _ = std::fs::remove_file(&path);
+            Err(format!("{}: {error}", path.display()))
+        }
+    }
 }
 
 /// Whether `event` is the person using this window: a key, a click, a
@@ -2444,9 +2474,9 @@ struct App {
     agents: Option<switch::Picker>,
     /// `/new`, its lists over the composer, then its first message in it.
     making: Option<new::Making>,
-    /// The first message for the agent this window becomes, which its
-    /// window sends once set up.
-    send_after: Option<String>,
+    /// The file with the first message for the agent this window becomes,
+    /// which its window sends once set up.
+    send_after: Option<PathBuf>,
     /// Ctrl+R: the prompts sent before, narrowed by what is typed.
     searching: Option<Search>,
     /// `/config`, open over the composer.
@@ -3667,13 +3697,22 @@ impl App {
         }
         self.configure().await;
         self.tell_upgrades().await;
-        // The first message `/new` was given, sent as the person wrote it.
-        // A message as it is, never a command or a shell line typed anew.
-        if let Some(first) = self.options.send.take()
-            && let Err(error) = self.send(first.clone(), None, false, false, &[]).await
-        {
-            self.input.set(&first);
-            self.notice = Some(error);
+        // The first message `/new` was given, sent as the person wrote it:
+        // a message as it is, never a command or a shell line typed anew.
+        if let Some(file) = self.options.send.take() {
+            let first = std::fs::read_to_string(&file);
+            let _ = std::fs::remove_file(&file);
+            match first {
+                Ok(first) => {
+                    if let Err(error) = self.send(first.clone(), None, false, false, &[]).await {
+                        self.input.set(&first);
+                        self.notice = Some(error);
+                    }
+                }
+                Err(error) => {
+                    self.notice = Some(format!("the first message, {}: {error}", file.display()))
+                }
+            }
         }
         let (keys_tx, mut keys) = tokio::sync::mpsc::unbounded_channel();
         // Poll, not a bare read, so the reader ends with the client.
@@ -8235,10 +8274,12 @@ impl App {
     /// starts with `/`, best first, with where the letters typed are in
     /// each: the person's own picks rank first among equal matches.
     fn menu(&self) -> Vec<(&'static str, &'static str, Vec<usize>)> {
-        // A command brought back with Up is walked past, not picked.
+        // A command brought back with Up is walked past, not picked; a
+        // new agent's first message is words as written.
         if !self.input.starts_with('/')
             || self.input.contains(char::is_whitespace)
             || self.recall.showing(&self.input)
+            || self.new_brief()
         {
             return Vec::new();
         }
@@ -10945,7 +10986,13 @@ impl App {
             return;
         };
         let made = match place {
-            None => {
+            None => 'lead: {
+                // Its own window sends the first message, as the person
+                // wrote it, from a file kept before anything is made.
+                let file = match first_message(&self.store(), &brief) {
+                    Ok(file) => file,
+                    Err(error) => break 'lead Err(error),
+                };
                 // The project's own role is noted nowhere, so the lead
                 // follows the project when it changes.
                 let chosen = (!profile.default).then(|| profile.name.clone());
@@ -10961,11 +11008,13 @@ impl App {
                         {
                             self.notice = Some(format!("{} runs as {chosen}: {error}", lead.bot));
                         }
-                        // Its own window sends it, as the person wrote it.
-                        self.send_after = Some(brief);
+                        self.send_after = Some(file);
                         Ok(lead.bot)
                     }
-                    Err(error) => Err(error),
+                    Err(error) => {
+                        let _ = std::fs::remove_file(&file);
+                        Err(error)
+                    }
                 }
             }
             Some(place) => {
@@ -13106,6 +13155,24 @@ mod tests {
         assert!(app.boost.is_none() && app.notice.is_none());
     }
 
+    #[test]
+    fn a_new_leads_first_message_is_kept_in_a_file_of_the_persons_own() {
+        use std::os::unix::fs::PermissionsExt;
+        let store = std::env::temp_dir().join(format!("sonny-first-{}", std::process::id()));
+        // Longer than one argument may be.
+        let brief = "x".repeat(200_000);
+        let file = first_message(&store, &brief).unwrap();
+        assert!(
+            file.display()
+                .to_string()
+                .starts_with(&store.display().to_string())
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), brief);
+        let mode = std::fs::metadata(&file).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        std::fs::remove_file(&file).unwrap();
+    }
+
     #[tokio::test]
     async fn new_asks_the_profile_then_where_a_worker_works_then_its_first_message() {
         let client = daemon_answering(|_| json!({})).await;
@@ -13165,6 +13232,10 @@ mod tests {
             rows[0].to_string().contains("What should it do?"),
             "{rows:?}"
         );
+        // Words as written: no command offered for a slash.
+        app.input.set("/com");
+        assert!(app.menu().is_empty());
+        app.input.clear();
         // The lead's approval keys are letters of the message here.
         app.approvals
             .push(json!({"name": "shell", "arguments": {"command": "ls"}}));

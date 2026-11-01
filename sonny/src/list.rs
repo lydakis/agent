@@ -218,6 +218,10 @@ impl Picker {
             if let Some(picks) = &mut self.picks {
                 picks.pick_now(&name);
             }
+            // Ranked higher now, the row taken stays the one picked.
+            if let Some(now) = self.shown().iter().position(|(row, _)| *row == at) {
+                self.pick = now;
+            }
         }
     }
 
@@ -373,6 +377,23 @@ mod tests {
         assert_eq!(list.event(&key(KeyCode::Enter)), Act::Stay);
         assert_eq!(list.event(&key(KeyCode::Esc)), Act::Close);
         assert_eq!(list.event(&key(KeyCode::Left)), Act::Other);
+    }
+
+    #[test]
+    fn the_row_taken_stays_picked_as_its_pick_ranks_it_higher() {
+        use ratatui::crossterm::event::KeyCode;
+        let rows = vec![
+            ("shop.a".into(), String::new()),
+            ("shop.b".into(), String::new()),
+        ];
+        let mut list = Picker::new(rows, 0).weighed(crate::fuzzy::Picks::default());
+        list.narrow("shop".into());
+        list.event(&key(KeyCode::Down));
+        assert_eq!(list.chosen(), Some(1));
+        assert_eq!(list.event(&key(KeyCode::Enter)), Act::Take(1));
+        list.took();
+        assert_eq!(list.shown()[0].0, 1, "ranked first now");
+        assert_eq!(list.chosen(), Some(1));
     }
 
     #[test]
