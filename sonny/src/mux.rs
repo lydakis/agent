@@ -117,7 +117,7 @@ pub enum Placement {
 /// own, as a VS Code editor never does, and closing it would take new
 /// work out of view before they saw it. It stays, and while only such
 /// windows could make room a new task's window does not open, until the
-/// person asks for it.
+/// person asks for it or its task comes to need them.
 pub struct Room {
     /// Task windows at most, 0 for no limit.
     pub most: usize,
@@ -916,6 +916,12 @@ impl Layout {
         Ok(Shown::Opened(closed))
     }
 
+    /// The tasks whose window this layout set aside, and where a lead
+    /// keeps them across a restart, for [`Worker::aside`].
+    fn asides(&self) -> (HashSet<String>, Option<Aside>) {
+        (self.aside.clone(), self.kept.clone())
+    }
+
     /// Whether the task's window was closed for room.
     pub fn aside(&self, bot: &str) -> bool {
         self.aside.contains(bot) || self.kept.as_ref().is_some_and(|kept| (kept.was)(bot))
@@ -1190,6 +1196,9 @@ pub struct Worker {
     home: String,
     here: bool,
     places: Arc<Mutex<Places>>,
+    /// The tasks whose window was set aside for room, as the last batch
+    /// of work left them.
+    aside: Arc<Mutex<(HashSet<String>, Option<Aside>)>>,
 }
 
 impl Worker {
@@ -1197,6 +1206,8 @@ impl Worker {
         let (work, queue) = mpsc::channel::<Work>();
         let places = Arc::new(Mutex::new(Places::new()));
         let kept = places.clone();
+        let aside = Arc::new(Mutex::new(layout.asides()));
+        let asides = aside.clone();
         let (home, here) = (layout.home(), layout.here());
         std::thread::spawn(move || {
             let mut layout = layout;
@@ -1219,6 +1230,9 @@ impl Worker {
                         *places = read;
                     }
                 }
+                if let Ok(mut aside) = asides.lock() {
+                    *aside = layout.asides();
+                }
             }
         });
         Self {
@@ -1226,7 +1240,16 @@ impl Worker {
             home,
             here,
             places,
+            aside,
         }
+    }
+
+    /// Whether the task's window was set aside for room, as the work sent
+    /// so far left it: closed for room, or not opened for want of it.
+    pub fn aside(&self, bot: &str) -> bool {
+        self.aside.lock().is_ok_and(|aside| {
+            aside.0.contains(bot) || aside.1.as_ref().is_some_and(|kept| (kept.was)(bot))
+        })
     }
 
     /// Run `job` on the layout, after those sent before it.
