@@ -165,8 +165,12 @@ says no ends, listed as not sent.
 `--runs N` ends the automation once N messages went out; a fire after that
 (its end could not unload it) only tries to end it again.
 `--turn-budget-tokens N` submits each message with that turn cap, so one
-runaway fire fails with `turn_budget_exhausted` instead of spending the
-agent's whole lifetime budget. Each message the
+runaway run fails with `turn_budget_exhausted` instead of spending the
+agent's whole lifetime budget. The cap counts every request's input, the
+agent's history included, so the tool and the skill tell agents to set one
+only when the person asks for a spending limit: in the 11-01 eval every
+agent that capped its own job (4k to 12k tokens) saw its first run fail on
+29k to 42k of history. Each message the
 agent gets starts with one line, `[automation NAME · YYYY-MM-DD HH:MM · why]`,
 the local fire time and what fired it (its time, `file PATH`, `commit REPO
 at SHA`, or `fired`), so a

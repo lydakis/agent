@@ -374,7 +374,9 @@ fn automations() -> Value {
                                 exits 0, so a check that finds nothing costs no turn."},
                         "runs": {"type": "integer", "minimum": 1, "description": "Ends it after N messages."},
                         "turn_budget_tokens": {"type": "integer", "minimum": 1,
-                            "description": "A cap on each turn a run starts."},
+                            "description": "A cap on the tokens of each turn a run starts, counting every request's \
+                                input with the agent's history, so a cap below that history fails every run \
+                                before it starts. Set one only when the person asks for a spending limit."},
                         "shadow": {"type": "boolean",
                             "description": "A dry run, as when moving a job from elsewhere onto an automation: \
                                 each run goes to a read-only copy of the agent, where anything past \

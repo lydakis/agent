@@ -98,7 +98,9 @@ and returns its `outcome` and the `handle` of the turn it sent, to pass to
 `wait`; it says `pending` when the run has not said within 90 seconds.
 
 An automation's `turn_budget_tokens` caps each run on its own, and a run past
-it fails with `turn_budget_exhausted`.
+it fails with `turn_budget_exhausted`. It counts every request's input, the
+agent's history included, so a cap below that history fails every run
+before it starts: set one only when the person asks for a spending limit.
 
 ## Monitors
 
