@@ -487,14 +487,18 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
             command.args(["--created-by", lead]);
         }
     }
+    // The brief goes in on stdin, never as an argument: Linux refuses an
+    // argument of 128 KiB or more, and a pasted brief can be longer.
     let output = command
         .args(["--bot", name, "--workspace"])
         .arg(&place.dir)
         .args(flags)
-        .arg("--")
-        .args(&brief)
-        .stdin(Stdio::null())
-        .output();
+        .args(["--", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .and_then(|child| given(child, brief.join(" ")));
     let output = match output {
         Ok(output) if output.status.success() => output,
         Ok(output) => {
@@ -612,6 +616,23 @@ fn branch_name(name: &str) -> bool {
             .stderr(Stdio::null())
             .status()
             .is_ok_and(|status| status.success())
+}
+
+/// What `child` makes of `input` on its stdin, written from a thread of
+/// its own so a child that answers before reading it all never waits on
+/// this one.
+fn given(mut child: std::process::Child, input: String) -> std::io::Result<std::process::Output> {
+    use std::io::Write;
+    let writer = (child.stdin.take()).map(|mut stdin| {
+        std::thread::spawn(move || {
+            let _ = stdin.write_all(input.as_bytes());
+        })
+    });
+    let output = child.wait_with_output();
+    if let Some(writer) = writer {
+        let _ = writer.join();
+    }
+    output
 }
 
 /// The store of the daemon a task is started on, beside which its profile
@@ -2212,6 +2233,23 @@ mod tests {
             Some(agent_client::socket::canonical_store(&store).unwrap())
         );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_brief_longer_than_an_argument_may_be_reaches_the_task() {
+        // Past Linux's 128 KiB for one argument.
+        let brief = "word ".repeat(40_000);
+        let child = Command::new("wc")
+            .arg("-c")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let output = given(child, brief.clone()).unwrap();
+        assert!(output.status.success());
+        let counted = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(counted.trim(), brief.len().to_string());
     }
 
     #[test]

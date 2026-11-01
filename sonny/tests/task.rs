@@ -33,7 +33,7 @@ impl Lab {
         std::fs::write(
             &agent,
             "#!/bin/sh\ncase \"$1\" in\n\
-             run) printf '%s\\n' \"$@\" > \"$AGENT_LOG\"; [ -z \"$AGENT_FAIL\" ] || exit 1; echo '{\"handle\":\"h\"}';;\n\
+             run) for a in \"$@\"; do if [ \"$a\" = - ]; then cat; echo; else printf '%s\\n' \"$a\"; fi; done > \"$AGENT_LOG\"; [ -z \"$AGENT_FAIL\" ] || exit 1; echo '{\"handle\":\"h\"}';;\n\
              ls) cat \"$AGENT_LOG.ls\" 2>/dev/null || echo '[]';;\n\
              rm) printf '%s\\n' \"$@\" > \"$AGENT_LOG.rm\";;\n\
              fork) printf '%s\\n' \"$@\" > \"$AGENT_LOG.fork\";;\nesac\n",
@@ -738,9 +738,16 @@ fn a_task_forked_from_another_s_turn_gets_its_files_then_in_a_worktree_of_its_ow
             &workspace
         ]
     );
+    // One prompt on stdin, as `run` joins its words: the copy's note,
+    // then the brief.
     assert_eq!(ran[6], "--");
     assert!(ran[7].contains(&format!("in '{workspace}'")), "{}", ran[7]);
-    assert_eq!(ran[8], "try another way");
+    assert!(
+        ran[7].ends_with(". Work only there. try another way"),
+        "{}",
+        ran[7]
+    );
+    assert_eq!(ran.len(), 8);
     let read = |name: &str| std::fs::read_to_string(copy.join(name)).unwrap();
     assert_eq!(read("src/lib.rs"), "three\n");
     assert_eq!(read("src/new.rs"), "made\n");
