@@ -107,7 +107,7 @@ pub fn default_tools(
 
 /// The socket protocol's version in `ready`. The daemon and its clients ship
 /// together, so a client refuses a daemon of any other version.
-pub const PROTOCOL: u64 = 34;
+pub const PROTOCOL: u64 = 38;
 
 /// Variables naming the terminal a daemon was started in: a terminal
 /// multiplexer's place. A client starting the daemon leaves them out of its

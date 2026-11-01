@@ -390,10 +390,11 @@ bound; the operating system is then the only limit.
 | Flag | Bounds | Default |
 | --- | --- | --- |
 | `--max-processes` | Child processes running at once, foreground or background. Waiting never counts. | 64 per logical CPU |
-| `--max-detached` | Detached shell commands still running, daemon-wide; exited ones are reaped and stop counting. Zero is unbounded. | 16 |
+| `--max-lasting` | Processes that outlive their call, still running, daemon-wide: terminals and detached shell commands together. A terminal holds its slot until its whole session is gone, a detached command until it is reaped. Zero is unbounded. | 4 per logical CPU |
 | `--max-active` | Turns with a live task: a model call in flight or a foreground tool. Parked turns never count. | 4,096 |
 | `--max-pending` | Submissions waiting to start: queued behind a bot's own work or ready for a slot, daemon-wide. A submission that would wait past the bound answers `pending_limit` and writes nothing; one that starts at once is never refused by it. | none |
 | `--max-pending-bytes` | UTF-8 bytes of those waiting submissions: their prompts and the words they quote, which wait with them. | none |
+| `--max-input-bytes` | Bytes of request lines every session together has read and the daemon has not yet taken up. A line is read on credit for its first 4 KiB, and one that goes on waits for credit for the longest line (8 MiB) at once and gives back what it did not use, so readers never each hold part of what they need; an eighth of the bound is kept for lines that end within 4 KiB, so interrupts, renewals and status reads get in while long submits wait. At least one longest line and its reserve. Zero is unbounded. | a sixteenth of physical memory, at least 64 MiB |
 | `--max-readers` | Store reader connections, each on its own thread, for the reads clients ask for that decide nothing ([observation reads](#observation-reads)), which take all but one, and for turns' own reads. At least 1. | one per logical CPU |
 | `--max-connecting` | Provider requests awaiting response headers, a Bedrock Runtime call's body digest included. Established streams are not capped. Both providers hold headers until the first token, so a permit is held for the whole time to first token; a bound of N caps throughput at N calls per first-token latency. | none |
 | `--stall-timeout` | How long an established provider stream may go without a content frame before the attempt fails as `provider_stream_stalled` and is retried. Keepalives do not count. Whole seconds, `1s` to `24h`. | `2m` |
@@ -427,7 +428,7 @@ keep-warm when it sets any of them.
 | `compact_tokens` (`--compact-tokens`) | Input tokens per request that start elision and compaction too, whichever of this and `compact_at` comes first (see [compaction](#compaction)). 0 leaves only `compact_at`; otherwise at least 1,024. | from the model's context window |
 | `max_rounds` (`--max-rounds`) | Model calls each turn may make; the last goes with no tool call allowed, and the turn fails `tool_round_limit` past it. | none |
 | `keep_turns` (`--keep-turns`) | After each of its turns finishes, prune the bot to this many turns' records (see [Retention](#retention)). | none |
-| `approval_hold_ms` (`--approval-hold`) | Milliseconds a gated call waits live for its verdict before its turn parks (see [tool approval](#tool-approval)). 0 parks at once; at most 3,600,000. | 2,000 |
+| `approval_hold_ms` (`--approval-hold`) | Milliseconds a gated call waits live for its verdict before its turn parks (see [tool approval](#tool-approval)), and a terminal read waits live for its output before its turn parks. 0 parks at once; at most 3,600,000. | 2,000 |
 | `max_output_tokens` (`--max-output-tokens`) | Generated tokens per model call, including reasoning, summaries included. Anthropic calls use the model's full output limit (read inside Bedrock ids) unless this is set; set, it is sent as `max_tokens`, at least 2,048 so a legacy thinking budget of 1,024 or more fits beside the answer. Bedrock deducts input plus this bound from quota when a call starts, so a bound near real output buys throughput there. | none |
 | `keep_warm` (`--keep-warm`) | Seconds an Anthropic prompt cache may sit unread while a turn runs a tool before it is refreshed (see [keeping the cache warm](#keeping-the-anthropic-cache-warm)). Below 300; 0 never refreshes. | 240 |
 | `cache_ttl` (`--cache-ttl`) | Anthropic prompt-cache lifetime, `5m` or `1h`, on every cache marker of a request: the instructions', the request's own, and the pinned compaction summary's and note's, since the API refuses a longer lifetime after a shorter one. `1h` bills each write at twice the input rate instead of 1.25 times and sends no refreshes. Responses providers are unaffected. Bedrock takes `1h` for Claude 4.5 and later and may refuse it for older Claude (its prompt-caching guide, read 2026-10-28), so calls to older Claude there keep five minutes whatever this says, also after `configure` switches a bot to one. A bot whose summarizer or fallback is such a model keeps five minutes on every call, since those calls carry the same pinned blocks. `inspect` reports a lifetime never set as `null`, so a client's own default can tell it from `5m` someone chose. | unset (`5m`) |
@@ -519,7 +520,9 @@ once on a 401 or 403, which retries the call as `provider_login_refreshed`.
 A 401 or 403 whose `x-amzn-ErrorType` is one of the AWS SDKs' clock-skew
 codes (`RequestExpired`, `InvalidSignatureException` and the rest), as for
 a request signed before the machine slept, retries at once as
-`provider_signature_expired`, signed again with the time now.
+`provider_signature_expired`, signed again with the time now. So does any
+other 401 or 403 whose `Date` header is more than four minutes from when
+the request was signed, the AWS SDK for Java's skew rule.
 Bedrock URLs must be https; the key id, secret and session token are
 redacted from tool output and, from the environment, kept out of shells, as
 are the `AWS_PROFILE`, `AWS_DEFAULT_PROFILE`, `AWS_REGION` and
@@ -1041,21 +1044,48 @@ start a second daemon for the same socket: they refuse a newer one, and
 replace an older one once its running turns end (docs/CLI.md).
 
 `agent shutdown` returns once the daemon process has exited, so a caller may
-copy or reopen the store: the daemon answers the request first, then cancels
-active turns, commits their records and closes the database. The `ready` line
+copy or reopen the store: the daemon answers the request first, then parks
+running turns, commits their records and closes the database. The `ready` line
 carries the daemon's `pid` for this. The command fails with
 `daemon_shutdown_timeout` after 30 seconds.
 
 `shutdown` takes an optional `grace_ms`, up to 86,400,000. With it the daemon
-answers, then drains: running turns go on for up to that long and no turn
-starts. A `reject` submission answers `daemon_draining`; `queue` and `steer`
+answers, then drains: no turn starts, and each running turn starts no further
+model call or tool call. A turn whose model is answering finishes when that
+answer ends it; otherwise it parks at its next boundary, once the model's
+answer and every call already running have committed. Calls the answer made
+that had not started are answered `daemon_shutdown`, saying they did not run.
+A `reject` submission answers `daemon_draining`; `queue` and `steer`
 submissions are recorded as usual, and queued work starts on the next daemon
 start. Parked and paced turns stay parked, as on any shutdown. `stats` reports
 `draining: true`. The daemon exits when no turn is running or the deadline
 passes, whichever comes first. A later `shutdown` can only bring the deadline
-closer; SIGTERM and SIGINT still exit at once. Turns still running at exit are
-cancelled like any others at shutdown. `agent shutdown --grace DURATION` sends
+closer; SIGTERM and SIGINT still exit at once. `agent shutdown --grace DURATION` sends
 it and waits that much longer than 30 seconds.
+
+Whatever still runs when the daemon exits (the deadline passed, no grace was
+given, or a signal came) parks as a pull parks it, and the next start
+continues it, as capacity allows and with no `resume`: `turn_paced` says
+`{"resume_at_ms": null, "stopped": true}`, and so does the turn view's
+`waiting_on`. The reply it was writing is dropped and asked for again then.
+Each call it had not answered gets `{error: "daemon_shutdown", detail}`,
+saying the stop cut it off before its result was recorded (it may have had
+effects) or came before it ran, and none is run again; the first's
+`tool_completed` says `outcome_unknown`, the second's `cancelled`, as a pause
+says them. A call waiting for its verdict as the drain begins does not
+start, even if allowed then, and a model call that failed sends no retry:
+the turn parks, and its retry count starts over when it continues. No
+prompt-cache refresh goes out during a drain either. The time the daemon
+was down is not counted in `paced_ms`. A client's `wait` still open is
+answered as its deadline would answer it, the parked turn reported pending
+as it stands. Background commands and terminals end with the daemon as
+before. Only a planned stop parks: a daemon that exits on a fatal error ends
+its running turns `interrupted` with `process_interrupted`, as a crash would,
+and leaves its waits unanswered. A park says which halt held it in the
+turn's `waiting` record (`halt`: `pause` or `shutdown`); schema 74 moves a
+pull's park from its own flag to that. Protocol 36 parks turns on a stop; before it, they ended
+`interrupted` with `daemon_shutdown`. A daemon older than 36 still ends them
+that way when an upgrade replaces it.
 
 Protocol 24 also adds the pull cord: `pause` stops every agent until
 `resume`, and holds across restarts, since the store keeps it (schema 64;
@@ -1890,10 +1920,13 @@ named bot, and no external request or tool is automatically repeated. Existing
 queued work remains eligible to start. Explicitly stopped turns stay stopped.
 
 An interrupted turn's `turn_finished` error names the cause, so a client can
-decide whether to resubmit: `cancelled` for a client's `interrupt`,
-`daemon_shutdown` when the daemon shut down around it (`shutdown` or a
-signal), and `process_interrupted` when the daemon died with it running and the
-next open ended it. The daemon never continues such a turn on its own.
+decide whether to resubmit: `cancelled` for a client's `interrupt`
+and `process_interrupted` when the daemon died with it running and the next
+open ended it, or stopped on a fatal error, such as a store that refuses
+writes, and ended it on the way out. The daemon never continues such a turn on its own. A turn the
+daemon was asked to stop around (`shutdown` or a signal) is not interrupted:
+it parks as a pause parks it, each call still open answered `daemon_shutdown`,
+and continues at the next start; the time down is not pacing.
 
 `inspect` reports the identity's state and changes nothing; no operation
 automatically continues an interrupted network request. A new submission is an
@@ -2100,10 +2133,12 @@ prompt nodes alone, so deleting the source bot does not remove a surviving
 fork's previews. Turn numbers are ordinals along the lineage
 (`turn_seq`, stored on each turn's first item and indexed), so a fork's numbering
 continues its source's. The `history` tool returns one turn's prompt, replies,
-tool calls, and results as provider JSONL with only the top-level
-`encrypted_content` field removed from reasoning items. Reasoning records and
-readable summaries remain, as do Anthropic thinking and signatures. Stored
-items, raw `history_items` reads, forks, and provider replay remain unchanged.
+tool calls, and results as provider JSONL without the opaque state a provider
+hands back only to be replayed: the top-level `encrypted_content` of reasoning
+items, a thinking block's `signature`, a redacted thinking block's `data`, and
+a web search result's `encrypted_content`. Reasoning records, readable
+summaries and thinking text remain. Stored items, raw `history_items` reads,
+forks, and provider replay remain unchanged.
 With `bot`, it reads another agent's turn the same way, numbered along that
 agent's lineage and as it stands, a running turn included; with `bot` and no
 `turn`, it lists that agent's newest 20 turns, newest first, each with its
@@ -2372,9 +2407,11 @@ for it, since such a file would hold output that never passed credential
 redaction; a command that wants its output redirects it to a file itself. No process slot, timeout, group kill, or
 handle applies to it, so it outlives the turn and the daemon and is outside
 `--max-processes`; stopping it is the bot's job. What does bound it is
-`--max-detached`: each detached child retains a slot until its async waiter
-reaps it on exit, and a new detach refuses with `detached_limit` while all
-slots are held. It exists because Terminal-Bench
+`--max-lasting`, shared with terminals as a systemd slice holds a
+service's processes: each detached child retains a slot until its async
+waiter reaps it on exit, and a new detach or terminal refuses with
+`lasting_limit`, naming how many terminals and detached commands hold the
+slots, while all are held. Nothing waits in line for one. It exists because Terminal-Bench
 tasks that leave a server for the grader failed when the server died with its
 command. `tty: true` runs the command in a terminal instead, for a REPL or a
 program that prompts, as Codex's `exec_command` does: the command gets a
@@ -2384,12 +2421,27 @@ with a `proc:N` handle while it runs. `write_stdin` types into that handle
 (`chars`, with a control key as its character, such as `\u0003` for Ctrl-C)
 and returns what the command wrote since the last read, after waiting
 `yield_time_ms` (250 ms after typing, 5 s when only reading); `kill: true` ends
-the command's process group. Output merges stdout and stderr, as a terminal
+the command's process group. A read that waits longer than the bot's
+`approval_hold_ms` waits live only for that hold; then its turn parks as
+`wait` parks on the terminal's handle, holding no task and no active slot,
+until the command ends or the read's time runs out, and the read's result is
+what the command wrote meanwhile. A steer waiting for the boundary keeps the
+read live. Output merges stdout and stderr, as a terminal
 does, keeps its last 64 KiB unread, counting what it drops, and is redacted
-like any other. A terminal takes no process slot and no timeout: it runs until
+like any other; a secret field's value, cut off at the end of a read, waits
+for the next one so it is redacted whole, while its name and separator are
+shown at once, so a prompt such as `Password: ` reaches the bot, and the
+next read is redacted as read after them. A
+terminal takes no process slot and no timeout: it runs until
 it exits or is killed, across turns, and `wait` on its handle reports how it
-ended, with what no write read. Each bot keeps at most 16; starting another
-kills the one it used least recently, as Codex prunes its sessions. Only the
+ended, with what no write read. It takes a `--max-lasting` slot before it
+starts and keeps it until its whole session is gone: a kill ends the
+command's group, the job in the terminal's foreground, and every other
+group in its session (found under `/proc` on Linux and from the process
+list on macOS), so a job a shell with job control started, ignoring
+SIGHUP, does not outlive it. Each bot keeps at most 16; starting another
+first kills the one it used least recently, as Codex prunes its sessions,
+so that one's slot is free for it. Only the
 bot that started a terminal types into it (`terminal_not_running` for any
 other, and for one that ended), and terminals end when the daemon stops. A
 terminal never leaves its bot's sandbox (`tty` with `require_escalated` is
@@ -2459,8 +2511,13 @@ see, and ends a command that makes system calls of another architecture.
 A sandboxed bot's commands reach the daemon through the bot's own socket,
 never the daemon's: so `agent` and the clients built on it work in its shell,
 as that bot and only as far as a sandboxed bot may go. The daemon opens the
-socket, `SOCKET.d/BOT_ID` beside its own, the first time one of the bot's
-commands runs, and closes it when the bot is deleted. On macOS Seatbelt
+socket, `SOCKET.d/BOT_ID` beside its own, when one of the bot's turns
+needs it, and keeps it listening while any of the bot's live turns or
+running commands (foreground, background, detached or a terminal) holds
+it, as systemd's socket activation keeps a unit's socket. Thirty seconds
+after the last one goes, or at once when the bot is deleted, it closes;
+connections it already accepted keep their sessions, and the bot's next
+turn opens it again. So a fleet of idle bots holds no listening sockets. On macOS Seatbelt
 denies the daemon's socket and that folder and allows the bot's own,
 network on or off. On Linux, where the command makes no Unix socket, the
 daemon hands it connections, as a broker does: `AGENT_SOCKET_FD` names a

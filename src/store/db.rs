@@ -836,10 +836,16 @@ pub struct Waiting {
     /// pool resumes there.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback: Option<ParkedFallback>,
-    /// Parked by the pull cord, not a closed pool: it waits for `resume`,
-    /// and the pause is not charged as pacing.
+    /// Parked by the pull cord, until `resume`, or by the daemon stopping,
+    /// until the next start, not by a closed pool: that time is not charged
+    /// as pacing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub halt: Option<Halt>,
+    /// The wait is a terminal poll, an empty `write_stdin` past its hold:
+    /// `handles` names the terminal, and its result is the terminal's
+    /// output when it ends or its yield runs out.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub pulled: bool,
+    pub poll: bool,
 }
 /// A declined request's fallback model, as `provider/model`, and the credit
 /// its retry redeems.
@@ -865,7 +871,7 @@ pub struct CopiedCall {
 impl Waiting {
     fn paced_elapsed_ms(&self) -> i64 {
         self.paced_since_ms
-            .filter(|_| !self.pulled)
+            .filter(|_| self.halt.is_none())
             .map_or(0, |since| epoch_ms().saturating_sub(since).max(0))
     }
 }
@@ -1063,9 +1069,18 @@ impl ApprovalPage {
         Ok(true)
     }
 }
-/// What a pull did to a running turn.
+/// What parks a running turn that its own rounds did not: the pull cord,
+/// which holds it until `resume`, or the daemon stopping, which leaves it
+/// for the next start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Halt {
+    Pause,
+    Shutdown,
+}
+/// What a pull or a stop did to a running turn.
 #[derive(Debug)]
-pub enum Pulled {
+pub enum Halted {
     /// Parked it, with these entries.
     Parked(Vec<Value>),
     /// Found it parked already, by its own park that committed as the pull
@@ -1507,7 +1522,7 @@ const TURN_VIEW: &str = "t.id,t.bot,b.id,t.request_id,t.status,t.input_tokens,
     t.finished_ms,json_extract(t.waiting,'$.call_id'),json_extract(t.waiting,'$.approval'),
     json_extract(t.waiting,'$.handles'),json_extract(t.waiting,'$.any'),
     json_extract(t.waiting,'$.deadline_ms'),json_extract(t.waiting,'$.answer'),
-    json_extract(t.waiting,'$.pulled')";
+    json_extract(t.waiting,'$.halt')";
 /// Columns `TURN_VIEW` takes, for queries that select more after it.
 const TURN_VIEW_COLUMNS: usize = 20;
 
@@ -1552,10 +1567,11 @@ fn turn_view(r: &rusqlite::Row) -> rusqlite::Result<Value> {
             json!({"call_id":call_id,"handles":handles,"deadline_ms":deadline_ms,
                 "any":r.get::<_, Option<i64>>(16)? == Some(1)})
         }
-        "paced" if r.get::<_, Option<i64>>(19)? == Some(1) => {
-            json!({"resume_at_ms":null,"paused":true})
-        }
-        "paced" => json!({"resume_at_ms":deadline_ms}),
+        "paced" => match r.get::<_, Option<String>>(19)?.as_deref() {
+            Some("pause") => json!({"resume_at_ms":null,"paused":true}),
+            Some("shutdown") => json!({"resume_at_ms":null,"stopped":true}),
+            _ => json!({"resume_at_ms":deadline_ms}),
+        },
         _ => Value::Null,
     };
     Ok(json!({"bot":bot,"bot_id":r.get::<_, i64>(2)?,"turn":turn,
@@ -1741,7 +1757,7 @@ impl Database {
     /// Stored schema version, kept in `PRAGMA user_version`. Stores created
     /// before versioning and stores from newer binaries are rejected; an older
     /// versioned store is migrated forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 73;
+    pub const SCHEMA: i32 = 74;
     /// Verbatim user prompts a compaction keeps: per-prompt text, and the
     /// total text plus `(ordinal, String)` entry metadata. Empty entries cost
     /// space too, so the retained list cannot grow with conversation length.
@@ -4867,8 +4883,8 @@ impl Database {
     }
 
     /// Page a reading view of provider items as JSONL by byte offset in that
-    /// view. Only reasoning.encrypted_content is omitted; stored items and
-    /// provider replay remain unchanged.
+    /// view. Only the opaque state a provider replays is omitted (see
+    /// `READING_ITEM`); stored items and provider replay remain unchanged.
     /// Pages end at UTF-8 boundaries and may split a JSON record. Concatenate
     /// their text before decoding; no content is replaced with previews.
     /// A bot's newest `limit` conversation turns, newest first, as its
@@ -6754,7 +6770,8 @@ impl Database {
             copied: None,
             summary_retry_ms,
             fallback: None,
-            pulled: false,
+            halt: None,
+            poll: false,
         };
         let tx = self.conn.savepoint()?;
         flush(&tx, turn, self.live.get(&turn))?;
@@ -6897,7 +6914,8 @@ impl Database {
             copied: None,
             summary_retry_ms,
             fallback: None,
-            pulled: false,
+            halt: None,
+            poll: false,
         };
         let tx = self.conn.savepoint()?;
         flush(&tx, turn, self.live.get(&turn))?;
@@ -8560,6 +8578,32 @@ impl Database {
         route: Option<&str>,
         summary_retry_ms: Option<u64>,
     ) -> Result<Value> {
+        self.suspend_wait(
+            turn,
+            call_id,
+            handles,
+            deadline_ms,
+            any,
+            pending,
+            route,
+            summary_retry_ms,
+            false,
+        )
+    }
+    /// `suspend`, for a terminal poll when `poll` is set.
+    #[allow(clippy::too_many_arguments)]
+    pub fn suspend_wait(
+        &mut self,
+        turn: i64,
+        call_id: &str,
+        handles: &[String],
+        deadline_ms: Option<u64>,
+        any: bool,
+        pending: &[ToolCall],
+        route: Option<&str>,
+        summary_retry_ms: Option<u64>,
+        poll: bool,
+    ) -> Result<Value> {
         let bot = self.active(turn)?;
         let executing: bool = self.conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM tools WHERE turn=? AND call_id=? AND status='executing')",
@@ -8587,7 +8631,8 @@ impl Database {
             copied: None,
             summary_retry_ms,
             fallback: None,
-            pulled: false,
+            halt: None,
+            poll,
         };
         let tx = self.conn.savepoint()?;
         // A verdict for a later call of the round waits in the store.
@@ -8644,7 +8689,8 @@ impl Database {
             copied,
             summary_retry_ms,
             fallback,
-            pulled: false,
+            halt: None,
+            poll: false,
         };
         let tx = self.conn.savepoint()?;
         flush(&tx, turn, self.live.get(&turn))?;
@@ -8666,21 +8712,24 @@ impl Database {
         self.forget_live(turn);
         Ok(entry(cursor, &bot.name, Some(turn), "turn_paced", data))
     }
-    /// Park a running turn the pull cord stopped, until `resume`. It is
-    /// parked as a closed pool parks it, at a model-call boundary: each call
-    /// it had not answered gets a result saying the pause stopped it, or
-    /// came before it ran, and none is run again. The reply it was writing
+    /// Park a running turn the pull cord stopped, until `resume`, or one the
+    /// daemon stopping cut off, until the next start. It is parked as a
+    /// closed pool parks it, at a model-call boundary: each call it had not
+    /// answered gets a result saying the pause or the stop cut it off, or
+    /// came before it ran, and none is run again, as Codex answers the
+    /// calls an interrupt cut off. The reply it was writing
     /// is asked for again when it continues. A turn whose own park committed
     /// as the pull cancelled its task stays as it parked: its park comes
     /// back, with its next lapse, for the task to register its wake-ups.
-    pub fn suspend_pulled(
+    pub fn suspend_halted(
         &mut self,
         turn: i64,
+        stop: Halt,
         retries: u64,
         paced_ms: u64,
         summary_ms: u64,
         route: Option<&str>,
-    ) -> Result<Pulled> {
+    ) -> Result<Halted> {
         let bot = self.active(turn)?;
         match bot.status.as_str() {
             "running" => {}
@@ -8689,7 +8738,7 @@ impl Database {
                 let waiting = self
                     .waiting(turn)?
                     .ok_or(Error::new("invalid_tool_state"))?;
-                return Ok(Pulled::Already(Box::new(waiting), self.next_lapse(turn)?));
+                return Ok(Halted::Already(Box::new(waiting), self.next_lapse(turn)?));
             }
             _ => return fail("invalid_tool_state"),
         }
@@ -8701,9 +8750,13 @@ impl Database {
             .query_map([turn], |r| r.get(0))?
             .collect::<rusqlite::Result<_>>()?;
         // Why, who and when; not whose turns it parked.
-        let pause = self
-            .pause()?
-            .map(|p| json!({"reason":p["reason"],"by":p["by"],"at_ms":p["at_ms"]}));
+        let pause = match stop {
+            Halt::Pause => self
+                .pause()?
+                .map(|p| json!({"reason":p["reason"],"by":p["by"],"at_ms":p["at_ms"]})),
+            Halt::Shutdown => None,
+        };
+        // No deadline: the pause's `resume`, or the next start, wakes it.
         let waiting = Waiting {
             turn,
             bot: bot.name.clone(),
@@ -8724,20 +8777,26 @@ impl Database {
             copied: None,
             summary_retry_ms: None,
             fallback: None,
-            pulled: true,
+            halt: Some(stop),
+            poll: false,
         };
         let tx = self.conn.savepoint()?;
         flush(&tx, turn, self.live.get(&turn))?;
         let (head, mut entries) = close_unanswered(&tx, &bot, turn, bot.head, |executing| {
-            let detail = if executing {
-                "the pause stopped this call before its result was recorded; it may have had effects. It is not run again"
-            } else {
-                "the pause came before this call ran; it did not run"
+            let result = match (stop, executing) {
+                (Halt::Pause, true) => json!({"error":"daemon_paused","detail":
+                    "the pause stopped this call before its result was recorded; it may have had effects. It is not run again",
+                    "pause":pause}),
+                (Halt::Pause, false) => json!({"error":"daemon_paused","detail":
+                    "the pause came before this call ran; it did not run","pause":pause}),
+                (Halt::Shutdown, true) => json!({"error":"daemon_shutdown","detail":
+                    "the daemon stopped this call before its result was recorded; it may have had effects. It is not run again"}),
+                (Halt::Shutdown, false) => json!({"error":"daemon_shutdown","detail":
+                    "the daemon stopped before this call ran; it did not run"}),
             };
-            (
-                json!({"error":"daemon_paused","detail":detail,"pause":pause}),
-                false,
-            )
+            // A call cut off while it ran may have had effects: its event
+            // says the outcome is unknown, as its result does.
+            (result, executing)
         })?;
         if head != bot.head {
             // Every call of the round is answered, so the round is closed.
@@ -8760,8 +8819,12 @@ impl Database {
                 })?
                 .collect::<rusqlite::Result<_>>()?;
             for (approval, id, name) in asked {
+                let reason = match stop {
+                    Halt::Pause => "the pause stopped the call",
+                    Halt::Shutdown => "the daemon stopped the call",
+                };
                 let data = json!({"call_id":id,"step_of":call_id,"name":name,"decision":"deny",
-                    "reason":"the pause stopped the call","approvals":[]});
+                    "reason":reason,"approvals":[]});
                 event(&tx, &bot.name, Some(turn), "step_decided", data)?;
                 steps.push(approval);
             }
@@ -8785,7 +8848,10 @@ impl Database {
             ],
         )?;
         tx.execute("UPDATE bots SET status='paced' WHERE name=?", [&bot.name])?;
-        let data = json!({"resume_at_ms":null,"paused":true});
+        let data = match stop {
+            Halt::Pause => json!({"resume_at_ms":null,"paused":true}),
+            Halt::Shutdown => json!({"resume_at_ms":null,"stopped":true}),
+        };
         let cursor = event(&tx, &bot.name, Some(turn), "turn_paced", data.clone())?;
         tx.commit()?;
         self.forget_live(turn);
@@ -8794,7 +8860,7 @@ impl Database {
             self.unstep(approval, true);
         }
         entries.push(entry(cursor, &bot.name, Some(turn), "turn_paced", data));
-        Ok(Pulled::Parked(entries))
+        Ok(Halted::Parked(entries))
     }
     /// Every parked turn, on handles or on a pool, for re-registration after
     /// a restart.
@@ -11563,12 +11629,29 @@ fn keep_quotes(tx: &Connection, turn: i64, quotes: Option<&str>, node: i64) -> R
 /// of a user item or a tool's result without their bytes, each counted in
 /// `omitted_bytes` (a data URL keeps its media type). The model is sent
 /// them whole.
-/// An item as history reads show it: one line, without reasoning's
-/// encrypted content. Applied to `item`, which `PICTURELESS` provides.
+/// An item as history reads show it: one line, without the opaque state
+/// a provider hands back only to be replayed (reasoning's encrypted
+/// content; a thinking block's signature, a redacted one's data, a web
+/// search result's encrypted content). Applied to `item`, which
+/// `PICTURELESS` provides.
 const READING_ITEM: &str = "CASE
     WHEN json_extract(CAST(item AS TEXT),'$.type')='reasoning'
      AND json_type(CAST(item AS TEXT),'$.encrypted_content') IS NOT NULL
     THEN CAST(json_remove(CAST(item AS TEXT),'$.encrypted_content') AS BLOB)
+    WHEN json_extract(CAST(item AS TEXT),'$.role')='assistant'
+     AND json_type(CAST(item AS TEXT),'$.content')='array'
+     AND (instr(item,'\"signature\"')>0 OR instr(item,'\"redacted_thinking\"')>0
+          OR instr(item,'\"encrypted_content\"')>0)
+    THEN CAST(json_set(CAST(item AS TEXT),'$.content',json((SELECT json_group_array(CASE
+        WHEN json_extract(b.value,'$.type')='thinking' THEN json_remove(b.value,'$.signature')
+        WHEN json_extract(b.value,'$.type')='redacted_thinking' THEN json_remove(b.value,'$.data')
+        WHEN json_extract(b.value,'$.type')='web_search_tool_result'
+         AND json_type(b.value,'$.content')='array'
+        THEN json_set(b.value,'$.content',json((SELECT json_group_array(
+            json_remove(r.value,'$.encrypted_content'))
+            FROM json_each(b.value,'$.content') AS r)))
+        ELSE json(b.value) END)
+        FROM json_each(CAST(item AS TEXT),'$.content') AS b))) AS BLOB)
     WHEN instr(item,x'0a')=0 AND instr(item,x'0d')=0 THEN item
     ELSE CAST(json(CAST(item AS TEXT)) AS BLOB) END";
 /// Each subquery's array is passed through `json()`: a value's JSON subtype
@@ -12574,6 +12657,15 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
             );
         }
     }
+    // 73 -> 74: a turn the pull cord parked says so as its halt, beside the
+    // daemon stopping, rather than with a flag of its own.
+    if from < 74 {
+        conn.execute(
+            "UPDATE turns SET waiting=json_set(json_remove(waiting,'$.pulled'),'$.halt','pause')
+             WHERE json_extract(waiting,'$.pulled')=1",
+            [],
+        )?;
+    }
     Ok(())
 }
 /// 53 -> 54: a turn's denial count became a window of its last decided
@@ -13144,6 +13236,50 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_history_read_leaves_out_the_state_a_provider_replays() {
+        let conn = Connection::open_in_memory().unwrap();
+        let read = |item: &str| -> Value {
+            let text: String = conn
+                .query_row(
+                    &format!(
+                        "SELECT CAST({READING_ITEM} AS TEXT) FROM (SELECT CAST(?1 AS BLOB) AS item)"
+                    ),
+                    [item],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(!text.contains('\n'), "{text}");
+            serde_json::from_str(&text).unwrap()
+        };
+        let claude = json!({"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "plan", "signature": "sig".repeat(100)},
+            {"type": "redacted_thinking", "data": "opaque"},
+            {"type": "server_tool_use", "id": "s", "name": "web_search", "input": {"query": "q"}},
+            {"type": "web_search_tool_result", "tool_use_id": "s", "content": [
+                {"type": "web_search_result", "url": "https://example.test", "title": "T",
+                 "encrypted_content": "opaque"}]},
+            {"type": "text", "text": "a \"signature\" in words stays"}]});
+        assert_eq!(
+            read(&serde_json::to_string_pretty(&claude).unwrap()),
+            json!({"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "plan"},
+                {"type": "redacted_thinking"},
+                {"type": "server_tool_use", "id": "s", "name": "web_search", "input": {"query": "q"}},
+                {"type": "web_search_tool_result", "tool_use_id": "s", "content": [
+                    {"type": "web_search_result", "url": "https://example.test", "title": "T"}]},
+                {"type": "text", "text": "a \"signature\" in words stays"}]})
+        );
+        let reasoning = json!({"type": "reasoning", "summary": [], "encrypted_content": "x"});
+        assert_eq!(
+            read(&reasoning.to_string()),
+            json!({"type": "reasoning", "summary": []})
+        );
+        // Anything else reads as it is stored.
+        let user = json!({"role": "user", "content": [{"type": "text", "text": "\"signature\""}]});
+        assert_eq!(read(&user.to_string()), user);
+    }
 
     #[test]
     fn a_cut_patch_still_names_every_file_it_changes() {

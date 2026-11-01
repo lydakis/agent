@@ -2,7 +2,7 @@
 use agent_runtime::{Error, Result, fail_with};
 
 const CONNECTION: &str = "--store --socket";
-const STARTUP: &str = "--provider --max-processes --max-detached --max-active --max-connecting --max-pending --max-pending-bytes --max-readers --stall-timeout --idle-exit";
+const STARTUP: &str = "--provider --max-processes --max-lasting --max-active --max-connecting --max-pending --max-pending-bytes --max-input-bytes --max-readers --stall-timeout --idle-exit";
 
 struct Command {
     name: &'static str,
@@ -170,7 +170,7 @@ const COMMANDS: &[Command] = &[
     },
     Command {
         name: "shutdown",
-        about: "Stop the daemon once running turns end or the grace passes",
+        about: "Stop the daemon; running turns park and the next start continues them",
         usage: "shutdown [--grace DURATION]",
         flags: "--grace --pretty",
         settings: "",
@@ -346,11 +346,18 @@ fn print_flags(flags: &str) {
                 "The tools a fork may call, within its source's; '' allows none; default: the source's",
             ),
             "--max-processes" => ("N", "Concurrent process limit; 0 is unbounded"),
-            "--max-detached" => ("N", "Detached commands still running; 0 is unbounded"),
+            "--max-lasting" => (
+                "N",
+                "Terminals and detached commands still running; 0 is unbounded",
+            ),
             "--max-active" => ("N", "Concurrent active turn limit; 0 is unbounded"),
             "--max-connecting" => ("N", "Concurrent provider startup limit; 0 is unbounded"),
             "--max-pending" => ("N", "Submissions waiting to start; 0 is unbounded"),
             "--max-pending-bytes" => ("N", "Prompt bytes waiting to start; 0 is unbounded"),
+            "--max-input-bytes" => (
+                "N",
+                "Request bytes read ahead of the service; default memory/16; 0 is unbounded",
+            ),
             "--max-readers" => ("N", "Store reader connections; default one per CPU"),
             "--max-output-tokens" => (
                 "N",
@@ -503,7 +510,7 @@ fn print_flags(flags: &str) {
             ),
             "--approval-hold" => (
                 "DURATION",
-                "A new bot's gated calls wait this long for a verdict before the turn parks; default 2s",
+                "A new bot's gated calls wait this long for a verdict, and its terminal reads for output, before the turn parks; default 2s",
             ),
             _ => unreachable!("flag missing help"),
         };

@@ -52,6 +52,28 @@ class ApprovalTests(ModelFixture):
         events = client.request('events', bot=bot, after=0, limit=256)['result']['events']
         return [e['data'] for e in events if e.get('turn') == turn and e['event'] == kind]
 
+    def test_a_call_allowed_during_a_drain_does_not_start(self):
+        # The call waits for its verdict as the drain begins; allowed then,
+        # it still does not run, and the turn parks for the next start.
+        marker = self.path / 'ran'
+        client = self.gated(settings={'approval_hold_ms': 60000})
+        turn = client.request('submit', bot='Bob', request_id='t', prompt=f'shell:touch {marker}')['result']['turn']
+        call_id = self.announced(client, turn)[0]['call_id']
+        self.assertTrue(client.request('shutdown', grace_ms=60_000)['result']['shutting_down'])
+        self.assertEqual(self.answer(client, turn, call_id)['result']['pending'], [])
+        parked = client.receive(lambda e: e.get('event') == 'turn_paced' and e.get('turn') == turn)
+        self.assertEqual(parked['data'], {'resume_at_ms': None, 'stopped': True})
+        self.assertEqual(client.process.wait(timeout=10), 0)
+        self.assertFalse(marker.exists())
+        restarted = self.client('echo,shell,wait')
+        self.addCleanup(lambda: restarted.close(kill=True))
+        self.assertEqual(restarted.finished(turn)['data']['status'], 'completed')
+        completed, output = self.tool_output(restarted, call_id)
+        self.assertEqual((completed['cancelled'], completed['outcome_unknown']), (True, False))
+        self.assertEqual(output['error'], 'daemon_shutdown')
+        self.assertIn('did not run', output['detail'])
+        self.assertFalse(marker.exists())
+
     def test_an_ungated_bot_announces_nothing(self):
         client = self.client('echo,shell')
         created = client.request('create', bot='Bob', workspace=str(self.path))['result']

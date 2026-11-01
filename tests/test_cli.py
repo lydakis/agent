@@ -499,7 +499,7 @@ class SocketAndCliTests(ModelFixture):
                              (('--provider', 'other=responses,http://127.0.0.1:1/v1'), '--provider other: not registered'),
                              (('--provider', f'openai=responses-ws,{self.url}'), 'over websocket but daemon has'),
                              (('--max-processes', '3'), '--max-processes'),
-                             (('--max-detached', '2'), '--max-detached'),
+                             (('--max-lasting', '2'), '--max-lasting'),
                              (('--max-pending', '5'), '--max-pending')):
             refused = attempt(*flags)
             self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
@@ -708,7 +708,7 @@ class SocketAndCliTests(ModelFixture):
         client.verify_followers({'Bob': page})
         self.assertEqual([e['turn'] for e in page['events'] if e['event'] == 'turn_finished'], turns)
 
-    def test_socket_shutdown_delivers_completion_and_wait_result(self):
+    def test_socket_shutdown_parks_the_turn_and_answers_its_waits(self):
         client = SocketClient(self.binary, self.store, self.url, 'echo')
         self.addCleanup(client.close)
         client.request('create', bot='Bob', workspace=str(self.path))
@@ -721,11 +721,12 @@ class SocketAndCliTests(ModelFixture):
         # arrives on the independent control connection.
         follower.request('inspect', bot='Bob')
         client.request('shutdown')
-        # Shutdown, not a client, cancelled the turn: the cause is its error.
-        self.assertEqual(client.finished(turn)['data']['error'], 'daemon_shutdown')
+        # The turn parks for the next start rather than ending, and its wait
+        # is answered as its deadline would answer it: still pending.
+        follower.receive(lambda e: e.get('event') == 'turn_paced' and e.get('turn') == turn)
         result = follower.receive(lambda e: e.get('id') == 'waiter')['result']
-        self.assertEqual(result['results'][handle]['error'], 'daemon_shutdown')
-        self.assertEqual(result['pending'], [])
+        self.assertEqual(result['pending'], [handle])
+        self.assertEqual(result['results'][handle]['waiting_on'], {'resume_at_ms': None, 'stopped': True})
         self.assertEqual(client.process.wait(timeout=2), 0)
 
     def test_the_same_command_resent_gets_what_it_made(self):

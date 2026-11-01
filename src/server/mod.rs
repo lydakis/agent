@@ -578,9 +578,10 @@ enum Command {
         #[serde(default)]
         active: bool,
     },
-    /// Stop the daemon. With `grace_ms`, running turns first get up to that
-    /// long to finish while nothing new starts; whatever still runs is then
-    /// cancelled with `daemon_shutdown`.
+    /// Stop the daemon. With `grace_ms`, it first drains for up to that
+    /// long: nothing starts, and each running turn parks at its next
+    /// boundary. Whatever still runs at exit parks, its unanswered calls
+    /// answered `daemon_shutdown`; the next start continues it.
     Shutdown {
         #[serde(default)]
         grace_ms: u64,
@@ -781,8 +782,8 @@ pub struct Configuration {
     pub providers: Vec<ProviderSpec>,
     /// Concurrent child processes; default 64 per logical CPU; zero unbounded.
     pub max_processes: Option<usize>,
-    /// Detached commands still running, daemon-wide; default 16; zero unbounded.
-    pub max_detached: Option<usize>,
+    /// Terminals and detached commands still running, daemon-wide; default 4 per logical CPU; zero unbounded.
+    pub max_lasting: Option<usize>,
     /// Turns with a live task (model call or foreground tool); default 4,096; zero unbounded.
     pub max_active: Option<usize>,
     /// Provider requests awaiting response headers; unbounded by default,
@@ -793,6 +794,9 @@ pub struct Configuration {
     /// unbounded by default, since waiting work is durable rows.
     pub max_pending: Option<usize>,
     pub max_pending_bytes: Option<usize>,
+    /// Bytes of request lines read and not yet taken up, every session
+    /// together; a sixteenth of physical memory by default; zero unbounded.
+    pub max_input_bytes: Option<usize>,
     /// Store reader connections serving observation reads; one per
     /// logical CPU by default.
     pub max_readers: Option<usize>,
@@ -820,11 +824,12 @@ pub struct Configuration {
 #[derive(Clone, Copy)]
 pub struct Limits {
     pub processes: usize,
-    pub detached: usize,
+    pub lasting: usize,
     pub active: usize,
     pub connecting: usize,
     pub pending: usize,
     pub pending_bytes: usize,
+    pub input_bytes: usize,
     /// Store reader connections; observation reads take all but one, which
     /// is kept for turns' own reads.
     pub readers: usize,
@@ -839,13 +844,16 @@ impl Limits {
         let active = config.max_active.unwrap_or(4096);
         Limits {
             processes: config.max_processes.unwrap_or(64 * cpus),
-            detached: config
-                .max_detached
-                .unwrap_or(agent_runtime::tools::DEFAULT_DETACHED_BUDGET),
+            lasting: config
+                .max_lasting
+                .unwrap_or_else(agent_runtime::tools::default_lasting),
             active,
             connecting: config.max_connecting.unwrap_or(0),
             pending: config.max_pending.unwrap_or(0),
             pending_bytes: config.max_pending_bytes.unwrap_or(0),
+            input_bytes: config
+                .max_input_bytes
+                .unwrap_or_else(session::default_input_bytes),
             readers: config
                 .max_readers
                 .unwrap_or_else(agent_runtime::store::default_readers)
@@ -1117,9 +1125,10 @@ struct Service {
     wakes: Wakes,
     /// The newest steer each parked turn has been woken for.
     steer_wakes: HashMap<i64, i64>,
-    /// Shutting down with a grace period: running turns go on, no turn
-    /// starts, and accepted submissions wait durably for the next start.
-    draining: bool,
+    /// Shutting down with a grace period: no turn starts, each running turn
+    /// parks at its next boundary, and accepted submissions wait durably
+    /// for the next start. Every turn task reads it.
+    draining: Arc<std::sync::atomic::AtomicBool>,
     /// The pause that holds, as the store keeps it: no turn starts and
     /// accepted submissions wait for `resume`.
     paused: Option<Value>,
@@ -1444,7 +1453,7 @@ pub async fn run(config: Configuration) -> Result<()> {
         ));
     }
     agent_runtime::sandbox::warm();
-    let (sender, mut inbound) = session::channel(64);
+    let (sender, mut inbound) = session::channel_with(64, limits.input_bytes);
     let sessions_next = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
     let mut daemon = agent_runtime::sandbox::Daemon {
         store: Some(std::fs::canonicalize(&config.store)?),
@@ -1486,7 +1495,7 @@ pub async fn run(config: Configuration) -> Result<()> {
         .with_environment(environment)
         .with_daemon(daemon)
         .with_process_budget(limits.processes)
-        .with_detached_budget(limits.detached);
+        .with_lasting_budget(limits.lasting);
     // Observation reads and replay pages share all but one reader, so turns'
     // own reads always find one.
     let lane = lane::Lane::new(limits.readers.saturating_sub(1), deliver);
@@ -1498,8 +1507,8 @@ pub async fn run(config: Configuration) -> Result<()> {
     let ready = json!({"event":"ready","protocol":agent_client::PROTOCOL,"pid":std::process::id(),
         "paused":paused,
         "store":{"identity":format!("{identity:032x}"),"lineage":format!("{:016x}", lineage as u64)},
-        "limits":{"processes":limits.processes,"detached":limits.detached,"active":limits.active,"connecting":limits.connecting,
-            "pending":limits.pending,"pending_bytes":limits.pending_bytes,
+        "limits":{"processes":limits.processes,"lasting":limits.lasting,"active":limits.active,"connecting":limits.connecting,
+            "pending":limits.pending,"pending_bytes":limits.pending_bytes,"input_bytes":limits.input_bytes,
             "readers":limits.readers,"connections":limits.connections,
             "idle_exit_seconds":config.idle_exit,
             "stall_timeout_seconds":stall_timeout.as_secs()},
@@ -1629,7 +1638,7 @@ pub async fn run(config: Configuration) -> Result<()> {
         tokens: Arc::default(),
         wakes,
         steer_wakes,
-        draining: false,
+        draining: Arc::default(),
         paused,
         notices: Vec::new(),
         admissions: std::collections::VecDeque::with_capacity(ADMISSION_WINDOW),
@@ -1657,7 +1666,7 @@ pub async fn run(config: Configuration) -> Result<()> {
     // the stdio owner's output is what failed.
     let served: Result<()> = async {
         loop {
-            if service.draining && service.active.is_empty() {
+            if service.draining() && service.active.is_empty() {
                 break;
             }
             // Computed before the select so its arms borrow the service freely.
@@ -1704,7 +1713,7 @@ pub async fn run(config: Configuration) -> Result<()> {
                 }
                 // Idle bots whose time ran out are deleted, here and not on a
                 // client's request, so a client that stopped leaves none.
-                _ = tokio::time::sleep_until(expiry.unwrap_or_else(tokio::time::Instant::now)), if expiry.is_some() && !service.draining => {
+                _ = tokio::time::sleep_until(expiry.unwrap_or_else(tokio::time::Instant::now)), if expiry.is_some() && !service.draining() => {
                     service.expire().await?;
                 }
                 // A parked turn's time comes due (a pool reopens, a gate lapses,
@@ -1742,7 +1751,7 @@ pub async fn run(config: Configuration) -> Result<()> {
                     // What a companion sends is no client's activity.
                     let companion = match &message {
                         Inbound::Open(_, _, _, peer) => peer.is_some_and(|pid| service.companions.runs_pid(pid)),
-                        Inbound::Request(id, _) | Inbound::Closed(id) => companion_sessions.contains(id),
+                        Inbound::Request(id, ..) | Inbound::Closed(id) => companion_sessions.contains(id),
                     };
                     if !companion {
                         last_activity = std::time::Instant::now();
@@ -1769,7 +1778,8 @@ pub async fn run(config: Configuration) -> Result<()> {
                             service.abandon_steps(id);
                             if id == 0 && stdio_owner { break; }
                         }
-                        Inbound::Request(id, request) => {
+                        // The line's credit goes back as this request is taken up.
+                        Inbound::Request(id, request, _credit) => {
                             let Some(output) = sessions.get(&id).cloned() else { continue };
                             // A bad id is refused like a malformed line, after the
                             // admissions queued before it.
@@ -1863,7 +1873,7 @@ pub async fn run(config: Configuration) -> Result<()> {
                                 // A later shutdown can only bring the deadline closer.
                                 let until = tokio::time::Instant::now() + Duration::from_millis(grace_ms);
                                 drain_until = Some(drain_until.map_or(until, |current| current.min(until)));
-                                service.draining = true;
+                                service.draining.store(true, std::sync::atomic::Ordering::Relaxed);
                                 if grace_ms == 0 || service.active.is_empty() {
                                     // The socket writer is a task on this runtime. Give
                                     // it time to acknowledge shutdown before exiting.
@@ -1898,8 +1908,13 @@ pub async fn run(config: Configuration) -> Result<()> {
     answer_observed(&mut service, &mut sessions, stdio_owner).await;
     // Release every slot as it is cancelled: a turn interrupted earlier keeps
     // its first cause, and its dropped sender still stops a finish retry.
+    // A planned stop parks each running turn for the next start; a fatal
+    // error ends it, as a crash would, so a failing daemon never brings a
+    // turn back on its own.
+    let planned = served.is_ok();
+    let cause = if planned { turn::SHUTDOWN } else { turn::DIED };
     for active in std::mem::take(&mut service.active).into_values() {
-        active.cancel(turn::SHUTDOWN);
+        active.cancel(cause);
     }
     // A completion that could not commit leaves its turn for the next start
     // to end as interrupted; the rest still drain, and the exit reports it.
@@ -1936,6 +1951,11 @@ pub async fn run(config: Configuration) -> Result<()> {
         let _ = publisher.await;
     }
     drop(firehose_hub);
+    // After a planned stop a wait still open gets its answer, the turns it
+    // waits on shown as they stand: parked ones go on only at the next start.
+    if planned {
+        handles.expire_requests();
+    }
     let mut reads = handles.shutdown();
     // Socket writers need runtime time to flush terminal events and wait
     // results. Drain concurrently under one deadline, so slow clients cannot
@@ -2225,6 +2245,9 @@ impl Service {
             None => Ok(()),
         }
     }
+    fn draining(&self) -> bool {
+        self.draining.load(std::sync::atomic::Ordering::Relaxed)
+    }
     fn has_capacity(&self) -> bool {
         self.held().is_none()
             && (self.limit_active == 0 || self.active.len() + self.reserved < self.limit_active)
@@ -2233,7 +2256,7 @@ impl Service {
     /// Why no turn may start, if none may: the daemon is shutting down or
     /// paused.
     fn held(&self) -> Option<&'static str> {
-        if self.draining {
+        if self.draining() {
             Some("daemon_draining")
         } else if self.paused.is_some() {
             Some(turn::PAUSED)
@@ -2823,6 +2846,7 @@ impl Service {
             tokens: self.tokens.clone(),
             read_results: Default::default(),
             side: Default::default(),
+            stopping: self.draining.clone(),
         };
         self.jobs.spawn(async move {
             let (bot, id) = (task.bot.clone(), task.turn);
@@ -3593,7 +3617,7 @@ impl Service {
                     "store": store.stats(),
                     "tokens": self.tokens.snapshot(),
                     "handles": {"waiters": waiters, "retained": retained},
-                    "draining": self.draining,
+                    "draining": self.draining(),
                     "paused": self.paused,
                 }))
             }
@@ -4517,7 +4541,8 @@ fn delivered(hub: &Hub, events: &Unpublished) -> bool {
 }
 
 /// Answer the admissions still queued at shutdown and start their turns, so
-/// shutdown ends those turns like any other running turn. A stdio owner that
+/// shutdown parks those turns like any other running turn (or, on a fatal
+/// error, ends them). A stdio owner that
 /// cannot take a reply within its timeout gets no more: the rest settle
 /// without waiting on it again.
 async fn answer_queued(
@@ -5071,9 +5096,10 @@ mod tests {
             limits: Limits {
                 pending: 0,
                 pending_bytes: 0,
+                input_bytes: 0,
                 readers: 1,
                 processes: 16,
-                detached: 16,
+                lasting: 16,
                 active: 1024,
                 connecting: 64,
                 connections: 11,
@@ -5102,7 +5128,7 @@ mod tests {
             tokens: Arc::default(),
             wakes: Wakes::default(),
             steer_wakes: HashMap::new(),
-            draining: false,
+            draining: Arc::default(),
             paused: None,
             notices: Vec::new(),
             admissions: std::collections::VecDeque::new(),
@@ -5273,9 +5299,10 @@ mod tests {
             limits: Limits {
                 pending: 0,
                 pending_bytes: 0,
+                input_bytes: 0,
                 readers: 1,
                 processes: 16,
-                detached: 16,
+                lasting: 16,
                 active: 1024,
                 connecting: 64,
                 connections: 11,
@@ -5304,7 +5331,7 @@ mod tests {
             tokens: Arc::default(),
             wakes: Wakes::default(),
             steer_wakes: HashMap::new(),
-            draining: false,
+            draining: Arc::default(),
             paused: None,
             notices: Vec::new(),
             admissions: std::collections::VecDeque::new(),
@@ -5491,9 +5518,10 @@ mod tests {
             limits: Limits {
                 pending: 0,
                 pending_bytes: 0,
+                input_bytes: 0,
                 readers: 1,
                 processes: 16,
-                detached: 16,
+                lasting: 16,
                 active: 1024,
                 connecting: 64,
                 connections: 11,
@@ -5526,7 +5554,7 @@ mod tests {
             tokens: Arc::default(),
             wakes: Wakes::default(),
             steer_wakes: HashMap::new(),
-            draining: false,
+            draining: Arc::default(),
             paused: None,
             notices: Vec::new(),
             admissions: std::collections::VecDeque::new(),
@@ -5736,9 +5764,10 @@ mod tests {
             limits: Limits {
                 pending: 0,
                 pending_bytes: 0,
+                input_bytes: 0,
                 readers: 1,
                 processes: 16,
-                detached: 16,
+                lasting: 16,
                 active: 1024,
                 connecting: 64,
                 connections: 11,
@@ -5756,7 +5785,7 @@ mod tests {
             tokens: Arc::default(),
             wakes: Wakes::default(),
             steer_wakes: HashMap::new(),
-            draining: false,
+            draining: Arc::default(),
             paused: None,
             notices: Vec::new(),
             admissions: std::collections::VecDeque::new(),

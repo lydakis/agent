@@ -58,6 +58,7 @@ mod plan;
 mod project;
 mod prompt;
 mod reactions;
+mod recall;
 mod resolved;
 mod rex;
 mod said;
@@ -72,6 +73,7 @@ mod skills;
 mod sky;
 mod snapshot;
 mod sound;
+mod stamp;
 mod started;
 mod status;
 mod suggest;
@@ -843,7 +845,14 @@ fn main() -> std::process::ExitCode {
         {
             match &rest[1..] {
                 [] => home::Places::home().and_then(|places| home::set_up(&places, None)),
-                [url] => home::Places::home().and_then(|places| home::set_up(&places, Some(url))),
+                [help] if help == "-h" || help == "--help" => {
+                    println!("usage: {}", home::USAGE);
+                    Ok(())
+                }
+                // A flag is never a repository's URL.
+                [url] if !url.starts_with('-') => {
+                    home::Places::home().and_then(|places| home::set_up(&places, Some(url)))
+                }
                 _ => Err(format!("usage: {}", home::USAGE)),
             }
         }
@@ -919,7 +928,10 @@ fn sky_cli(args: &[String]) -> Result<(), String> {
 
 async fn run() -> Result<(), String> {
     if std::env::args().nth(1).as_deref() == Some("--version") {
-        println!("sonny {}", env!("CARGO_PKG_VERSION"));
+        match option_env!("SONNY_COMMIT") {
+            Some(commit) => println!("sonny {} ({commit})", env!("CARGO_PKG_VERSION")),
+            None => println!("sonny {}", env!("CARGO_PKG_VERSION")),
+        }
         return Ok(());
     }
     let options = parse()?;
@@ -1989,6 +2001,8 @@ struct App {
     /// The model's context window, as the daemon says it with each round.
     window: Option<u64>,
     input: prompt::Prompt,
+    /// The prompts sent before, which Up and Down bring back.
+    recall: recall::Recall<Vec<Option<attach::Picture>>>,
     /// Lines waiting to be written into the conversation, and what marks
     /// the rows of some, by their place among them.
     pending: Vec<Line<'static>>,
@@ -3054,6 +3068,7 @@ impl App {
             context: None,
             window: None,
             input: prompt::Prompt::default(),
+            recall: recall::Recall::default(),
             pending: Vec::new(),
             marks: Vec::new(),
             any_history: false,
@@ -3236,6 +3251,9 @@ impl App {
         self.width = terminal.size().map(|s| s.width as usize).unwrap_or(80);
         self.reactions = reactions::Reactions::load(self.reactions_key.as_deref());
         self.picks = fuzzy::Picks::load("commands");
+        // The newest prompts' pictures, up to as much as one message
+        // may carry.
+        self.recall = recall::Recall::load(attach::MOST_BYTES);
         self.margin = margin::Margin::load(self.reactions_key.as_deref());
         self.picked = reactions::Picked::load(self.reactions_key.as_deref());
         self.history().await;
@@ -6683,9 +6701,13 @@ impl App {
             }
             "turn_paced" => {
                 if let Some(running) = &mut self.running {
-                    running.phase = match data["paused"] == true {
-                        true => "Paused",
-                        false => "Rate limited",
+                    running.phase = if data["paused"] == true {
+                        "Paused"
+                    } else if data["stopped"] == true {
+                        // The daemon stopped; its next start continues it.
+                        "Stopped"
+                    } else {
+                        "Rate limited"
                     }
                     .into();
                 }
@@ -7672,7 +7694,11 @@ impl App {
     /// starts with `/`, best first, with where the letters typed are in
     /// each: the person's own picks rank first among equal matches.
     fn menu(&self) -> Vec<(&'static str, &'static str, Vec<usize>)> {
-        if !self.input.starts_with('/') || self.input.contains(char::is_whitespace) {
+        // A command brought back with Up is walked past, not picked.
+        if !self.input.starts_with('/')
+            || self.input.contains(char::is_whitespace)
+            || self.recall.showing(&self.input)
+        {
             return Vec::new();
         }
         let names = COMMANDS.iter().map(|(name, _)| &name[1..]);
@@ -8156,6 +8182,7 @@ impl App {
         let rows = [
             ("enter", "send, or steer the running turn"),
             ("tab", "queue for after the running turn"),
+            ("↑↓", "earlier prompts, past the first or last row"),
             ("shift+enter", "new line (alt+enter, ctrl+j)"),
             ("esc", "interrupt, or stop a ! command"),
             ("/", "commands"),
@@ -9096,11 +9123,27 @@ impl App {
                     {
                         self.step_ask(key.code == KeyCode::Down)
                     }
+                    // Past the first row, the prompts sent before, as a
+                    // shell's history; past the last, back to the newest
+                    // and what was being written.
                     KeyCode::Up => {
-                        self.input.up(self.prose());
+                        if !self.input.up(self.prose())
+                            && let Some(text) = self.recall.older(&self.input, &mut self.pictures)
+                        {
+                            self.input.set(&text);
+                            // One of several rows starts at its top, so Up
+                            // keeps going back.
+                            if self.input.layout(self.prose()).len() > 1 {
+                                self.input.top();
+                            }
+                        }
                     }
                     KeyCode::Down => {
-                        self.input.down(self.prose());
+                        if !self.input.down(self.prose())
+                            && let Some(text) = self.recall.newer(&self.input, &mut self.pictures)
+                        {
+                            self.input.set(&text);
+                        }
                     }
                     // Alt-Enter too, for terminals that send Shift-Enter
                     // as a plain Enter.
@@ -9176,6 +9219,20 @@ impl App {
         if prompt.is_empty() {
             return;
         }
+        // With the pictures it shows, by their numbers.
+        let attached = (self.pictures.iter().enumerate())
+            .map(|(at, picture)| {
+                picture
+                    .clone()
+                    .filter(|_| prompt.contains(&attach::placeholder(at + 1)))
+            })
+            .collect::<Vec<_>>();
+        let attached = match attached.iter().any(Option::is_some) {
+            true => attached,
+            false => Vec::new(),
+        };
+        let bytes = (attached.iter().flatten()).map(|p| p.data.len()).sum();
+        self.recall.sent(&prompt, attached, bytes);
         // A command run, so the menu ranks it first next time.
         let word = prompt.split_whitespace().next().unwrap_or_default();
         if COMMANDS.iter().any(|(name, _)| *name == word) {
@@ -9577,11 +9634,17 @@ impl App {
         // A steer never moves a bot, so a moved lead comes back with the
         // next message that starts a turn.
         let workspace = (!steer).then(|| self.move_to.clone()).flatten();
+        // The person's words carry when they were sent; a record of what
+        // Sonny did for them is read as it is.
+        let sent = match origin {
+            None => stamp::now(&prompt),
+            Some(_) => prompt.clone(),
+        };
         let reply = self
             .client
             .request(
                 "submit",
-                json!({"bot": self.bot, "request_id": unique("tui"), "prompt": prompt,
+                json!({"bot": self.bot, "request_id": unique("tui"), "prompt": sent,
                     "delivery": delivery, "model": model, "workspace": workspace,
                     "effort": effort, "origin": origin, "images": attach::submitted(pictures)}),
             )
@@ -11477,11 +11540,13 @@ fn quiet_message(text: &str) -> bool {
 }
 
 /// A message item's text: a prompt's own words, without the line the
-/// daemon adds after them naming who sent it.
+/// daemon adds after them naming who sent it or the time Sonny stamped on
+/// them.
 fn text(item: &Value) -> String {
     match (&item["role"], &item["content"]) {
         (role, Value::Array(parts)) if role == "user" => (parts.iter())
             .find_map(|part| part["text"].as_str())
+            .map(stamp::unstamped)
             .unwrap_or_default()
             .to_owned(),
         (_, content) => joined(content),
@@ -11623,6 +11688,20 @@ fn zen_notice(on: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_message_is_drawn_without_the_time_it_was_sent() {
+        let sent = stamp::stamped("ship it", 1_793_473_920);
+        let item = json!({"type": "message", "role": "user", "content": [
+            {"type": "input_text", "text": sent},
+            {"type": "input_text", "text": "[Sent by lookout.tasks.]"}]});
+        assert_eq!(text(&item), "ship it");
+    }
+
+    /// The words a submit carried, without the time Sonny stamped on them.
+    fn words_sent(asked: &Value) -> &str {
+        stamp::unstamped(asked["prompt"].as_str().unwrap_or_default())
+    }
 
     #[test]
     fn over_ssh_with_nothing_to_open_on_a_link_is_copied() {
@@ -12638,7 +12717,7 @@ mod tests {
             if asked["op"] == "submit" {
                 seen.lock()
                     .unwrap()
-                    .push(asked["prompt"].as_str().unwrap().to_owned());
+                    .push(stamp::unstamped(asked["prompt"].as_str().unwrap()).to_owned());
             }
             json!({"turn": 2})
         })
@@ -13126,7 +13205,7 @@ mod tests {
         assert!(app.repaint);
         let prompts: Vec<String> = (asked.lock().unwrap().iter())
             .filter(|op| op["op"] == "submit")
-            .map(|op| op["prompt"].as_str().unwrap_or("").to_owned())
+            .map(|op| stamp::unstamped(op["prompt"].as_str().unwrap_or("")).to_owned())
             .collect();
         assert_eq!(prompts, ["/zen the receipts' currency", "/zen off"]);
     }
@@ -13489,7 +13568,7 @@ mod tests {
         // The next message goes alone.
         app.input.set("thanks");
         app.submit().await;
-        assert_eq!(sent.lock().unwrap()[2]["prompt"], "thanks");
+        assert_eq!(words_sent(&sent.lock().unwrap()[2]), "thanks");
     }
 
     #[tokio::test]
@@ -13549,7 +13628,7 @@ mod tests {
             (&sent[2]["delivery"], &sent[3]["delivery"]),
             (&json!("reject"), &json!("steer"))
         );
-        assert_eq!(sent[4]["prompt"], "and now?");
+        assert_eq!(words_sent(&sent[4]), "and now?");
         assert_eq!(sent[4]["origin"], Value::Null);
         assert_eq!(sent[4]["delivery"], "steer");
         // A turn it starts moves a moved lead, as any message's does.
@@ -14201,7 +14280,7 @@ mod tests {
         // Words with an emoji are a message, sent as one.
         app.input.set("👍 ship it");
         app.submit().await;
-        assert_eq!(sent.lock().unwrap()[3]["prompt"], "👍 ship it");
+        assert_eq!(words_sent(&sent.lock().unwrap()[3]), "👍 ship it");
         assert_eq!(sent.lock().unwrap()[3]["delivery"], "reject");
     }
 
@@ -14594,7 +14673,7 @@ mod tests {
         // lead, and it is the person's.
         let queued = sent.lock().unwrap()[0].clone();
         assert_eq!(queued["delivery"], "queue");
-        assert_eq!(queued["prompt"], "after this");
+        assert_eq!(words_sent(&queued), "after this");
         assert_eq!(queued["workspace"], "/moved");
         assert!(app.move_to.is_none());
         assert_eq!(app.yours, Some(2));
@@ -15499,7 +15578,7 @@ mod tests {
         let seen = sent.clone();
         let client = daemon_answering(move |asked| {
             if asked["op"] == "submit" {
-                seen.lock().unwrap().push(asked["prompt"].clone());
+                seen.lock().unwrap().push(json!(words_sent(asked)));
             }
             json!({"turn": 9})
         })
@@ -16008,6 +16087,53 @@ mod tests {
             &*app.input, "w?",
             "typed after a word, it is a question mark"
         );
+    }
+
+    #[tokio::test]
+    async fn up_and_down_past_the_rows_walk_the_prompts_sent() {
+        let mut app = app(daemon_answering(|_| json!({})).await);
+        app.recall.sent("/status", Vec::new(), 0);
+        app.recall.sent("first line\nsecond line", Vec::new(), 0);
+        let key = |code| Event::Key(event::KeyEvent::new(code, KeyModifiers::NONE));
+        // A draft of two rows: Up moves through it before going back.
+        app.input.set("draft\nmore");
+        app.key(key(KeyCode::Up)).await;
+        assert_eq!(&*app.input, "draft\nmore");
+        app.key(key(KeyCode::Up)).await;
+        assert_eq!(&*app.input, "first line\nsecond line");
+        let rows = app.input.layout(app.prose());
+        assert_eq!(
+            app.input.cursor(&rows).0,
+            0,
+            "on its top row, so Up goes on"
+        );
+        // Ctrl-P is Up, as in a shell.
+        let ctrl_p = event::KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL);
+        app.key(Event::Key(ctrl_p)).await;
+        assert_eq!(&*app.input, "/status");
+        assert!(
+            app.menu().is_empty(),
+            "a recalled command is not picked from"
+        );
+        app.key(key(KeyCode::Up)).await;
+        assert_eq!(&*app.input, "/status", "the oldest stays");
+        app.key(key(KeyCode::Down)).await;
+        assert_eq!(&*app.input, "first line\nsecond line");
+        let rows = app.input.layout(app.prose());
+        assert_eq!(
+            app.input.cursor(&rows).0,
+            1,
+            "on its last row, so Down goes on"
+        );
+        app.key(key(KeyCode::Down)).await;
+        assert_eq!(&*app.input, "draft\nmore", "the draft comes back");
+        app.key(key(KeyCode::Down)).await;
+        assert_eq!(&*app.input, "draft\nmore");
+        // What is sent is the newest.
+        app.input.set("ship it");
+        app.submit().await;
+        app.key(key(KeyCode::Up)).await;
+        assert_eq!(&*app.input, "ship it");
     }
 
     #[tokio::test]

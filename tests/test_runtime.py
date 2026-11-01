@@ -22,6 +22,8 @@ from bench.runtime_client import PROTECTING, Client, node_item, poll, serve_args
 
 # Longer than 256 bytes, with text a shell would run if pasted unquoted.
 ODD_CALL_ID = "odd $(touch pwned) 'x'\n" + 'L' * 300
+# The line Sonny ends a message to a bot with: when it was sent.
+SENT = re.compile(r'\n\n\[Sent [A-Z][a-z]{2} \d{1,2} [A-Z][a-z]{2} \d{4} \d{2}:\d{2}, UTC[+-]\d{2}:\d{2}\.\]$')
 
 
 
@@ -129,6 +131,8 @@ class Model(http.server.BaseHTTPRequestHandler):
             # A trigger's message comes after its one-line header.
             if user.startswith('[trigger ') and '\n' in user:
                 user = user.split('\n', 1)[1]
+            # Sonny's message ends with a line naming when it was sent.
+            user = SENT.sub('', user)
             if user in getattr(self.server, 'refused_prompts', ()):
                 # A refusal with no usage: the turn fails without a model round.
                 body = b'{"error":{"message":"synthetic refusal"}}'
@@ -808,7 +812,7 @@ class AnthropicModel(http.server.BaseHTTPRequestHandler):
                     blocks.append({'type': 'text', 'text': 'echo:' + last['content'][0]['content']})
                 stop = 'refusal' if details else 'end_turn'
             else:
-                user = last['content'][0]['text']
+                user = SENT.sub('', last['content'][0]['text'])
                 if user == 'think-only':
                     stop = 'end_turn'
                 elif user == 'silent':
@@ -966,6 +970,22 @@ class AnthropicRuntimeTests(unittest.TestCase):
         self.assertEqual(len(usage), 4)
         self.assertEqual(sent, sorted(sent))
         self.assertGreaterEqual(sent[2] - sent[1], 900)
+
+    def test_a_drain_sends_no_refresh_while_a_command_finishes(self):
+        client, model, path = self.start(settings={'keep_warm': 1})
+        client.request('create', bot='Bob', workspace=str(path), effort='low')
+        turn = client.request('submit', bot='Bob', request_id='w1', prompt='shell:sleep 2.5')['result']['turn']
+        client.receive(lambda m: m.get('event') == 'tool_started' and m.get('turn') == turn)
+        model.requests.get(timeout=3)
+        # The command runs on through the drain, past when its cache would be
+        # refreshed twice; no refresh goes out, and the turn parks after it.
+        self.assertTrue(client.request('shutdown', grace_ms=60_000)['result']['shutting_down'])
+        parked = client.receive(lambda e: e.get('event') == 'turn_paced' and e.get('turn') == turn)
+        self.assertEqual(parked['data'], {'resume_at_ms': None, 'stopped': True})
+        self.assertEqual(client.process.wait(timeout=10), 0)
+        self.assertTrue(model.requests.empty())
+        self.assertFalse([m for m in client.saved if m.get('event') == 'usage'
+                          and m['data'].get('purpose') == 'keep_warm'])
 
     def test_refreshes_stop_at_the_turns_cap(self):
         client, model, path = self.start(settings={'keep_warm': 1})
@@ -1458,7 +1478,7 @@ class ModelFixture(unittest.TestCase):
 @unittest.skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'set AGENT_TEST_RUNTIME=1 after a Rust release build')
 class RuntimeTests(ModelFixture):
     def test_detached_shell_releases_its_daemon_slot_after_exit(self):
-        client = self.client('shell', extra=('--max-detached', '1'))
+        client = self.client('shell', extra=('--max-lasting', '1'))
         client.request('create', bot='Bob', workspace=str(self.path), tools=['shell'])
 
         def result(prompt, request_id):
@@ -1474,7 +1494,7 @@ class RuntimeTests(ModelFixture):
         self.assertTrue(first['detached'])
         pid = first['pid']
         try:
-            self.assertEqual(result('detach:true', 'full')['error'], 'detached_limit')
+            self.assertEqual(result('detach:true', 'full')['error'], 'lasting_limit')
         finally:
             try:
                 os.kill(pid, 9)
@@ -1562,15 +1582,132 @@ class RuntimeTests(ModelFixture):
         client.process.stdin.write(json.dumps({'id': 'waiter', 'op': 'wait', 'handles': [handle]}) + '\n')
         client.process.stdin.flush()
         self.assertTrue(client.request('shutdown')['result']['shutting_down'])
-        terminal = client.finished(turn)
-        self.assertEqual((terminal['data']['status'], terminal['data']['error']), ('interrupted', 'daemon_shutdown'))
+        # The running turn parks, as a pull parks it, for the next start.
+        parked = client.receive(lambda e: e.get('event') == 'turn_paced' and e.get('turn') == turn)
+        self.assertEqual(parked['data'], {'resume_at_ms': None, 'stopped': True})
+        # The wait is answered as its deadline would answer it: still pending,
+        # the turn shown parked.
         waited = client.receive(lambda e: e.get('id') == 'waiter')['result']
-        self.assertEqual(waited['results'][handle]['error'], 'daemon_shutdown')
-        self.assertEqual(waited['pending'], [])
+        self.assertEqual(waited['pending'], [handle])
+        self.assertEqual((waited['results'][handle]['status'], waited['results'][handle]['waiting_on']),
+                         ('paced', {'resume_at_ms': None, 'stopped': True}))
         self.assertEqual(client.process.wait(timeout=2), 0)
         restarted = self.client()
+        # It goes on from where it stopped, and the time down is not pacing.
+        self.model.requests.get(timeout=3)
+        view = restarted.request('wait', handles=[handle], timeout_ms=0)['result']['results'][handle]
+        self.assertEqual((view['status'], view['paced_ms']), ('running', 0))
         replay = restarted.request('events', bot='Bob', after=0, limit=256)['result']['events']
-        self.assertEqual(next(e for e in replay if e['event'] == 'turn_finished')['data'], terminal['data'])
+        self.assertFalse(any(e['event'] == 'turn_finished' for e in replay))
+
+    def test_a_drain_starts_no_call_and_parks_the_turn_for_the_next_start(self):
+        # The model is answering when the drain starts. The calls it returns
+        # do not start: the turn parks long before the grace ends, and the
+        # next start continues it with those calls answered as not run.
+        gate = threading.Event()
+        self.model.request_gates = queue.Queue()
+        self.model.request_gates.put(gate)
+        self.model.call_script = [[('shell', {'command': 'echo x > ran'}), ('shell', {'command': 'echo y'})]]
+        client = self.client('shell')
+        self.addCleanup(lambda: client.close(kill=True))
+        client.request('create', bot='Bob', workspace=str(self.path), tools=['shell'])
+        turn = client.request('submit', bot='Bob', request_id='drain', prompt='script')['result']['turn']
+        self.model.requests.get(timeout=3)
+        started = time.monotonic()
+        self.assertTrue(client.request('shutdown', grace_ms=60_000)['result']['shutting_down'])
+        gate.set()
+        parked = client.receive(lambda e: e.get('event') == 'turn_paced' and e.get('turn') == turn)
+        self.assertEqual(parked['data'], {'resume_at_ms': None, 'stopped': True})
+        self.assertEqual(client.process.wait(timeout=10), 0)
+        self.assertLess(time.monotonic() - started, 10)
+        self.assertFalse((self.path / 'ran').exists())
+        restarted = self.client('shell')
+        self.addCleanup(lambda: restarted.close(kill=True))
+        handle = f'turn:Bob/{turn}'
+        done = restarted.request('wait', handles=[handle], timeout_ms=10_000)['result']['results'][handle]
+        self.assertEqual((done['status'], done['paced_ms']), ('completed', 0))
+        request = self.model.requests.get(timeout=3)
+        outputs = {i['call_id']: json.loads(i['output']) for i in request['input']
+                   if i.get('type') == 'function_call_output'}
+        self.assertEqual(set(outputs), {'script-0', 'script-0.1'})
+        for output in outputs.values():
+            self.assertEqual(output['error'], 'daemon_shutdown')
+            self.assertIn('did not run', output['detail'])
+        self.assertFalse((self.path / 'ran').exists())
+
+    def test_a_drain_lets_a_running_command_finish_then_parks_before_the_next_call(self):
+        marker = self.path / 'ran'
+        self.model.slow_command = f'sleep 1; echo x >> {marker}; echo finished'
+        client = self.client('echo,shell')
+        self.addCleanup(lambda: client.close(kill=True))
+        client.request('create', bot='Alice', workspace=str(self.path))
+        turn = client.request('submit', bot='Alice', request_id='a', prompt='sayslow:the review')['result']['turn']
+        client.receive(lambda m: m.get('event') == 'tool_started' and m.get('turn') == turn)
+        self.model.requests.get(timeout=3)
+        self.assertTrue(client.request('shutdown', grace_ms=60_000)['result']['shutting_down'])
+        # The command runs to its result, which is kept; then the turn parks
+        # rather than asking the model again.
+        done = client.receive(lambda m: m.get('event') == 'tool_completed' and m.get('turn') == turn)
+        self.assertNotIn('cancelled', done['data'])
+        parked = client.receive(lambda e: e.get('event') == 'turn_paced' and e.get('turn') == turn)
+        self.assertEqual(parked['data'], {'resume_at_ms': None, 'stopped': True})
+        self.assertEqual(client.process.wait(timeout=10), 0)
+        self.assertTrue(self.model.requests.empty())
+        restarted = self.client('echo,shell')
+        self.addCleanup(lambda: restarted.close(kill=True))
+        self.assertEqual(restarted.finished(turn)['data']['status'], 'completed')
+        request = self.model.requests.get(timeout=3)
+        output = json.loads(next(i for i in request['input'] if i.get('type') == 'function_call_output'
+                                 and i['call_id'] == 'slow-1')['output'])
+        self.assertIn('finished', json.dumps(output))
+        self.assertEqual(marker.read_text(), 'x\n')
+
+    def test_a_drain_sends_no_retry_of_a_failed_model_call(self):
+        # The model call failed and waits 0.7 s for its retry when the drain
+        # begins: no retry is sent, and the turn parks for the next start.
+        client = self.client()
+        self.addCleanup(lambda: client.close(kill=True))
+        client.request('create', bot='Bob', workspace=str(self.path))
+        turn = client.request('submit', bot='Bob', request_id='r', prompt='busy:1')['result']['turn']
+        client.receive(lambda e: e.get('event') == 'retry' and e.get('turn') == turn)
+        self.assertTrue(client.request('shutdown', grace_ms=60_000)['result']['shutting_down'])
+        parked = client.receive(lambda e: e.get('event') == 'turn_paced' and e.get('turn') == turn)
+        self.assertEqual(parked['data'], {'resume_at_ms': None, 'stopped': True})
+        self.assertEqual(client.process.wait(timeout=10), 0)
+        self.assertEqual(sum(1 for e in client.saved if e.get('event') == 'turn_finished'), 0)
+        restarted = self.client()
+        self.addCleanup(lambda: restarted.close(kill=True))
+        self.assertEqual(restarted.finished(turn)['data']['status'], 'completed')
+
+    def test_a_drain_starts_no_more_of_a_wide_batch_and_keeps_what_ran(self):
+        # Five commands run together, four at a time: the fifth would start
+        # as the first finishes, but the drain began, so it does not run.
+        slow = f'sleep 1; echo x >> {self.path / "ran"}'
+        self.model.call_script = [[('shell', {'command': slow}) for _ in range(4)]
+                                  + [('shell', {'command': f'echo y > {self.path / "late"}'})]]
+        client = self.client('shell')
+        self.addCleanup(lambda: client.close(kill=True))
+        client.request('create', bot='Bob', workspace=str(self.path), tools=['shell'])
+        turn = client.request('submit', bot='Bob', request_id='wide', prompt='script')['result']['turn']
+        client.receive(lambda m: m.get('event') == 'tool_started' and m.get('turn') == turn)
+        self.model.requests.get(timeout=3)
+        self.assertTrue(client.request('shutdown', grace_ms=60_000)['result']['shutting_down'])
+        parked = client.receive(lambda e: e.get('event') == 'turn_paced' and e.get('turn') == turn)
+        self.assertEqual(parked['data'], {'resume_at_ms': None, 'stopped': True})
+        self.assertEqual(client.process.wait(timeout=10), 0)
+        self.assertEqual((self.path / 'ran').read_text(), 'x\n' * 4)
+        self.assertFalse((self.path / 'late').exists())
+        restarted = self.client('shell')
+        self.addCleanup(lambda: restarted.close(kill=True))
+        self.assertEqual(restarted.finished(turn)['data']['status'], 'completed')
+        request = self.model.requests.get(timeout=3)
+        outputs = {i['call_id']: json.loads(i['output']) for i in request['input']
+                   if i.get('type') == 'function_call_output'}
+        self.assertEqual(len(outputs), 5)
+        stopped = [o for o in outputs.values() if o.get('error') == 'daemon_shutdown']
+        self.assertEqual(len(stopped), 1)
+        self.assertIn('did not run', stopped[0]['detail'])
+        self.assertFalse((self.path / 'late').exists())
 
     def test_a_pause_stops_every_agent_until_resume_across_restarts(self):
         self.model.release_headers = threading.Event()
@@ -1849,7 +1986,7 @@ class RuntimeTests(ModelFixture):
         waited = restarted.request('wait', handles=[handle], timeout_ms=5000)['result']
         self.assertEqual(waited['results'][handle]['status'], 'completed')
 
-    def test_shutdown_grace_expiry_cancels_with_the_shutdown_cause(self):
+    def test_shutdown_grace_expiry_parks_what_still_runs_for_the_next_start(self):
         client = self.client()
         self.addCleanup(lambda: client.close(kill=True))
         client.request('create', bot='Bob', workspace=str(self.path))
@@ -1859,13 +1996,14 @@ class RuntimeTests(ModelFixture):
         # A later shutdown can only bring the deadline closer.
         started = time.monotonic()
         self.assertTrue(client.request('shutdown', grace_ms=300)['result']['shutting_down'])
-        terminal = client.finished(turn)
-        self.assertEqual((terminal['data']['status'], terminal['data']['error']), ('interrupted', 'daemon_shutdown'))
+        client.receive(lambda e: e.get('event') == 'turn_paced' and e.get('turn') == turn)
         self.assertGreaterEqual(time.monotonic() - started, .25)
         self.assertEqual(client.process.wait(timeout=3), 0)
         restarted = self.client()
-        result = poll(restarted, 'Bob', turn)['result']
-        self.assertEqual((result['status'], result['error']), ('interrupted', 'daemon_shutdown'))
+        self.model.requests.get(timeout=3)
+        handle = f'turn:Bob/{turn}'
+        view = restarted.request('wait', handles=[handle], timeout_ms=0)['result']['results'][handle]
+        self.assertEqual(view['status'], 'running')
 
     def held_admissions(self, client, count):
         """Submissions to `count` bots, each of which would start a turn that
@@ -1885,16 +2023,15 @@ class RuntimeTests(ModelFixture):
     def answered(self, client):
         return any('id' in message for message in [*client.saved, *list(client.queue.queue)] if message)
 
-    def assert_shutdown_ended(self, client, turns):
-        """Shutdown ended every started turn with its own cause, rather than
-        leaving it running for the next start to find."""
+    def assert_shutdown_parked(self, client, turns):
+        """Shutdown parked every started turn for the next start, rather than
+        leaving it running for that start to end as interrupted."""
         for turn in turns:
-            data = client.finished(turn)['data']
-            self.assertEqual((data['status'], data['error']), ('interrupted', 'daemon_shutdown'))
+            client.receive(lambda e: e.get('event') == 'turn_paced' and e.get('turn') == turn)
         self.assertEqual(client.process.wait(timeout=10), 0)
         with sqlite3.connect(self.path / 'state.sqlite') as db:
-            self.assertEqual(db.execute("SELECT count(*) FROM turns WHERE status!='interrupted'").fetchone()[0], 0)
-            self.assertEqual(db.execute("SELECT count(*) FROM bots WHERE running_turn IS NOT NULL").fetchone()[0], 0)
+            self.assertEqual(db.execute("SELECT count(*) FROM turns WHERE status!='paced'").fetchone()[0], 0)
+            self.assertEqual(db.execute("SELECT count(*) FROM bots WHERE status!='paced'").fetchone()[0], 0)
 
     def test_a_shutdown_request_behind_queued_admissions_waits_for_their_answers(self):
         client = self.client()
@@ -1908,7 +2045,7 @@ class RuntimeTests(ModelFixture):
         self.assertEqual([r['id'] for r in replies], [line['id'] for line in lines])
         self.assertTrue(replies[-1]['result']['shutting_down'])
         self.assertEqual({r['result']['status'] for r in replies[:-1]}, {'running'})
-        self.assert_shutdown_ended(client, [r['result']['turn'] for r in replies[:-1]])
+        self.assert_shutdown_parked(client, [r['result']['turn'] for r in replies[:-1]])
 
     def test_a_termination_signal_still_answers_the_admissions_it_finds_queued(self):
         client = self.client()
@@ -1925,7 +2062,7 @@ class RuntimeTests(ModelFixture):
             reply = client.receive(lambda m, id=line['id']: m.get('id') == id)
             self.assertEqual(reply['result']['status'], 'running')
             turns.append(reply['result']['turn'])
-        self.assert_shutdown_ended(client, turns)
+        self.assert_shutdown_parked(client, turns)
 
     def test_request_startup_is_bounded_but_established_streams_are_not(self):
         self.model.release_headers = threading.Event()
@@ -2650,6 +2787,52 @@ class RuntimeTests(ModelFixture):
         started = time.monotonic()
         client.close()
         self.assertLess(time.monotonic() - started, 3)
+
+    def test_a_terminal_poll_past_the_hold_parks_its_turn_off_the_active_slot(self):
+        client = self.client('echo,shell,write_stdin,wait', extra=('--max-active', '1'),
+                             settings={'approval_hold_ms': 100})
+        for bot in ('Bob', 'Eve'):
+            client.request('create', bot=bot, workspace=str(self.path),
+                           tools=['echo', 'shell', 'write_stdin', 'wait'])
+
+        def submit(bot, request_id, name, arguments):
+            prompt = 'calls:' + json.dumps([[name, arguments]])
+            return client.request('submit', bot=bot, request_id=request_id, prompt=prompt)['result']['turn']
+
+        def result(bot, turn):
+            self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+            return json.loads(poll(client, bot, turn)['result']['text'][5:])
+
+        started = result('Bob', submit('Bob', 's', 'shell', {
+            'command': 'printf ready; while [ ! -f release ]; do sleep .01; done; printf done',
+            'tty': True, 'yield_time_ms': 1000}))
+        self.assertEqual((started['output'], started['running']), ('ready', True))
+        handle = started['handle']
+        # A long poll parks its turn after the hold, waiting on the terminal.
+        turn = submit('Bob', 'p', 'write_stdin', {'handle': handle, 'yield_time_ms': 30000})
+        waiting = client.receive(lambda m: m.get('event') == 'turn_waiting' and m.get('turn') == turn)
+        self.assertEqual(waiting['data']['handles'], [handle])
+        # It holds no slot: another bot's turn runs to its end meanwhile.
+        other = submit('Eve', 'e', 'echo', {'text': 'hi'})
+        self.assertEqual(client.finished(other)['data']['status'], 'completed')
+        # The terminal's end wakes it, with what it wrote and how it ended.
+        began = time.monotonic()
+        (self.path / 'release').touch()
+        ended = result('Bob', turn)
+        self.assertLess(time.monotonic() - began, 10)
+        self.assertEqual((ended['output'], ended['exit_code'], ended['handle']), ('done', 0, handle))
+        # A poll whose time runs out reports the terminal still running.
+        handle = result('Bob', submit('Bob', 's2', 'shell', {
+            'command': 'sleep 600', 'tty': True, 'yield_time_ms': 0}))['handle']
+        turn = submit('Bob', 'p2', 'write_stdin', {'handle': handle, 'yield_time_ms': 400})
+        client.receive(lambda m: m.get('event') == 'turn_waiting' and m.get('turn') == turn)
+        lapsed = result('Bob', turn)
+        self.assertEqual((lapsed['output'], lapsed['running'], lapsed['handle']), ('', True, handle))
+        # A poll within the hold stays live.
+        turn = submit('Bob', 'p3', 'write_stdin', {'handle': handle, 'yield_time_ms': 50})
+        self.assertTrue(result('Bob', turn)['running'])
+        events = client.request('events', bot='Bob', after=0, limit=256)['result']['events']
+        self.assertFalse(any(e['event'] == 'turn_waiting' and e['turn'] == turn for e in events))
 
     def test_retention_prunes_records_and_deletes_idle_bots(self):
         client = self.client(settings={'keep_turns': 2})
