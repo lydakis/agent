@@ -18,10 +18,14 @@ from the model's account. A bot that ends its turn on the halt's answer, with
 steps left, is counted `stopped`, the Monday rehearsal's failure (11-01).
 
 Real model, real spend. Run it on the ChatGPT plan after `agent login
-chatgpt`, once per binary to compare wordings:
+chatgpt`, once per binary and task prompt to compare them (main's prompt from
+`git show main:sonny/agents/task.md`):
 
     .local/venv/bin/python -m bench.resume_eval --model chatgpt/MODEL \\
         --trials 3 --binary .local/target/release/agent --out .local/resume-eval/new.json
+
+A bot that had left the long step before the halt never met it: its trial is
+marked `exercised: false` and left out of the counts.
 """
 import argparse
 import hashlib
@@ -43,11 +47,10 @@ STEPS = 6
 CUT = 3
 # Seconds each quick run of a step takes.
 QUICK = 2
-# The pull cord's line from Sonny's task prompt (sonny/agents/task.md), so the
-# bot knows what a pause is for, as Sonny's agents do.
-INSTRUCTIONS = ('You are an agent working in this folder for a person. When you see agents doing harm that '
-                'someone needs to look at, such as data being lost, money being spent or messages going out, '
-                'stop every agent with agent pause --reason WHY; resuming them is the person\'s call.')
+PREAMBLE = 'You are an agent working in this folder for a person.'
+# Sonny's task prompt, whose pull-cord paragraph the bot is told, as Sonny's
+# agents are: what a pause is for, and what to do about a call one cut off.
+TASK_PROMPT = Path(__file__).resolve().parents[1] / 'sonny/agents/task.md'
 PROMPT = (f'Run ./step 1 through ./step {STEPS} in order, each as its own shell command, waiting for each to '
           f'finish before the next; ./step {CUT} can take up to ten minutes, so give it a ten-minute timeout. '
           f'Then reply with the {STEPS} codes they printed, in order.')
@@ -71,6 +74,18 @@ def started(work, n):
     return log.exists() and f'start {n}' in log.read_text().splitlines()
 
 
+def instructions(task_prompt):
+    """The preamble and the task prompt's paragraph on the pull cord."""
+    paragraph = next(p for p in task_prompt.read_text().split('\n\n') if 'pause --reason' in p)
+    return PREAMBLE + ' ' + paragraph.strip().replace('"$AGENT_BIN"', 'agent')
+
+
+def inside_cut(work):
+    """Whether the long step is running: started once and not done."""
+    lines = (work / 'steps.log').read_text().splitlines()
+    return lines.count(f'start {CUT}') == 1 and f'done {CUT}' not in lines
+
+
 def score(work, seed, answer, status):
     lines = (work / 'steps.log').read_text().splitlines() if (work / 'steps.log').exists() else []
     done = sorted({int(line.split()[1]) for line in lines if line.startswith('done ')})
@@ -82,7 +97,8 @@ def score(work, seed, answer, status):
             'step_runs': {n: lines.count(f'start {n}') for n in range(1, STEPS + 1)}}
 
 
-def run_condition(binary, spec, model, condition, trials, out_dir, env, seed, hold, timeout):
+def run_condition(binary, spec, model, condition, trials, out_dir, env, seed, hold, timeout,
+                  task_prompt=TASK_PROMPT):
     provider, family, url, key_env = spec
     root = Path(tempfile.mkdtemp(prefix=f'resume-{condition}-', dir=out_dir))
     store = root / 'state.sqlite'
@@ -103,7 +119,7 @@ def run_condition(binary, spec, model, condition, trials, out_dir, env, seed, ho
             step.write_text(STEP.replace('{cut}', str(CUT)).replace('{long}', '600').replace('{quick}', str(QUICK))
                             .replace('{seed}', str(seed + n)))
             step.chmod(0o755)
-            client.request('create', bot=name, workspace=str(work), instructions=INSTRUCTIONS, tools=['shell'])
+            client.request('create', bot=name, workspace=str(work), instructions=instructions(task_prompt), tools=['shell'])
             turns[name] = client.request('submit', bot=name, request_id='steps', prompt=PROMPT)['result']['turn']
         deadline = time.monotonic() + timeout
         while not all(started(root / name, CUT) for name in names):
@@ -111,6 +127,9 @@ def run_condition(binary, spec, model, condition, trials, out_dir, env, seed, ho
                 raise AssertionError('not every bot reached the long step')
             time.sleep(.5)
         time.sleep(2)
+        # A bot that left the long step before the halt never met it: its
+        # trial says so and is not scored.
+        exercised = {name: inside_cut(root / name) for name in names}
         halted = time.monotonic()
         if condition == 'pause':
             client.request('pause', reason='checking what the agents are doing', by='person')
@@ -141,6 +160,7 @@ def run_condition(binary, spec, model, condition, trials, out_dir, env, seed, ho
                 item = node_item(client, name, end['checkpoint']).get('result', {})
                 answer = ''.join(c.get('text', '') for c in item.get('content', []) if isinstance(c, dict))
             results[name] = {'status': end.get('status'), 'error': end.get('error'), 'answer': answer[:2000],
+                             'exercised': exercised[name],
                              **score(root / name, seed + n, answer, end.get('status'))}
         client.request('shutdown')
     finally:
@@ -159,6 +179,8 @@ def main():
     parser.add_argument('--timeout', type=float, default=1200, help='seconds for a condition')
     parser.add_argument('--binary', type=Path, default=Path('.local/target/release/agent'))
     parser.add_argument('--url', help="another Responses endpoint for the provider, as a scripted model's")
+    parser.add_argument('--task-prompt', type=Path, default=TASK_PROMPT,
+                        help="a task prompt whose pull-cord paragraph the bots are told, such as main's")
     args = parser.parse_args()
     provider, model = args.model.split('/', 1)
     family, url, key_env = ENDPOINTS[provider]
@@ -174,13 +196,15 @@ def main():
     blocks = []
     for condition in args.conditions:
         block = run_condition(args.binary.resolve(), (provider, family, url, key_env), model, condition,
-                              args.trials, out_dir, env, args.seed, args.hold, args.timeout)
+                              args.trials, out_dir, env, args.seed, args.hold, args.timeout, args.task_prompt)
         blocks.append(block)
-        bots = block['bots'].values()
+        bots = [b for b in block['bots'].values() if b['exercised']]
         print(json.dumps({'condition': condition, 'passed': sum(b['passed'] for b in bots),
-                          'stopped': sum(b['stopped'] for b in bots), 'trials': len(bots)}), flush=True)
+                          'stopped': sum(b['stopped'] for b in bots), 'trials': len(bots),
+                          'not_exercised': len(block['bots']) - len(bots)}), flush=True)
         args.out.write_text(json.dumps({'binary_sha256': file_hash(args.binary), 'model': args.model,
-                                        'seed': args.seed, 'conditions': blocks}, indent=1))
+                                        'instructions': instructions(args.task_prompt), 'seed': args.seed,
+                                        'conditions': blocks}, indent=1))
 
 
 if __name__ == '__main__':

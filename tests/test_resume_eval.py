@@ -67,7 +67,7 @@ class ResumeRunnerTests(ModelFixture):
             with self.subTest(condition):
                 result = self.run_one(condition, stops=False)
                 self.assertEqual(result['status'], 'completed', result)
-                self.assertTrue(result['passed'] and not result['stopped'], result)
+                self.assertTrue(result['exercised'] and result['passed'] and not result['stopped'], result)
                 self.assertEqual(result['step_runs'], {1: 1, 2: 1, 3: 2, 4: 1, 5: 1, 6: 1})
 
     def test_a_bot_that_ends_its_turn_on_the_halt_is_counted_stopped(self):

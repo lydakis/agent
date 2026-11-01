@@ -1901,7 +1901,7 @@ class RuntimeTests(ModelFixture):
         output = json.loads(next(i for i in request['input'] if i.get('type') == 'function_call_output'
                                  and i['call_id'] == 'slow-1')['output'])
         self.assertEqual(output['error'], 'daemon_paused')
-        self.assertIn('Work has since resumed and your turn goes on', output['detail'])
+        self.assertIn('Work has since resumed and this turn goes on', output['detail'])
         self.assertEqual(output['pause']['reason'], 'the loop is sending mail')
         self.assertEqual(marker.read_text(), 'x\n')
 

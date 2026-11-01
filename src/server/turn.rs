@@ -4330,7 +4330,7 @@ impl Turn {
         if self.stopping.load(Relaxed) {
             let stopped = Error::with(
                 SHUTDOWN,
-                "the daemon stopped before this call ran, so it did not run. The daemon has since started again and your turn goes on: run it now if the work still needs it",
+                "the daemon stopped before this call ran, so it did not run. The daemon has since started again and this turn goes on",
             );
             return (call_id, Ok(failure(stopped)));
         }

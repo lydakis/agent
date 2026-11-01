@@ -2284,12 +2284,11 @@ impl Registry {
 }
 
 /// How a command the pull cord ended answers. Nothing reruns it; the agent
-/// reads this only once work has resumed, so it says so and leaves the
-/// choice to redo it with the agent.
+/// reads this only once work has resumed, so it says so.
 fn stopped_by_pause() -> Error {
     Error::with(
         "daemon_paused",
-        "the pause stopped this command before it finished, so it may have had effects. Work has since resumed: check what the command did, and run it again if the work still needs it",
+        "the pause stopped this command before it finished, so it may have had effects; nothing has run it again. Work has since resumed",
     )
 }
 
