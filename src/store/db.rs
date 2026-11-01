@@ -8,7 +8,7 @@ use crate::{
     tools::{Declared, Outcome},
 };
 use bytes::Bytes;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, config::DbConfig, params};
 use serde::Serialize;
 use serde_json::{Value, json, value::RawValue};
 use std::{
@@ -1523,6 +1523,16 @@ pub struct TurnContext {
 /// again. Every `prepare_cached` site fits, at a few KiB of SQLite memory
 /// each for the ones in use.
 const STATEMENTS: usize = 256;
+/// Plans that don't depend on bound values: SQLite's query planner
+/// stability guarantee. The store never runs ANALYZE, so a bound value
+/// can't improve a plan. Without it, SQLite 3.54 marks a join with an
+/// `x = ?` term to be planned again once its bindings are cleared, which
+/// the statement cache does each time a statement goes back: every reuse
+/// parsed the statement again, half a millisecond for `history_items`.
+fn plan_stably(conn: &Connection) -> Result<()> {
+    conn.set_db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_QPSG, true)?;
+    Ok(())
+}
 pub struct Database {
     conn: Connection,
     /// Bounds on submissions waiting to start, turns and prompt bytes; zero
@@ -1848,6 +1858,7 @@ impl Database {
     /// checkpoints the way the writer does.
     pub fn reader(conn: Connection) -> Result<Self> {
         conn.set_prepared_statement_cache_capacity(STATEMENTS);
+        plan_stably(&conn)?;
         conn.execute_batch(
             "PRAGMA query_only=ON; PRAGMA cache_size=-2048; PRAGMA checkpoint_fullfsync=ON;",
         )?;
@@ -1885,6 +1896,7 @@ impl Database {
         // fails with SQLITE_FULL when the disk is. In memory it is freed
         // when the job ends, bounded by the pages one job changes.
         conn.set_prepared_statement_cache_capacity(STATEMENTS);
+        plan_stably(&conn)?;
         conn.execute_batch(
             "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
             PRAGMA fullfsync=OFF; PRAGMA checkpoint_fullfsync=ON;
@@ -13728,6 +13740,32 @@ mod tests {
         let mut shown: Vec<String> = resolved.into_iter().map(|(k, _)| k).collect();
         shown.sort();
         assert_eq!(shown, listed);
+    }
+
+    #[test]
+    fn a_cached_statement_is_not_planned_again_when_reused() {
+        let dir = std::env::temp_dir().join(format!("agent-plans-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.sqlite");
+        let mut writer = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        let mut reader = Database::reader(Connection::open(&path).unwrap()).unwrap();
+        for db in [&mut writer, &mut reader] {
+            let conn = db.connection();
+            // A join with a bound value, as `history_items` reads an item.
+            let sql = "SELECT n.id FROM nodes n LEFT JOIN declined d ON d.node=n.id WHERE n.id=?1";
+            for value in [1, 2, 3] {
+                let mut statement = conn.prepare_cached(sql).unwrap();
+                statement.query([value]).unwrap().next().unwrap();
+            }
+            let statement = conn.prepare_cached(sql).unwrap();
+            assert_eq!(
+                statement.get_status(rusqlite::StatementStatus::RePrepare),
+                0
+            );
+        }
+        drop((reader, writer));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
