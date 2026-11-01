@@ -74,8 +74,13 @@ type Examples = (PrefixRule, Vec<Vec<String>>, Vec<Vec<String>>);
 impl Builder {
     fn check_examples(&self) -> Result<(), String> {
         for (rule, matches, not_matches) in &self.examples {
+            // Whether it matches, whatever it decides: an allow rule lets
+            // out no path `host_executable` doesn't name, but matches it.
             let alone = Policy {
-                prefix_rules: vec![rule.clone()],
+                prefix_rules: vec![PrefixRule {
+                    decision: Decision::Prompt,
+                    ..rule.clone()
+                }],
                 host_executables: self.hosts.clone(),
                 invalid: None,
             };
@@ -627,10 +632,10 @@ prefix_rule(
             Some(Decision::Forbidden)
         );
         assert_eq!(decision(&policy, "/tmp/git push"), None);
-        assert_eq!(
-            decision(&policy, "/usr/local/bin/rg x"),
-            Some(Decision::Allow)
-        );
+        // Allowed by its name only where host_executable says it is, since
+        // a bot could write a program of that name anywhere else.
+        assert_eq!(decision(&policy, "/usr/local/bin/rg x"), None);
+        assert_eq!(decision(&policy, "rg x"), Some(Decision::Allow));
         let error =
             super::tests::policy("host_executable(name = \"git\", paths = [\"/usr/bin/hg\"])")
                 .unwrap_err();

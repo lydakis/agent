@@ -9,7 +9,8 @@
 //! alternatives. A command matches a rule when its words start with the
 //! pattern's; one run by an absolute path that no rule names as written is
 //! matched by its program's name, when `host_executables` lists that path
-//! for it or lists none. Of the rules a command matches, the strictest
+//! for it or lists none, though only one it lists is allowed by that name.
+//! Of the rules a command matches, the strictest
 //! decides.
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -187,7 +188,8 @@ impl Policy {
 
     /// The rules `command` matches: those for its first word as written,
     /// or, when none match and it is an absolute path, those for the
-    /// program's name, unless `host_executables` lists other paths for it.
+    /// program's name, unless `host_executables` lists other paths for it;
+    /// its `allow` rules only when `host_executables` lists this path.
     pub fn matching(&self, command: &[String]) -> Vec<Matched> {
         let found = |words: &[String]| -> Vec<Matched> {
             (self.prefix_rules.iter())
@@ -210,15 +212,22 @@ impl Policy {
         let Some(name) = program.file_name().and_then(|name| name.to_str()) else {
             return exact;
         };
-        if (self.host_executables.get(name))
-            .is_some_and(|paths| !paths.iter().any(|path| Path::new(path) == program))
-        {
-            return exact;
-        }
+        let pinned = match self.host_executables.get(name) {
+            Some(paths) if !paths.iter().any(|path| Path::new(path) == program) => return exact,
+            Some(_) => true,
+            None => false,
+        };
         let named: Vec<String> = std::iter::once(name.to_owned())
             .chain(command[1..].iter().cloned())
             .collect();
-        found(&named)
+        let mut matched = found(&named);
+        // Where Codex differs: a path no `host_executable` names could be a
+        // file the bot wrote itself, so the name's rules may ask about it
+        // or refuse it but never let it out unasked.
+        if !pinned {
+            matched.retain(|m| m.decision != Decision::Allow);
+        }
+        matched
     }
 }
 
@@ -266,13 +275,17 @@ mod tests {
             "prefix_rules": [
                 {"pattern": ["git", "push"], "decision": "forbidden"},
                 {"pattern": ["rg"]},
+                {"pattern": ["rm"], "decision": "forbidden"},
             ],
             "host_executables": {"git": ["/usr/bin/git"]},
         }));
         let decision = |command: &str| policy.verdict(&[words(command)]).decision;
         assert_eq!(decision("/usr/bin/git push"), Some(Decision::Forbidden));
         assert_eq!(decision("/tmp/git push"), None);
-        assert_eq!(decision("/usr/local/bin/rg x"), Some(Decision::Allow));
+        // A path no host_executable names may ask or refuse by the name's
+        // rules, but is never let out by them: the bot could have written it.
+        assert_eq!(decision("/tmp/rg x"), None);
+        assert_eq!(decision("/tmp/rm -rf x"), Some(Decision::Forbidden));
         assert_eq!(decision("./rg x"), None);
         let verdict = policy.verdict(&[words("/usr/bin/git push")]);
         assert_eq!(verdict.matched[0].prefix, ["/usr/bin/git", "push"]);

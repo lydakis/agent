@@ -618,7 +618,8 @@ way `/react` does, and each note in the margin has its own `↩`.
   `justification` the agent is told); `sonny rules check -- git push`
   shows what the rules say. The files are Starlark, as Codex runs them,
   so variables, loops and functions work, and `host_executable` names
-  where a program lives (`/usr/bin/git` runs as `git`); Codex's
+  where a program lives (`/usr/bin/git` runs as `git`; a path it doesn't
+  name stays in the sandbox, as the name's `allow` rules never let it out); Codex's
   `network_rule` is refused, since a sandbox's network is on or off. A
   file that doesn't read keeps the rules last read, or, with none read
   yet, has every command refused with where it went wrong. When you

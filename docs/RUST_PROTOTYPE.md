@@ -2644,7 +2644,8 @@ A pattern is a command's first words; a list in it is a choice of words.
 the optional `source`, where the rule was written, when it has none. A
 command run by an absolute path that no rule matches as written is
 matched by its program's name, as Codex resolves it: when
-`host_executables` lists that path for the name, or lists nothing for it.
+`host_executables` lists that path for the name, or lists nothing for it;
+by the name's `allow` rules, only at a path it lists.
 `invalid`, with why, says the client couldn't read the rules: every shell
 call fails `rules_invalid` with it, where Codex would refuse to start. A
 pattern or list of choices that is empty, an empty justification, or a
@@ -2700,10 +2701,17 @@ every sandbox and, when missing, from being made there. The CLI passes
 writable folder that is a symlink refuses the call with
 `sandbox_unavailable`.
 
-Where this differs from Codex: `network_rule` waits for a proxy that
-filters a sandbox's network by host, which the daemon doesn't have; a
-sandbox's network is on or off. Sonny refuses a rules file that has one,
-so no rule is taken as kept that isn't.
+Where this differs from Codex:
+
+- `network_rule` waits for a proxy that filters a sandbox's network by
+  host, which the daemon doesn't have; a sandbox's network is on or off.
+  Sonny refuses a rules file that has one, so no rule is taken as kept
+  that isn't.
+- Codex lets a program run by any absolute path out by its name's
+  `allow` rules when no `host_executable` names it. Here such a path is
+  only asked about or refused by them, since a sandboxed bot could write
+  `/tmp/rg` and so leave the sandbox unasked; `host_executable` names the
+  paths an `allow` rule lets out.
 
 Protocol 39 replaces the bot setting `unsandboxed`, a sandboxed bot's
 list of command prefixes run outside it, with these rules, which can ask
