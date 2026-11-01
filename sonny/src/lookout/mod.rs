@@ -4254,20 +4254,29 @@ mod tests {
             .insert("calc.fix".into(), vec!["calc.lead".into()]);
         let from = json!({"from": {"bot": "calc.lead", "turn": 1, "bot_id": 1}});
         let failed = json!({"status": "failed", "error": "provider_http_400"});
+        // Its filter hears the end as task updates deliver it, with who
+        // asked: the lead, as `you`.
         for (filter, bounces) in [
             (
                 json!({"type": ["turn.ended"], "status": ["completed"]}),
                 true,
             ),
             (json!({"type": ["turn.ended"], "status": ["failed"]}), false),
+            (json!({"type": ["turn.ended"], "by": ["you"]}), false),
+            (json!({"type": ["turn.ended"], "by": ["person"]}), true),
+            (json!({"type": ["turn.ended"], "resolved": [false]}), false),
         ] {
             let mut lookout = seated("idle");
             lookout.subs[0].filter = Some(filter);
             let listed = lookout.updates.listed();
             lookout.sync(&listed);
+            let accepted = ev("calc.fix", 4, "accepted", from.clone());
+            let finished = ev("calc.fix", 4, "turn_finished", failed.clone());
+            lookout.updates.event(&accepted, Instant::now());
+            lookout.updates.event(&finished, Instant::now());
             service.lookouts.insert("calc.lead".into(), lookout);
-            service.bounced(&ev("calc.fix", 4, "accepted", from.clone()), true);
-            let told = service.bounced(&ev("calc.fix", 4, "turn_finished", failed.clone()), true);
+            service.bounced(&accepted, true);
+            let told = service.bounced(&finished, true);
             assert_eq!(told.len(), usize::from(bounces));
         }
     }
