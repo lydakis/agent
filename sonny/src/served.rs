@@ -269,8 +269,8 @@ fn subscriptions() -> Value {
             watches the tasks of a bot (every agent it or its tasks made) or bots by name. It also hears the \
             sources the person set up outside (a chat, a mailbox, a feed), each by name, in a note starting \
             \"From your sources\": every event, at once when the source says it steers, or one topic of a \
-            source as NAME:TOPIC, or only those its filter matches. A task subscribed to a topic, such as its \
-            pull request, hears it in place of the agents that made it. The commons is a source too, each \
+            source as NAME:TOPIC, or only those its filter matches. A topic one of your tasks subscribes to, \
+            such as its pull request, goes to that task instead of you. The commons is a source too, each \
             thread a topic: posting in a thread subscribes you to it as commons.THREAD, and removing that \
             leaves it. Add steer yourself for what you own; a filter or a digest only when the person asks \
             for one: what a filter leaves out you never hear, and a digest makes you late. Add one, or \
