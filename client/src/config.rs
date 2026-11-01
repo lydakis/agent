@@ -41,6 +41,7 @@
 //! commons_invite_tokens = 1000000  # what an invite pays for in its thread
 //! commons_digest = "1h"         # an agent hears its commons threads at most this often, unless asked sooner; 0 at once
 //! ask_wait_minutes = 60         # how long an unanswered ask waits to go ahead or remind; 0 never
+//! task_windows = 64            # task windows a lead keeps open, 32 by default; past it the least recently used closes; 0 no limit
 //! task_depth = 3                # generations of tasks below a lead, 2 by default (tasks' own start none); 0 no end
 //! sky_haikus = 0                # haikus a day from the sky's busiest agent, 8 by default; 0 none
 //! sky_haiku_window = 10         # minutes of messages and tool calls that make an agent busiest
@@ -387,6 +388,10 @@ pub struct Sonny {
     /// before its agent goes on with what it recommended, where it said
     /// it could, or is reminded of it; 0 lets every ask wait for them.
     pub ask_wait_minutes: u64,
+    /// How many of its tasks' windows a lead keeps open in its
+    /// multiplexer: past it, a new one closes the window the person used
+    /// least recently; 0 for no limit.
+    pub task_windows: u64,
     /// How many generations below a lead its line goes: a lead's tasks
     /// are the first, and an agent of the last starts none; 0 for no end.
     pub task_depth: u64,
@@ -459,6 +464,7 @@ impl Default for Sonny {
             commons_invite_tokens: 1_000_000,
             commons_digest: COMMONS_DIGEST.to_owned(),
             ask_wait_minutes: 60,
+            task_windows: 32,
             task_depth: 2,
             sky_haikus: 8,
             sky_haiku_window: 10,
@@ -940,6 +946,7 @@ fn parse(text: &str) -> Result<Config, String> {
                 "commons_invite_tokens",
                 "commons_digest",
                 "ask_wait_minutes",
+                "task_windows",
                 "task_depth",
                 "sky_haikus",
                 "sky_haiku_window",
@@ -1010,6 +1017,7 @@ fn parse(text: &str) -> Result<Config, String> {
                 "commons_invites" => Some(&mut config.sonny.commons_invites),
                 "commons_invite_tokens" => Some(&mut config.sonny.commons_invite_tokens),
                 "ask_wait_minutes" => Some(&mut config.sonny.ask_wait_minutes),
+                "task_windows" => Some(&mut config.sonny.task_windows),
                 "task_depth" => Some(&mut config.sonny.task_depth),
                 "sky_haikus" => Some(&mut config.sonny.sky_haikus),
                 "sky_haiku_window" => Some(&mut config.sonny.sky_haiku_window),

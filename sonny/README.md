@@ -248,6 +248,7 @@ at its model's own effort (`AGENT_EFFORT` when its model is
 | Whether agents have the commons | `[sonny] commons` (true, the default, or false) | |
 | When a note opens the margin | `[sonny] margin_opens` (`always`, the default, `unless-closed` or `never`) | |
 | Where a click on an agent's name goes | `[sonny] agent_opens` (`tab`, the default, or `beside`) | |
+| Task windows a lead keeps open | `[sonny] task_windows` (32 by default, 0 for no limit) | |
 | The daemon started with the machine | `[sonny] start_at_boot` (true or false, the default) | |
 | News from outside for the lookout | `[sonny.sources.NAME] command`, `every` | |
 
@@ -304,7 +305,20 @@ and its agents get no layout skill. A task's window
 closes once its work is taken: its turn completed and the lead (or the task
 that started it) waited on it. One that failed, stopped or waits on you stays
 open, and a task given more work opens again; ask the lead to show one, or
-run `sonny --agent NAME`. `--rex-host HOST` puts the session on another Rex
+run `sonny --agent NAME`. A lead keeps `[sonny] task_windows` of its tasks'
+windows open, 32 by default (0 for no limit), as VS Code's editor limit
+keeps editors: past it, a new one closes the window you used least
+recently, as each window's own Sonny saw you focus, type or click there
+(marked in `~/.agent/sonny/used/`). Only the lead's own tasks' windows
+count and close, as another lead of the folder keeps its own; tasks shown
+together in one window count once and close together. One that
+needs you (an approval, or a question open in it), failed, or holds a
+block its task asked for (a dev server) is never closed for room, as the
+lead heard or as that window's own Sonny last said (kept in
+`~/.agent/sonny/held/`, so it holds across either one starting again);
+with no other, the limit is passed. A window closed for room stays closed while its
+task works on, and `/status` (or its name) opens it again, also after the
+lead starts again (kept in `~/.agent/sonny/aside/`). `--rex-host HOST` puts the session on another Rex
 server; `--no-layout` turns the layout off. Sonny writes the skill for the
 multiplexer it runs in to `~/.agents/skills` (`rex-windows`,
 `herdr-panes` or `cmux-tabs`, from `skills/`), so any agent can run a long command where
