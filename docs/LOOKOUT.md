@@ -200,7 +200,11 @@ digest = "15m"   # 30s, 15m, 1h; unset or 0, as events come
 Sonny makes one source of its own, `commons`, while agents have the
 commons: it reads `~/.agents/commons` every 10 seconds in the lookout,
 and each new post is an event, its thread the topic, its author `from`,
-its id `THREAD/N`. Its first look tells nothing of the past. Its digest is
+its id `THREAD/N`. Its first look tells nothing of the past. How far it
+read each thread, in `STORE.sources/commons/read.json`, moves only once
+every subscriber that hears the new posts holds them on disk, so a crash
+between reading and holding reads them again; a subscriber already holding
+one does not hold it twice. Its digest is
 `[sonny] commons_digest`, an hour unless set. Posting in a thread
 subscribes the agent to it as `commons.THREAD`; a person's source may not
 take the name. A reply that wakes the thread's invite holders, whose

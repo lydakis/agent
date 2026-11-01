@@ -120,6 +120,16 @@ pub fn named(name: &str) -> (&str, Option<&str>) {
     }
 }
 
+/// What sources send the lookout: an event, or a question after a few,
+/// answered once every subscriber that hears them keeps them on disk
+/// (true), or could not (false). Sonny's own sources move their cursor
+/// only on a true answer, so a crash never loses what they read.
+#[derive(Debug)]
+pub enum Said {
+    Event(Box<Event>),
+    Kept(tokio::sync::oneshot::Sender<bool>),
+}
+
 /// One thing a source said.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Event {
@@ -294,7 +304,7 @@ impl Drop for Group {
 pub struct Runner {
     /// Where each source keeps what it needs between runs, as a cursor.
     dir: PathBuf,
-    sent: Sender<Event>,
+    sent: Sender<Said>,
     running: HashMap<String, (Source, tokio::task::JoinHandle<()>)>,
     /// Why the settings did not read, last time.
     unreadable: Option<String>,
@@ -303,7 +313,7 @@ pub struct Runner {
 }
 
 impl Runner {
-    pub fn new(dir: PathBuf, sent: Sender<Event>) -> Runner {
+    pub fn new(dir: PathBuf, sent: Sender<Said>) -> Runner {
         Runner {
             dir,
             sent,
@@ -395,7 +405,7 @@ impl Drop for Runner {
 
 /// Run a source's command again and again, sending each new event, until
 /// the task is aborted.
-async fn run(source: Source, every: Duration, dir: PathBuf, shape: PathBuf, sent: Sender<Event>) {
+async fn run(source: Source, every: Duration, dir: PathBuf, shape: PathBuf, sent: Sender<Said>) {
     let mut seen = Seen::default();
     let mut shape = Shape::read(shape);
     loop {
@@ -427,7 +437,7 @@ async fn own(
     every: Duration,
     dir: PathBuf,
     shape: PathBuf,
-    sent: Sender<Event>,
+    sent: Sender<Said>,
     poked: std::sync::Arc<tokio::sync::Notify>,
 ) {
     let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
@@ -437,15 +447,37 @@ async fn own(
     let mut shape = Shape::read(shape);
     loop {
         let (home, dir) = (home.clone(), dir.clone());
-        let lines = tokio::task::spawn_blocking(move || crate::commons::news(&home, &dir))
+        let news = tokio::task::spawn_blocking(move || crate::commons::news(&home, &dir))
             .await
             .unwrap_or_default();
-        for line in lines {
-            if !emit(&source, &line, &mut seen, &mut shape, &sent).await {
+        for line in &news.lines {
+            if !emit(&source, line, &mut seen, &mut shape, &sent).await {
                 return;
             }
         }
         shape.flush();
+        // The cursor moves past the news once every subscriber that hears
+        // it keeps it on disk: a crash before then reads it again, and an
+        // event read again that a subscriber holds already is not held twice.
+        let kept = match news.lines.is_empty() {
+            true => true,
+            false => {
+                let (kept, answer) = tokio::sync::oneshot::channel();
+                if sent.send(Said::Kept(kept)).await.is_err() {
+                    return;
+                }
+                answer.await.unwrap_or(false)
+            }
+        };
+        if kept {
+            let marked = tokio::task::spawn_blocking(move || news.mark_read()).await;
+            if !matches!(marked, Ok(true)) {
+                println!(
+                    "{}",
+                    json!({"event": "source_failed", "source": source.name, "why": "its cursor did not save"})
+                );
+            }
+        }
         if sent.is_closed() {
             return;
         }
@@ -463,7 +495,7 @@ async fn emit(
     line: &str,
     seen: &mut Seen,
     shape: &mut Shape,
-    sent: &Sender<Event>,
+    sent: &Sender<Said>,
 ) -> bool {
     let Some(mut event) = Event::parse(&source.name, line, super::epoch_ms()) else {
         return true;
@@ -473,7 +505,7 @@ async fn emit(
     }
     event.digest = digest(source);
     shape.saw(&event.fields);
-    sent.send(event).await.is_ok()
+    sent.send(Said::Event(Box::new(event))).await.is_ok()
 }
 
 /// IDs a source printed lately.
@@ -504,7 +536,7 @@ impl Seen {
 async fn once(
     source: &Source,
     dir: &Path,
-    sent: &Sender<Event>,
+    sent: &Sender<Said>,
     seen: &mut Seen,
     shape: &mut Shape,
 ) -> Result<std::process::ExitStatus, String> {
@@ -1141,10 +1173,13 @@ mod tests {
         }]);
         let mut texts = Vec::new();
         while texts.len() < 3 {
-            let event = tokio::time::timeout(Duration::from_secs(10), got.recv())
+            let Said::Event(event) = tokio::time::timeout(Duration::from_secs(10), got.recv())
                 .await
                 .unwrap()
-                .unwrap();
+                .unwrap()
+            else {
+                panic!("a command's source asks nothing back");
+            };
             assert_eq!(event.digest, Some(Duration::from_secs(300)));
             texts.push(event.text);
         }

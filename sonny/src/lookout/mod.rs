@@ -792,7 +792,7 @@ impl Service {
         &mut self,
         client: Arc<Client>,
         mut events: agent_client::Events,
-        from_sources: &mut tokio::sync::mpsc::Receiver<sources::Event>,
+        from_sources: &mut tokio::sync::mpsc::Receiver<sources::Said>,
     ) {
         let (bots, complete) = listed(&client).await;
         self.records = (bots.iter())
@@ -1085,10 +1085,8 @@ impl Service {
                 }
                 // What sources say is news once the stream is live; until
                 // then it waits in the channel.
-                Some(event) = from_sources.recv(), if self.live => {
-                    for lookout in self.lookouts.values_mut() {
-                        lookout.heard_from(&event);
-                    }
+                Some(said) = from_sources.recv(), if self.live => {
+                    self.said(said);
                 }
                 Some((lead, id, seen)) = results.recv() => {
                     // From a lookout since deleted.
@@ -1460,6 +1458,28 @@ impl Service {
                 Some((by.to_owned(), bot, id, emoji, remove, upto))
             }
             _ => None,
+        }
+    }
+
+    /// What a source said: an event each lookout holds if it hears it, or
+    /// a question answered once what every lookout holds is on disk. What
+    /// lookouts hold is written now for it, not on the next tick, so a
+    /// source that waits on the answer waits no longer than the writes.
+    fn said(&mut self, said: sources::Said) {
+        match said {
+            sources::Said::Event(event) => {
+                for lookout in self.lookouts.values_mut() {
+                    lookout.heard_from(&event);
+                }
+            }
+            sources::Said::Kept(kept) => {
+                for lookout in self.lookouts.values_mut() {
+                    lookout.flush();
+                }
+                held::then(move |written| {
+                    let _ = kept.send(written);
+                });
+            }
         }
     }
 
@@ -2606,7 +2626,7 @@ impl Lookout {
     /// hears that source.
     fn heard_from(&mut self, event: &sources::Event) {
         let subs = self.hearing(event);
-        if subs.is_empty() {
+        if subs.is_empty() || self.holds(event) {
             return;
         }
         if self.heard.len() >= HEARD {
@@ -2622,6 +2642,19 @@ impl Lookout {
             subs,
         });
         self.keep();
+    }
+
+    /// Whether an event with this one's source and ID waits already, or
+    /// is on its way: a source that read it again after a crash, before
+    /// its cursor moved, says it again.
+    fn holds(&self, event: &sources::Event) -> bool {
+        let Some(id) = event.id.as_deref() else {
+            return false;
+        };
+        let sending = self.sourcing.iter().flat_map(|(sent, ..)| sent);
+        (self.heard.iter().chain(&self.resend).chain(sending)).any(|heard| {
+            heard.event.source == event.source && heard.event.id.as_deref() == Some(id)
+        })
     }
 
     /// Tell the subscriber what its sources said: at once for an event its
@@ -2727,13 +2760,17 @@ impl Lookout {
 /// syncs never hold up the event loop: the newest body for each file
 /// wins, in the order handed over.
 mod held {
+    use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::{Mutex, OnceLock, mpsc};
 
+    /// What is called once the writes handed over before it are done:
+    /// whether every file holds what it was last handed.
+    type Then = Box<dyn FnOnce(bool) + Send>;
+
     enum Job {
         Write(PathBuf, Option<Vec<u8>>),
-        #[cfg_attr(not(test), allow(dead_code))]
-        Done(mpsc::Sender<()>),
+        Done(Then),
     }
 
     fn sender() -> &'static Mutex<mpsc::Sender<Job>> {
@@ -2741,6 +2778,9 @@ mod held {
         SENDER.get_or_init(|| {
             let (send, jobs) = mpsc::channel::<Job>();
             std::thread::spawn(move || {
+                // Writes that failed, tried again with the next, unless a
+                // newer body for the file came since.
+                let mut failed: HashMap<PathBuf, Option<Vec<u8>>> = HashMap::new();
                 while let Ok(job) = jobs.recv() {
                     let mut writes: Vec<(PathBuf, Option<Vec<u8>>)> = Vec::new();
                     let mut done = Vec::new();
@@ -2750,29 +2790,42 @@ mod held {
                                 writes.retain(|(had, _)| *had != path);
                                 writes.push((path, body));
                             }
-                            Job::Done(tell) => done.push(tell),
+                            Job::Done(then) => done.push(then),
+                        }
+                    }
+                    for (path, body) in failed.drain() {
+                        if !writes.iter().any(|(had, _)| *had == path) {
+                            writes.push((path, body));
                         }
                     }
                     for (path, body) in writes {
-                        match body {
-                            None => {
-                                let _ = std::fs::remove_file(&path);
-                            }
-                            Some(body) => {
-                                if let Some(dir) = path.parent() {
-                                    let _ = super::make_dir(dir);
-                                }
-                                let _ = agent_client::files::replace_mode(&path, &body, 0o600);
-                            }
+                        if !lands(&path, body.as_deref()) {
+                            failed.insert(path, body);
                         }
                     }
-                    for tell in done {
-                        let _ = tell.send(());
+                    for then in done {
+                        then(failed.is_empty());
                     }
                 }
             });
             Mutex::new(send)
         })
+    }
+
+    /// Whether the file holds `body` now, or is gone for none.
+    fn lands(path: &std::path::Path, body: Option<&[u8]>) -> bool {
+        match body {
+            None => match std::fs::remove_file(path) {
+                Ok(()) => true,
+                Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+            },
+            Some(body) => {
+                if let Some(dir) = path.parent() {
+                    let _ = super::make_dir(dir);
+                }
+                agent_client::files::replace_mode(path, body, 0o600).is_ok()
+            }
+        }
     }
 
     pub fn write(path: PathBuf, body: Option<Vec<u8>>) {
@@ -2781,14 +2834,23 @@ mod held {
         }
     }
 
+    /// Calls `then` once every write handed over before it is done, with
+    /// whether each file holds what it was last handed. Never called
+    /// only if the writer is gone, which drops `then`.
+    pub fn then(then: impl FnOnce(bool) + Send + 'static) {
+        if let Ok(send) = sender().lock() {
+            let _ = send.send(Job::Done(Box::new(then)));
+        }
+    }
+
     /// Waits for every write handed over before it.
     #[cfg(test)]
-    pub fn written() {
+    pub fn written() -> bool {
         let (tell, told) = mpsc::channel();
-        if let Ok(send) = sender().lock() {
-            let _ = send.send(Job::Done(tell));
-        }
-        let _ = told.recv();
+        then(move |written| {
+            let _ = tell.send(written);
+        });
+        told.recv().unwrap_or(false)
     }
 }
 
@@ -4504,5 +4566,226 @@ mod tests {
             told > 0 && lookout.heard.len() == NOTE_ITEMS - told,
             "{told}"
         );
+    }
+
+    /// Where the crash tests keep their commons, store and cursor.
+    struct Crash {
+        home: PathBuf,
+        store: PathBuf,
+    }
+
+    impl Crash {
+        fn held(&self) -> PathBuf {
+            beside(&self.store, ".sources")
+                .join(".held")
+                .join("calc.lead.json")
+        }
+
+        fn cursor(&self) -> PathBuf {
+            beside(&self.store, ".sources").join("commons")
+        }
+
+        /// The subscriber's lookout as a restarted lookout makes it: what
+        /// it held read back.
+        fn lookout(&self) -> Lookout {
+            let mut lookout = Lookout::new("calc.lead");
+            lookout.subs = vec![subs::Sub::commons("t", Some(1))];
+            (lookout.updates).seat(&json!({"name": "calc.lead", "bot_id": 1, "status": "idle"}));
+            lookout.restore(self.held());
+            lookout
+        }
+
+        fn service(&self) -> Service {
+            let mut service = service(self.store.clone(), &[]);
+            service.lookouts.insert("calc.lead".into(), self.lookout());
+            service
+        }
+    }
+
+    /// The commons source, as `sources::configured` makes it.
+    fn commons_source() -> agent_client::config::Source {
+        agent_client::config::Source {
+            name: agent_client::config::COMMONS_SOURCE.into(),
+            command: String::new(),
+            every: Some("1h".into()),
+            digest: None,
+        }
+    }
+
+    /// One side of the crash tests, run in a process of its own by
+    /// `commons_news_outlives_a_crash_at_every_step`: a lookout whose
+    /// commons source reads two new replies, killed at `SONNY_CRASH_STEP`
+    /// with no chance to clean up. Run on its own, it does nothing.
+    #[tokio::test]
+    async fn commons_crash_child() {
+        let (Some(step), Some(store)) = (
+            std::env::var("SONNY_CRASH_STEP").ok(),
+            std::env::var_os("SONNY_CRASH_STORE"),
+        ) else {
+            return;
+        };
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+        let crash = Crash {
+            home,
+            store: PathBuf::from(store),
+        };
+        let mut service = crash.service();
+        let (sent, mut got) = tokio::sync::mpsc::channel(16);
+        let mut runner = sources::Runner::new(beside(&crash.store, ".sources"), sent);
+        runner.set(vec![commons_source()]);
+        while let Some(said) = got.recv().await {
+            match (said, step.as_str()) {
+                // Read and on its way to the lookout, held by no one yet.
+                (said @ sources::Said::Event(_), "heard") => {
+                    service.said(said);
+                    std::process::abort();
+                }
+                (said @ sources::Said::Event(_), _) => service.said(said),
+                // Every event in the lookout's memory, none on disk.
+                (sources::Said::Kept(_), "kept") => std::process::abort(),
+                // On disk, the cursor not moved yet.
+                (sources::Said::Kept(_), "written") => {
+                    let (kept, answer) = tokio::sync::oneshot::channel();
+                    service.said(sources::Said::Kept(kept));
+                    assert!(answer.await.unwrap());
+                    std::process::abort();
+                }
+                // On disk, and the cursor moved past it.
+                (sources::Said::Kept(kept), _) => {
+                    service.said(sources::Said::Kept(kept));
+                    let read = crash.cursor().join("read.json");
+                    let moved = || {
+                        let read: Value = std::fs::read_to_string(&read)
+                            .ok()
+                            .and_then(|text| serde_json::from_str(&text).ok())
+                            .unwrap_or_default();
+                        read["t"]["posts"] == 3
+                    };
+                    let until = Instant::now() + Duration::from_secs(10);
+                    while !moved() && Instant::now() < until {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    assert!(moved());
+                    std::process::abort();
+                }
+            }
+        }
+        panic!("the commons source stopped");
+    }
+
+    #[test]
+    fn commons_news_outlives_a_crash_at_every_step() {
+        // (step, whether the subscriber's file holds the replies after the
+        // crash, whether the commons tells them again)
+        let steps = [
+            ("heard", false, true),
+            ("kept", false, true),
+            ("written", true, true),
+            ("marked", true, false),
+        ];
+        for (step, kept, again) in steps {
+            let root =
+                std::env::temp_dir().join(format!("sonny-crash-{step}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            let crash = Crash {
+                home: root.join("home"),
+                store: root.join("state.sqlite"),
+            };
+            let post = |by: &str, arguments: Value| {
+                crate::commons::call(&crash.home, by, None, None, &arguments).unwrap()
+            };
+            post(
+                "calc.lead",
+                json!({"post": {"name": "t", "title": "T", "text": "x"}}),
+            );
+            // The first look tells none of the past.
+            let first = crate::commons::news(&crash.home, &crash.cursor());
+            assert!(first.lines.is_empty());
+            assert!(first.mark_read());
+            post("b.y", json!({"reply": {"thread": "t", "text": "one"}}));
+            post("c.z", json!({"reply": {"thread": "t", "text": "two"}}));
+            let child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "lookout::tests::commons_crash_child",
+                    "--exact",
+                    "--nocapture",
+                ])
+                .env("HOME", &crash.home)
+                .env("SONNY_CRASH_STEP", step)
+                .env("SONNY_CRASH_STORE", &crash.store)
+                .output()
+                .unwrap();
+            assert!(
+                !child.status.success(),
+                "{step}: the child ran to the end: {}",
+                String::from_utf8_lossy(&child.stdout)
+            );
+            assert!(
+                std::os::unix::process::ExitStatusExt::signal(&child.status) == Some(libc::SIGABRT),
+                "{step}: {:?} {}",
+                child.status,
+                String::from_utf8_lossy(&child.stderr)
+            );
+            // Restarted: what the subscriber held, then what the commons
+            // reads again, which it holds once.
+            let mut lookout = crash.lookout();
+            assert_eq!(lookout.heard.len(), if kept { 2 } else { 0 }, "{step}");
+            let news = crate::commons::news(&crash.home, &crash.cursor());
+            assert_eq!(news.lines.len(), if again { 2 } else { 0 }, "{step}");
+            for line in &news.lines {
+                lookout.heard_from(&sources::Event::parse("commons", line, epoch_ms()).unwrap());
+            }
+            let mut ids: Vec<_> = (lookout.heard.iter())
+                .map(|heard| heard.event.id.clone().unwrap())
+                .collect();
+            ids.sort();
+            assert_eq!(ids, ["t/1", "t/2"], "{step}");
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_source_waits_for_what_lookouts_hold_to_be_written() {
+        let root = std::env::temp_dir().join(format!("sonny-kept-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let crash = Crash {
+            home: root.join("home"),
+            store: root.join("state.sqlite"),
+        };
+        let mut service = crash.service();
+        let event = |text: &str| {
+            sources::Event::parse(
+                "commons",
+                &json!({"id": text, "topic": "t", "text": text}).to_string(),
+                1,
+            )
+            .unwrap()
+        };
+        service.said(sources::Said::Event(Box::new(event("t/1"))));
+        // Asked, it writes what it holds at once and answers once written.
+        let (kept, answer) = tokio::sync::oneshot::channel();
+        service.said(sources::Said::Kept(kept));
+        assert!(answer.await.unwrap());
+        let written: Value =
+            serde_json::from_str(&std::fs::read_to_string(crash.held()).unwrap()).unwrap();
+        assert_eq!(written["events"][0]["id"], "t/1");
+        // Said again, as after a crash before the cursor moved, it is held once.
+        service.said(sources::Said::Event(Box::new(event("t/1"))));
+        assert_eq!(service.lookouts["calc.lead"].heard.len(), 1);
+        // A write that fails says so, and is tried again with the next.
+        std::fs::remove_file(crash.held()).unwrap();
+        std::fs::create_dir(crash.held()).unwrap();
+        service.said(sources::Said::Event(Box::new(event("t/2"))));
+        let (kept, answer) = tokio::sync::oneshot::channel();
+        service.said(sources::Said::Kept(kept));
+        assert!(!answer.await.unwrap());
+        std::fs::remove_dir(crash.held()).unwrap();
+        let (kept, answer) = tokio::sync::oneshot::channel();
+        service.said(sources::Said::Kept(kept));
+        assert!(answer.await.unwrap());
+        let written: Value =
+            serde_json::from_str(&std::fs::read_to_string(crash.held()).unwrap()).unwrap();
+        assert_eq!(written["events"].as_array().unwrap().len(), 2);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
