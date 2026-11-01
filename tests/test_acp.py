@@ -151,10 +151,10 @@ class AcpTests(ModelFixture):
         return thread, opened['result']['sessionId']
 
     def adopt(self, thread, session, name='lead'):
-        """The thread's first words, `/lead NAME`: it is that lead of the
+        """The thread's first words, `/switch NAME`: it is that lead of the
         folder, which starts no turn."""
         answered, updates = thread.answer_of(thread.ask('session/prompt', {
-            'sessionId': session, 'prompt': self.wrapped(f'/lead {name}')}))
+            'sessionId': session, 'prompt': self.wrapped(f'/switch {name}')}))
         self.assertEqual(answered['result'], {'stopReason': 'end_turn'})
         bot = 'calc.lead' if name == 'lead' else f'calc.lead.{name}'
         self.assertEqual([u['content']['text'] for u in updates if u['sessionUpdate'] == 'agent_message_chunk'],
@@ -375,7 +375,7 @@ class AcpTests(ModelFixture):
         self.assertEqual((lead['model'], lead['effort']), ('synthetic-model', 'high'))
         made = self.daemon.request('inspect', bot='calc.lead.again')['result']
         self.assertEqual((made['model'], made['effort']), ('other-model', 'low'))
-        # A thread whose first words are `/lead NAME` is that lead, and one
+        # A thread whose first words are `/switch NAME` is that lead, and one
         # asking for a lead the folder has not is refused.
         third, session = self.open(repo)
         self.adopt(third, session, 'again')
@@ -385,7 +385,7 @@ class AcpTests(ModelFixture):
         self.assertEqual(len(self.daemon.request('turns', bot='calc.lead.again')['result']['turns']), 2)
         fourth, session = self.open(repo)
         refused, _ = fourth.answer_of(fourth.ask('session/prompt', {'sessionId': session,
-                                                                     'prompt': self.wrapped('/lead gone')}))
+                                                                     'prompt': self.wrapped('/switch gone')}))
         self.assertIn('error', refused)
         # Another lead outlives the folder's first.
         self.assertIn('result', self.daemon.request('delete', bot='calc.lead'))
