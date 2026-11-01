@@ -6566,3 +6566,27 @@ lines under the 64 MiB bound each held part of the credit they needed and
 waited for the rest, so they deadlocked. That is why a line past its first
 4 KiB now waits for all of its credit at once.
 `long_lines_past_the_budget_together_all_get_in` is the regression test.
+
+The Perf workflow's matched screen of the ordinary request path, base
+main ec88749 against the PR head b739e2c, on the GitHub runner
+(2026-11-01):
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 45.908 | 46.601 | +1.5% |
+| admission | burst submit p99, ms | 6.235 | 6.34 | +1.7% |
+| completion | release to terminal p99, ms | 17.237 | 17.611 | +2.2% |
+| footprint | idle RSS, MiB | 20.277 | 20.07 | -1.0% |
+| footprint | per idle bot, KiB | 1.526 | 1.556 | +2.0% |
+| footprint | RSS after a turn each, MiB | 28.279 | 27.814 | -1.6% |
+| footprint | CPU per turn, ms | 1.617 | 1.614 | -0.2% |
+| lifecycle | CPU, s | 1.4 | 1.395 | -0.4% |
+| lifecycle | p95 turn, ms | 583.638 | 587.636 | +0.7% |
+| lifecycle | peak RSS, MiB | 27.02 | 26.85 | -0.6% |
+
+Every request line under 4 KiB, which is every line these benches send,
+takes one uncontended semaphore permit before its read and gives it back
+when the service takes the request up. No measure moves past 2.2%, inside
+the runner's spread between screens (release to terminal read 17.35 and
+17.24 ms on the base across the last two), and store jobs per turn held
+at about 7.5.
