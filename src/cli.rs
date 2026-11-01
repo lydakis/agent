@@ -203,8 +203,8 @@ const COMMANDS: &[Command] = &[
     Command {
         name: "sandbox",
         about: "Run a command in a sandbox: read-only, or writing only the folders named",
-        usage: "sandbox [--writable PATH]... [--network] -- COMMAND [ARGS...]",
-        flags: "--writable --network",
+        usage: "sandbox [--writable PATH]... -- COMMAND [ARGS...]",
+        flags: "--writable",
         settings: "",
         startup: false,
     },
@@ -465,10 +465,7 @@ fn print_flags(flags: &str) {
                 "PATH",
                 "Another folder a workspace-write bot, or a sandboxed command, may change; repeat for more",
             ),
-            "--network" => (
-                "",
-                "A workspace-write bot's commands, or a sandboxed command, may use the network",
-            ),
+            "--network" => ("", "A workspace-write bot's commands may use the network"),
             "--outputs" => (
                 "PATH",
                 "Where a new bot's tool outputs cut for the model are written whole, one file per stream; default the outputs folder beside the store",
@@ -877,7 +874,6 @@ mod tests {
             "sandbox",
             "--writable",
             "/r",
-            "--network",
             "--",
             "git",
             "--no-pager",
@@ -891,7 +887,6 @@ mod tests {
                 "sandbox",
                 "--writable",
                 "/r",
-                "--network",
                 "--",
                 "git",
                 "--no-pager",
@@ -914,5 +909,7 @@ mod tests {
         assert!(prepare(words(&["sandbox", "--writable", "/a"])).is_err());
         assert!(prepare(words(&["sandbox", "--"])).is_err());
         assert!(prepare(words(&["sandbox", "--bot", "x", "--", "ls"])).is_err());
+        // With the network off, it reaches no socket, the daemon's least.
+        assert!(prepare(words(&["sandbox", "--network", "--", "ls"])).is_err());
     }
 }

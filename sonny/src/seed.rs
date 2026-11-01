@@ -62,7 +62,6 @@ fn folders(top: &Path) -> Vec<PathBuf> {
             "--directory",
         ],
         &[],
-        false,
     ) else {
         return Vec::new();
     };
@@ -101,7 +100,7 @@ fn folders(top: &Path) -> Vec<PathBuf> {
 /// output cloned beside it.
 fn touch_tracked(dir: &Path) {
     use std::os::unix::ffi::OsStrExt;
-    let Ok(listed) = crate::task::confined_bytes(dir, &["ls-files", "-z"], &[], false) else {
+    let Ok(listed) = crate::task::confined_bytes(dir, &["ls-files", "-z"], &[]) else {
         return;
     };
     for file in listed.split(|byte| *byte == 0) {

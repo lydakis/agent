@@ -241,7 +241,6 @@ fn git_marks(root: &Path) -> HashMap<PathBuf, Mark> {
             ".",
         ],
         &[],
-        false,
     ) else {
         return HashMap::new();
     };

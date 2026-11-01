@@ -125,9 +125,11 @@ fn run() -> Result<i32> {
     }
 }
 
-/// `agent sandbox [--writable PATH]... [--network] -- COMMAND [ARGS...]`:
-/// the command in the sandbox a bot's commands run in, writing only the
-/// folders named (none: read-only), on the network only with `--network`. For a client that runs a
+/// `agent sandbox [--writable PATH]... -- COMMAND [ARGS...]`: the command
+/// in the sandbox a bot's commands run in, writing only the folders named
+/// (none: read-only), with the network off. Off, it reaches no Unix socket
+/// either, so not the daemon's, nor a bot's, which a bot's sandbox hides
+/// by the daemon's own knowledge of them. For a client that runs a
 /// program in a folder an agent may write, which could run what the agent
 /// left there: git runs a repository's hooks and the commands its config
 /// names. As Codex's `codex sandbox`, with no daemon: the same sandbox,
@@ -143,13 +145,8 @@ fn sandboxed(args: &[String]) -> Result<i32> {
         return fail_with("usage", "sandbox needs a command after --");
     };
     let mut writable = Vec::new();
-    let mut network = false;
     let mut iter = flags.iter();
     while let Some(flag) = iter.next() {
-        if flag == "--network" {
-            network = true;
-            continue;
-        }
         match (flag.as_str(), iter.next()) {
             // By its real path, which is what the sandbox sees.
             ("--writable", Some(path)) => match std::fs::canonicalize(path)
@@ -176,7 +173,7 @@ fn sandboxed(args: &[String]) -> Result<i32> {
         true => Mode::ReadOnly,
         false => Mode::WorkspaceWrite,
     };
-    let policy = Policy::new(Some(mode), None, &writable, network, &daemon)?
+    let policy = Policy::new(Some(mode), None, &writable, false, &daemon)?
         .ok_or(Error::new("sandbox_unavailable"))?;
     let rest: Vec<&str> = rest.iter().map(String::as_str).collect();
     let mut child = agent_runtime::sandbox::command(&policy, program, &rest, false)?;

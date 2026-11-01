@@ -169,17 +169,13 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
     // fork's are.
     let mut helped = None;
     let mut written = source.is_some();
-    // The lead's mode, whose sandbox the task works in and Sonny's git for
-    // it runs in: its network, or `None` with no sandbox.
+    // The lead's mode, whose sandbox the task works in, and Sonny's git for
+    // it in a sandbox too unless the lead has none.
     let mode = lead_mode(&agent, starter).unwrap_or_else(crate::approvals::default);
-    let fields = crate::approvals::sandbox(mode, here);
-    let network = (fields.get("sandbox").and_then(Value::as_str) != Some("danger-full-access"))
-        .then(|| {
-            fields
-                .get("network")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-        });
+    let confine = crate::approvals::sandbox(mode, here)
+        .get("sandbox")
+        .and_then(Value::as_str)
+        != Some("danger-full-access");
     let mut place = match &source {
         Some(source) => forked(&agent, name, source)?,
         None if info["threads_in"] == "project" => in_place(here, name),
@@ -192,7 +188,7 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
                 helped = worktree_of(&at, task);
                 written = true;
             }
-            worktree(&at, name, base.as_deref().unwrap_or("HEAD"), network)?
+            worktree(&at, name, base.as_deref().unwrap_or("HEAD"), confine)?
         }
     };
     // A worktree's files come from commits a task can write, which may
@@ -1208,9 +1204,8 @@ fn own_folder(here: &Path, name: &str) -> Result<Place, String> {
 /// A git worktree on branch agent/NAME at the last commit, in the lead's
 /// subfolder of it. Outside git, the lead's folder, which the task shares.
 ///
-/// `network` is the lead's sandbox's, which git runs in, or `None` for a
-/// lead with no sandbox.
-fn worktree(here: &Path, name: &str, base: &str, network: Option<bool>) -> Result<Place, String> {
+/// `confine`: git runs in a sandbox, as for a lead with one.
+fn worktree(here: &Path, name: &str, base: &str, confine: bool) -> Result<Place, String> {
     if git(here, &["rev-parse", "--show-toplevel"]).is_err() {
         return Ok(Place {
             note: Some(format!(
@@ -1245,22 +1240,23 @@ fn worktree(here: &Path, name: &str, base: &str, network: Option<bool>) -> Resul
             path: path.clone(),
             branch: branch.clone(),
         };
-        match network {
+        match confine {
             // Checking out runs the repository's hooks and filters, which a
             // repository an agent made inside the lead's folder holds as the
-            // agent wrote them: in the lead's sandbox, writing only the
-            // repository's git folder and the new worktree, made empty.
-            Some(network) => {
+            // agent wrote them: in a sandbox, writing only the repository's
+            // git folder and the new worktree, made empty, off the network
+            // (an LFS file comes from the objects the repository holds).
+            true => {
                 let made = (std::fs::create_dir_all(&path).map_err(|e| e.to_string()))
                     .and_then(|()| common_dir(here).ok_or("no git folder".to_owned()))
-                    .and_then(|common| confined(here, &args, &[&common, &path], network));
+                    .and_then(|common| confined(here, &args, &[&common, &path]));
                 if let Err(e) = made {
                     self::undo(&undo);
                     let _ = std::fs::remove_dir_all(&path);
                     return Err(e);
                 }
             }
-            None => {
+            false => {
                 git(here, &args)?;
             }
         }
@@ -1454,27 +1450,18 @@ pub fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
 /// git in `dir`, a repository an agent may have written, run as an
 /// agent's command is: git runs a repository's hooks and the programs its
 /// config names (an fsmonitor, a filter), even to list its files, so in a
-/// sandbox writing only `writable` (none: read-only), on the network only
-/// with `network`, as Codex's agents run git (#597). As Sonny itself on a
-/// machine with no sandbox, where no agent is confined either.
-pub fn confined(
-    dir: &Path,
-    args: &[&str],
-    writable: &[&Path],
-    network: bool,
-) -> Result<String, String> {
-    let out = confined_bytes(dir, args, writable, network)?;
+/// sandbox writing only `writable` (none: read-only), off the network and
+/// so every Unix socket, the daemon's too, as Codex's agents run git
+/// (#597). As Sonny itself on a machine with no sandbox, where no agent is
+/// confined either.
+pub fn confined(dir: &Path, args: &[&str], writable: &[&Path]) -> Result<String, String> {
+    let out = confined_bytes(dir, args, writable)?;
     Ok(String::from_utf8_lossy(&out).trim().to_owned())
 }
 
 /// [`confined`]'s output as git wrote it, for output split on NULs.
-pub fn confined_bytes(
-    dir: &Path,
-    args: &[&str],
-    writable: &[&Path],
-    network: bool,
-) -> Result<Vec<u8>, String> {
-    confined_in(sandboxer(), dir, args, writable, network)
+pub fn confined_bytes(dir: &Path, args: &[&str], writable: &[&Path]) -> Result<Vec<u8>, String> {
+    confined_in(sandboxer(), dir, args, writable)
 }
 
 /// [`confined_bytes`] with Agent's binary `agent` running the sandbox, or
@@ -1484,7 +1471,6 @@ fn confined_in(
     dir: &Path,
     args: &[&str],
     writable: &[&Path],
-    network: bool,
 ) -> Result<Vec<u8>, String> {
     let git = crate::snapshot::git_program();
     let mut command = match agent {
@@ -1493,9 +1479,6 @@ fn confined_in(
             command.arg("sandbox");
             for path in writable {
                 command.arg("--writable").arg(path);
-            }
-            if network {
-                command.arg("--network");
             }
             command.arg("--").arg(git);
             command
@@ -1671,7 +1654,6 @@ pub fn remove(here: &Path, name: &str, discard: bool) -> Result<String, String> 
                     "--untracked-files=all",
                 ],
                 &[],
-                false,
             )?
             .is_empty()
         {
@@ -1815,7 +1797,7 @@ mod tests {
         git(&repo, &status).unwrap();
         assert!(marker.exists(), "git runs it as Sonny");
         std::fs::remove_file(&marker).unwrap();
-        confined_in(Some(&agent), &repo, &status, &[], false).unwrap();
+        confined_in(Some(&agent), &repo, &status, &[]).unwrap();
         assert!(!marker.exists(), "the sandbox keeps it from writing");
         git(&repo, &["config", "--unset", "core.fsmonitor"]).unwrap();
 
@@ -1831,7 +1813,7 @@ mod tests {
         let target = tree.to_string_lossy();
         let args = ["worktree", "add", "-q", "-b", "agent/t", &target, "HEAD"];
         // The hook's write fails, so git says the checkout failed.
-        let _ = confined_in(Some(&agent), &repo, &args, &[&common, &tree], false);
+        let _ = confined_in(Some(&agent), &repo, &args, &[&common, &tree]);
         assert!(tree.join("a.txt").is_file(), "the worktree is checked out");
         assert!(!marker.exists(), "the hook ran in the sandbox");
         let _ = std::fs::remove_dir_all(&dir);

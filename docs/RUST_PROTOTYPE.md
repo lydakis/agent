@@ -2627,12 +2627,13 @@ On Linux, bubblewrap makes an empty folder on the host to mount a missing
 it, and a detached command holds it until it exits. A sandbox that needs
 one being removed waits until it is gone.
 
-`agent sandbox [--writable PATH]... [--network] -- COMMAND [ARGS...]` runs
-one command in the same sandbox, with no daemon, as Codex's `codex sandbox`
-does: read-only with no `--writable`, else writing the folders named, `$TMPDIR`
-and `/tmp`, and reaching the network only with `--network` and a folder to
-write. The agent's home stays read-only, as `--protect-path` keeps it for a
-bot. It exits as its command does. It is for a client that runs a program
+`agent sandbox [--writable PATH]... -- COMMAND [ARGS...]` runs one command
+in the same sandbox, with no daemon, as Codex's `codex sandbox` does:
+read-only with no `--writable`, else writing the folders named, `$TMPDIR` and
+`/tmp`, always with the network off. Off, it reaches no Unix socket either,
+so not the daemon's nor a bot's, which a bot's own sandbox hides by the
+daemon's knowledge of them and this one has no daemon to ask. The agent's
+home stays read-only, as `--protect-path` keeps it for a bot. It exits as its command does. It is for a client that runs a program
 where an agent may have written: git runs a repository's hooks and the
 programs its config names (an fsmonitor, a filter) even to list its files,
 so a repository an agent made would run what it left there as the person.
