@@ -248,6 +248,7 @@ at its model's own effort (`AGENT_EFFORT` when its model is
 | Whether agents have the commons | `[sonny] commons` (true, the default, or false) | |
 | When a note opens the margin | `[sonny] margin_opens` (`always`, the default, `unless-closed` or `never`) | |
 | Where a click on an agent's name goes | `[sonny] agent_opens` (`tab`, the default, or `beside`) | |
+| Task windows a lead keeps open | `[sonny] task_windows` (32 by default, 0 for no limit) | |
 | The daemon started with the machine | `[sonny] start_at_boot` (true or false, the default) | |
 | News from outside for the lookout | `[sonny.sources.NAME] command`, `every` | |
 
@@ -304,7 +305,20 @@ and its agents get no layout skill. A task's window
 closes once its work is taken: its turn completed and the lead (or the task
 that started it) waited on it. One that failed, stopped or waits on you stays
 open, and a task given more work opens again; ask the lead to show one, or
-run `sonny --agent NAME`. `--rex-host HOST` puts the session on another Rex
+run `sonny --agent NAME`. A lead keeps `[sonny] task_windows` of its tasks'
+windows open, 32 by default (0 for no limit), as VS Code's editor limit
+keeps editors: past it, a new one closes the window you used least
+recently, as each window's own Sonny saw you focus, type or click there
+(marked in `~/.agent/sonny/used/`). Only the lead's own tasks' windows
+count and close, as another lead of the folder keeps its own; tasks shown
+together in one window count once and close together. One that
+needs you (an approval, or a question open in it), failed, or holds a
+block its task asked for (a dev server) is never closed for room, as the
+lead heard or as that window's own Sonny last said (kept in
+`~/.agent/sonny/held/`, so it holds across either one starting again);
+with no other, the limit is passed. A window closed for room stays closed while its
+task works on, and `/status` (or its name) opens it again, also after the
+lead starts again (kept in `~/.agent/sonny/aside/`). `--rex-host HOST` puts the session on another Rex
 server; `--no-layout` turns the layout off. Sonny writes the skill for the
 multiplexer it runs in to `~/.agents/skills` (`rex-windows`,
 `herdr-panes` or `cmux-tabs`, from `skills/`), so any agent can run a long command where
@@ -665,8 +679,12 @@ way `/react` does, and each note in the margin has its own `↩`.
   task's window closes once its turn ends. New work sent to the task
   reopens it. Each agent's
   time is how long its running turn has been at it, or how long its last
-  turn took. An agent with automations or follows of its own
-  shows `↻ 2 automations` beside its model. A click on an agent's name goes
+  turn took. Beside its model each agent names the profile it runs
+  as, `lead` and `task` too, which the footer leaves out (it names a
+  profile only when it is not the seat's own): a lead's as its project
+  sets it, a task's as it was started, with `start_task`'s `profile` or
+  its project's default. An agent with
+  automations or follows of its own shows `↻ 2 automations` there too. A click on an agent's name goes
   to it as a click on a task in a roster does (below), and so does
   Enter on the agent ↑ and ↓ pick (`›`); ‹ in its title,
   or Ctrl+[ from the conversation, goes back to `/status`. It opens
@@ -674,6 +692,8 @@ way `/react` does, and each note in the margin has its own `↩`.
   `/status` and Enter open the task a reply just pointed you to.
 
   ![/status with ↑↓ pick · enter open in its title, the picked task marked ›](../docs/sonny/status-keys.png)
+
+  ![/status naming each agent's profile beside its model: superlead, task, reviewer](../docs/sonny/status-profile.png)
 
   ![A task opened from /status in the pane, its ‹ going back to /status](../docs/sonny/status-opens-agent.png)
 - `/background` (or `/triggers`, `/lookout`) lists, in the pane beside the
@@ -728,8 +748,15 @@ way `/react` does, and each note in the margin has its own `↩`.
   none sit on the outer edge, as a tree's leaves do, so the sky fills to
   its rim. Throwaway copies, such as the approver's judges or a
   suggestion's writer, get no star: what they are told and do lights the
-  agent that made them, and a judge's question comes in from the edge, not
-  from you. It is a
+  agent that made them; a judge's question to its copy is not drawn. A
+  reviewer's verdict is: a red streak onto the agent whose call it
+  denied, a yellow one when it hands the call to you, nothing for an
+  allow, whose call runs. What comes in from no agent flies in from the
+  edge only when it is from outside: a follow, another person, a
+  schedule (whose tick flashes as it fires), a reply's note from the
+  commons, task updates. A commons invite flies from whoever started the
+  thread, a margin note you closed from you, and an agent's own goal only
+  pulses its star. It is a
   calm window to keep open and watch: dim lines join who made whom, and
   every pair that has ever talked keeps a dim curve, the last 96 pairs, past
   turns and live, denser and brighter the more the pair talked this hour. A
@@ -803,6 +830,8 @@ way `/react` does, and each note in the margin has its own `↩`.
   ![/sky with the busiest agent's haiku](../docs/sonny/sky-haiku.gif)
 
   ![/sky with an agent scheduling another, its tick on the rim and what is next up](../docs/sonny/sky-schedules.gif)
+
+  ![/sky: a reviewer's no streaking red onto an agent, a hand-off yellow, a schedule's tick flashing as it fires, a goal pulsing a star](../docs/sonny/sky-origins.gif)
 
   ![/sky with states and its chat log](../docs/sonny/sky-states.png)
 

@@ -90,6 +90,7 @@ mod tree;
 mod trigger;
 mod upgrade;
 mod usage;
+mod used;
 mod user_shell;
 mod zen;
 
@@ -1410,6 +1411,7 @@ fn status_report(state: &str, bot: &str) {
         return;
     }
     herdr::report(state);
+    used::reported(bot, state);
     if state == "clear" {
         cmux::release();
     }
@@ -2034,6 +2036,9 @@ struct App {
     /// The agent whose tab is being looked for, from a window with no
     /// layout of its own, and the look.
     tab_job: Option<(String, tokio::task::JoinHandle<Result<(), String>>)>,
+    /// When the person last used this window, for a lead that keeps only
+    /// so many task windows open.
+    window_used: used::Marks,
     place_read: Option<(String, Instant)>,
     model: String,
     effort: Option<String>,
@@ -2487,10 +2492,89 @@ struct Fleet {
     /// Tasks' turns that resolved them: their window closes once the turn
     /// completes.
     resolving: resolved::Own,
+    /// `[sonny] task_windows`, read on the worker as the file changes.
+    windows: Arc<std::sync::Mutex<TaskWindows>>,
 }
 
-/// A lead as the person tells it apart: `shop lead` for the folder's
-/// first, `shop lead billing` for `shop.lead.billing`.
+/// `[sonny] task_windows` as the config file last said it, read again
+/// only once the file changed, so that a change in `/config` from any
+/// window holds from the next task window on.
+#[derive(Default)]
+struct TaskWindows {
+    read: Option<Option<std::time::SystemTime>>,
+    most: usize,
+}
+
+impl TaskWindows {
+    fn most(&mut self) -> usize {
+        let path = agent_client::config::path();
+        let changed = (path.as_ref())
+            .and_then(|path| std::fs::metadata(path).ok())
+            .and_then(|file| file.modified().ok());
+        if self.read != Some(changed) {
+            self.read = Some(changed);
+            self.most = agent_client::config::load()
+                .map_or(agent_client::config::Sonny::default().task_windows, |c| {
+                    c.sonny.task_windows
+                }) as usize;
+        }
+        self.most
+    }
+}
+
+/// The status row's word on task windows closed for room.
+fn made_room(closed: &[String], project: &str, most: usize) -> String {
+    let tasks = format!("{project}.");
+    let names: Vec<&str> = (closed.iter())
+        .map(|bot| bot.strip_prefix(&tasks).unwrap_or(bot))
+        .collect();
+    format!(
+        "closed {}'s window for room ({most} task windows at most, in /config); /status opens it again",
+        names.join(", ")
+    )
+}
+
+/// What a lead may close for room in its multiplexer: only its own tasks'
+/// windows (another lead of the folder keeps its own there), none whose
+/// task it heard failed or need the person, and none whose window says so
+/// (`held`), as its own Sonny knows its questions and keeps that across
+/// either one starting again.
+fn room_for(
+    project: &str,
+    lineage: &std::collections::HashSet<String>,
+    doing: &HashMap<String, &'static str>,
+    held: mux::Held,
+) -> mux::Room {
+    mux::Room {
+        most: 0,
+        project: project.to_owned(),
+        mine: lineage.iter().chain(doing.keys()).cloned().collect(),
+        keep: (doing.iter())
+            .filter(|(_, doing)| matches!(**doing, "needs you" | "failed"))
+            .map(|(bot, _)| bot.clone())
+            .collect(),
+        used: Arc::new(used::when),
+        held,
+    }
+}
+
+/// The profile an agent runs as: a lead's as the project in its `folder`
+/// or the config sets it; a task's as Sonny noted it when it started the
+/// task, which then had its own or its project's; none for another.
+fn seat_profile(
+    store: &std::path::Path,
+    bot: &str,
+    lead: bool,
+    folder: &std::path::Path,
+) -> Option<String> {
+    match lead {
+        true => agent_client::project::read(folder)
+            .ok()
+            .and_then(|info| project::lead_profile(&info).ok()),
+        false => task::noted_profile(store, bot),
+    }
+}
+
 fn lead_title(project: &str, bot: &str) -> String {
     match bot.ends_with(".lead") {
         true => format!("{project} lead"),
@@ -2712,6 +2796,8 @@ impl Fleet {
         let note = (!layout.here()).then(|| format!("tasks open in {}", layout.home()));
         mux::install_skill(options.rex_host.as_deref());
         let (tell, said) = tokio::sync::mpsc::unbounded_channel();
+        let mut layout = layout;
+        layout.keep_aside(used::aside());
         let mut fleet = Self {
             layout: mux::Worker::new(layout),
             said,
@@ -2735,6 +2821,7 @@ impl Fleet {
             waits: Default::default(),
             returned: Vec::new(),
             resolving: Default::default(),
+            windows: Default::default(),
         };
         let own = lead.to_owned();
         fleet.layout.send(move |layout| layout.adopt_own(&own));
@@ -2811,21 +2898,48 @@ impl Fleet {
         self.name_windows();
     }
 
-    /// Open the task's window, unless it has one. With `tell`, the lead's
-    /// view hears where it opened, when not beside it, or why it did not.
-    fn show(&mut self, bot: &str, tell: bool) {
+    /// What a task's window runs, and its name while it is `doing` so.
+    fn window(&self, bot: &str, doing: &str) -> (Vec<String>, String) {
         let mut command = self.command.clone();
         command.extend(["--agent".into(), bot.into()]);
-        let name = format!("{} · working", self.short(bot));
+        (command, format!("{} · {doing}", self.short(bot)))
+    }
+
+    /// The room the project's task windows have, its limit read on the
+    /// worker: what needs the person or failed keeps its window.
+    fn room(&self) -> (Arc<std::sync::Mutex<TaskWindows>>, mux::Room) {
+        let room = room_for(
+            &self.project,
+            &self.lineage,
+            &self.doing,
+            Arc::new(used::held),
+        );
+        (self.windows.clone(), room)
+    }
+
+    /// Open the task's window, unless it has one or it was closed for
+    /// room. With `tell`, the lead's view hears where it opened, when not
+    /// beside it, or why it did not; windows closed for room are said in
+    /// the status row.
+    fn show(&mut self, bot: &str, tell: bool) {
+        let (command, name) = self.window(bot, "working");
         let (bot_name, home, here) = (
             bot.to_owned(),
             self.layout.home().to_owned(),
             self.layout.here(),
         );
         let told = self.tell.clone();
+        let (windows, mut room) = self.room();
         self.layout.send(move |layout| {
-            let said = match layout.show(&bot_name, &name, &command) {
-                Ok(true) if !here => Some(format!("{bot_name} is in {home}")),
+            room.most = windows.lock().map_or(0, |mut windows| windows.most());
+            let said = match layout.show_task(&bot_name, &name, &command, &room, false) {
+                Ok(mux::Shown::Opened(closed)) => {
+                    if !closed.is_empty() {
+                        let _ =
+                            told.send(Told::Notice(made_room(&closed, &room.project, room.most)));
+                    }
+                    (!here).then(|| format!("{bot_name} is in {home}"))
+                }
                 Ok(_) => None,
                 Err(error) => Some(error),
             };
@@ -2838,10 +2952,28 @@ impl Fleet {
 
     /// Bring the task's own tab into view in the multiplexer, as the
     /// person asked; looked for on the worker, after every window opened
-    /// so far. With none, `beside` opens it in the pane, else says so.
-    fn go_to(&self, bot: &str, beside: bool) {
+    /// so far, and opened again when it was closed for room. With none,
+    /// `beside` opens it in the pane, else says so.
+    fn go_to(&mut self, bot: &str, beside: bool) {
+        let doing = self.doing.get(bot).copied().unwrap_or("idle");
+        let (command, name) = self.window(bot, doing);
+        let (windows, mut room) = self.room();
         let (bot, told) = (bot.to_owned(), self.tell.clone());
         self.layout.send(move |layout| {
+            if layout.aside(&bot) {
+                room.most = windows.lock().map_or(0, |mut windows| windows.most());
+                match layout.show_task(&bot, &name, &command, &room, true) {
+                    Ok(mux::Shown::Opened(closed)) if !closed.is_empty() => {
+                        let _ =
+                            told.send(Told::Notice(made_room(&closed, &room.project, room.most)));
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        let _ = told.send(Told::Notice(error));
+                        return;
+                    }
+                }
+            }
             if let Err(error) = layout.focus(&bot) {
                 let _ = told.send(match beside {
                     true => Told::Beside(bot),
@@ -3109,6 +3241,8 @@ impl Fleet {
             }
             "deleted" => {
                 self.close(bot);
+                let gone = bot.to_owned();
+                self.layout.send(move |_| used::forget(&gone));
                 self.lineage.remove(bot);
                 self.doing.remove(bot);
                 None
@@ -3134,6 +3268,7 @@ impl App {
             place: place::Place::default(),
             place_job: None,
             tab_job: None,
+            window_used: Default::default(),
             place_read: None,
             model,
             effort: record["effort"].as_str().map(str::to_owned),
@@ -3356,7 +3491,25 @@ impl App {
             }
             self.approvals_for(Some(turn)).await;
         } else {
-            status_report("idle", &self.bot);
+            // Its last turn's end, as a turn's end reports it live: a window
+            // opened again on an agent whose turn failed still says so, and
+            // keeps its place among the lead's windows.
+            // A model that said nothing is no failure, as live.
+            let failed = match self
+                .client
+                .request(
+                    "turns",
+                    json!({"bot": self.bot, "newest": true, "limit": 4}),
+                )
+                .await
+            {
+                Ok(page) => {
+                    let last = self.task_turn(&page).await;
+                    last["status"] == "failed" && last["error"] != EMPTY
+                }
+                Err(_) => false,
+            };
+            status_report(if failed { "error" } else { "idle" }, &self.bot);
         }
         self.configure().await;
         self.tell_upgrades().await;
@@ -4627,7 +4780,7 @@ impl App {
     fn open_agent(&mut self, bot: &str, other: bool) {
         use agent_client::config::AgentOpens;
         let tab = (self.agent_opens == AgentOpens::Tab) != other;
-        match &self.fleet {
+        match &mut self.fleet {
             Some(fleet) if tab => fleet.go_to(bot, true),
             // A task's window, or one in the pane, lays nothing out
             // itself: its project's layout is found off the screen, and
@@ -7335,6 +7488,9 @@ impl App {
             .as_millis() as u64;
         let store = self.store();
         let mut rows = Vec::new();
+        // Each lead's project file read once a refresh; a task's profile
+        // is the one noted when it started.
+        let mut profiles: HashMap<String, Option<String>> = HashMap::new();
         // With other leads in the folder, their tasks are theirs: each
         // lead shows as a row of its own.
         let shared = lead != format!("{project}.lead")
@@ -7481,6 +7637,23 @@ impl App {
                     bot["model"].as_str().unwrap_or("?")
                 ),
             };
+            // The profile it runs as, said even when it is its seat's own,
+            // which the footer leaves out.
+            let profile = match project::is_lead(name) {
+                true => {
+                    let folder = bot["workspace"].as_str().unwrap_or("").to_owned();
+                    (profiles.entry(folder))
+                        .or_insert_with_key(|folder| match folder.as_str() {
+                            "" => None,
+                            folder => {
+                                seat_profile(&store, name, true, std::path::Path::new(folder))
+                            }
+                        })
+                        .clone()
+                }
+                false => seat_profile(&store, name, false, std::path::Path::new("")),
+            }
+            .unwrap_or_default();
             rows.push(status::Row {
                 name: short(name, &project, &lead),
                 bot: name.to_owned(),
@@ -7489,6 +7662,7 @@ impl App {
                 seconds,
                 at,
                 model,
+                profile,
                 latest: step,
                 place,
                 pr: pr.unwrap_or_default(),
@@ -8607,7 +8781,7 @@ impl App {
             // An agent's title button: this window becomes its Sonny.
             "main" => self.switch_command(id).await,
             // Its name: its own tab, where the lead's tasks are laid out.
-            "tab" => match &self.fleet {
+            "tab" => match &mut self.fleet {
                 Some(fleet) => fleet.go_to(id, false),
                 None => {
                     self.notice = Some(format!(
@@ -8873,6 +9047,21 @@ impl App {
         // back between two draws, and a terminal regains focus after the
         // display slept. Every cell is written again then, as vim and
         // ncurses programs do on each resize, and on Ctrl-L as a shell does.
+        // The person focused, typed or clicked here: this window is used.
+        if matches!(
+            &event,
+            Event::FocusGained
+                | Event::Key(KeyEvent {
+                    kind: KeyEventKind::Press,
+                    ..
+                })
+                | Event::Mouse(event::MouseEvent {
+                    kind: event::MouseEventKind::Down(_),
+                    ..
+                })
+        ) {
+            self.window_used.used(&self.bot);
+        }
         match &event {
             Event::Resize(..) => self.stale = true,
             Event::FocusGained => {
@@ -10564,6 +10753,9 @@ impl App {
     }
 
     fn frame(&mut self, terminal: &mut Tui) -> std::io::Result<()> {
+        // A question open here holds this window's place in its lead's
+        // multiplexer, as the person still has it to answer.
+        used::asking(&self.bot, !self.asks.is_empty());
         self.show_asked();
         self.margin_back();
         // /status beside the conversation, gone once the pane is.
@@ -11381,9 +11573,8 @@ impl App {
     }
 
     /// The profile the agent runs as, when it isn't its seat's own: a
-    /// lead's other than `lead`, a task's other than `task`, as its
-    /// project or the config sets them. Read again only for another agent
-    /// or folder.
+    /// lead's other than `lead`, a task's other than `task`. Read again
+    /// only for another agent or folder.
     fn profile(&self) -> Option<String> {
         let key = (self.bot.clone(), self.workspace.clone());
         if let Some((read, profile)) = &*self.profile.borrow()
@@ -11391,16 +11582,10 @@ impl App {
         {
             return profile.clone();
         }
+        let lead = self.project.is_some();
         let here = std::path::Path::new(&self.workspace);
-        let info = |dir: &std::path::Path| agent_client::project::read(dir).ok();
-        let profile = match (&self.project, task::source_folder(here)) {
-            (Some(_), _) => (info(here).and_then(|info| project::lead_profile(&info).ok()))
-                .filter(|profile| profile != "lead"),
-            (None, Some(source)) => (info(&source))
-                .and_then(|info| project::task_profile(&info).ok())
-                .filter(|profile| profile != "task"),
-            (None, None) => None,
-        };
+        let profile = seat_profile(&self.store(), &self.bot, lead, here)
+            .filter(|profile| profile != if lead { "lead" } else { "task" });
         *self.profile.borrow_mut() = Some((key, profile.clone()));
         profile
     }
@@ -11940,6 +12125,56 @@ fn zen_notice(on: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_lead_makes_room_only_from_its_own_windows_that_nothing_holds() {
+        // Two leads share the folder's multiplexer home: `shop.x` is the
+        // other's. This lead heard `shop.a` fail; `shop.c`'s window has a
+        // question open, which only that window's Sonny knows.
+        let mut layout = mux::in_memory(&[
+            ("shop.lead", "lead"),
+            ("shop.x", "x"),
+            ("shop.a", "a"),
+            ("shop.b", "b"),
+            ("shop.c", "c"),
+        ]);
+        let lineage: std::collections::HashSet<String> =
+            ["shop.lead", "shop.a", "shop.b", "shop.c", "shop.d"]
+                .map(String::from)
+                .into();
+        let doing: HashMap<String, &'static str> = [
+            ("shop.a".to_owned(), "failed"),
+            ("shop.b".to_owned(), "done"),
+        ]
+        .into();
+        let room = mux::Room {
+            most: 3,
+            ..room_for(
+                "shop",
+                &lineage,
+                &doing,
+                Arc::new(|bot: &str| bot == "shop.c"),
+            )
+        };
+        // Its three windows are full: the one nothing holds closes, never
+        // the other lead's, the failed one or the one asking.
+        assert_eq!(
+            layout.show_task("shop.d", "d", &[], &room, false).unwrap(),
+            mux::Shown::Opened(vec!["shop.b".into()])
+        );
+        // One more closes the only window left that nothing holds, however
+        // lately it opened.
+        let more: std::collections::HashSet<String> =
+            lineage.iter().cloned().chain(["shop.e".into()]).collect();
+        let room = mux::Room {
+            most: 3,
+            ..room_for("shop", &more, &doing, Arc::new(|bot: &str| bot == "shop.c"))
+        };
+        assert_eq!(
+            layout.show_task("shop.e", "e", &[], &room, false).unwrap(),
+            mux::Shown::Opened(vec!["shop.d".into()])
+        );
+    }
 
     #[test]
     fn a_message_is_drawn_without_the_time_it_was_sent() {
@@ -12715,6 +12950,55 @@ mod tests {
         moved.store(true, Ordering::SeqCst);
         app.status_rows().await.unwrap();
         assert_eq!(histories.load(Ordering::SeqCst), 259);
+    }
+
+    #[tokio::test]
+    async fn status_names_each_agents_profile_even_its_seats_own() {
+        let dir = std::env::temp_dir().join(format!("sonny-status-profile-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join(".agents")).unwrap();
+        std::fs::write(
+            dir.join(".agents/project.toml"),
+            "name = \"shop\"\nprofile = \"superlead\"\n",
+        )
+        .unwrap();
+        let folder = dir.to_string_lossy().into_owned();
+        let client =
+            daemon_answering(
+                move |asked| match asked["op"].as_str().unwrap_or_default() {
+                    "bots" => json!({"bots": [
+                {"name": "shop.lead", "bot_id": 1, "head": 1, "workspace": folder,
+                    "status": "idle", "running_turn": null},
+                {"name": "shop.fix", "bot_id": 2, "head": 1,
+                    "status": "idle", "running_turn": null},
+                {"name": "shop.old", "bot_id": 3, "head": 1,
+                    "status": "idle", "running_turn": null},
+            ], "next_after": null}),
+                    "turns" => json!({"turns": [], "next_before": null}),
+                    "history_nodes" => json!({"nodes": [], "next_from": null}),
+                    "history_items" => json!({"items": []}),
+                    _ => json!({"error": {"code": "unexpected", "message": asked.to_string()}}),
+                },
+            )
+            .await;
+        let mut app = app(client);
+        app.bot = "shop.lead".into();
+        app.options.store = dir.join("store");
+        // A task runs as the profile it was started with, whatever its
+        // project tells tasks by default.
+        task::note_profile(&app.store(), "shop.fix", "reviewer").unwrap();
+        let (_, rows) = app.status_rows().await.unwrap();
+        let profile = |bot: &str| {
+            rows.iter()
+                .find(|row| row.bot == bot)
+                .unwrap()
+                .profile
+                .clone()
+        };
+        assert_eq!(profile("shop.lead"), "superlead");
+        assert_eq!(profile("shop.fix"), "reviewer");
+        // Not started by Sonny: nothing said rather than a guess.
+        assert_eq!(profile("shop.old"), "");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[tokio::test]
@@ -14435,6 +14719,20 @@ mod tests {
         let text = app.footer_line(140).to_string();
         assert!(
             text.contains(&format!(" {} · superlead · ", models::label(&app.model))),
+            "{text}"
+        );
+        // A task, as Sonny noted it when it started it: named only when
+        // it is not `task`.
+        app.options.store = dir.join("store");
+        app.project = None;
+        app.bot = "top.fix".into();
+        task::note_profile(&app.store(), "top.fix", "task").unwrap();
+        assert!(!app.footer_line(140).to_string().contains("task ·"));
+        app.bot = "top.check".into();
+        task::note_profile(&app.store(), "top.check", "reviewer").unwrap();
+        let text = app.footer_line(140).to_string();
+        assert!(
+            text.contains(&format!(" {} · reviewer · ", models::label(&app.model))),
             "{text}"
         );
         std::fs::remove_dir_all(&dir).unwrap();
