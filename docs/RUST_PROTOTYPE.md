@@ -1335,7 +1335,11 @@ does not, and each is one op:
 - `stats` returns the daemon's live state without sampling its process from
   outside: open sessions, active turns against the bound, parked turns,
   running processes against the process bound and how many of them are
-  still in line for a slot (`queued_processes`), turns queued or ready to
+  still in line for a slot (`queued_processes`), terminals and detached
+  commands running against `--max-lasting` (`lasting_processes`, of them
+  `lasting_terminals`, and `lasting_limit`, 0 for none), the load gate as
+  `load_gate` (`{limit, shut}`, shut while the load is at the limit or
+  over it, `null` with no gate), turns queued or ready to
   start (`queued_turns`) with their prompt and quoted bytes (`pending_bytes`) and the
   bounds on both (`pending_limit`, `pending_bytes_limit`), daemon-wide in-flight
   requests per shared HTTP client shard (`transport.in_flight_by_shard`),

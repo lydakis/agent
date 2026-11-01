@@ -59,7 +59,7 @@ const REPLY_WAIT_MS: u64 = 86_400_000;
 /// How long `fire` waits for launchd's run of the job to say what came of
 /// it: its gate's whole time, and then some for the send.
 const FIRE_WAIT: Duration = Duration::from_secs(90);
-pub const USAGE: &str = "usage: trigger add [--name NAME] [WHEN] [--bot NAME | --start NAME --model PROVIDER/MODEL [--effort LEVEL]] [--reply-to BOT] [--if CMD] [--runs N] [--turn-budget-tokens N] [--replace] -- MESSAGE\n         WHEN: --every N{m,h,d} | --in N{m,h} | --at 'YYYY-MM-DD HH:MM' | --cron 'MIN HOUR DAY MONTH WEEKDAY' | --file PATH | --commit REPO; none: only fire runs it\n       trigger ls [--after NAME]\n       trigger show NAME\n       trigger fire NAME\n       trigger rm NAME";
+pub const USAGE: &str = "usage: trigger add [--name NAME] [WHEN] [--bot NAME | --start NAME --model PROVIDER/MODEL [--effort LEVEL]] [--reply-to BOT] [--if CMD] [--runs N] [--turn-budget-tokens N] [--shadow] [--replace] -- MESSAGE\n         WHEN: --every N{m,h,d} | --in N{m,h} | --at 'YYYY-MM-DD HH:MM' | --cron 'MIN HOUR DAY MONTH WEEKDAY' | --file PATH | --commit REPO; none: only fire runs it\n       trigger ls [--after NAME]\n       trigger show NAME\n       trigger fire NAME\n       trigger rm NAME";
 
 /// The system's own scheduler, which keeps Sonny's one job.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -315,6 +315,9 @@ pub struct Trigger {
     /// on that socket serving another store is not its daemon.
     pub store_id: String,
     pub message: String,
+    /// Each fire goes to a read-only copy of its agent instead, whose
+    /// answer is a report for whoever hears of the trigger: a dry run.
+    pub shadow: bool,
 }
 
 impl Trigger {
@@ -394,6 +397,9 @@ impl Trigger {
             pair("--socket", path(socket));
         }
         pair("--store-id", self.store_id.clone());
+        if self.shadow {
+            pair("--shadow", "1".into());
+        }
         args.extend(["--".into(), self.message.clone()]);
         args
     }
@@ -413,7 +419,7 @@ impl Trigger {
             let value = iter
                 .next()
                 .ok_or_else(|| bad(&format!("{flag} needs a value")))?;
-            const FLAGS: [&str; 22] = [
+            const FLAGS: [&str; 23] = [
                 "--name",
                 "--generation",
                 "--bot",
@@ -436,6 +442,7 @@ impl Trigger {
                 "--file",
                 "--store",
                 "--socket",
+                "--shadow",
             ];
             let known = FLAGS
                 .iter()
@@ -492,6 +499,7 @@ impl Trigger {
             daemon,
             store_id: need("--store-id")?,
             message,
+            shadow: text("--shadow").is_some(),
         })
     }
 
@@ -510,7 +518,8 @@ impl Trigger {
             "reply_to": self.reply_to.as_ref().map(|r| &r.0), "if": self.gate, "runs": self.runs,
             "turn_budget_tokens": self.turn_budget_tokens,
             "sent": state["sent"].as_u64().unwrap_or(0), "message": self.message,
-            "once": self.at.is_some(), "last": state["last"], "checked": state["checked"]})
+            "once": self.at.is_some(), "shadow": self.shadow, "last": state["last"],
+            "checked": state["checked"]})
     }
 
     /// The first field another trigger of its name differs in, to name in
@@ -537,6 +546,7 @@ impl Trigger {
             ("dir", self.dir == other.dir),
             ("daemon", self.daemon == other.daemon),
             ("store_id", self.store_id == other.store_id),
+            ("shadow", self.shadow == other.shadow),
         ]
         .into_iter()
         .find(|(_, same)| !same)
@@ -1329,6 +1339,230 @@ pub fn list(places: &Places, after: Option<&str>) -> Value {
     let next = more.then(|| names.last().cloned()).flatten();
     let rows: Vec<_> = names.into_iter().map(|name| row(places, &name)).collect();
     json!({"triggers": rows, "next_after": next})
+}
+
+/// What a backup keeps of this HOME's triggers: each one's definition as
+/// it was asked for, by name, without what its fires did nor the ids its
+/// daemon gave, which a new machine's store does not have. It is a list to
+/// read: nothing is set up from it, and a restore hands it to each
+/// folder's lead ([`restored`]).
+pub fn backed_up(places: &Places) -> Vec<Value> {
+    let mut all: Vec<Value> = (triggers(places).into_iter())
+        .map(|(trigger, _)| trigger.backed_up())
+        .collect();
+    all.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+    all
+}
+
+impl Trigger {
+    fn backed_up(&self) -> Value {
+        let (start, by) = match &self.target {
+            Target::Bot { .. } => (Value::Null, Value::Null),
+            Target::Start {
+                model, effort, by, ..
+            } => (
+                json!({"model": model, "effort": effort}),
+                json!(by.as_ref().map(|(by, _)| by)),
+            ),
+        };
+        json!({"name": self.name, "when": self.when, "bot": self.bot(), "start": start,
+            "by": by, "reply_to": self.reply_to.as_ref().map(|(to, _)| to), "if": self.gate,
+            "runs": self.runs, "turn_budget_tokens": self.turn_budget_tokens,
+            "once": self.at.is_some(), "commit": self.commit, "file": self.file,
+            "dir": self.dir, "shadow": self.shadow, "message": self.message})
+    }
+}
+
+/// Where a restore leaves the backup's list of triggers, and which
+/// projects' leads were handed theirs, a line each.
+fn restored_list(home: &Path) -> PathBuf {
+    home.join(".agent/sonny/restored-triggers.json")
+}
+
+fn restored_told(home: &Path) -> PathBuf {
+    home.join(".agent/sonny/restored-told")
+}
+
+/// A restore's list of triggers, `held` as the backup holds it, for the
+/// leads of this machine to set up again; a backup that holds none leaves
+/// none, and no lead was handed any of it yet.
+pub fn restore(home: &Path, held: Option<&[u8]>) -> Result<(), String> {
+    let (list, told) = (restored_list(home), restored_told(home));
+    let _ = std::fs::remove_file(&told);
+    match held {
+        Some(bytes) => {
+            if let Some(dir) = list.parent() {
+                std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+            }
+            agent_client::files::replace_mode(&list, bytes, 0o600)
+        }
+        None => match std::fs::remove_file(&list) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.to_string()),
+            _ => Ok(()),
+        },
+    }
+}
+
+/// What a restore brought that no lead was handed yet: the rows of the
+/// folders whose lead has not opened since, which a backup keeps until it
+/// has, so a sync before then does not lose them.
+pub fn pending_restored(home: &Path) -> Vec<Value> {
+    let told = crate::upgrade::lines(&restored_told(home));
+    let list = restored_rows(home);
+    let projects = restored_projects(&list, &told);
+    (list.iter())
+        .filter(|row| {
+            let bot = row["bot"].as_str().unwrap_or_default();
+            owner(bot, &projects).is_none_or(|project| !told.iter().any(|t| t == project))
+        })
+        .cloned()
+        .collect()
+}
+
+fn restored_rows(home: &Path) -> Vec<Value> {
+    (std::fs::read(restored_list(home)).ok())
+        .and_then(|list| serde_json::from_slice(&list).ok())
+        .unwrap_or_default()
+}
+
+/// The projects a restored list names: each lead a row messages, was
+/// added by or answers to, with `more` (one told, or one opening now). A
+/// folder's leads each have their own look in it, so each folder that had
+/// one is there.
+fn restored_projects(list: &[Value], more: &[String]) -> Vec<String> {
+    let mut projects: Vec<String> = more.to_vec();
+    for row in list {
+        for field in ["bot", "by", "reply_to"] {
+            if let Some(project) = row[field].as_str().and_then(crate::project::lead_project) {
+                projects.push(project.to_owned());
+            }
+        }
+    }
+    projects.sort();
+    projects.dedup();
+    projects
+}
+
+/// The project `bot` is in: the longest of `projects` its name starts
+/// with, so `shop.web.fix` is `shop.web`'s when both are projects.
+fn owner<'a>(bot: &str, projects: &'a [String]) -> Option<&'a str> {
+    (projects.iter())
+        .filter(|project| bot.starts_with(&format!("{project}.")))
+        .max_by_key(|project| project.len())
+        .map(String::as_str)
+}
+
+/// How the note a restore leaves a lead starts.
+pub const RESTORED: &str = "Sonny restored this home from its backup: ";
+
+/// What sent that note, for the daemon's record of the turn.
+pub const RESTORE_ORIGIN: &str = "sonny.restore";
+
+/// The triggers a restore brought that were `project`'s, for its lead to
+/// set up again, as a step an upgrade asks of it: which the person asked
+/// for is the lead's to judge, from what they say and its memory. A lead's
+/// own look (`LEAD.next`) is left out, since each lead sets its own.
+pub struct Restored {
+    home: PathBuf,
+    project: String,
+    /// Each note and the request id that makes it one turn, however often
+    /// it is sent.
+    notes: Vec<(String, String)>,
+}
+
+/// How much of a restored list one note carries: the daemon takes a
+/// message of at most 256 KiB, and a definition is at most 128 KiB.
+const RESTORED_PART: usize = 128 * 1024;
+
+/// What the first lead of `project` opened since a restore is to set up
+/// again; none once one was told, or when none of them were its.
+pub fn restored(project: &str) -> Option<Restored> {
+    restored_in(Path::new(&std::env::var_os("HOME")?), project)
+}
+
+pub(crate) fn restored_in(home: &Path, project: &str) -> Option<Restored> {
+    let told = crate::upgrade::lines(&restored_told(home));
+    if told.iter().any(|line| line == project) {
+        return None;
+    }
+    let list = restored_rows(home);
+    let projects = restored_projects(&list, &[told, vec![project.to_owned()]].concat());
+    let theirs: Vec<String> = (list.iter())
+        .filter(|row| {
+            let (name, bot) = (
+                row["name"].as_str(),
+                row["bot"].as_str().unwrap_or_default(),
+            );
+            owner(bot, &projects) == Some(project)
+                && !(crate::project::is_lead(bot) && name == Some(&format!("{bot}.next")))
+        })
+        .map(Value::to_string)
+        .collect();
+    if theirs.is_empty() {
+        return None;
+    }
+    // In parts the daemon takes, each a turn of its own.
+    let mut parts: Vec<Vec<String>> = vec![];
+    let mut size = 0;
+    for row in theirs {
+        if parts.is_empty() || size + row.len() > RESTORED_PART {
+            parts.push(vec![]);
+            size = 0;
+        }
+        size += row.len() + 1;
+        parts.last_mut().expect("a part").push(row);
+    }
+    let count = parts.len();
+    let notes = (parts.iter().enumerate())
+        .map(|(at, rows)| {
+            let part = match count {
+                1 => String::new(),
+                _ => format!(" (part {} of {count})", at + 1),
+            };
+            let note = format!(
+                "{RESTORED}its triggers did not come back, since each was tied to an agent in \
+                 the old machine's store, which a backup leaves out. These were this folder's, \
+                 as the backup kept them, one a line{part}:\n{}\nSet up again with the triggers \
+                 tool the ones the person asked for that still have work to do, for the agents \
+                 that do that work here now. Leave out what has run its course, such as a \
+                 one-off whose time passed, and what an agent set only for its own work. Tell \
+                 the person in a line what you set up and what you left out.",
+                rows.join("\n")
+            );
+            let key = format!(
+                "sonny-restore-{}",
+                crate::project::fingerprint(&format!("{project}\n{note}"))
+            );
+            (note, key)
+        })
+        .collect();
+    Some(Restored {
+        home: home.to_owned(),
+        project: project.to_owned(),
+        notes,
+    })
+}
+
+impl Restored {
+    /// Each note, with the request id that makes the same note sent twice
+    /// one turn.
+    pub fn notes(&self) -> &[(String, String)] {
+        &self.notes
+    }
+
+    #[cfg(test)]
+    pub fn note(&self) -> String {
+        let notes: Vec<&str> = self.notes.iter().map(|(note, _)| note.as_str()).collect();
+        notes.join("\n")
+    }
+
+    /// Its lead was told: no other lead of the project is.
+    pub fn told(&self) {
+        crate::upgrade::add(
+            &restored_told(&self.home),
+            std::slice::from_ref(&self.project),
+        );
+    }
 }
 
 /// A trigger as the sky shows it: the agent it messages, how it was
@@ -2143,6 +2377,7 @@ struct Add {
     gate: Option<String>,
     runs: Option<u64>,
     turn_budget_tokens: Option<u64>,
+    shadow: bool,
     replace: bool,
     message: String,
 }
@@ -2150,7 +2385,7 @@ struct Add {
 fn parse_add(args: &[String], now: i64) -> Result<Add, String> {
     let bad = |what: String| format!("invalid_trigger: {what}\n{USAGE}");
     let mut v = std::collections::HashMap::<String, String>::new();
-    let (mut when, mut commit, mut replace) = (None, None, false);
+    let (mut when, mut commit, mut replace, mut shadow) = (None, None, false, false);
     let mut iter = args.iter();
     let message = loop {
         let Some(flag) = iter.next() else {
@@ -2161,6 +2396,10 @@ fn parse_add(args: &[String], now: i64) -> Result<Add, String> {
         }
         if flag == "--replace" {
             replace = true;
+            continue;
+        }
+        if flag == "--shadow" {
+            shadow = true;
             continue;
         }
         let value = iter
@@ -2257,6 +2496,7 @@ fn parse_add(args: &[String], now: i64) -> Result<Add, String> {
         gate,
         runs,
         turn_budget_tokens,
+        shadow,
         replace,
         message,
     })
@@ -2661,6 +2901,9 @@ fn add_args(asked: &Value) -> Vec<String> {
     if asked["replace"] == true {
         args.push("--replace".to_owned());
     }
+    if asked["shadow"] == true {
+        args.push("--shadow".to_owned());
+    }
     let message = asked["message"].as_str().unwrap_or_default();
     args.extend(["--".to_owned(), message.to_owned()]);
     args
@@ -2831,6 +3074,8 @@ fn add(places: &Places, args: &[String]) -> Result<Value, String> {
             };
             let reply_to = match &asked.reply_to {
                 Some(bot) => Some((bot.clone(), bot_id(&client, bot).await?)),
+                // A shadow run's report is for the agent that set it up.
+                None if asked.shadow => shell.clone(),
                 None => None,
             };
             let store_id = client
@@ -2875,6 +3120,7 @@ fn add(places: &Places, args: &[String]) -> Result<Value, String> {
         daemon,
         store_id,
         message: asked.message,
+        shadow: asked.shadow,
     };
     // Where HEAD is now is seen, a repository with no commit yet too: only
     // a commit after it fires. It is read before launchd watches; one made
@@ -3165,9 +3411,15 @@ async fn deliver(
     // short, or the trigger that replaced this one, sends it again as it
     // was, and its answer to where it was to go under the same request id,
     // which the daemon takes once.
-    if let Some((sent, sender)) = ask.and_then(|ask| sent_for(ask, trigger)) {
+    if let Some((sent, sender, record)) = ask.and_then(|ask| sent_for(ask, trigger)) {
+        if let Some(record) = record {
+            return shadow_run(client, places, &sender, kept, record, ask).await;
+        }
         let bot = sent["bot"].as_str().unwrap_or_default().to_owned();
         return submit(client, &sender, &bot, sent, false, ask).await;
+    }
+    if trigger.shadow {
+        return shadow(client, places, trigger, kept, why, ask).await;
     }
     let prompt = format!(
         "[trigger {} · {} · {why}]\n{}",
@@ -3214,6 +3466,330 @@ async fn deliver(
     submit(client, trigger, bot, asking, started, ask).await
 }
 
+/// The tag of a shadow copy's one gate, which nobody serves: no call of it
+/// should ever ask, and one that did lapses unanswered, denied.
+const SHADOW_TAG: &str = "shadow";
+/// How much of an agent's name its shadow copy's name keeps: with
+/// `.shadow-` and six hex digits after it, the daemon's 128 bytes.
+const SHADOW_SOURCE_MAX: usize = 128 - ".shadow-".len() - 6;
+/// The daemon's tools a shadow copy goes without: a shell and its input.
+const SHADOW_WITHHELD: [&str; 2] = ["shell", "write_stdin"];
+/// How long a call on that gate waits before it lapses.
+const SHADOW_LAPSE_MS: u64 = 60_000;
+/// How long a shadow copy left idle stays, should its fire stop before it
+/// removes it.
+const SHADOW_EXPIRE_MS: u64 = 86_400_000;
+
+/// The agent a shadow copy copies, when `bot` is named as one: its name,
+/// `.shadow-` and up to six hex digits, as a side chat is named. A name
+/// alone only ever takes power away (see [`crate::exec`]), so an agent
+/// named so by anyone else does itself no good.
+pub fn shadow_source(bot: &str) -> Option<&str> {
+    let (source, stamp) = bot.rsplit_once(".shadow-")?;
+    let hex = |b: u8| b.is_ascii_digit() || (b'a'..=b'f').contains(&b);
+    (!source.is_empty() && (1..=6).contains(&stamp.len()) && stamp.bytes().all(hex))
+        .then_some(source)
+}
+
+/// A new shadow copy's name for `bot`: its name, cut to what fits, then
+/// `.shadow-` and a stamp. What a copy is of is kept with its fire, not
+/// read back from the name.
+fn shadow_name(bot: &str) -> String {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as u64);
+    let mut keep = bot.len().min(SHADOW_SOURCE_MAX);
+    while !bot.is_char_boundary(keep) {
+        keep -= 1;
+    }
+    let kept = bot[..keep].trim_end_matches('.');
+    format!("{kept}.shadow-{:x}", (stamp ^ sends()) % 0x100_0000)
+}
+
+/// The command rules a shadow copy goes by: the person's without their
+/// `allow` rules, which run a command outside the sandbox unasked. A
+/// `prompt` rule, with no gate to ask, refuses; a `forbidden` one still
+/// refuses.
+pub fn shadow_rules(
+    rules: Option<&agent_client::rules::Policy>,
+) -> Option<agent_client::rules::Policy> {
+    let mut rules = rules?.clone();
+    (rules.prefix_rules).retain(|rule| rule.decision != agent_client::rules::Decision::Allow);
+    Some(rules).filter(|rules| *rules != agent_client::rules::Policy::default())
+}
+
+/// What a shadow copy of the agent `record` describes may call: the
+/// daemon's tools it has but a shell, which the read-only sandbox confines,
+/// and of Sonny's, only `exec`, whose calls of a server's tools that do not
+/// say they only read are refused. Asking the person, starting tasks,
+/// writing memory and the like are not among them. Nor is a shell: a
+/// command in it reaches the daemon's socket, which takes a message to
+/// another agent or a pause from a read-only agent too.
+fn shadow_tools(record: &Value) -> Vec<String> {
+    let names = |list: &Value| -> Vec<String> {
+        (list.as_array().into_iter().flatten())
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect()
+    };
+    let mut tools = names(&record["tools"]);
+    tools.retain(|tool| !SHADOW_WITHHELD.contains(&tool.as_str()));
+    let declared = record["declared"].as_array().into_iter().flatten();
+    if declared
+        .clone()
+        .any(|tool| tool["name"] == crate::exec::NAME)
+    {
+        tools.push(crate::exec::NAME.to_owned());
+    }
+    if let Some(allowed) = record["allowed"].as_array() {
+        let allowed = names(&Value::Array(allowed.clone()));
+        tools.retain(|tool| allowed.contains(tool));
+    }
+    tools
+}
+
+/// The `configure` fields that make `name` a shadow copy: read-only, with
+/// no gate but the one `exec` needs to run at all, whose calls never ask
+/// it, and the person's command rules without their `allow`s.
+fn shadow_fields(name: &str, id: i64, tools: &[String]) -> Value {
+    let rules = shadow_rules(crate::rules::given().as_ref());
+    let mut fields = json!({"bot": name, "bot_id": id,
+        "settings": {"sandbox": "read-only", "rules": rules}});
+    match tools.iter().any(|tool| tool == crate::exec::NAME) {
+        true => {
+            fields["approve"] = json!([crate::exec::NAME]);
+            fields["approver"] = json!(SHADOW_TAG);
+            fields["approve_expire_ms"] = json!(SHADOW_LAPSE_MS);
+        }
+        false => fields["approve"] = json!([]),
+    }
+    fields
+}
+
+/// A shadow copy of `bot` where it is now, confined; its name and id.
+async fn fork_shadow(client: &Client, bot: &str, id: i64) -> Result<(String, i64), Value> {
+    let failed = |error: agent_client::Error| match error.code.as_str() {
+        "bot_not_found" => json!({"outcome": "gone", "detail": error.to_string()}),
+        _ => json!({"outcome": "failed", "detail": error.to_string()}),
+    };
+    let record = (client
+        .request("inspect", json!({"bot": bot, "bot_id": id}))
+        .await)
+        .map_err(failed)?;
+    let name = shadow_name(bot);
+    let tools = shadow_tools(&record);
+    let forked = client
+        .request(
+            "fork",
+            json!({"source": bot, "bot": name, "allow": tools, "expire_ms": SHADOW_EXPIRE_MS,
+                "request_id": name}),
+        )
+        .await
+        .map_err(failed)?;
+    let shadow = forked["bot_id"].as_i64().unwrap_or_default();
+    confine(client, &name, shadow, &tools).await?;
+    Ok((name, shadow))
+}
+
+/// Make `name` a shadow copy, or remove it: a copy that could not be
+/// confined never runs.
+async fn confine(client: &Client, name: &str, id: i64, tools: &[String]) -> Result<(), Value> {
+    let configured = client
+        .request("configure", shadow_fields(name, id, tools))
+        .await;
+    if let Err(error) = configured {
+        let _ = client
+            .request("delete", json!({"bot": name, "bot_id": id}))
+            .await;
+        return Err(json!({"outcome": "failed", "detail": format!("shadow: {error}")}));
+    }
+    Ok(())
+}
+
+/// A `--shadow` fire: the message goes to a read-only copy of the agent,
+/// where every call past reading is refused, never asked about, and the
+/// copy's answer goes to whoever hears of the trigger as a report, to set
+/// beside what the job it stands in for did. The copy goes once its report
+/// is passed on.
+async fn shadow(
+    client: &Client,
+    places: &Places,
+    trigger: &Trigger,
+    kept: &mut Kept,
+    why: &str,
+    ask: Option<&Asked>,
+) -> Value {
+    // A `--start` trigger's agent no fire made yet is made as its first
+    // fire would make it, and sent nothing: the copy is of it, so it has
+    // the same expiry and the same tools as any other copy.
+    let (bot, id) = match (&trigger.target, kept.started_id) {
+        (Target::Bot { name, id }, _) => (name.as_str(), *id),
+        (Target::Start { name, .. }, Some(id)) => (name.as_str(), id),
+        (Target::Start { name, .. }, None) => match start(client, trigger).await {
+            Ok(id) => {
+                kept.started_id = Some(id);
+                made(places, trigger, id);
+                (name.as_str(), id)
+            }
+            Err(error) => return unmade(error),
+        },
+    };
+    let (name, shadow) = match fork_shadow(client, bot, id).await {
+        Ok(made) => made,
+        Err(outcome) => return outcome,
+    };
+    let prompt = format!(
+        "[trigger {} · {} · {why} · shadow run]\nThis is a shadow run: you are a read-only \
+         copy of {bot}, and every call past reading is refused, not asked about. Do the work \
+         below as far as reading goes, then end with what you would have done: each change, \
+         message or post, with what it would have said.\n\n{}",
+        trigger.name,
+        stamp(now()),
+        trigger.message
+    );
+    let asking = json!({"bot": name, "bot_id": shadow, "request_id": request_id(trigger, shadow, ask),
+        "prompt": prompt, "delivery": "reject", "origin": "trigger",
+        "budget_tokens": trigger.turn_budget_tokens});
+    let sent = json!({"store_id": trigger.store_id, "generation": trigger.generation,
+        "reply_to": trigger.reply_to, "shadow_of": bot, "submit": asking});
+    if let Some(ask) = ask {
+        // As any ask keeps what it sent: one cut short goes on with this
+        // copy and this request, which the daemon takes once, and does not
+        // make another copy to do the work again.
+        if let Err(error) = keep_sent(places, trigger, ask, &sent) {
+            let _ = client
+                .request("delete", json!({"bot": name, "bot_id": shadow}))
+                .await;
+            return json!({"outcome": "failed", "detail": error});
+        }
+    }
+    shadow_run(client, places, trigger, kept, sent, ask).await
+}
+
+/// Send a shadow copy its turn, and pass its answer on as a report; the
+/// copy goes once its report went.
+async fn shadow_run(
+    client: &Client,
+    places: &Places,
+    trigger: &Trigger,
+    kept: &Kept,
+    mut sent: Value,
+    ask: Option<&Asked>,
+) -> Value {
+    let asking = sent["submit"].clone();
+    let of = sent["shadow_of"].as_str().unwrap_or_default().to_owned();
+    let name = asking["bot"].as_str().unwrap_or_default().to_owned();
+    let id = asking["bot_id"].as_i64().unwrap_or_default();
+    let delete = async || {
+        let _ = client
+            .request("delete", json!({"bot": name, "bot_id": id}))
+            .await;
+    };
+    // One whose report went before it was cut short ends as it did: its
+    // copy may be gone already, and nothing goes again.
+    if sent["done"].is_object() {
+        delete().await;
+        return sent["done"].clone();
+    }
+    let turn = match client.request("submit", asking).await {
+        Ok(turn) => turn["turn"].as_i64().unwrap_or_default(),
+        Err(error) => {
+            let _ = client
+                .request("delete", json!({"bot": name, "bot_id": id}))
+                .await;
+            return json!({"outcome": "failed", "detail": format!("shadow: {error}")});
+        }
+    };
+    let mut outcome = json!({"outcome": "sent", "turn": turn, "shadow": name,
+        "handle": format!("turn:{name}/{turn}")});
+    if let Some(ask) = ask.filter(|a| a.kind == Ask::Fire) {
+        let _ = std::fs::write(&ask.receipt, outcome.to_string());
+    }
+    outcome["reply"] = report(client, trigger, kept, (&name, id, turn), &of).await;
+    if let Some(ended) = outcome["reply"]
+        .as_object_mut()
+        .and_then(|r| r.remove("ended"))
+    {
+        outcome["ended"] = ended;
+    }
+    if outcome["reply"]["outcome"] == "sent" {
+        // Kept before the copy goes, so an ask cut short now ends as this
+        // one did rather than as a copy that is not there.
+        sent["done"] = outcome.clone();
+        let kept = ask.is_none_or(|ask| keep_sent(places, trigger, ask, &sent).is_ok());
+        if kept {
+            delete().await;
+        }
+    }
+    outcome
+}
+
+/// Who a shadow run's report goes to: the trigger's `--reply-to`, else the
+/// agent that added a `--start` trigger, else the agent it copies.
+fn reported_to(trigger: &Trigger, kept: &Kept) -> Option<(String, i64)> {
+    gate_told(trigger, kept)
+}
+
+/// Pass a shadow run's answer on, once its turn ends, as a report.
+async fn report(
+    client: &Client,
+    trigger: &Trigger,
+    kept: &Kept,
+    (bot, id, turn): (&str, i64, i64),
+    of: &str,
+) -> Value {
+    let Some((to, to_id)) = reported_to(trigger, kept) else {
+        return json!({"outcome": "failed", "detail": "no agent to report to"});
+    };
+    let handle = format!("turn:{bot}/{turn}");
+    let waited = client
+        .request(
+            "wait",
+            json!({"handles": [handle], "timeout_ms": REPLY_WAIT_MS}),
+        )
+        .await;
+    let result = match waited {
+        Ok(waited) => waited["results"][&handle].clone(),
+        Err(error) => return json!({"outcome": "failed", "detail": error.to_string()}),
+    };
+    if result["pending"] == true || result.is_null() {
+        return json!({"outcome": "failed", "detail": "the turn did not end within a day"});
+    }
+    let status = result["status"].as_str().unwrap_or("ended");
+    // How the copy's turn ended, kept with the fire's outcome: once the copy
+    // goes its handle reads nothing.
+    let ended = json!({"status": status, "error": result["error"], "detail": result["detail"]});
+    let cut = match result["text_truncated"] == true {
+        true => " · cut short",
+        false => "",
+    };
+    let prompt = format!(
+        "[trigger {} · {} · shadow run of {of} {status}{cut}: a read-only copy, so nothing \
+         past reading was done]\n{}",
+        trigger.name,
+        stamp(now()),
+        answer(&result)
+    );
+    let sent = client
+        .request(
+            "submit",
+            json!({"bot": to, "bot_id": to_id,
+                "request_id": format!("{}shadow.{to_id}.{id}.{turn}", sent_by(trigger)),
+                "prompt": prompt, "delivery": "queue", "from": {"bot": bot, "turn": turn}}),
+        )
+        .await;
+    let mut reply = match sent {
+        Ok(sent) => json!({"outcome": "sent", "bot": to, "turn": sent["turn"]}),
+        Err(error) if error.code == "idempotency_conflict" => json!({"outcome": "sent", "bot": to}),
+        Err(error) if error.code == "bot_not_found" => {
+            json!({"outcome": "failed", "bot": to, "gone": true, "detail": error.to_string()})
+        }
+        Err(error) => json!({"outcome": "failed", "bot": to, "detail": error.to_string()}),
+    };
+    reply["ended"] = ended;
+    reply
+}
+
 /// Write what an ask sends into it, durably: beside the queue first, where
 /// a fire taking asks does not look, then renamed into its place.
 fn keep_sent(places: &Places, trigger: &Trigger, ask: &Asked, sent: &Value) -> Result<(), String> {
@@ -3233,8 +3809,9 @@ fn keep_sent(places: &Places, trigger: &Trigger, ask: &Asked, sent: &Value) -> R
 /// The request an ask sent before, to send again, and the trigger that sent
 /// it, whose generation and `--reply-to` its answer goes under: only to the
 /// store it went to, since one that replaced its trigger on another store
-/// sends its own.
-fn sent_for(ask: &Asked, trigger: &Trigger) -> Option<(Value, Trigger)> {
+/// sends its own. A shadow fire's whole record comes too, which names the
+/// agent its copy is of and, once its report went, how it ended.
+fn sent_for(ask: &Asked, trigger: &Trigger) -> Option<(Value, Trigger, Option<Value>)> {
     let sent = std::fs::read(&ask.path)
         .ok()
         .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
@@ -3248,7 +3825,8 @@ fn sent_for(ask: &Asked, trigger: &Trigger) -> Option<(Value, Trigger)> {
         reply_to: serde_json::from_value(sent["reply_to"].clone()).ok()?,
         ..trigger.clone()
     };
-    Some((submit.clone(), sender))
+    let record = sent["shadow_of"].is_string().then(|| sent.clone());
+    Some((submit.clone(), sender, record))
 }
 
 /// Send a fire's turn, and its answer on to `--reply-to`.
@@ -3312,7 +3890,7 @@ async fn submit(
 /// agent it messages, without starting a turn: it reads it in its next
 /// model call, also the one it is busy with, instead of hearing nothing.
 async fn missed(client: &Client, trigger: &Trigger, (bot, id): (&str, i64), outcome: &Value) {
-    let (to, to_id) = match &trigger.reply_to {
+    let to = match &trigger.reply_to {
         Some((to, to_id)) => (to.as_str(), *to_id),
         None => (bot, id),
     };
@@ -3323,6 +3901,19 @@ async fn missed(client: &Client, trigger: &Trigger, (bot, id): (&str, i64), outc
         stamp(now()),
         trigger.when
     );
+    // Telling is a courtesy: what came of the fire is its row's either way.
+    let _ = note(client, trigger, to, &prompt).await;
+}
+
+/// `prompt` for `to` as a trigger's note: attached to its next model call,
+/// starting no turn, under a request id of its own that no fire takes for
+/// one of its own (`fire_generation`).
+async fn note(
+    client: &Client,
+    trigger: &Trigger,
+    (to, to_id): (&str, i64),
+    prompt: &str,
+) -> agent_client::Result<()> {
     let request = format!(
         "{}missed.{to_id}.{}.{}.{}",
         sent_by(trigger),
@@ -3330,14 +3921,79 @@ async fn missed(client: &Client, trigger: &Trigger, (bot, id): (&str, i64), outc
         std::process::id(),
         sends()
     );
-    // Telling is a courtesy: what came of the fire is its row's either way.
-    let _ = client
+    client
         .request(
             "submit",
             json!({"bot": to, "bot_id": to_id, "request_id": request, "prompt": prompt,
                 "delivery": "attach", "origin": "trigger", "wait_ms": attach_wait()}),
         )
-        .await;
+        .await
+        .map(drop)
+}
+
+/// What a fire's `--if` says that its agents hear, as monitoring alerts
+/// on a change of state rather than on each check: that it broke, the
+/// first time it could not say, and that it works again, the first time
+/// after that it said yes or no. `before` is what it said last, as the
+/// row keeps it.
+#[derive(Debug, PartialEq)]
+enum GateNews {
+    Broke(String),
+    Works,
+}
+
+impl GateNews {
+    /// What `said` is news of after `before`, whose `told` says a break
+    /// was told and no note since said it works again. A break told
+    /// already is not told again; one not told yet (its note did not go)
+    /// is, and so is a recovery whose note did not go.
+    fn of(before: &Value, said: &Result<Result<(), String>, String>) -> Option<Self> {
+        let told = before["told"] == true;
+        match said {
+            Err(why) => (!told).then(|| Self::Broke(why.clone())),
+            Ok(_) => told.then_some(Self::Works),
+        }
+    }
+
+    fn prompt(&self, trigger: &Trigger) -> String {
+        let (name, at) = (&trigger.name, stamp(now()));
+        match self {
+            Self::Broke(why) => format!(
+                "[trigger {name} · {at} · its --if could not run, so {} sends nothing to {} \
+                 until it can: {why}. Told once; the next note says it works again.]",
+                trigger.when,
+                trigger.bot()
+            ),
+            Self::Works => format!("[trigger {name} · {at} · its --if works again]"),
+        }
+    }
+}
+
+/// Who hears of a trigger's `--if`: the agent its answers go to, else the
+/// agent that added a `--start` trigger, else the agent it messages; none
+/// for a `--start` trigger whose agent is not made yet and that no agent
+/// added.
+fn gate_told(trigger: &Trigger, kept: &Kept) -> Option<(String, i64)> {
+    if let Some(to) = &trigger.reply_to {
+        return Some(to.clone());
+    }
+    match &trigger.target {
+        Target::Bot { name, id } => Some((name.clone(), *id)),
+        Target::Start { by: Some(by), .. } => Some(by.clone()),
+        Target::Start { name, .. } => kept.started_id.map(|id| (name.clone(), id)),
+    }
+}
+
+/// Tell of `news`, through the trigger's daemon. Whether it went.
+fn tell_gate(trigger: &Trigger, kept: &Kept, news: &GateNews) -> bool {
+    let Some((to, to_id)) = gate_told(trigger, kept) else {
+        return false;
+    };
+    let prompt = news.prompt(trigger);
+    let told = with_daemon(trigger, async |client| {
+        note(client, trigger, (&to, to_id), &prompt).await
+    });
+    matches!(told, Ok(Ok(())))
 }
 
 /// How long a trigger's note waits for a call before it goes as a steer:
@@ -3355,7 +4011,7 @@ pub fn attach_wait() -> Option<u64> {
 pub fn fire_generation(request_id: &str) -> Option<&str> {
     let (generation, rest) = request_id.strip_prefix("trigger_")?.split_once('_')?;
     let own = !rest.contains(".to.")
-        && !["reply.", "missed.", "failed."]
+        && !["reply.", "missed.", "failed.", "shadow."]
             .iter()
             .any(|note| rest.starts_with(note));
     own.then_some(generation)
@@ -3541,6 +4197,15 @@ async fn reply(client: &Client, trigger: &Trigger, bot: &str, mut outcome: Value
 /// What a turn's `wait` result says: its text, else its error. A turn that
 /// ended saying nothing passes on nothing, not "null".
 /// The turn the last fire of `row` sent, by handle, when it sent one.
+/// How the turn `row`'s fire sent ended: as its outcome kept it, for a
+/// shadow fire, whose copy is gone; else as `ended` read it.
+fn ended_for<'a>(row: &'a Value, ended: &'a HashMap<String, Value>) -> Option<&'a Value> {
+    match &row["last"]["ended"] {
+        kept @ Value::Object(_) => sent(row).map(|_| kept),
+        _ => ended.get(&sent(row)?),
+    }
+}
+
 pub fn sent(row: &Value) -> Option<String> {
     let last = &row["last"];
     (last["outcome"] == "sent")
@@ -3583,7 +4248,7 @@ pub fn forget_done(places: &Places, store_id: &str, ended: &HashMap<String, Valu
         (row["name"] == name
             && row["store_id"] == store_id
             && row["last"]["reply"]["outcome"] != "failed"
-            && ended.get(&handle)?["status"] == "completed"
+            && ended_for(&row, ended)?["status"] == "completed"
             && !places.job(name).exists())
         .then_some(handle)
     };
@@ -3626,7 +4291,7 @@ pub fn forget_done(places: &Places, store_id: &str, ended: &HashMap<String, Valu
 /// so a fire that went out and whose turn then failed, as when the machine
 /// was offline or a login expired, reads so wherever its row is shown.
 pub fn with_turn(row: &mut Value, ended: &HashMap<String, Value>) {
-    let Some(result) = sent(row).and_then(|handle| ended.get(&handle)) else {
+    let Some(result) = ended_for(row, ended).cloned() else {
         return;
     };
     let status = result["status"].clone();
@@ -3800,12 +4465,36 @@ fn fire(places: &Places, trigger: &Trigger, ask: Option<&Asked>) {
     // A gate that says no costs this process and nothing else, and its row
     // says when it last looked; a one-off had its one time, and ends saying
     // so. One that could not say is a failed fire, shown as one.
+    // A check is work too: while the daemon is paused it waits for the
+    // resume, as the turn a fire sends then waits for it.
+    if trigger.gate.is_some() {
+        until_resumed(trigger);
+    }
     let said = trigger
         .gate
         .as_deref()
         .map(|c| gate(c, trigger.dir.as_deref(), &trigger.daemon));
     let checked = |gate: &str, detail: Option<&String>| {
         named(json!({"checked_ms": now * 1000, "gate": gate, "detail": detail}))
+    };
+    // A check that broke is told once, and that it works again once: an
+    // `--if` that fails every minute is one note, not one a minute.
+    let news = said
+        .as_ref()
+        .and_then(|said| GateNews::of(&kept.checked, said));
+    // Whether the break stays told and not yet told over: a recovery whose
+    // note did not go is told on the next check that works.
+    let told = match &news {
+        Some(news @ GateNews::Broke(_)) => tell_gate(trigger, &kept, news),
+        Some(news @ GateNews::Works) => !tell_gate(trigger, &kept, news),
+        None => kept.checked["told"] == true,
+    };
+    let checked = |gate: &str, detail: Option<&String>| {
+        let mut checked = checked(gate, detail);
+        if told {
+            checked["told"] = json!(true);
+        }
+        checked
     };
     match said {
         None => {}
@@ -3883,6 +4572,17 @@ fn looked(places: &Places, trigger: &Trigger, seen: &Seen) {
 
 /// `f` with the trigger's daemon; why not, as a failed outcome, when it
 /// cannot be reached or serves another store.
+/// How often a fire waiting out a pause looks again.
+const PAUSE_LOOK: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Wait while `trigger`'s daemon is paused. A daemon that does not answer
+/// is not paused here: the check then runs and says what it finds.
+fn until_resumed(trigger: &Trigger) {
+    while with_daemon(trigger, async |client| client.paused().is_object()) == Ok(true) {
+        std::thread::sleep(PAUSE_LOOK);
+    }
+}
+
 fn with_daemon<T>(trigger: &Trigger, f: impl AsyncFnOnce(&Client) -> T) -> Result<T, Value> {
     let failed = |detail: String| json!({"outcome": "failed", "detail": detail});
     let runtime = runtime().map_err(failed)?;
@@ -3946,7 +4646,7 @@ pub(crate) async fn connect(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[tokio::test]
@@ -3976,6 +4676,217 @@ mod tests {
         let prompt = submit["prompt"].as_str().unwrap();
         assert!(prompt.starts_with("[trigger (ended) · "), "{prompt}");
         assert!(prompt.ends_with(" · turn 4 it sent calc.lead failed: provider_error]"));
+    }
+
+    #[test]
+    fn a_backup_keeps_each_definition_and_a_restore_hands_a_folders_to_its_lead() {
+        let w = World::new("backed-up");
+        let look = Trigger {
+            name: "p.lead.next".into(),
+            target: Target::Bot {
+                name: "p.lead".into(),
+                id: 3,
+            },
+            ..trigger()
+        };
+        let digest = Trigger {
+            name: "p.digest".into(),
+            target: Target::Start {
+                name: "p.digest".into(),
+                model: "openai/gpt".into(),
+                effort: Some("low".into()),
+                by: Some(("p.lead".into(), 3)),
+            },
+            gate: Some("test -s inbox".into()),
+            dir: Some("/work/p".into()),
+            ..trigger()
+        };
+        let other = Trigger {
+            name: "q.check".into(),
+            target: Target::Bot {
+                name: "q.lead".into(),
+                id: 8,
+            },
+            ..trigger()
+        };
+        for t in [&look, &digest, &trigger(), &other] {
+            w.install(t).unwrap();
+        }
+        w.settle(&digest, json!({"outcome": "sent", "turn": 5}));
+        let list = backed_up(&w.places);
+        let names: Vec<_> = list
+            .iter()
+            .map(|row| row["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["p.digest", "p.fix-login", "p.lead.next", "q.check"]);
+        assert_eq!(
+            list[0],
+            json!({"name": "p.digest", "when": "every 30m", "bot": "p.digest",
+                "start": {"model": "openai/gpt", "effort": "low"}, "by": "p.lead",
+                "reply_to": null, "if": "test -s inbox", "runs": null,
+                "turn_budget_tokens": null, "once": false, "commit": null, "file": null,
+                "dir": "/work/p", "shadow": false, "message": digest.message}),
+            "what it did and its daemon's ids stay out"
+        );
+
+        let home = w.root.join("restored-home");
+        let text = serde_json::to_vec(&list).unwrap();
+        restore(&home, Some(&text)).unwrap();
+        let p = restored_in(&home, "p").unwrap();
+        assert!(p.note().starts_with(RESTORED), "{}", p.note());
+        assert!(p.note().contains(r#""name":"p.digest""#));
+        assert!(p.note().contains(r#""name":"p.fix-login""#));
+        assert!(
+            !p.note().contains("p.lead.next"),
+            "a lead's own look is its own"
+        );
+        assert!(!p.note().contains("q.check"), "another folder's");
+        assert_eq!(p.notes().len(), 1);
+        assert!(p.notes()[0].1.starts_with("sonny-restore-"));
+        assert!(restored_in(&home, "r").is_none(), "nothing of its own");
+        p.told();
+        assert!(
+            restored_in(&home, "p").is_none(),
+            "one lead of a folder is told"
+        );
+        assert!(restored_in(&home, "q").is_some());
+        // A restore again starts over; one from a backup with none leaves none.
+        restore(&home, Some(&text)).unwrap();
+        assert!(restored_in(&home, "p").is_some());
+        restore(&home, None).unwrap();
+        assert!(restored_in(&home, "q").is_none());
+        // A folder named inside another's name is its own: `shop.web`'s
+        // look names it, so its triggers are neither `shop`'s to set up nor
+        // dropped from the backup when `shop` was told.
+        let rows = json!([
+            {"name": "shop.lead.next", "bot": "shop.lead"},
+            {"name": "shop.web.lead.next", "bot": "shop.web.lead"},
+            {"name": "shop.web.deploy", "bot": "shop.web.deploy", "by": "shop.web.lead"},
+            {"name": "shop.audit", "bot": "shop.audit"}]);
+        restore(&home, Some(rows.to_string().as_bytes())).unwrap();
+        let shop = restored_in(&home, "shop").unwrap();
+        assert!(shop.note().contains("shop.audit"), "{}", shop.note());
+        assert!(!shop.note().contains("shop.web.deploy"), "{}", shop.note());
+        shop.told();
+        let pending: Vec<_> = (pending_restored(&home).into_iter())
+            .map(|row| row["name"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(pending, ["shop.web.lead.next", "shop.web.deploy"]);
+        let web = restored_in(&home, "shop.web").unwrap();
+        assert!(web.note().contains("shop.web.deploy"), "{}", web.note());
+        // A list longer than one message takes goes in parts, each one the
+        // daemon takes, each its own turn.
+        let big: Vec<Value> = (0..20)
+            .map(|n| json!({"name": format!("r.job-{n}"), "bot": "r.job", "message": "x".repeat(16 * 1024)}))
+            .collect();
+        restore(&home, Some(serde_json::to_vec(&big).unwrap().as_slice())).unwrap();
+        let r = restored_in(&home, "r").unwrap();
+        assert_eq!(r.notes().len(), 3);
+        for (at, (note, key)) in r.notes().iter().enumerate() {
+            assert!(note.len() < 256 * 1024, "{}", note.len());
+            assert!(note.contains(&format!("(part {} of 3)", at + 1)));
+            assert!(r.notes()[..at].iter().all(|(_, other)| other != key));
+        }
+        assert_eq!(r.note().matches("\"name\":\"r.job-").count(), 20);
+    }
+
+    #[test]
+    fn a_gate_that_breaks_is_told_once_and_again_when_it_works() {
+        let broke: Result<Result<(), String>, String> = Err("--if: ran past 60s".into());
+        let (yes, no) = (Ok(Ok(())), Ok(Err("--if: exit status: 1".into())));
+        let never = Value::Null;
+        let went = json!({"gate": "go"});
+        let told = json!({"gate": "failed", "detail": "--if: ran past 60s", "told": true});
+        let untold = json!({"gate": "failed", "detail": "--if: ran past 60s", "told": false});
+        // The first break is news, from any state but one told already.
+        let news = Some(GateNews::Broke("--if: ran past 60s".into()));
+        assert_eq!(GateNews::of(&never, &broke), news);
+        assert_eq!(GateNews::of(&went, &broke), news);
+        assert_eq!(GateNews::of(&json!({"gate": "no"}), &broke), news);
+        assert_eq!(GateNews::of(&told, &broke), None, "told once");
+        assert_eq!(GateNews::of(&untold, &broke), news, "its note did not go");
+        // Working again is news only after a break someone heard of.
+        assert_eq!(GateNews::of(&told, &yes), Some(GateNews::Works));
+        assert_eq!(GateNews::of(&told, &no), Some(GateNews::Works));
+        assert_eq!(GateNews::of(&untold, &yes), None);
+        assert_eq!(GateNews::of(&went, &yes), None);
+        assert_eq!(GateNews::of(&never, &no), None);
+        // A recovery whose note did not go stays owed on a check that went.
+        let owed = json!({"gate": "go", "told": true});
+        assert_eq!(GateNews::of(&owed, &yes), Some(GateNews::Works));
+        assert_eq!(GateNews::of(&owed, &broke), None, "the break was heard of");
+        let s = trigger();
+        let prompt = GateNews::Broke("--if: ran past 60s".into()).prompt(&s);
+        assert!(prompt.starts_with("[trigger p.fix-login · "), "{prompt}");
+        assert!(
+            prompt.contains(" · its --if could not run, so every 30m sends nothing to p.fix-login until it can: --if: ran past 60s. "),
+            "{prompt}"
+        );
+        assert!(
+            GateNews::Works
+                .prompt(&s)
+                .ends_with(" · its --if works again]")
+        );
+    }
+
+    #[test]
+    fn a_gate_is_told_to_who_hears_of_the_trigger() {
+        let s = trigger();
+        let kept = Kept::default();
+        assert_eq!(gate_told(&s, &kept), Some(("p.fix-login".into(), 42)));
+        let answered = Trigger {
+            reply_to: Some(("p.lead".into(), 3)),
+            ..s.clone()
+        };
+        assert_eq!(gate_told(&answered, &kept), Some(("p.lead".into(), 3)));
+        let start = |by| Trigger {
+            target: Target::Start {
+                name: "p.digest".into(),
+                model: "m".into(),
+                effort: None,
+                by,
+            },
+            ..s.clone()
+        };
+        let added = start(Some(("p.lead".into(), 7)));
+        assert_eq!(gate_told(&added, &kept), Some(("p.lead".into(), 7)));
+        let alone = start(None);
+        assert_eq!(gate_told(&alone, &kept), None, "no agent yet");
+        let made = Kept {
+            started_id: Some(9),
+            ..Kept::default()
+        };
+        assert_eq!(gate_told(&alone, &made), Some(("p.digest".into(), 9)));
+    }
+
+    #[tokio::test]
+    async fn a_gates_note_is_attached_and_starts_no_fire_of_its_own() {
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = asked.clone();
+        let client = crate::tests::daemon_answering(move |request| {
+            seen.lock().unwrap().push(request.clone());
+            json!({})
+        })
+        .await;
+        let s = trigger();
+        note(
+            &client,
+            &s,
+            ("p.lead", 3),
+            "[trigger p.fix-login · its --if works again]",
+        )
+        .await
+        .unwrap();
+        let submit = asked.lock().unwrap()[0].clone();
+        assert_eq!(
+            (&submit["bot"], &submit["bot_id"]),
+            (&json!("p.lead"), &json!(3))
+        );
+        assert_eq!(submit["delivery"], "attach");
+        assert_eq!(submit["origin"], "trigger");
+        let request = submit["request_id"].as_str().unwrap();
+        assert!(request.starts_with("trigger_test-1_missed.3."), "{request}");
+        assert_eq!(fire_generation(request), None);
     }
 
     #[test]
@@ -4164,6 +5075,16 @@ mod tests {
         );
     }
 
+    /// A definition of `name`, as `add` writes one, for tests elsewhere.
+    pub(crate) fn definition_of(name: &str) -> String {
+        let named = Trigger {
+            name: name.into(),
+            ..trigger()
+        };
+        let when = every("30m", clock(2026, 9, 28, 9, 7)).unwrap();
+        definition(Path::new("/A/agent-app"), &named, &when, &[])
+    }
+
     fn trigger() -> Trigger {
         Trigger {
             generation: "test-1".into(),
@@ -4188,6 +5109,7 @@ mod tests {
             },
             store_id: "00ab".into(),
             message: "Check the PR's CI & reviews; <fix> what's \"red\".\nThen say so.".into(),
+            shadow: false,
         }
     }
 
@@ -4252,6 +5174,12 @@ mod tests {
             ..s.clone()
         };
         assert_eq!(Trigger::parse(&once.args()[1..]).unwrap(), once);
+        let shadowed = Trigger {
+            shadow: true,
+            ..s.clone()
+        };
+        assert_eq!(Trigger::parse(&shadowed.args()[1..]).unwrap(), shadowed);
+        assert_eq!(shadowed.differs(&s), Some("shadow"));
         // Everything else a trigger may carry comes back as it went.
         let full = Trigger {
             target: Target::Start {
@@ -5702,6 +6630,230 @@ mod tests {
             (None, None, "every 30m")
         );
         assert!(parse_add(&add_args(&json!({"every": "7m", "message": "go"})), now).is_err());
+        assert!(!mine.shadow);
+        let shadowed = json!({"every": "30m", "shadow": true, "message": "go"});
+        assert!(parse_add(&add_args(&shadowed), now).unwrap().shadow);
+    }
+
+    #[test]
+    fn a_shadow_copy_is_named_for_its_agent_and_keeps_only_what_reads() {
+        assert_eq!(shadow_source("p.lead.shadow-1a2b3c"), Some("p.lead"));
+        assert_eq!(shadow_source("p.digest.shadow-f"), Some("p.digest"));
+        for not in [
+            "p.lead",
+            "p.shadow-free",
+            ".shadow-1a",
+            "p.shadow-1a2b3c4",
+            "p.shadow-",
+        ] {
+            assert_eq!(shadow_source(not), None, "{not}");
+        }
+        let name = shadow_name("p.lead");
+        assert_eq!(shadow_source(&name), Some("p.lead"), "{name}");
+        // A name near the daemon's limit is cut so its copy's still fits.
+        let long = format!("p.{}", "a".repeat(126));
+        let name = shadow_name(&long);
+        assert!(name.len() <= 128, "{}", name.len());
+        assert!(
+            shadow_source(&name).is_some_and(|of| long.starts_with(of)),
+            "{name}"
+        );
+        // Its tools: the daemon's it has but a shell, whose commands reach
+        // the daemon's socket, and of Sonny's only exec, within what it may
+        // call.
+        let record = json!({"tools": ["shell", "write_stdin", "read", "write", "web_search"],
+            "declared": [{"name": "ask"}, {"name": "exec"}, {"name": "memory"}]});
+        assert_eq!(
+            shadow_tools(&record),
+            ["read", "write", "web_search", "exec"]
+        );
+        let narrowed = json!({"tools": ["shell", "read"], "allowed": ["read"],
+            "declared": [{"name": "exec"}]});
+        assert_eq!(shadow_tools(&narrowed), ["read"]);
+        // Its gate holds exec only, which nobody serves and which lapses.
+        let tools: Vec<String> = ["read", "exec"].map(String::from).to_vec();
+        let fields = shadow_fields("p.lead.shadow-1", 9, &tools);
+        assert_eq!(fields["settings"]["sandbox"], "read-only");
+        assert_eq!(
+            (
+                &fields["approve"],
+                &fields["approver"],
+                &fields["approve_expire_ms"]
+            ),
+            (&json!(["exec"]), &json!("shadow"), &json!(SHADOW_LAPSE_MS))
+        );
+        let reads = shadow_fields("p.lead.shadow-1", 9, &["read".to_owned()]);
+        assert_eq!(reads["approve"], json!([]));
+        assert!(reads.get("approver").is_none());
+        // The person's rules, without what they let run outside.
+        let rules: agent_client::rules::Policy = serde_json::from_value(json!({
+            "prefix_rules": [
+                {"pattern": ["mcpx"], "decision": "allow"},
+                {"pattern": ["git", "push"], "decision": "prompt"},
+                {"pattern": ["rm"], "decision": "forbidden"}]
+        }))
+        .unwrap();
+        let kept = shadow_rules(Some(&rules)).unwrap();
+        let decisions: Vec<_> = kept.prefix_rules.iter().map(|r| r.decision).collect();
+        use agent_client::rules::Decision;
+        assert_eq!(decisions, [Decision::Prompt, Decision::Forbidden]);
+        let only_allows: agent_client::rules::Policy = serde_json::from_value(json!({
+            "prefix_rules": [{"pattern": ["mcpx"], "decision": "allow"}]
+        }))
+        .unwrap();
+        assert_eq!(shadow_rules(Some(&only_allows)), None);
+        assert_eq!(shadow_rules(None), None);
+    }
+
+    #[tokio::test]
+    async fn a_shadow_fire_goes_to_a_read_only_copy_and_reports_what_it_would_do() {
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = asked.clone();
+        let client = crate::tests::daemon_answering(move |request| {
+            seen.lock().unwrap().push(request.clone());
+            match request["op"].as_str() {
+                Some("inspect") => json!({"tools": ["shell", "read"],
+                    "declared": [{"name": "exec"}, {"name": "ask"}]}),
+                Some("fork") => json!({"bot_id": 77, "head": 4}),
+                Some("submit") if request["bot_id"] == 77 => json!({"turn": 1}),
+                Some("submit") => json!({"turn": 12}),
+                Some("wait") => {
+                    let handle = request["handles"][0].as_str().unwrap().to_owned();
+                    json!({"results": {handle: {"status": "completed",
+                        "text": "Would post: 3 new issues."}}})
+                }
+                _ => json!({}),
+            }
+        })
+        .await;
+        let s = Trigger {
+            shadow: true,
+            reply_to: Some(("p.lead".into(), 3)),
+            ..trigger()
+        };
+        let w = World::new("shadow-fire");
+        // A fire someone asked for, as `fire NAME` takes one.
+        let taking = w.places.taking(&s.name);
+        std::fs::create_dir_all(&taking).unwrap();
+        let ask = Asked {
+            kind: Ask::Fire,
+            path: taking.join("1"),
+            receipt: w.places.receipt(&s.name, "1"),
+        };
+        std::fs::write(&ask.path, "").unwrap();
+        let mut kept = Kept::default();
+        let outcome = shadow(&client, &w.places, &s, &mut kept, "every 30m", Some(&ask)).await;
+        let name = outcome["shadow"].as_str().unwrap().to_owned();
+        assert_eq!(shadow_source(&name), Some("p.fix-login"));
+        assert_eq!(outcome["outcome"], "sent");
+        assert_eq!(outcome["handle"], format!("turn:{name}/1"));
+        assert_eq!(
+            outcome["reply"],
+            json!({"outcome": "sent", "bot": "p.lead", "turn": 12})
+        );
+        let log = asked.clone();
+        let asked = log.lock().unwrap().clone();
+        let ops: Vec<&str> = asked.iter().map(|r| r["op"].as_str().unwrap()).collect();
+        assert_eq!(
+            ops,
+            [
+                "inspect",
+                "fork",
+                "configure",
+                "submit",
+                "wait",
+                "submit",
+                "delete"
+            ]
+        );
+        let fork = &asked[1];
+        assert_eq!(fork["source"], "p.fix-login");
+        assert_eq!(fork["allow"], json!(["read", "exec"]));
+        assert!(fork["created_by"].is_null(), "its rules are its own");
+        let configure = &asked[2];
+        assert_eq!(configure["bot_id"], 77);
+        assert_eq!(configure["settings"]["sandbox"], "read-only");
+        assert_eq!(configure["approver"], "shadow");
+        let run = asked[3]["prompt"].as_str().unwrap();
+        assert!(run.contains(" · every 30m · shadow run]\nThis is a shadow run: you are a read-only copy of p.fix-login"), "{run}");
+        assert!(run.ends_with(&s.message));
+        let report = &asked[5];
+        assert_eq!(
+            (&report["bot"], &report["bot_id"]),
+            (&json!("p.lead"), &json!(3))
+        );
+        let said = report["prompt"].as_str().unwrap();
+        assert!(
+            said.contains(" · shadow run of p.fix-login completed: a read-only copy"),
+            "{said}"
+        );
+        assert!(said.ends_with("\nWould post: 3 new issues."), "{said}");
+        let request = report["request_id"].as_str().unwrap();
+        assert_eq!(request, "trigger_test-1_shadow.3.77.1");
+        assert_eq!(fire_generation(request), None);
+        assert_eq!(asked[6]["bot"], name.as_str());
+        // How its turn ended stays with the outcome, its copy gone: the row
+        // reads it there, not from a handle that reads nothing now.
+        assert_eq!(outcome["ended"]["status"], "completed");
+        assert!(outcome["reply"].get("ended").is_none());
+        let row = json!({"last": outcome});
+        let read = HashMap::new();
+        assert_eq!(ended_for(&row, &read).unwrap()["status"], "completed");
+        // The ask kept what it sent before it went, and how it ended once
+        // its report went, before its copy went.
+        let (sent, _, record) = sent_for(&ask, &s).unwrap();
+        let record = record.unwrap();
+        assert_eq!(record["shadow_of"], "p.fix-login");
+        assert_eq!(sent["request_id"], asked[3]["request_id"]);
+        assert_eq!(record["done"], outcome);
+        // So one cut short after that ends as it did, sending nothing again.
+        let again = deliver(&client, &w.places, &s, &mut kept, "every 30m", Some(&ask)).await;
+        assert_eq!(again, outcome);
+        let resent = log.lock().unwrap()[7..].to_vec();
+        let ops: Vec<&str> = resent.iter().map(|r| r["op"].as_str().unwrap()).collect();
+        assert_eq!(ops, ["delete"]);
+        // One cut short before its report went goes on with the same copy
+        // and request, which the daemon takes once, and makes no other.
+        let mut cut = record.clone();
+        cut.as_object_mut().unwrap().remove("done");
+        std::fs::write(&ask.path, cut.to_string()).unwrap();
+        let again = deliver(&client, &w.places, &s, &mut kept, "every 30m", Some(&ask)).await;
+        assert_eq!(again["shadow"], name.as_str());
+        let resent = log.lock().unwrap()[8..].to_vec();
+        let ops: Vec<&str> = resent.iter().map(|r| r["op"].as_str().unwrap()).collect();
+        assert_eq!(ops, ["submit", "wait", "submit", "delete"]);
+        assert_eq!(
+            resent[0]["request_id"], asked[3]["request_id"],
+            "the same request, which the daemon takes once"
+        );
+        assert_eq!(resent[2]["request_id"], report["request_id"]);
+    }
+
+    #[tokio::test]
+    async fn a_shadow_that_cannot_be_confined_is_removed_before_it_runs() {
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = asked.clone();
+        let client = crate::tests::daemon_answering(move |request| {
+            seen.lock().unwrap().push(request.clone());
+            match request["op"].as_str() {
+                Some("inspect") => json!({"tools": ["shell"]}),
+                Some("fork") => json!({"bot_id": 77}),
+                Some("configure") => json!({"error": "invalid_setting", "detail": "no"}),
+                _ => json!({}),
+            }
+        })
+        .await;
+        let s = Trigger {
+            shadow: true,
+            ..trigger()
+        };
+        let w = World::new("shadow-unconfined");
+        let outcome = shadow(&client, &w.places, &s, &mut Kept::default(), "fired", None).await;
+        assert_eq!(outcome["outcome"], "failed");
+        let ops: Vec<String> = (asked.lock().unwrap().iter())
+            .map(|r| r["op"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(ops, ["inspect", "fork", "configure", "delete"]);
     }
 
     #[test]

@@ -335,7 +335,10 @@ needs you (an approval, or a question open in it), failed, or holds a
 block its task asked for (a dev server) is never closed for room, as the
 lead heard or as that window's own Sonny last said (kept in
 `~/.agent/sonny/held/`, so it holds across either one starting again);
-with no other, the limit is passed. A window closed for room stays closed while its
+with no other, the limit is passed. A window you have not looked at yet is
+not one you used least recently, so it is not closed for room either: while
+only such windows could make room, a new task's window does not open (the
+status row says so) and waits for you, as one closed for room does. A window closed for room stays closed while its
 task works on, and `/status` (or its name) opens it again, also after the
 lead starts again (kept in `~/.agent/sonny/aside/`). `--rex-host HOST` puts the session on another Rex
 server; `--no-layout` turns the layout off. Sonny writes the skill for the
@@ -981,13 +984,17 @@ way `/react` does, and each note in the margin has its own `↩`.
   picking it means, and the one it recommends and why. Sonny draws the
   decision in the conversation where it was asked, its words read as
   Markdown with the same renderer a reply uses, and the composer's hint
-  names it: what you type next answers it (an option's number picks it),
-  and goes to the lead as `You asked: QUESTION` and your answer. While you
-  type, the composer's band names the question over your words, as the
-  sent answer shows it. With several open, the composer answers one at a
-  time, the oldest first, and says which (`1 of 2`); ↑↓ with nothing typed
-  switches to another, and a click on any card's option answers that one.
-  Esc sets them aside for a message of your own, and Esc again goes back.
+  names it: a pick answers it (an option's number, or a click on the
+  option), and goes to the lead as `You asked: QUESTION` and the option.
+  While you type a number, the composer's band names the question over
+  it, as the sent answer shows it. Words you type are your own message,
+  sent as you wrote them and never framed as an answer, so something
+  typed while a question is open, meant for anything, answers nothing by
+  accident; the lead reads whether your words answer it, as a reply under
+  a card in a chat is read. With several open, the composer picks for one
+  at a time, the oldest first, and says which (`1 of 2`); ↑↓ with nothing
+  typed switches to another, and a click on any card's option answers
+  that one. Esc sets them aside, and Esc again brings them back.
   Once you send words of your own, the conversation has moved on: the open
   questions leave the composer and the `needs you` count, and their cards'
   options still answer them. The lead does not wait on you blindly: each

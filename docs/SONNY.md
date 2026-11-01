@@ -43,7 +43,7 @@ sandbox. For people, scripts and other harnesses, Sonny writes
 `sonny trigger`:
 
 ```sh
-~/.agent/trigger add [--name NAME] [WHEN] [--bot NAME | --start NAME --model PROVIDER/MODEL [--effort LEVEL]] [--reply-to BOT] [--if CMD] [--runs N] [--turn-budget-tokens N] -- MESSAGE
+~/.agent/trigger add [--name NAME] [WHEN] [--bot NAME | --start NAME --model PROVIDER/MODEL [--effort LEVEL]] [--reply-to BOT] [--if CMD] [--runs N] [--turn-budget-tokens N] [--shadow] -- MESSAGE
   WHEN: --every 30m | --in 45m | --at 'YYYY-MM-DD HH:MM' | --cron 'MIN HOUR DAY MONTH WEEKDAY' | --file PATH | --commit REPO
 ~/.agent/trigger ls [--after NAME]
 ~/.agent/trigger show NAME
@@ -53,6 +53,34 @@ sandbox. For people, scripts and other harnesses, Sonny writes
 
 Every reply is one JSON value on stdout; a failure is one
 `{"error": CODE, "detail": ...}` on stderr with exit 1.
+
+**Shadow runs.** `--shadow` is a dry run, for moving a job from elsewhere
+onto a trigger. Each fire forks its agent where it is now (a `--start`
+trigger whose agent no fire made yet first makes that agent, as its first
+fire would, and sends it nothing)
+into `BOT.shadow-HEX`, a copy in the read-only sandbox, with no shell, no
+gate a person or a model answers, the person's command rules without their
+`allow` rules, and of Sonny's tools only
+`exec`, whose MCP calls of a tool that does not say it only reads
+(`readOnlyHint`), or that its server's approval mode would ask about, are
+refused. So everything past reading is refused, never asked about. A copy
+that cannot be confined is removed before it runs. Its answer goes to
+`--reply-to`, which defaults to the agent that added the trigger, else to
+the agent that added a `--start` one, else to the agent it copies, as
+`[trigger NAME · TIME · shadow run of BOT STATUS: ...]`, and the copy is
+removed once that went (or after a day idle). It has no shell because a
+sandboxed agent's commands still reach its daemon socket, which takes a
+message to another agent or a pause from a read-only agent too; so a dry run
+reads with the daemon's file tools and read-only MCP tools, not commands.
+
+**A broken `--if`.** A gate that cannot run, or runs past 60 s, fails the
+fire. The agent that hears of the trigger (`--reply-to`, else the agent
+that added a `--start` trigger, else the agent it messages) is told once
+when it breaks, and once when it works again, as alerts fire on a change
+of state rather than on every check; the row's `checked.told` keeps
+whether the break was told. While the daemon is paused (`/pause`), a gate
+does not run: its fire waits for the resume, as the turn a fire sends then
+waits for it.
 
 **When.** `--every` counts from the next whole minute in minutes that
 divide an hour, hours that divide a day, or `1d`, and waits at least one

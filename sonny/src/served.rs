@@ -375,6 +375,12 @@ fn triggers() -> Value {
                         "runs": {"type": "integer", "minimum": 1, "description": "Ends it after N messages."},
                         "turn_budget_tokens": {"type": "integer", "minimum": 1,
                             "description": "A cap on each fired turn's tokens."},
+                        "shadow": {"type": "boolean",
+                            "description": "A dry run, as when moving a job from elsewhere onto a trigger: \
+                                each fire goes to a read-only copy of the agent, where anything past \
+                                reading is refused rather than asked about, and its answer comes to you \
+                                (or reply_to) as a report of what it would have done. Replace it without \
+                                shadow once the reports match the job."},
                         "replace": {"type": "boolean",
                             "description": "Replace one by this name that differs, keeping its record."},
                         "message": {"type": "string", "minLength": 1}
