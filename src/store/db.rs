@@ -465,7 +465,8 @@ impl Settings {
             "speed":self.speed().map_or("standard", crate::provider::Speed::name),
             "sandbox":self.sandbox,"writable":self.writable,"network":self.network,
             "outputs":self.outputs,
-            "hide_senders":self.hide_senders,"unix_sockets":self.unix_sockets})
+            "hide_senders":self.hide_senders,"unix_sockets":self.unix_sockets,
+            "rules":self.rules})
     }
     fn stored(&self) -> Result<Option<String>> {
         Ok((*self != Self::default())
@@ -2693,7 +2694,17 @@ impl Database {
         settings.speed = settings
             .speed
             .filter(|speed| *speed != crate::provider::Speed::Standard);
-        if bot.created_by_id.is_some() && named.iter().any(|key| key == "rules") {
+        // Its creator's while there is one: a bot whose creator is gone
+        // keeps the rules it had, and its client sets them from then on, as
+        // no creator's sandbox holds it either.
+        if let Some(creator) = bot.created_by_id
+            && named.iter().any(|key| key == "rules")
+            && self
+                .conn
+                .query_row("SELECT 1 FROM bots WHERE id=?", [creator], |_| Ok(()))
+                .optional()?
+                .is_some()
+        {
             return fail_with(
                 "invalid_setting",
                 "rules: a bot made by another goes by its creator's rules",
@@ -13441,6 +13452,13 @@ mod tests {
         names.sort();
         listed.sort();
         assert_eq!(names, listed);
+        // And clients are shown each, as it applies.
+        let Value::Object(resolved) = Settings::default().resolved() else {
+            unreachable!("settings are an object");
+        };
+        let mut shown: Vec<String> = resolved.into_iter().map(|(k, _)| k).collect();
+        shown.sort();
+        assert_eq!(shown, listed);
     }
 
     #[test]

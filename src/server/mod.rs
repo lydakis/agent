@@ -16,7 +16,7 @@ use agent_runtime::{
     provider::{Listed, Provider, STREAMS_PER_CONNECTION, Transport},
     store::{
         Answer, Binding, Bot, Decision, Delivery, FOLDERS_JSON, Fork, Gate, MAX_GATES, Publication,
-        Settings, Started, Step, Stepped, Store, TurnOptions, Waiting, Wake,
+        RULES_JSON, Settings, Started, Step, Stepped, Store, TurnOptions, Waiting, Wake,
     },
     tools::{
         ANSWER_BYTES, DECLARED_BYTES, Declared, MAX_DECLARED, Outcome, Registry, validate_declared,
@@ -145,15 +145,19 @@ fn admission_bound(command: &Command, id: &Value, deliveries: usize) -> Bound {
                     }
             }),
             output::encoded_len(&(bot, created_by)),
-            // The workspace, the writable folders and the Unix sockets,
-            // canonical, which the reply's settings repeat; a bot a
-            // sandboxed bot makes can take its creator's.
+            // The workspace, the writable folders, the Unix sockets,
+            // canonical, and the command rules, which the reply's settings
+            // repeat; a bot another makes takes its creator's rules, and a
+            // sandboxed one's folders.
             usize::from(workspace.is_some()) * PATH_JSON
                 + match created_by {
-                    Some(_) => 2 * FOLDERS_JSON,
+                    Some(_) => 2 * FOLDERS_JSON + RULES_JSON,
                     None => {
                         (settings.writable.len() * PATH_JSON).min(FOLDERS_JSON)
                             + (settings.unix_sockets.len() * PATH_JSON).min(FOLDERS_JSON)
+                            + (settings.rules.as_ref())
+                                .map_or(0, |rules| output::encoded_len(rules).unwrap_or(RULES_JSON))
+                                .min(RULES_JSON)
                     }
                 },
             // Both the bot and its event carry its gates, most of them
@@ -7099,6 +7103,15 @@ mod tests {
             *effort = Some("high".into());
             *compaction_instructions = Some(awkward);
             *compaction_model = Some("openai/synthetic".into());
+        }
+        // Command rules as large as a bot may be given, escaped in JSON.
+        if let Command::Create { settings, .. } = &mut create {
+            let why = "\u{1}".repeat((RULES_JSON - 200) / 6);
+            settings.rules = Some(
+                serde_json::from_value(json!({"prefix_rules": [
+                    {"pattern": ["rm"], "decision": "forbidden", "justification": why}]}))
+                .unwrap(),
+            );
         }
         // Its sockets as many as it may name, each escaped in JSON, where a
         // sandbox can run.

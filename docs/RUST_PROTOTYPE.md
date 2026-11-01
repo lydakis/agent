@@ -2688,7 +2688,10 @@ rules.
 A bot made by another (its `created_by`) goes by its creator's rules: it
 takes them when it is made, whatever its own client gives, and follows
 them when they change, as do the bots it makes; configuring `rules` on it
-is `invalid_setting`. So no bot loosens the rules by making another.
+is `invalid_setting`. So no bot loosens the rules by making another. Once its
+creator is deleted, a bot keeps the rules it had and is given its own from
+then on, as no creator's sandbox holds it either; Sonny gives such an agent
+its rules as it gives a root one.
 
 A sandbox never lets a bot write the files its rules come from:
 `serve --protect-path PATH`, which repeats, keeps a path read-only in

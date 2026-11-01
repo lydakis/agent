@@ -3972,7 +3972,7 @@ fn a_bot_keeps_its_settings_and_a_fork_copies_them() {
         json!({"context_bytes":4096,"context_items":4096,"note_turns":48,"compact_at":75,
             "compact_keep":25,"compact_tokens":null,"keep_turns":1,"max_rounds":null,"approval_hold_ms":2000,"max_output_tokens":null,
             "keep_warm":0,"cache_ttl":"1h","speed":"fast","sandbox":null,"writable":[],"network":false,"outputs":null,"hide_senders":false,
-            "unix_sockets":[]})
+            "unix_sockets":[],"rules":null})
     );
     // Retention follows the bot's own setting.
     for n in 1..=3 {
@@ -15141,6 +15141,17 @@ fn a_bot_made_by_another_goes_by_its_creators_rules() {
         .unwrap();
     assert_eq!(changed, ["rules"]);
     assert_eq!(db.inspect("Cat").unwrap().settings, Settings::default());
+    // A bot whose creator is gone keeps the rules it had, as made by it,
+    // and is given its own from then on.
+    db.set_settings("Ann", None, &named, &own).unwrap();
+    db.delete_bot("Bob").unwrap();
+    let cat = db.inspect("Cat").unwrap();
+    assert_eq!(cat.created_by.as_deref(), Some("Bob"));
+    assert_eq!(cat.settings.rules, Some(rules(&["ls"])));
+    let changed = db
+        .set_settings("Cat", None, &named, &Settings::default())
+        .unwrap();
+    assert_eq!(changed, ["rules"]);
     // Rules that could never match are refused.
     let empty = Settings {
         rules: Some(serde_json::from_value(json!({"prefix_rules": [{"pattern": []}]})).unwrap()),

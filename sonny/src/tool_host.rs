@@ -230,12 +230,16 @@ async fn follow_config(client: Arc<Client>) {
     };
     let mut seen = None;
     let mut waiting: Vec<Value> = Vec::new();
+    let mut live = std::collections::HashSet::new();
     loop {
         let rules = crate::rules::given();
         let now = (stamp(), rules.clone());
         if seen.as_ref() != Some(&now) {
             seen = Some(now);
             waiting = crate::lookout::all_bots(&client).await;
+            live = (waiting.iter())
+                .filter_map(|bot| bot["bot_id"].as_i64())
+                .collect();
         }
         if !waiting.is_empty() {
             match agent_client::config::load() {
@@ -243,6 +247,7 @@ async fn follow_config(client: Arc<Client>) {
                     let given = Given {
                         config: &config,
                         rules: rules.as_ref(),
+                        live: &live,
                     };
                     waiting = apply_config(&client, &given, waiting).await;
                 }
@@ -261,6 +266,9 @@ async fn follow_config(client: Arc<Client>) {
 struct Given<'a> {
     config: &'a agent_client::config::Config,
     rules: Option<&'a agent_client::rules::Policy>,
+    /// The bots there are, by id: one whose creator is among them goes by
+    /// that creator's rules.
+    live: &'a std::collections::HashSet<i64>,
 }
 
 /// Configure each of `bots` that `given` would make otherwise; those at
@@ -300,7 +308,8 @@ async fn apply_config(client: &Client, given: &Given<'_>, bots: Vec<Value>) -> V
 /// The `configure` fields that bring one of Sonny's agents, as `inspect`
 /// gives it, to what `given` gives an agent on its model when it is made
 /// ([`crate::made`]); none when it is there, or isn't Sonny's. An agent
-/// made by another goes by its creator's rules, which the daemon keeps.
+/// made by another goes by its creator's rules, which the daemon keeps,
+/// while that creator is there.
 fn configured(record: &Value, given: &Given<'_>) -> Option<serde_json::Map<String, Value>> {
     let declared = record["declared"].as_array()?;
     if !declared
@@ -328,7 +337,9 @@ fn configured(record: &Value, given: &Given<'_>) -> Option<serde_json::Map<Strin
         settings.insert("hide_senders".into(), json!(hide));
     }
     let rules = json!(given.rules);
-    if record["created_by_id"].is_null() && record["settings"]["rules"] != rules {
+    let creator = record["created_by_id"].as_i64();
+    let own = creator.is_none_or(|creator| !given.live.contains(&creator));
+    if own && record["settings"]["rules"] != rules {
         settings.insert("rules".into(), rules);
     }
     if !settings.is_empty() {
@@ -340,6 +351,8 @@ fn configured(record: &Value, given: &Given<'_>) -> Option<serde_json::Map<Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
+    use std::sync::LazyLock;
 
     #[test]
     fn an_agent_follows_what_config_gives_its_model() {
@@ -350,9 +363,11 @@ mod tests {
                 "declared": [{"name": "start_task", "answered_by": crate::served::TAG}]})
         };
         fn given(config: &agent_client::config::Config) -> Given<'_> {
+            static NONE: LazyLock<HashSet<i64>> = LazyLock::new(HashSet::new);
             Given {
                 config,
                 rules: None,
+                live: &NONE,
             }
         }
         assert_eq!(
@@ -391,13 +406,16 @@ mod tests {
                 "source": "default.rules:1"}]
         }))
         .unwrap();
+        let live = HashSet::from([7]);
         let ruled = Given {
             config: &config,
             rules: Some(&policy),
+            live: &live,
         };
         let unruled = Given {
             config: &config,
             rules: None,
+            live: &live,
         };
         let agent = |rules: Value, creator: Value| {
             json!({"provider": "anthropic", "model": "claude", "fallback": null,
@@ -414,8 +432,13 @@ mod tests {
             configured(&agent(json!(policy), Value::Null), &unruled).map(Value::Object),
             Some(json!({"settings": {"rules": null}}))
         );
-        // One made by another takes its creator's, which the daemon keeps.
+        // One made by another takes its creator's, which the daemon keeps,
+        // and once that creator is gone, Sonny's.
         assert_eq!(configured(&agent(Value::Null, json!(7)), &ruled), None);
+        assert_eq!(
+            configured(&agent(Value::Null, json!(8)), &ruled).map(Value::Object),
+            Some(json!({"settings": {"rules": policy}}))
+        );
     }
 
     #[test]
