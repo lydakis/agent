@@ -1,8 +1,11 @@
 name: Perf
 
-# Screens a pull request's daemon against its base's on one runner: the
-# AGENTS.md hot-path benches (admission and completion bursts, lifecycle,
-# footprint), run alternately so both builds see the same machine. Store
+# Screens a pull request's daemon and Sonny against its base's on one
+# runner: the AGENTS.md hot-path benches (admission and completion bursts,
+# lifecycle, footprint) and Sonny's own at fleet scale (the lookout at 10,
+# 100 and 1,000 subscribers, a quiet lead's window under unrelated traffic,
+# a sky replay of the hour), run alternately so both builds see the same
+# machine. Store
 # work per turn is counted and fails the check when it rises; CPU, latency
 # and memory only warn, since a shared runner moves them by itself. The
 # table is in the job summary. Synthetic provider, nothing is spent.
@@ -11,10 +14,14 @@ on:
   pull_request:
     paths:
       - "src/**"
+      - "sonny/**"
+      - "client/**"
       - "Cargo.lock"
       - "Cargo.toml"
       - ".github/workflows/perf.yml"
       - "bench/perf_gate.py"
+      - "bench/sonny_screen.py"
+      - "bench/lookout_scale.py"
 
 permissions:
   contents: read
@@ -26,7 +33,7 @@ concurrency:
 jobs:
   screen:
     runs-on: ubuntu-24.04
-    timeout-minutes: 40
+    timeout-minutes: 55
     defaults:
       run:
         shell: bash
@@ -41,14 +48,20 @@ jobs:
         env:
           BASE: ${{ github.event.pull_request.base.sha }}
         run: |
-          cargo build --release --locked --bin agent
-          mkdir -p .local/perf
+          build() {
+            cargo build --release --locked --bin agent
+            cargo build --release --locked -p sonny --bin sonny
+          }
+          build
+          mkdir -p .local/perf/head .local/perf/base
           cp .local/target/release/agent .local/perf/agent-head
+          cp .local/target/release/agent .local/target/release/sonny .local/perf/head/
           # The base builds in the same target folder, so only what the
           # pull request changed compiles again.
           git worktree add -q .local/base "$BASE"
-          (cd .local/base && CARGO_TARGET_DIR="$PWD/../target" cargo build --release --locked --bin agent)
+          (cd .local/base && export CARGO_TARGET_DIR="$PWD/../target" && build)
           cp .local/target/release/agent .local/perf/agent-base
+          cp .local/target/release/agent .local/target/release/sonny .local/perf/base/
       - name: Screen both, alternately
         run: |
           python3 -m venv .local/venv
@@ -62,6 +75,8 @@ jobs:
               $py -m bench.footprint --binary $bin --repeat 2 --out .local/perf/footprint-$side-$round
               $py -m bench.lifecycle --binary $bin --transport socket --agents 32 --mode echo \
                 --tools echo,shell,read,write,edit --repeat 1 --out .local/perf/lifecycle-$side-$round
+              $py -m bench.sonny_screen --agent .local/perf/$side/agent --sonny .local/perf/$side/sonny \
+                --out .local/perf/sonny-$side-$round
             done
           done
       - name: Compare

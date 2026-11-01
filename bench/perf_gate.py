@@ -1,7 +1,7 @@
 """Compare a pull request's daemon with its base's, as the Perf workflow runs them.
 
 Reads `NAME-SIDE-ROUND/result.json` under one folder, where NAME is a bench
-(admission, completion, footprint, lifecycle), SIDE is `base` or `head`,
+(admission, completion, footprint, lifecycle, sonny), SIDE is `base` or `head`,
 and ROUND counts alternating runs. Store work per turn is counted, not
 timed, so it is the same on every run: more of it on the head fails. CPU,
 latency and memory move with the runner, so they only warn, and only when
@@ -59,6 +59,17 @@ TIMINGS = {
                   ('per idle bot, KiB', lambda r: r['per_idle_bot_kib']),
                   ('RSS after a turn each, MiB', lambda r: r['turns_rss_mib']),
                   ('CPU per turn, ms', lambda r: r['cpu_ms_per_turn'])],
+    # bench.sonny_screen: Sonny's own paths that grow with the fleet.
+    'sonny': [*((f'lookout CPU per 1k deltas at {n}, ms', lambda r, n=n: r['lookout'][n]['cpu_ms_per_1k_deltas'])
+                for n in ('10', '100', '1000')),
+              ('lookout seated at 1000, s', lambda r: r['lookout']['1000']['start']['seated_s']),
+              ('lookout note p95 at 1000, ms', lambda r: r['lookout']['1000']['note_delay_ms_p95'] or 0),
+              ('quiet window CPU, ms/s', lambda r: r['window']['cpu_ms_per_s']),
+              ('quiet window reads, KiB/s', lambda r: r['window']['read_kib_per_s']),
+              ('quiet window requests, /s', lambda r: r['window']['requests_per_s']),
+              ('quiet window RSS, MiB', lambda r: r['window']['peak_rss_mib']),
+              ('sky replay CPU, s', lambda r: r['sky']['cpu_s']),
+              ('sky replay RSS, MiB', lambda r: r['sky']['peak_rss_mib'])],
     'lifecycle': [('CPU, s', lambda r: r['target_observed_cpu_seconds']),
                   ('p95 turn, ms', lambda r: r['turn_ms']['p95']),
                   ('peak RSS, MiB', lambda r: r['daemon_peak_rss_bytes'] / 2**20)],
@@ -83,7 +94,11 @@ def compare(root):
             if now != was:
                 rows.append((name, f'{kind} (count)', was, now, ''))
         for label, value in timings:
-            was_all, now_all = [value(r) for r in base], [value(r) for r in head]
+            try:
+                was_all, now_all = [value(r) for r in base], [value(r) for r in head]
+            except (KeyError, TypeError):
+                # A measure one side's runs lack, as a bench run smaller.
+                continue
             was, now = statistics.median(was_all), statistics.median(now_all)
             change = (now - was) / was if was else 0.0
             if change > WARN and min(now_all) > max(was_all):
@@ -98,7 +113,7 @@ def main():
     rows, failed, warned = compare(Path(sys.argv[1]))
     table = ['| Bench | Measure | Base | Head | Change |', '| --- | --- | ---: | ---: | ---: |']
     table += [f'| {b} | {m} | {was} | {now} | {change} |' for b, m, was, now, change in rows]
-    text = '\n'.join(['## Daemon screen, base against head', '', *table, ''])
+    text = '\n'.join(['## Daemon and Sonny screen, base against head', '', *table, ''])
     if failed:
         text += '\nStore work per turn rose; record why in docs/DAEMON_MEASUREMENTS.md:\n'
         text += ''.join(f'- {line}\n' for line in failed)

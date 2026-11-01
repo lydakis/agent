@@ -6631,3 +6631,35 @@ when the service takes the request up. No measure moves past 2.2%, inside
 the runner's spread between screens (release to terminal read 17.35 and
 17.24 ms on the base across the last two), and store jobs per turn held
 at about 7.5.
+
+## A quiet lead's window reads only its own tasks (bots by maker)
+
+`bench.sonny_screen` opens one quiet lead's Sonny in an 80x24 terminal. A
+socket in front of the daemon's counts what the window asks for and what
+it reads back, while 1,000 tasks of ten other leads run turns it has
+nothing to do with. Before this change, the window paged every running
+bot every three seconds and kept its own locally. Now it asks `bots` for
+those its lead made (`created_by_id`), which come from the `bots_maker`
+index. Each figure is one run on a 4-core Linux container with release
+builds:
+
+| Quiet window, 1,000 busy tasks elsewhere | Before | After |
+| --- | ---: | ---: |
+| Bytes read from the daemon, KiB/s | 34.41 | 0.02 |
+| `bots` requests, /s | 0.59 | 0.34 |
+| Sonny CPU, ms/s | 7.49 | 5.03 |
+| Sonny peak RSS, MiB | 18.4 | 18.1 |
+
+Each page now holds that lead's own running tasks, which is none here, so
+what the window reads no longer grows with the fleet. The Perf workflow
+now runs this bench on `sonny/**` and `client/**` changes too. It also
+covers the lookout at 10, 100 and 1,000 subscribers and a sky replay of
+the hour at 512x, and like the daemon's timings it warns rather than
+fails.
+
+The same run shows the next limit at 1,000 subscribers: of 5,000 task
+turns that ended, the leads' notes named 660 within the ten seconds after
+the load, at a p95 of 20 s. At 100 subscribers they named every one, at a
+p95 of 2.8 s. A lead takes its notes one turn at a time, so a hundred
+tasks finishing together queue behind each other. That is the lookout's
+batching question, not the daemon's.
