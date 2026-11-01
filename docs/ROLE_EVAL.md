@@ -114,7 +114,7 @@ under `.local/role-eval/<model>/burst/`. Score:
 | B3 | answers each of the five quick looks itself, with no task for it, one point each |
 | B4 | brings each of the three calls only the person can make to them by the end, one point each |
 | B5 | on the person's return, says what needs them and what is in flight, with no ask missing |
-| L1 | answers the mid-burst question (five minutes, going by the code) in its reply; note `answered` in timeline.json, the seconds until it did |
+| L1 | answers the mid-burst question (19.99 EUR, going by the code, which no ask changes) in its reply; note `answered` in timeline.json, the seconds until it did, while the waves went on |
 
 Also count asks that were never mentioned or acted on, and replies about
 noise (Noise, above).

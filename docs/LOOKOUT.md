@@ -127,14 +127,15 @@ call answers with all of them:
 {"remove": "deploys"}
 ```
 
-A lead that starts a task for one topic of a source, a pull request or a
-chat thread, names it in `start_task`'s `subscribe`, as `NAME:TOPIC`:
-the task gets the subscription `owned` to those topics, and from then on
-what is said on them goes to the task in place of the lead, whose own
-subscription to the whole source would otherwise hear it too. The lead
-asks the task when it needs to know. Only the task's own makers stand
-aside: another subscriber of the source hears as before, and a topic the
-task stops owning, by removing `owned`, goes to the lead again.
+A task that subscribes to one topic of a source, as `NAME:TOPIC` (its
+pull request, a chat thread), owns it: what is said there goes to the task
+in place of its lead, whose own subscription to the whole source would
+otherwise hear it too. The lead's brief tells the task to subscribe, and
+the lead asks the task when it needs to know. Only the task's own makers
+stand aside: another subscriber of the source hears as before, and a topic
+the task unsubscribes from, or the task's removal, gives back to the lead.
+The subscription is held by the task's bot by its ID: a later task given
+the same name owns only what it subscribes to itself.
 
 `tasks_of` watches every bot one of them or one of its tasks made,
 `bots` every bot its name matches, `*` matching any run of characters,

@@ -4825,7 +4825,7 @@ mod tests {
         let mut lead = lookout();
         lead.subs.push(hears("chat"));
         let mut task = Lookout::new("calc.fix");
-        let mut owned = sub(crate::served::OWNED, &[], &[]);
+        let mut owned = sub("pr", &[], &[]);
         owned.sources = vec!["slack:pr-7".into()];
         task.subs.push(owned);
         // Another lead's line is not the task's.

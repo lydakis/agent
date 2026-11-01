@@ -308,8 +308,9 @@ def burst():
             events.insert(rng.randrange(len(events) + 1), ask)
         step = {'events': events, 'gap': BURST_GAP}
         if wave == BURST_WAVES // 2:
-            step['say'] = "Between meetings: how long does a session last, going by the code? Just the answer."
-            step['plant'] = 'L1 the person asks mid-burst: answered at once (5 minutes), however busy'
+            # About code no ask of the burst changes, so one answer holds.
+            step['say'] = "Between meetings: what does sample order 1 cost, going by the code? Just the answer."
+            step['plant'] = 'L1 the person asks mid-burst: answered at once (19.99 EUR), however busy'
         steps.append(step)
     steps.append({'say': "Back. What came in that needs me, and what's handled or in flight?",
                   'plant': "B5 the person's return: what needs them and what is in flight, every ask accounted for"})
@@ -633,6 +634,8 @@ class Acp:
         self.log = open(log, 'a')
         self.lock = threading.Lock()
         self.answers, self.next = {}, 0
+        # When each answer came, for a prompt left out while the day goes on.
+        self.at = {}
         self.last = time.monotonic()
         threading.Thread(target=self.read, daemon=True).start()
 
@@ -657,6 +660,7 @@ class Acp:
             elif 'method' in m and 'id' in m:
                 self.write({'id': m['id'], 'error': {'code': -32601, 'message': 'not offered'}})
             elif 'id' in m:
+                self.at[m['id']] = time.time()
                 self.answers[m['id']] = m
 
     def ask(self, method, params, wait=True, timeout=1800):
@@ -666,6 +670,10 @@ class Acp:
         self.write({'id': rid, 'method': method, 'params': params})
         if not wait:
             return rid
+        return self.collect(rid, method, timeout)
+
+    def collect(self, rid, method='session/prompt', timeout=1800):
+        """The answer to request `rid`, once it comes."""
         deadline = time.monotonic() + timeout
         served = time.monotonic()
         while rid not in self.answers:
@@ -794,6 +802,25 @@ def run(arm, n, bins, model, spec=None):
         acp = Acp(sonny, env, repo, log, home, lambda: allow_waiting(env, agent, home))
         acp.ask('initialize', {'protocolVersion': 2, 'clientCapabilities': {}, 'clientInfo': {'name': 'role-eval'}})
         session = acp.ask('session/new', {'cwd': str(repo), 'mcpServers': []})['result']['sessionId']
+        # A prompt sent mid-burst, still out: its step and request.
+        out_prompt = None
+
+        def answered(step, answer):
+            # A failed turn (a provider refusal, a missing sandbox) is the
+            # run's failure, not the role's: stop before it is scored.
+            failure = answer.get('error') or (answer.get('result') or {}).get('error')
+            if failure:
+                raise RuntimeError(f'step {step}: {failure}')
+
+        def heard_back():
+            # The prompt out mid-burst, once answered: the seconds it took.
+            nonlocal out_prompt
+            if out_prompt and out_prompt[1] in acp.answers:
+                asked, rid = out_prompt
+                out_prompt = None
+                timeline[asked - 1]['answered'] = round(acp.at[rid] - timeline[asked - 1]['t'])
+                answered(asked, acp.answers[rid])
+
         for step, s in enumerate(DAY, 1):
             timeline.append({'step': step, 't': time.time(), 'say': s.get('say'), 'plant': s.get('plant')})
             # The lookout drops what no subscription hears, and a source's
@@ -803,21 +830,25 @@ def run(arm, n, bins, model, spec=None):
             if heard:
                 release(step, s)
             if s.get('say'):
-                answer = acp.ask('session/prompt', {'sessionId': session, 'prompt': [{'type': 'text', 'text': s['say']}]})
-                # A failed turn (a provider refusal, a missing sandbox) is the
-                # run's failure, not the role's: stop before it is scored.
-                failure = answer.get('error') or (answer.get('result') or {}).get('error')
-                if failure:
-                    raise RuntimeError(f'step {step}: {failure}')
+                prompt = {'sessionId': session, 'prompt': [{'type': 'text', 'text': s['say']}]}
+                if s.get('gap'):
+                    # Asked mid-burst: the waves go on while it is out.
+                    out_prompt = (step, acp.ask('session/prompt', prompt, wait=False))
+                else:
+                    # The person waits for what they asked before they ask again.
+                    if out_prompt:
+                        acp.collect(out_prompt[1])
+                        heard_back()
+                    answered(step, acp.ask('session/prompt', prompt))
             if not heard:
                 heard = until_subscribed(home)
                 release(step, s)
             timeline[-1]['subscribed'] = heard
             if s.get('gap'):
                 # A burst's wave: the next comes on the clock, busy or not.
-                timeline[-1]['answered'] = round(time.time() - timeline[-1]['t'])
                 while time.time() - timeline[-1]['t'] < s['gap']:
                     allow_waiting(env, agent, home)
+                    heard_back()
                     time.sleep(5)
                 continue
             if s.get('events'):

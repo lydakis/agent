@@ -1,6 +1,7 @@
 import json
 import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -197,6 +198,34 @@ class ConfinedTests(unittest.TestCase):
                 finally:
                     acp.close()
             self.assertTrue(served)
+
+    def test_a_prompt_left_out_holds_up_nothing_and_its_answer_keeps_its_time(self):
+        # The burst's mid-burst question: the waves go on while it is out.
+        with tempfile.TemporaryDirectory() as tmp:
+            sonny = Path(tmp) / 'sonny'
+            sonny.write_text('#!/usr/bin/env python3\nimport json, sys, time\n'
+                             'for line in sys.stdin:\n'
+                             '    time.sleep(1)\n'
+                             '    print(json.dumps({"id": json.loads(line)["id"], "result": {}}), flush=True)\n')
+            sonny.chmod(0o755)
+            acp = role_eval.Acp(sonny, dict(os.environ), tmp, Path(tmp) / 'acp.jsonl', tmp)
+            try:
+                sent = time.time()
+                rid = acp.ask('session/prompt', {}, wait=False)
+                self.assertLess(time.time() - sent, 0.5)
+                self.assertNotIn(rid, acp.answers)
+                self.assertEqual(acp.collect(rid, timeout=10), {'id': rid, 'result': {}})
+                self.assertGreaterEqual(acp.at[rid] - sent, 1)
+            finally:
+                acp.close()
+
+    def test_the_mid_burst_question_is_about_code_no_ask_changes(self):
+        asked = next(s for s in role_eval.BURST if s.get('say') and s.get('gap'))
+        self.assertIn('sample order 1', asked['say'])
+        self.assertIn("Order(1, Decimal('19.99'), 'EUR'", role_eval.FILES['shop/orders.py'])
+        # Asks add to Order (a __str__, is_refund), never change a sample.
+        for ask in role_eval.BURST_ASKS:
+            self.assertNotIn('order 1', ask[2])
 
     def test_runs_live_outside_what_the_sandbox_always_writes(self):
         # /tmp and $TMPDIR are writable in every sandbox: a run there could

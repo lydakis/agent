@@ -237,15 +237,18 @@ pub fn steer_files(store: &Path) {
 
 /// The config at `path` with `urgent` under a source named `steer`, and
 /// `[sonny] commons_digest` moved to `[sonny.sources.commons] digest`,
-/// each line kept as the person wrote it otherwise. Whether it is done.
+/// each line kept as the person wrote it otherwise. Whether it is done:
+/// a config it cannot move cleanly is left as it is, for the config's own
+/// error to name the key, and tried again next time.
 fn config_steers(path: &Path) -> bool {
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
         Err(e) => return e.kind() == std::io::ErrorKind::NotFound,
     };
     match steers(&text) {
-        None => true,
-        Some(moved) => {
+        Err(()) => false,
+        Ok(None) => true,
+        Ok(Some(moved)) => {
             use std::os::unix::fs::PermissionsExt;
             let mode = std::fs::metadata(path).map_or(0o600, |m| m.permissions().mode() & 0o777);
             agent_client::files::replace_mode(path, moved.as_bytes(), mode).is_ok()
@@ -254,8 +257,66 @@ fn config_steers(path: &Path) -> bool {
 }
 
 /// `text` as [`config_steers`] writes it: none when there is nothing to
-/// move.
-fn steers(text: &str) -> Option<String> {
+/// move. The keys are found in the parsed config, not its lines, and the
+/// lines written must parse to the config with only those keys moved, so
+/// a string that holds `urgent =` is never touched; a config whose keys
+/// sit where lines can't move them (a dotted key, an inline table) is an
+/// error.
+fn steers(text: &str) -> Result<Option<String>, ()> {
+    let old: toml::Table = text.parse().map_err(drop)?;
+    let Some(expected) = steered(&old) else {
+        return Ok(None);
+    };
+    let new = steer_lines(text).ok_or(())?;
+    match new.parse::<toml::Table>() {
+        Ok(parsed) if parsed == expected => Ok(Some(new)),
+        _ => Err(()),
+    }
+}
+
+/// `config` with each source's `urgent` named `steer` and `[sonny]
+/// commons_digest` as the commons source's `digest`; none when it holds
+/// neither.
+fn steered(config: &toml::Table) -> Option<toml::Table> {
+    use toml::Value;
+    let mut config = config.clone();
+    let Some(Value::Table(sonny)) = config.get_mut("sonny") else {
+        return None;
+    };
+    let mut changed = false;
+    let digest = sonny.remove("commons_digest");
+    if let Some(Value::Table(sources)) = sonny.get_mut("sources") {
+        for (_, source) in sources.iter_mut() {
+            if let Value::Table(source) = source
+                && let Some(value) = source.remove("urgent")
+            {
+                source.insert("steer".into(), value);
+                changed = true;
+            }
+        }
+    }
+    if let Some(digest) = digest {
+        let sources = sonny
+            .entry("sources")
+            .or_insert_with(|| Value::Table(toml::Table::new()));
+        let Value::Table(sources) = sources else {
+            return None;
+        };
+        let commons = sources
+            .entry("commons")
+            .or_insert_with(|| Value::Table(toml::Table::new()));
+        let Value::Table(commons) = commons else {
+            return None;
+        };
+        commons.insert("digest".into(), digest);
+        changed = true;
+    }
+    changed.then_some(config)
+}
+
+/// The lines of `text` with the keys [`steered`] moves moved, outside any
+/// multiline string; none when nothing moved.
+fn steer_lines(text: &str) -> Option<String> {
     let header = |line: &str| {
         let line = line.trim();
         (line.starts_with('[') && !line.starts_with("[["))
@@ -266,7 +327,16 @@ fn steers(text: &str) -> Option<String> {
     let mut lines: Vec<String> = Vec::new();
     let mut digest = None;
     let mut changed = false;
+    let mut quoted = false;
     for line in text.lines() {
+        // Inside a multiline string, a line is the string's.
+        let opens = line.matches("\"\"\"").count() + line.matches("'''").count();
+        if quoted {
+            quoted = opens % 2 == 0;
+            lines.push(line.to_owned());
+            continue;
+        }
+        quoted = opens % 2 == 1;
         if let Some(name) = header(line) {
             table = name;
         } else if table.starts_with("sonny.sources.") && key(line).as_deref() == Some("urgent") {
@@ -535,6 +605,7 @@ fn drop_named(
 pub fn change(
     store: &Path,
     subscriber: &str,
+    owner: Option<i64>,
     add: Option<&Value>,
     remove: Option<&str>,
     sources: &[String],
@@ -542,7 +613,9 @@ pub fn change(
     if !plain(subscriber, BOT_NAME_MAX) {
         return Err(format!("{subscriber:?} is not a bot's name"));
     }
-    let add = add.map(parse).transpose()?;
+    // What it adds is held by the bot of that ID, so a later bot given
+    // the name, a task started again, say, never inherits it.
+    let add = add.map(parse).transpose()?.map(|sub| Sub { owner, ..sub });
     let known = |name: &String| {
         let (source, topic) = super::sources::named(name);
         sources.iter().any(|s| s == source) && topic.is_none_or(|topic| plain(topic, NAME_MAX))
@@ -560,6 +633,12 @@ pub fn change(
     // One change at a time, so two at once both land.
     let _held = held(store)?;
     let mut subs = read_whole(store, subscriber)?;
+    // What another bot of the name held is gone with it.
+    let mine = |s: &Sub| s.owner.is_none() || owner.is_none() || s.owner == owner;
+    if !subs.iter().all(mine) {
+        subs.retain(mine);
+        write(store, subscriber, &subs)?;
+    }
     let mut said = json!({});
     if let Some(name) = remove {
         said["removed"] = json!(drop_named(store, subscriber, &mut subs, name)?);
@@ -707,17 +786,28 @@ mod tests {
     fn the_steer_migration_renames_urgent_and_moves_the_commons_digest() {
         let text = "model = \"m\"\n\n[sonny]\ncommons_digest = \"30m\"\ntheme = \"dark\"\n\n[sonny.sources.github]\ncommand = \"gh\"\nurgent = \"review_requested\" # mine\n";
         assert_eq!(
-            steers(text).unwrap(),
+            steers(text).unwrap().unwrap(),
             "model = \"m\"\n\n[sonny]\ntheme = \"dark\"\n\n[sonny.sources.github]\ncommand = \"gh\"\nsteer = \"review_requested\" # mine\n\n[sonny.sources.commons]\ndigest = \"30m\"\n"
         );
         let beside = "[sonny]\ncommons_digest = \"0\"\n[sonny.sources.commons]\nurgent = \"*\"\n";
         assert_eq!(
-            steers(beside).unwrap(),
+            steers(beside).unwrap().unwrap(),
             "[sonny]\n[sonny.sources.commons]\ndigest = \"0\"\nsteer = \"*\"\n"
         );
         // What another table names `urgent` is its own.
-        assert_eq!(steers("[other]\nurgent = 1\n"), None);
-        assert_eq!(steers(""), None);
+        assert_eq!(steers("[other]\nurgent = 1\n"), Ok(None));
+        assert_eq!(steers(""), Ok(None));
+        // A command's own words are the command's, in a config already
+        // current or not.
+        let script = "[sonny.sources.ci]\ncommand = \"\"\"\nurgent=1\necho $urgent\n\"\"\"\n";
+        assert_eq!(steers(script), Ok(None));
+        let both = format!("{script}urgent = \"*\"\n");
+        assert_eq!(
+            steers(&both).unwrap().unwrap(),
+            format!("{script}steer = \"*\"\n")
+        );
+        // One the lines can't move is left for the config's own error.
+        assert_eq!(steers("sonny.sources.ci.urgent = \"*\"\n"), Err(()));
     }
 
     #[test]
@@ -767,6 +857,41 @@ mod tests {
     }
 
     #[test]
+    fn a_bot_given_a_gone_bots_name_inherits_none_of_its_subscriptions() {
+        let store = std::env::temp_dir().join(format!("subs-reused-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(dir(&store));
+        let pr = json!({"name": "pr", "sources": ["github:7"]});
+        let first = change(
+            &store,
+            "shop.fix",
+            Some(1),
+            Some(&pr),
+            None,
+            &["github".into()],
+        )
+        .unwrap();
+        assert_eq!(first["subscriptions"][0]["bot_id"], 1);
+        assert!(!read(&store, "shop.fix")[0].held_by(&json!({"bot_id": 2})));
+        // The name started again: what the gone task held goes, and the new
+        // one adds its own topic under the same name.
+        let other = json!({"name": "pr", "sources": ["github:8"]});
+        let again = change(
+            &store,
+            "shop.fix",
+            Some(2),
+            Some(&other),
+            None,
+            &["github".into()],
+        )
+        .unwrap();
+        assert_eq!(again["added"], true);
+        assert_eq!(again["subscriptions"].as_array().unwrap().len(), 1);
+        assert_eq!(again["subscriptions"][0]["sources"], json!(["github:8"]));
+        assert_eq!(again["subscriptions"][0]["bot_id"], 2);
+        let _ = std::fs::remove_dir_all(dir(&store));
+    }
+
+    #[test]
     fn another_lead_of_a_folder_hears_its_own_tasks_only() {
         assert_eq!(Sub::lead("shop.lead", "shop").bots, ["shop.*"]);
         let other = Sub::lead("shop.lead.billing", "shop");
@@ -799,7 +924,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let store = dir.join("state.sqlite");
         let sources = ["cr".to_owned()];
-        let add = |sub: Value| change(&store, "shop.lead", Some(&sub), None, &sources);
+        let add = |sub: Value| change(&store, "shop.lead", None, Some(&sub), None, &sources);
         let filter = json!({"paths": [{"prefix": "src/billing/"}]});
         let crs = json!({"name": "crs", "sources": ["cr"], "filter": filter});
         // No event seen yet: nothing to warn of.
@@ -890,7 +1015,7 @@ mod tests {
         assert_eq!(listed["fields"]["meta.team"], "string, as \"core\"");
         assert_eq!(warned["examples"], super::super::sources::EXAMPLES);
         // A caller hearing none of them sees each field's kinds alone.
-        let other = change(&store, "ops.lead", None, None, &sources).unwrap();
+        let other = change(&store, "ops.lead", None, None, None, &sources).unwrap();
         assert_eq!(other["sources"][0]["fields"]["paths"], "list of strings");
         assert_eq!(other["sources"][0]["fields"]["text"], "string");
         assert!(other.get("examples").is_none(), "{other}");
@@ -909,7 +1034,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("lookout-subs-edit-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let store = dir.join("state.sqlite");
-        let add = |sub: Value| change(&store, "shop.lead", Some(&sub), None, &[]);
+        let add = |sub: Value| change(&store, "shop.lead", None, Some(&sub), None, &[]);
         let prs = json!({"name": "prs", "tasks_of": ["shop.lead"]});
         assert_eq!(add(prs.clone()).unwrap()["added"], true);
         let again = add(prs.clone()).unwrap();
@@ -928,27 +1053,27 @@ mod tests {
             "{none}"
         );
         let sources = ["mail".to_owned(), "slack".to_owned()];
-        let heard = change(&store, "shop.lead", Some(&slack), None, &sources).unwrap();
+        let heard = change(&store, "shop.lead", None, Some(&slack), None, &sources).unwrap();
         let names: Vec<&Value> = (heard["sources"].as_array().unwrap().iter())
             .map(|s| &s["name"])
             .collect();
         assert_eq!(names, ["mail", "slack"]);
         assert_eq!(heard["sources"][0], json!({"name": "mail", "events": 0}));
         let typo = json!({"name": "s2", "sources": ["slakc"]});
-        let refused = change(&store, "shop.lead", Some(&typo), None, &sources).unwrap_err();
+        let refused = change(&store, "shop.lead", None, Some(&typo), None, &sources).unwrap_err();
         assert!(
             refused.ends_with("the sources there are mail, slack"),
             "{refused}"
         );
-        change(&store, "shop.lead", None, Some("slack"), &sources).unwrap();
+        change(&store, "shop.lead", None, None, Some("slack"), &sources).unwrap();
         // A topic of a source there is, as plainly named.
         let deploys = json!({"name": "deploys", "sources": ["slack:deploys"]});
-        change(&store, "shop.lead", Some(&deploys), None, &sources).unwrap();
+        change(&store, "shop.lead", None, Some(&deploys), None, &sources).unwrap();
         let worded = json!({"name": "d2", "sources": ["slack:a b"]});
-        assert!(change(&store, "shop.lead", Some(&worded), None, &sources).is_err());
+        assert!(change(&store, "shop.lead", None, Some(&worded), None, &sources).is_err());
         let elsewhere = json!({"name": "d3", "sources": ["slakc:deploys"]});
-        assert!(change(&store, "shop.lead", Some(&elsewhere), None, &sources).is_err());
-        change(&store, "shop.lead", None, Some("deploys"), &sources).unwrap();
+        assert!(change(&store, "shop.lead", None, Some(&elsewhere), None, &sources).is_err());
+        change(&store, "shop.lead", None, None, Some("deploys"), &sources).unwrap();
         // A commons thread's subscription fits a thread of the longest name.
         let thread = "t".repeat(64);
         let commons = Sub::commons(&thread, Some(7));
@@ -960,6 +1085,7 @@ mod tests {
         let away = change(
             &store,
             "../away",
+            None,
             Some(&json!({"name": "x", "bots": ["a"]})),
             None,
             &[],
@@ -970,12 +1096,13 @@ mod tests {
         change(
             &store,
             &long,
+            None,
             Some(&json!({"name": "x", "bots": ["a"]})),
             None,
             &[],
         )
         .unwrap();
-        let gone = change(&store, &long, None, Some("x"), &[]).unwrap();
+        let gone = change(&store, &long, None, None, Some("x"), &[]).unwrap();
         assert_eq!(
             (gone["removed"].clone(), gone["subscriptions"].clone()),
             (json!(true), json!([]))
@@ -986,7 +1113,7 @@ mod tests {
                 let store = store.clone();
                 std::thread::spawn(move || {
                     let sub = json!({"name": format!("n{n}"), "bots": ["a"]});
-                    change(&store, "many", Some(&sub), None, &[]).unwrap();
+                    change(&store, "many", None, Some(&sub), None, &[]).unwrap();
                 })
             })
             .collect();
@@ -1009,8 +1136,8 @@ mod tests {
         assert_eq!(Sub::from_json(&tasks.to_json()), Some(tasks.clone()));
         assert_eq!(parse(&tasks.to_json()), Ok(tasks));
         assert_eq!(all(&store).len(), 2);
-        change(&store, "shop.lead", None, Some("prs"), &[]).unwrap();
-        change(&store, "shop.lead", None, Some("tasks"), &[]).unwrap();
+        change(&store, "shop.lead", None, None, Some("prs"), &[]).unwrap();
+        change(&store, "shop.lead", None, None, Some("tasks"), &[]).unwrap();
         assert_eq!(all(&store).len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }

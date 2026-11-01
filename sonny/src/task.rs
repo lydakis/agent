@@ -78,15 +78,6 @@ struct Source {
 /// Start the task `start` asks for in `project`, whose lead's folder is
 /// `here`, for `starter`, the lead or a task of its line, whose mode it
 /// works in, and say what started and how its work comes back.
-/// The bot a task of `project` named `short` is, as its start names it.
-pub fn named(project: &str, short: &str) -> String {
-    let short = short.trim();
-    match short.strip_prefix(&format!("{project}.")) {
-        Some(_) => short.to_owned(),
-        None => format!("{project}.{short}"),
-    }
-}
-
 pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result<String, String> {
     let short = start.name.trim();
     // A lead's name is never a task's.
@@ -95,7 +86,10 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
             "{short:?} names a lead; give the task a name of its own"
         ));
     }
-    let name = named(project, short);
+    let name = match short.strip_prefix(&format!("{project}.")) {
+        Some(_) => short.to_owned(),
+        None => format!("{project}.{short}"),
+    };
     let name = name.as_str();
     if short.is_empty() || !branch_name(name) {
         return Err(format!("{short:?} is not a name a git branch can have"));
