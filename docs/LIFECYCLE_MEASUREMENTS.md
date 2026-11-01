@@ -298,8 +298,12 @@ What changed:
   bundled SQLite 3.53.2 to 3.54.1) on. Every later main tried, `f44b859`,
   `5c8b044`, `d617c75` and `70637f9`, is equally slow, so the 2026-10-31
   daemon work did not cause it. #544's own query change touches only items
-  that carry an image, which this workload never stores. Why the new SQLite
-  is slower here is not yet known.
+  that carry an image, which this workload never stores. The cause: with
+  SQLite 3.54.1, and rusqlite clearing bindings when a statement goes back
+  to its cache, cached joins were planned again on every reuse. #617 turns
+  on the query planner stability guarantee for store connections; the
+  [run after that fix](#re-run-after-the-sqlite-fix-2026-11-01) shows the
+  phase back below Pi Durable's.
 - **Pi Durable 1.4.0 overlaps fewer tool turns.** In the echo and shell cases
   it reached 22 to 28 of 32 concurrent provider requests (1.0.0: all 32), so
   each of those runs carries the "configured provider concurrency not
@@ -310,3 +314,37 @@ What changed:
 - Both engines used more CPU than on 2026-10-09, Pi Durable about 1.7 to
   1.9 times and Agent about 2.0 to 2.4 times. Part of that is likely the host, which
   this run cannot separate.
+
+### Re-run after the SQLite fix, 2026-11-01
+
+The same seven commands on the same host class, 2026-11-01 14:32–14:38 UTC,
+at main `37ebb4d` (#617 merged; release binary `22a800ef…`), same Pi Durable
+1.4.0 and Node. Captures under the ignored
+`.local/bench/harness-nov01-37ebb4d-pi-durable/`. Every measured run completed
+all 96 turns with no invalid request.
+
+| Case | Engine, durability | Peak RSS, MiB | CPU s | Turn p50 / p99, ms | Restart to ready, ms | Resume, re-read, items, duplicate, fork (all 32), ms |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| Text | Agent, FULL | 26.0 (25.5–26.2) | 1.50 (1.40–1.52) | 534 / 549 | 288 (269–443) | 396 (323–412) |
+| Text | Pi Durable, FULL | 153.7 (152.8–154.5) | 4.61 (4.39–4.82) | 561 / 822 | 459 (418–492) | 508 (507–537) |
+| Echo round trip | Agent, FULL | 26.5 (26.5–26.7) | 1.58 (1.47–1.66) | 587 / 602 | 325 (295–334) | 430 (385–475) |
+| Echo round trip | Pi Durable, FULL | 164.7 (161.3–167.3) | 6.09 (5.46–6.17) | 750 / 1,062 | 395 (377–449) | 498 (452–551) |
+| Echo round trip | Pi Durable, NORMAL (package default) | 165.9 (164.3–167.4) | 5.21 (4.58–5.30) | 685 / 973 | 388 (380–471) | 404 (375–434) |
+| Shell round trip | Agent, FULL | 185.1 (184.9–185.1) | 1.58 (1.58–1.68) | 852 / 896 | 340 (271–358) | 451 (413–480) |
+| Shell round trip | Pi Durable, FULL | 208.1 (207.6–223.0) | 7.11 (6.25–7.24) | 1,173 / 1,519 | 456 (367–525) | 564 (510–580) |
+
+- **The after-restart phase is fixed.** Agent's echo case took 430 ms
+  against 864 ms at `70637f9`, and is below Pi Durable's in every matched
+  (FULL) case again. Timing each request (three echo runs) puts the 384
+  `history_items` reads at 0.45 to 0.83 ms a call, back to the
+  pre-#544 0.55 ms range.
+- Agent's CPU also fell, most in the tool cases (echo 2.11 to 1.58 s, shell
+  1.92 to 1.58 s), likely because tool turns read history the same way.
+- Pi Durable FULL again reached only 20 to 25 of 32 concurrent provider
+  requests in the echo and shell cases and carries the concurrency warning;
+  NORMAL reached 30 to 32. Agent reached 32 in every run.
+- Agent's shell peak stays at about 185 MiB, so the rise against 2026-10-09
+  is not from the SQLite change.
+- Pi Durable's numbers moved by up to 10% between the two runs today (echo
+  RSS 154.7 to 164.7 MiB) with no change on its side, so read differences
+  that small as host noise.
