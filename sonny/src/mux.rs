@@ -385,10 +385,12 @@ impl Place {
 }
 
 /// One of a project's Sonny windows, as the person last used it: its
-/// process, when, and where it is, `None` for a terminal in no multiplexer.
+/// process, the agent it shows, when, and where it is, `None` for a
+/// terminal in no multiplexer.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Window {
     pub pid: u32,
+    pub bot: String,
     pub used_ms: u64,
     pub place: Option<Place>,
 }
@@ -402,6 +404,7 @@ fn windows(file: &Path) -> Vec<Window> {
         .filter_map(|window| {
             Some(Window {
                 pid: u32::try_from(window["pid"].as_u64()?).ok()?,
+                bot: window["bot"].as_str().unwrap_or_default().to_owned(),
                 used_ms: window["used_ms"].as_u64()?,
                 place: Place::of(&window["place"]),
             })
@@ -445,6 +448,30 @@ pub fn latest(socket: &Path, project: &str) -> Option<(Window, bool)> {
     latest_in(&Place::file(socket, project)?, alive)
 }
 
+/// The window an agent acts in: the open one the person used last among
+/// those showing it, else among those showing the agent that made it, and
+/// so on up `chain` (the agent first, then its makers); else the project's
+/// window used last. So an agent spoken to in one terminal acts there
+/// while another terminal talks to another of the project's agents.
+fn latest_for_in(
+    file: &Path,
+    chain: &[String],
+    alive: impl Fn(u32) -> bool,
+) -> Option<(Window, bool)> {
+    let windows = windows(file);
+    for bot in chain {
+        if let Some(open) = (windows.iter()).find(|window| window.bot == *bot && alive(window.pid))
+        {
+            return Some((open.clone(), true));
+        }
+    }
+    latest_in(file, alive)
+}
+
+pub fn latest_for(socket: &Path, project: &str, chain: &[String]) -> Option<(Window, bool)> {
+    latest_for_in(&Place::file(socket, project)?, chain, alive)
+}
+
 /// Notes that the person used this window of `project`'s just now, at
 /// `place`. The windows since closed go, but for the newest, whose place
 /// still counts once every window is closed.
@@ -485,6 +512,7 @@ fn write(file: &Path, windows: &[Window]) {
         .map(|window| {
             serde_json::json!({
                 "pid": window.pid,
+                "bot": window.bot,
                 "used_ms": window.used_ms,
                 "place": window.place.as_ref().map(Place::json),
             })
@@ -512,6 +540,8 @@ fn now_ms() -> u64 {
 /// time they do, at most once a second.
 pub struct Marker {
     file: PathBuf,
+    /// The agent this window shows.
+    bot: String,
     place: Option<Place>,
     /// A window of an agent, not a lead, takes the place of the project's
     /// window used last, since it opened in that one's home.
@@ -521,9 +551,10 @@ pub struct Marker {
 
 impl Marker {
     /// A lead's window, laid out at `place` or in no multiplexer.
-    pub fn lead(socket: &Path, project: &str, place: Option<Place>) -> Option<Self> {
+    pub fn lead(socket: &Path, project: &str, bot: &str, place: Option<Place>) -> Option<Self> {
         Some(Self {
             file: Place::file(socket, project)?,
+            bot: bot.to_owned(),
             place,
             follows: false,
             last: None,
@@ -538,11 +569,13 @@ impl Marker {
     pub fn agent(
         socket: &Path,
         project: &str,
+        bot: &str,
         here: bool,
         given: Option<Option<Place>>,
     ) -> Option<Self> {
         Some(Self {
             file: Place::file(socket, project)?,
+            bot: bot.to_owned(),
             follows: here && given.is_none(),
             place: given.flatten(),
             last: None,
@@ -589,6 +622,7 @@ impl Marker {
         let place = self.place.clone();
         let me = Window {
             pid: std::process::id(),
+            bot: self.bot.clone(),
             used_ms: now_ms(),
             place,
         };
@@ -602,16 +636,17 @@ impl Marker {
     }
 }
 
-/// Whether the project's window the person used last is in `home`, the
+/// Whether the window `lead` acts in ([`latest_for`]) is in `home`, the
 /// home of this lead's window (that window, or an agent's in the same
 /// home), or no open window is known: only then does the lead's new work
 /// open there.
-pub fn mine(socket: &Path, project: &str, home: &Place) -> bool {
-    Place::file(socket, project).is_none_or(|file| mine_in(&file, std::process::id(), home, alive))
+pub fn mine(socket: &Path, project: &str, lead: &str, home: &Place) -> bool {
+    Place::file(socket, project)
+        .is_none_or(|file| mine_in(&file, std::process::id(), lead, home, alive))
 }
 
-fn mine_in(file: &Path, me: u32, home: &Place, alive: impl Fn(u32) -> bool) -> bool {
-    latest_in(file, alive).is_none_or(|(window, open)| {
+fn mine_in(file: &Path, me: u32, lead: &str, home: &Place, alive: impl Fn(u32) -> bool) -> bool {
+    latest_for_in(file, &[lead.to_owned()], alive).is_none_or(|(window, open)| {
         !open || window.pid == me || window.place.as_ref() == Some(home)
     })
 }
@@ -1256,8 +1291,13 @@ pub fn here(project: &str, host: Option<&str>) -> Option<Layout> {
 /// else in the multiplexer project `like`'s home is in, made when needed.
 /// With none of these, the lead is in no multiplexer, and neither is
 /// anything it would see.
-pub fn for_agent(socket: &Path, project: &str, like: Option<&str>) -> Result<Layout, String> {
-    let kept = match latest(socket, project) {
+pub fn for_agent(
+    socket: &Path,
+    project: &str,
+    chain: &[String],
+    like: Option<&str>,
+) -> Result<Layout, String> {
+    let kept = match latest_for(socket, project, chain) {
         Some((Window { place: None, .. }, true)) => {
             return Err(format!(
                 "{project}'s Sonny was used last in a terminal outside Rex, Herdr and cmux, \
@@ -1892,6 +1932,7 @@ mod tests {
         for (at, place) in places.iter().enumerate() {
             let me = Window {
                 pid: 10 + at as u32,
+                bot: "shop.lead".into(),
                 used_ms: 100 + at as u64,
                 place: Some(place.clone()),
             };
@@ -1921,6 +1962,7 @@ mod tests {
         let _ = std::fs::remove_file(&file);
         let rex = Window {
             pid: 1,
+            bot: "shop.lead".into(),
             used_ms: 100,
             place: Some(Place::Rex {
                 session: "s1".into(),
@@ -1929,6 +1971,7 @@ mod tests {
         };
         let ghostty = Window {
             pid: 2,
+            bot: "shop.lead".into(),
             used_ms: 200,
             place: None,
         };
@@ -1949,11 +1992,72 @@ mod tests {
         // A new window drops every closed one but the newest.
         let third = Window {
             pid: 3,
+            bot: "shop.lead".into(),
             used_ms: 400,
             place: None,
         };
         mark_in(&file, third.clone(), |pid| pid == 3);
         assert_eq!(windows(&file), [third, again]);
+        let _ = std::fs::remove_file(&file);
+    }
+
+    /// Ghostty's Sonny talks to the lead and Rex's to another lead of the
+    /// project at once: each agent acts in the terminal it is spoken to
+    /// in, its tasks in their maker's, and an agent no window shows in the
+    /// project's window used last.
+    #[test]
+    fn each_agent_acts_in_the_terminal_it_is_spoken_to_in() {
+        let file = std::env::temp_dir().join(format!("sonny-each-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&file);
+        let home = Place::Rex {
+            session: "s1".into(),
+            host: None,
+        };
+        let rex = Window {
+            pid: 1,
+            bot: "shop.lead.web".into(),
+            used_ms: 100,
+            place: Some(home.clone()),
+        };
+        let ghostty = Window {
+            pid: 2,
+            bot: "shop.lead".into(),
+            used_ms: 200,
+            place: None,
+        };
+        mark_in(&file, rex.clone(), |_| true);
+        mark_in(&file, ghostty.clone(), |_| true);
+        let chain = |bots: &[&str]| bots.iter().map(|bot| bot.to_string()).collect::<Vec<_>>();
+        let open = |pid| pid == 1 || pid == 2;
+        assert_eq!(
+            latest_for_in(&file, &chain(&["shop.lead"]), open),
+            Some((ghostty.clone(), true))
+        );
+        assert_eq!(
+            latest_for_in(&file, &chain(&["shop.lead.web"]), open),
+            Some((rex.clone(), true))
+        );
+        // A task of the Rex lead's, shown nowhere, acts in its maker's.
+        let task = chain(&["shop.fix", "shop.lead.web"]);
+        assert_eq!(latest_for_in(&file, &task, open), Some((rex.clone(), true)));
+        // An agent no window shows, made by none that is: the project's
+        // window used last.
+        assert_eq!(
+            latest_for_in(&file, &chain(&["shop.cron"]), open),
+            Some((ghostty, true))
+        );
+        // The Rex lead's window opens its tasks' tabs though Ghostty's was
+        // used since; the Ghostty lead's work opens none in Rex.
+        assert!(mine_in(&file, 1, "shop.lead.web", &home, open));
+        let other = Place::Herdr {
+            workspace: "w2".into(),
+        };
+        assert!(!mine_in(&file, 3, "shop.lead", &other, open));
+        // The Rex lead's window closed: its tasks go by the project's.
+        assert_eq!(
+            latest_for_in(&file, &task, |pid| pid == 2).map(|(w, _)| w.pid),
+            Some(2)
+        );
         let _ = std::fs::remove_file(&file);
     }
 
@@ -1982,12 +2086,14 @@ mod tests {
         // for the task's window.
         let lead = Window {
             pid: gone,
+            bot: "shop.lead".into(),
             used_ms: now_ms() - 10,
             place: Some(home.clone()),
         };
         mark_in(&file, lead, |_| true);
         let mut task = Marker {
             file: file.clone(),
+            bot: "shop.fix".into(),
             place: None,
             follows: true,
             last: None,
@@ -2000,13 +2106,14 @@ mod tests {
         assert_eq!(windows(&file)[0].place, Some(home.clone()));
         // The task's window used last, in the lead's home: the lead still
         // opens its tasks there; a lead elsewhere does not.
-        assert!(mine_in(&file, gone, &home, |pid| pid == me));
-        assert!(!mine_in(&file, 2, &other, |pid| pid == me));
+        assert!(mine_in(&file, gone, "shop.fix", &home, |pid| pid == me));
+        assert!(!mine_in(&file, 2, "shop.fix", &other, |pid| pid == me));
         // A window in another home used since: the task keeps its own.
         mark_in(
             &file,
             Window {
                 pid: 1,
+                bot: "shop.lead".into(),
                 used_ms: now_ms() + 1000,
                 place: Some(other.clone()),
             },
@@ -2028,6 +2135,7 @@ mod tests {
         let me = std::process::id();
         let bare = Window {
             pid: me,
+            bot: "shop.lead".into(),
             used_ms: 5,
             place: None,
         };
@@ -2051,6 +2159,7 @@ mod tests {
         };
         let mut task = Marker {
             file: file.clone(),
+            bot: "shop.fix".into(),
             follows: false,
             place: Some(home.clone()),
             last: None,

@@ -285,7 +285,7 @@ async fn show(
             "{side:?} is not a side: right, left, above, below or float"
         ));
     }
-    let (socket, project) = agents_project(caller).await?;
+    let (socket, project, chain) = agents_project(caller).await?;
     let me = std::env::current_exe().map_err(|e| e.to_string())?;
     if split.is_none()
         && let Some(other) = project::lead_project(bot).filter(|p| *p != project)
@@ -294,7 +294,7 @@ async fn show(
         let (home, opened) = open_lead(&socket, store.as_deref(), other, bot, &project, &me)?;
         return Ok(json!({"bot": bot, "in": home, "opened": opened}));
     }
-    let mut layout = mux::for_agent(&socket, &project, None)?;
+    let mut layout = mux::for_agent(&socket, &project, &chain, None)?;
     // Opened in this home, the agent's window knows it is there.
     let command = [
         me.to_string_lossy().into_owned(),
@@ -335,7 +335,7 @@ fn open_lead(
     like: &str,
     me: &std::path::Path,
 ) -> Result<(String, bool), String> {
-    let mut layout = mux::for_agent(socket, project, Some(like))?;
+    let mut layout = mux::for_agent(socket, project, &[bot.to_owned()], Some(like))?;
     let bot = bot.to_owned();
     let mut command = vec![me.to_string_lossy().into_owned()];
     if let Some(store) = store {
@@ -355,16 +355,43 @@ fn open_lead(
     Ok((layout.home(), opened))
 }
 
-/// The daemon's socket and the project `bot` belongs to, for a call of
-/// `bot`'s.
-async fn agents_project(bot: &str) -> Result<(PathBuf, String), String> {
+/// The daemon's socket, the project `bot` belongs to, and `bot` with the
+/// agents that made it, up to the first lead, for a call of `bot`'s.
+async fn agents_project(bot: &str) -> Result<(PathBuf, String, Vec<String>), String> {
     let socket = std::env::var_os("AGENT_SOCKET")
         .map(PathBuf::from)
         .ok_or("AGENT_SOCKET is not set")?;
     let socket = std::path::absolute(socket).map_err(|e| e.to_string())?;
     let client = Client::connect(&socket).await.map_err(|e| e.to_string())?.0;
     let project = project_of(&client, bot).await;
-    Ok((socket, project))
+    let chain = makers(&client, bot).await;
+    Ok((socket, project, chain))
+}
+
+/// `bot`, then the agent that made it, and so on to the first lead or an
+/// agent no agent made: whose windows an agent acts in ([`mux::latest_for`]).
+async fn makers(client: &Client, bot: &str) -> Vec<String> {
+    let mut chain = vec![bot.to_owned()];
+    // A chain of makers is short; the cap only stops a loop.
+    while chain.len() < 16 && !project::is_lead(&chain[chain.len() - 1]) {
+        let at = &chain[chain.len() - 1];
+        let page = (client
+            .request("bots", json!({"name": at, "limit": 1}))
+            .await)
+            .unwrap_or_default();
+        let row = &page["bots"][0];
+        let Some(by) = row["created_by"]
+            .as_str()
+            .filter(|by| !by.is_empty() && row["name"] == at.as_str())
+        else {
+            break;
+        };
+        if chain.iter().any(|seen| seen == by) {
+            break;
+        }
+        chain.push(by.to_owned());
+    }
+    chain
 }
 
 /// A `run_in_pane` call of `owner`'s: run a command it wants watched (a
@@ -389,8 +416,8 @@ async fn run_in_pane(
     if !cwd.is_absolute() || !cwd.is_dir() {
         return Err(format!("{} is not a folder", cwd.display()));
     }
-    let (socket, project) = agents_project(owner).await?;
-    let mut layout = mux::for_agent(&socket, &project, None)?;
+    let (socket, project, chain) = agents_project(owner).await?;
+    let mut layout = mux::for_agent(&socket, &project, &chain, None)?;
     let command = ["sh".to_owned(), "-c".to_owned(), command.to_owned()];
     let block = layout.split(owner, name, cwd, &command, split.as_deref())?;
     Ok(json!({"block": block, "label": format!("{owner}/{name}"), "in": layout.home()}))
@@ -1085,20 +1112,21 @@ async fn run() -> Result<(), String> {
             app.notice = fleet.note.clone();
         }
     }
-    // The person's window of a project, wherever it is: while it is the one
-    // used last, the project's agents open where it is, or nowhere when it
-    // is in no multiplexer, never in another terminal's.
+    // The person's window of an agent, wherever it is: while it is the one
+    // used last of those showing the agent, the agent and what it made open
+    // where it is, or nowhere when it is in no multiplexer, never in
+    // another terminal's.
     if options.side.is_none() && !options.embedded {
         app.marker = match &project {
             Some(project) => {
                 let place = app.fleet.as_ref().map(|fleet| fleet.place.clone());
-                mux::Marker::lead(&options.socket, project, place)
+                mux::Marker::lead(&options.socket, project, &name, place)
             }
             None => {
                 let project = project_of(&app.client, &name).await;
                 let here = options.layout && mux::inside(options.rex_host.as_deref());
                 let given = options.window_place.as_deref().and_then(mux::Place::decode);
-                mux::Marker::agent(&options.socket, &project, here, given)
+                mux::Marker::agent(&options.socket, &project, &name, here, given)
             }
         };
         if let Some(marker) = &mut app.marker {
@@ -2842,7 +2870,9 @@ impl Fleet {
         let layout = mux::here(project, options.rex_host.as_deref())?;
         let place = layout.kept();
         // This window is the one used now, before its tasks open.
-        if let Some(mut marker) = mux::Marker::lead(&options.socket, project, Some(place.clone())) {
+        if let Some(mut marker) =
+            mux::Marker::lead(&options.socket, project, lead, Some(place.clone()))
+        {
             marker.used();
         }
         let (client, mut events) = Client::connect(&options.socket).await.ok()?;
@@ -3005,12 +3035,12 @@ impl Fleet {
         let told = self.tell.clone();
         let (windows, mut room) = self.room();
         let (socket, project) = (self.socket.clone(), self.project.clone());
-        let place = self.place.clone();
+        let (place, lead) = (self.place.clone(), self.lead.clone());
         self.layout.send(move |layout| {
             // Typed in elsewhere since, the person is in another of the
             // project's windows, outside this home: the task's window
             // opens in none.
-            if !mux::mine(&socket, &project, &place) {
+            if !mux::mine(&socket, &project, &lead, &place) {
                 return;
             }
             room.most = windows.lock().map_or(0, |mut windows| windows.most());
@@ -4893,7 +4923,7 @@ impl App {
                             None => project_of(&client, &me).await,
                         };
                         tokio::task::spawn_blocking(move || {
-                            mux::for_agent(&socket, &project, None)?.focus(&bot)
+                            mux::for_agent(&socket, &project, &[me], None)?.focus(&bot)
                         })
                         .await
                         .map_err(|e| e.to_string())?

@@ -305,18 +305,20 @@ commands in tabs and read them. The tool host, the daemon's companion, reaches i
 either way when the daemon started from a cmux tab; otherwise it needs
 Automation mode too.
 Each of a
-project's Sonny windows notes where it is in `~/.agent/sonny/places`, and
-when the person last used it (a key, a click, a paste, or the window coming
-to the front). An agent's `run_in_pane` and `show_agent` calls go where the
-open window used last is, that Herdr or cmux workspace or Rex session,
-rather than one guessed from where the tool host answering them runs, which
-is in neither; and only a lead's window in that same home opens tabs for
-its new tasks. A task's window keeps the home it opened in.
-This is tmux's rule for a command that names no client: the one used most
-recently. So with one Sonny in Rex and another in a bare terminal, what the
-agents open follows the one being typed in, and while that is the bare
-terminal, a call opens nothing anywhere and says nothing opened would be
-seen. With every window closed, the last one used still names the place. A
+project's Sonny windows notes where it is in `~/.agent/sonny/places`, the
+agent it shows, and when the person last used it (a key, a click, a paste,
+or the window coming to the front). An agent acts in the terminal it is
+spoken to in: its `run_in_pane` and `show_agent` calls go where the open
+window used last of those showing it is, that Herdr or cmux workspace or
+Rex session; a task no window shows goes where the agent that made it is
+spoken to; and only a lead's own window, or one in the same home, opens
+tabs for its new tasks. An agent no window shows, made by none that is,
+goes by the project's window used last. A task's window keeps the home it
+opened in. This is tmux's rule for a command that names no client, the one
+used most recently, taken per agent. So with the lead in a bare terminal and
+another lead of the project in Rex, each acts where it is spoken to: the
+first's calls open nothing anywhere and say nothing opened would be seen,
+while the Rex lead opens its tasks' tabs as before. With every window closed, the last one used still names the place. A
 project whose lead is in no multiplexer gets none, and its agents get no
 layout skill. A task's window
 closes once its work is taken: its turn completed and the lead (or the task
