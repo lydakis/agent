@@ -1232,6 +1232,23 @@ fn worktree(here: &Path, name: &str, base: &str, confine: bool) -> Result<Place,
             ));
         }
         Undo::Nothing
+    } else if crate::snapshot::plain(
+        here,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ],
+    )
+    .is_ok()
+    {
+        // Kept from a task of this name removed before, with commits not
+        // merged: not this start's to make, nor to delete if it fails.
+        return Err(format!(
+            "branch {branch} already exists, kept from a task of this name; pick another name, \
+             or delete it with `git branch -D {branch}` once its work is merged or not wanted"
+        ));
     } else {
         let target = path.to_string_lossy();
         let args = ["worktree", "add", "-q", "-b", &branch, &target, base];
@@ -1275,6 +1292,28 @@ fn worktree(here: &Path, name: &str, base: &str, confine: bool) -> Result<Place,
         undo,
         copy: Some((top, path)),
     })
+}
+
+/// Whether a worktree holds a submodule checked out, which git will not
+/// remove unless forced, since the submodule's repository goes with it.
+/// Git's own check (`validate_no_submodules`), run in the sandbox, as
+/// removal skips git's with `--force`: a `modules` folder in the
+/// worktree's git folder, or a submodule in its index with a `.git`.
+fn has_submodules(path: &Path) -> Result<bool, String> {
+    let git_dir = confined(path, &["rev-parse", "--absolute-git-dir"], &[])?;
+    if Path::new(&git_dir).join("modules").is_dir() {
+        return Ok(true);
+    }
+    let staged = confined_bytes(
+        path,
+        &["--no-optional-locks", "ls-files", "--stage", "-z"],
+        &[],
+    )?;
+    Ok(staged
+        .split(|byte| *byte == 0)
+        .filter_map(|entry| std::str::from_utf8(entry).ok()?.strip_prefix("160000 "))
+        .filter_map(|entry| Some(entry.split_once('\t')?.1))
+        .any(|name| path.join(name).join(".git").exists()))
 }
 
 /// Whether `dir` is in a worktree Sonny made a task.
@@ -1652,6 +1691,7 @@ pub fn remove(here: &Path, name: &str, discard: bool) -> Result<String, String> 
                     "status",
                     "--porcelain",
                     "--untracked-files=all",
+                    "--ignore-submodules=none",
                 ],
                 &[],
             )?
@@ -1660,6 +1700,15 @@ pub fn remove(here: &Path, name: &str, discard: bool) -> Result<String, String> 
             return Err(format!(
                 "{name}'s worktree has uncommitted changes; commit them, or with discard, it is \
                  removed anyway"
+            ));
+        }
+        if !discard
+            && let Some((_, path)) = &worktree
+            && has_submodules(path)?
+        {
+            return Err(format!(
+                "{name}'s worktree has submodules checked out, whose repositories go with it; \
+                 push their work, then with discard it is removed anyway"
             ));
         }
         // What the task made there, Sonny cannot check without running it:
@@ -1689,7 +1738,7 @@ pub fn remove(here: &Path, name: &str, discard: bool) -> Result<String, String> 
         kept().map_err(|e| format!("{name}'s bot was removed, but {e}"))?;
     }
     if let Some((repo, path)) = &worktree {
-        // Checked for changes above, in the sandbox: git's own check would
+        // Checked for changes and submodules above, in the sandbox: git's own check would
         // run the repository's fsmonitor and filters as the person, so it
         // is skipped (`--force`, which still keeps a locked worktree), and
         // no hook runs.

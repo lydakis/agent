@@ -994,6 +994,50 @@ fn a_task_given_a_linked_checkout_in_the_lead_s_folder_is_removed_from_it() {
 }
 
 #[test]
+fn a_task_s_worktree_with_a_submodule_is_removed_only_with_discard() {
+    let lab = Lab::new("rm-submodule");
+    let (ok, said) = lab.task(false, false);
+    assert!(ok, "{said}");
+    let worktree = lab.home.join(".agent/worktrees/demo.fix");
+    let other = lab.scratch.join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    lab.git(&other, &["init", "-q", "-b", "main"]);
+    std::fs::write(other.join("a.txt"), "a\n").unwrap();
+    lab.git(&other, &["add", "a.txt"]);
+    lab.git(&other, &["commit", "-q", "-m", "a"]);
+    let other = other.to_string_lossy().into_owned();
+    let add = ["-c", "protocol.file.allow=always", "submodule", "add", "-q"];
+    lab.git(&worktree, &[&add[..], &[&other, "sub"]].concat());
+    lab.git(&worktree, &["commit", "-q", "-m", "sub"]);
+    // Work in it that status is told to hide is still not lost.
+    lab.git(&worktree, &["config", "submodule.sub.ignore", "all"]);
+    std::fs::write(worktree.join("sub/a.txt"), "changed\n").unwrap();
+    let (ok, err) = lab.remove(&lab.repo, false);
+    assert!(!ok && err.contains("uncommitted changes"), "{err}");
+    // Clean, its repository would still go with it, as git says.
+    std::fs::write(worktree.join("sub/a.txt"), "a\n").unwrap();
+    let (ok, err) = lab.remove(&lab.repo, false);
+    assert!(!ok && err.contains("submodules"), "{err}");
+    assert!(worktree.join("sub/a.txt").exists());
+    let (ok, err) = lab.remove(&lab.repo, true);
+    assert!(ok, "{err}");
+    assert!(!worktree.exists());
+}
+
+#[test]
+fn a_task_named_for_a_kept_branch_does_not_start_or_delete_it() {
+    let lab = Lab::new("kept-branch");
+    lab.git(&lab.repo, &["branch", "agent/demo.fix"]);
+    let (ok, said) = lab.task(false, false);
+    assert!(!ok && said.contains("already exists"), "{said}");
+    assert_eq!(
+        lab.git(&lab.repo, &["branch", "--list", "agent/demo.fix"]),
+        "agent/demo.fix"
+    );
+    assert!(!lab.home.join(".agent/worktrees/demo.fix").exists());
+}
+
+#[test]
 fn a_task_of_a_lead_in_a_submodule_is_removed_with_its_worktree() {
     let lab = Lab::new("submodule");
     let main = lab.scratch.join("main");
