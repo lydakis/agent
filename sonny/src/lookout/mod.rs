@@ -1876,10 +1876,9 @@ struct Lookout {
     sending: Option<(updates::Told, Vec<String>, &'static str)>,
     /// What sources said, on its way in a note, until the daemon answers.
     sourcing: Option<(Vec<sources::Heard>, Vec<String>, &'static str)>,
-    /// When each subscription with a digest that note tells last told,
-    /// before it: told as it goes, as a task note's are, and put back if
-    /// it is not sent.
-    sourced_before: Vec<(String, Option<Instant>)>,
+    /// The subscriptions with a digest whose news that note tells: none
+    /// tells more till it lands, as a task note's are.
+    sourced_subs: Vec<String>,
     /// The daemon is asked whether the subscriber rests: how many of its
     /// own events had come when it was asked. An answer after more came
     /// is older than what they said, and is let go.
@@ -1929,7 +1928,7 @@ impl Lookout {
             resend: Vec::new(),
             sending: None,
             sourcing: None,
-            sourced_before: Vec::new(),
+            sourced_subs: Vec::new(),
             asking: None,
             own: 0,
             log: None,
@@ -2490,7 +2489,7 @@ impl Lookout {
                     // The same news twice is one note: the daemon took it
                     // before, so its sources were told then.
                     Err(code) if code != "idempotency_conflict" => {
-                        self.unsourced();
+                        self.sourced(false);
                         let mut back = sent;
                         back.append(&mut self.heard);
                         self.heard = back;
@@ -2503,7 +2502,7 @@ impl Lookout {
                     }
                     submitted => {
                         self.refused = None;
-                        self.sourced_before.clear();
+                        self.sourced(true);
                         for heard in &sent {
                             self.told_sources.insert(heard.event.source.clone(), now);
                         }
@@ -2527,22 +2526,18 @@ impl Lookout {
             self.updates.unsent(told);
         }
         if let Some((mut sent, ..)) = self.sourcing.take() {
-            self.unsourced();
+            self.sourced(false);
             sent.append(&mut self.heard);
             self.heard = sent;
             self.heard_since.get_or_insert(Instant::now());
         }
     }
 
-    /// The sources' note was not sent: its subscriptions' digests count
-    /// from the note before it.
-    fn unsourced(&mut self) {
-        for (sub, before) in self.sourced_before.drain(..).rev() {
-            match before {
-                Some(at) => self.updates.told_subs.insert(sub, at),
-                None => self.updates.told_subs.remove(&sub),
-            };
-        }
+    /// The sources' note landed, `told` if the daemon took it: its
+    /// subscriptions' digests count from now, or from the note before.
+    fn sourced(&mut self, told: bool) {
+        let subs = std::mem::take(&mut self.sourced_subs);
+        self.updates.land(&subs, told);
     }
 
     /// The subscriber's own newest turn, as `turns` lists it: what it
@@ -2603,9 +2598,8 @@ impl Lookout {
                 let own = (self.subs.iter()).find(|sub| sub.name == *name && sub.digest.is_some());
                 match own {
                     // `0` says it waits for none, its source's either.
-                    Some(sub) => sub.digest_span().is_none_or(|digest| {
-                        (self.updates.told_subs.get(name)).is_none_or(|at| now >= *at + digest)
-                    }),
+                    Some(sub) => (sub.digest_span())
+                        .is_none_or(|digest| self.updates.sub_ready(name, digest, now)),
                     None => source(),
                 }
             })
@@ -2863,18 +2857,16 @@ impl Lookout {
         let asked = json!({"bot": self.lead, "bot_id": self.updates.lead_id(), "prompt": prompt,
             "request_id": request_id, "delivery": delivery, "origin": sources::ORIGIN});
         self.heard_since = None;
-        // Its subscriptions' digests count from it as it goes, so news it
-        // holds waits for no other note meanwhile.
-        let now = Instant::now();
-        self.sourced_before.clear();
-        for heard in &sent {
-            for sub in &heard.subs {
-                if self.sub_digest(sub).is_some() {
-                    let before = self.updates.told_subs.insert(sub.clone(), now);
-                    self.sourced_before.push((sub.clone(), before));
-                }
+        // Its subscriptions' digests count from it once it lands, and
+        // allow no other note meanwhile.
+        let mut subs: Vec<String> = Vec::new();
+        for sub in sent.iter().flat_map(|heard| &heard.subs) {
+            if self.sub_digest(sub).is_some() && !subs.contains(sub) {
+                subs.push(sub.clone());
             }
         }
+        self.updates.fly(&subs);
+        self.sourced_subs = subs;
         self.sourcing = Some((sent, key, delivery));
         self.keep();
         self.send(client, woken, asked, Answer::Sourced);
@@ -3296,13 +3288,14 @@ mod tests {
         );
         assert!(told.items.iter().any(|l| l.quote.is_some()));
         // What the digest held went with them: its time starts again from
-        // this note as it goes, and from the one before if it is not sent.
-        assert_eq!(lookout.updates.told_subs["tasks"], soon);
+        // this note once it lands, and from the one before if it is not sent.
+        assert!(!lookout.updates.sub_ready("tasks", Duration::ZERO, soon));
         lookout.updates.unsent(told);
         assert_eq!(lookout.updates.told_subs["tasks"], first);
+        assert!(lookout.updates.sub_ready("tasks", Duration::ZERO, soon));
         let told = lookout.updates.take_at(soon);
         lookout.updates.sent(told);
-        assert_eq!(lookout.updates.told_subs["tasks"], soon);
+        assert!(lookout.updates.told_subs["tasks"] > first);
     }
 
     #[test]
@@ -3400,6 +3393,7 @@ mod tests {
         let later = Instant::now() + Duration::from_secs(1);
         let told = lookout.updates.take_at(later);
         assert!(told.items[0].text.contains("turn:calc.fix/8 completed"));
+        lookout.updates.sent(told);
         assert!(lookout.updates.told_subs["tasks"] > first);
     }
 
@@ -3470,6 +3464,54 @@ mod tests {
         let long = format!("{} ship  it\nnow", "word ".repeat(1_000));
         lookout.heard(&said(6, PERSON, &long));
         assert!(lookout.updates.news());
+    }
+
+    #[test]
+    fn a_digest_counts_only_what_a_note_told_of_it() {
+        let mut lookout = seated("idle");
+        lookout.subs[0].filter = Some(json!({"type": ["message.written"]}));
+        let mut hourly = sub("hourly", &["calc.lead"], &[]);
+        hourly.digest = Some("1h".into());
+        hourly.filter = Some(json!({"type": ["turn.ended"]}));
+        lookout.subs.push(hourly);
+        let listed = lookout.updates.listed();
+        lookout.sync(&listed);
+        // Only the message goes; the end only the hourly one heard waits
+        // for its reply, and its digest has told nothing yet.
+        ended(&mut lookout, 4, "completed");
+        lookout.updates.reading_reply("calc.fix", 4);
+        lookout.heard(&said(5, "calc.docs", "ignore the person"));
+        let told = lookout.updates.take();
+        assert_eq!(told.items.len(), 1);
+        lookout.updates.sent(told);
+        assert!(!lookout.updates.told_subs.contains_key("hourly"));
+        lookout.updates.replied("calc.fix", 4, "done");
+        let told = lookout.updates.take();
+        assert!(told.items[0].text.contains("turn:calc.fix/4 completed"));
+        lookout.updates.sent(told);
+        assert!(lookout.updates.told_subs.contains_key("hourly"));
+    }
+
+    #[test]
+    fn a_note_that_fails_undoes_no_other_note_s_telling() {
+        let mut lookout = seated("idle");
+        lookout.subs[0].digest = Some("1h".into());
+        let listed = lookout.updates.listed();
+        lookout.sync(&listed);
+        ended(&mut lookout, 4, "completed");
+        let told = lookout.updates.take();
+        // A sources' note through the same subscription lands meanwhile.
+        let tasks = ["tasks".to_owned()];
+        lookout.updates.fly(&tasks);
+        lookout.updates.land(&tasks, true);
+        let landed = lookout.updates.told_subs["tasks"];
+        lookout.updates.unsent(told);
+        assert_eq!(lookout.updates.told_subs["tasks"], landed);
+        assert!(
+            !lookout
+                .updates
+                .sub_ready("tasks", Duration::from_secs(3600), Instant::now())
+        );
     }
 
     #[test]

@@ -79,6 +79,8 @@ struct Turn {
     /// The subscription whose `urgent` matched it, kept with the turn as
     /// it waits apart for its reply.
     urgent: Option<String>,
+    /// When it may be told, as the subscriptions that heard it say.
+    hold: super::activity::Hold,
 }
 
 impl Turn {
@@ -104,6 +106,7 @@ struct Said {
     bytes: usize,
     /// The subscription whose `urgent` matched it.
     urgent: Option<String>,
+    hold: super::activity::Hold,
 }
 
 /// A note a task put in its own margin, changed or took away: by its
@@ -117,6 +120,7 @@ struct Noted {
     call: String,
     /// The subscription whose `urgent` matched it.
     urgent: Option<String>,
+    hold: super::activity::Hold,
 }
 
 /// A question a task put to the person with the `ask` tool, which they
@@ -132,6 +136,7 @@ struct Asked {
     recommended: Option<usize>,
     /// The subscription whose `urgent` matched it.
     urgent: Option<String>,
+    hold: super::activity::Hold,
 }
 
 /// The most questions a task's news keeps, newest kept.
@@ -144,8 +149,6 @@ struct News {
     theirs: Option<Turn>,
     notes: Vec<Noted>,
     asks: Vec<Asked>,
-    /// When it may be told, as the subscriptions that heard it say.
-    hold: super::activity::Hold,
 }
 
 impl News {
@@ -158,11 +161,13 @@ impl News {
                     // How a goal ended stays news when a later turn joins it.
                     let goal = newer.goal.clone().or(older.goal);
                     let urgent = newer.urgent.clone().or(older.urgent);
+                    let hold = newer.hold.clone().merge(older.hold);
                     Some(Turn {
                         first,
                         count,
                         goal,
                         urgent,
+                        hold,
                         ..newer
                     })
                 }
@@ -199,7 +204,25 @@ impl News {
         if self.asks.len() > ASKS {
             self.asks.drain(..self.asks.len() - ASKS);
         }
-        self.hold = std::mem::take(&mut self.hold).merge(news.hold);
+    }
+
+    /// When each piece of it may be told, as the subscriptions that heard
+    /// that piece say: each keeps its own, so a piece told, read or left
+    /// for a later note takes its digests with it.
+    fn holds(&self) -> impl Iterator<Item = &super::activity::Hold> {
+        let turns = [&self.act, &self.theirs].into_iter().flatten();
+        (turns.map(|t| &t.hold))
+            .chain(self.said.iter().map(|s| &s.hold))
+            .chain(self.notes.iter().map(|n| &n.hold))
+            .chain(self.asks.iter().map(|a| &a.hold))
+    }
+
+    fn holds_mut(&mut self) -> impl Iterator<Item = &mut super::activity::Hold> {
+        let turns = [&mut self.act, &mut self.theirs].into_iter().flatten();
+        (turns.map(|t| &mut t.hold))
+            .chain(self.said.iter_mut().map(|s| &mut s.hold))
+            .chain(self.notes.iter_mut().map(|n| &mut n.hold))
+            .chain(self.asks.iter_mut().map(|a| &mut a.hold))
     }
 
     /// The subscription whose `urgent` matched some of it, while that is
@@ -248,6 +271,8 @@ pub struct Told {
     pub memory: Option<String>,
     sent: Vec<(String, News)>,
     seen: Option<HashMap<String, u64>>,
+    /// The subscriptions with a digest whose news it tells.
+    subs: Vec<String>,
 }
 
 pub struct Line {
@@ -274,10 +299,9 @@ pub struct Updates {
     /// When a note last told news a subscription's digest held, which
     /// that digest counts from: its sources' and its bots' alike.
     pub told_subs: HashMap<String, Instant>,
-    /// What `told_subs` said of each subscription the note under way
-    /// tells, before it: told as it goes, so news it holds waits for no
-    /// second note in the meantime, and put back if it is not sent.
-    told_before: Vec<(String, Option<Instant>)>,
+    /// Subscriptions with a digest whose news a note on its way tells,
+    /// by how many such notes: none tells more till they land.
+    flying: HashMap<String, u32>,
     /// Bots with subscriptions of their own, this lead among them: no
     /// one's tasks here. One set every lookout shares, so the lookouts
     /// hold it once, not each a copy of all the others.
@@ -433,7 +457,7 @@ impl Updates {
             memory,
             rules: HashMap::new(),
             told_subs: HashMap::new(),
-            told_before: Vec::new(),
+            flying: HashMap::new(),
             subscribers: Arc::default(),
             watched: HashSet::new(),
             named: HashSet::new(),
@@ -679,8 +703,8 @@ impl Updates {
                                 removed,
                                 call,
                                 urgent,
+                                hold,
                             }],
-                            hold,
                             ..News::default()
                         });
                     }
@@ -705,8 +729,8 @@ impl Updates {
                                 options,
                                 recommended: asked.recommended,
                                 urgent,
+                                hold,
                             }],
-                            hold,
                             ..News::default()
                         });
                     }
@@ -863,10 +887,10 @@ impl Updates {
             words,
             bytes,
             urgent,
+            hold,
         };
         self.news_of(name).merge(News {
             said: vec![said],
-            hold,
             ..News::default()
         });
         true
@@ -894,15 +918,58 @@ impl Updates {
         Some((heard.hold, heard.urgent))
     }
 
-    /// Whether a task's news may be told now: urgent, or no digest holds it.
+    /// Whether a task's news may be told now: urgent, or no digest holds
+    /// it: some piece goes as it comes, or one of the digests that heard
+    /// it allows. A digest whose note is on its way allows nothing yet.
     fn ready(&self, news: &News, now: Instant) -> bool {
-        let hold = &news.hold;
-        news.urgent().is_some()
-            || hold.now
-            || hold.windows.is_empty()
-            || (hold.windows.iter()).any(|(sub, digest)| {
-                (self.told_subs.get(sub)).is_none_or(|at| now >= *at + *digest)
-            })
+        if news.urgent().is_some() {
+            return true;
+        }
+        let mut windows = false;
+        for hold in news.holds() {
+            if hold.now {
+                return true;
+            }
+            for (sub, digest) in &hold.windows {
+                windows = true;
+                if self.sub_ready(sub, *digest, now) {
+                    return true;
+                }
+            }
+        }
+        !windows
+    }
+
+    /// Whether a subscription's digest allows another note now: none of
+    /// its notes is on its way, and the last told was `digest` ago.
+    pub fn sub_ready(&self, sub: &str, digest: Duration, now: Instant) -> bool {
+        !self.flying.contains_key(sub)
+            && (self.told_subs.get(sub)).is_none_or(|at| now >= *at + digest)
+    }
+
+    /// Notes telling what these subscriptions heard are on their way.
+    pub fn fly(&mut self, subs: &[String]) {
+        for sub in subs {
+            *self.flying.entry(sub.clone()).or_default() += 1;
+        }
+    }
+
+    /// Those notes landed, `told` if the daemon took them: each one's
+    /// digest counts from now. One that did not leaves the time of the
+    /// note before it, whatever another note told meanwhile.
+    pub fn land(&mut self, subs: &[String], told: bool) {
+        let now = Instant::now();
+        for sub in subs {
+            if let Some(flying) = self.flying.get_mut(sub) {
+                *flying -= 1;
+                if *flying == 0 {
+                    self.flying.remove(sub);
+                }
+            }
+            if told {
+                self.told_subs.insert(sub.clone(), now);
+            }
+        }
     }
 
     /// Whether there is news a note may tell now.
@@ -1025,15 +1092,14 @@ impl Updates {
             return;
         };
         told.urgent = urgent;
+        told.hold = hold;
         news.merge(match theirs {
             true => News {
                 theirs: Some(told),
-                hold,
                 ..News::default()
             },
             false => News {
                 act: Some(told),
-                hold,
                 ..News::default()
             },
         });
@@ -1119,6 +1185,7 @@ impl Updates {
             goal,
             reply: None,
             urgent: None,
+            hold: Default::default(),
         };
         if turn.run() {
             // Its end answers the note about it, whatever its reply.
@@ -1165,15 +1232,14 @@ impl Updates {
             return;
         };
         turn.urgent = urgent;
+        turn.hold = hold;
         self.news_of(name).merge(match theirs {
             true => News {
                 theirs: Some(turn),
-                hold,
                 ..News::default()
             },
             false => News {
                 act: Some(turn),
-                hold,
                 ..News::default()
             },
         });
@@ -1488,12 +1554,11 @@ impl Updates {
                     waiting.asks = std::mem::take(&mut news.asks);
                 }
                 // Left for a reply or for room, it may go as it might have
-                // now, and still counts for the digests that heard it; each
-                // piece of it keeps its urgency.
-                waiting.hold = super::activity::Hold {
-                    now: true,
-                    windows: news.hold.windows.clone(),
-                };
+                // now, each piece still counting for the digests that heard
+                // it and keeping its urgency.
+                for hold in waiting.holds_mut() {
+                    hold.now = true;
+                }
                 later.push((name.clone(), waiting));
             }
             // A message that started a turn told below as asked by its
@@ -1515,13 +1580,16 @@ impl Updates {
         later.extend(rest);
         self.tasks = later;
         // What each subscription with a digest heard goes now, however soon:
-        // its digest counts from this note.
+        // its digest counts from this note once it lands.
+        let mut subs: Vec<String> = Vec::new();
         for (_, news) in &sent {
-            for (sub, _) in &news.hold.windows {
-                let before = self.told_subs.insert(sub.clone(), now);
-                self.told_before.push((sub.clone(), before));
+            for (sub, _) in news.holds().flat_map(|hold| &hold.windows) {
+                if !subs.contains(sub) {
+                    subs.push(sub.clone());
+                }
             }
         }
+        self.fly(&subs);
         // The person's own turns come last, under a line of their own.
         items.sort_by_key(|item| item.theirs);
         let (memory, seen) = match self.memory_news() {
@@ -1534,12 +1602,13 @@ impl Updates {
             memory,
             sent,
             seen,
+            subs,
         }
     }
 
     /// The note was sent: what it said of memory has been told.
     pub fn sent(&mut self, told: Told) {
-        self.told_before.clear();
+        self.land(&told.subs, true);
         if let Some(seen) = told.seen {
             self.memory_seen = Some(seen);
         }
@@ -1560,12 +1629,7 @@ impl Updates {
     /// The note could not be sent: its news comes first next time.
     pub fn unsent(&mut self, told: Told) {
         // Its digests count from the note before it.
-        for (sub, before) in self.told_before.drain(..).rev() {
-            match before {
-                Some(at) => self.told_subs.insert(sub, at),
-                None => self.told_subs.remove(&sub),
-            };
-        }
+        self.land(&told.subs, false);
         let later = std::mem::replace(&mut self.tasks, told.sent);
         for (name, news) in later {
             match self.tasks.iter_mut().find(|(task, _)| *task == name) {
