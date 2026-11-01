@@ -445,6 +445,7 @@ keep-warm when it sets any of them.
 | `sandbox` (`--sandbox`) | How the bot's commands, writes and edits are confined, by Codex's names: `read-only`, `workspace-write` or `danger-full-access` (see [sandbox](#sandbox)). | none |
 | `writable` (`--writable`, repeatable) | Absolute folders a `workspace-write` bot may write besides its own; each must exist and is stored by its real path. At most 64, 32 KiB as JSON. | none |
 | `network` (`--network`) | A `workspace-write` bot's commands may use the network. | off |
+| `hold_ms` (`--hold`) | How long a turn waits on a cause a person can fix (a sign-in, a key, a usage limit, a provider down or not set up) before it fails with it ([held turns](#held-turns)), up to 365 days; 0 fails at once. `hold = "5d"` in `~/.agent/config.toml` sets it on the bots the CLI and Sonny make. | 5 days |
 | `hide_senders` (`--hide-senders`) | Its model reads what other bots and clients send it without the line naming the sender (see [fleet controllers](#fleet-controllers)); `senders = "hidden"` in `~/.agent/config.toml` sets it on the bots the CLI and Sonny make. | off |
 | `outputs` (`--outputs`) | An absolute folder that holds each tool output stream cut for the model whole, one file per stream, in place of the store's copy (see [retained outputs](#retained-outputs)). The daemon makes it, owner-only, and writes there only while the bot's sandbox cannot write it; otherwise the stream stays in the store. `agent run --new` and Sonny name `outputs` beside the store unless told otherwise. | none |
 | `unix_sockets` (`--unix-socket`, repeatable) | Absolute Unix sockets, or folders of them, the only ones a sandboxed bot's commands reach, such as a Docker or SSH agent socket (see [sandbox](#sandbox)). Each is stored by its real path while it exists. At most 64. | none |
@@ -2153,8 +2154,16 @@ or only `bot`'s, and answers `{retried: N}`; a sandboxed bot's own socket
 refuses it with `not_permitted`, since what held the turn is the person's to
 fix. The daemon tries every held turn at once when it starts, since a
 restart may follow a fix to the config or a key, and `agent login chatgpt`
-asks the running daemon to once it has saved the new sign-in. A held turn
-ends only when someone interrupts it. Before protocol 47 these failures
+asks the running daemon to once it has saved the new sign-in. A turn is
+held for its bot's `hold_ms` from when the hold began, five days unset, as
+mail is retried for four to five days (RFC 5321) before it is returned to
+its sender; the first try after that fails it with its cause, as it would
+have failed before, so whoever sent it hears (Sonny's lookout bounces it to
+the agent that sent it). `hold_ms` 0 fails at once, for a caller that waits
+on no person. An interrupt ends a held turn sooner. A turn resumed from a
+park on a call the model made, such as a wait, whose provider is gone
+after a restart still fails: the park's call has a result to record that a
+held park cannot keep. Before protocol 47 these failures
 ended the turn `failed`, and a refused start never reached the bot's
 history.
 

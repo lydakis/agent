@@ -3009,7 +3009,7 @@ fn a_turn_its_start_refused_for_a_fixable_cause_keeps_its_place_in_line() {
         .unwrap();
     assert_eq!(db.next_ready().unwrap(), Some(("Bob".into(), first.turn)));
     let refused = Error::with("provider_unavailable", "openai");
-    let (events, next) = db.hold(first.turn, &refused).unwrap();
+    let (events, next) = db.hold(first.turn, &refused).unwrap().unwrap();
     assert_eq!(events[0]["event"], "turn_held");
     assert_eq!(events[0]["data"]["blocked"]["code"], "provider_unavailable");
     let due = events[0]["data"]["resume_at_ms"].as_i64().unwrap();
@@ -3066,10 +3066,16 @@ fn a_run_of_holds_keeps_when_it_began_and_waits_longer_each_try() {
         .begin("Bob", "r1", "go", false, &queue(), allow_provider)
         .unwrap()
         .turn;
-    let (first, _) = db.hold(turn, &Error::new("workspace_required")).unwrap();
+    let (first, _) = db
+        .hold(turn, &Error::new("workspace_required"))
+        .unwrap()
+        .unwrap();
     let since = first[0]["data"]["blocked"]["since_ms"].as_u64().unwrap();
     db.retry_held(None).unwrap();
-    let (again, _) = db.hold(turn, &Error::new("provider_unavailable")).unwrap();
+    let (again, _) = db
+        .hold(turn, &Error::new("provider_unavailable"))
+        .unwrap()
+        .unwrap();
     let blocked = &again[0]["data"]["blocked"];
     assert_eq!(
         blocked["since_ms"].as_u64(),
@@ -3098,6 +3104,30 @@ fn a_run_of_holds_keeps_when_it_began_and_waits_longer_each_try() {
         "stale_turn"
     );
     assert!(db.held().unwrap().is_empty());
+}
+
+#[test]
+fn a_bot_that_holds_nothing_has_its_refused_start_end() {
+    let mut db = db();
+    let mut unattended = binding();
+    unattended.settings.hold_ms = Some(0);
+    db.create("Bob", Some("/synthetic"), unattended).unwrap();
+    let turn = db
+        .begin("Bob", "r1", "go", false, &queue(), allow_provider)
+        .unwrap()
+        .turn;
+    // Its hold is spent before it begins: the caller ends it with the cause.
+    assert!(
+        db.hold(turn, &Error::new("provider_unavailable"))
+            .unwrap()
+            .is_none()
+    );
+    assert!(db.held().unwrap().is_empty());
+    // A hold lasts the bot's `hold_ms` from when it began, five days unset.
+    let settings = agent_runtime::store::Settings::default();
+    assert!(settings.holds(None, 10));
+    assert!(settings.holds(Some(0), 5 * 86_400_000 - 1));
+    assert!(!settings.holds(Some(0), 5 * 86_400_000));
 }
 
 #[test]
@@ -4318,7 +4348,7 @@ fn a_bot_keeps_its_settings_and_a_fork_copies_them() {
         serde_json::to_value(&bob).unwrap()["settings"],
         json!({"context_bytes":4096,"context_items":4096,"note_turns":48,"compact_at":75,
             "compact_keep":25,"compact_tokens":null,"keep_turns":1,"max_rounds":null,"approval_hold_ms":2000,"max_output_tokens":null,
-            "keep_warm":0,"cache_ttl":"1h","speed":"fast","sandbox":null,"writable":[],"network":false,"outputs":null,"hide_senders":false,
+            "keep_warm":0,"cache_ttl":"1h","speed":"fast","sandbox":null,"writable":[],"network":false,"outputs":null,"hide_senders":false,"hold_ms":432000000,
             "unix_sockets":[],"rules":null})
     );
     // Retention follows the bot's own setting.

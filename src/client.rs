@@ -384,6 +384,11 @@ fn parse(args: &[String]) -> Result<Options> {
                         options.settings.insert(key, json!(number));
                         options.settings_flags.push(flag.to_owned());
                     }
+                    "--hold" => {
+                        let ms = crate::cli::duration_ms(flag, &value)?;
+                        options.settings.insert("hold_ms".to_owned(), json!(ms));
+                        options.settings_flags.push(flag.to_owned());
+                    }
                     "--approval-hold" => {
                         let ms = crate::cli::duration_ms(flag, &value)?;
                         options
@@ -1591,6 +1596,9 @@ fn run(options: &Options) -> Result<i32> {
         let mut settings = options.settings.clone();
         if config()?.hide_senders {
             settings.entry("hide_senders").or_insert(json!(true));
+        }
+        if let Some(ms) = config()?.hold_ms {
+            settings.entry("hold_ms").or_insert(json!(ms));
         }
         // Cut outputs go whole to a folder beside the store, as the
         // summary prompt goes by default; --outputs names another.

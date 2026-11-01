@@ -240,6 +240,12 @@ pub struct Settings {
     /// model without the line saying so after its words.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub hide_senders: bool,
+    /// How long a turn is held on a cause a person can fix (a refused
+    /// sign-in or key, a usage limit, a provider that is down or not set
+    /// up) before it fails with it, from when the hold began; 0 fails at
+    /// once. Unset, `HOLD_MS`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hold_ms: Option<u64>,
     /// Model calls one of its turns may make, the last with no tool call
     /// allowed; none bounds them only by the turn's token budget.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -310,6 +316,16 @@ impl Settings {
     }
     pub fn approval_hold_ms(&self) -> u64 {
         self.approval_hold_ms.unwrap_or(2000)
+    }
+    /// How long a turn may be held, as mail is retried before it is
+    /// returned to its sender.
+    pub fn hold_ms(&self) -> u64 {
+        self.hold_ms.unwrap_or(HOLD_MS)
+    }
+    /// Whether a turn whose hold began at `since_ms` (now, for one not yet
+    /// held) is still held at `now_ms`, rather than failing with its cause.
+    pub fn holds(&self, since_ms: Option<u64>, now_ms: u64) -> bool {
+        now_ms.saturating_sub(since_ms.unwrap_or(now_ms)) < self.hold_ms()
     }
     /// How long a cache may sit unread before a refresh; `None` never.
     pub fn keep_warm(&self) -> Option<std::time::Duration> {
@@ -394,6 +410,9 @@ impl Settings {
         if self.approval_hold_ms.is_some_and(|n| n > 3_600_000) {
             return refuse("approval_hold_ms is at most 3600000; 0 parks at once");
         }
+        if self.hold_ms.is_some_and(|n| n > HOLD_MAX_MS) {
+            return refuse("hold_ms is at most 31536000000 (365 days); 0 fails at once");
+        }
         if self.max_output_tokens == Some(0) {
             return refuse("max_output_tokens is at least 1");
         }
@@ -465,7 +484,8 @@ impl Settings {
             "speed":self.speed().map_or("standard", crate::provider::Speed::name),
             "sandbox":self.sandbox,"writable":self.writable,"network":self.network,
             "outputs":self.outputs,
-            "hide_senders":self.hide_senders,"unix_sockets":self.unix_sockets,
+            "hide_senders":self.hide_senders,"hold_ms":self.hold_ms(),
+            "unix_sockets":self.unix_sockets,
             "rules":self.rules})
     }
     fn stored(&self) -> Result<Option<String>> {
@@ -477,7 +497,7 @@ impl Settings {
 /// The settings that make a bot's sandbox, which change together.
 pub const SANDBOX: [&str; 4] = ["sandbox", "writable", "network", "unix_sockets"];
 /// Every setting's name, as `create` and `configure` take it.
-pub const SETTINGS: [&str; 20] = [
+pub const SETTINGS: [&str; 21] = [
     "context_bytes",
     "context_items",
     "note_turns",
@@ -495,6 +515,7 @@ pub const SETTINGS: [&str; 20] = [
     "network",
     "outputs",
     "hide_senders",
+    "hold_ms",
     "max_rounds",
     "unix_sockets",
     "rules",
@@ -867,6 +888,10 @@ impl Blocked {
 }
 /// The first and the longest wait between tries of a held turn.
 pub const HOLD_FIRST_MS: u64 = 60_000;
+/// How long a turn is held unless its bot says otherwise.
+pub const HOLD_MS: u64 = agent_client::HOLD_MS;
+/// The longest hold a bot may ask for.
+pub const HOLD_MAX_MS: u64 = 365 * 86_400_000;
 pub const HOLD_LAST_MS: u64 = 3_600_000;
 /// A turn parked on handles; it holds no task or memory until they resolve.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
@@ -6111,8 +6136,9 @@ impl Database {
     /// rather than end it: it keeps its place in the bot's line, so no
     /// later message overtakes it, and is tried again after the hold's
     /// wait, or at once when `retry_held` says the cause may be fixed.
-    /// Returns its `turn_held` event and when the next held turn is due.
-    pub fn hold(&mut self, turn: i64, error: &Error) -> Result<(Vec<Value>, Option<i64>)> {
+    /// Returns its `turn_held` event and when the next held turn is due, or
+    /// nothing once it has been held its bot's `hold_ms`: it ends instead.
+    pub fn hold(&mut self, turn: i64, error: &Error) -> Result<Option<(Vec<Value>, Option<i64>)>> {
         let (name, status, held): (String, String, Option<String>) = self
             .conn
             .query_row(
@@ -6130,6 +6156,10 @@ impl Database {
         let since = (held.as_deref())
             .and_then(|held| serde_json::from_str::<Blocked>(held).ok())
             .map_or(now, |held| held.since_ms);
+        // Held as long as its bot holds turns, then it ends with the cause.
+        if !self.inspect(&name)?.settings.holds(Some(since), now) {
+            return Ok(None);
+        }
         let blocked = Blocked {
             code: error.code.clone(),
             detail: error.detail.clone(),
@@ -6145,10 +6175,10 @@ impl Database {
         let cursor = event(&tx, &name, Some(turn), "turn_held", data.clone())?;
         let next = next_held(&tx, now as i64)?;
         tx.commit()?;
-        Ok((
+        Ok(Some((
             vec![entry(cursor, &name, Some(turn), "turn_held", data)],
             next,
-        ))
+        )))
     }
     /// When the first turn held in line is next tried, after `after`: one
     /// due already is the dispatcher's.
@@ -13932,6 +13962,7 @@ mod tests {
             network: true,
             outputs: Some("/".into()),
             hide_senders: true,
+            hold_ms: Some(1),
             max_rounds: Some(1),
             unix_sockets: vec!["/".into()],
             rules: Some(crate::rules::Policy {

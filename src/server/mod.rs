@@ -2649,13 +2649,16 @@ impl Service {
     }
     /// Hold a ready turn its start refused for a cause a person can fix.
     /// One that stopped being ready meanwhile (interrupted, say) is left.
-    async fn hold(&mut self, turn: i64, error: Error) -> Result<()> {
-        let held = self.store.op("hold", move |db| db.hold(turn, &error)).await;
+    /// One held past its bot's `hold_ms` ends with the cause instead.
+    async fn hold(&mut self, bot: String, turn: i64, error: Error) -> Result<()> {
+        let cause = error.clone();
+        let held = self.store.op("hold", move |db| db.hold(turn, &cause)).await;
         match held {
-            Ok((_, next)) => {
+            Ok(Some((_, next))) => {
                 self.holds_at(next, now_ms());
                 Ok(())
             }
+            Ok(None) => self.end_queued(bot, turn, error).await,
             Err(error) if error.code == "stale_turn" || error.code == "turn_not_found" => Ok(()),
             Err(error) => Err(error),
         }
@@ -3021,8 +3024,9 @@ impl Service {
                     self.end_queued(bot, turn, error).await?;
                 }
             }
-            // A cause a person can fix holds it in line instead.
-            Err(error) if turn::held_at_start(&error.code) => self.hold(turn, error).await?,
+            // A cause a person can fix holds it in line instead, for as
+            // long as its bot holds turns.
+            Err(error) if turn::held_at_start(&error.code) => self.hold(bot, turn, error).await?,
             Err(error) => self.end_queued(bot, turn, error).await?,
         }
         Ok(())

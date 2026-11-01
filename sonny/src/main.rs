@@ -1352,6 +1352,9 @@ pub(crate) fn made(
     if config.hide_senders {
         settings.insert("hide_senders".into(), json!(true));
     }
+    if let Some(ms) = config.hold_ms {
+        settings.insert("hold_ms".into(), json!(ms));
+    }
     // The command rules in ~/.agent/rules, which the daemon applies.
     if let Some(rules) = rules::given() {
         settings.insert("rules".into(), json!(rules));

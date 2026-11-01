@@ -2175,8 +2175,9 @@ impl Turn {
             // which a park at a model call cannot, and a turn that starts
             // here was let in by a start that found the provider: those
             // end, as before.
-            let Some(waiting) = (self.resumed.as_ref()).filter(|w| w.paced_since_ms.is_some())
-            else {
+            let Some(waiting) = (self.resumed.as_ref()).filter(|w| {
+                w.paced_since_ms.is_some() && record.settings.holds(w.held_since_ms, now_ms())
+            }) else {
                 return Err(error);
             };
             if let Some(route) = &waiting.route {
@@ -3399,7 +3400,10 @@ impl Turn {
                 // retries, holds the turn rather than ending it. A summary
                 // fails as before: the turn's own call goes on, and holds
                 // there if the cause outlasts it.
-                if !summary && (held(&error.code) || retryable(&error.code)) {
+                if !summary
+                    && record.settings.holds(accounting.held_since, now_ms())
+                    && (held(&error.code) || retryable(&error.code))
+                {
                     accounting.call_fallback = fallback.as_ref().map(Fallback::parked);
                     accounting.hold(&error);
                     return Ok(None);

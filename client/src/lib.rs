@@ -109,6 +109,10 @@ pub fn default_tools(
 /// The socket protocol's version in `ready`. The daemon and its clients ship
 /// together, so a client refuses a daemon of any other version.
 pub const PROTOCOL: u64 = 47;
+/// How long the daemon holds a turn on a cause a person can fix before it
+/// fails with it, for a bot that sets no `hold_ms`: five days, as mail is
+/// retried (RFC 5321 suggests four to five) before it is returned.
+pub const HOLD_MS: u64 = 5 * 86_400_000;
 
 /// Variables naming the terminal a daemon was started in: a terminal
 /// multiplexer's place. A client starting the daemon leaves them out of its

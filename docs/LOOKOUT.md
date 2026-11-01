@@ -112,9 +112,9 @@ like any note. The sender knows what the message was for, so it decides
 whether to send again, wait, or tell the person; nobody else could. A
 sender that already hears the bot, such as a lead with its own task, gets
 the turn's end as a task update instead, and a bot's own messages never
-bounce. A cause a person can fix does not end a turn: the daemon
-[holds it](RUST_PROTOTYPE.md#held-turns), so only what is final
-bounces.
+bounce. A cause a person can fix does not end a turn at once: the daemon
+[holds it](RUST_PROTOTYPE.md#held-turns) for the bot's `hold_ms`, five
+days unset, so what bounces is final, or was held that long.
 
 ## Subscriptions
 

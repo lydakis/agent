@@ -697,6 +697,16 @@ class DeliveryTests(ModelFixture):
         self.assertEqual(client.finished(later['turn'])['data']['status'], 'completed')
         self.assertEqual(client.request('held')['result']['held'], [])
 
+    def test_a_bot_that_holds_nothing_ends_where_another_would_hold(self):
+        client = self.client()
+        client.request('create', bot='Bob', workspace=str(self.path), settings={'hold_ms': 0})
+        self.assertEqual(client.request('inspect', bot='Bob')['result']['settings']['hold_ms'], 0)
+        self.model.unauthorized_prompts = {'locked'}
+        turn = client.request('submit', bot='Bob', request_id='1', prompt='locked')['result']['turn']
+        ended = client.finished(turn)['data']
+        self.assertEqual((ended['status'], ended['error']), ('failed', 'provider_http_401'))
+        self.assertEqual(client.request('held')['result']['held'], [])
+
     def test_a_held_turn_a_restart_resumes_without_its_provider_stays_held(self):
         client = self.client()
         client.request('create', bot='Bob', workspace=str(self.path))
