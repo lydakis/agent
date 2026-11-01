@@ -6314,6 +6314,12 @@ mod tests {
             .unwrap();
         send.send(Feed::Ready).unwrap();
         view.drain();
+        // The read that started then lands first, so the one below reads
+        // the file as written, not as it was.
+        while view.reading {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            view.drain();
+        }
         assert!(view.verse.is_none());
         let lines = [
             "frost on the window",
