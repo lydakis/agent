@@ -8,6 +8,7 @@
 //! provider = "chatgpt"          # the daemon's, with no AGENT_PROVIDER
 //! web_search = "disabled"       # "live", the default, lets new agents search and fetch
 //! senders = "hidden"            # "shown", the default, labels what agents send
+//! attach_wait = "1d"            # how long an attached note waits for a call, the default; "0" as long as it takes
 //!
 //! [daemon]                      # what the agent CLI starts the daemon with; restart it to apply
 //! processes = "cpus * 64"       # commands running at once, the default
@@ -91,6 +92,11 @@ pub struct Config {
     /// sent it with no line naming the sender: `senders = "hidden"`;
     /// `"shown"`, the default, names it.
     pub hide_senders: bool,
+    /// `attach_wait`: how long a message sent with delivery attach waits
+    /// for a call to take it in before it goes as a steer, in
+    /// milliseconds; unset is `ATTACH_WAIT_MS`, and 0 waits as long as it
+    /// takes. See `attach_wait`.
+    pub attach_wait_ms: Option<u64>,
     /// Each model's fallback, as `provider/model` in its family: a new
     /// agent on that model that names none sends a request a safety
     /// classifier declined to it, that request alone.
@@ -101,6 +107,40 @@ pub struct Config {
     /// `[daemon]`: each limit the agent CLI starts a daemon with, by key,
     /// as the formula the file gives; see `DAEMON_LIMITS` and `formula`.
     pub daemon: BTreeMap<String, String>,
+}
+
+/// How long an attached message waits when the file says nothing: a day,
+/// long enough for a quiet agent's next turn, short enough that nobody
+/// sends one wondering whether it will ever be read.
+pub const ATTACH_WAIT_MS: u64 = 86_400_000;
+/// The longest the daemon lets an attached message wait: a year.
+pub const MAX_ATTACH_WAIT_MS: u64 = 365 * ATTACH_WAIT_MS;
+
+impl Config {
+    /// The `wait_ms` a client sends with delivery attach: none when
+    /// `attach_wait` is 0, which waits as long as it takes.
+    pub fn attach_wait(&self) -> Option<u64> {
+        Some(self.attach_wait_ms.unwrap_or(ATTACH_WAIT_MS)).filter(|&ms| ms > 0)
+    }
+}
+
+/// A duration in milliseconds: digits and a unit (`ms`, `s`, `m`, `h` or
+/// `d`), or a bare `0`. Any other bare number is none, so nothing guesses
+/// its unit.
+pub fn duration_ms(value: &str) -> Option<u64> {
+    if value == "0" {
+        return Some(0);
+    }
+    let unit = value.find(|c: char| !c.is_ascii_digit())?;
+    let scale = match &value[unit..] {
+        "ms" => 1,
+        "s" => 1000,
+        "m" => 60_000,
+        "h" => 3_600_000,
+        "d" => 86_400_000,
+        _ => return None,
+    };
+    value[..unit].parse::<u64>().ok()?.checked_mul(scale)
 }
 
 /// The `[daemon]` keys, the `agent serve` flag each sets, and the formula
@@ -884,6 +924,16 @@ fn parse(text: &str) -> Result<Config, String> {
             };
             continue;
         }
+        if name == "attach_wait" {
+            let text = string(name, value)?;
+            let ms = duration_ms(&text)
+                .filter(|&ms| ms <= MAX_ATTACH_WAIT_MS)
+                .ok_or_else(|| {
+                    format!("attach_wait is a duration such as 1h or 1d, up to 365d, or \"0\", not {text}")
+                })?;
+            config.attach_wait_ms = Some(ms);
+            continue;
+        }
         if name == "fallbacks" {
             let models = value.as_table().ok_or("fallbacks must be a table")?;
             for (model, fallback) in models {
@@ -1531,6 +1581,23 @@ mod tests {
                 .unwrap_err()
                 .contains("daemon.processes")
         );
+    }
+
+    #[test]
+    fn an_attached_note_waits_a_day_unless_the_file_says_otherwise() {
+        assert_eq!(Config::default().attach_wait(), Some(ATTACH_WAIT_MS));
+        let hour = parse("attach_wait = \"1h\"").unwrap();
+        assert_eq!(hour.attach_wait(), Some(3_600_000));
+        let never = parse("attach_wait = \"0\"").unwrap();
+        assert_eq!(never.attach_wait(), None, "0 waits as long as it takes");
+        assert_eq!(
+            parse("attach_wait = \"365d\"").unwrap().attach_wait(),
+            Some(MAX_ATTACH_WAIT_MS)
+        );
+        for refused in ["\"366d\"", "\"30\"", "\"1w\"", "\"\"", "1"] {
+            let error = parse(&format!("attach_wait = {refused}")).unwrap_err();
+            assert!(error.contains("attach_wait"), "{refused}: {error}");
+        }
     }
 
     #[test]

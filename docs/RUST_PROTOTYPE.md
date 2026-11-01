@@ -1820,6 +1820,23 @@ the turn's id and handle at once, and `wait`, `turns`, and
   never moves the retention boundary past itself. `interrupt` withdraws one
   that waits.
   `agent run --delivery attach` returns at once, inside a bot's shell too.
+  `wait_ms` (protocol 45) bounds the wait: 1 ms to 365 days
+  (`invalid_wait` otherwise), with `attach` only (`invalid_delivery`). Once
+  no call has taken the message in by then, it goes as a steer sent then
+  would: `queued` for a bot with a turn running or ready, which it joins at
+  the next boundary (waking one parked on `wait`, a foreground command it
+  runs moving to the background as for any steer) or runs after, and
+  `ready` to start a turn of its own on an idle bot. Its row becomes a
+  `steer` (a retry is still the `attach` it was, its `wait_ms` compared
+  like any field), it counts in `queued_turns` and the pending bounds from
+  then on, and its `queued` event says `lapsed: true`. A partial index on
+  the attached rows' due times (`turns.due_ms`, schema 76) gives the daemon
+  its next look, planned at start, so one that came due while no daemon ran
+  goes at once; a drain leaves the rest for the next daemon. Without
+  `wait_ms` it waits as long as it takes, as before; stores from before
+  schema 76 keep their waiting messages so. The daemon has no default: the
+  agent CLI and Sonny send `attach_wait` from `~/.agent/config.toml`,
+  default a day, `"0"` for none.
 
 A queued or ready turn that cannot start when its place comes (for example,
 the bot's budget is spent) finishes as `failed` with that
