@@ -2742,7 +2742,9 @@ async fn detach(
 /// Whether anything in a process group still runs. A member that has exited
 /// still answers a signal until it is reaped, and an init that does not reap
 /// orphans, as some containers run, leaves it so for good: on Linux only a
-/// member that is not a zombie counts. Elsewhere init reaps orphans.
+/// member that is not a zombie counts, and a process whose main thread has
+/// exited is a zombie only once its other threads have too. Elsewhere init
+/// reaps orphans.
 #[cfg(target_os = "linux")]
 fn group_runs(group: i32) -> bool {
     // SAFETY: kill with a negative pid and signal 0 only checks the group.
@@ -2770,7 +2772,26 @@ fn group_runs(group: i32) -> bool {
             .split_whitespace();
         let state = fields.next();
         let pgrp = fields.nth(1).and_then(|pgrp| pgrp.parse::<i32>().ok());
-        pgrp == Some(group) && !matches!(state, Some("Z" | "X"))
+        pgrp == Some(group) && (!exited(state) || threads_run(pid))
+    })
+}
+#[cfg(target_os = "linux")]
+fn exited(state: Option<&str>) -> bool {
+    matches!(state, Some("Z" | "X"))
+}
+/// Whether any thread of a process whose main thread is a zombie still runs.
+#[cfg(target_os = "linux")]
+fn threads_run(pid: &str) -> bool {
+    let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
+        return false;
+    };
+    tasks.flatten().any(|task| {
+        std::fs::read_to_string(task.path().join("stat")).is_ok_and(|stat| {
+            !exited(
+                stat.rsplit_once(')')
+                    .and_then(|(_, rest)| rest.split_whitespace().next()),
+            )
+        })
     })
 }
 #[cfg(all(unix, not(target_os = "linux")))]

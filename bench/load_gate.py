@@ -133,6 +133,10 @@ def run(args, gate):
             conn.request('bots', limit=1)
             probes['control_ms'].append(1000 * (time.monotonic() - started))
 
+    # A probe waits for its own turn however long the gate holds it, so the
+    # slowest samples are kept, and a probe that never ends fails the run.
+    unended = []
+
     def turns(bot, prompt, key):
         conn, n = Conn(bench.socket), 0
         while not stop.wait(.5):
@@ -140,8 +144,10 @@ def run(args, gate):
             started = time.monotonic()
             reply = conn.request('submit', bot=bot, request_id=f'p{n}', prompt=prompt,
                                  delivery='reject')
-            if 'result' in reply and turn_ended(conn, bot, reply['result']['turn'], 120):
-                probes[key].append(1000 * (time.monotonic() - started))
+            if not turn_ended(conn, bot, reply['result']['turn']):
+                unended.append(key)
+                return
+            probes[key].append(1000 * (time.monotonic() - started))
 
     def worker(bot):
         conn = Conn(bench.socket)
@@ -168,12 +174,14 @@ def run(args, gate):
     wall = time.monotonic() - started
     stop.set()
     for thread in watching:
-        thread.join(130)
+        thread.join()
     stats = daemon.done()
     after = threads_cpu(bench.daemon.pid)
     spent = sorted(((round(cpu - before.get(name, 0), 2), name) for name, cpu in after.items()),
                    reverse=True)
     bench.close()
+    if unended:
+        sys.exit(f'probes {unended} did not end with gate {gate:g}: the run does not compare')
     finished = len(done.read_text()) if done.exists() else 0
     if finished != args.workers * args.rounds:
         sys.exit(f'{finished} of {args.workers * args.rounds} work commands finished their work '
