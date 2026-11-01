@@ -67,12 +67,18 @@ impl Place {
 /// tasks all work in it.
 pub fn places(dir: &Path) -> Vec<Place> {
     let info = agent_client::project::read(dir).unwrap_or_default();
+    places_for(&info, agent_client::policy::checkout(dir).is_some())
+}
+
+/// The places for a folder whose project file reads `info`, in a git
+/// checkout or not.
+fn places_for(info: &serde_json::Value, in_git: bool) -> Vec<Place> {
     if info["threads_in"] == "project" {
         return vec![Place::Here];
     }
-    match agent_client::policy::checkout(dir) {
-        Some(_) => vec![Place::Worktree, Place::Here, Place::Empty],
-        None => vec![Place::Here, Place::Empty],
+    match in_git {
+        true => vec![Place::Worktree, Place::Here, Place::Empty],
+        false => vec![Place::Here, Place::Empty],
     }
 }
 
@@ -433,8 +439,15 @@ mod tests {
 
     #[test]
     fn a_folder_outside_git_has_no_worktree_and_a_shared_project_one_place() {
+        // Decided apart from the folder's ancestry: a sandbox running
+        // meanwhile holds a placeholder /tmp/.git over the test folders.
+        let none = serde_json::json!({});
+        assert_eq!(places_for(&none, false), [Place::Here, Place::Empty]);
+        assert_eq!(
+            places_for(&none, true),
+            [Place::Worktree, Place::Here, Place::Empty]
+        );
         let dir = temp("places");
-        assert_eq!(places(&dir), [Place::Here, Place::Empty]);
         std::fs::write(
             dir.join(agent_client::project::FILE),
             "name = \"p\"\nthreads_in = \"project\"\n",

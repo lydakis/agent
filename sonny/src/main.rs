@@ -13370,6 +13370,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("sonny-new-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join(".agents/agents")).unwrap();
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
         std::fs::write(
             dir.join(".agents/agents/reviewer.md"),
             "---\ndescription: Reviews a change\n---\nYou review.\n",
@@ -13398,10 +13399,13 @@ mod tests {
             app.key(key(KeyCode::Char(c))).await;
         }
         app.key(key(KeyCode::Enter)).await;
-        // Outside git: this folder or an empty one.
+        // In git: a worktree first, then this folder or an empty one. (The
+        // folder is a checkout of its own: outside one, any sandbox running
+        // meanwhile holds a placeholder /tmp/.git that makes it /tmp's.)
         let (items, _) = app.making.as_ref().and_then(new::Making::listed).unwrap();
         let places: Vec<&str> = items.iter().map(|item| item.name.as_str()).collect();
-        assert_eq!(places, ["this folder", "empty folder"]);
+        assert_eq!(places, ["worktree", "this folder", "empty folder"]);
+        app.key(key(KeyCode::Down)).await;
         app.key(key(KeyCode::Enter)).await;
         // Then its first message, in the composer, under what it starts.
         assert!(app.new_brief() && !app.listing_open());
