@@ -46,6 +46,9 @@ const HEALTHY: Duration = Duration::from_secs(60);
 const LINE_BYTES: usize = 48 << 20;
 /// The largest file opened on another machine.
 const OPEN_BYTES: usize = 32 << 20;
+/// The slowest a link is taken to carry a call, in bytes a second: a call
+/// that is large has as long again as it takes at that rate to be taken.
+const CARRIED: u64 = 1 << 20;
 /// The files opened on another machine: what a viewer shows, never what
 /// runs.
 const VIEWED: [&str; 14] = [
@@ -361,13 +364,11 @@ pub async fn call(
     send(&mut write, &json!({"proof": challenge}))
         .await
         .map_err(gone)?;
-    send(
-        &mut write,
-        &json!({"call": {"tool": tool, "payload": payload}}),
-    )
-    .await
-    .map_err(gone)?;
-    let first = tokio::time::timeout(ACK, line(&mut read, LINE_BYTES)).await;
+    let called = json!({"call": {"tool": tool, "payload": payload}});
+    send(&mut write, &called).await.map_err(gone)?;
+    // Taken once the other end has all of it, so as long as it is to carry.
+    let carried = Duration::from_millis(called.to_string().len() as u64 * 1000 / CARRIED);
+    let first = tokio::time::timeout(ACK + carried, line(&mut read, LINE_BYTES)).await;
     let mut next = Some(first.map_err(|_| not_connected(machine))?.map_err(gone)?);
     loop {
         let said = match next.take() {
@@ -457,7 +458,12 @@ pub fn open(target: &str) -> Result<String, String> {
     match rx.recv_timeout(Duration::from_secs(15)) {
         Ok(Ok(_)) => Ok(machine.name),
         Ok(Err(error)) => Err(error),
-        Err(_) => Err(format!("{} did not open it in time", machine.name)),
+        // Still on its way, which a large file over a slow link may be: it
+        // opens when it gets there, and this window does not wait.
+        Err(_) => Err(format!(
+            "still sending it to {}; it opens there when it arrives",
+            machine.name
+        )),
     }
 }
 

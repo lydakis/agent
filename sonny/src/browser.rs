@@ -1091,7 +1091,8 @@ pub async fn answer(
             Ok(allowed) => allowed,
             Err(why) => return Ok(Value::String(why)),
         };
-        let lent = json!({"commands": lines, "bot": call["bot"], "bot_id": record["bot_id"]});
+        let lent = json!({"commands": lines, "bot": call["bot"], "bot_id": record["bot_id"],
+            "store": client.store().unwrap_or_default()});
         let answer = crate::link::call(machine, NAME, lent, Some(&steps)).await;
         if let Some(step) = allowed {
             steps.ran(step, answer.is_err()).await;
@@ -1154,7 +1155,13 @@ pub async fn lent(
         ));
     }
     let bot = payload["bot"].as_str().unwrap_or_default();
-    let session = session(&format!("link\0{from}\0{}", payload["bot_id"]), bot);
+    // As here: by its store too, since two stores there may each have an
+    // agent of one name and ID.
+    let store = payload["store"].as_str().unwrap_or_default();
+    let session = session(
+        &format!("link\0{from}\0{store}\0{}", payload["bot_id"]),
+        bot,
+    );
     drive(&lines, &Reach::lent(), &session, Some(profile), steps).await
 }
 
