@@ -59,12 +59,13 @@ pub async fn listing(client: &Client, bot: Option<&str>) -> agent_client::Result
     }
 }
 
-/// What an agent's history says: the question it has open, and whether
-/// its last turn resolved it.
+/// What an agent's history says: the question it has open, whether its
+/// last turn resolved it, and that turn, the newest its history holds.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Seen {
     pub ask: Option<String>,
     pub itself: bool,
+    pub turn: Option<i64>,
 }
 
 /// How many of an agent's newest nodes are read for its open question.
@@ -74,7 +75,7 @@ const SCANNED: usize = 400;
 const READ: usize = 100;
 
 /// Read `bot`'s newest history for the question it has open, and whether
-/// its turn `last` resolved it; none when the history could not be listed,
+/// its turn `last`, or with none its newest, resolved it; none when the history could not be listed,
 /// what a later read gave up on read as far as it came. Newest first, and
 /// no further than the person's last words of their own: past those every
 /// question before is set aside.
@@ -85,6 +86,8 @@ pub async fn scan(client: &Client, bot: &str, last: Option<i64>) -> Option<Seen>
         .ok()?;
     let listed = page["nodes"].as_array().cloned().unwrap_or_default();
     let nodes: Vec<i64> = listed.iter().filter_map(|n| n["node"].as_i64()).collect();
+    let newest = listed.iter().filter_map(|n| n["turn"].as_i64()).max();
+    let last = last.or(newest);
     let in_last: HashSet<i64> = (listed.iter())
         .filter(|n| last.is_some() && n["turn"].as_i64() == last)
         .filter_map(|n| n["node"].as_i64())
@@ -124,6 +127,7 @@ pub async fn scan(client: &Client, bot: &str, last: Option<i64>) -> Option<Seen>
     Some(Seen {
         ask: crate::asks::open(&items),
         itself: resolved_itself(&turn, bot),
+        turn: last,
     })
 }
 

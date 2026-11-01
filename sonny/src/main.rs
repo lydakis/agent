@@ -2574,6 +2574,8 @@ struct Fleet {
     scanned: HashMap<String, Value>,
     /// Bots whose questions are to be read, with the head they are at.
     unread: Vec<(String, Value)>,
+    /// The daemon's store, beside which the marks of resolved tasks are kept.
+    store: PathBuf,
     /// The name each window was given, kept by the worker.
     named: Arc<std::sync::Mutex<HashMap<String, String>>>,
     /// What to ring for, taken by the app after each event.
@@ -2925,6 +2927,8 @@ impl Fleet {
             needs: Default::default(),
             scanned: HashMap::new(),
             unread: Vec::new(),
+            store: agent_client::socket::canonical_store(&options.store)
+                .unwrap_or_else(|_| options.store.clone()),
             named: Default::default(),
             alerts: Vec::new(),
             zen: false,
@@ -2969,6 +2973,7 @@ impl Fleet {
             needs: Default::default(),
             scanned: HashMap::new(),
             unread: Vec::new(),
+            store: PathBuf::new(),
             named: Default::default(),
             alerts: Vec::new(),
             zen: false,
@@ -3070,6 +3075,17 @@ impl Fleet {
         self.name_windows();
     }
 
+    /// The question `bot`'s history has open, unless the task is resolved:
+    /// by itself in that turn, or by its lead's mark that no later turn
+    /// reopened, as `/status` files it.
+    fn open_ask(&self, bot: &str, seen: needs::Seen) -> Option<String> {
+        let running = self.activity.get(bot) == Some(&"working");
+        let resolved = bot != self.lead
+            && (seen.itself
+                || resolved::holds(resolved::read(&self.store, bot), seen.turn, running));
+        seen.ask.filter(|_| !resolved)
+    }
+
     /// What a read elsewhere found of what waits on the person, in place of
     /// what was kept: the calls of the agents `calls` names, and the
     /// questions of those `asks` does, but of none an event left unsure.
@@ -3095,9 +3111,8 @@ impl Fleet {
             let Some(seen) = needs::scan(&self.client, &bot, turn).await else {
                 continue;
             };
-            // A task that resolved itself in that turn waits on no one.
-            let resolved = seen.itself && bot != self.lead;
-            self.needs.asked(&bot, seen.ask.filter(|_| !resolved));
+            let ask = self.open_ask(&bot, seen);
+            self.needs.asked(&bot, ask);
             self.scanned.remove(&bot);
             let waits = self.needs.waits(&bot);
             self.settle(&bot, waits);
@@ -3110,7 +3125,8 @@ impl Fleet {
             if let Some(seen) = needs::scan(&self.client, &bot, None).await
                 && !self.needs.unsure(&bot)
             {
-                self.needs.asked(&bot, seen.ask);
+                let ask = self.open_ask(&bot, seen);
+                self.needs.asked(&bot, ask);
                 self.scanned.insert(bot.clone(), head);
                 self.settle(&bot, false);
             }
@@ -3314,8 +3330,11 @@ impl Fleet {
     /// new work has it at work again.
     fn resolved(&mut self, task: &str) {
         if self.lineage.contains(task)
-            && !matches!(self.doing.get(task), Some(&"working" | &"needs you"))
+            && self.activity.get(task) != Some(&"working")
+            && !self.needs.holds(task)
         {
+            // Resolved, a question it left open is set aside.
+            self.needs.forget(task);
             self.ended.remove(task);
             self.close(task);
             self.doing.remove(task);
@@ -7936,14 +7955,20 @@ impl App {
                         seen
                     }
                 },
-                _ => Seen { ask, itself: false },
+                _ => Seen {
+                    ask,
+                    ..Default::default()
+                },
             };
             let itself = seen.itself && name != lead && ran["status"] == "completed";
             let resolved = itself
                 || resolved::holds(resolved::read(&store, name), turn["turn"].as_i64(), running);
-            // This window's own agent waits on what it shows open here.
+            // This window's own agent waits on what it shows open here too,
+            // its transcript read only so far back.
             let ask = match name == self.bot {
-                true => self.asks.first().map(|ask| ask.question.clone()),
+                true => (self.asks.first())
+                    .map(|ask| ask.question.clone())
+                    .or(seen.ask),
                 false => seen.ask,
             };
             if name == self.bot && held.is_ok() {
@@ -9010,7 +9035,11 @@ impl App {
                 .filter(|(bot, doing)| **bot != self.bot && **doing == state)
                 .count()
         };
-        let here = !self.asks.is_empty() || !self.approvals.is_empty();
+        // Its transcript read only so far back, the fleet's read of its
+        // history may hold a question this window does not.
+        let here = !self.asks.is_empty()
+            || !self.approvals.is_empty()
+            || (self.fleet.as_ref()).is_some_and(|fleet| fleet.needs.waits(&self.bot));
         (count("working"), usize::from(here) + count("needs you"))
     }
 
@@ -17151,6 +17180,27 @@ mod tests {
         ));
         assert_eq!(fleet.doing["calc.fix"], "working");
         assert_eq!(app.agents(), (1, 2));
+    }
+
+    #[tokio::test]
+    async fn a_resolved_tasks_old_question_stays_set_aside_after_a_restart() {
+        let (client, events) = project_waiting().await;
+        let mut fleet = Fleet::in_memory(client, events, "calc", "calc.lead");
+        let dir = std::env::temp_dir().join(unique("sonny-resolved-needs"));
+        fleet.store = dir.join("store");
+        // The lead resolved it past the turn that asked.
+        std::fs::create_dir_all(dir.join("store.resolved")).unwrap();
+        std::fs::write(dir.join("store.resolved/calc.ask.json"), r#"{"turn": 5}"#).unwrap();
+        fleet.reconcile().await;
+        while !fleet.unread.is_empty() {
+            fleet.rescan().await;
+        }
+        assert_eq!(fleet.doing["calc.ask"], "idle");
+        assert_eq!(
+            fleet.doing["calc.new"], "needs you",
+            "one not resolved still asks"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]
