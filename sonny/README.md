@@ -735,9 +735,9 @@ way `/react` does, and each note in the margin has its own `↩`.
   allow, whose call runs. What comes in from no agent flies in from the
   edge only when it is from outside: a follow, another person, a
   schedule (whose tick flashes as it fires), a reply's note from the
-  commons. A commons invite flies from whoever started the thread, a task
-  update from the task it quotes, a margin note you closed from you, and
-  an agent's own goal only pulses its star. It is a
+  commons, task updates. A commons invite flies from whoever started the
+  thread, a margin note you closed from you, and an agent's own goal only
+  pulses its star. It is a
   calm window to keep open and watch: dim lines join who made whom, and
   every pair that has ever talked keeps a dim curve, the last 96 pairs, past
   turns and live, denser and brighter the more the pair talked this hour. A

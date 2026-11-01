@@ -494,7 +494,7 @@ pub struct View {
     bookings: HashMap<(String, i64, String), Booking>,
     /// Calls waiting on a reviewer such as `auto`, by agent, turn and call:
     /// the reviewer's tag.
-    reviewed: HashMap<(String, i64, String), String>,
+    reviewed: HashSet<(String, i64, String)>,
     told: HashMap<String, Instant>,
 }
 
@@ -851,7 +851,7 @@ impl View {
             booked: None,
             booking: false,
             bookings: HashMap::new(),
-            reviewed: HashMap::new(),
+            reviewed: HashSet::new(),
             told: HashMap::new(),
         }
     }
@@ -1924,20 +1924,18 @@ impl View {
                 for call in data["calls"].as_array().into_iter().flatten() {
                     let gates = call["gates"].as_array().map_or(&[][..], Vec::as_slice);
                     let manual = gates.iter().any(|g| g == "manual");
-                    let reviewer =
-                        (gates.iter().filter_map(Value::as_str)).find(|&gate| gate != "manual");
+                    let reviewed = gates.iter().any(|g| g.is_string() && g != "manual");
                     let Some(id) = call["call_id"].as_str() else {
                         continue;
                     };
                     if manual {
                         self.agents[at].held.insert(id.to_owned());
                     }
-                    if let Some(reviewer) = reviewer {
+                    if reviewed {
                         if self.reviewed.len() >= REVIEWED {
                             self.reviewed.clear();
                         }
-                        let key = (name.to_owned(), turn, id.to_owned());
-                        self.reviewed.insert(key, reviewer.to_owned());
+                        self.reviewed.insert((name.to_owned(), turn, id.to_owned()));
                     }
                 }
                 self.waits(at, waiting, now);
@@ -1948,7 +1946,7 @@ impl View {
                     self.agents[at].held.insert(id.to_owned());
                     // A reviewer handed the call to the person.
                     let key = (name.to_owned(), turn, id.to_owned());
-                    if self.reviewed.remove(&key).is_some() {
+                    if self.reviewed.remove(&key) {
                         self.verdict(at, NEEDS, now);
                     }
                 }
@@ -1961,10 +1959,8 @@ impl View {
                     // A step of a call, such as an MCP call inside `exec`,
                     // its reviewer refused.
                     let key = (name.to_owned(), turn, id.to_owned());
-                    if let Some(reviewer) = self.reviewed.remove(&key)
-                        && data["denied"] == true
-                    {
-                        self.denied(at, &reviewer, data, now);
+                    if self.reviewed.remove(&key) {
+                        self.denied(at, data, now);
                     }
                 }
             }
@@ -1972,10 +1968,8 @@ impl View {
                 if let Some(id) = data["call_id"].as_str() {
                     self.agents[at].held.remove(id);
                     let key = (name.to_owned(), turn, id.to_owned());
-                    if let Some(reviewer) = self.reviewed.remove(&key)
-                        && data["denied"] == true
-                    {
-                        self.denied(at, &reviewer, data, now);
+                    if self.reviewed.remove(&key) {
+                        self.denied(at, data, now);
                     }
                     if let Some(booking) = self.bookings.remove(&key)
                         && data["failed"] != true
@@ -2287,17 +2281,6 @@ impl View {
         {
             return End::Agent(by);
         }
-        // Task updates quote the task they tell of: from it, when one.
-        if origin == crate::lookout::TASKS_ORIGIN {
-            let quoted: HashSet<usize> = (data["quotes"].as_array().into_iter().flatten())
-                .filter_map(|quote| quote["bot"].as_str())
-                .filter_map(|bot| self.agent(bot))
-                .filter(|&by| by != at)
-                .collect();
-            if let [by] = quoted.into_iter().collect::<Vec<_>>()[..] {
-                return End::Agent(by);
-            }
-        }
         match data["origin"].is_string() || data["person"].is_string() {
             true => End::Rim(at),
             false => End::Person,
@@ -2349,8 +2332,20 @@ impl View {
         });
     }
 
-    /// A reviewer refused an agent's call: its streak, and a line.
-    fn denied(&mut self, at: usize, reviewer: &str, data: &Value, now: Instant) {
+    /// A reviewer refused an agent's call: its streak, and a line. The
+    /// call's recorded verdicts name who refused it; the person's own no,
+    /// even on a call a reviewer also gates, draws nothing.
+    fn denied(&mut self, at: usize, data: &Value, now: Instant) {
+        if data["denied"] != true {
+            return;
+        }
+        let Some(reviewer) = (data["approvals"].as_array().into_iter().flatten())
+            .filter(|verdict| verdict["allow"] == false)
+            .filter_map(|verdict| verdict["tag"].as_str())
+            .find(|&tag| tag != "manual")
+        else {
+            return;
+        };
         self.verdict(at, FAILED, now);
         let tool = data["name"].as_str().unwrap_or("call");
         let said = format!("✗ {reviewer} denied {}'s {tool}", self.short(at));
@@ -6332,14 +6327,11 @@ mod tests {
         let (lead, login) = (view.index["shop.lead"], view.index["shop.login"]);
         // A margin note closed: the person's.
         assert_eq!(view.sender(&json!({"origin": "margin"}), lead), End::Person);
-        // Task updates from the one task they quote; several, the edge.
+        // Task updates name no task: what they quote is the person's
+        // words, so they come from the edge.
         let tasks = crate::lookout::TASKS_ORIGIN;
-        let one = json!({"origin": tasks, "quotes": [{"bot": "shop.login", "turn": 3}]});
-        assert_eq!(view.sender(&one, lead), End::Agent(login));
-        let two = json!({"origin": tasks, "quotes": [{"bot": "shop.login"}, {"bot": "shop.cart"}]});
-        assert_eq!(view.sender(&two, lead), End::Agent(login));
-        let none = json!({"origin": tasks});
-        assert_eq!(view.sender(&none, lead), End::Rim(lead));
+        let quoting = json!({"origin": tasks, "quotes": [{"bot": "shop.login", "turn": 3}]});
+        assert_eq!(view.sender(&quoting, lead), End::Rim(lead));
         // Follows and other people stay outside.
         assert_eq!(
             view.sender(&json!({"origin": "lookout.github"}), lead),
@@ -6402,6 +6394,8 @@ mod tests {
         send.send(asked(1, "c2", json!(["auto"]))).unwrap();
         send.send(asked(1, "c3", json!(["auto"]))).unwrap();
         send.send(asked(1, "c4", json!(["manual"]))).unwrap();
+        send.send(asked(1, "c5", json!(["auto", "manual"])))
+            .unwrap();
         view.drain();
         // Asking is not drawn: everyone asks the reviewer all the time.
         assert!(view.sparks.is_empty());
@@ -6416,14 +6410,24 @@ mod tests {
         send.send(live(
             "tool_completed",
             2,
-            json!({"call_id": "c2", "name": "shell", "denied": true}),
+            json!({"call_id": "c2", "name": "shell", "denied": true,
+                "approvals": [{"tag": "auto", "allow": false}]}),
         ))
         .unwrap();
-        // The person's own no is the person's, not the reviewer's.
+        // The person's own no is the person's, not the reviewer's, even on
+        // a call the reviewer allowed first.
         send.send(live(
             "tool_completed",
             1,
-            json!({"call_id": "c4", "name": "edit", "denied": true}),
+            json!({"call_id": "c4", "name": "edit", "denied": true,
+                "approvals": [{"tag": "manual", "allow": false}]}),
+        ))
+        .unwrap();
+        send.send(live(
+            "tool_completed",
+            1,
+            json!({"call_id": "c5", "name": "edit", "denied": true,
+                "approvals": [{"tag": "auto", "allow": true}, {"tag": "manual", "allow": false}]}),
         ))
         .unwrap();
         view.drain();
@@ -6431,7 +6435,8 @@ mod tests {
         send.send(live(
             "tool_completed",
             1,
-            json!({"call_id": "c2", "name": "shell", "denied": true}),
+            json!({"call_id": "c2", "name": "shell", "denied": true,
+                "approvals": [{"tag": "auto", "allow": false}]}),
         ))
         .unwrap();
         // A step of a call, an MCP call inside `exec`, refused.
@@ -6439,7 +6444,8 @@ mod tests {
         send.send(live(
             "step_decided",
             1,
-            json!({"call_id": "s1", "name": "github.search", "decision": "deny", "denied": true}),
+            json!({"call_id": "s1", "name": "github.search", "decision": "deny", "denied": true,
+                "approvals": [{"tag": "auto", "allow": false}]}),
         ))
         .unwrap();
         send.send(live(
