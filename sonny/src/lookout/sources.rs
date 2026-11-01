@@ -822,11 +822,7 @@ impl Shape {
 fn sample(fields: &Value) -> Option<Value> {
     fn cut_down(value: &Value, depth: usize, cut_any: &mut bool) -> Value {
         match value {
-            Value::String(text) => {
-                let short = cut(text, EXAMPLE_CHARS);
-                *cut_any |= short.len() != text.len();
-                Value::String(short)
-            }
+            Value::String(text) => Value::String(cut_marked(text, EXAMPLE_CHARS, cut_any)),
             Value::Array(items) if depth < 4 => {
                 *cut_any |= items.len() > SAMPLE_ITEMS;
                 (items.iter().take(SAMPLE_ITEMS))
@@ -836,7 +832,10 @@ fn sample(fields: &Value) -> Option<Value> {
             Value::Object(map) if depth < 4 => {
                 *cut_any |= map.len() > SHAPE_FIELDS;
                 (map.iter().take(SHAPE_FIELDS))
-                    .map(|(key, value)| (cut(key, 64), cut_down(value, depth + 1, cut_any)))
+                    .map(|(key, value)| {
+                        let key = cut_marked(key, 64, cut_any);
+                        (key, cut_down(value, depth + 1, cut_any))
+                    })
                     .collect::<serde_json::Map<_, _>>()
                     .into()
             }
@@ -846,6 +845,12 @@ fn sample(fields: &Value) -> Option<Value> {
             }
             other => other.clone(),
         }
+    }
+    /// `cut`, saying in `cut_any` whether it cut: by characters, as `cut`
+    /// counts, never by bytes, which the ellipsis it adds can even out.
+    fn cut_marked(text: &str, max: usize, cut_any: &mut bool) -> String {
+        *cut_any |= text.chars().nth(max).is_some();
+        cut(text, max)
     }
     let mut cut_any = false;
     let sample = json!({"fields": cut_down(fields, 0, &mut cut_any), "cut": cut_any});
@@ -1268,7 +1273,14 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&shape.file).unwrap()).unwrap();
         assert_eq!(written["events"], 2 + SHAPE_EVENTS);
         assert_eq!(written["recent"].as_array().unwrap().len(), SHAPE_RECENT);
-        // A long value is cut, and says so.
+        // A long value is cut, and says so, even one whose ellipsis makes
+        // up the bytes it cut, and a long key too.
+        let just_over = "x".repeat(EXAMPLE_CHARS + 3);
+        assert_eq!(sample(&json!({"text": just_over})).unwrap()["cut"], true);
+        let exact = "x".repeat(EXAMPLE_CHARS);
+        assert_eq!(sample(&json!({"text": exact})).unwrap()["cut"], false);
+        let key = "k".repeat(65);
+        assert_eq!(sample(&json!({"text": "t", key: 1})).unwrap()["cut"], true);
         let long = "x".repeat(EXAMPLE_CHARS * 2);
         let kept = sample(&json!({"text": long, "list": (0..20).collect::<Vec<_>>()})).unwrap();
         assert_eq!(kept["cut"], true);
