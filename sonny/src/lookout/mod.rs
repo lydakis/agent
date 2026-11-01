@@ -553,6 +553,7 @@ async fn serve(settings: Settings) -> Result<(), String> {
         goals: goals::Goals::new(&settings.store, &settings.socket),
         fires: HashMap::new(),
         resume: marks(&settings.store).0,
+        replayed: None,
         replay: marks(&settings.store).1,
         in_flight: HashMap::new(),
         telling: HashMap::new(),
@@ -645,6 +646,10 @@ struct Service {
     telling: HashMap<(String, i64), Telling>,
     /// Where the last lookout left off: events after it are news.
     resume: Option<i64>,
+    /// How far a first replay got, with no lookout before it to leave off:
+    /// one a lag cuts short goes on from there, as a consumer goes on
+    /// from its last offset, rather than reading the whole log again.
+    replayed: Option<i64>,
     /// Where the last lookout's stream starts again: before the oldest turn
     /// still under way then, so what each said before it ends is known.
     replay: Option<i64>,
@@ -803,6 +808,15 @@ fn watchers(subscribers: &HashMap<String, Vec<subs::Sub>>) -> Arc<HashSet<String
     )
 }
 
+/// Where the stream starts again: before the oldest of where the last
+/// lookout left off and the oldest turn still under way; with neither, as
+/// far as a first replay got, or the start.
+fn follow_after(resume: Option<i64>, replay: Option<i64>, replayed: Option<i64>) -> i64 {
+    ([resume, replay].into_iter().flatten().min())
+        .or(replayed)
+        .unwrap_or(0)
+}
+
 impl Service {
     async fn watch(
         &mut self,
@@ -873,7 +887,8 @@ impl Service {
         // again. What came before was told, or seen live by this lookout,
         // so the stream starts after it, or before the oldest turn still
         // under way, whose events are history: never the whole log again.
-        // Only a lookout with no cursor yet reads it all, once.
+        // Only a lookout with no cursor yet reads it all, once: one a lag
+        // cuts short goes on from where it got to.
         self.resume = self.floor().or(self.resume);
         // A turn the listing shows ended, or never running, ended unseen.
         let running: HashMap<&str, i64> = (bots.iter())
@@ -886,11 +901,7 @@ impl Service {
             false => self.replay_floor(),
         };
         self.started = false;
-        let after = [self.resume, replay]
-            .into_iter()
-            .flatten()
-            .min()
-            .unwrap_or(0);
+        let after = follow_after(self.resume, replay, self.replayed);
         let follow = json!({"bot": "*", "after": after, "kinds": KINDS});
         if let Err(error) = client.request("follow", follow).await {
             println!(
@@ -978,6 +989,9 @@ impl Service {
                     }
                     if live && !held && cursor > self.cursor {
                         self.cursor = cursor;
+                    }
+                    if !live && self.resume.is_none() && cursor > self.replayed {
+                        self.replayed = cursor;
                     }
                     if let (Some("created" | "forked"), Some(name)) =
                         (event["event"].as_str(), event["bot"].as_str())
@@ -3038,6 +3052,18 @@ mod tests {
         assert_eq!(event["data"]["arguments"], json!(whole));
     }
 
+    #[test]
+    fn a_first_replay_a_lag_cuts_short_goes_on_from_where_it_got_to() {
+        // No lookout before it and nothing under way: from the start, once.
+        assert_eq!(follow_after(None, None, None), 0);
+        assert_eq!(follow_after(None, None, Some(4_096)), 4_096);
+        // A turn under way still has its start read again.
+        assert_eq!(follow_after(None, Some(1_500), Some(4_096)), 1_500);
+        // Where the last lookout left off says, as it always did.
+        assert_eq!(follow_after(Some(9_000), None, Some(4_096)), 9_000);
+        assert_eq!(follow_after(Some(9_000), Some(8_000), None), 8_000);
+    }
+
     fn lookout() -> Lookout {
         let mut lookout = Lookout::new("calc.lead");
         lookout.subs = vec![subs::Sub::lead("calc.lead", "calc")];
@@ -3969,6 +3995,7 @@ mod tests {
             cursor: None,
             saved: None,
             resume: None,
+            replayed: None,
             replay: None,
             in_flight: HashMap::new(),
             telling: HashMap::new(),
