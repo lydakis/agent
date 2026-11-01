@@ -3424,6 +3424,11 @@ impl Turn {
                 if self.side.replaced.load(Relaxed) {
                     return Ok(call.await);
                 }
+                // Nor once the daemon is stopping: no call after this one
+                // would read it, and the drain sends no new request.
+                if self.stopping.load(Relaxed) {
+                    return Ok(call.await);
+                }
                 *warm.pending = Some(self.refresh(warm));
             }
             let refreshed = {
@@ -3483,6 +3488,15 @@ impl Turn {
                     result = &mut run => return Ok(Ran::Done(result)),
                     () = &mut lifted => return Ok(Ran::Lifted(run)),
                     () = tokio::time::sleep_until(warm.read_at + warm.after) => {}
+                }
+                // A stopping daemon sends no new refresh: the next call that
+                // would read the cache waits for the next start.
+                if self.stopping.load(Relaxed) {
+                    return Ok(tokio::select! {
+                        biased;
+                        result = &mut run => Ran::Done(result),
+                        () = &mut lifted => Ran::Lifted(run),
+                    });
                 }
                 *warm.pending = Some(self.refresh(warm));
             }

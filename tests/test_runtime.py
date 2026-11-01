@@ -971,6 +971,22 @@ class AnthropicRuntimeTests(unittest.TestCase):
         self.assertEqual(sent, sorted(sent))
         self.assertGreaterEqual(sent[2] - sent[1], 900)
 
+    def test_a_drain_sends_no_refresh_while_a_command_finishes(self):
+        client, model, path = self.start(settings={'keep_warm': 1})
+        client.request('create', bot='Bob', workspace=str(path), effort='low')
+        turn = client.request('submit', bot='Bob', request_id='w1', prompt='shell:sleep 2.5')['result']['turn']
+        client.receive(lambda m: m.get('event') == 'tool_started' and m.get('turn') == turn)
+        model.requests.get(timeout=3)
+        # The command runs on through the drain, past when its cache would be
+        # refreshed twice; no refresh goes out, and the turn parks after it.
+        self.assertTrue(client.request('shutdown', grace_ms=60_000)['result']['shutting_down'])
+        parked = client.receive(lambda e: e.get('event') == 'turn_paced' and e.get('turn') == turn)
+        self.assertEqual(parked['data'], {'resume_at_ms': None, 'stopped': True})
+        self.assertEqual(client.process.wait(timeout=10), 0)
+        self.assertTrue(model.requests.empty())
+        self.assertFalse([m for m in client.saved if m.get('event') == 'usage'
+                          and m['data'].get('purpose') == 'keep_warm'])
+
     def test_refreshes_stop_at_the_turns_cap(self):
         client, model, path = self.start(settings={'keep_warm': 1})
         def run(bot, cap):

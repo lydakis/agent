@@ -1071,7 +1071,8 @@ effects) or came before it ran, and none is run again; the first's
 `tool_completed` says `outcome_unknown`, the second's `cancelled`, as a pause
 says them. A call waiting for its verdict as the drain begins does not
 start, even if allowed then, and a model call that failed sends no retry:
-the turn parks, and its retry count starts over when it continues. The time the daemon
+the turn parks, and its retry count starts over when it continues. No
+prompt-cache refresh goes out during a drain either. The time the daemon
 was down is not counted in `paced_ms`. A client's `wait` still open is
 answered as its deadline would answer it, the parked turn reported pending
 as it stands. Background commands and terminals end with the daemon as
