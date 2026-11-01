@@ -3,6 +3,7 @@
 #![allow(clippy::undocumented_unsafe_blocks)]
 use agent_runtime::tools::{Credentials, Prepared, Registry};
 use serde_json::{Value, json};
+use std::collections::HashMap;
 
 #[tokio::test]
 async fn shell_preserves_exit_status_and_separate_outputs() {
@@ -148,6 +149,38 @@ async fn known_credential_text_is_redacted_before_tool_result_serialization() {
         .unwrap();
     let result: Value = serde_json::from_str(&outcome.output).unwrap();
     assert_eq!(result["stdout"], "\u{fffd}[REDACTED]");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn large_output_is_redacted_off_the_runtime_whole() {
+    let credentials = Credentials::default();
+    credentials.set("AGENT_TEST_FAKE_KEY", "synthetic-large-value");
+    let tools = Registry::new("shell")
+        .unwrap()
+        .with_credentials(credentials);
+    // Past the inline bound on both streams: each is redacted on a
+    // blocking thread, its preview and its artifact alike.
+    let command = "head -c 300000 /dev/zero | tr '\\0' a; printf ' synthetic-large-value'; \
+                   printf 'synthetic-large-value ' >&2; head -c 300000 /dev/zero | tr '\\0' b >&2";
+    let shell = tools
+        .prepare("shell", &json!({ "command": command }).to_string())
+        .unwrap();
+    let outcome = tools
+        .execute(shell, &std::env::temp_dir(), &[], None)
+        .await
+        .unwrap();
+    let result: Value = serde_json::from_str(&outcome.output).unwrap();
+    assert_eq!(result["exit_code"], 0);
+    let streams: HashMap<&str, String> = outcome
+        .artifacts
+        .iter()
+        .map(|(name, bytes)| (*name, String::from_utf8(bytes.clone()).unwrap()))
+        .collect();
+    assert!(streams["stdout"].ends_with(" [REDACTED]"));
+    assert!(streams["stderr"].starts_with("[REDACTED] "));
+    for text in streams.values().chain([&outcome.output]) {
+        assert!(!text.contains("synthetic-large-value"));
+    }
 }
 
 #[tokio::test]
