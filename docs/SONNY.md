@@ -74,7 +74,7 @@ message to another agent or a pause from a read-only agent too; so a dry run
 reads with the daemon's file tools and read-only MCP tools, not commands.
 
 **A broken `--if`.** A gate that cannot run, or runs past 60 s, fails the
-fire. The agent that hears of the automation (`--reply-to`, else the agent
+run. The agent that hears of the automation (`--reply-to`, else the agent
 that added a `--start` automation, else the agent it messages) is told once
 when it breaks, and once when it works again, as alerts fire on a change
 of state rather than on every check; the row's `checked.told` keeps
