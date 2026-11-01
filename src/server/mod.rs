@@ -624,6 +624,16 @@ enum Command {
         #[serde(default)]
         by: Option<String>,
     },
+    /// Every turn held on a cause a person can fix, oldest first: parked on
+    /// a call (`started`), or refused at its start and waiting in line. A
+    /// read.
+    Held,
+    /// Try every held turn again now, or only `bot`'s: the person may have
+    /// fixed what held them. Answers how many.
+    RetryHeld {
+        #[serde(default)]
+        bot: Option<String>,
+    },
 }
 /// The most agents a pause names as the ones it parked; it counts them all.
 const PAUSE_NAMES: usize = 64;
@@ -1192,6 +1202,9 @@ struct Service {
     /// When to look for attached messages whose wait ran out, kept as
     /// `expiry` is.
     lapses: Option<tokio::time::Instant>,
+    /// When the first turn held in line on a cause is tried again, kept as
+    /// `lapses` is.
+    holds: Option<tokio::time::Instant>,
 }
 
 /// Parked turns' wake times, at most one per turn: a turn that parks again
@@ -1665,7 +1678,12 @@ pub async fn run(config: Configuration) -> Result<()> {
         .await?;
     for (waiting, lapse, steered) in parked {
         if waiting.paced_since_ms.is_some() {
-            wakes.set(waiting.deadline_ms.unwrap_or(0), waiting.bot, waiting.turn);
+            // One held on a cause is tried again at once (see `retry_held`).
+            let at = match waiting.blocked {
+                Some(_) => 0,
+                None => waiting.deadline_ms.unwrap_or(0),
+            };
+            wakes.set(at, waiting.bot, waiting.turn);
             continue;
         }
         // A verdict park wakes on an answer, which may have committed
@@ -1741,11 +1759,16 @@ pub async fn run(config: Configuration) -> Result<()> {
         unpublished: std::collections::VecDeque::new(),
         expiry: None,
         lapses: None,
+        holds: None,
     };
     // Forks whose time ran out while no daemon ran are deleted at once.
     service.plan_expiry(Duration::ZERO).await?;
     // So are attached messages that waited out a stop delivered.
     service.plan_lapses().await?;
+    // A start may follow the fix of what held turns (a key, a provider,
+    // the config): every held turn is tried again at once.
+    service.retry_held(None).await?;
+    service.holds_due().await?;
     let idle_exit = config
         .idle_exit
         .filter(|_| config.socket.is_some())
@@ -1770,6 +1793,7 @@ pub async fn run(config: Configuration) -> Result<()> {
             let ready_retry = service.ready_retry_at;
             let expiry = service.expiry;
             let lapses = service.lapses;
+            let holds = service.holds;
             tokio::select! {
                 _ = stdout_closed.wait_for(|closed| *closed), if stdio_owner => return fail("output_closed"),
                 Some(error) = failures.recv() => return Err(error),
@@ -1824,6 +1848,16 @@ pub async fn run(config: Configuration) -> Result<()> {
                             service.lapses = Some(tokio::time::Instant::now() + delay);
                         }
                         lapsed => lapsed?,
+                    }
+                }
+                // Turns held in line on a cause are tried again.
+                _ = tokio::time::sleep_until(holds.unwrap_or_else(tokio::time::Instant::now)), if holds.is_some() && !service.draining() => {
+                    match service.holds_due().await {
+                        Err(error) if error.code == "storage_error" => {
+                            let delay = service.storage_retry();
+                            service.holds = Some(tokio::time::Instant::now() + delay);
+                        }
+                        due => due?,
                     }
                 }
                 // A parked turn's time comes due (a pool reopens, a gate lapses,
@@ -2144,6 +2178,8 @@ impl Service {
             // Any agent may pull the cord; letting the line go on is the
             // person's, from outside any sandbox.
             Command::Resume { .. } => return refuse("resume a pause"),
+            // What held a turn is the person's to fix, outside any sandbox.
+            Command::RetryHeld { .. } => return refuse("retry held turns"),
             // A companion runs as the daemon does, outside any sandbox.
             Command::Companions { .. } => return refuse("manage the daemon's companions"),
             _ => {}
@@ -2593,6 +2629,56 @@ impl Service {
         self.lapses_at(next, now_ms());
         Ok(())
     }
+    /// Plan the next try of the turns held in line, after `wall`.
+    fn holds_at(&mut self, next: Option<i64>, wall: u64) {
+        let now = tokio::time::Instant::now();
+        self.holds =
+            next.map(|at| now + Duration::from_millis((at.max(0) as u64).saturating_sub(wall)));
+    }
+    /// The turns held in line whose try is due go to the dispatcher; the
+    /// timer moves to the next one after them.
+    async fn holds_due(&mut self) -> Result<()> {
+        let wall = now_ms();
+        let next = self
+            .store
+            .read("next_held_due", move |db| db.next_held_due(wall as i64))
+            .await?;
+        self.ready_hint = true;
+        self.holds_at(next, wall);
+        Ok(())
+    }
+    /// Hold a ready turn its start refused for a cause a person can fix.
+    /// One that stopped being ready meanwhile (interrupted, say) is left.
+    async fn hold(&mut self, turn: i64, error: Error) -> Result<()> {
+        let held = self.store.op("hold", move |db| db.hold(turn, &error)).await;
+        match held {
+            Ok((_, next)) => {
+                self.holds_at(next, now_ms());
+                Ok(())
+            }
+            Err(error) if error.code == "stale_turn" || error.code == "turn_not_found" => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+    /// Try every held turn again now, or only `bot`'s, as the person may
+    /// have fixed what held them: those parked on a call wake, and those
+    /// held in line go to the dispatcher. Returns how many.
+    async fn retry_held(&mut self, bot: Option<String>) -> Result<usize> {
+        let (parked, lined) = self
+            .store
+            .op("retry_held", move |db| db.retry_held(bot.as_deref()))
+            .await?;
+        let now = now_ms();
+        for (bot, turn) in &parked {
+            if !self.active.get(bot).is_some_and(|a| a.turn == *turn) {
+                self.wakes.set(now, bot.clone(), *turn);
+            }
+        }
+        if lined > 0 {
+            self.ready_hint = true;
+        }
+        Ok(parked.len() + lined)
+    }
     fn lapses_at(&mut self, next: Option<i64>, wall: u64) {
         let now = tokio::time::Instant::now();
         self.lapses =
@@ -2935,6 +3021,8 @@ impl Service {
                     self.end_queued(bot, turn, error).await?;
                 }
             }
+            // A cause a person can fix holds it in line instead.
+            Err(error) if turn::held_at_start(&error.code) => self.hold(turn, error).await?,
             Err(error) => self.end_queued(bot, turn, error).await?,
         }
         Ok(())
@@ -3743,6 +3831,14 @@ impl Service {
                         db.pauses(after, before, limit.unwrap_or(64), newest)
                     })
                     .await
+            }
+            Command::Held => {
+                let held = store.read("held", |db| db.held()).await?;
+                Ok(json!({"held": held}))
+            }
+            Command::RetryHeld { bot } => {
+                let retried = self.retry_held(bot).await?;
+                Ok(json!({"retried": retried}))
             }
             Command::Resume { by } => {
                 if by.as_ref().is_some_and(|b| b.is_empty() || b.len() > 128) {
@@ -5373,6 +5469,7 @@ mod tests {
             unpublished: std::collections::VecDeque::new(),
             expiry: None,
             lapses: None,
+            holds: None,
             reserved: 0,
             storage_backoff: Duration::ZERO,
             ready_retry_at: None,
@@ -5578,6 +5675,7 @@ mod tests {
             unpublished: std::collections::VecDeque::new(),
             expiry: None,
             lapses: None,
+            holds: None,
             reserved: 0,
             storage_backoff: Duration::ZERO,
             ready_retry_at: None,
@@ -5803,6 +5901,7 @@ mod tests {
             unpublished: std::collections::VecDeque::new(),
             expiry: None,
             lapses: None,
+            holds: None,
             reserved: 0,
             storage_backoff: Duration::ZERO,
             ready_retry_at: None,
@@ -6037,6 +6136,7 @@ mod tests {
             unpublished: std::collections::VecDeque::new(),
             expiry: None,
             lapses: None,
+            holds: None,
             reserved: 0,
             storage_backoff: Duration::ZERO,
             ready_retry_at: None,
@@ -6510,7 +6610,7 @@ mod tests {
         let bob = running(&store, &["Bob".into()]).await[0].1;
         store
             .call(move |db| {
-                db.suspend_paced(bob, 0, 0, 0, 0, 0, 0, false, None, None, None, None)
+                db.suspend_paced(bob, 0, 0, 0, 0, 0, 0, false, None, None, None, None, None)
                     .map(|_| ())
             })
             .await

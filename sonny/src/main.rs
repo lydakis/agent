@@ -7195,14 +7195,21 @@ impl App {
             "turn_paced" => {
                 if let Some(running) = &mut self.running {
                     running.phase = if data["paused"] == true {
-                        "Paused"
+                        "Paused".into()
                     } else if data["stopped"] == true {
                         // The daemon stopped; its next start continues it.
-                        "Stopped"
+                        "Stopped".into()
+                    } else if data["blocked"].is_object() {
+                        // Held on a cause the person can fix; /status says how.
+                        let blocked = &data["blocked"];
+                        let (what, _) = status::held_cause(
+                            blocked["code"].as_str().unwrap_or(""),
+                            blocked["detail"].as_str(),
+                        );
+                        format!("Held: {what}")
                     } else {
-                        "Rate limited"
-                    }
-                    .into();
+                        "Rate limited".into()
+                    };
                 }
             }
             "turn_resumed" => {
@@ -7579,6 +7586,10 @@ impl App {
             let logs = tilde(&format!("{}.companions", self.store().display()));
             alerts.extend(status::companion_alerts(&listed["companions"], now, &logs));
         }
+        // Turns held on a cause the person can fix, one alert per cause.
+        if let Ok(listed) = self.client.request("held", json!({})).await {
+            alerts.extend(status::held_alerts(&listed["held"]));
+        }
         let folder = (self
             .client
             .request("inspect", json!({"bot": self.bot}))
@@ -7775,10 +7786,22 @@ impl App {
                 true => ran,
                 false => self.with_error(ran).await,
             };
+            // A turn held on a cause, parked on its call or in line, says so.
+            let held = (turns.iter()).find_map(|turn| {
+                let blocked = &turn["waiting_on"]["blocked"];
+                blocked.is_object().then(|| {
+                    status::held_cause(
+                        blocked["code"].as_str().unwrap_or(""),
+                        blocked["detail"].as_str(),
+                    )
+                    .0
+                })
+            });
             let state = match (
                 running,
                 if running { &turn } else { &ran }["status"].as_str(),
             ) {
+                _ if let Some(what) = &held => format!("{}{what}", status::HELD),
                 (true, Some("waiting")) if turn["waiting_on"]["approval"] == true => {
                     "needs you".into()
                 }

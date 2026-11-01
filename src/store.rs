@@ -16,7 +16,7 @@ mod context;
 mod db;
 pub use context::{ContextPrefix, ContextUsage, pinned_item, thinking_bytes, without_thinking};
 pub use db::{
-    Absorbed, Answered, Binding, Bot, CacheTtl, CallAnswer, CatchUp, CompactionPlan,
+    Absorbed, Answered, Binding, Blocked, Bot, CacheTtl, CallAnswer, CatchUp, CompactionPlan,
     CompactionView, CopiedCall, DENIAL_WINDOW, Database, Decision, Delivery, ElisionPlan,
     FOLDERS_JSON, Fork, Gate, Gated, Halt, Halted, Lapsed, MAX_GATES, ParkedFallback, Planning,
     Publication, QuoteRef, RULES_JSON, SANDBOX, SETTINGS, Served, Settings, Started, Step, Stepped,

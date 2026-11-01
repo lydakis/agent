@@ -117,6 +117,12 @@ pub const TASK_UPDATES: &str = "Task updates: ";
 /// What sends the note to the lead: its words are the lookout's, which
 /// ask for nothing; the person's it quotes stay theirs.
 pub const TASKS_ORIGIN: &str = "lookout.tasks";
+/// An agent whose message a turn carries, by name and id when known.
+type Sender = (String, Option<i64>);
+
+/// The origin of a note telling an agent that a turn its message started
+/// or joined ended without being carried out.
+pub const BOUNCE_ORIGIN: &str = "lookout.bounce";
 
 /// What the subscriber is told: what happened in the bots it watches, by
 /// handles its wait tool reads, the person's words quoted. `steer` when it
@@ -254,6 +260,31 @@ async fn reply_text(client: &Client, seen: &Seen) -> Option<String> {
         .await
         .ok()?;
     Some(said(&read).unwrap_or_default())
+}
+
+/// Tell `to` that `bot`'s turn its message started or joined ended
+/// without being carried out (`error`): a note it reads in its next model
+/// call, without starting a turn, as a trigger's failure is told. Its
+/// request id names the turn and who is told, so it is told once.
+async fn tell_bounced(
+    client: &Client,
+    (to, to_id): (&str, Option<i64>),
+    (bot, turn): (&str, i64),
+    error: &str,
+) -> agent_client::Result<()> {
+    let prompt = bounce_note(bot, turn, error);
+    let mut submit = json!({"bot": to, "request_id": format!("bounce.{bot}.{turn}.{to}"),
+        "prompt": crate::stamp::now(&prompt), "delivery": "attach", "origin": BOUNCE_ORIGIN,
+        "wait_ms": crate::trigger::attach_wait()});
+    if let Some(id) = to_id {
+        submit["bot_id"] = json!(id);
+    }
+    client.request("submit", submit).await.map(drop)
+}
+
+/// The words of a bounce: whose turn, and how it ended.
+fn bounce_note(bot: &str, turn: i64, error: &str) -> String {
+    format!("[your message to {bot} was not carried out: turn {turn} ended {error}]")
 }
 
 /// Who asked for a task's turn, as its prompt records it: the bot whose turn
@@ -566,6 +597,7 @@ async fn serve(settings: Settings) -> Result<(), String> {
         saved: None,
         goals: goals::Goals::new(&settings.store, &settings.socket),
         fires: HashMap::new(),
+        senders: HashMap::new(),
         resume: marks(&settings.store).0,
         replayed: None,
         replay: marks(&settings.store).1,
@@ -696,6 +728,9 @@ struct Service {
     /// Turns triggers' fires sent, by agent and turn, each with its
     /// trigger's generation: one that fails is told (`trigger::tell_failed`).
     fires: HashMap<(String, i64), String>,
+    /// The agents whose messages started or joined each turn, by bot and
+    /// turn, for whom a turn that fails is a note (`bounced`).
+    senders: HashMap<(String, i64), Vec<Sender>>,
     /// Failed fires' turns whose note is under way, by agent and turn: held
     /// as a goal's check is, so a restart or a reconnect before the daemon
     /// takes the note replays the turn and tells it again, not never.
@@ -1095,6 +1130,14 @@ impl Service {
                         };
                         self.telling.insert(key, telling);
                     }
+                    // A message another agent sent that a failed turn
+                    // never carried out goes back to it, as a bounce.
+                    for (to, to_id, bot, turn, error) in self.bounced(&event, live) {
+                        let client = client.clone();
+                        tokio::spawn(async move {
+                            let _ = tell_bounced(&client, (&to, to_id), (&bot, turn), &error).await;
+                        });
+                    }
                     if let Some((bot, turn)) = self.goals.event(&event, bot_id, live, &client, &checked) {
                         for lookout in self.lookouts.values_mut() {
                             lookout.updates.goal_turn(&bot, turn);
@@ -1259,6 +1302,58 @@ impl Service {
                     .then(|| (generation, bot.to_owned(), turn, error.to_owned()))
             }
             _ => None,
+        }
+    }
+
+    /// Who to tell that a turn their message started or joined ended
+    /// failed or interrupted: each agent whose message it carried, other
+    /// than the bot itself and any whose lookout hears the bot already
+    /// (a lead hears its task's turn end). Told only of what happens
+    /// live; a turn whose start was never seen tells no one.
+    fn bounced(
+        &mut self,
+        event: &Value,
+        live: bool,
+    ) -> Vec<(String, Option<i64>, String, i64, String)> {
+        let (Some(bot), Some(turn)) = (event["bot"].as_str(), event["turn"].as_i64()) else {
+            return Vec::new();
+        };
+        let data = &event["data"];
+        match event["event"].as_str() {
+            // A steer's event comes on the turn it joins.
+            Some("accepted" | "queued" | "steered") => {
+                let Some(from) = data["from"]["bot"].as_str().filter(|from| *from != bot) else {
+                    return Vec::new();
+                };
+                // Bounded: turns whose end was never seen are let go.
+                if self.senders.len() >= FIRES {
+                    self.senders.clear();
+                }
+                let senders = self.senders.entry((bot.to_owned(), turn)).or_default();
+                if !senders.iter().any(|(known, _)| known == from) {
+                    senders.push((from.to_owned(), data["from"]["bot_id"].as_i64()));
+                }
+                Vec::new()
+            }
+            Some("turn_finished") => {
+                let Some(senders) = self.senders.remove(&(bot.to_owned(), turn)) else {
+                    return Vec::new();
+                };
+                let status = data["status"].as_str().unwrap_or("");
+                let error = data["error"].as_str().unwrap_or(status);
+                if !live
+                    || !matches!(status, "failed" | "interrupted")
+                    || error == "empty_completion"
+                {
+                    return Vec::new();
+                }
+                let hearing = self.watchers.get(bot);
+                (senders.into_iter())
+                    .filter(|(from, _)| !hearing.is_some_and(|names| names.contains(from)))
+                    .map(|(from, id)| (from, id, bot.to_owned(), turn, error.to_owned()))
+                    .collect()
+            }
+            _ => Vec::new(),
         }
     }
 
@@ -4107,6 +4202,71 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_message_a_failed_turn_never_carried_out_goes_back_to_its_sender() {
+        let mut service = service(PathBuf::from("/nonexistent"), &[]);
+        let from = |bot: &str| json!({"from": {"bot": bot, "turn": 1, "bot_id": 7}});
+        let failed = json!({"status": "failed", "error": "provider_http_400"});
+        // A message from another agent starts the turn; one more joins it.
+        assert!(
+            service
+                .bounced(&ev("docs", 4, "accepted", from("api.lead")), true)
+                .is_empty()
+        );
+        service.bounced(&ev("docs", 4, "steered", from("web.lead")), true);
+        service.bounced(&ev("docs", 4, "steered", from("api.lead")), true);
+        let told = service.bounced(&ev("docs", 4, "turn_finished", failed.clone()), true);
+        let to: Vec<(&str, Option<i64>, i64, &str)> = (told.iter())
+            .map(|(to, id, _, turn, error)| (to.as_str(), *id, *turn, error.as_str()))
+            .collect();
+        assert_eq!(
+            to,
+            [
+                ("api.lead", Some(7), 4, "provider_http_400"),
+                ("web.lead", Some(7), 4, "provider_http_400")
+            ]
+        );
+        assert!(
+            service
+                .bounced(&ev("docs", 4, "turn_finished", failed.clone()), true)
+                .is_empty()
+        );
+        // Not a completed turn, one that said nothing, the replay's, nor a
+        // message the bot sent itself.
+        for (turn, end, live, sender) in [
+            (5, json!({"status": "completed"}), true, "api.lead"),
+            (
+                6,
+                json!({"status": "failed", "error": "empty_completion"}),
+                true,
+                "api.lead",
+            ),
+            (7, failed.clone(), false, "api.lead"),
+            (8, failed.clone(), true, "docs"),
+        ] {
+            service.bounced(&ev("docs", turn, "queued", from(sender)), live);
+            assert!(
+                service
+                    .bounced(&ev("docs", turn, "turn_finished", end), live)
+                    .is_empty()
+            );
+        }
+        // Nor a lead whose lookout hears the bot: its task's end reaches it.
+        service
+            .watchers
+            .insert("docs".into(), vec!["api.lead".into()]);
+        service.bounced(&ev("docs", 9, "accepted", from("api.lead")), true);
+        assert!(
+            service
+                .bounced(&ev("docs", 9, "turn_finished", failed), true)
+                .is_empty()
+        );
+        assert_eq!(
+            bounce_note("docs", 4, "provider_http_400"),
+            "[your message to docs was not carried out: turn 4 ended provider_http_400]"
+        );
+    }
+
     fn service(store: PathBuf, records: &[Value]) -> Service {
         Service {
             runner: sources::Runner::new(store.join("sources"), tokio::sync::mpsc::channel(1).0),
@@ -4136,6 +4296,7 @@ mod tests {
             rewriting: HashSet::new(),
             goals: goals::Goals::new(Path::new("/nonexistent"), Path::new("")),
             fires: HashMap::new(),
+            senders: HashMap::new(),
         }
     }
 

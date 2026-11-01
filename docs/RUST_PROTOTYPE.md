@@ -575,7 +575,8 @@ the file) and writes the rotated pair back before using it. A file holding
 another token than the one in memory (a new sign-in, another daemon's
 refresh) is taken as it is. A 401 for the held token refreshes it once and
 retries without backoff (`provider_login_refreshed`); a 401 moments after a
-refresh ends the turn with `provider_login_rejected`, naming the file. A
+refresh holds the turn on `provider_login_rejected`, naming the file
+([held turns](#held-turns)). A
 refused refresh answers `provider_login_expired`, naming the file and
 `agent login chatgpt` (for `invalid_client`, to delete the file and register
 again); a 5xx or 429 from the token endpoint keeps the token
@@ -586,8 +587,8 @@ the route takes function tools only grouped or as `additional_tools`; a call
 comes back naming it and is replayed as it came. They carry no
 `max_output_tokens`, which it refuses,
 and its usage limit (`subscription_sharing_usage_limit_exceeded`, a 429 or a
-failed stream) ends the turn as `provider_quota_exhausted` rather than being
-paced and retried; a stream that fails with
+failed stream) holds the turn on `provider_quota_exhausted` rather than
+pacing and retrying it ([held turns](#held-turns)); a stream that fails with
 `subscription_sharing_usage_unavailable` or `_user_unavailable` is retried
 with backoff as `provider_plan_unavailable`. Not yet measured on a real plan: prompt-cache hit rates
 at this endpoint, `responses-ws`, and which request fields it accepts beyond
@@ -616,7 +617,8 @@ A rate limit the provider reports inside the stream (a Responses `error` or
 `provider_incomplete`, which remains a response the model could not finish; a
 rate limit refused at the HTTP layer stays `provider_http_429`. A complete
 HTTP 429 body with `error.code` or `error.type` equal to `insufficient_quota`
-becomes `provider_quota_exhausted`, without retrying or pausing the shared pool.
+becomes `provider_quota_exhausted`, without retrying or pausing the shared pool;
+the turn is held on it ([held turns](#held-turns)).
 Transport failures (`provider_connection_failed`, or `provider_connection_os_N`
 when an OS error code is known) carry the cause chain as detail: the URL and
 the HTTP, TLS, or socket layer that failed, never a header. The selected provider's credential is redacted from decoded messages (and its
@@ -1516,8 +1518,11 @@ the refused call's `name` and argument preview as `tool_started` would),
 `turn_waiting` and `turn_resumed` (a parked turn's handles, the call whose
 verdict it waits for, or with `load: true` the command the load gate holds, and its wake-up), `turn_paced` (a turn parked at its model-call boundary because its
 provider's pool is closed by a rate limit, with `resume_at_ms`, or because the
-pull cord stopped it, with `resume_at_ms` null and `paused: true`; it resumes
-through `turn_resumed` like a parked wait), `steered` (a steer's item joining
+pull cord stopped it, with `resume_at_ms` null and `paused: true`, or because
+a cause a person can fix holds it, with `blocked`; it resumes
+through `turn_resumed` like a parked wait), `turn_held` (a ready turn whose
+start was refused for such a cause, held in line: see
+[held turns](#held-turns)), `steered` (a steer's item joining
 the running turn: `steer` names the steer's turn, `node` its item, `from`
 or `origin` its sender as on `accepted`, and `attached: true` when it was sent
 with `delivery: "attach"`), and
@@ -2105,6 +2110,49 @@ the cached prefix, it rewrites the message cache once. A model that calls a
 tool anyway has those calls run, as any committed plan's, and the turn then
 fails `tool_round_limit`.
 Unbilled failures remain bounded by the attempt and time limits above.
+
+### Held turns
+
+Protocol 47: a failure a person can fix holds the turn instead of ending
+it, as email holds mail for a host that is down and a workflow engine
+retries an activity until it is fixed, since the person who would see the
+error is often not the one who sent the message. Held on its call: a login
+refused or expired (`provider_login_rejected`, `provider_login_expired`,
+`provider_login_unavailable`), a key or account the provider refuses
+(`provider_http_401`, `provider_http_403`), a provider quota spent
+(`provider_quota_exhausted`), or a transient failure still failing past the
+attempt and time limits above (an outage). Held in line: a turn whose start
+is refused because the config lacks its provider (`provider_unavailable`) or
+it has no folder (`workspace_required`). Everything else stays final: a
+client error, a response the model could not finish, a refusal, the bot's
+and the turn's own token caps (`budget_exhausted`, `turn_budget_exhausted`,
+limits whoever made the bot or sent the message chose; the bot's is a
+lifetime cap no request raises), a round limit, an interrupt.
+
+A turn held on its call parks as a closed pool parks it, at its model-call
+boundary: status `paced`, and `turn_paced` carries `blocked`, `{code, detail?,
+since_ms}`, beside `resume_at_ms`, as the turn view's `waiting_on` does.
+Nothing in its history changes and nothing is resent: the message that
+started it is in its history already. A turn held in line keeps status
+`ready` and its place, so no later message of its bot overtakes it; it is
+told by a `turn_held` event, `{blocked, resume_at_ms}`, and its turn view's
+`waiting_on` says the same (schema 78 keeps the cause on the row, `held`, and
+the next try in `due_ms`). Either is tried again after as long as the hold
+has lasted, from a minute up to an hour, so each wait about doubles the last,
+with a fresh retry budget; `since_ms` is when the run of holds began, kept
+until a call is answered. Time held on a call counts in `paced_ms`.
+
+`{"op":"held"}` lists every held turn, oldest first: `{held: [{bot, bot_id,
+turn, handle, started, blocked, resume_at_ms}]}`, `started` for one held on
+its call. `{"op":"retry_held","bot":NAME?}` tries every held turn again now,
+or only `bot`'s, and answers `{retried: N}`; a sandboxed bot's own socket
+refuses it with `not_permitted`, since what held the turn is the person's to
+fix. The daemon tries every held turn at once when it starts, since a
+restart may follow a fix to the config or a key, and `agent login chatgpt`
+asks the running daemon to once it has saved the new sign-in. A held turn
+ends only when someone interrupts it. Before protocol 47 these failures
+ended the turn `failed`, and a refused start never reached the bot's
+history.
 
 The transport keeps 64 streams per HTTP/2 connection rather than the 100 the
 providers allow, so a connection the provider's edge resets takes fewer turns

@@ -844,6 +844,30 @@ pub struct Absorbed {
     /// A pass that left attached messages out found some waiting.
     pub attached_left: bool,
 }
+/// What holds a turn that a person can set right: a sign-in, a quota, a
+/// budget, a provider or folder the config lacks, or a provider that
+/// stayed down past its retries. The turn waits on it, tried again on a
+/// backoff and at once when told the cause may be fixed, rather than
+/// ending; `since_ms` is when this run of holds began.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct Blocked {
+    pub code: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    pub since_ms: u64,
+}
+impl Blocked {
+    /// The wait before the next try: as long as the hold has lasted, from
+    /// a minute up to an hour, so each try about doubles the last wait.
+    pub fn wait_ms(&self, now_ms: u64) -> u64 {
+        now_ms
+            .saturating_sub(self.since_ms)
+            .clamp(HOLD_FIRST_MS, HOLD_LAST_MS)
+    }
+}
+/// The first and the longest wait between tries of a held turn.
+pub const HOLD_FIRST_MS: u64 = 60_000;
+pub const HOLD_LAST_MS: u64 = 3_600_000;
 /// A turn parked on handles; it holds no task or memory until they resolve.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub struct Waiting {
@@ -893,6 +917,10 @@ pub struct Waiting {
     /// as pacing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub halt: Option<Halt>,
+    /// Parked on a cause a person can fix (`Blocked`), not a closed pool:
+    /// the call is tried again at `deadline_ms`, with a fresh retry budget.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked: Option<Blocked>,
     /// The wait is a terminal poll, an empty `write_stdin` past its hold:
     /// `handles` names the terminal, and its result is the terminal's
     /// output when it ends or its yield runs out.
@@ -1612,9 +1640,10 @@ const TURN_VIEW: &str = "t.id,t.bot,b.id,t.request_id,t.status,t.input_tokens,
     t.finished_ms,json_extract(t.waiting,'$.call_id'),json_extract(t.waiting,'$.approval'),
     json_extract(t.waiting,'$.handles'),json_extract(t.waiting,'$.any'),
     json_extract(t.waiting,'$.deadline_ms'),json_extract(t.waiting,'$.answer'),
-    json_extract(t.waiting,'$.halt'),json_extract(t.waiting,'$.load')";
+    json_extract(t.waiting,'$.halt'),json_extract(t.waiting,'$.load'),
+    json_extract(t.waiting,'$.blocked'),t.held,t.due_ms";
 /// Columns `TURN_VIEW` takes, for queries that select more after it.
-const TURN_VIEW_COLUMNS: usize = 21;
+const TURN_VIEW_COLUMNS: usize = 24;
 
 /// The turn view's own fields beside a turn's identity and status: who asked,
 /// what it waits on, its usage and timing. A model's `wait` leaves them out.
@@ -1663,7 +1692,16 @@ fn turn_view(r: &rusqlite::Row) -> rusqlite::Result<Value> {
         "paced" => match r.get::<_, Option<String>>(19)?.as_deref() {
             Some("pause") => json!({"resume_at_ms":null,"paused":true}),
             Some("shutdown") => json!({"resume_at_ms":null,"stopped":true}),
-            _ => json!({"resume_at_ms":deadline_ms}),
+            _ => match blocked(r.get(21)?) {
+                Some(blocked) => json!({"resume_at_ms":deadline_ms,"blocked":blocked}),
+                None => json!({"resume_at_ms":deadline_ms}),
+            },
+        },
+        // Refused at its start for a cause a person can fix: it keeps its
+        // place in line and is tried again then.
+        "ready" => match blocked(r.get(22)?) {
+            Some(blocked) => json!({"resume_at_ms":r.get::<_, Option<i64>>(23)?,"blocked":blocked}),
+            None => Value::Null,
         },
         _ => Value::Null,
     };
@@ -1674,6 +1712,11 @@ fn turn_view(r: &rusqlite::Row) -> rusqlite::Result<Value> {
         "output_tokens":r.get::<_, i64>(7)?,"model_rounds":r.get::<_, i64>(8)?,
         "retries":r.get::<_, i64>(9)?,"paced_ms":r.get::<_, i64>(10)?,
         "started_ms":r.get::<_, Option<i64>>(11)?,"finished_ms":r.get::<_, Option<i64>>(12)?}))
+}
+
+/// A hold's cause as stored, for a client to read.
+fn blocked(stored: Option<String>) -> Option<Value> {
+    stored.and_then(|b| serde_json::from_str::<Value>(&b).ok())
 }
 
 /// The most buckets a `usage` series splits its window into.
@@ -1850,7 +1893,7 @@ impl Database {
     /// Stored schema version, kept in `PRAGMA user_version`. Stores created
     /// before versioning and stores from newer binaries are rejected; an older
     /// versioned store is migrated forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 76;
+    pub const SCHEMA: i32 = 78;
     /// Verbatim user prompts a compaction keeps: per-prompt text, and the
     /// total text plus `(ordinal, String)` entry metadata. Empty entries cost
     /// space too, so the retained list cannot grow with conversation length.
@@ -2032,7 +2075,7 @@ impl Database {
                 cached_input_tokens INTEGER NOT NULL DEFAULT 0,
                 from_bot TEXT, from_turn INTEGER, from_id INTEGER, origin TEXT, reasoning TEXT, inherited_reasoning TEXT,
                 bot_model TEXT, bot_reasoning TEXT, images TEXT, person TEXT, quotes TEXT, reply_node INTEGER,
-                wait_ms INTEGER, due_ms INTEGER,
+                wait_ms INTEGER, due_ms INTEGER, held TEXT,
                 UNIQUE(bot,request_id));
             CREATE INDEX IF NOT EXISTS turns_bot_id ON turns(bot,id);
             CREATE INDEX IF NOT EXISTS turns_started ON turns(bot,id) WHERE started_ms IS NOT NULL;
@@ -2090,6 +2133,7 @@ impl Database {
             CREATE INDEX IF NOT EXISTS turns_steers ON turns(bot,id) WHERE status='queued' AND delivery='steer';
             CREATE INDEX IF NOT EXISTS turns_attached ON turns(bot,id) WHERE status='attached';
             CREATE INDEX IF NOT EXISTS turns_due ON turns(due_ms) WHERE status='attached' AND due_ms IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS turns_held ON turns(due_ms) WHERE status='ready' AND held IS NOT NULL;
             CREATE INDEX IF NOT EXISTS turns_ready ON turns(id) WHERE status='ready';
             CREATE INDEX IF NOT EXISTS turns_ready_bot ON turns(bot) WHERE status='ready';
             CREATE INDEX IF NOT EXISTS processes_running ON processes(turn) WHERE status='running';
@@ -6047,13 +6091,120 @@ impl Database {
             .prepare_cached("SELECT EXISTS(SELECT 1 FROM turns WHERE bot=? AND status='ready')")?
             .query_row([name], |r| r.get(0))?)
     }
-    /// The oldest turn waiting only for an active slot.
+    /// The oldest turn waiting only for an active slot: one held on a
+    /// cause (`hold`) once its next try is due.
     pub fn next_ready(&self) -> Result<Option<(String, i64)>> {
         Ok(self
             .conn
-            .prepare_cached("SELECT bot,id FROM turns WHERE status='ready' ORDER BY id LIMIT 1")?
-            .query_row([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .prepare_cached(
+                "SELECT bot,id FROM turns WHERE status='ready' AND (held IS NULL OR due_ms<=?)
+                 ORDER BY id LIMIT 1",
+            )?
+            .query_row([epoch_ms()], |r| Ok((r.get(0)?, r.get(1)?)))
             .optional()?)
+    }
+    /// Hold a ready turn its start refused for a cause a person can fix,
+    /// rather than end it: it keeps its place in the bot's line, so no
+    /// later message overtakes it, and is tried again after the hold's
+    /// wait, or at once when `retry_held` says the cause may be fixed.
+    /// Returns its `turn_held` event and when the next held turn is due.
+    pub fn hold(&mut self, turn: i64, error: &Error) -> Result<(Vec<Value>, Option<i64>)> {
+        let (name, status, held): (String, String, Option<String>) = self
+            .conn
+            .query_row(
+                "SELECT bot,status,held FROM turns WHERE id=?",
+                [turn],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?
+            .ok_or(Error::new("turn_not_found"))?;
+        if status != "ready" {
+            return fail("stale_turn");
+        }
+        let now = epoch_ms() as u64;
+        // A run of holds keeps when it began, whatever its cause now.
+        let since = (held.as_deref())
+            .and_then(|held| serde_json::from_str::<Blocked>(held).ok())
+            .map_or(now, |held| held.since_ms);
+        let blocked = Blocked {
+            code: error.code.clone(),
+            detail: error.detail.clone(),
+            since_ms: since,
+        };
+        let due = now + blocked.wait_ms(now);
+        let tx = self.conn.savepoint()?;
+        tx.execute(
+            "UPDATE turns SET held=?2,due_ms=?3 WHERE id=?1",
+            params![turn, serde_json::to_string(&blocked)?, due as i64],
+        )?;
+        let data = json!({"blocked":blocked,"resume_at_ms":due});
+        let cursor = event(&tx, &name, Some(turn), "turn_held", data.clone())?;
+        let next = next_held(&tx, now as i64)?;
+        tx.commit()?;
+        Ok((
+            vec![entry(cursor, &name, Some(turn), "turn_held", data)],
+            next,
+        ))
+    }
+    /// When the first turn held in line is next tried, after `after`: one
+    /// due already is the dispatcher's.
+    pub fn next_held_due(&self, after: i64) -> Result<Option<i64>> {
+        next_held(&self.conn, after)
+    }
+    /// Every held turn, oldest first: those a start refused, waiting in
+    /// line, and those parked on a call, each with its cause and next try.
+    pub fn held(&self) -> Result<Vec<Value>> {
+        let mut held = Vec::new();
+        let mut statement = self.conn.prepare_cached(
+            "SELECT t.id,t.bot,b.id,t.held,t.due_ms,0 FROM turns t JOIN bots b ON b.name=t.bot
+             WHERE t.status='ready' AND t.held IS NOT NULL
+             UNION ALL
+             SELECT t.id,t.bot,b.id,json_extract(t.waiting,'$.blocked'),
+                json_extract(t.waiting,'$.deadline_ms'),1
+             FROM turns t JOIN bots b ON b.name=t.bot
+             WHERE t.status='paced' AND json_extract(t.waiting,'$.blocked') IS NOT NULL
+             ORDER BY 1",
+        )?;
+        let mut rows = statement.query([])?;
+        while let Some(r) = rows.next()? {
+            let Some(blocked) = blocked(r.get(3)?) else {
+                continue;
+            };
+            let (turn, bot): (i64, String) = (r.get(0)?, r.get(1)?);
+            held.push(json!({"bot":bot,"bot_id":r.get::<_, i64>(2)?,"turn":turn,
+                "handle":format!("turn:{bot}/{turn}"),"started":r.get::<_, i64>(5)? == 1,
+                "blocked":blocked,"resume_at_ms":r.get::<_, Option<i64>>(4)?}));
+        }
+        Ok(held)
+    }
+    /// Make every held turn's next try due now, or only `bot`'s: the
+    /// person may have fixed the cause. Returns the held turns parked on a
+    /// call, for the caller to wake, and how many waiting in line are due.
+    pub fn retry_held(&mut self, bot: Option<&str>) -> Result<(Vec<(String, i64)>, usize)> {
+        let now = epoch_ms();
+        let lined = match bot {
+            Some(bot) => self.conn.execute(
+                "UPDATE turns SET due_ms=?1 WHERE status='ready' AND held IS NOT NULL AND bot=?2",
+                params![now, bot],
+            )?,
+            None => self.conn.execute(
+                "UPDATE turns SET due_ms=?1 WHERE status='ready' AND held IS NOT NULL",
+                [now],
+            )?,
+        };
+        let mut parked = Vec::new();
+        let mut statement = self.conn.prepare_cached(
+            "SELECT bot,id FROM turns WHERE status='paced'
+                AND json_extract(waiting,'$.blocked') IS NOT NULL ORDER BY id",
+        )?;
+        let mut rows = statement.query([])?;
+        while let Some(r) = rows.next()? {
+            let (name, turn): (String, i64) = (r.get(0)?, r.get(1)?);
+            if bot.is_none_or(|bot| bot == name) {
+                parked.push((name, turn));
+            }
+        }
+        Ok((parked, lined))
     }
     /// A turn's own status, for a caller that names the bot.
     pub fn turn_status(&self, name: &str, turn: i64) -> Result<String> {
@@ -6998,6 +7149,7 @@ impl Database {
             summary_retry_ms,
             fallback: None,
             halt: None,
+            blocked: None,
             poll: false,
             load: false,
             rulings: BTreeMap::new(),
@@ -7060,6 +7212,7 @@ impl Database {
             summary_retry_ms,
             fallback: None,
             halt: None,
+            blocked: None,
             poll: false,
             load: true,
             rulings: BTreeMap::new(),
@@ -7215,6 +7368,7 @@ impl Database {
             summary_retry_ms,
             fallback: None,
             halt: None,
+            blocked: None,
             poll: false,
             load: false,
             rulings: BTreeMap::new(),
@@ -8934,6 +9088,7 @@ impl Database {
             summary_retry_ms,
             fallback: None,
             halt: None,
+            blocked: None,
             poll,
             load: false,
             rulings: BTreeMap::new(),
@@ -8970,10 +9125,15 @@ impl Database {
         route: Option<&str>,
         summary_retry_ms: Option<u64>,
         fallback: Option<ParkedFallback>,
+        blocked: Option<Blocked>,
     ) -> Result<Value> {
         let bot = self.active(turn)?;
         if bot.status != "running" {
             return fail("invalid_tool_state");
+        }
+        let mut data = json!({"resume_at_ms":resume_at_ms});
+        if let Some(blocked) = &blocked {
+            data["blocked"] = json!(blocked);
         }
         let waiting = Waiting {
             turn,
@@ -8994,6 +9154,7 @@ impl Database {
             summary_retry_ms,
             fallback,
             halt: None,
+            blocked,
             poll: false,
             load: false,
             rulings: BTreeMap::new(),
@@ -9012,7 +9173,6 @@ impl Database {
             ],
         )?;
         tx.execute("UPDATE bots SET status='paced' WHERE name=?", [&bot.name])?;
-        let data = json!({"resume_at_ms":resume_at_ms});
         let cursor = event(&tx, &bot.name, Some(turn), "turn_paced", data.clone())?;
         tx.commit()?;
         self.forget_live(turn);
@@ -9084,6 +9244,7 @@ impl Database {
             summary_retry_ms: None,
             fallback: None,
             halt: Some(stop),
+            blocked: None,
             poll: false,
             load: false,
             rulings: BTreeMap::new(),
@@ -11804,6 +11965,14 @@ fn keep_sender(tx: &Connection, turn: i64, node: i64, data: &mut Value) -> Resul
 /// what the submitting client called itself, or the person the client
 /// says wrote it; and the turns it quotes, each with who wrote it and,
 /// once the prompt is an item, where in the item its words are.
+/// When the first turn held in line is next tried, after `after`.
+fn next_held(conn: &Connection, after: i64) -> Result<Option<i64>> {
+    Ok(conn
+        .prepare_cached(
+            "SELECT MIN(due_ms) FROM turns WHERE status='ready' AND held IS NOT NULL AND due_ms>?",
+        )?
+        .query_row([after], |r| r.get(0))?)
+}
 fn sender_fields(
     data: &mut Value,
     from: Option<(&str, i64)>,
@@ -12005,12 +12174,12 @@ fn start_locked(
     keep_sender(tx, turn, head, data)?;
     if prompt.len() >= PROMPT_SHARE_BYTES {
         tx.execute(
-            "UPDATE turns SET status='running',started_ms=?,prompt='',prompt_node=? WHERE id=?",
+            "UPDATE turns SET status='running',started_ms=?,held=NULL,prompt='',prompt_node=? WHERE id=?",
             params![epoch_ms(), head, turn],
         )?;
     } else {
         tx.execute(
-            "UPDATE turns SET status='running',started_ms=? WHERE id=?",
+            "UPDATE turns SET status='running',started_ms=?,held=NULL WHERE id=?",
             params![epoch_ms(), turn],
         )?;
     }
@@ -13147,6 +13316,18 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
             "ALTER TABLE turns ADD COLUMN wait_ms INTEGER;
              ALTER TABLE turns ADD COLUMN due_ms INTEGER;",
         )?;
+    }
+    // Schema 78: a turn refused at its start for a cause a person can fix
+    // keeps its place in line, held on that cause.
+    if from < 78
+        && conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='turns')
+             AND NOT EXISTS(SELECT 1 FROM pragma_table_info('turns') WHERE name='held')",
+            [],
+            |r| r.get::<_, bool>(0),
+        )?
+    {
+        conn.execute("ALTER TABLE turns ADD COLUMN held TEXT", [])?;
     }
     Ok(())
 }

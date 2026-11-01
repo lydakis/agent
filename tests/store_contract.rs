@@ -3,9 +3,9 @@ use agent_runtime::{
     codec::Family,
     provider::{ToolCall, Usage},
     store::{
-        Answered, Binding, Bot, CacheTtl, CompactionPlan, ContextUsage, Database, Decision,
-        Delivery, Fork, Gate, Gated, Halt, Halted, Planning, QuoteRef, Settings, Strip, TurnBudget,
-        TurnOptions, Wake,
+        Answered, Binding, Blocked, Bot, CacheTtl, CompactionPlan, ContextUsage, Database,
+        Decision, Delivery, Fork, Gate, Gated, Halt, Halted, Planning, QuoteRef, Settings, Strip,
+        TurnBudget, TurnOptions, Wake,
     },
     tools::{Declared, Inherit, Outcome},
 };
@@ -2969,7 +2969,8 @@ fn schema_75_keeps_waiting_notes_waiting_with_no_limit() {
     Connection::open(&path)
         .unwrap()
         .execute_batch(
-            "DROP INDEX turns_due; ALTER TABLE turns DROP COLUMN due_ms;
+            "DROP INDEX turns_due; DROP INDEX turns_held; ALTER TABLE turns DROP COLUMN held;
+             ALTER TABLE turns DROP COLUMN due_ms;
              ALTER TABLE turns DROP COLUMN wait_ms; PRAGMA user_version=75;",
         )
         .unwrap();
@@ -2987,6 +2988,194 @@ fn schema_75_keeps_waiting_notes_waiting_with_no_limit() {
     db.begin("Bob", "n2", "fyi", true, &capped, allow_provider)
         .unwrap();
     assert!(db.next_due().unwrap().is_some());
+    drop(db);
+    std::fs::remove_file(path).unwrap();
+}
+
+/// A message that waits for room rather than being refused.
+fn queue() -> TurnOptions {
+    TurnOptions {
+        delivery: Delivery::Queue,
+        ..TurnOptions::default()
+    }
+}
+
+#[test]
+fn a_turn_its_start_refused_for_a_fixable_cause_keeps_its_place_in_line() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let first = db
+        .begin("Bob", "r1", "first", false, &queue(), allow_provider)
+        .unwrap();
+    assert_eq!(db.next_ready().unwrap(), Some(("Bob".into(), first.turn)));
+    let refused = Error::with("provider_unavailable", "openai");
+    let (events, next) = db.hold(first.turn, &refused).unwrap();
+    assert_eq!(events[0]["event"], "turn_held");
+    assert_eq!(events[0]["data"]["blocked"]["code"], "provider_unavailable");
+    let due = events[0]["data"]["resume_at_ms"].as_i64().unwrap();
+    assert_eq!(next, Some(due));
+    // Not tried again before its time, and nothing overtakes it.
+    assert_eq!(db.next_ready().unwrap(), None);
+    let second = db
+        .begin("Bob", "r2", "second", false, &queue(), allow_provider)
+        .unwrap();
+    assert_eq!(second.status, "queued");
+    assert_eq!(db.next_ready().unwrap(), None);
+    let view = db.turn_view("Bob", first.turn).unwrap();
+    assert_eq!(view["status"], "ready");
+    assert_eq!(
+        view["waiting_on"]["blocked"]["code"],
+        "provider_unavailable"
+    );
+    assert_eq!(view["waiting_on"]["resume_at_ms"], due);
+    let held = db.held().unwrap();
+    assert_eq!(held.len(), 1);
+    assert_eq!(held[0]["turn"], first.turn);
+    assert_eq!(held[0]["started"], false);
+    // Fixed: tried again now, it starts, and is held no longer.
+    assert_eq!(db.retry_held(Some("Alice")).unwrap(), (vec![], 0));
+    assert_eq!(db.retry_held(Some("Bob")).unwrap(), (vec![], 1));
+    assert_eq!(db.next_ready().unwrap(), Some(("Bob".into(), first.turn)));
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    assert!(
+        db.next_held_due(0)
+            .unwrap()
+            .is_some_and(|due| due <= now + 1_000)
+    );
+    assert_eq!(
+        db.next_held_due(now + 1_000).unwrap(),
+        None,
+        "due now is the dispatcher's"
+    );
+    db.start(first.turn, allow_provider).unwrap();
+    assert!(db.held().unwrap().is_empty());
+    assert_eq!(
+        db.turn_view("Bob", first.turn).unwrap()["waiting_on"],
+        Value::Null
+    );
+}
+
+#[test]
+fn a_run_of_holds_keeps_when_it_began_and_waits_longer_each_try() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let turn = db
+        .begin("Bob", "r1", "go", false, &queue(), allow_provider)
+        .unwrap()
+        .turn;
+    let (first, _) = db.hold(turn, &Error::new("workspace_required")).unwrap();
+    let since = first[0]["data"]["blocked"]["since_ms"].as_u64().unwrap();
+    db.retry_held(None).unwrap();
+    let (again, _) = db.hold(turn, &Error::new("provider_unavailable")).unwrap();
+    let blocked = &again[0]["data"]["blocked"];
+    assert_eq!(
+        blocked["since_ms"].as_u64(),
+        Some(since),
+        "one run of holds"
+    );
+    assert_eq!(
+        blocked["code"], "provider_unavailable",
+        "named by its cause now"
+    );
+    // The wait is as long as the hold has lasted, from a minute to an hour.
+    let held = |since_ms| Blocked {
+        code: "provider_unavailable".into(),
+        detail: None,
+        since_ms,
+    };
+    assert_eq!(held(1_000).wait_ms(1_000), 60_000);
+    assert_eq!(held(0).wait_ms(600_000), 600_000);
+    assert_eq!(held(0).wait_ms(86_400_000), 3_600_000);
+    // A turn no longer ready is not held.
+    db.end_queued(turn, &Error::new("cancelled")).unwrap();
+    assert_eq!(
+        db.hold(turn, &Error::new("provider_unavailable"))
+            .unwrap_err()
+            .code,
+        "stale_turn"
+    );
+    assert!(db.held().unwrap().is_empty());
+}
+
+#[test]
+fn a_turn_held_on_its_call_says_so_and_is_woken_to_try_again() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let turn = db
+        .begin(
+            "Bob",
+            "r1",
+            "go",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let blocked = Blocked {
+        code: "provider_login_rejected".into(),
+        detail: Some("HTTP 401".into()),
+        since_ms: 5,
+    };
+    let entry = db
+        .suspend_paced(
+            turn,
+            99,
+            0,
+            0,
+            0,
+            0,
+            0,
+            false,
+            None,
+            None,
+            None,
+            None,
+            Some(blocked),
+        )
+        .unwrap();
+    assert_eq!(entry["event"], "turn_paced");
+    assert_eq!(entry["data"]["blocked"]["code"], "provider_login_rejected");
+    assert_eq!(entry["data"]["resume_at_ms"], 99);
+    let view = db.turn_view("Bob", turn).unwrap();
+    assert_eq!(view["status"], "paced");
+    assert_eq!(view["waiting_on"]["blocked"]["detail"], "HTTP 401");
+    let held = db.held().unwrap();
+    assert_eq!(held.len(), 1);
+    assert_eq!(held[0]["started"], true);
+    assert_eq!(held[0]["resume_at_ms"], 99);
+    assert_eq!(
+        db.retry_held(None).unwrap(),
+        (vec![("Bob".to_owned(), turn)], 0)
+    );
+    let waiting = db.waiting_turns().unwrap();
+    assert_eq!(waiting[0].blocked.as_ref().map(|b| b.since_ms), Some(5));
+}
+
+#[test]
+fn schema_77_holds_a_refused_start_in_line() {
+    let path =
+        std::env::temp_dir().join(format!("agent-schema77-held-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    {
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        db.create("Bob", Some("/synthetic"), binding()).unwrap();
+        db.begin("Bob", "r1", "go", false, &queue(), allow_provider)
+            .unwrap();
+    }
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            "DROP INDEX turns_held; ALTER TABLE turns DROP COLUMN held; PRAGMA user_version=77;",
+        )
+        .unwrap();
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    let (_, turn) = db.next_ready().unwrap().unwrap();
+    db.hold(turn, &Error::new("provider_unavailable")).unwrap();
+    assert_eq!(db.held().unwrap().len(), 1);
     drop(db);
     std::fs::remove_file(path).unwrap();
 }

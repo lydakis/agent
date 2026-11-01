@@ -3342,7 +3342,7 @@ async fn missed(client: &Client, trigger: &Trigger, (bot, id): (&str, i64), outc
 
 /// How long a trigger's note waits for a call before it goes as a steer:
 /// the person's `attach_wait`, a day unless config.toml says otherwise.
-fn attach_wait() -> Option<u64> {
+pub fn attach_wait() -> Option<u64> {
     agent_client::config::load()
         .unwrap_or_default()
         .attach_wait()

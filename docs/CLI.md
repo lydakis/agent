@@ -1,7 +1,7 @@
 # CLI contract
 
 Agent uses flat verbs: `run`, `follow`, `fork`, `interrupt`, `wait`, `ls`,
-`inspect`, `turns`, `usage`, `rm`, `prune`, `approvals`, `answer`, `models`, `companion`, `start`, `stats`,
+`inspect`, `turns`, `usage`, `rm`, `prune`, `approvals`, `answer`, `held`, `retry`, `models`, `companion`, `start`, `stats`,
 `shutdown`, and `serve`. All named
 bots use the same commands. There is no parent/child command hierarchy.
 
@@ -79,6 +79,15 @@ instead of from a cursor; it conflicts with `--after`.
 row plus its instructions, settings and compaction. It changes nothing, so it
 is safe to repeat; with `--bot-id N`, a bot that no longer holds that
 identity is `bot_not_found`.
+`held` lists the [held turns](RUST_PROTOTYPE.md#held-turns): turns a cause
+a person can fix (a sign-in, a usage limit, a refused key, a provider that is
+not set up or not answering) holds instead of failing, each with its bot, its
+cause as `blocked` (`code`, `detail`, `since_ms`), and when it next tries on
+its own as `resume_at_ms`, waiting longer each try up to an hour. `retry`
+tries every held turn again now, or one bot's with `--bot NAME`, and prints
+`{"retried": N}`; once the cause is fixed, that is the way not to wait.
+`login chatgpt` does it on its own once it signs in, and a daemon that starts
+tries its held turns at once.
 
 ## Arguments and flags
 

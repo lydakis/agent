@@ -201,6 +201,22 @@ const COMMANDS: &[Command] = &[
         startup: true,
     },
     Command {
+        name: "held",
+        about: "Turns held on a cause you can fix (a sign-in, a key, a quota, the config): each with its cause and next try",
+        usage: "held",
+        flags: "--pretty --no-spawn",
+        settings: "",
+        startup: true,
+    },
+    Command {
+        name: "retry",
+        about: "Try held turns again now, every bot's or one's, once what held them is fixed",
+        usage: "retry [--bot NAME]",
+        flags: "--bot --pretty",
+        settings: "",
+        startup: false,
+    },
+    Command {
         name: "sandbox",
         about: "Run a command in a sandbox: read-only, or writing only the folders named",
         usage: "sandbox [--writable PATH]... -- COMMAND [ARGS...]",
