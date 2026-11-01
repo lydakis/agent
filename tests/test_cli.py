@@ -842,7 +842,7 @@ class SocketAndCliTests(ModelFixture):
             sock.connect(str(self.socket))
             ready = json.loads(sock.makefile('r').readline())
         self.assertTrue({'processes', 'active', 'connecting', 'connections', 'idle_exit_seconds'} <= set(ready['limits']))
-        self.assertEqual(ready['limits']['stall_timeout_seconds'], 120)
+        self.assertEqual(ready['limits']['stall_timeout_seconds'], 600)
         # How a bot calls its model is its own setting, not the daemon's.
         self.assertFalse({'output_tokens', 'keep_warm_seconds', 'cache_ttl'} & set(ready['limits']))
         self.assertEqual(ready['limits']['connections'], -(-ready['limits']['active'] // 64))
