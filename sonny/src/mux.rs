@@ -452,16 +452,19 @@ impl Marker {
             return;
         }
         self.last = Some(Instant::now());
-        let place = match self.follows {
-            false => self.place.clone(),
-            true => match windows(&self.file)
-                .into_iter()
-                .find(|window| window.place.is_some() && alive(window.pid))
-            {
-                Some(window) => window.place,
-                None => return,
-            },
-        };
+        // An agent's window opened in a multiplexer was opened in the home
+        // of the window used last that is in one: that home is its own
+        // from then on, wherever the person goes after.
+        if self.follows {
+            let opened_in = (windows(&self.file).into_iter())
+                .find(|window| window.place.is_some() && alive(window.pid));
+            let Some(window) = opened_in else {
+                return;
+            };
+            self.place = window.place;
+            self.follows = false;
+        }
+        let place = self.place.clone();
         let me = Window {
             pid: std::process::id(),
             used_ms: now_ms(),
@@ -471,10 +474,18 @@ impl Marker {
     }
 }
 
-/// Whether this window is the project's the person used last, or no
-/// window is known: only then does its lead's new work open in its home.
-pub fn mine(socket: &Path, project: &str) -> bool {
-    latest(socket, project).is_none_or(|(window, open)| !open || window.pid == std::process::id())
+/// Whether the project's window the person used last is in `home`, the
+/// home of this lead's window (that window, or an agent's in the same
+/// home), or no open window is known: only then does the lead's new work
+/// open there.
+pub fn mine(socket: &Path, project: &str, home: &Place) -> bool {
+    Place::file(socket, project).is_none_or(|file| mine_in(&file, std::process::id(), home, alive))
+}
+
+fn mine_in(file: &Path, me: u32, home: &Place, alive: impl Fn(u32) -> bool) -> bool {
+    latest_in(file, alive).is_none_or(|(window, open)| {
+        !open || window.pid == me || window.place.as_ref() == Some(home)
+    })
 }
 
 pub struct Layout {
@@ -1417,6 +1428,68 @@ mod tests {
         };
         mark_in(&file, third.clone(), |pid| pid == 3);
         assert_eq!(windows(&file), [third, again]);
+        let _ = std::fs::remove_file(&file);
+    }
+
+    /// A task's window, opened in the lead's home, takes that home as its
+    /// own when it starts and keeps it: used, it leaves the lead's new
+    /// tasks opening there, and never moves to a home typed in since.
+    #[test]
+    fn an_agents_window_keeps_the_home_it_opened_in() {
+        let file = std::env::temp_dir().join(format!("sonny-agent-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&file);
+        let me = std::process::id();
+        let gone = {
+            let mut child = Command::new("true").spawn().unwrap();
+            let pid = child.id();
+            child.wait().unwrap();
+            pid
+        };
+        let home = Place::Rex {
+            session: "s1".into(),
+            host: None,
+        };
+        let other = Place::Herdr {
+            workspace: "w2".into(),
+        };
+        // The lead's window in Rex, open; this test's process stands in
+        // for the task's window.
+        let lead = Window {
+            pid: gone,
+            used_ms: now_ms() - 10,
+            place: Some(home.clone()),
+        };
+        mark_in(&file, lead, |_| true);
+        let mut task = Marker {
+            file: file.clone(),
+            place: None,
+            follows: true,
+            last: None,
+        };
+        // Read while the lead's window counts as open.
+        let opened_in = windows(&file)[0].place.clone();
+        task.place = opened_in;
+        task.follows = false;
+        task.used();
+        assert_eq!(windows(&file)[0].place, Some(home.clone()));
+        // The task's window used last, in the lead's home: the lead still
+        // opens its tasks there; a lead elsewhere does not.
+        assert!(mine_in(&file, gone, &home, |pid| pid == me));
+        assert!(!mine_in(&file, 2, &other, |pid| pid == me));
+        // A window in another home used since: the task keeps its own.
+        mark_in(
+            &file,
+            Window {
+                pid: 1,
+                used_ms: now_ms() + 1000,
+                place: Some(other.clone()),
+            },
+            |_| true,
+        );
+        task.last = None;
+        task.used();
+        let own = windows(&file).into_iter().find(|window| window.pid == me);
+        assert_eq!(own.and_then(|window| window.place), Some(home));
         let _ = std::fs::remove_file(&file);
     }
 

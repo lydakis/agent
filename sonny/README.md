@@ -309,7 +309,8 @@ when the person last used it (a key, a click, a paste, or the window coming
 to the front). An agent's `run_in_pane` and `show_agent` calls go where the
 open window used last is, that Herdr or cmux workspace or Rex session,
 rather than one guessed from where the tool host answering them runs, which
-is in neither; and only that window opens tabs for the lead's new tasks.
+is in neither; and only a lead's window in that same home opens tabs for
+its new tasks. A task's window keeps the home it opened in.
 This is tmux's rule for a command that names no client: the one used most
 recently. So with one Sonny in Rex and another in a bare terminal, what the
 agents open follows the one being typed in, and while that is the bare

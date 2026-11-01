@@ -2877,10 +2877,12 @@ impl Fleet {
         );
         let told = self.tell.clone();
         let (socket, project) = (self.socket.clone(), self.project.clone());
+        let place = self.place.clone();
         self.layout.send(move |layout| {
-            // Typed in elsewhere since, the person is in another window
-            // of the project's: the task's window opens in none.
-            if !mux::mine(&socket, &project) {
+            // Typed in elsewhere since, the person is in another of the
+            // project's windows, outside this home: the task's window
+            // opens in none.
+            if !mux::mine(&socket, &project, &place) {
                 return;
             }
             let said = match layout.show(&bot_name, &name, &command) {
