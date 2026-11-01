@@ -1080,17 +1080,6 @@ fn inside(here: &Path, folder: &str) -> Result<PathBuf, String> {
     Ok(real)
 }
 
-/// The git folder of the repository `dir` is in, by its real path, which
-/// its linked worktrees share.
-fn common_dir(dir: &Path) -> Option<PathBuf> {
-    git(
-        dir,
-        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-    )
-    .ok()
-    .and_then(|dir| std::fs::canonicalize(dir).ok())
-}
-
 /// The checkout to run git in for the worktree `path`: `here`'s own, when
 /// `path` is a worktree of its repository.
 fn repository_of(here: &Path, path: &Path) -> Option<PathBuf> {
@@ -1258,16 +1247,8 @@ fn worktree(here: &Path, name: &str, base: &str, confine: bool) -> Result<Place,
             branch: branch.clone(),
         };
         match confine {
-            // Checking out runs the repository's hooks and filters, which a
-            // repository an agent made inside the lead's folder holds as the
-            // agent wrote them: in a sandbox, writing only the repository's
-            // git folder and the new worktree, made empty, off the network
-            // (an LFS file comes from the objects the repository holds).
             true => {
-                let made = (std::fs::create_dir_all(&path).map_err(|e| e.to_string()))
-                    .and_then(|()| common_dir(here).ok_or("no git folder".to_owned()))
-                    .and_then(|common| confined(here, &args, &[&common, &path]));
-                if let Err(e) = made {
+                if let Err(e) = add_confined(sandboxer(), here, &branch, &path, base) {
                     self::undo(&undo);
                     let _ = std::fs::remove_dir_all(&path);
                     return Err(e);
@@ -1314,6 +1295,40 @@ fn has_submodules(path: &Path) -> Result<bool, String> {
         .filter_map(|entry| std::str::from_utf8(entry).ok()?.strip_prefix("160000 "))
         .filter_map(|entry| Some(entry.split_once('\t')?.1))
         .any(|name| path.join(name).join(".git").exists()))
+}
+
+/// A worktree of `here`'s repository at `path` on the new `branch`, made
+/// by git running none of the repository's code (no checkout, hook or
+/// fsmonitor), then checked out with `agent` (none: no sandbox here) in
+/// the sandbox, writing only the worktree and its own git folder, off the
+/// network (an LFS file comes from the objects the repository holds). The
+/// checkout is what runs the repository's filters and its post-checkout
+/// hook, which a repository an agent made inside the lead's folder holds
+/// as the agent wrote them. The shared git folder is never written from
+/// the sandbox, so its config need not be one the sandbox can keep
+/// read-only, as one that includes other files is not.
+fn add_confined(
+    agent: Option<&Path>,
+    here: &Path,
+    branch: &str,
+    path: &Path,
+    base: &str,
+) -> Result<(), String> {
+    let target = path.to_string_lossy();
+    let add = [
+        "worktree",
+        "add",
+        "-q",
+        "--no-checkout",
+        "-b",
+        branch,
+        &target,
+        base,
+    ];
+    crate::snapshot::plain(here, &add)?;
+    let own = crate::snapshot::plain(path, &["rev-parse", "--absolute-git-dir"])?;
+    let own = std::fs::canonicalize(own.trim()).map_err(|e| format!("{own}: {e}"))?;
+    confined_in(agent, path, &["checkout", "-f", "-q"], &[path, &own]).map(drop)
 }
 
 /// Whether `dir` is in a worktree Sonny made a task.
@@ -1851,20 +1866,23 @@ mod tests {
         git(&repo, &["config", "--unset", "core.fsmonitor"]).unwrap();
 
         // A hook runs on a worktree's checkout, writing only the worktree
-        // and the repository's git folder.
+        // and its own git folder, even where the repository's config
+        // includes another file, which the sandbox can't keep read-only.
+        git(&repo, &["config", "include.path", "shared.config"]).unwrap();
         let hook = repo.join(".git/hooks/post-checkout");
         std::fs::write(&hook, format!("#!/bin/sh\ntouch {}\n", marker.display())).unwrap();
         std::fs::set_permissions(&hook, std::os::unix::fs::PermissionsExt::from_mode(0o755))
             .unwrap();
         let tree = dir.join("tree");
-        std::fs::create_dir(&tree).unwrap();
-        let common = common_dir(&repo).unwrap();
-        let target = tree.to_string_lossy();
-        let args = ["worktree", "add", "-q", "-b", "agent/t", &target, "HEAD"];
         // The hook's write fails, so git says the checkout failed.
-        let _ = confined_in(Some(&agent), &repo, &args, &[&common, &tree]);
+        let made = add_confined(Some(&agent), &repo, "agent/t", &tree, "HEAD");
+        assert!(made.is_err_and(|e| e.contains("touch")), "the hook ran");
         assert!(tree.join("a.txt").is_file(), "the worktree is checked out");
         assert!(!marker.exists(), "the hook ran in the sandbox");
+        std::fs::remove_file(&hook).unwrap();
+        let other = dir.join("other");
+        add_confined(Some(&agent), &repo, "agent/u", &other, "HEAD").unwrap();
+        assert!(other.join("a.txt").is_file());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
