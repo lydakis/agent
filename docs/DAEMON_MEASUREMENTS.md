@@ -6863,3 +6863,35 @@ turns each:
 What it costs: reading concurrently takes more of the daemon. In a second pair of runs split by thread, the readers took 6.9 s on base and 13.4 s on head, and the storage writer took 9.6 s and 12.8 s. That stretched the tasks' own rounds by about 45% on this CPU-bound box, where the synthetic model streams from the same four CPUs; real tasks mostly wait on their model. A build of the head with one connection (cap and settle changes kept) sat between the two: p95 13.4 s and 20.9 s of daemon CPU. The pool is what brings the notes in on time.
 
 A rerun on today's `main` with the delivery count (same shapes, four rounds) told all 4,000 turns in each shape, with note p95 2.9 s at 10 × 100 and 4.2 s at 100 × 10. Every note reached its lead, all of them as a turn of their own: the screen's leads are idle between notes, so none was absorbed.
+
+## Cached statements planned once again (SQLite 3.54)
+
+#544 moved the bundled SQLite from 3.53.2 to 3.54.1. In 3.54, a join that
+binds an `x = ?` value is marked to be planned again whenever that value
+changes. rusqlite clears a statement's bindings each time it goes back to
+the cache, and SQLite now takes that clearing as a change. So every reuse
+of such a statement parsed and planned it again. `history_items` read
+each item that way: 384 of 384 calls planned again, at about half a
+millisecond each for its picture-stripping query. Both store connections
+now turn on SQLite's query planner stability guarantee (QPSG), so a plan
+no longer depends on bound values. The store never runs ANALYZE, so no
+statistics could make a plan better for one value than another.
+
+One plan did read a value: a GLOB pattern's literal prefix (`lead-*`)
+bounded the name index, in `list`, history search and `usage`. Those
+queries now write the bound out, `name >= prefix AND name < prefix ||
+x'ff'`, so the plan keeps the range whatever the planner reads. On
+100,010 names, a `m-*` page of five took 200,046 VM steps under the
+guarantee without the bound, and 65 with it, against 47 before.
+
+`bench.lifecycle` at concurrency 32 (three turns, 384 `history_items`
+calls), timing each request from the client. Three runs each, alternated
+on one 4-CPU box:
+
+| Build | `history_items` total, ms | Resume, replay, item, fork, ms |
+| --- | ---: | ---: |
+| SQLite 3.53.2 (before #544) | 313–352 | 518–592 |
+| SQLite 3.54.1, `main` | 655–880 | 870–1,133 |
+| SQLite 3.54.1, QPSG | 275–378 | 466–649 |
+
+No other request moved.

@@ -19,8 +19,10 @@ import sys
 from pathlib import Path
 
 # Clauses a listing formats in by name, each planned with every value it
-# takes: keep in step with `list` and `turns` in src/store/db.rs.
-OPTIONAL = {'{glob}': ('', ' AND name GLOB ?3'), '{maker}': ('', ' AND created_by_id = ?4'),
+# takes: keep in step with `list`, `usage` and `turns` in src/store/db.rs.
+OPTIONAL = {'{glob}': ('', " AND t.bot GLOB ?3 AND t.bot >= ?4 AND t.bot < ?4 || CAST(x'ff' AS TEXT)"),
+            '{from}': ('name > ?1', "name >= max(?1 || char(1), ?5) AND name < ?5 || CAST(x'ff' AS TEXT) AND name GLOB ?3"),
+            '{maker}': ('', ' AND created_by_id = ?4'),
             '{running}': ('', ' AND running_turn IS NOT NULL'),
             '{order}': ('ASC', 'DESC')}
 

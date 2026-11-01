@@ -5580,6 +5580,36 @@ fn bot_pages_filter_by_name_pattern_and_activity() {
     assert!(rest["next_after"].is_null());
     // GLOB is case-sensitive, like names.
     assert!(names(db.list(None, 64, Some("ALPHA.*"), false, None).unwrap()).is_empty());
+    // A pattern's literal prefix bounds the page, as written out in the
+    // query: a name that is the whole prefix matches, and a cursor before,
+    // inside or past the prefix's range starts where it should.
+    assert_eq!(
+        names(db.list(None, 64, Some("alpha.lead"), false, None).unwrap()),
+        ["alpha.lead"]
+    );
+    assert_eq!(
+        names(db.list(None, 64, Some("alpha.lead*"), false, None).unwrap()),
+        ["alpha.lead"]
+    );
+    assert_eq!(
+        names(db.list(Some("a"), 64, Some("beta.*"), false, None).unwrap()),
+        ["beta.lead", "beta.worker"]
+    );
+    assert_eq!(
+        names(
+            db.list(Some("beta.lead"), 64, Some("beta.*"), false, None)
+                .unwrap()
+        ),
+        ["beta.worker"]
+    );
+    assert!(names(db.list(Some("c"), 64, Some("beta.*"), false, None).unwrap()).is_empty());
+    assert_eq!(
+        names(
+            db.list(None, 64, Some("[ab]*.worker"), false, None)
+                .unwrap()
+        ),
+        ["alpha.worker", "beta.worker"]
+    );
     for bad in ["", &"*".repeat(257)] {
         assert_eq!(
             db.list(None, 64, Some(bad), false, None).unwrap_err().code,
