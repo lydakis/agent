@@ -15594,6 +15594,54 @@ fn submissions_filling_the_pending_bounds_hold_back_no_note() {
 }
 
 #[test]
+fn notes_of_many_ended_commands_each_fit_the_bots_context() {
+    let mut db = db();
+    let mut small = binding();
+    small.settings.context_bytes = Some(1024);
+    db.create("Fay", Some("/synthetic"), small).unwrap();
+    let turn = (db.begin(
+        "Fay",
+        "f1",
+        "work",
+        true,
+        &TurnOptions::default(),
+        allow_provider,
+    ))
+    .unwrap()
+    .turn;
+    let long = "why ".repeat(100);
+    let ids: Vec<i64> = (0..4)
+        .map(|n| db.process_start(turn, &format!("shell-{n}")).unwrap())
+        .collect();
+    for id in &ids {
+        db.process_finish(
+            *id,
+            &json!({"error":"process_lost","detail":long}),
+            &[],
+            &[],
+        )
+        .unwrap();
+    }
+    db.finish(turn, None).unwrap();
+    let mut heard = Vec::new();
+    while let Some((_, note)) = db.next_ready().unwrap() {
+        let prompts = db.prompts("Fay", note, 4096).unwrap();
+        let words: Value =
+            serde_json::from_str(prompts["prompts"][0]["text"].as_str().unwrap()).unwrap();
+        assert!(words.to_string().len() <= 1024 / 8 + 64, "{words}");
+        assert!(!words["finished"].as_object().unwrap().is_empty());
+        for (handle, ended) in words["finished"].as_object().unwrap() {
+            assert!(ended["detail"].as_str().unwrap().ends_with('…'));
+            heard.push(handle.clone());
+        }
+        db.start(note, allow_provider).unwrap();
+        db.finish(note, None).unwrap();
+    }
+    let all: Vec<String> = ids.iter().map(|id| format!("proc:{id}")).collect();
+    assert_eq!(heard, all, "each told once, in order, over several notes");
+}
+
+#[test]
 fn retention_keeps_what_a_note_still_to_run_tells_of() {
     let mut db = db();
     let mut kept = binding();

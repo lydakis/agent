@@ -840,6 +840,17 @@ fn ended_as(result: &Value) -> Value {
             ended.insert(key.to_owned(), value.clone());
         }
     }
+    // Why it failed, in a line: the rest is the handle's.
+    if let Some(Value::String(detail)) = ended.get_mut("detail")
+        && detail.len() > 96
+    {
+        let cut = (0..=96)
+            .rev()
+            .find(|&i| detail.is_char_boundary(i))
+            .unwrap_or(0);
+        detail.truncate(cut);
+        detail.push('…');
+    }
     Value::Object(ended)
 }
 /// What the storage worker hands to the publisher after each job, in commit
@@ -9573,9 +9584,9 @@ impl Database {
         let Some((None, settings)) = found else {
             return Ok(false);
         };
-        let quiet = match settings {
-            Some(text) => serde_json::from_str::<Settings>(&text)?.quiet_background,
-            None => false,
+        let settings: Settings = match settings {
+            Some(text) => serde_json::from_str(&text)?,
+            None => Settings::default(),
         };
         let ended: Vec<(i64, Option<String>)> = self
             .conn
@@ -9589,20 +9600,33 @@ impl Database {
             .conn
             .prepare_cached("UPDATE processes SET told=? WHERE id=?")?;
         // Its client collects them itself.
-        if quiet {
+        if settings.quiet_background {
             for (id, _) in &ended {
                 told.execute(params![0, id])?;
             }
             return Ok(false);
         }
         drop(told);
+        // A note takes at most an eighth of the bot's context, so it always
+        // fits; what is left goes in the next, once that one's turn ends.
+        let room = settings.context_bytes() / 8;
         let mut finished = serde_json::Map::new();
+        let mut batch = Vec::new();
+        let mut size = 0;
         for (id, result) in &ended {
             let result: Value = match result {
                 Some(result) => serde_json::from_str(result)?,
                 None => Value::Null,
             };
-            finished.insert(format!("proc:{id}"), ended_as(&result));
+            let handle = format!("proc:{id}");
+            let ended = ended_as(&result);
+            let entry = handle.len() + ended.to_string().len() + 4;
+            if !batch.is_empty() && size + entry > room {
+                break;
+            }
+            size += entry;
+            finished.insert(handle, ended);
+            batch.push(*id);
         }
         let prompt = json!({"finished": finished}).to_string();
         let options = TurnOptions {
@@ -9631,7 +9655,7 @@ impl Database {
         let mut told = self
             .conn
             .prepare_cached("UPDATE processes SET told=? WHERE id=?")?;
-        for (id, _) in &ended {
+        for id in &batch {
             told.execute(params![started.turn, id])?;
         }
         Ok(started.status == "ready")

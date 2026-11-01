@@ -2243,12 +2243,19 @@ impl Turn {
                             .registry
                             .poll_end(record.bot_id, handle, ended.as_deref())
                         {
-                            Ok(outcome) => self.seen(handle, outcome).await?,
+                            Ok(outcome) => outcome,
                             Err(error) => failure(error),
                         };
+                    let seen = Self::seen(handle, &outcome);
                     let id = waiting.call_id.clone();
                     self.store
-                        .op("tool_finish", move |db| db.tool_finish(turn, &id, &outcome))
+                        .op("tool_finish", move |db| {
+                            let finished = db.tool_finish(turn, &id, &outcome)?;
+                            if let Some(seen) = seen {
+                                db.saw_end(seen)?;
+                            }
+                            Ok(finished)
+                        })
                         .await?;
                 } else if !waiting.approval && !waiting.load {
                     // A later call's lapse can wake the wait before its
@@ -3878,6 +3885,8 @@ impl Turn {
             let answered = record
                 .declared(&call.name)
                 .is_some_and(|tool| tool.answered_by.is_some());
+            // A terminal whose end this result shows its bot.
+            let mut seen = None;
             let outcome = match prepared {
                 // A declared tool runs nothing: its meaning is its client's,
                 // and so is its answer, when its client gives one.
@@ -3977,10 +3986,13 @@ impl Turn {
                         sender,
                     );
                     match self.run_tool(start, None, warm.as_deref_mut()).await? {
-                        Ran::Done(Ok(outcome)) => self.seen(id, outcome).await?,
+                        Ran::Done(Ok(outcome)) => {
+                            seen = Self::seen(id, &outcome);
+                            outcome
+                        }
                         // A start that failed is its end, and the call says so.
                         Ran::Done(Err(error)) => {
-                            self.store.op("saw_end", move |db| db.saw_end(id)).await?;
+                            seen = Some(id);
                             failure(error)
                         }
                         Ran::Lifted(_) => unreachable!("only a command moves to the background"),
@@ -4008,7 +4020,10 @@ impl Turn {
                         sandbox,
                     );
                     match self.run_tool(hold, None, warm.as_deref_mut()).await? {
-                        Ran::Done(Ok(Some(outcome))) => self.seen(handle, outcome).await?,
+                        Ran::Done(Ok(Some(outcome))) => {
+                            seen = Self::seen(handle, &outcome);
+                            outcome
+                        }
                         Ran::Done(Ok(None)) => match self
                             .park_poll(
                                 &call.call_id,
@@ -4042,7 +4057,10 @@ impl Turn {
                         sandbox,
                     );
                     match self.run_tool(typed, None, warm.as_deref_mut()).await? {
-                        Ran::Done(Ok(outcome)) => self.seen(handle, outcome).await?,
+                        Ran::Done(Ok(outcome)) => {
+                            seen = Self::seen(handle, &outcome);
+                            outcome
+                        }
                         Ran::Done(Err(error)) => failure(error),
                         Ran::Lifted(_) => unreachable!("only a command moves to the background"),
                     }
@@ -4181,7 +4199,13 @@ impl Turn {
             };
             let id = call.call_id;
             self.store
-                .op("tool_finish", move |db| db.tool_finish(turn, &id, &outcome))
+                .op("tool_finish", move |db| {
+                    let finished = db.tool_finish(turn, &id, &outcome)?;
+                    if let Some(seen) = seen {
+                        db.saw_end(seen)?;
+                    }
+                    Ok(finished)
+                })
                 .await?;
         }
         Ok(None)
@@ -5052,15 +5076,13 @@ impl Turn {
         Ok(ControlFlow::Break(lapse.map_or(Stop::Parked, Stop::Lapses)))
     }
 
-    /// What a terminal's write, poll or start returned, which says how it
-    /// ended once it has: its bot saw that, so nothing tells it later.
-    async fn seen(&self, id: i64, outcome: Outcome) -> Result<Outcome> {
-        let ended = serde_json::from_str::<Value>(&outcome.output)
-            .is_ok_and(|output| output.get("exit_code").is_some());
-        if ended {
-            self.store.op("saw_end", move |db| db.saw_end(id)).await?;
-        }
-        Ok(outcome)
+    /// Terminal `id`, when what its write, poll or start returned says how
+    /// it ended: its bot sees that in this result, so nothing tells it
+    /// later. Recorded with the result, in its commit.
+    fn seen(id: i64, outcome: &Outcome) -> Option<i64> {
+        serde_json::from_str::<Value>(&outcome.output)
+            .is_ok_and(|output| output.get("exit_code").is_some())
+            .then_some(id)
     }
 
     /// Start a command now; its result is retrievable through a proc handle
