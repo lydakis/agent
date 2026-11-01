@@ -20,7 +20,7 @@ const COMMANDS: &[Command] = &[
         name: "run",
         about: "Send a prompt to a bot, or make one with --new; prints the turn as it runs",
         usage: "run [OPTIONS] [--] PROMPT...",
-        flags: "--bot --new --fork --allow --expires --detach --delivery --attach-wait --turn --model --workspace --effort --turn-budget-tokens --image --quote --agents --profile --request-id --bot-id --pretty --no-spawn",
+        flags: "--bot --new --created-by --fork --allow --expires --detach --delivery --attach-wait --turn --model --workspace --effort --turn-budget-tokens --image --quote --agents --profile --request-id --bot-id --pretty --no-spawn",
         settings: "--tools --instructions --instructions-file --budget-tokens --compaction-instructions --compaction-instructions-file --compaction-model --no-compaction --fallback --approval --approve --context-bytes --context-items --note-turns --compact-at --compact-keep --compact-tokens --max-rounds --keep-turns --approval-hold --max-output-tokens --keep-warm --cache-ttl --speed --sandbox --writable --network --hide-senders --unix-socket --outputs",
         startup: true,
     },
@@ -505,7 +505,10 @@ fn print_flags(flags: &str) {
                 "Only bots whose name matches, as SQLite GLOB: * any run, ? one byte, [..] a set",
             ),
             "--active" => ("", "Only bots with a turn running"),
-            "--created-by" => ("BOT", "Only bots this bot made"),
+            "--created-by" => (
+                "BOT",
+                "Only bots this bot made; with run --new, the bot whose new bot this is, for a client starting one for its agent",
+            ),
             "--newest" => ("", "Newest first, read from the end"),
             "--limit" => ("N", "List at most N"),
             "--since" => (

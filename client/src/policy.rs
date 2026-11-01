@@ -473,14 +473,15 @@ impl Kind {
         }
     }
     /// The name an entry of this directory would index under. Only a name
-    /// --profile accepts is offered as a role, and never a client's own.
+    /// --profile accepts is offered as a role; the index leaves a client's
+    /// own out.
     fn name(self, path: &Path) -> Option<String> {
         let name = path.file_name()?.to_str()?;
         match self {
             Kind::Skills => Some(name.to_owned()),
             Kind::Profiles => name
                 .strip_suffix(".md")
-                .filter(|stem| profile_name(stem) && !client_role(stem))
+                .filter(|stem| profile_name(stem))
                 .map(str::to_owned),
         }
     }
@@ -770,6 +771,38 @@ fn search(workspace: &Path, kind: Kind) -> Vec<PathBuf> {
 }
 
 fn index(dirs: Vec<PathBuf>, kind: Kind, budget: usize) -> Result<Vec<Entry>, Failure> {
+    Ok(scan(dirs, kind, budget, true)?.0)
+}
+
+/// Every profile file the person can start an agent in from `workspace`,
+/// as a client lists them to pick from: the folder's, then the person's,
+/// client roles and their variants among them, which the Profiles index
+/// leaves out. Each comes with the profile it `extends`, by name, so a
+/// client can tell a variant of its lead from one of its tasks.
+pub fn profiles(workspace: &Path) -> Result<Vec<(Entry, Option<String>)>, Failure> {
+    let (entries, mut bases) = scan(
+        search(workspace, Kind::Profiles),
+        Kind::Profiles,
+        usize::MAX,
+        false,
+    )?;
+    Ok((entries.into_iter())
+        .map(|entry| {
+            let base = bases.remove(&entry.name);
+            (entry, base)
+        })
+        .collect())
+}
+
+/// The entries in `dirs`, the first directory's winning a clash, and what
+/// each profile extends; with `hide`, client roles and their variants left
+/// out.
+fn scan(
+    dirs: Vec<PathBuf>,
+    kind: Kind,
+    budget: usize,
+    hide: bool,
+) -> Result<(Vec<Entry>, std::collections::BTreeMap<String, String>), Failure> {
     let mut found = std::collections::BTreeMap::<String, Entry>::new();
     // Profiles that build on a client role: that role's variants, set as
     // a lead's or task's role, not roles to start a peer in.
@@ -810,6 +843,10 @@ fn index(dirs: Vec<PathBuf>, kind: Kind, budget: usize) -> Result<Vec<Entry>, Fa
             let Some(name) = kind.name(&path) else {
                 continue;
             };
+            // A client role's own file is no role to start a peer in.
+            if hide && matches!(kind, Kind::Profiles) && client_role(&name) {
+                continue;
+            }
             if found.contains_key(&name) || hidden.contains(&name) {
                 continue;
             }
@@ -845,11 +882,16 @@ fn index(dirs: Vec<PathBuf>, kind: Kind, budget: usize) -> Result<Vec<Entry>, Fa
                 }
             };
             let (front, body) = front_matter(&text);
-            if matches!(kind, Kind::Profiles) && front.extends.as_deref().is_some_and(client_role) {
+            if hide
+                && matches!(kind, Kind::Profiles)
+                && front.extends.as_deref().is_some_and(client_role)
+            {
                 hidden.insert(entry.name);
                 continue;
             }
-            if let Some(base) = front.extends.filter(|b| *b != entry.name) {
+            // Extending its own name builds on the file it shadows: listed,
+            // that is the same role, as a folder's `lead.md` is a lead.
+            if let Some(base) = front.extends.filter(|b| !hide || *b != entry.name) {
                 bases.insert(entry.name.clone(), base);
             }
             let summary = front.description.filter(|d| !d.is_empty()).or_else(|| {
@@ -868,7 +910,8 @@ fn index(dirs: Vec<PathBuf>, kind: Kind, budget: usize) -> Result<Vec<Entry>, Fa
             found.insert(entry.name.clone(), entry);
         }
     }
-    // A profile that extends a hidden one is a client role's variant too.
+    // A profile that extends a hidden one is a client role's variant too;
+    // none is hidden when every profile is listed.
     loop {
         let more: Vec<String> = (bases.iter())
             .filter(|(name, base)| found.contains_key(*name) && hidden.contains(*base))
@@ -882,7 +925,7 @@ fn index(dirs: Vec<PathBuf>, kind: Kind, budget: usize) -> Result<Vec<Entry>, Fa
             hidden.insert(name);
         }
     }
-    Ok(found.into_values().collect())
+    Ok((found.into_values().collect(), bases))
 }
 
 /// A role a bot is started in: the body of `.agents/agents/<name>.md`, and
@@ -1306,6 +1349,51 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         // Discovery reports canonical paths (macOS aliases /var to /private/var).
         std::fs::canonicalize(&dir).unwrap()
+    }
+
+    #[test]
+    fn profiles_lists_client_roles_and_their_variants_with_what_each_extends() {
+        let root = temp("listed");
+        let agents = root.join(".agents/agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        let write = |name: &str, text: &str| std::fs::write(agents.join(name), text).unwrap();
+        write("lead.md", "---\nextends: lead\n---\nAlso: be brief.\n");
+        write(
+            "my-lead.md",
+            "---\nextends: lead\ndescription: Mine\n---\nMore.\n",
+        );
+        write("deeper.md", "---\nextends: my-lead\n---\nMore still.\n");
+        write(
+            "reviewer.md",
+            "---\ndescription: Reviews\n---\nYou review.\n",
+        );
+        let listed: Vec<(String, Option<String>)> = (profiles(&root).unwrap().into_iter())
+            .map(|(entry, base)| (entry.name, base))
+            .filter(|(name, _)| ["lead", "my-lead", "deeper", "reviewer"].contains(&name.as_str()))
+            .collect();
+        assert_eq!(
+            listed,
+            [
+                ("deeper".into(), Some("my-lead".into())),
+                ("lead".into(), Some("lead".into())),
+                ("my-lead".into(), Some("lead".into())),
+                ("reviewer".into(), None),
+            ]
+        );
+        // The Profiles index an agent reads still leaves the lead's out.
+        let indexed: Vec<String> =
+            (index(search(&root, Kind::Profiles), Kind::Profiles, usize::MAX))
+                .unwrap()
+                .into_iter()
+                .map(|entry| entry.name)
+                .collect();
+        assert!(indexed.contains(&"reviewer".to_owned()));
+        assert!(
+            !indexed
+                .iter()
+                .any(|name| ["lead", "my-lead", "deeper"].contains(&name.as_str()))
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

@@ -61,14 +61,31 @@ name). In a window, `/switch` lists every agent the daemon keeps over the
 composer, found by typing as every list is: the folder's leads first, then
 the project's other agents, then other projects' leads, then the rest, the
 one beside the conversation picked to start. Enter opens the pick in the
-window; the last row, `new lead`, makes the folder another lead, named by
-what was typed when it can name one. `/switch NAME` opens that agent at once
-(a name in this project may leave out the project), or lists what NAME
-narrows to; `/lead` alone is `/switch`, `/lead NAME` opens a lead of the
-folder and `/lead new [NAME]` makes one. The `↗` beside the name of an agent
-open in the pane, or Ctrl+G, moves that agent into the window.
+window. `/switch NAME` opens that agent at once (a name in this project may
+leave out the project), or lists what NAME narrows to. The `↗` beside the
+name of an agent open in the pane, or Ctrl+G, moves that agent into the
+window.
 
-![/switch listing every agent, narrowed by typing fix, making a new lead, in Flexoki light, and with NO_COLOR](../docs/sonny/switch-picker.png)
+![/switch listing every agent, then narrowed by typing fix, in Flexoki dark and light](../docs/sonny/switch-picker.png)
+
+`/new [NAME]`, in a lead's window, starts an agent from its folder in three
+steps over the composer. First its profile: every profile file in the
+folder's `.agents/agents`, then in `~/.agents/agents`, then the ones Sonny
+ships, the roles of a lead (`lead`, one that extends it, and the project's
+own, marked `•`) before the rest, each with its description. Then, for an
+agent that is not a lead, where it works: a worktree of its own (first in a
+git repository), this folder beside the lead, or an empty folder; a project
+whose tasks all work in its folder (`threads_in = "project"`) asks nothing.
+Then the first message, written in the composer under what it will start;
+Enter starts the agent with it and the window becomes that agent's. A lead
+stays in this folder, as every lead does, named NAME or after the message's
+first words, and keeps the profile picked when it is not the project's; any
+other agent is this lead's task, started as the lead would start it. Nothing
+is made before the message is sent, and Esc goes back a step. A profile
+names no place, as Codex asks where a new thread works when it starts and
+Claude Code's agents take `isolation` each time.
+
+![/new listing the profiles, then where a reviewer works, then its first message](../docs/sonny/new-agent.png)
 
 `/goal WHAT` asks the agent to set a goal
 on itself and work until WHAT is done (`/goal` shows goals, `/goal clear`
@@ -374,8 +391,9 @@ argument `acp`. A thread opened in a folder is a lead of that folder, set
 up as the one `sonny` there opens: its rules, skills and memory, Sonny's
 tools, its approval mode and sandbox, the lookout and the tool host. Each new thread is a
 lead of its own, named after the first words it is sent (the folder's first
-lead when it has none yet), unless those words are `/lead NAME`, which
-binds the thread to that lead of the folder, or `/lead new [NAME]`. A call that
+lead when it has none yet), unless those words are `/switch NAME`, which
+binds the thread to that lead of the folder, or `/new [NAME]`, which makes
+one so named, in the project's lead role. A call that
 waits for you is asked in the thread (Allow or Deny); one the reviewer passes
 runs without asking. The turns the lead takes on its own, as when the lookout
 wakes it because a task finished, show in the thread between yours, as work
@@ -403,7 +421,7 @@ people say it) beside the provider, as "Global Claude Opus 5.5 · bedrock", with
 `~/.agent/models`' notes, and the models only that file names, after
 "Default", the model the lead or task runs; its effort picker lists the
 family's efforts after "Default" too. A pick made before the first prompt is
-for a lead Sonny makes: a lead the thread binds to with `/lead NAME` keeps its
+for a lead Sonny makes: a lead the thread binds to with `/switch NAME` keeps its
 own, since T3 Code puts its last pick to every new thread. One made later is
 the lead's from its next turn. A thread offers only its bot's provider family,
 since a bot changes model only within it, and a task's thread keeps the model
@@ -1305,14 +1323,18 @@ With nothing typed, `?` lists every key beside the conversation. Every
 hint on screen is written one way, as Codex writes them: the key, then
 what it does muted, `·` between them (`↑↓ pick · enter open · esc
 close`). Every list over the composer (the slash menu, `/model`,
-`/permissions`, `/retry`, a reply to react to) is one list: up to 8 rows
-under a blank one, the pick in reverse video, `•` before what is in
-effect, and its keys where the footer was.
+`/switch`, `/new`, `/permissions`, `/fast`, `/retry`, a reply to react to
+or answer, Ctrl+R) is one list: up to 8 rows under a blank one, the pick
+in reverse video, `•` before what is in effect, and its keys where the
+footer was. Each narrows as you type, found by its name or what it is,
+and Backspace back to nothing picks the row it opened on; a question an
+agent asks keeps its options as they are, since their order is its
+recommendation.
 
 ![? with nothing typed: every key beside the conversation](../docs/sonny/shortcuts.png)
 
-Every list you narrow by typing (the slash menu, `/model`, `sonny setup`'s
-pickers) finds rows one way: the letters typed, in order, the first of
+Every list you narrow by typing (those over the composer and `sonny
+setup`'s pickers) finds rows one way: the letters typed, in order, the first of
 them starting the name or a word in it, so `/cms` finds `/commons` and
 `g6l` finds `gpt-6-luna`; the letters found are bold. The whole name
 ranks first, then names it starts, then a word in a name it starts, then

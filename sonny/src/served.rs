@@ -641,11 +641,14 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                 model: text("model"),
                 effort: text("effort"),
                 own_folder: arguments["own_folder"] == true,
+                here: false,
                 folder: text("folder"),
                 from: text("from"),
                 turn: arguments["turn"].as_i64(),
                 // A task's own helper builds on its work.
                 builds_on: (!line.role.lead).then(|| caller.clone()),
+                env: Vec::new(),
+                made_by: None,
             };
             let started = crate::task::start(&line.folder, &line.project, &caller, &start)
                 .map_err(|e| ("task_not_started", e))?;

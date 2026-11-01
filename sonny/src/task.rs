@@ -51,6 +51,9 @@ pub struct Start {
     /// An empty folder of the task's own, rather than a worktree or, outside
     /// git, the lead's folder itself.
     pub own_folder: bool,
+    /// The lead's folder itself, rather than a worktree of it, as a
+    /// project's tasks all work when its `threads_in` says so.
+    pub here: bool,
     /// A folder inside the lead's that the task works at instead of the
     /// lead's own, such as a repository it holds, of which the task then
     /// gets a worktree.
@@ -63,6 +66,14 @@ pub struct Start {
     /// work: in the repository it works in, unless `folder` or
     /// `own_folder` says otherwise, from the last commit on its branch.
     pub builds_on: Option<String>,
+    /// What the agent command runs with beyond Sonny's own environment:
+    /// the daemon it starts the task on, when a window of Sonny's starts it
+    /// rather than an agent's shell, which has it already.
+    pub env: Vec<(String, String)>,
+    /// The lead a window of Sonny's starts the task for, which makes it
+    /// that lead's task while its brief stays the person's words; an
+    /// agent's shell starts tasks as its own agent.
+    pub made_by: Option<String>,
 }
 
 /// The task a fork copies, and its files after the turn it copies.
@@ -103,6 +114,7 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
     // With the provider keys the app keeps, should this start the daemon;
     // read before the folder is made, so a bad env file leaves nothing.
     let mut command = crate::agent_command(&agent)?;
+    command.envs(start.env.iter().map(|(key, value)| (key, value)));
     let config = agent_client::config::load()?;
 
     let info = agent_client::project::read(here)?;
@@ -178,7 +190,8 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
         != Some("danger-full-access");
     let mut place = match &source {
         Some(source) => forked(&agent, name, source)?,
-        None if info["threads_in"] == "project" => in_place(here, name),
+        None if info["threads_in"] == "project" => in_place(here, name, true),
+        None if start.here && folder.is_none() => in_place(here, name, false),
         None if start.own_folder => own_folder(here, name)?,
         None => {
             // On the last commit of the branch of the task it helps, in
@@ -468,6 +481,12 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
     command.args(["run", "--detach"]);
     if source.is_none() {
         command.arg("--new");
+        if let Some(lead) = &start.made_by {
+            for key in ["AGENT_BOT", "AGENT_BOT_ID", "AGENT_TURN"] {
+                command.env_remove(key);
+            }
+            command.args(["--created-by", lead]);
+        }
     }
     let output = command
         .args(["--bot", name, "--workspace"])
@@ -1086,13 +1105,18 @@ fn undo(undo: &Undo) {
 }
 
 /// Every task works in the lead's folder.
-fn in_place(here: &Path, name: &str) -> Place {
+/// The lead's folder itself for the task `name`: as every task of the
+/// project works, or `all` false, as the person asked for this one.
+fn in_place(here: &Path, name: &str, all: bool) -> Place {
     Place {
         dir: here.to_owned(),
         told: here.to_owned(),
-        note: Some(format!(
-            "{name}: works in this folder itself, as every task of this project does"
-        )),
+        note: Some(match all {
+            true => {
+                format!("{name}: works in this folder itself, as every task of this project does")
+            }
+            false => format!("{name}: works in this folder itself, beside its lead"),
+        }),
         undo: Undo::Nothing,
         copy: None,
     }
@@ -1240,7 +1264,7 @@ fn worktree(here: &Path, name: &str, base: &str, confine: bool) -> Result<Place,
                  it is not a git repository; a task that needs a copy of its own, such as a \
                  workspace its tooling makes, takes own_folder"
             )),
-            ..in_place(here, name)
+            ..in_place(here, name, true)
         });
     }
     let top = PathBuf::from(git(here, &["rev-parse", "--show-toplevel"])?);
