@@ -1148,6 +1148,9 @@ async fn run() -> Result<(), String> {
     // sandbox, and a side chat leaves it to its agent.
     if options.side.is_none() && project::is_lead(&name) {
         app.upgrades = skills::upgraded();
+        // So is the first of a folder's leads opened since a restore,
+        // which sets up again the folder's triggers the person asked for.
+        app.restored = project::lead_project(&name).and_then(trigger::restored);
     }
     if let Some(set) = setup::just_set() {
         app.notice = Some(set);
@@ -2320,6 +2323,9 @@ struct App {
     /// What Sonny's upgrade set beside the person's own edits, told to the
     /// bot once it is set up.
     upgrades: Option<skills::Upgrades>,
+    /// The triggers a restore brought for this folder's lead to set up
+    /// again, until it is told of them.
+    restored: Option<trigger::Restored>,
     /// The folder the next message moves the bot to: its lead moved away.
     move_to: Option<String>,
     /// The name under which Sonny notes the instructions it wrote.
@@ -3406,6 +3412,7 @@ impl App {
             elsewhere: false,
             instruct: None,
             upgrades: None,
+            restored: None,
             move_to: None,
             lead: String::new(),
             retry: None,
@@ -3797,6 +3804,18 @@ impl App {
     /// What Sonny's upgrade set beside the person's edits, told to the bot
     /// after any turn it runs, so it asks the person whether to bring it in.
     async fn tell_upgrades(&mut self) {
+        if let Some(restored) = self.restored.take() {
+            let asked = json!({"bot": self.bot, "prompt": restored.note(),
+                "request_id": restored.request_id(), "delivery": "queue",
+                "origin": trigger::RESTORE_ORIGIN});
+            match self.client.request("submit", asked).await {
+                Ok(_) => restored.told(),
+                Err(error) if error.code == "idempotency_conflict" => restored.told(),
+                Err(error) => {
+                    self.notice = Some(format!("telling of the restored triggers: {error}"));
+                }
+            }
+        }
         let Some(upgrades) = self.upgrades.take() else {
             return;
         };

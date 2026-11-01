@@ -1331,6 +1331,154 @@ pub fn list(places: &Places, after: Option<&str>) -> Value {
     json!({"triggers": rows, "next_after": next})
 }
 
+/// What a backup keeps of this HOME's triggers: each one's definition as
+/// it was asked for, by name, without what its fires did nor the ids its
+/// daemon gave, which a new machine's store does not have. It is a list to
+/// read: nothing is set up from it, and a restore hands it to each
+/// folder's lead ([`restored`]).
+pub fn backed_up(places: &Places) -> Vec<Value> {
+    let mut all: Vec<Value> = (triggers(places).into_iter())
+        .map(|(trigger, _)| trigger.backed_up())
+        .collect();
+    all.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+    all
+}
+
+impl Trigger {
+    fn backed_up(&self) -> Value {
+        let (start, by) = match &self.target {
+            Target::Bot { .. } => (Value::Null, Value::Null),
+            Target::Start {
+                model, effort, by, ..
+            } => (
+                json!({"model": model, "effort": effort}),
+                json!(by.as_ref().map(|(by, _)| by)),
+            ),
+        };
+        json!({"name": self.name, "when": self.when, "bot": self.bot(), "start": start,
+            "by": by, "reply_to": self.reply_to.as_ref().map(|(to, _)| to), "if": self.gate,
+            "runs": self.runs, "turn_budget_tokens": self.turn_budget_tokens,
+            "once": self.at.is_some(), "commit": self.commit, "file": self.file,
+            "dir": self.dir, "message": self.message})
+    }
+}
+
+/// Where a restore leaves the backup's list of triggers, and which
+/// projects' leads were handed theirs, a line each.
+fn restored_list(home: &Path) -> PathBuf {
+    home.join(".agent/sonny/restored-triggers.json")
+}
+
+fn restored_told(home: &Path) -> PathBuf {
+    home.join(".agent/sonny/restored-told")
+}
+
+/// A restore's list of triggers, `held` as the backup holds it, for the
+/// leads of this machine to set up again; a backup that holds none leaves
+/// none, and no lead was handed any of it yet.
+pub fn restore(home: &Path, held: Option<&[u8]>) -> Result<(), String> {
+    let (list, told) = (restored_list(home), restored_told(home));
+    let _ = std::fs::remove_file(&told);
+    match held {
+        Some(bytes) => {
+            if let Some(dir) = list.parent() {
+                std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+            }
+            agent_client::files::replace_mode(&list, bytes, 0o600)
+        }
+        None => match std::fs::remove_file(&list) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.to_string()),
+            _ => Ok(()),
+        },
+    }
+}
+
+/// How the note a restore leaves a lead starts.
+pub const RESTORED: &str = "Sonny restored this home from its backup: ";
+
+/// What sent that note, for the daemon's record of the turn.
+pub const RESTORE_ORIGIN: &str = "sonny.restore";
+
+/// The triggers a restore brought that were `project`'s, for its lead to
+/// set up again, as a step an upgrade asks of it: which the person asked
+/// for is the lead's to judge, from what they say and its memory. A lead's
+/// own look (`LEAD.next`) is left out, since each lead sets its own.
+pub struct Restored {
+    home: PathBuf,
+    project: String,
+    note: String,
+    key: String,
+}
+
+/// What the first lead of `project` opened since a restore is to set up
+/// again; none once one was told, or when none of them were its.
+pub fn restored(project: &str) -> Option<Restored> {
+    restored_in(Path::new(&std::env::var_os("HOME")?), project)
+}
+
+pub(crate) fn restored_in(home: &Path, project: &str) -> Option<Restored> {
+    let told = crate::upgrade::lines(&restored_told(home));
+    if told.iter().any(|line| line == project) {
+        return None;
+    }
+    let list = std::fs::read(restored_list(home)).ok()?;
+    let list: Vec<Value> = serde_json::from_slice(&list).ok()?;
+    let prefix = format!("{project}.");
+    let theirs: Vec<String> = (list.iter())
+        .filter(|row| {
+            let (name, bot) = (
+                row["name"].as_str(),
+                row["bot"].as_str().unwrap_or_default(),
+            );
+            bot.starts_with(&prefix)
+                && !(crate::project::is_lead(bot) && name == Some(&format!("{bot}.next")))
+        })
+        .map(Value::to_string)
+        .collect();
+    if theirs.is_empty() {
+        return None;
+    }
+    let note = format!(
+        "{RESTORED}its triggers did not come back, since each was tied to an agent in the \
+         old machine's store, which a backup leaves out. These were this folder's, as the \
+         backup kept them, one a line:\n{}\nSet up again with the triggers tool the ones \
+         the person asked for that still have work to do, for the agents that do that work \
+         here now. Leave out what has run its course, such as a one-off whose time passed, \
+         and what an agent set only for its own work. Tell the person in a line what you \
+         set up and what you left out.",
+        theirs.join("\n")
+    );
+    let key = format!(
+        "sonny-restore-{}",
+        crate::project::fingerprint(&format!("{project}\n{note}"))
+    );
+    Some(Restored {
+        home: home.to_owned(),
+        project: project.to_owned(),
+        note,
+        key,
+    })
+}
+
+impl Restored {
+    pub fn note(&self) -> &str {
+        &self.note
+    }
+
+    /// The same note twice is one turn.
+    pub fn request_id(&self) -> &str {
+        &self.key
+    }
+
+    /// Its lead was told: no other lead of the project is.
+    pub fn told(&self) {
+        crate::upgrade::add(
+            &restored_told(&self.home),
+            std::slice::from_ref(&self.project),
+        );
+    }
+}
+
 /// A trigger as the sky shows it: the agent it messages, how it was
 /// asked for, and, when a clock sets it, its next two times (Unix
 /// seconds), so how near the next is can be told against the wait.
@@ -3312,7 +3460,7 @@ async fn submit(
 /// agent it messages, without starting a turn: it reads it in its next
 /// model call, also the one it is busy with, instead of hearing nothing.
 async fn missed(client: &Client, trigger: &Trigger, (bot, id): (&str, i64), outcome: &Value) {
-    let (to, to_id) = match &trigger.reply_to {
+    let to = match &trigger.reply_to {
         Some((to, to_id)) => (to.as_str(), *to_id),
         None => (bot, id),
     };
@@ -3323,6 +3471,19 @@ async fn missed(client: &Client, trigger: &Trigger, (bot, id): (&str, i64), outc
         stamp(now()),
         trigger.when
     );
+    // Telling is a courtesy: what came of the fire is its row's either way.
+    let _ = note(client, trigger, to, &prompt).await;
+}
+
+/// `prompt` for `to` as a trigger's note: attached to its next model call,
+/// starting no turn, under a request id of its own that no fire takes for
+/// one of its own (`fire_generation`).
+async fn note(
+    client: &Client,
+    trigger: &Trigger,
+    (to, to_id): (&str, i64),
+    prompt: &str,
+) -> agent_client::Result<()> {
     let request = format!(
         "{}missed.{to_id}.{}.{}.{}",
         sent_by(trigger),
@@ -3330,14 +3491,78 @@ async fn missed(client: &Client, trigger: &Trigger, (bot, id): (&str, i64), outc
         std::process::id(),
         sends()
     );
-    // Telling is a courtesy: what came of the fire is its row's either way.
-    let _ = client
+    client
         .request(
             "submit",
             json!({"bot": to, "bot_id": to_id, "request_id": request, "prompt": prompt,
                 "delivery": "attach", "origin": "trigger", "wait_ms": attach_wait()}),
         )
-        .await;
+        .await
+        .map(drop)
+}
+
+/// What a fire's `--if` says that its agents hear, as monitoring alerts
+/// on a change of state rather than on each check: that it broke, the
+/// first time it could not say, and that it works again, the first time
+/// after that it said yes or no. `before` is what it said last, as the
+/// row keeps it.
+#[derive(Debug, PartialEq)]
+enum GateNews {
+    Broke(String),
+    Works,
+}
+
+impl GateNews {
+    /// What `said` is news of after `before`. A break told already is
+    /// not told again; one not told yet (its note did not go) is.
+    fn of(before: &Value, said: &Result<Result<(), String>, String>) -> Option<Self> {
+        let broken = before["gate"] == "failed";
+        let told = broken && before["told"] == true;
+        match said {
+            Err(why) => (!told).then(|| Self::Broke(why.clone())),
+            Ok(_) => told.then_some(Self::Works),
+        }
+    }
+
+    fn prompt(&self, trigger: &Trigger) -> String {
+        let (name, at) = (&trigger.name, stamp(now()));
+        match self {
+            Self::Broke(why) => format!(
+                "[trigger {name} · {at} · its --if could not run, so {} sends nothing to {} \
+                 until it can: {why}. Told once; the next note says it works again.]",
+                trigger.when,
+                trigger.bot()
+            ),
+            Self::Works => format!("[trigger {name} · {at} · its --if works again]"),
+        }
+    }
+}
+
+/// Who hears of a trigger's `--if`: the agent its answers go to, else the
+/// agent that added a `--start` trigger, else the agent it messages; none
+/// for a `--start` trigger whose agent is not made yet and that no agent
+/// added.
+fn gate_told(trigger: &Trigger, kept: &Kept) -> Option<(String, i64)> {
+    if let Some(to) = &trigger.reply_to {
+        return Some(to.clone());
+    }
+    match &trigger.target {
+        Target::Bot { name, id } => Some((name.clone(), *id)),
+        Target::Start { by: Some(by), .. } => Some(by.clone()),
+        Target::Start { name, .. } => kept.started_id.map(|id| (name.clone(), id)),
+    }
+}
+
+/// Tell of `news`, through the trigger's daemon. Whether it went.
+fn tell_gate(trigger: &Trigger, kept: &Kept, news: &GateNews) -> bool {
+    let Some((to, to_id)) = gate_told(trigger, kept) else {
+        return false;
+    };
+    let prompt = news.prompt(trigger);
+    let told = with_daemon(trigger, async |client| {
+        note(client, trigger, (&to, to_id), &prompt).await
+    });
+    matches!(told, Ok(Ok(())))
 }
 
 /// How long a trigger's note waits for a call before it goes as a steer:
@@ -3807,6 +4032,15 @@ fn fire(places: &Places, trigger: &Trigger, ask: Option<&Asked>) {
     let checked = |gate: &str, detail: Option<&String>| {
         named(json!({"checked_ms": now * 1000, "gate": gate, "detail": detail}))
     };
+    // A check that broke is told once, and that it works again once: an
+    // `--if` that fails every minute is one note, not one a minute.
+    let news = said
+        .as_ref()
+        .and_then(|said| GateNews::of(&kept.checked, said));
+    let told = match &news {
+        Some(news) => tell_gate(trigger, &kept, news),
+        None => kept.checked["told"] == true,
+    };
     match said {
         None => {}
         Some(Ok(Ok(()))) => kept.checked = checked("go", None),
@@ -3831,6 +4065,7 @@ fn fire(places: &Places, trigger: &Trigger, ask: Option<&Asked>) {
         }
         Some(Err(broken)) => {
             kept.checked = checked("failed", Some(&broken));
+            kept.checked["told"] = json!(told);
             let failed = named(json!({"outcome": "failed", "detail": broken}));
             settle(places, trigger, &failed, &kept);
             return;
@@ -3946,7 +4181,7 @@ pub(crate) async fn connect(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[tokio::test]
@@ -3976,6 +4211,179 @@ mod tests {
         let prompt = submit["prompt"].as_str().unwrap();
         assert!(prompt.starts_with("[trigger (ended) · "), "{prompt}");
         assert!(prompt.ends_with(" · turn 4 it sent calc.lead failed: provider_error]"));
+    }
+
+    #[test]
+    fn a_backup_keeps_each_definition_and_a_restore_hands_a_folders_to_its_lead() {
+        let w = World::new("backed-up");
+        let look = Trigger {
+            name: "p.lead.next".into(),
+            target: Target::Bot {
+                name: "p.lead".into(),
+                id: 3,
+            },
+            ..trigger()
+        };
+        let digest = Trigger {
+            name: "p.digest".into(),
+            target: Target::Start {
+                name: "p.digest".into(),
+                model: "openai/gpt".into(),
+                effort: Some("low".into()),
+                by: Some(("p.lead".into(), 3)),
+            },
+            gate: Some("test -s inbox".into()),
+            dir: Some("/work/p".into()),
+            ..trigger()
+        };
+        let other = Trigger {
+            name: "q.check".into(),
+            target: Target::Bot {
+                name: "q.lead".into(),
+                id: 8,
+            },
+            ..trigger()
+        };
+        for t in [&look, &digest, &trigger(), &other] {
+            w.install(t).unwrap();
+        }
+        w.settle(&digest, json!({"outcome": "sent", "turn": 5}));
+        let list = backed_up(&w.places);
+        let names: Vec<_> = list
+            .iter()
+            .map(|row| row["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["p.digest", "p.fix-login", "p.lead.next", "q.check"]);
+        assert_eq!(
+            list[0],
+            json!({"name": "p.digest", "when": "every 30m", "bot": "p.digest",
+                "start": {"model": "openai/gpt", "effort": "low"}, "by": "p.lead",
+                "reply_to": null, "if": "test -s inbox", "runs": null,
+                "turn_budget_tokens": null, "once": false, "commit": null, "file": null,
+                "dir": "/work/p", "message": digest.message}),
+            "what it did and its daemon's ids stay out"
+        );
+
+        let home = w.root.join("restored-home");
+        let text = serde_json::to_vec(&list).unwrap();
+        restore(&home, Some(&text)).unwrap();
+        let p = restored_in(&home, "p").unwrap();
+        assert!(p.note().starts_with(RESTORED), "{}", p.note());
+        assert!(p.note().contains(r#""name":"p.digest""#));
+        assert!(p.note().contains(r#""name":"p.fix-login""#));
+        assert!(
+            !p.note().contains("p.lead.next"),
+            "a lead's own look is its own"
+        );
+        assert!(!p.note().contains("q.check"), "another folder's");
+        assert!(p.request_id().starts_with("sonny-restore-"));
+        assert!(restored_in(&home, "r").is_none(), "nothing of its own");
+        p.told();
+        assert!(
+            restored_in(&home, "p").is_none(),
+            "one lead of a folder is told"
+        );
+        assert!(restored_in(&home, "q").is_some());
+        // A restore again starts over; one from a backup with none leaves none.
+        restore(&home, Some(&text)).unwrap();
+        assert!(restored_in(&home, "p").is_some());
+        restore(&home, None).unwrap();
+        assert!(restored_in(&home, "q").is_none());
+    }
+
+    #[test]
+    fn a_gate_that_breaks_is_told_once_and_again_when_it_works() {
+        let broke: Result<Result<(), String>, String> = Err("--if: ran past 60s".into());
+        let (yes, no) = (Ok(Ok(())), Ok(Err("--if: exit status: 1".into())));
+        let never = Value::Null;
+        let went = json!({"gate": "go"});
+        let told = json!({"gate": "failed", "detail": "--if: ran past 60s", "told": true});
+        let untold = json!({"gate": "failed", "detail": "--if: ran past 60s", "told": false});
+        // The first break is news, from any state but one told already.
+        let news = Some(GateNews::Broke("--if: ran past 60s".into()));
+        assert_eq!(GateNews::of(&never, &broke), news);
+        assert_eq!(GateNews::of(&went, &broke), news);
+        assert_eq!(GateNews::of(&json!({"gate": "no"}), &broke), news);
+        assert_eq!(GateNews::of(&told, &broke), None, "told once");
+        assert_eq!(GateNews::of(&untold, &broke), news, "its note did not go");
+        // Working again is news only after a break someone heard of.
+        assert_eq!(GateNews::of(&told, &yes), Some(GateNews::Works));
+        assert_eq!(GateNews::of(&told, &no), Some(GateNews::Works));
+        assert_eq!(GateNews::of(&untold, &yes), None);
+        assert_eq!(GateNews::of(&went, &yes), None);
+        assert_eq!(GateNews::of(&never, &no), None);
+        let s = trigger();
+        let prompt = GateNews::Broke("--if: ran past 60s".into()).prompt(&s);
+        assert!(prompt.starts_with("[trigger p.fix-login · "), "{prompt}");
+        assert!(
+            prompt.contains(" · its --if could not run, so every 30m sends nothing to p.fix-login until it can: --if: ran past 60s. "),
+            "{prompt}"
+        );
+        assert!(
+            GateNews::Works
+                .prompt(&s)
+                .ends_with(" · its --if works again]")
+        );
+    }
+
+    #[test]
+    fn a_gate_is_told_to_who_hears_of_the_trigger() {
+        let s = trigger();
+        let kept = Kept::default();
+        assert_eq!(gate_told(&s, &kept), Some(("p.fix-login".into(), 42)));
+        let answered = Trigger {
+            reply_to: Some(("p.lead".into(), 3)),
+            ..s.clone()
+        };
+        assert_eq!(gate_told(&answered, &kept), Some(("p.lead".into(), 3)));
+        let start = |by| Trigger {
+            target: Target::Start {
+                name: "p.digest".into(),
+                model: "m".into(),
+                effort: None,
+                by,
+            },
+            ..s.clone()
+        };
+        let added = start(Some(("p.lead".into(), 7)));
+        assert_eq!(gate_told(&added, &kept), Some(("p.lead".into(), 7)));
+        let alone = start(None);
+        assert_eq!(gate_told(&alone, &kept), None, "no agent yet");
+        let made = Kept {
+            started_id: Some(9),
+            ..Kept::default()
+        };
+        assert_eq!(gate_told(&alone, &made), Some(("p.digest".into(), 9)));
+    }
+
+    #[tokio::test]
+    async fn a_gates_note_is_attached_and_starts_no_fire_of_its_own() {
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = asked.clone();
+        let client = crate::tests::daemon_answering(move |request| {
+            seen.lock().unwrap().push(request.clone());
+            json!({})
+        })
+        .await;
+        let s = trigger();
+        note(
+            &client,
+            &s,
+            ("p.lead", 3),
+            "[trigger p.fix-login · its --if works again]",
+        )
+        .await
+        .unwrap();
+        let submit = asked.lock().unwrap()[0].clone();
+        assert_eq!(
+            (&submit["bot"], &submit["bot_id"]),
+            (&json!("p.lead"), &json!(3))
+        );
+        assert_eq!(submit["delivery"], "attach");
+        assert_eq!(submit["origin"], "trigger");
+        let request = submit["request_id"].as_str().unwrap();
+        assert!(request.starts_with("trigger_test-1_missed.3."), "{request}");
+        assert_eq!(fire_generation(request), None);
     }
 
     #[test]
@@ -4162,6 +4570,16 @@ mod tests {
                 .unwrap_err()
                 .contains("narrow")
         );
+    }
+
+    /// A definition of `name`, as `add` writes one, for tests elsewhere.
+    pub(crate) fn definition_of(name: &str) -> String {
+        let named = Trigger {
+            name: name.into(),
+            ..trigger()
+        };
+        let when = every("30m", clock(2026, 9, 28, 9, 7)).unwrap();
+        definition(Path::new("/A/agent-app"), &named, &when, &[])
     }
 
     fn trigger() -> Trigger {
