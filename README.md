@@ -201,6 +201,33 @@ of the folder, lays them out in Rex, Herdr or cmux, and hears what they did. It
 also gives every agent [triggers, memory, skills and your MCP servers](docs/SONNY.md),
 the last through scripts that call many tools and return only what they print.
 
+### When to use Sonny
+
+For one quick task, use Claude Code or Codex: you ask, you watch, and the
+answer comes straight back, with no lead between you and the work. That is a
+recommendation from using both, not a measured comparison. They keep your
+attention on one task; Sonny lets you spend less attention across many. It
+is for the work you don't want to watch closely: five things rather than
+one, each needing a question answered or a decision now and then, while
+mail, chat and other people keep adding to it.
+
+You hand the folder's lead several things at once. It starts a task for
+each and hears how every turn ended through the [lookout](docs/LOOKOUT.md),
+so you don't check on them. What needs you comes to you: a task's question
+or a decision reaches the lead, and the footer counts it (`? 1 needs you`).
+News from outside comes in the same way, from the lookout's
+[sources](docs/LOOKOUT.md#sources) such as a chat poller or a mailbox. The
+lead can read further through your MCP servers, and weighs what it hears
+against the work it holds. Memory keeps how you work, so a correction holds
+for every later agent.
+
+It asks for a different habit: step back and ask for more. If you'd rather
+watch one thing get done, open Codex or Claude Code. If you have several,
+give them to the lead, and spend your attention on its questions and
+decisions instead of on watching.
+
+### Install and first run
+
 ```sh
 brew install lydakis/agent/sonny        # or, on Linux, install.sh above
 sonny                                   # in your project's folder
