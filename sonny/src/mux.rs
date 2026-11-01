@@ -291,6 +291,22 @@ impl Place {
         }
     }
 
+    /// A window's place, or none, as `--window-place` carries it.
+    pub fn encode(place: &Option<Place>) -> String {
+        place
+            .as_ref()
+            .map_or(serde_json::Value::Null, Place::json)
+            .to_string()
+    }
+
+    pub fn decode(text: &str) -> Option<Option<Place>> {
+        let json: serde_json::Value = serde_json::from_str(text).ok()?;
+        match json.is_null() {
+            true => Some(None),
+            false => Place::of(&json).map(Some),
+        }
+    }
+
     fn of(json: &serde_json::Value) -> Option<Self> {
         let text = |key: &str| json[key].as_str().map(str::to_owned);
         match json["multiplexer"].as_str()? {
@@ -458,15 +474,29 @@ impl Marker {
     /// The window of one of the project's agents, not its lead: `here`
     /// when it runs in a multiplexer, so in the home its lead's window
     /// laid out there.
-    pub fn agent(socket: &Path, project: &str, here: bool) -> Option<Self> {
+    /// `given` is the place of the window this one replaced in the same
+    /// terminal (`/switch`), which is this one's too.
+    pub fn agent(
+        socket: &Path,
+        project: &str,
+        here: bool,
+        given: Option<Option<Place>>,
+    ) -> Option<Self> {
         Some(Self {
             file: Place::file(socket, project)?,
-            place: None,
-            follows: here,
+            follows: here && given.is_none(),
+            place: given.flatten(),
             last: None,
         })
     }
 
+    /// Where this window is, once known: handed to the Sonny that
+    /// replaces it in the same terminal.
+    pub fn known(&self) -> Option<Option<Place>> {
+        (!self.follows).then(|| self.place.clone())
+    }
+
+    /// Typing: noted at most once a second.
     pub fn used(&mut self) {
         if self
             .last
@@ -474,6 +504,12 @@ impl Marker {
         {
             return;
         }
+        self.used_now();
+    }
+
+    /// A click, a paste, Enter or the window coming to the front: noted
+    /// at once, as the person may have just come back from another window.
+    pub fn used_now(&mut self) {
         self.last = Some(Instant::now());
         // An agent's window opened in a multiplexer was opened in the home
         // of the window used last that is in one: that home is its own
@@ -1405,6 +1441,9 @@ mod tests {
             assert_eq!(latest_in(&file, |_| true), Some((me, true)));
         }
         assert_eq!(windows(&file).len(), 3);
+        for place in [Some(places[2].clone()), None] {
+            assert_eq!(Place::decode(&Place::encode(&place)), Some(place));
+        }
         std::fs::write(
             &file,
             "{\"windows\": [{\"pid\": 1, \"used_ms\": 1, \"place\": {\"multiplexer\": \"tmux\"}}]}",
@@ -1539,6 +1578,31 @@ mod tests {
         retire_in(&file, me);
         let (window, open) = latest_in(&file, alive).unwrap();
         assert_eq!((window.pid, window.place, open), (0, None, false));
+        let _ = std::fs::remove_file(&file);
+    }
+
+    /// `/switch` from a lead's window to one of its tasks: the task's
+    /// window is in the same terminal, so it takes the lead's place even
+    /// with no open window left to read it from, and hands it on in turn.
+    #[test]
+    fn a_window_switched_to_takes_the_place_it_replaced() {
+        let file = std::env::temp_dir().join(format!("sonny-given-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&file);
+        let home = Place::Cmux {
+            workspace: "9A".into(),
+        };
+        let mut task = Marker {
+            file: file.clone(),
+            follows: false,
+            place: Some(home.clone()),
+            last: None,
+        };
+        assert_eq!(task.known(), Some(Some(home.clone())));
+        task.used_now();
+        assert_eq!(windows(&file)[0].place, Some(home));
+        // One still to learn its home hands nothing on.
+        task.follows = true;
+        assert_eq!(task.known(), None);
         let _ = std::fs::remove_file(&file);
     }
 

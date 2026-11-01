@@ -239,6 +239,8 @@ struct Options {
     /// Drawn in another Sonny's pane: the terminal's tab is that Sonny's,
     /// so this one claims nothing of it.
     embedded: bool,
+    /// Where the window this one replaced (`/switch`) was, as JSON.
+    window_place: Option<String>,
     /// Which of the folder's leads to open, with no `--agent`.
     lead: project::Pick,
 }
@@ -702,6 +704,7 @@ fn parse() -> Result<Options, String> {
         (None, None, None, false, None, None);
     let (mut layout, mut rex_host, mut sound) = (true, None, true);
     let (mut side, mut embedded) = (None, false);
+    let mut window_place = None;
     let mut lead = project::Pick::Last;
     let mut args = args.peekable();
     while let Some(arg) = args.next() {
@@ -726,6 +729,8 @@ fn parse() -> Result<Options, String> {
             "--side" => side = Some(value()?.parse().map_err(|_| usage())?),
             // Unlisted: how a task opens in the pane.
             "--embedded" => embedded = true,
+            // Unlisted: how `/switch` hands the window's place on.
+            "--window-place" => window_place = Some(value()?),
             _ => return Err(usage()),
         }
     }
@@ -742,6 +747,7 @@ fn parse() -> Result<Options, String> {
         sound,
         side,
         embedded,
+        window_place,
         lead,
     })
 }
@@ -756,7 +762,7 @@ fn reopen(bot: &str) -> Vec<String> {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--new" => {}
-            "--workspace" | "--lead" | "--agent" => {
+            "--workspace" | "--lead" | "--agent" | "--window-place" => {
                 args.next();
             }
             "--new-lead" => {
@@ -1087,7 +1093,8 @@ async fn run() -> Result<(), String> {
             None => {
                 let project = project_of(&app.client, &name).await;
                 let here = options.layout && mux::inside(options.rex_host.as_deref());
-                mux::Marker::agent(&options.socket, &project, here)
+                let given = options.window_place.as_deref().and_then(mux::Place::decode);
+                mux::Marker::agent(&options.socket, &project, here, given)
             }
         };
         if let Some(marker) = &mut app.marker {
@@ -1188,10 +1195,13 @@ async fn run() -> Result<(), String> {
     // `/lead NAME`: this window becomes that lead's Sonny, as if opened on it.
     if let (Ok(()), Some(other)) = (&result, app.switch_to.take()) {
         use std::os::unix::process::CommandExt;
-        // This process goes on as the other agent's Sonny: this window,
-        // as its project knows it, is closed.
+        // This process goes on as the other agent's Sonny, in this same
+        // terminal: this window, as its project knows it, is closed, and
+        // where it is goes on to the next.
+        let mut place = None;
         if let Some(marker) = &app.marker {
             marker.retire();
+            place = marker.known();
         }
         let me = std::env::current_exe().map_err(|e| e.to_string())?;
         // Named by --agent, whatever folder this window is in.
@@ -1201,6 +1211,9 @@ async fn run() -> Result<(), String> {
         }
         if !args.iter().any(|arg| arg == "--agent") {
             args.extend(["--agent".into(), other.clone()]);
+        }
+        if let Some(place) = place {
+            args.extend(["--window-place".into(), mux::Place::encode(&place)]);
         }
         let error = std::process::Command::new(me).args(&args).exec();
         return Err(format!("could not open {other}: {error}"));
@@ -8960,7 +8973,12 @@ impl App {
         if let Some(marker) = &mut self.marker
             && used(&event)
         {
-            marker.used();
+            // Typing marks at most once a second; anything else (Enter
+            // included) at once, as it may follow a visit elsewhere.
+            match &event {
+                Event::Key(key) if key.code != KeyCode::Enter => marker.used(),
+                _ => marker.used_now(),
+            }
         }
         // The terminal may no longer show what was drawn: a multiplexer
         // sizes a pane down and back to have its program draw it whole
@@ -12443,6 +12461,7 @@ mod tests {
             sound: false,
             side: None,
             embedded: false,
+            window_place: None,
             lead: project::Pick::Last,
         };
         App::new(client, "b", &json!({"name": "b"}), options)
