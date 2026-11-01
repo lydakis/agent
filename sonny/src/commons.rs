@@ -908,12 +908,20 @@ pub fn audience(home: &Path, thread: &str, author: &str) -> usize {
         .map_or(0, |by| by.keys().filter(|bot| *bot != author).count())
 }
 
-/// Who posted last in `thread`: who an invite to it or a reply's note
-/// comes from. None for no such thread.
-pub fn last_poster(home: &Path, thread: &str) -> Option<String> {
+/// Who started `thread`: who its invites come from. Its first line
+/// only, which never changes, so a later post never renames it and a
+/// long thread costs no more than a short one. None for no such thread.
+pub fn starter(home: &Path, thread: &str) -> Option<String> {
+    use std::io::{BufRead, Read};
     valid_name(thread).ok()?;
-    let posts = posts(&dir(home).join(format!("{thread}.jsonl"))).ok()?;
-    posts.last()?["by"].as_str().map(str::to_owned)
+    let file = std::fs::File::open(dir(home).join(format!("{thread}.jsonl"))).ok()?;
+    let mut first = String::new();
+    // A post is a line; one past a megabyte is no post the tool wrote.
+    std::io::BufReader::new(file.take(1 << 20))
+        .read_line(&mut first)
+        .ok()?;
+    let post: Value = serde_json::from_str(first.trim()).ok()?;
+    post["by"].as_str().map(str::to_owned)
 }
 
 /// A thread as the tool shows it, read by no one yet.
@@ -1632,6 +1640,24 @@ mod tests {
         assert_eq!(news(&home, &cursor).lines, lost);
         assert_eq!(look(&home, &cursor), lost);
         assert!(look(&home, &cursor).is_empty());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_thread_s_starter_stays_its_starter_whoever_replies() {
+        let home = home("starter");
+        let post = |by: &str, arguments: Value| call(&home, by, None, None, &arguments).unwrap();
+        post(
+            "a.x",
+            json!({"post": {"name": "plan", "title": "The plan", "text": "first"}}),
+        );
+        post(
+            "b.y",
+            json!({"reply": {"thread": "plan", "text": "second"}}),
+        );
+        assert_eq!(starter(&home, "plan").as_deref(), Some("a.x"));
+        assert_eq!(starter(&home, "nothing"), None);
+        assert_eq!(starter(&home, "../escape"), None);
         let _ = std::fs::remove_dir_all(&home);
     }
 

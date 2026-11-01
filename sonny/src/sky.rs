@@ -1958,6 +1958,14 @@ impl View {
             "step_decided" | "turn_resumed" if live => {
                 if let Some(id) = data["call_id"].as_str() {
                     self.agents[at].held.remove(id);
+                    // A step of a call, such as an MCP call inside `exec`,
+                    // its reviewer refused.
+                    let key = (name.to_owned(), turn, id.to_owned());
+                    if let Some(reviewer) = self.reviewed.remove(&key)
+                        && data["denied"] == true
+                    {
+                        self.denied(at, &reviewer, data, now);
+                    }
                 }
             }
             "tool_completed" if live => {
@@ -1967,10 +1975,7 @@ impl View {
                     if let Some(reviewer) = self.reviewed.remove(&key)
                         && data["denied"] == true
                     {
-                        self.verdict(at, FAILED, now);
-                        let tool = data["name"].as_str().unwrap_or("a call");
-                        let said = format!("✗ {reviewer} denied {}'s {tool}", self.short(at));
-                        self.say(now, said, Some(FAILED), &[at]);
+                        self.denied(at, &reviewer, data, now);
                     }
                     if let Some(booking) = self.bookings.remove(&key)
                         && data["failed"] != true
@@ -2271,11 +2276,13 @@ impl View {
         if origin == "margin" {
             return End::Person;
         }
-        // The commons invites and wakes on someone's post: from them.
+        // The commons invites to a thread on its starter's post: from
+        // them. A reply's note names no one the thread can't later
+        // rename, so it comes from the edge.
         if origin == "commons"
-            && let Some(thread) = commons_thread(data["request_id"].as_str().unwrap_or(""))
+            && let Some(thread) = commons_invite(data["request_id"].as_str().unwrap_or(""))
             && let Some(home) = std::env::var_os("HOME")
-            && let Some(by) = crate::commons::last_poster(std::path::Path::new(&home), thread)
+            && let Some(by) = crate::commons::starter(std::path::Path::new(&home), thread)
             && let Some(by) = self.agent(&by).filter(|&by| by != at)
         {
             return End::Agent(by);
@@ -2340,6 +2347,14 @@ impl View {
             born: now,
             color: Some(color),
         });
+    }
+
+    /// A reviewer refused an agent's call: its streak, and a line.
+    fn denied(&mut self, at: usize, reviewer: &str, data: &Value, now: Instant) {
+        self.verdict(at, FAILED, now);
+        let tool = data["name"].as_str().unwrap_or("call");
+        let said = format!("✗ {reviewer} denied {}'s {tool}", self.short(at));
+        self.say(now, said, Some(FAILED), &[at]);
     }
 
     /// When what happens at `now` happened, for the hour's counts: `now`
@@ -3767,12 +3782,10 @@ fn hue(from: End, to: End) -> Option<Color> {
     }
 }
 
-/// The commons thread a commons note's request names: an invite's
-/// (`commons.invite.THREAD`) or a reply's (`commons.THREAD.SEEN.woken`).
-fn commons_thread(request: &str) -> Option<&str> {
-    let rest = request.strip_prefix("commons.")?;
-    let rest = rest.strip_prefix("invite.").unwrap_or(rest);
-    rest.split('.').next().filter(|thread| !thread.is_empty())
+/// The thread a commons invite's request names (`commons.invite.THREAD`).
+fn commons_invite(request: &str) -> Option<&str> {
+    let thread = request.strip_prefix("commons.invite.")?;
+    (!thread.is_empty() && !thread.contains('.')).then_some(thread)
 }
 
 /// A time of day, as a replay's chat log and footer say it: `02:10`.
@@ -6333,16 +6346,13 @@ mod tests {
             End::Rim(lead)
         );
         assert_eq!(view.sender(&json!({"person": "Ana"}), lead), End::Rim(lead));
-        // The commons names the thread its note is about.
+        // A commons invite names its thread; a reply's note is not one.
         assert_eq!(
-            commons_thread("commons.invite.release-notes"),
+            commons_invite("commons.invite.release-notes"),
             Some("release-notes")
         );
-        assert_eq!(
-            commons_thread("commons.release-notes.4.woken"),
-            Some("release-notes")
-        );
-        assert_eq!(commons_thread("lookout-abc"), None);
+        assert_eq!(commons_invite("commons.release-notes.4.woken"), None);
+        assert_eq!(commons_invite("lookout-abc"), None);
         // A goal: the star pulses, nothing flies, the log says so.
         send.send(Feed::Live(
             json!({"event": "accepted", "bot": "shop.login", "turn": 1,
@@ -6424,6 +6434,14 @@ mod tests {
             json!({"call_id": "c2", "name": "shell", "denied": true}),
         ))
         .unwrap();
+        // A step of a call, an MCP call inside `exec`, refused.
+        send.send(asked(1, "s1", json!(["auto"]))).unwrap();
+        send.send(live(
+            "step_decided",
+            1,
+            json!({"call_id": "s1", "name": "github.search", "decision": "deny", "denied": true}),
+        ))
+        .unwrap();
         send.send(live(
             "approval_asked",
             1,
@@ -6440,6 +6458,7 @@ mod tests {
             streaks,
             [
                 (End::Rim(lead), End::Agent(lead), Some(FAILED)),
+                (End::Rim(lead), End::Agent(lead), Some(FAILED)),
                 (End::Rim(lead), End::Agent(lead), Some(NEEDS)),
             ]
         );
@@ -6450,12 +6469,14 @@ mod tests {
                 // The manual call waits on the person from the start.
                 "? shop lead waits for you",
                 "✗ auto denied shop lead's shell",
+                "✗ auto denied shop lead's github.search",
                 "? shop lead waits for you",
             ]
         );
         assert_eq!(view.ticker[1].hue, Some(FAILED));
-        // Not counted as messages.
+        // Not counted as messages, and none left waiting.
         assert!(view.recent.is_empty());
+        assert!(view.reviewed.is_empty());
     }
 
     #[tokio::test]
