@@ -253,6 +253,7 @@ at its model's own effort (`AGENT_EFFORT` when its model is
 | The approver's judge | `[judge] model`, `effort` | |
 | What `/side`'s copy may do | `[sonny] side_chat` (`answer` or `fork`) | |
 | The chime, and every tool call drawn | `[sonny] chime`, `verbose` (true or false) | |
+| The widest the conversation is written | `[sonny] text_width` (100 by default, at least 40, 0 for the window's whole width) | |
 | A guess at your next message | `[sonny] suggest` (true, the default, or false) | |
 | Whether agents have the commons | `[sonny] commons` (true, the default, or false) | |
 | When a note opens the margin | `[sonny] margin_opens` (`always`, the default, `unless-closed` or `never`) | |
@@ -1279,7 +1280,11 @@ heading takes no `•` before it.
 
 Sonny owns the whole screen, as Codex does; there is no inline mode.
 The conversation and the composer keep to a column 100 wide, however wide the window, so a reply
-reads as a column rather than a band across the screen. The composer sits on the same
+reads as a column rather than a band across the screen. `[sonny] text_width` (in `/config`)
+sets another width, at least 40, the pane beside the conversation taking the rest; 0 lets the
+conversation fill the window, as Claude Code's does, and a file, a card or the margin then
+opens over it, Ctrl+\ flipping between the two, as in a window too narrow for both, and the
+margin waits for `/margin`. The composer sits on the same
 tinted band as your messages, a row of it above and below the words, so it stays
 apart from the conversation in any theme and what you write looks as it will once
 sent; without colour (`NO_COLOR`) a rule above it does the same. The footer sits
@@ -1405,7 +1410,7 @@ agent in the pane, where you answer it. A file, `/status`, `/background` or a si
 chat opens over the margin, its title's `←`, Esc and Ctrl+[ going back to it;
 Esc in the margin closes it, and `/margin` brings it back. The margin
 opens by itself when the agent puts up or changes a note, once the window
-leaves the conversation its 100 columns and the margin 40 more, even
+leaves the conversation its 100 columns (`text_width`) and the margin 40 more, even
 after Esc closed it, under whatever is open over it, as VS Code's
 `reveal` shows a task's output; `[sonny] margin_opens = "unless-closed"`
 leaves it closed after Esc until `/margin`, and `"never"` opens it only

@@ -165,11 +165,37 @@ const WALKED_PAGES: usize = 32;
 /// where a note the margin shows of it starts.
 const REFERENCE_PAGES: usize = 25;
 /// The widest the conversation is written, however wide the window: a
-/// reply reads as a column, not a band across the screen. Prose reads
-/// best at 45 to 90 characters a line, but replies carry code, paths and
-/// tables too, which most style guides keep within 100 (rustfmt's own
-/// width), so they stay whole at 100 and prose stays near the measure.
-const PROSE: usize = 100;
+/// reply reads as a column, not a band across the screen.
+/// `[sonny] text_width` sets it, 100 by default
+/// ([`agent_client::config::TEXT_WIDTH`] says why); 0 lets it fill the
+/// window, as Claude Code's does.
+static MEASURE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(agent_client::config::TEXT_WIDTH as usize);
+/// The measure of a conversation that fills the window: wider than any
+/// window, so the pane beside it never has room and opens over it, as in a
+/// narrow window, and small enough that a column or two added to it is
+/// still a terminal's width.
+const WHOLE: usize = u16::MAX as usize / 2;
+
+/// The widest the conversation is written; [`MEASURE`].
+fn measure() -> usize {
+    MEASURE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The measure as `[sonny] text_width` sets it: 0 the window's whole width.
+/// Whether it changed.
+fn set_measure(text_width: u64) -> bool {
+    let measure = measure_of(text_width);
+    MEASURE.swap(measure, std::sync::atomic::Ordering::Relaxed) != measure
+}
+
+/// The measure `[sonny] text_width` names.
+fn measure_of(text_width: u64) -> usize {
+    match text_width {
+        0 => WHOLE,
+        width => usize::try_from(width).unwrap_or(WHOLE).min(WHOLE),
+    }
+}
 
 /// The blank columns between the conversation and the line beside it,
 /// matched on the pane's side, as the conversation's own rows open.
@@ -1117,6 +1143,7 @@ async fn run() -> Result<(), String> {
     let settings = settings::Settings::load();
     app.sounds.chime = settings.chime;
     app.verbose = settings.verbose;
+    set_measure(settings.text_width);
     app.zen = zen::focus(app.reactions_key.as_deref());
     app.margin_opens = settings.margin_opens;
     app.agent_opens = settings.agent_opens;
@@ -1415,7 +1442,7 @@ fn remote_without_display(var: &dyn Fn(&str) -> Option<std::ffi::OsString>) -> b
 /// middle of it, and the composer's limits show in any theme. Without
 /// colour (`NO_COLOR`) a muted rule above it.
 fn edge(frame: &mut ratatui::Frame, gap: Rect, composer: Rect, pad: Rect) {
-    let width = composer.width.min(PROSE as u16);
+    let width = composer.width.min(measure() as u16);
     if look::no_color() {
         let rule = Line::from("─".repeat(width as usize)).dim();
         frame.render_widget(Paragraph::new(rule), Rect { width, ..gap });
@@ -5233,7 +5260,7 @@ impl App {
         }
         program.env("TERM", "xterm-256color");
         let height = self.height.saturating_sub(2).max(2) as u16;
-        let width = match pane::width(self.full_width, PROSE as u16 + GUTTER) {
+        let width = match pane::width(self.full_width, measure() as u16 + GUTTER) {
             0 => 80,
             width => width,
         };
@@ -9312,7 +9339,7 @@ impl App {
     /// The file `link` names, read for the pane at its width.
     fn preview(&self, link: &str) -> Result<pane::Pane, String> {
         let workspace = std::path::Path::new(&self.workspace);
-        let width = pane::width(self.full_width, PROSE as u16 + GUTTER).max(20) as usize;
+        let width = pane::width(self.full_width, measure() as u16 + GUTTER).max(20) as usize;
         pane::Pane::preview(link, workspace, width)
     }
 
@@ -9362,7 +9389,7 @@ impl App {
         };
         // The margin where the conversation leaves room for it, or while
         // the keys are in it; out of the way otherwise, and in zen.
-        let prose = PROSE as u16 + GUTTER;
+        let prose = measure() as u16 + GUTTER;
         let margin = pane::margin_width(area.width, prose);
         if open.is_margin() && (margin.is_none() || self.zen.is_some()) && !self.pane_keys {
             return (self.centred(area), None);
@@ -9394,7 +9421,7 @@ impl App {
     /// The conversation alone in the window: in zen, its column in the
     /// middle, as a reader centres a page; else where it is, on the left.
     fn centred(&self, area: Rect) -> Rect {
-        let column = PROSE as u16;
+        let column = measure() as u16;
         match self.zen {
             Some(_) if area.width > column => Rect {
                 x: area.x + (area.width - column) / 2,
@@ -9412,7 +9439,7 @@ impl App {
 
     /// The width the conversation is written at.
     fn prose(&self) -> usize {
-        self.width.min(PROSE)
+        self.width.min(measure())
     }
 
     /// `text` put on the clipboard, and said so.
@@ -9741,7 +9768,8 @@ impl App {
             } else if let config::Key::Close = view.event(&event) {
                 self.config = None;
             }
-            // The chime and the view as the file now has them.
+            // The chime, the view and the text's width as the file now
+            // has them; a new width written again as a resize is.
             let settings = settings::Settings::load();
             self.sounds.chime = settings.chime;
             self.margin_opens = settings.margin_opens;
@@ -9749,6 +9777,10 @@ impl App {
             if self.verbose != settings.verbose {
                 self.verbose = settings.verbose;
                 self.repaint = true;
+            }
+            if set_measure(settings.text_width) {
+                self.repaint = true;
+                self.stale = true;
             }
             return;
         }
@@ -11370,12 +11402,14 @@ impl App {
         } as usize;
         self.width = width;
         self.height = terminal.size()?.height as usize;
-        let (composer_rows, (cursor_row, cursor_col)) = self.composer(width.min(PROSE));
+        let (composer_rows, (cursor_row, cursor_col)) = self.composer(width.min(measure()));
         // A short pane keeps the rows around the cursor, where typing goes on.
         let room = (terminal.size()?.height as usize).saturating_sub(VIEWPORT as usize - 1);
         // What is typed to answer a question has the question over it,
         // as a reply in a chat has what it replies to.
-        let heading = self.answering_over(width.min(PROSE)).filter(|_| room > 1);
+        let heading = self
+            .answering_over(width.min(measure()))
+            .filter(|_| room > 1);
         let text_room = room - usize::from(heading.is_some());
         let (mut composer_rows, mut cursor_row) =
             window(composer_rows, cursor_row, text_room.max(1));
@@ -11383,7 +11417,7 @@ impl App {
         let first_row = match &self.composing {
             Some((_, (_, first, _))) => Some(*first),
             None => (!self.input.is_empty()).then(|| {
-                let layout = self.input.layout(width.min(PROSE));
+                let layout = self.input.layout(width.min(measure()));
                 self.input.cursor(&layout).0 - cursor_row
             }),
         };
@@ -11395,7 +11429,7 @@ impl App {
         let mut counter_at = Vec::new();
         // The reply's open line, wrapped as it will be written: it grows
         // here row by row until its newline writes it into the history.
-        let mut open_rows = self.open_rows(width.min(PROSE));
+        let mut open_rows = self.open_rows(width.min(measure()));
         // Then what was sent and has not landed, kept in view below it.
         open_rows.extend(self.staged_rows(width));
         open_rows.extend(self.shell_rows(width));
@@ -11411,7 +11445,7 @@ impl App {
         let beside = !self.margin.closed()
             && self.zen.is_none()
             && opened
-            && pane::margin_width(size.width, PROSE as u16 + GUTTER).is_some();
+            && pane::margin_width(size.width, measure() as u16 + GUTTER).is_some();
         self.fold_notes(beside);
         let below = VIEWPORT - 2 + live_rows + composer_rows.len() as u16;
         let workspace = std::path::PathBuf::from(&self.workspace);
@@ -11419,7 +11453,7 @@ impl App {
             && self.pane.as_ref().is_some_and(pane::Pane::is_margin)
         {
             let live = self.running.as_ref().map(|running| running.turn);
-            let width = (at.width.saturating_sub(1) as usize).min(PROSE);
+            let width = (at.width.saturating_sub(1) as usize).min(measure());
             let (lines, marks) = self.margin.lines(width, &workspace, live);
             let glance = self.glance().line();
             if let Some(pane) = &mut self.pane {
@@ -11434,12 +11468,12 @@ impl App {
         {
             let wide = match chat.width {
                 0 => size.width,
-                _ => pane::width(size.width, PROSE as u16 + GUTTER),
+                _ => pane::width(size.width, measure() as u16 + GUTTER),
             };
             // The sky fills the pane, however wide; the other cards are
             // prose, read at the conversation's measure.
             let full = wide.saturating_sub(2) as usize;
-            let width = full.min(PROSE);
+            let width = full.min(measure());
             pane.prose = watch.sky.is_none();
             if let Some(view) = &mut watch.sky {
                 let width = full;
@@ -11584,7 +11618,7 @@ impl App {
                 return;
             }
             let room = area.height.saturating_sub(below);
-            let column = area.width.min(PROSE as u16);
+            let column = area.width.min(measure() as u16);
             let rows = self.screen.height(column as usize).min(room as usize);
             // `/config` lists every setting over the rows above.
             let rows = match &self.config {
@@ -11925,7 +11959,7 @@ impl App {
                 },
                 None => composer,
             };
-            composer_at = first_row.map(|first| (text, first, width.min(PROSE)));
+            composer_at = first_row.map(|first| (text, first, width.min(measure())));
             // Keys in the pane: no cursor where they do not go.
             if !self.pane_keys {
                 frame.set_cursor_position((
@@ -11939,7 +11973,7 @@ impl App {
             // composer has them, saying what Enter does with the pick.
             let (line, opens) = match menu_keys(&menu, self.pick, &self.input) {
                 Some(keys) => (Line::from(hint::spans(keys)), Vec::new()),
-                None => self.footer(width.min(PROSE)),
+                None => self.footer(width.min(measure())),
             };
             frame.render_widget(Paragraph::new(line), footer);
             counter_at = (opens.into_iter())
@@ -12365,7 +12399,7 @@ impl App {
         }
         // The pane folded away where the window has room for one of the
         // two: its key and its name, a click flipping over to it.
-        let room = pane::width(self.full_width, PROSE as u16 + GUTTER);
+        let room = pane::width(self.full_width, measure() as u16 + GUTTER);
         if let Some(open) = &self.pane
             && !open.is_margin()
             && !self.pane_keys
@@ -18537,6 +18571,24 @@ mod tests {
         app.refold = true;
         app.fold_notes(false);
         assert!(app.plans.is_empty());
+    }
+
+    #[test]
+    fn the_text_width_sets_the_conversations_measure_and_0_fills_the_window() {
+        assert_eq!(measure_of(agent_client::config::TEXT_WIDTH), 100);
+        // A wider text keeps its columns, the margin taking the rest.
+        let wide = measure_of(140) as u16 + GUTTER;
+        assert_eq!(pane::margin_width(300, wide), Some(157));
+        assert_eq!(pane::width(160, wide), 160);
+        // The window's whole width: no window has room for a pane beside
+        // it, so one opens over it, and a column added to it still fits.
+        let whole = measure_of(0);
+        assert!(whole >= u16::MAX as usize / 2);
+        let whole = whole as u16 + GUTTER;
+        for window in [80, 400, 2_000] {
+            assert_eq!(pane::margin_width(window, whole), None);
+            assert_eq!(pane::width(window, whole), window);
+        }
     }
 
     #[tokio::test]

@@ -56,7 +56,7 @@ fn short(key: &str) -> &str {
 }
 
 /// Every key `agent_client::config` reads.
-pub const SETTINGS: [Setting; 30] = [
+pub const SETTINGS: [Setting; 31] = [
     Setting {
         key: "model",
         about: "a new agent's model, when none is named (provider/model)",
@@ -134,6 +134,12 @@ pub const SETTINGS: [Setting; 30] = [
         about: "every tool call drawn, or the clean view: replies, tasks, questions and the plan",
         values: SWITCH,
         default: "false",
+    },
+    Setting {
+        key: "sonny.text_width",
+        about: "the widest the conversation is written, in columns, however wide the window, the pane beside it taking the rest; 0 for the window's whole width, a pane then opening over it",
+        values: &[],
+        default: "100",
     },
     Setting {
         key: "sonny.margin_opens",
@@ -567,7 +573,8 @@ mod tests {
         for (at, setting) in SETTINGS.iter().enumerate() {
             view.pick = at;
             let named = match (number(setting), span(setting)) {
-                (true, _) => "7",
+                // Wide enough for a text width.
+                (true, _) => "70",
                 (_, true) => "15m",
                 _ => "a/b",
             };

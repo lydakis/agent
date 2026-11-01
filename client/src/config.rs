@@ -35,6 +35,7 @@
 //! side_chat = "fork"            # "answer", the default, calls no tool
 //! chime = false                 # rings when work ends or waits, the default
 //! verbose = true                # every tool call drawn, not the clean view
+//! text_width = 0                # the widest the conversation is written, 100 by default; 0 the window's whole width
 //! margin_opens = "never"         # "always", the default, or "unless-closed"
 //! agent_opens = "beside"        # a click on an agent's name: "tab", the default, or "beside"
 //! suggest = false               # no guess at the next message, on by default
@@ -413,6 +414,10 @@ pub struct Sonny {
     /// Whether every tool call is drawn, or only the bot's words and the
     /// calls that move the work on (the clean view, the default).
     pub verbose: bool,
+    /// The widest the conversation is written, in columns, however wide
+    /// the window: 0 for the window's whole width. At least
+    /// [`TEXT_WIDTH_LEAST`] otherwise.
+    pub text_width: u64,
     /// When a note the agent puts up or changes opens the margin.
     pub margin_opens: MarginOpens,
     /// Where a click on an agent's name takes the person; a right click
@@ -479,6 +484,16 @@ pub const BROWSER_CONFIRM: [&str; 4] = ["eval", "download", "upload", "state"];
 /// config says otherwise: an hour, as Slack's slowest email batching.
 pub const COMMONS_DIGEST: &str = "1h";
 
+/// The widest the conversation is written unless the config says
+/// otherwise: prose reads best at 45 to 90 characters a line, but replies
+/// carry code, paths and tables too, which most style guides keep within
+/// 100 (rustfmt's own width), so they stay whole at 100.
+pub const TEXT_WIDTH: u64 = 100;
+
+/// The narrowest `text_width` other than 0, the margin's own least width:
+/// a narrower column wraps a path or a line of code at every turn.
+pub const TEXT_WIDTH_LEAST: u64 = 40;
+
 /// The name of the source Sonny's lookout makes of the commons.
 pub const COMMONS_SOURCE: &str = "commons";
 
@@ -527,6 +542,7 @@ impl Default for Sonny {
             tool_processes: 0,
             chime: true,
             verbose: false,
+            text_width: TEXT_WIDTH,
             start_at_boot: false,
             margin_opens: MarginOpens::default(),
             agent_opens: AgentOpens::default(),
@@ -1022,6 +1038,7 @@ fn parse(text: &str) -> Result<Config, String> {
                 "side_chat",
                 "chime",
                 "verbose",
+                "text_width",
                 "margin_opens",
                 "agent_opens",
                 "suggest",
@@ -1109,11 +1126,19 @@ fn parse(text: &str) -> Result<Config, String> {
                 "sky_haiku_margin" => Some(&mut config.sonny.sky_haiku_margin),
                 "sky_haiku_hold" => Some(&mut config.sonny.sky_haiku_hold),
                 "tool_processes" => Some(&mut config.sonny.tool_processes),
+                "text_width" => Some(&mut config.sonny.text_width),
                 _ => None,
             } {
                 *count = (value.as_integer())
                     .and_then(|n| u64::try_from(n).ok())
                     .ok_or_else(|| format!("{name}.{key} must be a whole number, 0 or more"))?;
+                let width = config.sonny.text_width;
+                if key == "text_width" && (1..TEXT_WIDTH_LEAST).contains(&width) {
+                    return Err(format!(
+                        "{name}.{key} must be 0, for the window's whole width, \
+                         or at least {TEXT_WIDTH_LEAST}, not {width}"
+                    ));
+                }
                 continue;
             }
             if (name.as_str(), key.as_str()) == ("sonny", "browser_confirm") {
@@ -1723,6 +1748,19 @@ mod tests {
             0
         );
         assert!(parse("[sonny]\nsky_haiku_margin = 1.5").is_err());
+        assert_eq!(config.sonny.text_width, 100);
+        let text_width = |text: &str| parse(text).map(|config| config.sonny.text_width);
+        assert_eq!(text_width("[sonny]\ntext_width = 0"), Ok(0));
+        assert_eq!(text_width("[sonny]\ntext_width = 140"), Ok(140));
+        assert_eq!(text_width("[sonny]\ntext_width = 40"), Ok(40));
+        assert_eq!(
+            text_width("[sonny]\ntext_width = 39"),
+            Err(
+                "sonny.text_width must be 0, for the window's whole width, or at least 40, not 39"
+                    .into()
+            )
+        );
+        assert!(text_width("[sonny]\ntext_width = -1").is_err());
         assert_eq!(config.sonny.task_depth, 2);
         assert_eq!(
             parse("[sonny]\ntask_depth = 0").unwrap().sonny.task_depth,
