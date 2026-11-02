@@ -1,0 +1,5 @@
+{"number": 101, "title": "Crash when the config file is empty", "body": "Running `tally --config empty.toml` with a zero-byte file exits with a panic: called `Option::unwrap()` on a `None` value at src/config.rs:42."}
+{"number": 102, "title": "Panic on startup with an empty config", "body": "If ~/.tally/config.toml exists but is empty, tally panics before printing anything. Deleting the file fixes it."}
+{"number": 103, "title": "Add a dark theme to the report page", "body": "The HTML report is hard to read at night. A dark theme that follows the system setting would help."}
+{"number": 104, "title": "README install command is wrong", "body": "The README says `cargo install tally-cli`, but the crate is published as `tally`."}
+{"number": 105, "title": "API token printed in the debug log", "body": "With RUST_LOG=debug, the request logger prints the Authorization header, including the full API token."}
