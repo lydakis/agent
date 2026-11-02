@@ -964,6 +964,20 @@ os.execvpe('sh', ['sh', '-c', command], {{**os.environ, 'HOME': {json.dumps(str(
             time.sleep(.2)
         self.assertEqual(sock.stat().st_ino, first)
 
+    def test_a_config_that_stops_loading_keeps_the_link_and_says_why(self):
+        laptop, _ = self.linked()
+        sock = self.path / '.agent/links/laptop.sock'
+        first = sock.stat().st_ino
+        config = laptop / '.agent/config.toml'
+        config.write_text(config.read_text() + 'no_such_key = 1\n')
+        time.sleep(8)
+        self.assertEqual(sock.stat().st_ino, first)
+        self.assertTrue(json.loads((laptop / '.agent/sonny/links/box.json').read_text())['connected'])
+        env = {**clean_env(), 'HOME': str(laptop)}
+        said = subprocess.run([str(self.sonny), 'link'], env=env, capture_output=True, text=True, timeout=30)
+        self.assertIn('config does not load', said.stdout)
+        self.assertNotIn('No links', said.stdout)
+
     def test_a_connection_that_cannot_prove_itself_sends_no_call(self):
         self.linked()
         import socket as sockets

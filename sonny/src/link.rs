@@ -773,9 +773,13 @@ pub async fn keep(hub: crate::mcp::Hub) {
     let mut running: HashMap<String, (agent_client::config::Link, tokio::task::JoinHandle<()>)> =
         HashMap::new();
     loop {
-        let links = agent_client::config::load()
-            .map(|config| config.sonny.links)
-            .unwrap_or_default();
+        // A config that does not load, say while it is being edited, keeps
+        // the links as they are; `sonny link` says what is wrong with it.
+        let Ok(config) = agent_client::config::load() else {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            continue;
+        };
+        let links = config.sonny.links;
         running.retain(|key, (link, job)| {
             let kept = links.get(key) == Some(link) && !job.is_finished();
             if !kept {
@@ -1345,7 +1349,13 @@ fn forget_machine(machine: &str) -> Result<(), String> {
 
 /// `sonny link`: this machine's links, and the machines linked here.
 fn list() {
-    let config = agent_client::config::load().unwrap_or_default();
+    let (config, loaded) = match agent_client::config::load() {
+        Ok(config) => (config, true),
+        Err(error) => {
+            println!("This machine's links are unknown while its config does not load: {error}");
+            (agent_client::config::Config::default(), false)
+        }
+    };
     for (key, link) in &config.sonny.links {
         let said: Value = (mine()
             .and_then(|dir| std::fs::read(dir.join(format!("{key}.json"))).ok()))
@@ -1386,7 +1396,7 @@ fn list() {
             lends.join(", ")
         );
     }
-    if config.sonny.links.is_empty() && machines().is_empty() {
+    if loaded && config.sonny.links.is_empty() && machines().is_empty() {
         println!("No links. {USAGE}");
     }
 }
