@@ -19,17 +19,21 @@ pub struct Output {
     pub success: bool,
 }
 
-/// Run `program` with `args` in `dir`, with no input, without the
-/// variables `removed`, to its end; it is killed if this is dropped first.
+/// A variable to set to a value, or with none, to take away.
+pub type Change<'a> = (&'a str, Option<&'a OsStr>);
+
+/// Run `program` with `args` in `dir`, with no input, with this process's
+/// variables as `changes` changes them, to its end; it is killed if this
+/// is dropped first.
 pub async fn output(
     program: &Path,
     args: &[String],
     dir: &Path,
-    removed: &[&str],
+    changes: &[Change<'_>],
 ) -> std::io::Result<Output> {
     #[cfg(target_os = "macos")]
     {
-        own::output(program, args, dir, removed).await
+        own::output(program, args, dir, changes).await
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -39,8 +43,11 @@ pub async fn output(
             .current_dir(dir)
             .stdin(std::process::Stdio::null())
             .kill_on_drop(true);
-        for name in removed {
-            command.env_remove(name);
+        for (name, value) in changes {
+            match value {
+                Some(value) => command.env(name, value),
+                None => command.env_remove(name),
+            };
         }
         let out = command.output().await?;
         Ok(Output {
@@ -51,11 +58,20 @@ pub async fn output(
     }
 }
 
-/// `name=value` for each of this process's variables but `removed`.
+/// `name=value` for each of this process's variables as `changes` changes
+/// them.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-fn environment(removed: &[&str]) -> Vec<std::ffi::OsString> {
+fn environment(changes: &[Change<'_>]) -> Vec<std::ffi::OsString> {
+    let set = changes.iter().filter_map(|(name, value)| {
+        value.map(|value| (OsStr::new(name).to_owned(), value.to_owned()))
+    });
     std::env::vars_os()
-        .filter(|(name, _)| !removed.iter().any(|r| OsStr::new(r) == name))
+        .filter(|(name, _)| {
+            !changes
+                .iter()
+                .any(|(changed, _)| OsStr::new(changed) == name)
+        })
+        .chain(set)
         .map(|(name, value)| {
             let mut pair = name;
             pair.push("=");
@@ -129,14 +145,14 @@ mod own {
         program: &Path,
         args: &[String],
         dir: &Path,
-        removed: &[&str],
+        changes: &[super::Change<'_>],
     ) -> std::io::Result<(libc::pid_t, OwnedFd, OwnedFd)> {
         let path = c(program.as_os_str().as_bytes())?;
         let mut argv = vec![path.clone()];
         for arg in args {
             argv.push(c(arg.as_bytes())?);
         }
-        let envp: Vec<CString> = (super::environment(removed).iter())
+        let envp: Vec<CString> = (super::environment(changes).iter())
             .map(|pair: &OsString| c(pair.as_bytes()))
             .collect::<Result<_, _>>()?;
         let pointers = |strings: &[CString]| -> Vec<*mut libc::c_char> {
@@ -221,9 +237,9 @@ mod own {
         program: &Path,
         args: &[String],
         dir: &Path,
-        removed: &[&str],
+        changes: &[super::Change<'_>],
     ) -> std::io::Result<Output> {
-        let (pid, out, err) = spawn(program, args, dir, removed)?;
+        let (pid, out, err) = spawn(program, args, dir, changes)?;
         let started = Started(Arc::new(Mutex::new(Some(pid))));
         let held = started.0.clone();
         let waited = tokio::task::spawn_blocking(move || -> std::io::Result<i32> {
@@ -266,6 +282,7 @@ mod own {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use std::ffi::OsStr;
 
         unsafe extern "C" {
             fn responsibility_get_pid_responsible_for_pid(pid: libc::pid_t) -> libc::pid_t;
@@ -275,10 +292,12 @@ mod own {
         async fn a_program_started_is_responsible_for_itself_and_says_what_it_printed() {
             // HOME, which every test run has, to see one taken away.
             assert!(std::env::var_os("HOME").is_some());
-            let script = "echo $$ $(pwd) ${HOME-unset}; echo said >&2; sleep 1; exit 3";
+            let script =
+                "echo $$ $(pwd) ${HOME-unset} ${SONNY_GIVEN-unset}; echo said >&2; sleep 1; exit 3";
             let args = vec!["-c".to_owned(), script.to_owned()];
             let ran = tokio::spawn(async move {
-                output(Path::new("/bin/sh"), &args, Path::new("/"), &["HOME"]).await
+                let changes = [("HOME", None), ("SONNY_GIVEN", Some(OsStr::new("given")))];
+                output(Path::new("/bin/sh"), &args, Path::new("/"), &changes).await
             });
             // Asked while it sleeps, so its ID is still its own.
             tokio::time::sleep(std::time::Duration::from_millis(300)).await;
@@ -307,7 +326,7 @@ mod own {
             let ran = ran.await.unwrap().unwrap();
             assert_eq!(
                 String::from_utf8_lossy(&ran.stdout),
-                format!("{pid} / unset\n")
+                format!("{pid} / unset given\n")
             );
             assert_eq!(ran.stderr, b"said\n");
             assert!(!ran.success);

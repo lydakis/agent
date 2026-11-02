@@ -4,7 +4,10 @@
 //! run, and again whenever it changes, it is admitted: refused while it,
 //! or the folder its copy goes in, is in a folder some agent of this store
 //! writes, else copied into `~/.agent/sonny/programs/NAME/`. The tool runs
-//! only that copy. So an agent that can write where the program is
+//! only that copy, with `~/.agent/sonny/run/` as its temporary folder,
+//! checked the same way: what a program leaves running there, as
+//! agent-desktop leaves the host its commands go through, is reached by
+//! no other caller and was started by Sonny from the copy. So an agent that can write where the program is
 //! installed never has it run, whichever agent calls the tool, and a swap
 //! after it was admitted changes nothing that runs until it is admitted
 //! again. An agent with no sandbox is not counted: it runs as the person
@@ -105,16 +108,19 @@ struct Admitted {
     copied: Vec<Stamp>,
 }
 
-/// The programs admitted, by name, each copied into `dir/NAME`.
+/// The programs admitted, by name, each copied into `dir/NAME`, and the
+/// temporary folder they run with.
 pub struct Pins {
     dir: PathBuf,
+    run: PathBuf,
     admitted: tokio::sync::Mutex<HashMap<String, Admitted>>,
 }
 
 impl Pins {
-    pub fn new(dir: PathBuf) -> Pins {
+    pub fn new(dir: PathBuf, run: PathBuf) -> Pins {
         Pins {
             dir,
+            run,
             admitted: tokio::sync::Mutex::new(HashMap::new()),
         }
     }
@@ -148,7 +154,7 @@ impl Pins {
         let into = self.dir.join(program);
         let writers = writers().await?;
         let mut checked: Vec<&Path> = files.iter().map(PathBuf::as_path).collect();
-        checked.push(&into);
+        checked.extend([into.as_path(), self.run.as_path()]);
         for path in checked {
             if let Some((agent, folder)) = written(path, &writers) {
                 return Err(format!(
@@ -228,12 +234,22 @@ fn copy(files: &[PathBuf], into: &Path) -> std::io::Result<Vec<PathBuf>> {
     Ok(copies)
 }
 
-/// Where Sonny keeps the copies.
-fn dir() -> PathBuf {
+/// Sonny's own folder, `name` in `~/.agent/sonny`.
+fn dir(name: &str) -> PathBuf {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir)
-        .join(".agent/sonny/programs")
+        .join(".agent/sonny")
+        .join(name)
+}
+
+/// The temporary folder `pins`'s programs run with, there and private:
+/// agent-desktop starts no host in a folder others could open.
+fn private(pins: &Pins) -> std::io::Result<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(&pins.run)?;
+    std::fs::set_permissions(&pins.run, std::fs::Permissions::from_mode(0o700))?;
+    Ok(pins.run.clone())
 }
 
 /// The folders the agents of `client`'s store write, from their sandboxes.
@@ -266,7 +282,13 @@ pub async fn writers(client: &agent_client::Client) -> Result<Vec<Writer>, Strin
 }
 
 /// The tool host's programs, found on its `PATH` once.
-static PINS: std::sync::LazyLock<Pins> = std::sync::LazyLock::new(|| Pins::new(dir()));
+static PINS: std::sync::LazyLock<Pins> =
+    std::sync::LazyLock::new(|| Pins::new(dir("programs"), dir("run")));
+
+/// The temporary folder the programs run with: `TMPDIR` for each.
+pub fn temporary() -> std::io::Result<PathBuf> {
+    private(&PINS)
+}
 
 /// The tool host's connection to its store, whose agents the programs are
 /// admitted against, wherever the call comes from: one of them, or an
@@ -332,7 +354,7 @@ mod tests {
     async fn the_copy_runs_and_a_swap_after_it_was_admitted_changes_nothing_that_runs() {
         let root = temp();
         let origin = install(&root.join("bin"), "tool", "one");
-        let pins = Pins::new(root.join("programs"));
+        let pins = Pins::new(root.join("programs"), root.join("run"));
         let copy = pins.program("tool", &origin, none).await.unwrap();
         assert_eq!(copy, root.join("programs/tool/tool"));
         assert_eq!(std::fs::read_to_string(&copy).unwrap(), "one");
@@ -382,7 +404,7 @@ mod tests {
         let root = temp();
         let project = root.join("project");
         let origin = install(&project.join("node_modules/.bin"), "tool", "theirs");
-        let pins = Pins::new(root.join("programs"));
+        let pins = Pins::new(root.join("programs"), root.join("run"));
         // The caller's folder, or another agent's: refused either way.
         for agent in ["calc.lead", "other.lead"] {
             let writers = vec![(agent.to_owned(), project.clone())];
@@ -413,6 +435,31 @@ mod tests {
             .await
             .unwrap_err();
         assert!(refused.contains("programs/tool"), "{refused}");
+        // Nor when the folder they run with is one an agent writes, where
+        // it could leave a host of its own for them to talk to.
+        let writers = vec![("calc.lead".to_owned(), root.join("run"))];
+        let refused = pins
+            .program("tool", &elsewhere, || async { Ok(writers) })
+            .await
+            .unwrap_err();
+        assert!(refused.contains("run"), "{refused}");
+        assert!(!root.join("programs/tool").exists());
+    }
+
+    #[test]
+    fn the_programs_run_with_a_temporary_folder_only_this_user_opens() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = temp();
+        let pins = Pins::new(root.join("programs"), root.join("run"));
+        assert_eq!(private(&pins).unwrap(), root.join("run"));
+        // Loosened since, it is made private again before the next run.
+        std::fs::set_permissions(root.join("run"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        private(&pins).unwrap();
+        let mode = std::fs::metadata(root.join("run"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o700);
     }
 
     #[tokio::test]
@@ -428,7 +475,7 @@ mod tests {
         );
         install(&bin, "agent-desktop-win32-x64.exe", "other");
         install(&bin, "agent-desktop", "launcher");
-        let pins = Pins::new(root.join("programs"));
+        let pins = Pins::new(root.join("programs"), root.join("run"));
         let copy = pins.program("agent-desktop", &origin, none).await.unwrap();
         let mut copied: Vec<String> = std::fs::read_dir(copy.parent().unwrap())
             .unwrap()
