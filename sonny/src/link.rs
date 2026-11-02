@@ -1048,9 +1048,12 @@ async fn lend(
             let named = payload["whole"].as_str().map(Path::new);
             // Kept apart from this machine's agents, and by the store there
             // too, since two stores may each have an agent of one name.
-            let store: String = (payload["store"].as_str().unwrap_or_default().chars())
-                .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-                .collect();
+            // By a digest of the store's path: a name for a folder, one to
+            // a store.
+            use sha2::Digest;
+            let store = payload["store"].as_str().unwrap_or_default();
+            let digest = sha2::Sha256::digest(store.as_bytes());
+            let store: String = digest[..16].iter().map(|b| format!("{b:02x}")).collect();
             let space = Path::new(key).join(store);
             crate::exec::lent(hub, &bot, input, left, steps, named, &space)
                 .await
