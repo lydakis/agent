@@ -1427,10 +1427,10 @@ impl View {
                 .unwrap_or(now)
                 .saturating_duration_since(verse.since);
             let minutes = (held.as_secs() / 60).max(1);
-            let signed = format!("— {name}, busiest for {minutes}m");
             lines.push(Line::default());
-            let signed = Span::styled(cut(&signed, haiku::WIDTH), Ink::Faint.style());
-            lines.push(Line::from(signed));
+            for signed in signature(&name, minutes, haiku::WIDTH) {
+                lines.push(Line::from(Span::styled(signed, Ink::Faint.style())));
+            }
         }
         lines
     }
@@ -3865,6 +3865,18 @@ fn span(lasted: Duration) -> String {
         _ if s % 3600 < 60 => format!("{}h", s / 3600),
         _ => format!("{}h {}m", s / 3600, s % 3600 / 60),
     }
+}
+
+/// A haiku's signature, `room` columns wide: on one line when it fits,
+/// else broken after the name, the time under it where the name starts,
+/// so only a name longer than the whole width is cut.
+fn signature(name: &str, minutes: u64, room: usize) -> Vec<String> {
+    let whole = format!("— {name}, busiest for {minutes}m");
+    if whole.width() <= room {
+        return vec![whole];
+    }
+    let named = format!("{},", cut(name, room.saturating_sub(3)));
+    vec![format!("— {named}"), format!("  busiest for {minutes}m")]
 }
 
 /// Words cut to `room` columns, an ellipsis saying so.
@@ -6468,6 +6480,22 @@ mod tests {
         assert_eq!(view.ticker[1].hue, Some(FAILED));
         // Not counted as messages.
         assert!(view.recent.is_empty());
+    }
+
+    #[test]
+    fn a_long_signature_breaks_after_the_name_instead_of_cutting_the_time() {
+        assert_eq!(
+            signature("shop lead", 5, 34),
+            ["— shop lead, busiest for 5m"]
+        );
+        assert_eq!(
+            signature("desktop-permissions", 12, 34),
+            ["— desktop-permissions,", "  busiest for 12m"]
+        );
+        let long = signature(&"n".repeat(60), 12, 34);
+        assert_eq!(long[1], "  busiest for 12m");
+        assert!(long[0].starts_with("— nnn") && long[0].ends_with("…,"));
+        assert!(long.iter().all(|line| line.width() <= 34), "{long:?}");
     }
 
     #[tokio::test]
