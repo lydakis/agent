@@ -481,27 +481,50 @@ pub fn here() -> bool {
     crate::setup::on_path(PROGRAM) && crate::setup::desktop_shows()
 }
 
-/// The tool, while agents here can use the desktop.
+/// The tool, while agents here can use the desktop, or a machine linked
+/// here lends its own, which `machine` names.
 pub fn tool() -> Option<Value> {
-    here().then(|| {
-        json!({
-            "name": NAME,
-            "description": DESCRIPTION,
-            "parameters": {
-                "type": "object",
-                "properties": {"commands": {"type": "array", "minItems": 1,
-                    "maxItems": COMMANDS, "items": {"type": "string", "minLength": 1},
-                    "description": "agent-desktop command lines, without `agent-desktop`."}},
-                "required": ["commands"],
-                "additionalProperties": false
-            },
-            "answered_by": crate::served::TAG,
-            "expire_ms": TIMEOUT.as_millis() as u64,
-            // The agent's gate judges what acts on the desktop, not the
-            // call.
-            "steps": true,
-        })
-    })
+    let here = here();
+    let machines: Vec<String> = (crate::link::machines().into_iter())
+        .filter(|machine| machine.desktop)
+        .map(|machine| machine.name)
+        .collect();
+    if !here && machines.is_empty() {
+        return None;
+    }
+    let mut properties = json!({"commands": {"type": "array", "minItems": 1,
+        "maxItems": COMMANDS, "items": {"type": "string", "minLength": 1},
+        "description": "agent-desktop command lines, without `agent-desktop`."}});
+    let mut required = vec!["commands"];
+    let mut description = DESCRIPTION.to_owned();
+    if !machines.is_empty() {
+        let names = machines.join(", ");
+        properties["machine"] = json!({"type": "string", "enum": machines,
+            "description": "Another machine of the person's to run it on, while it is connected."});
+        description.push_str(&format!(
+            " `machine` runs it on the desktop of {names}, another machine of the person's."
+        ));
+        if !here {
+            required.push("machine");
+        } else {
+            description.push_str(" Without it, it runs here.");
+        }
+    }
+    Some(json!({
+        "name": NAME,
+        "description": description,
+        "parameters": {
+            "type": "object",
+            "properties": properties,
+            "required": required,
+            "additionalProperties": false
+        },
+        "answered_by": crate::served::TAG,
+        "expire_ms": TIMEOUT.as_millis() as u64,
+        // The agent's gate judges what acts on the desktop, not the
+        // call.
+        "steps": true,
+    }))
 }
 
 /// What one command printed: its answer as words, and whether it worked.
@@ -649,14 +672,31 @@ fn lines_of(commands: &Value) -> Result<Vec<String>, (&'static str, String)> {
 }
 
 /// Answer `call`, a `desktop` call: check its commands, put those that
-/// act to the agent's gate once, then run them in order on this machine's
-/// desktop, and return what they printed, with the screenshots they took.
+/// act to the agent's gate once, then run them in order on the desktop of
+/// this machine, or of the one `machine` names, and return what they
+/// printed, with the screenshots they took.
 pub async fn answer(
     call: &Value,
     steps: crate::exec::Steps,
 ) -> Result<Value, (&'static str, String)> {
     let lines = lines_of(&call["arguments"]["commands"])?;
+    // That machine checks the commands as its own, and asks this agent's
+    // gate for what acts there.
+    if let Some(machine) = call["arguments"]["machine"].as_str() {
+        return crate::link::call(machine, NAME, json!({"commands": lines}), Some(&steps)).await;
+    }
     drive(&lines, &steps).await
+}
+
+/// Answer a `desktop` call an agent of a machine linked here made: its
+/// commands run on this machine's desktop, with that agent's gate asked
+/// what acts.
+pub async fn lent(
+    payload: &Value,
+    steps: &crate::exec::Steps,
+) -> Result<Value, (&'static str, String)> {
+    let lines = lines_of(&payload["commands"])?;
+    drive(&lines, steps).await
 }
 
 /// Run `lines` on this machine's desktop, with the agent whose `steps`

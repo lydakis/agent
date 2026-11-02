@@ -334,9 +334,15 @@ class ServedToolTests(ModelFixture):
         made = self.daemon.request('create', bot='calc.lead', workspace=str(self.path), model='openai/synthetic-model',
                                    instructions='Lead.', declare=[tool], **create)
         self.assertIn('result', made)
-        bin = self.path / 'desktop-bin'
+        bin = self.stand_in_desktop(self.path)
+        self.host(PATH=f"{bin}:{os.environ['PATH']}", DISPLAY=':99')
+
+    def stand_in_desktop(self, home):
+        """A folder in `home` holding a stand-in agent-desktop that answers
+        as agent-desktop does and notes each command it ran."""
+        bin = home / 'desktop-bin'
         bin.mkdir()
-        self.desktop_ran = self.path / 'desktop-ran'
+        self.desktop_ran = home / 'desktop-ran'
         (bin / 'agent-desktop').write_text(f"""#!{sys.executable}
 import json, sys
 args = sys.argv[1:]
@@ -349,7 +355,7 @@ if command == 'screenshot':
 print(json.dumps({{'version': '2.5', 'ok': True, 'command': command, 'data': data}}))
 """)
         (bin / 'agent-desktop').chmod(0o755)
-        self.host(PATH=f"{bin}:{os.environ['PATH']}", DISPLAY=':99')
+        return bin
 
     def ran_on_desktop(self):
         if not self.desktop_ran.exists():
@@ -834,7 +840,7 @@ print(json.dumps({{'version': '2.5', 'ok': True, 'command': command, 'data': dat
         self.host()
         self.assertTrue(json.loads(self.call('calc.lead', 'memory', {'user': True})))
 
-    def linked(self, approval_mode='auto'):
+    def linked(self, approval_mode='auto', **extra):
         """A laptop, its own daemon and tool host in a home of its own,
         linked to this machine, the box, by a stand-in for ssh that runs
         the command it is given here, in the box's home. Its MCP server
@@ -858,7 +864,7 @@ os.execvpe('sh', ['sh', '-c', command], {{**os.environ, 'HOME': {json.dumps(str(
         ssh.chmod(0o755)
         lender = SocketClient(self.binary, laptop / 'state.sqlite', self.url, 'echo')
         self.addCleanup(lender.close)
-        env = {**clean_env(), 'HOME': str(laptop), 'AGENT_BIN': str(self.binary), 'SONNY_LINK_SSH': str(ssh)}
+        env = {**clean_env(), 'HOME': str(laptop), 'AGENT_BIN': str(self.binary), 'SONNY_LINK_SSH': str(ssh), **extra}
         host = subprocess.Popen([str(self.sonny), 'tool-host', '--store', str(laptop / 'state.sqlite'),
                                  '--socket', str(lender.socket_path)], env=env, stdout=subprocess.PIPE, text=True)
         self.addCleanup(lambda: (host.kill(), host.wait(timeout=5), host.stdout.close()))
@@ -938,6 +944,47 @@ os.execvpe('sh', ['sh', '-c', command], {{**os.environ, 'HOME': {json.dumps(str(
                                 request=asked[0]['request'], decision=decision, by='test')
             self.assertEqual(self.daemon.finished(turn, 30)['data']['status'], 'completed')
             self.assertIn(said, self.output('calc.lead', turn))
+
+    def test_a_box_agent_uses_the_linked_machine_s_desktop_with_its_own_gate(self):
+        laptop = self.path / 'laptop'
+        laptop.mkdir()
+        bin = self.stand_in_desktop(laptop)
+        self.linked(PATH=f"{bin}:{os.environ['PATH']}", DISPLAY=':99')
+        listed = subprocess.run([str(self.sonny), 'link'], env={**clean_env(), 'HOME': str(self.path)},
+                                check=True, capture_output=True, text=True).stdout
+        self.assertRegex(listed, r'laptop  linked here · connected · .*desktop')
+        self.daemon.request('create', bot='calc.lead', workspace=str(self.path), model='openai/synthetic-model',
+                            instructions='Lead.', declare=[{**declared('desktop'), 'steps': True}],
+                            approve=['desktop'], approver='manual')
+        # The box shows no desktop of its own.
+        self.host()
+        self.model.requests = queue.Queue()
+        self.call('calc.lead', 'desktop', {'machine': 'laptop', 'commands': ['snapshot --app Calc', 'screenshot']},
+                  wait=30)
+        requests = []
+        while not self.model.requests.empty():
+            requests.append(self.model.requests.get())
+        [answered] = [i for i in requests[-1]['input'] if i.get('call_id') == 'script-0' and 'output' in i]
+        self.assertEqual([part['type'] for part in answered['output']], ['input_text', 'input_image'], answered)
+        self.assertIn('--- DESKTOP_CONTENT nonce=', answered['output'][0]['text'])
+        self.assertEqual(self.ran_on_desktop(), [['snapshot', '--app=Calc'], ['screenshot']])
+        # What acts there is put to the box agent's gate, and runs once allowed.
+        self.script.append(('desktop', {'machine': 'laptop', 'commands': ['press return']}))
+        self.model.call_script = self.script
+        turn = self.daemon.request('submit', bot='calc.lead', request_id='linked-act', prompt='script')['result']['turn']
+        deadline = time.monotonic() + 30
+        while not (asked := self.daemon.request('approvals', bot='calc.lead')['result']['approvals']):
+            self.assertLess(time.monotonic(), deadline, 'no approval was asked')
+            time.sleep(.05)
+        self.assertEqual(asked[0]['arguments']['acts'], ['press return'])
+        self.assertEqual(len(self.ran_on_desktop()), 2)
+        self.daemon.request('answer', bot='calc.lead', turn=turn, call_id=asked[0]['call_id'],
+                            request=asked[0]['request'], decision='allow', by='test')
+        self.assertEqual(self.daemon.finished(turn, 30)['data']['status'], 'completed')
+        self.assertEqual(self.ran_on_desktop()[2:], [['press', 'return']])
+        refused = json.loads(self.call('calc.lead', 'desktop', {'machine': 'laptop', 'commands': ['batch []']},
+                                       wait=30))
+        self.assertEqual(refused['error'], 'desktop_refused')
 
     def test_one_tool_host_of_a_home_holds_its_link_and_tells_the_host_what_changes(self):
         laptop, _ = self.linked()
