@@ -122,7 +122,7 @@ pub fn due(places: &Places, now_ms: u128) -> bool {
 /// there by hand is not set up: a sync from it would push this machine's
 /// home over the one it holds, before setup restored it.
 fn timed(places: &Places) -> bool {
-    places.repo.join(".git").exists() && last(places).is_some()
+    agent_client::policy::git_entry(&places.repo) && last(places).is_some()
 }
 
 /// What the last sync did, with whether backup is set up.
@@ -195,7 +195,7 @@ fn adopt(places: &Places, url: &str, env: Option<&[(OsString, OsString)]>) -> Re
                     places.repo.display()
                 ));
             }
-            None if places.repo.join(".git").exists() => {
+            None if agent_client::policy::git_entry(&places.repo) => {
                 git(&places.repo, &["remote", "add", "origin", url], env)?;
             }
             None => {
@@ -413,7 +413,7 @@ fn unpushed(repo: &Path, env: Option<&[(OsString, OsString)]>) -> bool {
 
 /// The repository's `origin` URL, if it is one with a remote.
 fn origin(repo: &Path, env: Option<&[(OsString, OsString)]>) -> Option<String> {
-    if !repo.join(".git").exists() {
+    if !agent_client::policy::git_entry(repo) {
         return None;
     }
     git(repo, &["remote", "get-url", "origin"], env)
@@ -1462,6 +1462,8 @@ mod tests {
         let places = places(&root);
         assert!(!due(&places, 1_000_000), "no repository, no sync");
         std::fs::create_dir_all(places.repo.join(".git")).unwrap();
+        assert!(!due(&places, 1_000_000), "an empty .git is no repository");
+        std::fs::write(places.repo.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
         assert!(!due(&places, 1_000_000), "a clone setup never synced from");
         write(&places.state, "{\"at_ms\": 1000000}");
         assert!(!due(&places, 1_000_000 + 599_999));

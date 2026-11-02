@@ -13826,6 +13826,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join(".agents/agents")).unwrap();
         std::fs::create_dir_all(dir.join(".git")).unwrap();
+        std::fs::write(dir.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
         std::fs::write(
             dir.join(".agents/agents/reviewer.md"),
             "---\ndescription: Reviews a change\n---\nYou review.\n",

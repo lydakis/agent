@@ -1411,11 +1411,7 @@ fn has_submodules(path: &Path) -> Result<bool, String> {
         .split(|byte| *byte == 0)
         .filter_map(|entry| entry.strip_prefix(b"160000 "))
         .filter_map(|entry| Some(&entry[entry.iter().position(|byte| *byte == b'\t')? + 1..]))
-        .any(|name| {
-            path.join(std::ffi::OsStr::from_bytes(name))
-                .join(".git")
-                .exists()
-        }))
+        .any(|name| agent_client::policy::git_entry(&path.join(std::ffi::OsStr::from_bytes(name)))))
 }
 
 /// A worktree of `here`'s repository at `path` on the new `branch`, made
@@ -2014,6 +2010,8 @@ mod tests {
             Err(e) if e.raw_os_error() == Some(libc::EILSEQ) => {}
             made => {
                 made.unwrap();
+                std::fs::write(repo.join(name).join(".git/HEAD"), "ref: refs/heads/main\n")
+                    .unwrap();
                 assert!(has_submodules(&repo).unwrap());
             }
         }

@@ -32,8 +32,8 @@ pub fn read(dir: &Path) -> Place {
 fn git_dir(dir: &Path) -> Option<PathBuf> {
     let found = dir
         .ancestors()
-        .map(|at| at.join(".git"))
-        .find(|git| git.exists())?;
+        .find(|at| agent_client::policy::git_entry(at))?
+        .join(".git");
     if found.is_dir() {
         return Some(found);
     }
