@@ -56,7 +56,7 @@ const SWITCHES: [&str; 22] = [
     "--clear",
     "--abort",
     "--screenshot",
-    "--httpOnly",
+    "--http-only",
     "--secure",
 ];
 
@@ -92,7 +92,7 @@ const VALUED: [&str; 35] = [
     "--wait-until",
     "--domain",
     "--path",
-    "--sameSite",
+    "--same-site",
     "--expires",
     "--headers",
     "--frame",
@@ -1566,5 +1566,74 @@ mod tests {
             "{actions}"
         );
         assert!(actions.ends_with(",upload,cookies_get"), "{actions}");
+    }
+
+    /// The commands [`checked`] names besides [`PAGE`]'s.
+    const NAMED: [&str; 21] = [
+        "open",
+        "goto",
+        "navigate",
+        "pushstate",
+        "read",
+        "vitals",
+        "a11y",
+        "tab",
+        "screenshot",
+        "pdf",
+        "download",
+        "upload",
+        "record",
+        "trace",
+        "profiler",
+        "network",
+        "diff",
+        "state",
+        "auth",
+        "find",
+        "get",
+    ];
+
+    /// Every command and flag the tool passes is one agent-browser still
+    /// documents, against `AGENT_BROWSER_INVENTORY`, a list
+    /// `sonny/upstream/inventory.py` made of a release; and a flag of its
+    /// that the release makes global is read as one, so words are counted
+    /// as agent-browser counts them. Run each week against the latest.
+    #[test]
+    fn agent_browser_documents_what_the_tool_passes() {
+        let Some(path) = std::env::var_os("AGENT_BROWSER_INVENTORY") else {
+            return;
+        };
+        let listed = std::fs::read_to_string(path).unwrap();
+        let lines: std::collections::HashSet<&str> = listed.lines().collect();
+        let mut gone = Vec::new();
+        for command in PAGE.iter().chain(&NAMED) {
+            if !lines.contains(format!("command {command}").as_str()) {
+                gone.push(format!("command {command}"));
+            }
+        }
+        let flags = SWITCHES.iter().chain(&VALUED).chain(&[
+            "--enable",
+            "--screenshot-dir",
+            "-o",
+            "--output",
+            "-b",
+            "--baseline",
+            "--base64",
+        ]);
+        for flag in flags {
+            if !lines.iter().any(|line| line.ends_with(&format!(" {flag}"))) {
+                gone.push(format!("flag {flag}"));
+            }
+            let global = lines.contains(format!("global {flag}").as_str());
+            if global && !GLOBAL_SWITCHES.contains(flag) && !GLOBAL_VALUED.contains(flag) {
+                gone.push(format!(
+                    "{flag} is global now, and not in GLOBAL_SWITCHES or GLOBAL_VALUED"
+                ));
+            }
+        }
+        assert!(
+            gone.is_empty(),
+            "agent-browser no longer documents: {gone:#?}"
+        );
     }
 }
