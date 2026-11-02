@@ -54,8 +54,9 @@ const VIEWED: [&str; 14] = [
 ];
 
 /// The codes a call's error may carry back, as typed here.
-const CODES: [&str; 9] = [
+const CODES: [&str; 10] = [
     "browser_refused",
+    "desktop_refused",
     "exec_refused",
     "open_refused",
     "timed_out",
@@ -110,6 +111,8 @@ pub struct Machine {
     pub browser: bool,
     /// Whether that browser starts signed in as the person is there.
     pub signed_in: bool,
+    /// Whether its desktop runs commands sent here.
+    pub desktop: bool,
     /// Whether it opens links and files sent to it.
     pub open: bool,
     /// Its MCP servers, by name.
@@ -139,6 +142,7 @@ impl Machine {
             name: name.to_owned(),
             browser: said["browser"] == true,
             signed_in: said["signed_in"] == true,
+            desktop: said["desktop"] == true,
             open: said["open"] == true,
             servers,
         }
@@ -1036,7 +1040,8 @@ impl Drop for AbortOnDrop {
 }
 
 /// What this machine lends over `link`: its browser, while agent-browser
-/// is here, its MCP servers as last listed, and opens.
+/// is here, its desktop, while agents here can use it, its MCP servers as
+/// last listed, and opens.
 async fn lends(link: &agent_client::config::Link, hub: &crate::mcp::Hub) -> Value {
     let config = agent_client::config::load().unwrap_or_default();
     hub.configure(&config.sonny.mcp_servers).await;
@@ -1055,6 +1060,7 @@ async fn lends(link: &agent_client::config::Link, hub: &crate::mcp::Hub) -> Valu
     json!({
         "browser": crate::setup::on_path("agent-browser"),
         "signed_in": !link.browser_profile.is_empty(),
+        "desktop": crate::desktop::here(),
         "open": true,
         "servers": servers,
     })
@@ -1078,6 +1084,13 @@ async fn lend(
             match tokio::time::timeout(left.min(crate::browser::TIMEOUT), browsed).await {
                 Ok(answer) => answer,
                 Err(_) => Err(("timed_out", "the browser's commands ran out of time".into())),
+            }
+        }
+        Some(crate::desktop::NAME) => {
+            let driven = crate::desktop::lent(payload, &steps);
+            match tokio::time::timeout(left.min(crate::desktop::TIMEOUT), driven).await {
+                Ok(answer) => answer,
+                Err(_) => Err(("timed_out", "the desktop's commands ran out of time".into())),
             }
         }
         Some(crate::exec::NAME) => {
@@ -1383,6 +1396,9 @@ fn list() {
         let mut lends = Vec::new();
         if machine.browser {
             lends.push("browser".to_owned());
+        }
+        if machine.desktop {
+            lends.push("desktop".to_owned());
         }
         if !machine.servers.is_empty() {
             lends.push(format!("{} MCP servers", machine.servers.len()));
