@@ -557,6 +557,9 @@ once it answers. Every reaction sits right under the message it is on,
 however far up that is, and never as a row of its own: yours under the
 reply, the agent's under your message, and a lead's under your words in
 one of its tasks, with its name (`👀 calc.lead`) under the agent's own.
+Skin tones and other joined emoji draw as one: where the
+terminal can join them but has it off (grapheme clustering, mode 2027),
+Sonny turns it on while it runs and back off when it leaves.
 
 ![The agent's 🎉 under a message, and a 👍 on its reply](../docs/sonny/reactions.png)
 
