@@ -2724,7 +2724,7 @@ class RuntimeTests(ModelFixture):
         # As in Codex, nothing past the providers' keys is left out by default.
         self.assertEqual(seen('Bob'), 'synthetic-a:synthetic-b:synthetic-c:kept')
         shutdown()
-        (self.path / '.agent').mkdir()
+        (self.path / '.agent').mkdir(exist_ok=True)
         (self.path / '.agent/config.toml').write_text(
             '[shell_environment_policy]\nignore_default_excludes = false\nexclude = ["aws_*"]\n')
         # A daemon started after takes the defaults and the listed names.
