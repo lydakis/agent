@@ -80,12 +80,12 @@ class Session:
 
 
 def set_up_template(session):
-    """Make the template bot, or bring its tools up to date. CLI-made bots can't declare tools."""
-    tools = {'instructions': INSTRUCTIONS, 'tools': [], 'declare': TOOLS}
-    made = session.request('create', bot=TEMPLATE, model=os.environ['AGENT_MODEL'],
-                           workspace=os.getcwd(), **tools)  # a turn needs a folder, even with no file tools
+    """Make the template bot, or bring it up to date. CLI-made bots can't declare tools."""
+    choices = {'model': os.environ['AGENT_MODEL'], 'instructions': INSTRUCTIONS, 'declare': TOOLS}
+    made = session.request('create', bot=TEMPLATE, tools=[], **choices,
+                           workspace=os.getcwd())  # a turn needs a folder, even with no file tools
     if made.get('error') == 'bot_exists':
-        made = session.request('configure', bot=TEMPLATE, **tools)
+        made = session.request('configure', bot=TEMPLATE, **choices)
     if 'error' in made:
         sys.exit(f'template: {made}')
 
@@ -144,9 +144,10 @@ def main():
     for start in range(0, len(handles), 64):  # a wait takes at most 64 handles
         results = cli('wait', '--timeout', '10m', *handles[start:start + 64])['results']
         for handle in handles[start:start + 64]:
-            outcome = results.get(handle, {'status': 'pending', 'text': '', 'error': 'not finished'})
-            failed += outcome['status'] != 'completed'
-            print(f"{handle}: {outcome['status']}: {outcome['text'] or outcome['error']}", file=sys.stderr)
+            outcome = results[handle]  # {"pending": true} when the wait timed out first
+            status = 'pending' if outcome.get('pending') else outcome['status']
+            failed += status != 'completed'
+            print(f"{handle}: {status}: {outcome.get('text') or outcome.get('error')}", file=sys.stderr)
     sys.exit(1 if failed else 0)
 
 

@@ -38,9 +38,9 @@ The issues in `issues.jsonl` are made up.
 
 Measured on 2026-11-02 at 7ea7b7a (protocol 48, schema 78).
 
-**Lines.** `triage.py` is 154 lines, 108 of them code (no blank lines,
+**Lines.** `triage.py` is 155 lines, 109 of them code (no blank lines,
 comments or docstrings). 28 of those are the app itself: its instructions,
-its two tool schemas and what the tools do. The other 80 connect it to Agent:
+its two tool schemas and what the tools do. The other 81 connect it to Agent:
 
 | Part | Code lines | Uses |
 | --- | --- | --- |
@@ -49,7 +49,7 @@ its two tool schemas and what the tools do. The other 80 connect it to Agent:
 | A socket session: `ready`, then requests matched by `id` | 17 | socket |
 | Make the template bot, or update its tools | 8 | socket `create`, `configure` |
 | Answer calls to the declared tools | 19 | socket `follow`, `tool_calls`, `tool_result` |
-| Start the daemon, fork per issue, wait, report | 21 | CLI `start`, `run --fork --detach`, `wait` |
+| Start the daemon, fork per issue, wait, report | 22 | CLI `start`, `run --fork --detach`, `wait` |
 
 The offline run of five issues takes about 0.45 s of wall time, daemon start
 included.
@@ -65,6 +65,7 @@ declared tools:
    gets the same turn.
 3. `agent wait HANDLE...` takes at most 64 handles, prints every result as
    JSON, and exits 1 when any turn failed, with the results still on stdout.
+   A turn the wait timed out on is `{"pending": true}`, with no `status`.
 4. The socket speaks one JSON object per line. A session starts with a
    `ready` line. A reply carries its request's `id`, and events, which carry
    none, can come between, so a client matches replies by `id` or uses one
@@ -77,7 +78,8 @@ declared tools:
    most an hour. A waiting call parks as a row in the store, so a long wait
    costs nothing and outlasts a restart of the app.
 7. A bot that exists answers `create` with `bot_exists`, and `configure`
-   replaces its declared tools.
+   replaces its model, instructions and declared tools, so a rerun with
+   another `AGENT_MODEL` uses it.
 8. `follow` with `bot: "*"`, `since_ms` and `kinds: ["tool_started"]` gets
    every bot's calls as they start, and `follow_live` marks the end of the
    replay.
