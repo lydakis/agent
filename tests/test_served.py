@@ -497,9 +497,9 @@ print(json.dumps({{'version': '2.5', 'ok': True, 'command': command, 'data': dat
         for bot in ('calc.a', 'shop.b'):
             self.daemon.request('create', bot=bot, workspace=str(self.path), model='openai/synthetic-model',
                                 instructions='Agent.', declare=[declared('commons')])
-        # Each reply as it comes, not an hour's digest.
+        # Each reply as it comes, not a digest.
         (self.path / '.agent').mkdir(exist_ok=True)
-        (self.path / '.agent/config.toml').write_text('[sonny]\ncommons_digest = "0"\n')
+        (self.path / '.agent/config.toml').write_text('[sonny]\n[sonny.sources.commons]\ndigest = "0"\n')
         self.host()
         self.lookout()
         # The commons source's first look, which tells none of the past.

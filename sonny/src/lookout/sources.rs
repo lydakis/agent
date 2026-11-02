@@ -2,15 +2,15 @@
 //! `[sonny.sources.NAME]` in `~/.agent/config.toml`, a command the lookout
 //! runs with `sh -c`; every line it prints is one event, plain text or a
 //! JSON object with `text` and maybe `id`, `topic`, `from`, `url` and
-//! `urgent`, which cuts into a subscriber's turn instead of waiting for it,
-//! and any other fields it has. One that exits runs again `every` while
+//! `steer`, true for one that cuts into a subscriber's turn instead of
+//! waiting for it, and any other fields it has. One that exits runs again `every` while
 //! later (a minute unless set), so a poller that prints what is new and
 //! exits and a stream that never exits both work. Agents subscribe to a
 //! source by name, or to one topic of it as `NAME:TOPIC`, and never set one
 //! up: the command runs as the person, outside any sandbox. Nothing judges
 //! sources: every event is told, unless the subscription's filter, a
 //! pattern on the event's fields, leaves it out; the person's command says
-//! what is urgent. A source's `digest` says how often at most a subscriber
+//! what steers. A source's `digest` says how often at most a subscriber
 //! hears it, as Slack batches email. The lookout keeps each source's shape,
 //! the fields its events lately had, so an agent knows what it may filter
 //! on.
@@ -20,7 +20,7 @@
 //!
 //! What a source says is no one's words here: its note goes with an
 //! origin, so the approver never reads it as the person's.
-use agent_client::config::{COMMONS_SOURCE, Source};
+use agent_client::config::Source;
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -60,7 +60,7 @@ const SHAPE_EVENTS: u64 = 200;
 /// How often, at most, a shape whose fields did not change is written.
 const SHAPE_EVERY: Duration = Duration::from_secs(60);
 /// The fields every event has, which the note says on its own.
-const OWN: [&str; 7] = ["text", "id", "topic", "from", "url", "urgent", "told"];
+const OWN: [&str; 7] = ["text", "id", "topic", "from", "url", "steer", "told"];
 /// How the note to the subscriber starts, which Sonny shows folded.
 pub const FROM_SOURCES: &str = "From your sources: ";
 /// What a `subscriptions` answer says of the examples it shows.
@@ -89,11 +89,8 @@ pub fn configured() -> Result<Vec<Source>, String> {
     let mut sources = config.sources;
     if config.commons {
         sources.push(Source {
-            name: COMMONS_SOURCE.into(),
-            command: String::new(),
             every: Some(COMMONS_EVERY.into()),
-            digest: Some(config.commons_digest),
-            urgent: None,
+            ..config.commons_source
         });
     }
     Ok(sources)
@@ -153,9 +150,9 @@ pub struct Event {
     pub from: Option<String>,
     pub url: Option<String>,
     /// It cuts into a subscriber's turn instead of waiting for it to end.
-    pub urgent: bool,
-    /// The subscription whose `urgent` made it so, when its source did not.
-    pub urgent_by: Option<String>,
+    pub steer: bool,
+    /// The subscription whose `steer` made it so, when its source did not.
+    pub steer_by: Option<String>,
     /// How often at most a subscriber hears its source, as it was set
     /// when the event came.
     pub digest: Option<Duration>,
@@ -184,7 +181,7 @@ impl Event {
                      topic: Option<String>,
                      from: Option<String>,
                      url: Option<String>,
-                     urgent,
+                     steer,
                      fields| Event {
             source: source.to_owned(),
             id,
@@ -192,8 +189,8 @@ impl Event {
             text: cut(text, TEXT_CHARS),
             from: from.map(|from| cut(&from, FIELD_CHARS)),
             url: url.map(|url| cut(&url, FIELD_CHARS)),
-            urgent,
-            urgent_by: None,
+            steer,
+            steer_by: None,
             digest: None,
             fields: Arc::new(fields),
             told: Vec::new(),
@@ -221,7 +218,7 @@ impl Event {
             _ => None,
         };
         let text = said("text")?;
-        let urgent = object["urgent"] == true;
+        let steer = object["steer"] == true;
         // A topic is what a subscription names after the colon, and goes in
         // the note unquoted, so it holds no colon and no line break.
         let topic = said("topic")
@@ -231,7 +228,7 @@ impl Event {
             .filter_map(|bot| bot.as_str().map(|bot| cut(bot, FIELD_CHARS)))
             .take(64)
             .collect();
-        let mut parsed = event(&text, id, topic, from, url, urgent, object);
+        let mut parsed = event(&text, id, topic, from, url, steer, object);
         parsed.told = told;
         Some(parsed)
     }
@@ -250,11 +247,11 @@ impl Event {
     /// As the lookout keeps it while it waits to be told.
     pub fn to_json(&self) -> Value {
         let mut kept = json!({"source": self.source, "id": self.id, "topic": self.topic,
-            "text": self.text, "from": self.from, "url": self.url, "urgent": self.urgent,
+            "text": self.text, "from": self.from, "url": self.url, "steer": self.steer,
             "digest": self.digest.map(|d| d.as_secs()), "at_ms": self.at_ms as u64, "seq": self.seq,
             "told": self.told, "fields": *self.fields});
-        if let Some(by) = &self.urgent_by {
-            kept["urgent_by"] = json!(by);
+        if let Some(by) = &self.steer_by {
+            kept["steer_by"] = json!(by);
         }
         kept
     }
@@ -268,8 +265,8 @@ impl Event {
             text: text("text")?,
             from: text("from"),
             url: text("url"),
-            urgent: value["urgent"] == true,
-            urgent_by: text("urgent_by"),
+            steer: value["steer"] == true,
+            steer_by: text("steer_by"),
             digest: value["digest"].as_u64().map(Duration::from_secs),
             fields: Arc::new(match &value["fields"] {
                 Value::Object(_) => value["fields"].clone(),
@@ -390,11 +387,11 @@ impl Runner {
                 }
             };
             // A pattern that does not check would mark nothing as it says.
-            if let Some(Err(why)) = source.urgent.as_ref().map(super::pattern::check) {
+            if let Some(Err(why)) = source.steer.as_ref().map(super::pattern::check) {
                 println!(
                     "{}",
                     json!({"event": "source_refused", "source": source.name,
-                        "why": format!("sonny.sources.{}.urgent: {why}", source.name)})
+                        "why": format!("sonny.sources.{}.steer: {why}", source.name)})
                 );
                 continue;
             }
@@ -530,11 +527,11 @@ async fn emit(
         return true;
     }
     event.digest = digest(source);
-    // What the person's settings mark urgent is, as if the source had.
-    if !event.urgent
-        && (source.urgent.as_ref()).is_some_and(|u| super::pattern::matches(u, &event.fields))
+    // What the person's settings say steers does, as if the source had said so.
+    if !event.steer
+        && (source.steer.as_ref()).is_some_and(|u| super::pattern::matches(u, &event.fields))
     {
-        event.urgent = true;
+        event.steer = true;
     }
     shape.saw(&event.fields);
     sent.send(Said::Event(Box::new(event))).await.is_ok()
@@ -698,17 +695,17 @@ pub fn line(item: &Heard) -> String {
     if let Some(url) = &event.url {
         what.push_str(&format!(", {}", json!(url)));
     }
-    let urgent = match (event.urgent, &event.urgent_by) {
+    let steer = match (event.steer, &event.steer_by) {
         (false, _) => String::new(),
-        (true, None) => ", urgent".to_owned(),
-        (true, Some(sub)) => format!(", urgent by your {sub}"),
+        (true, None) => ", as a steer".to_owned(),
+        (true, Some(sub)) => format!(", as a steer by your {sub}"),
     };
     let others = match event.others() {
         Some(others) => format!(" {others}"),
         None => String::new(),
     };
     format!(
-        "- {what} (for your {}{urgent}): {}{others}",
+        "- {what} (for your {}{steer}): {}{others}",
         item.subs.join(", "),
         json!(event.text)
     )
@@ -1074,7 +1071,7 @@ pub fn note(heard: &[Heard], more: usize) -> String {
     if more > 0 {
         lines.push(format!("- {more} more in the next note"));
     }
-    lines.push(match heard.iter().any(|item| item.event.urgent) {
+    lines.push(match heard.iter().any(|item| item.event.steer) {
         true => "Handle what cannot wait, then carry on with your turn.".to_owned(),
         false => "Act where something changes your work, and tell the person, briefly, what they \
             would want to hear. If nothing, end your turn with an empty reply."
@@ -1093,7 +1090,7 @@ mod tests {
             command: "true".into(),
             every: every.map(str::to_owned),
             digest: None,
-            urgent: None,
+            steer: None,
         }
     }
 
@@ -1120,11 +1117,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn what_the_person_marks_urgent_is_as_if_the_source_had() {
-        let dir = std::env::temp_dir().join(format!("sources-urgent-{}", std::process::id()));
+    async fn what_the_person_says_steers_does_as_if_the_source_had() {
+        let dir = std::env::temp_dir().join(format!("sources-steer-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let marked = Source {
-            urgent: Some(json!({"from": ["boss"]})),
+            steer: Some(json!({"from": ["boss"]})),
             ..source(None)
         };
         let (sent, mut got) = tokio::sync::mpsc::channel(4);
@@ -1143,12 +1140,12 @@ mod tests {
             events.push(event);
         }
         let (lunch, call) = (&events[0], &events[1]);
-        assert!(!lunch.urgent && call.urgent && call.urgent_by.is_none());
+        assert!(!lunch.steer && call.steer && call.steer_by.is_none());
         // One that does not check is refused, as a bad `every` is.
         let (sent, _got) = tokio::sync::mpsc::channel(4);
         let mut runner = Runner::new(dir.clone(), sent);
         runner.set(vec![Source {
-            urgent: Some(json!({"from": "boss"})),
+            steer: Some(json!({"from": "boss"})),
             ..source(None)
         }]);
         assert!(runner.running.is_empty());
@@ -1178,14 +1175,14 @@ mod tests {
             (plain.text.as_str(), plain.id, plain.at_ms),
             ("deploy failed", None, 7)
         );
-        assert!(!plain.urgent);
+        assert!(!plain.steer);
         let object = Event::parse(
             "slack",
-            r#"{"text": "ship it?", "id": 41, "from": "ana", "url": "https://x.test/41", "urgent": true}"#,
+            r#"{"text": "ship it?", "id": 41, "from": "ana", "url": "https://x.test/41", "steer": true}"#,
             0,
         )
         .unwrap();
-        assert!(object.urgent);
+        assert!(object.steer);
         assert_eq!(object.id.as_deref(), Some("41"));
         assert_eq!(object.from.as_deref(), Some("ana"));
         assert_eq!(object.url.as_deref(), Some("https://x.test/41"));
@@ -1386,15 +1383,15 @@ mod tests {
 
     #[test]
     fn the_note_quotes_what_sources_said_as_data() {
-        let event = |text: &str, from: Option<&str>, urgent| Event {
+        let event = |text: &str, from: Option<&str>, steer| Event {
             source: "slack".into(),
             id: None,
             topic: None,
             text: text.into(),
             from: from.map(str::to_owned),
             url: None,
-            urgent,
-            urgent_by: None,
+            steer,
+            steer_by: None,
             digest: None,
             fields: Arc::new(json!({"text": text})),
             told: Vec::new(),
@@ -1431,9 +1428,9 @@ mod tests {
             super::note(&[heard(topical, &["eng"])], 0)
                 .contains("- slack:deploys, from \"b.y\" (for your eng): \"on it\"")
         );
-        let urgent = super::note(&[heard(event("prod is down", None, true), &["eng"])], 0);
-        assert!(urgent.contains("- slack (for your eng, urgent): \"prod is down\""));
-        assert!(urgent.ends_with("Handle what cannot wait, then carry on with your turn."));
+        let steer = super::note(&[heard(event("prod is down", None, true), &["eng"])], 0);
+        assert!(steer.contains("- slack (for your eng, as a steer): \"prod is down\""));
+        assert!(steer.ends_with("Handle what cannot wait, then carry on with your turn."));
     }
 
     #[tokio::test]
@@ -1450,7 +1447,7 @@ mod tests {
             command: command.into(),
             every: Some("1s".into()),
             digest: Some("5m".into()),
-            urgent: None,
+            steer: None,
         }]);
         let mut texts = Vec::new();
         while texts.len() < 3 {

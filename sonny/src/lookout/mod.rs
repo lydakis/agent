@@ -170,7 +170,7 @@ fn note(told: &updates::Told, steer: Option<&Steer>) -> String {
                 .to_owned()
         }
         Some(Steer::Rule(sub)) => format!(
-            "This cuts into your turn because your subscription {sub} marks it urgent: act on it \
+            "This cuts into your turn because your subscription {sub} says it steers: act on it \
             where it changes what you or a task is doing, then carry on with your turn."
         ),
         None => "Each ended turn comes with what the task replied; read a turn with one \
@@ -962,6 +962,7 @@ impl Service {
                 .collect();
             crate::commons::subscribe_posters(&home, &self.store, &names);
         }
+        subs::steer_files(&self.store);
         self.subscribers = subs::all(&self.store).into_iter().collect();
         self.registry = watchers(&self.subscribers);
         for bot in &bots {
@@ -2886,7 +2887,7 @@ impl Lookout {
         };
         // A subscription's own digest takes its source's place for what
         // it hears, `0` too; one that says none goes by the source's.
-        event.urgent
+        event.steer
             || heard.subs.iter().any(|name| {
                 let own = (self.subs.iter()).find(|sub| sub.name == *name && sub.digest.is_some());
                 match own {
@@ -3042,14 +3043,14 @@ impl Lookout {
         let mut event = event.clone();
         // What a subscription that hears it marks urgent is, as if its
         // source had.
-        if !event.urgent
+        if !event.steer
             && let Some(sub) = (self.subs.iter()).find(|sub| {
                 subs.contains(&sub.name)
-                    && (sub.urgent.as_ref()).is_some_and(|u| pattern::matches(u, &event.fields))
+                    && (sub.steer.as_ref()).is_some_and(|u| pattern::matches(u, &event.fields))
             })
         {
-            event.urgent = true;
-            event.urgent_by = Some(sub.name.clone());
+            event.steer = true;
+            event.steer_by = Some(sub.name.clone());
         }
         self.heard.push(sources::Heard { event, subs });
         self.keep();
@@ -3096,11 +3097,11 @@ impl Lookout {
         // it was, busy or not: the daemon took it already, or takes it now.
         let sent = std::mem::take(&mut self.resend);
         if !sent.is_empty() {
-            let steer = sent.iter().any(|heard| heard.event.urgent);
+            let steer = sent.iter().any(|heard| heard.event.steer);
             let prompt = sources::note(&sent, self.heard.len());
             return self.source(client, woken, sent, prompt, steer);
         }
-        let steer = self.heard.iter().any(|heard| heard.event.urgent);
+        let steer = self.heard.iter().any(|heard| heard.event.steer);
         if !(steer || (now >= since + SETTLE && self.updates.idle())) {
             return;
         }
@@ -3109,7 +3110,7 @@ impl Lookout {
         let (mut ready, held): (Vec<_>, Vec<_>) = std::mem::take(&mut self.heard)
             .into_iter()
             .partition(|heard| self.ready(heard, now));
-        ready.sort_by_key(|heard| !heard.event.urgent);
+        ready.sort_by_key(|heard| !heard.event.steer);
         let mut bytes = 0;
         let take = (ready.iter().take(NOTE_ITEMS))
             .take_while(|heard| {
@@ -3427,7 +3428,7 @@ mod tests {
             sources: Vec::new(),
             filter: None,
             digest: None,
-            urgent: None,
+            steer: None,
             owner: None,
         }
     }
@@ -3650,7 +3651,7 @@ mod tests {
     #[test]
     fn what_a_subscription_marks_urgent_cuts_in_and_says_why() {
         let mut lookout = seated("running");
-        lookout.subs[0].urgent = Some(json!({"status": ["failed"]}));
+        lookout.subs[0].steer = Some(json!({"status": ["failed"]}));
         lookout.subs[0].digest = Some("1h".into());
         let listed = lookout.updates.listed();
         lookout.sync(&listed);
@@ -3665,7 +3666,7 @@ mod tests {
         let steered = note(&told, Some(&Steer::Rule("tasks".into())));
         assert!(
             steered.contains(
-                "This cuts into your turn because your subscription tasks marks it urgent"
+                "This cuts into your turn because your subscription tasks says it steers"
             ),
             "{steered}"
         );
@@ -3714,7 +3715,7 @@ mod tests {
     #[test]
     fn an_urgent_turn_waiting_for_its_reply_stays_urgent() {
         let mut lookout = seated("running");
-        lookout.subs[0].urgent = Some(json!({"status": ["failed"]}));
+        lookout.subs[0].steer = Some(json!({"status": ["failed"]}));
         let listed = lookout.updates.listed();
         lookout.sync(&listed);
         ended(&mut lookout, 5, "failed");
@@ -3749,7 +3750,7 @@ mod tests {
     #[test]
     fn an_urgent_turn_left_for_the_next_note_stays_urgent() {
         let mut lookout = seated("running");
-        lookout.subs[0].urgent = Some(json!({"status": ["failed"]}));
+        lookout.subs[0].steer = Some(json!({"status": ["failed"]}));
         let listed = lookout.updates.listed();
         lookout.sync(&listed);
         ended(&mut lookout, 5, "failed");
@@ -3783,7 +3784,7 @@ mod tests {
     #[test]
     fn what_the_subscriber_read_is_neither_urgent_nor_news_again() {
         let mut lookout = seated("running");
-        lookout.subs[0].urgent = Some(json!({"status": ["failed"]}));
+        lookout.subs[0].steer = Some(json!({"status": ["failed"]}));
         lookout.subs[0].filter = Some(json!({"by": [{"anything-but": "calc.other"}]}));
         let listed = lookout.updates.listed();
         lookout.sync(&listed);
@@ -5090,8 +5091,8 @@ mod tests {
             text: text.into(),
             from: Some("ana".into()),
             url: None,
-            urgent,
-            urgent_by: None,
+            steer: urgent,
+            steer_by: None,
             digest: None,
             fields: std::sync::Arc::new(json!({"text": text})),
             told: Vec::new(),
@@ -5140,7 +5141,7 @@ mod tests {
         let mut lookout = lookout();
         let mut chat = hears("chat");
         chat.digest = Some("1h".into());
-        chat.urgent = Some(json!({"text": [{"prefix": "down"}]}));
+        chat.steer = Some(json!({"text": [{"prefix": "down"}]}));
         lookout.subs.push(chat);
         lookout.subs.push(hears("eng"));
         let now = Instant::now();
@@ -5164,15 +5165,15 @@ mod tests {
         // What it marks urgent is, and the note says whose mark it is.
         lookout.heard_from(&slack("down: prod", false));
         let down = &lookout.heard[1];
-        assert!(down.event.urgent && lookout.ready(down, now));
+        assert!(down.event.steer && lookout.ready(down, now));
         assert!(
-            sources::line(down).contains("(for your chat, urgent by your chat)"),
+            sources::line(down).contains("(for your chat, as a steer by your chat)"),
             "{}",
             sources::line(down)
         );
         // A source's own urgent mark reads as it always did.
         lookout.heard_from(&slack("fire", true));
-        assert!(sources::line(&lookout.heard[2]).contains("(for your chat, urgent)"));
+        assert!(sources::line(&lookout.heard[2]).contains("(for your chat, as a steer)"));
     }
 
     #[test]
@@ -5552,7 +5553,7 @@ mod tests {
         assert_eq!(submit["delivery"], "steer");
         let prompt = submit["prompt"].as_str().unwrap();
         assert!(
-            prompt.contains(r#"(for your chat, urgent): "prod is down""#),
+            prompt.contains(r#"(for your chat, as a steer): "prod is down""#),
             "{prompt}"
         );
         assert!(prompt.contains("Handle what cannot wait"), "{prompt}");
@@ -5620,7 +5621,7 @@ mod tests {
             command: String::new(),
             every: Some("1h".into()),
             digest: None,
-            urgent: None,
+            steer: None,
         }
     }
 

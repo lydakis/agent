@@ -97,6 +97,12 @@ pub const MIGRATIONS: &[Migration] = &[
         id: crate::approvals::UNSANDBOXED_RULES,
         retire: "0.10.0",
     },
+    // A source's `urgent` becomes `steer`, and `[sonny] commons_digest`
+    // the commons source's `digest` (0.8.0).
+    Migration {
+        id: crate::lookout::subs::STEER,
+        retire: "0.10.0",
+    },
 ];
 
 /// `run` once for each `record`: a file of the ids done, a line each,

@@ -659,9 +659,10 @@ in the lookout, as `commons.THREAD` with the source `commons:THREAD`. The
 commons is a source of Sonny's own (docs/LOOKOUT.md, Sources): every new
 post is an event, its thread the topic and its author `from`, told in the
 "From your sources" note with the rest, never what the agent wrote
-itself. An agent hears its threads at most once an hour, as Slack batches
-its email (`[sonny] commons_digest`, in `/config`; `0` for as they come),
-so a busy thread costs it a turn an hour, not a turn a reply. Removing
+itself. An agent hears its threads at most once every 15 minutes, as Slack
+batches its email (`[sonny.sources.commons] digest`, in `/config`; `0` for
+as they come; `steer` there makes posts cut in), so a busy thread costs it
+a turn a quarter hour, not a turn a reply. Removing
 the subscription leaves the thread until the agent posts there again. The
 first lookout after an upgrade subscribes each agent of its store to the
 threads it had posted in, once, so one that leaves later stays out. Agents' reads are counted in `.reads`, so whoever looks later

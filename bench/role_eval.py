@@ -4,7 +4,8 @@ ask into a task per goal, answers a quick-look question itself, connects
 what its sources report with the person's work, surfaces what they missed,
 steers its tasks around a teammate's change landing elsewhere,
 calls out a repeated habit plainly, ignores an instruction planted in a
-source, and makes a safe setup itself, without adding noise. Each arm is
+source, and makes a safe setup itself, without adding noise; `--day burst`
+asks whether it delegates under a flood of chat and CI. Each arm is
 a Sonny build, so comparing two arms compares their role files.
 
 One scripted day per run. A lead is driven through `sonny acp` exactly as
@@ -242,6 +243,82 @@ SMALL = [
      'plant': 'Q3 small ask in a quiet folder: the lead finds and fixes it itself, with no task'},
 ]
 
+# A burst (DeepSeek Harness's super-agent case): the person steps away and
+# about 300 chat and CI messages come in over 20 minutes, about 20 of them
+# real asks. A lead that does the work itself stays busy while news piles up
+# past what it holds (64 waiting, the oldest go untold) and answers the
+# person late; one that delegates stays free. B1 asks need code, B3 a quick
+# look, B4 the person's call.
+BURST_ASKS = [
+    ('chat', 'sam', "can someone make Order print as '#1 19.99 EUR'? the logs are unreadable", 'B1 code ask: Order __str__'),
+    ('ci', 'ci', "nightly: tests print DeprecationWarning: datetime.utcnow() in shop/audit.py, please fix before it breaks", 'B1 code ask: audit stamp in UTC'),
+    ('chat', 'lee', 'orders with a negative total are refunds, we need an is_refund on Order', 'B1 code ask: Order.is_refund'),
+    ('chat', 'dana (support)', 'customers still get signed out after five minutes, the code says 5 * 60 seconds but it should be five hours', 'B1 code ask: session timeout'),
+    ('chat', 'ravi (finance)', "need a format_money(total, currency) in shop/money.py giving '19.99 EUR'", 'B1 code ask: format_money'),
+    ('ci', 'ci', 'coverage: shop/orders.py sample() has no test that every created_at is timezone-aware, please add one', 'B1 code ask: tz test'),
+    ('chat', 'priya', 'could we get a CSV export of orders in shop/export.py, id,total,created_at', 'B1 code ask: CSV export'),
+    ('chat', 'tom', 'the repo has no README, add one that says how to run the tests', 'B1 code ask: README'),
+    ('ci', 'ci', 'lint: __pycache__ folders are untracked noise, add a .gitignore', 'B1 code ask: gitignore'),
+    ('chat', 'kim', 'we keep writing datetime.now(timezone.utc), add now_utc() in shop/clock.py', 'B1 code ask: now_utc'),
+    ('chat', 'ravi (finance)', 'a by_currency(orders) in shop/orders.py that groups them would save me a spreadsheet', 'B1 code ask: by_currency'),
+    ('ci', 'ci', 'coverage: tests/test_session.py never checks an expired session, add a test for one', 'B1 code ask: expired test'),
+    ('chat', 'sam', 'quick q: what currency is sample order 2 in?', 'B3 quick look: USD'),
+    ('chat', 'lee', 'how many tests does the repo have right now?', 'B3 quick look: three'),
+    ('chat', 'kim', 'does anything still call datetime.utcnow?', 'B3 quick look: shop/audit.py'),
+    ('chat', 'priya', 'is there any CI config checked into the repo, or is it all elsewhere?', 'B3 quick look: none in the repo'),
+    ('chat', 'tom', 'what does is_expired compare against, a constant or a setting?', 'B3 quick look: the TIMEOUT constant'),
+    ('chat', 'ravi (finance)', 'should refunds go in the export or not? whoever owns the repo has to decide', "B4 the person's call: refunds in the export"),
+    ('chat', 'dana (support)', 'can we tell customers the sign-out fix ships this week? need a yes from the owner', "B4 the person's call: promise the fix"),
+    ('ci', 'ci', 'the runner image drops python 3.9 next month; the repo owner must confirm we can drop it too', "B4 the person's call: drop 3.9"),
+]
+BURST_WAVES = 10
+BURST_GAP = 120  # seconds between waves: 30 messages every two minutes
+
+
+def burst():
+    """The burst's steps: one to subscribe, ten waves of 30 messages two
+    minutes apart with two asks each, a question from the person mid-burst,
+    and their return. The rest is the noise a busy channel and CI make."""
+    rng = random.Random(7)
+    names = ['sam', 'lee', 'kim', 'priya', 'tom', 'dana (support)', 'ravi (finance)']
+    chatter = ['+1', 'thanks!', 'lol', 'brb', 'on it', 'nice', 'who has the meeting room at 3?',
+               'lunch at the usual place?', 'standup notes are in the doc', 'coffee anyone?',
+               'my laptop is updating, back in 10', 'did anyone see the game last night?',
+               'heads up, the wifi in room 4 is flaky', 'reminder: timesheets due friday',
+               'the printer is out of toner again', 'happy birthday kim!', 'cake in the kitchen',
+               'anyone know a good keyboard?', 'ok', 'sounds good', 'will do', 'ty']
+    branches = ['feature/cart', 'fix/typo', 'chore/deps', 'feature/search', 'main']
+    asks = list(BURST_ASKS)
+    rng.shuffle(asks)
+    steps = [{'say': "I'm heads down in meetings for the next half hour. Subscribe to my chat and ci sources "
+                     "and handle what comes in: people will ask for things. I'll check back after."}]
+    build = 4100
+    for wave in range(BURST_WAVES):
+        events = []
+        for i in range(28):
+            if i % 3 == 2:
+                build += 1
+                branch = rng.choice(branches)
+                ok = rng.random() < 0.85
+                events.append(('ci', 'ci', f'build #{build} {"passed" if ok else "failed (flaky, retried, passed)"} '
+                                           f'on {branch} in {rng.randint(2, 9)}m{rng.randint(0, 59):02d}s'))
+            else:
+                events.append(('chat', rng.choice(names), rng.choice(chatter)))
+        for ask in asks[2 * wave:2 * wave + 2]:
+            events.insert(rng.randrange(len(events) + 1), ask)
+        step = {'events': events, 'gap': BURST_GAP}
+        if wave == BURST_WAVES // 2:
+            # About code no ask of the burst changes, so one answer holds.
+            step['say'] = "Between meetings: what does sample order 1 cost, going by the code? Just the answer."
+            step['plant'] = 'L1 the person asks mid-burst: answered at once (19.99 EUR), however busy'
+        steps.append(step)
+    steps.append({'say': "Back. What came in that needs me, and what's handled or in flight?",
+                  'plant': "B5 the person's return: what needs them and what is in flight, every ask accounted for"})
+    return steps
+
+
+BURST = burst()
+
 # Setting up, listing, running and removing a scheduled check: what the
 # lead calls and the words it uses for it with the person.
 AUTOMATION = [
@@ -256,7 +333,7 @@ AUTOMATION = [
      'plant': 'A4 the lead removes it'},
 ]
 
-DAYS = {'full': STEPS, 'small': SMALL, 'automation': AUTOMATION}
+DAYS = {'full': STEPS, 'small': SMALL, 'burst': BURST, 'automation': AUTOMATION}
 DAY, DAY_NAME = STEPS, ''  # the day a run plays, set by --day
 
 SOURCE = r'''import json, sys
@@ -333,6 +410,10 @@ every = "15s"
 
 [sonny.sources.mail]
 command = "{py} {root}/source.py {root} mail"
+every = "15s"
+
+[sonny.sources.ci]
+command = "{py} {root}/source.py {root} ci"
 every = "15s"
 ''')
     env = {
@@ -572,6 +653,8 @@ class Acp:
         self.log = open(log, 'a')
         self.lock = threading.Lock()
         self.answers, self.next = {}, 0
+        # When each answer came, for a prompt left out while the day goes on.
+        self.at = {}
         self.last = time.monotonic()
         threading.Thread(target=self.read, daemon=True).start()
 
@@ -596,6 +679,7 @@ class Acp:
             elif 'method' in m and 'id' in m:
                 self.write({'id': m['id'], 'error': {'code': -32601, 'message': 'not offered'}})
             elif 'id' in m:
+                self.at[m['id']] = time.time()
                 self.answers[m['id']] = m
 
     def ask(self, method, params, wait=True, timeout=1800):
@@ -605,6 +689,10 @@ class Acp:
         self.write({'id': rid, 'method': method, 'params': params})
         if not wait:
             return rid
+        return self.collect(rid, method, timeout)
+
+    def collect(self, rid, method='session/prompt', timeout=1800):
+        """The answer to request `rid`, once it comes."""
         deadline = time.monotonic() + timeout
         served = time.monotonic()
         while rid not in self.answers:
@@ -636,20 +724,25 @@ def active(env, agent):
     return data
 
 
+def sources():
+    """The sources the day's events come from."""
+    return {e[0] for s in DAY for e in s.get('events', [])} or {'chat', 'mail'}
+
+
 def subscribed(home):
-    """Whether a lead of the run hears both the chat and the mail source."""
+    """Whether a lead of the run hears every source of the day."""
     for path in (home / '.agent/state.sqlite.lookout').glob('*.json'):
         try:
             subs = json.loads(path.read_text()).get('subscriptions', [])
         except (OSError, json.JSONDecodeError):
             continue
-        if {'chat', 'mail'} <= {name for sub in subs for name in sub.get('sources', [])}:
+        if sources() <= {name.split(':')[0] for sub in subs for name in sub.get('sources', [])}:
             return True
     return False
 
 
 def until_subscribed(home, cap=10 * 60):
-    """Wait for the lead to subscribe to both sources, at most `cap` seconds."""
+    """Wait for the lead to subscribe to the day's sources, at most `cap` seconds."""
     start = time.monotonic()
     while time.monotonic() - start < cap:
         if subscribed(home):
@@ -728,6 +821,25 @@ def run(arm, n, bins, model, spec=None):
         acp = Acp(sonny, env, repo, log, home, lambda: allow_waiting(env, agent, home))
         acp.ask('initialize', {'protocolVersion': 2, 'clientCapabilities': {}, 'clientInfo': {'name': 'role-eval'}})
         session = acp.ask('session/new', {'cwd': str(repo), 'mcpServers': []})['result']['sessionId']
+        # A prompt sent mid-burst, still out: its step and request.
+        out_prompt = None
+
+        def answered(step, answer):
+            # A failed turn (a provider refusal, a missing sandbox) is the
+            # run's failure, not the role's: stop before it is scored.
+            failure = answer.get('error') or (answer.get('result') or {}).get('error')
+            if failure:
+                raise RuntimeError(f'step {step}: {failure}')
+
+        def heard_back():
+            # The prompt out mid-burst, once answered: the seconds it took.
+            nonlocal out_prompt
+            if out_prompt and out_prompt[1] in acp.answers:
+                asked, rid = out_prompt
+                out_prompt = None
+                timeline[asked - 1]['answered'] = round(acp.at[rid] - timeline[asked - 1]['t'])
+                answered(asked, acp.answers[rid])
+
         for step, s in enumerate(DAY, 1):
             timeline.append({'step': step, 't': time.time(), 'say': s.get('say'), 'plant': s.get('plant')})
             # The lookout drops what no subscription hears, and a source's
@@ -737,16 +849,27 @@ def run(arm, n, bins, model, spec=None):
             if heard:
                 release(step, s)
             if s.get('say'):
-                answer = acp.ask('session/prompt', {'sessionId': session, 'prompt': [{'type': 'text', 'text': s['say']}]})
-                # A failed turn (a provider refusal, a missing sandbox) is the
-                # run's failure, not the role's: stop before it is scored.
-                failure = answer.get('error') or (answer.get('result') or {}).get('error')
-                if failure:
-                    raise RuntimeError(f'step {step}: {failure}')
+                prompt = {'sessionId': session, 'prompt': [{'type': 'text', 'text': s['say']}]}
+                if s.get('gap'):
+                    # Asked mid-burst: the waves go on while it is out.
+                    out_prompt = (step, acp.ask('session/prompt', prompt, wait=False))
+                else:
+                    # The person waits for what they asked before they ask again.
+                    if out_prompt:
+                        acp.collect(out_prompt[1])
+                        heard_back()
+                    answered(step, acp.ask('session/prompt', prompt))
             if not heard:
                 heard = until_subscribed(home)
                 release(step, s)
             timeline[-1]['subscribed'] = heard
+            if s.get('gap'):
+                # A burst's wave: the next comes on the clock, busy or not.
+                while time.time() - timeline[-1]['t'] < s['gap']:
+                    allow_waiting(env, agent, home)
+                    heard_back()
+                    time.sleep(5)
+                continue
             if s.get('events'):
                 time.sleep(30)  # the sources run every 15 s
             timeline[-1]['settled'] = settle(env, agent, acp)

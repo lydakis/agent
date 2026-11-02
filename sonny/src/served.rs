@@ -272,10 +272,12 @@ fn subscriptions() -> Value {
             The person's own words cut into your running turn; the rest waits until your turn ends. Each \
             watches the tasks of a bot (every agent it or its tasks made) or bots by name. It also hears the \
             sources the person set up outside (a chat, a mailbox, a feed), each by name, in a note starting \
-            \"From your sources\": every event, at once when the source marks it urgent, or one topic of a \
+            \"From your sources\": every event, at once when the source says it steers, or one topic of a \
             source as NAME:TOPIC, or only those its filter matches. The commons is a source too, each thread \
             a topic: posting in a thread subscribes you to it as commons.THREAD, and removing that leaves it. \
-            Add one, or remove one by name; with neither, or after either, the result lists them all, with \
+            Add steer yourself for what you own; a filter or a digest only when the person asks for one: \
+            what a filter leaves out you never hear, and a digest makes you late. Add one, or remove one by \
+            name; with neither, or after either, the result lists them all, with \
             the sources there are and the fields their events lately had, to filter on. Adding one again \
             changes nothing; one by a name in use that differs is refused with the field, so remove it first.",
         "parameters": {
@@ -312,9 +314,9 @@ fn subscriptions() -> Value {
                                 its sources' own digest: the first after a quiet spell at once, the rest in one \
                                 note. The person's words, a question to them and an approval only they can give \
                                 never wait for it."},
-                        "urgent": {"type": "object",
-                            "description": "What it hears that this matches, a pattern as filter's, cuts into \
-                                your running turn and waits for no digest, as the person's words do. As \
+                        "steer": {"type": "object",
+                            "description": "What it hears that this matches, a pattern as filter's, is a steer: \
+                                it cuts into your running turn and waits for no digest, as the person's words do. As \
                                 {\"type\": [\"turn.ended\"], \"status\": [\"failed\"]}."}
                     },
                     "required": ["name"],
@@ -731,9 +733,13 @@ async fn called(name: &str, arguments: &Value) -> Answer {
             .map_err(|e| ("project_not_made", e)),
         SUBSCRIPTIONS => {
             let (store, _) = crate::daemon_paths(None, None).map_err(|e| ("no_store", e))?;
+            let caller_id = std::env::var("AGENT_BOT_ID")
+                .ok()
+                .and_then(|id| id.parse().ok());
             crate::lookout::subs::change(
                 &store,
                 &caller,
+                caller_id,
                 arguments.get("add"),
                 arguments["remove"].as_str(),
                 &crate::lookout::sources::names(),
