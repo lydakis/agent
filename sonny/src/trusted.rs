@@ -371,7 +371,10 @@ mod tests {
             .program("tool", &origin, || async { Ok(writers) })
             .await
             .unwrap_err();
-        assert!(refused.contains("which the agent calc.lead writes"), "{refused}");
+        assert!(
+            refused.contains("which the agent calc.lead writes"),
+            "{refused}"
+        );
     }
 
     #[tokio::test]
