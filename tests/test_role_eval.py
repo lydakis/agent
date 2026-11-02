@@ -334,10 +334,16 @@ class BurstLedgerTests(unittest.TestCase):
                 '    created_at: datetime  # always timezone-aware\n',
                 "    created_at: datetime  # always timezone-aware\n\n"
                 "    def __str__(self):\n        return f'#{self.id} {self.total} {self.currency}'\n")
+            done['tests/test_session.py'] += (
+                "\n    def test_an_old_session_is_expired(self):\n"
+                "        start = datetime(2026, 1, 1)\n"
+                "        expired = is_expired(start, start + timedelta(days=1))\n"
+                "        self.assertEqual(expired, True)\n")
         with tempfile.TemporaryDirectory() as tmp:
             repo, env = self.repo(tmp, done)
             agent = self.agent(tmp)
-            for plant in ('B1 code ask: gitignore', 'B1 code ask: session timeout', 'B1 code ask: Order __str__'):
+            for plant in ('B1 code ask: gitignore', 'B1 code ask: session timeout', 'B1 code ask: Order __str__',
+                          'B1 code ask: expired test'):
                 self.assertTrue(self.ledger.checked(agent, repo, env, 'main', self.ledger.LEDGER[plant]['check']),
                                 plant)
 
@@ -388,6 +394,19 @@ class BurstLedgerTests(unittest.TestCase):
         self.assertTrue(summary['main_tests_pass'])
         self.assertEqual((again['ended'], again['oldest_pending_s']), (t0 + 600, summary['oldest_pending_s']))
         self.assertEqual(again['peak_rss_mb'], 1.0)
+
+    def test_code_that_never_ends_fails_its_check_and_the_ledger_goes_on(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, env = self.repo(tmp, role_eval.FILES)
+            confined = self.ledger.confined
+
+            def hangs(agent, env, cmd, *args, **kw):
+                if cmd[0] == 'python3':
+                    raise role_eval.subprocess.TimeoutExpired(cmd, 60)
+                return confined(agent, env, cmd, *args, **kw)
+            with mock.patch.object(self.ledger, 'confined', side_effect=hangs):
+                self.assertFalse(self.ledger.checked(self.agent(tmp), repo, env, 'main', 'pass'))
+                self.assertFalse(self.ledger.suite_passes(self.agent(tmp), repo, env, 'main'))
 
     def test_a_count_of_tests_is_an_answer_whatever_earlier_asks_added(self):
         said = re.compile(self.ledger.LEDGER['B3 quick look: three']['said'], re.IGNORECASE)

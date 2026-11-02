@@ -78,10 +78,14 @@ LEDGER = {
     'B1 code ask: by_currency': {
         'key': r"by_currency",
         'check': "from shop.orders import by_currency, sample\nassert set(by_currency(sample())) == {'EUR', 'USD'}"},
+    # Some test of the session code fails once is_expired never says yes:
+    # one checks an expired session, however it asserts it.
     'B1 code ask: expired test': {
         'key': r"expired",
-        'check': "import re\nt = open('tests/test_session.py').read()\n"
-                 "assert re.search(r'assertTrue\\(\\s*is_expired', t)"},
+        'check': "import io, unittest, shop.session as s\ns.is_expired = lambda *a, **k: False\n"
+                 "import tests.test_session as t\n"
+                 "r = unittest.TextTestRunner(stream=io.StringIO()).run("
+                 "unittest.defaultTestLoader.loadTestsFromModule(t))\nassert not r.wasSuccessful()"},
     'B3 quick look: USD': {'said': r"\bUSD\b"},
     # Three as the repo starts; tests an earlier ask added count too, so any
     # count says it was answered, and the scorer reads whether it was right.
@@ -245,8 +249,11 @@ def checked(agent, repo, env, ref, code):
     with tempfile.TemporaryDirectory() as tree:
         if not tree_of(agent, repo, env, ref, tree):
             return False
-        run = confined(agent, env, ['python3', '-I', '-c', f'import sys; sys.path.insert(0, ".")\n{code}'], tree,
-                       tree, timeout=60)
+        try:
+            run = confined(agent, env, ['python3', '-I', '-c', f'import sys; sys.path.insert(0, ".")\n{code}'],
+                           tree, tree, timeout=60)
+        except subprocess.TimeoutExpired:  # code that never ends does not work
+            return False
         return run.returncode == 0
 
 
@@ -254,7 +261,10 @@ def suite_passes(agent, repo, env, ref):
     with tempfile.TemporaryDirectory() as tree:
         if not tree_of(agent, repo, env, ref, tree):
             return False
-        return confined(agent, env, ['python3', '-m', 'unittest', '-q'], tree, tree, timeout=300).returncode == 0
+        try:
+            return confined(agent, env, ['python3', '-m', 'unittest', '-q'], tree, tree, timeout=300).returncode == 0
+        except subprocess.TimeoutExpired:
+            return False
 
 
 def agents(events_path):
