@@ -266,7 +266,10 @@ daemon does.
 ## Output and status
 
 Default output is machine-readable JSON. `run` and `follow` stream one JSON
-object per line. Snapshot commands return compact JSON objects; `ls` and `turns`
+object per line. `run` follows its bot live before it submits, so a turn that
+answers before the submit is answered still prints its text whole, and its
+output is that turn's events (#613); a resent `--request-id` follows the turn
+it made from the turn's start. Snapshot commands return compact JSON objects; `ls` and `turns`
 return arrays. Every command prints its reply: `interrupt` the turn view,
 `answer` what it answered, and `shutdown` `{"stopped":true,"pid":N}` once the
 daemon is gone. Every client command takes `--pretty`; `serve` runs until
