@@ -182,6 +182,11 @@ fn sandboxed(args: &[String]) -> Result<i32> {
             })
             .into_iter()
             .collect(),
+        // And what the daemon walls off, as it would for a bot.
+        walled: (agent_client::config::run())
+            .and_then(|run| std::fs::canonicalize(run).ok())
+            .into_iter()
+            .collect(),
         ..Daemon::default()
     };
     let mode = match writable.is_empty() {
@@ -235,6 +240,7 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
     let (mut redact_fields, mut redact_blocks) = (Vec::new(), Vec::new());
     let (mut protected, mut protected_existing) = (Vec::new(), Vec::new());
     let mut protected_paths = Vec::new();
+    let mut walled = Vec::new();
     let mut iter = args.iter();
     while let Some(flag) = iter.next() {
         let value = iter
@@ -260,6 +266,7 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
             }
             "--protect" => protected.push(value.clone()),
             "--protect-path" => protected_paths.push(value.into()),
+            "--wall" => walled.push(value.into()),
             "--protect-existing" => protected_existing.push(value.clone()),
             "--max-processes"
             | "--max-lasting"
@@ -323,5 +330,6 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
         protected,
         protected_existing,
         protected_paths,
+        walled,
     })
 }

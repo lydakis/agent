@@ -974,6 +974,11 @@ fn connect_or_start(options: &Options) -> Result<Connection> {
     if let Some(home) = agent_client::config::home() {
         command.arg("--protect-path").arg(home);
     }
+    // Where clients keep the sockets of the programs they run for bots
+    // outside the sandbox, which do as they are asked as the person.
+    if let Some(run) = agent_client::config::run() {
+        command.arg("--wall").arg(run);
+    }
     for pattern in config()?.shell_environment_policy.excludes() {
         command.arg("--shell-exclude").arg(pattern);
     }

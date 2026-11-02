@@ -4,10 +4,12 @@
 //! run, and again whenever it changes, it is admitted: refused while it,
 //! or the folder its copy goes in, is in a folder some agent of this store
 //! writes, else copied into `~/.agent/sonny/programs/NAME/`. The tool runs
-//! only that copy, with `~/.agent/sonny/run/` as its temporary folder,
+//! only that copy, with `~/.agent/run/sonny/` as its temporary folder,
 //! checked the same way: what a program leaves running there, as
-//! agent-desktop leaves the host its commands go through, is reached by
-//! no other caller and was started by Sonny from the copy. So an agent that can write where the program is
+//! agent-desktop leaves the host its commands go through and agent-browser
+//! its sessions, was started by Sonny from the copy, is reached by no
+//! other caller, and, in the folder the daemon walls off, by no sandboxed
+//! command, whose network would otherwise reach it. So an agent that can write where the program is
 //! installed never has it run, whichever agent calls the tool, and a swap
 //! after it was admitted changes nothing that runs until it is admitted
 //! again. An agent with no sandbox is not counted: it runs as the person
@@ -282,8 +284,11 @@ pub async fn writers(client: &agent_client::Client) -> Result<Vec<Writer>, Strin
 }
 
 /// The tool host's programs, found on its `PATH` once.
-static PINS: std::sync::LazyLock<Pins> =
-    std::sync::LazyLock::new(|| Pins::new(dir("programs"), dir("run")));
+static PINS: std::sync::LazyLock<Pins> = std::sync::LazyLock::new(|| {
+    let run =
+        (agent_client::config::run()).unwrap_or_else(|| std::env::temp_dir().join(".agent/run"));
+    Pins::new(dir("programs"), run.join("sonny"))
+});
 
 /// The temporary folder the programs run with: `TMPDIR` for each.
 pub fn temporary() -> std::io::Result<PathBuf> {

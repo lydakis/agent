@@ -228,7 +228,7 @@ const COMMANDS: &[Command] = &[
         name: "serve",
         about: "Run the daemon in the foreground; other commands start it for you",
         usage: "serve --store PATH --provider SPEC... [OPTIONS]",
-        flags: "--shell-exclude --redact-field --redact-block --protect --protect-existing --protect-path",
+        flags: "--shell-exclude --redact-field --redact-block --protect --protect-existing --protect-path --wall",
         settings: "",
         startup: true,
     },
@@ -427,6 +427,10 @@ fn print_flags(flags: &str) {
             "--protect-path" => (
                 "PATH",
                 "Keep PATH, by its absolute path, read-only in every sandbox, and from being made when missing; repeatable",
+            ),
+            "--wall" => (
+                "FOLDER",
+                "Keep every sandboxed command, the network on or not, from the Unix sockets in FOLDER, made private if missing; repeatable",
             ),
             "--protect" => (
                 "NAME",
@@ -682,6 +686,7 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
                     | "--protect"
                     | "--protect-existing"
                     | "--protect-path"
+                    | "--wall"
             )
         {
             return fail_with("usage", format!("{flag} may only be specified once"));

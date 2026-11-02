@@ -259,6 +259,46 @@ class ApprovalTests(ModelFixture):
         self.assertEqual(list(outside.iterdir()), [])
 
     @unittest.skipUnless(shutil.which('bwrap') or sys.platform == 'darwin', 'sandboxes need bubblewrap')
+    def test_a_walled_folder_s_sockets_are_out_of_reach_with_the_network_on(self):
+        import socket as sockets
+        # Short, for a socket's path; in a folder the sandbox writes.
+        base = Path(tempfile.mkdtemp(prefix='w', dir='/tmp'))
+        self.addCleanup(shutil.rmtree, base)
+        walled, other = base / 'run', base / 'other'
+        other.mkdir()
+        daemon = SocketClient(self.binary, self.path / 'state.sqlite', self.url, 'echo,shell',
+                              extra=['--wall', str(walled)],
+                              settings={'sandbox': 'workspace-write', 'network': True})
+        self.addCleanup(daemon.close)
+        # Made at start, private, so a sandbox started before a socket is
+        # in it hides it all the same.
+        self.assertEqual(walled.stat().st_mode & 0o777, 0o700)
+        listeners = []
+        for folder in (walled, other):
+            listener = sockets.socket(sockets.AF_UNIX)
+            listener.bind(str(folder / 'host.sock'))
+            listener.listen()
+            self.addCleanup(listener.close)
+            listeners.append(listener)
+        daemon.request('create', bot='Bob', workspace=str(self.path))
+        (self.path / 'probe.py').write_text(
+            'import json, socket, sys\n'
+            'def reached(path):\n'
+            '    try:\n'
+            '        socket.socket(socket.AF_UNIX).connect(path); return True\n'
+            '    except OSError:\n'
+            '        return False\n'
+            'print(json.dumps([reached(path) for path in sys.argv[1:]]))\n')
+        prompt = f"shell:python3 probe.py {walled / 'host.sock'} {other / 'host.sock'}"
+        turn = daemon.request('submit', bot='Bob', request_id='t', prompt=prompt)['result']['turn']
+        self.assertEqual(daemon.finished(turn)['data']['status'], 'completed')
+        probed = json.loads(self.tool_output(daemon, 'shell-1')[1]['stdout'])
+        # With the network on it reaches a socket of the person's, as Codex's
+        # full network does, but never one in the walled folder, whose
+        # program acts as the person.
+        self.assertEqual(probed, [False, True])
+
+    @unittest.skipUnless(shutil.which('bwrap') or sys.platform == 'darwin', 'sandboxes need bubblewrap')
     def test_a_sandboxed_bot_uses_the_daemon_as_itself_and_no_further(self):
         (ROOT / '.local').mkdir(exist_ok=True)
         outside = Path(tempfile.mkdtemp(dir=ROOT / '.local'))

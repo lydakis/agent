@@ -2837,6 +2837,17 @@ every sandbox and, when missing, from being made there. The CLI passes
 writable folder that is a symlink refuses the call with
 `sandbox_unavailable`.
 
+Nor reach a program a client runs for bots outside the sandbox, which does
+what it is asked as the person: `serve --wall FOLDER`, which repeats, keeps
+every sandboxed command from the Unix sockets in FOLDER, the network on or
+off and whatever its `unix_sockets` name, as Codex hides its app-server's
+sockets. The daemon makes the folder, private to its user, as it starts,
+so a sandbox started before a socket is in it hides it all the same.
+Seatbelt denies connecting to it and hard links into it; bubblewrap hides
+it under an empty read-only folder. It stays read-only in every root. The
+CLI passes `~/.agent/run`, where Sonny's agent-desktop host and
+agent-browser sessions listen.
+
 Where this differs from Codex:
 
 - `network_rule` waits for a proxy that filters a sandbox's network by

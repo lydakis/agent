@@ -539,7 +539,8 @@ async fn run(args: &[String]) -> Ran {
     // With Sonny's own temporary folder, where agent-desktop keeps the host
     // its commands go through: one Sonny started from the copy, never one
     // another program left running for the same copy, whose permissions
-    // and process would then be what acts.
+    // and process would then be what acts; and in the folder the daemon
+    // walls off, so no sandboxed command reaches it past the agent's gate.
     let temporary = match crate::trusted::temporary() {
         Ok(temporary) => temporary,
         Err(e) => {
