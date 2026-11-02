@@ -70,6 +70,7 @@
 //! host = "me@devbox"            # what ssh dials
 //! machine = "laptop"            # what the agents there call this machine, its hostname by default
 //! browser_profile = "Default"   # the Chrome profile their browser starts from, Default by default; "" a fresh one
+//! calls = 16                    # how many of their calls this machine runs at once, 4 per CPU by default
 //! [sonny.sources.slack]         # what Sonny's lookout runs for news
 //! command = "~/bin/slack-poll"  # run with sh -c; each line it prints is one event
 //! every = "1m"                  # how long after it exits it runs again
@@ -502,6 +503,9 @@ pub struct Link {
     /// `--profile` takes it: `Default`, the default, signed in as the
     /// person is here; empty for a fresh browser.
     pub browser_profile: String,
+    /// How many calls of that host's agents this machine runs at once;
+    /// unset, four for each of its CPUs.
+    pub calls: Option<usize>,
 }
 
 /// The Chrome profile a link's browsers start from unless it says.
@@ -766,6 +770,14 @@ fn link(name: &str, value: &toml::Value) -> Result<Link, String> {
             "machine" => link.machine = string(&key_at, value)?,
             "command" => link.command = Some(string(&key_at, value)?),
             // "" is a fresh browser, with no profile to start from.
+            "calls" => {
+                link.calls = Some(
+                    (value.as_integer())
+                        .filter(|n| *n >= 1)
+                        .ok_or_else(|| format!("{key_at} is a whole number, 1 or more"))?
+                        as usize,
+                );
+            }
             "browser_profile" => {
                 link.browser_profile = (value.as_str())
                     .ok_or_else(|| format!("{key_at} must be a string"))?
@@ -1717,6 +1729,9 @@ mod tests {
         );
         assert!(parse("[sonny.links.box]\nhost = \"\"\n").is_err());
         assert!(parse("[sonny.links.box]\nhost = \"box\"\nbrowser_profile = 1\n").is_err());
+        let config = parse("[sonny.links.box]\nhost = \"box\"\ncalls = 2\n").unwrap();
+        assert_eq!(config.sonny.links["box"].calls, Some(2));
+        assert!(parse("[sonny.links.box]\nhost = \"box\"\ncalls = 0\n").is_err());
     }
 
     #[test]
