@@ -51,6 +51,7 @@
 //! sky_haiku_margin = 50         # how much busier, in percent, a challenger must be to take the title
 //! sky_haiku_hold = 10           # minutes the title is held before it can pass
 //! tool_processes = 8            # processes Sonny runs for agents at once in all: tool calls 3/4, goal checks 1/4; 0, the default, four times the CPUs
+//! lookout_waiting = 4096        # events from sources that wait for one agent, 1024 by default; past it newer ones are not kept, and its next note says so; 0 no limit
 //! default_permissions = "strict"   # the /permissions row a new lead starts in, auto by default
 //! browser_confirm = ["eval"]    # agent-browser actions the agent's gate approves; eval, download, upload and state by default
 //!
@@ -478,6 +479,10 @@ pub struct Sonny {
     /// for tool calls the tool host answers, a quarter for goal checks,
     /// each at least one. 0 for four times the CPUs.
     pub tool_processes: u64,
+    /// How many events from sources wait for one agent at most: past it,
+    /// newer ones are not kept, and its next note says how many, from
+    /// where and when. 0 for no limit.
+    pub lookout_waiting: u64,
     /// What the lookout runs for news from outside, by name.
     pub sources: Vec<Source>,
     /// The agent-browser action categories that the `browser` tool puts
@@ -572,6 +577,7 @@ impl Default for Sonny {
             sky_haiku_margin: 50,
             sky_haiku_hold: 10,
             tool_processes: 0,
+            lookout_waiting: 1024,
             chime: true,
             verbose: false,
             text_width: TEXT_WIDTH,
@@ -1145,6 +1151,7 @@ fn parse(text: &str) -> Result<Config, String> {
                 "sky_haiku_margin",
                 "sky_haiku_hold",
                 "tool_processes",
+                "lookout_waiting",
                 "unsandboxed",
                 "default_permissions",
                 "browser_confirm",
@@ -1226,6 +1233,7 @@ fn parse(text: &str) -> Result<Config, String> {
                 "sky_haiku_margin" => Some(&mut config.sonny.sky_haiku_margin),
                 "sky_haiku_hold" => Some(&mut config.sonny.sky_haiku_hold),
                 "tool_processes" => Some(&mut config.sonny.tool_processes),
+                "lookout_waiting" => Some(&mut config.sonny.lookout_waiting),
                 "text_width" => Some(&mut config.sonny.text_width),
                 _ => None,
             } {

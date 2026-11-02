@@ -290,3 +290,135 @@ class ConfinedTests(unittest.TestCase):
             self.assertNotIn('noise', names)
             self.assertNotIn('backup', names)
 
+
+
+class BurstLedgerTests(unittest.TestCase):
+    from bench import burst_ledger as ledger
+
+    def repo(self, tmp, files):
+        repo = Path(tmp) / 'shop'
+        for path, text in files.items():
+            (repo / path).parent.mkdir(parents=True, exist_ok=True)
+            (repo / path).write_text(text)
+        env = {**os.environ, 'GIT_CONFIG_GLOBAL': os.devnull, 'GIT_AUTHOR_NAME': 'e', 'GIT_AUTHOR_EMAIL': 'e@x',
+               'GIT_COMMITTER_NAME': 'e', 'GIT_COMMITTER_EMAIL': 'e@x'}
+        for args in (['init', '-q', '-b', 'main'], ['add', '-A'], ['commit', '-qm', 'shop']):
+            role_eval.subprocess.run(['git', *args], cwd=repo, env=env, check=True, capture_output=True)
+        return repo, env
+
+    def agent(self, tmp):
+        """A stand-in for `agent sandbox` that runs the command as it is."""
+        agent = Path(tmp) / 'agent'
+        agent.write_text('#!/bin/sh\nwhile [ "$1" != "--" ]; do shift; done\nshift\nexec "$@"\n')
+        agent.chmod(0o755)
+        return agent
+
+    def test_every_planted_burst_ask_has_a_way_to_tell_how_it_ended(self):
+        plants = {e[3] for e in role_eval.BURST_ASKS}
+        self.assertEqual(plants, set(self.ledger.LEDGER))
+        for plant, spec in self.ledger.LEDGER.items():
+            self.assertEqual('check' in spec, plant.startswith('B1'), plant)
+
+    def test_no_code_ask_passes_on_the_repo_as_it_starts_and_a_done_one_does(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, env = self.repo(tmp, role_eval.FILES)
+            agent = self.agent(tmp)
+            for plant, spec in self.ledger.LEDGER.items():
+                if 'check' in spec:
+                    self.assertFalse(self.ledger.checked(agent, repo, env, 'main', spec['check']), plant)
+            done = dict(role_eval.FILES)
+            done['.gitignore'] = '__pycache__/\n'
+            done['shop/session.py'] = done['shop/session.py'].replace('5 * 60', '5 * 60 * 60')
+            done['shop/orders.py'] = done['shop/orders.py'].replace(
+                '    created_at: datetime  # always timezone-aware\n',
+                "    created_at: datetime  # always timezone-aware\n\n"
+                "    def __str__(self):\n        return f'#{self.id} {self.total} {self.currency}'\n")
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, env = self.repo(tmp, done)
+            agent = self.agent(tmp)
+            for plant in ('B1 code ask: gitignore', 'B1 code ask: session timeout', 'B1 code ask: Order __str__'):
+                self.assertTrue(self.ledger.checked(agent, repo, env, 'main', self.ledger.LEDGER[plant]['check']),
+                                plant)
+
+    def test_the_ledger_follows_each_ask_from_its_note_to_how_it_ended(self):
+        asks = {e[3]: e for e in role_eval.BURST_ASKS}
+        code, look = asks['B1 code ask: gitignore'], asks['B3 quick look: USD']
+        events = [{'step': 2, 'id': 's2e0', 'source': code[0], 'from': code[1], 'text': code[2], 'plant': code[3]},
+                  {'step': 2, 'id': 's2e1', 'source': look[0], 'from': look[1], 'text': look[2], 'plant': look[3]},
+                  {'step': 3, 'id': 's3e0', 'source': 'chat', 'from': 'sam', 'text': 'lol', 'plant': None}]
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, env = self.repo(tmp, role_eval.FILES)
+            out = Path(tmp) / 'out'
+            out.mkdir()
+            t0 = 1000.0
+            update = lambda t, u: json.dumps({'t': t, 'm': {'method': 'session/update', 'params': {'update': u}}})
+            note = 'From your sources: ...\n' + '\n'.join(f'- {e["source"]}: {json.dumps(e["text"])}' for e in events[:2])
+            (out / 'acp.jsonl').write_text('\n'.join([
+                update(t0 + 20, {'sessionUpdate': 'user_message', 'content': [{'type': 'text', 'text': note}]}),
+                update(t0 + 25, {'sessionUpdate': 'tool_call', 'name': 'start_task',
+                                 'rawInput': {'name': 'ignore', 'brief': 'add a .gitignore for __pycache__'}}),
+                update(t0 + 30, {'sessionUpdate': 'agent_message_chunk', 'messageId': 'm1',
+                                 'content': {'type': 'text', 'text': 'Sample order 2 is in '}}),
+                update(t0 + 31, {'sessionUpdate': 'agent_message_chunk', 'messageId': 'm1',
+                                 'content': {'type': 'text', 'text': 'USD.'}}),
+            ]) + '\n')
+            (out / 'events.jsonl').write_text('\n'.join(json.dumps(e) for e in [
+                {'t': t0, 'event': 'usage', 'bot': 'shop.ignore', 'data': {'input_tokens': 10, 'output_tokens': 2}},
+                {'t': t0, 'event': 'turn_finished', 'bot': 'shop.ignore', 'data': {'status': 'failed', 'error': 'x'}},
+                {'t': t0, 'event': 'deleted', 'bot': 'shop.ignore'},
+            ]) + '\n')
+            lookout = Path(tmp) / 'lookout.jsonl'
+            lookout.write_text(json.dumps({'lead': 'shop.lead', 'source': 'chat', 'skipped': 'full'}) + '\n'
+                               + json.dumps({'lead': 'shop.lead', 'woke': [], 'waiting': 40}) + '\n')
+            timeline = [{'step': 1, 't': t0 - 100}, {'step': 2, 't': t0}, {'step': 3, 't': t0 + 120}]
+            agent = self.agent(tmp)
+            summary = self.ledger.ledger(out, agent, repo, env, events, timeline, lookout, {'peak_rss_mb': 1.0},
+                                         ended=t0 + 600)
+            rows = {r['ask']: r for r in json.loads((out / 'asks.json').read_text())['asks']}
+            # Written again later, an ask still waits only until the run ended.
+            again = self.ledger.ledger(out, agent, repo, env, events, timeline, lookout)
+        self.assertEqual(set(rows), {code[3], look[3]})
+        self.assertEqual((rows[code[3]]['reached_s'], rows[code[3]]['delegated_s']), (20, 25))
+        self.assertIs(rows[code[3]]['on_main'], False)
+        self.assertEqual(rows[look[3]]['said_s'], 31)
+        self.assertEqual((summary['reached'], summary['handled'], summary['code_on_main']), (2, 2, 0))
+        self.assertEqual((summary['turns_failed'], summary['deleted'], summary['input_tokens']), (1, 1, 10))
+        self.assertEqual((summary['not_kept'], summary['most_waiting'], summary['peak_rss_mb']), (1, 40, 1.0))
+        self.assertTrue(summary['main_tests_pass'])
+        self.assertEqual((again['ended'], again['oldest_pending_s']), (t0 + 600, summary['oldest_pending_s']))
+
+    def test_a_code_ask_the_lead_did_itself_counts_as_handled(self):
+        code = next(e for e in role_eval.BURST_ASKS if e[3] == 'B1 code ask: gitignore')
+        events = [{'step': 1, 'id': 's1e0', 'source': code[0], 'from': code[1], 'text': code[2], 'plant': code[3]}]
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, env = self.repo(tmp, role_eval.FILES)
+            out = Path(tmp) / 'out'
+            out.mkdir()
+            edit = {'sessionUpdate': 'tool_call', 'name': next(iter(self.ledger.EDITS)),
+                    'rawInput': {'path': '.gitignore', 'content': '__pycache__/'}}
+            (out / 'acp.jsonl').write_text(json.dumps({'t': 50.0, 'm': {'method': 'session/update',
+                                                                        'params': {'update': edit}}}) + '\n')
+            summary = self.ledger.ledger(out, self.agent(tmp), repo, env, events, [{'step': 1, 't': 0.0}],
+                                         Path(tmp) / 'none.jsonl', ended=500.0)
+            row = json.loads((out / 'asks.json').read_text())['asks'][0]
+        self.assertEqual((row['edited_itself_s'], row['pending_s'], summary['handled']), (50, 50, 1))
+
+    @unittest.skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'set AGENT_TEST_RUNTIME=1 after a Rust release build')
+    def test_the_ledger_runs_the_agents_code_in_the_sandbox_without_the_key(self):
+        agent = Path('.local/target/release/agent').resolve()
+        probe = role_eval.subprocess.run([agent, 'sandbox', '--', 'true'], capture_output=True, text=True)
+        if 'sandbox_unavailable' in probe.stdout + probe.stderr and os.environ.get('AGENT_TEST_SANDBOX') != '1':
+            self.skipTest('no sandbox runs here; AGENT_TEST_SANDBOX=1 makes this fail instead')
+        # Outside /tmp, which every sandbox writes, as the eval's runs are.
+        Path('.local').mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir='.local') as tmp:
+            outside = Path(tmp).resolve() / 'outside'
+            outside.mkdir()
+            repo, env = self.repo(tmp, role_eval.FILES)
+            env = {**env, 'HOME': str(outside), 'OPENAI_API_KEY': 'sk-test'}
+            wrote = f"open({str(outside / 'x')!r}, 'w').write('x')"
+            self.assertFalse(self.ledger.checked(agent, repo, env, 'main', wrote))
+            self.assertFalse((outside / 'x').exists())
+            self.assertTrue(self.ledger.checked(agent, repo, env, 'main', "open('here', 'w').write('x')"))
+            keyless = "import os, sys; sys.exit('OPENAI_API_KEY' in os.environ)"
+            self.assertTrue(self.ledger.checked(agent, repo, env, 'main', keyless))

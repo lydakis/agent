@@ -1540,12 +1540,16 @@ fn news(text: &str) -> Option<Vec<String>> {
 /// chat): \"lunch?\"" is one from slack.
 fn sourced(rest: &str) -> Vec<String> {
     let mut counts: Vec<(String, usize)> = Vec::new();
-    let mut more = None;
+    let (mut more, mut unkept) = (None, None);
     for item in rest.lines().filter_map(|line| line.strip_prefix("- ")) {
         if let Some((count, _)) = item.split_once(" more ")
             && count.parse::<usize>().is_ok()
         {
-            more = Some(format!("+{count} more"));
+            // "- 12 more events from chat came …, and they were not kept"
+            match item.contains(" not kept") {
+                true => unkept = Some(format!("{count} not kept")),
+                false => more = Some(format!("+{count} more")),
+            }
             continue;
         }
         let source = item.split([',', ' ']).next().unwrap_or_default().to_owned();
@@ -1560,6 +1564,7 @@ fn sourced(rest: &str) -> Vec<String> {
         n => format!("{source} {n}"),
     }));
     parts.extend(more);
+    parts.extend(unkept);
     parts
 }
 
@@ -3178,11 +3183,12 @@ mod tests {
              - slack, from \"ana\" (for your chat): \"lunch?\"\n\
              - mail (for your inbox): \"invoice\"\n\
              - slack (for your chat): \"ship it\"\n\
-             - 3 more in the next note\n\
+             - 3 more waiting, in the notes after this one\n\
+             - 40 more events from chat and ci came between 9 minutes ago and 1 minute ago, and they were not kept: 1024 were waiting for you already\n\
              Act where something changes your work.";
         assert_eq!(
             text(&super::prompt(note, None, 90)),
-            ["↳ From your sources · slack 2 · mail · +3 more"]
+            ["↳ From your sources · slack 2 · mail · +3 more · 40 not kept"]
         );
     }
 
