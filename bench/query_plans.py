@@ -33,7 +33,7 @@ STRUCTURAL_SCANS = {'SCAN CONSTANT ROW', 'SCAN c', 'SCAN chain', 'SCAN held', 'S
 
 def statements(source):
     constants = {name: value.replace('\\"', '"') for name, value in re.findall(
-        r'const (COLUMNS|READING_ITEM|TURN_VIEW|PICTURELESS|REPLY_NODE|HELD): &str = "((?:[^"\\]|\\.)*)";', source, re.S)}
+        r'const (COLUMNS|READING_ITEM|TURN_VIEW|PICTURELESS|REPLY_NODE|HELD): &str =\s*"((?:[^"\\]|\\.)*)";', source, re.S)}
     literals = re.findall(r'r?#?"((?:[^"\\]|\\.)*)"#?', source, re.S)
     for literal in literals:
         text = re.sub(r'\s+', ' ', literal.replace('\\n', ' ')).strip()

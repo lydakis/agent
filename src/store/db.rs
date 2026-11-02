@@ -6277,7 +6277,8 @@ impl Database {
             );
         }
         // The held turns, as a bench/query_plans.py fragment.
-        const HELD: &str = "SELECT t.id,t.bot,b.id,t.held,t.due_ms,0 FROM turns t JOIN bots b ON b.name=t.bot
+        const HELD: &str =
+            "SELECT t.id,t.bot,b.id,t.held,t.due_ms,0 FROM turns t JOIN bots b ON b.name=t.bot
              WHERE t.status='ready' AND t.held IS NOT NULL AND (?1 IS NULL OR t.bot=?1)
              UNION ALL
              SELECT t.id,t.bot,b.id,json_extract(t.waiting,'$.blocked'),
