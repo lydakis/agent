@@ -6976,3 +6976,34 @@ on one 4-CPU box:
 | SQLite 3.54.1, QPSG | 275–378 | 466–649 |
 
 No other request moved.
+
+## Listing with each bot's turn
+
+Protocol 49 lets `bots` carry each bot's turn now (`turn: true`), so a
+client lists once and then follows events instead of asking `turns` bot by
+bot (#658). One store of 10,000 bots with three finished turns each, every
+bot paged in 40 pages of 256, eleven listings a run, three runs alternated
+on one 4-CPU box. Storage time is the daemon's own `list` time per whole
+listing; wall time is the client's, request to last page.
+
+| Build | Storage ms per listing | Wall p50 ms | Pages |
+| --- | ---: | ---: | ---: |
+| `main` | 70–79 | 162–186 | 4.1 MB |
+| head, unasked | 69–82 | 160–189 | 4.1 MB |
+| head, `turn: true` | 157–166 | 318–352 | 7.3 MB |
+| head, `turns` asked for each of the 10,000 | 1,132–1,466 | 2,670–4,647 | |
+
+Unasked, a listing reads what it did. Asked, the turns take one indexed
+lookup a bot, by key or through `turns_ready_bot` and `turns_started`,
+about 9 µs each with building the turn view, and about 320 bytes.
+
+Sonny's `/status` now lists that way. Against a 1,001-agent project
+(`bench.lookout_scale --projects 1 --tasks 1000`, idle), four refreshes:
+
+| Build | First refresh | Each refresh after | Daemon CPU, four refreshes |
+| --- | ---: | ---: | ---: |
+| `main` | 3.19 s | 0.65–0.70 s | 3.5 s |
+| head | 2.17–2.35 s | 55–73 ms | 1.5 s |
+
+The first refresh still reads each agent's latest history items once;
+refreshes after it read only the histories that moved.

@@ -1,5 +1,6 @@
 """The offline SQL audit must reject missing indexes on growing tables."""
 from pathlib import Path
+import re
 import sqlite3
 import subprocess
 import sys
@@ -19,10 +20,10 @@ class QueryPlanTests(unittest.TestCase):
                 self.assertIn(f'DELETE FROM {table} WHERE turn=?', queries)
         self.assertIn("DELETE FROM processes WHERE turn=? AND status!='running'", queries)
         # Every filter and direction of a listing is planned.
-        bots = [q for q in queries if q.startswith('SELECT name,head,') and ' FROM bots WHERE name ' in q]
-        self.assertEqual(len(bots), 8)
-        self.assertTrue(any('name GLOB ?3 AND running_turn IS NOT NULL ORDER BY name' in q for q in bots))
-        self.assertTrue(any('name GLOB ?3 AND created_by_id = ?4 AND running_turn IS NOT NULL' in q
+        bots = [q for q in queries if q.startswith('SELECT b.name,b.head,') and ' WHERE b.name ' in q]
+        self.assertEqual(len(bots), 16)
+        self.assertTrue(any('b.name GLOB ?3 AND b.running_turn IS NOT NULL ORDER BY b.name' in q for q in bots))
+        self.assertTrue(any('b.name GLOB ?3 AND b.created_by_id = ?4 AND b.running_turn IS NOT NULL' in q
                             for q in bots))
         self.assertTrue(any('ORDER BY t.id DESC LIMIT ?4' in q for q in queries))
         self.assertTrue(any('ORDER BY t.id ASC LIMIT ?4' in q for q in queries))
@@ -48,6 +49,28 @@ class QueryPlanTests(unittest.TestCase):
         searches = [s for s in steps if s.startswith('SEARCH turns')]
         self.assertEqual(sorted(searches), ['SEARCH turns USING INDEX turns_attached (bot=? AND id<?)',
                                             'SEARCH turns USING INDEX turns_steers (bot=? AND id<?)'], steps)
+
+    def test_a_listed_bots_turn_is_one_indexed_lookup(self):
+        # Every listing asked for turns finds each bot's by key, its next in
+        # line or its last that ran through their partial indexes: never by
+        # reading its history. Unasked, it reads no turn.
+        root = Path(__file__).resolve().parent.parent
+        source = (root / 'src/store/db.rs').read_text().split('#[cfg(test)]', 1)[0]
+        ddl = source.split('tx.execute_batch("', 1)[1].split('")?;', 1)[0]
+        conn = sqlite3.connect(':memory:')
+        conn.executescript(ddl)
+        listings = [q for q in statements(source) if q.startswith('SELECT b.name,b.head,')]
+        self.assertEqual(len(listings), 16)
+        for query in listings:
+            steps = [row[3] for row in conn.execute('EXPLAIN QUERY PLAN ' + query, ('a', 2, 'b', 3, 'c')[:max(
+                int(n) for n in re.findall(r'\?(\d)', query))])]
+            turns = [step for step in steps if 'turns' in step or step.startswith('SEARCH t ')]
+            if ' LEFT JOIN turns t ' in query:
+                self.assertEqual(turns, ['SEARCH t USING INTEGER PRIMARY KEY (rowid=?) LEFT-JOIN',
+                                         'SEARCH turns USING COVERING INDEX turns_ready_bot (bot=?)',
+                                         'SEARCH turns USING INDEX turns_started (bot=?)'], steps)
+            else:
+                self.assertEqual(turns, [], steps)
 
     def test_current_schema_passes_and_missing_indexes_fail(self):
         root = Path(__file__).resolve().parent.parent

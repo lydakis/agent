@@ -5779,13 +5779,13 @@ fn bot_pages_obey_byte_budget_without_loading_instructions() {
         db.create(&format!("bot-{n:03}"), Some(&workspace), config)
             .unwrap();
     }
-    let page = db.list(None, 256, None, false, None).unwrap();
+    let page = db.list(None, 256, None, false, None, false).unwrap();
     let bots = page["bots"].as_array().unwrap();
     assert!(!bots.is_empty() && bots.len() < 140);
     assert!(serde_json::to_vec(&page).unwrap().len() < 524288);
     assert!(bots.iter().all(|b| b.get("instructions").is_none()));
     let rest = db
-        .list(page["next_after"].as_str(), 256, None, false, None)
+        .list(page["next_after"].as_str(), 256, None, false, None, false)
         .unwrap();
     assert_eq!(bots.len() + rest["bots"].as_array().unwrap().len(), 140);
     assert!(rest["next_after"].is_null());
@@ -5824,64 +5824,105 @@ fn bot_pages_filter_by_name_pattern_and_activity() {
             .collect()
     };
     assert_eq!(
-        names(db.list(None, 64, Some("alpha.*"), false, None).unwrap()),
+        names(
+            db.list(None, 64, Some("alpha.*"), false, None, false)
+                .unwrap()
+        ),
         ["alpha.lead", "alpha.worker"]
     );
     assert_eq!(
-        names(db.list(None, 64, Some("*.lead"), false, None).unwrap()),
+        names(
+            db.list(None, 64, Some("*.lead"), false, None, false)
+                .unwrap()
+        ),
         ["alpha.lead", "beta.lead"]
     );
     assert_eq!(
-        names(db.list(None, 64, None, true, None).unwrap()),
+        names(db.list(None, 64, None, true, None, false).unwrap()),
         ["alpha.worker", "beta.lead"]
     );
     assert_eq!(
-        names(db.list(None, 64, Some("beta.*"), true, None).unwrap()),
+        names(
+            db.list(None, 64, Some("beta.*"), true, None, false)
+                .unwrap()
+        ),
         ["beta.lead"]
     );
     // Filtered pages continue from their cursor like any other.
-    let page = db.list(None, 1, Some("*.lead"), false, None).unwrap();
+    let page = db
+        .list(None, 1, Some("*.lead"), false, None, false)
+        .unwrap();
     assert_eq!(page["next_after"], "alpha.lead");
     let rest = db
-        .list(page["next_after"].as_str(), 1, Some("*.lead"), false, None)
+        .list(
+            page["next_after"].as_str(),
+            1,
+            Some("*.lead"),
+            false,
+            None,
+            false,
+        )
         .unwrap();
     assert_eq!(names(rest.clone()), ["beta.lead"]);
     assert!(rest["next_after"].is_null());
     // GLOB is case-sensitive, like names.
-    assert!(names(db.list(None, 64, Some("ALPHA.*"), false, None).unwrap()).is_empty());
+    assert!(
+        names(
+            db.list(None, 64, Some("ALPHA.*"), false, None, false)
+                .unwrap()
+        )
+        .is_empty()
+    );
     // A pattern's literal prefix bounds the page, as written out in the
     // query: a name that is the whole prefix matches, and a cursor before,
     // inside or past the prefix's range starts where it should.
     assert_eq!(
-        names(db.list(None, 64, Some("alpha.lead"), false, None).unwrap()),
+        names(
+            db.list(None, 64, Some("alpha.lead"), false, None, false)
+                .unwrap()
+        ),
         ["alpha.lead"]
     );
     assert_eq!(
-        names(db.list(None, 64, Some("alpha.lead*"), false, None).unwrap()),
+        names(
+            db.list(None, 64, Some("alpha.lead*"), false, None, false)
+                .unwrap()
+        ),
         ["alpha.lead"]
     );
     assert_eq!(
-        names(db.list(Some("a"), 64, Some("beta.*"), false, None).unwrap()),
+        names(
+            db.list(Some("a"), 64, Some("beta.*"), false, None, false)
+                .unwrap()
+        ),
         ["beta.lead", "beta.worker"]
     );
     assert_eq!(
         names(
-            db.list(Some("beta.lead"), 64, Some("beta.*"), false, None)
+            db.list(Some("beta.lead"), 64, Some("beta.*"), false, None, false)
                 .unwrap()
         ),
         ["beta.worker"]
     );
-    assert!(names(db.list(Some("c"), 64, Some("beta.*"), false, None).unwrap()).is_empty());
+    assert!(
+        names(
+            db.list(Some("c"), 64, Some("beta.*"), false, None, false)
+                .unwrap()
+        )
+        .is_empty()
+    );
     assert_eq!(
         names(
-            db.list(None, 64, Some("[ab]*.worker"), false, None)
+            db.list(None, 64, Some("[ab]*.worker"), false, None, false)
                 .unwrap()
         ),
         ["alpha.worker", "beta.worker"]
     );
     for bad in ["", &"*".repeat(257)] {
         assert_eq!(
-            db.list(None, 64, Some(bad), false, None).unwrap_err().code,
+            db.list(None, 64, Some(bad), false, None, false)
+                .unwrap_err()
+                .code,
             "invalid_bot_filter"
         );
     }
@@ -5942,34 +5983,50 @@ fn bot_pages_filter_by_maker_from_its_own_index() {
             .collect()
     };
     assert_eq!(
-        names(db.list(None, 64, None, false, Some(lead)).unwrap()),
+        names(db.list(None, 64, None, false, Some(lead), false).unwrap()),
         ["a.task", "c.task"]
     );
     assert_eq!(
-        names(db.list(None, 64, None, true, Some(lead)).unwrap()),
+        names(db.list(None, 64, None, true, Some(lead), false).unwrap()),
         ["c.task"]
     );
     assert_eq!(
-        names(db.list(None, 64, Some("b.*"), false, Some(lead)).unwrap()),
+        names(
+            db.list(None, 64, Some("b.*"), false, Some(lead), false)
+                .unwrap()
+        ),
         Vec::<String>::new()
     );
     assert_eq!(
         names(
-            db.list(None, 64, Some("*.task"), false, Some(other))
+            db.list(None, 64, Some("*.task"), false, Some(other), false)
                 .unwrap()
         ),
         ["b.task"]
     );
     // Pages by maker continue from their cursor like any other.
-    let page = db.list(None, 1, None, false, Some(lead)).unwrap();
+    let page = db.list(None, 1, None, false, Some(lead), false).unwrap();
     assert_eq!(page["next_after"], "a.task");
     let rest = db
-        .list(page["next_after"].as_str(), 1, None, false, Some(lead))
+        .list(
+            page["next_after"].as_str(),
+            1,
+            None,
+            false,
+            Some(lead),
+            false,
+        )
         .unwrap();
     assert_eq!(names(rest.clone()), ["c.task"]);
     assert!(rest["next_after"].is_null());
     // A maker reused by name is another id, and sees none of the first's.
-    assert!(names(db.list(None, 64, None, false, Some(lead + 1000)).unwrap()).is_empty());
+    assert!(
+        names(
+            db.list(None, 64, None, false, Some(lead + 1000), false)
+                .unwrap()
+        )
+        .is_empty()
+    );
     // The maker filter reads its own index, with or without activity.
     let path = std::env::temp_dir().join(format!("agent-maker-{}.sqlite", std::process::id()));
     let _ = std::fs::remove_file(&path);
@@ -6332,7 +6389,7 @@ fn creation_and_fork_reject_incomplete_deleted_and_reused_creator_identities() {
             (Some("Creator"), None, "creator_identity_required"),
             (None, Some(creator.bot_id), "creator_identity_required"),
         ] {
-            let before = db.list(None, 64, None, false, None).unwrap();
+            let before = db.list(None, 64, None, false, None, false).unwrap();
             let mut b = binding();
             b.created_by = name;
             b.created_by_id = id;
@@ -6354,7 +6411,7 @@ fn creation_and_fork_reject_incomplete_deleted_and_reused_creator_identities() {
                 .code,
                 code
             );
-            assert_eq!(db.list(None, 64, None, false, None).unwrap(), before);
+            assert_eq!(db.list(None, 64, None, false, None, false).unwrap(), before);
         }
         if !reused {
             db.create("Creator", Some("/synthetic"), binding()).unwrap();
@@ -6381,7 +6438,7 @@ fn lineage_pins_the_creator_identity_so_a_reused_name_is_a_stranger() {
         Some(first_a.bot_id),
         "B still names the A that made it"
     );
-    let page = db.list(None, 64, None, false, None).unwrap();
+    let page = db.list(None, 64, None, false, None, false).unwrap();
     let listed = page["bots"].as_array().unwrap();
     let b_row = listed.iter().find(|r| r["name"] == "B").unwrap();
     assert_eq!(b_row["created_by_id"], first_a.bot_id);
@@ -6540,7 +6597,7 @@ fn forks_keep_the_binding_and_instructions_and_record_a_creator() {
     );
     assert_eq!(db.inspect("Bob").unwrap().instructions, "first text");
     // Listing carries the creator; a fork keeps the model and tools.
-    let page = db.list(None, 64, None, false, None).unwrap();
+    let page = db.list(None, 64, None, false, None, false).unwrap();
     let listed: Vec<(&str, Option<&str>)> = page["bots"]
         .as_array()
         .unwrap()
@@ -9328,10 +9385,93 @@ fn cached_input_tokens_are_kept_per_turn_and_per_bot_with_their_ratio() {
         (400, 240, 0.6)
     );
     assert_eq!(bot.tokens_used, 420);
-    let page = db.list(None, 10, None, false, None).unwrap();
+    let page = db.list(None, 10, None, false, None, false).unwrap();
     assert_eq!(page["bots"][0]["cache_hit"], 0.6);
     assert_eq!(agent_runtime::store::cache_hit(0, 0), 0.0);
     assert_eq!(agent_runtime::store::cache_hit(1, 3), 0.333);
+}
+
+#[test]
+fn a_listed_bot_carries_the_turn_it_is_on_or_else_the_last_that_ran() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    db.create("Idle", Some("/synthetic"), binding()).unwrap();
+    let listed = |db: &Database| -> Vec<Value> {
+        let page = db.list(None, 10, None, false, None, true).unwrap();
+        (page["bots"].as_array().unwrap().iter())
+            .map(|bot| bot["turn"].clone())
+            .collect()
+    };
+    // Never ran: no turn.
+    assert_eq!(listed(&db), [Value::Null, Value::Null]);
+    let turn = db
+        .begin(
+            "Bob",
+            "r1",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    // A message steered in is a turn of its own that never runs.
+    let steer = TurnOptions {
+        delivery: Delivery::Steer,
+        ..TurnOptions::default()
+    };
+    db.begin("Bob", "s1", "also this", true, &steer, allow_provider)
+        .unwrap();
+    db.absorb(
+        turn,
+        None,
+        8 << 20,
+        4096,
+        ContextUsage::default(),
+        false,
+        true,
+    )
+    .unwrap();
+    let running = listed(&db);
+    assert_eq!(running[0]["turn"], turn);
+    assert_eq!(running[0]["handle"], format!("turn:Bob/{turn}"));
+    assert_eq!(running[1], Value::Null);
+    // The same view `turns` gives, field for field.
+    let page = db.turns("Bob", 0, None, 10, false).unwrap();
+    let viewed = (page["turns"].as_array().unwrap().iter())
+        .find(|t| t["turn"] == turn)
+        .unwrap();
+    for (key, value) in running[0].as_object().unwrap() {
+        assert_eq!(&viewed[key], value, "{key}");
+    }
+    db.append(turn, vec![assistant("done")], &[], None).unwrap();
+    db.finish(turn, None).unwrap();
+    // Ended: the turn that ran, not the steered message after it.
+    let ended = listed(&db);
+    assert_eq!(ended[0]["turn"], turn);
+    assert_eq!(ended[0]["status"], "completed");
+    assert!(ended[0]["finished_ms"].is_i64());
+    // One waiting in line, with no room to run: the one it is on.
+    let lined = db
+        .begin(
+            "Idle",
+            "q1",
+            "later",
+            false,
+            &TurnOptions {
+                delivery: Delivery::Queue,
+                ..TurnOptions::default()
+            },
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let waiting = listed(&db);
+    assert_eq!(waiting[1]["turn"], lined);
+    assert_eq!(waiting[1]["status"], "ready");
+    // Unasked, a listing reads no turn.
+    let page = db.list(None, 10, None, false, None, false).unwrap();
+    assert!(page["bots"][0].get("turn").is_none());
 }
 
 #[test]
@@ -9747,7 +9887,7 @@ fn bot_identities_are_assigned_in_creation_order_and_never_reused() {
         let db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
         assert_eq!(db.inspect("New").unwrap().bot_id, 3);
         assert_eq!(
-            db.list(None, 8, None, false, None).unwrap()["bots"][0]["bot_id"],
+            db.list(None, 8, None, false, None, false).unwrap()["bots"][0]["bot_id"],
             1
         );
     }
@@ -14175,7 +14315,7 @@ fn a_fork_narrows_what_it_may_call_and_never_widens() {
         .collect();
     assert_eq!(announced.len(), 1);
     assert_eq!(announced[0]["name"], "read");
-    let listed = db.list(None, 16, None, false, None).unwrap();
+    let listed = db.list(None, 16, None, false, None, false).unwrap();
     let reader = listed["bots"]
         .as_array()
         .unwrap()
@@ -14828,7 +14968,7 @@ fn an_expiring_fork_is_due_once_idle_that_long_and_never_while_a_turn_runs() {
     let at = side.expires_at.unwrap();
     assert!(at >= before + 900_000, "{at} from {before}");
     // Records show it; a source that never asked for one shows none.
-    let listed = db.list(None, 10, None, false, None).unwrap();
+    let listed = db.list(None, 10, None, false, None, false).unwrap();
     assert_eq!(listed["bots"][0]["name"], "Bob");
     assert!(listed["bots"][0].get("expires_at").is_none());
     assert_eq!(listed["bots"][1]["expires_at"], at);

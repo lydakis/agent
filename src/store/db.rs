@@ -1735,6 +1735,8 @@ const TURN_VIEW: &str = "t.id,t.bot,b.id,t.request_id,t.status,t.input_tokens,
     json_extract(t.waiting,'$.blocked'),t.held,t.due_ms";
 /// Columns `TURN_VIEW` takes, for queries that select more after it.
 const TURN_VIEW_COLUMNS: usize = 24;
+/// Columns a `bots` listing selects before its `TURN_VIEW`.
+const LISTED_COLUMNS: usize = 21;
 
 /// The turn view's own fields beside a turn's identity and status: who asked,
 /// what it waits on, its usage and timing. A model's `wait` leaves them out.
@@ -1757,52 +1759,61 @@ pub const TURN_VIEW_ACCOUNTING: [&str; 13] = [
 /// One turn as it stands. `waiting_on` is what a parked turn waits for, as
 /// its `turn_waiting` or `turn_paced` event said, and null otherwise.
 fn turn_view(r: &rusqlite::Row) -> rusqlite::Result<Value> {
-    let turn: i64 = r.get(0)?;
-    let bot: String = r.get(1)?;
-    let status: String = r.get(4)?;
-    let call_id: Option<String> = r.get(13)?;
-    let deadline_ms: Option<i64> = r.get(17)?;
-    let answer: Option<String> = r.get(18)?;
+    turn_view_at(r, 0)
+}
+
+/// [`turn_view`] of a row whose `TURN_VIEW` columns start at column `at`.
+fn turn_view_at(r: &rusqlite::Row, at: usize) -> rusqlite::Result<Value> {
+    let turn: i64 = r.get(at)?;
+    let bot: String = r.get(at + 1)?;
+    let status: String = r.get(at + 4)?;
+    let call_id: Option<String> = r.get(at + 13)?;
+    let deadline_ms: Option<i64> = r.get(at + 17)?;
+    let answer: Option<String> = r.get(at + 18)?;
     let waiting_on = match status.as_str() {
         "waiting" if answer.is_some() => {
             json!({"call_id":call_id,"answer":answer,"deadline_ms":deadline_ms})
         }
-        "waiting" if r.get::<_, Option<i64>>(14)? == Some(1) => {
+        "waiting" if r.get::<_, Option<i64>>(at + 14)? == Some(1) => {
             json!({"call_id":call_id,"approval":true,"deadline_ms":deadline_ms})
         }
-        "waiting" if r.get::<_, Option<i64>>(20)? == Some(1) => {
+        "waiting" if r.get::<_, Option<i64>>(at + 20)? == Some(1) => {
             json!({"call_id":call_id,"load":true,"deadline_ms":deadline_ms})
         }
         "waiting" => {
             let handles = r
-                .get::<_, Option<String>>(15)?
+                .get::<_, Option<String>>(at + 15)?
                 .and_then(|h| serde_json::from_str::<Value>(&h).ok());
             json!({"call_id":call_id,"handles":handles,"deadline_ms":deadline_ms,
-                "any":r.get::<_, Option<i64>>(16)? == Some(1)})
+                "any":r.get::<_, Option<i64>>(at + 16)? == Some(1)})
         }
-        "paced" => match r.get::<_, Option<String>>(19)?.as_deref() {
+        "paced" => match r.get::<_, Option<String>>(at + 19)?.as_deref() {
             Some("pause") => json!({"resume_at_ms":null,"paused":true}),
             Some("shutdown") => json!({"resume_at_ms":null,"stopped":true}),
-            _ => match blocked(r.get(21)?) {
+            _ => match blocked(r.get(at + 21)?) {
                 Some(blocked) => json!({"resume_at_ms":deadline_ms,"blocked":blocked}),
                 None => json!({"resume_at_ms":deadline_ms}),
             },
         },
         // Refused at its start for a cause a person can fix: it keeps its
         // place in line and is tried again then.
-        "ready" => match blocked(r.get(22)?) {
-            Some(blocked) => json!({"resume_at_ms":r.get::<_, Option<i64>>(23)?,"blocked":blocked}),
+        "ready" => match blocked(r.get(at + 22)?) {
+            Some(blocked) => {
+                json!({"resume_at_ms":r.get::<_, Option<i64>>(at + 23)?,"blocked":blocked})
+            }
             None => Value::Null,
         },
         _ => Value::Null,
     };
-    Ok(json!({"bot":bot,"bot_id":r.get::<_, i64>(2)?,"turn":turn,
-        "handle":format!("turn:{bot}/{turn}"),"request_id":r.get::<_, String>(3)?,
+    let view = json!({"bot":bot,"bot_id":r.get::<_, i64>(at + 2)?,"turn":turn,
+        "handle":format!("turn:{bot}/{turn}"),"request_id":r.get::<_, String>(at + 3)?,
         "status":status,"waiting_on":waiting_on,
-        "input_tokens":r.get::<_, i64>(5)?,"cached_input_tokens":r.get::<_, i64>(6)?,
-        "output_tokens":r.get::<_, i64>(7)?,"model_rounds":r.get::<_, i64>(8)?,
-        "retries":r.get::<_, i64>(9)?,"paced_ms":r.get::<_, i64>(10)?,
-        "started_ms":r.get::<_, Option<i64>>(11)?,"finished_ms":r.get::<_, Option<i64>>(12)?}))
+        "input_tokens":r.get::<_, i64>(at + 5)?,"cached_input_tokens":r.get::<_, i64>(at + 6)?,
+        "output_tokens":r.get::<_, i64>(at + 7)?,"model_rounds":r.get::<_, i64>(at + 8)?,
+        "retries":r.get::<_, i64>(at + 9)?,"paced_ms":r.get::<_, i64>(at + 10)?,
+        "started_ms":r.get::<_, Option<i64>>(at + 11)?,
+        "finished_ms":r.get::<_, Option<i64>>(at + 12)?});
+    Ok(view)
 }
 
 /// A hold's cause as stored, for a client to read.
@@ -3029,6 +3040,7 @@ impl Database {
         name: Option<&str>,
         active: bool,
         created_by: Option<i64>,
+        turn: bool,
     ) -> Result<Value> {
         if !(1..=256).contains(&limit) || after.is_some_and(|s| s.len() > 128) {
             return fail_with(
@@ -3053,12 +3065,12 @@ impl Database {
         // `after`, since no name holds a byte below '-'. One bound each
         // way, so the index range is the same whichever the planner reads.
         let from = if name.is_some() {
-            "name >= max(?1 || char(1), ?5) AND name < ?5 || CAST(x'ff' AS TEXT) AND name GLOB ?3"
+            "b.name >= max(?1 || char(1), ?5) AND b.name < ?5 || CAST(x'ff' AS TEXT) AND b.name GLOB ?3"
         } else {
-            "name > ?1"
+            "b.name > ?1"
         };
         let maker = if created_by.is_some() {
-            " AND created_by_id = ?4"
+            " AND b.created_by_id = ?4"
         } else {
             ""
         };
@@ -3071,14 +3083,30 @@ impl Database {
             values.push(&prefix);
         }
         let running = if active {
-            " AND running_turn IS NOT NULL"
+            " AND b.running_turn IS NOT NULL"
         } else {
             ""
         };
+        // Asked for, each bot's turn now, as `turns` shows it: the one it
+        // runs, or else the one first in its line (held there, perhaps), or
+        // else the last that ran. Messages steered into a turn and calls
+        // attached to the next one never ran, so the started-turns index
+        // finds that one. Unasked, the listing reads bots alone.
+        let turn_from = if turn {
+            format!(
+                ",{TURN_VIEW} FROM bots b LEFT JOIN turns t ON t.id = coalesce(b.running_turn,
+                 (SELECT min(id) FROM turns WHERE bot=b.name AND status='ready'),
+                 (SELECT max(id) FROM turns WHERE bot=b.name AND started_ms IS NOT NULL))"
+            )
+        } else {
+            " FROM bots b".to_owned()
+        };
         let mut statement = self.conn.prepare_cached(&format!(
-            "SELECT name,head,workspace,status,running_turn,provider,family,model,reasoning,budget_tokens,tokens_used,tools,
-                    input_tokens,cached_input_tokens,id,created_by,created_by_id,gates,allowed,expire_ms,expires_at
-             FROM bots WHERE {from}{maker}{running} ORDER BY name LIMIT ?2"
+            "SELECT b.name,b.head,b.workspace,b.status,b.running_turn,b.provider,b.family,b.model,
+                    b.reasoning,b.budget_tokens,b.tokens_used,b.tools,b.input_tokens,
+                    b.cached_input_tokens,b.id,b.created_by,b.created_by_id,b.gates,b.allowed,
+                    b.expire_ms,b.expires_at{turn_from}
+             WHERE {from}{maker}{running} ORDER BY b.name LIMIT ?2"
         ))?;
         let mut rows = statement.query(values.as_slice())?;
         let mut bots = Vec::new();
@@ -3101,6 +3129,12 @@ impl Database {
                     .map(|gates| serde_json::from_str::<Value>(&gates)).transpose()?
                     .unwrap_or_else(|| json!([]))});
             let mut bot = bot;
+            if turn {
+                bot["turn"] = match r.get::<_, Option<i64>>(LISTED_COLUMNS)? {
+                    Some(_) => turn_view_at(r, LISTED_COLUMNS)?,
+                    None => Value::Null,
+                };
+            }
             if let Some(allowed) = r.get::<_, Option<String>>(18)? {
                 bot["allowed"] = json!(split_tools(&allowed));
             }

@@ -582,7 +582,8 @@ enum Command {
     ProviderModels,
     /// A page of bots in name order: with `name`, those matching a GLOB
     /// pattern; with `active`, those with a turn running; with
-    /// `created_by_id`, those the bot with that id made.
+    /// `created_by_id`, those the bot with that id made. With `turn`, each
+    /// bot carries its turn now.
     Bots {
         after: Option<String>,
         limit: Option<usize>,
@@ -590,6 +591,8 @@ enum Command {
         #[serde(default)]
         active: bool,
         created_by_id: Option<i64>,
+        #[serde(default)]
+        turn: bool,
     },
     /// Stop the daemon. With `grace_ms`, it first drains for up to that
     /// long: nothing starts, and each running turn parks at its next
@@ -4341,6 +4344,7 @@ impl Service {
                 name,
                 active,
                 created_by_id,
+                turn,
             } => {
                 let reader = store.reader();
                 self.observe(session, output, id, async move {
@@ -4351,6 +4355,7 @@ impl Service {
                             name.as_deref(),
                             active,
                             created_by_id,
+                            turn,
                         )
                     }))
                     .await

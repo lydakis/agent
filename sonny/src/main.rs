@@ -8173,11 +8173,12 @@ impl App {
             |bot| lookout::subs::matches(&pattern, bot),
         );
         // Every page of the listing: past the first 256, agents are the
-        // project's too.
+        // project's too. Each comes with the turn it is on, or else its
+        // last that ran.
         let mut listed = Vec::new();
         let mut after: Option<String> = None;
         loop {
-            let mut ask = json!({"name": pattern, "limit": 256});
+            let mut ask = json!({"name": pattern, "limit": 256, "turn": true});
             if let Some(after) = &after {
                 ask["after"] = json!(after);
             }
@@ -8234,13 +8235,6 @@ impl App {
             {
                 continue;
             }
-            let turns = self
-                .client
-                .request("turns", json!({"bot": name, "newest": true, "limit": 8}))
-                .await
-                .ok()
-                .and_then(|page| page["turns"].as_array().cloned())
-                .unwrap_or_default();
             // Its latest items are read again only once its history moved:
             // the same head is the same history. A failed read is kept
             // for none, so the next refresh tries again.
@@ -8253,35 +8247,21 @@ impl App {
                 kept.insert(name.to_owned(), (head, latest.clone()));
             }
             let latest = latest.unwrap_or_default();
-            let turn = turns.first().cloned().unwrap_or(Value::Null);
-            // A message steered into a running turn is recorded as a turn
-            // of its own that never ran: the time is the one it joined. One
-            // attached to the next call has not run either.
-            let ran = turns
-                .iter()
-                .find(|turn| !matches!(turn["status"].as_str(), Some("steered" | "attached")))
-                .cloned()
-                .unwrap_or(Value::Null);
             let running = !bot["running_turn"].is_null();
-            let ran = match running {
-                true => ran,
-                false => self.with_error(ran).await,
+            let turn = match running {
+                true => bot["turn"].clone(),
+                false => self.with_error(bot["turn"].clone()).await,
             };
             // A turn held on a cause, parked on its call or in line, says so.
-            let blocked_on = (turns.iter()).find_map(|turn| {
-                let blocked = &turn["waiting_on"]["blocked"];
-                blocked.is_object().then(|| {
-                    status::held_cause(
-                        blocked["code"].as_str().unwrap_or(""),
-                        blocked["detail"].as_str(),
-                    )
-                    .0
-                })
+            let blocked = &turn["waiting_on"]["blocked"];
+            let blocked_on = blocked.is_object().then(|| {
+                status::held_cause(
+                    blocked["code"].as_str().unwrap_or(""),
+                    blocked["detail"].as_str(),
+                )
+                .0
             });
-            let state = match (
-                running,
-                if running { &turn } else { &ran }["status"].as_str(),
-            ) {
+            let state = match (running, turn["status"].as_str()) {
                 _ if let Some(what) = &blocked_on => format!("{}{what}", status::HELD),
                 // A call a reviewer weighs waits on no one here.
                 (true, Some("waiting")) if turn["waiting_on"]["approval"] == true => {
@@ -8306,20 +8286,20 @@ impl App {
                 (true, Some("queued")) => "queued".into(),
                 (true, _) => "working".into(),
                 // One with a goal says whether that turn met it.
-                (false, Some("completed" | "steered")) => {
-                    lookout::goals::standing(&self.options.store, name, ran["turn"].as_i64())
+                (false, Some("completed")) => {
+                    lookout::goals::standing(&self.options.store, name, turn["turn"].as_i64())
                         .unwrap_or("done")
                         .into()
                 }
-                (false, Some("failed")) if ran["error"] == EMPTY => started::QUIET.into(),
+                (false, Some("failed")) if turn["error"] == EMPTY => started::QUIET.into(),
                 (false, Some("interrupted")) => "stopped".into(),
                 (false, Some(other)) => other.to_owned(),
                 (false, None) => "idle".into(),
             };
             // A running turn counts on from its start; one that ended
             // shows how long it took.
-            let started = ran["started_ms"].as_u64();
-            let finished = ran["finished_ms"].as_u64();
+            let started = turn["started_ms"].as_u64();
+            let finished = turn["finished_ms"].as_u64();
             let (at, seconds) = match running {
                 true => (started, started.map(|at| now.saturating_sub(at) / 1000)),
                 false => (
@@ -8340,7 +8320,7 @@ impl App {
                 Some(last) if !running => match self.asks_seen.get(name) {
                     Some((at, seen)) if *at == last => seen.clone(),
                     _ => {
-                        let seen = self.scan(name, ran["turn"].as_i64()).await;
+                        let seen = self.scan(name, turn["turn"].as_i64()).await;
                         self.asks_seen.insert(name.to_owned(), (last, seen.clone()));
                         seen
                     }
@@ -8350,7 +8330,7 @@ impl App {
                     ..Default::default()
                 },
             };
-            let itself = seen.itself && name != lead && ran["status"] == "completed";
+            let itself = seen.itself && name != lead && turn["status"] == "completed";
             let resolved = itself
                 || resolved::holds(resolved::read(&store, name), turn["turn"].as_i64(), running);
             // This window's own agent waits on what it shows open here too,
@@ -14348,8 +14328,7 @@ mod tests {
         assert_eq!(rows.len(), 257);
         assert!(rows.iter().any(|row| row.bot == "shop.t256"));
         assert_eq!(histories.load(Ordering::SeqCst), 257);
-        // No history moved: only the one whose read failed is read again
-        // (and every agent's turns, as queued work moves no record).
+        // No history moved: only the one whose read failed is read again.
         app.status_rows().await.unwrap();
         assert_eq!(histories.load(Ordering::SeqCst), 258);
         app.status_rows().await.unwrap();
@@ -14362,18 +14341,18 @@ mod tests {
 
     #[tokio::test]
     async fn status_says_needs_you_only_for_calls_the_person_must_answer_and_the_tabs_agree() {
-        let waiting = json!([{"turn": 4, "status": "waiting", "waiting_on": {"approval": true}}]);
+        let waiting = json!({"turn": 4, "status": "waiting", "waiting_on": {"approval": true}});
         let (client, events) = daemon_with_events(json!({}), move |asked| {
             match asked["op"].as_str().unwrap_or_default() {
-                "bots" => json!({"bots": [
-                    {"name": "shop.lead", "bot_id": 1, "head": 1, "running_turn": null},
+                // Each agent's turn comes with the listing, asked for.
+                "bots" if asked["turn"] == true => json!({"bots": [
+                    {"name": "shop.lead", "bot_id": 1, "head": 1, "running_turn": null,
+                        "turn": null},
                     {"name": "shop.fix", "bot_id": 2, "head": 1, "running_turn": 4,
-                        "created_by": "shop.lead"},
+                        "created_by": "shop.lead", "turn": waiting},
                     {"name": "shop.web", "bot_id": 3, "head": 1, "running_turn": 4,
-                        "created_by": "shop.lead"},
+                        "created_by": "shop.lead", "turn": waiting},
                 ], "next_after": null}),
-                "turns" if asked["bot"] == "shop.lead" => json!({"turns": []}),
-                "turns" => json!({"turns": waiting}),
                 "approvals" => json!({"approvals": [
                     {"bot": "shop.fix", "turn": 4, "call_id": "c1", "gates": ["manual"]},
                     {"bot": "shop.web", "turn": 4, "call_id": "c2", "gates": ["auto"]},
@@ -14407,6 +14386,42 @@ mod tests {
         assert_eq!(fleet.doing["shop.fix"], "needs you");
         assert_eq!(fleet.doing["shop.web"], "working");
         assert_eq!(app.agents(), (1, 1));
+    }
+
+    #[tokio::test]
+    async fn status_reads_each_agents_turn_from_the_listing_held_in_line_or_ended() {
+        let client =
+            daemon_answering(
+                move |asked| match asked["op"].as_str().unwrap_or_default() {
+                    // One listing says where every agent is: nothing asks bot by bot.
+                    "bots" if asked["turn"] == true => json!({"bots": [
+                {"name": "shop.lead", "bot_id": 1, "head": 1, "running_turn": null, "turn": null},
+                {"name": "shop.held", "bot_id": 2, "head": 1, "running_turn": null,
+                    "turn": {"turn": 7, "status": "ready", "started_ms": null, "finished_ms": null,
+                        "waiting_on": {"resume_at_ms": 1,
+                            "blocked": {"code": "provider_quota_exhausted"}}}},
+                {"name": "shop.done", "bot_id": 3, "head": 1, "running_turn": null,
+                    "turn": {"turn": 5, "status": "completed", "started_ms": 1000,
+                        "finished_ms": 4000, "waiting_on": null}},
+            ], "next_after": null}),
+                    "history_nodes" => json!({"nodes": [], "next_from": null}),
+                    "history_items" => json!({"items": []}),
+                    "approvals" => json!({"approvals": []}),
+                    _ => json!({"error": {"code": "unexpected", "message": asked.to_string()}}),
+                },
+            )
+            .await;
+        let mut app = app(client);
+        app.bot = "shop.lead".into();
+        let (_, rows) = app.status_rows().await.unwrap();
+        let row = |bot: &str| rows.iter().find(|row| row.bot == bot).unwrap();
+        assert_eq!(
+            row("shop.held").state,
+            format!("{}usage limit reached", status::HELD)
+        );
+        assert_eq!(row("shop.done").state, "done");
+        assert_eq!(row("shop.done").seconds, Some(3));
+        assert_eq!(row("shop.lead").state, "idle");
     }
 
     #[tokio::test]

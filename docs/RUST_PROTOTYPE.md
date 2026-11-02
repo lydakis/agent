@@ -1484,6 +1484,20 @@ sees none of that one's. Filtered pages page and bound like any
 other. `bots` and `turns` run on the store's reader connections, beside the
 service loop ([observation reads](#observation-reads)), so a listing never
 waits behind, or holds up, the writer or another client.
+Protocol 49 adds `turn: true`, which gives each listed bot its `turn`: the
+turn view `turns` returns (status, `waiting_on`, usage, timing) of the turn
+it runs, or else of the one first in its line (held there, perhaps), or
+else of the last that ran, and null for a bot with none. A message steered
+into a turn and a call attached to the next one never ran, so neither is
+that last one. A client lists once for every bot's state and then follows
+events, as list-then-watch clients do, instead of asking `turns` bot by
+bot. Each is one indexed lookup: by key, or through the partial indexes of
+turns in line (`turns_ready_bot`) and turns started (`turns_started`). A
+turn that ended in failure has its error on `wait`, as before. Unasked, a
+listing reads bots alone and costs what it did; at 10,000 bots the turns
+add about 90 ms of storage time to a whole listing and 3 MB to its pages,
+where asking `turns` bot by bot took 1.1 to 1.5 s of storage time and 2.7 to 4.6 s
+([measurements](DAEMON_MEASUREMENTS.md#listing-with-each-bots-turn)).
 
 Protocol 23 adds `usage`, what bots' turns spent, also a read on the reader
 connection: one grouped statement over `turns`, so one snapshot. `name` keeps

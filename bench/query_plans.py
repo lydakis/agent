@@ -21,10 +21,13 @@ from pathlib import Path
 # Clauses a listing formats in by name, each planned with every value it
 # takes: keep in step with `list`, `usage` and `turns` in src/store/db.rs.
 OPTIONAL = {'{glob}': ('', " AND t.bot GLOB ?3 AND t.bot >= ?4 AND t.bot < ?4 || CAST(x'ff' AS TEXT)"),
-            '{from}': ('name > ?1', "name >= max(?1 || char(1), ?5) AND name < ?5 || CAST(x'ff' AS TEXT) AND name GLOB ?3"),
-            '{maker}': ('', ' AND created_by_id = ?4'),
-            '{running}': ('', ' AND running_turn IS NOT NULL'),
-            '{order}': ('ASC', 'DESC')}
+            '{from}': ('b.name > ?1', "b.name >= max(?1 || char(1), ?5) AND b.name < ?5 || CAST(x'ff' AS TEXT) AND b.name GLOB ?3"),
+            '{maker}': ('', ' AND b.created_by_id = ?4'),
+            '{running}': ('', ' AND b.running_turn IS NOT NULL'),
+            '{order}': ('ASC', 'DESC'),
+            '{turn_from}': (' FROM bots b', ',{TURN_VIEW} FROM bots b LEFT JOIN turns t ON t.id = coalesce(b.running_turn,'
+                            ' (SELECT min(id) FROM turns WHERE bot=b.name AND status=\'ready\'),'
+                            ' (SELECT max(id) FROM turns WHERE bot=b.name AND started_ms IS NOT NULL))')}
 
 STRUCTURAL_SCANS = {'SCAN CONSTANT ROW', 'SCAN c', 'SCAN chain', 'SCAN kin', 'SCAN sqlite_master',
                     'SCAN sqlite_sequence'}
@@ -55,6 +58,8 @@ def statements(source):
             for placeholder, values in OPTIONAL.items():
                 variants = [v.replace(placeholder, value) for v in variants for value in values]
             for variant in dict.fromkeys(variants):
+                # A clause may itself name the turn view.
+                variant = variant.replace('{TURN_VIEW}', constants['TURN_VIEW'])
                 yield re.sub(r'\s+', ' ', variant).strip()
 
 
