@@ -304,6 +304,22 @@ impl Reach {
         }
     }
 
+    /// The folders its sandbox writes, the temporary ones with them, as
+    /// the daemon's sandbox lets it: none when it writes nothing, or when
+    /// it runs unconfined, as the person does.
+    pub fn written(&self) -> Vec<PathBuf> {
+        match (&self.roots, self.writes) {
+            (Some(roots), true) => {
+                let temporary = (std::env::var_os("TMPDIR").map(PathBuf::from))
+                    .filter(|path| path.is_absolute())
+                    .into_iter()
+                    .chain([PathBuf::from("/tmp")]);
+                roots.iter().cloned().chain(temporary).collect()
+            }
+            _ => Vec::new(),
+        }
+    }
+
     /// `path` as a file the browser writes, inside the reach, or why not.
     fn output(&self, path: &str) -> Result<String, String> {
         if !self.writes {
@@ -447,6 +463,8 @@ struct Checked {
 /// How a session's browser starts: the actions it confirms, and the
 /// Chrome profile it starts from when not agent-browser's own.
 struct Launch {
+    /// The copy of agent-browser that runs.
+    program: PathBuf,
     confirm: String,
     profile: Option<String>,
 }
@@ -969,45 +987,6 @@ fn rendered(answer: &Value) -> String {
     }
 }
 
-/// The program the tool runs, found once as Sonny finds git: the first on
-/// `PATH` in a folder named from the root, so one an agent puts later in
-/// a folder of its own, or `.`, is never run.
-fn program() -> &'static Path {
-    static FOUND: std::sync::LazyLock<PathBuf> =
-        std::sync::LazyLock::new(|| found(&std::env::var_os("PATH").unwrap_or_default()));
-    &FOUND
-}
-
-/// The native program in `path`: the one npm's wrapper script would run,
-/// so no node starts for each command, else the first found.
-fn found(path: &std::ffi::OsStr) -> PathBuf {
-    let found = std::env::split_paths(path)
-        .filter(|dir| dir.is_absolute())
-        .map(|dir| dir.join(PROGRAM))
-        .find(|path| path.is_file());
-    let Some(found) = found else {
-        // None found runs nothing: an absolute path that is not there.
-        return PathBuf::from("/nonexistent").join(PROGRAM);
-    };
-    let real = std::fs::canonicalize(&found).unwrap_or(found);
-    if real.extension().is_some_and(|ext| ext == "js") {
-        let os = match std::env::consts::OS {
-            "macos" => "darwin",
-            os => os,
-        };
-        let arch = match std::env::consts::ARCH {
-            "x86_64" => "x64",
-            "aarch64" => "arm64",
-            arch => arch,
-        };
-        let native = real.with_file_name(format!("{PROGRAM}-{os}-{arch}"));
-        if native.is_file() {
-            return native;
-        }
-    }
-    real
-}
-
 /// The tool, while agent-browser is installed here or on a machine linked
 /// here, which `machine` names.
 pub fn tool() -> Option<Value> {
@@ -1065,7 +1044,7 @@ pub fn tool() -> Option<Value> {
 /// name the program it launches. Its paths are whole already.
 async fn run(session: &str, args: &[String], launch: &Launch) -> Ran {
     let confirm = launch.confirm.as_str();
-    let mut command = tokio::process::Command::new(program());
+    let mut command = tokio::process::Command::new(&launch.program);
     command
         .arg("--json")
         .args(args)
@@ -1150,15 +1129,6 @@ pub async fn answer(
             format!(
                 "{} holds agent-browser's settings and is in a folder you write, so the browser is not run for you",
                 settings.display()
-            ),
-        ));
-    }
-    if reach.holds(program()) {
-        return Err((
-            "browser_refused",
-            format!(
-                "{} is in a folder you write, so it is not run for you",
-                program().display()
             ),
         ));
     }
@@ -1249,7 +1219,11 @@ async fn drive(
         Ok(config) => confirmed(&config.sonny.browser_confirm),
         Err(_) => confirmed(&agent_client::config::BROWSER_CONFIRM.map(str::to_owned)),
     };
+    let program = crate::trusted::program(PROGRAM)
+        .await
+        .map_err(|e| ("browser_refused", e))?;
     let launch = Launch {
+        program,
         confirm: confirm.clone(),
         profile: profile.map(str::to_owned),
     };
@@ -1754,8 +1728,11 @@ mod tests {
         std::fs::write(dir.join("bin").join(PROGRAM), "").unwrap();
         let path = std::env::join_paths(["bin".into(), dir.join("bin")]).unwrap();
         // `bin` is relative: a folder of whoever runs it, so skipped.
-        assert_eq!(found(&path), dir.join("bin").join(PROGRAM));
-        assert!(found(std::ffi::OsStr::new("bin")).is_absolute());
+        assert_eq!(
+            crate::trusted::native(PROGRAM, &path),
+            dir.join("bin").join(PROGRAM)
+        );
+        assert!(crate::trusted::native(PROGRAM, std::ffi::OsStr::new("bin")).is_absolute());
     }
 
     #[test]

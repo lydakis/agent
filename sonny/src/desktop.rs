@@ -14,7 +14,7 @@
 //! and any other is refused, so a flag a new agent-desktop adds stays out
 //! until it is looked at.
 use serde_json::{Value, json};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -438,43 +438,6 @@ fn checked(line: &str) -> Result<Checked, String> {
     }
 }
 
-/// The program the tool runs, found once as the browser tool finds its
-/// own: the first on `PATH` in a folder named from the root, so one an
-/// agent puts in a folder of its own, or `.`, is never run.
-fn program() -> &'static Path {
-    static FOUND: std::sync::LazyLock<PathBuf> =
-        std::sync::LazyLock::new(|| found(&std::env::var_os("PATH").unwrap_or_default()));
-    &FOUND
-}
-
-/// The native program in `path`: the one npm's launcher would run beside
-/// it, so no node starts for each command, else the first found.
-fn found(path: &std::ffi::OsStr) -> PathBuf {
-    let found = std::env::split_paths(path)
-        .filter(|dir| dir.is_absolute())
-        .map(|dir| dir.join(PROGRAM))
-        .find(|path| path.is_file());
-    let Some(found) = found else {
-        // None found runs nothing: an absolute path that is not there.
-        return PathBuf::from("/nonexistent").join(PROGRAM);
-    };
-    let real = std::fs::canonicalize(&found).unwrap_or(found);
-    let os = match std::env::consts::OS {
-        "macos" => "darwin",
-        os => os,
-    };
-    let arch = match std::env::consts::ARCH {
-        "x86_64" => "x64",
-        "aarch64" => "arm64",
-        arch => arch,
-    };
-    let native = real.with_file_name(format!("{PROGRAM}-{os}-{arch}"));
-    match native.is_file() {
-        true => native,
-        false => real,
-    }
-}
-
 /// Whether agents here can use the desktop: agent-desktop is installed
 /// and there is a desktop to use.
 pub fn here() -> bool {
@@ -560,11 +523,11 @@ fn nonce() -> String {
 /// Run one of agent-desktop's commands, in `/`, with none of the
 /// person's agent-desktop session settings, which name files and IDs that
 /// are not the agent's.
-async fn run(args: &[String]) -> Ran {
+async fn run(program: &Path, args: &[String]) -> Ran {
     // Responsible for itself, so what the person granted agent-desktop is
     // what it has, wherever the daemon was started.
     let ran = crate::responsible::output(
-        program(),
+        program,
         args,
         Path::new("/"),
         &["AGENT_DESKTOP_SESSION", "AGENT_DESKTOP_AGENT_ID"],
@@ -716,6 +679,9 @@ pub async fn drive(
     let checked: Vec<Checked> = (lines.iter().map(|line| checked(line)))
         .collect::<Result<_, _>>()
         .map_err(|e| ("desktop_refused", e))?;
+    let program = crate::trusted::program(PROGRAM)
+        .await
+        .map_err(|e| ("desktop_refused", e))?;
     // Asked before the desktop is taken, so another agent's call goes on
     // while this one waits for its verdict.
     let acts: Vec<&String> = (lines.iter().zip(&checked))
@@ -741,7 +707,7 @@ pub async fn drive(
         if lines.len() > 1 {
             text.push_str(&format!("$ {line}\n"));
         }
-        let ran = run(&command.args).await;
+        let ran = run(&program, &command.args).await;
         let (mut said, ok) = (ran.said, ran.ok);
         // Fitted off the tool host's one thread: a large screen's picture
         // takes a while to scale.
@@ -1080,13 +1046,16 @@ mod tests {
             arch => arch,
         };
         let path = std::ffi::OsString::from(format!("relative:{}", dir.join("bin").display()));
-        assert_eq!(found(&path), dir.join("bin").join(PROGRAM));
+        assert_eq!(
+            crate::trusted::native(PROGRAM, &path),
+            dir.join("bin").join(PROGRAM)
+        );
         let native = dir.join("bin").join(format!("{PROGRAM}-{os}-{arch}"));
         std::fs::write(&native, "").unwrap();
-        assert_eq!(found(&path), native);
+        assert_eq!(crate::trusted::native(PROGRAM, &path), native);
         // A folder not named from the root is never looked in.
         assert_eq!(
-            found(std::ffi::OsStr::new("bin")),
+            crate::trusted::native(PROGRAM, std::ffi::OsStr::new("bin")),
             Path::new("/nonexistent").join(PROGRAM)
         );
         let _ = std::fs::remove_dir_all(&dir);
