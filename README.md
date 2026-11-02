@@ -192,6 +192,8 @@ already owns the store. The [CLI contract](docs/CLI.md) has the details.
 Programs that want a persistent connection can speak the daemon's JSONL socket
 protocol directly; [`client/`](client) is a Rust client for it. See the
 [software protocol](docs/RUST_PROTOTYPE.md#software-protocol).
+[examples/triage](examples/triage) is a small service built on both, with
+tools of its own that its bots call.
 
 ## Sonny
 
