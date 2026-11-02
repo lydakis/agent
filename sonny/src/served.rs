@@ -1026,6 +1026,7 @@ async fn serve(store: PathBuf, socket: PathBuf, nudge: Arc<Notify>, serving: Ser
     tokio::spawn(crate::link::keep(hub.clone()));
     loop {
         if let Ok((client, _events)) = Client::connect(&socket).await {
+            crate::trusted::against(client.clone());
             loop {
                 let Ok(calls) = waiting(&client).await else {
                     break;
