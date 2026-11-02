@@ -251,7 +251,7 @@ fn mode_in(record: &Value, modes: &[Mode]) -> Option<&'static str> {
     let repository = (record["workspace"].as_str()).is_some_and(|dir| {
         std::path::Path::new(dir)
             .ancestors()
-            .any(|dir| dir.join(".git").exists())
+            .any(agent_client::policy::git_entry)
     });
     let network = settings["network"].as_bool().unwrap_or(false);
     let reached = list(settings, "unix_sockets");

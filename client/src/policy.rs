@@ -641,7 +641,7 @@ fn project_from(dir: &Path, home: Option<&Path>) -> Result<Option<(String, PathB
             }
             let path = at.join(".agents/project.toml");
             if !is_file(&path)? {
-                if std::fs::symlink_metadata(at.join(".git")).is_ok() {
+                if git_entry(at) {
                     break;
                 }
                 continue;
@@ -668,6 +668,21 @@ fn project_from(dir: &Path, home: Option<&Path>) -> Result<Option<(String, PathB
     Ok(None)
 }
 
+/// Whether `at` is the top of a git checkout: its `.git` is a file (a
+/// linked worktree's or a submodule's), or a folder git could read, with
+/// `HEAD` in it. An empty `.git` folder is not one: a sandbox on Linux
+/// makes one on the host, to mount over, in every writable folder that has
+/// none while its command runs (#635). Codex reads it the same way
+/// (`find_ancestor_git_entry`).
+pub fn git_entry(at: &Path) -> bool {
+    let dot = at.join(".git");
+    match std::fs::symlink_metadata(&dot) {
+        Ok(meta) if meta.is_dir() => std::fs::symlink_metadata(dot.join("HEAD")).is_ok(),
+        Ok(_) => true,
+        Err(_) => false,
+    }
+}
+
 /// The top of the git checkout `dir` is in, as the main checkout's when it
 /// is a linked worktree, looking no higher than the home folder (the home
 /// folder's own only for the home folder itself), as [`project`] looks.
@@ -682,7 +697,7 @@ fn checkout_from(dir: &Path, home: Option<&Path>) -> Option<PathBuf> {
         if home.as_deref() == Some(at) && at != dir.as_path() {
             return None;
         }
-        if std::fs::symlink_metadata(at.join(".git")).is_ok() {
+        if git_entry(at) {
             return Some(main_checkout(at).unwrap_or_else(|| at.to_path_buf()));
         }
     }
@@ -704,6 +719,9 @@ fn project_name(name: &str) -> bool {
 /// the files rather than by running git, so composing spawns nothing.
 fn main_checkout(dir: &Path) -> Option<PathBuf> {
     for top in dir.ancestors() {
+        if !git_entry(top) {
+            continue;
+        }
         let dot = top.join(".git");
         let Ok(meta) = std::fs::symlink_metadata(&dot) else {
             continue;
@@ -1872,7 +1890,14 @@ mod tests {
         assert_eq!(checkout_from(&repo.join("web"), Some(&home)), Some(top));
         // A project above a repository, or the home folder's, is not its.
         let nested = repo.join("web/inner");
+        // An empty `.git`, as a sandbox holds one while its command runs,
+        // is not a checkout (#635).
         std::fs::create_dir_all(nested.join(".git")).unwrap();
+        assert_eq!(
+            checkout_from(&nested, Some(&home)),
+            Some(repo.canonicalize().unwrap())
+        );
+        std::fs::write(nested.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
         assert_eq!(project(&nested).unwrap(), None);
         assert_eq!(
             checkout_from(&nested, Some(&home)),
@@ -1891,6 +1916,7 @@ mod tests {
         );
         // Nor is a home folder that is a repository a folder's checkout.
         std::fs::create_dir_all(home.join(".git")).unwrap();
+        std::fs::write(home.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
         assert_eq!(
             checkout_from(&home.join("Developer/plain"), Some(&home)),
             None
