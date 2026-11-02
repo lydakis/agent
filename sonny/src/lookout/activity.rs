@@ -59,7 +59,7 @@ impl Rule {
         Rule {
             sub: sub.name.clone(),
             filter: sub.filter.clone().map(Arc::new),
-            urgent: sub.urgent.clone().map(Arc::new),
+            urgent: sub.steer.clone().map(Arc::new),
             digest: sub.digest_span(),
         }
     }
