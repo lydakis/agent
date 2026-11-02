@@ -341,7 +341,20 @@ its other fields follow as compact JSON, cut at 2,000 characters. The
 note goes with the origin `lookout.sources`, so the approver never reads
 it as the person's words, and Sonny shows it folded, as `↳ From your
 sources · slack 2`. A note names at most 16 events, the ones that steer first, and
-the rest wait for the next; past 64 waiting, the oldest go untold.
+the rest wait for the next, on disk with the rest of what the subscriber is to
+be told, so a restart loses none. Up to 1,024 events wait
+(`sonny.lookout_waiting`, 0 for no limit). Past that, a newer event is not
+kept. One that steers takes the place of the newest waiting event that does
+not. The subscriber's next note says how many were not kept, from which
+sources and when, for example `- 40 more events from chat and ci came between
+9 minutes ago and 1 minute ago, and they were not kept: 1024 were waiting for
+you already`. That note's row shows `40 not kept`. Until a note with that line
+lands, the count is kept with the rest and told again. The log names each event
+that was not kept, with its source and ID, and `/status` shows how many wait and
+how many were not kept today. George chose this over dropping the oldest
+(11-02). Keeping every ask is what "nothing fell through" needs, and a
+source's own history cannot bring back an event that was dropped from a script
+source.
 
 ## Task updates
 
