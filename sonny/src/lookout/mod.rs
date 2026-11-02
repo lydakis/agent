@@ -56,6 +56,14 @@ const NOTE_ITEMS: usize = 16;
 /// them newer ones are not kept, and its next note says so.
 const WAITING: usize = 1024;
 
+/// What `sonny.lookout_waiting` says now, 0 for no limit. Settings that do
+/// not read keep the default.
+fn waiting() -> usize {
+    (agent_client::config::load()).map_or(WAITING, |config| {
+        usize::try_from(config.sonny.lookout_waiting).unwrap_or(usize::MAX)
+    })
+}
+
 /// Events from sources a subscriber's full lookout did not keep: how many,
 /// from where and when, for its next note to say.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -712,6 +720,7 @@ async fn serve(settings: Settings) -> Result<(), String> {
     let mut service = Service {
         runner: sources::Runner::new(beside(&settings.store, ".sources"), sent),
         store: settings.store.clone(),
+        waiting: waiting(),
         records: HashMap::new(),
         working: HashMap::new(),
         subscribers: HashMap::new(),
@@ -824,6 +833,9 @@ struct Telling {
 
 struct Service {
     store: PathBuf,
+    /// How many events from sources wait for one subscriber
+    /// (`sonny.lookout_waiting`), as the settings said at the last read.
+    waiting: usize,
     /// The sources the person set up, running.
     runner: sources::Runner,
     /// Every bot as the daemon lists it, kept up from the stream: who made
@@ -1396,6 +1408,10 @@ impl Service {
                         reread = Some(now);
                         self.goals.reread();
                         self.runner.reload();
+                        self.waiting = waiting();
+                        for lookout in self.lookouts.values_mut() {
+                            lookout.waiting = self.waiting;
+                        }
                         self.reread(&client).await;
                     }
                     for lookout in self.lookouts.values_mut() {
@@ -1891,6 +1907,7 @@ impl Service {
         let workspace = PathBuf::from(record["workspace"].as_str().unwrap_or("/"));
         let updates = updates_for(lead, &workspace, self.registry.clone(), self.live);
         let mut lookout = Lookout::new(lead);
+        lookout.waiting = self.waiting;
         self.seated += 1;
         lookout.id = self.seated;
         lookout.log = Some(self.log.clone());
@@ -3082,10 +3099,12 @@ impl Lookout {
         };
         let events: Vec<Value> = self.heard.iter().map(json).collect();
         let told_subs = &self.updates.told_subs;
-        let mut unkept = self.unkept.clone();
-        unkept.merge(self.unkept_sent.clone());
+        // What the note under way says was not kept stays with it, so the
+        // note sent again says the same.
+        let (unkept, unkept_sending) = (&self.unkept, &self.unkept_sent);
         if events.is_empty()
             && unkept.count == 0
+            && unkept_sending.count == 0
             && sending.is_empty()
             && self.told_sources.is_empty()
             && told_subs.is_empty()
@@ -3110,6 +3129,9 @@ impl Lookout {
         }
         if unkept.count > 0 {
             body["unkept"] = unkept.to_json();
+        }
+        if unkept_sending.count > 0 {
+            body["unkept_sending"] = unkept_sending.to_json();
         }
         Some((path, Some(body.to_string().into_bytes())))
     }
@@ -3167,6 +3189,7 @@ impl Lookout {
         self.heard = heard("events");
         self.resend = heard("sending");
         self.unkept = Unkept::from_json(&kept["unkept"]);
+        self.unkept_sent = Unkept::from_json(&kept["unkept_sending"]);
         self.heard_since = (!self.heard.is_empty() || !self.resend.is_empty()).then_some(now);
         self.rehear();
     }
@@ -3256,7 +3279,8 @@ impl Lookout {
         let sent = std::mem::take(&mut self.resend);
         if !sent.is_empty() {
             let steer = sent.iter().any(|heard| heard.event.steer);
-            let prompt = sources::note(&sent, self.heard.len(), None);
+            let unkept = self.unkept_sent.line(self.waiting, epoch_ms() as u64);
+            let prompt = sources::note(&sent, self.heard.len(), unkept.as_deref());
             return self.source(client, woken, sent, prompt, steer);
         }
         let steer = self.heard.iter().any(|heard| heard.event.steer);
@@ -4621,6 +4645,7 @@ mod tests {
         Service {
             runner: sources::Runner::new(store.join("sources"), tokio::sync::mpsc::channel(1).0),
             store,
+            waiting: WAITING,
             records: (records.iter())
                 .map(|r| (r["name"].as_str().unwrap().to_owned(), r.clone()))
                 .collect(),
@@ -4791,6 +4816,17 @@ mod tests {
         assert!(service.lookouts.is_empty());
         self::held::written();
         assert!(!held.exists());
+    }
+
+    #[test]
+    fn a_lookout_holds_as_many_from_sources_as_the_settings_say() {
+        let record = json!({"name": "calc.fix", "bot_id": 4, "workspace": "/", "status": "idle"});
+        let mut service = service(PathBuf::new(), std::slice::from_ref(&record));
+        service.waiting = 0;
+        let sub = subs::Sub::commons("tidy", Some(4));
+        (service.subscribers).insert("calc.fix".into(), vec![sub]);
+        assert!(service.place(&record));
+        assert_eq!(service.lookouts["calc.fix"].waiting, 0);
     }
 
     #[test]
@@ -5769,6 +5805,28 @@ mod tests {
         lookout.answered(Answer::Sourced(Err("bot_busy".into())));
         assert_eq!(lookout.unkept.count, 1);
         assert_eq!(lookout.heard.len(), 2);
+        // A note under way when the lookout stops says it again when it goes
+        // again, even with nothing else waiting.
+        let sent = std::mem::take(&mut lookout.heard);
+        lookout.unkept_sent = std::mem::take(&mut lookout.unkept);
+        lookout.sourcing = Some((sent, vec!["k".into()], "queue"));
+        lookout.keep();
+        lookout.flush();
+        held::written();
+        let mut lookout = made();
+        lookout.restore(path.clone());
+        assert_eq!((lookout.resend.len(), lookout.unkept.count), (2, 0));
+        lookout.heard_since = Some(Instant::now());
+        wake_sources(&mut lookout, &client).await;
+        let prompt = got.recv().await.unwrap()["prompt"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(prompt.contains("\"five\""), "{prompt}");
+        assert!(
+            prompt.contains("- 1 more event from slack came"),
+            "{prompt}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

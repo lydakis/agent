@@ -128,10 +128,13 @@ account of it:
 - whether the lead sent it to a task, from its calls (`delegated`), or
   changed the code itself;
 - for a code ask, whether its change works, checked on main and on every
-  branch tip;
+  branch tip. The check runs the agents' code, and git in their repository,
+  in `agent sandbox` with the network off and no provider key, as their own
+  commands run;
 - for a quick look or one of the person's calls, when the lead said it to
   the person;
-- how long the ask waited before the lead acted on it.
+- how long the ask waited before the lead acted on it, by sending it to a
+  task or by starting it itself, or until the run ended.
 
 The summary counts:
 
@@ -141,7 +144,8 @@ The summary counts:
   recorded from the event stream while the run goes (`events.jsonl`), so a
   task deleted before the end still counts.
 - the lookout's events that were not kept;
-- the run's peak memory and CPU time.
+- the run's peak memory and CPU time: the daemon, the lead's `sonny acp`
+  and every process under them.
 
 The ledger is evidence for the scorer; the rows above are still read from the
 transcript. `python3 -m bench.role_eval ledger --day burst` writes it again

@@ -833,7 +833,7 @@ def run(arm, n, bins, model, spec=None):
     recorder = sampler = None
     if DAY is BURST:
         recorder = burst_ledger.Recorder(agent, env, out / 'events.jsonl')
-        sampler = burst_ledger.Sampler(home)
+        sampler = burst_ledger.Sampler(home, roots=lambda: [acp.p.pid] if acp else [])
     landed = {}
 
     def release(step, s):
@@ -946,8 +946,8 @@ def run(arm, n, bins, model, spec=None):
         messages(home, out)
         if DAY is BURST:
             try:
-                burst_ledger.ledger(out, repo, env, events(), timeline,
-                                    home / '.agent/state.sqlite.lookout.jsonl', resources)
+                burst_ledger.ledger(out, agent, repo, env, events(), timeline,
+                                    home / '.agent/state.sqlite.lookout.jsonl', resources, ended=time.time())
             except Exception as error:  # the run's other evidence stands
                 print(f'{arm}{n}: no ledger: {error}', file=sys.stderr)
         # Nothing outside the run should have changed: what did is kept, and
@@ -1127,7 +1127,8 @@ def main():
             env = {'HOME': str(root / 'h'), 'PATH': '/opt/homebrew/bin:/usr/bin:/bin',
                    'GIT_CONFIG_GLOBAL': str(root / 'gitconfig')}
             timeline = json.loads((out / 'timeline.json').read_text())
-            print(out, burst_ledger.ledger(out, root / 'shop', env, json.loads((root / 'events.json').read_text()),
+            print(out, burst_ledger.ledger(out, root / 'bin/agent', root / 'shop', env,
+                                           json.loads((root / 'events.json').read_text()),
                                            timeline, root / 'h/.agent/state.sqlite.lookout.jsonl'))
     else:
         # Only runs that finished: a failed run stays out of scoring.

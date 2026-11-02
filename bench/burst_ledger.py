@@ -134,26 +134,39 @@ class Recorder:
 
 
 class Sampler:
-    """The run's processes (those whose command line names its HOME: the
-    daemon, its companions, their tools), every few seconds: the peak of
-    their summed memory and the CPU time they had used."""
+    """The run's processes, every few seconds: those whose command line
+    names its HOME (the daemon, its companions), the ones `roots` names
+    (the lead's `sonny acp`), and every process under them (their tools).
+    The peak of their summed memory and the CPU time they had used."""
 
-    def __init__(self, home, every=5):
-        self.home, self.every = str(home), every
+    def __init__(self, home, every=5, roots=lambda: ()):
+        self.home, self.every, self.roots = str(home), every, roots
         self.peak_rss_kb, self.cpu_s = 0, {}
         self.stop = threading.Event()
         self.thread = threading.Thread(target=self.run, daemon=True)
         self.thread.start()
 
     def sample(self):
-        out = subprocess.run(['ps', '-axo', 'pid=,rss=,time=,command='], capture_output=True, text=True).stdout
-        rss = 0
+        out = subprocess.run(['ps', '-axo', 'pid=,ppid=,rss=,time=,command='], capture_output=True,
+                             text=True).stdout
+        rows, children = {}, {}
         for line in out.splitlines():
-            parts = line.split(None, 3)
-            if len(parts) < 4 or self.home not in parts[3]:
+            parts = line.split(None, 4)
+            if len(parts) < 5:
                 continue
-            rss += int(parts[1])
-            self.cpu_s[parts[0]] = seconds(parts[2])
+            rows[parts[0]] = parts
+            children.setdefault(parts[1], []).append(parts[0])
+        ours = [pid for pid, parts in rows.items() if self.home in parts[4]]
+        ours += [str(pid) for pid in self.roots() if str(pid) in rows]
+        seen, rss = set(), 0
+        while ours:
+            pid = ours.pop()
+            if pid in seen:
+                continue
+            seen.add(pid)
+            rss += int(rows[pid][2])
+            self.cpu_s[pid] = seconds(rows[pid][3])
+            ours += children.get(pid, [])
         self.peak_rss_kb = max(self.peak_rss_kb, rss)
 
     def run(self):
@@ -201,24 +214,45 @@ def lead_view(acp_log):
     return notes, calls, [tuple(s) for s in said]
 
 
-def checked(repo, env, ref, code):
+# What a command over the run's files gets of the run's environment: no
+# provider key.
+PASSED = ('HOME', 'PATH', 'LANG', 'TERM', 'GIT_CONFIG_GLOBAL', 'TMPDIR')
+
+
+def confined(agent, env, cmd, cwd, writable=None, **kw):
+    """Run `cmd` over files agents wrote as the agents' own commands run:
+    in `agent sandbox`, network off, writing only `writable`, with the run's
+    HOME and no key. git runs a repository's hooks and the programs its
+    config names, and the code is the agents', so none of it runs as the
+    person."""
+    sandbox = [str(agent), 'sandbox', *(['--writable', str(writable)] if writable else []), '--', *cmd]
+    return subprocess.run(sandbox, cwd=cwd, env={k: env[k] for k in PASSED if k in env}, capture_output=True,
+                          **kw)
+
+
+def tree_of(agent, repo, env, ref, tree):
+    """`ref`'s files in `tree`, or False."""
+    archive = confined(agent, env, ['git', 'archive', ref], repo)
+    if archive.returncode != 0:
+        return False
+    return subprocess.run(['tar', '-x', '-C', tree], input=archive.stdout, capture_output=True).returncode == 0
+
+
+def checked(agent, repo, env, ref, code):
     """Whether `code` passes at the root of `ref`'s files."""
     with tempfile.TemporaryDirectory() as tree:
-        archive = subprocess.run(['git', 'archive', ref], cwd=repo, env=env, capture_output=True)
-        if archive.returncode != 0:
+        if not tree_of(agent, repo, env, ref, tree):
             return False
-        subprocess.run(['tar', '-x', '-C', tree], input=archive.stdout, capture_output=True)
-        run = subprocess.run(['python3', '-I', '-c', f'import sys; sys.path.insert(0, ".")\n{code}'], cwd=tree,
-                             capture_output=True, timeout=60)
+        run = confined(agent, env, ['python3', '-I', '-c', f'import sys; sys.path.insert(0, ".")\n{code}'], tree,
+                       tree, timeout=60)
         return run.returncode == 0
 
 
-def suite_passes(repo, env, ref):
+def suite_passes(agent, repo, env, ref):
     with tempfile.TemporaryDirectory() as tree:
-        archive = subprocess.run(['git', 'archive', ref], cwd=repo, env=env, capture_output=True)
-        subprocess.run(['tar', '-x', '-C', tree], input=archive.stdout, capture_output=True)
-        return subprocess.run(['python3', '-m', 'unittest', '-q'], cwd=tree, capture_output=True,
-                              timeout=300).returncode == 0
+        if not tree_of(agent, repo, env, ref, tree):
+            return False
+        return confined(agent, env, ['python3', '-m', 'unittest', '-q'], tree, tree, timeout=300).returncode == 0
 
 
 def agents(events_path):
@@ -265,13 +299,18 @@ def unkept(lookout_log, lead):
     return {'not_kept': dropped, 'most_waiting': waiting}
 
 
-def ledger(out, repo, env, events, timeline, lookout_log, resources=None, lead='shop.lead'):
-    """Write `asks.json` and `asks.md` in `out`: each planted ask's way."""
+def ledger(out, agent, repo, env, events, timeline, lookout_log, resources=None, lead='shop.lead', ended=None):
+    """Write `asks.json` and `asks.md` in `out`: each planted ask's way.
+    An ask not acted on waits until `ended`, when the run ended; written
+    again later, the ledger keeps the end it wrote first, or else takes the
+    run's last evidence."""
     out = Path(out)
     notes, calls, said = lead_view(out / 'acp.jsonl')
-    branches = subprocess.run(['git', 'for-each-ref', '--format=%(refname:short)', 'refs/heads'], cwd=repo,
-                              env=env, capture_output=True, text=True).stdout.split()
-    end = max([t for t, _ in notes + said] + [t for t, _, _ in calls] + [time.time()])
+    branches = confined(agent, env, ['git', 'for-each-ref', '--format=%(refname:short)', 'refs/heads'],
+                        repo).stdout.decode().split()
+    if ended is None and (out / 'asks.json').exists():
+        ended = json.loads((out / 'asks.json').read_text())['summary'].get('ended')
+    end = ended or max([t for t, _ in notes + said] + [t for t, _, _ in calls] + [s.get('t', 0) for s in timeline] + [0])
     rows = []
     for event in events:
         plant = event.get('plant') or ''
@@ -293,16 +332,17 @@ def ledger(out, repo, env, events, timeline, lookout_log, resources=None, lead='
                            if t >= after and name in EDITS and key.search(text)), None)
             row['delegated_s'] = delegated and round(delegated - after)
             row['edited_itself_s'] = itself and round(itself - after)
-            row['on_main'] = checked(repo, env, 'main', spec['check'])
-            row['on_branches'] = [b for b in branches if b != 'main' and checked(repo, env, b, spec['check'])]
-            handled = delegated
+            row['on_main'] = checked(agent, repo, env, 'main', spec['check'])
+            row['on_branches'] = [b for b in branches if b != 'main' and checked(agent, repo, env, b, spec['check'])]
+            # Acted on when sent to a task or when the lead began it itself.
+            handled = min((t for t in (delegated, itself) if t is not None), default=None)
         else:
             words = re.compile(spec['said'], re.IGNORECASE)
             told = next((t for t, text in said if t >= after and words.search(text)), None)
             row['said_s'] = told and round(told - after)
             handled = told
         # How long it waited for the lead to act on it, or still waits.
-        row['pending_s'] = round((handled or end) - after) if released else None
+        row['pending_s'] = round((end if handled is None else handled) - after) if released is not None else None
         row['handled'] = handled is not None
         rows.append(row)
     found = agents(events_path=out / 'events.jsonl')
@@ -313,7 +353,7 @@ def ledger(out, repo, env, events, timeline, lookout_log, resources=None, lead='
         'code_on_main': sum(bool(r.get('on_main')) for r in rows),
         'code_on_a_branch_only': sum(bool(r.get('on_branches')) and not r.get('on_main') for r in rows),
         'oldest_pending_s': max((r['pending_s'] for r in rows if r['pending_s'] is not None), default=None),
-        'main_tests_pass': suite_passes(repo, env, 'main'),
+        'main_tests_pass': suite_passes(agent, repo, env, 'main'),
         'agents': len(found),
         'turns_failed': sum(a['turns'].get('failed', 0) for a in found.values()),
         'deleted': sum(a['deleted'] for a in found.values()),
@@ -322,6 +362,7 @@ def ledger(out, repo, env, events, timeline, lookout_log, resources=None, lead='
         'output_tokens': sum(a['output_tokens'] for a in found.values()),
         **unkept(lookout_log, lead),
         **(resources or {}),
+        'ended': end,
     }
     (out / 'asks.json').write_text(json.dumps({'summary': summary, 'asks': rows, 'agents': found}, indent=1))
     lines = ['# The burst\'s asks', '',
