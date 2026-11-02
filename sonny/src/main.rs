@@ -94,6 +94,7 @@ mod tool_host;
 mod transcript;
 mod tree;
 mod trigger;
+mod trusted;
 mod upgrade;
 mod usage;
 mod used;

@@ -405,6 +405,21 @@ print(json.dumps({{'version': '2.5', 'ok': True, 'command': command, 'data': dat
             self.assertIn(named, refused['detail'])
         self.assertEqual(len(self.ran_on_desktop()), 5)
 
+    def test_an_agent_desktop_any_agent_could_swap_is_never_run(self):
+        # The stand-in is in calc.lead's own folder, which its sandbox writes.
+        self.desktop(settings={'sandbox': 'workspace-write'}, approve=['desktop'], approver='manual')
+        refused = json.loads(self.call('calc.lead', 'desktop', {'commands': ['list-apps']}))
+        self.assertEqual(refused['error'], 'desktop_refused')
+        self.assertIn('which the agent calc.lead writes, so it is not run', refused['detail'])
+        # Nor for another agent, with no sandbox, while calc.lead could swap it.
+        self.daemon.request('create', bot='free.lead', workspace=str(self.path / 'desktop-bin'),
+                            model='openai/synthetic-model', instructions='Lead.',
+                            declare=[{**declared('desktop'), 'steps': True}])
+        refused = json.loads(self.call('free.lead', 'desktop', {'commands': ['list-apps']}))
+        self.assertEqual(refused['error'], 'desktop_refused')
+        self.assertIn('which the agent calc.lead writes', refused['detail'])
+        self.assertEqual(self.ran_on_desktop(), [])
+
     @unittest.skipUnless(shutil.which('agent-browser'), 'agent-browser is not installed')
     def test_an_agent_s_browser_shows_it_the_page_and_refuses_what_reaches_the_host(self):
         self.browser(settings={'sandbox': 'workspace-write', 'network': True}, approve=['browser'], approver='manual')
