@@ -5,7 +5,8 @@ once with the current binary to migrate a copy). Flags full scans on growing
 tables and temporary B-trees. Structural cases are listed, not counted:
 `SCAN CONSTANT ROW` from EXISTS subqueries, the recursive-CTE step scans that
 are bounded by a window or one turn, or by one bot's descendants (`kin`,
-each step found by the `bots_maker` index), and per-turn sorts over a turn's tool
+each step found by the `bots_maker` index), the `held` turns (each half
+found by the `turns_ready` or `turns_paced` index), and per-turn sorts over a turn's tool
 rows, plus schema metadata (`sqlite_sequence` holds one row per
 autoincrement table). Statements inside
 the one-time migration function are skipped. Exit
@@ -26,20 +27,20 @@ OPTIONAL = {'{glob}': ('', " AND t.bot GLOB ?3 AND t.bot >= ?4 AND t.bot < ?4 ||
             '{running}': ('', ' AND running_turn IS NOT NULL'),
             '{order}': ('ASC', 'DESC')}
 
-STRUCTURAL_SCANS = {'SCAN CONSTANT ROW', 'SCAN c', 'SCAN chain', 'SCAN kin', 'SCAN sqlite_master',
+STRUCTURAL_SCANS = {'SCAN CONSTANT ROW', 'SCAN c', 'SCAN chain', 'SCAN held', 'SCAN kin', 'SCAN sqlite_master',
                     'SCAN sqlite_sequence'}
 
 
 def statements(source):
     constants = {name: value.replace('\\"', '"') for name, value in re.findall(
-        r'const (COLUMNS|READING_ITEM|TURN_VIEW|PICTURELESS|REPLY_NODE): &str = "((?:[^"\\]|\\.)*)";', source, re.S)}
+        r'const (COLUMNS|READING_ITEM|TURN_VIEW|PICTURELESS|REPLY_NODE|HELD): &str =\s*"((?:[^"\\]|\\.)*)";', source, re.S)}
     literals = re.findall(r'r?#?"((?:[^"\\]|\\.)*)"#?', source, re.S)
     for literal in literals:
         text = re.sub(r'\s+', ' ', literal.replace('\\n', ' ')).strip()
         if not re.match(r'(WITH|SELECT|INSERT|UPDATE|DELETE)\b', text) or ';' in text:
             continue
         for placeholder, name in (('{READING_ITEM}', 'READING_ITEM'), ('{TURN_VIEW}', 'TURN_VIEW'),
-                                  ('{PICTURELESS}', 'PICTURELESS'), ('{REPLY_NODE}', 'REPLY_NODE'),
+                                  ('{PICTURELESS}', 'PICTURELESS'), ('{REPLY_NODE}', 'REPLY_NODE'), ('{HELD}', 'HELD'),
                                   ('{}', 'COLUMNS')):
             if placeholder in text:
                 text = text.replace(placeholder, constants[name])

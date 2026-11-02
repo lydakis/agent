@@ -2176,9 +2176,17 @@ has lasted, from a minute up to an hour, so each wait about doubles the last,
 with a fresh retry budget; `since_ms` is when the run of holds began, kept
 until a call is answered. Time held on a call counts in `paced_ms`.
 
-`{"op":"held"}` lists every held turn, oldest first: `{held: [{bot, bot_id,
-turn, handle, started, blocked, resume_at_ms}]}`, `started` for one held on
-its call. `{"op":"retry_held","bot":NAME?}` tries every held turn again now,
+`{"op":"held","after":TURN?,"limit":N?,"bot":NAME?}` lists the held turns
+after turn `after`, oldest first, `limit` (1 to 256, 64 unset) a page, or
+only `bot`'s: `{held: [{bot, bot_id, turn, handle, started, blocked,
+resume_at_ms}], more, total, causes: [{code, turns, bots, detail}]}`,
+`started` for one held on its call. `total` counts every held turn and
+`causes` each cause's code, its turns and agents and its oldest turn's
+detail, so a reader that only says how many are held, as Sonny's alerts
+do, reads one page whatever the fleet's size (protocol 48; before, one
+answer held every turn and went past the frame limit near 6,000 agents).
+A page is bounded by bytes too, as `pauses` pages are.
+`{"op":"retry_held","bot":NAME?}` tries every held turn again now,
 or only `bot`'s, and answers `{retried: N}`; a sandboxed bot's own socket
 refuses it with `not_permitted`, since what held the turn is the person's to
 fix. The daemon tries every held turn at once when it starts, since a

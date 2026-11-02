@@ -3028,10 +3028,24 @@ fn a_turn_its_start_refused_for_a_fixable_cause_keeps_its_place_in_line() {
         "provider_unavailable"
     );
     assert_eq!(view["waiting_on"]["resume_at_ms"], due);
-    let held = db.held().unwrap();
+    let held = held_rows(&db);
     assert_eq!(held.len(), 1);
     assert_eq!(held[0]["turn"], first.turn);
     assert_eq!(held[0]["started"], false);
+    // Counted by cause, a page at a time, or one bot's only.
+    let listed = db.held(0, 1, None).unwrap();
+    assert_eq!(
+        (&listed["total"], &listed["more"]),
+        (&json!(1), &json!(false))
+    );
+    assert_eq!(
+        listed["causes"],
+        json!([{"code": "provider_unavailable", "turns": 1, "bots": 1,
+            "detail": held[0]["blocked"]["detail"]}])
+    );
+    assert_eq!(db.held(first.turn, 1, None).unwrap()["held"], json!([]));
+    assert_eq!(db.held(0, 64, Some("Alice")).unwrap()["total"], 0);
+    assert_eq!(db.held(0, 0, None).unwrap_err().code, "invalid_held_page");
     // Fixed: tried again now, it starts, and is held no longer.
     assert_eq!(db.retry_held(Some("Alice")).unwrap(), (vec![], 0));
     assert_eq!(db.retry_held(Some("Bob")).unwrap(), (vec![], 1));
@@ -3051,7 +3065,7 @@ fn a_turn_its_start_refused_for_a_fixable_cause_keeps_its_place_in_line() {
         "due now is the dispatcher's"
     );
     db.start(first.turn, allow_provider).unwrap();
-    assert!(db.held().unwrap().is_empty());
+    assert!(held_rows(&db).is_empty());
     assert_eq!(
         db.turn_view("Bob", first.turn).unwrap()["waiting_on"],
         Value::Null
@@ -3108,7 +3122,7 @@ fn a_run_of_holds_keeps_when_it_began_and_waits_longer_each_try() {
             .code,
         "stale_turn"
     );
-    assert!(db.held().unwrap().is_empty());
+    assert!(held_rows(&db).is_empty());
 }
 
 #[test]
@@ -3127,7 +3141,7 @@ fn a_bot_that_holds_nothing_has_its_refused_start_end() {
             .unwrap()
             .is_none()
     );
-    assert!(db.held().unwrap().is_empty());
+    assert!(held_rows(&db).is_empty());
     // A hold lasts the bot's `hold_ms` from when it began, five days unset.
     let settings = agent_runtime::store::Settings::default();
     assert!(settings.holds(None, 10));
@@ -3179,7 +3193,7 @@ fn a_turn_held_on_its_call_says_so_and_is_woken_to_try_again() {
     let view = db.turn_view("Bob", turn).unwrap();
     assert_eq!(view["status"], "paced");
     assert_eq!(view["waiting_on"]["blocked"]["detail"], "HTTP 401");
-    let held = db.held().unwrap();
+    let held = held_rows(&db);
     assert_eq!(held.len(), 1);
     assert_eq!(held[0]["started"], true);
     assert_eq!(held[0]["resume_at_ms"], 99);
@@ -3227,7 +3241,7 @@ fn an_ordinary_retry_between_holds_keeps_when_they_began() {
         .unwrap();
     // A retry the provider asked for, not a hold: nothing says held.
     assert!(entry["data"].get("blocked").is_none());
-    assert!(db.held().unwrap().is_empty());
+    assert!(held_rows(&db).is_empty());
     let waiting = db.waiting_turns().unwrap();
     assert_eq!(
         (waiting[0].blocked.clone(), waiting[0].held_since_ms),
@@ -3255,7 +3269,7 @@ fn schema_77_holds_a_refused_start_in_line() {
     let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
     let (_, turn) = db.next_ready().unwrap().unwrap();
     db.hold(turn, &Error::new("provider_unavailable")).unwrap();
-    assert_eq!(db.held().unwrap().len(), 1);
+    assert_eq!(held_rows(&db).len(), 1);
     drop(db);
     std::fs::remove_file(path).unwrap();
 }
@@ -16044,4 +16058,12 @@ fn schema_76_tells_no_bot_of_commands_that_ended_before() {
     assert_ne!(ended, running);
     drop(db);
     std::fs::remove_file(path).unwrap();
+}
+
+/// Every held turn, as one page of `held` holds them in these tests.
+fn held_rows(db: &Database) -> Vec<Value> {
+    db.held(0, 256, None).unwrap()["held"]
+        .as_array()
+        .unwrap()
+        .clone()
 }

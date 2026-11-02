@@ -8059,9 +8059,10 @@ impl App {
             let logs = tilde(&format!("{}.companions", self.store().display()));
             alerts.extend(status::companion_alerts(&listed["companions"], now, &logs));
         }
-        // Turns held on a cause the person can fix, one alert per cause.
-        if let Ok(listed) = self.client.request("held", json!({})).await {
-            alerts.extend(status::held_alerts(&listed["held"]));
+        // Turns held on a cause the person can fix, one alert per cause:
+        // counted by the daemon, named from the first page.
+        if let Ok(listed) = self.client.request("held", json!({"limit": 64})).await {
+            alerts.extend(status::held_alerts(&listed));
         }
         let folder = (self
             .client

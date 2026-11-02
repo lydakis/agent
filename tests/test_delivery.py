@@ -684,8 +684,19 @@ class DeliveryTests(ModelFixture):
         self.assertGreaterEqual(held['data']['resume_at_ms'] - blocked['since_ms'], 60_000)
         view = client.request('turns', bot='Bob')['result']['turns'][-1]
         self.assertEqual((view['status'], view['waiting_on']['blocked']['code']), ('paced', 'provider_http_401'))
-        listed = client.request('held')['result']['held']
-        self.assertEqual([(h['bot'], h['turn'], h['started']) for h in listed], [('Bob', turn, True)])
+        listed = client.request('held')['result']
+        self.assertEqual([(h['bot'], h['turn'], h['started']) for h in listed['held']], [('Bob', turn, True)])
+        # Counted by cause, so a reader needs no page to say how many.
+        self.assertEqual((listed['total'], listed['more']), (1, False))
+        self.assertEqual(listed['causes'], [{'code': 'provider_http_401', 'turns': 1, 'bots': 1,
+                                             'detail': 'synthetic bad key'}])
+        # Paged after a turn, or one bot's only.
+        self.assertEqual(client.request('held', after=turn)['result']['held'], [])
+        other = client.request('held', bot='Alice')['result']
+        self.assertEqual((other['held'], other['total'], other['causes']), ([], 0, []))
+        for page in ({'limit': 0}, {'limit': 257}, {'after': -1}):
+            self.assertEqual(client.request('held', **page)['error'], 'invalid_held_page')
+        self.assertEqual(client.request('retry_held', bot='Alice')['result']['retried'], 0)
         # A message behind it waits its turn.
         later = client.request('submit', bot='Bob', request_id='2', prompt='hello', delivery='queue')['result']
         self.assertEqual(later['status'], 'queued')

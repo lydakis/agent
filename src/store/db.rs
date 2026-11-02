@@ -6263,58 +6263,89 @@ impl Database {
     pub fn next_held_due(&self, after: i64) -> Result<Option<i64>> {
         next_held(&self.conn, after)
     }
-    /// Every held turn, oldest first: those a start refused, waiting in
-    /// line, and those parked on a call, each with its cause and next try.
-    pub fn held(&self) -> Result<Vec<Value>> {
-        let mut held = Vec::new();
-        let mut statement = self.conn.prepare_cached(
+    /// The held turns after turn `after`, oldest first, `limit` (1 to 256)
+    /// a page, or only `bot`'s: those a start refused, waiting in line,
+    /// and those parked on a call, each with its cause and next try. With
+    /// them, how many are held in all and, for each cause's code, how many
+    /// turns and agents it holds and the detail of its oldest, so a reader
+    /// that wants only those reads no page at fleet size.
+    pub fn held(&self, after: i64, limit: usize, bot: Option<&str>) -> Result<Value> {
+        if after < 0 || !(1..=256).contains(&limit) {
+            return fail_with(
+                "invalid_held_page",
+                "limit must be 1 to 256 and after 0 or more",
+            );
+        }
+        // The held turns, as a bench/query_plans.py fragment.
+        const HELD: &str =
             "SELECT t.id,t.bot,b.id,t.held,t.due_ms,0 FROM turns t JOIN bots b ON b.name=t.bot
-             WHERE t.status='ready' AND t.held IS NOT NULL
+             WHERE t.status='ready' AND t.held IS NOT NULL AND (?1 IS NULL OR t.bot=?1)
              UNION ALL
              SELECT t.id,t.bot,b.id,json_extract(t.waiting,'$.blocked'),
                 json_extract(t.waiting,'$.deadline_ms'),1
              FROM turns t JOIN bots b ON b.name=t.bot
              WHERE t.status='paced' AND json_extract(t.waiting,'$.blocked') IS NOT NULL
-             ORDER BY 1",
-        )?;
-        let mut rows = statement.query([])?;
+                AND (?1 IS NULL OR t.bot=?1)";
+        let mut statement = self.conn.prepare_cached(&format!(
+            "WITH held(id,bot,bot_id,blocked,due,started) AS ({HELD})
+             SELECT id,bot,bot_id,blocked,due,started FROM held WHERE id>?2 ORDER BY id LIMIT ?3"
+        ))?;
+        let mut rows = statement.query(params![bot, after, (limit + 1) as i64])?;
+        // Bounded by bytes as well as count, as `pauses` pages are.
+        let (mut held, mut bytes, mut more) = (Vec::new(), 0, false);
         while let Some(r) = rows.next()? {
             let Some(blocked) = blocked(r.get(3)?) else {
                 continue;
             };
-            let (turn, bot): (i64, String) = (r.get(0)?, r.get(1)?);
-            held.push(json!({"bot":bot,"bot_id":r.get::<_, i64>(2)?,"turn":turn,
-                "handle":format!("turn:{bot}/{turn}"),"started":r.get::<_, i64>(5)? == 1,
-                "blocked":blocked,"resume_at_ms":r.get::<_, Option<i64>>(4)?}));
+            let (turn, name): (i64, String) = (r.get(0)?, r.get(1)?);
+            let row = json!({"bot":name,"bot_id":r.get::<_, i64>(2)?,"turn":turn,
+                "handle":format!("turn:{name}/{turn}"),"started":r.get::<_, i64>(5)? == 1,
+                "blocked":blocked,"resume_at_ms":r.get::<_, Option<i64>>(4)?});
+            let size = crate::output::encoded_len(&row)? + 1;
+            if held.len() == limit || bytes + size > crate::output::MAX_EVENT / 2 {
+                more = true;
+                break;
+            }
+            bytes += size;
+            held.push(row);
         }
-        Ok(held)
+        // One row a code: its oldest turn's detail (SQLite takes the bare
+        // column from the row MIN picks).
+        let mut statement = self.conn.prepare_cached(&format!(
+            "WITH held(id,bot,bot_id,blocked,due,started) AS ({HELD})
+             SELECT json_extract(blocked,'$.code') AS code,COUNT(*),COUNT(DISTINCT bot),
+                json_extract(blocked,'$.detail'),MIN(id)
+             FROM held WHERE code IS NOT NULL GROUP BY code ORDER BY MIN(id)"
+        ))?;
+        let mut rows = statement.query(params![bot])?;
+        let (mut causes, mut total) = (Vec::new(), 0);
+        while let Some(r) = rows.next()? {
+            let turns: i64 = r.get(1)?;
+            total += turns;
+            causes.push(json!({"code":r.get::<_, String>(0)?,"turns":turns,
+                "bots":r.get::<_, i64>(2)?,"detail":r.get::<_, Option<String>>(3)?}));
+        }
+        Ok(json!({"held": held, "more": more, "total": total, "causes": causes}))
     }
     /// Make every held turn's next try due now, or only `bot`'s: the
     /// person may have fixed the cause. Returns the held turns parked on a
     /// call, for the caller to wake, and how many waiting in line are due.
     pub fn retry_held(&mut self, bot: Option<&str>) -> Result<(Vec<(String, i64)>, usize)> {
         let now = epoch_ms();
-        let lined = match bot {
-            Some(bot) => self.conn.execute(
-                "UPDATE turns SET due_ms=?1 WHERE status='ready' AND held IS NOT NULL AND bot=?2",
-                params![now, bot],
-            )?,
-            None => self.conn.execute(
-                "UPDATE turns SET due_ms=?1 WHERE status='ready' AND held IS NOT NULL",
-                [now],
-            )?,
-        };
+        let lined = self.conn.execute(
+            "UPDATE turns SET due_ms=?1 WHERE status='ready' AND held IS NOT NULL
+                AND (?2 IS NULL OR bot=?2)",
+            params![now, bot],
+        )?;
         let mut parked = Vec::new();
         let mut statement = self.conn.prepare_cached(
             "SELECT bot,id FROM turns WHERE status='paced'
-                AND json_extract(waiting,'$.blocked') IS NOT NULL ORDER BY id",
+                AND json_extract(waiting,'$.blocked') IS NOT NULL AND (?1 IS NULL OR bot=?1)
+             ORDER BY id",
         )?;
-        let mut rows = statement.query([])?;
+        let mut rows = statement.query(params![bot])?;
         while let Some(r) = rows.next()? {
-            let (name, turn): (String, i64) = (r.get(0)?, r.get(1)?);
-            if bot.is_none_or(|bot| bot == name) {
-                parked.push((name, turn));
-            }
+            parked.push((r.get(0)?, r.get(1)?));
         }
         Ok((parked, lined))
     }

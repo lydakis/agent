@@ -203,8 +203,8 @@ const COMMANDS: &[Command] = &[
     Command {
         name: "held",
         about: "Turns held on a cause you can fix (a sign-in, a key, a quota, the config): each with its cause and next try",
-        usage: "held",
-        flags: "--pretty --no-spawn",
+        usage: "held [--bot NAME] [--after TURN] [--limit N]",
+        flags: "--bot --after --limit --pretty --no-spawn",
         settings: "",
         startup: true,
     },

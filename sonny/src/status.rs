@@ -297,33 +297,53 @@ pub fn held_cause(code: &str, detail: Option<&str>) -> (String, String) {
     (what.to_owned(), fix)
 }
 
-/// The turns held on a cause (`held`'s list), one alert per cause: what
-/// holds them, whose they are, and how to set it right.
-pub fn held_alerts(held: &serde_json::Value) -> Vec<Alert> {
-    let mut causes: Vec<(String, String, Vec<String>)> = Vec::new();
-    for turn in held.as_array().into_iter().flatten() {
+/// The turns held on a cause (`held`'s answer: its counts by cause and
+/// its first page), one alert per cause: what holds them, how many agents,
+/// those the page names, and how to set it right.
+pub fn held_alerts(listed: &serde_json::Value) -> Vec<Alert> {
+    // What, its fix, how many agents, and the names the page holds.
+    let mut causes: Vec<(String, String, u64, Vec<String>)> = Vec::new();
+    for cause in listed["causes"].as_array().into_iter().flatten() {
+        let code = cause["code"].as_str().unwrap_or("");
+        let (what, fix) = held_cause(code, cause["detail"].as_str());
+        // Codes that read the same are one alert; an agent held on two of
+        // them counts in each.
+        let bots = cause["bots"].as_u64().unwrap_or(0);
+        match causes.iter_mut().find(|(known, ..)| *known == what) {
+            Some((_, _, count, _)) => *count += bots,
+            None => causes.push((what, fix, bots, Vec::new())),
+        }
+    }
+    for turn in listed["held"].as_array().into_iter().flatten() {
         let blocked = &turn["blocked"];
-        let (what, fix) = held_cause(
+        let (what, _) = held_cause(
             blocked["code"].as_str().unwrap_or(""),
             blocked["detail"].as_str(),
         );
         let bot = turn["bot"].as_str().unwrap_or("an agent").to_owned();
-        match causes.iter_mut().find(|(known, _, _)| *known == what) {
-            Some((_, _, bots)) if bots.contains(&bot) => {}
-            Some((_, _, bots)) => bots.push(bot),
-            None => causes.push((what, fix, vec![bot])),
+        if let Some((.., names)) = causes.iter_mut().find(|(known, ..)| *known == what)
+            && !names.contains(&bot)
+        {
+            names.push(bot);
         }
     }
     (causes.into_iter())
-        .map(|(what, fix, bots)| Alert {
-            failed: true,
-            said: format!(
-                "{what} · {} agent{} waiting: {}",
-                bots.len(),
-                if bots.len() == 1 { "" } else { "s" },
-                bots.join(", ")
-            ),
-            detail: fix,
+        .map(|(what, fix, count, names)| {
+            let count = count.max(names.len() as u64);
+            let rest = count - names.len() as u64;
+            Alert {
+                failed: true,
+                said: format!(
+                    "{what} · {count} agent{} waiting: {}{}",
+                    if count == 1 { "" } else { "s" },
+                    names.join(", "),
+                    match rest {
+                        0 => String::new(),
+                        n => format!(" and {n} more"),
+                    }
+                ),
+                detail: fix,
+            }
         })
         .collect()
 }
@@ -499,12 +519,16 @@ mod tests {
 
     #[test]
     fn turns_held_on_one_cause_are_one_alert_naming_each_agent_and_the_fix() {
-        let held = serde_json::json!([
+        let held = serde_json::json!({"held": [
             {"bot": "api", "blocked": {"code": "provider_login_rejected", "since_ms": 1}},
             {"bot": "web", "blocked": {"code": "provider_login_expired", "since_ms": 2}},
             {"bot": "web", "blocked": {"code": "provider_login_expired", "since_ms": 2}},
             {"bot": "docs", "blocked": {"code": "provider_unavailable", "detail": "anthropic", "since_ms": 3}},
-        ]);
+        ], "causes": [
+            {"code": "provider_login_rejected", "turns": 1, "bots": 1},
+            {"code": "provider_login_expired", "turns": 2, "bots": 1},
+            {"code": "provider_unavailable", "turns": 1, "bots": 1, "detail": "anthropic"},
+        ]});
         let alerts = held_alerts(&held);
         assert_eq!(alerts.len(), 2);
         assert_eq!(
@@ -522,6 +546,14 @@ mod tests {
                 .contains("add anthropic to ~/.agent/config.toml")
         );
         assert!(alerts.iter().all(|a| a.failed));
+        // Counted in all, named as far as the page goes.
+        let many = serde_json::json!({"held": [
+            {"bot": "api", "blocked": {"code": "provider_quota_exhausted", "since_ms": 1}},
+        ], "causes": [{"code": "provider_quota_exhausted", "turns": 7000, "bots": 6000}]});
+        assert_eq!(
+            held_alerts(&many)[0].said,
+            "usage limit reached · 6000 agents waiting: api and 5999 more"
+        );
         assert_eq!(
             group("held: ChatGPT sign-in", true, false, false, false),
             Group::NeedsYou
