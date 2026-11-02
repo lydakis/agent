@@ -168,6 +168,28 @@ class ConfinedTests(unittest.TestCase):
                     acp.close()
             self.assertTrue(served)
 
+    def test_a_run_lets_go_of_its_homes_scheduler_job_and_only_that(self):
+        # Sonny loads a job per HOME in the person's own scheduler; one a run
+        # left would stay loaded after it.
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            agents = home / 'Library/LaunchAgents'
+            agents.mkdir(parents=True)
+            (agents / f'{role_eval.SCHEDULER}8a8d61ae.plist').write_text('')
+            (agents / 'com.other.plist').write_text('')
+            units = home / '.config/systemd/user'
+            units.mkdir(parents=True)
+            (units / f'{role_eval.SCHEDULER}8a8d61ae.service').write_text('')
+            for platform, want in [('darwin', ['/bin/launchctl', 'bootout', f'gui/{os.getuid()}',
+                                               str(agents / f'{role_eval.SCHEDULER}8a8d61ae.plist')]),
+                                   ('linux', ['systemctl', '--user', 'disable', '--now',
+                                              f'{role_eval.SCHEDULER}8a8d61ae.service'])]:
+                with mock.patch.object(role_eval.sys, 'platform', platform), \
+                        mock.patch.object(role_eval.subprocess, 'run') as run:
+                    role_eval.let_go_scheduler(home)
+                self.assertEqual([c.args[0] for c in run.call_args_list], [want])
+            self.assertTrue((agents / f'{role_eval.SCHEDULER}8a8d61ae.plist').exists())
+
     def test_runs_live_outside_what_the_sandbox_always_writes(self):
         # /tmp and $TMPDIR are writable in every sandbox: a run there could
         # have its copy of the build replaced.

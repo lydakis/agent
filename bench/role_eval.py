@@ -529,6 +529,23 @@ def determinable(home, request):
     return plain(words[1:], SCRIPTS[script][words[0]])
 
 
+# The label Sonny's scheduler job takes, before its HOME's tag.
+SCHEDULER = 'me.lydakis.agent.scheduler.'
+
+
+def let_go_scheduler(home):
+    """Unload the run HOME's scheduler job. Sonny loads one per HOME in the
+    person's own launchd or systemd, whatever HOME made it, and it stays
+    loaded after the run while its HOME is still there. Its file stays,
+    with the rest of the run."""
+    if sys.platform == 'darwin':
+        for job in sorted((home / 'Library/LaunchAgents').glob(f'{SCHEDULER}*.plist')):
+            subprocess.run(['/bin/launchctl', 'bootout', f'gui/{os.getuid()}', str(job)], capture_output=True)
+    else:
+        for job in sorted((home / '.config/systemd/user').glob(f'{SCHEDULER}*.service')):
+            subprocess.run(['systemctl', '--user', 'disable', '--now', job.name], capture_output=True)
+
+
 def changed_outside(since, root, limit=200):
     """What changed in the real home after `since`, a few levels down and
     past its hidden folders and Library, which other programs write all
@@ -775,6 +792,7 @@ def run(arm, n, bins, model, spec=None):
                     subprocess.run([str(sonny), verb, 'rm', t['name']], env=env, capture_output=True)
                 break
         subprocess.run([str(agent), 'shutdown'], env=env, capture_output=True)
+        let_go_scheduler(home)
         # Saved facts; `~/.agent/memory` is the memory script, not a folder.
         if (home / '.agents/memory').is_dir():
             shutil.copytree(home / '.agents/memory', out / 'memory', dirs_exist_ok=True)
