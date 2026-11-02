@@ -135,7 +135,9 @@ jobs:
             # to trust; trust only the two formulas this job checks.
             brew trust --formula "lydakis/agent/$name"
             ruby -c "tap/Formula/$name.rb"
-            brew style "lydakis/agent/$name"
+            # The formula alone: the tap also keeps an older `agent` cask,
+            # which this job does not publish.
+            brew style --formula "lydakis/agent/$name"
             brew audit --formula --strict --online "lydakis/agent/$name"
           done
           # Sonny pulls in the daemon, and both build from source here as
