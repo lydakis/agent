@@ -11193,17 +11193,8 @@ impl App {
             }
         }
         self.notice = None;
-        // In view as it was last drawn: in the conversation's rows shown,
-        // or the words still being written under them.
-        let shown = (self.screen.drawn_at(screen::Tag::End(node))).is_some()
-            || (self.live.as_ref()).is_some_and(|live| live.node == Some(node));
-        let said = match added {
-            true => format!("{emoji} on “{first}”"),
-            false => format!("took back {emoji} on “{first}”"),
-        };
-        // Under the reply, wherever it is in the conversation, with a row
-        // of its own that says which when the reply is out of view; else,
-        // as when it is no longer there, that row alone.
+        // Under the reply, wherever it is in the conversation; else, as
+        // when it is no longer there, a row of its own that says which.
         if last && self.running.is_none() {
             self.end_live(Words::Reply);
         }
@@ -11211,9 +11202,6 @@ impl App {
         self.flush();
         let (tag, buttons) = (screen::Tag::Reactions(node), self.reacted_buttons(node));
         if (self.screen).put_under_with(screen::Tag::End(node), tag, row, buttons) {
-            if !shown {
-                self.notice = Some(said);
-            }
             return true;
         }
         // A reply still being written gets them under it once it is; one
@@ -11221,7 +11209,10 @@ impl App {
         if (self.live.as_ref()).is_some_and(|live| live.node == Some(node)) {
             return true;
         }
-        self.notice = Some(said);
+        self.notice = Some(match added {
+            true => format!("{emoji} on “{first}”"),
+            false => format!("took back {emoji} on “{first}”"),
+        });
         true
     }
 
@@ -13723,14 +13714,6 @@ mod tests {
     fn drawn(app: &mut App) -> Vec<String> {
         app.flush();
         app.screen.texts()
-    }
-
-    /// The conversation drawn as a window `height` rows tall shows it.
-    fn shown(app: &mut App, height: u16) {
-        app.flush();
-        let area = ratatui::layout::Rect::new(0, 0, 80, height);
-        app.screen
-            .render(area, &mut ratatui::buffer::Buffer::empty(area), |_| None);
     }
 
     fn turn_event(event: &str, turn: i64, data: Value) -> Value {
@@ -16488,7 +16471,7 @@ mod tests {
             app.commit_said(node, lines);
             app.saw_reply(node, reply);
         }
-        shown(&mut app, 24);
+        app.flush();
         // The last reply: the emoji alone, attached, right under it.
         app.input.set(":+1:");
         app.submit().await;
@@ -16577,7 +16560,7 @@ mod tests {
             app.commit_said(node, lines);
             app.saw_reply(node, reply);
         }
-        shown(&mut app, 24);
+        app.flush();
         // The mark under the older reply picks it, as /react does.
         app.press_row("react/4").await;
         assert_eq!(app.react_to, Some((4, "Merged it.".into())));
@@ -16585,7 +16568,6 @@ mod tests {
         app.submit().await;
         assert_eq!(sent.lock().unwrap()[0]["prompt"], "> Merged it.\n\n🎉");
         assert_eq!(app.reactions.on(4), ["🎉"]);
-        assert_eq!(app.notice, None, "in view, the reaction shows itself");
         // Each of the person's reactions is a button on its row.
         let buttons = app.reacted_buttons(4);
         assert_eq!(buttons, [(2, 5, format!("{}unreact/4/🎉", screen::BUTTON))]);
@@ -16603,15 +16585,6 @@ mod tests {
         // One no longer on it does nothing.
         app.press_row("unreact/4/🎉").await;
         assert!(app.reactions.on(4).is_empty());
-        // A reply scrolled out of view gets it under it all the same, and
-        // the footer says which, so it does not go unseen.
-        shown(&mut app, 1);
-        app.press_row("react/4").await;
-        app.input.set("🙏🏻");
-        app.submit().await;
-        assert_eq!(app.reactions.on(4), ["🙏🏻"]);
-        assert_eq!(app.notice.as_deref(), Some("🙏🏻 on “Merged it.”"));
-        assert_eq!(drawn(&mut app)[2], "   🙏🏻 ");
     }
 
     #[tokio::test]
