@@ -624,10 +624,17 @@ enum Command {
         #[serde(default)]
         by: Option<String>,
     },
-    /// Every turn held on a cause a person can fix, oldest first: parked on
-    /// a call (`started`), or refused at its start and waiting in line. A
-    /// read.
-    Held,
+    /// The turns held on a cause a person can fix, oldest first, a page
+    /// after turn `after`, or only `bot`'s: parked on a call (`started`),
+    /// or refused at its start and waiting in line; with how many are held
+    /// in all and by each cause. A read.
+    Held {
+        #[serde(default)]
+        after: i64,
+        limit: Option<usize>,
+        #[serde(default)]
+        bot: Option<String>,
+    },
     /// Try every held turn again now, or only `bot`'s: the person may have
     /// fixed what held them. Answers how many.
     RetryHeld {
@@ -3840,9 +3847,12 @@ impl Service {
                     })
                     .await
             }
-            Command::Held => {
-                let held = store.read("held", |db| db.held()).await?;
-                Ok(json!({"held": held}))
+            Command::Held { after, limit, bot } => {
+                store
+                    .read("held", move |db| {
+                        db.held(after, limit.unwrap_or(64), bot.as_deref())
+                    })
+                    .await
             }
             Command::RetryHeld { bot } => {
                 let retried = self.retry_held(bot).await?;

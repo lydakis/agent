@@ -85,7 +85,9 @@ not set up or not answering) holds instead of failing, each with its bot, its
 cause as `blocked` (`code`, `detail`, `since_ms`), and when it next tries on
 its own as `resume_at_ms`, waiting longer each try up to an hour, for the
 bot's `--hold` (5 days unset, `hold` in `~/.agent/config.toml` for the bots
-the CLI makes; `0` fails at once), then it fails with its cause. `retry`
+the CLI makes; `0` fails at once), then it fails with its cause. It prints 64
+a page (`--limit N`, up to 256), the next page after `--after TURN`, one
+bot's with `--bot NAME`, with `total` and each cause's count in `causes`. `retry`
 tries every held turn again now, or one bot's with `--bot NAME`, and prints
 `{"retried": N}`; once the cause is fixed, that is the way not to wait.
 `login chatgpt` does it on its own once it signs in, and a daemon that starts

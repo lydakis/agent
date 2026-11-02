@@ -1339,7 +1339,11 @@ pub fn main(args: Vec<String>) -> Result<i32> {
         }
         "held" => {
             let mut connection = ensure_existing_daemon(&options)?;
-            let held = connection.request("held", json!({}))?;
+            let held = connection.request(
+                "held",
+                json!({"after": options.after, "limit": options.limit.unwrap_or(64).min(256),
+                    "bot": options.bot}),
+            )?;
             print_json(&held, options.pretty)?;
             Ok(0)
         }
