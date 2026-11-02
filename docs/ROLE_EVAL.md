@@ -119,6 +119,25 @@ under `.local/role-eval/<model>/burst/`. Score:
 Also count asks that were never mentioned or acted on, and replies about
 noise (Noise, above).
 
+### Results
+
+Three runs on a Mac on 11-02, build 8b0b429 (#644), `chatgpt/gpt-6.1-sol` on
+the ChatGPT plan, scored by hand from each run's transcript and messages:
+
+| Row | Runs A1-A3 |
+| --- | --- |
+| B1 | 11, 12 and 12 of 12 code asks sent to a task |
+| B3 | 5 of 5 quick looks answered by the lead itself, in every run |
+| B4 | 3 of 3 of the person's calls brought to them, in every run |
+| B5 | passed in every run |
+| L1 | the mid-burst question answered in 3 to 8 s while the waves went on |
+| Noise | no replies about chatter or passing builds |
+
+Each lead started 5 to 7 tasks, and a run used about 6.5M to 9.6M input
+tokens, mostly cache reads. These rows count what the lead did with each
+ask. They do not check that a task's change works, and they do not count
+asks the lookout dropped past 64 waiting.
+
 ## Cost
 
 One run of the day uses about 2M input tokens, mostly cache reads, across

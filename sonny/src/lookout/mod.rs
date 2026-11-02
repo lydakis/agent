@@ -418,6 +418,35 @@ async fn read_event(client: &Client, seen: Seen) -> Seen {
     Seen { text, from, ..seen }
 }
 
+/// How long reading a message's or a reply's words may take before the
+/// news goes out without them, as Codex bounds a tool call (60 s unless
+/// configured): a read the daemon never answers holds no task's end
+/// (#388). The lead can still `wait` on the turn for its reply.
+const READ_DEADLINE: Duration = Duration::from_secs(60);
+
+/// `seen` read as `read_event` reads it, or by `READ_DEADLINE` without its
+/// words: a reply then counts as unread, and its turn's end is told.
+async fn read_in_time(client: &Client, seen: Seen) -> Seen {
+    let late = unread(&seen);
+    within(READ_DEADLINE, read_event(client, seen), late).await
+}
+
+/// `seen` with no words read: a reply's turn ends told without it.
+fn unread(seen: &Seen) -> Seen {
+    Seen {
+        asked: match seen.reply {
+            true => Asked::Unread,
+            false => seen.asked.clone(),
+        },
+        ..seen.clone()
+    }
+}
+
+/// What `read` gives within `deadline`, else `late`.
+async fn within<T>(deadline: Duration, read: impl Future<Output = T>, late: T) -> T {
+    tokio::time::timeout(deadline, read).await.unwrap_or(late)
+}
+
 const USAGE: &str = "usage: sonny lookout [--store PATH] [--socket PATH]";
 
 /// `sonny lookout`: one lookout for the store's daemon.
@@ -1307,7 +1336,7 @@ impl Service {
                         lookout.updates.reading_reply(&seen.task, seen.turn);
                     }
                     tokio::spawn(async move {
-                        let seen = read_event(&client, seen).await;
+                        let seen = read_in_time(&client, seen).await;
                         let _ = done.send((lead, id, started, seen)).await;
                     });
                 }
@@ -3286,6 +3315,36 @@ fn epoch_ms() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_reply_read_that_never_answers_lets_its_turn_s_end_go_without_it() {
+        // #388: the daemon took the read and never answered.
+        let seen = Seen {
+            task: "calc.quick".into(),
+            turn: 4,
+            from: "calc.quick".into(),
+            node: Some(9),
+            reply: true,
+            completed: true,
+            brief: None,
+            text: String::new(),
+            asked: Asked::Unknown,
+        };
+        let deadline = Duration::from_millis(20);
+        let read = within(deadline, std::future::pending::<Seen>(), unread(&seen)).await;
+        assert_eq!(read.asked, Asked::Unread);
+        assert_eq!((read.task.as_str(), read.turn), ("calc.quick", 4));
+        // A message's read keeps who asked: only its words are missing.
+        let message = Seen {
+            reply: false,
+            asked: Asked::Known,
+            ..seen
+        };
+        assert_eq!(unread(&message).asked, Asked::Known);
+        // An answer in time is the answer.
+        let quick = within(READ_DEADLINE, async { 7 }, 0).await;
+        assert_eq!(quick, 7);
+    }
 
     #[tokio::test]
     async fn a_long_margin_call_is_read_whole_for_its_note_s_id() {

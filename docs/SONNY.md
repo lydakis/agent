@@ -1018,6 +1018,10 @@ The host's agents see each linked machine by name:
   (agent-browser copies the profile, so the person's own Chrome is left
   alone). Paths there don't belong to the agent: a screenshot with no path
   comes back as a picture, and other files are refused.
+- `desktop` takes `machine` while that machine's agents could use its
+  desktop (agent-desktop is installed there and it shows a desktop). The
+  commands run on its desktop, checked there as its own agents' are, and
+  what acts waits for the calling agent's gate on the host.
 - `exec` lists each machine's servers under `# On NAME`. A script whose
   options line says `// @exec: {"machine": "NAME"}` runs on that machine,
   against its servers alone.
