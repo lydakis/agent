@@ -289,12 +289,22 @@ fn lines<R: AsyncBufRead + Unpin + Send + 'static>(
 /// their answers, wait for room once `QUEUED_BYTES` are queued, so a slow
 /// link holds what is queued for it to that, and its pings and cancels
 /// wait behind at most the one line being written.
+///
+/// A long call keeps its place behind the long lines before it, so its
+/// cancel, which would go ahead of it, takes it out of the queue instead
+/// while it waits there.
 #[derive(Clone)]
 struct Out {
     small: mpsc::UnboundedSender<String>,
-    large: mpsc::UnboundedSender<(String, tokio::sync::OwnedSemaphorePermit)>,
+    large: mpsc::UnboundedSender<Long>,
     room: Arc<tokio::sync::Semaphore>,
+    /// The long calls queued, by number, and whether each was let go.
+    held: Held,
 }
+
+/// A long line queued: the call it is, if one, and the room it holds.
+type Long = (Option<u64>, String, tokio::sync::OwnedSemaphorePermit);
+type Held = Arc<Mutex<HashMap<u64, bool>>>;
 
 impl Out {
     /// An `Out`, and the task that writes what it is given to `writer`.
@@ -304,12 +314,29 @@ impl Out {
         let (small, smalls) = mpsc::unbounded_channel();
         let (large, larges) = mpsc::unbounded_channel();
         let room = Arc::new(tokio::sync::Semaphore::new(QUEUED_BYTES));
-        let writing = tokio::spawn(write_out(writer, smalls, larges));
-        (Self { small, large, room }, writing)
+        let held: Held = Arc::default();
+        let writing = tokio::spawn(write_out(writer, smalls, larges, held.clone()));
+        let out = Self {
+            small,
+            large,
+            room,
+            held,
+        };
+        (out, writing)
     }
 
     /// Send `value`: at once when small, else once there is room.
     async fn send(&self, value: &Value) {
+        self.queue(None, value).await;
+    }
+
+    /// Send call `id`, `value`, as `send` does, for `cancel` to take back
+    /// while it waits.
+    async fn call(&self, id: u64, value: &Value) {
+        self.queue(Some(id), value).await;
+    }
+
+    async fn queue(&self, call: Option<u64>, value: &Value) {
         let mut text = value.to_string();
         text.push('\n');
         if text.len() <= SMALL {
@@ -318,8 +345,21 @@ impl Out {
         }
         let bytes = text.len().min(QUEUED_BYTES) as u32;
         if let Ok(room) = self.room.clone().acquire_many_owned(bytes).await {
-            let _ = self.large.send((text, room));
+            if let Some(id) = call {
+                self.held.lock().unwrap().insert(id, false);
+            }
+            let _ = self.large.send((call, text, room));
         }
+    }
+
+    /// Let call `id` go: out of the queue while it waits there, else by
+    /// telling the other end, after the call itself.
+    fn cancel(&self, id: u64) {
+        if let Some(let_go) = self.held.lock().unwrap().get_mut(&id) {
+            *let_go = true;
+            return;
+        }
+        self.tell(&json!({"id": id, "cancel": true}));
     }
 
     /// Send `value` now, whatever its size: what this end says of itself,
@@ -335,14 +375,21 @@ impl Out {
 async fn write_out<W: AsyncWrite + Unpin>(
     mut writer: W,
     mut smalls: mpsc::UnboundedReceiver<String>,
-    mut larges: mpsc::UnboundedReceiver<(String, tokio::sync::OwnedSemaphorePermit)>,
+    mut larges: mpsc::UnboundedReceiver<Long>,
+    held: Held,
 ) {
     loop {
         // The room a long line holds is given back once it is written.
         let (text, _room) = tokio::select! {
             biased;
             Some(text) = smalls.recv() => (text, None),
-            Some((text, room)) = larges.recv() => (text, Some(room)),
+            Some((call, text, room)) = larges.recv() => {
+                let let_go = call.is_some_and(|id| held.lock().unwrap().remove(&id) == Some(true));
+                if let_go {
+                    continue;
+                }
+                (text, Some(room))
+            }
             else => return,
         };
         if writer.write_all(text.as_bytes()).await.is_err() || writer.flush().await.is_err() {
@@ -776,37 +823,63 @@ async fn borrow(stream: tokio::net::UnixStream, link: Session<'_>) -> std::io::R
         let refused = done(Err(busy(machine, most)));
         return send(&mut write, &json!({"done": refused})).await;
     }
-    out.send(&json!({"id": id, "call": called["call"]})).await;
+    // Queued at once, though a long call may wait for room on a slow link,
+    // its caller watched the while: one gone takes it back before it goes.
+    let mut queued = send(&mut write, &json!({"queued": true})).await.is_ok();
+    let mut early = Vec::new();
+    if queued {
+        let call = json!({"id": id, "call": called["call"]});
+        let sending = out.call(id, &call);
+        tokio::pin!(sending);
+        loop {
+            tokio::select! {
+                () = &mut sending => break,
+                said = read.recv() => match said {
+                    Some(Ok(said)) => early.push(said),
+                    _ => {
+                        queued = false;
+                        break;
+                    }
+                },
+            }
+        }
+    }
+    if !queued {
+        waiting.lock().unwrap().remove(&id);
+        return Ok(());
+    }
+    for mut said in early {
+        said["id"] = json!(id);
+        out.send(&said).await;
+    }
     // From here the call is the link's: whatever ends this connection,
     // its entry goes and, unless it finished, the other end hears to stop.
-    let queued = send(&mut write, &json!({"queued": true})).await.is_ok();
-    let ended = queued
-        && loop {
-            tokio::select! {
-                said = from.recv() => {
-                    let Some(said) = said else { break false };
-                    let finished = said.get("done").is_some();
-                    if send(&mut write, &said).await.is_err() {
-                        break false;
-                    }
-                    if finished {
-                        break true;
-                    }
+    let ended = loop {
+        tokio::select! {
+            said = from.recv() => {
+                let Some(said) = said else { break false };
+                let finished = said.get("done").is_some();
+                if send(&mut write, &said).await.is_err() {
+                    break false;
                 }
-                said = read.recv() => {
-                    match said {
-                        Some(Ok(mut said)) => {
-                            said["id"] = json!(id);
-                            out.send(&said).await;
-                        }
-                        _ => break false,
-                    }
+                if finished {
+                    break true;
                 }
             }
-        };
+            said = read.recv() => {
+                match said {
+                    Some(Ok(mut said)) => {
+                        said["id"] = json!(id);
+                        out.send(&said).await;
+                    }
+                    _ => break false,
+                }
+            }
+        }
+    };
     waiting.lock().unwrap().remove(&id);
     if !ended {
-        out.tell(&json!({"id": id, "cancel": true}));
+        out.cancel(id);
     }
     Ok(())
 }
@@ -1601,6 +1674,32 @@ mod tests {
         assert_eq!(said.recv().await.unwrap().unwrap()["id"], 1);
         second.await.unwrap();
         assert_eq!(said.recv().await.unwrap().unwrap()["id"], 2);
+    }
+
+    #[tokio::test]
+    async fn a_long_call_let_go_while_queued_never_goes_and_one_gone_is_cancelled_after_it() {
+        let (write, read) = tokio::io::duplex(1024);
+        let (out, _writing) = Out::to(write);
+        let long = |n: u64| json!({"id": n, "call": {"input": "x".repeat(QUEUED_BYTES / 3)}});
+        out.send(&long(1)).await;
+        out.call(5, &long(5)).await;
+        // Its cancel would go ahead of it: it takes it out instead.
+        out.cancel(5);
+        out.call(6, &json!({"id": 6, "call": {}})).await;
+        out.cancel(6);
+        let mut said = lines(BufReader::new(read), LINE_BYTES, None);
+        assert_eq!(
+            said.recv().await.unwrap().unwrap(),
+            json!({"id": 6, "call": {}})
+        );
+        assert_eq!(
+            said.recv().await.unwrap().unwrap(),
+            json!({"id": 6, "cancel": true})
+        );
+        assert_eq!(said.recv().await.unwrap().unwrap()["id"], 1);
+        out.tell(&json!({"ping": true}));
+        assert_eq!(said.recv().await.unwrap().unwrap(), json!({"ping": true}));
+        assert!(out.held.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
