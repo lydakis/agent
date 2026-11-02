@@ -760,12 +760,17 @@ fn link(name: &str, value: &toml::Value) -> Result<Link, String> {
         ..Link::default()
     };
     for (key, value) in table {
-        let text = string(&format!("{at}.{key}"), value)?;
+        let key_at = format!("{at}.{key}");
         match key.as_str() {
-            "host" => link.host = text,
-            "machine" => link.machine = text,
-            "command" => link.command = Some(text),
-            "browser_profile" => link.browser_profile = text,
+            "host" => link.host = string(&key_at, value)?,
+            "machine" => link.machine = string(&key_at, value)?,
+            "command" => link.command = Some(string(&key_at, value)?),
+            // "" is a fresh browser, with no profile to start from.
+            "browser_profile" => {
+                link.browser_profile = (value.as_str())
+                    .ok_or_else(|| format!("{key_at} must be a string"))?
+                    .to_owned();
+            }
             _ => return Err(format!("unknown key {at}.{key}")),
         }
     }
@@ -1700,6 +1705,19 @@ fn replace(path: &Path, text: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_link_with_an_empty_browser_profile_starts_a_fresh_browser() {
+        let config = parse("[sonny.links.box]\nhost = \"box\"\nbrowser_profile = \"\"\n").unwrap();
+        assert_eq!(config.sonny.links["box"].browser_profile, "");
+        let config = parse("[sonny.links.box]\nhost = \"box\"\n").unwrap();
+        assert_eq!(
+            config.sonny.links["box"].browser_profile,
+            LINK_BROWSER_PROFILE
+        );
+        assert!(parse("[sonny.links.box]\nhost = \"\"\n").is_err());
+        assert!(parse("[sonny.links.box]\nhost = \"box\"\nbrowser_profile = 1\n").is_err());
+    }
 
     #[test]
     fn daemon_limits_are_numbers_or_formulas_of_the_machine() {
