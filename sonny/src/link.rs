@@ -46,9 +46,6 @@ const HEALTHY: Duration = Duration::from_secs(60);
 const LINE_BYTES: usize = 48 << 20;
 /// The largest file opened on another machine.
 const OPEN_BYTES: usize = 32 << 20;
-/// The slowest a link is taken to carry a call, in bytes a second: a call
-/// that is large has as long again as it takes at that rate to be taken.
-const CARRIED: u64 = 1 << 20;
 /// The files opened on another machine: what a viewer shows, never what
 /// runs.
 const VIEWED: [&str; 14] = [
@@ -214,13 +211,19 @@ fn not_connected(machine: &str) -> Failed {
 }
 
 /// A line of JSON from `reader`, at most `max` bytes; none at its end.
+/// `heard`, when given, is set to when the last of its bytes came, so a
+/// line that takes long to come still says the other end is there.
 async fn line<R: AsyncBufRead + Unpin>(
     reader: &mut R,
     max: usize,
+    heard: Option<&AtomicU64>,
 ) -> std::io::Result<Option<Value>> {
     let mut read = Vec::new();
     loop {
         let available = reader.fill_buf().await?;
+        if let Some(heard) = heard {
+            heard.store(now_ms(), Ordering::Relaxed);
+        }
         if available.is_empty() {
             return match read.is_empty() {
                 true => Ok(None),
@@ -253,11 +256,12 @@ async fn line<R: AsyncBufRead + Unpin>(
 fn lines<R: AsyncBufRead + Unpin + Send + 'static>(
     mut reader: R,
     max: usize,
+    heard: Option<Arc<AtomicU64>>,
 ) -> mpsc::Receiver<std::io::Result<Value>> {
     let (tx, rx) = mpsc::channel(4);
     tokio::spawn(async move {
         loop {
-            let read = line(&mut reader, max).await;
+            let read = line(&mut reader, max, heard.as_deref()).await;
             let ended = !matches!(read, Ok(Some(_)));
             let sent = match read {
                 Ok(Some(value)) => tx.send(Ok(value)).await,
@@ -345,7 +349,7 @@ pub async fn call(
     let mut read = BufReader::new(read);
     let gone = |_| not_connected(machine);
     // Proved: a file only the person's programs write.
-    let challenge = tokio::time::timeout(ACK, line(&mut read, 1024)).await;
+    let challenge = tokio::time::timeout(ACK, line(&mut read, 1024, None)).await;
     let challenge = challenge
         .map_err(|_| not_connected(machine))?
         .map_err(gone)?;
@@ -366,14 +370,14 @@ pub async fn call(
         .map_err(gone)?;
     let called = json!({"call": {"tool": tool, "payload": payload}});
     send(&mut write, &called).await.map_err(gone)?;
-    // Taken once the other end has all of it, so as long as it is to carry.
-    let carried = Duration::from_millis(called.to_string().len() as u64 * 1000 / CARRIED);
-    let first = tokio::time::timeout(ACK + carried, line(&mut read, LINE_BYTES)).await;
+    // Queued at once while the machine is there, however long the call
+    // then takes to carry, and behind whatever else is on its way.
+    let first = tokio::time::timeout(ACK, line(&mut read, LINE_BYTES, None)).await;
     let mut next = Some(first.map_err(|_| not_connected(machine))?.map_err(gone)?);
     loop {
         let said = match next.take() {
             Some(said) => said,
-            None => line(&mut read, LINE_BYTES).await.map_err(gone)?,
+            None => line(&mut read, LINE_BYTES, None).await.map_err(gone)?,
         };
         let Some(said) = said else {
             return Err(("link_refused", format!("{machine} dropped the call")));
@@ -541,15 +545,20 @@ async fn serve(machine: String) -> Result<(), String> {
     let waiting: Waiting = Arc::default();
     let ready: Ready = Arc::default();
     let next = Arc::new(AtomicU64::new(1));
-    let mut stdin = lines(BufReader::new(tokio::io::stdin()), LINE_BYTES);
-    let mut heard = Instant::now();
+    // When the lender last sent a byte: a ping a `PING`, or a line long
+    // in coming.
+    let heard = Arc::new(AtomicU64::new(now_ms()));
+    let mut stdin = lines(
+        BufReader::new(tokio::io::stdin()),
+        LINE_BYTES,
+        Some(heard.clone()),
+    );
     let mut told = Instant::now() - PING;
     let mut tick = tokio::time::interval(Duration::from_secs(5));
     loop {
         tokio::select! {
             said = stdin.recv() => {
                 let Some(Ok(said)) = said else { break };
-                heard = Instant::now();
                 if told.elapsed() >= Duration::from_secs(10) {
                     told = Instant::now();
                     let _ = replace(&dir.join(format!("{machine}.seen")), &now_ms().to_string());
@@ -582,10 +591,13 @@ async fn serve(machine: String) -> Result<(), String> {
             }
             accepted = listener.accept() => {
                 if let Ok((stream, _)) = accepted {
-                    let (out, waiting, ready, next, dir) =
-                        (out.clone(), waiting.clone(), ready.clone(), next.clone(), dir.clone());
+                    let (out, waiting, ready, next, dir, heard, machine) = (
+                        out.clone(), waiting.clone(), ready.clone(), next.clone(), dir.clone(),
+                        heard.clone(), machine.clone(),
+                    );
                     tokio::spawn(async move {
-                        let _ = borrow(stream, &dir, out, waiting, ready, next).await;
+                        let link = Session { machine: &machine, dir: &dir, out, waiting, ready, next, heard };
+                        let _ = borrow(stream, link).await;
                     });
                 }
             }
@@ -593,7 +605,8 @@ async fn serve(machine: String) -> Result<(), String> {
                 // Quiet too long, as a lender asleep; or another session's
                 // socket in this one's place.
                 let replaced = std::fs::metadata(&path).map(|m| m.ino()).ok() != ours;
-                if heard.elapsed() >= SILENT || replaced {
+                let quiet = now_ms().saturating_sub(heard.load(Ordering::Relaxed));
+                if quiet >= SILENT.as_millis() as u64 || replaced {
                     break;
                 }
             }
@@ -606,27 +619,40 @@ async fn serve(machine: String) -> Result<(), String> {
     Ok(())
 }
 
-/// One connection from this machine's own programs: proved, then its call
-/// sent down the link and what comes back sent to it, until it ends.
-async fn borrow(
-    stream: tokio::net::UnixStream,
-    dir: &Path,
+/// The session, as a connection to it sees it.
+struct Session<'a> {
+    machine: &'a str,
+    dir: &'a Path,
     out: mpsc::UnboundedSender<Value>,
     waiting: Waiting,
     ready: Ready,
     next: Arc<AtomicU64>,
-) -> std::io::Result<()> {
+    heard: Arc<AtomicU64>,
+}
+
+/// One connection from this machine's own programs: proved, then its call
+/// sent down the link and what comes back sent to it, until it ends.
+async fn borrow(stream: tokio::net::UnixStream, link: Session<'_>) -> std::io::Result<()> {
+    let Session {
+        machine,
+        dir,
+        out,
+        waiting,
+        ready,
+        next,
+        heard,
+    } = link;
     let (read, mut write) = stream.into_split();
     let mut read = BufReader::new(read);
     let challenge = nonce();
     send(&mut write, &json!({"challenge": challenge})).await?;
-    let proof = tokio::time::timeout(ACK, line(&mut read, 1024)).await;
+    let proof = tokio::time::timeout(ACK, line(&mut read, 1024, None)).await;
     let proved = matches!(&proof, Ok(Ok(Some(said))) if said["proof"] == challenge.as_str())
         && proved(&dir.join(".proof").join(&challenge));
     if !proved {
         return Ok(());
     }
-    let Some(called) = tokio::time::timeout(ACK, line(&mut read, LINE_BYTES))
+    let Some(called) = tokio::time::timeout(ACK, line(&mut read, LINE_BYTES, None))
         .await
         .ok()
         .and_then(Result::ok)
@@ -642,11 +668,19 @@ async fn borrow(
         )
         .await;
     }
+    // Not there: nothing heard from it in longer than it goes between
+    // pings, and a little.
+    let quiet = now_ms().saturating_sub(heard.load(Ordering::Relaxed));
+    if quiet > (PING + ACK).as_millis() as u64 {
+        let gone = done(Err(not_connected(machine)));
+        return send(&mut write, &json!({"done": gone})).await;
+    }
     let id = next.fetch_add(1, Ordering::SeqCst);
-    let mut read = lines(read, LINE_BYTES);
+    let mut read = lines(read, LINE_BYTES, None);
     let (to, mut from) = mpsc::unbounded_channel();
     waiting.lock().unwrap().insert(id, to);
     let _ = out.send(json!({"id": id, "call": called["call"]}));
+    send(&mut write, &json!({"queued": true})).await?;
     let ended = loop {
         tokio::select! {
             said = from.recv() => {
@@ -900,7 +934,7 @@ async fn dial(
     // with it, they are aborted too.
     let mut running = tokio::task::JoinSet::new();
     let mut calls: HashMap<u64, tokio::task::AbortHandle> = HashMap::new();
-    let mut stdout = lines(BufReader::new(stdout), LINE_BYTES);
+    let mut stdout = lines(BufReader::new(stdout), LINE_BYTES, None);
     let mut ping = tokio::time::interval(PING);
     let mut refused = None;
     // What the host was last told this machine has, told again as it
@@ -1402,7 +1436,7 @@ mod tests {
     #[tokio::test]
     async fn a_line_that_comes_in_pieces_is_read_whole_whatever_else_wakes() {
         let (mut write, read) = tokio::io::duplex(64);
-        let mut said = lines(BufReader::new(read), 1024);
+        let mut said = lines(BufReader::new(read), 1024, None);
         tokio::spawn(async move {
             write.write_all(b"{\"a\":").await.unwrap();
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1422,9 +1456,12 @@ mod tests {
     #[tokio::test]
     async fn a_line_too_long_is_refused_and_one_at_its_end_is_none() {
         let mut short: &[u8] = b"{\"a\":1}\n";
-        assert_eq!(line(&mut short, 100).await.unwrap(), Some(json!({"a": 1})));
-        assert_eq!(line(&mut short, 100).await.unwrap(), None);
+        assert_eq!(
+            line(&mut short, 100, None).await.unwrap(),
+            Some(json!({"a": 1}))
+        );
+        assert_eq!(line(&mut short, 100, None).await.unwrap(), None);
         let mut long: &[u8] = b"{\"a\":\"0123456789\"}\n";
-        assert!(line(&mut long, 8).await.is_err());
+        assert!(line(&mut long, 8, None).await.is_err());
     }
 }
