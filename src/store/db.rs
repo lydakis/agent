@@ -6276,17 +6276,18 @@ impl Database {
                 "limit must be 1 to 256 and after 0 or more",
             );
         }
-        const HELD: &str = "WITH h(id,bot,bot_id,blocked,due,started) AS (
-             SELECT t.id,t.bot,b.id,t.held,t.due_ms,0 FROM turns t JOIN bots b ON b.name=t.bot
+        // The held turns, as a bench/query_plans.py fragment.
+        const HELD: &str = "SELECT t.id,t.bot,b.id,t.held,t.due_ms,0 FROM turns t JOIN bots b ON b.name=t.bot
              WHERE t.status='ready' AND t.held IS NOT NULL AND (?1 IS NULL OR t.bot=?1)
              UNION ALL
              SELECT t.id,t.bot,b.id,json_extract(t.waiting,'$.blocked'),
                 json_extract(t.waiting,'$.deadline_ms'),1
              FROM turns t JOIN bots b ON b.name=t.bot
              WHERE t.status='paced' AND json_extract(t.waiting,'$.blocked') IS NOT NULL
-                AND (?1 IS NULL OR t.bot=?1))";
+                AND (?1 IS NULL OR t.bot=?1)";
         let mut statement = self.conn.prepare_cached(&format!(
-            "{HELD} SELECT id,bot,bot_id,blocked,due,started FROM h WHERE id>?2 ORDER BY id LIMIT ?3"
+            "WITH held(id,bot,bot_id,blocked,due,started) AS ({HELD})
+             SELECT id,bot,bot_id,blocked,due,started FROM held WHERE id>?2 ORDER BY id LIMIT ?3"
         ))?;
         let mut rows = statement.query(params![bot, after, (limit + 1) as i64])?;
         // Bounded by bytes as well as count, as `pauses` pages are.
@@ -6310,9 +6311,10 @@ impl Database {
         // One row a code: its oldest turn's detail (SQLite takes the bare
         // column from the row MIN picks).
         let mut statement = self.conn.prepare_cached(&format!(
-            "{HELD} SELECT json_extract(blocked,'$.code') AS code,COUNT(*),COUNT(DISTINCT bot),
+            "WITH held(id,bot,bot_id,blocked,due,started) AS ({HELD})
+             SELECT json_extract(blocked,'$.code') AS code,COUNT(*),COUNT(DISTINCT bot),
                 json_extract(blocked,'$.detail'),MIN(id)
-             FROM h WHERE code IS NOT NULL GROUP BY code ORDER BY MIN(id)"
+             FROM held WHERE code IS NOT NULL GROUP BY code ORDER BY MIN(id)"
         ))?;
         let mut rows = statement.query(params![bot])?;
         let (mut causes, mut total) = (Vec::new(), 0);
