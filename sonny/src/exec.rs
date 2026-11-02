@@ -106,7 +106,11 @@ type CallToolResult<TStructured = { [key: string]: unknown }> = {
 pub fn tool() -> Option<Value> {
     let servers = agent_client::config::load().ok()?.sonny.mcp_servers;
     let servers: Servers = servers.into_iter().filter(|(_, s)| s.enabled).collect();
-    if servers.is_empty() {
+    // The machines linked here that lend servers of their own.
+    let machines: Vec<crate::link::Machine> = (crate::link::machines().into_iter())
+        .filter(|machine| !machine.servers.is_empty())
+        .collect();
+    if servers.is_empty() && machines.is_empty() {
         return None;
     }
     let cache = crate::mcp::cache_dir();
@@ -121,7 +125,7 @@ pub fn tool() -> Option<Value> {
         .collect();
     Some(json!({
         "name": NAME,
-        "description": description(&servers, &known),
+        "description": description(&servers, &known, &machines),
         "parameters": {
             "type": "object",
             "properties": {"input": {"type": "string",
@@ -138,11 +142,66 @@ pub fn tool() -> Option<Value> {
 }
 
 /// The tool's description: Codex's, then each server with its tools'
-/// declarations while they fit.
-fn description(servers: &Servers, known: &BTreeMap<String, Known>) -> String {
+/// declarations while they fit, then each linked machine's.
+fn description(
+    servers: &Servers,
+    known: &BTreeMap<String, Known>,
+    machines: &[crate::link::Machine],
+) -> String {
     let mut sections = vec![DESCRIPTION.to_owned(), TYPES.to_owned()];
     let mut left = DECLARATIONS;
     let mut omitted = 0;
+    let mut collided = Vec::new();
+    collided.extend(declare(
+        servers,
+        known,
+        &mut sections,
+        &mut left,
+        &mut omitted,
+    ));
+    for machine in machines {
+        let name = &machine.name;
+        sections.push(format!(
+            "# On {name}\nThese servers are on {name}, another machine of the person's: start a script with `// @exec: {{\"machine\": \"{name}\"}}` to run it there, against them alone. A script runs on one machine, and {name} answers only while it is connected."
+        ));
+        let (servers, known): (Servers, BTreeMap<String, Known>) = (machine.servers.iter())
+            .map(|(server, lent)| {
+                let config = agent_client::config::McpServer {
+                    description: lent.description.clone(),
+                    enabled: true,
+                    ..Default::default()
+                };
+                let known = Known {
+                    tools: lent.tools.clone(),
+                    ..Known::default()
+                };
+                ((server.clone(), config), (server.clone(), known))
+            })
+            .unzip();
+        collided.extend(declare(
+            &servers,
+            &known,
+            &mut sections,
+            &mut left,
+            &mut omitted,
+        ));
+    }
+    if omitted > 0 {
+        sections.push(format!("{omitted} more tools are in `ALL_TOOLS`."));
+    }
+    sections.extend(collided);
+    sections.join("\n\n")
+}
+
+/// Each of `servers` with its tools' declarations while `left` holds them,
+/// added to `sections`; why the tools two would share a name are left out.
+fn declare(
+    servers: &Servers,
+    known: &BTreeMap<String, Known>,
+    sections: &mut Vec<String>,
+    left: &mut usize,
+    omitted: &mut usize,
+) -> Vec<String> {
     let collided = collisions(
         known
             .iter()
@@ -169,19 +228,15 @@ fn description(servers: &Servers, known: &BTreeMap<String, Known>) -> String {
                 continue;
             }
             let declared = declaration(name, tool);
-            if declared.len() > left {
-                omitted += 1;
+            if declared.len() > *left {
+                *omitted += 1;
                 continue;
             }
-            left -= declared.len();
+            *left -= declared.len();
             sections.push(declared);
         }
     }
-    if omitted > 0 {
-        sections.push(format!("{omitted} more tools are in `ALL_TOOLS`."));
-    }
-    sections.extend(collided.values().cloned());
-    sections.join("\n\n")
+    collided.into_values().collect()
 }
 
 /// The identifiers two or more tools of `listings` would share, each with
@@ -420,6 +475,8 @@ pub struct Script {
     pub code: String,
     pub max_output_tokens: Option<usize>,
     pub timeout_ms: Option<u64>,
+    /// The machine it runs on, over a link, when not this one.
+    pub machine: Option<String>,
 }
 
 /// The source of an `exec` call, with its options line read off, as
@@ -439,12 +496,13 @@ pub fn parse(input: &str) -> Result<Script, String> {
             code: input.to_owned(),
             max_output_tokens: None,
             timeout_ms: None,
+            machine: None,
         });
     };
     if rest.trim().is_empty() {
         return Err("exec pragma must be followed by JavaScript source on subsequent lines".into());
     }
-    let fields = "supported fields `max_output_tokens` and `timeout_ms`";
+    let fields = "supported fields `max_output_tokens`, `timeout_ms` and `machine`";
     let options: Value = serde_json::from_str(options.trim())
         .map_err(|e| format!("exec pragma must be valid JSON with {fields}: {e}"))?;
     let options = options
@@ -454,6 +512,7 @@ pub fn parse(input: &str) -> Result<Script, String> {
         code: rest.to_owned(),
         max_output_tokens: None,
         timeout_ms: None,
+        machine: None,
     };
     for (key, value) in options {
         let number = || {
@@ -466,6 +525,12 @@ pub fn parse(input: &str) -> Result<Script, String> {
             "timeout_ms" => script.timeout_ms = Some(number()?),
             "yield_time_ms" => {
                 number()?;
+            }
+            "machine" => {
+                let machine = value
+                    .as_str()
+                    .ok_or("exec pragma field `machine` must be a machine's name")?;
+                script.machine = Some(machine.to_owned());
             }
             _ => return Err(format!("exec pragma only supports {fields}; got `{key}`")),
         }
@@ -499,10 +564,7 @@ static ANSWERINGS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::
 /// The `exec` call a script answers, whose steps its calls are: where a
 /// call that asks first is put to the agent's gate.
 pub struct Steps {
-    pub client: Arc<Client>,
-    pub bot: String,
-    pub turn: i64,
-    pub call_id: String,
+    via: Via,
     /// This answering of the call, so its steps' ids are its own: a
     /// lookout that restarts and answers the same call again never repeats
     /// one, which the agent's judge would take as reviewed already.
@@ -510,13 +572,36 @@ pub struct Steps {
     next: std::sync::atomic::AtomicU64,
 }
 
+/// Where a step is put: this machine's daemon, or the gate of the agent of
+/// another machine whose call this answers over a link.
+enum Via {
+    Daemon {
+        client: Arc<Client>,
+        bot: String,
+        turn: i64,
+        call_id: String,
+    },
+    Link(crate::link::Asker),
+}
+
 impl Steps {
     pub fn new(client: Arc<Client>, bot: String, turn: i64, call_id: String) -> Self {
-        Self {
+        Self::via(Via::Daemon {
             client,
             bot,
             turn,
             call_id,
+        })
+    }
+
+    /// The steps of a call made over a link, put to its agent's gate there.
+    pub fn over(asker: crate::link::Asker) -> Self {
+        Self::via(Via::Link(asker))
+    }
+
+    fn via(via: Via) -> Self {
+        Self {
+            via,
             run: format!(
                 "{:x}{:x}{:x}",
                 std::time::SystemTime::now()
@@ -539,14 +624,23 @@ impl Steps {
         called: &str,
         arguments: Value,
     ) -> Result<Option<String>, String> {
+        let (client, bot, turn, call_id) = match &self.via {
+            Via::Daemon {
+                client,
+                bot,
+                turn,
+                call_id,
+            } => (client, bot, turn, call_id),
+            Via::Link(asker) => return asker.ask(tool, called, arguments).await,
+        };
         let step = format!(
             "{}.{}",
             self.run,
             self.next.fetch_add(1, Ordering::SeqCst) + 1
         );
-        let asked = json!({"bot": self.bot, "turn": self.turn, "call_id": self.call_id,
+        let asked = json!({"bot": bot, "turn": turn, "call_id": call_id,
             "step": step, "name": tool, "arguments": arguments});
-        match self.client.request("approve_step", asked).await {
+        match client.request("approve_step", asked).await {
             Ok(reply) if reply["decision"] == "allow" => Ok(reply["approvals"]
                 .as_array()
                 .is_some_and(|approvals| !approvals.is_empty())
@@ -562,9 +656,19 @@ impl Steps {
     /// Tell the agent how an allowed step ended, so its judge counts it
     /// among the calls done. Its turn may be gone by then: nothing to tell.
     pub async fn ran(&self, step: String, failed: bool) {
-        let ran = json!({"bot": self.bot, "turn": self.turn, "call_id": self.call_id,
-            "step": step, "failed": failed});
-        let _ = self.client.request("step_result", ran).await;
+        match &self.via {
+            Via::Daemon {
+                client,
+                bot,
+                turn,
+                call_id,
+            } => {
+                let ran = json!({"bot": bot, "turn": turn, "call_id": call_id,
+                    "step": step, "failed": failed});
+                let _ = client.request("step_result", ran).await;
+            }
+            Via::Link(asker) => asker.ran(step, failed).await,
+        }
     }
 }
 
@@ -583,11 +687,66 @@ pub async fn answer(
     run(hub, home_dir().as_deref(), bot, input, left, steps).await
 }
 
+/// Where the whole of an output cut to its budget goes.
+pub enum Whole<'a> {
+    /// Saved in this folder's `output`, when there is one.
+    Saved(Option<&'a Path>),
+    /// Handed back to the machine that called over a link, under the name
+    /// of the file there it is saved to.
+    Sent(&'a Path, &'a Mutex<Option<String>>),
+}
+
+/// Answer the `exec` call `bot` of another machine made over a link, as
+/// `answer` does, with the whole of an output cut to its budget handed
+/// back with the answer, for that machine to save as `named`, since no
+/// file here is that agent's. What it stores is kept under `space`, a
+/// folder of its own apart from this machine's agents.
+pub async fn lent(
+    hub: &Hub,
+    bot: &str,
+    input: &str,
+    left: Duration,
+    steps: Steps,
+    named: Option<&Path>,
+    space: &Path,
+) -> Result<Value, String> {
+    let servers = agent_client::config::load()?.sonny.mcp_servers;
+    hub.configure(&servers).await;
+    let cut = Mutex::new(None);
+    let whole = match named {
+        Some(named) => Whole::Sent(named, &cut),
+        None => Whole::Saved(None),
+    };
+    let dir = home_dir().map(|dir| dir.join("linked").join(space));
+    let answer = run_keeping(hub, dir.as_deref(), &whole, bot, input, left, Some(steps)).await?;
+    Ok(json!({"answer": answer, "whole": cut.into_inner().unwrap()}))
+}
+
+/// A file for the whole of a cut output, here, for a machine linked here
+/// to name: what it hands back is saved to it.
+pub fn whole_file() -> Option<PathBuf> {
+    let dir = home_dir()?.join("output");
+    Some(fresh(&dir).ok()?.join(format!("{}.txt", stamp())))
+}
+
 /// Run a script against the servers `hub` serves, keeping what it saves
 /// under `dir`.
 async fn run(
     hub: &Hub,
     dir: Option<&Path>,
+    bot: &str,
+    input: &str,
+    left: Duration,
+    steps: Option<Steps>,
+) -> Result<Value, String> {
+    run_keeping(hub, dir, &Whole::Saved(dir), bot, input, left, steps).await
+}
+
+/// `run`, with the whole of an output cut to its budget going to `whole`.
+async fn run_keeping(
+    hub: &Hub,
+    dir: Option<&Path>,
+    whole: &Whole<'_>,
     bot: &str,
     input: &str,
     left: Duration,
@@ -620,7 +779,7 @@ async fn run(
                 &BTreeMap::new(),
                 String::new(),
                 budget,
-                dir,
+                whole,
             )));
         }
     };
@@ -670,7 +829,7 @@ async fn run(
     let body = std::mem::take(&mut *output.lock().unwrap()).body();
     let pictures = std::mem::take(&mut *pictures.lock().unwrap());
     Ok(parts(
-        said(&ended, started, &calls, body, budget, dir),
+        said(&ended, started, &calls, body, budget, whole),
         pictures,
     ))
 }
@@ -801,7 +960,7 @@ fn said(
     calls: &BTreeMap<String, usize>,
     mut body: String,
     budget: usize,
-    dir: Option<&Path>,
+    whole: &Whole<'_>,
 ) -> String {
     let status = match ended {
         Ended::Completed => "Script completed".to_owned(),
@@ -826,7 +985,7 @@ fn said(
         }
         body.push_str(&format!("Script error:\n{error}"));
     }
-    head + &budgeted(body, budget, dir)
+    head + &budgeted(body, budget, whole)
 }
 
 /// What a script printed, a line for each `text()`, kept within
@@ -922,18 +1081,24 @@ impl Drop for Stop {
 
 /// `body` within `tokens`, of about four bytes each: its start and end,
 /// with the whole saved to a file the cut names.
-fn budgeted(body: String, tokens: usize, dir: Option<&Path>) -> String {
+fn budgeted(body: String, tokens: usize, whole: &Whole<'_>) -> String {
     let bytes = tokens.saturating_mul(4);
     if body.len() <= bytes {
         return body;
     }
-    let saved = dir.and_then(|dir| {
-        let file = fresh(&dir.join("output"))
-            .ok()?
-            .join(format!("{}.txt", stamp()));
-        std::fs::write(&file, &body).ok()?;
-        Some(file)
-    });
+    let saved = match whole {
+        Whole::Saved(dir) => dir.and_then(|dir| {
+            let file = fresh(&dir.join("output"))
+                .ok()?
+                .join(format!("{}.txt", stamp()));
+            std::fs::write(&file, &body).ok()?;
+            Some(file)
+        }),
+        Whole::Sent(named, cut) => {
+            *cut.lock().unwrap() = Some(body.clone());
+            Some(named.to_path_buf())
+        }
+    };
     let half = bytes / 2;
     let mut start = half;
     while !body.is_char_boundary(start) {
@@ -1681,9 +1846,13 @@ mod tests {
             Script {
                 code: "text(1)".into(),
                 max_output_tokens: Some(5),
-                timeout_ms: Some(9)
+                timeout_ms: Some(9),
+                machine: None,
             }
         );
+        let there = parse("// @exec: {\"machine\": \"mac\"}\ntext(1)").unwrap();
+        assert_eq!(there.machine.as_deref(), Some("mac"));
+        assert!(parse("// @exec: {\"machine\": 1}\ntext(1)").is_err());
         assert!(parse("  ").is_err());
         assert!(parse("// @exec: {}\n").is_err());
         assert!(
@@ -1751,7 +1920,7 @@ mod tests {
             },
         )]
         .into();
-        let text = description(&servers, &known);
+        let text = description(&servers, &known, &[]);
         assert!(text.contains("## test\nTest tools"));
         assert!(text.contains("declare const tools: { mcp__test__tool0(args: { [key: string]: unknown; }): Promise<CallToolResult>; };"));
         let declared = text.matches("### `mcp__test__").count();
@@ -1759,7 +1928,7 @@ mod tests {
         assert!(text.ends_with(&format!("{} more tools are in `ALL_TOOLS`.", 40 - declared)));
         // A server not listed yet is still named.
         let unlisted: BTreeMap<String, Known> = [("test".to_owned(), Known::default())].into();
-        assert!(description(&servers, &unlisted).contains("once it starts"));
+        assert!(description(&servers, &unlisted, &[]).contains("once it starts"));
     }
 
     fn scratch(name: &str) -> PathBuf {
@@ -2347,7 +2516,7 @@ text(ALL_TOOLS.map(t => t.name).join(","));"#,
                 )
             })
             .collect();
-        let described = description(&servers, &known);
+        let described = description(&servers, &known, &[]);
         assert!(
             !described.contains("### `mcp__my_server__echo`"),
             "{described}"
@@ -2570,7 +2739,7 @@ text(ALL_TOOLS.map(t => t.name).join(","));"#,
         (std::fs::File::options().write(true).open(&old).unwrap())
             .set_modified(week_ago)
             .unwrap();
-        budgeted("y".repeat(100), 1, dir.parent());
+        budgeted("y".repeat(100), 1, &Whole::Saved(dir.parent()));
         let left: Vec<String> = (std::fs::read_dir(&dir).unwrap().flatten())
             .map(|entry| entry.file_name().to_string_lossy().into_owned())
             .collect();

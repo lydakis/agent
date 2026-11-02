@@ -231,7 +231,15 @@ async fn follow_config(client: Arc<Client>) {
     let mut seen = None;
     let mut waiting: Vec<Value> = Vec::new();
     let mut live = std::collections::HashSet::new();
+    // What the machines linked here lend, which their agents' tools say.
+    let mut lent = crate::link::stamp();
     loop {
+        let now_lent = crate::link::stamp();
+        if now_lent != lent {
+            lent = now_lent;
+            let bots = crate::lookout::all_bots(&client).await;
+            tokio::spawn(refresh_tools(client.clone(), bots));
+        }
         let rules = crate::rules::given();
         let now = (stamp(), rules.clone());
         if seen.as_ref() != Some(&now) {

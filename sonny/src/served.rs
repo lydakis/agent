@@ -1022,6 +1022,8 @@ async fn serve(store: PathBuf, socket: PathBuf, nudge: Arc<Notify>, serving: Ser
     };
     // The MCP servers scripts call, kept up between calls.
     let hub = crate::mcp::Hub::for_person();
+    // This machine lent to those it links to, from these same servers.
+    tokio::spawn(crate::link::keep(hub.clone()));
     loop {
         if let Ok((client, _events)) = Client::connect(&socket).await {
             loop {
@@ -1161,6 +1163,24 @@ async fn script(
         call["turn"].as_i64().unwrap_or(0),
         str_of(&call["call_id"]),
     );
+    // On the machine its options line names, against that machine's
+    // servers, with this agent's gate asked what they ask first.
+    if let Ok(crate::exec::Script {
+        machine: Some(machine),
+        ..
+    }) = crate::exec::parse(input)
+    {
+        // What the output's budget cuts comes back whole, saved here, where
+        // the agent reads it.
+        let whole = crate::exec::whole_file();
+        let lent = json!({"input": input, "bot": bot, "timeout_ms": left(call).as_millis() as u64,
+            "whole": whole, "store": client.store().unwrap_or_default()});
+        let answer = crate::link::call(&machine, EXEC, lent, Some(&steps)).await?;
+        if let (Some(file), Some(text)) = (&whole, answer["whole"].as_str()) {
+            let _ = std::fs::write(file, text);
+        }
+        return Ok(answer["answer"].clone());
+    }
     crate::exec::answer(hub, &bot, input, left(call), Some(steps))
         .await
         .map_err(|e| ("exec_refused", e))
