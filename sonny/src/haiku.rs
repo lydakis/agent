@@ -73,8 +73,16 @@ impl Default for Rule {
 #[derive(Debug)]
 pub struct Title {
     pub rule: Rule,
-    /// Each message and tool call of the window: when, and whose.
-    busy: VecDeque<(Instant, String)>,
+    /// Each message and tool call of the window: when, and whose, by
+    /// its place in `names`.
+    busy: VecDeque<(Instant, u32)>,
+    /// Who has a message or call in the window, and how many, kept as
+    /// `busy` changes: weighing goes through who is busy, not through all
+    /// they did, and the window keeps no name of its own.
+    names: Vec<(String, u64)>,
+    places: HashMap<String, u32>,
+    /// Places whose count came to none, to give out again.
+    free: Vec<u32>,
     /// The holder, by name, and since when.
     pub holder: Option<(String, Instant)>,
     /// When watching began: the first title waits a whole window, so it
@@ -87,6 +95,9 @@ impl Title {
         Title {
             rule,
             busy: VecDeque::new(),
+            names: Vec::new(),
+            places: HashMap::new(),
+            free: Vec::new(),
             holder: None,
             opened: now,
         }
@@ -99,14 +110,41 @@ impl Title {
             return;
         }
         self.forget(now);
-        self.busy.push_back((now, name.to_owned()));
+        let place = match self.places.get(name) {
+            Some(&place) => place,
+            None => {
+                let place = match self.free.pop() {
+                    Some(place) => {
+                        self.names[place as usize].0 = name.to_owned();
+                        place
+                    }
+                    None => {
+                        self.names.push((name.to_owned(), 0));
+                        (self.names.len() - 1) as u32
+                    }
+                };
+                self.places.insert(name.to_owned(), place);
+                place
+            }
+        };
+        self.names[place as usize].1 += 1;
+        self.busy.push_back((now, place));
     }
 
     /// Let go of what is older than the window.
     fn forget(&mut self, now: Instant) {
         let window = self.rule.window;
         while (self.busy.front()).is_some_and(|(at, _)| now.duration_since(*at) > window) {
-            self.busy.pop_front();
+            let Some((_, place)) = self.busy.pop_front() else {
+                break;
+            };
+            let (name, count) = &mut self.names[place as usize];
+            *count -= 1;
+            if *count == 0 {
+                self.places.remove(name.as_str());
+                name.clear();
+                self.free.push(place);
+            }
         }
     }
 
@@ -119,21 +157,18 @@ impl Title {
         if self.holder.as_ref().is_some_and(|(name, _)| gone(name)) {
             self.holder = None;
         }
-        let mut counts: HashMap<&str, u64> = HashMap::new();
-        for (_, name) in &self.busy {
-            *counts.entry(name).or_default() += 1;
-        }
         let holder = self.holder.as_ref().map(|(name, _)| name.as_str());
-        // The busiest; on a tie, the holder keeps it, else the first seen.
-        let (best, most) = (counts.iter())
-            .filter(|&(&name, _)| !gone(name))
-            .map(|(&name, &n)| (name, n))
+        // The busiest; on a tie, the holder keeps it, else the first by name.
+        let (best, most) = (self.names.iter())
+            .filter(|(name, n)| *n > 0 && !gone(name))
+            .map(|(name, n)| (name.as_str(), *n))
             .max_by_key(|&(name, n)| (n, Some(name) == holder, std::cmp::Reverse(name)))?;
         let passes = match &self.holder {
             None => now.duration_since(self.opened) >= window,
             Some((name, _)) if name == best => false,
             Some((name, since)) => {
-                let held = counts.get(name.as_str()).copied().unwrap_or(0);
+                let held = (self.places.get(name.as_str()))
+                    .map_or(0, |&place| self.names[place as usize].1);
                 now.duration_since(*since) >= self.rule.hold
                     && most > held
                     && most * 100 >= held * (100 + self.rule.margin)
@@ -626,5 +661,68 @@ mod tests {
         assert_eq!(Kept::load(&store, Path::new("/tmp/agent.sock")), kept);
         assert_eq!(Kept::load(&store, Path::new("/tmp/other.sock")).by, "x");
         let _ = std::fs::remove_dir_all(store.file.unwrap().parent().unwrap());
+    }
+}
+
+#[cfg(test)]
+mod scale {
+    use super::*;
+
+    /// The busiest-agent window at fleet scale: a ten-minute window of
+    /// messages and tool calls from 10,000 agents, weighed once a second.
+    /// `cargo test -p sonny --release haiku::scale -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn the_window_at_fleet_scale() {
+        /// Resident memory now, in KiB, what was freed given back first so
+        /// this counts what is held; none where it can't be read.
+        #[cfg(target_os = "linux")]
+        fn rss_kib() -> usize {
+            // SAFETY: malloc_trim only returns free heap pages to the system.
+            unsafe { libc::malloc_trim(0) };
+            std::fs::read_to_string("/proc/self/statm")
+                .ok()
+                .and_then(|s| s.split_whitespace().nth(1)?.parse::<usize>().ok())
+                .map_or(0, |pages| pages * 4)
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        fn rss_kib() -> usize {
+            0
+        }
+        let names: Vec<String> = (0..10_000)
+            .map(|n| format!("p{}.task-{n}", n % 100))
+            .collect();
+        let rule = Rule {
+            daily: 8,
+            window: Duration::from_secs(600),
+            margin: 50,
+            hold: Duration::from_secs(600),
+        };
+        let start = Instant::now();
+        let before = rss_kib();
+        let mut title = Title::new(rule, start);
+        // 2,000 a second for the window, weighed each second.
+        let (mut noted, mut weighed) = (Duration::ZERO, Duration::ZERO);
+        for second in 0..600u64 {
+            let now = start + Duration::from_secs(second);
+            let clock = Instant::now();
+            for n in 0..2_000usize {
+                title.note(
+                    now,
+                    &names[(second as usize * 2_000 + n) * 7919 % names.len()],
+                );
+            }
+            noted += clock.elapsed();
+            let clock = Instant::now();
+            title.crown(now, |_| false);
+            weighed += clock.elapsed();
+        }
+        let held = rss_kib().saturating_sub(before);
+        eprintln!(
+            "TITLE 1.2M in window: rss +{held} KiB, note {:.0} ns each, crown {:?} each",
+            noted.as_nanos() as f64 / 1.2e6,
+            weighed / 600
+        );
     }
 }

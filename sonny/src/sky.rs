@@ -329,6 +329,9 @@ struct Agent {
     sender: Option<End>,
     /// The model it runs.
     model: String,
+    /// Its model as `m` colours it, worked out when the model changes
+    /// rather than each frame.
+    named: String,
     gone: bool,
     // Laid out: where it is drawn now, gliding from where it was to where
     // the layout puts it.
@@ -345,10 +348,18 @@ impl Agent {
     /// Its model, as `m` colours it: by name and provider, so one
     /// model's ids from one provider, as two Bedrock regions', share a
     /// colour.
-    fn model_or_unknown(&self) -> String {
+    fn model_or_unknown(&self) -> &str {
         match self.model.as_str() {
-            "" => "unknown".to_owned(),
-            model => crate::models::named(model),
+            "" => "unknown",
+            _ => &self.named,
+        }
+    }
+
+    /// It runs `model` now.
+    fn set_model(&mut self, model: &str) {
+        if self.model != model {
+            self.model = model.to_owned();
+            self.named = crate::models::named(model);
         }
     }
 
@@ -557,7 +568,7 @@ struct Replay {
     cast: Vec<Value>,
     /// Every event from `from` on, in the store's order, and how many
     /// have played.
-    tape: Vec<Value>,
+    tape: Vec<Taped>,
     played: usize,
     /// The tape holds all the past; what comes after is live.
     ready: bool,
@@ -576,6 +587,32 @@ struct Replay {
     /// at the replay's time shows, as it did then.
     poems: Vec<haiku::Poem>,
     poem: Option<i64>,
+}
+
+/// An event on a replay's tape, kept as its text: a tenth of what the
+/// event takes parsed, a full tape tens of megabytes rather than
+/// hundreds. It is read again as it plays. When it was written, and
+/// whether it made an agent, which a step back looks for, are kept beside
+/// it.
+#[derive(Debug)]
+struct Taped {
+    written: Option<i64>,
+    made: bool,
+    text: Box<str>,
+}
+
+impl Taped {
+    fn new(event: &Value) -> Self {
+        Taped {
+            written: event["written_ms"].as_i64(),
+            made: matches!(event["event"].as_str(), Some("created" | "forked")),
+            text: event.to_string().into_boxed_str(),
+        }
+    }
+
+    fn event(&self) -> Value {
+        serde_json::from_str(&self.text).unwrap_or_default()
+    }
 }
 
 /// Who told whom, agent to agent: the last message of each pair, oldest
@@ -632,13 +669,13 @@ impl Replay {
     /// Who was made or removed in what goes is folded into the cast, as a
     /// keyframe takes in the frames before it.
     fn keep(&mut self, event: Value) {
-        self.tape.push(event);
+        self.tape.push(Taped::new(&event));
         let gone = TAPE / 10;
         if self.tape.len() <= TAPE {
             return;
         }
         self.cut |= self.played < gone;
-        for event in self.tape.drain(..gone) {
+        for event in self.tape.drain(..gone).map(|taped| taped.event()) {
             self.prior.keep(&event);
             let Some(name) = event["bot"].as_str() else {
                 continue;
@@ -659,7 +696,7 @@ impl Replay {
             }
         }
         self.played = self.played.saturating_sub(gone);
-        if let Some(first) = self.tape.first().and_then(|e| e["written_ms"].as_i64()) {
+        if let Some(first) = self.tape.first().and_then(|taped| taped.written) {
             self.from = self.from.max(first);
         }
         self.at = self.at.max(self.from as f64);
@@ -674,11 +711,11 @@ impl Replay {
                 bot["model"] = json!(model);
             }
         }
-        for event in &mut self.tape {
-            if matches!(event["event"].as_str(), Some("created" | "forked"))
-                && let Some(model) = new(&event["bot"])
-            {
+        for taped in self.tape.iter_mut().filter(|taped| taped.made) {
+            let mut event = taped.event();
+            if let Some(model) = new(&event["bot"]) {
                 event["data"]["model"] = json!(model);
+                *taped = Taped::new(&event);
             }
         }
     }
@@ -1074,10 +1111,8 @@ impl View {
                     if let Some(replay) = &mut self.replay {
                         replay.remodel(&HashMap::from([(name.as_str(), model.as_str())]));
                     }
-                    if let Some(at) = self.agent(&name)
-                        && self.agents[at].model != model
-                    {
-                        self.agents[at].model = model;
+                    if let Some(at) = self.agent(&name) {
+                        self.agents[at].set_model(&model);
                     }
                 }
                 Feed::Ready => self.live = true,
@@ -1461,10 +1496,10 @@ impl View {
             let Some(replay) = &mut self.replay else {
                 return;
             };
-            let Some(event) = replay.tape.get(replay.played) else {
+            let Some(taped) = replay.tape.get(replay.played) else {
                 return;
             };
-            let written = event["written_ms"].as_f64().unwrap_or(replay.from as f64);
+            let written = taped.written.unwrap_or(replay.from) as f64;
             if written > replay.at {
                 return;
             }
@@ -1473,7 +1508,7 @@ impl View {
                 .checked_sub(Duration::from_secs_f64(ago))
                 .unwrap_or(self.opened.min(now));
             let age = Duration::from_secs_f64((replay.at - written).max(0.0) / 1000.0);
-            let event = event.clone();
+            let event = taped.event();
             replay.played += 1;
             self.written = Some(written as i64);
             self.history = Some((now, age));
@@ -1497,12 +1532,10 @@ impl View {
             replay.played = 0;
             // Who the tape makes waits for its making; a name used again
             // is someone else, told apart by id as `seat` tells them.
-            let mut made: HashMap<&str, Vec<Option<i64>>> = HashMap::new();
-            for event in &replay.tape {
-                if matches!(event["event"].as_str(), Some("created" | "forked"))
-                    && let Some(name) = event["bot"].as_str()
-                {
-                    made.entry(name)
+            let mut made: HashMap<String, Vec<Option<i64>>> = HashMap::new();
+            for event in (replay.tape.iter().filter(|taped| taped.made)).map(Taped::event) {
+                if let Some(name) = event["bot"].as_str() {
+                    made.entry(name.to_owned())
                         .or_default()
                         .push(event["data"]["bot_id"].as_i64());
                 }
@@ -1686,10 +1719,7 @@ impl View {
             .map(str::to_owned);
         agent.made_by_id = bot["created_by_id"].as_i64();
         agent.running = bot["running_turn"].as_i64();
-        let model = bot["model"].as_str().unwrap_or_default();
-        if agent.model != model {
-            agent.model = model.to_owned();
-        }
+        agent.set_model(bot["model"].as_str().unwrap_or_default());
         Some(at)
     }
 
@@ -2646,7 +2676,12 @@ impl View {
             .filter(|&at| !self.agents[at].gone)
             .map(|at| (interest(at), at))
             .collect();
-        ranked.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+        // The `room` most interesting, picked rather than all sorted:
+        // which they are, not their order, is what is drawn.
+        let order = |a: &(f32, usize), b: &(f32, usize)| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1));
+        if room > 0 && room < ranked.len() {
+            ranked.select_nth_unstable_by(room - 1, order);
+        }
         let mut shown = vec![false; count];
         for (n, (score, at)) in ranked.into_iter().enumerate() {
             shown[at] = n < room || score >= 500.0;
@@ -2964,7 +2999,11 @@ impl View {
             }
         }
         let shade = Shade::now();
-        let hues: HashMap<String, Color> = self.hues().into_iter().collect();
+        // Only on `m` are stars in their models' colours.
+        let hues: HashMap<String, Color> = match self.models {
+            true => self.hues().into_iter().collect(),
+            false => HashMap::new(),
+        };
         // The folded: a faint dot each, so a cloud's density says its size,
         // and a count on each arm.
         let mut folded: HashMap<usize, (usize, (f32, f32))> = HashMap::new();
@@ -2991,7 +3030,7 @@ impl View {
             // On `m`, each in its model's colour instead, bold while it
             // works.
             let hue = (self.models)
-                .then(|| hues.get(&agent.model_or_unknown()).copied())
+                .then(|| hues.get(agent.model_or_unknown()).copied())
                 .flatten();
             let stilled = Self::stilled(cord.as_ref(), &sky, agent.at);
             let (ink, big) = match (hue, agent.state()) {
@@ -3424,11 +3463,13 @@ impl View {
     /// Each model's colour on `m`: the most agents' first, then by name,
     /// a hue each while they last; the rest share the text's.
     fn hues(&self) -> Vec<(String, Color)> {
-        let mut models: HashMap<String, usize> = HashMap::new();
+        let mut models: HashMap<&str, usize> = HashMap::new();
         for agent in self.agents.iter().filter(|a| !a.gone) {
             *models.entry(agent.model_or_unknown()).or_default() += 1;
         }
-        let mut models: Vec<(String, usize)> = models.into_iter().collect();
+        let mut models: Vec<(String, usize)> = (models.into_iter())
+            .map(|(model, n)| (model.to_owned(), n))
+            .collect();
         models.sort_by(|(a, n), (b, m)| m.cmp(n).then_with(|| a.cmp(b)));
         (models.into_iter())
             .map(|(model, _)| model)
@@ -3584,12 +3625,17 @@ impl View {
         // providers serve one model.
         if self.models {
             let hues = self.hues();
-            let names: HashMap<String, String> = (self.agents.iter())
-                .filter(|a| !a.model.is_empty())
-                .map(|a| (a.model_or_unknown(), crate::models::label(&a.model)))
+            // Each model's id once, then its name: a few models, however
+            // many agents.
+            let mut ids: HashMap<&str, &str> = HashMap::new();
+            for agent in self.agents.iter().filter(|a| !a.model.is_empty()) {
+                ids.entry(agent.model_or_unknown()).or_insert(&agent.model);
+            }
+            let names: HashMap<&str, String> = (ids.into_iter())
+                .map(|(key, id)| (key, crate::models::label(id)))
                 .collect();
             let named: Vec<String> = (hues.iter())
-                .map(|(key, _)| names.get(key).unwrap_or(key).clone())
+                .map(|(key, _)| names.get(key.as_str()).unwrap_or(key).clone())
                 .collect();
             for ((key, hue), short) in hues.iter().zip(&named) {
                 let model = match named.iter().filter(|n| *n == short).count() {
@@ -5889,7 +5935,7 @@ mod tests {
         assert!(replay.cut);
         assert!(replay.at >= replay.from as f64);
         assert_eq!(
-            replay.tape.last().unwrap()["written_ms"],
+            replay.tape.last().unwrap().event()["written_ms"],
             2 * TAPE as i64 - 1
         );
         // Paused with a fifth played, twice the bound more stays bound too.
@@ -5995,7 +6041,7 @@ mod tests {
         replay.keep(json!({"event": "created", "bot": "b", "data": {"model": "m1"}}));
         replay.remodel(&HashMap::from([("a", "m2"), ("b", "m3")]));
         assert_eq!(replay.cast[0]["model"], "m2");
-        assert_eq!(replay.tape[0]["data"]["model"], "m3");
+        assert_eq!(replay.tape[0].event()["data"]["model"], "m3");
     }
 
     #[tokio::test]
@@ -6029,7 +6075,7 @@ mod tests {
             .unwrap();
         view.drain();
         let replay = view.replay.as_ref().unwrap();
-        assert_eq!(replay.tape[0]["data"]["model"], "m2");
+        assert_eq!(replay.tape[0].event()["data"]["model"], "m2");
     }
 
     #[tokio::test]
@@ -7430,5 +7476,183 @@ mod scale {
                 "{count:>6} agents: first frame {first:?}, then {frame:?} a frame; list {list:?}"
             );
         }
+    }
+
+    /// Resident memory now, in KiB, what was freed given back first so
+    /// this counts what is held; none where it can't be read.
+    #[cfg(target_os = "linux")]
+    fn rss_kib() -> usize {
+        // SAFETY: malloc_trim only returns free heap pages to the system.
+        unsafe { libc::malloc_trim(0) };
+        std::fs::read_to_string("/proc/self/statm")
+            .ok()
+            .and_then(|s| s.split_whitespace().nth(1)?.parse::<usize>().ok())
+            .map_or(0, |pages| pages * 4)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn rss_kib() -> usize {
+        0
+    }
+
+    fn fleet(count: usize) -> (Vec<Value>, usize) {
+        let projects = (count / 100).max(1);
+        let mut bots = Vec::new();
+        for p in 0..projects {
+            bots.push(
+                json!({"name": format!("p{p}.lead"), "bot_id": p + 1, "model": "gpt-6.1-sol"}),
+            );
+        }
+        for n in 0..count - projects {
+            let p = n % projects;
+            bots.push(
+                json!({"name": format!("p{p}.task-{n}"), "created_by": format!("p{p}.lead"),
+                "created_by_id": p + 1, "bot_id": 100_000 + n, "model": "gpt-6.1-sol",
+                "running_turn": (n % 4 == 0).then_some(1)}),
+            );
+        }
+        (bots, projects)
+    }
+
+    /// One live event of a busy fleet: a lead tells a task, the task
+    /// works (tool calls), its turn ends.
+    fn busy(n: usize, count: usize, projects: usize) -> Value {
+        let task = (n * 7919) % (count - projects);
+        let p = task % projects;
+        let bot = format!("p{p}.task-{task}");
+        let turn = 2 + (n / count) as i64;
+        let (event, data) = match n % 8 {
+            0 => (
+                "accepted",
+                json!({"from": {"bot": format!("p{p}.lead"), "bot_id": p + 1}}),
+            ),
+            1 | 3 | 5 => (
+                "tool_started",
+                json!({"name": "shell", "call_id": format!("c{n}")}),
+            ),
+            2 | 4 | 6 => (
+                "tool_completed",
+                json!({"name": "shell", "call_id": format!("c{}", n - 1)}),
+            ),
+            _ => ("turn_finished", json!({"status": "completed"})),
+        };
+        json!({"cursor": n + 1, "event": event, "bot": bot, "turn": turn, "data": data,
+            "written_ms": wall_ms()})
+    }
+
+    fn pct(mut times: Vec<Duration>, p: usize) -> Duration {
+        times.sort();
+        times[(times.len() * p / 100).min(times.len() - 1)]
+    }
+
+    /// The sky at fleet scale, one size a run so memory is its own:
+    /// `SKY_AGENTS=10000 cargo test -p sonny --release fleet_profile -- --ignored --nocapture`.
+    #[tokio::test]
+    #[ignore]
+    async fn fleet_profile() {
+        let count: usize = std::env::var("SKY_AGENTS")
+            .ok()
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(1_000);
+        let events: usize = std::env::var("SKY_EVENTS")
+            .ok()
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(200_000);
+        let base = rss_kib();
+        let (send, feed) = mpsc::unbounded_channel();
+        let mut view = View::with(PathBuf::new(), feed, tokio::spawn(async {}));
+        let (bots, projects) = fleet(count);
+        // Who told whom before: a past of accepted turns.
+        for n in 0..count * 2 {
+            let mut event = busy(n * 8, count, projects);
+            event["written_ms"] = json!(wall_ms() - 1_000);
+            send.send(Feed::Past(event)).unwrap();
+        }
+        send.send(Feed::Roll(bots)).unwrap();
+        send.send(Feed::Ready).unwrap();
+        let start = Instant::now();
+        while !view.feed.is_empty() {
+            view.drain();
+        }
+        let seated = start.elapsed();
+        let start = Instant::now();
+        view.card(200, 56);
+        let first = start.elapsed();
+        let after_open = rss_kib();
+        // Live: as many events as the follow can bring, drained whole.
+        let mut drained = Duration::ZERO;
+        for chunk in 0..events / 1000 {
+            for n in chunk * 1000..(chunk + 1) * 1000 {
+                send.send(Feed::Live(busy(n, count, projects))).unwrap();
+            }
+            let start = Instant::now();
+            while !view.feed.is_empty() {
+                view.drain();
+            }
+            drained += start.elapsed();
+        }
+        // Steady: each frame some events, then the frame.
+        let per_frame = count / 20;
+        let (mut drains, mut frames) = (Vec::new(), Vec::new());
+        for f in 0..200 {
+            for n in 0..per_frame {
+                send.send(Feed::Live(busy(
+                    events + f * per_frame + n,
+                    count,
+                    projects,
+                )))
+                .unwrap();
+            }
+            let start = Instant::now();
+            while !view.feed.is_empty() {
+                view.drain();
+            }
+            drains.push(start.elapsed());
+            let start = Instant::now();
+            view.card(200, 56);
+            frames.push(start.elapsed());
+        }
+        let start = Instant::now();
+        view.card(50, 20);
+        let list = start.elapsed();
+        let live_rss = rss_kib();
+        // A replay's tape, full, with the view let go first.
+        drop(view);
+        let live_gone = rss_kib();
+        let mut replay = Replay::new(wall_ms() - 3_600_000);
+        let start = Instant::now();
+        for n in 0..TAPE + TAPE / 20 {
+            replay.keep(slim(busy(n, count, projects)));
+        }
+        let taped = start.elapsed();
+        let tape_rss = rss_kib();
+        eprintln!("SKY {count} agents ({projects} projects)");
+        eprintln!(
+            "  open: seat+past {seated:?}, first frame {first:?}, rss +{} KiB",
+            after_open.saturating_sub(base)
+        );
+        eprintln!(
+            "  live: {events} events drained in {drained:?} = {:.2} us/event",
+            drained.as_secs_f64() * 1e6 / events as f64
+        );
+        eprintln!(
+            "  steady ({per_frame} events/frame): drain p50 {:?} p95 {:?}; card p50 {:?} p95 {:?}; list {list:?}",
+            pct(drains.clone(), 50),
+            pct(drains, 95),
+            pct(frames.clone(), 50),
+            pct(frames, 95)
+        );
+        eprintln!(
+            "  rss after live {} KiB (+{} since open)",
+            live_rss.saturating_sub(base),
+            live_rss.saturating_sub(after_open)
+        );
+        eprintln!(
+            "  tape: {} events kept in {taped:?}, {} on tape, rss +{} KiB",
+            TAPE + TAPE / 20,
+            replay.tape.len(),
+            tape_rss as i64 - live_gone as i64
+        );
+        drop(replay);
     }
 }

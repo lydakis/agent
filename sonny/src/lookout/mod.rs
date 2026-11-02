@@ -629,6 +629,7 @@ async fn serve(settings: Settings) -> Result<(), String> {
         runner: sources::Runner::new(beside(&settings.store, ".sources"), sent),
         store: settings.store.clone(),
         records: HashMap::new(),
+        made: Made::default(),
         working: HashMap::new(),
         subscribers: HashMap::new(),
         registry: Arc::default(),
@@ -745,6 +746,8 @@ struct Service {
     /// Every bot as the daemon lists it, kept up from the stream: who made
     /// whom, for subscriptions to tasks of a bot other than the lead.
     records: HashMap<String, Value>,
+    /// Who made whom among `records`.
+    made: Made,
     /// The folder each turn under way works in, as it started: a bot may
     /// move between turns.
     working: HashMap<(String, i64), PathBuf>,
@@ -816,20 +819,63 @@ struct Service {
     rewriting: HashSet<(String, i64, String)>,
 }
 
-/// Every bot that one of `made` made, and what those made, as the daemon
-/// lists them; side chats are no one's tasks.
-fn grow(made: &mut HashSet<String>, records: &HashMap<String, Value>) {
-    loop {
-        let before = made.len();
+/// Who made whom among the bots the daemon lists, kept as the listing
+/// changes: a lineage grows through what each bot made, as a tree's
+/// child lists are walked, rather than through every bot listed again
+/// for each lookout and each generation.
+#[derive(Debug, Default)]
+struct Made {
+    /// By maker's name, listed or not: what it made, and whether each is
+    /// a side chat, which is no one's task.
+    by: HashMap<String, Vec<(String, bool)>>,
+    /// The leads listed.
+    leads: HashSet<String>,
+}
+
+impl Made {
+    fn of(records: &HashMap<String, Value>) -> Self {
+        let mut made = Made::default();
         for (name, record) in records {
-            if (record["created_by"].as_str()).is_some_and(|by| made.contains(by))
-                && record["expire_ms"].is_null()
-            {
-                made.insert(name.clone());
+            made.add(name, record);
+        }
+        made
+    }
+
+    fn add(&mut self, name: &str, record: &Value) {
+        if let Some(by) = record["created_by"].as_str() {
+            let side = !record["expire_ms"].is_null();
+            self.by
+                .entry(by.to_owned())
+                .or_default()
+                .push((name.to_owned(), side));
+        }
+        if crate::project::lead_project(name).is_some() {
+            self.leads.insert(name.to_owned());
+        }
+    }
+
+    fn remove(&mut self, name: &str, record: &Value) {
+        if let Some(by) = record["created_by"].as_str()
+            && let Some(made) = self.by.get_mut(by)
+        {
+            made.retain(|(made, _)| made != name);
+            if made.is_empty() {
+                self.by.remove(by);
             }
         }
-        if made.len() == before {
-            return;
+        self.leads.remove(name);
+    }
+
+    /// Every bot that one of `made` made, and what those made; side chats
+    /// are no one's tasks.
+    fn grow(&self, made: &mut HashSet<String>) {
+        let mut next: Vec<String> = made.iter().cloned().collect();
+        while let Some(by) = next.pop() {
+            for (name, _) in (self.by.get(&by).into_iter().flatten()).filter(|(_, side)| !side) {
+                if made.insert(name.clone()) {
+                    next.push(name.clone());
+                }
+            }
         }
     }
 }
@@ -968,6 +1014,7 @@ impl Service {
         self.records = (bots.iter())
             .filter_map(|b| Some((b["name"].as_str()?.to_owned(), b.clone())))
             .collect();
+        self.made = Made::of(&self.records);
         // Turns begun before the lookout watched, whose start it may not
         // hear again.
         crate::snapshot::running_now(
@@ -1032,6 +1079,9 @@ impl Service {
         // cuts short goes on from where it got to.
         self.resume = self.floor().or(self.resume);
         self.ended_unseen(&bots);
+        // The listing is in `records` now: let it go rather than hold a
+        // second copy of every bot for as long as the lookout watches.
+        drop(bots);
         let replay = match self.started {
             true => self.replay,
             false => self.replay_floor(),
@@ -1137,14 +1187,19 @@ impl Service {
                     {
                         let mut record = event["data"].clone();
                         record["name"] = json!(name);
-                        self.records.insert(name.to_owned(), record.clone());
+                        if let Some(had) = self.records.insert(name.to_owned(), record.clone()) {
+                            self.made.remove(name, &had);
+                        }
+                        self.made.add(name, &record);
                         self.seat(&client, &record).await;
                     }
                     if event["event"] == "deleted"
                         && let Some(name) = event["bot"].as_str()
                     {
                         self.in_flight.retain(|(bot, _), _| bot != name);
-                        self.records.remove(name);
+                        if let Some(had) = self.records.remove(name) {
+                            self.made.remove(name, &had);
+                        }
                         if let Some(lookout) = self.lookouts.remove(name) {
                             lookout.unheld();
                             self.index();
@@ -1816,7 +1871,7 @@ impl Service {
         // What it subscribed to before it was made, or made again.
         // Less what was made for another bot of its name.
         lookout.subs = file.into_iter().filter(|sub| sub.held_by(record)).collect();
-        lookout.roots(&self.records);
+        lookout.roots(&self.records, &self.made);
         let held = beside(&self.store, ".sources").join(".held");
         lookout.restore(held.join(format!("{lead}.json")));
         self.lookouts.insert(lead.to_owned(), lookout);
@@ -1876,7 +1931,7 @@ impl Service {
                 .collect();
             if all || subs != lookout.subs {
                 lookout.subs = subs;
-                lookout.roots(&self.records);
+                lookout.roots(&self.records, &self.made);
                 lookout.rehear();
             }
         }
@@ -2546,10 +2601,10 @@ impl Lookout {
 
     /// Every bot a subscription names the makers of, other than the lead,
     /// from what the daemon lists: what each made, and what those made.
-    fn roots(&mut self, records: &HashMap<String, Value>) {
+    fn roots(&mut self, records: &HashMap<String, Value>, made: &Made) {
         // The subscriber's own: what it made before it was seated is listed,
         // not replayed.
-        grow(&mut self.lineage, records);
+        made.grow(&mut self.lineage);
         let roots: HashSet<String> = (self.subs.iter())
             .flat_map(|sub| sub.tasks_of.iter().cloned())
             .filter(|root| *root != self.lead)
@@ -2559,27 +2614,41 @@ impl Lookout {
             if self.others.contains_key(&root) {
                 continue;
             }
-            let mut made: HashSet<String> = [root.clone()].into();
-            grow(&mut made, records);
-            self.others.insert(root, made);
+            let mut lineage: HashSet<String> = [root.clone()].into();
+            made.grow(&mut lineage);
+            self.others.insert(root, lineage);
         }
         // Another lead's tasks stay theirs once that lead is gone: their
         // maker is still named as one.
-        self.theirs = (records.iter())
-            .filter(|(name, record)| {
-                self.sibling(name)
-                    || record["created_by"]
-                        .as_str()
-                        .is_some_and(|by| self.sibling(by))
-            })
-            .map(|(name, _)| name.clone())
+        let siblings = (made.leads.iter())
+            .chain(made.by.keys())
+            .filter(|name| self.sibling(name));
+        let mut theirs = HashSet::new();
+        for sibling in siblings {
+            if records.contains_key(sibling) {
+                theirs.insert(sibling.clone());
+            }
+            theirs
+                .extend((made.by.get(sibling).into_iter().flatten()).map(|(name, _)| name.clone()));
+        }
+        made.grow(&mut theirs);
+        self.theirs = theirs;
+        // Only a `--bot` glob names bots beyond the lineages.
+        self.globbed = match self.subs.iter().any(|sub| !sub.bots.is_empty()) {
+            true => (records.iter())
+                .filter(|(name, record)| self.globs(name) && record["expire_ms"].is_null())
+                .map(|(name, _)| name.clone())
+                .collect(),
+            false => HashSet::new(),
+        };
+        // What it watches is among those, as listed.
+        let named: Vec<String> = (self.lineage.iter())
+            .chain(self.others.values().flatten())
+            .chain(&self.globbed)
+            .filter(|name| records.contains_key(*name))
+            .cloned()
             .collect();
-        grow(&mut self.theirs, records);
-        self.globbed = (records.iter())
-            .filter(|(name, record)| self.globs(name) && record["expire_ms"].is_null())
-            .map(|(name, _)| name.clone())
-            .collect();
-        self.sync(records.keys());
+        self.sync(&named);
         self.seat_watched(records);
     }
 
@@ -4243,10 +4312,11 @@ mod tests {
         sub.bots = vec!["web.lead".into()];
         assert!(!lookout.watches("web.lead"));
         lookout.subs.push(sub);
-        lookout.roots(&HashMap::from([(
+        let records = HashMap::from([(
             "web.lead".to_owned(),
             json!({"name": "web.lead", "bot_id": 7}),
-        )]));
+        )]);
+        lookout.roots(&records, &Made::of(&records));
         assert!(lookout.watches("web.lead"));
         // Its own lookout's note, and the person's question.
         let note = json!({"request_id": "lookout-0123456789abcdef"});
@@ -4300,7 +4370,7 @@ mod tests {
             .into_iter()
             .map(|(name, by)| (name.to_owned(), json!({"name": name, "created_by": by})))
             .collect();
-        lookout.roots(&records);
+        lookout.roots(&records, &Made::of(&records));
         assert!(lookout.watches("r.a") && lookout.watches("r.b"));
     }
 
@@ -4492,6 +4562,11 @@ mod tests {
             records: (records.iter())
                 .map(|r| (r["name"].as_str().unwrap().to_owned(), r.clone()))
                 .collect(),
+            made: Made::of(
+                &(records.iter())
+                    .map(|r| (r["name"].as_str().unwrap().to_owned(), r.clone()))
+                    .collect(),
+            ),
             working: HashMap::new(),
             subscribers: HashMap::new(),
             registry: Arc::default(),
@@ -5098,14 +5173,15 @@ mod tests {
         lookout
             .subs
             .push(sub("billing", &[], &["shop.lead.billing"]));
-        lookout.roots(&HashMap::from([
+        let records = HashMap::from([
             ("shop.lead.billing".to_owned(), json!({})),
             (
                 "shop.invoices".to_owned(),
                 json!({"created_by": "shop.lead.billing"}),
             ),
             ("shop.stray".to_owned(), json!({})),
-        ]));
+        ]);
+        lookout.roots(&records, &Made::of(&records));
         assert!(lookout.watches("shop.lead.billing"));
         assert!(!lookout.watches("shop.invoices"));
     }
@@ -5117,7 +5193,7 @@ mod tests {
         lookout.lead = "shop.lead".into();
         // shop.lead.billing was deleted; its task and the task's own task
         // live on.
-        lookout.roots(&HashMap::from([
+        let records = HashMap::from([
             (
                 "shop.invoices".to_owned(),
                 json!({"created_by": "shop.lead.billing"}),
@@ -5127,7 +5203,8 @@ mod tests {
                 json!({"created_by": "shop.invoices"}),
             ),
             ("shop.stray".to_owned(), json!({})),
-        ]));
+        ]);
+        lookout.roots(&records, &Made::of(&records));
         assert!(lookout.watches("shop.stray"));
         assert!(!lookout.watches("shop.invoices"));
         assert!(!lookout.watches("shop.invoices-pdf"));
