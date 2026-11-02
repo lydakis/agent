@@ -960,6 +960,14 @@ pub fn home() -> Option<PathBuf> {
     std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".agent"))
 }
 
+/// Where the agent's clients keep the sockets of programs they run outside
+/// the sandbox for bots, `~/.agent/run`, such as Sonny's agent-desktop
+/// host and agent-browser sessions: the daemon walls it off from every
+/// sandboxed command, as each does what it is asked as the person.
+pub fn run() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".agent/run"))
+}
+
 /// The person's command rules, `~/.agent/rules`: each `*.rules` file in it
 /// holds Codex's `prefix_rule` calls, which every agent's commands follow.
 pub fn rules() -> Option<PathBuf> {

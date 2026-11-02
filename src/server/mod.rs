@@ -847,6 +847,9 @@ pub struct Configuration {
     pub protected_existing: Vec<String>,
     /// Paths kept read-only in every sandbox, and kept from being made.
     pub protected_paths: Vec<PathBuf>,
+    /// Folders whose Unix sockets no sandboxed command reaches, made if
+    /// missing, private to the daemon's user.
+    pub walled: Vec<PathBuf>,
 }
 
 /// `path` by its real path, or, while it doesn't exist, by the real path
@@ -1543,6 +1546,19 @@ pub async fn run(config: Configuration) -> Result<()> {
     let protected_paths = (config.protected_paths.iter())
         .map(|path| real_or_named(path))
         .collect::<Result<Vec<_>>>()?;
+    // Made now, so a sandbox started before a socket is in one hides it all
+    // the same, and no other user's sockets are in it.
+    let walled = (config.walled.iter())
+        .map(|folder| -> Result<PathBuf> {
+            use std::os::unix::fs::DirBuilderExt;
+            let folder = std::path::absolute(folder)?;
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&folder)?;
+            Ok(std::fs::canonicalize(&folder)?)
+        })
+        .collect::<Result<Vec<_>>>()?;
     agent_runtime::sandbox::warm();
     let (sender, mut inbound) = session::channel_with(64, limits.input_bytes);
     let sessions_next = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
@@ -1569,6 +1585,7 @@ pub async fn run(config: Configuration) -> Result<()> {
         // Each by its real path once it exists, as a root is matched; a
         // missing one by the real path of the folder it would be made in.
         protected_paths,
+        walled,
     };
     daemon.capabilities = daemon
         .socket

@@ -1054,12 +1054,26 @@ async fn run(session: &str, args: &[String], launch: &Launch) -> Ran {
             };
         }
     };
+    // Its sessions' sockets in Sonny's own folder, which the daemon walls
+    // off: each session does what it is asked, without the agent's gate,
+    // for whoever reaches it.
+    let sockets = match crate::trusted::temporary() {
+        Ok(sockets) => sockets,
+        Err(e) => {
+            return Ran {
+                said: format!("{PROGRAM} is not run: its sockets' folder: {e}"),
+                ok: false,
+                confirmation: None,
+            };
+        }
+    };
     let mut command = tokio::process::Command::new(&program);
     command
         .arg("--json")
         .args(args)
         .current_dir("/")
         .env("AGENT_BROWSER_SESSION", session)
+        .env("AGENT_BROWSER_SOCKET_DIR", &sockets)
         .env("AGENT_BROWSER_CONTENT_BOUNDARIES", "1")
         .env("AGENT_BROWSER_IDLE_TIMEOUT_MS", IDLE_MS)
         // A link's browser starts from the Chrome profile it names; any

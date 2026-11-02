@@ -79,6 +79,9 @@ pub struct Policy {
     /// runs as the person, which runs what a command asks of it outside
     /// the sandbox. Never the daemon's nor another bot's, either way.
     pub sockets: Vec<PathBuf>,
+    /// Folders whose Unix sockets its commands never reach, the network on
+    /// or off, named or not ([`Daemon::walled`]).
+    pub walled: Vec<PathBuf>,
 }
 
 impl Policy {
@@ -124,6 +127,7 @@ impl Policy {
             listening: None,
             helper: daemon.helper.clone(),
             sockets: Vec::new(),
+            walled: daemon.walled.clone(),
         }))
     }
 
@@ -421,6 +425,12 @@ pub struct Daemon {
     /// Names at the top of every writable root that stay read-only when
     /// they exist (`--protect-existing`).
     pub protected_existing: Vec<String>,
+    /// Folders whose Unix sockets no sandboxed command reaches, the network
+    /// on or not (`--wall`): where the daemon's clients keep the sockets of
+    /// programs they run outside the sandbox, which do what they are asked
+    /// as the person, as Codex hides its own app-server's. Each exists, by
+    /// its real path.
+    pub walled: Vec<PathBuf>,
 }
 
 /// A share in a bot's own socket, which listens while any share lives,
@@ -491,6 +501,18 @@ fn root(path: &Path, daemon: &Daemon) -> Result<Root> {
             format!(
                 "{} is reached through a link, so it is not the folder the bot was given",
                 path.display()
+            ),
+        );
+    }
+    // Nor one inside a walled folder: a socket there could be renamed to a
+    // folder outside the wall's rule and reached by its new name.
+    if let Some(wall) = daemon.walled.iter().find(|wall| path.starts_with(wall)) {
+        return fail_with(
+            "sandbox_unavailable",
+            format!(
+                "{} is inside {}, whose sockets are kept from every sandboxed command",
+                path.display(),
+                wall.display()
             ),
         );
     }
@@ -573,9 +595,10 @@ fn root(path: &Path, daemon: &Daemon) -> Result<Root> {
     {
         read_only.extend(store_files(store).filter(|file| file.exists()));
     }
-    for kept in daemon
-        .protected_paths
-        .iter()
+    // A walled folder too: renamed, or a socket made in it, it would let
+    // one out past its rule.
+    for kept in (daemon.protected_paths.iter())
+        .chain(&daemon.walled)
         .filter(|kept| kept.starts_with(path))
     {
         match std::fs::symlink_metadata(kept) {
@@ -834,6 +857,18 @@ mod linux {
                 }
                 None => args.extend(["--ro-bind".into(), "/dev/null".into(), path(socket)]),
             }
+        }
+        // A walled folder is out of sight, as Codex hides its app-server's
+        // sockets: a socket in it is a program's that acts as the person.
+        for folder in &policy.walled {
+            args.extend([
+                "--perms".into(),
+                "555".into(),
+                "--tmpfs".into(),
+                path(folder),
+                "--remount-ro".into(),
+                path(folder),
+            ]);
         }
         args.extend(["--unshare-user", "--unshare-pid", "--unshare-ipc"].map(String::from));
         if !policy.network {
@@ -1309,6 +1344,7 @@ pub fn seatbelt(policy: &Policy) -> (String, Vec<(String, PathBuf)>) {
         .iter()
         .flat_map(|root| root.read_only.iter().chain(&root.missing))
         .chain(&policy.socket)
+        .chain(&policy.walled)
         .flat_map(|kept| kept.ancestors().skip(1))
         .filter(|folder| {
             policy
@@ -1356,6 +1392,15 @@ pub fn seatbelt(policy: &Policy) -> (String, Vec<(String, PathBuf)>) {
             ));
         }
         sections.push(rules.join("\n"));
+    }
+    // Never a walled folder's, whose programs act as the person, by any
+    // name: after what the network or the settings let it reach.
+    for folder in &policy.walled {
+        let key = param(folder);
+        sections.push(format!(
+            "(deny network-outbound (remote unix-socket (subpath (param \"{key}\"))))\n\
+             (deny file-link (subpath (param \"{key}\")))"
+        ));
     }
     // Never the daemon's socket itself: the bot's own instead, which
     // answers as that bot and only as far as a sandboxed bot may go. Nor
@@ -1796,6 +1841,82 @@ mod tests {
     }
 
     #[test]
+    fn a_walled_folder_s_sockets_are_never_reached_even_named_or_with_the_network_on() {
+        let base =
+            std::env::temp_dir().join(format!("agent-sandbox-walled-{}", std::process::id()));
+        std::fs::create_dir_all(base.join("run")).unwrap();
+        let base = std::fs::canonicalize(&base).unwrap();
+        let run = base.join("run");
+        for network in [true, false] {
+            let policy = Policy::new(
+                Some(Mode::WorkspaceWrite),
+                Some(&base),
+                &[],
+                network,
+                &Daemon {
+                    walled: vec![run.clone()],
+                    ..protecting()
+                },
+            )
+            .unwrap()
+            .unwrap()
+            // Named in its settings, too.
+            .with_sockets(&[run.join("host.sock").to_string_lossy().into_owned()]);
+            assert_eq!(policy.walled, std::slice::from_ref(&run));
+            let (profile, params) = seatbelt(&policy);
+            let key = (params.iter())
+                .find(|(_, path)| path == &run)
+                .map(|(key, _)| key.clone())
+                .unwrap();
+            // After all that lets it out, by its name or a hard link to it.
+            let denied = format!(
+                "(deny network-outbound (remote unix-socket (subpath (param \"{key}\"))))\n\
+                 (deny file-link (subpath (param \"{key}\")))"
+            );
+            let at = profile.find(&denied).unwrap();
+            if network {
+                assert!(at > profile.find("(allow network-outbound)\n").unwrap());
+            }
+            assert!(
+                at > profile
+                    .find("(allow network-outbound (remote unix-socket")
+                    .unwrap_or(0)
+            );
+            // Nor renamed out from under its rule, or written, inside a root.
+            assert!(policy.can_write(&base));
+            assert!(!policy.can_write(&run.join("host.sock")));
+            #[cfg(target_os = "linux")]
+            assert!(linux::args(&policy, false).windows(6).any(|w| w
+                == [
+                    "--perms",
+                    "555",
+                    "--tmpfs",
+                    &run.to_string_lossy(),
+                    "--remount-ro",
+                    &run.to_string_lossy()
+                ]));
+        }
+        // A root inside the wall is refused: its sockets could be renamed
+        // out to a folder the rule doesn't name.
+        std::fs::create_dir_all(run.join("session")).unwrap();
+        for cwd in [run.clone(), run.join("session")] {
+            let error = Policy::new(
+                Some(Mode::WorkspaceWrite),
+                Some(&cwd),
+                &[],
+                true,
+                &Daemon {
+                    walled: vec![run.clone()],
+                    ..protecting()
+                },
+            )
+            .unwrap_err();
+            assert_eq!(error.code, "sandbox_unavailable");
+        }
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
     fn many_nested_roots_still_fit_one_invocation() {
         // 64 nested roots with long names, about the settings' limit: each
         // rule names only its own, so the profile and its parameters grow
@@ -1823,6 +1944,7 @@ mod tests {
             listening: None,
             helper: None,
             sockets: Vec::new(),
+            walled: Vec::new(),
         };
         let (profile, params) = seatbelt(&policy);
         let size = profile.len()

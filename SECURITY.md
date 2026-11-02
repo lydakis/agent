@@ -119,7 +119,14 @@ vulnerability, whether or not the code's own documentation agrees.
   commands to those paths on macOS, and on Linux a seccomp filter refuses
   every Unix socket a command would make, so a bot that names any reaches
   them all. With the network on, a bot reaches every Unix socket but the
-  daemon's and the other bots', as Codex's full network does. The Linux
+  daemon's and the other bots', as Codex's full network does. Either way
+  it never reaches one in a walled folder (`serve --wall`), where clients
+  keep the sockets of programs they run for bots outside the sandbox:
+  the CLI walls `~/.agent/run`, where Sonny's agent-desktop host and
+  agent-browser sessions listen, as Codex hides its own app-server's
+  sockets. Seatbelt denies them by path; on Linux the folder is hidden.
+  A writable root inside a walled folder is refused.
+  The Linux
   filter also refuses `io_uring` and foreign-architecture system calls.
 - A call that would leave the sandbox (a shell call asking
   `require_escalated`, a write outside the writable folders) waits on the
@@ -281,9 +288,10 @@ approval gate as a call that leaves the sandbox would; `memory` and
 - **agent-browser and agent-desktop** run only from copies in
   `~/.agent/sonny/programs/`, refused while the program, or that folder,
   is in a folder a sandboxed agent writes, and checked again whenever it
-  changes. agent-desktop runs with `~/.agent/sonny/run/` as its temporary
-  folder, checked the same way, so the host it keeps there for its
-  commands is one Sonny started.
+  changes. They run with `~/.agent/run/sonny/` as their temporary and
+  socket folder, checked the same way and walled off from every sandboxed
+  command, so agent-desktop's host and agent-browser's sessions are ones
+  Sonny started, reached only through the tools and their gates.
 - **The commons** is a board shared by one person's agents across
   projects, as files under `~/.agents/commons`; each post's author is set
   by Sonny from the calling agent, never from what it wrote. A new thread
@@ -331,13 +339,13 @@ is built.
   bot can read any file the person can and send it to its model provider.
 - With the network on, Sonny's default, a sandboxed bot reaches every
   Unix socket on the machine. One that runs a program outside the sandbox
-  on request, such as Docker's or ssh-agent's, is a way out of it. So are
-  agent-desktop's host and agent-browser's sessions, which act without
-  the agent's approvals.
+  on request, such as Docker's or ssh-agent's, is a way out of it, unless
+  it listens in a walled folder.
 - The programs' copies and agent-desktop's temporary folder are checked
   against the agents' writable folders when a copy is made or changes,
-  not on every call. An agent given write access to `~/.agent/sonny`
-  after that could leave a host there that answers Sonny's desktop calls
+  not on every call. An agent given write access to `~/.agent` after that
+  (it is read-only in every sandbox) could leave a host there that answers
+  Sonny's desktop calls
   with made-up results. It runs in that agent's sandbox, so it cannot act
   with the person's grants, and an agent that writes `~/.agent` can
   already rewrite Sonny's settings.

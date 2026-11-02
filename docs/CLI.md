@@ -45,7 +45,10 @@ keeps it read-only where it exists; a client passes `.git`, `.agents` and
 keeps PATH, by its absolute path, read-only in every sandbox and from being
 made there; the CLI passes `~/.agent/rules`, where Sonny reads the
 [command rules](RUST_PROTOTYPE.md#command-rules) it gives its bots, so no
-bot writes its own.
+bot writes its own. `serve --wall FOLDER` keeps every sandboxed command,
+the network on or not, from the Unix sockets in FOLDER, which it makes
+private if missing; the CLI passes `~/.agent/run`, where clients such as
+Sonny keep the sockets of programs they run for bots outside the sandbox.
 The daemon's [limits](RUST_PROTOTYPE.md#limits) come from `[daemon]` in
 `~/.agent/config.toml` where the command line sets none, each a number or
 a formula of the machine, as `processes = "cpus * 64"` or

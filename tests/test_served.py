@@ -317,13 +317,14 @@ class ServedToolTests(ModelFixture):
                                    instructions='Lead.', declare=[tool], **create)
         self.assertIn('result', made)
         program = shutil.which('agent-browser')
-        # Its sockets beside its session's name, under the 104 bytes a
-        # socket's path may have.
-        sockets = Path(tempfile.mkdtemp(prefix='ab', dir='/tmp'))
+        # Its sockets in Sonny's own folder, the one the daemon walls off,
+        # whatever the tool host's environment says.
+        sockets = self.path / '.agent/run/sonny'
         self.addCleanup(lambda: subprocess.run([program, 'close', '--all'], capture_output=True,
                                                env={**clean_env(), 'HOME': str(self.path),
                                                     'AGENT_BROWSER_SOCKET_DIR': str(sockets)}))
-        self.host(PATH=f"{Path(program).parent}:{os.environ['PATH']}", AGENT_BROWSER_SOCKET_DIR=str(sockets))
+        self.host(PATH=f"{Path(program).parent}:{os.environ['PATH']}",
+                  AGENT_BROWSER_SOCKET_DIR=str(self.path / 'elsewhere'))
 
     def desktop(self, **create):
         """A lead with the desktop tool, and the tool host, with a stand-in
@@ -384,7 +385,7 @@ print(json.dumps({{'version': '2.5', 'ok': True, 'command': command, 'data': dat
         # With Sonny's own temporary folder, private, where agent-desktop
         # keeps the host its commands go through: never one another program
         # left running.
-        temporary = self.path / '.agent/sonny/run'
+        temporary = self.path / '.agent/run/sonny'
         self.assertEqual(self.desktop_temporary.read_text(), str(temporary))
         self.assertEqual(temporary.stat().st_mode & 0o777, 0o700)
         # A call that acts is put to the agent's gate once, before anything
@@ -451,6 +452,11 @@ print(json.dumps({{'version': '2.5', 'ok': True, 'command': command, 'data': dat
         self.assertTrue(said.endswith('$ screenshot\n✓ Screenshot, shown below'), said)
         self.assertIn('AGENT_BROWSER_PAGE_CONTENT nonce=', said)
         self.assertTrue(answered['output'][1]['image_url'].startswith('data:image/png;base64,'))
+        # Its session's socket in Sonny's own folder, the one the daemon
+        # walls off, whatever the tool host's environment named.
+        sockets = [p.name for p in (self.path / '.agent/run/sonny').iterdir() if p.is_socket()]
+        self.assertTrue(sockets, list((self.path / '.agent/run/sonny').iterdir()))
+        self.assertFalse((self.path / 'elsewhere').exists())
         # As many pictures as one result holds, and words for the rest.
         requests = self.model.requests = queue.Queue()
         self.call('calc.lead', 'browser', {'commands': ['screenshot'] * 21}, wait=60)
