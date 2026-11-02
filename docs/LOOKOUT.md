@@ -98,8 +98,23 @@ handled 41.0 cases against 44.3 with them, caught 11.0 of 24 drifting tasks
 against 13.3, and sent 23.3 needless messages against 26.0.
 
 Because the lookout watches the tasks, a lead no longer sets itself
-triggers to check on running work; triggers stay for what the person
+automations to check on running work; automations stay for what the person
 schedules.
+
+### Bounced messages
+
+The lookout also hands back what a turn never carried out, as mail
+returns a letter it could not deliver. It notes which bots sent each
+message (an `accepted`, `queued` or `steered` event's `from`), and when
+that turn ends failed or interrupted it attaches a note to each sender:
+`[your message to BOT was not carried out: turn N ended CODE]`, stamped
+like any note. The sender knows what the message was for, so it decides
+whether to send again, wait, or tell the person; nobody else could. A
+sender that already hears the bot, such as a lead with its own task, gets
+the turn's end as a task update instead, and a bot's own messages never
+bounce. A cause a person can fix does not end a turn at once: the daemon
+[holds it](RUST_PROTOTYPE.md#held-turns) for the bot's `hold_ms`, five
+days unset, so what bounces is final, or was held that long.
 
 ## Subscriptions
 
@@ -153,7 +168,7 @@ it does not, so remove it first. Each subscriber's are one file,
 `STORE.lookout/BOT.json`, which a running lookout reads again every 15
 seconds. Removing `tasks` stops a lead's lookout until Sonny next opens its
 project. `/background` in Sonny lists the project's agents' subscriptions,
-with their triggers; `d` there removes one.
+with their automations; `d` there removes one.
 
 ## Sources
 
@@ -325,8 +340,8 @@ those with subscriptions of their own:
 - every message someone other than the subscriber writes in one: the
   person's quoted, anyone else's named by who wrote it and the turn's
   handle;
-- a turn the subscriber asked for and did not wait on, or another agent or a
-  trigger asked for, once it ends, with what the task replied;
+- a turn the subscriber asked for and did not wait on, or another agent or
+  an automation asked for, once it ends, with what the task replied;
 - an approval only the person can give, once it has waited 2 minutes;
 - a question a task put to the person with the `ask` tool, once the call
   ran: its question and options, marked with `>` as the task's words,
@@ -355,7 +370,7 @@ is an event with a `type` and fields, as a source's are, and the
 | `type` | When | Fields beside `type`, `bot` (where), `maker` (who made that bot) and `turn` |
 | --- | --- | --- |
 | `message.written` | someone other than the subscriber writes in a watched bot | `by` (`person`, an agent's name, a program), `text` (the person's words) |
-| `turn.ended` | a turn that is news ends | `by` (who asked: `you`, `person`, an agent's name, `trigger`), `status`, `resolved`, `goal`, `theirs` |
+| `turn.ended` | a turn that is news ends | `by` (who asked: `you`, `person`, an agent's name, `automation`), `status`, `resolved`, `goal`, `theirs` |
 | `approval.waiting` | an approval only the person can give has waited | |
 | `ask.posted` | a task asked the person with `ask` | `question`, `options` |
 | `turn.silent` | a running turn printed nothing for 30 minutes | |

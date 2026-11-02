@@ -1258,12 +1258,16 @@ mod tests {
             "new_project",
             "subscriptions",
             "run_in_pane",
-            "triggers",
+            "automations",
             "goal"
         ]);
         // The browser, there when agent-browser is, reaches outside.
         if crate::browser::tool().is_some() {
             waiting.as_array_mut().unwrap().push(json!("browser"));
+        }
+        // And the desktop, there when agent-desktop is and a desktop shows.
+        if crate::desktop::tool().is_some() {
+            waiting.as_array_mut().unwrap().push(json!("desktop"));
         }
         assert_eq!(regate(&panes, "auto").unwrap()["approve"], waiting);
     }

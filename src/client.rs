@@ -390,6 +390,11 @@ fn parse(args: &[String]) -> Result<Options> {
                         options.settings.insert(key, json!(number));
                         options.settings_flags.push(flag.to_owned());
                     }
+                    "--hold" => {
+                        let ms = crate::cli::duration_ms(flag, &value)?;
+                        options.settings.insert("hold_ms".to_owned(), json!(ms));
+                        options.settings_flags.push(flag.to_owned());
+                    }
                     "--approval-hold" => {
                         let ms = crate::cli::duration_ms(flag, &value)?;
                         options
@@ -1095,6 +1100,29 @@ fn created_by() -> Result<(Option<String>, Option<i64>)> {
     }
 }
 
+/// Who makes a new bot: the bot whose shell this runs in, else the one
+/// `--created-by` names, as a client that starts a bot for one of its agents
+/// says, by its id, so the bot is that agent's while the prompt stays the
+/// person's. An agent's shell makes bots only as itself.
+fn made_by(
+    options: &Options,
+    connection: &mut Connection,
+) -> Result<(Option<String>, Option<i64>)> {
+    let (name, id) = created_by()?;
+    match (&options.created_by, name) {
+        (None, name) => Ok((name, id)),
+        (Some(named), Some(name)) if *named == name => Ok((Some(name), id)),
+        (Some(_), Some(_)) => fail_with(
+            "usage",
+            "an agent's shell makes bots as itself; leave out --created-by",
+        ),
+        (Some(named), None) => {
+            let maker = connection.request("inspect", json!({"bot": named}))?;
+            Ok((Some(named.clone()), maker["bot_id"].as_i64()))
+        }
+    }
+}
+
 /// A `--quote`: `BOT/TURN`, as a handle names it with or without `turn:`,
 /// and `:reply` for the reply that turn ended with.
 fn quote(value: &str) -> Result<Value> {
@@ -1309,6 +1337,18 @@ pub fn main(args: Vec<String>) -> Result<i32> {
             print_json(&resumed, options.pretty)?;
             Ok(0)
         }
+        "held" => {
+            let mut connection = ensure_existing_daemon(&options)?;
+            let held = connection.request("held", json!({}))?;
+            print_json(&held, options.pretty)?;
+            Ok(0)
+        }
+        "retry" => {
+            let mut connection = ensure_daemon(&options)?;
+            let retried = connection.request("retry_held", json!({"bot": options.bot}))?;
+            print_json(&retried, options.pretty)?;
+            Ok(0)
+        }
         "pauses" => {
             let mut connection = ensure_existing_daemon(&options)?;
             let page = connection.request(
@@ -1498,6 +1538,12 @@ fn run(options: &Options) -> Result<i32> {
     // A named bot is continued, never silently replaced: an unknown name is an
     // error unless --new asks for creation. No name means a fresh identity.
     let created = options.new || options.bot.is_none();
+    if options.created_by.is_some() && (!created || options.fork.is_some()) {
+        return fail_with(
+            "usage",
+            "--created-by names who makes a new bot; use it with --new",
+        );
+    }
     // A new bot starts here or in --workspace; a bot keeps its folder
     // unless --workspace moves it, so only then is a folder resolved.
     let workspace = if created || options.workspace.is_some() {
@@ -1564,7 +1610,7 @@ fn run(options: &Options) -> Result<i32> {
             None => config()?.fallbacks.remove(&model),
         };
         let instructions = composed_instructions(options, workspace, role.as_ref())?;
-        let (created_by, created_by_id) = created_by()?;
+        let (created_by, created_by_id) = made_by(options, &mut connection)?;
         // --tools, else the role's, else the default set for its model.
         let tools: Vec<String> = match role.as_ref().and_then(|r| r.tools.clone()) {
             Some(tools) if !options.tools_explicit => tools,
@@ -1585,6 +1631,9 @@ fn run(options: &Options) -> Result<i32> {
         let mut settings = options.settings.clone();
         if config()?.hide_senders {
             settings.entry("hide_senders").or_insert(json!(true));
+        }
+        if let Some(ms) = config()?.hold_ms {
+            settings.entry("hold_ms").or_insert(json!(ms));
         }
         // Cut outputs go whole to a folder beside the store, as the
         // summary prompt goes by default; --outputs names another.
@@ -2497,6 +2546,17 @@ impl Renderer {
                         say!("{}", self.dim(&format!("  {}", streamed(line))));
                     }
                 }
+            }
+            // Held on a cause the person can fix: say what, and how to go on.
+            "turn_paced" | "turn_held" if data["blocked"].is_object() => {
+                self.flush();
+                let blocked = &data["blocked"];
+                let mut line = format!("⏸ held: {}", blocked["code"].as_str().unwrap_or("?"));
+                if let Some(detail) = blocked["detail"].as_str() {
+                    line.push_str(&format!(" ({detail})"));
+                }
+                line.push_str("; tried again on its own, or now with `agent retry` once fixed");
+                say!("{}", self.dim(&line));
             }
             "usage" => {
                 self.usage.0 += data["input_tokens"].as_u64().unwrap_or(0);

@@ -128,11 +128,20 @@ class Model(http.server.BaseHTTPRequestHandler):
             texts = [i['content'][0]['text'] for i in request['input'] if i.get('role') == 'user']
             # A `steer:` message joins the running task, which its prompt drives.
             user = next((t for t in reversed(texts) if not t.startswith('steer:')), texts[-1])
-            # A trigger's message comes after its one-line header.
-            if user.startswith('[trigger ') and '\n' in user:
+            # An automation's message comes after its one-line header.
+            if user.startswith('[automation ') and '\n' in user:
                 user = user.split('\n', 1)[1]
             # Sonny's message ends with a line naming when it was sent.
             user = SENT.sub('', user)
+            if user in getattr(self.server, 'unauthorized_prompts', ()):
+                # A key the provider refuses: the person's to fix.
+                body = b'{"error":{"message":"synthetic bad key"}}'
+                self.send_response(401)
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                self.wfile.flush()
+                return
             if user in getattr(self.server, 'refused_prompts', ()):
                 # A refusal with no usage: the turn fails without a model round.
                 body = b'{"error":{"message":"synthetic refusal"}}'
@@ -3100,11 +3109,15 @@ class RuntimeTests(ModelFixture):
         data, retries = run('incomplete')
         self.assertEqual((data['status'], data['error'], retries), ('failed', 'provider_incomplete', []))
         # A refusal that never lifts is bounded: 64 paced attempts, each held
-        # for the provider's Retry-After, then the turn fails with the refusal.
-        data, retries = run('limited-forever:1', timeout=60)
-        self.assertEqual((data['status'], data['error']), ('failed', 'provider_http_429'))
-        self.assertEqual(len(retries), 63)
+        # for the provider's Retry-After, then the turn is held on it, an
+        # outage the person sees, tried again on its own a minute later.
+        turn = client.request('submit', bot='Bob', request_id='forever', prompt='limited-forever:1')['result']['turn']
+        held = client.receive(lambda e: e.get('event') == 'turn_paced' and e.get('turn') == turn
+                              and 'blocked' in e['data'], timeout=60)
+        self.assertEqual(held['data']['blocked']['code'], 'provider_http_429')
         self.assertEqual(client.request('turns', bot='Bob')['result']['turns'][-1]['retries'], 63)
+        client.request('interrupt', bot='Bob', turn=turn)
+        self.assertEqual(client.finished(turn)['data']['status'], 'interrupted')
 
     def test_premature_provider_eof_cannot_be_a_successful_checkpoint(self):
         client = self.client()

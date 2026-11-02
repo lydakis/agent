@@ -84,12 +84,12 @@ struct Turn {
 }
 
 impl Turn {
-    /// A trigger's run that went well: news only once its reply has words.
+    /// An automation's run that went well: news only once its reply has words.
     /// One that failed, was stopped, resolved its task or ended a goal is
     /// news however it replied.
     fn run(&self) -> bool {
         self.status == "completed"
-            && self.by.as_deref() == Some("trigger")
+            && self.by.as_deref().is_some_and(crate::trigger::sent_it)
             && !self.resolved
             && self.goal.is_none()
     }
@@ -365,6 +365,9 @@ pub struct Updates {
     /// note the lead had not heard: a filter on who asked hears them as
     /// they are.
     unheard: HashMap<Key, (Turn, bool)>,
+    /// The turn that last ended and who asked for it, as its end names
+    /// them: none when that is still to be read.
+    ended: Option<(Key, Option<String>)>,
 }
 
 /// A turn whose answer a trigger passes to the lead: when it becomes news
@@ -483,6 +486,7 @@ impl Updates {
             memory_seen: None,
             opened: now_ms(),
             resolving: Default::default(),
+            ended: None,
             replying: HashSet::new(),
             runs: HashMap::new(),
             unheard: HashMap::new(),
@@ -764,6 +768,8 @@ impl Updates {
                 };
                 let answered = self.answer_to.remove(&key(turn));
                 let noted = self.noted.remove(&key(turn));
+                let by = self.by(&status, from.clone(), origin.clone());
+                self.ended = Some((key(turn), by));
                 if let Some(bot) = self.bots.get_mut(name)
                     && bot.running.is_none_or(|running| running == turn)
                 {
@@ -919,6 +925,39 @@ impl Updates {
         }
         let heard = super::activity::hear(rules, &event, skips)?;
         Some((heard.hold, heard.urgent))
+    }
+
+    /// Whether a turn of `name`'s that just ended `status` reaches the
+    /// subscriber as news: one of its tasks, whose end its subscriptions'
+    /// filters hear as task updates hear it, with who asked for it. One
+    /// whose asker is still to be read, or that the lookout did not see
+    /// end, is not heard yet.
+    pub fn hears_end(&self, name: &str, turn: i64, status: &str) -> bool {
+        let Some((_, by)) = (self.ended.as_ref()).filter(|(key, _)| key.0 == name && key.1 == turn)
+        else {
+            return false;
+        };
+        if by.is_none() && self.rules.contains_key(name) {
+            return false;
+        }
+        let ended = Turn {
+            first: turn,
+            turn,
+            status: status.to_owned(),
+            by: by.clone(),
+            count: 1,
+            which: None,
+            resolved: false,
+            goal: None,
+            reply: None,
+            urgent: None,
+            hold: Default::default(),
+        };
+        let theirs = by.as_deref() == Some("the person") && status == "completed";
+        self.task(name)
+            && self
+                .gate(name, false, || turn_event(&ended, theirs))
+                .is_some()
     }
 
     /// Whether a task's news may be told now: urgent, or no digest holds
@@ -1131,7 +1170,14 @@ impl Updates {
             APPROVAL | QUIET => None,
             _ if from.as_deref() == Some(self.lead.as_str()) => Some("you".to_owned()),
             _ if from.is_none() && origin.as_deref() == Some(UNKNOWN) => None,
-            _ => Some(from.or(origin).unwrap_or_else(|| "the person".into())),
+            // An automation's turn from before 0.8.0 says `trigger`.
+            _ => Some(
+                from.or(origin.map(|origin| match crate::trigger::sent_it(&origin) {
+                    true => crate::trigger::ORIGIN.to_owned(),
+                    false => origin,
+                }))
+                .unwrap_or_else(|| "the person".into()),
+            ),
         }
     }
 
@@ -2154,19 +2200,26 @@ mod tests {
     }
 
     #[test]
-    fn a_trigger_s_run_that_went_well_and_said_nothing_is_no_news() {
+    fn an_automation_s_run_that_went_well_and_said_nothing_is_no_news() {
         let mut updates = fleet();
-        let trigger = || json!({"origin": "trigger"});
+        let trigger = || json!({"origin": "automation"});
         turn(&mut updates, "shop.fix", 4, trigger(), "completed");
         updates.reading_reply("shop.fix", 4);
-        turn(&mut updates, "shop.docs", 2, trigger(), "failed");
+        // One from before 0.8.0 says `trigger`, and reads as the same.
+        turn(
+            &mut updates,
+            "shop.docs",
+            2,
+            json!({"origin": "trigger"}),
+            "failed",
+        );
         updates.reading_reply("shop.docs", 2);
         updates.replied("shop.fix", 4, "  \n");
         updates.replied("shop.docs", 2, "");
         // One that went wrong is told, words or none.
         assert_eq!(
             text(&updates.take()),
-            "- shop.docs: turn:shop.docs/2 failed, asked by trigger"
+            "- shop.docs: turn:shop.docs/2 failed, asked by automation"
         );
         // One with words is told with them.
         turn(&mut updates, "shop.fix", 5, trigger(), "completed");
@@ -2177,7 +2230,7 @@ mod tests {
     #[test]
     fn two_quiet_runs_that_ended_before_their_replies_were_read_are_no_news() {
         let mut updates = fleet();
-        let trigger = || json!({"origin": "trigger"});
+        let trigger = || json!({"origin": "automation"});
         turn(&mut updates, "shop.fix", 4, trigger(), "completed");
         turn(&mut updates, "shop.fix", 5, trigger(), "completed");
         // Both ended before either reply was read, each held apart.

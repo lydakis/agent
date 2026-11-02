@@ -167,7 +167,7 @@ impl Pane {
             .then(|| crate::tree::Tree::new(&path));
         // A tree reads at the conversation's width, its marks near its names.
         let width = match tree {
-            Some(_) => width.min(crate::PROSE),
+            Some(_) => width.min(crate::measure()),
             None => width,
         };
         let (target, prose) = match &tree {
@@ -276,7 +276,7 @@ impl Pane {
             return false;
         }
         // A tree reads at the conversation's width, as it is drawn.
-        let width = (self.area.width as usize).min(crate::PROSE);
+        let width = (self.area.width as usize).min(crate::measure());
         let back = self.screen.back();
         let before = self.screen.height(width);
         self.screen = Screen::default();
@@ -549,7 +549,7 @@ impl Pane {
         // Prose and its title read at the conversation's measure, a column
         // in from the line between; what is left of a wide pane stays
         // empty on the right, as beside the conversation alone.
-        let measure = crate::PROSE as u16 + 1;
+        let measure = crate::measure() as u16 + 1;
         let area = match self.prose && self.program.is_none() {
             true => Rect {
                 width: area.width.min(measure),
@@ -701,7 +701,7 @@ impl Pane {
                 // Prose reads at the width the conversation is written at.
                 let rows = match self.prose {
                     true => Rect {
-                        width: rows.width.min(crate::PROSE as u16),
+                        width: rows.width.min(crate::measure() as u16),
                         ..rows
                     },
                     false => rows,
@@ -1469,26 +1469,26 @@ mod tests {
         let shown = rows(&mut pane, 150, 5);
         // The title and the file's rows stop at 100 columns.
         assert!(shown[0].ends_with("esc close"), "{shown:?}");
-        assert!(shown[2].width() <= crate::PROSE, "{}", shown[2].width());
+        assert!(shown[2].width() <= crate::measure(), "{}", shown[2].width());
         assert!(shown[3].starts_with("    word"), "{shown:?}");
         // Code goes as wide as the pane.
         let code = dir.join("a.rs");
         std::fs::write(&code, format!("let x = \"{}\";\n", "w".repeat(120))).unwrap();
         let mut pane = Pane::preview(&format!("file://{}", code.display()), &dir, 150).unwrap();
-        assert!(rows(&mut pane, 150, 4)[2].width() > crate::PROSE);
+        assert!(rows(&mut pane, 150, 4)[2].width() > crate::measure());
         // Markdown is prose.
         let doc = dir.join("a.md");
         std::fs::write(&doc, format!("{}\n", "word ".repeat(40))).unwrap();
         let mut pane = Pane::preview(&format!("file://{}", doc.display()), &dir, 150).unwrap();
         let shown = rows(&mut pane, 150, 4);
-        assert!(shown[2].width() <= crate::PROSE, "{shown:?}");
+        assert!(shown[2].width() <= crate::measure(), "{shown:?}");
         // A card is prose too, its title over it as wide; one that fills
         // the pane, as the sky does, keeps the pane's width.
         let mut card = Pane::card("status", "esc close");
         card.set_card(vec![Line::from("x".repeat(140))], "esc close");
         let shown = rows(&mut card, 150, 4);
-        assert_eq!(shown[2].width(), crate::PROSE);
-        assert!(shown[0].width() <= crate::PROSE + 1, "{shown:?}");
+        assert_eq!(shown[2].width(), crate::measure());
+        assert!(shown[0].width() <= crate::measure() + 1, "{shown:?}");
         assert!(shown[0].ends_with("esc close"), "{shown:?}");
         card.prose = false;
         assert_eq!(rows(&mut card, 150, 3)[2].width(), 140);

@@ -506,14 +506,15 @@ impl Kind {
         }
     }
     /// The name an entry of this directory would index under. Only a name
-    /// --profile accepts is offered as a role, and never a client's own.
+    /// --profile accepts is offered as a role; the index leaves a client's
+    /// own out.
     fn name(self, path: &Path) -> Option<String> {
         let name = path.file_name()?.to_str()?;
         match self {
             Kind::Skills => Some(name.to_owned()),
             Kind::Profiles => name
                 .strip_suffix(".md")
-                .filter(|stem| profile_name(stem) && !client_role(stem))
+                .filter(|stem| profile_name(stem))
                 .map(str::to_owned),
         }
     }
@@ -803,6 +804,25 @@ fn search(workspace: &Path, kind: Kind) -> Vec<PathBuf> {
 }
 
 fn index(dirs: Vec<PathBuf>, kind: Kind, budget: usize) -> Result<Vec<Entry>, Failure> {
+    scan(dirs, kind, budget, true)
+}
+
+/// Every profile file the person can start an agent in from `workspace`,
+/// as a client lists them to pick from: the folder's, then the person's,
+/// client roles and their variants among them, which the Profiles index
+/// leaves out. [`lineage`] says what each is built on.
+pub fn profiles(workspace: &Path) -> Result<Vec<Entry>, Failure> {
+    scan(
+        search(workspace, Kind::Profiles),
+        Kind::Profiles,
+        usize::MAX,
+        false,
+    )
+}
+
+/// The entries in `dirs`, the first directory's winning a clash; with
+/// `hide`, client roles and their variants left out.
+fn scan(dirs: Vec<PathBuf>, kind: Kind, budget: usize, hide: bool) -> Result<Vec<Entry>, Failure> {
     let mut found = std::collections::BTreeMap::<String, Entry>::new();
     // Profiles that build on a client role: that role's variants, set as
     // a lead's or task's role, not roles to start a peer in.
@@ -843,6 +863,10 @@ fn index(dirs: Vec<PathBuf>, kind: Kind, budget: usize) -> Result<Vec<Entry>, Fa
             let Some(name) = kind.name(&path) else {
                 continue;
             };
+            // A client role's own file is no role to start a peer in.
+            if hide && matches!(kind, Kind::Profiles) && client_role(&name) {
+                continue;
+            }
             if found.contains_key(&name) || hidden.contains(&name) {
                 continue;
             }
@@ -879,7 +903,10 @@ fn index(dirs: Vec<PathBuf>, kind: Kind, budget: usize) -> Result<Vec<Entry>, Fa
                 }
             };
             let (front, body) = front_matter(&text);
-            if matches!(kind, Kind::Profiles) && front.extends.as_deref().is_some_and(client_role) {
+            if hide
+                && matches!(kind, Kind::Profiles)
+                && front.extends.as_deref().is_some_and(client_role)
+            {
                 hidden.insert(entry.name);
                 continue;
             }
@@ -905,7 +932,8 @@ fn index(dirs: Vec<PathBuf>, kind: Kind, budget: usize) -> Result<Vec<Entry>, Fa
             found.insert(entry.name.clone(), entry);
         }
     }
-    // A profile that extends a hidden one is a client role's variant too.
+    // A profile that extends a hidden one is a client role's variant too;
+    // none is hidden when every profile is listed.
     loop {
         let more: Vec<String> = (bases.iter())
             .filter(|(name, base)| found.contains_key(*name) && hidden.contains(*base))
@@ -982,6 +1010,63 @@ pub fn profile_with(
     builtins: &[(&str, &str)],
     skills: &[(&str, &str)],
 ) -> Result<Option<Profile>, Failure> {
+    let Some(chain) = chain(workspace, name, builtins)? else {
+        return Ok(None);
+    };
+    let mut used: usize = chain.iter().map(|(profile, _)| profile.body.len()).sum();
+    // The base first: each profile adds to what it extends.
+    let mut role = chain[0].0.clone();
+    role.name = name.to_owned();
+    role.model = None;
+    role.tools = None;
+    let mut bodies = Vec::new();
+    let shipped = skills;
+    let mut skills: Vec<String> = Vec::new();
+    for (profile, front) in chain.iter().rev() {
+        if !profile.body.is_empty() {
+            bodies.push(profile.body.clone());
+        }
+        role.model = profile.model.clone().or(role.model);
+        role.tools = profile.tools.clone().or(role.tools);
+        for skill in front.skills.iter().flatten() {
+            if !skills.contains(skill) {
+                skills.push(skill.clone());
+            }
+        }
+    }
+    for skill in &skills {
+        let room = MAX_INSTRUCTIONS.saturating_sub(used);
+        let text = skill_text(workspace, skill, room, shipped)?;
+        used += text.len();
+        bodies.push(format!("## Skill: {skill}\n\n{text}"));
+    }
+    role.body = bodies.join("\n\n");
+    Ok(Some(role))
+}
+
+/// The profiles `name` is built from in `workspace`, by name, itself first
+/// and what it extends after, as [`profile_with`] follows them: a name
+/// extending its own builds on the file it shadows. Empty when there is
+/// no profile `name`.
+pub fn lineage(
+    workspace: &Path,
+    name: &str,
+    builtins: &[(&str, &str)],
+) -> Result<Vec<String>, Failure> {
+    Ok((chain(workspace, name, builtins)?
+        .unwrap_or_default()
+        .into_iter())
+    .map(|(profile, _)| profile.name)
+    .collect())
+}
+
+/// The files `name` is built from, itself first, each with its front
+/// matter; `None` when there is no profile `name`.
+fn chain(
+    workspace: &Path,
+    name: &str,
+    builtins: &[(&str, &str)],
+) -> Result<Option<Vec<(Profile, Front)>>, Failure> {
     let mut layers: Vec<Option<PathBuf>> = search(workspace, Kind::Profiles)
         .into_iter()
         .map(Some)
@@ -1038,34 +1123,7 @@ pub fn profile_with(
             Some(base) => (want, from) = (base, 0),
         }
     }
-    // The base first: each profile adds to what it extends.
-    let mut role = chain[0].0.clone();
-    role.name = name.to_owned();
-    role.model = None;
-    role.tools = None;
-    let mut bodies = Vec::new();
-    let shipped = skills;
-    let mut skills: Vec<String> = Vec::new();
-    for (profile, front) in chain.iter().rev() {
-        if !profile.body.is_empty() {
-            bodies.push(profile.body.clone());
-        }
-        role.model = profile.model.clone().or(role.model);
-        role.tools = profile.tools.clone().or(role.tools);
-        for skill in front.skills.iter().flatten() {
-            if !skills.contains(skill) {
-                skills.push(skill.clone());
-            }
-        }
-    }
-    for skill in &skills {
-        let room = MAX_INSTRUCTIONS.saturating_sub(used);
-        let text = skill_text(workspace, skill, room, shipped)?;
-        used += text.len();
-        bodies.push(format!("## Skill: {skill}\n\n{text}"));
-    }
-    role.body = bodies.join("\n\n");
-    Ok(Some(role))
+    Ok(Some(chain))
 }
 
 /// The first profile named `name` at `from` or a later layer, with the layer
@@ -1343,6 +1401,59 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         // Discovery reports canonical paths (macOS aliases /var to /private/var).
         std::fs::canonicalize(&dir).unwrap()
+    }
+
+    #[test]
+    fn profiles_lists_client_roles_and_their_variants_and_what_each_is_built_on() {
+        let root = temp("listed");
+        let agents = root.join(".agents/agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        let write = |name: &str, text: &str| std::fs::write(agents.join(name), text).unwrap();
+        write("lead.md", "---\nextends: lead\n---\nAlso: be brief.\n");
+        write(
+            "my-lead.md",
+            "---\nextends: lead\ndescription: Mine\n---\nMore.\n",
+        );
+        write("deeper.md", "---\nextends: my-lead\n---\nMore still.\n");
+        write("superlead.md", "---\nextends: superlead\n---\nAnd this.\n");
+        write(
+            "reviewer.md",
+            "---\ndescription: Reviews\n---\nYou review.\n",
+        );
+        let listed: Vec<String> = (profiles(&root).unwrap().into_iter())
+            .map(|entry| entry.name)
+            .collect();
+        for name in ["lead", "my-lead", "deeper", "superlead", "reviewer"] {
+            assert!(listed.contains(&name.to_owned()), "{name}: {listed:?}");
+        }
+        // Built on as a bot's role is: a name extending its own builds on
+        // the file it shadows, here the client's.
+        let shipped = [
+            ("lead", "You lead."),
+            ("superlead", "---\nextends: lead\n---\nYou lead leads."),
+        ];
+        let built = |name: &str| lineage(&root, name, &shipped).unwrap();
+        assert_eq!(built("deeper"), ["deeper", "my-lead", "lead", "lead"]);
+        assert_eq!(
+            built("superlead"),
+            ["superlead", "superlead", "lead", "lead"]
+        );
+        assert_eq!(built("reviewer"), ["reviewer"]);
+        assert!(built("nobody").is_empty());
+        // The Profiles index an agent reads still leaves the lead's out.
+        let indexed: Vec<String> =
+            (index(search(&root, Kind::Profiles), Kind::Profiles, usize::MAX))
+                .unwrap()
+                .into_iter()
+                .map(|entry| entry.name)
+                .collect();
+        assert!(indexed.contains(&"reviewer".to_owned()));
+        assert!(
+            !indexed
+                .iter()
+                .any(|name| ["lead", "my-lead", "deeper"].contains(&name.as_str()))
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

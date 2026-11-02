@@ -94,11 +94,19 @@ class ProviderErrorTests(unittest.TestCase):
                     try:
                         client.request('create', bot='Bob', workspace=directory)
                         turn = client.request('submit', bot='Bob', request_id='r', prompt='check')['result']['turn']
-                        finished = client.finished(turn)
-                        detail = finished['data']['detail']
-                        expected_code = 'provider_http_401' if mode.startswith('http_') else (
+                        # A refused key is the person's to fix: the turn is
+                        # held on it, saying why, rather than ended.
+                        held = mode.startswith('http_')
+                        if held:
+                            ended = client.receive(lambda e: e.get('event') == 'turn_paced'
+                                                   and e.get('turn') == turn and 'blocked' in e['data'])
+                            code, detail = ended['data']['blocked']['code'], ended['data']['blocked'].get('detail')
+                        else:
+                            finished = client.finished(turn)
+                            code, detail = finished['data']['error'], finished['data']['detail']
+                        expected_code = 'provider_http_401' if held else (
                             'provider_error' if mode == 'anthropic_error' else 'provider_incomplete')
-                        self.assertEqual(finished['data']['error'], expected_code)
+                        self.assertEqual(code, expected_code)
                         if mode in ('http_oversized', 'http_broken', 'http_escaped_plain', 'http_unknown_json'):
                             self.assertIsNone(detail)
                         elif mode in ('http_benign', 'http_plain_benign'):
@@ -109,10 +117,15 @@ class ProviderErrorTests(unittest.TestCase):
                             self.assertIn('[REDACTED]', detail)
                             self.assertLessEqual(len(detail), 512)
                         page = client.request('events', bot='Bob', after=0, limit=256)['result']['events']
-                        terminal = next(e for e in page if e['event'] == 'turn_finished')
-                        self.assertEqual(terminal['data']['detail'], detail)
+                        kind = 'turn_paced' if held else 'turn_finished'
+                        terminal = next(e for e in page if e['event'] == kind)
+                        said = terminal['data']['blocked'] if held else terminal['data']
+                        self.assertEqual(said.get('detail'), detail)
                         with sqlite3.connect(path) as db:
-                            stored = json.loads(db.execute("SELECT data FROM events WHERE kind='turn_finished'").fetchone()[0])
-                            self.assertEqual(stored['detail'], detail)
+                            stored = json.loads(db.execute("SELECT data FROM events WHERE kind=?", (kind,)).fetchone()[0])
+                            self.assertEqual((stored['blocked'] if held else stored).get('detail'), detail)
+                        if held:
+                            client.request('interrupt', bot='Bob', turn=turn)
+                            self.assertEqual(client.finished(turn)['data']['status'], 'interrupted')
                     finally:
                         client.close()

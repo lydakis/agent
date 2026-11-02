@@ -1566,7 +1566,7 @@ mod tests {
             let changed = changed_paths(tool, &arguments);
             reaches_home(&home, tool, &arguments, &changed, Some(&folder), confined)
         };
-        let job = "~/.agent/triggers/jobs/x.json";
+        let job = "~/.agent/automations/jobs/x.json";
         // In its sandbox a command can't write there: nothing to hold.
         assert!(!reaches(
             "shell",
@@ -1585,7 +1585,7 @@ mod tests {
         // Named from a workdir in the home.
         assert!(reaches(
             "shell",
-            json!({"command": "rm -rf triggers/../.agent",
+            json!({"command": "rm -rf automations/../.agent",
             "workdir": "~", "sandbox_permissions": "require_escalated"}),
             true
         ));
@@ -1621,8 +1621,12 @@ mod tests {
         ));
         let patch = "*** Begin Patch\n*** Add File: ../.agent/rules/x.rules\n+x\n*** End Patch";
         assert!(reaches("apply_patch", json!({"input": patch}), true));
-        // Other tools, such as Sonny's own triggers tool, are its way in.
-        assert!(!reaches("triggers", json!({"add": {"message": job}}), true));
+        // Other tools, such as Sonny's own automations tool, are its way in.
+        assert!(!reaches(
+            "automations",
+            json!({"add": {"message": job}}),
+            true
+        ));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1657,7 +1661,7 @@ mod tests {
         ));
         assert!(reaches(
             "shell",
-            escalated("touch ~/.agent/triggers/jobs/x.json")
+            escalated("touch ~/.agent/automations/jobs/x.json")
         ));
         assert!(reaches(
             "shell",

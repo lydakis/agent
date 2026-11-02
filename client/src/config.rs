@@ -9,6 +9,7 @@
 //! web_search = "disabled"       # "live", the default, lets new agents search and fetch
 //! senders = "hidden"            # "shown", the default, labels what agents send
 //! attach_wait = "1d"            # how long an attached note waits for a call, the default; "0" as long as it takes
+//! hold = "5d"                   # how long a new agent's turn waits on a cause you can fix before it fails, the default; "0" fails at once
 //!
 //! [daemon]                      # what the agent CLI starts the daemon with; restart it to apply
 //! processes = "cpus * 64"       # commands running at once, the default
@@ -35,6 +36,7 @@
 //! side_chat = "fork"            # "answer", the default, calls no tool
 //! chime = false                 # rings when work ends or waits, the default
 //! verbose = true                # every tool call drawn, not the clean view
+//! text_width = 0                # the widest the conversation is written, 100 by default; 0 the window's whole width
 //! margin_opens = "never"         # "always", the default, or "unless-closed"
 //! agent_opens = "beside"        # a click on an agent's name: "tab", the default, or "beside"
 //! suggest = false               # no guess at the next message, on by default
@@ -103,6 +105,11 @@ pub struct Config {
     /// milliseconds; unset is `ATTACH_WAIT_MS`, and 0 waits as long as it
     /// takes. See `attach_wait`.
     pub attach_wait_ms: Option<u64>,
+    /// `hold`: how long a new agent's turn is held on a cause the person
+    /// can fix (a sign-in, a usage limit, a provider down) before it fails
+    /// with it, in milliseconds, as the bot setting `hold_ms`; unset leaves
+    /// the daemon's five days, and 0 fails at once.
+    pub hold_ms: Option<u64>,
     /// Each model's fallback, as `provider/model` in its family: a new
     /// agent on that model that names none sends a request a safety
     /// classifier declined to it, that request alone.
@@ -417,6 +424,10 @@ pub struct Sonny {
     /// Whether every tool call is drawn, or only the bot's words and the
     /// calls that move the work on (the clean view, the default).
     pub verbose: bool,
+    /// The widest the conversation is written, in columns, however wide
+    /// the window: 0 for the window's whole width. At least
+    /// [`TEXT_WIDTH_LEAST`] otherwise.
+    pub text_width: u64,
     /// When a note the agent puts up or changes opens the margin.
     pub margin_opens: MarginOpens,
     /// Where a click on an agent's name takes the person; a right click
@@ -505,6 +516,16 @@ pub const BROWSER_CONFIRM: [&str; 4] = ["eval", "download", "upload", "state"];
 /// config says otherwise: an hour, as Slack's slowest email batching.
 pub const COMMONS_DIGEST: &str = "1h";
 
+/// The widest the conversation is written unless the config says
+/// otherwise: prose reads best at 45 to 90 characters a line, but replies
+/// carry code, paths and tables too, which most style guides keep within
+/// 100 (rustfmt's own width), so they stay whole at 100.
+pub const TEXT_WIDTH: u64 = 100;
+
+/// The narrowest `text_width` other than 0, the margin's own least width:
+/// a narrower column wraps a path or a line of code at every turn.
+pub const TEXT_WIDTH_LEAST: u64 = 40;
+
 /// The name of the source Sonny's lookout makes of the commons.
 pub const COMMONS_SOURCE: &str = "commons";
 
@@ -553,6 +574,7 @@ impl Default for Sonny {
             tool_processes: 0,
             chime: true,
             verbose: false,
+            text_width: TEXT_WIDTH,
             start_at_boot: false,
             margin_opens: MarginOpens::default(),
             agent_opens: AgentOpens::default(),
@@ -1011,6 +1033,16 @@ fn parse(text: &str) -> Result<Config, String> {
             };
             continue;
         }
+        if name == "hold" {
+            let text = string(name, value)?;
+            let ms = duration_ms(&text)
+                .filter(|&ms| ms <= MAX_ATTACH_WAIT_MS)
+                .ok_or_else(|| {
+                    format!("hold is a duration such as 1h or 5d, up to 365d, or \"0\", not {text}")
+                })?;
+            config.hold_ms = Some(ms);
+            continue;
+        }
         if name == "attach_wait" {
             let text = string(name, value)?;
             let ms = duration_ms(&text)
@@ -1092,6 +1124,7 @@ fn parse(text: &str) -> Result<Config, String> {
                 "side_chat",
                 "chime",
                 "verbose",
+                "text_width",
                 "margin_opens",
                 "agent_opens",
                 "suggest",
@@ -1189,11 +1222,19 @@ fn parse(text: &str) -> Result<Config, String> {
                 "sky_haiku_margin" => Some(&mut config.sonny.sky_haiku_margin),
                 "sky_haiku_hold" => Some(&mut config.sonny.sky_haiku_hold),
                 "tool_processes" => Some(&mut config.sonny.tool_processes),
+                "text_width" => Some(&mut config.sonny.text_width),
                 _ => None,
             } {
                 *count = (value.as_integer())
                     .and_then(|n| u64::try_from(n).ok())
                     .ok_or_else(|| format!("{name}.{key} must be a whole number, 0 or more"))?;
+                let width = config.sonny.text_width;
+                if key == "text_width" && (1..TEXT_WIDTH_LEAST).contains(&width) {
+                    return Err(format!(
+                        "{name}.{key} must be 0, for the window's whole width, \
+                         or at least {TEXT_WIDTH_LEAST}, not {width}"
+                    ));
+                }
                 continue;
             }
             if (name.as_str(), key.as_str()) == ("sonny", "browser_confirm") {
@@ -1572,6 +1613,8 @@ pub fn write(path: &Path, pairs: &[(&str, Option<toml::Value>)]) -> Result<(), S
     if text == before || (before.is_empty() && lines.is_empty()) {
         return Ok(());
     }
+    // A value every reader would refuse is refused here, the file kept.
+    parse(&text).map_err(|reason| format!("config_invalid: {}: {reason}", path.display()))?;
     replace(path, &text)
 }
 
@@ -1727,6 +1770,17 @@ mod tests {
     }
 
     #[test]
+    fn a_hold_is_the_daemon_s_unless_the_file_says_otherwise() {
+        assert_eq!(Config::default().hold_ms, None);
+        assert_eq!(parse("hold = \"2d\"").unwrap().hold_ms, Some(172_800_000));
+        assert_eq!(parse("hold = \"0\"").unwrap().hold_ms, Some(0));
+        for refused in ["\"366d\"", "\"30\"", "1"] {
+            let error = parse(&format!("hold = {refused}")).unwrap_err();
+            assert!(error.contains("hold"), "{refused}: {error}");
+        }
+    }
+
+    #[test]
     fn an_attached_note_waits_a_day_unless_the_file_says_otherwise() {
         assert_eq!(Config::default().attach_wait(), Some(ATTACH_WAIT_MS));
         let hour = parse("attach_wait = \"1h\"").unwrap();
@@ -1803,6 +1857,19 @@ mod tests {
             0
         );
         assert!(parse("[sonny]\nsky_haiku_margin = 1.5").is_err());
+        assert_eq!(config.sonny.text_width, 100);
+        let text_width = |text: &str| parse(text).map(|config| config.sonny.text_width);
+        assert_eq!(text_width("[sonny]\ntext_width = 0"), Ok(0));
+        assert_eq!(text_width("[sonny]\ntext_width = 140"), Ok(140));
+        assert_eq!(text_width("[sonny]\ntext_width = 40"), Ok(40));
+        assert_eq!(
+            text_width("[sonny]\ntext_width = 39"),
+            Err(
+                "sonny.text_width must be 0, for the window's whole width, or at least 40, not 39"
+                    .into()
+            )
+        );
+        assert!(text_width("[sonny]\ntext_width = -1").is_err());
         assert_eq!(config.sonny.task_depth, 2);
         assert_eq!(
             parse("[sonny]\ntask_depth = 0").unwrap().sonny.task_depth,

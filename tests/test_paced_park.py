@@ -138,7 +138,7 @@ class PacedParkTests(ModelFixture):
         row = client.request('turns', bot='Bob')['result']['turns'][0]
         self.assertEqual(row['retries'], 9)
 
-    def test_a_paced_turn_survives_restart_and_ends_at_the_paced_cap(self):
+    def test_a_paced_turn_survives_restart_and_is_held_at_the_paced_cap(self):
         self.model.retry_delays = ['0.3']
         client = self.client()
         client.request('create', bot='Bob', workspace=str(self.path))
@@ -154,14 +154,18 @@ class PacedParkTests(ModelFixture):
         self.model.retry_delays = ['0.02']
         client = self.client()
         client.receive(lambda m: m.get('event') == 'turn_resumed' and m.get('turn') == turn, timeout=10)
-        ended = client.receive(lambda m: m.get('event') == 'turn_finished' and m.get('turn') == turn, timeout=60)
-        self.assertEqual(ended['data']['status'], 'failed')
-        self.assertIn(ended['data']['error'], ('provider_rate_limited', 'provider_http_429'))
-        # 64 attempts across two execution segments: 63 retries, the last attempt fails.
+        # 64 attempts across two execution segments: 63 retries, then the
+        # refusal that never lifts holds the turn, as an outage, rather than
+        # failing it: the message is still to be carried out.
+        held = client.receive(lambda m: m.get('event') == 'turn_paced' and m.get('turn') == turn
+                              and 'blocked' in m['data'], timeout=60)
+        self.assertIn(held['data']['blocked']['code'], ('provider_rate_limited', 'provider_http_429'))
         row = client.request('turns', bot='Bob', after=0)['result']['turns'][0]
         self.assertEqual(row['retries'], 63)
         self.assertEqual(self.model.requests.qsize(), 64)
-        # The bot is usable again, and nothing about the conversation was written for the failed turn.
+        client.request('interrupt', bot='Bob', turn=turn)
+        self.assertEqual(client.finished(turn)['data']['status'], 'interrupted')
+        # The bot is usable again, and nothing about the conversation was written for the held turn.
         again = client.request('submit', bot='Bob', request_id='again', prompt='hello')['result']['turn']
         self.assertEqual(client.finished(again)['data']['status'], 'completed')
 

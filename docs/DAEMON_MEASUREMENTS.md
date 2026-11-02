@@ -6862,6 +6862,52 @@ at each finish. Sonny's rows moved within their noise too. The commit after
 5c9e615 reads only the fields that say how a command ended, in a bounded
 batch, so a note never loads a command's output.
 
+## Held turns (#633)
+
+`turns` gains a `held` column. `next_ready` now reads its ready row only
+where `held IS NULL OR due_ms<=?`, still in id order, and a partial index
+`turns_held` on `due_ms` holds only the ready rows that are held, for the
+held turns' next deadline and `retry_held`. A turn is held only on a cause
+a person can fix, and its bot's later turns wait behind it, so a bot keeps
+at most one held row and ordinary dispatch reads the rows it did before.
+A held call is a pace park that keeps one more field (`held_since_ms`).
+Whether a hold may go on is one comparison against the bot's settings,
+which the turn already holds. Nothing runs per turn when nothing is held.
+
+The Perf workflow's matched screen, base `main` against this branch at
+648002c, on a GitHub runner (medians of two alternating rounds each):
+
+| Measure | Base | Head | Change |
+| --- | ---: | ---: | ---: |
+| Lone submit CPU, ms | 30.711 | 31.09 | +1.2% |
+| Burst submit p99, ms | 4.244 | 4.106 | -3.2% |
+| Release to terminal p99, ms | 9.645 | 9.634 | -0.1% |
+| Idle RSS, MiB | 20.773 | 20.098 | -3.3% |
+| Per idle bot, KiB | 1.306 | 1.682 | +28.8% |
+| RSS after a turn each, MiB | 30.969 | 30.691 | -0.9% |
+| Daemon CPU per turn, ms | 0.881 | 0.926 | +5.0% |
+| Lifecycle CPU, s | 0.925 | 0.91 | -1.6% |
+| Lifecycle p95 turn, ms | 612.467 | 587.842 | -4.0% |
+| Lifecycle peak RSS, MiB | 27.453 | 27.148 | -1.1% |
+
+The screen on 013e71d, whose daemon code is the same as 648002c's,
+measured +1.2%, +3.5%, +1.2%, +0.7%, +3.0%, +1.8% and -0.1% on the first
+seven rows, and +2.1%, -0.1% and -0.6% on the lifecycle rows. Nothing
+moved past noise in either run, and the gate counted no more store work
+per turn. Per idle bot swings run to run, as #575 and #609 saw, and it
+moved the other way from idle RSS here. The benches hold no turn, so the new path costs them
+only the `held IS NULL` test on the ready row they already read.
+
+Sonny's rows moved within their noise, except the quiet window's reads
+and requests. In one of the head's two rounds, the window counted the TUI's
+own opening reads and one `configure` and `submit`, which landed after
+the two seconds the bench waits for it to open. That round read 1.38 KiB/s,
+and the other read 0.01. The window runs no lookout, which is where this
+branch's other Sonny changes are, and the 013e71d screen measured 0.01
+against 0.01. The lookout's CPU per 1k deltas at 10x1 doubled from one
+tick to two of its clock (6.25 to 12.5 ms); the larger shapes moved under
+8%.
+
 ## The lookout's notes at 1,000 tasks (#576)
 
 The lookout read every finished turn's reply on its one connection. The

@@ -28,12 +28,13 @@ pub const SHOW: &str = "show_agent";
 pub const RUN: &str = "run_in_pane";
 pub const PROJECT: &str = "new_project";
 pub const SUBSCRIPTIONS: &str = "subscriptions";
-pub const TRIGGERS: &str = "triggers";
+pub const AUTOMATIONS: &str = "automations";
 pub const MEMORY: &str = "memory";
 pub const COMMONS: &str = "commons";
 pub const GOAL: &str = "goal";
 pub const EXEC: &str = crate::exec::NAME;
 pub const BROWSER: &str = crate::browser::NAME;
+pub const DESKTOP: &str = crate::desktop::NAME;
 
 /// The tools whose calls wait for a verdict wherever the agent's other
 /// calls do: a start runs the folder's setup script and a new project its
@@ -41,17 +42,19 @@ pub const BROWSER: &str = crate::browser::NAME;
 /// drop work, a subscription sends other bots' words to the subscriber's
 /// judge, a trigger is a job that runs as the person, its `if`
 /// command outside any sandbox, a script calls MCP servers, which run
-/// as the person too, and so does a goal's check and the browser.
-pub const GATED: [&str; 9] = [
+/// as the person too, and so does a goal's check, the browser and the
+/// desktop.
+pub const GATED: [&str; 10] = [
     START,
     REMOVE,
     PROJECT,
     SUBSCRIPTIONS,
     RUN,
-    TRIGGERS,
+    AUTOMATIONS,
     EXEC,
     GOAL,
     BROWSER,
+    DESKTOP,
 ];
 
 /// The most of what a call printed that its result holds, under the
@@ -127,13 +130,14 @@ pub fn tools(role: Role) -> Vec<Value> {
     if role.lead {
         tools.push(project());
     }
-    tools.extend([subscriptions(), show(), run(), triggers(), memory()]);
+    tools.extend([subscriptions(), show(), run(), automations(), memory()]);
     if crate::commons::on() {
         tools.push(commons());
     }
     tools.push(crate::lookout::goals::tool(GOAL, TAG));
     tools.extend(crate::exec::tool());
     tools.extend(crate::browser::tool());
+    tools.extend(crate::desktop::tool());
     tools
 }
 
@@ -324,16 +328,16 @@ fn subscriptions() -> Value {
     })
 }
 
-fn triggers() -> Value {
+fn automations() -> Value {
     json!({
-        "name": TRIGGERS,
-        "description": "Your triggers, which wake an agent later, again and again, or when something \
-            happens, even with Sonny closed (a Mac keeps watch). Each fire gives the agent the message in its \
-            own conversation after a line with the fire time and what fired it; a fire while the agent is working \
-            waits for its work, one fire of a repeating trigger at a time. Add one, or remove, fire or show one by name; with none, the result lists \
+        "name": AUTOMATIONS,
+        "description": "Your automations, which wake an agent later, again and again, or when something \
+            happens, even with Sonny closed (a Mac keeps watch). Each run gives the agent the message in its \
+            own conversation after a line with the run's time and what started it; a run while the agent is working \
+            waits for its work, one run of a repeating automation at a time. Add one, or remove, run or show one by name; with none, the result lists \
             them all with any problems. Adding the same one again changes nothing; a different one under a name \
             in use is refused with the field that differs unless replace is set. Write the message as what to \
-            check and when to stop, including removing its own trigger once the work is done.",
+            check and when to stop, including removing its own automation once the work is done.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -350,9 +354,9 @@ fn triggers() -> Value {
                         "cron": {"type": "string", "minLength": 1,
                             "description": "MIN HOUR DAY MONTH WEEKDAY."},
                         "file": {"type": "string", "minLength": 1,
-                            "description": "Fires when this file is written."},
+                            "description": "Runs when this file is written."},
                         "commit": {"type": "string", "minLength": 1,
-                            "description": "Fires when this repository gets a new commit."},
+                            "description": "Runs when this repository gets a new commit."},
                         "bot": {"type": "string", "minLength": 1,
                             "description": "The agent it messages; you when neither this nor start is given."},
                         "start": {
@@ -364,20 +368,22 @@ fn triggers() -> Value {
                             },
                             "required": ["name", "model"],
                             "additionalProperties": false,
-                            "description": "An agent the first fire makes, in your folder as a task is made, \
-                                and later fires message."
+                            "description": "An agent the first run makes, in your folder as a task is made, \
+                                and later runs message."
                         },
                         "reply_to": {"type": "string", "minLength": 1,
                             "description": "Who gets the turn's answer when it ends."},
                         "if": {"type": "string", "minLength": 1,
-                            "description": "A shell command run in your folder first; it fires only when that \
+                            "description": "A shell command run in your folder first; it runs only when that \
                                 exits 0, so a check that finds nothing costs no turn."},
                         "runs": {"type": "integer", "minimum": 1, "description": "Ends it after N messages."},
                         "turn_budget_tokens": {"type": "integer", "minimum": 1,
-                            "description": "A cap on each fired turn's tokens."},
+                            "description": "A cap on the tokens of each turn a run starts, counting every request's \
+                                input with the agent's history, so a cap below that history fails every run \
+                                before it starts. Set one only when the person asks for a spending limit."},
                         "shadow": {"type": "boolean",
-                            "description": "A dry run, as when moving a job from elsewhere onto a trigger: \
-                                each fire goes to a read-only copy of the agent, where anything past \
+                            "description": "A dry run, as when moving a job from elsewhere onto an automation: \
+                                each run goes to a read-only copy of the agent, where anything past \
                                 reading is refused rather than asked about, and its answer comes to you \
                                 (or reply_to) as a report of what it would have done. Replace it without \
                                 shadow once the reports match the job."},
@@ -387,11 +393,11 @@ fn triggers() -> Value {
                     },
                     "required": ["message"],
                     "additionalProperties": false,
-                    "description": "With none of every, in, at, cron, file and commit, only fire runs it."
+                    "description": "With none of every, in, at, cron, file and commit, only run runs it."
                 },
                 "remove": {"type": "string", "minLength": 1, "description": "The name of one to remove."},
-                "fire": {"type": "string", "minLength": 1,
-                    "description": "The name of one to fire now; the result says what the fire did."},
+                "run": {"type": "string", "minLength": 1,
+                    "description": "The name of one to run now; the result says what the run did."},
                 "show": {"type": "string", "minLength": 1, "description": "The name of one to show."}
             },
             "additionalProperties": false
@@ -649,11 +655,14 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                 model: text("model"),
                 effort: text("effort"),
                 own_folder: arguments["own_folder"] == true,
+                here: false,
                 folder: text("folder"),
                 from: text("from"),
                 turn: arguments["turn"].as_i64(),
                 // A task's own helper builds on its work.
                 builds_on: (!line.role.lead).then(|| caller.clone()),
+                env: Vec::new(),
+                made_by: None,
             };
             let started = crate::task::start(&line.folder, &line.project, &caller, &start)
                 .map_err(|e| ("task_not_started", e))?;
@@ -817,13 +826,13 @@ async fn called(name: &str, arguments: &Value) -> Answer {
             .map_err(|e| ("tool_failed", e.to_string()))?
             .map_err(|e| ("ask_refused", e))
         }
-        TRIGGERS => {
+        AUTOMATIONS => {
             // A trigger's add runs on a runtime of its own.
             let arguments = arguments.clone();
             let mut said = tokio::task::spawn_blocking(move || crate::trigger::tool(&arguments))
                 .await
                 .map_err(|e| ("tool_failed", e.to_string()))?
-                .map_err(|e| ("trigger_refused", e))?;
+                .map_err(|e| ("automation_refused", e))?;
             // How the turns their last fires sent ended, as the person's
             // `/background` shows them; without the daemon, as the files say.
             // Only a trigger made on this daemon's store: a turn handle names
@@ -838,8 +847,8 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                         .collect(),
                     _ => Vec::new(),
                 };
-                let mut rows: Vec<&mut Value> = if said["triggers"].is_array() {
-                    (said["triggers"].as_array_mut().into_iter().flatten()).collect()
+                let mut rows: Vec<&mut Value> = if said["automations"].is_array() {
+                    (said["automations"].as_array_mut().into_iter().flatten()).collect()
                 } else if said["last"].is_object() {
                     vec![&mut said]
                 } else {
@@ -1033,6 +1042,7 @@ async fn serve(store: PathBuf, socket: PathBuf, nudge: Arc<Notify>, serving: Ser
                                 // In the host, where the servers stay up.
                                 Some(EXEC) => script(&hub, &client, &call).await,
                                 Some(BROWSER) => browse(&client, &call).await,
+                                Some(DESKTOP) => desktop(&client, &call).await,
                                 _ => answer(&client, &call, &me, &store, &socket)
                                     .await
                                     .map(Value::String),
@@ -1188,6 +1198,24 @@ async fn browse(client: &Arc<Client>, call: &Value) -> Result<Value, (&'static s
     }
 }
 
+/// Answer a `desktop` call in the host, with the agent's gate judging what
+/// acts on the desktop.
+async fn desktop(client: &Arc<Client>, call: &Value) -> Result<Value, (&'static str, String)> {
+    let bot = str_of(&call["bot"]);
+    unreviewed(client, &bot, &Value::Null, DESKTOP).await?;
+    let steps = crate::exec::Steps::new(
+        client.clone(),
+        bot,
+        call["turn"].as_i64().unwrap_or(0),
+        str_of(&call["call_id"]),
+    );
+    let left = left(call).min(crate::desktop::TIMEOUT);
+    match tokio::time::timeout(left, crate::desktop::answer(call, steps)).await {
+        Ok(answer) => answer,
+        Err(_) => Err(("timed_out", "the desktop's commands ran out of time".into())),
+    }
+}
+
 /// Refuses `tool`, one Sonny gates, to `bot` when it acts outside a
 /// sandbox no one reviews calls from. The sandbox is read from `inspect`,
 /// which a `bots` listing leaves out; `bot_id`, when given, pins the bot.
@@ -1260,7 +1288,9 @@ fn outside(item: &Value) -> bool {
                     call["namespace"] == "web"
                         || matches!(
                             call["name"].as_str(),
-                            Some("web_fetch" | "web_search" | crate::exec::NAME | BROWSER)
+                            Some(
+                                "web_fetch" | "web_search" | crate::exec::NAME | BROWSER | DESKTOP
+                            )
                         )
                 }
                 _ => false,
@@ -1489,7 +1519,7 @@ fn code(said: &str) -> &'static str {
         "project_not_made",
         "no_store",
         "subscription_refused",
-        "trigger_refused",
+        "automation_refused",
         "memory_refused",
         "unknown_tool",
         "tool_failed",
@@ -1567,13 +1597,13 @@ mod tests {
     #[test]
     fn a_lead_answers_more_than_its_tasks_and_keeps_its_own() {
         // `exec` comes and goes with the person's MCP servers, and
-        // `browser` with agent-browser.
+        // `browser` with agent-browser, and `desktop` with agent-desktop.
         let names = |tools: Vec<Value>| -> Vec<String> {
             (tools.iter().map(|t| str_of(&t["name"])))
-                .filter(|name| name != EXEC && name != BROWSER)
+                .filter(|name| name != EXEC && name != BROWSER && name != DESKTOP)
                 .collect()
         };
-        let every = [SUBSCRIPTIONS, SHOW, RUN, TRIGGERS, MEMORY, COMMONS, GOAL];
+        let every = [SUBSCRIPTIONS, SHOW, RUN, AUTOMATIONS, MEMORY, COMMONS, GOAL];
         assert_eq!(names(tools(Role::at(2, 2))), every);
         let mut task = vec![START, REMOVE];
         task.extend(every);
@@ -1587,11 +1617,12 @@ mod tests {
         {
             assert_eq!(tool["answered_by"], TAG);
             // A lead's own are not its tasks', in a line one deep.
-            // The browser, when there, is every agent's as well.
+            // The browser and the desktop, when there, are every agent's
+            // as well.
             let name = str_of(&tool["name"]);
             assert_eq!(
                 tool.get("inherit").is_some(),
-                !(every.contains(&name.as_str()) || name == BROWSER)
+                !(every.contains(&name.as_str()) || name == BROWSER || name == DESKTOP)
             );
         }
         assert_eq!(project_of("shop.web.lead"), "shop.web");
