@@ -447,7 +447,9 @@ client keeps a pool: the daemon answers one read at a time from each
 connection, so on a single one a busy fleet's replies were read one by
 one, about 8 seconds behind at 1,000 tasks (#576). A turn that completed
 ended on its reply, its checkpoint, so that is one read; another turn's
-nodes are looked through for its last words. When a note has waited a minute for a subscriber the events
+nodes are looked through for its last words. A read gets 60 seconds, as
+Codex gives a tool call: one the daemon never answers lets its turn's end go
+without the words, and the lead can still `wait` on the turn (#388). When a note has waited a minute for a subscriber the events
 say is busy, the lookout asks the daemon, so a missed event never holds
 the note until the next turn.
 

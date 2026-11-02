@@ -1682,6 +1682,13 @@ fn run(options: &Options) -> Result<i32> {
         ("attach", None) => config()?.attach_wait(),
         _ => None,
     };
+    // Live before the turn can start: text deltas go only to live
+    // followers, so a follow sent after the submit could miss a fast
+    // answer, whole or its start, while its replay caught up.
+    let live = match options.detach {
+        true => None,
+        false => Some(follow_live(&mut connection, &bot)?),
+    };
     let submitted = connection
         .request(
             "submit",
@@ -1703,9 +1710,30 @@ fn run(options: &Options) -> Result<i32> {
     let turn = submitted["turn"]
         .as_i64()
         .ok_or(Error::new("daemon_protocol_mismatch"))?;
-    let after = submitted["cursor"].as_i64().map(|c| c - 1).unwrap_or(0);
-    connection.request("follow", json!({"bot":bot,"after":after}))?;
+    let first = submitted["cursor"].as_i64().unwrap_or(0);
+    let resent = submitted["duplicate"] == true;
+    if resent {
+        // A resent submission's turn may be over already: follow it from
+        // its start, on a connection of its own, so nothing the follow
+        // from now sent is shown.
+        connection = Connection::connect(&options.socket)?;
+        let after = submitted["cursor"].as_i64().map(|c| c - 1).unwrap_or(0);
+        connection.request("follow", json!({"bot":bot,"after":after}))?;
+    } else {
+        // Of what came while the submit was answered, what follows it: the
+        // durable from the submission's cursor, and this turn's live events.
+        connection
+            .pending
+            .retain(|event| match event["cursor"].as_i64() {
+                Some(cursor) => cursor >= first,
+                None => event.get("turn").is_none_or(|t| t.is_null() || *t == turn),
+            });
+    }
     let mut renderer = Renderer::new(options.pretty, Some(turn), &options.target);
+    // The follow is this run's own; a terminal's status hears it is live.
+    if let Some(live) = live.filter(|_| options.pretty && !resent) {
+        renderer.event(&mut connection, &live)?;
+    }
     if options.pretty {
         eprintln!(
             "agent: {bot} turn {turn}{}{}",
@@ -1720,6 +1748,22 @@ fn run(options: &Options) -> Result<i32> {
         let event = connection.next_event()?;
         if let Some(code) = renderer.event(&mut connection, &event)? {
             return Ok(code);
+        }
+    }
+}
+
+/// Follow `bot` from now, and return its `follow_live` once the follow is
+/// live: what the bot did before is not this run's to show.
+fn follow_live(connection: &mut Connection, bot: &str) -> Result<Value> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| Error::new("clock_before_epoch"))?
+        .as_millis() as u64;
+    connection.request("follow", json!({"bot":bot,"since_ms":now}))?;
+    loop {
+        let event = connection.next_event()?;
+        if event["event"] == "follow_live" {
+            return Ok(event);
         }
     }
 }

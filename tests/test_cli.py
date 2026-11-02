@@ -1133,6 +1133,69 @@ class CliTests(ModelFixture):
                                      [*replay, terminal])
                     self.assertEqual(result.returncode, expected_code, result.stderr)
 
+    def test_cli_run_follows_live_before_it_submits_so_a_fast_answer_prints_whole(self):
+        # Text deltas reach live followers only (#613). A turn that streams
+        # before the submit is answered still prints, whole and once, and
+        # what the bot did before the submission does not.
+        earlier = [dict(cursor=4, bot='Bob', turn=7, event='turn_finished', data=dict(status='completed')),
+                   dict(event='text_delta', bot='Bob', turn=7, durable=False, item=3, text='old')]
+        fast = [dict(cursor=5, bot='Bob', turn=8, event='accepted', data=dict(request_id='r')),
+                dict(event='text_delta', bot='Bob', turn=8, durable=False, item=1, text='hel'),
+                dict(event='text_delta', bot='Bob', turn=8, durable=False, item=1, text='lo'),
+                dict(cursor=6, bot='Bob', turn=8, event='message', data=dict(item=1)),
+                dict(cursor=7, bot='Bob', turn=8, event='turn_finished', data=dict(status='completed'))]
+        live = dict(event='follow_live', bot='Bob', cursor=3)
+        for pretty in (False, True):
+            with self.subTest(pretty=pretty), tempfile.TemporaryDirectory(dir='/tmp') as directory:
+                path = Path(directory)/'daemon.sock'
+                errors, ops = [], []
+                with socket.socket(socket.AF_UNIX) as listener:
+                    listener.bind(str(path))
+                    listener.listen(4)
+                    listener.settimeout(3)
+                    def serve():
+                        try:
+                            while 'submit' not in ops:
+                                with listener.accept()[0] as peer:
+                                    peer.settimeout(3)
+                                    with peer.makefile('rb') as reader:
+                                        def send(*events):
+                                            peer.sendall(b''.join((json.dumps(event)+'\n').encode() for event in events))
+                                        send(dict(event='ready', protocol=PROTOCOL))
+                                        for line in reader:
+                                            request = json.loads(line)
+                                            ops.append(request['op'])
+                                            if request['op'] == 'inspect':
+                                                send(dict(id=request['id'], result=dict(name='Bob', gates=[])))
+                                            elif request['op'] == 'follow':
+                                                self.assertIn('since_ms', request)
+                                                send(dict(id=request['id'], result=dict(following='Bob', after=3)), live)
+                                            elif request['op'] == 'submit':
+                                                # The turn ran and ended before its submit's reply.
+                                                send(*earlier, *fast,
+                                                     dict(id=request['id'], result=dict(turn=8, cursor=5, status='accepted')))
+                                            else:
+                                                send(dict(id=request['id'], result={}))
+                        except Exception as error:
+                            errors.append(error)
+                    worker = threading.Thread(target=serve)
+                    worker.start()
+                    try:
+                        result = subprocess.run([str(self.binary), 'run', *(['--pretty'] if pretty else []),
+                                                 '--bot', 'Bob', '--store', str(Path(directory)/'state.db'),
+                                                 '--socket', str(path), '--no-spawn', 'hi'],
+                                                env=clean_env(), capture_output=True, text=True, timeout=5)
+                    finally:
+                        worker.join(timeout=4)
+                    self.assertFalse(worker.is_alive())
+                    self.assertEqual(errors, [])
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertLess(ops.index('follow'), ops.index('submit'))
+                    if pretty:
+                        self.assertEqual(result.stdout.strip(), 'hello')
+                    else:
+                        self.assertEqual([json.loads(line) for line in result.stdout.splitlines()], fast)
+
     def test_concurrent_cli_startup_waits_for_store_recovery(self):
         # Recreate a crash with the maximum admitted number of unfinished turns.
         with tempfile.TemporaryDirectory(dir='/tmp') as directory:
