@@ -51,9 +51,101 @@ const QUOTE_CHARS: usize = 2000;
 /// A note from sources names at most this many events; the rest wait for
 /// the next.
 const NOTE_ITEMS: usize = 16;
-/// How many events from sources wait for a subscriber; past them the
-/// oldest go untold.
-const HEARD: usize = 64;
+/// How many events from sources wait for a subscriber unless
+/// `sonny.lookout_waiting` says: kept on disk with what it is told, past
+/// them newer ones are not kept, and its next note says so.
+const WAITING: usize = 1024;
+
+/// What `sonny.lookout_waiting` says now, 0 for no limit. Settings that do
+/// not read keep the default.
+fn waiting() -> usize {
+    (agent_client::config::load()).map_or(WAITING, |config| {
+        usize::try_from(config.sonny.lookout_waiting).unwrap_or(usize::MAX)
+    })
+}
+
+/// Events from sources a subscriber's full lookout did not keep: how many,
+/// from where and when, for its next note to say.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Unkept {
+    count: u64,
+    sources: std::collections::BTreeSet<String>,
+    first_ms: u64,
+    last_ms: u64,
+}
+
+impl Unkept {
+    fn add(&mut self, source: &str, at_ms: u64) {
+        if self.count == 0 {
+            self.first_ms = at_ms;
+        }
+        self.count += 1;
+        self.sources.insert(source.to_owned());
+        self.first_ms = self.first_ms.min(at_ms);
+        self.last_ms = self.last_ms.max(at_ms);
+    }
+
+    fn merge(&mut self, other: Unkept) {
+        if other.count == 0 {
+            return;
+        }
+        if self.count == 0 {
+            *self = other;
+            return;
+        }
+        self.count += other.count;
+        self.sources.extend(other.sources);
+        self.first_ms = self.first_ms.min(other.first_ms);
+        self.last_ms = self.last_ms.max(other.last_ms);
+    }
+
+    fn to_json(&self) -> Value {
+        json!({"count": self.count, "sources": self.sources, "first_ms": self.first_ms,
+            "last_ms": self.last_ms})
+    }
+
+    fn from_json(kept: &Value) -> Unkept {
+        Unkept {
+            count: kept["count"].as_u64().unwrap_or(0),
+            sources: (kept["sources"].as_array().into_iter().flatten())
+                .filter_map(|name| Some(name.as_str()?.to_owned()))
+                .collect(),
+            first_ms: kept["first_ms"].as_u64().unwrap_or(0),
+            last_ms: kept["last_ms"].as_u64().unwrap_or(0),
+        }
+    }
+
+    /// The note's line for them, `now_ms` being when it goes; none when
+    /// every event was kept.
+    fn line(&self, waiting: usize, now_ms: u64) -> Option<String> {
+        if self.count == 0 {
+            return None;
+        }
+        let names: Vec<&str> = self.sources.iter().map(String::as_str).collect();
+        let from = match names.as_slice() {
+            [one] => one.to_string(),
+            [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+            [] => "your sources".to_owned(),
+        };
+        let ago = |at_ms: u64| match now_ms.saturating_sub(at_ms) / 60_000 {
+            0 => "less than a minute ago".to_owned(),
+            1 => "1 minute ago".to_owned(),
+            minutes => format!("{minutes} minutes ago"),
+        };
+        let (first, last) = (ago(self.first_ms), ago(self.last_ms));
+        let when = match first == last {
+            true => first,
+            false => format!("between {first} and {last}"),
+        };
+        let (count, them) = match self.count {
+            1 => ("1 more event".to_owned(), "it was"),
+            n => (format!("{n} more events"), "they were"),
+        };
+        Some(format!(
+            "- {count} from {from} came {when}, and {them} not kept: {waiting} were waiting for you already"
+        ))
+    }
+}
 
 /// What to read for the note: a message someone other than the subscriber
 /// wrote in a bot it watches, or the reply a turn of one ended with.
@@ -628,7 +720,9 @@ async fn serve(settings: Settings) -> Result<(), String> {
     let mut service = Service {
         runner: sources::Runner::new(beside(&settings.store, ".sources"), sent),
         store: settings.store.clone(),
+        waiting: waiting(),
         records: HashMap::new(),
+        made: Made::default(),
         working: HashMap::new(),
         subscribers: HashMap::new(),
         registry: Arc::default(),
@@ -740,11 +834,16 @@ struct Telling {
 
 struct Service {
     store: PathBuf,
+    /// How many events from sources wait for one subscriber
+    /// (`sonny.lookout_waiting`), as the settings said at the last read.
+    waiting: usize,
     /// The sources the person set up, running.
     runner: sources::Runner,
     /// Every bot as the daemon lists it, kept up from the stream: who made
     /// whom, for subscriptions to tasks of a bot other than the lead.
     records: HashMap<String, Value>,
+    /// Who made whom among `records`.
+    made: Made,
     /// The folder each turn under way works in, as it started: a bot may
     /// move between turns.
     working: HashMap<(String, i64), PathBuf>,
@@ -816,20 +915,63 @@ struct Service {
     rewriting: HashSet<(String, i64, String)>,
 }
 
-/// Every bot that one of `made` made, and what those made, as the daemon
-/// lists them; side chats are no one's tasks.
-fn grow(made: &mut HashSet<String>, records: &HashMap<String, Value>) {
-    loop {
-        let before = made.len();
+/// Who made whom among the bots the daemon lists, kept as the listing
+/// changes: a lineage grows through what each bot made, as a tree's
+/// child lists are walked, rather than through every bot listed again
+/// for each lookout and each generation.
+#[derive(Debug, Default)]
+struct Made {
+    /// By maker's name, listed or not: what it made, and whether each is
+    /// a side chat, which is no one's task.
+    by: HashMap<String, Vec<(String, bool)>>,
+    /// The leads listed.
+    leads: HashSet<String>,
+}
+
+impl Made {
+    fn of(records: &HashMap<String, Value>) -> Self {
+        let mut made = Made::default();
         for (name, record) in records {
-            if (record["created_by"].as_str()).is_some_and(|by| made.contains(by))
-                && record["expire_ms"].is_null()
-            {
-                made.insert(name.clone());
+            made.add(name, record);
+        }
+        made
+    }
+
+    fn add(&mut self, name: &str, record: &Value) {
+        if let Some(by) = record["created_by"].as_str() {
+            let side = !record["expire_ms"].is_null();
+            self.by
+                .entry(by.to_owned())
+                .or_default()
+                .push((name.to_owned(), side));
+        }
+        if crate::project::lead_project(name).is_some() {
+            self.leads.insert(name.to_owned());
+        }
+    }
+
+    fn remove(&mut self, name: &str, record: &Value) {
+        if let Some(by) = record["created_by"].as_str()
+            && let Some(made) = self.by.get_mut(by)
+        {
+            made.retain(|(made, _)| made != name);
+            if made.is_empty() {
+                self.by.remove(by);
             }
         }
-        if made.len() == before {
-            return;
+        self.leads.remove(name);
+    }
+
+    /// Every bot that one of `made` made, and what those made; side chats
+    /// are no one's tasks.
+    fn grow(&self, made: &mut HashSet<String>) {
+        let mut next: Vec<String> = made.iter().cloned().collect();
+        while let Some(by) = next.pop() {
+            for (name, _) in (self.by.get(&by).into_iter().flatten()).filter(|(_, side)| !side) {
+                if made.insert(name.clone()) {
+                    next.push(name.clone());
+                }
+            }
         }
     }
 }
@@ -968,6 +1110,7 @@ impl Service {
         self.records = (bots.iter())
             .filter_map(|b| Some((b["name"].as_str()?.to_owned(), b.clone())))
             .collect();
+        self.made = Made::of(&self.records);
         // Turns begun before the lookout watched, whose start it may not
         // hear again.
         crate::snapshot::running_now(
@@ -1032,6 +1175,9 @@ impl Service {
         // cuts short goes on from where it got to.
         self.resume = self.floor().or(self.resume);
         self.ended_unseen(&bots);
+        // The listing is in `records` now: let it go rather than hold a
+        // second copy of every bot for as long as the lookout watches.
+        drop(bots);
         let replay = match self.started {
             true => self.replay,
             false => self.replay_floor(),
@@ -1137,14 +1283,19 @@ impl Service {
                     {
                         let mut record = event["data"].clone();
                         record["name"] = json!(name);
-                        self.records.insert(name.to_owned(), record.clone());
+                        if let Some(had) = self.records.insert(name.to_owned(), record.clone()) {
+                            self.made.remove(name, &had);
+                        }
+                        self.made.add(name, &record);
                         self.seat(&client, &record).await;
                     }
                     if event["event"] == "deleted"
                         && let Some(name) = event["bot"].as_str()
                     {
                         self.in_flight.retain(|(bot, _), _| bot != name);
-                        self.records.remove(name);
+                        if let Some(had) = self.records.remove(name) {
+                            self.made.remove(name, &had);
+                        }
                         if let Some(lookout) = self.lookouts.remove(name) {
                             lookout.unheld();
                             self.index();
@@ -1312,6 +1463,10 @@ impl Service {
                         reread = Some(now);
                         self.goals.reread();
                         self.runner.reload();
+                        self.waiting = waiting();
+                        for lookout in self.lookouts.values_mut() {
+                            lookout.waiting = self.waiting;
+                        }
                         self.reread(&client).await;
                     }
                     for lookout in self.lookouts.values_mut() {
@@ -1807,6 +1962,7 @@ impl Service {
         let workspace = PathBuf::from(record["workspace"].as_str().unwrap_or("/"));
         let updates = updates_for(lead, &workspace, self.registry.clone(), self.live);
         let mut lookout = Lookout::new(lead);
+        lookout.waiting = self.waiting;
         self.seated += 1;
         lookout.id = self.seated;
         lookout.log = Some(self.log.clone());
@@ -1816,7 +1972,7 @@ impl Service {
         // What it subscribed to before it was made, or made again.
         // Less what was made for another bot of its name.
         lookout.subs = file.into_iter().filter(|sub| sub.held_by(record)).collect();
-        lookout.roots(&self.records);
+        lookout.roots(&self.records, &self.made);
         let held = beside(&self.store, ".sources").join(".held");
         lookout.restore(held.join(format!("{lead}.json")));
         self.lookouts.insert(lead.to_owned(), lookout);
@@ -1876,7 +2032,7 @@ impl Service {
                 .collect();
             if all || subs != lookout.subs {
                 lookout.subs = subs;
-                lookout.roots(&self.records);
+                lookout.roots(&self.records, &self.made);
                 lookout.rehear();
             }
         }
@@ -2019,20 +2175,32 @@ pub fn status(store: &std::path::Path, lead: &str) -> String {
     if !running(store) {
         return "Lookout · not running".to_owned();
     }
-    let (mut seated, mut notes) = (false, 0);
+    let (mut seated, mut notes, mut unkept, mut waiting) = (false, 0, 0, 0);
     for line in logged(store, lead) {
         seated |= line["seated"] == true;
+        // What a note from sources left waiting, as of the latest.
+        if line["sources"] == true {
+            waiting = line["waiting"].as_u64().unwrap_or(0);
+        }
         if today(&line) {
             notes += usize::from(line.get("woke").is_some());
+            unkept += usize::from(line.get("skipped").is_some() && line.get("source").is_some());
         }
     }
-    match seated {
-        false => "Lookout · not watching this lead yet".to_owned(),
-        true => format!(
-            "Lookout · watching · {notes} note{} in the last day",
-            if notes == 1 { "" } else { "s" }
-        ),
+    if !seated {
+        return "Lookout · not watching this lead yet".to_owned();
     }
+    let mut said = format!(
+        "Lookout · watching · {notes} note{} in the last day",
+        if notes == 1 { "" } else { "s" }
+    );
+    if waiting > 0 {
+        said.push_str(&format!(" · {waiting} from sources waiting"));
+    }
+    if unkept > 0 {
+        said.push_str(&format!(" · {unkept} from sources not kept"));
+    }
+    said
 }
 
 /// The end of the log, the lines about one subscriber.
@@ -2152,6 +2320,13 @@ struct Lookout {
     from: Option<i64>,
     /// What sources said that the subscriber is to hear, oldest first.
     heard: Vec<sources::Heard>,
+    /// How many of those wait at most (`sonny.lookout_waiting`), 0 for no
+    /// limit.
+    waiting: usize,
+    /// What came past them, not kept, for the next note to say.
+    unkept: Unkept,
+    /// What the note on its way says was not kept, until the daemon takes it.
+    unkept_sent: Unkept,
     /// When the first of those came.
     heard_since: Option<Instant>,
     /// When a note last told the subscriber each source, which a source's
@@ -2216,6 +2391,9 @@ impl Lookout {
             since: None,
             from: None,
             heard: Vec::new(),
+            waiting: WAITING,
+            unkept: Unkept::default(),
+            unkept_sent: Unkept::default(),
             heard_since: None,
             told_sources: HashMap::new(),
             held: None,
@@ -2546,10 +2724,10 @@ impl Lookout {
 
     /// Every bot a subscription names the makers of, other than the lead,
     /// from what the daemon lists: what each made, and what those made.
-    fn roots(&mut self, records: &HashMap<String, Value>) {
+    fn roots(&mut self, records: &HashMap<String, Value>, made: &Made) {
         // The subscriber's own: what it made before it was seated is listed,
         // not replayed.
-        grow(&mut self.lineage, records);
+        made.grow(&mut self.lineage);
         let roots: HashSet<String> = (self.subs.iter())
             .flat_map(|sub| sub.tasks_of.iter().cloned())
             .filter(|root| *root != self.lead)
@@ -2559,27 +2737,41 @@ impl Lookout {
             if self.others.contains_key(&root) {
                 continue;
             }
-            let mut made: HashSet<String> = [root.clone()].into();
-            grow(&mut made, records);
-            self.others.insert(root, made);
+            let mut lineage: HashSet<String> = [root.clone()].into();
+            made.grow(&mut lineage);
+            self.others.insert(root, lineage);
         }
         // Another lead's tasks stay theirs once that lead is gone: their
         // maker is still named as one.
-        self.theirs = (records.iter())
-            .filter(|(name, record)| {
-                self.sibling(name)
-                    || record["created_by"]
-                        .as_str()
-                        .is_some_and(|by| self.sibling(by))
-            })
-            .map(|(name, _)| name.clone())
+        let siblings = (made.leads.iter())
+            .chain(made.by.keys())
+            .filter(|name| self.sibling(name));
+        let mut theirs = HashSet::new();
+        for sibling in siblings {
+            if records.contains_key(sibling) {
+                theirs.insert(sibling.clone());
+            }
+            theirs
+                .extend((made.by.get(sibling).into_iter().flatten()).map(|(name, _)| name.clone()));
+        }
+        made.grow(&mut theirs);
+        self.theirs = theirs;
+        // Only a `--bot` glob names bots beyond the lineages.
+        self.globbed = match self.subs.iter().any(|sub| !sub.bots.is_empty()) {
+            true => (records.iter())
+                .filter(|(name, record)| self.globs(name) && record["expire_ms"].is_null())
+                .map(|(name, _)| name.clone())
+                .collect(),
+            false => HashSet::new(),
+        };
+        // What it watches is among those, as listed.
+        let named: Vec<String> = (self.lineage.iter())
+            .chain(self.others.values().flatten())
+            .chain(&self.globbed)
+            .filter(|name| records.contains_key(*name))
+            .cloned()
             .collect();
-        grow(&mut self.theirs, records);
-        self.globbed = (records.iter())
-            .filter(|(name, record)| self.globs(name) && record["expire_ms"].is_null())
-            .map(|(name, _)| name.clone())
-            .collect();
-        self.sync(records.keys());
+        self.sync(&named);
         self.seat_watched(records);
     }
 
@@ -2812,6 +3004,7 @@ impl Lookout {
                         let mut back = sent;
                         back.append(&mut self.heard);
                         self.heard = back;
+                        self.unkept.merge(std::mem::take(&mut self.unkept_sent));
                         self.heard_since.get_or_insert(now);
                         self.write(&json!({"at_ms": epoch_ms(), "lead": self.lead,
                             "wake_failed": code, "sources": true}));
@@ -2822,12 +3015,14 @@ impl Lookout {
                     submitted => {
                         self.refused = None;
                         self.sourced(true);
+                        self.unkept_sent = Unkept::default();
                         for heard in &sent {
                             self.told_sources.insert(heard.event.source.clone(), now);
                         }
                         if submitted.is_ok() {
                             self.write(&json!({"at_ms": epoch_ms(), "lead": self.lead,
-                                "woke": key, "delivery": delivery, "sources": true}));
+                                "woke": key, "delivery": delivery, "sources": true,
+                                "waiting": self.heard.len()}));
                         }
                     }
                 }
@@ -2848,6 +3043,7 @@ impl Lookout {
             self.sourced(false);
             sent.append(&mut self.heard);
             self.heard = sent;
+            self.unkept.merge(std::mem::take(&mut self.unkept_sent));
             self.heard_since.get_or_insert(Instant::now());
         }
     }
@@ -2972,7 +3168,12 @@ impl Lookout {
         };
         let events: Vec<Value> = self.heard.iter().map(json).collect();
         let told_subs = &self.updates.told_subs;
+        // What the note under way says was not kept stays with it, so the
+        // note sent again says the same.
+        let (unkept, unkept_sending) = (&self.unkept, &self.unkept_sent);
         if events.is_empty()
+            && unkept.count == 0
+            && unkept_sending.count == 0
             && sending.is_empty()
             && self.told_sources.is_empty()
             && told_subs.is_empty()
@@ -2994,6 +3195,12 @@ impl Lookout {
         // reads as it did before there were any.
         if !told_subs.is_empty() {
             body["told_subs"] = json!(at_ms(told_subs));
+        }
+        if unkept.count > 0 {
+            body["unkept"] = unkept.to_json();
+        }
+        if unkept_sending.count > 0 {
+            body["unkept_sending"] = unkept_sending.to_json();
         }
         Some((path, Some(body.to_string().into_bytes())))
     }
@@ -3050,6 +3257,8 @@ impl Lookout {
         };
         self.heard = heard("events");
         self.resend = heard("sending");
+        self.unkept = Unkept::from_json(&kept["unkept"]);
+        self.unkept_sent = Unkept::from_json(&kept["unkept_sending"]);
         self.heard_since = (!self.heard.is_empty() || !self.resend.is_empty()).then_some(now);
         self.rehear();
     }
@@ -3061,14 +3270,6 @@ impl Lookout {
         if subs.is_empty() || self.holds(event) {
             return;
         }
-        if self.heard.len() >= HEARD {
-            let dropped = self.heard.remove(0);
-            self.write(
-                &json!({"at_ms": epoch_ms(), "lead": self.lead, "source": dropped.event.source,
-                "skipped": "too many events waiting for the subscriber"}),
-            );
-        }
-        self.heard_since.get_or_insert_with(Instant::now);
         let mut event = event.clone();
         // What a subscription that hears it marks urgent is, as if its
         // source had.
@@ -3081,6 +3282,26 @@ impl Lookout {
             event.steer = true;
             event.steer_by = Some(sub.name.clone());
         }
+        // Full: a newer event is not kept, and the next note says so. One
+        // that steers takes the place of the newest that does not.
+        if self.waiting > 0 && self.heard.len() >= self.waiting {
+            let newest = (self.heard.iter()).rposition(|heard| !heard.event.steer);
+            let dropped = match (event.steer, newest) {
+                (true, Some(at)) => self.heard.remove(at).event,
+                _ => event.clone(),
+            };
+            let at_ms = epoch_ms();
+            self.unkept.add(&dropped.source, at_ms as u64);
+            self.write(
+                &json!({"at_ms": at_ms, "lead": self.lead, "source": dropped.source,
+                "id": dropped.id, "skipped": "more waiting than sonny.lookout_waiting"}),
+            );
+            self.keep();
+            if !(event.steer && newest.is_some()) {
+                return;
+            }
+        }
+        self.heard_since.get_or_insert_with(Instant::now);
         self.heard.push(sources::Heard { event, subs });
         self.keep();
     }
@@ -3127,7 +3348,8 @@ impl Lookout {
         let sent = std::mem::take(&mut self.resend);
         if !sent.is_empty() {
             let steer = sent.iter().any(|heard| heard.event.steer);
-            let prompt = sources::note(&sent, self.heard.len());
+            let unkept = self.unkept_sent.line(self.waiting, epoch_ms() as u64);
+            let prompt = sources::note(&sent, self.heard.len(), unkept.as_deref());
             return self.source(client, woken, sent, prompt, steer);
         }
         let steer = self.heard.iter().any(|heard| heard.event.steer);
@@ -3151,7 +3373,10 @@ impl Lookout {
         let sent: Vec<sources::Heard> = ready.drain(..take).collect();
         ready.extend(held);
         self.heard = ready;
-        let prompt = sources::note(&sent, self.heard.len());
+        // What did not fit is told with it, and again if it is refused.
+        self.unkept_sent = std::mem::take(&mut self.unkept);
+        let unkept = self.unkept_sent.line(self.waiting, epoch_ms() as u64);
+        let prompt = sources::note(&sent, self.heard.len(), unkept.as_deref());
         self.source(client, woken, sent, prompt, steer);
     }
 
@@ -4243,10 +4468,11 @@ mod tests {
         sub.bots = vec!["web.lead".into()];
         assert!(!lookout.watches("web.lead"));
         lookout.subs.push(sub);
-        lookout.roots(&HashMap::from([(
+        let records = HashMap::from([(
             "web.lead".to_owned(),
             json!({"name": "web.lead", "bot_id": 7}),
-        )]));
+        )]);
+        lookout.roots(&records, &Made::of(&records));
         assert!(lookout.watches("web.lead"));
         // Its own lookout's note, and the person's question.
         let note = json!({"request_id": "lookout-0123456789abcdef"});
@@ -4300,7 +4526,7 @@ mod tests {
             .into_iter()
             .map(|(name, by)| (name.to_owned(), json!({"name": name, "created_by": by})))
             .collect();
-        lookout.roots(&records);
+        lookout.roots(&records, &Made::of(&records));
         assert!(lookout.watches("r.a") && lookout.watches("r.b"));
     }
 
@@ -4489,9 +4715,15 @@ mod tests {
         Service {
             runner: sources::Runner::new(store.join("sources"), tokio::sync::mpsc::channel(1).0),
             store,
+            waiting: WAITING,
             records: (records.iter())
                 .map(|r| (r["name"].as_str().unwrap().to_owned(), r.clone()))
                 .collect(),
+            made: Made::of(
+                &(records.iter())
+                    .map(|r| (r["name"].as_str().unwrap().to_owned(), r.clone()))
+                    .collect(),
+            ),
             working: HashMap::new(),
             subscribers: HashMap::new(),
             registry: Arc::default(),
@@ -4659,6 +4891,17 @@ mod tests {
         assert!(service.lookouts.is_empty());
         self::held::written();
         assert!(!held.exists());
+    }
+
+    #[test]
+    fn a_lookout_holds_as_many_from_sources_as_the_settings_say() {
+        let record = json!({"name": "calc.fix", "bot_id": 4, "workspace": "/", "status": "idle"});
+        let mut service = service(PathBuf::new(), std::slice::from_ref(&record));
+        service.waiting = 0;
+        let sub = subs::Sub::commons("tidy", Some(4));
+        (service.subscribers).insert("calc.fix".into(), vec![sub]);
+        assert!(service.place(&record));
+        assert_eq!(service.lookouts["calc.fix"].waiting, 0);
     }
 
     #[test]
@@ -5057,6 +5300,19 @@ mod tests {
             status(&store, "calc.lead"),
             "Lookout · watching · 1 note in the last day"
         );
+        // What a full lookout left waiting, and did not keep, shows too.
+        append(
+            &log,
+            &json!({"at_ms": now, "lead": "calc.lead", "woke": [], "sources": true, "waiting": 40}),
+        );
+        append(
+            &log,
+            &json!({"at_ms": now, "lead": "calc.lead", "source": "chat", "skipped": "full"}),
+        );
+        assert_eq!(
+            status(&store, "calc.lead"),
+            "Lookout · watching · 2 notes in the last day · 40 from sources waiting · 1 from sources not kept"
+        );
         assert_eq!(
             status(&store, "shop.lead"),
             "Lookout · not watching this lead yet"
@@ -5098,14 +5354,15 @@ mod tests {
         lookout
             .subs
             .push(sub("billing", &[], &["shop.lead.billing"]));
-        lookout.roots(&HashMap::from([
+        let records = HashMap::from([
             ("shop.lead.billing".to_owned(), json!({})),
             (
                 "shop.invoices".to_owned(),
                 json!({"created_by": "shop.lead.billing"}),
             ),
             ("shop.stray".to_owned(), json!({})),
-        ]));
+        ]);
+        lookout.roots(&records, &Made::of(&records));
         assert!(lookout.watches("shop.lead.billing"));
         assert!(!lookout.watches("shop.invoices"));
     }
@@ -5117,7 +5374,7 @@ mod tests {
         lookout.lead = "shop.lead".into();
         // shop.lead.billing was deleted; its task and the task's own task
         // live on.
-        lookout.roots(&HashMap::from([
+        let records = HashMap::from([
             (
                 "shop.invoices".to_owned(),
                 json!({"created_by": "shop.lead.billing"}),
@@ -5127,7 +5384,8 @@ mod tests {
                 json!({"created_by": "shop.invoices"}),
             ),
             ("shop.stray".to_owned(), json!({})),
-        ]));
+        ]);
+        lookout.roots(&records, &Made::of(&records));
         assert!(lookout.watches("shop.stray"));
         assert!(!lookout.watches("shop.invoices"));
         assert!(!lookout.watches("shop.invoices-pdf"));
@@ -5179,16 +5437,27 @@ mod tests {
         assert_eq!(lookout.heard.len(), 1);
         assert_eq!(lookout.heard[0].subs, ["chat", "eng"]);
         assert!(lookout.heard_since.is_some());
-        // A subscriber that never rests keeps only the newest.
-        for n in 0..HEARD + 5 {
+        // A subscriber that never rests keeps the oldest it can hold, and
+        // counts what it did not keep for its next note.
+        lookout.waiting = 8;
+        for n in 1..8 + 5 {
             lookout.heard_from(&slack(&n.to_string(), false));
         }
-        assert_eq!(lookout.heard.len(), HEARD);
-        assert_eq!(lookout.heard[HEARD - 1].event.text, (HEARD + 4).to_string());
+        assert_eq!(lookout.heard.len(), 8);
+        assert_eq!(lookout.heard[0].event.text, "lunch?");
+        assert_eq!(lookout.heard[7].event.text, "7");
+        assert_eq!(lookout.unkept.count, 5);
+        assert_eq!(lookout.unkept.sources, ["slack".to_owned()].into());
+        // One that steers takes the place of the newest that does not.
+        lookout.heard_from(&slack("prod is down", true));
+        assert_eq!(lookout.heard.len(), 8);
+        assert_eq!(lookout.heard[6].event.text, "6");
+        assert_eq!(lookout.heard[7].event.text, "prod is down");
+        assert_eq!(lookout.unkept.count, 6);
         // Events still waiting follow the subscriptions as they change.
         lookout.subs.retain(|sub| sub.name == "eng");
         lookout.rehear();
-        assert_eq!(lookout.heard.len(), HEARD);
+        assert_eq!(lookout.heard.len(), 8);
         assert!(lookout.heard.iter().all(|heard| heard.subs == ["eng"]));
         lookout.subs.clear();
         lookout.rehear();
@@ -5301,7 +5570,7 @@ mod tests {
         // under the same request.
         let mut sending = made();
         sending.heard_from(&slack("two", false));
-        let asked = sources::note(&sending.heard, 0);
+        let asked = sources::note(&sending.heard, 0, None);
         let sent = std::mem::take(&mut sending.heard);
         sending.sourcing = Some((sent, vec!["k".into()], "queue"));
         sending.heard_from(&slack("three", false));
@@ -5314,7 +5583,7 @@ mod tests {
         assert_eq!(back.resend.len(), 1);
         assert_eq!(back.resend[0].event.text, "two");
         assert_eq!(back.heard.len(), 1);
-        assert_eq!(sources::note(&back.resend, 0), asked);
+        assert_eq!(sources::note(&back.resend, 0, None), asked);
         // Another bot of the name hears none of it.
         let mut other = Lookout::new("calc.lead");
         other.subs.push(hears("chat"));
@@ -5558,6 +5827,84 @@ mod tests {
         let urgent = got.recv().await.unwrap();
         assert_eq!(urgent["delivery"], "steer");
         assert!(urgent["prompt"].as_str().unwrap().contains("down"));
+    }
+
+    #[tokio::test]
+    async fn what_a_full_lookout_did_not_keep_is_told_until_a_note_lands() {
+        let dir = std::env::temp_dir().join(format!("sonny-unkept-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("calc.lead.json");
+        let made = || {
+            let mut lookout = lookout();
+            lookout.updates.live = true;
+            lookout.subs.push(hears("chat"));
+            (lookout.updates).seat(&json!({"name": "calc.lead", "bot_id": 1, "status": "idle"}));
+            lookout.waiting = 2;
+            lookout
+        };
+        let mut lookout = made();
+        lookout.restore(path.clone());
+        for text in ["one", "two", "three", "four"] {
+            lookout.heard_from(&slack(text, false));
+        }
+        assert_eq!(lookout.unkept.count, 2);
+        // Kept on disk with what waits, so a restart still tells it.
+        lookout.flush();
+        held::written();
+        let mut lookout = made();
+        lookout.restore(path.clone());
+        assert_eq!(lookout.heard.len(), 2);
+        assert_eq!(lookout.unkept.count, 2);
+        // The next note says it, once.
+        let (client, mut got) = submits().await;
+        lookout.heard_since = Some(Instant::now() - SETTLE);
+        wake_sources(&mut lookout, &client).await;
+        let prompt = got.recv().await.unwrap()["prompt"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(prompt.contains("\"one\""), "{prompt}");
+        assert!(
+            prompt.contains(
+                "- 2 more events from slack came less than a minute ago, and they were not kept: \
+                 2 were waiting for you already"
+            ),
+            "{prompt}"
+        );
+        assert_eq!(lookout.unkept.count + lookout.unkept_sent.count, 0);
+        // A note refused says it again in the next.
+        lookout.heard_from(&slack("five", false));
+        lookout.heard_from(&slack("six", false));
+        let sent = std::mem::take(&mut lookout.heard);
+        lookout.unkept.add("slack", epoch_ms() as u64);
+        lookout.unkept_sent = std::mem::take(&mut lookout.unkept);
+        lookout.sourcing = Some((sent, vec!["k".into()], "queue"));
+        lookout.answered(Answer::Sourced(Err("bot_busy".into())));
+        assert_eq!(lookout.unkept.count, 1);
+        assert_eq!(lookout.heard.len(), 2);
+        // A note under way when the lookout stops says it again when it goes
+        // again, even with nothing else waiting.
+        let sent = std::mem::take(&mut lookout.heard);
+        lookout.unkept_sent = std::mem::take(&mut lookout.unkept);
+        lookout.sourcing = Some((sent, vec!["k".into()], "queue"));
+        lookout.keep();
+        lookout.flush();
+        held::written();
+        let mut lookout = made();
+        lookout.restore(path.clone());
+        assert_eq!((lookout.resend.len(), lookout.unkept.count), (2, 0));
+        lookout.heard_since = Some(Instant::now());
+        wake_sources(&mut lookout, &client).await;
+        let prompt = got.recv().await.unwrap()["prompt"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(prompt.contains("\"five\""), "{prompt}");
+        assert!(
+            prompt.contains("- 1 more event from slack came"),
+            "{prompt}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

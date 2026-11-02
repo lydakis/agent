@@ -1164,9 +1164,22 @@ it lists, so it refuses what reaches past the desktop: launching an app
 with arguments, environment, a folder or a DevTools port, `batch`,
 `trace`, sessions, and any path, a screenshot's or the clipboard's. On
 macOS it needs Accessibility, and Screen Recording for screenshots, for
-the app that started the tool host: an agent refused for a missing one
-asks you, and `permissions --guide`, run through the tool so it asks
-for the right app, opens the settings page with a guide.
+agent-desktop itself, whichever terminal started the daemon: Sonny starts
+it responsible for itself, so macOS asks about it and not that terminal.
+An agent refused for a missing one asks you, and `permissions --guide`,
+run through the tool, opens the settings page with a guide. agent-desktop
+is not signed by a developer, so macOS forgets the grant when it is
+upgraded, and asks again.
+Neither tool runs the agent-browser or agent-desktop on your `PATH`
+itself. Each runs a copy in `~/.agent/sonny/programs/`, made from it
+before its first call and again whenever it changes, and not while it,
+or that folder, is in a folder some agent of the store writes (its
+workspace, a folder its sandbox may write, or the temporary folders a
+workspace-write sandbox writes). So a program an agent could swap never
+runs, whichever agent calls, and a swap after the copy was made changes
+nothing until it is copied again. An agent with no sandbox is not
+counted, as it already runs as you. On macOS, the copy is what you grant
+Accessibility and Screen Recording to.
 [docs/SONNY.md](../docs/SONNY.md) has the details of automations, memory,
 skills and MCP.
 Sonny starts its lookout, `sonny lookout`, when it opens a project: one

@@ -102,9 +102,9 @@ person is away for half an hour and to handle what comes in, then sends
 minutes apart on the clock whether the lead is busy or not. Twenty of them
 are real asks, two a wave in a shuffled order that stays the same from run
 to run: twelve need code, five a quick look, three the person's call. The rest is chatter and CI
-builds passing. Past 64 waiting, the oldest of a subscriber's news goes
-untold, so a lead that does the work itself loses asks while it works; one
-that delegates stays free. Halfway through, the person asks a one-line
+builds passing. News waits for a busy lead (up to 1,024 events), so a lead
+that does the work itself answers late while it works; one that delegates
+stays free. Halfway through, the person asks a one-line
 question, and at the end comes back to ask what needs them. Its output sits
 under `.local/role-eval/<model>/burst/`. Score:
 
@@ -118,6 +118,38 @@ under `.local/role-eval/<model>/burst/`. Score:
 
 Also count asks that were never mentioned or acted on, and replies about
 noise (Noise, above).
+
+Each burst run also writes `asks.md` and `asks.json` (`bench/burst_ledger.py`),
+which give each ask's path from the run's own evidence rather than the lead's
+account of it:
+
+- when the ask was released;
+- whether a note brought it to the lead (`reached`);
+- whether the lead sent it to a task, from its calls (`delegated`), or
+  changed the code itself;
+- for a code ask, whether its change works, checked on main and on every
+  branch tip. The check runs the agents' code, and git in their repository,
+  in `agent sandbox` with the network off and no provider key, as their own
+  commands run;
+- for a quick look or one of the person's calls, when the lead said it to
+  the person;
+- how long the ask waited before the lead acted on it, by sending it to a
+  task or by starting it itself, or until the run ended.
+
+The summary counts:
+
+- asks reached, handled and on main, and the oldest wait;
+- whether main's tests pass;
+- every agent's turns by how they ended, and their tokens. These are
+  recorded from the event stream while the run goes (`events.jsonl`), so a
+  task deleted before the end still counts.
+- the lookout's events that were not kept;
+- the run's peak memory and CPU time: the daemon, the lead's `sonny acp`
+  and every process under them.
+
+The ledger is evidence for the scorer; the rows above are still read from the
+transcript. `python3 -m bench.role_eval ledger --day burst` writes it again
+for runs whose root is still in `~/.role-eval`.
 
 ### Results
 
@@ -135,8 +167,10 @@ the ChatGPT plan, scored by hand from each run's transcript and messages:
 
 Each lead started 5 to 7 tasks, and a run used about 6.5M to 9.6M input
 tokens, mostly cache reads. These rows count what the lead did with each
-ask. They do not check that a task's change works, and they do not count
-asks the lookout dropped past 64 waiting.
+ask. The runs came before the ledger, so they do not check that a task's
+change works, and before the lookout kept news past 64 waiting, so an ask
+dropped then is not counted. `ledger --day burst` over the three runs' roots
+adds the ledger.
 
 ## Cost
 

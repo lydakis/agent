@@ -56,6 +56,8 @@ import zlib
 import time
 from pathlib import Path
 
+from . import burst_ledger
+
 OUT = Path(__file__).resolve().parents[1] / '.local/role-eval'
 RUNS = OUT / 'runs'
 MODEL = 'chatgpt/gpt-6.1-sol'
@@ -246,9 +248,9 @@ SMALL = [
 # A burst (DeepSeek Harness's super-agent case): the person steps away and
 # about 300 chat and CI messages come in over 20 minutes, about 20 of them
 # real asks. A lead that does the work itself stays busy while news piles up
-# past what it holds (64 waiting, the oldest go untold) and answers the
-# person late; one that delegates stays free. B1 asks need code, B3 a quick
-# look, B4 the person's call.
+# and answers the person late; one that delegates stays free. B1 asks need
+# code, B3 a quick look, B4 the person's call. `burst_ledger` follows each
+# ask from its note to how it ended.
 BURST_ASKS = [
     ('chat', 'sam', "can someone make Order print as '#1 19.99 EUR'? the logs are unreadable", 'B1 code ask: Order __str__'),
     ('ci', 'ci', "nightly: tests print DeprecationWarning: datetime.utcnow() in shop/audit.py, please fix before it breaks", 'B1 code ask: audit stamp in UTC'),
@@ -826,6 +828,12 @@ def run(arm, n, bins, model, spec=None):
     sh([str(agent), 'start', '--idle-exit', '0'], env=env)
     acp = None
     timeline = []
+    # The burst's evidence, kept as it comes: tasks deleted before the end
+    # still count, with what they cost.
+    recorder = sampler = None
+    if DAY is BURST:
+        recorder = burst_ledger.Recorder(agent, env, out / 'events.jsonl')
+        sampler = burst_ledger.Sampler(home, roots=lambda: [acp.p.pid] if acp else [])
     landed = {}
 
     def release(step, s):
@@ -901,6 +909,9 @@ def run(arm, n, bins, model, spec=None):
         (out / 'usage.json').write_text(usage.stdout)
         bots = subprocess.run([str(agent), 'ls'], env=env, capture_output=True, text=True)
         (out / 'bots.txt').write_text(bots.stdout)
+        resources = sampler.close() if sampler else None
+        if recorder:
+            recorder.close()
         if acp:
             acp.close()
         # An automation is loaded in the user's own scheduler whatever HOME
@@ -933,6 +944,12 @@ def run(arm, n, bins, model, spec=None):
             main += [f'--- main:{path}', shown.stdout or '(none)']
         (out / 'main.txt').write_text('\n'.join(main) + '\n')
         messages(home, out)
+        if DAY is BURST:
+            try:
+                burst_ledger.ledger(out, agent, repo, env, events(), timeline,
+                                    home / '.agent/state.sqlite.lookout.jsonl', resources, ended=time.time())
+            except Exception as error:  # the run's other evidence stands
+                print(f'{arm}{n}: no ledger: {error}', file=sys.stderr)
         # Nothing outside the run should have changed: what did is kept, and
         # said, for whoever reads the run.
         outside = changed_outside(started, root)
@@ -1067,7 +1084,7 @@ def blind():
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('cmd', choices=['run', 'all', 'blind', 'transcript'])
+    ap.add_argument('cmd', choices=['run', 'all', 'blind', 'transcript', 'ledger'])
     ap.add_argument('--arm', default='A')
     ap.add_argument('--n', type=int, default=1)
     ap.add_argument('--runs', type=int, default=3)
@@ -1101,6 +1118,18 @@ def main():
             sys.exit(f'{failed} of {len(jobs)} runs failed')
     elif a.cmd == 'blind':
         blind()
+    elif a.cmd == 'ledger':
+        # A finished burst run's ledger again, while its root is still there.
+        for arm, n in ([(a.arm, a.n)] if a.runs == 0 else [(arm, n) for n in range(1, a.runs + 1) for arm in 'AB']):
+            out, root = RUNS / f'{arm}{n}', ROOT / f'{zlib.crc32((a.model + DAY_NAME).encode()):08x}-{arm}{n}'
+            if not (out / 'acp.jsonl').exists() or not (root / 'shop').exists():
+                continue
+            env = {'HOME': str(root / 'h'), 'PATH': '/opt/homebrew/bin:/usr/bin:/bin',
+                   'GIT_CONFIG_GLOBAL': str(root / 'gitconfig')}
+            timeline = json.loads((out / 'timeline.json').read_text())
+            print(out, burst_ledger.ledger(out, root / 'bin/agent', root / 'shop', env,
+                                           json.loads((root / 'events.json').read_text()),
+                                           timeline, root / 'h/.agent/state.sqlite.lookout.jsonl'))
     else:
         # Only runs that finished: a failed run stays out of scoring.
         for p in RUNS.iterdir():
