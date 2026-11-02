@@ -67,7 +67,10 @@ controller is with a large cluster. It follows only the event kinds it
 reads, so the text models stream never reaches it. Each event reaches only the
 subscribers that watch its bot, or every one for a bot made or deleted,
 and each checks that one bot alone. Each subscriber keeps only the bots it
-watches. Notes and status checks go to the daemon beside the stream, so no
+watches, worked out from who made whom: one index of each bot's makings,
+kept as bots are made and deleted, so a subscriber's start walks its own
+tasks rather than every bot listed (10,000 bots: 1.9 s of CPU to start
+before, 0.8 s after). Notes and status checks go to the daemon beside the stream, so no
 call to it holds the events up. `bench/lookout_scale.py` measures it with
 up to thousands of streaming bots. When the daemon lets go of it
 (`disconnected` in its log), it connects again from its cursor.
