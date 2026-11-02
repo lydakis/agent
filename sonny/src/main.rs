@@ -64,6 +64,7 @@ mod prompt;
 mod reactions;
 mod recall;
 mod resolved;
+mod responsible;
 mod rex;
 mod rules;
 mod said;

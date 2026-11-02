@@ -561,19 +561,19 @@ fn nonce() -> String {
 /// person's agent-desktop session settings, which name files and IDs that
 /// are not the agent's.
 async fn run(args: &[String]) -> Ran {
-    let mut command = tokio::process::Command::new(program());
-    command
-        .args(args)
-        .current_dir("/")
-        .env_remove("AGENT_DESKTOP_SESSION")
-        .env_remove("AGENT_DESKTOP_AGENT_ID")
-        .stdin(std::process::Stdio::null())
-        .kill_on_drop(true);
-    match command.output().await {
+    // Responsible for itself, so what the person granted agent-desktop is
+    // what it has, wherever the daemon was started.
+    let ran = crate::responsible::output(
+        program(),
+        args,
+        Path::new("/"),
+        &["AGENT_DESKTOP_SESSION", "AGENT_DESKTOP_AGENT_ID"],
+    );
+    match ran.await {
         Ok(out) => Ran::of(
             &String::from_utf8_lossy(&out.stdout),
             &String::from_utf8_lossy(&out.stderr),
-            out.status.success(),
+            out.success,
         ),
         Err(e) => Ran {
             said: format!("{PROGRAM} could not start: {e}"),
