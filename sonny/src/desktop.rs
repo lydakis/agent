@@ -523,11 +523,23 @@ fn nonce() -> String {
 /// Run one of agent-desktop's commands, in `/`, with none of the
 /// person's agent-desktop session settings, which name files and IDs that
 /// are not the agent's.
-async fn run(program: &Path, args: &[String]) -> Ran {
+async fn run(args: &[String]) -> Ran {
+    // Checked again as it starts, so a copy changed since, while the call
+    // waited for its approval, is admitted again or not run.
+    let program = match crate::trusted::program(PROGRAM).await {
+        Ok(program) => program,
+        Err(e) => {
+            return Ran {
+                said: format!("{PROGRAM} is not run: {e}"),
+                ok: false,
+                picture: None,
+            };
+        }
+    };
     // Responsible for itself, so what the person granted agent-desktop is
     // what it has, wherever the daemon was started.
     let ran = crate::responsible::output(
-        program,
+        &program,
         args,
         Path::new("/"),
         &["AGENT_DESKTOP_SESSION", "AGENT_DESKTOP_AGENT_ID"],
@@ -679,7 +691,9 @@ pub async fn drive(
     let checked: Vec<Checked> = (lines.iter().map(|line| checked(line)))
         .collect::<Result<_, _>>()
         .map_err(|e| ("desktop_refused", e))?;
-    let program = crate::trusted::program(PROGRAM)
+    // Refused before anything is asked; checked again as each command
+    // starts.
+    crate::trusted::program(PROGRAM)
         .await
         .map_err(|e| ("desktop_refused", e))?;
     // Asked before the desktop is taken, so another agent's call goes on
@@ -707,7 +721,7 @@ pub async fn drive(
         if lines.len() > 1 {
             text.push_str(&format!("$ {line}\n"));
         }
-        let ran = run(&program, &command.args).await;
+        let ran = run(&command.args).await;
         let (mut said, ok) = (ran.said, ran.ok);
         // Fitted off the tool host's one thread: a large screen's picture
         // takes a while to scale.

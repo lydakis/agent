@@ -362,6 +362,16 @@ mod tests {
         std::fs::write(&copy, "swapped").unwrap();
         let copy = pins.program("tool", &origin, none).await.unwrap();
         assert_eq!(std::fs::read_to_string(&copy).unwrap(), "two");
+        // Swapped by an agent given its folder since it was admitted, as
+        // while a call waits for approval: the next start asks again, and
+        // refuses it.
+        std::fs::write(&copy, "theirs").unwrap();
+        let writers = vec![("calc.lead".to_owned(), root.join("programs"))];
+        let refused = pins
+            .program("tool", &origin, || async { Ok(writers) })
+            .await
+            .unwrap_err();
+        assert!(refused.contains("which the agent calc.lead writes"), "{refused}");
     }
 
     #[tokio::test]

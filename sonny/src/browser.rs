@@ -463,8 +463,6 @@ struct Checked {
 /// How a session's browser starts: the actions it confirms, and the
 /// Chrome profile it starts from when not agent-browser's own.
 struct Launch {
-    /// The copy of agent-browser that runs.
-    program: PathBuf,
     confirm: String,
     profile: Option<String>,
 }
@@ -1044,7 +1042,19 @@ pub fn tool() -> Option<Value> {
 /// name the program it launches. Its paths are whole already.
 async fn run(session: &str, args: &[String], launch: &Launch) -> Ran {
     let confirm = launch.confirm.as_str();
-    let mut command = tokio::process::Command::new(&launch.program);
+    // Checked again as it starts, so a copy changed since, while the call
+    // waited for a confirmation, is admitted again or not run.
+    let program = match crate::trusted::program(PROGRAM).await {
+        Ok(program) => program,
+        Err(e) => {
+            return Ran {
+                said: format!("{PROGRAM} is not run: {e}"),
+                ok: false,
+                confirmation: None,
+            };
+        }
+    };
+    let mut command = tokio::process::Command::new(&program);
     command
         .arg("--json")
         .args(args)
@@ -1219,11 +1229,11 @@ async fn drive(
         Ok(config) => confirmed(&config.sonny.browser_confirm),
         Err(_) => confirmed(&agent_client::config::BROWSER_CONFIRM.map(str::to_owned)),
     };
-    let program = crate::trusted::program(PROGRAM)
+    // Refused before anything runs; checked again as each command starts.
+    crate::trusted::program(PROGRAM)
         .await
         .map_err(|e| ("browser_refused", e))?;
     let launch = Launch {
-        program,
         confirm: confirm.clone(),
         profile: profile.map(str::to_owned),
     };
