@@ -680,30 +680,33 @@ async fn borrow(stream: tokio::net::UnixStream, link: Session<'_>) -> std::io::R
     let (to, mut from) = mpsc::unbounded_channel();
     waiting.lock().unwrap().insert(id, to);
     let _ = out.send(json!({"id": id, "call": called["call"]}));
-    send(&mut write, &json!({"queued": true})).await?;
-    let ended = loop {
-        tokio::select! {
-            said = from.recv() => {
-                let Some(said) = said else { break false };
-                let finished = said.get("done").is_some();
-                if send(&mut write, &said).await.is_err() {
-                    break false;
-                }
-                if finished {
-                    break true;
-                }
-            }
-            said = read.recv() => {
-                match said {
-                    Some(Ok(mut said)) => {
-                        said["id"] = json!(id);
-                        let _ = out.send(said);
+    // From here the call is the link's: whatever ends this connection,
+    // its entry goes and, unless it finished, the other end hears to stop.
+    let queued = send(&mut write, &json!({"queued": true})).await.is_ok();
+    let ended = queued
+        && loop {
+            tokio::select! {
+                said = from.recv() => {
+                    let Some(said) = said else { break false };
+                    let finished = said.get("done").is_some();
+                    if send(&mut write, &said).await.is_err() {
+                        break false;
                     }
-                    _ => break false,
+                    if finished {
+                        break true;
+                    }
+                }
+                said = read.recv() => {
+                    match said {
+                        Some(Ok(mut said)) => {
+                            said["id"] = json!(id);
+                            let _ = out.send(said);
+                        }
+                        _ => break false,
+                    }
                 }
             }
-        }
-    };
+        };
     waiting.lock().unwrap().remove(&id);
     if !ended {
         let _ = out.send(json!({"id": id, "cancel": true}));
@@ -1097,9 +1100,15 @@ async fn lend(
                 .await
                 .map_err(|e| ("exec_refused", e))
         }
-        Some("open") => opened(payload)
-            .map(Value::String)
-            .map_err(|e| ("open_refused", e)),
+        // Its decoding, writing and marking block, so off the runtime the
+        // link's other calls and pings run on.
+        Some("open") => {
+            let payload = payload.clone();
+            match tokio::task::spawn_blocking(move || opened(&payload)).await {
+                Ok(opened) => opened.map(Value::String).map_err(|e| ("open_refused", e)),
+                Err(e) => Err(("open_refused", e.to_string())),
+            }
+        }
         other => Err((
             "link_refused",
             format!("{} is not lent here", other.unwrap_or("that")),
