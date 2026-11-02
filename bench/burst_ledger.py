@@ -83,7 +83,9 @@ LEDGER = {
         'check': "import re\nt = open('tests/test_session.py').read()\n"
                  "assert re.search(r'assertTrue\\(\\s*is_expired', t)"},
     'B3 quick look: USD': {'said': r"\bUSD\b"},
-    'B3 quick look: three': {'said': r"\b(three|3)\s+(unit\s+)?tests?\b"},
+    # Three as the repo starts; tests an earlier ask added count too, so any
+    # count says it was answered, and the scorer reads whether it was right.
+    'B3 quick look: three': {'said': r"\b(\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s+(unit\s+)?tests?\b"},
     'B3 quick look: shop/audit.py': {'said': r"audit\.py"},
     'B3 quick look: none in the repo': {'said': r"\b(no|none|isn.t|not|nothing)\b[^.\n]{0,60}\bCI\b|\bCI\b[^.\n]{0,60}\b(no|none|isn.t|not|nothing)\b"},
     'B3 quick look: the TIMEOUT constant': {'said': r"TIMEOUT"},
@@ -308,8 +310,13 @@ def ledger(out, agent, repo, env, events, timeline, lookout_log, resources=None,
     notes, calls, said = lead_view(out / 'acp.jsonl')
     branches = confined(agent, env, ['git', 'for-each-ref', '--format=%(refname:short)', 'refs/heads'],
                         repo).stdout.decode().split()
-    if ended is None and (out / 'asks.json').exists():
-        ended = json.loads((out / 'asks.json').read_text())['summary'].get('ended')
+    # Written again later: what only the run could measure stays as the
+    # run wrote it.
+    if (out / 'asks.json').exists():
+        before = json.loads((out / 'asks.json').read_text())['summary']
+        ended = before.get('ended') if ended is None else ended
+        if resources is None:
+            resources = {k: before[k] for k in ('peak_rss_mb', 'cpu_s') if k in before}
     end = ended or max([t for t, _ in notes + said] + [t for t, _, _ in calls] + [s.get('t', 0) for s in timeline] + [0])
     rows = []
     for event in events:

@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import tempfile
 import time
 import unittest
@@ -386,6 +387,13 @@ class BurstLedgerTests(unittest.TestCase):
         self.assertEqual((summary['not_kept'], summary['most_waiting'], summary['peak_rss_mb']), (1, 40, 1.0))
         self.assertTrue(summary['main_tests_pass'])
         self.assertEqual((again['ended'], again['oldest_pending_s']), (t0 + 600, summary['oldest_pending_s']))
+        self.assertEqual(again['peak_rss_mb'], 1.0)
+
+    def test_a_count_of_tests_is_an_answer_whatever_earlier_asks_added(self):
+        said = re.compile(self.ledger.LEDGER['B3 quick look: three']['said'], re.IGNORECASE)
+        for answer in ('There are 3 tests.', 'five tests now', 'It has 5 unit tests'):
+            self.assertTrue(said.search(answer), answer)
+        self.assertFalse(said.search('the tests pass'))
 
     def test_a_code_ask_the_lead_did_itself_counts_as_handled(self):
         code = next(e for e in role_eval.BURST_ASKS if e[3] == 'B1 code ask: gitignore')
