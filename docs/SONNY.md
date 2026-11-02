@@ -996,6 +996,7 @@ host = "devbox"                 # what ssh dials
 machine = "laptop"              # what the agents there call this machine; its hostname by default
 command = "/home/me/.local/bin/sonny"   # Sonny there, as setup found it
 browser_profile = "Default"     # the Chrome profile their browser starts from; "" a fresh one
+calls = 16                      # how many of their calls this machine runs at once; 4 per CPU by default
 ```
 
 The linked machine dials. Its tool host keeps
@@ -1031,7 +1032,11 @@ about, an action in `browser_confirm`) comes back over the link to the
 calling agent's gate on the host, so you see it in the host's Sonny, where
 you are working. The linked machine's own settings decide what it
 confirms. A call to a machine that is asleep returns `not_connected` at
-once, or within 3 seconds, with when it was last connected.
+once, or within 3 seconds, with when it was last connected. A machine runs
+at most `calls` of the host's calls at once; one past that returns
+`link_busy`, to call again when one ends. On a slow link, each end holds at
+most one longest line (48 MB) of calls and answers queued, and the pings,
+confirmations and cancels go ahead of them.
 
 An agent's sandbox reaches Unix sockets once it reaches the network, so the
 socket alone proves nothing. Before a connection may send a call, it must

@@ -834,7 +834,7 @@ print(json.dumps({{'version': '2.5', 'ok': True, 'command': command, 'data': dat
         self.host()
         self.assertTrue(json.loads(self.call('calc.lead', 'memory', {'user': True})))
 
-    def linked(self, approval_mode='auto'):
+    def linked(self, approval_mode='auto', link='', rate=0):
         """A laptop, its own daemon and tool host in a home of its own,
         linked to this machine, the box, by a stand-in for ssh that runs
         the command it is given here, in the box's home. Its MCP server
@@ -843,17 +843,29 @@ print(json.dumps({{'version': '2.5', 'ok': True, 'command': command, 'data': dat
         (laptop / '.agent').mkdir(parents=True)
         server = Path(__file__).with_name('mcp_server.py')
         (laptop / '.agent/config.toml').write_text(
-            f'[sonny.links.box]\nhost = "box"\nmachine = "laptop"\ncommand = {json.dumps(str(self.sonny))}\n\n'
+            f'[sonny.links.box]\nhost = "box"\nmachine = "laptop"\ncommand = {json.dumps(str(self.sonny))}\n{link}\n'
             f'[sonny.mcp_servers.test]\ncommand = {json.dumps(sys.executable)}\nargs = [{json.dumps(str(server))}]\n'
             f'default_tools_approval_mode = "{approval_mode}"\n'
             f'env = {{ MCP_STARTS = {json.dumps(str(laptop / "starts"))} }}\n')
         ssh = self.path / 'ssh'
+        # At `rate` bytes a second, what the laptop sends the box comes as
+        # down a slow link.
         ssh.write_text(f"""#!{sys.executable}
-import os, subprocess, sys
+import os, subprocess, sys, time
 args = sys.argv[1:]
 host, command = args[args.index('--') + 1], args[-1]
 assert host == 'box', host
-os.execvpe('sh', ['sh', '-c', command], {{**os.environ, 'HOME': {json.dumps(str(self.path))}}})
+env = {{**os.environ, 'HOME': {json.dumps(str(self.path))}}}
+rate = {rate}
+if not rate:
+    os.execvpe('sh', ['sh', '-c', command], env)
+there = subprocess.Popen(['sh', '-c', command], stdin=subprocess.PIPE, env=env)
+while chunk := os.read(0, 16384):
+    there.stdin.write(chunk)
+    there.stdin.flush()
+    time.sleep(len(chunk) / rate)
+there.stdin.close()
+there.wait()
 """)
         ssh.chmod(0o755)
         lender = SocketClient(self.binary, laptop / 'state.sqlite', self.url, 'echo')
@@ -977,6 +989,81 @@ os.execvpe('sh', ['sh', '-c', command], {{**os.environ, 'HOME': {json.dumps(str(
         said = subprocess.run([str(self.sonny), 'link'], env=env, capture_output=True, text=True, timeout=30)
         self.assertIn('config does not load', said.stdout)
         self.assertNotIn('No links', said.stdout)
+
+    def borrow(self, tool, payload):
+        """A call of `tool` with `payload` to the laptop, as the box's own
+        programs make it: proved, then sent. Its socket, and the reader of
+        what comes back."""
+        import socket as sockets
+        conn = sockets.socket(sockets.AF_UNIX)
+        self.addCleanup(conn.close)
+        conn.connect(str(self.path / '.agent/links/laptop.sock'))
+        reader = conn.makefile('r')
+        challenge = json.loads(reader.readline())['challenge']
+        (self.path / '.agent/links/.proof' / challenge).touch()
+        conn.sendall((json.dumps({'proof': challenge}) + '\n').encode())
+        conn.sendall((json.dumps({'call': {'tool': tool, 'payload': payload}}) + '\n').encode())
+        return conn, reader
+
+    def lent_script(self, code, **more):
+        return {'input': code, 'bot': 'calc.lead', 'store': str(self.store), 'timeout_ms': 60_000, **more}
+
+    def test_a_machine_takes_as_many_calls_at_once_as_its_link_says_and_a_call_let_go_frees_its_place(self):
+        self.linked(link='calls = 1\n')
+        self.assertEqual(json.loads((self.path / '.agent/links/laptop.json').read_text())['calls'], 1)
+        slow = 'await tools.mcp__test__slow({ms: 20000}); text("slept");'
+        first, said = self.borrow('exec', self.lent_script(slow))
+        self.assertEqual(json.loads(said.readline()), {'queued': True})
+        _, busy = self.borrow('exec', self.lent_script('text(1);'))
+        refused = json.loads(busy.readline())['done']['error']
+        self.assertEqual(refused['code'], 'link_busy')
+        self.assertIn('laptop is running 1 calls', refused['detail'])
+        # Its caller gone, the call is let go there too, and its place with it.
+        import socket as sockets
+        first.shutdown(sockets.SHUT_RDWR)
+        let_go = time.monotonic()
+        while True:
+            _, then = self.borrow('exec', self.lent_script('text(2);'))
+            answer = json.loads(then.readline())
+            if answer == {'queued': True}:
+                break
+            self.assertEqual(answer['done']['error']['code'], 'link_busy')
+            self.assertLess(time.monotonic() - let_go, 10, 'the call let go still held its place')
+            time.sleep(.1)
+        while 'done' not in (answer := json.loads(then.readline())):
+            pass
+        self.assertIn('Output:\n2', answer['done'].get('output', {}).get('answer', ''), answer)
+        print(f'\nlink: a call let go freed its place in {time.monotonic() - let_go:.2f}s', file=sys.stderr)
+
+    def test_on_a_slow_link_an_ask_goes_ahead_of_long_answers(self):
+        rate = 2 << 20
+        _, lender = self.linked(approval_mode='prompt', rate=rate)
+        # The whole output a script gives is at most about 1 MB.
+        big = 1 << 20
+        longs = [self.borrow('exec', self.lent_script(f'text("x".repeat({big}));', whole=str(self.path / f'whole-{n}')))
+                 for n in range(8)]
+        for _, said in longs:
+            self.assertEqual(json.loads(said.readline()), {'queued': True})
+        time.sleep(.5)
+        _, asking = self.borrow('exec', self.lent_script('await tools.mcp__test__echo({text: "hi"});'))
+        asked_at = time.monotonic()
+        while 'ask' not in (said := json.loads(asking.readline())):
+            self.assertNotIn('done', said, said)
+        ask_took = time.monotonic() - asked_at
+        for _, said in longs:
+            while 'done' not in (answer := json.loads(line := said.readline())):
+                pass
+            self.assertNotIn('error', answer['done'], str(answer)[:300])
+            self.assertGreater(len(line), big - (64 << 10), str(answer)[:300])
+        longs_took = time.monotonic() - asked_at
+        # Eight answers of about 1 MB take 4 s at 2 MB a second; the ask, at
+        # most the one being written.
+        self.assertGreater(longs_took, 3, longs_took)
+        self.assertLess(ask_took, 1.5, (ask_took, longs_took))
+        peak = next(line for line in Path(f'/proc/{lender.pid}/status').read_text().splitlines()
+                    if line.startswith('VmHWM'))
+        print(f'\nlink: ask in {ask_took:.2f}s, eight 1 MB answers in {longs_took:.2f}s at 2 MB/s; '
+              f'tool host peak {peak.split(":")[1].strip()}', file=sys.stderr)
 
     def test_a_connection_that_cannot_prove_itself_sends_no_call(self):
         self.linked()
