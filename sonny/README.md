@@ -1179,7 +1179,11 @@ workspace-write sandbox writes). So a program an agent could swap never
 runs, whichever agent calls, and a swap after the copy was made changes
 nothing until it is copied again. An agent with no sandbox is not
 counted, as it already runs as you. On macOS, the copy is what you grant
-Accessibility and Screen Recording to.
+Accessibility and Screen Recording to. Its temporary folder is
+`~/.agent/sonny/run/`, private and checked the same way, so the
+background host agent-desktop keeps for its commands is one Sonny started:
+a copy run from elsewhere, a terminal or another app, gets its own host,
+under that app's permissions, and never serves Sonny's calls.
 [docs/SONNY.md](../docs/SONNY.md) has the details of automations, memory,
 skills and MCP.
 Sonny starts its lookout, `sonny lookout`, when it opens a project: one

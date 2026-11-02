@@ -832,7 +832,7 @@ fn git(root: &Path, args: &[&str]) -> Result<String, String> {
 /// The memory folder as a git repository, made one if it is not yet.
 fn repo(root: &Path) -> Result<(), String> {
     std::fs::create_dir_all(root).map_err(|e| format!("memory_failed: {}: {e}", root.display()))?;
-    let new = !root.join(".git").exists();
+    let new = !crate::policy::git_entry(root);
     if new {
         // Objects as private as the facts, which are 0600.
         git(root, &["init", "-q", "--shared=0600"])?;
@@ -937,7 +937,7 @@ fn changed(root: &Path) -> Result<Value, String> {
     // A cleanup cut short counts too, so the next night finishes it.
     let saved = if root.join(CLEANUP).exists() {
         true
-    } else if root.join(".git").exists() {
+    } else if crate::policy::git_entry(root) {
         // Reads are not changes, also in a repository whose ignore file
         // predates them.
         git(root, &["status", "--porcelain", "--untracked-files=all"])?

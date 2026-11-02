@@ -272,6 +272,18 @@ approval gate as a call that leaves the sandbox would; `memory` and
   clipboard, the DevTools address, and writes outside the agent's folder.
   `eval`, `download`, `upload`, `state` and vault sign-ins wait for a
   verdict.
+- **The desktop tool** drives the person's desktop with agent-desktop,
+  which holds the person's Accessibility and Screen Recording grants. What
+  only looks runs at once; a call that acts waits for a verdict once, and
+  only the flags it lists pass. It starts agent-desktop responsible for
+  itself on macOS, so the grant to it is the one that counts, never the
+  terminal's that started the daemon.
+- **agent-browser and agent-desktop** run only from copies in
+  `~/.agent/sonny/programs/`, refused while the program, or that folder,
+  is in a folder a sandboxed agent writes, and checked again whenever it
+  changes. agent-desktop runs with `~/.agent/sonny/run/` as its temporary
+  folder, checked the same way, so the host it keeps there for its
+  commands is one Sonny started.
 - **The commons** is a board shared by one person's agents across
   projects, as files under `~/.agents/commons`; each post's author is set
   by Sonny from the calling agent, never from what it wrote. A new thread
@@ -319,7 +331,16 @@ is built.
   bot can read any file the person can and send it to its model provider.
 - With the network on, Sonny's default, a sandboxed bot reaches every
   Unix socket on the machine. One that runs a program outside the sandbox
-  on request, such as Docker's or ssh-agent's, is a way out of it.
+  on request, such as Docker's or ssh-agent's, is a way out of it. So are
+  agent-desktop's host and agent-browser's sessions, which act without
+  the agent's approvals.
+- The programs' copies and agent-desktop's temporary folder are checked
+  against the agents' writable folders when a copy is made or changes,
+  not on every call. An agent given write access to `~/.agent/sonny`
+  after that could leave a host there that answers Sonny's desktop calls
+  with made-up results. It runs in that agent's sandbox, so it cannot act
+  with the person's grants, and an agent that writes `~/.agent` can
+  already rewrite Sonny's settings.
 - One allowed escalation, or one `allow` rule, gives a command the
   daemon's own socket and so full daemon authority. A rule matches a
   command's first words, so `allow` on `git` lets out every `git`

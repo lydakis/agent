@@ -536,14 +536,28 @@ async fn run(args: &[String]) -> Ran {
             };
         }
     };
+    // With Sonny's own temporary folder, where agent-desktop keeps the host
+    // its commands go through: one Sonny started from the copy, never one
+    // another program left running for the same copy, whose permissions
+    // and process would then be what acts.
+    let temporary = match crate::trusted::temporary() {
+        Ok(temporary) => temporary,
+        Err(e) => {
+            return Ran {
+                said: format!("{PROGRAM} is not run: its temporary folder: {e}"),
+                ok: false,
+                picture: None,
+            };
+        }
+    };
     // Responsible for itself, so what the person granted agent-desktop is
     // what it has, wherever the daemon was started.
-    let ran = crate::responsible::output(
-        &program,
-        args,
-        Path::new("/"),
-        &["AGENT_DESKTOP_SESSION", "AGENT_DESKTOP_AGENT_ID"],
-    );
+    let changes = [
+        ("AGENT_DESKTOP_SESSION", None),
+        ("AGENT_DESKTOP_AGENT_ID", None),
+        ("TMPDIR", Some(temporary.as_os_str())),
+    ];
+    let ran = crate::responsible::output(&program, args, Path::new("/"), &changes);
     match ran.await {
         Ok(out) => Ran::of(
             &String::from_utf8_lossy(&out.stdout),
