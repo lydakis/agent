@@ -504,6 +504,18 @@ fn root(path: &Path, daemon: &Daemon) -> Result<Root> {
             ),
         );
     }
+    // Nor one inside a walled folder: a socket there could be renamed to a
+    // folder outside the wall's rule and reached by its new name.
+    if let Some(wall) = daemon.walled.iter().find(|wall| path.starts_with(wall)) {
+        return fail_with(
+            "sandbox_unavailable",
+            format!(
+                "{} is inside {}, whose sockets are kept from every sandboxed command",
+                path.display(),
+                wall.display()
+            ),
+        );
+    }
     let mut read_only = Vec::new();
     let mut missing = Vec::new();
     let mut left = Vec::new();
@@ -1883,6 +1895,23 @@ mod tests {
                     "--remount-ro",
                     &run.to_string_lossy()
                 ]));
+        }
+        // A root inside the wall is refused: its sockets could be renamed
+        // out to a folder the rule doesn't name.
+        std::fs::create_dir_all(run.join("session")).unwrap();
+        for cwd in [run.clone(), run.join("session")] {
+            let error = Policy::new(
+                Some(Mode::WorkspaceWrite),
+                Some(&cwd),
+                &[],
+                true,
+                &Daemon {
+                    walled: vec![run.clone()],
+                    ..protecting()
+                },
+            )
+            .unwrap_err();
+            assert_eq!(error.code, "sandbox_unavailable");
         }
         std::fs::remove_dir_all(base).unwrap();
     }

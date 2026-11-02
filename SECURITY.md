@@ -125,6 +125,7 @@ vulnerability, whether or not the code's own documentation agrees.
   the CLI walls `~/.agent/run`, where Sonny's agent-desktop host and
   agent-browser sessions listen, as Codex hides its own app-server's
   sockets. Seatbelt denies them by path; on Linux the folder is hidden.
+  A writable root inside a walled folder is refused.
   The Linux
   filter also refuses `io_uring` and foreign-architecture system calls.
 - A call that would leave the sandbox (a shell call asking
