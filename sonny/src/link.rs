@@ -337,14 +337,17 @@ impl Out {
     }
 
     async fn queue(&self, call: Option<u64>, value: &Value) {
-        let mut text = value.to_string();
-        text.push('\n');
-        if text.len() <= SMALL {
-            let _ = self.small.send(text);
+        // Measured before it is written out, so that what waits for room
+        // holds no copy of it.
+        let length = written_length(value) + 1;
+        if length <= SMALL {
+            self.tell(value);
             return;
         }
-        let bytes = text.len().min(QUEUED_BYTES) as u32;
+        let bytes = length.min(QUEUED_BYTES) as u32;
         if let Ok(room) = self.room.clone().acquire_many_owned(bytes).await {
+            let mut text = value.to_string();
+            text.push('\n');
             if let Some(id) = call {
                 self.held.lock().unwrap().insert(id, false);
             }
@@ -369,6 +372,23 @@ impl Out {
         text.push('\n');
         let _ = self.small.send(text);
     }
+}
+
+/// How many bytes `value` is written as, counted without writing it.
+fn written_length(value: &Value) -> usize {
+    struct Count(usize);
+    impl std::io::Write for Count {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 += bytes.len();
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut count = Count(0);
+    let _ = serde_json::to_writer(&mut count, value);
+    count.0
 }
 
 /// Write the lines given, the small ones first, until the writer fails.
@@ -1674,6 +1694,12 @@ mod tests {
         assert_eq!(said.recv().await.unwrap().unwrap()["id"], 1);
         second.await.unwrap();
         assert_eq!(said.recv().await.unwrap().unwrap()["id"], 2);
+    }
+
+    #[test]
+    fn a_value_s_length_is_counted_as_it_is_written() {
+        let value = json!({"a": "é\n\"", "b": [1, 2.5, null], "c": {"d": true}});
+        assert_eq!(written_length(&value), value.to_string().len());
     }
 
     #[tokio::test]
