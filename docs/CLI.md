@@ -1,7 +1,7 @@
 # CLI contract
 
 Agent uses flat verbs: `run`, `follow`, `fork`, `interrupt`, `wait`, `ls`,
-`inspect`, `turns`, `usage`, `rm`, `prune`, `approvals`, `answer`, `models`, `companion`, `start`, `stats`,
+`inspect`, `turns`, `usage`, `rm`, `prune`, `approvals`, `answer`, `held`, `retry`, `models`, `companion`, `start`, `stats`,
 `shutdown`, and `serve`. All named
 bots use the same commands. There is no parent/child command hierarchy.
 
@@ -79,6 +79,17 @@ instead of from a cursor; it conflicts with `--after`.
 row plus its instructions, settings and compaction. It changes nothing, so it
 is safe to repeat; with `--bot-id N`, a bot that no longer holds that
 identity is `bot_not_found`.
+`held` lists the [held turns](RUST_PROTOTYPE.md#held-turns): turns a cause
+a person can fix (a sign-in, a usage limit, a refused key, a provider that is
+not set up or not answering) holds instead of failing, each with its bot, its
+cause as `blocked` (`code`, `detail`, `since_ms`), and when it next tries on
+its own as `resume_at_ms`, waiting longer each try up to an hour, for the
+bot's `--hold` (5 days unset, `hold` in `~/.agent/config.toml` for the bots
+the CLI makes; `0` fails at once), then it fails with its cause. `retry`
+tries every held turn again now, or one bot's with `--bot NAME`, and prints
+`{"retried": N}`; once the cause is fixed, that is the way not to wait.
+`login chatgpt` does it on its own once it signs in, and a daemon that starts
+tries its held turns at once.
 
 ## Arguments and flags
 
@@ -208,7 +219,7 @@ identity is `bot_not_found`.
   `--note-turns`, `--compact-at`, `--compact-keep`, `--compact-tokens`, `--keep-turns`,
   `--approval-hold`, `--max-output-tokens`, `--keep-warm`, `--cache-ttl`,
   `--sandbox`, `--writable` (repeatable, made absolute from the current
-  folder), `--network`, `--hide-senders`, `--quiet-background`, `--unix-socket` (repeatable: an
+  folder), `--network`, `--hide-senders`, `--quiet-background`, `--hold`, `--unix-socket` (repeatable: an
   absolute socket, or folder of them, its commands reach) and `--outputs` (made absolute; a new
   bot gets `outputs` beside the store without it); they are not daemon options,
   and an existing bot keeps its own (see [bot settings](RUST_PROTOTYPE.md#bot-settings)).

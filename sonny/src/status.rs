@@ -74,6 +74,8 @@ pub fn group(state: &str, running: bool, asking: bool, pr: bool, resolved: bool)
     match state {
         _ if resolved && !running => Group::Resolved,
         "needs you" | "failed" => Group::NeedsYou,
+        // Held on a cause the person can fix: theirs to set right.
+        _ if state.starts_with(HELD) => Group::NeedsYou,
         _ if asking => Group::NeedsYou,
         _ if running => Group::Working,
         "done" | crate::started::CHECKED if pr => Group::Review,
@@ -253,6 +255,79 @@ pub fn companion_alerts(companions: &serde_json::Value, now_ms: u64, logs: &str)
         .collect()
 }
 
+/// How `/status` names an agent whose turn is held, before the cause.
+pub const HELD: &str = "held: ";
+
+/// What holds a turn, in the person's words, and how to set it right,
+/// from the daemon's cause (`code`) and what the provider said (`detail`).
+pub fn held_cause(code: &str, detail: Option<&str>) -> (String, String) {
+    let (what, fix) = match code {
+        "provider_login_rejected" | "provider_login_expired" | "provider_login_unavailable" => (
+            "ChatGPT sign-in",
+            "run agent login chatgpt; held turns go on at once".to_owned(),
+        ),
+        "provider_quota_exhausted" => (
+            "usage limit reached",
+            "they go on when the limit resets, tried again each hour at most".to_owned(),
+        ),
+        "provider_http_401" => (
+            "API key refused",
+            "fix the key in ~/.agent/env and restart the daemon".to_owned(),
+        ),
+        "provider_http_403" => (
+            "access refused",
+            "check the account's access, then agent retry".to_owned(),
+        ),
+        "provider_unavailable" => (
+            "provider not set up",
+            format!(
+                "add {} to ~/.agent/config.toml and restart the daemon",
+                detail.unwrap_or("it")
+            ),
+        ),
+        "workspace_required" => (
+            "no folder to work in",
+            "give the agent a folder, then agent retry".to_owned(),
+        ),
+        _ => (
+            "provider unreachable",
+            format!("{code}; tried again on its own, or now with agent retry"),
+        ),
+    };
+    (what.to_owned(), fix)
+}
+
+/// The turns held on a cause (`held`'s list), one alert per cause: what
+/// holds them, whose they are, and how to set it right.
+pub fn held_alerts(held: &serde_json::Value) -> Vec<Alert> {
+    let mut causes: Vec<(String, String, Vec<String>)> = Vec::new();
+    for turn in held.as_array().into_iter().flatten() {
+        let blocked = &turn["blocked"];
+        let (what, fix) = held_cause(
+            blocked["code"].as_str().unwrap_or(""),
+            blocked["detail"].as_str(),
+        );
+        let bot = turn["bot"].as_str().unwrap_or("an agent").to_owned();
+        match causes.iter_mut().find(|(known, _, _)| *known == what) {
+            Some((_, _, bots)) if bots.contains(&bot) => {}
+            Some((_, _, bots)) => bots.push(bot),
+            None => causes.push((what, fix, vec![bot])),
+        }
+    }
+    (causes.into_iter())
+        .map(|(what, fix, bots)| Alert {
+            failed: true,
+            said: format!(
+                "{what} · {} agent{} waiting: {}",
+                bots.len(),
+                if bots.len() == 1 { "" } else { "s" },
+                bots.join(", ")
+            ),
+            detail: fix,
+        })
+        .collect()
+}
+
 /// The skills agents are offered whose front matter needs a fix, in one
 /// alert: each by name and what is wrong.
 pub fn skill_alerts(skills: &[agent_client::policy::Skill]) -> Vec<Alert> {
@@ -419,6 +494,37 @@ mod tests {
         assert_eq!(
             lines[1].to_string(),
             "  its log: ~/.agent/state.sqlite.companions/approver-auto.log"
+        );
+    }
+
+    #[test]
+    fn turns_held_on_one_cause_are_one_alert_naming_each_agent_and_the_fix() {
+        let held = serde_json::json!([
+            {"bot": "api", "blocked": {"code": "provider_login_rejected", "since_ms": 1}},
+            {"bot": "web", "blocked": {"code": "provider_login_expired", "since_ms": 2}},
+            {"bot": "web", "blocked": {"code": "provider_login_expired", "since_ms": 2}},
+            {"bot": "docs", "blocked": {"code": "provider_unavailable", "detail": "anthropic", "since_ms": 3}},
+        ]);
+        let alerts = held_alerts(&held);
+        assert_eq!(alerts.len(), 2);
+        assert_eq!(
+            alerts[0].said,
+            "ChatGPT sign-in · 2 agents waiting: api, web"
+        );
+        assert!(alerts[0].detail.starts_with("run agent login chatgpt"));
+        assert_eq!(
+            alerts[1].said,
+            "provider not set up · 1 agent waiting: docs"
+        );
+        assert!(
+            alerts[1]
+                .detail
+                .contains("add anthropic to ~/.agent/config.toml")
+        );
+        assert!(alerts.iter().all(|a| a.failed));
+        assert_eq!(
+            group("held: ChatGPT sign-in", true, false, false, false),
+            Group::NeedsYou
         );
     }
 

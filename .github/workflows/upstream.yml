@@ -1,0 +1,114 @@
+name: Upstream
+
+# Each week, the latest agent-browser and agent-desktop against Sonny's
+# browser and desktop tools, which pass only the commands and flags they
+# list. Two things are found. What a release documents that
+# sonny/upstream/<program>.txt does not is new: it opens an issue naming
+# each new command and flag with its help, and the job stays green, since
+# the tools refuse what they do not list. Supporting it, or deciding not
+# to, and refreshing the list with sonny/upstream/inventory.py closes it.
+# A command or flag the tools pass that the release no longer documents,
+# or a line agent-desktop's own parser no longer takes, is breakage: the
+# job fails and opens an issue. It runs on its own, so neither blocks a
+# pull request.
+
+on:
+  schedule:
+    # Saturdays, so what a week's releases changed is known before Monday.
+    - cron: "0 12 * * 6"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: upstream
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_TERM_COLOR: never
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the latest releases
+        # Without their install scripts, which fetch or link nothing the
+        # check needs; their native programs are what it runs.
+        run: |
+          mkdir -p .local/upstream
+          npm install --prefix .local/upstream --no-save --ignore-scripts agent-browser@latest agent-desktop@latest
+          bin="$PWD/.local/upstream/node_modules"
+          chmod +x "$bin"/agent-browser/bin/agent-browser-linux-x64 "$bin"/agent-desktop/bin/agent-desktop-linux-x64
+          echo "BROWSER_PROGRAM=$bin/agent-browser/bin/agent-browser-linux-x64" >> "$GITHUB_ENV"
+          echo "DESKTOP_PROGRAM=$bin/agent-desktop/bin/agent-desktop-linux-x64" >> "$GITHUB_ENV"
+      - name: List what they document
+        run: |
+          python3 sonny/upstream/inventory.py list agent-browser "$BROWSER_PROGRAM" > .local/upstream/agent-browser.txt
+          python3 sonny/upstream/inventory.py list agent-desktop "$DESKTOP_PROGRAM" > .local/upstream/agent-desktop.txt
+          head -1 .local/upstream/*.txt
+      - name: Open an issue for what is new
+        run: |
+          # Read whole first: grep stopping early would fail the pipe.
+          opened=$(gh issue list --state all --limit 500 --json title --jq '.[].title')
+          for program in agent-browser agent-desktop; do
+            case $program in
+              agent-browser) native=$BROWSER_PROGRAM ;;
+              agent-desktop) native=$DESKTOP_PROGRAM ;;
+            esac
+            news=".local/upstream/$program.md"
+            python3 sonny/upstream/inventory.py news "$program" "$native" "sonny/upstream/$program.txt" > "$news"
+            [ -s "$news" ] || continue
+            title="$("$native" --version) documents commands or flags Sonny's tools do not list"
+            if grep -Fxq "$title" <<< "$opened"; then
+              echo "$title: opened before"
+              continue
+            fi
+            {
+              cat "$news"
+              echo
+              echo "Sonny's tool refuses each of these until it lists it. Add those agents should have to its lists in \`sonny/src/\` (or decide not to), then refresh \`sonny/upstream/$program.txt\` with \`python3 sonny/upstream/inventory.py list $program <native program>\` in the same pull request, which closes this."
+              echo
+              echo "Found by [this run]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID)."
+            } > "$news.issue"
+            gh issue create --title "$title" --body-file "$news.issue"
+          done
+      - name: Check what the tools pass is still there
+        id: tools
+        run: |
+          # The tests run in sonny/, so the inventories are named whole.
+          AGENT_BROWSER_INVENTORY="$PWD/.local/upstream/agent-browser.txt" \
+          AGENT_DESKTOP_INVENTORY="$PWD/.local/upstream/agent-desktop.txt" \
+          AGENT_DESKTOP_PARSES="$DESKTOP_PROGRAM" \
+            cargo test --locked -p sonny -- \
+              agent_browser_documents_what_the_tool_passes \
+              agent_desktop_has_what_the_tool_passes \
+              agent_desktop_parses_what_the_tool_passes 2>&1 | tee .local/upstream/tools.log
+      - name: Open an issue for what broke
+        if: failure() && steps.tools.outcome == 'failure'
+        run: |
+          title="$("$BROWSER_PROGRAM" --version) or $("$DESKTOP_PROGRAM" --version) drops what Sonny's tools pass"
+          open=$(gh issue list --state open --limit 500 --json title --jq '.[].title')
+          if grep -Fxq "$title" <<< "$open"; then
+            echo "$title: open already"
+            exit 0
+          fi
+          {
+            echo "A command or flag Sonny's browser or desktop tool passes is no longer documented, or a line it passes no longer parses. Agents get an error for it until the tool's lists in \`sonny/src/\` follow the release."
+            echo
+            echo '```'
+            grep -A 20 "no longer\|panicked" .local/upstream/tools.log | head -60
+            echo '```'
+            echo
+            echo "Found by [this run]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID)."
+          } > .local/upstream/broke.md
+          gh issue create --title "$title" --body-file .local/upstream/broke.md

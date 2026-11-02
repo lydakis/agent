@@ -152,7 +152,7 @@ class ProviderPacingTests(unittest.TestCase):
         self.assertEqual(done['data']['status'], 'completed')
         self.assertEqual(self.server.calls, 3)
 
-    def test_permanent_quota_fails_once_without_pausing_the_pool(self):
+    def test_permanent_quota_holds_the_turn_once_without_pausing_the_pool(self):
         self.server.mode = 'quota'
         for field in ('type', 'code', 'details'):
             with self.subTest(field=field):
@@ -160,13 +160,21 @@ class ProviderPacingTests(unittest.TestCase):
                 self.server.quota_field = field
                 client = self.client(field)
                 turn = self.submit(client, 'A')
-                self.assertEqual(client.finished(turn)['data']['error'], 'provider_quota_exhausted')
+                # A spent quota is the person's to fix: the turn waits on it.
+                held = client.receive(lambda e: e.get('event') == 'turn_paced' and e.get('turn') == turn
+                                      and 'blocked' in e['data'])
+                self.assertEqual(held['data']['blocked']['code'], 'provider_quota_exhausted')
+                self.assertGreaterEqual(held['data']['resume_at_ms'] - held['data']['blocked']['since_ms'], 60_000)
                 row = client.request('turns', bot='A')['result']['turns'][0]
-                self.assertEqual((row['retries'], row['model_rounds']), (0, 0))
+                self.assertEqual((row['status'], row['retries'], row['model_rounds']), ('paced', 0, 0))
                 self.assertEqual(self.server.calls, 1)
-                turn = self.submit(client, 'B')
-                self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+                listed = client.request('held')['result']['held']
+                self.assertEqual([(h['bot'], h['turn'], h['started']) for h in listed], [('A', turn, True)])
+                turn_b = self.submit(client, 'B')
+                self.assertEqual(client.finished(turn_b)['data']['status'], 'completed')
                 self.assertEqual(self.server.calls, 2)
+                client.request('interrupt', bot='A', turn=turn)
+                self.assertEqual(client.finished(turn)['data']['status'], 'interrupted')
                 client.close()
 
     def test_billed_retries_share_the_durable_turn_round_limit(self):

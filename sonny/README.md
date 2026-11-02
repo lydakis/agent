@@ -130,10 +130,11 @@ list says how to fix it (`aws sso login --profile NAME` for an expired AWS
 session), and Enter lists again. The pick is kept as `model`, and a new
 `config.toml` starts with comments saying what each setting does. Setup
 ends with what it chose and with any tool agents need that is missing
-(bubblewrap for the sandbox on Linux, ripgrep, agent-browser), with the
-command that installs it. When agent-browser finds no Chrome to drive,
-setup offers to download Chrome for Testing for it (`agent-browser
-install`). When Claude Code, Codex, OpenCode or Kiro have MCP servers set
+(bubblewrap for the sandbox on Linux, ripgrep, agent-browser, and
+agent-desktop where there is a desktop), with the command that installs
+it. When agent-browser finds no Chrome to drive, setup offers to download
+Chrome for Testing for it (`agent-browser install`), and where npm is
+there and agent-desktop is not, it offers `npm install -g agent-desktop`. When Claude Code, Codex, OpenCode or Kiro have MCP servers set
 up (in your home or this folder), setup offers them too, all ticked, as
 `sonny mcp import` does. When no way to reach a model is ready, setup also
 offers each of those agents found on `PATH` ("Let Claude Code set up
@@ -727,7 +728,8 @@ way `/react` does, and each note in the margin has its own `↩`.
 - `/status` shows the project's agents in the pane beside the
   conversation. The lead comes first; its tasks
   follow grouped by where they stand: **Needs you** (waiting on your
-  approval, asking you a question, or failed),
+  approval, asking you a question, held on something only you can fix,
+  such as a ChatGPT sign-in, or failed),
   **Working** (a turn running, queued, rate limited, waiting on other
   tasks, or `waiting on its reviewer` while the approver weighs a call), **Ready for review** (finished, its last reply linking a pull
   request), **Done** (finished or stopped with nothing open), and
@@ -951,6 +953,13 @@ way `/react` does, and each note in the margin has its own `↩`.
   ![An exec call drawn as one line with what its script printed](../docs/sonny/exec-script.png)
 
   ![/mcp in the pane](../docs/sonny/pane-mcp.png)
+- `sonny link HOST`, run on your laptop (or any machine you're signed in
+  on), links it to the host's agents over SSH while it is connected.
+  `browser` with `machine` drives that machine's browser, signed in as you;
+  an `exec` script whose options line names the machine runs against its
+  MCP servers; and a link or picture the host's Sonny can't open opens
+  there. Anything that needs approval is asked in your Sonny on the host
+  ([docs/SONNY.md](../docs/SONNY.md#links)).
 - Every task works in a git worktree of its own, at the last commit on
   the branch `agent/NAME`, so only the lead works in the folder; outside
   git, tasks work in the lead's folder. The lead starts each task with its
@@ -1141,6 +1150,23 @@ The actions in `sonny.browser_confirm` (`eval`, `download`, `upload` and
 `state` by default), signing in from agent-browser's vault, and every
 call of an agent kept off the network wait for the agent's approvals,
 like any call that leaves its sandbox.
+With agent-desktop installed, on a machine that shows a desktop, Sonny
+writes its `agent-desktop` skill the same way (`agent-desktop skills get
+desktop`), and agents see and use the person's own desktop through the
+`desktop` tool, which the tool host answers outside their sandbox, since a
+sandboxed process reaches no other app. It runs the skill's commands one
+call at a time across agents, as there is one desktop: what only looks (a
+snapshot, `find`, a screenshot, which comes back as a picture, the apps
+and windows) runs at once; a call with a command that acts (a click,
+typing, a key, launching or closing an app, a window, a notification, the
+clipboard) waits for the agent's approvals once. It passes only the flags
+it lists, so it refuses what reaches past the desktop: launching an app
+with arguments, environment, a folder or a DevTools port, `batch`,
+`trace`, sessions, and any path, a screenshot's or the clipboard's. On
+macOS it needs Accessibility, and Screen Recording for screenshots, for
+the app that started the tool host: an agent refused for a missing one
+asks you, and `permissions --guide`, run through the tool so it asks
+for the right app, opens the settings page with a guide.
 [docs/SONNY.md](../docs/SONNY.md) has the details of automations, memory,
 skills and MCP.
 Sonny starts its lookout, `sonny lookout`, when it opens a project: one

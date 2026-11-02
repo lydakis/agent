@@ -149,8 +149,15 @@ class DeliveryTests(ModelFixture):
         head = client.request('inspect', bot='Cancelled')['result']['head']
         client.request('interrupt', bot='Cancelled', turn=active['Cancelled'])
         self.assertEqual(client.finished(active['Cancelled'])['data']['status'], 'interrupted')
-        self.assertEqual(client.finished(steers['Cancelled'])['data']['error'], 'provider_unavailable')
+        # A provider the config lacks is the person's to fix: the steer is
+        # held in line on it, not ended, and its words wait outside history.
+        held = client.receive(lambda e: e.get('event') == 'turn_held' and e.get('turn') == steers['Cancelled'])
+        self.assertEqual(held['data']['blocked']['code'], 'provider_unavailable')
+        view = client.request('turns', bot='Cancelled', after=active['Cancelled'])['result']['turns'][0]
+        self.assertEqual((view['status'], view['waiting_on']['blocked']['code']), ('ready', 'provider_unavailable'))
         self.assertEqual(client.request('inspect', bot='Cancelled')['result']['head'], head)
+        client.request('interrupt', bot='Cancelled', turn=steers['Cancelled'])
+        self.assertEqual(client.finished(steers['Cancelled'])['data']['status'], 'interrupted')
         self.model.release_headers.set()
         for bot in ('Bob', 'Changed'):
             self.assertEqual(client.finished(steers[bot])['data']['status'], 'steered')
@@ -664,6 +671,75 @@ class DeliveryTests(ModelFixture):
         self.assertEqual(client.finished(during['turn'])['data']['into'], first)
         self.assertEqual(client.finished(first)['data']['status'], 'completed')
         self.assertEqual(client.request('stats')['result']['queued_turns'], 0)
+
+    def test_a_turn_held_on_a_fixable_cause_goes_on_once_it_is_fixed(self):
+        client = self.client()
+        client.request('create', bot='Bob', workspace=str(self.path))
+        self.model.unauthorized_prompts = {'locked'}
+        turn = client.request('submit', bot='Bob', request_id='1', prompt='locked')['result']['turn']
+        held = client.receive(lambda m: m.get('event') == 'turn_paced' and m.get('turn') == turn)
+        blocked = held['data']['blocked']
+        self.assertEqual((blocked['code'], blocked['detail']), ('provider_http_401', 'synthetic bad key'))
+        # Not retried at once: the first wait is a minute.
+        self.assertGreaterEqual(held['data']['resume_at_ms'] - blocked['since_ms'], 60_000)
+        view = client.request('turns', bot='Bob')['result']['turns'][-1]
+        self.assertEqual((view['status'], view['waiting_on']['blocked']['code']), ('paced', 'provider_http_401'))
+        listed = client.request('held')['result']['held']
+        self.assertEqual([(h['bot'], h['turn'], h['started']) for h in listed], [('Bob', turn, True)])
+        # A message behind it waits its turn.
+        later = client.request('submit', bot='Bob', request_id='2', prompt='hello', delivery='queue')['result']
+        self.assertEqual(later['status'], 'queued')
+        # Fixed: told so, the call is tried again and the turn goes on.
+        self.model.unauthorized_prompts = set()
+        self.assertEqual(client.request('retry_held')['result']['retried'], 1)
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        self.assertEqual(poll(client, 'Bob', turn)['result']['text'], 'reply:locked')
+        self.assertEqual(client.finished(later['turn'])['data']['status'], 'completed')
+        self.assertEqual(client.request('held')['result']['held'], [])
+
+    def test_a_bot_that_holds_nothing_ends_where_another_would_hold(self):
+        client = self.client()
+        client.request('create', bot='Bob', workspace=str(self.path), settings={'hold_ms': 0})
+        self.assertEqual(client.request('inspect', bot='Bob')['result']['settings']['hold_ms'], 0)
+        self.model.unauthorized_prompts = {'locked'}
+        turn = client.request('submit', bot='Bob', request_id='1', prompt='locked')['result']['turn']
+        ended = client.finished(turn)['data']
+        self.assertEqual((ended['status'], ended['error']), ('failed', 'provider_http_401'))
+        self.assertEqual(client.request('held')['result']['held'], [])
+
+    def test_a_short_hold_tries_once_more_at_its_end_then_fails(self):
+        client = self.client()
+        client.request('create', bot='Bob', workspace=str(self.path), settings={'hold_ms': 1500})
+        self.model.unauthorized_prompts = {'locked'}
+        began = time.monotonic()
+        turn = client.request('submit', bot='Bob', request_id='1', prompt='locked')['result']['turn']
+        held = client.receive(lambda m: m.get('event') == 'turn_paced' and m.get('turn') == turn)
+        # Its next try is when the hold ends, not the first hold's minute.
+        self.assertLessEqual(held['data']['resume_at_ms'] - held['data']['blocked']['since_ms'], 1500)
+        ended = client.finished(turn)['data']
+        self.assertEqual((ended['status'], ended['error']), ('failed', 'provider_http_401'))
+        self.assertLess(time.monotonic() - began, 30)
+
+    def test_a_held_turn_a_restart_resumes_without_its_provider_stays_held(self):
+        client = self.client()
+        client.request('create', bot='Bob', workspace=str(self.path))
+        self.model.unauthorized_prompts = {'locked'}
+        turn = client.request('submit', bot='Bob', request_id='1', prompt='locked')['result']['turn']
+        client.receive(lambda m: m.get('event') == 'turn_paced' and m.get('turn') == turn)
+        client.close()
+        # Started again with its provider missing from the config: a start
+        # tries held turns at once, and this one is held on that instead.
+        client = Client(self.binary, self.path / 'state.sqlite', self.url, provider='other')
+        self.addCleanup(client.close)
+        held = client.receive(lambda m: m.get('event') == 'turn_paced' and m.get('turn') == turn
+                              and m['data'].get('blocked', {}).get('code') == 'provider_unavailable')
+        self.assertEqual(held['data']['blocked']['detail'], 'openai')
+        client.close()
+        # Set up again, and the key fixed: the next start carries it out.
+        self.model.unauthorized_prompts = set()
+        client = self.client()
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        self.assertEqual(poll(client, 'Bob', turn)['result']['text'], 'reply:locked')
 
     def test_a_steer_that_misses_the_last_boundary_becomes_the_next_turn(self):
         client = self.client()

@@ -365,6 +365,9 @@ pub struct Updates {
     /// note the lead had not heard: a filter on who asked hears them as
     /// they are.
     unheard: HashMap<Key, (Turn, bool)>,
+    /// The turn that last ended and who asked for it, as its end names
+    /// them: none when that is still to be read.
+    ended: Option<(Key, Option<String>)>,
 }
 
 /// A turn whose answer a trigger passes to the lead: when it becomes news
@@ -483,6 +486,7 @@ impl Updates {
             memory_seen: None,
             opened: now_ms(),
             resolving: Default::default(),
+            ended: None,
             replying: HashSet::new(),
             runs: HashMap::new(),
             unheard: HashMap::new(),
@@ -764,6 +768,8 @@ impl Updates {
                 };
                 let answered = self.answer_to.remove(&key(turn));
                 let noted = self.noted.remove(&key(turn));
+                let by = self.by(&status, from.clone(), origin.clone());
+                self.ended = Some((key(turn), by));
                 if let Some(bot) = self.bots.get_mut(name)
                     && bot.running.is_none_or(|running| running == turn)
                 {
@@ -919,6 +925,39 @@ impl Updates {
         }
         let heard = super::activity::hear(rules, &event, skips)?;
         Some((heard.hold, heard.urgent))
+    }
+
+    /// Whether a turn of `name`'s that just ended `status` reaches the
+    /// subscriber as news: one of its tasks, whose end its subscriptions'
+    /// filters hear as task updates hear it, with who asked for it. One
+    /// whose asker is still to be read, or that the lookout did not see
+    /// end, is not heard yet.
+    pub fn hears_end(&self, name: &str, turn: i64, status: &str) -> bool {
+        let Some((_, by)) = (self.ended.as_ref()).filter(|(key, _)| key.0 == name && key.1 == turn)
+        else {
+            return false;
+        };
+        if by.is_none() && self.rules.contains_key(name) {
+            return false;
+        }
+        let ended = Turn {
+            first: turn,
+            turn,
+            status: status.to_owned(),
+            by: by.clone(),
+            count: 1,
+            which: None,
+            resolved: false,
+            goal: None,
+            reply: None,
+            urgent: None,
+            hold: Default::default(),
+        };
+        let theirs = by.as_deref() == Some("the person") && status == "completed";
+        self.task(name)
+            && self
+                .gate(name, false, || turn_event(&ended, theirs))
+                .is_some()
     }
 
     /// Whether a task's news may be told now: urgent, or no digest holds

@@ -275,7 +275,7 @@ class LookoutTests(ModelFixture):
         # ID, which it prints again on its next run.
         poller = self.path / 'poll.sh'
         poller.write_text('echo "lunch?"\n'
-                          'echo \'{"text": "deploy failed on prod", "id": "d1", "from": "ci", "urgent": true}\'\n'
+                          'echo \'{"text": "deploy failed on prod", "id": "d1", "from": "ci", "steer": true}\'\n'
                           'echo \'{"text": "deploy failed on prod", "id": "d1", "from": "ci"}\'\n'
                           'echo "$SONNY_SOURCE" > "$SONNY_SOURCE_DIR/ran"\n')
         (self.path / '.agent').mkdir(exist_ok=True)
@@ -291,7 +291,7 @@ class LookoutTests(ModelFixture):
         self.assertIsNotNone(prompt, 'the subscriber never heard its source')
         # Not the person's words: the approver reads the origin.
         self.assertEqual(prompt['origin'], 'lookout.sources')
-        self.assertIn('- chat, from "ci" (for your all, deploys, urgent): "deploy failed on prod"', prompt['text'])
+        self.assertIn('- chat, from "ci" (for your all, deploys, as a steer): "deploy failed on prod"', prompt['text'])
         self.assertIsNotNone(self.note_for('reviewer', starting='From your sources: ', having='"lunch?"'))
         # An event printed again by its ID is told once.
         time.sleep(3)
@@ -327,6 +327,36 @@ class LookoutTests(ModelFixture):
         self.assertEqual(shape['events'], 2)
         self.assertEqual(shape['fields']['paths']['kinds'], ['list of strings'])
         self.assertEqual(shape['fields']['lines']['kinds'], ['number'])
+
+    def test_a_failed_message_goes_back_to_its_sender_unless_its_lead_hears_the_end(self):
+        self.make('calc.lead', 'ops.lead')
+        self.subscribe('calc.lead', 'calc')
+        lead = self.daemon.request('inspect', bot='calc.lead')['result']['bot_id']
+        self.daemon.request('create', bot='calc.fix', workspace=str(self.path), model='openai/synthetic-model',
+                            instructions='Test agent.', tools=['echo'], created_by='calc.lead', created_by_id=lead)
+        self.model.refused_prompts = {'fix the lexer', 'ship the fix'}
+        turns = {}
+        for bot in ('calc.lead', 'ops.lead'):
+            turns[bot] = self.daemon.request('submit', bot=bot, request_id='own', prompt='plan')['result']['turn']
+            self.assertEqual(self.daemon.finished(turns[bot])['data']['status'], 'completed')
+        self.start()
+        time.sleep(1)
+        # The lead's own task fails its message: the lead hears that end
+        # as a task update, so no bounce comes as well.
+        mine = self.daemon.request('submit', bot='calc.fix', request_id='l', prompt='fix the lexer',
+                                   **{'from': {'bot': 'calc.lead', 'turn': turns['calc.lead']}})['result']['turn']
+        self.assertEqual(self.daemon.finished(mine)['data']['status'], 'failed')
+        woke = self.note_for('calc.lead', having=f'turn:calc.fix/{mine} failed')
+        self.assertIsNotNone(woke, 'the lead was not told its task failed')
+        # Another project's lead hears nothing of calc.fix: its message
+        # comes back to it.
+        theirs = self.daemon.request('submit', bot='calc.fix', request_id='o', prompt='ship the fix',
+                                     **{'from': {'bot': 'ops.lead', 'turn': turns['ops.lead']}})['result']['turn']
+        self.assertEqual(self.daemon.finished(theirs)['data']['status'], 'failed')
+        bounce = self.prompt_for('ops.lead', starting='[your message to calc.fix')
+        self.assertIsNotNone(bounce, 'the sender was not told its message failed')
+        self.assertIn(f'turn {theirs} ended provider_http_400', bounce['text'])
+        self.assertIsNone(self.prompt_for('calc.lead', timeout=3, starting='[your message to calc.fix'))
 
 if __name__ == '__main__':
     unittest.main()

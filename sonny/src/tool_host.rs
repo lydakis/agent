@@ -231,7 +231,15 @@ async fn follow_config(client: Arc<Client>) {
     let mut seen = None;
     let mut waiting: Vec<Value> = Vec::new();
     let mut live = std::collections::HashSet::new();
+    // What the machines linked here lend, which their agents' tools say.
+    let mut lent = crate::link::stamp();
     loop {
+        let now_lent = crate::link::stamp();
+        if now_lent != lent {
+            lent = now_lent;
+            let bots = crate::lookout::all_bots(&client).await;
+            tokio::spawn(refresh_tools(client.clone(), bots));
+        }
         let rules = crate::rules::given();
         let now = (stamp(), rules.clone());
         if seen.as_ref() != Some(&now) {
@@ -336,6 +344,14 @@ fn configured(record: &Value, given: &Given<'_>) -> Option<serde_json::Map<Strin
     if hidden != given.config.hide_senders {
         let hide = given.config.hide_senders.then_some(true);
         settings.insert("hide_senders".into(), json!(hide));
+    }
+    // As long as the config says, or the daemon's own when it says none.
+    let hold = given.config.hold_ms.unwrap_or(agent_client::HOLD_MS);
+    if record["settings"]["hold_ms"]
+        .as_u64()
+        .is_some_and(|ms| ms != hold)
+    {
+        settings.insert("hold_ms".into(), json!(given.config.hold_ms));
     }
     // A trigger's shadow copy keeps the rules it was made with: the
     // person's, without what they let run outside the sandbox.

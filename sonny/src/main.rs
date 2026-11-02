@@ -24,6 +24,7 @@ mod cmux;
 mod commons;
 mod config;
 mod declared;
+mod desktop;
 mod diff;
 mod embed;
 mod exec;
@@ -37,6 +38,7 @@ mod home;
 mod html;
 mod image;
 mod js;
+mod link;
 mod links;
 mod list;
 mod login;
@@ -934,6 +936,9 @@ fn main() -> std::process::ExitCode {
         // SAFETY: nothing else runs yet: no thread is started before this.
         unsafe { std::env::set_var("AGENT_CLI", format!("\"{}\" agent", me.display())) };
     }
+    // Before anything reads the config, which refuses a key it no longer
+    // knows.
+    lookout::subs::at_start();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.split_first() {
         // The tool host runs this for each call of a tool Sonny answers.
@@ -974,6 +979,7 @@ fn main() -> std::process::ExitCode {
         Some((verb, rest)) if verb == tool_host::NAME => tool_host::run(rest),
         Some((verb, rest)) if verb == "approver" => approver::run(rest),
         Some((verb, rest)) if verb == "mcp" => mcp::cli(rest),
+        Some((verb, rest)) if verb == "link" => link::cli(rest),
         Some((verb, rest)) if verb == "rules" => {
             return std::process::ExitCode::from(rules::cli(rest) as u8);
         }
@@ -1469,6 +1475,9 @@ pub(crate) fn made(
     if config.hide_senders {
         settings.insert("hide_senders".into(), json!(true));
     }
+    if let Some(ms) = config.hold_ms {
+        settings.insert("hold_ms".into(), json!(ms));
+    }
     // The command rules in ~/.agent/rules, which the daemon applies.
     if let Some(rules) = rules::given() {
         settings.insert("rules".into(), json!(rules));
@@ -1506,8 +1515,18 @@ fn cache_to_take(bot: &Value) -> Option<&'static str> {
 /// print it: a click never does nothing.
 fn open(target: &str) -> Result<(), String> {
     if nowhere_to_open(&|key| std::env::var_os(key), cfg!(target_os = "macos")) {
+        // On a machine linked here that is connected, as the person's laptop.
+        let linked = link::open(target);
+        if linked.is_ok() {
+            return Ok(());
+        }
         term::copy(target);
-        return Err(format!("nothing opens on this machine; copied {target}"));
+        return Err(match linked {
+            Err(why) if link::machines().iter().any(|machine| machine.open) => {
+                format!("{why}; copied {target}")
+            }
+            _ => format!("nothing opens on this machine; copied {target}"),
+        });
     }
     open::that_detached(target).map_err(|error| {
         term::copy(target);
@@ -7641,14 +7660,21 @@ impl App {
             "turn_paced" => {
                 if let Some(running) = &mut self.running {
                     running.phase = if data["paused"] == true {
-                        "Paused"
+                        "Paused".into()
                     } else if data["stopped"] == true {
                         // The daemon stopped; its next start continues it.
-                        "Stopped"
+                        "Stopped".into()
+                    } else if data["blocked"].is_object() {
+                        // Held on a cause the person can fix; /status says how.
+                        let blocked = &data["blocked"];
+                        let (what, _) = status::held_cause(
+                            blocked["code"].as_str().unwrap_or(""),
+                            blocked["detail"].as_str(),
+                        );
+                        format!("Held: {what}")
                     } else {
-                        "Rate limited"
-                    }
-                    .into();
+                        "Rate limited".into()
+                    };
                 }
             }
             "turn_resumed" => {
@@ -8030,6 +8056,10 @@ impl App {
             let logs = tilde(&format!("{}.companions", self.store().display()));
             alerts.extend(status::companion_alerts(&listed["companions"], now, &logs));
         }
+        // Turns held on a cause the person can fix, one alert per cause.
+        if let Ok(listed) = self.client.request("held", json!({})).await {
+            alerts.extend(status::held_alerts(&listed["held"]));
+        }
         let folder = (self
             .client
             .request("inspect", json!({"bot": self.bot}))
@@ -8234,10 +8264,22 @@ impl App {
                 true => ran,
                 false => self.with_error(ran).await,
             };
+            // A turn held on a cause, parked on its call or in line, says so.
+            let blocked_on = (turns.iter()).find_map(|turn| {
+                let blocked = &turn["waiting_on"]["blocked"];
+                blocked.is_object().then(|| {
+                    status::held_cause(
+                        blocked["code"].as_str().unwrap_or(""),
+                        blocked["detail"].as_str(),
+                    )
+                    .0
+                })
+            });
             let state = match (
                 running,
                 if running { &turn } else { &ran }["status"].as_str(),
             ) {
+                _ if let Some(what) = &blocked_on => format!("{}{what}", status::HELD),
                 // A call a reviewer weighs waits on no one here.
                 (true, Some("waiting")) if turn["waiting_on"]["approval"] == true => {
                     match held {

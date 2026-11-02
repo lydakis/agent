@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 /// What every agent of Sonny's leans on: the lead's and tasks' roles (and
 /// the superlead's, which a project opts into), the memory, plan, zen,
 /// coordination, commons and automation skills, the nightly cleanup's,
-/// agent-browser's own when it is installed, and `~/.agent/memory` and
+/// agent-browser's and agent-desktop's own when they are installed, and `~/.agent/memory` and
 /// `~/.agent/automation`, which run this Sonny. Written at each start, so they
 /// lead to this copy.
 pub fn install_own() {
@@ -35,6 +35,7 @@ pub fn install_own() {
     install("sonny-setup", crate::setup::SKILL);
     install("sonny-config", &crate::config::skill());
     install_browser();
+    install_desktop();
     // A job reaches the daemon the way every agent Sonny runs does.
     let automation = include_str!("../skills/automation/SKILL.md");
     install("automation", &agent_client::policy::with_cli(automation));
@@ -115,6 +116,47 @@ fn install_browser() {
     } else {
         refresh();
     }
+}
+
+/// agent-desktop's own skill, as the installed binary serves it, as
+/// agent-browser's is: in its answer's `data.content`. Only where agents
+/// can use the desktop, which the `desktop` tool says.
+fn install_desktop() {
+    const NAME: &str = "agent-desktop";
+    if !crate::desktop::here() {
+        remove(NAME);
+        return;
+    }
+    let refresh = || {
+        let served = std::process::Command::new(NAME)
+            .args(["skills", "get", "desktop"])
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output();
+        if let Ok(served) = served
+            && let Some(text) = served_skill(&served.stdout)
+        {
+            install(NAME, &text);
+        }
+    };
+    let written = std::env::var_os("HOME").is_some_and(|home| {
+        PathBuf::from(home)
+            .join(".agents/skills")
+            .join(NAME)
+            .exists()
+    });
+    if written {
+        std::thread::spawn(refresh);
+    } else {
+        refresh();
+    }
+}
+
+/// The skill in agent-desktop's answer to `skills get`, when it is one.
+fn served_skill(stdout: &[u8]) -> Option<String> {
+    let answer: serde_json::Value = serde_json::from_slice(stdout).ok()?;
+    let text = answer["data"]["content"].as_str()?;
+    (answer["ok"] == true && text.starts_with("---\n")).then(|| text.to_owned())
 }
 
 /// A skill of Sonny's in the person's skills, written as a normal skill:
@@ -871,6 +913,20 @@ fn remove_in(home: &Path, name: &str) {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn agent_desktop_s_skill_is_its_answer_s_content() {
+        let served = br#"{"version":"2.5","ok":true,"command":"skills","data":{"content":"---\nname: agent-desktop\n---\n# agent-desktop","skill":"agent-desktop"}}"#;
+        assert_eq!(
+            served_skill(served).as_deref(),
+            Some("---\nname: agent-desktop\n---\n# agent-desktop")
+        );
+        let refused =
+            br#"{"version":"2.5","ok":false,"command":"skills","error":{"code":"INVALID_ARGS"}}"#;
+        assert_eq!(served_skill(refused), None);
+        assert_eq!(served_skill(b"not json"), None);
+    }
+
     use super::*;
 
     #[test]

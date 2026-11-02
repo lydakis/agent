@@ -34,6 +34,7 @@ pub const COMMONS: &str = "commons";
 pub const GOAL: &str = "goal";
 pub const EXEC: &str = crate::exec::NAME;
 pub const BROWSER: &str = crate::browser::NAME;
+pub const DESKTOP: &str = crate::desktop::NAME;
 
 /// The tools whose calls wait for a verdict wherever the agent's other
 /// calls do: a start runs the folder's setup script and a new project its
@@ -41,8 +42,9 @@ pub const BROWSER: &str = crate::browser::NAME;
 /// drop work, a subscription sends other bots' words to the subscriber's
 /// judge, a trigger is a job that runs as the person, its `if`
 /// command outside any sandbox, a script calls MCP servers, which run
-/// as the person too, and so does a goal's check and the browser.
-pub const GATED: [&str; 9] = [
+/// as the person too, and so does a goal's check, the browser and the
+/// desktop.
+pub const GATED: [&str; 10] = [
     START,
     REMOVE,
     PROJECT,
@@ -52,6 +54,7 @@ pub const GATED: [&str; 9] = [
     EXEC,
     GOAL,
     BROWSER,
+    DESKTOP,
 ];
 
 /// The most of what a call printed that its result holds, under the
@@ -134,6 +137,7 @@ pub fn tools(role: Role) -> Vec<Value> {
     tools.push(crate::lookout::goals::tool(GOAL, TAG));
     tools.extend(crate::exec::tool());
     tools.extend(crate::browser::tool());
+    tools.extend(crate::desktop::tool());
     tools
 }
 
@@ -268,10 +272,12 @@ fn subscriptions() -> Value {
             The person's own words cut into your running turn; the rest waits until your turn ends. Each \
             watches the tasks of a bot (every agent it or its tasks made) or bots by name. It also hears the \
             sources the person set up outside (a chat, a mailbox, a feed), each by name, in a note starting \
-            \"From your sources\": every event, at once when the source marks it urgent, or one topic of a \
+            \"From your sources\": every event, at once when the source says it steers, or one topic of a \
             source as NAME:TOPIC, or only those its filter matches. The commons is a source too, each thread \
             a topic: posting in a thread subscribes you to it as commons.THREAD, and removing that leaves it. \
-            Add one, or remove one by name; with neither, or after either, the result lists them all, with \
+            Add steer yourself for what you own; a filter or a digest only when the person asks for one: \
+            what a filter leaves out you never hear, and a digest makes you late. Add one, or remove one by \
+            name; with neither, or after either, the result lists them all, with \
             the sources there are and the fields their events lately had, to filter on. Adding one again \
             changes nothing; one by a name in use that differs is refused with the field, so remove it first.",
         "parameters": {
@@ -308,9 +314,9 @@ fn subscriptions() -> Value {
                                 its sources' own digest: the first after a quiet spell at once, the rest in one \
                                 note. The person's words, a question to them and an approval only they can give \
                                 never wait for it."},
-                        "urgent": {"type": "object",
-                            "description": "What it hears that this matches, a pattern as filter's, cuts into \
-                                your running turn and waits for no digest, as the person's words do. As \
+                        "steer": {"type": "object",
+                            "description": "What it hears that this matches, a pattern as filter's, is a steer: \
+                                it cuts into your running turn and waits for no digest, as the person's words do. As \
                                 {\"type\": [\"turn.ended\"], \"status\": [\"failed\"]}."}
                     },
                     "required": ["name"],
@@ -727,9 +733,13 @@ async fn called(name: &str, arguments: &Value) -> Answer {
             .map_err(|e| ("project_not_made", e)),
         SUBSCRIPTIONS => {
             let (store, _) = crate::daemon_paths(None, None).map_err(|e| ("no_store", e))?;
+            let caller_id = std::env::var("AGENT_BOT_ID")
+                .ok()
+                .and_then(|id| id.parse().ok());
             crate::lookout::subs::change(
                 &store,
                 &caller,
+                caller_id,
                 arguments.get("add"),
                 arguments["remove"].as_str(),
                 &crate::lookout::sources::names(),
@@ -1012,6 +1022,8 @@ async fn serve(store: PathBuf, socket: PathBuf, nudge: Arc<Notify>, serving: Ser
     };
     // The MCP servers scripts call, kept up between calls.
     let hub = crate::mcp::Hub::for_person();
+    // This machine lent to those it links to, from these same servers.
+    tokio::spawn(crate::link::keep(hub.clone()));
     loop {
         if let Ok((client, _events)) = Client::connect(&socket).await {
             loop {
@@ -1036,6 +1048,7 @@ async fn serve(store: PathBuf, socket: PathBuf, nudge: Arc<Notify>, serving: Ser
                                 // In the host, where the servers stay up.
                                 Some(EXEC) => script(&hub, &client, &call).await,
                                 Some(BROWSER) => browse(&client, &call).await,
+                                Some(DESKTOP) => desktop(&client, &call).await,
                                 _ => answer(&client, &call, &me, &store, &socket)
                                     .await
                                     .map(Value::String),
@@ -1150,6 +1163,24 @@ async fn script(
         call["turn"].as_i64().unwrap_or(0),
         str_of(&call["call_id"]),
     );
+    // On the machine its options line names, against that machine's
+    // servers, with this agent's gate asked what they ask first.
+    if let Ok(crate::exec::Script {
+        machine: Some(machine),
+        ..
+    }) = crate::exec::parse(input)
+    {
+        // What the output's budget cuts comes back whole, saved here, where
+        // the agent reads it.
+        let whole = crate::exec::whole_file();
+        let lent = json!({"input": input, "bot": bot, "timeout_ms": left(call).as_millis() as u64,
+            "whole": whole, "store": client.store().unwrap_or_default()});
+        let answer = crate::link::call(&machine, EXEC, lent, Some(&steps)).await?;
+        if let (Some(file), Some(text)) = (&whole, answer["whole"].as_str()) {
+            let _ = std::fs::write(file, text);
+        }
+        return Ok(answer["answer"].clone());
+    }
     crate::exec::answer(hub, &bot, input, left(call), Some(steps))
         .await
         .map_err(|e| ("exec_refused", e))
@@ -1170,6 +1201,24 @@ async fn browse(client: &Arc<Client>, call: &Value) -> Result<Value, (&'static s
     match tokio::time::timeout(left, crate::browser::answer(client, call, steps)).await {
         Ok(answer) => answer,
         Err(_) => Err(("timed_out", "the browser's commands ran out of time".into())),
+    }
+}
+
+/// Answer a `desktop` call in the host, with the agent's gate judging what
+/// acts on the desktop.
+async fn desktop(client: &Arc<Client>, call: &Value) -> Result<Value, (&'static str, String)> {
+    let bot = str_of(&call["bot"]);
+    unreviewed(client, &bot, &Value::Null, DESKTOP).await?;
+    let steps = crate::exec::Steps::new(
+        client.clone(),
+        bot,
+        call["turn"].as_i64().unwrap_or(0),
+        str_of(&call["call_id"]),
+    );
+    let left = left(call).min(crate::desktop::TIMEOUT);
+    match tokio::time::timeout(left, crate::desktop::answer(call, steps)).await {
+        Ok(answer) => answer,
+        Err(_) => Err(("timed_out", "the desktop's commands ran out of time".into())),
     }
 }
 
@@ -1245,7 +1294,9 @@ fn outside(item: &Value) -> bool {
                     call["namespace"] == "web"
                         || matches!(
                             call["name"].as_str(),
-                            Some("web_fetch" | "web_search" | crate::exec::NAME | BROWSER)
+                            Some(
+                                "web_fetch" | "web_search" | crate::exec::NAME | BROWSER | DESKTOP
+                            )
                         )
                 }
                 _ => false,
@@ -1552,10 +1603,10 @@ mod tests {
     #[test]
     fn a_lead_answers_more_than_its_tasks_and_keeps_its_own() {
         // `exec` comes and goes with the person's MCP servers, and
-        // `browser` with agent-browser.
+        // `browser` with agent-browser, and `desktop` with agent-desktop.
         let names = |tools: Vec<Value>| -> Vec<String> {
             (tools.iter().map(|t| str_of(&t["name"])))
-                .filter(|name| name != EXEC && name != BROWSER)
+                .filter(|name| name != EXEC && name != BROWSER && name != DESKTOP)
                 .collect()
         };
         let every = [SUBSCRIPTIONS, SHOW, RUN, AUTOMATIONS, MEMORY, COMMONS, GOAL];
@@ -1572,11 +1623,12 @@ mod tests {
         {
             assert_eq!(tool["answered_by"], TAG);
             // A lead's own are not its tasks', in a line one deep.
-            // The browser, when there, is every agent's as well.
+            // The browser and the desktop, when there, are every agent's
+            // as well.
             let name = str_of(&tool["name"]);
             assert_eq!(
                 tool.get("inherit").is_some(),
-                !(every.contains(&name.as_str()) || name == BROWSER)
+                !(every.contains(&name.as_str()) || name == BROWSER || name == DESKTOP)
             );
         }
         assert_eq!(project_of("shop.web.lead"), "shop.web");

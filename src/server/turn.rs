@@ -401,8 +401,28 @@ struct Accounting {
     /// to add, ends the turn rather than failing it. An empty reply to a
     /// prompt fails; an empty summary is the summary's own failure.
     answered: bool,
+    /// The cause a person can fix that parks the turn, when one does; and
+    /// when the run of holds it belongs to began, kept across tries.
+    blocked: Option<agent_runtime::store::Blocked>,
+    held_since: Option<u64>,
 }
 impl Accounting {
+    /// Park on a cause a person can fix: the call is tried again after the
+    /// hold's wait, no later than the bot's `hold_ms` allows, with a fresh
+    /// retry budget. Returns when.
+    fn hold(&mut self, error: &Error, hold_ms: u64) -> u64 {
+        let now = now_ms();
+        let blocked = agent_runtime::store::Blocked {
+            code: error.code.clone(),
+            detail: error.detail.clone(),
+            since_ms: *self.held_since.get_or_insert(now),
+        };
+        self.call_attempts = 0;
+        self.call_spent_ms = 0;
+        self.parked_until = now + blocked.wait_ms(now, hold_ms);
+        self.blocked = Some(blocked);
+        self.parked_until
+    }
     fn totals(&self) -> (u64, u64) {
         (
             self.retries + u64::from(self.retrying && self.report.dispatched),
@@ -597,6 +617,8 @@ impl Turn {
             let compaction = accounting.compaction;
             let copied = accounting.copied.take().filter(|_| compaction);
             let route = accounting.route.get().cloned();
+            let blocked = accounting.blocked.take();
+            let held_since = accounting.held_since;
             // Commit the park and its accounting together, outside cancellation.
             self.store
                 .op("suspend_paced", move |db| {
@@ -613,6 +635,8 @@ impl Turn {
                         route.as_deref(),
                         summary_retry_ms,
                         fallback,
+                        blocked,
+                        held_since,
                     )
                     .map(|_| ())
                 })
@@ -2143,10 +2167,31 @@ impl Turn {
         record.effort = context.effort.clone();
         record.turn_budget = context.budget;
         let (provider, model) = split_model(&context.model)?;
-        let provider = self
-            .providers
-            .get(provider)
-            .ok_or(Error::with("provider_unavailable", provider))?;
+        let Some(provider) = self.providers.get(provider) else {
+            let error = Error::with("provider_unavailable", provider);
+            // A turn this daemon resumed at a model call without its
+            // provider, set up again only by a restart, which tries it at
+            // once: held there, keeping what its park kept. A park on a
+            // call the model made has that call's continuation to keep,
+            // which a park at a model call cannot, and a turn that starts
+            // here was let in by a start that found the provider: those
+            // end, as before.
+            let Some(waiting) = (self.resumed.as_ref()).filter(|w| {
+                w.paced_since_ms.is_some() && record.settings.holds(w.held_since_ms, now_ms())
+            }) else {
+                return Err(error);
+            };
+            if let Some(route) = &waiting.route {
+                let _ = accounting.route.set(route.clone());
+            }
+            accounting.summary_retry_at = waiting.summary_retry_ms.unwrap_or(0);
+            accounting.held_since = waiting.held_since_ms;
+            accounting.call_fallback = waiting.fallback.clone();
+            accounting.compaction = waiting.compaction;
+            accounting.copied = waiting.copied.clone().filter(|_| waiting.compaction);
+            accounting.hold(&error, record.settings.hold_ms());
+            return Ok(Round::Paced(accounting.parked_until));
+        };
         // The daemon runs whatever provider set started it; the one thing a
         // conversation needs is that its provider speaks the bot's encoding.
         if provider.family() != record.family()? {
@@ -2197,6 +2242,8 @@ impl Turn {
                     .await?
             };
             // Only a pool park continues the same model call's retry budget.
+            // A held turn's run of holds goes on until a call is answered.
+            accounting.held_since = waiting.held_since_ms;
             if waiting.paced_since_ms.is_some() {
                 accounting.call_attempts = waiting.call_attempts;
                 accounting.call_spent_ms = waiting.call_spent_ms;
@@ -3228,6 +3275,8 @@ impl Turn {
                             )
                             .await?;
                     }
+                    // An answer ends a run of holds.
+                    accounting.held_since = None;
                     return Ok(Some(completion));
                 }
                 Err(mut error) => {
@@ -3277,6 +3326,7 @@ impl Turn {
                 accounting.call_fallback = fallback.as_ref().map(Fallback::parked);
                 accounting.call_spent_ms = spent.as_millis() as u64;
                 accounting.parked_until = now_ms() + block.as_millis() as u64;
+                accounting.blocked = None;
                 return Ok(None);
             }
             // Whatever the provider billed for a failed attempt is still spent.
@@ -3358,6 +3408,18 @@ impl Turn {
             // Time spent waiting fairly in the pool is the fleet's, not this
             // call's; the budget counts only the attempts and their backoff.
             if !retryable(&error.code) || attempt >= cap || spent >= RETRY_BUDGET {
+                // A cause a person can fix, or an outage that outlasted its
+                // retries, holds the turn rather than ending it. A summary
+                // fails as before: the turn's own call goes on, and holds
+                // there if the cause outlasts it.
+                if !summary
+                    && record.settings.holds(accounting.held_since, now_ms())
+                    && (held(&error.code) || retryable(&error.code))
+                {
+                    accounting.call_fallback = fallback.as_ref().map(Fallback::parked);
+                    accounting.hold(&error, record.settings.hold_ms());
+                    return Ok(None);
+                }
                 return Err(error);
             }
             // A pool closed by a rate limit for a while is not this turn's to
@@ -3410,6 +3472,7 @@ impl Turn {
                 accounting.call_spent_ms = (spent + backoff).as_millis() as u64;
                 accounting.call_fallback = fallback.as_ref().map(Fallback::parked);
                 accounting.parked_until = now_ms() + block.as_millis() as u64;
+                accounting.blocked = None;
                 return Ok(None);
             }
             if !delay.is_zero() {
@@ -5304,6 +5367,29 @@ fn retryable(code: &str) -> bool {
             | "provider_socket_expired"
     ) || code.starts_with("provider_connection_")
         || code.starts_with("provider_http_5")
+}
+
+/// Causes a person can fix that refuse a turn's start, which hold it in
+/// line until they are: a provider the config lacks, no folder to work in.
+/// A bot's budget is a lifetime cap no request raises, so it ends the turn.
+pub fn held_at_start(code: &str) -> bool {
+    matches!(code, "provider_unavailable" | "workspace_required")
+}
+
+/// Causes a person can fix, which hold the turn until they are: a login
+/// refused or expired, a key or account the provider refuses, a provider
+/// quota spent. The bot's and the turn's own token caps are limits their
+/// makers set, and end it.
+fn held(code: &str) -> bool {
+    matches!(
+        code,
+        "provider_login_rejected"
+            | "provider_login_expired"
+            | "provider_login_unavailable"
+            | "provider_quota_exhausted"
+            | "provider_http_401"
+            | "provider_http_403"
+    )
 }
 
 /// A stream that stalled on this request stalls again when resent at once

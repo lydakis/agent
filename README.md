@@ -257,6 +257,10 @@ sender, so no agent takes it for yours; `senders = "hidden"` leaves that out.
 A note sent with `--delivery attach` rides on the bot's next call and goes as a
 steer if none comes within `attach_wait` (`1d` unless `config.toml` says
 otherwise; `"0"` waits as long as it takes).
+A turn stopped by something only you can fix (a sign-in, a key, a usage
+limit, a provider that is down) waits for you rather than failing, for
+`hold` (`5d` unless `config.toml` says otherwise; `"0"` fails at once):
+`agent held` lists what waits and `agent retry` tries it again now.
 A request Claude's safety classifiers decline ends the turn, unless
 `[fallbacks]` names another model for the bot's own; that model then answers
 that request alone ([CLI.md](docs/CLI.md)).

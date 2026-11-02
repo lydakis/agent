@@ -1,6 +1,7 @@
 import json
 import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -43,6 +44,36 @@ class SetupTests(unittest.TestCase):
         rubric = (Path(__file__).resolve().parents[1] / 'docs/ROLE_EVAL.md').read_text()
         for plant in plants:
             self.assertIn(f'| {plant} |', rubric)
+
+
+    def test_every_planted_burst_ask_is_scored(self):
+        rubric = (Path(__file__).resolve().parents[1] / 'docs/ROLE_EVAL.md').read_text()
+        plants = [s['plant'] for s in role_eval.BURST if s.get('plant')]
+        plants += [e[3] for s in role_eval.BURST for e in s.get('events', []) if len(e) > 3]
+        for plant in plants:
+            self.assertIn(f'| {plant.split()[0]} |', rubric)
+
+    def test_the_burst_is_three_hundred_messages_with_twenty_asks_none_lost_by_the_source(self):
+        events = [e for s in role_eval.BURST for e in s.get('events', [])]
+        self.assertEqual(len(events), 300)
+        self.assertEqual(sum(len(e) > 3 for e in events), 20)
+        self.assertEqual({e[0] for e in events}, {'chat', 'ci'})
+        # A wave fits in what a subscriber holds (64), and every ID stays in
+        # what a source remembers (1024), so only a busy lead loses news.
+        self.assertLessEqual(max(len(s.get('events', [])) for s in role_eval.BURST), 64)
+        self.assertEqual(role_eval.BURST, role_eval.burst(), 'the same burst every run')
+
+    def test_a_lead_is_subscribed_once_it_hears_every_source_of_the_day(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(role_eval, 'DAY', role_eval.BURST):
+            home = Path(tmp)
+            folder = home / '.agent/state.sqlite.lookout'
+            folder.mkdir(parents=True)
+            subs = [{'name': 'chat', 'sources': ['chat']}]
+            (folder / 'shop.lead.json').write_text(json.dumps({'subscriptions': subs}))
+            self.assertFalse(role_eval.subscribed(home))
+            subs.append({'name': 'ci', 'sources': ['ci:main']})
+            (folder / 'shop.lead.json').write_text(json.dumps({'subscriptions': subs}))
+            self.assertTrue(role_eval.subscribed(home))
 
 
 class BlindTests(unittest.TestCase):
@@ -189,6 +220,34 @@ class ConfinedTests(unittest.TestCase):
                     role_eval.let_go_scheduler(home)
                 self.assertEqual([c.args[0] for c in run.call_args_list], [want])
             self.assertTrue((agents / f'{role_eval.SCHEDULER}8a8d61ae.plist').exists())
+
+    def test_a_prompt_left_out_holds_up_nothing_and_its_answer_keeps_its_time(self):
+        # The burst's mid-burst question: the waves go on while it is out.
+        with tempfile.TemporaryDirectory() as tmp:
+            sonny = Path(tmp) / 'sonny'
+            sonny.write_text('#!/usr/bin/env python3\nimport json, sys, time\n'
+                             'for line in sys.stdin:\n'
+                             '    time.sleep(1)\n'
+                             '    print(json.dumps({"id": json.loads(line)["id"], "result": {}}), flush=True)\n')
+            sonny.chmod(0o755)
+            acp = role_eval.Acp(sonny, dict(os.environ), tmp, Path(tmp) / 'acp.jsonl', tmp)
+            try:
+                sent = time.time()
+                rid = acp.ask('session/prompt', {}, wait=False)
+                self.assertLess(time.time() - sent, 0.5)
+                self.assertNotIn(rid, acp.answers)
+                self.assertEqual(acp.collect(rid, timeout=10), {'id': rid, 'result': {}})
+                self.assertGreaterEqual(acp.at[rid] - sent, 1)
+            finally:
+                acp.close()
+
+    def test_the_mid_burst_question_is_about_code_no_ask_changes(self):
+        asked = next(s for s in role_eval.BURST if s.get('say') and s.get('gap'))
+        self.assertIn('sample order 1', asked['say'])
+        self.assertIn("Order(1, Decimal('19.99'), 'EUR'", role_eval.FILES['shop/orders.py'])
+        # Asks add to Order (a __str__, is_refund), never change a sample.
+        for ask in role_eval.BURST_ASKS:
+            self.assertNotIn('order 1', ask[2])
 
     def test_runs_live_outside_what_the_sandbox_always_writes(self):
         # /tmp and $TMPDIR are writable in every sandbox: a run there could
