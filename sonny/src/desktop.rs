@@ -866,6 +866,42 @@ mod tests {
         }
     }
 
+    /// Every command and flag the tool passes is one agent-desktop still
+    /// has, against `AGENT_DESKTOP_INVENTORY`, a list
+    /// `sonny/upstream/inventory.py` made of a release. Run each week
+    /// against the latest, with `AGENT_DESKTOP_PARSES` above.
+    #[test]
+    fn agent_desktop_has_what_the_tool_passes() {
+        let Some(path) = std::env::var_os("AGENT_DESKTOP_INVENTORY") else {
+            return;
+        };
+        let listed = std::fs::read_to_string(path).unwrap();
+        let lines: std::collections::HashSet<&str> = listed.lines().collect();
+        let has = |line: String| lines.contains(line.as_str());
+        let mut gone = Vec::new();
+        for spec in SPECS {
+            if !has(format!("command {}", spec.name)) {
+                gone.push(format!("command {}", spec.name));
+            }
+            for flag in spec.switches.iter().chain(spec.valued) {
+                if !has(format!("{} {flag}", spec.name)) && !has(format!("global {flag}")) {
+                    gone.push(format!("{} {flag}", spec.name));
+                }
+            }
+        }
+        for skills in ["list", "get", "path"] {
+            if !has(format!("command skills {skills}")) {
+                gone.push(format!("command skills {skills}"));
+            }
+        }
+        for flag in GLOBAL_SWITCHES.iter().chain(GLOBAL_VALUED) {
+            if !has(format!("global {flag}")) {
+                gone.push(format!("global {flag}"));
+            }
+        }
+        assert!(gone.is_empty(), "agent-desktop no longer has: {gone:#?}");
+    }
+
     #[test]
     fn what_acts_is_asked_about_and_what_looks_is_not() {
         for line in [
