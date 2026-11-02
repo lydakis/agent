@@ -140,8 +140,14 @@ def main():
                         '--request-id', f'issue-{number}', '--',
                         f"Issue #{number}: {issue['title']}\n\n{issue['body']}")
         handles.append(submitted['handle'])
-    for handle, outcome in cli('wait', '--timeout', '10m', *handles)['results'].items():
-        print(f"{handle}: {outcome['status']}: {outcome['text'] or outcome['error']}", file=sys.stderr)
+    failed = 0
+    for start in range(0, len(handles), 64):  # a wait takes at most 64 handles
+        results = cli('wait', '--timeout', '10m', *handles[start:start + 64])['results']
+        for handle in handles[start:start + 64]:
+            outcome = results.get(handle, {'status': 'pending', 'text': '', 'error': 'not finished'})
+            failed += outcome['status'] != 'completed'
+            print(f"{handle}: {outcome['status']}: {outcome['text'] or outcome['error']}", file=sys.stderr)
+    sys.exit(1 if failed else 0)
 
 
 if __name__ == '__main__':

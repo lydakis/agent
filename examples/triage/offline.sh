@@ -4,7 +4,7 @@
 set -e
 here=$(cd "$(dirname "$0")" && pwd)
 dir=$(mktemp -d "${TMPDIR:-/tmp}/triage.XXXXXX")
-export AGENT_STORE="$dir/state.sqlite" AGENT_MODEL=scripted/triage
+export AGENT_STORE="$dir/state.sqlite" AGENT_SOCKET="$dir/agent.sock" AGENT_MODEL=scripted/triage
 trap '"${AGENT_BIN:-agent}" shutdown >/dev/null 2>&1; kill "$model" 2>/dev/null; rm -rf "$dir"' EXIT
 python3 "$here/scripted_model.py" 0 >"$dir/port" &
 model=$!
