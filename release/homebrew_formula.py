@@ -25,7 +25,7 @@ FORMULAS = {
         # sandboxed by default), which it never looks up on PATH: the
         # build fixes where this one is.
         '  on_linux do\n    depends_on "bubblewrap"\n  end\n',
-        '    ENV["AGENT_BWRAP"] = (Formula["bubblewrap"].opt_bin/"bwrap").to_s if OS.linux?\n'
+        '    ENV["AGENT_BWRAP"] = (formula_opt_bin("bubblewrap")/"bwrap").to_s if OS.linux?\n'
         '    system "cargo", "install", *std_cargo_args\n',
         '    assert_equal "agent-runtime #{version}", shell_output("#{bin}/agent --version").strip\n',
     ),
