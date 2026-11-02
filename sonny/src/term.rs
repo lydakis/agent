@@ -2,8 +2,10 @@
 //! the colour scheme it reports, mode 2031), so tints read on light and
 //! dark; its theme's foreground, red and green (OSC 10 and 4), which
 //! Sonny's own grays and tints start from; whether it draws Kitty
-//! graphics; and its cell size in pixels, so an image fills whole cells. A terminal that follows the Mac's light and
-//! dark appearance (Rex does) is followed as it switches.
+//! graphics; its cell size in pixels, so an image fills whole cells; and
+//! whether it joins an emoji's parts into one character (mode 2027), as
+//! a skin tone onto the hand it colours. A terminal that follows the
+//! Mac's light and dark appearance (Rex does) is followed as it switches.
 use std::{
     io::Write,
     sync::{
@@ -26,6 +28,9 @@ static SWITCHED: AtomicBool = AtomicBool::new(false);
 static THEME: OnceLock<Theme> = OnceLock::new();
 /// The theme changed since it was asked, so its colors are not known.
 static STALE: AtomicBool = AtomicBool::new(false);
+/// Sonny turned the terminal's grapheme clustering on, to be turned off
+/// again as it leaves.
+static CLUSTERED: AtomicBool = AtomicBool::new(false);
 
 pub type Rgb = (u8, u8, u8);
 
@@ -112,6 +117,19 @@ pub fn detect() {
         graphics: reply.contains("_Gi=31;OK"),
         cell: cell_size(&reply).unwrap_or((8, 16)),
     });
+    // A terminal that can cluster but has it off draws 👍🏻 as 👍 and a
+    // swatch, wider than Sonny lays it out, and the cell after it then
+    // covers the swatch: turned on, as Zellij does, so an emoji takes the
+    // cells Sonny gives it.
+    if clustering(&reply) == Some(false) {
+        let mut stdout = std::io::stdout();
+        if write!(stdout, "\x1b[?2027h")
+            .and_then(|()| stdout.flush())
+            .is_ok()
+        {
+            CLUSTERED.store(true, Ordering::Relaxed);
+        }
+    }
     // A terminal on this Mac that matches its appearance now is taken to
     // follow it, as Rex and Ghostty can.
     if mac == Some(light) && std::env::var_os("SSH_CONNECTION").is_none() {
@@ -126,6 +144,28 @@ pub fn detect() {
                 }
             }
         });
+    }
+}
+
+/// The terminal as Sonny found it: grapheme clustering off again when
+/// [`detect`] turned it on. Call on leaving, with the screen given back.
+pub fn restore() {
+    if CLUSTERED.swap(false, Ordering::Relaxed) {
+        let mut stdout = std::io::stdout();
+        let _ = write!(stdout, "\x1b[?2027l");
+        let _ = stdout.flush();
+    }
+}
+
+/// Whether the terminal's grapheme clustering (mode 2027) is on, as its
+/// answer to DECRQM, `CSI ? 2027 ; Ps $ y`, says: none for a terminal
+/// that does not know the mode or cannot change it.
+fn clustering(reply: &str) -> Option<bool> {
+    let at = reply.find("\x1b[?2027;")? + "\x1b[?2027;".len();
+    match reply.get(at..)?.split_once("$y")?.0 {
+        "1" => Some(true),
+        "2" => Some(false),
+        _ => None,
     }
 }
 
@@ -158,15 +198,16 @@ fn colorfgbg() -> Option<bool> {
     Some(matches!(background, 7 | 15))
 }
 
-/// OSC 11 and 10, red and green (OSC 4), a Kitty graphics query and the
-/// cell size, then DA1, which every terminal answers, so the wait ends as
+/// OSC 11 and 10, red and green (OSC 4), a Kitty graphics query, the
+/// cell size and the colour scheme, whether emoji are clustered (DECRQM
+/// 2027), then DA1, which every terminal answers, so the wait ends as
 /// soon as the rest is in.
 fn query() -> Option<String> {
     let mut stdout = std::io::stdout();
     write!(
         stdout,
         "\x1b]11;?\x1b\\\x1b]10;?\x1b\\\x1b]4;1;?\x1b\\\x1b]4;2;?\x1b\\\
-         \x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\\x1b[16t\x1b[?996n\x1b[c"
+         \x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\\x1b[16t\x1b[?996n\x1b[?2027$p\x1b[c"
     )
     .ok()?;
     stdout.flush().ok()?;
@@ -280,6 +321,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn grapheme_clustering_reads_as_on_off_or_unknown() {
+        let reply = |ps: &str| format!("\x1b[?997;1n\x1b[?2027;{ps}$y\x1b[?62;22c");
+        assert_eq!(clustering(&reply("1")), Some(true));
+        assert_eq!(clustering(&reply("2")), Some(false));
+        // Not known, or set for good either way: nothing to change.
+        for ps in ["0", "3", "4"] {
+            assert_eq!(clustering(&reply(ps)), None, "{ps}");
+        }
+        assert_eq!(clustering("\x1b[?2027;2"), None);
+    }
+
+    #[test]
     fn a_background_reads_as_light_or_dark() {
         let light = parse("\x1b]11;rgb:fdfd/f9f9/eded\x1b\\\x1b[?62;22c").unwrap();
         assert!(luminance(light) > 0.5);
@@ -288,6 +341,7 @@ mod tests {
         assert!(parse("\x1b[?62;22c").is_none());
         let reply = "\x1b]11;rgb:1e1e/1e1e/2e2e\x1b\\\x1b]10;rgb:cd/d6/f4\x07\
                      \x1b]4;1;rgb:f3f3/8b8b/a8a8\x1b\\\x1b[?62;22c";
+        assert_eq!(clustering(reply), None);
         assert_eq!(
             answered(reply),
             Theme {

@@ -4635,6 +4635,7 @@ pub fn watch(
             }
         });
     let _ = execute!(std::io::stdout(), cursor::Show, LeaveAlternateScreen);
+    crate::term::restore();
     let _ = terminal::disable_raw_mode();
     drawn
 }

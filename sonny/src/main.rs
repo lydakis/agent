@@ -1340,6 +1340,7 @@ async fn run() -> Result<(), String> {
     own_screen(false);
     keys_apart(false);
     let _ = execute!(std::io::stdout(), DisableBracketedPaste);
+    term::restore();
     let _ = disable_raw_mode();
     status_report("clear", &name);
     // `/switch NAME` or `/new`: this window becomes that agent's Sonny, as
