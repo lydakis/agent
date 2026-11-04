@@ -38,11 +38,22 @@ pub struct Usage {
 
 /// Why a judge gave no answers: what failed in this check.
 #[derive(Debug, PartialEq)]
-pub struct Failed(pub String);
+pub struct Failed {
+    pub why: String,
+    /// The start of the judge's reply, when there was one it could not be
+    /// read as answers: for a log, redacted by whoever writes it there.
+    pub reply: Option<String>,
+}
 
 fn failed(why: impl Into<String>) -> Failed {
-    Failed(why.into())
+    Failed {
+        why: why.into(),
+        reply: None,
+    }
 }
+
+/// How much of a reply that could not be read [`Failed`] keeps.
+const KEPT_REPLY: usize = 2048;
 
 /// A general model's reply as answers: its JSON object, found in the
 /// reply, with a probability for every id asked. `None` when any is
@@ -321,11 +332,20 @@ pub async fn turn_with(
         );
         return (Err(failed(why)), None);
     }
+    let text = outcome["text"].as_str().unwrap_or_default();
     let Some(answers) = (outcome["text_truncated"] != true)
-        .then(|| parse(outcome["text"].as_str().unwrap_or_default(), ids))
+        .then(|| parse(text, ids))
         .flatten()
     else {
-        return (Err(failed("the judge's answer did not parse")), None);
+        let mut cut = text.len().min(KEPT_REPLY);
+        while !text.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        let failed = Failed {
+            why: "the judge's answer did not parse".into(),
+            reply: Some(text[..cut].to_owned()),
+        };
+        return (Err(failed), None);
     };
     let read = client
         .request("turns", json!({"bot": name, "after": turn - 1, "limit": 1}))

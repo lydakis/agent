@@ -160,11 +160,9 @@ pub fn main(settings: Settings) -> Result<i32> {
 /// What a judge request came back with.
 enum Judged {
     /// An assessment for every call, by its id.
-    Answers {
-        answers: Value,
-        usage: Usage,
-    },
-    Failed(String),
+    Answers { answers: Value, usage: Usage },
+    /// Why, and the start of a reply that could not be read.
+    Failed { why: String, reply: Option<String> },
 }
 
 struct Judge {
@@ -201,7 +199,7 @@ impl Judge {
                 answers: Value::Object(answers),
                 usage,
             },
-            Err(Failed(why)) => Judged::Failed(why),
+            Err(Failed { why, reply }) => Judged::Failed { why, reply },
         }
     }
 }
@@ -516,33 +514,26 @@ async fn round(shared: Arc<Shared>, bot: String, turn: i64, calls: Vec<Value>) {
     let judge_ms = started.elapsed().as_millis() as u64;
     let mut answered = Vec::with_capacity(calls.len());
     for (call, verdict) in calls.iter().zip(&verdicts) {
-        let (mut decision, reason) = match verdict {
-            Verdict::Allow => ("allow", None),
-            Verdict::Deny(reason) | Verdict::Unreviewed(reason) => ("deny", Some(reason.as_str())),
-            Verdict::Doubt(reason) => ("ask", Some(reason.as_str())),
-        };
-        // A round nobody assessed is denied without counting toward the
-        // breaker, as in Codex.
-        let unreviewed = matches!(verdict, Verdict::Unreviewed(_));
-        let answer = |decision: &str| {
+        let answer = |(decision, reason, unreviewed): &(&str, Option<String>, bool)| {
             let mut answer = json!({"bot":bot,"turn":turn,"call_id":call["call_id"],
                 "request":call["request"],"tag":shared.tag,"decision":decision,"reason":reason,
                 "by":"approver","lease":shared.lease});
-            if unreviewed {
+            if *unreviewed {
                 answer["unreviewed"] = json!(true);
             }
             shared.client.request("answer", answer)
         };
-        let mut result = answer(decision).await;
-        // A gate that lapses has nobody to wait on: the doubt is a denial.
-        if decision == "ask"
+        let mut given = decide(verdict, false);
+        let mut result = answer(&given).await;
+        if given.0 == "ask"
             && result
                 .as_ref()
                 .is_err_and(|error| error.code == "approval_ask_expiring")
         {
-            decision = "deny";
-            result = answer(decision).await;
+            given = decide(verdict, true);
+            result = answer(&given).await;
         }
+        let (decision, reason, _) = given;
         let error = result.err().map(|error| {
             if error.code == "approvals_lost" {
                 shared.lost.notify_one();
@@ -557,6 +548,23 @@ async fn round(shared: Arc<Shared>, bot: String, turn: i64, calls: Vec<Value>) {
         "judge_ms":judge_ms,"input_tokens":usage.input,"cached_tokens":usage.cached,
         "output_tokens":usage.output}),
     );
+}
+
+/// The daemon's answer to a call given `verdict`: its decision, its
+/// reason, and whether it is a denial nobody assessed, which never counts
+/// toward the breaker, as in Codex. A round the review never assessed is
+/// no verdict: it goes to the person, as a doubt does, the call waiting as
+/// it is. Where the gate `lapses` nobody can be asked: a doubt is denied,
+/// and an unassessed call is denied with what the agent is told of it.
+fn decide(verdict: &Verdict, lapses: bool) -> (&'static str, Option<String>, bool) {
+    match verdict {
+        Verdict::Allow => ("allow", None, false),
+        Verdict::Deny(reason) => ("deny", Some(reason.clone()), false),
+        Verdict::Doubt(reason) if lapses => ("deny", Some(reason.clone()), false),
+        Verdict::Doubt(reason) => ("ask", Some(reason.clone()), false),
+        Verdict::Unreviewed(reason) if lapses => ("deny", Some(reason.clone()), true),
+        Verdict::Unreviewed(reason) => ("ask", Some(policy::handed_over(reason)), false),
+    }
 }
 
 async fn interrupt(shared: &Shared, bot: &str, turn: i64) {
@@ -621,9 +629,14 @@ async fn judge(
         )
         .await
     {
-        Judged::Failed(detail) => {
-            report(json!({"event":"judge_failed","bot":bot,"turn":turn,"detail":detail}));
-            Err(Unreviewed::Failed(detail))
+        Judged::Failed { why, reply } => {
+            // The reply kept, redacted, so a failure can be read later.
+            let reply = reply.map(|reply| shared.redactor.redact(&reply).into_owned());
+            report(
+                json!({"event":"judge_failed","bot":bot,"turn":turn,"detail":why,
+                "reply":reply}),
+            );
+            Err(Unreviewed::Failed(why))
         }
         Judged::Answers { answers, usage } => {
             let verdicts = intent
@@ -1875,6 +1888,35 @@ mod tests {
         assert!(written_file(&fifo).is_none());
         assert!(written_file(&dir.join("gone")).is_none());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_review_that_failed_hands_the_call_to_the_person_as_it_is() {
+        let failed = policy::not_reviewed("the judge's answer did not parse");
+        let (decision, reason, unreviewed) = decide(&failed, false);
+        assert_eq!(decision, "ask");
+        assert!(!unreviewed);
+        assert_eq!(
+            reason.as_deref(),
+            Some(
+                "Automatic approval review failed: the judge's answer did not parse, \
+                 so this waits for you."
+            )
+        );
+        assert_eq!(decide(&policy::timed_out(), false).0, "ask");
+        // Where nobody can be asked, the agent is told the review failed,
+        // and the breaker doesn't count it.
+        let Verdict::Unreviewed(told) = &failed else {
+            unreachable!()
+        };
+        assert_eq!(decide(&failed, true), ("deny", Some(told.clone()), true));
+        // A verdict stays one.
+        let denied = Verdict::Deny("no".into());
+        assert_eq!(decide(&denied, false), ("deny", Some("no".into()), false));
+        assert_eq!(decide(&Verdict::Allow, false), ("allow", None, false));
+        let doubt = Verdict::Doubt("long".into());
+        assert_eq!(decide(&doubt, false).0, "ask");
+        assert_eq!(decide(&doubt, true), ("deny", Some("long".into()), false));
     }
 
     #[test]
