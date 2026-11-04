@@ -660,14 +660,40 @@ fn repositories(dir: &std::path::Path) -> Vec<String> {
 
 /// Whether `record`'s sandbox is the one `fields` give it: its mode, its
 /// writable folders, which a moved folder leaves stale, and its network.
+/// The folders as sets: the daemon keeps them sorted and each once, and
+/// Sonny lists them in its own order, so order alone is no change.
 pub fn sandboxed_as(record: &Value, fields: &Map<String, Value>) -> bool {
     let fields = Value::Object(fields.clone());
     let settings = &record["settings"];
     settings["sandbox"] == fields["sandbox"]
-        && list(settings, "writable") == list(&fields, "writable")
-        && list(settings, "unix_sockets") == list(&fields, "unix_sockets")
+        && set(settings, "writable") == set(&fields, "writable")
+        && set(settings, "unix_sockets") == set(&fields, "unix_sockets")
         && settings["network"].as_bool().unwrap_or(false)
             == fields["network"].as_bool().unwrap_or(false)
+}
+
+/// [`list`], sorted and each once.
+fn set(value: &Value, key: &str) -> Vec<String> {
+    let mut items = list(value, key);
+    items.sort();
+    items.dedup();
+    items
+}
+
+/// [`sandbox`]'s fields for each row and folder asked, looked up once:
+/// one pick given to many agents walks each folder for its repositories
+/// once, not once per agent and again on each try. Kept for one pick,
+/// so the next pick, or the next agent made, looks again.
+#[derive(Default)]
+pub struct Sandboxes(std::collections::HashMap<(String, String), Map<String, Value>>);
+
+impl Sandboxes {
+    /// The sandbox fields of the row `mode` in `workspace`.
+    pub fn of(&mut self, mode: &str, workspace: &str) -> &Map<String, Value> {
+        (self.0)
+            .entry((mode.to_owned(), workspace.to_owned()))
+            .or_insert_with(|| sandbox(mode, std::path::Path::new(workspace)))
+    }
 }
 
 /// Whether the bot `record` describes may run Sonny's tool `tool`: any
@@ -730,8 +756,8 @@ pub fn made_by<'a>(bots: &'a [Value], lead: &str) -> Vec<&'a Value> {
 /// mode gives an agent in its folder, or `None` when its gate is already
 /// the one `gate` makes and its sandbox the mode's: the same approver over the same tools,
 /// with no expiry. `record` is the bot as `inspect` gives it, with the
-/// tools its client declared.
-pub fn regate(record: &Value, mode: &str) -> Option<Map<String, Value>> {
+/// tools its client declared; its folder's sandbox comes from `sandboxes`.
+pub fn regate(record: &Value, mode: &str, sandboxes: &mut Sandboxes) -> Option<Map<String, Value>> {
     let tools: Vec<String> = record["tools"]
         .as_array()
         .into_iter()
@@ -765,9 +791,9 @@ pub fn regate(record: &Value, mode: &str) -> Option<Map<String, Value>> {
     let mut fields = fields;
     let mut confined = true;
     if let Some(workspace) = record["workspace"].as_str() {
-        let sandbox = sandbox(mode, std::path::Path::new(workspace));
-        confined = sandboxed_as(record, &sandbox);
-        fields.insert("settings".into(), Value::Object(sandbox));
+        let sandbox = sandboxes.of(mode, workspace);
+        confined = sandboxed_as(record, sandbox);
+        fields.insert("settings".into(), Value::Object(sandbox.clone()));
     }
     (!has || !confined).then_some(fields)
 }
@@ -808,12 +834,12 @@ mod tests {
         let task = json!({"workspace": dir, "gates": [],
             "settings": {"sandbox": "workspace-write", "writable": [git], "network": true}});
         assert_eq!(
-            regate(&task, "full").unwrap()["settings"]["sandbox"],
+            regate(&task, "full", &mut Sandboxes::default()).unwrap()["settings"]["sandbox"],
             "danger-full-access"
         );
         let freed = json!({"workspace": dir, "gates": [],
             "settings": {"sandbox": "danger-full-access", "writable": [], "network": false}});
-        assert_eq!(regate(&freed, "full"), None);
+        assert_eq!(regate(&freed, "full", &mut Sandboxes::default()), None);
         let unconfined = json!({"settings": {"sandbox": "danger-full-access", "writable": [], "network": false}});
         assert!(sandboxed_as(&unconfined, &full));
         // A lead made before leads were confined is confined again, and
@@ -1232,20 +1258,23 @@ mod tests {
         assert_eq!(names, [&json!("task"), &json!("helper")]);
         // Each takes the mode unless it has it already; a gate Sonny did
         // not set is replaced too.
-        assert_eq!(regate(&bots[1], "full"), Some(gate("full", &[])));
-        assert_eq!(regate(&bots[1], "auto"), None);
-        assert!(regate(&bots[2], "auto").is_some());
+        assert_eq!(
+            regate(&bots[1], "full", &mut Sandboxes::default()),
+            Some(gate("full", &[]))
+        );
+        assert_eq!(regate(&bots[1], "auto", &mut Sandboxes::default()), None);
+        assert!(regate(&bots[2], "auto", &mut Sandboxes::default()).is_some());
         // Nothing to gate: already as `full` leaves it.
         let reader = json!({"name": "r", "tools": ["read"], "gates": []});
-        assert_eq!(regate(&reader, "auto"), None);
-        assert_eq!(regate(&reader, "ask"), None);
+        assert_eq!(regate(&reader, "auto", &mut Sandboxes::default()), None);
+        assert_eq!(regate(&reader, "ask", &mut Sandboxes::default()), None);
         // The same tag over fewer tools, or one that lapses, is set again.
         let partial = json!({"tools": ["shell", "read", "write"],
             "gates": [{"tag": "manual", "tools": ["shell"]}]});
-        assert!(regate(&partial, "ask").is_some());
+        assert!(regate(&partial, "ask", &mut Sandboxes::default()).is_some());
         let lapsing = json!({"tools": ["shell", "read"],
             "gates": [{"tag": "auto", "tools": ["shell"], "expire_ms": 45000}]});
-        assert!(regate(&lapsing, "auto").is_some());
+        assert!(regate(&lapsing, "auto", &mut Sandboxes::default()).is_some());
         // Of the tools its client declared, those that can drop work, run
         // something outside the sandbox or send words elsewhere wait for
         // the verdict too.
@@ -1269,6 +1298,37 @@ mod tests {
         if crate::desktop::tool().is_some() {
             waiting.as_array_mut().unwrap().push(json!("desktop"));
         }
-        assert_eq!(regate(&panes, "auto").unwrap()["approve"], waiting);
+        assert_eq!(
+            regate(&panes, "auto", &mut Sandboxes::default()).unwrap()["approve"],
+            waiting
+        );
+    }
+
+    #[test]
+    fn a_sandbox_in_another_order_is_the_same_and_a_folder_is_walked_once() {
+        // The daemon keeps writable folders sorted; Sonny appends its own
+        // last. The same folders in another order need no configure.
+        let fields = confined(json!({"sandbox": "workspace-write",
+            "writable": ["/b/.git", "/a/.git", "/zen"], "network": true}));
+        let kept = json!({"settings": {"sandbox": "workspace-write",
+            "writable": ["/a/.git", "/b/.git", "/zen"], "network": true}});
+        assert!(sandboxed_as(&kept, &fields));
+        let fewer = json!({"settings": {"sandbox": "workspace-write",
+            "writable": ["/a/.git", "/zen"], "network": true}});
+        assert!(!sandboxed_as(&fewer, &fields));
+        // One pick walks a folder once, however many agents work there.
+        let dir = std::env::temp_dir().join(format!("sonny-walked-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("one")).unwrap();
+        let dir = std::fs::canonicalize(&dir).unwrap();
+        crate::task::git(&dir.join("one"), &["init", "-q"]).unwrap();
+        let workspace = dir.to_str().unwrap();
+        let mut sandboxes = Sandboxes::default();
+        let first = sandboxes.of("auto", workspace).clone();
+        std::fs::create_dir_all(dir.join("two")).unwrap();
+        crate::task::git(&dir.join("two"), &["init", "-q"]).unwrap();
+        assert_eq!(sandboxes.of("auto", workspace), &first);
+        // The next pick looks again.
+        assert_ne!(Sandboxes::default().of("auto", workspace), &first);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -419,6 +419,146 @@ async fn agents_project(bot: &str) -> Result<(PathBuf, String, Vec<String>), Str
     Ok((socket, project, chain))
 }
 
+/// How long after a pass a `/permissions` pick looks again for the agents
+/// still busy with a turn.
+const SPREAD_AGAIN: Duration = Duration::from_secs(2);
+
+/// A `/permissions` pick on its way to the agents the lead made.
+struct Spread {
+    mode: &'static str,
+    /// When to look again for those still on their old permissions.
+    at: Instant,
+    /// The pass at work beside the window.
+    pass: Option<tokio::task::JoinHandle<Passed>>,
+    /// The agents that have the row, by identity: not looked at again.
+    settled: std::collections::HashSet<i64>,
+    /// Those busy when asked, by name: each takes the row once its turn
+    /// ends, and the footer counts them until then.
+    waiting: Vec<String>,
+    /// Whether a pass has listed the agents at all.
+    listed: bool,
+    /// Each folder's sandbox, looked for once for this pick.
+    sandboxes: approvals::Sandboxes,
+}
+
+impl Spread {
+    /// The pick of `mode`, after `earlier`, a pass still at work for an
+    /// earlier pick, so the two never configure the same agent at once.
+    fn new(mode: &'static str, earlier: Option<tokio::task::JoinHandle<Passed>>) -> Self {
+        Self {
+            mode,
+            at: Instant::now(),
+            pass: earlier,
+            settled: Default::default(),
+            waiting: Vec::new(),
+            listed: false,
+            sandboxes: Default::default(),
+        }
+    }
+}
+
+/// What one pass of a [`Spread`] did.
+struct Passed {
+    mode: &'static str,
+    /// Whether it listed the agents; one that could not tries again.
+    listed: bool,
+    settled: Vec<i64>,
+    waiting: Vec<String>,
+    notice: Option<String>,
+    sandboxes: approvals::Sandboxes,
+}
+
+/// One pass of a `/permissions` pick over the agents `lead` made and
+/// those they made, all but those `settled`: each that hasn't `mode` is
+/// configured to it; one busy is left for the next pass. The folder walks
+/// run off the runtime, each folder once per pick.
+async fn spread_pass(
+    client: Arc<Client>,
+    lead: String,
+    mode: &'static str,
+    settled: std::collections::HashSet<i64>,
+    mut sandboxes: approvals::Sandboxes,
+    woken: Arc<tokio::sync::Notify>,
+) -> Passed {
+    let mut passed = Passed {
+        mode,
+        listed: false,
+        settled: Vec::new(),
+        waiting: Vec::new(),
+        notice: None,
+        sandboxes: Default::default(),
+    };
+    let mut bots = Vec::new();
+    let mut after = json!("");
+    let listed = loop {
+        let Ok(page) = (client)
+            .request("bots", json!({"after": after, "limit": 256}))
+            .await
+        else {
+            break false;
+        };
+        bots.extend(page["bots"].as_array().cloned().unwrap_or_default());
+        match &page["next_after"] {
+            Value::Null => break true,
+            next => after = next.clone(),
+        }
+    };
+    let made: Vec<Value> = match listed {
+        true => approvals::made_by(&bots, &lead)
+            .into_iter()
+            .filter(|bot| (bot["bot_id"].as_i64()).is_none_or(|id| !settled.contains(&id)))
+            .cloned()
+            .collect(),
+        false => Vec::new(),
+    };
+    passed.listed = listed;
+    for bot in made {
+        let name = bot["name"].as_str().unwrap_or_default().to_owned();
+        let id = bot["bot_id"].as_i64();
+        // As `inspect` gives it, with the tools its client declared.
+        let Ok(record) = (client)
+            .request("inspect", json!({"bot": name, "bot_id": bot["bot_id"]}))
+            .await
+        else {
+            continue;
+        };
+        let walked = tokio::task::spawn_blocking(move || {
+            let fields = approvals::regate(&record, mode, &mut sandboxes);
+            (fields, sandboxes)
+        })
+        .await;
+        let fields = match walked {
+            Ok((fields, kept)) => {
+                sandboxes = kept;
+                fields
+            }
+            Err(_) => {
+                sandboxes = Default::default();
+                break;
+            }
+        };
+        let Some(fields) = fields else {
+            passed.settled.extend(id);
+            continue;
+        };
+        // That bot, not one given its name since it was listed.
+        let mut asked = Value::Object(fields);
+        asked["bot"] = json!(name);
+        asked["bot_id"] = bot["bot_id"].clone();
+        match client.request("configure", asked).await {
+            Ok(_) => passed.settled.extend(id),
+            Err(error) if error.code == "bot_busy" => passed.waiting.push(name),
+            Err(error) => {
+                passed.notice = Some(format!("{name}'s permissions: {error}"));
+                passed.settled.extend(id);
+            }
+        }
+    }
+    passed.sandboxes = sandboxes;
+    woken.notify_one();
+    passed
+}
+
 /// `bot`, then the agent that made it, and so on to the first lead or an
 /// agent no agent made: whose windows an agent acts in ([`mux::latest_for`]).
 async fn makers(client: &Client, bot: &str) -> Vec<String> {
@@ -2700,9 +2840,9 @@ struct App {
     approve_shown: Option<String>,
     /// The mode picked, set once no turn runs.
     gating: Option<&'static str>,
-    /// The mode picked, still to give the agents the lead made, and when
-    /// to try next: one busy now takes it once idle.
-    spread: Option<(&'static str, Instant)>,
+    /// The mode picked, still to give the agents the lead made: one busy
+    /// now takes it once idle.
+    spread: Option<Spread>,
     /// The newest reply's text, for `/copy`.
     last_reply: String,
     /// A `!command` of the person's, running.
@@ -4266,9 +4406,7 @@ impl App {
             if self.retry.is_some_and(|at| at <= Instant::now()) {
                 self.reattach(events).await;
             }
-            if self.spread.is_some_and(|(_, at)| at <= Instant::now()) {
-                self.spread().await;
-            }
+            self.spread().await;
             // What the side chat copied goes on the clipboard, as the
             // terminal Sonny runs in would have put it.
             if let Some(program) = self.pane.as_ref().and_then(|p| p.program.as_ref()) {
@@ -4579,61 +4717,47 @@ impl App {
 
     /// Give the row picked with `/permissions` to every agent the lead made,
     /// and those they made: the person's pick overrides the gate each was
-    /// made with. One that is busy is tried again a little later.
+    /// made with. The work runs beside the window, so the window answers
+    /// meanwhile; one busy agent is tried again a little after the pass
+    /// ends, and an agent that has the row is not looked at again.
     async fn spread(&mut self) {
-        let Some((mode, _)) = self.spread else {
+        let Some(spread) = &mut self.spread else {
             return;
         };
-        self.spread = Some((mode, Instant::now() + Duration::from_secs(2)));
-        let mut bots = Vec::new();
-        let mut after = json!("");
-        loop {
-            let Ok(page) = self
-                .client
-                .request("bots", json!({"after": after, "limit": 256}))
-                .await
-            else {
-                return;
-            };
-            bots.extend(page["bots"].as_array().cloned().unwrap_or_default());
-            match &page["next_after"] {
-                Value::Null => break,
-                next => after = next.clone(),
-            }
-        }
-        let mut busy = false;
-        for bot in approvals::made_by(&bots, &self.bot) {
-            // As `inspect` gives it, with the tools its client declared.
-            let Ok(record) = (self.client)
-                .request(
-                    "inspect",
-                    json!({"bot": bot["name"], "bot_id": bot["bot_id"]}),
-                )
-                .await
-            else {
-                continue;
-            };
-            let Some(fields) = approvals::regate(&record, mode) else {
-                continue;
-            };
-            // That bot, not one given its name since it was listed.
-            let mut asked = Value::Object(fields);
-            asked["bot"] = bot["name"].clone();
-            asked["bot_id"] = bot["bot_id"].clone();
-            match self.client.request("configure", asked).await {
-                Ok(_) => {}
-                Err(error) if error.code == "bot_busy" => busy = true,
-                Err(error) => {
-                    let name = bot["name"].as_str().unwrap_or_default();
-                    self.notice = Some(format!("{name}'s permissions: {error}"));
+        if spread.pass.as_ref().is_some_and(|pass| pass.is_finished()) {
+            let pass = spread.pass.take().expect("a pass");
+            // A pass made for an earlier pick tells nothing of this one.
+            if let Ok(passed) = pass.await
+                && passed.mode == spread.mode
+            {
+                spread.sandboxes = passed.sandboxes;
+                spread.settled.extend(passed.settled);
+                spread.waiting = passed.waiting;
+                spread.listed |= passed.listed;
+                if let Some(notice) = passed.notice {
+                    self.notice = Some(notice);
                 }
             }
+            spread.at = Instant::now() + SPREAD_AGAIN;
+            // The lead's own change still waiting: an agent it makes
+            // meanwhile takes its old gate, so this goes on until both
+            // are set.
+            if spread.listed && spread.waiting.is_empty() && self.gating.is_none() {
+                self.spread = None;
+            }
+            return;
         }
-        // The lead's own change still waiting: an agent it makes meanwhile
-        // takes its old gate, so this goes on until both are set.
-        if !busy && self.gating.is_none() {
-            self.spread = None;
+        if spread.pass.is_some() || spread.at > Instant::now() {
+            return;
         }
+        spread.pass = Some(tokio::spawn(spread_pass(
+            self.client.clone(),
+            self.bot.clone(),
+            spread.mode,
+            spread.settled.clone(),
+            std::mem::take(&mut spread.sandboxes),
+            self.woken.clone(),
+        )));
     }
 
     /// The rows `/fast` lists: standard, and each tier faster than it
@@ -10017,7 +10141,10 @@ impl App {
                             // Set again even when it is the row the agent
                             // has, as the config may have changed it since;
                             // the agents the lead made take it too.
-                            self.spread = Some((mode, Instant::now()));
+                            // A pass still running for an earlier pick
+                            // ends before this one's starts.
+                            let earlier = self.spread.take().and_then(|s| s.pass);
+                            self.spread = Some(Spread::new(mode, earlier));
                             self.gating = Some(mode);
                             self.configure().await;
                             if self.gating.is_some() {
@@ -12816,12 +12943,25 @@ impl App {
             let effort = effort.as_ref().map(|e| format!(" {e}")).unwrap_or_default();
             waits.push(format!("→ {}{effort}", models::label(model)));
         }
-        if let Some(mode) = self.gating {
+        // The lead's own pick, or, once it has it, the agents it made
+        // still on their old permissions until their turns end.
+        let waiting = (self.spread.as_ref()).map_or(0, |spread| spread.waiting.len());
+        let picked = self.gating.or_else(|| {
+            (self.spread.as_ref())
+                .filter(|_| waiting > 0)
+                .map(|spread| spread.mode)
+        });
+        if let Some(mode) = picked {
             let row = approvals::footer(mode).unwrap_or_else(|| mode.to_owned());
-            waits.push(match approvals::mark(mode) {
+            let mut wait = match approvals::mark(mode) {
                 Some(mark) => format!("{mark} {row}"),
                 None => row,
-            });
+            };
+            if self.gating.is_none() {
+                let agents = if waiting == 1 { "agent" } else { "agents" };
+                wait.push_str(&format!(" for {waiting} {agents}"));
+            }
+            waits.push(wait);
         }
         if let Some(speed) = self.pace {
             waits.push(format!("{speed} speed"));
@@ -18433,6 +18573,61 @@ mod tests {
         );
         app.read_running_tasks().await;
         assert_eq!(app.agents(), (2, 1));
+    }
+
+    #[tokio::test]
+    async fn a_picked_row_reaches_the_lead_s_agents_once_each_beside_the_window() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let inspected = Arc::new(AtomicUsize::new(0));
+        let configured = Arc::new(AtomicUsize::new(0));
+        let (seen, set) = (inspected.clone(), configured.clone());
+        // The lead made a task, which made a helper; the task is busy the
+        // first time it is asked.
+        let client = daemon_answering(move |asked| match asked["op"].as_str() {
+            Some("bots") => json!({"bots": [
+                {"name": "b", "bot_id": 2},
+                {"name": "task", "bot_id": 3, "created_by_id": 2},
+                {"name": "helper", "bot_id": 4, "created_by_id": 3},
+            ], "next_after": null}),
+            Some("inspect") => {
+                seen.fetch_add(1, Ordering::SeqCst);
+                json!({"tools": ["shell"], "gates": [], "settings": {}})
+            }
+            Some("configure") => {
+                let first = set.fetch_add(1, Ordering::SeqCst) == 0;
+                match (asked["bot"].as_str(), first) {
+                    (Some("task"), true) => json!({"error": "bot_busy", "detail": "busy"}),
+                    _ => json!({}),
+                }
+            }
+            _ => json!({}),
+        })
+        .await;
+        let mut app = app(client);
+        app.mode = Some("full");
+        app.spread = Some(Spread::new("auto", None));
+        // The pass starts and the window goes on; it reports when done.
+        app.spread().await;
+        while !app.spread.as_ref().unwrap().pass.as_ref().unwrap().is_finished() {
+            tokio::task::yield_now().await;
+        }
+        app.spread().await;
+        let spread = app.spread.as_ref().unwrap();
+        assert_eq!(spread.waiting, ["task"]);
+        // Not looked at again until a little after the pass.
+        assert!(spread.at > Instant::now());
+        let footer = app.footer(100).0.to_string();
+        assert!(footer.contains("for 1 agent when idle"), "{footer}");
+        // The next pass asks the busy one only.
+        app.spread.as_mut().unwrap().at = Instant::now();
+        app.spread().await;
+        while !app.spread.as_ref().unwrap().pass.as_ref().unwrap().is_finished() {
+            tokio::task::yield_now().await;
+        }
+        app.spread().await;
+        assert!(app.spread.is_none());
+        assert_eq!(inspected.load(Ordering::SeqCst), 3);
+        assert_eq!(configured.load(Ordering::SeqCst), 3);
     }
 
     #[tokio::test]
