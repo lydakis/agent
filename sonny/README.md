@@ -851,8 +851,8 @@ way `/react` does, and each note in the margin has its own `↩`.
   the bottom, fading as it rises; in a narrower pane the last few lines sit
   under it. `?` swaps the log for a legend of every mark and shape and a few
   numbers: projects, leads, agents, messages and tool calls a minute and
-  this hour, the busiest pair. `m` colours each agent by its model where it
-  stands, the footer naming each colour. `z` is zen: the sky alone, no log,
+  this hour, the busiest pair. `m` colours each agent, its star and its name,
+  by its model where it stands, the footer naming each colour. `z` is zen: the sky alone, no log,
   no footer, no names but what needs you or failed. The arrows pick a star
   and Enter puts it in the middle: its maker, what it made and whoever it
   talked to in the last hour on the first ring, two hops on the next, the
