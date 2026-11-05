@@ -880,7 +880,10 @@ class DeliveryTests(ModelFixture):
         self.assertEqual(client.finished(right['turn'])['data']['into'], first)
         self.assertEqual(client.finished(first)['data']['status'], 'completed')
         # Nothing was written for the refused ones, and an idle bot has no turn to steer.
-        self.assertEqual([t['request_id'] for t in client.request('turns', bot='Bob', after=0)['result']['turns']], ['1', 'r'])
+        # The steer moved the running sleep to the background, so its end wakes Bob
+        # once more, before or after this read: that turn is the daemon's own.
+        turns = client.request('turns', bot='Bob', after=0)['result']['turns']
+        self.assertEqual([t['request_id'] for t in turns if not t['request_id'].startswith('background-')], ['1', 'r'])
         idle = client.request('submit', bot='Bob', request_id='i', prompt='late', delivery='steer', expected_turn=first)
         self.assertEqual(idle['error'], 'stale_turn')
 
