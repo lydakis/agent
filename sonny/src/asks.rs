@@ -41,7 +41,8 @@ const QUOTED: usize = 300;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Ask {
-    /// The call that asked it.
+    /// What it is, as [`id`] names it: the agent, the turn and the call
+    /// that asked it.
     pub id: String,
     pub question: String,
     /// Why it is asked: what the answer decides.
@@ -98,6 +99,24 @@ pub struct Choice {
     pub explanation: String,
 }
 
+/// An ask's identity, `ask:BOT/TURN/CALL`: the agent that asked, the turn
+/// it asked in, and the call. A provider's call IDs are unique only within
+/// a turn, so the call alone may name two asks. A bot's name holds no `/`.
+pub fn id(bot: &str, turn: i64, call: &str) -> String {
+    format!("ask:{bot}/{turn}/{call}")
+}
+
+/// The `request_id` the person's answer to ask `id` is sent with, the same
+/// from every window and on every resend: the daemon takes one answer to
+/// an ask and refuses another (`idempotency_conflict`), so two windows
+/// showing it can't both answer.
+pub fn request_id(id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(id.as_bytes());
+    let hex: String = digest[..16].iter().map(|b| format!("{b:02x}")).collect();
+    format!("answer-{hex}")
+}
+
 /// The `ask` tool as Sonny declares it on a bot, answered by its tool
 /// host, which sets the deadline.
 pub fn tool() -> Value {
@@ -109,7 +128,7 @@ pub fn tool() -> Value {
             with what happens if they pick it, the one you recommend and why, and what you do until \
             they answer. Options without what they mean are useless to the person, so say what each \
             one does to their goal. Ask once, one decision per call, and do not repeat it in your \
-            reply. A pick comes as their next message, starting \"You asked\", the ask's call ID \
+            reply. A pick comes as their next message, starting \"You asked\", the ask's ID \
             and your question; words they write instead come as they wrote them, so read whether they \
             answer it. Say in if_unanswered what you do until then. go_now goes on with the option \
             you recommend at once, for a step you can undo once they have seen it. go_later goes \
@@ -192,7 +211,7 @@ fn tidy(text: Option<&str>) -> String {
         .to_owned()
 }
 
-/// The question an `ask` call with `arguments` put, as call `id`.
+/// The question an `ask` call with `arguments` put, as ask `id` ([`id`]).
 pub fn call(id: &str, arguments: &Value) -> Option<Ask> {
     let question = tidy(arguments["question"].as_str());
     let options: Vec<Choice> = arguments["options"]
@@ -253,13 +272,14 @@ pub fn settled(mut ask: Ask, output: &str) -> Ask {
     ask
 }
 
-/// The oldest question still open among a bot's `items`, newest first:
-/// an `ask` call that was taken, with no answer to it after, as the pinned
-/// questions are closed: by the person's `You asked` message naming its
-/// call, one answer to one ask, or by words of their own after it, the
-/// conversation going on past it. Asks are told apart by call, never by
-/// wording: two asking the same question are two decisions.
-pub fn open(items: &[Value]) -> Option<String> {
+/// The oldest question still open among `bot`'s `items`, newest first,
+/// each call marked with the `turn` it was made in: an `ask` call that was
+/// taken, with no answer to it after, as the pinned questions are closed:
+/// by the person's `You asked` message naming that ask, one answer to one
+/// ask, or by words of their own after it, the conversation going on past
+/// it. Asks are told apart by agent, turn and call, never by wording: two
+/// asking the same question are two decisions.
+pub fn open(bot: &str, items: &[Value]) -> Option<String> {
     let (mut answers, mut refused, mut open) = (Vec::new(), Vec::new(), None);
     let mut moved_on = false;
     for item in items {
@@ -283,7 +303,10 @@ pub fn open(items: &[Value]) -> Option<String> {
                 .and_then(|a| serde_json::from_str::<Value>(a).ok())
                 .and_then(|arguments| call("", &arguments))
         {
-            match (answers.iter()).position(|answered| item["call_id"] == answered.as_str()) {
+            let asked = (item["turn"].as_i64())
+                .zip(item["call_id"].as_str())
+                .map(|(turn, call)| id(bot, turn, call));
+            match (answers.iter()).position(|answered| Some(answered) == asked.as_ref()) {
                 Some(at) => {
                     answers.remove(at);
                 }
@@ -307,12 +330,13 @@ pub fn moves_on(text: &str, from: Option<&str>) -> bool {
         && crate::user_shell::read(text).is_none()
 }
 
-/// The ask call a person's message answers, when [`answer`] wrote it.
+/// The ask a person's message answers, as [`id`] names it, when
+/// [`answer`] wrote it.
 pub fn answered(text: &str) -> Option<&str> {
-    parts(text).map(|(call, ..)| call)
+    parts(text).map(|(id, ..)| id).filter(|id| well_formed(id))
 }
 
-/// The ask call a message answers, sent `from` another agent, a client or
+/// The ask a message answers, sent `from` another agent, a client or
 /// another person, or by the person when none: only the person answers
 /// an ask, so the same words from anyone else answer none. Every reader
 /// of asks (the window, history, an ask's deadline) goes by this.
@@ -320,17 +344,34 @@ pub fn answer_of<'a>(text: &'a str, from: Option<&str>) -> Option<&'a str> {
     from.is_none().then(|| answered(text)).flatten()
 }
 
-/// A person's message [`answer`] wrote, as the question and its answer.
+/// Whether `id` names an ask whole: agent, turn and call. An answer sent
+/// before asks named their turn names the call alone, which may be
+/// another turn's: it answers none, and reads as the person's own words.
+fn well_formed(id: &str) -> bool {
+    let Some((bot, rest)) = id
+        .strip_prefix("ask:")
+        .and_then(|rest| rest.split_once('/'))
+    else {
+        return false;
+    };
+    let Some((turn, call)) = rest.split_once('/') else {
+        return false;
+    };
+    !bot.is_empty() && turn.parse::<i64>().is_ok() && !call.is_empty()
+}
+
+/// A person's message [`answer`] wrote, as the question and its answer,
+/// for the transcript to draw it so, whichever form named its ask.
 pub fn split(text: &str) -> Option<(&str, &str)> {
     parts(text).map(|(_, question, answer)| (question, answer))
 }
 
-/// A person's message [`answer`] wrote, as the ask call it answers, the
-/// question and the answer.
+/// A person's message [`answer`] wrote, as the ask it names, the question
+/// and the answer.
 fn parts(text: &str) -> Option<(&str, &str, &str)> {
-    let (call, rest) = text.strip_prefix("You asked (")?.split_once("): ")?;
+    let (id, rest) = text.strip_prefix("You asked (")?.split_once("): ")?;
     let (question, answer) = rest.split_once("\n\n")?;
-    (!call.is_empty() && !call.contains(char::is_whitespace)).then_some((call, question, answer))
+    (!id.is_empty() && !id.contains(char::is_whitespace)).then_some((id, question, answer))
 }
 
 /// The row that says which question a message answers, above it.
@@ -590,8 +631,8 @@ fn now() -> i64 {
 /// lets every ask wait with no deadline. The result says when, for the
 /// card and the agent.
 pub fn served(arguments: &Value, bot: &str, turn: i64, call: &str) -> Result<String, String> {
-    let ask =
-        self::call(call, arguments).ok_or("invalid_arguments: a question to ask, in question")?;
+    let ask = self::call(&id(bot, turn, call), arguments)
+        .ok_or("invalid_arguments: a question to ask, in question")?;
     let asked = arguments["if_unanswered"].as_str().unwrap_or_default();
     let plan = Unanswered::parse(asked)
         .ok_or("invalid_arguments: if_unanswered is go_now, go_later or wait")?;
@@ -775,18 +816,19 @@ fn fire(question: &str, plan: Unanswered, label: &str) -> String {
     }
 }
 
-/// Whether ask call `call` is still open, read from the agent's history
-/// newest first, one entry at a time, as [`open`] reads it: answered by
-/// the person, or set aside by words of their own after it, it is
-/// settled. `None` while the entries read have not reached the call.
+/// Whether the ask `asked` by call `call` is still open, read from the
+/// agent's history newest first, one entry at a time, as [`open`] reads
+/// it: answered by the person, or set aside by words of their own after
+/// it, it is settled. `None` while the entries read have not reached the
+/// call.
 #[derive(Default)]
 struct Reading {
-    /// The ask calls the person answered after the call, so far.
+    /// The asks the person answered after the call, so far.
     answers: Vec<String>,
 }
 
 impl Reading {
-    fn entry(&mut self, entry: &Value, call: &str) -> Option<bool> {
+    fn entry(&mut self, entry: &Value, asked: &str, call: &str) -> Option<bool> {
         if crate::lookout::said_by_person(entry).is_some() {
             let text = crate::text(&entry["item"]);
             match answer_of(&text, None) {
@@ -795,14 +837,14 @@ impl Reading {
                 None => {}
             }
         }
-        let asked = crate::responses(&entry["item"])
+        let made = crate::responses(&entry["item"])
             .into_iter()
             .find(|item| item["type"] == "function_call" && item["call_id"] == call)?;
-        let asks = (asked["arguments"].as_str())
+        let asks = (made["arguments"].as_str())
             .and_then(|a| serde_json::from_str::<Value>(a).ok())
             .and_then(|arguments| self::call("", &arguments))
             .is_some();
-        Some(asks && !self.answers.iter().any(|answered| answered == call))
+        Some(asks && !self.answers.iter().any(|answered| answered == asked))
     }
 }
 
@@ -812,8 +854,9 @@ pub async fn still_open(bot: &str, turn: i64, call: &str) -> Result<bool, String
     let socket = daemon.socket()?;
     let client = crate::trigger::connect(&socket, &daemon).await?;
     let (mut reading, mut found) = (Reading::default(), None);
+    let asked = id(bot, turn, call);
     crate::said::walk(&client, bot, turn, |_, entry| {
-        found = reading.entry(entry, call);
+        found = reading.entry(entry, &asked, call);
         found.is_some()
     })
     .await
@@ -924,7 +967,7 @@ mod tests {
 
     #[test]
     fn a_call_puts_its_question_and_an_answer_closes_it() {
-        let ask = call("c1", &keep_api()).unwrap();
+        let ask = call(&id("lead", 1, "c1"), &keep_api()).unwrap();
         assert_eq!(ask.question, "Keep the old API?");
         assert_eq!(
             ask.options
@@ -934,25 +977,33 @@ mod tests {
             ["Keep it", "Drop it"]
         );
         assert_eq!(ask.recommended, Some(1));
-        assert_eq!(call("c2", &json!({"question": " "})), None);
+        assert_eq!(call(&id("lead", 1, "c2"), &json!({"question": " "})), None);
         // A recommendation past the options recommends none.
-        let past = call("c2", &json!({"question": "Tag it?", "recommended": 3})).unwrap();
+        let past = call(
+            &id("lead", 1, "c2"),
+            &json!({"question": "Tag it?", "recommended": 3}),
+        )
+        .unwrap();
         assert_eq!(past.recommended, None);
         let mut open = vec![ask.clone(), past];
         close(&mut open, "how is it going?", None);
         assert_eq!(open.len(), 2);
         // The same question asked again is another decision: its answer
         // closes it alone, whichever came first.
-        let again = call("c3", &keep_api()).unwrap();
+        let again = call(&id("lead", 1, "c3"), &keep_api()).unwrap();
         open.insert(0, again.clone());
         close(&mut open, &answer(&ask, "2"), None);
         assert_eq!(
             open.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(),
-            ["c3", "c2"]
+            ["ask:lead/1/c3", "ask:lead/1/c2"]
         );
         close(&mut open, &answer(&again, "1"), None);
         // A question with a blank line in it is still closed by its answer.
-        let long = call("c4", &json!({"question": "Ship it?\n\n  Tests pass.  "})).unwrap();
+        let long = call(
+            &id("lead", 1, "c4"),
+            &json!({"question": "Ship it?\n\n  Tests pass.  "}),
+        )
+        .unwrap();
         assert_eq!(long.question, "Ship it?\n  Tests pass.");
         open.push(long.clone());
         close(&mut open, &answer(&long, "yes"), None);
@@ -1114,76 +1165,142 @@ mod tests {
     #[test]
     fn the_persons_own_words_move_on_and_nothing_else_does() {
         assert!(moves_on("Meanwhile, why so slow?", None));
-        assert!(!moves_on("You asked (a1): Keep it?\n\nYes", None));
+        assert!(!moves_on(
+            "You asked (ask:lead/1/a1): Keep it?\n\nYes",
+            None
+        ));
         assert!(!moves_on("Done: tests pass", Some("tally.halves")));
         assert!(!moves_on(&crate::reactions::message("👍", None), None));
     }
 
     #[test]
     fn a_question_is_open_until_its_answer_lands() {
-        let asked = json!({"type": "function_call", "name": TOOL, "call_id": "a1",
-            "arguments": json!({"question": "Keep it?", "options": [{"label": "Yes", "explanation": "e"}]}).to_string()});
+        let asking = |call: &str, turn: i64, question: &str| {
+            json!({"type": "function_call", "name": TOOL, "call_id": call, "turn": turn,
+                "arguments": json!({"question": question,
+                    "options": [{"label": "Yes", "explanation": "e"}]}).to_string()})
+        };
+        let asked = asking("a1", 3, "Keep it?");
         let reply =
             json!({"role": "assistant", "content": [{"type": "output_text", "text": "Asked."}]});
         let output = json!({"type": "function_call_output", "call_id": "a1", "output": "Asked."});
         let person =
             |text: &str| json!({"role": "user", "content": [{"type": "input_text", "text": text}]});
+        let answered = |call: &str, turn: i64, question: &str| {
+            let ask = call_of(call, turn, question);
+            person(&answer(&ask, "1"))
+        };
         // Newest first.
         assert_eq!(
-            open(&[reply.clone(), output.clone(), asked.clone()]),
+            open("lead", &[reply.clone(), output.clone(), asked.clone()]),
             Some("Keep it?".into())
         );
         // A reaction answers nothing.
         let thumbs = crate::reactions::message("👍", None);
         assert_eq!(
-            open(&[person(&thumbs), reply.clone(), asked.clone()]),
+            open("lead", &[person(&thumbs), reply.clone(), asked.clone()]),
             Some("Keep it?".into())
         );
         // Words of the person's own after it set it aside: the
         // conversation went on past it. Before it, they do not.
         assert_eq!(
-            open(&[person("Meanwhile, why?"), reply.clone(), asked.clone()]),
+            open(
+                "lead",
+                &[person("Meanwhile, why?"), reply.clone(), asked.clone()]
+            ),
             None
         );
         assert_eq!(
-            open(&[reply.clone(), asked.clone(), person("Plan the release")]),
+            open(
+                "lead",
+                &[reply.clone(), asked.clone(), person("Plan the release")]
+            ),
             Some("Keep it?".into())
         );
         assert_eq!(
-            open(&[
-                reply.clone(),
-                person("You asked (a1): Keep it?\n\nYes"),
-                asked.clone()
-            ]),
+            open(
+                "lead",
+                &[reply.clone(), answered("a1", 3, "Keep it?"), asked.clone()]
+            ),
             None
         );
-        assert_eq!(open(&[reply, output]), None);
+        assert_eq!(open("lead", &[reply, output]), None);
         // Two asked, one answered: the other stays open.
-        let other = json!({"type": "function_call", "name": TOOL, "call_id": "a2",
-            "arguments": json!({"question": "Ship it?"}).to_string()});
+        let other = asking("a2", 3, "Ship it?");
         assert_eq!(
-            open(&[
-                person("You asked (a1): Keep it?\n\nYes"),
-                other,
-                asked.clone()
-            ]),
+            open(
+                "lead",
+                &[answered("a1", 3, "Keep it?"), other, asked.clone()]
+            ),
             Some("Ship it?".into())
         );
         // Two asking the same question are two decisions: answering the
         // later leaves the earlier open, whatever the words.
-        let again = json!({"type": "function_call", "name": TOOL, "call_id": "a3",
-            "arguments": json!({"question": "Keep it?"}).to_string()});
+        let again = asking("a3", 3, "Keep it?");
         assert_eq!(
-            open(&[
-                person("You asked (a3): Keep it?\n\nYes"),
-                again,
-                asked.clone()
-            ]),
+            open(
+                "lead",
+                &[answered("a3", 3, "Keep it?"), again, asked.clone()]
+            ),
+            Some("Keep it?".into())
+        );
+        // A provider's call IDs are unique only within a turn: an ask of
+        // another turn with the same call is another decision, and
+        // another agent's ask with the same turn and call is too.
+        let later = asking("a1", 7, "Tag it?");
+        assert_eq!(
+            open(
+                "lead",
+                &[answered("a1", 7, "Tag it?"), later.clone(), asked.clone()]
+            ),
+            Some("Keep it?".into())
+        );
+        assert_eq!(
+            open(
+                "lead",
+                &[answered("a1", 3, "Keep it?"), later, asked.clone()]
+            ),
+            Some("Tag it?".into())
+        );
+        let elsewhere = call(&id("task", 3, "a1"), &json!({"question": "Keep it?"})).unwrap();
+        assert_eq!(
+            open("lead", &[person(&answer(&elsewhere, "Yes")), asked.clone()]),
             Some("Keep it?".into())
         );
         let unknown = json!({"type": "function_call_output", "call_id": "a1",
             "output": json!({"error": "unknown_tool"}).to_string()});
-        assert_eq!(open(&[unknown, asked]), None);
+        assert_eq!(open("lead", &[unknown, asked]), None);
+    }
+
+    /// Ask `call` of `lead`'s turn `turn`, asking `question`.
+    fn call_of(call: &str, turn: i64, question: &str) -> Ask {
+        self::call(
+            &id("lead", turn, call),
+            &json!({"question": question, "options": [{"label": "Yes", "explanation": "e"}]}),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn an_answer_names_its_ask_whole_and_one_sent_before_reads_as_words() {
+        let ask = call_of("toolu_1", 12, "Publish it?");
+        let sent = answer(&ask, "1");
+        assert_eq!(sent, "You asked (ask:lead/12/toolu_1): Publish it?\n\nYes");
+        assert_eq!(answer_of(&sent, None), Some("ask:lead/12/toolu_1"));
+        assert_eq!(split(&sent), Some(("Publish it?", "Yes")));
+        // One sent naming the call alone could be another turn's: it
+        // answers none, and is drawn as the answer it was.
+        let old = "You asked (toolu_1): Publish it?\n\nYes";
+        assert_eq!(answer_of(old, None), None);
+        assert!(moves_on(old, None));
+        assert_eq!(split(old), Some(("Publish it?", "Yes")));
+        // Every window sends one ask's answer under the same request,
+        // and another ask's under another, within the daemon's names.
+        let request = request_id(&ask.id);
+        assert_eq!(request, request_id("ask:lead/12/toolu_1"));
+        assert_ne!(request, request_id("ask:lead/13/toolu_1"));
+        assert!(request.len() <= 128);
+        assert!((request.bytes()).all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b)));
     }
 
     /// The card's rows as a screen draws them at `width`, laid at `made`.
@@ -1375,23 +1492,23 @@ mod tests {
                 .unwrap()
                 .contains("put the exact line to run in")
         );
-        let ask = call("c9", &sign_in()).unwrap();
+        let ask = call(&id("lead", 4, "c9"), &sign_in()).unwrap();
         assert_eq!(ask.command.as_deref(), Some("npm login --auth-type=web"));
         assert!(ask.options.is_empty());
         // Nothing to go ahead with: it waits, whatever was asked.
         assert_eq!(ask.unanswered, Some(Unanswered::Wait));
         // Still open until the person says how it went, as any ask.
         let items = [
-            json!({"type": "function_call", "name": TOOL, "call_id": "c9",
+            json!({"type": "function_call", "name": TOOL, "call_id": "c9", "turn": 4,
             "arguments": sign_in().to_string()}),
         ];
         assert_eq!(
-            open(&items).as_deref(),
+            open("lead", &items).as_deref(),
             Some("Sign in to the package registry")
         );
         assert_eq!(
             answer(&ask, "done, signed in"),
-            "You asked (c9): Sign in to the package registry\n\ndone, signed in"
+            "You asked (ask:lead/4/c9): Sign in to the package registry\n\ndone, signed in"
         );
         let hint: String = hint(&ask, 0, 1, 80)
             .iter()
@@ -1542,7 +1659,7 @@ mod tests {
         };
         let read = |entries: &[Value]| {
             let mut reading = Reading::default();
-            entries.iter().find_map(|entry| reading.entry(entry, "a1"))
+            (entries.iter()).find_map(|entry| reading.entry(entry, &id("lead", 2, "a1"), "a1"))
         };
         assert_eq!(read(std::slice::from_ref(&asking)), Some(true));
         // Words of their own after it: the conversation moved on.
@@ -1551,18 +1668,28 @@ mod tests {
             Some(false)
         );
         // Its own answer settles it; another question's does not.
-        let ask = call("a1", &asked("go_later")).unwrap();
+        let ask = call(&id("lead", 2, "a1"), &asked("go_later")).unwrap();
         assert_eq!(
             read(&[person(&answer(&ask, "1")), asking.clone()]),
             Some(false)
         );
         assert_eq!(
-            read(&[person("You asked (a2): Tag it?\n\nYes"), asking.clone()]),
+            read(&[
+                person("You asked (ask:lead/2/a2): Tag it?\n\nYes"),
+                asking.clone()
+            ]),
+            Some(true)
+        );
+        // Nor does the answer to an ask of another turn with the same
+        // call: provider call IDs are unique only within a turn.
+        let earlier = call(&id("lead", 1, "a1"), &asked("go_later")).unwrap();
+        assert_eq!(
+            read(&[person(&answer(&earlier, "1")), asking.clone()]),
             Some(true)
         );
         // Nor does the answer to another ask of the same words: its
         // deadline still holds.
-        let again = call("a3", &asked("go_later")).unwrap();
+        let again = call(&id("lead", 2, "a3"), &asked("go_later")).unwrap();
         assert_eq!(again.question, ask.question);
         assert_eq!(
             read(&[person(&answer(&again, "1")), asking.clone()]),
@@ -1579,15 +1706,18 @@ mod tests {
             Some(true)
         );
         // Before the call is reached, nothing is known yet.
-        assert_eq!(read(&[person("You asked (a2): Tag it?\n\nYes")]), None);
+        assert_eq!(
+            read(&[person("You asked (ask:lead/2/a2): Tag it?\n\nYes")]),
+            None
+        );
     }
 
     #[test]
     fn only_the_person_answers_an_ask_in_the_window_history_and_its_deadline() {
         let arguments = asked("go_later");
         let asking = json!({"node": 1, "item": {"type": "function_call", "name": TOOL,
-            "call_id": "a1", "arguments": arguments.to_string()}});
-        let ask = call("a1", &arguments).unwrap();
+            "call_id": "a1", "turn": 2, "arguments": arguments.to_string()}});
+        let ask = call(&id("lead", 2, "a1"), &arguments).unwrap();
         let words = answer(&ask, "1");
         // The same words, from the person and from each other sender, as
         // history keeps them and as the transcript marks who sent them.
@@ -1621,13 +1751,13 @@ mod tests {
             if let Some(from) = &from {
                 item["from"] = json!(from);
             }
-            let history = open(&[item, asking["item"].clone()]);
+            let history = open("lead", &[item, asking["item"].clone()]);
             assert_eq!(history.is_none(), theirs, "{sender}");
             // The deadline.
             let mut reading = Reading::default();
             let deadline = [entry, asking.clone()]
                 .iter()
-                .find_map(|entry| reading.entry(entry, "a1"));
+                .find_map(|entry| reading.entry(entry, &ask.id, "a1"));
             assert_eq!(deadline, Some(!theirs), "{sender}");
             // The card pinned live.
             let mut pinned = vec![ask.clone()];

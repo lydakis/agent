@@ -99,6 +99,10 @@ pub async fn scan(client: &Client, bot: &str, last: Option<i64>) -> Option<Seen>
         .ok()?;
     let listed = page["nodes"].as_array().cloned().unwrap_or_default();
     let nodes: Vec<i64> = listed.iter().filter_map(|n| n["node"].as_i64()).collect();
+    // Each node's turn, which names an ask with its call.
+    let turns: HashMap<i64, i64> = (listed.iter())
+        .filter_map(|n| Some((n["node"].as_i64()?, n["turn"].as_i64()?)))
+        .collect();
     let newest = listed.iter().filter_map(|n| n["turn"].as_i64()).max();
     let last = last.or(newest);
     let in_last: HashSet<i64> = (listed.iter())
@@ -116,6 +120,11 @@ pub async fn scan(client: &Client, bot: &str, last: Option<i64>) -> Option<Seen>
             let mut kept = vec![item];
             while let Some((_, item)) = read.next_if(|(next, _)| *next == node) {
                 kept.push(item);
+            }
+            if let Some(&at) = turns.get(&node) {
+                for item in &mut kept {
+                    item["turn"] = json!(at);
+                }
             }
             if in_last.contains(&node) {
                 turn.extend(kept.iter().cloned());
@@ -138,7 +147,7 @@ pub async fn scan(client: &Client, bot: &str, last: Option<i64>) -> Option<Seen>
         }
     }
     Some(Seen {
-        ask: crate::asks::open(&items),
+        ask: crate::asks::open(bot, &items),
         itself: resolved_itself(&turn, bot),
         turn: last,
     })
