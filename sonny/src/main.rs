@@ -517,6 +517,10 @@ struct Passed {
     after_lead: bool,
     settled: Vec<i64>,
     waiting: Vec<String>,
+    /// Whether it changed an agent, or stopped short: an agent changed
+    /// while on its old permissions may have made one no listing named
+    /// yet, so only a pass that changes nothing ends the pick.
+    again: bool,
     notice: Option<String>,
     sandboxes: approvals::Sandboxes,
 }
@@ -539,6 +543,7 @@ async fn spread_pass(
         after_lead: false,
         settled: Vec::new(),
         waiting: Vec::new(),
+        again: false,
         notice: None,
         sandboxes: Default::default(),
     };
@@ -583,10 +588,13 @@ async fn spread_pass(
                     || passed.settled.contains(&maker)
             });
         // As `inspect` gives it, with the tools its client declared.
+        // One that can't be read is still on its old permissions, as far
+        // as anyone knows, and waits as a busy one does.
         let Ok(record) = (client)
             .request("inspect", json!({"bot": name, "bot_id": bot["bot_id"]}))
             .await
         else {
+            passed.waiting.push(name);
             continue;
         };
         let walked = tokio::task::spawn_blocking(move || {
@@ -601,6 +609,7 @@ async fn spread_pass(
             }
             Err(_) => {
                 sandboxes = Default::default();
+                passed.again = true;
                 break;
             }
         };
@@ -612,7 +621,9 @@ async fn spread_pass(
         let mut asked = Value::Object(fields);
         asked["bot"] = json!(name);
         asked["bot_id"] = bot["bot_id"].clone();
-        match client.request("configure", asked).await {
+        let configured = client.request("configure", asked).await;
+        passed.again |= configured.is_ok();
+        match configured {
             Ok(_) if maker_set => passed.settled.extend(id),
             Ok(_) => {}
             Err(error) if error.code == "bot_busy" => passed.waiting.push(name),
@@ -4786,11 +4797,11 @@ impl App {
             let pass = spread.pass.take().expect("a pass");
             // A pass made for an earlier pick, even of the same row, whose
             // config may have changed since, tells nothing of this one.
-            let mut after_lead = false;
+            let (mut after_lead, mut again) = (false, true);
             if let Ok(passed) = pass.await
                 && passed.pick == spread.pick
             {
-                after_lead = passed.after_lead;
+                (after_lead, again) = (passed.after_lead, passed.again);
                 spread.sandboxes = passed.sandboxes;
                 spread.settled.extend(passed.settled);
                 spread.waiting = passed.waiting;
@@ -4802,8 +4813,10 @@ impl App {
             // The lead's own change still waiting: an agent it makes
             // meanwhile takes its old gate, so this goes on until both
             // are set, and ends only on a pass that listed the agents
-            // after the lead had its change.
-            if after_lead && spread.waiting.is_empty() && self.gating.is_none() {
+            // after the lead had its change, read each, and changed none:
+            // one changed while on its old permissions may have made an
+            // agent that listing did not name.
+            if after_lead && !again && spread.waiting.is_empty() && self.gating.is_none() {
                 self.spread = None;
             }
             return;
@@ -18750,6 +18763,11 @@ mod tests {
             tokio::task::yield_now().await;
         }
         app.spread().await;
+        // It changed both, so one more pass makes sure neither made an
+        // agent meanwhile; that one changes nothing and ends the pick.
+        assert!(app.spread.is_some());
+        finish(&mut app).await;
+        app.spread().await;
         assert!(app.spread.is_none());
         assert_eq!(inspected.load(Ordering::SeqCst), 4);
         assert_eq!(configured.load(Ordering::SeqCst), 4);
@@ -18782,9 +18800,68 @@ mod tests {
         let spread = app.spread.as_ref().unwrap();
         assert!(spread.settled.is_empty());
         assert!(spread.pass.is_none());
+        // A pass that changes them, then a quiet one.
+        finish(&mut app).await;
+        app.spread().await;
+        assert!(app.spread.is_some());
         finish(&mut app).await;
         app.spread().await;
         assert!(app.spread.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_pick_ends_only_once_every_agent_was_read_and_none_made_one_unseen() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (passes, configured) = (
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(std::sync::Mutex::new(Vec::<String>::new())),
+        );
+        let (listed, set) = (passes.clone(), configured.clone());
+        // The task can't be read on the first pass. Once on Auto it is
+        // listed with a helper it made while still on Full, and that
+        // helper with one of its own a pass later.
+        let client = daemon_answering(move |asked| match asked["op"].as_str() {
+            Some("bots") => {
+                let pass = listed.fetch_add(1, Ordering::SeqCst);
+                let mut bots = vec![
+                    json!({"name": "b", "bot_id": 2}),
+                    json!({"name": "task", "bot_id": 3, "created_by_id": 2}),
+                ];
+                if pass >= 2 {
+                    bots.push(json!({"name": "helper", "bot_id": 4, "created_by_id": 3}));
+                }
+                if pass >= 3 {
+                    bots.push(json!({"name": "deeper", "bot_id": 5, "created_by_id": 4}));
+                }
+                json!({"bots": bots, "next_after": null})
+            }
+            Some("inspect") if asked["bot"] == "task" && listed.load(Ordering::SeqCst) == 1 => {
+                json!({"error": "storage", "detail": "disk I/O error"})
+            }
+            Some("inspect") => json!({"tools": ["shell"], "gates": [], "settings": {}}),
+            Some("configure") => {
+                set.lock()
+                    .unwrap()
+                    .push(asked["bot"].as_str().unwrap_or_default().to_owned());
+                json!({})
+            }
+            _ => json!({}),
+        })
+        .await;
+        let mut app = app(client);
+        app.mode = Some("full");
+        app.spread = Some(Spread::new("auto", None));
+        let mut ran = 0;
+        while app.spread.is_some() && ran < 10 {
+            finish(&mut app).await;
+            app.spread().await;
+            ran += 1;
+        }
+        assert!(app.spread.is_none());
+        // Every agent took the row, each once, whatever came after.
+        assert_eq!(*configured.lock().unwrap(), ["task", "helper", "deeper"]);
+        // The unread pass, then one for each agent, then a quiet one.
+        assert_eq!(passes.load(Ordering::SeqCst), 5);
     }
 
     /// Start a spread's next pass and wait for it to end.
