@@ -417,14 +417,30 @@ pub fn too_long(why: &str) -> Verdict {
     Verdict::Doubt(format!("not reviewed: {why}. {ASK}"))
 }
 
-/// A round the judge never assessed, after every attempt: denied, labeled
-/// so the model can tell an outage from a refusal. A provider's detail is
+/// A round the judge never assessed, after every attempt, as the model is
+/// told it where nobody can be asked: denied, labeled so the model can
+/// tell an outage from a refusal. A provider's detail is
 /// clipped like a rationale, so the reason stays within the daemon's limit.
 pub fn not_reviewed(why: &str) -> Verdict {
     let why = clip(why, RATIONALE_BYTES);
     Verdict::Unreviewed(format!(
         "Automatic approval review failed: {why}.\nThe action was not executed. {FAILED}"
     ))
+}
+
+/// What the person is asked about a call whose review never assessed it,
+/// from the review's own `reason` ([`not_reviewed`], [`timed_out`]): what
+/// failed, and that the call waits on them. A failed review is not a
+/// verdict, so the call waits as it is, rather than being denied for the
+/// agent to make again.
+pub fn handed_over(reason: &str) -> String {
+    // A failure's own line, which may hold a provider's sentences; else
+    // the first sentence.
+    let first = match reason.split_once('\n') {
+        Some((line, _)) => line,
+        None => reason.split_once(". ").map_or(reason, |(first, _)| first),
+    };
+    format!("{}, so this waits for you.", first.trim_end_matches('.'))
 }
 
 /// A round whose review did not finish before its deadline.
@@ -1406,6 +1422,20 @@ mod tests {
         };
         assert!(long.len() < RATIONALE_BYTES + 1024);
         assert!(matches!(timed_out(), Verdict::Unreviewed(r) if r.contains("You may retry once")));
+        // Handed to the person, each says what failed and nothing meant
+        // for the agent.
+        let Verdict::Unreviewed(late) = timed_out() else {
+            unreachable!()
+        };
+        assert_eq!(
+            handed_over(&late),
+            "Automatic approval review did not finish before its deadline, so this waits for you."
+        );
+        assert_eq!(
+            handed_over(&failed),
+            "Automatic approval review failed: the judge's answer did not parse, \
+             so this waits for you."
+        );
         assert!(matches!(
             too_long("the call is too long to show"),
             Verdict::Doubt(_)
