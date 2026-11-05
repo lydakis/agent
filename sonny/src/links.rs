@@ -66,14 +66,32 @@ pub fn cells(
             if !ends(&rows[last_row], last_end) {
                 continue;
             }
-            // A web address where one starts, else a path once what opens
-            // and closes around it is off.
-            let (lead, target, kept) = match web(&word) {
-                Some(lead) => {
+            // A web address where one starts; a `file://` address as the
+            // path it names, so only one that is there; else a path once
+            // what opens and closes around it is off.
+            let (lead, target, kept) = match (web(&word), scheme(&word, &["file://"])) {
+                (Some(lead), _) => {
                     let url = trim(&word[lead..]);
                     (lead, url.clone(), url.len())
                 }
-                None => {
+                (None, Some(lead)) => {
+                    let url = trim(&word[lead..]);
+                    let Some((path, line)) = crate::pane::file_url(&url) else {
+                        continue;
+                    };
+                    let Some(path) = path.to_str() else {
+                        continue;
+                    };
+                    let named = match line {
+                        Some(line) => format!("{path}#L{line}"),
+                        None => path.to_owned(),
+                    };
+                    match file(&named) {
+                        Some(target) => (lead, target, url.len()),
+                        None => continue,
+                    }
+                }
+                (None, None) => {
                     let lead = word.len() - word.trim_start_matches(['(', '[', '{', '\'']).len();
                     let path = trim(&word[lead..]);
                     // A name's or a path's own `'s` is no part of it, unless
@@ -237,7 +255,13 @@ impl Names {
 /// Where a web address starts in `word`, if one does: not inside a word,
 /// as in `xhttps://`.
 fn web(word: &str) -> Option<usize> {
-    let at = ["https://", "http://"]
+    scheme(word, &["https://", "http://"])
+}
+
+/// Where an address of one of `schemes` starts in `word`, if one does:
+/// not inside a word.
+fn scheme(word: &str, schemes: &[&str]) -> Option<usize> {
+    let at = schemes
         .iter()
         .filter_map(|scheme| word.find(scheme))
         .min()?;
@@ -560,6 +584,17 @@ mod tests {
             Some(format!("{main}#L40"))
         );
         assert_eq!(file_line(&dir, "src/main.rs"), Some(main.clone()));
+        // A `file://` address opens as the path it names: escapes read
+        // back, its line kept, and only when the file is there.
+        let spaced = format!("file://{}/a%20b.md", dir.display());
+        assert_eq!(
+            opens(&format!("Wrote {spaced}."), 200),
+            [(8, spaced.clone())]
+        );
+        assert_eq!(opens(&format!("{main}#L4"), 200), [(2, main.clone())]);
+        let gone = format!("file://{}/src/gone.rs", dir.display());
+        assert!(opens(&format!("see {gone}"), 200).is_empty());
+        assert!(opens(&format!("x{main}"), 200).is_empty(), "inside a word");
         // A file's `'s` is no part of it, unless its name ends so.
         assert_eq!(opens("src/main.rs's tests", 80), [(2, main.clone())]);
         std::fs::write(dir.join("src/owner's"), "").unwrap();
