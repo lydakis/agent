@@ -265,7 +265,7 @@ pub fn open(items: &[Value]) -> Option<String> {
     for item in items {
         if item["role"] == "user" {
             let text = crate::text(item);
-            match answered(&text) {
+            match answer_of(&text, item["from"].as_str()) {
                 Some(call) => answers.push(call.to_owned()),
                 None => moved_on |= moves_on(&text, item["from"].as_str()),
             }
@@ -312,6 +312,14 @@ pub fn answered(text: &str) -> Option<&str> {
     parts(text).map(|(call, ..)| call)
 }
 
+/// The ask call a message answers, sent `from` another agent, a client or
+/// another person, or by the person when none: only the person answers
+/// an ask, so the same words from anyone else answer none. Every reader
+/// of asks (the window, history, an ask's deadline) goes by this.
+pub fn answer_of<'a>(text: &'a str, from: Option<&str>) -> Option<&'a str> {
+    from.is_none().then(|| answered(text)).flatten()
+}
+
 /// A person's message [`answer`] wrote, as the question and its answer.
 pub fn split(text: &str) -> Option<(&str, &str)> {
     parts(text).map(|(_, question, answer)| (question, answer))
@@ -339,8 +347,8 @@ fn answering_row(question: &str, place: &str, width: usize) -> Line<'static> {
 }
 
 /// `asks` without the one `text` answers; whether it was there.
-pub fn close(asks: &mut Vec<Ask>, text: &str) -> bool {
-    let at = answered(text).and_then(|call| asks.iter().position(|ask| ask.id == call));
+pub fn close(asks: &mut Vec<Ask>, text: &str, from: Option<&str>) -> bool {
+    let at = answer_of(text, from).and_then(|call| asks.iter().position(|ask| ask.id == call));
     at.map(|at| asks.remove(at)).is_some()
 }
 
@@ -781,7 +789,7 @@ impl Reading {
     fn entry(&mut self, entry: &Value, call: &str) -> Option<bool> {
         if crate::lookout::said_by_person(entry).is_some() {
             let text = crate::text(&entry["item"]);
-            match answered(&text) {
+            match answer_of(&text, None) {
                 Some(answered) => self.answers.push(answered.to_owned()),
                 None if moves_on(&text, entry["from"].as_str()) => return Some(false),
                 None => {}
@@ -931,23 +939,23 @@ mod tests {
         let past = call("c2", &json!({"question": "Tag it?", "recommended": 3})).unwrap();
         assert_eq!(past.recommended, None);
         let mut open = vec![ask.clone(), past];
-        close(&mut open, "how is it going?");
+        close(&mut open, "how is it going?", None);
         assert_eq!(open.len(), 2);
         // The same question asked again is another decision: its answer
         // closes it alone, whichever came first.
         let again = call("c3", &keep_api()).unwrap();
         open.insert(0, again.clone());
-        close(&mut open, &answer(&ask, "2"));
+        close(&mut open, &answer(&ask, "2"), None);
         assert_eq!(
             open.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(),
             ["c3", "c2"]
         );
-        close(&mut open, &answer(&again, "1"));
+        close(&mut open, &answer(&again, "1"), None);
         // A question with a blank line in it is still closed by its answer.
         let long = call("c4", &json!({"question": "Ship it?\n\n  Tests pass.  "})).unwrap();
         assert_eq!(long.question, "Ship it?\n  Tests pass.");
         open.push(long.clone());
-        close(&mut open, &answer(&long, "yes"));
+        close(&mut open, &answer(&long, "yes"), None);
         assert_eq!(open.len(), 1);
     }
 
@@ -1572,5 +1580,63 @@ mod tests {
         );
         // Before the call is reached, nothing is known yet.
         assert_eq!(read(&[person("You asked (a2): Tag it?\n\nYes")]), None);
+    }
+
+    #[test]
+    fn only_the_person_answers_an_ask_in_the_window_history_and_its_deadline() {
+        let arguments = asked("go_later");
+        let asking = json!({"node": 1, "item": {"type": "function_call", "name": TOOL,
+            "call_id": "a1", "arguments": arguments.to_string()}});
+        let ask = call("a1", &arguments).unwrap();
+        let words = answer(&ask, "1");
+        // The same words, from the person and from each other sender, as
+        // history keeps them and as the transcript marks who sent them.
+        let senders = [
+            (json!({"from": null, "origin": null, "person": null}), true),
+            (
+                json!({"from": {"bot": "shop.lead", "turn": 3}, "origin": null, "person": null}),
+                false,
+            ),
+            (
+                json!({"from": null, "origin": "automation", "person": null}),
+                false,
+            ),
+            (
+                json!({"from": null, "origin": null, "person": "dana"}),
+                false,
+            ),
+        ];
+        for (sender, theirs) in senders {
+            let from = crate::transcript::sender(
+                sender["from"]["bot"].as_str(),
+                sender["origin"].as_str(),
+                sender["person"].as_str(),
+            );
+            let mut entry = sender.clone();
+            entry["node"] = json!(9);
+            entry["item"] =
+                json!({"role": "user", "content": [{"type": "input_text", "text": words}]});
+            // History and the window's list of open questions.
+            let mut item = entry["item"].clone();
+            if let Some(from) = &from {
+                item["from"] = json!(from);
+            }
+            let history = open(&[item, asking["item"].clone()]);
+            assert_eq!(history.is_none(), theirs, "{sender}");
+            // The deadline.
+            let mut reading = Reading::default();
+            let deadline = [entry, asking.clone()]
+                .iter()
+                .find_map(|entry| reading.entry(entry, "a1"));
+            assert_eq!(deadline, Some(!theirs), "{sender}");
+            // The card pinned live.
+            let mut pinned = vec![ask.clone()];
+            assert_eq!(
+                close(&mut pinned, &words, from.as_deref()),
+                theirs,
+                "{sender}"
+            );
+            assert_eq!(answer_of(&words, from.as_deref()).is_some(), theirs);
+        }
     }
 }
