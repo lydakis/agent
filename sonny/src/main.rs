@@ -1821,7 +1821,7 @@ fn edge(frame: &mut ratatui::Frame, gap: Rect, composer: Rect, pad: Rect) {
     };
     frame
         .buffer_mut()
-        .set_style(band, Style::default().bg(look::band()));
+        .set_style(band, Style::default().bg(look::BAND));
 }
 
 /// The viewport's rows, top to bottom: the reply's open line (`live`

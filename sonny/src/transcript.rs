@@ -1220,7 +1220,7 @@ pub fn prompt(text: &str, from: Option<&str>, width: usize) -> Vec<Line<'static>
     };
     // On its band with a row of it above and below, as the composer it
     // was written in: the words sit in the middle, not on an edge.
-    let band = crate::look::band();
+    let band = crate::look::BAND;
     out.push(Line::default().bg(band));
     out.extend(answering.map(|row| row.bg(band)));
     for (i, line) in lines[..shown].iter().enumerate() {
@@ -1341,7 +1341,7 @@ pub fn with_quotes(
     quotes: &str,
     width: usize,
 ) -> Vec<Line<'static>> {
-    let band = crate::look::band();
+    let band = crate::look::BAND;
     let Some(end) = prompt.pop() else {
         return prompt;
     };
@@ -3088,7 +3088,13 @@ mod tests {
         assert_eq!(shown, ["", "  answering “Ship it?”", "› Not yet", ""]);
         let rows = prompt("You asked (c1): Ship **it**?\n\nNot yet", None, 80);
         assert_eq!(rows[1].to_string(), "  answering “Ship it?”");
-        assert!(rows.iter().all(|row| row.style.bg.is_some()));
+        // The band's role, made the theme's band as each frame is drawn,
+        // so a light/dark switch reaches these rows without drawing them
+        // again.
+        assert!(
+            rows.iter()
+                .all(|row| row.style.bg == Some(crate::look::BAND))
+        );
     }
 
     #[test]
