@@ -1068,9 +1068,9 @@ type Serving = Arc<Mutex<Calls>>;
 /// which the daemon tells its agent), and none starts while it holds.
 fn pause(serving: &Serving, paused: bool) {
     let mut calls = serving.lock().unwrap();
+    let pausing = paused && !calls.paused;
     calls.paused = paused;
     if paused {
-        let before = calls.jobs.len();
         calls.jobs.retain(|_, job| match job {
             Job::Running(job) => {
                 job.abort();
@@ -1078,10 +1078,11 @@ fn pause(serving: &Serving, paused: bool) {
             }
             Job::Answered(_) => true,
         });
-        // Only a call let go can be on a listing read before it.
-        if calls.jobs.len() < before {
-            calls.stops += 1;
-        }
+    }
+    // A pause halts every waiting call, also one not started yet that a
+    // listing read before it names.
+    if pausing {
+        calls.stops += 1;
     }
 }
 
@@ -1862,6 +1863,45 @@ mod tests {
             .expect("woken to look again");
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(ran.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_call_listed_across_a_pause_before_any_started_does_not_start() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let serving: Serving = Default::default();
+        let held = serving.clone();
+        // The first page names a call; a pause and a resume come before
+        // the second, with nothing started yet for the pause to stop.
+        let client = crate::tests::daemon_answering(move |asked| match asked["op"].as_str() {
+            Some("tool_calls") if asked["after"] == 0 => {
+                json!({"calls": [{"bot": "b", "turn": 1, "call_id": "c1", "name": EXEC}],
+                    "next_after": 1})
+            }
+            Some("tool_calls") => {
+                pause(&held, true);
+                pause(&held, false);
+                json!({"calls": [], "next_after": null})
+            }
+            _ => json!({}),
+        })
+        .await;
+        let ran = Arc::new(AtomicUsize::new(0));
+        let runs = ran.clone();
+        let run = move |_call: Value| {
+            let runs = runs.clone();
+            async move {
+                runs.fetch_add(1, Ordering::SeqCst);
+                Ok(json!("written"))
+            }
+        };
+        let nudge = Arc::new(Notify::new());
+        sweep(&client, &serving, &nudge, run).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), nudge.notified())
+            .await
+            .expect("woken to look again");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(ran.load(Ordering::SeqCst), 0);
+        assert!(serving.lock().unwrap().jobs.is_empty());
     }
 
     #[test]
