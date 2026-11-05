@@ -2798,7 +2798,9 @@ would run alone, so `timeout 60 mcpx call` is allowed by an `mcpx` rule
 and `timeout 60 git push` refused by a `git push` one; `env` (bare, or
 with `-i`, `-u`, `-C` and assignments) and the shell's own `NAME=VALUE`
 before a command change what it runs with, so through them only the
-rules that ask or refuse match. A wrapper by its path, or in a form not
+rules that ask or refuse match. Nor does a wrapper let out a program it
+runs by its path: the wrapper is found on `PATH`, so only a program by
+its name, found the same way, is allowed through it. A wrapper by its path, or in a form not
 read here (another option, such as `env -S`), is matched as written
 only. Rules for the wrapper itself still match too.
 `invalid`, with why, says the client couldn't read the rules: every shell

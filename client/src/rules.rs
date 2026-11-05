@@ -191,15 +191,19 @@ impl Policy {
     /// [`unwrapped`] reads, as the command the wrapper runs. Through a
     /// wrapper that changes what the command runs with (its environment or
     /// folder), only the rules that ask or refuse match: the same words
-    /// could run another program there, so they may not let it out.
+    /// could run another program there, so they may not let it out. Nor
+    /// do they let out a program run by its path: the wrapper is found on
+    /// `PATH`, so it is trusted no more than a program by its name, and a
+    /// rule that pins a path would lend its trust to whatever is found.
     pub fn matching(&self, command: &[String]) -> Vec<Matched> {
         let mut matched = self.matching_words(command);
         let (mut rest, mut plain) = (command, true);
         // Each wrapper read takes at least its own word, so this ends.
         while let Some(wrapped) = unwrapped(rest) {
             plain &= wrapped.plain;
+            let by_path = wrapped.command[0].contains('/');
             let mut found = self.matching_words(wrapped.command);
-            if !plain {
+            if !plain || by_path {
                 found.retain(|m| m.decision != Decision::Allow);
             }
             matched.extend(found);
@@ -475,7 +479,8 @@ mod tests {
             {"pattern": ["mcpx"]},
             {"pattern": ["git", "push"], "decision": "forbidden", "source": "default.rules:2"},
             {"pattern": ["make"], "decision": "prompt"},
-        ]}));
+            {"pattern": ["true"]},
+        ], "host_executables": {"true": ["/usr/bin/true"]}}));
         let decision = |command: &str| policy.verdict(&[words(command)]).decision;
         for allowed in [
             "mcpx call",
@@ -498,11 +503,17 @@ mod tests {
             "PATH=/tmp mcpx",
             "timeout 60 env FOO=1 mcpx",
             "/tmp/timeout 60 mcpx",
+            // A program pinned by its path lends no trust to a wrapper
+            // found on PATH.
+            "timeout 60 /usr/bin/true",
+            "timeout 60 ./mcpx",
         ] {
             assert_eq!(decision(kept), None, "{kept}");
         }
+        assert_eq!(decision("/usr/bin/true"), Some(Decision::Allow));
         for refused in [
             "timeout 60 git push",
+            "timeout 60 /usr/bin/git push",
             "env PATH=/tmp git push -f",
             "FOO=1 nice git push",
             "nohup -- time git push",
