@@ -1070,7 +1070,7 @@ async fn serve(store: PathBuf, socket: PathBuf, nudge: Arc<Notify>, serving: Ser
                         }
                     }
                 };
-                let Ok(unsent) = sweep(&client, &serving, run).await else {
+                let Ok(unsent) = sweep(&client, &serving, &nudge, run).await else {
                     break;
                 };
                 let again = if unsent { RESEND } else { SWEEP };
@@ -1089,11 +1089,13 @@ async fn serve(store: PathBuf, socket: PathBuf, nudge: Arc<Notify>, serving: Ser
 
 /// One look at what waits on Sonny: the results the daemon has not taken
 /// handed in again, then each waiting call not already served started
-/// with `run`. Whether results remain unsent; an error when the calls
-/// could not be listed.
+/// with `run`. A result the daemon did not take when its call ended
+/// wakes `nudge`, to be handed in again soon. Whether results remain
+/// unsent; an error when the calls could not be listed.
 async fn sweep<Run, Ran>(
     client: &Arc<Client>,
     serving: &Serving,
+    nudge: &Arc<Notify>,
     run: Run,
 ) -> Result<bool, agent_client::Error>
 where
@@ -1115,6 +1117,7 @@ where
             continue;
         }
         let (client, serving, held) = (client.clone(), serving.clone(), key.clone());
+        let nudge = nudge.clone();
         let ran = run(call.clone());
         let job = tokio::spawn(async move {
             let answer = ran.await;
@@ -1136,7 +1139,9 @@ where
                 }
                 jobs.insert(key.clone(), Job::Answered(asked));
             }
-            hand_in(&client, &serving, &key).await;
+            if !hand_in(&client, &serving, &key).await {
+                nudge.notify_one();
+            }
         });
         jobs.insert(held, Job::Running(job.abort_handle()));
     }
@@ -1146,11 +1151,12 @@ where
 /// Hand the daemon the result kept for `key`, and let it go once the
 /// daemon has it or says the call wants none: answered already, out of
 /// time, its turn over. Anything else, such as a lost connection or a
-/// store that could not write, keeps it to be handed in again.
-async fn hand_in(client: &Client, serving: &Serving, key: &(i64, String)) {
+/// store that could not write, keeps it to be handed in again. Whether
+/// it is let go.
+async fn hand_in(client: &Client, serving: &Serving, key: &(i64, String)) -> bool {
     let asked = match serving.lock().unwrap().get(key) {
         Some(Job::Answered(asked)) => asked.clone(),
-        _ => return,
+        _ => return true,
     };
     let taken = match client.request("tool_result", asked).await {
         Ok(_) => true,
@@ -1159,6 +1165,7 @@ async fn hand_in(client: &Client, serving: &Serving, key: &(i64, String)) {
     if taken {
         serving.lock().unwrap().remove(key);
     }
+    taken
 }
 
 /// Whether the daemon's refusal of a result says the call wants none, so
@@ -1660,23 +1667,25 @@ mod tests {
                 Ok(json!("written"))
             }
         };
-        sweep(&client, &serving, run.clone()).await.unwrap();
-        // It runs and its result is handed in, and lost.
-        while handed.load(Ordering::SeqCst) < 1 {
-            tokio::task::yield_now().await;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        let nudge = Arc::new(Notify::new());
+        sweep(&client, &serving, &nudge, run.clone()).await.unwrap();
+        // It runs and its result is handed in, and lost: the host is woken
+        // to hand it in again soon, not at its next sweep.
+        tokio::time::timeout(Duration::from_secs(5), nudge.notified())
+            .await
+            .expect("woken for the lost result");
+        assert_eq!(handed.load(Ordering::SeqCst), 1);
         assert!(matches!(
             serving.lock().unwrap().values().next(),
             Some(Job::Answered(_))
         ));
         // Recording failed again: the result is still kept, and the call,
         // listed again, is not run again.
-        assert!(sweep(&client, &serving, run.clone()).await.unwrap());
+        assert!(sweep(&client, &serving, &nudge, run.clone()).await.unwrap());
         assert_eq!(handed.load(Ordering::SeqCst), 2);
         assert_eq!(effects.load(Ordering::SeqCst), 1);
         // Taken at last, it is let go: one effect in all.
-        assert!(!sweep(&client, &serving, run).await.unwrap());
+        assert!(!sweep(&client, &serving, &nudge, run).await.unwrap());
         assert_eq!(handed.load(Ordering::SeqCst), 3);
         assert!(serving.lock().unwrap().is_empty());
         assert_eq!(effects.load(Ordering::SeqCst), 1);
