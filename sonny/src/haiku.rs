@@ -300,6 +300,51 @@ impl Poem {
     }
 }
 
+/// The upgrade migration that keeps each daemon's claim apart from the
+/// haiku shown, in `haiku.json` (0.8.1).
+pub const CLAIMS: &str = "haiku-claims";
+
+/// `haiku.json` as Sonny 0.8.0 wrote it, made current once for its HOME,
+/// recorded in `migrated` beside it: each daemon's claim was its `by` and
+/// `since_ms`, and a claim cleared the haiku, so one that wrote nothing
+/// left none; the last of the day's shows in its place.
+pub fn upgrade(store: &Store) {
+    let Some(file) = store.file.clone() else {
+        return;
+    };
+    let Some(record) = file.parent().map(|dir| dir.join("migrated")) else {
+        return;
+    };
+    crate::upgrade::once(&record, CLAIMS, || {
+        if !file.exists() {
+            return true;
+        }
+        let Some(_lock) = store.lock() else {
+            return false;
+        };
+        let mut all = store.all();
+        for kept in all.values_mut().filter_map(Value::as_object_mut) {
+            if kept.contains_key("claim") {
+                continue;
+            }
+            let claim = json!({"by": kept.get("by").cloned().unwrap_or(json!("")),
+                "since_ms": kept.get("since_ms").cloned().unwrap_or(json!(0))});
+            kept.insert("claim".into(), claim);
+            let three = |poem: &Value| poem["lines"].as_array().is_some_and(|l| l.len() == 3);
+            if !three(&Value::Object(kept.clone())) {
+                let past = kept.get("past").and_then(Value::as_array);
+                let last = (past.and_then(|past| past.iter().rev().find(|poem| three(poem))))
+                    .cloned()
+                    .unwrap_or_else(|| json!({"by": "", "lines": [], "at_ms": 0, "since_ms": 0}));
+                for field in ["by", "lines", "at_ms", "since_ms"] {
+                    kept.insert(field.into(), last[field].clone());
+                }
+            }
+        }
+        store.write(&Value::Object(all)).is_ok()
+    });
+}
+
 /// Where every sky keeps its haikus: `~/.agent/sonny/haiku.json`.
 #[derive(Clone, Debug)]
 pub struct Store {
@@ -326,6 +371,31 @@ impl Store {
         Store {
             file: Some(dir.join("haiku.json")),
         }
+    }
+
+    /// The file's lock, held until it is dropped: one sky reads, changes
+    /// and writes it at a time.
+    fn lock(&self) -> Option<std::fs::File> {
+        let lock = self.file.as_ref()?.with_extension("json.lock");
+        std::fs::create_dir_all(lock.parent()?).ok()?;
+        let lock = (std::fs::OpenOptions::new().create(true).truncate(false))
+            .write(true)
+            .open(lock)
+            .ok()?;
+        lock.lock().ok()?;
+        Some(lock)
+    }
+
+    /// Write `all` as the file, whole or not at all, should a sky stop
+    /// halfway.
+    fn write(&self, all: &Value) -> std::io::Result<()> {
+        let file = self.file.as_ref().ok_or(std::io::ErrorKind::NotFound)?;
+        if let Some(dir) = file.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let part = file.with_extension(format!("json.{}", std::process::id()));
+        std::fs::write(&part, all.to_string())?;
+        std::fs::rename(&part, file)
     }
 
     /// Every daemon's haiku, by socket, as the file keeps them.
@@ -356,20 +426,11 @@ impl Kept {
             .map(Poem::read)
             .filter(|poem| poem.lines.len() == 3)
             .collect();
-        // A file from before claims were kept apart cleared the haiku at
-        // each claim: the last one written is the last of the day's.
-        let shown = Some(Poem::read(&kept)).filter(|poem| poem.lines.len() == 3);
-        let shown = shown.or_else(|| past.last().cloned()).unwrap_or_default();
-        let claim = match (
-            kept["claim"]["by"].as_str(),
-            kept["claim"]["since_ms"].as_i64(),
-        ) {
-            (Some(by), Some(since_ms)) => (by.to_owned(), since_ms),
-            _ => (
-                kept["by"].as_str().unwrap_or("").to_owned(),
-                kept["since_ms"].as_i64().unwrap_or(0),
-            ),
-        };
+        let shown = Poem::read(&kept);
+        let claim = (
+            kept["claim"]["by"].as_str().unwrap_or("").to_owned(),
+            kept["claim"]["since_ms"].as_i64().unwrap_or(0),
+        );
         Kept {
             day: kept["day"].as_str().unwrap_or("").to_owned(),
             written: kept["written"].as_u64().unwrap_or(0),
@@ -393,14 +454,8 @@ impl Kept {
         socket: &Path,
         change: impl FnOnce(&mut Kept) -> T,
     ) -> Option<(T, Kept)> {
-        let lock = store.file.as_ref()?.with_extension("json.lock");
-        std::fs::create_dir_all(lock.parent()?).ok()?;
         // Held until the end of the step, and let go as the file closes.
-        let lock = (std::fs::OpenOptions::new().create(true).truncate(false))
-            .write(true)
-            .open(lock)
-            .ok()?;
-        lock.lock().ok()?;
+        let _lock = store.lock()?;
         let mut kept = Kept::load(store, socket);
         let changed = change(&mut kept);
         kept.save(store).ok()?;
@@ -464,7 +519,6 @@ impl Kept {
     }
 
     fn save(&self, store: &Store) -> std::io::Result<()> {
-        let file = store.file.as_ref().ok_or(std::io::ErrorKind::NotFound)?;
         // Each daemon's apart, by its socket; the others' as they are.
         let mut all = store.all();
         all.insert(
@@ -475,14 +529,16 @@ impl Kept {
                 "unwritten": self.unwritten.as_ref().map(Unwritten::json),
                 "past": self.past.iter().map(Poem::json).collect::<Vec<_>>()}),
         );
-        let kept = Value::Object(all);
-        if let Some(dir) = file.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        // Whole or not at all, should a sky stop halfway.
-        let part = file.with_extension(format!("json.{}", std::process::id()));
-        std::fs::write(&part, kept.to_string())?;
-        std::fs::rename(&part, file)
+        store.write(&Value::Object(all))
+    }
+
+    /// Who holds the title at `now_ms`, and since when: the last claim's
+    /// agent, whether or not it wrote its haiku, while that claim is
+    /// younger than `within`.
+    pub fn holder(&self, now_ms: i64, within: std::time::Duration) -> Option<(String, i64)> {
+        let (holder, since_ms) = &self.claim;
+        (!holder.is_empty() && now_ms - since_ms < within.as_millis() as i64)
+            .then(|| (holder.clone(), *since_ms))
     }
 
     /// Whether a haiku may be written now, at `now_ms`, by `by`, holder
@@ -829,6 +885,11 @@ mod tests {
                 why: Failed::NotAHaiku
             })
         );
+        // The title is b's, whose haiku shows nowhere, for its hold: a
+        // sky opened now does not hand it on early.
+        let hour = std::time::Duration::from_secs(3600);
+        assert_eq!(kept.holder(next + 60_000, hour), Some(("b".into(), next)));
+        assert_eq!(kept.holder(next + 3_600_000, hour), None);
         // Not tried again for the same hold.
         let (again, _) = Kept::update(&store, socket, |kept| {
             kept.claim(&rule, "b", next + 5, next + 5)
@@ -845,7 +906,7 @@ mod tests {
     }
 
     #[test]
-    fn a_file_whose_claim_cleared_the_haiku_shows_the_last_one_written() {
+    fn a_file_whose_claim_cleared_the_haiku_shows_the_last_one_written_once_upgraded() {
         // As Sonny 0.8.0 left it: a claim that wrote nothing saved no lines.
         let store = Store::new();
         let file = store.file.clone().unwrap();
@@ -855,6 +916,7 @@ mod tests {
             "by": "b", "lines": [], "at_ms": ms + 9, "since_ms": ms + 5,
             "past": [{"by": "a", "lines": ["x", "y", "z"], "at_ms": ms + 1, "since_ms": ms}]}});
         std::fs::write(&file, old.to_string()).unwrap();
+        upgrade(&store);
         let kept = Kept::load(&store, Path::new("/tmp/agent.sock"));
         assert_eq!(
             (kept.by.as_str(), kept.at_ms, kept.since_ms),
@@ -863,6 +925,12 @@ mod tests {
         assert_eq!(kept.lines, ["x", "y", "z"]);
         // The claim it held stays spent.
         assert_eq!(kept.claim, ("b".to_owned(), ms + 5));
+        // Once: the file as written since is left as it is.
+        let lines = ["n".to_owned(), "o".into(), "w".into()];
+        let socket = Path::new("/tmp/agent.sock");
+        assert!(Kept::publish(&store, socket, "b", ms + 5, &lines, ms + 20));
+        upgrade(&store);
+        assert_eq!(Kept::load(&store, socket).lines, lines);
         let _ = std::fs::remove_dir_all(file.parent().unwrap());
     }
 }

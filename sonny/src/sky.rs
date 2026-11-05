@@ -828,6 +828,7 @@ impl View {
         let now = Instant::now();
         // The haiku every sky of this daemon shows, while it is fresh.
         let store = haiku::Store::new();
+        haiku::upgrade(&store);
         let kept = haiku::Kept::load(&store, &socket);
         let ago = |ms: i64| {
             let ms = (wall_ms() - ms).max(0) as u64;
@@ -843,7 +844,7 @@ impl View {
             until: None,
             story: None,
         });
-        let heir = fresh.then(|| (kept.by.clone(), ago(kept.since_ms)));
+        let heir = (kept.holder(wall_ms(), HOUR)).map(|(holder, held)| (holder, ago(held)));
         Self {
             socket,
             resolved: PathBuf::new(),
