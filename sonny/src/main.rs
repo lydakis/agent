@@ -2707,6 +2707,9 @@ struct App {
     /// The staged turns sent with Tab to run after the running one, which
     /// they do not join.
     queued: Vec<i64>,
+    /// The staged steers of the running turn, which it takes in once the
+    /// call under way ends: a model's answer, or a tool's run.
+    steering: Vec<i64>,
     /// Pictures given with the message being written, each behind its
     /// placeholder in the composer: [`attach::placeholder`] of its place
     /// here, from 1.
@@ -4169,6 +4172,7 @@ impl App {
             said: String::new(),
             staged: Vec::new(),
             queued: Vec::new(),
+            steering: Vec::new(),
             pictures: Vec::new(),
             reactions: reactions::Reactions::default(),
             picks: fuzzy::Picks::default(),
@@ -7180,8 +7184,17 @@ impl App {
                             .collect()
                     }
                 };
+                // What it waits for, as the person who sent it would ask:
+                // a queued message the turn's end, a steer the end of the
+                // call under way, however long that runs.
                 if self.queued.contains(turn) {
                     shown.push(Line::from("  queued for after this turn").dim().italic());
+                } else if self.steering.contains(turn) && self.running.is_some() {
+                    shown.push(
+                        Line::from("  steer waiting for the current call to end")
+                            .dim()
+                            .italic(),
+                    );
                 }
                 std::iter::once(Line::default()).chain(shown)
             })
@@ -11142,10 +11155,14 @@ impl App {
             }
             self.staged.push((turn, prompt));
             let staged = &self.staged;
-            self.queued
-                .retain(|queued| staged.iter().any(|(turn, _)| turn == queued));
+            let waiting = |sent: &i64| staged.iter().any(|(turn, _)| turn == sent);
+            self.queued.retain(waiting);
+            self.steering.retain(waiting);
             if queue {
                 self.queued.push(turn);
+            }
+            if steer && self.running.is_some() {
+                self.steering.push(turn);
             }
         }
         if workspace.is_some() {
@@ -17210,6 +17227,19 @@ mod tests {
         app.key(enter()).await;
         let steer = sent.lock().unwrap()[1].clone();
         assert_eq!(steer["delivery"], "steer");
+        let staged: Vec<String> = app.staged_rows(80).iter().map(|l| l.to_string()).collect();
+        assert_eq!(
+            staged[3..],
+            [
+                "",
+                "› now",
+                "  steer waiting for the current call to end",
+                ""
+            ],
+            "a steer says what it waits for, as a queued message does"
+        );
+        // Sent with no turn running, a message waits for nothing.
+        app.running = None;
         let staged: Vec<String> = app.staged_rows(80).iter().map(|l| l.to_string()).collect();
         assert_eq!(staged[3..], ["", "› now", ""]);
         // Once its turn starts it is no longer waiting.
