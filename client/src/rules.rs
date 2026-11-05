@@ -10,8 +10,9 @@
 //! pattern's; one run by an absolute path that no rule names as written is
 //! matched by its program's name, when `host_executables` lists that path
 //! for it or lists none, though only one it lists is allowed by that name.
-//! Of the rules a command matches, the strictest
-//! decides.
+//! A command run under a wrapper this reads, such as `timeout 60 git
+//! status`, is also matched as the command it runs ([`unwrapped`]). Of
+//! the rules a command matches, the strictest decides.
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -186,11 +187,33 @@ impl Policy {
         verdict
     }
 
-    /// The rules `command` matches: those for its first word as written,
-    /// or, when none match and it is an absolute path, those for the
-    /// program's name, unless `host_executables` lists other paths for it;
-    /// its `allow` rules only when `host_executables` lists this path.
+    /// The rules `command` matches as written and, under each wrapper
+    /// [`unwrapped`] reads, as the command the wrapper runs. Through a
+    /// wrapper that changes what the command runs with (its environment or
+    /// folder), only the rules that ask or refuse match: the same words
+    /// could run another program there, so they may not let it out.
     pub fn matching(&self, command: &[String]) -> Vec<Matched> {
+        let mut matched = self.matching_words(command);
+        let (mut rest, mut plain) = (command, true);
+        // Each wrapper read takes at least its own word, so this ends.
+        while let Some(wrapped) = unwrapped(rest) {
+            plain &= wrapped.plain;
+            let mut found = self.matching_words(wrapped.command);
+            if !plain {
+                found.retain(|m| m.decision != Decision::Allow);
+            }
+            matched.extend(found);
+            rest = wrapped.command;
+        }
+        matched
+    }
+
+    /// The rules `command` matches by its own words: those for its first
+    /// word as written, or, when none match and it is an absolute path,
+    /// those for the program's name, unless `host_executables` lists other
+    /// paths for it; its `allow` rules only when `host_executables` lists
+    /// this path.
+    fn matching_words(&self, command: &[String]) -> Vec<Matched> {
         let found = |words: &[String]| -> Vec<Matched> {
             (self.prefix_rules.iter())
                 .filter(|rule| rule.matches(words).is_some())
@@ -229,6 +252,161 @@ impl Policy {
         }
         matched
     }
+}
+
+/// A command as a wrapper runs it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Wrapped<'a> {
+    /// The words of the command the wrapper runs.
+    pub command: &'a [String],
+    /// Whether the command runs as it would on its own: false when the
+    /// wrapper sets its environment or its folder.
+    pub plain: bool,
+}
+
+/// The command `command` runs under a wrapper read by its words, when it
+/// is one of these, by its bare name and in a form written out here; any
+/// other form, such as a wrapper by its path, which could be a program the
+/// bot wrote, is not read and is ruled as written:
+///
+/// - `timeout [-k D] [-s SIGNAL] [--foreground] [--preserve-status] [-v] DURATION COMMAND`
+/// - `nice [-n N | -N] COMMAND` and `nohup COMMAND`
+/// - `time [-p] COMMAND`
+/// - `env [-i] [-u NAME] [-C DIR] [NAME=VALUE]... COMMAND`, plain only
+///   bare
+/// - `NAME=VALUE... COMMAND`, the shell's assignments, never plain
+pub fn unwrapped(command: &[String]) -> Option<Wrapped<'_>> {
+    let first = command.first()?.as_str();
+    let (rest, plain) = if is_assignment(first) {
+        let set = command.iter().take_while(|w| is_assignment(w)).count();
+        (&command[set..], false)
+    } else {
+        let args = &command[1..];
+        match first {
+            "timeout" => (after_timeout(args)?, true),
+            "nice" => (after_nice(args)?, true),
+            "nohup" => (args.strip_prefix(&["--".to_owned()]).unwrap_or(args), true),
+            "time" => (args.strip_prefix(&["-p".to_owned()]).unwrap_or(args), true),
+            "env" => after_env(args)?,
+            _ => return None,
+        }
+    };
+    (!rest.is_empty()).then_some(Wrapped {
+        command: rest,
+        plain,
+    })
+}
+
+/// `NAME=VALUE` as the shell reads an assignment before a command.
+fn is_assignment(word: &str) -> bool {
+    word.split_once('=').is_some_and(|(name, _)| {
+        let mut chars = name.chars();
+        chars
+            .next()
+            .is_some_and(|c| c == '_' || c.is_ascii_alphabetic())
+            && chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
+    })
+}
+
+/// What `timeout`'s options and duration leave: the command.
+fn after_timeout(args: &[String]) -> Option<&[String]> {
+    let mut at = 0;
+    loop {
+        let arg = args.get(at)?.as_str();
+        at += 1;
+        match arg {
+            "--" => break,
+            "--foreground" | "-f" | "--preserve-status" | "-p" | "-v" | "--verbose" => {}
+            "-k" | "--kill-after" => {
+                is_duration(args.get(at)?).then_some(())?;
+                at += 1;
+            }
+            "-s" | "--signal" => {
+                is_signal(args.get(at)?).then_some(())?;
+                at += 1;
+            }
+            _ if arg.starts_with('-') && !is_duration(arg) => {
+                let (value, valid): (&str, fn(&str) -> bool) =
+                    match (arg.strip_prefix("--kill-after="), arg.strip_prefix("-k")) {
+                        (Some(value), _) | (None, Some(value)) => (value, is_duration),
+                        _ => match (arg.strip_prefix("--signal="), arg.strip_prefix("-s")) {
+                            (Some(value), _) | (None, Some(value)) => (value, is_signal),
+                            _ => return None,
+                        },
+                    };
+                valid(value).then_some(())?;
+            }
+            _ => {
+                at -= 1;
+                break;
+            }
+        }
+    }
+    is_duration(args.get(at)?).then(|| &args[at + 1..])
+}
+
+/// A duration as `timeout` reads one: a number, whole or not, and a unit.
+fn is_duration(word: &str) -> bool {
+    let number = word.strip_suffix(['s', 'm', 'h', 'd']).unwrap_or(word);
+    let (whole, fraction) = number.split_once('.').unwrap_or((number, ""));
+    !(whole.is_empty() && fraction.is_empty())
+        && whole.chars().all(|c| c.is_ascii_digit())
+        && fraction.chars().all(|c| c.is_ascii_digit())
+}
+
+/// A signal by its name or number, as `timeout -s` takes one.
+fn is_signal(word: &str) -> bool {
+    !word.is_empty() && word.chars().all(|c| c.is_ascii_alphanumeric() || c == '+')
+}
+
+/// What `nice`'s adjustment leaves: the command.
+fn after_nice(args: &[String]) -> Option<&[String]> {
+    let number = |word: &str| {
+        let digits = word.strip_prefix(['-', '+']).unwrap_or(word);
+        !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit())
+    };
+    let first = args.first().map(String::as_str);
+    let taken = match first {
+        Some("-n" | "--adjustment") => number(args.get(1)?).then_some(2)?,
+        Some(arg) if arg.starts_with('-') => {
+            let value = (arg.strip_prefix("--adjustment="))
+                .or_else(|| arg.strip_prefix("-n"))
+                .or_else(|| arg.strip_prefix('-'))?;
+            number(value).then_some(1)?
+        }
+        _ => 0,
+    };
+    let args = &args[taken..];
+    Some(args.strip_prefix(&["--".to_owned()]).unwrap_or(args))
+}
+
+/// What `env`'s options and assignments leave, the command, and whether
+/// it runs as it would without them.
+fn after_env(args: &[String]) -> Option<(&[String], bool)> {
+    let mut at = 0;
+    while let Some(arg) = args.get(at).map(String::as_str) {
+        match arg {
+            "--" => {
+                at += 1;
+                break;
+            }
+            "-i" | "--ignore-environment" | "-" => at += 1,
+            "-u" | "--unset" | "-C" | "--chdir" => {
+                args.get(at + 1)?;
+                at += 2;
+            }
+            _ if arg.starts_with("--unset=") || arg.starts_with("--chdir=") => at += 1,
+            _ if arg.len() > 2 && (arg.starts_with("-u") || arg.starts_with("-C")) => at += 1,
+            // Another option, such as -S, which splits a word into more.
+            _ if arg.starts_with('-') => return None,
+            _ => break,
+        }
+    }
+    let set = args[at..]
+        .iter()
+        .take_while(|word| word.contains('='))
+        .count();
+    Some((&args[at + set..], at + set == 0))
 }
 
 #[cfg(test)]
@@ -289,6 +467,83 @@ mod tests {
         assert_eq!(decision("./rg x"), None);
         let verdict = policy.verdict(&[words("/usr/bin/git push")]);
         assert_eq!(verdict.matched[0].prefix, ["/usr/bin/git", "push"]);
+    }
+
+    #[test]
+    fn a_wrapped_command_is_ruled_as_the_command_it_runs() {
+        let policy = policy(serde_json::json!({"prefix_rules": [
+            {"pattern": ["mcpx"]},
+            {"pattern": ["git", "push"], "decision": "forbidden", "source": "default.rules:2"},
+            {"pattern": ["make"], "decision": "prompt"},
+        ]}));
+        let decision = |command: &str| policy.verdict(&[words(command)]).decision;
+        for allowed in [
+            "mcpx call",
+            "timeout 60 mcpx call",
+            "timeout -k 5 -s KILL 1.5m mcpx call",
+            "timeout --signal=TERM --kill-after=10s --preserve-status 30 mcpx",
+            "timeout -sINT -- 60 mcpx",
+            "nice -n 10 mcpx",
+            "nice -5 timeout 60 nohup mcpx",
+            "time -p env mcpx",
+        ] {
+            assert_eq!(decision(allowed), Some(Decision::Allow), "{allowed}");
+        }
+        // What sets the command's environment or folder, or a wrapper by
+        // its path, may still ask or refuse, but never lets it out.
+        for kept in [
+            "env PATH=/tmp mcpx",
+            "env -C /tmp mcpx",
+            "env -i mcpx",
+            "PATH=/tmp mcpx",
+            "timeout 60 env FOO=1 mcpx",
+            "/tmp/timeout 60 mcpx",
+        ] {
+            assert_eq!(decision(kept), None, "{kept}");
+        }
+        for refused in [
+            "timeout 60 git push",
+            "env PATH=/tmp git push -f",
+            "FOO=1 nice git push",
+            "nohup -- time git push",
+        ] {
+            assert_eq!(decision(refused), Some(Decision::Forbidden), "{refused}");
+        }
+        assert_eq!(
+            decision("env -u HOME make"),
+            Some(Decision::Prompt),
+            "an unset is read too"
+        );
+        // Forms not written out here are ruled as written.
+        for unread in [
+            "timeout 60",
+            "timeout --frobnicate 60 git push",
+            "timeout sixty git push",
+            "env -S 'git push' x",
+            "nice -n x git push",
+            "command git push",
+        ] {
+            assert_eq!(decision(unread), None, "{unread}");
+        }
+        let verdict = policy.verdict(&[words("timeout 60 git push")]);
+        assert_eq!(verdict.matched[0].prefix, ["git", "push"]);
+        assert_eq!(
+            verdict.matched[0].source.as_deref(),
+            Some("default.rules:2")
+        );
+        // A rule for the wrapper itself still decides as written.
+        let wrapper = policy_with_timeout();
+        assert_eq!(
+            wrapper.verdict(&[words("timeout 60 ls")]).decision,
+            Some(Decision::Prompt)
+        );
+    }
+
+    fn policy_with_timeout() -> Policy {
+        policy(serde_json::json!({"prefix_rules": [
+            {"pattern": ["timeout"], "decision": "prompt"},
+            {"pattern": ["ls"]},
+        ]}))
     }
 
     #[test]
