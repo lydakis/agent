@@ -736,7 +736,9 @@ way `/react` does, and each note in the margin has its own `↩`.
   **Working** (a turn running, queued, rate limited, waiting on other
   tasks, or `waiting on its reviewer` while the approver weighs a call), **Ready for review** (finished, its last reply linking a pull
   request), **Done** (finished or stopped with nothing open), and
-  **Resolved**, only counted until `r` shows them. As threads in a
+  **Resolved**. Done and Resolved fold to their heading (`Done · 3 ▸`)
+  until a click on it, or `d` and `r` with the keys in the pane, opens
+  them, and the same folds them again. As threads in a
   claude.ai project do, a task resolves itself with the `resolve_task`
   tool once nothing is left to do in it, such as when its pull request
   merged or you dropped the work, and the lead can resolve any of its

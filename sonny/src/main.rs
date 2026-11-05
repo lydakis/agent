@@ -2528,8 +2528,8 @@ struct Watch {
     lookout: String,
     /// What is wrong around the agents, under the lookout's line.
     alerts: Vec<status::Alert>,
-    /// The resolved tasks are listed, not only counted.
-    resolved: bool,
+    /// The groups that fold, opened with a click or their key.
+    open: Vec<status::Group>,
     /// `/background` holds the screen instead of the card.
     background: Option<background::View>,
     /// `/usage` holds it instead.
@@ -2545,6 +2545,18 @@ struct Watch {
     /// The agent `/status` has picked from the keys, by its place among
     /// the agents it lists: ↑ and ↓ move it, Enter opens it.
     pick: Option<usize>,
+}
+
+impl Watch {
+    /// The group `group` opened, or folded again.
+    fn toggle(&mut self, group: status::Group) {
+        match self.open.iter().position(|open| *open == group) {
+            Some(at) => {
+                self.open.remove(at);
+            }
+            None => self.open.push(group),
+        }
+    }
 }
 
 /// Ctrl+R's search of the prompts sent before.
@@ -8077,7 +8089,7 @@ impl App {
             read: Instant::now(),
             lookout: self.lookout_line(),
             alerts,
-            resolved: false,
+            open: Vec::new(),
             background: None,
             usage: None,
             commons: None,
@@ -8118,7 +8130,7 @@ impl App {
             read: Instant::now(),
             lookout: String::new(),
             alerts: Vec::new(),
-            resolved: false,
+            open: Vec::new(),
             background: Some(view),
             usage: None,
             commons: None,
@@ -8142,7 +8154,7 @@ impl App {
             read: Instant::now(),
             lookout: String::new(),
             alerts: Vec::new(),
-            resolved: false,
+            open: Vec::new(),
             background: None,
             usage: Some(view),
             commons: None,
@@ -8166,7 +8178,7 @@ impl App {
             read: Instant::now(),
             lookout: String::new(),
             alerts: Vec::new(),
-            resolved: false,
+            open: Vec::new(),
             background: None,
             usage: None,
             commons: Some(commons::View::open(&home)),
@@ -8186,7 +8198,7 @@ impl App {
             read: Instant::now(),
             lookout: String::new(),
             alerts: Vec::new(),
-            resolved: false,
+            open: Vec::new(),
             background: None,
             usage: None,
             commons: None,
@@ -9314,12 +9326,15 @@ impl App {
                         && !switches(key)
                         && let Some(view) = self.watch.as_mut().and_then(|w| w.sky.as_mut())
                         && view.press(key.code) => {}
-                    // `/status` lists the resolved tasks, or only counts them.
-                    KeyCode::Char('r')
+                    // `/status` opens or folds its done and resolved tasks.
+                    KeyCode::Char(key @ ('d' | 'r'))
                         if pane.is_card()
                             && let Some(watch) = &mut self.watch =>
                     {
-                        watch.resolved = !watch.resolved
+                        watch.toggle(match key {
+                            'd' => status::Group::Done,
+                            _ => status::Group::Resolved,
+                        })
                     }
                     _ if switches(key) || key.code == KeyCode::Tab => self.pane_keys = false,
                     _ if copy && let Some(text) = pane.screen.selected() => {
@@ -9691,6 +9706,15 @@ impl App {
                 self.jump = Some((pin, JUMP_PAGES));
             }
             "back" => self.close_pane(true),
+            // A folding group's heading in `/status`: opened or folded.
+            "group" => {
+                if let Some(watch) = &mut self.watch {
+                    watch.toggle(match id {
+                        "r" => status::Group::Resolved,
+                        _ => status::Group::Done,
+                    });
+                }
+            }
             // The pane's switch hint, or the footer's for a pane folded
             // away: the keys, and in a window with room for one, the view,
             // over to the other.
@@ -12221,7 +12245,7 @@ impl App {
                 pane.set_card(lines, &view.keys());
                 pane.foot = None;
             } else {
-                let (mut lines, any_resolved, marks) = watch_card(watch, width, &self.bot);
+                let (mut lines, fold_keys, marks) = watch_card(watch, width, &self.bot);
                 let mut picked = None;
                 // The agent picked from the keys is drawn as the picker
                 // draws its pick, reversed.
@@ -12231,11 +12255,8 @@ impl App {
                     list::pick(line);
                     picked = Some(row);
                 }
-                let keys = match any_resolved && watch.resolved {
-                    true => "↑↓ pick · enter open · r hide resolved · esc close",
-                    false => PICK_KEYS,
-                };
-                pane.set_card_marked(lines, marks, keys);
+                let keys = status_keys(watch, &fold_keys);
+                pane.set_card_marked(lines, marks, &keys);
                 // Scrolled to once, as a new pick, so the page keys still
                 // move away from it; after the card, whose swap would
                 // drop the request.
@@ -13227,14 +13248,19 @@ fn card_bots(watch: &Watch, width: usize, me: &str) -> Vec<String> {
 }
 
 /// `/status`'s card at `width`, each line after a space, its times
-/// running turns counted on from when its rows were read; whether any task in it
-/// is resolved; and the line each agent but `me` starts on, which a click
-/// opens in the pane.
+/// running turns counted on from when its rows were read; the keys of the
+/// groups in it that fold; and the line each agent but `me` starts on,
+/// which a click opens in the pane, then each folding group's heading,
+/// which a click opens or folds.
 fn watch_card(
     watch: &Watch,
     width: usize,
     me: &str,
-) -> (Vec<Line<'static>>, bool, Vec<(usize, screen::Mark)>) {
+) -> (
+    Vec<Line<'static>>,
+    Vec<&'static str>,
+    Vec<(usize, screen::Mark)>,
+) {
     let since = watch.read.elapsed().as_secs();
     let rows: Vec<status::Row> = watch
         .rows
@@ -13247,8 +13273,11 @@ fn watch_card(
             row
         })
         .collect();
-    let any_resolved = rows.iter().any(|row| row.group == status::Group::Resolved);
-    let (mut card, named) = status::card(&watch.project, &rows, width, watch.resolved);
+    let status::Card {
+        lines: mut card,
+        named,
+        folds,
+    } = status::card(&watch.project, &rows, width, &watch.open);
     // The lookout's line goes under the heading, what is wrong under it,
     // and the agents' under that.
     let mut above: Vec<Line<'static>> = Vec::new();
@@ -13260,8 +13289,11 @@ fn watch_card(
     }
     let added = above.len();
     card.splice(1..1, above);
-    let marks = (named.into_iter())
-        .map(|(at, bot)| (at + if at >= 1 { added } else { 0 }, bot))
+    let below = |at: usize| at + if at >= 1 { added } else { 0 };
+    // The agents first, in their order, which the keys pick by; then the
+    // headings that open and fold their groups.
+    let mut marks: Vec<(usize, screen::Mark)> = (named.into_iter())
+        .map(|(at, bot)| (below(at), bot))
         .filter(|(_, bot)| bot != me)
         .map(|(at, bot)| {
             (
@@ -13270,6 +13302,11 @@ fn watch_card(
             )
         })
         .collect();
+    let fold_keys: Vec<&str> = folds.iter().map(|(_, group)| group_key(*group)).collect();
+    marks.extend(folds.into_iter().map(|(at, group)| {
+        let link = format!("{}group/{}", screen::BUTTON, group_key(group));
+        (below(at), screen::Mark::Link(link))
+    }));
     let lines = card
         .into_iter()
         .map(|line| {
@@ -13278,7 +13315,39 @@ fn watch_card(
             Line::from(spans).style(line.style)
         })
         .collect();
-    (lines, any_resolved, marks)
+    (lines, fold_keys, marks)
+}
+
+/// The key that opens or folds `group` in `/status`, and its name in a
+/// button: `d` done, `r` resolved.
+fn group_key(group: status::Group) -> &'static str {
+    match group {
+        status::Group::Resolved => "r",
+        _ => "d",
+    }
+}
+
+/// The keys `/status`'s title row names: the picks, then the key of
+/// each group that folds there (`keys`), as it would change it.
+fn status_keys(watch: &Watch, keys: &[&str]) -> String {
+    let mut said = String::from("↑↓ pick · enter open");
+    for key in keys {
+        let group = match *key {
+            "r" => status::Group::Resolved,
+            _ => status::Group::Done,
+        };
+        let verb = match watch.open.contains(&group) {
+            true => "fold",
+            false => "show",
+        };
+        let name = match group {
+            status::Group::Resolved => "resolved",
+            _ => "done",
+        };
+        said.push_str(&format!(" · {key} {verb} {name}"));
+    }
+    said.push_str(" · esc close");
+    said
 }
 
 /// Codex's sweep: a brighter band moving across the phase every two seconds.
@@ -18706,7 +18775,7 @@ mod tests {
             read: Instant::now(),
             lookout: "Lookout · on".into(),
             alerts: Vec::new(),
-            resolved: false,
+            open: Vec::new(),
             background: None,
             usage: None,
             commons: None,
@@ -19185,7 +19254,7 @@ mod tests {
             read: Instant::now(),
             lookout: String::new(),
             alerts: Vec::new(),
-            resolved: false,
+            open: Vec::new(),
             background: None,
             usage: None,
             commons: None,
