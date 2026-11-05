@@ -6976,3 +6976,59 @@ on one 4-CPU box:
 | SQLite 3.54.1, QPSG | 275–378 | 466–649 |
 
 No other request moved.
+
+## One owner for the live turns, and a slot count that is one read (#692)
+
+A turn's task gives up its slot before it submits its finish, so a client
+that saw `turn_finished` can start the next turn at once, as it may already
+delete the bot. The first cut counted slots by walking every live turn on
+each capacity check, and the run loop checks capacity in three `select!`
+guards per pass plus once per submit. `Actives` now owns the per-bot map,
+every change to it goes through `start`, `remove` or `drain`, and it keeps
+the count beside the map: one atomic add when a turn starts, one swap and
+subtract when it gives its slot back, and one load per check, where `main`
+read `HashMap::len`.
+
+`bench.admission_burst`, run through its own `run()` to pass the bench's
+64-bot cap, alternating `main` (before this change), the walking first cut
+(5b170d2) and the head on one 4-CPU Linux box. Each run creates and holds
+twice the bots in live turns: 64 at 32 bots, 2,000 at 1,000. Medians;
+five rounds at 32 bots, thirteen at 1,000 for `main` and the head, five
+for the walk:
+
+| Bots (live turns) | Measure | `main` | Walk | Head |
+| --- | --- | ---: | ---: | ---: |
+| 32 (64) | Lone submit CPU, ms | 27.9 | 30.6 | 31.4 |
+| 32 (64) | Burst submit CPU, ms | 11.2 | 11.0 | 11.4 |
+| 32 (64) | Burst submit p99, ms | 4.64 | 4.58 | 4.46 |
+| 32 (64) | RSS, MiB | 25.9 | 25.9 | 25.8 |
+| 1,000 (2,000) | Lone submit CPU, ms | 854 | 848 | 880 |
+| 1,000 (2,000) | Burst submit CPU, ms | 480 | 470 | 483 |
+| 1,000 (2,000) | Burst submit p99, ms | 361 | 351 | 371 |
+| 1,000 (2,000) | Burst create p99, ms | 250 | 264 | 256 |
+| 1,000 (2,000) | RSS, MiB | 122.2 | 122.1 | 122.2 |
+
+Every head row sits inside `main`'s range: lone submit CPU at 1,000 bots
+ran 753–933 ms on `main` and 835–959 on the head, burst submit CPU 454–499
+and 459–537. The walk did not show at 2,000 live turns either; a pass over
+2,000 entries is microseconds against a submit's store work. The count
+removes it anyway, so nothing on the hot path grows with the fleet.
+
+The Perf workflow's matched screen, base `main` against this branch at
+d85dfd9 (the count, merged with `main`), on a GitHub runner:
+
+| Measure | Base | Head | Change |
+| --- | ---: | ---: | ---: |
+| Lone submit CPU, ms | 40.126 | 41.122 | +2.5% |
+| Burst submit p99, ms | 6.306 | 6.354 | +0.8% |
+| Release to terminal p99, ms | 13.782 | 13.985 | +1.5% |
+| Idle RSS, MiB | 20.795 | 20.795 | +0.0% |
+| Per idle bot, KiB | 1.584 | 1.51 | -4.7% |
+| RSS after a turn each, MiB | 30.613 | 29.885 | -2.4% |
+| Daemon CPU per turn, ms | 1.276 | 1.293 | +1.3% |
+| Lifecycle CPU, s | 1.16 | 1.195 | +3.0% |
+| Lifecycle p95 turn, ms | 579.333 | 581.458 | +0.4% |
+| Lifecycle peak RSS, MiB | 27.678 | 27.338 | -1.2% |
+
+Nothing moved past noise, and the gate counted no more store work per
+turn. Sonny's rows moved within their noise.
