@@ -39,6 +39,11 @@ each setting is; what to set is the person's call.
   `description` for the list. Codex's own stricter workspace is
   `network = false` and `git = "read-only"`. `/permissions` lists it the
   next time it opens; `sonny.default_permissions` names it for new leads.
+- `[context_windows]` in the config: a model's context window in
+  tokens, which sets when its agents compact, by `PROVIDER/MODEL` with `*`
+  wildcards (`"bedrock/*openai.*" = 1000000`), over what its provider
+  lists; the most specific pattern wins, and it may be lower on purpose.
+  Read when the daemon starts.
 - Command rules are not in the config: `~/.agent/rules/*.rules` holds
   Codex-style `prefix_rule(pattern = ["mcpx"], decision = "allow")` lines
   (`allow` runs outside the sandbox without asking, `prompt` always asks,

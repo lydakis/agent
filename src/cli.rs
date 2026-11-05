@@ -228,7 +228,7 @@ const COMMANDS: &[Command] = &[
         name: "serve",
         about: "Run the daemon in the foreground; other commands start it for you",
         usage: "serve --store PATH --provider SPEC... [OPTIONS]",
-        flags: "--shell-exclude --redact-field --redact-block --protect --protect-existing --protect-path --wall",
+        flags: "--shell-exclude --redact-field --redact-block --protect --protect-existing --protect-path --wall --context-window",
         settings: "",
         startup: true,
     },
@@ -427,6 +427,10 @@ fn print_flags(flags: &str) {
             "--protect-path" => (
                 "PATH",
                 "Keep PATH, by its absolute path, read-only in every sandbox, and from being made when missing; repeatable",
+            ),
+            "--context-window" => (
+                "PATTERN=TOKENS",
+                "The context window of each model whose PROVIDER/MODEL path matches PATTERN (* and ? wildcards), over its provider's listing; the most specific pattern wins; repeatable; clients pass [context_windows] from ~/.agent/config.toml",
             ),
             "--wall" => (
                 "FOLDER",
@@ -687,6 +691,7 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
                     | "--protect-existing"
                     | "--protect-path"
                     | "--wall"
+                    | "--context-window"
             )
         {
             return fail_with("usage", format!("{flag} may only be specified once"));
