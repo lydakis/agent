@@ -1005,6 +1005,14 @@ impl Server {
         self.nudge.notify_one();
     }
 
+    /// The connection that reads the events was lost: a pause while it is
+    /// down reaches no event, so what the calls run stops, and nothing
+    /// starts until the next connection's greeting says work goes on.
+    pub fn disconnected(&self) {
+        hold(&self.serving, true, UNSEEN);
+        self.nudge.notify_one();
+    }
+
     /// An event the host read: a call of Sonny's that started, or a
     /// stream live again, which may follow calls started while it was not.
     /// A turn that ended, as one the person interrupted, stops what its
@@ -1028,7 +1036,7 @@ impl Server {
             let before = calls.jobs.len();
             calls.jobs.retain(|key, job| {
                 if key.0 == turn
-                    && let Job::Running(job) = job
+                    && let Job::Running { job, .. } = job
                 {
                     job.abort();
                 }
@@ -1044,8 +1052,14 @@ impl Server {
 /// A call Sonny answers: running, or answered with the result the daemon
 /// has not taken yet. A call answered is never run again: its result is
 /// handed in again until the daemon takes it or says the call wants none.
+/// One stopped before it ended is answered with why, so a turn parked on
+/// it is told rather than its call run again.
 enum Job {
-    Running(tokio::task::AbortHandle),
+    /// The call's `bot`, `turn` and `call_id` in `asked`, to answer it.
+    Running {
+        job: tokio::task::AbortHandle,
+        asked: Value,
+    },
     Answered(Value),
 }
 
@@ -1063,21 +1077,44 @@ struct Calls {
 
 type Serving = Arc<Mutex<Calls>>;
 
+/// Why a call stopped before it ended, as its answer says.
+const PAUSED: (&str, &str) = (
+    "daemon_paused",
+    "work was paused while the call ran, so Sonny stopped it; what it did before then stands",
+);
+const UNSEEN: (&str, &str) = (
+    "events_lost",
+    "Sonny lost the daemon's events while the call ran, so it could not see a pause, and \
+     stopped it; what it did before then stands",
+);
+
 /// Hold or let go of the calls: a pause stops what each still runs, so a
 /// script makes no call after it (one already made may have had effects,
 /// which the daemon tells its agent), and none starts while it holds.
 fn pause(serving: &Serving, paused: bool) {
+    hold(serving, paused, PAUSED);
+}
+
+/// Hold the calls, stopping what each runs and answering it with `why`,
+/// or let them go.
+fn hold(serving: &Serving, paused: bool, why: (&str, &str)) {
     let mut calls = serving.lock().unwrap();
     let pausing = paused && !calls.paused;
     calls.paused = paused;
     if paused {
-        calls.jobs.retain(|_, job| match job {
-            Job::Running(job) => {
-                job.abort();
-                false
-            }
-            Job::Answered(_) => true,
-        });
+        for job in calls.jobs.values_mut() {
+            let Job::Running {
+                job: running,
+                asked,
+            } = job
+            else {
+                continue;
+            };
+            running.abort();
+            let mut asked = asked.clone();
+            asked["error"] = json!({"code": why.0, "detail": why.1});
+            *job = Job::Answered(asked);
+        }
     }
     // A pause halts every waiting call, also one not started yet that a
     // listing read before it names.
@@ -1186,6 +1223,7 @@ where
         let (client, serving, held) = (client.clone(), serving.clone(), key.clone());
         let nudge = nudge.clone();
         let ran = run(call.clone());
+        let base = json!({"bot": call["bot"], "turn": call["turn"], "call_id": call["call_id"]});
         let job = tokio::spawn(async move {
             let answer = ran.await;
             let mut asked = json!({"bot": call["bot"], "turn": call["turn"],
@@ -1198,10 +1236,10 @@ where
             }
             // Kept before it is handed in: a call that ran never runs again
             // because recording its result failed. One whose turn ended
-            // meanwhile is let go.
+            // meanwhile is let go, and one stopped keeps the answer saying so.
             {
                 let mut calls = serving.lock().unwrap();
-                if !calls.jobs.contains_key(&key) {
+                if !matches!(calls.jobs.get(&key), Some(Job::Running { .. })) {
                     return;
                 }
                 calls.jobs.insert(key.clone(), Job::Answered(asked));
@@ -1210,7 +1248,8 @@ where
                 nudge.notify_one();
             }
         });
-        calls.jobs.insert(held, Job::Running(job.abort_handle()));
+        let job = job.abort_handle();
+        calls.jobs.insert(held, Job::Running { job, asked: base });
     }
     let calls = serving.lock().unwrap();
     Ok((calls.jobs.values()).any(|job| matches!(job, Job::Answered(_))))
@@ -1857,12 +1896,125 @@ mod tests {
         // The pause stops it; the listing read across the pause starts
         // nothing, and the host looks again soon.
         sweep(&client, &serving, &nudge, run).await.unwrap();
-        assert!(serving.lock().unwrap().jobs.is_empty());
+        assert!(matches!(
+            serving.lock().unwrap().jobs.values().next(),
+            None | Some(Job::Answered(_))
+        ));
         tokio::time::timeout(Duration::from_secs(1), nudge.notified())
             .await
             .expect("woken to look again");
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(ran.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_call_a_pause_stops_is_answered_so_it_does_not_run_again_after() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        // A turn parked on the call: the daemon lists it until it is
+        // answered, and a pause does not answer it.
+        let answered = Arc::new(Mutex::new(None::<Value>));
+        let took = answered.clone();
+        let client = crate::tests::daemon_answering(move |asked| match asked["op"].as_str() {
+            Some("tool_calls") if took.lock().unwrap().is_none() => json!({
+                "calls": [{"bot": "b", "turn": 1, "call_id": "c1", "name": EXEC}],
+                "next_after": null}),
+            Some("tool_calls") => json!({"calls": [], "next_after": null}),
+            Some("tool_result") => {
+                *took.lock().unwrap() = Some(asked.clone());
+                json!({})
+            }
+            _ => json!({}),
+        })
+        .await;
+        let server = Server {
+            nudge: Arc::new(Notify::new()),
+            serving: Default::default(),
+        };
+        let (ran, runs) = (Arc::new(AtomicUsize::new(0)), Arc::new(Notify::new()));
+        let (count, started) = (ran.clone(), runs.clone());
+        let run = move |_call: Value| {
+            let (count, started) = (count.clone(), started.clone());
+            async move {
+                count.fetch_add(1, Ordering::SeqCst);
+                started.notify_one();
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                Ok(json!("written"))
+            }
+        };
+        sweep(&client, &server.serving, &server.nudge, run.clone())
+            .await
+            .unwrap();
+        runs.notified().await;
+        server.event(&json!({"event": "paused", "pause": {"reason": "stop"}}));
+        server.event(&json!({"event": "resumed", "pause": {"reason": "stop"}}));
+        // The sweep after the resume hands in why it stopped, and does not
+        // run it again.
+        sweep(&client, &server.serving, &server.nudge, run.clone())
+            .await
+            .unwrap();
+        sweep(&client, &server.serving, &server.nudge, run)
+            .await
+            .unwrap();
+        assert_eq!(ran.load(Ordering::SeqCst), 1);
+        let answer = answered.lock().unwrap().clone().expect("answered");
+        assert_eq!(answer["error"]["code"], "daemon_paused");
+        assert_eq!(answer["call_id"], "c1");
+        assert!(server.serving.lock().unwrap().jobs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn losing_the_events_stops_what_calls_run_until_a_greeting_says_go_on() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let answered = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let took = answered.clone();
+        let client = crate::tests::daemon_answering(move |asked| match asked["op"].as_str() {
+            Some("tool_calls") => json!({
+                "calls": [{"bot": "b", "turn": 1, "call_id": "c1", "name": EXEC}],
+                "next_after": null}),
+            Some("tool_result") => {
+                took.lock().unwrap().push(asked.clone());
+                json!({})
+            }
+            _ => json!({}),
+        })
+        .await;
+        let server = Server {
+            nudge: Arc::new(Notify::new()),
+            serving: Default::default(),
+        };
+        let (written, wrote) = (Arc::new(AtomicUsize::new(0)), Arc::new(Notify::new()));
+        let (writes, reading) = (written.clone(), wrote.clone());
+        let run = move |_call: Value| {
+            let (writes, reading) = (writes.clone(), reading.clone());
+            async move {
+                reading.notify_one();
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                writes.fetch_add(1, Ordering::SeqCst);
+                Ok(json!("written"))
+            }
+        };
+        sweep(&client, &server.serving, &server.nudge, run.clone())
+            .await
+            .unwrap();
+        wrote.notified().await;
+        // The events' connection drops: a pause then would reach no event.
+        server.disconnected();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(written.load(Ordering::SeqCst), 0);
+        sweep(&client, &server.serving, &server.nudge, run.clone())
+            .await
+            .unwrap();
+        // Why it stopped is handed in, and nothing starts while it holds.
+        let said = answered.lock().unwrap().clone();
+        assert_eq!(said.len(), 1);
+        assert_eq!(said[0]["error"]["code"], "events_lost");
+        assert!(server.serving.lock().unwrap().jobs.is_empty());
+        // The next connection's greeting says work goes on.
+        server.connected(&client);
+        sweep(&client, &server.serving, &server.nudge, run)
+            .await
+            .unwrap();
+        assert_eq!(server.serving.lock().unwrap().jobs.len(), 1);
     }
 
     #[tokio::test]
