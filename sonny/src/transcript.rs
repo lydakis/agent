@@ -3028,13 +3028,13 @@ mod tests {
 
     #[test]
     fn an_answer_shows_itself_under_the_question_it_answers() {
-        let shown: Vec<String> = prompt("You asked: Ship it?\n\nNot yet", None, 80)
+        let shown: Vec<String> = prompt("You asked (c1): Ship it?\n\nNot yet", None, 80)
             .iter()
             .map(|row| row.to_string())
             .collect();
         // On the answer's band, over it, as the composer showed it.
         assert_eq!(shown, ["", "  answering “Ship it?”", "› Not yet", ""]);
-        let rows = prompt("You asked: Ship **it**?\n\nNot yet", None, 80);
+        let rows = prompt("You asked (c1): Ship **it**?\n\nNot yet", None, 80);
         assert_eq!(rows[1].to_string(), "  answering “Ship it?”");
         assert!(rows.iter().all(|row| row.style.bg.is_some()));
     }
