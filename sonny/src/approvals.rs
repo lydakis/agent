@@ -349,7 +349,8 @@ pub fn gate(name: &str, tools: &[String]) -> Map<String, Value> {
         // Nothing left to gate, such as a bot that only reads: a gate
         // needs a tool, so the bot is ungated.
         _ if approve.is_empty() => json!({"approve": []}),
-        // No expiry: a call the reviewer doubts waits for the person here.
+        // No expiry: a call the reviewer doubts, or could not review,
+        // waits for the person here.
         Reviewer::Model => json!({"approve": approve, "approver": "auto"}),
         Reviewer::You => json!({"approve": approve, "approver": "manual"}),
         // No one: a call that leaves the sandbox is refused, and the agent

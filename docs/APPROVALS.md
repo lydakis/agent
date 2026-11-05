@@ -489,12 +489,20 @@ this replaced:
   until now a judged-risky call waited for the person under Sonny's
   gate, which never lapses. The person's go-ahead in a message still
   authorizes the retry, as before and as in Codex.
-- **A review that fails is closed and labeled.** A round is sent up to 3
-  times within a 90 s budget (Codex's attempts and timeout), then denied
+- **A review that fails goes to the person, and is labeled.** A round is
+  sent up to 3 times within a 90 s budget (Codex's attempts and timeout).
+  Still unassessed, it is no verdict, so since 2026-11-04 (#669) its
+  calls wait for the person as a doubted call does ("Automatic approval
+  review failed: WHY, so this waits for you"), the call kept as it is so
+  the agent doesn't make it again. Codex denies here; the trade-off is a
+  turn that waits on the person against ordinary work (ending a hung
+  window, removing an automation mid-incident) refused for the judge's
+  own fault. Where the gate lapses and nobody can be asked, it is denied
   as "Automatic approval review failed: WHY", saying it is a review
   failure, not a judgment that the call is unsafe; one that ran out of
   time says the model may retry once. Both answer with `unreviewed`, so
-  they count toward no breaker. A call too long to show the judge is
+  they count toward no breaker. A judge reply that could not be read is
+  logged, its first 2 KB redacted, with the failure. A call too long to show the judge is
   still handed to the person, where one can answer, as Codex asks the
   person when a review's input is over its budget. The CLI's `auto` gate
   lapses at 105 s to fit the longer budget.
