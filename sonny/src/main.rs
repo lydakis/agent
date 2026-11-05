@@ -425,6 +425,8 @@ const SPREAD_AGAIN: Duration = Duration::from_secs(2);
 
 /// A `/permissions` pick on its way to the agents the lead made.
 struct Spread {
+    /// Which pick this is: each is its own, a row picked again too.
+    pick: u64,
     mode: &'static str,
     /// When to look again for those still on their old permissions.
     at: Instant,
@@ -435,8 +437,6 @@ struct Spread {
     /// Those busy when asked, by name: each takes the row once its turn
     /// ends, and the footer counts them until then.
     waiting: Vec<String>,
-    /// Whether a pass has listed the agents at all.
-    listed: bool,
     /// Each folder's sandbox, looked for once for this pick.
     sandboxes: approvals::Sandboxes,
 }
@@ -445,13 +445,14 @@ impl Spread {
     /// The pick of `mode`, after `earlier`, a pass still at work for an
     /// earlier pick, so the two never configure the same agent at once.
     fn new(mode: &'static str, earlier: Option<tokio::task::JoinHandle<Passed>>) -> Self {
+        static PICKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         Self {
+            pick: PICKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             mode,
             at: Instant::now(),
             pass: earlier,
             settled: Default::default(),
             waiting: Vec::new(),
-            listed: false,
             sandboxes: Default::default(),
         }
     }
@@ -459,9 +460,10 @@ impl Spread {
 
 /// What one pass of a [`Spread`] did.
 struct Passed {
-    mode: &'static str,
-    /// Whether it listed the agents; one that could not tries again.
-    listed: bool,
+    pick: u64,
+    /// Whether it listed the agents with the lead's own change made; one
+    /// that could not list them, or listed them before, tries again.
+    after_lead: bool,
     settled: Vec<i64>,
     waiting: Vec<String>,
     notice: Option<String>,
@@ -475,14 +477,15 @@ struct Passed {
 async fn spread_pass(
     client: Arc<Client>,
     lead: String,
-    mode: &'static str,
+    (pick, mode): (u64, &'static str),
+    lead_set: bool,
     settled: std::collections::HashSet<i64>,
     mut sandboxes: approvals::Sandboxes,
     woken: Arc<tokio::sync::Notify>,
 ) -> Passed {
     let mut passed = Passed {
-        mode,
-        listed: false,
+        pick,
+        after_lead: false,
         settled: Vec::new(),
         waiting: Vec::new(),
         notice: None,
@@ -511,7 +514,7 @@ async fn spread_pass(
             .collect(),
         false => Vec::new(),
     };
-    passed.listed = listed;
+    passed.after_lead = listed && lead_set;
     for bot in made {
         let name = bot["name"].as_str().unwrap_or_default().to_owned();
         let id = bot["bot_id"].as_i64();
@@ -4726,14 +4729,16 @@ impl App {
         };
         if spread.pass.as_ref().is_some_and(|pass| pass.is_finished()) {
             let pass = spread.pass.take().expect("a pass");
-            // A pass made for an earlier pick tells nothing of this one.
+            // A pass made for an earlier pick, even of the same row, whose
+            // config may have changed since, tells nothing of this one.
+            let mut after_lead = false;
             if let Ok(passed) = pass.await
-                && passed.mode == spread.mode
+                && passed.pick == spread.pick
             {
+                after_lead = passed.after_lead;
                 spread.sandboxes = passed.sandboxes;
                 spread.settled.extend(passed.settled);
                 spread.waiting = passed.waiting;
-                spread.listed |= passed.listed;
                 if let Some(notice) = passed.notice {
                     self.notice = Some(notice);
                 }
@@ -4741,8 +4746,9 @@ impl App {
             spread.at = Instant::now() + SPREAD_AGAIN;
             // The lead's own change still waiting: an agent it makes
             // meanwhile takes its old gate, so this goes on until both
-            // are set.
-            if spread.listed && spread.waiting.is_empty() && self.gating.is_none() {
+            // are set, and ends only on a pass that listed the agents
+            // after the lead had its change.
+            if after_lead && spread.waiting.is_empty() && self.gating.is_none() {
                 self.spread = None;
             }
             return;
@@ -4753,7 +4759,8 @@ impl App {
         spread.pass = Some(tokio::spawn(spread_pass(
             self.client.clone(),
             self.bot.clone(),
-            spread.mode,
+            (spread.pick, spread.mode),
+            self.gating.is_none(),
             spread.settled.clone(),
             std::mem::take(&mut spread.sandboxes),
             self.woken.clone(),
@@ -18608,7 +18615,15 @@ mod tests {
         app.spread = Some(Spread::new("auto", None));
         // The pass starts and the window goes on; it reports when done.
         app.spread().await;
-        while !app.spread.as_ref().unwrap().pass.as_ref().unwrap().is_finished() {
+        while !app
+            .spread
+            .as_ref()
+            .unwrap()
+            .pass
+            .as_ref()
+            .unwrap()
+            .is_finished()
+        {
             tokio::task::yield_now().await;
         }
         app.spread().await;
@@ -18621,13 +18636,65 @@ mod tests {
         // The next pass asks the busy one only.
         app.spread.as_mut().unwrap().at = Instant::now();
         app.spread().await;
-        while !app.spread.as_ref().unwrap().pass.as_ref().unwrap().is_finished() {
+        while !app
+            .spread
+            .as_ref()
+            .unwrap()
+            .pass
+            .as_ref()
+            .unwrap()
+            .is_finished()
+        {
             tokio::task::yield_now().await;
         }
         app.spread().await;
         assert!(app.spread.is_none());
         assert_eq!(inspected.load(Ordering::SeqCst), 3);
         assert_eq!(configured.load(Ordering::SeqCst), 3);
+        // A pass that listed the agents before the lead had its own
+        // change does not end the pick: the lead may have made one since.
+        app.gating = Some("auto");
+        app.spread = Some(Spread::new("auto", None));
+        finish(&mut app).await;
+        app.gating = None;
+        app.spread().await;
+        assert!(app.spread.is_some());
+        // The same row picked again, its config perhaps changed, takes
+        // nothing from the earlier pick's pass.
+        app.spread.as_mut().unwrap().at = Instant::now();
+        app.spread().await;
+        let earlier = app.spread.take().and_then(|spread| spread.pass);
+        app.spread = Some(Spread::new("auto", earlier));
+        while !app
+            .spread
+            .as_ref()
+            .unwrap()
+            .pass
+            .as_ref()
+            .unwrap()
+            .is_finished()
+        {
+            tokio::task::yield_now().await;
+        }
+        app.spread().await;
+        let spread = app.spread.as_ref().unwrap();
+        assert!(spread.settled.is_empty());
+        assert!(spread.pass.is_none());
+        finish(&mut app).await;
+        app.spread().await;
+        assert!(app.spread.is_none());
+    }
+
+    /// Start a spread's next pass and wait for it to end.
+    async fn finish(app: &mut App) {
+        app.spread.as_mut().unwrap().at = Instant::now();
+        app.spread().await;
+        while !(app.spread.as_ref())
+            .and_then(|spread| spread.pass.as_ref())
+            .is_none_or(|pass| pass.is_finished())
+        {
+            tokio::task::yield_now().await;
+        }
     }
 
     #[tokio::test]
