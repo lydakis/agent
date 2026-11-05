@@ -1861,6 +1861,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_pause_stops_a_script_s_tool_calls_even_one_answered_right_after_it() {
+        use agent_client::config::McpServer;
+        let dir = std::env::temp_dir().join(format!("sonny-pause-exec-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (log, gate) = (dir.join("calls"), dir.join("go"));
+        let reached = || std::fs::read_to_string(&log).unwrap_or_default();
+        // A server that notes each call as it arrives; its slow read
+        // answers once the test lets it.
+        let server = McpServer {
+            command: Some("python3".into()),
+            args: vec![concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/mcp_server.py").into()],
+            env: [("MCP_CALLS".to_owned(), log.display().to_string())].into(),
+            enabled: true,
+            ..McpServer::default()
+        };
+        let hub = crate::mcp::Hub::new(Some(dir.join("mcp")));
+        hub.configure(&[("test".to_owned(), server)].into()).await;
+        // A script that reads slowly, then keeps a note and writes, each
+        // tried whatever the one before said.
+        let input = format!(
+            "await tools.mcp__test__slow({{until: {}}});\n\
+             try {{ store('note', 1); }} catch (e) {{}}\n\
+             await tools.mcp__test__echo({{text: 'written'}});\ntext('done');",
+            serde_json::to_string(&gate.display().to_string()).unwrap()
+        );
+        let client = crate::tests::daemon_answering(|asked| match asked["op"].as_str() {
+            Some("tool_calls") => json!({
+                "calls": [{"bot": "b", "turn": 1, "call_id": "c1", "name": EXEC}],
+                "next_after": null}),
+            _ => json!({}),
+        })
+        .await;
+        let server = Server {
+            nudge: Arc::new(Notify::new()),
+            serving: Default::default(),
+        };
+        let run = {
+            let (hub, dir, input) = (hub.clone(), dir.clone(), input.clone());
+            move |_call: Value| {
+                let (hub, dir, input) = (hub.clone(), dir.clone(), input.clone());
+                async move {
+                    crate::exec::run(&hub, Some(&dir), "b", &input, Duration::from_secs(30), None)
+                        .await
+                        .map_err(|e| ("exec_refused", e))
+                }
+            }
+        };
+        sweep(&client, &server.serving, &server.nudge, run.clone())
+            .await
+            .unwrap();
+        // The read reaches the server, and the script waits on it.
+        let started = std::time::Instant::now();
+        while reached() != "slow\n" {
+            assert!(started.elapsed() < Duration::from_secs(20), "{}", reached());
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // Paused during the read, which answers the moment after.
+        server.event(&json!({"event": "paused", "pause": {"reason": "stop"}}));
+        std::fs::write(&gate, "").unwrap();
+        // Long enough for the read's answer to come back and a script that
+        // went on to write.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert_eq!(reached(), "slow\n");
+        assert!(!dir.join("store").join("b.json").exists());
+        {
+            let calls = server.serving.lock().unwrap();
+            let key = (1, "c1".to_owned());
+            let Some(Job::Answered(answered)) = calls.jobs.get(&key) else {
+                panic!("the call is answered");
+            };
+            assert_eq!(answered["error"]["code"], PAUSED.0);
+        }
+        // While the pause holds, the call listed again starts nothing.
+        sweep(&client, &server.serving, &server.nudge, run)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(reached(), "slow\n");
+        hub.stop().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn a_call_stopped_while_the_calls_were_listed_does_not_start_again() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let serving: Serving = Default::default();
