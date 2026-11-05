@@ -1,5 +1,5 @@
-//! One database worker for all agents, plus one reader for bulk context
-//! reads. Durable writes never block the I/O runtime, and jobs that queue
+//! One database worker for all agents, plus readers for bulk context
+//! reads, opened as reads wait for them. Durable writes never block the I/O runtime, and jobs that queue
 //! together commit together: one sync per group, not per job. Retention jobs
 //! for the same bot cross a publication boundary before they can prune each other.
 use crate::{Error, Result};
@@ -58,12 +58,169 @@ fn owner_only(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Reads queued for the reader connections, at least twice their number.
+/// Reads queued for the reader connections, at least twice their most.
 const READ_JOBS: usize = 32;
 
-/// Reader connections by default: one per logical CPU.
+/// Most reader connections by default: one per logical CPU.
 pub fn default_readers() -> usize {
     std::thread::available_parallelism().map_or(4, |n| n.get())
+}
+/// How long a reader past the first waits for a read before it closes: a
+/// pool's idle timeout (HikariCP's and Go's `database/sql` keep a floor of
+/// connections and close the rest once idle), short enough that a burst's
+/// readers are gone soon after it, long enough that a steady trickle of
+/// overlapping reads keeps its readers.
+const READER_IDLE: std::time::Duration = std::time::Duration::from_secs(30);
+/// SQLite page cache for every open reader together, in KiB: what one
+/// reader had alone. Each takes an equal share, so a wide pool holds no
+/// more than a narrow one. A write clears a WAL reader's cache anyway, so
+/// under load each reader's share outlives little more than one read.
+const READER_CACHE_KIB: usize = 2048;
+
+/// The reader connections, on threads of their own: the first opens with
+/// the store and stays; another opens when a read is queued with no reader
+/// waiting for it, up to `most`, and closes after `idle` without a read.
+struct Pool {
+    path: std::path::PathBuf,
+    most: usize,
+    idle: std::time::Duration,
+    state: std::sync::Mutex<Readers>,
+    wake: std::sync::Condvar,
+    /// Room for queued reads; a read holds its place until a reader takes it.
+    room: std::sync::Arc<tokio::sync::Semaphore>,
+}
+struct Readers {
+    jobs: std::collections::VecDeque<(ReadJob, tokio::sync::OwnedSemaphorePermit)>,
+    /// Readers open, and of them those waiting for a read.
+    open: usize,
+    waiting: usize,
+    /// Changes whenever `open` does, so each reader resizes its cache share.
+    generation: u64,
+    closed: bool,
+}
+impl Pool {
+    fn state(&self) -> std::sync::MutexGuard<'_, Readers> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+    /// Queue a read; open a reader for it if none is waiting for it.
+    fn push(self: &std::sync::Arc<Self>, job: ReadJob, place: tokio::sync::OwnedSemaphorePermit) {
+        let mut state = self.state();
+        state.jobs.push_back((job, place));
+        let unclaimed = state.jobs.len() > state.waiting;
+        if unclaimed && state.open < self.most {
+            state.open += 1;
+            state.generation += 1;
+            drop(state);
+            let pool = self.clone();
+            let spawned = std::thread::Builder::new()
+                .name("agent-storage-reader".into())
+                .spawn(move || {
+                    match Connection::open(&pool.path)
+                        .map_err(Error::from)
+                        .and_then(Database::reader)
+                    {
+                        Ok(db) => pool.serve(db, false),
+                        // The read stays queued for the readers already open.
+                        Err(_) => pool.gone(),
+                    }
+                });
+            if spawned.is_err() {
+                self.gone();
+            }
+        } else {
+            drop(state);
+            self.wake.notify_one();
+        }
+    }
+    fn gone(&self) {
+        let mut state = self.state();
+        state.open -= 1;
+        state.generation += 1;
+    }
+    /// Run queued reads until the store closes, or, for a reader past the
+    /// first, until it has waited `idle` for one.
+    fn serve(&self, db: Database, first: bool) {
+        let mut sized = None;
+        loop {
+            let (job, share) = {
+                let mut state = self.state();
+                loop {
+                    if let Some((job, place)) = state.jobs.pop_front() {
+                        drop(place);
+                        let share = (sized != Some(state.generation))
+                            .then(|| (state.generation, READER_CACHE_KIB / state.open.max(1)));
+                        break (job, share);
+                    }
+                    if state.closed {
+                        if !first {
+                            state.open -= 1;
+                            state.generation += 1;
+                        }
+                        return;
+                    }
+                    state.waiting += 1;
+                    let timed_out;
+                    (state, timed_out) = if first {
+                        (
+                            self.wake.wait(state).unwrap_or_else(|e| e.into_inner()),
+                            false,
+                        )
+                    } else {
+                        let (state, waited) = self
+                            .wake
+                            .wait_timeout(state, self.idle)
+                            .unwrap_or_else(|e| e.into_inner());
+                        (state, waited.timed_out())
+                    };
+                    state.waiting -= 1;
+                    if timed_out && state.jobs.is_empty() {
+                        state.open -= 1;
+                        state.generation += 1;
+                        return;
+                    }
+                }
+            };
+            if let Some((generation, kib)) = share {
+                // A failed resize keeps the share it had; the read goes on.
+                if db.cache_kib(kib).is_ok() {
+                    sized = Some(generation);
+                }
+            }
+            job(&db);
+        }
+    }
+    fn close(&self) {
+        self.state().closed = true;
+        self.wake.notify_all();
+    }
+}
+/// The store's hold on its readers: when the last `Store` and `Reader` go,
+/// the readers finish what is queued and close.
+struct ReadQueue(std::sync::Arc<Pool>);
+#[cfg(test)]
+impl ReadQueue {
+    /// A queue no reader serves, for a store whose reads a test never runs.
+    fn unread() -> Self {
+        Self(std::sync::Arc::new(Pool {
+            path: std::path::PathBuf::new(),
+            most: 1,
+            idle: READER_IDLE,
+            state: std::sync::Mutex::new(Readers {
+                jobs: std::collections::VecDeque::new(),
+                open: 1,
+                waiting: 0,
+                generation: 0,
+                closed: false,
+            }),
+            wake: std::sync::Condvar::new(),
+            room: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+        }))
+    }
+}
+impl Drop for ReadQueue {
+    fn drop(&mut self) {
+        self.0.close();
+    }
 }
 /// Most jobs one commit carries: one full queue. Under load the worker runs
 /// everything already queued, up to this many, inside one transaction and
@@ -354,7 +511,7 @@ impl Slot<'_> {
 #[derive(Clone)]
 pub struct Store {
     sender: mpsc::Sender<Box<dyn Job>>,
-    reader: mpsc::Sender<ReadJob>,
+    reader: std::sync::Arc<ReadQueue>,
     path: std::sync::Arc<std::path::PathBuf>,
     counters: std::sync::Arc<Counters>,
 }
@@ -408,10 +565,17 @@ impl Store {
     pub async fn open(path: &Path) -> Result<(Self, mpsc::Receiver<Publication>)> {
         Self::open_with(path, default_readers()).await
     }
-    /// `open` with `readers` reader connections (at least one).
+    /// `open` with at most `readers` reader connections (at least one).
     pub async fn open_with(
         path: &Path,
         readers: usize,
+    ) -> Result<(Self, mpsc::Receiver<Publication>)> {
+        Self::open_pooled(path, readers, READER_IDLE).await
+    }
+    async fn open_pooled(
+        path: &Path,
+        readers: usize,
+        idle: std::time::Duration,
     ) -> Result<(Self, mpsc::Receiver<Publication>)> {
         let path = path.to_path_buf();
         let (sender, mut receiver) = mpsc::channel::<Box<dyn Job>>(GROUP_JOBS);
@@ -588,44 +752,45 @@ impl Store {
         // block each other or the writer. They open after the worker, so the
         // file, its WAL, and the current schema exist, and each sees a job's
         // writes once that job is answered. They share one queue, each taking
-        // the next job when it is free.
-        let readers = readers.max(1);
-        let (reader, reads) = mpsc::channel::<ReadJob>(READ_JOBS.max(2 * readers));
-        let reads = std::sync::Arc::new(std::sync::Mutex::new(reads));
-        let mut opening = Vec::with_capacity(readers);
-        for index in 0..readers {
-            let (ready, opened) = oneshot::channel();
-            let (reader_path, reads) = (store_path.clone(), reads.clone());
-            std::thread::Builder::new()
-                .name(format!("agent-storage-reader-{index}"))
-                .spawn(move || {
-                    let db = Connection::open(&reader_path)
-                        .map_err(Error::from)
-                        .and_then(Database::reader);
-                    match db {
-                        Ok(db) => {
-                            let _ = ready.send(Ok(()));
-                            // The lock is held only while waiting for a job,
-                            // never while running one.
-                            while let Some(job) = {
-                                let mut reads = reads.lock().unwrap_or_else(|e| e.into_inner());
-                                reads.blocking_recv()
-                            } {
-                                job(&db);
-                            }
-                        }
-                        Err(error) => {
-                            let _ = ready.send(Err(error));
-                        }
+        // the next job when it is free. The first opens here, so a store that
+        // cannot be read fails to open; the rest open as reads wait.
+        let most = readers.max(1);
+        let pool = std::sync::Arc::new(Pool {
+            path: store_path.clone(),
+            most,
+            idle,
+            state: std::sync::Mutex::new(Readers {
+                jobs: std::collections::VecDeque::new(),
+                open: 1,
+                waiting: 0,
+                generation: 0,
+                closed: false,
+            }),
+            wake: std::sync::Condvar::new(),
+            room: std::sync::Arc::new(tokio::sync::Semaphore::new(READ_JOBS.max(2 * most))),
+        });
+        let (ready, opened) = oneshot::channel();
+        let serving = pool.clone();
+        std::thread::Builder::new()
+            .name("agent-storage-reader".into())
+            .spawn(move || {
+                match Connection::open(&serving.path)
+                    .map_err(Error::from)
+                    .and_then(Database::reader)
+                {
+                    Ok(db) => {
+                        let _ = ready.send(Ok(()));
+                        serving.serve(db, true);
                     }
-                })?;
-            opening.push(opened);
-        }
-        for opened in opening {
-            opened
-                .await
-                .map_err(|_| Error::new("storage_worker_failed"))??;
-        }
+                    Err(error) => {
+                        let _ = ready.send(Err(error));
+                    }
+                }
+            })?;
+        opened
+            .await
+            .map_err(|_| Error::new("storage_worker_failed"))??;
+        let reader = std::sync::Arc::new(ReadQueue(pool));
         Ok((
             Self {
                 sender,
@@ -645,6 +810,9 @@ impl Store {
             std::fs::metadata(name).map(|m| m.len()).unwrap_or(0)
         };
         let mut stats = self.counters.snapshot();
+        let readers = self.reader.0.state();
+        stats["readers"] = serde_json::json!({"open": readers.open, "most": self.reader.0.most});
+        drop(readers);
         stats["bytes"] = size("").into();
         stats["wal_bytes"] = size("-wal").into();
         stats
@@ -740,7 +908,7 @@ impl Store {
 /// Reads on the reader connection; see `Store::reader`.
 #[derive(Clone)]
 pub struct Reader {
-    reader: mpsc::Sender<ReadJob>,
+    reader: std::sync::Arc<ReadQueue>,
     counters: std::sync::Arc<Counters>,
 }
 impl Reader {
@@ -755,8 +923,11 @@ impl Reader {
         let (sender, receiver) = oneshot::channel();
         let counters = self.counters.clone();
         let queued = std::time::Instant::now();
-        self.reader
-            .send(Box::new(move |db| {
+        let pool = &self.reader.0;
+        let place = (pool.room.clone().acquire_owned().await)
+            .map_err(|_| Error::new("storage_worker_failed"))?;
+        pool.push(
+            Box::new(move |db| {
                 let started = std::time::Instant::now();
                 let outcome = operation(db);
                 counters.record(
@@ -766,9 +937,9 @@ impl Reader {
                     outcome.as_ref().is_err_and(|e| e.code == "storage_error"),
                 );
                 let _ = sender.send(outcome);
-            }))
-            .await
-            .map_err(|_| Error::new("storage_worker_failed"))?;
+            }),
+            place,
+        );
         receiver
             .await
             .map_err(|_| Error::new("storage_worker_failed"))?
@@ -1354,6 +1525,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn readers_open_while_reads_wait_and_close_once_idle() {
+        let path = scratch_path("readers");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        let idle = std::time::Duration::from_millis(500);
+        let (store, _publications) = Store::open_pooled(&path, 4, idle).await.unwrap();
+        let open = |store: &Store| store.stats()["readers"]["open"].as_u64().unwrap();
+        // A quiet store holds one reader, with the whole cache budget.
+        assert_eq!(open(&store), 1);
+        let share = |store: &Store| {
+            let store = store.clone();
+            async move {
+                store
+                    .read("pragma", |db| Ok(db.pragma("cache_size")))
+                    .await
+                    .unwrap()
+            }
+        };
+        assert_eq!(share(&store).await, -(READER_CACHE_KIB as i64));
+        // Four reads that each hold a reader until all four run at once:
+        // the pool opens a reader for each, and they split the budget.
+        let together = |store: &Store| {
+            let gate = Arc::new(Barrier::new(4));
+            let reads: Vec<_> = (0..4)
+                .map(|_| {
+                    let (gate, store) = (gate.clone(), store.clone());
+                    tokio::spawn(async move {
+                        store
+                            .read("held", move |db| {
+                                gate.wait();
+                                Ok(db.pragma("cache_size"))
+                            })
+                            .await
+                            .unwrap()
+                    })
+                })
+                .collect();
+            async move {
+                let mut shares = Vec::new();
+                for read in reads {
+                    shares.push(read.await.unwrap());
+                }
+                shares
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(10), together(&store))
+            .await
+            .expect("each waiting read gets a reader");
+        assert_eq!(open(&store), 4);
+        let shares = tokio::time::timeout(std::time::Duration::from_secs(10), together(&store))
+            .await
+            .unwrap();
+        assert_eq!(shares, vec![-(READER_CACHE_KIB as i64) / 4; 4]);
+        // Idle past the timeout, the readers past the first close, and the
+        // first takes the whole budget back.
+        tokio::time::sleep(idle * 3).await;
+        assert_eq!(open(&store), 1);
+        assert_eq!(share(&store).await, -(READER_CACHE_KIB as i64));
+    }
+
+    #[tokio::test]
     async fn the_writer_keeps_savepoint_journals_in_memory() {
         // A job's savepoint journal past 64 KiB would otherwise go to a
         // temporary file, created for every admission and refused on a full disk.
@@ -1452,10 +1683,9 @@ mod tests {
     #[tokio::test]
     async fn a_slot_waits_for_room_before_its_job_owns_anything() {
         let (sender, mut queue) = mpsc::channel(1);
-        let (reader, _reads) = mpsc::channel(1);
         let store = Store {
             sender,
-            reader,
+            reader: Arc::new(ReadQueue::unread()),
             path: Arc::new(std::path::PathBuf::new()),
             counters: Arc::default(),
         };
@@ -1478,10 +1708,9 @@ mod tests {
     #[test]
     fn live_counter_snapshots_reconcile_totals_and_histograms() {
         let (sender, _receiver) = mpsc::channel(1);
-        let (reader, _reads) = mpsc::channel(1);
         let store = Store {
             sender,
-            reader,
+            reader: Arc::new(ReadQueue::unread()),
             path: Arc::new(std::path::PathBuf::new()),
             counters: Arc::default(),
         };
