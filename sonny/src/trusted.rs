@@ -5,7 +5,13 @@
 //! or the folder its copy goes in, is in a folder some agent of this store
 //! writes, else copied into `~/.agent/sonny/programs/NAME/`. The tool runs
 //! only that copy, with `~/.agent/run/sonny/` as its temporary folder,
-//! checked the same way: what a program leaves running there, as
+//! checked the same way. An agent writes a path as the daemon's sandbox
+//! decides: the deepest of its folders that holds the path, a folder a
+//! link names by where it leads, but not inside what the daemon keeps
+//! read-only in every folder that holds it, `~/.agent` and the walled
+//! `~/.agent/run` (as the agent CLI starts it), so a lead opened in HOME
+//! counts for neither. A copy linked to from elsewhere is copied again
+//! before it runs. Then: what a program leaves running there, as
 //! agent-desktop leaves the host its commands go through and agent-browser
 //! its sessions, was started by Sonny from the copy, is reached by no
 //! other caller, and, in the folder the daemon walls off, by no sandboxed
@@ -77,9 +83,10 @@ fn files(program: &str, origin: &Path) -> Vec<PathBuf> {
     files
 }
 
-/// What changes when a file is written or replaced.
+/// What changes when a file is written, replaced, or linked to from
+/// another folder, where whoever writes that folder could write it.
 #[derive(Clone, Debug, PartialEq)]
-struct Stamp(u64, u64, u64, i64, i64, i64, i64);
+struct Stamp(u64, u64, u64, u64, i64, i64, i64, i64);
 
 fn stamp(path: &Path) -> Option<Stamp> {
     use std::os::unix::fs::MetadataExt;
@@ -87,6 +94,7 @@ fn stamp(path: &Path) -> Option<Stamp> {
     Some(Stamp(
         m.dev(),
         m.ino(),
+        m.nlink(),
         m.size(),
         m.mtime(),
         m.mtime_nsec(),
@@ -110,19 +118,22 @@ struct Admitted {
     copied: Vec<Stamp>,
 }
 
-/// The programs admitted, by name, each copied into `dir/NAME`, and the
-/// temporary folder they run with.
+/// The programs admitted, by name, each copied into `dir/NAME`, the
+/// temporary folder they run with, and what the daemon keeps read-only in
+/// every agent's folders that hold it.
 pub struct Pins {
     dir: PathBuf,
     run: PathBuf,
+    kept: Vec<PathBuf>,
     admitted: tokio::sync::Mutex<HashMap<String, Admitted>>,
 }
 
 impl Pins {
-    pub fn new(dir: PathBuf, run: PathBuf) -> Pins {
+    pub fn new(dir: PathBuf, run: PathBuf, kept: Vec<PathBuf>) -> Pins {
         Pins {
             dir,
             run,
+            kept: kept.iter().map(|path| real(path)).collect(),
             admitted: tokio::sync::Mutex::new(HashMap::new()),
         }
     }
@@ -158,11 +169,15 @@ impl Pins {
         let mut checked: Vec<&Path> = files.iter().map(PathBuf::as_path).collect();
         checked.extend([into.as_path(), self.run.as_path()]);
         for path in checked {
-            if let Some((agent, folder)) = written(path, &writers) {
+            if let Some((agent, folder)) = written(path, &writers, &self.kept) {
                 return Err(format!(
-                    "{} is in {}, which the agent {agent} writes, so it is not run",
+                    "{} is in {}, which the agent {agent} writes from its \
+                     sandbox, so it could put a program of its own there that runs as you. Set \
+                     {agent} to Read only with /permissions, or give it a folder that does not \
+                     hold {}",
                     path.display(),
-                    folder.display()
+                    folder.display(),
+                    path.display(),
                 ));
             }
         }
@@ -187,12 +202,30 @@ impl Pins {
     }
 }
 
-/// The writer whose folder holds `path`'s real path, if any does.
-fn written<'a>(path: &Path, writers: &'a [Writer]) -> Option<&'a Writer> {
+/// A writer that may write `path`'s real path, if one may, as the
+/// daemon's sandbox decides: for each agent, the deepest of its folders
+/// that holds it, unless one of `kept`, held read-only in every folder
+/// that holds it, holds the path too.
+fn written<'a>(path: &Path, writers: &'a [Writer], kept: &[PathBuf]) -> Option<&'a Writer> {
     let real = real(path);
-    writers.iter().find(|(_, folder)| {
-        real.starts_with(std::fs::canonicalize(folder).unwrap_or_else(|_| folder.clone()))
-    })
+    let mut deepest: Vec<(&Writer, PathBuf)> = Vec::new();
+    for writer in writers {
+        let folder = std::fs::canonicalize(&writer.1).unwrap_or_else(|_| writer.1.clone());
+        if !real.starts_with(&folder) {
+            continue;
+        }
+        match deepest.iter_mut().find(|(was, _)| was.0 == writer.0) {
+            Some(was) if was.1.starts_with(&folder) => {}
+            Some(was) => *was = (writer, folder),
+            None => deepest.push((writer, folder)),
+        }
+    }
+    deepest
+        .into_iter()
+        .find(|(_, folder)| {
+            !(kept.iter()).any(|kept| real.starts_with(kept) && kept.starts_with(folder))
+        })
+        .map(|(writer, _)| writer)
 }
 
 /// `path` with its symbolic links resolved, as far as it exists.
@@ -287,7 +320,14 @@ pub async fn writers(client: &agent_client::Client) -> Result<Vec<Writer>, Strin
 static PINS: std::sync::LazyLock<Pins> = std::sync::LazyLock::new(|| {
     let run =
         (agent_client::config::run()).unwrap_or_else(|| std::env::temp_dir().join(".agent/run"));
-    Pins::new(dir("programs"), run.join("sonny"))
+    // What the agent CLI starts every daemon keeping read-only
+    // (`--protect-path`, `--wall`).
+    let kept = [agent_client::config::home(), agent_client::config::run()];
+    Pins::new(
+        dir("programs"),
+        run.join("sonny"),
+        kept.into_iter().flatten().collect(),
+    )
 });
 
 /// The temporary folder the programs run with: `TMPDIR` for each.
@@ -363,7 +403,7 @@ mod tests {
     async fn the_copy_runs_and_a_swap_after_it_was_admitted_changes_nothing_that_runs() {
         let root = temp();
         let origin = install(&root.join("bin"), "tool", "one");
-        let pins = Pins::new(root.join("programs"), root.join("run"));
+        let pins = Pins::new(root.join("programs"), root.join("run"), Vec::new());
         let copy = pins.program("tool", &origin, none).await.unwrap();
         assert_eq!(copy, root.join("programs/tool/tool"));
         assert_eq!(std::fs::read_to_string(&copy).unwrap(), "one");
@@ -413,7 +453,7 @@ mod tests {
         let root = temp();
         let project = root.join("project");
         let origin = install(&project.join("node_modules/.bin"), "tool", "theirs");
-        let pins = Pins::new(root.join("programs"), root.join("run"));
+        let pins = Pins::new(root.join("programs"), root.join("run"), Vec::new());
         // The caller's folder, or another agent's: refused either way.
         for agent in ["calc.lead", "other.lead"] {
             let writers = vec![(agent.to_owned(), project.clone())];
@@ -455,11 +495,83 @@ mod tests {
         assert!(!root.join("programs/tool").exists());
     }
 
+    #[tokio::test]
+    async fn a_lead_opened_in_home_does_not_keep_the_programs_from_running() {
+        // A HOME whose `.agent`, and the walled `.agent/run` in it, the
+        // daemon keeps read-only for an agent whose folder holds them.
+        let home = temp();
+        let elsewhere = temp();
+        let origin = install(&elsewhere.join("bin"), "tool", "mine");
+        let agent = home.join(".agent");
+        let kept = vec![agent.clone(), agent.join("run")];
+        let pins = Pins::new(
+            agent.join("sonny/programs"),
+            agent.join("run/sonny"),
+            kept.clone(),
+        );
+        let opened = vec![("shop.lead".to_owned(), home.clone())];
+        let copy = pins
+            .program("tool", &origin, || async { Ok(opened) })
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&copy).unwrap(), "mine");
+        // Given a folder in it by name, which the daemon lets it write:
+        // refused, saying why and what to change.
+        let pins = Pins::new(
+            agent.join("sonny/programs"),
+            agent.join("run/sonny"),
+            kept.clone(),
+        );
+        let given = vec![
+            ("shop.lead".to_owned(), home.clone()),
+            ("shop.lead".to_owned(), agent.join("sonny")),
+        ];
+        let refused = pins
+            .program("tool", &origin, || async { Ok(given) })
+            .await
+            .unwrap_err();
+        assert!(
+            refused.contains("could put a program of its own there"),
+            "{refused}"
+        );
+        assert!(
+            refused.contains("Set shop.lead to Read only with /permissions"),
+            "{refused}"
+        );
+        // Its own folder still holds what is not kept: a program installed
+        // there is refused.
+        let theirs = install(&home.join("bin"), "tool", "theirs");
+        let opened = vec![("shop.lead".to_owned(), home.clone())];
+        assert!(
+            pins.program("tool", &theirs, || async { Ok(opened) })
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_copy_linked_to_from_another_folder_is_copied_again() {
+        let root = temp();
+        let origin = install(&root.join("bin"), "tool", "one");
+        let pins = Pins::new(root.join("programs"), root.join("run"), Vec::new());
+        let copy = pins.program("tool", &origin, none).await.unwrap();
+        // A hard link in a folder an agent writes would let it write the
+        // copy in place.
+        std::fs::create_dir_all(root.join("theirs")).unwrap();
+        let link = root.join("theirs/tool");
+        std::fs::hard_link(&copy, &link).unwrap();
+        let again = pins.program("tool", &origin, none).await.unwrap();
+        std::fs::write(&link, "swapped").unwrap();
+        assert_eq!(std::fs::read_to_string(&again).unwrap(), "one");
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(std::fs::metadata(&again).unwrap().nlink(), 1);
+    }
+
     #[test]
     fn the_programs_run_with_a_temporary_folder_only_this_user_opens() {
         use std::os::unix::fs::PermissionsExt;
         let root = temp();
-        let pins = Pins::new(root.join("programs"), root.join("run"));
+        let pins = Pins::new(root.join("programs"), root.join("run"), Vec::new());
         assert_eq!(private(&pins).unwrap(), root.join("run"));
         // Loosened since, it is made private again before the next run.
         std::fs::set_permissions(root.join("run"), std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -484,7 +596,7 @@ mod tests {
         );
         install(&bin, "agent-desktop-win32-x64.exe", "other");
         install(&bin, "agent-desktop", "launcher");
-        let pins = Pins::new(root.join("programs"), root.join("run"));
+        let pins = Pins::new(root.join("programs"), root.join("run"), Vec::new());
         let copy = pins.program("agent-desktop", &origin, none).await.unwrap();
         let mut copied: Vec<String> = std::fs::read_dir(copy.parent().unwrap())
             .unwrap()
