@@ -550,6 +550,13 @@ async fn round(shared: Arc<Shared>, bot: String, turn: i64, calls: Vec<Value>) {
     );
 }
 
+/// The start of a judge's reply that could not be read, as a log keeps
+/// it: redacted whole before it is cut, so no secret is cut where
+/// redaction would miss it.
+fn logged_reply(redactor: &Redactor, reply: &str) -> String {
+    judge::excerpt(&redactor.redact(reply)).to_owned()
+}
+
 /// The daemon's answer to a call given `verdict`: its decision, its
 /// reason, and whether it is a denial nobody assessed, which never counts
 /// toward the breaker, as in Codex. A round the review never assessed is
@@ -630,8 +637,7 @@ async fn judge(
         .await
     {
         Judged::Failed { why, reply } => {
-            // The reply kept, redacted, so a failure can be read later.
-            let reply = reply.map(|reply| shared.redactor.redact(&reply).into_owned());
+            let reply = reply.map(|reply| logged_reply(&shared.redactor, &reply));
             report(
                 json!({"event":"judge_failed","bot":bot,"turn":turn,"detail":why,
                 "reply":reply}),
@@ -1888,6 +1894,18 @@ mod tests {
         assert!(written_file(&fifo).is_none());
         assert!(written_file(&dir.join("gone")).is_none());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_reply_that_did_not_parse_is_redacted_before_it_is_cut() {
+        let secret = "s3cr3t-value-0123456789";
+        let redactor = Redactor::from_env([("MY_TOKEN".to_owned(), secret.to_owned())]);
+        // The secret straddles where the log cuts the reply.
+        let reply = format!("{}{secret} and more", "x".repeat(2048 - 10));
+        let logged = logged_reply(&redactor, &reply);
+        assert!(!logged.contains(&secret[..10]), "{logged}");
+        assert!(logged.len() <= 2048);
+        assert!(logged.starts_with("xxxx"));
     }
 
     #[test]

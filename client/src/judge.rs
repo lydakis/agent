@@ -40,8 +40,9 @@ pub struct Usage {
 #[derive(Debug, PartialEq)]
 pub struct Failed {
     pub why: String,
-    /// The start of the judge's reply, when there was one it could not be
-    /// read as answers: for a log, redacted by whoever writes it there.
+    /// The judge's reply, when there was one it could not be read as
+    /// answers: whole, so whoever logs it redacts it before [`excerpt`]
+    /// cuts it, and no secret is cut where redaction would miss it.
     pub reply: Option<String>,
 }
 
@@ -52,8 +53,18 @@ fn failed(why: impl Into<String>) -> Failed {
     }
 }
 
-/// How much of a reply that could not be read [`Failed`] keeps.
+/// How much of a reply that could not be read a log keeps.
 const KEPT_REPLY: usize = 2048;
+
+/// The start of `text` a log keeps of a reply that could not be read, cut
+/// at a character. Redact `text` first.
+pub fn excerpt(text: &str) -> &str {
+    let mut cut = text.len().min(KEPT_REPLY);
+    while !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    &text[..cut]
+}
 
 /// A general model's reply as answers: its JSON object, found in the
 /// reply, with a probability for every id asked. `None` when any is
@@ -337,13 +348,9 @@ pub async fn turn_with(
         .then(|| parse(text, ids))
         .flatten()
     else {
-        let mut cut = text.len().min(KEPT_REPLY);
-        while !text.is_char_boundary(cut) {
-            cut -= 1;
-        }
         let failed = Failed {
             why: "the judge's answer did not parse".into(),
-            reply: Some(text[..cut].to_owned()),
+            reply: Some(text.to_owned()),
         };
         return (Err(failed), None);
     };
