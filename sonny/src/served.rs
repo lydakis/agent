@@ -1025,7 +1025,7 @@ impl Server {
             && let Some(turn) = event["turn"].as_i64()
         {
             let mut calls = self.serving.lock().unwrap();
-            calls.stops += 1;
+            let before = calls.jobs.len();
             calls.jobs.retain(|key, job| {
                 if key.0 == turn
                     && let Job::Running(job) = job
@@ -1034,6 +1034,9 @@ impl Server {
                 }
                 key.0 != turn
             });
+            if calls.jobs.len() < before {
+                calls.stops += 1;
+            }
         }
     }
 }
@@ -1052,9 +1055,9 @@ enum Job {
 struct Calls {
     jobs: HashMap<(i64, String), Job>,
     paused: bool,
-    /// How many times calls were stopped and let go unanswered, by a pause
-    /// or their turn's end: a listing read across one may name a call
-    /// stopped since, which must not start again.
+    /// How many times calls were let go, stopped by a pause or with their
+    /// turn's end: a listing read across one may name a call let go since,
+    /// which must not start again.
     stops: u64,
 }
 
@@ -1067,7 +1070,7 @@ fn pause(serving: &Serving, paused: bool) {
     let mut calls = serving.lock().unwrap();
     calls.paused = paused;
     if paused {
-        calls.stops += 1;
+        let before = calls.jobs.len();
         calls.jobs.retain(|_, job| match job {
             Job::Running(job) => {
                 job.abort();
@@ -1075,6 +1078,10 @@ fn pause(serving: &Serving, paused: bool) {
             }
             Job::Answered(_) => true,
         });
+        // Only a call let go can be on a listing read before it.
+        if calls.jobs.len() < before {
+            calls.stops += 1;
+        }
     }
 }
 
