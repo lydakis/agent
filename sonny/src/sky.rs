@@ -520,7 +520,7 @@ enum Heard {
     /// was kept, in Unix ms, and its lines.
     Poem(String, i64, Vec<String>),
     /// The file as read, and the rule when it was read again too.
-    Read(haiku::Kept, Option<haiku::Rule>),
+    Read(Box<haiku::Kept>, Option<haiku::Rule>),
     /// The day's haikus, for a replay to show each when it was up.
     Poems(Vec<haiku::Poem>),
     /// The daemon's triggers as read, soonest first.
@@ -1159,7 +1159,7 @@ impl View {
                     if let Some(rule) = rule {
                         self.title.rule = rule;
                     }
-                    self.heed(kept, now);
+                    self.heed(*kept, now);
                 }
             }
         }
@@ -1207,7 +1207,10 @@ impl View {
             let send = self.heard.0.clone();
             self.runtime.spawn_blocking(move || {
                 let rule = rule.then(haiku::Rule::load);
-                let _ = send.send(Heard::Read(haiku::Kept::load(&store, &socket), rule));
+                let _ = send.send(Heard::Read(
+                    Box::new(haiku::Kept::load(&store, &socket)),
+                    rule,
+                ));
             });
         }
         // The triggers read again: each tick's next time, and a schedule
@@ -1266,13 +1269,19 @@ impl View {
             if !matches!(claimed.await, Ok(true)) {
                 return;
             }
-            let Some(lines) = haiku::write(socket.clone(), name.clone()).await else {
-                return;
-            };
+            // One that writes none leaves the haiku before showing, here
+            // and in every sky, and says why in the file.
+            let written = haiku::write(socket.clone(), name.clone()).await;
             let kept = tokio::task::spawn_blocking(move || {
                 let at = wall_ms();
-                haiku::Kept::publish(&store, &socket, &name, since, &lines, at)
-                    .then_some(Heard::Poem(name, at, lines))
+                match written {
+                    Ok(lines) => haiku::Kept::publish(&store, &socket, &name, since, &lines, at)
+                        .then(|| Heard::Poem(name, at, lines.to_vec())),
+                    Err(why) => {
+                        haiku::Kept::unwritten(&store, &socket, &name, since, why, at);
+                        None
+                    }
+                }
             });
             if let Ok(Some(poem)) = kept.await {
                 let _ = send.send(poem);
