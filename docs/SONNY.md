@@ -474,7 +474,7 @@ task's worktree share one copy whatever is committed (a task's worktree
 starts at the last commit, so an uncommitted AGENTS.md line never reaches
 it). Each folder's `MEMORY.md` is an index generated from the front matter,
 every fact in it, the most needed first: the folder's `work` facts by name
-on one line, then the person's own (`user`, `feedback`), then the rest,
+and date alone, newest first, then the person's own (`user`, `feedback`), then the rest,
 each group by `confirmed` count, then `verified` date, newest first. An
 index has no limit and a save is never refused for room. A new agent's
 instructions, and `show`, take each index's head
@@ -602,7 +602,10 @@ first, each with its `last_read` and `verified`, and the cleanup checks
 that they still hold, as Codex drops memories unused for 30 days and
 Copilot those unused for 28; unread alone removes nothing. Work facts are
 not in it: it lists as `stale_work` those not saved in over three days,
-which the cleanup retires. Reads with the
+which the cleanup retires, and `changed` is true while one is, so a quiet
+night still wakes the cleanup. A save of a new fact into a folder already
+holding 16,384 entries is `too_many_facts`, so a folder every command can
+read is never made one none can. Reads with the
 `read` tool are not counted, which is why the memory skill opens facts with
 the memory tool.
 

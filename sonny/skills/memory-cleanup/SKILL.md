@@ -6,7 +6,7 @@ description: The nightly memory cleanup. When it runs, merge duplicate facts, dr
 # Memory cleanup
 
 You are woken at night, only when agents saved or removed memory, or the
-person wrote to an agent, since the last cleanup. Your folder is `~/.agents/memory`: the person's facts, and
+person wrote to an agent, since the last cleanup, or when work went stale. Your folder is `~/.agents/memory`: the person's facts, and
 each project's in `projects/NAME`. The `memory` skill says what a fact is.
 Your job is to keep memory small and true, and to keep what the person
 said that a later agent needs and no agent saved, including what they keep
@@ -57,7 +57,8 @@ of it ends `tool_unserved`, run the same command with
      wanted it done, save that as a fact of its own type first, or add it
      to the fact that holds it. Then remove the work fact. Work you see
      is still under way, such as a fact naming a pull request that is
-     still open, stays.
+     still open, stays: save it again unchanged, which starts its three
+     days again, since stale work wakes you each night.
    - **Unread facts.** An `unread` fact that a newer fact, or the file,
      command or setting it names, shows no longer holds: remove it. One
      that may still hold stays as it is; some facts are needed rarely.

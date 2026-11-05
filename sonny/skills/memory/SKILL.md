@@ -28,7 +28,7 @@ confirmed again and again weighs more than one said once. The fact itself
 is `NAME.md` in the same folder.
 
 An index lists every fact, the most needed first: work under way, by name
-on one line, then the person's own facts (`user`, `feedback`), then the
+and date alone, newest first, then the person's own facts (`user`, `feedback`), then the
 rest, each group the most confirmed and most recently verified first.
 
 ## Reading
