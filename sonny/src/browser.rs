@@ -1246,7 +1246,7 @@ async fn drive(
     // Refused before anything runs; checked again as each command starts.
     crate::trusted::program(PROGRAM)
         .await
-        .map_err(|e| ("browser_refused", e))?;
+        .map_err(|e| ("browser_refused", format!("{PROGRAM} is not run: {e}")))?;
     let launch = Launch {
         confirm: confirm.clone(),
         profile: profile.map(str::to_owned),

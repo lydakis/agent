@@ -537,14 +537,26 @@ pub fn cli(args: &[String]) -> i32 {
 }
 
 /// `memory changed`, as `~/.agent/memory` runs it for the cleanup's
-/// trigger: [`changed`], printed as [`cli`] prints.
+/// trigger: [`changed`], printed as [`cli`] prints, but exit 1 when it is
+/// `unchanged`, the gate's no, so that a check that failed (exit 2) is told
+/// and not taken for a quiet night.
 pub fn changed_cli() -> i32 {
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
     let cwd = std::env::current_dir().ok();
-    printed(match (home, cwd) {
+    gate_printed(match (home, cwd) {
         (Some(home), Some(cwd)) => block_on(changed(&home, &cwd)),
         _ => Err("memory_failed: no HOME or working folder".into()),
     })
+}
+
+/// [`printed`], for a gate: exit 1 only for `unchanged`, 2 for any other
+/// failure.
+fn gate_printed(done: Result<Value, String>) -> i32 {
+    let no = matches!(&done, Err(error) if error.starts_with("unchanged:"));
+    match printed(done) {
+        1 if !no => 2,
+        code => code,
+    }
 }
 
 fn block_on(
@@ -574,6 +586,14 @@ fn printed(done: Result<Value, String>) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_unchanged_is_a_gate_no_and_any_other_failure_could_not_check() {
+        assert_eq!(gate_printed(Ok(json!({"changed": true}))), 0);
+        assert_eq!(gate_printed(Err("unchanged: nothing saved".into())), 1);
+        assert_eq!(gate_printed(Err("said_unread: no daemon".into())), 2);
+        assert_eq!(gate_printed(Err("memory_failed: no HOME".into())), 2);
+    }
 
     #[test]
     fn only_the_newest_words_that_fit_are_held_while_collecting() {

@@ -814,7 +814,7 @@ pub async fn still_open(bot: &str, turn: i64, call: &str) -> Result<bool, String
 }
 
 /// `sonny ask open BOT TURN CALL`, an ask's trigger's `--if`: exit 0
-/// while the ask is open, 1 once it is settled or cannot be read.
+/// while the ask is open, 1 once it is settled, 2 when it cannot be read.
 pub fn cli(args: &[String]) -> i32 {
     let [verb, bot, turn, call] = args else {
         eprintln!("usage: sonny ask open BOT TURN CALL");
@@ -833,9 +833,10 @@ pub fn cli(args: &[String]) -> i32 {
     match open {
         Ok(true) => 0,
         Ok(false) => 1,
+        // Not a no: the deadline's fire fails and says why.
         Err(error) => {
             eprintln!("{error}");
-            1
+            2
         }
     }
 }
