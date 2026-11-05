@@ -2593,7 +2593,8 @@ SIGHUP, does not outlive it. Each bot keeps at most 16; starting another
 first kills the one it used least recently, as Codex prunes its sessions,
 so that one's slot is free for it. Only the
 bot that started a terminal types into it (`terminal_not_running` for any
-other, and for one that ended), and terminals end when the daemon stops. A
+other, and for one that ended; `not_a_terminal` for its own background
+command, which takes no input), and terminals end when the daemon stops. A
 terminal never leaves its bot's sandbox (`tty` with `require_escalated` is
 refused), so input to a sandboxed bot's terminal runs without review, as its
 commands do; an unsandboxed bot's `write_stdin` is gated like `shell`.
