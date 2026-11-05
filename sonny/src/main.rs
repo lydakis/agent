@@ -458,6 +458,57 @@ impl Spread {
     }
 }
 
+/// `bot`'s turn `turn`, as `turns` lists it, read by its number: no
+/// number of messages steered or attached since can hide it. `None` when
+/// it has no such turn or it could not be read.
+async fn turn_row(client: &Client, bot: &str, turn: i64) -> Option<Value> {
+    let page = (client)
+        .request("turns", json!({"bot": bot, "after": turn - 1, "limit": 1}))
+        .await
+        .ok()?;
+    let row = page["turns"].get(0)?;
+    (row["turn"].as_i64() == Some(turn)).then(|| row.clone())
+}
+
+/// The newest turn of `bot` that says what it does: a message steered
+/// into a running turn is a turn of its own, settled at once, and one
+/// attached to the next call (a reaction) waits for work that is not
+/// there, so the turn before them is read, page by page back past any
+/// number of them, from `page`, its newest turns as already read, if they
+/// were. Its newest turn when none ran, and null when it has none.
+async fn last_ran(
+    client: &Client,
+    bot: &str,
+    page: Option<Value>,
+) -> Result<Value, agent_client::Error> {
+    let passive = |turn: &&Value| matches!(turn["status"].as_str(), Some("steered" | "attached"));
+    let asked = |before: Option<i64>| {
+        let mut asked = json!({"bot": bot, "newest": true, "limit": 64});
+        if let Some(before) = before {
+            asked["before"] = json!(before);
+        }
+        client.request("turns", asked)
+    };
+    let mut page = match page {
+        Some(page) => page,
+        None => asked(None).await?,
+    };
+    let mut newest = Value::Null;
+    loop {
+        let turns = page["turns"].as_array().map_or(&[][..], Vec::as_slice);
+        if newest.is_null() {
+            newest = turns.first().cloned().unwrap_or(Value::Null);
+        }
+        if let Some(ran) = turns.iter().find(|turn| !passive(turn)) {
+            return Ok(ran.clone());
+        }
+        match page["next_before"].as_i64() {
+            Some(before) => page = asked(Some(before)).await?,
+            None => return Ok(newest),
+        }
+    }
+}
+
 /// What one pass of a [`Spread`] did.
 struct Passed {
     pick: u64,
@@ -4246,18 +4297,8 @@ impl App {
             // opened again on an agent whose turn failed still says so, and
             // keeps its place among the lead's windows.
             // A model that said nothing is no failure, as live.
-            let failed = match self
-                .client
-                .request(
-                    "turns",
-                    json!({"bot": self.bot, "newest": true, "limit": 4}),
-                )
-                .await
-            {
-                Ok(page) => {
-                    let last = self.task_turn(&page).await;
-                    last["status"] == "failed" && last["error"] != EMPTY
-                }
+            let failed = match self.task_turn(&self.bot).await {
+                Ok(last) => last["status"] == "failed" && last["error"] != EMPTY,
                 Err(_) => false,
             };
             status_report(if failed { "error" } else { "idle" }, &self.bot);
@@ -5160,21 +5201,7 @@ impl App {
             if let Some(turn) = self.running.as_ref().map(|r| r.turn)
                 && now != Some(turn)
             {
-                let page = self
-                    .client
-                    .request(
-                        "turns",
-                        json!({"bot": self.bot, "newest": true, "limit": 8}),
-                    )
-                    .await
-                    .unwrap_or_default();
-                let row = page["turns"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .find(|row| row["turn"].as_i64() == Some(turn))
-                    .cloned()
-                    .unwrap_or_default();
+                let row = (turn_row(&self.client, &self.bot, turn).await).unwrap_or_default();
                 let status = row["status"].as_str().unwrap_or("unknown");
                 let ended = json!({"event": "turn_finished", "bot": self.bot,
                     "turn": turn, "data": {"status": status}});
@@ -5513,13 +5540,8 @@ impl App {
         let mut states = HashMap::new();
         let store = self.store();
         for bot in bots {
-            let read_turns = self
-                .client
-                .request("turns", json!({"bot": bot, "newest": true, "limit": 8}))
-                .await;
-            let state = match read_turns {
-                Ok(page) => {
-                    let turn = self.task_turn(&page).await;
+            let state = match self.task_turn(&bot).await {
+                Ok(turn) => {
                     let state = started::state(&turn);
                     // A turn that ended on a question waits on the person;
                     // read once per turn it ended.
@@ -5572,18 +5594,11 @@ impl App {
         }
     }
 
-    /// The turn that says what a task does, from its newest `turns`: a
-    /// message steered into a running turn is a turn of its own, settled
-    /// at once, so the turn it joined is read instead, and one attached to
-    /// the next call (a reaction) waits for work that is not there, so the
-    /// turn before it is read too. A failed one with why it failed.
-    async fn task_turn(&self, page: &Value) -> Value {
-        let turns = page["turns"].as_array().map_or(&[][..], Vec::as_slice);
-        let passive = |t: &&Value| matches!(t["status"].as_str(), Some("steered" | "attached"));
-        let Some(turn) = turns.iter().find(|t| !passive(t)) else {
-            return turns.first().cloned().unwrap_or(Value::Null);
-        };
-        self.with_error(turn.clone()).await
+    /// The turn that says what `bot` does ([`last_ran`]), a failed one
+    /// with why it failed.
+    async fn task_turn(&self, bot: &str) -> Result<Value, agent_client::Error> {
+        let turn = last_ran(&self.client, bot, None).await?;
+        Ok(self.with_error(turn).await)
     }
 
     /// A failed `turn` with why it failed, which `turns` leaves out, as
@@ -8380,11 +8395,11 @@ impl App {
             {
                 continue;
             }
-            let turns = self
-                .client
+            let page = (self.client)
                 .request("turns", json!({"bot": name, "newest": true, "limit": 8}))
                 .await
-                .ok()
+                .ok();
+            let turns = (page.as_ref())
                 .and_then(|page| page["turns"].as_array().cloned())
                 .unwrap_or_default();
             // Its latest items are read again only once its history moved:
@@ -8400,21 +8415,26 @@ impl App {
             }
             let latest = latest.unwrap_or_default();
             let turn = turns.first().cloned().unwrap_or(Value::Null);
-            // A message steered into a running turn is recorded as a turn
-            // of its own that never ran: the time is the one it joined. One
-            // attached to the next call has not run either.
-            let ran = turns
-                .iter()
-                .find(|turn| !matches!(turn["status"].as_str(), Some("steered" | "attached")))
-                .cloned()
-                .unwrap_or(Value::Null);
-            let running = !bot["running_turn"].is_null();
-            let ran = match running {
-                true => ran,
-                false => self.with_error(ran).await,
+            // The turn that runs is the one the daemon names, however many
+            // messages were steered into it or queued after it since; an
+            // idle agent's is the newest that ran ([`last_ran`]).
+            let running_turn = bot["running_turn"].as_i64();
+            let running = running_turn.is_some();
+            let ran = match running_turn {
+                Some(id) => match turns.iter().find(|turn| turn["turn"].as_i64() == Some(id)) {
+                    Some(row) => row.clone(),
+                    None => (turn_row(&self.client, name, id).await).unwrap_or(Value::Null),
+                },
+                None => match page.is_some() {
+                    true => {
+                        let ran = last_ran(&self.client, name, page).await;
+                        self.with_error(ran.unwrap_or(Value::Null)).await
+                    }
+                    false => Value::Null,
+                },
             };
             // A turn held on a cause, parked on its call or in line, says so.
-            let blocked_on = (turns.iter()).find_map(|turn| {
+            let blocked_on = (std::iter::once(&ran).chain(&turns)).find_map(|turn| {
                 let blocked = &turn["waiting_on"]["blocked"];
                 blocked.is_object().then(|| {
                     status::held_cause(
@@ -8424,13 +8444,10 @@ impl App {
                     .0
                 })
             });
-            let state = match (
-                running,
-                if running { &turn } else { &ran }["status"].as_str(),
-            ) {
+            let state = match (running, ran["status"].as_str()) {
                 _ if let Some(what) = &blocked_on => format!("{}{what}", status::HELD),
                 // A call a reviewer weighs waits on no one here.
-                (true, Some("waiting")) if turn["waiting_on"]["approval"] == true => {
+                (true, Some("waiting")) if ran["waiting_on"]["approval"] == true => {
                     match held {
                         Ok(_) => "waiting on its reviewer".into(),
                         // Unlisted, the call may be the person's.
@@ -8438,7 +8455,7 @@ impl App {
                     }
                 }
                 (true, Some("waiting")) => {
-                    let on: Vec<String> = turn["waiting_on"]["handles"]
+                    let on: Vec<String> = ran["waiting_on"]["handles"]
                         .as_array()
                         .into_iter()
                         .flatten()
@@ -17695,6 +17712,71 @@ mod tests {
         // Quiet rows one after another sit together.
         assert_eq!(rows[3], "• Removed calc.add");
         assert_eq!(rows[7], "• Messaged calc.sub ▸");
+    }
+
+    #[tokio::test]
+    async fn a_task_steered_more_often_than_a_page_holds_still_works() {
+        // Seventy messages steered into its running turn: more turns than
+        // one page lists, none of which ran.
+        let client = daemon_answering(|asked| {
+            if asked["op"] == "approvals" {
+                return json!({"approvals": []});
+            }
+            if asked["op"] == "history_nodes" {
+                return json!({"nodes": []});
+            }
+            let steers = (2..=71)
+                .rev()
+                .map(|turn| json!({"turn": turn, "status": "steered"}));
+            let rows: Vec<Value> =
+                (steers.chain([json!({"turn": 1, "status": "running"})])).collect();
+            let limit = asked["limit"].as_u64().unwrap_or(64) as usize;
+            match (
+                asked["op"].as_str(),
+                asked["before"].as_i64(),
+                asked["after"].as_i64(),
+            ) {
+                (Some("turns"), None, Some(after))
+                    if !asked["newest"].as_bool().unwrap_or(false) =>
+                {
+                    let page: Vec<Value> = (rows.iter().rev())
+                        .filter(|row| row["turn"].as_i64() > Some(after))
+                        .take(limit)
+                        .cloned()
+                        .collect();
+                    json!({"turns": page, "next_after": null})
+                }
+                (Some("turns"), before, _) => {
+                    let older: Vec<Value> = (rows.iter())
+                        .filter(|row| {
+                            before.is_none_or(|before| row["turn"].as_i64() < Some(before))
+                        })
+                        .cloned()
+                        .collect();
+                    let page: Vec<Value> = older.iter().take(limit).cloned().collect();
+                    let next = (older.len() > limit).then(|| page.last().unwrap()["turn"].clone());
+                    json!({"turns": page, "next_before": next})
+                }
+                _ => json!({}),
+            }
+        })
+        .await;
+        // The turn that ran is found past every page of steers, and the one
+        // the daemon names is read by its number.
+        let ran = last_ran(&client, "calc.many", None).await.unwrap();
+        assert_eq!(ran["turn"], 1);
+        assert_eq!(ran["status"], "running");
+        let row = turn_row(&client, "calc.many", 1).await.unwrap();
+        assert_eq!(row["status"], "running");
+        assert_eq!(turn_row(&client, "calc.many", 99).await, None);
+        // In the roster it works on, never done.
+        let mut app = app(client);
+        app.width = 80;
+        let arguments = json!({"name": "many", "brief": "Fix many"});
+        app.commit_call("c", served::START, &arguments, "turn:calc.many/1", false);
+        app.read_tasks().await;
+        let rows = drawn(&mut app);
+        assert_eq!(rows[1], "  ● many  working  Fix many");
     }
 
     #[tokio::test]
