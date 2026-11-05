@@ -710,7 +710,7 @@ pub async fn drive(
     // starts.
     crate::trusted::program(PROGRAM)
         .await
-        .map_err(|e| ("desktop_refused", e))?;
+        .map_err(|e| ("desktop_refused", format!("{PROGRAM} is not run: {e}")))?;
     // Asked before the desktop is taken, so another agent's call goes on
     // while this one waits for its verdict.
     let acts: Vec<&String> = (lines.iter().zip(&checked))
