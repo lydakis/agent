@@ -881,10 +881,12 @@ way `/react` does, and each note in the margin has its own `↩`.
   messages and tool calls over the last ten minutes; the title passes only
   to an agent half again as busy, once the holder has had it ten minutes,
   so it never flickers. Each new holder writes one, from a copy of itself
-  allowed no tool, eight a day at most, and every sky shows the same one;
-  a replay shows the one that was up at its time.
-  `[sonny]` sets `sky_haikus` (0 for none), `sky_haiku_window`,
-  `sky_haiku_margin` and `sky_haiku_hold`.
+  allowed no tool, as many a day as the title passes unless you set a
+  cap, and every sky shows the same one; a replay shows the one that was
+  up at its time, from the day's kept in `~/.agent/sonny/haikus.jsonl`.
+  `[sonny]` sets `sky_haikus` (false for none), `sky_haiku_daily` (the
+  most a day, 0 for no limit), `sky_haiku_keep` (hours kept, 24; 0 keeps
+  all), `sky_haiku_window`, `sky_haiku_margin` and `sky_haiku_hold`.
   An agent with a schedule (an automation that wakes it) carries a short tick
   just outside its star, out from the middle (inward at the pane's edge),
   plain once its next run is near (a tenth of the gap between runs, at

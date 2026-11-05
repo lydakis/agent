@@ -109,6 +109,18 @@ pub const MIGRATIONS: &[Migration] = &[
         id: crate::haiku::CLAIMS,
         retire: "0.10.0",
     },
+    // Each daemon's past haikus move from `haiku.json` to `haikus.jsonl`
+    // (0.9.0).
+    Migration {
+        id: crate::haiku::PAST,
+        retire: "0.11.0",
+    },
+    // `[sonny] sky_haikus`, a count, becomes the switch it is and the
+    // day's most, `sky_haiku_daily` (0.9.0).
+    Migration {
+        id: crate::haiku::DAILY,
+        retire: "0.11.0",
+    },
 ];
 
 /// `run` once for each `record`: a file of the ids done, a line each,
