@@ -462,11 +462,12 @@ between, the arrows move through its rows. Every window keeps its prompts in
 first, newest first, then those any window sent before it opened. Edit a
 prompt brought back and it is yours to send, or Up starts again from it.
 Ctrl+R finds one by typing, as a shell's reverse search and Claude Code's
-do: the prompts sent before are a list over the composer, newest first,
-narrowed by the letters typed (in order, the first starting a word, as the
-slash menu finds commands). Ctrl+R again or the arrows pick, Enter or Tab puts
-the pick in the composer to edit (Up and Down go on from it), and Esc leaves
-the composer as it was.
+do: the prompts sent before are a list over the composer, newest first, as
+the slash menu is, and the draft stays in the composer under it. The letters
+typed show under the composer, after `find`, and narrow the list (in order,
+the first starting a word, as the slash menu finds commands). Ctrl+R again
+or the arrows pick, Enter or Tab puts the pick in the composer to edit (Up
+and Down go on from it), and Esc leaves the composer as it was.
 
 ![Ctrl+R lists the prompts sent before, newest first; fix narrows it to two with the letters bold; Enter puts the picked one in the composer](../docs/sonny/prompt-search.png)
 A prompt this window sent comes back with its pictures (the newest as many
