@@ -109,8 +109,8 @@ pub fn tool() -> Value {
             with what happens if they pick it, the one you recommend and why, and what you do until \
             they answer. Options without what they mean are useless to the person, so say what each \
             one does to their goal. Ask once, one decision per call, and do not repeat it in your \
-            reply. A pick comes as their next message, starting \"You asked:\" and your \
-            question; words they write instead come as they wrote them, so read whether they \
+            reply. A pick comes as their next message, starting \"You asked\", the ask's call ID \
+            and your question; words they write instead come as they wrote them, so read whether they \
             answer it. Say in if_unanswered what you do until then. go_now goes on with the option \
             you recommend at once, for a step you can undo once they have seen it. go_later goes \
             on with it once the wait passes with no word from them, for a step you can undo but \
@@ -255,9 +255,10 @@ pub fn settled(mut ask: Ask, output: &str) -> Ask {
 
 /// The oldest question still open among a bot's `items`, newest first:
 /// an `ask` call that was taken, with no answer to it after, as the pinned
-/// questions are closed: by the person's `You asked:` message naming it,
-/// one answer to one question, or by words of their own after it, the
-/// conversation going on past it.
+/// questions are closed: by the person's `You asked` message naming its
+/// call, one answer to one ask, or by words of their own after it, the
+/// conversation going on past it. Asks are told apart by call, never by
+/// wording: two asking the same question are two decisions.
 pub fn open(items: &[Value]) -> Option<String> {
     let (mut answers, mut refused, mut open) = (Vec::new(), Vec::new(), None);
     let mut moved_on = false;
@@ -265,7 +266,7 @@ pub fn open(items: &[Value]) -> Option<String> {
         if item["role"] == "user" {
             let text = crate::text(item);
             match answered(&text) {
-                Some(question) => answers.push(question.to_owned()),
+                Some(call) => answers.push(call.to_owned()),
                 None => moved_on |= moves_on(&text, item["from"].as_str()),
             }
         }
@@ -282,7 +283,7 @@ pub fn open(items: &[Value]) -> Option<String> {
                 .and_then(|a| serde_json::from_str::<Value>(a).ok())
                 .and_then(|arguments| call("", &arguments))
         {
-            match answers.iter().position(|q| *q == ask.question) {
+            match (answers.iter()).position(|answered| item["call_id"] == answered.as_str()) {
                 Some(at) => {
                     answers.remove(at);
                 }
@@ -306,14 +307,22 @@ pub fn moves_on(text: &str, from: Option<&str>) -> bool {
         && crate::user_shell::read(text).is_none()
 }
 
-/// The question a person's message answers, when [`answer`] wrote it.
+/// The ask call a person's message answers, when [`answer`] wrote it.
 pub fn answered(text: &str) -> Option<&str> {
-    split(text).map(|(question, _)| question)
+    parts(text).map(|(call, ..)| call)
 }
 
 /// A person's message [`answer`] wrote, as the question and its answer.
 pub fn split(text: &str) -> Option<(&str, &str)> {
-    text.strip_prefix("You asked: ")?.split_once("\n\n")
+    parts(text).map(|(_, question, answer)| (question, answer))
+}
+
+/// A person's message [`answer`] wrote, as the ask call it answers, the
+/// question and the answer.
+fn parts(text: &str) -> Option<(&str, &str, &str)> {
+    let (call, rest) = text.strip_prefix("You asked (")?.split_once("): ")?;
+    let (question, answer) = rest.split_once("\n\n")?;
+    (!call.is_empty() && !call.contains(char::is_whitespace)).then_some((call, question, answer))
 }
 
 /// The row that says which question a message answers, above it.
@@ -329,10 +338,9 @@ fn answering_row(question: &str, place: &str, width: usize) -> Line<'static> {
     Line::from(format!("  answering “{cut}”{place}")).dim()
 }
 
-/// `asks` without the first one `text` answers; whether there was one.
+/// `asks` without the one `text` answers; whether it was there.
 pub fn close(asks: &mut Vec<Ask>, text: &str) -> bool {
-    let at =
-        answered(text).and_then(|question| asks.iter().position(|ask| ask.question == question));
+    let at = answered(text).and_then(|call| asks.iter().position(|ask| ask.id == call));
     at.map(|at| asks.remove(at)).is_some()
 }
 
@@ -343,8 +351,9 @@ pub fn picks(ask: &Ask, typed: &str) -> bool {
     (typed.trim().parse::<usize>()).is_ok_and(|n| (1..=ask.options.len()).contains(&n))
 }
 
-/// The person's message answering `ask`: an option's number stands for
-/// the option.
+/// The person's message answering `ask`, by its call, so it answers that
+/// ask and no other asking the same: an option's number stands for the
+/// option.
 pub fn answer(ask: &Ask, typed: &str) -> String {
     let picked = typed
         .parse::<usize>()
@@ -352,7 +361,7 @@ pub fn answer(ask: &Ask, typed: &str) -> String {
         .and_then(|n| n.checked_sub(1))
         .and_then(|at| ask.options.get(at))
         .map_or(typed, |choice| choice.label.as_str());
-    format!("You asked: {}\n\n{picked}", ask.question)
+    format!("You asked ({}): {}\n\n{picked}", ask.id, ask.question)
 }
 
 /// The decision as it is drawn where it was asked, as [`card`] lays it.
@@ -764,7 +773,7 @@ fn fire(question: &str, plan: Unanswered, label: &str) -> String {
 /// settled. `None` while the entries read have not reached the call.
 #[derive(Default)]
 struct Reading {
-    /// The questions the person answered after the call, so far.
+    /// The ask calls the person answered after the call, so far.
     answers: Vec<String>,
 }
 
@@ -773,7 +782,7 @@ impl Reading {
         if crate::lookout::said_by_person(entry).is_some() {
             let text = crate::text(&entry["item"]);
             match answered(&text) {
-                Some(question) => self.answers.push(question.to_owned()),
+                Some(answered) => self.answers.push(answered.to_owned()),
                 None if moves_on(&text, entry["from"].as_str()) => return Some(false),
                 None => {}
             }
@@ -781,11 +790,11 @@ impl Reading {
         let asked = crate::responses(&entry["item"])
             .into_iter()
             .find(|item| item["type"] == "function_call" && item["call_id"] == call)?;
-        let question = (asked["arguments"].as_str())
+        let asks = (asked["arguments"].as_str())
             .and_then(|a| serde_json::from_str::<Value>(a).ok())
             .and_then(|arguments| self::call("", &arguments))
-            .map(|ask| ask.question);
-        Some(question.is_some_and(|question| !self.answers.contains(&question)))
+            .is_some();
+        Some(asks && !self.answers.iter().any(|answered| answered == call))
     }
 }
 
@@ -923,11 +932,16 @@ mod tests {
         let mut open = vec![ask.clone(), past];
         close(&mut open, "how is it going?");
         assert_eq!(open.len(), 2);
+        // The same question asked again is another decision: its answer
+        // closes it alone, whichever came first.
+        let again = call("c3", &keep_api()).unwrap();
+        open.insert(0, again.clone());
         close(&mut open, &answer(&ask, "2"));
         assert_eq!(
             open.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(),
-            ["c2"]
+            ["c3", "c2"]
         );
+        close(&mut open, &answer(&again, "1"));
         // A question with a blank line in it is still closed by its answer.
         let long = call("c4", &json!({"question": "Ship it?\n\n  Tests pass.  "})).unwrap();
         assert_eq!(long.question, "Ship it?\n  Tests pass.");
@@ -939,15 +953,18 @@ mod tests {
     #[test]
     fn a_number_answers_with_its_option() {
         let ask = call("c1", &keep_api()).unwrap();
-        assert_eq!(answer(&ask, "2"), "You asked: Keep the old API?\n\nDrop it");
+        assert_eq!(
+            answer(&ask, "2"),
+            "You asked (c1): Keep the old API?\n\nDrop it"
+        );
         assert_eq!(
             answer(&ask, "3"),
-            "You asked: Keep the old API?\n\n3",
+            "You asked (c1): Keep the old API?\n\n3",
             "no third option: the digit is the answer"
         );
         assert_eq!(
             answer(&ask, "Keep it for one release"),
-            "You asked: Keep the old API?\n\nKeep it for one release"
+            "You asked (c1): Keep the old API?\n\nKeep it for one release"
         );
     }
 
@@ -1088,7 +1105,7 @@ mod tests {
     #[test]
     fn the_persons_own_words_move_on_and_nothing_else_does() {
         assert!(moves_on("Meanwhile, why so slow?", None));
-        assert!(!moves_on("You asked: Keep it?\n\nYes", None));
+        assert!(!moves_on("You asked (a1): Keep it?\n\nYes", None));
         assert!(!moves_on("Done: tests pass", Some("tally.halves")));
         assert!(!moves_on(&crate::reactions::message("👍", None), None));
     }
@@ -1126,7 +1143,7 @@ mod tests {
         assert_eq!(
             open(&[
                 reply.clone(),
-                person("You asked: Keep it?\n\nYes"),
+                person("You asked (a1): Keep it?\n\nYes"),
                 asked.clone()
             ]),
             None
@@ -1136,8 +1153,24 @@ mod tests {
         let other = json!({"type": "function_call", "name": TOOL, "call_id": "a2",
             "arguments": json!({"question": "Ship it?"}).to_string()});
         assert_eq!(
-            open(&[person("You asked: Keep it?\n\nYes"), other, asked.clone()]),
+            open(&[
+                person("You asked (a1): Keep it?\n\nYes"),
+                other,
+                asked.clone()
+            ]),
             Some("Ship it?".into())
+        );
+        // Two asking the same question are two decisions: answering the
+        // later leaves the earlier open, whatever the words.
+        let again = json!({"type": "function_call", "name": TOOL, "call_id": "a3",
+            "arguments": json!({"question": "Keep it?"}).to_string()});
+        assert_eq!(
+            open(&[
+                person("You asked (a3): Keep it?\n\nYes"),
+                again,
+                asked.clone()
+            ]),
+            Some("Keep it?".into())
         );
         let unknown = json!({"type": "function_call_output", "call_id": "a1",
             "output": json!({"error": "unknown_tool"}).to_string()});
@@ -1349,7 +1382,7 @@ mod tests {
         );
         assert_eq!(
             answer(&ask, "done, signed in"),
-            "You asked: Sign in to the package registry\n\ndone, signed in"
+            "You asked (c9): Sign in to the package registry\n\ndone, signed in"
         );
         let hint: String = hint(&ask, 0, 1, 80)
             .iter()
@@ -1515,7 +1548,15 @@ mod tests {
             Some(false)
         );
         assert_eq!(
-            read(&[person("You asked: Tag it?\n\nYes"), asking.clone()]),
+            read(&[person("You asked (a2): Tag it?\n\nYes"), asking.clone()]),
+            Some(true)
+        );
+        // Nor does the answer to another ask of the same words: its
+        // deadline still holds.
+        let again = call("a3", &asked("go_later")).unwrap();
+        assert_eq!(again.question, ask.question);
+        assert_eq!(
+            read(&[person(&answer(&again, "1")), asking.clone()]),
             Some(true)
         );
         // An automation's, another agent's or a reaction are not the person.
@@ -1529,6 +1570,6 @@ mod tests {
             Some(true)
         );
         // Before the call is reached, nothing is known yet.
-        assert_eq!(read(&[person("You asked: Tag it?\n\nYes")]), None);
+        assert_eq!(read(&[person("You asked (a2): Tag it?\n\nYes")]), None);
     }
 }

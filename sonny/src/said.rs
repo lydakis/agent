@@ -119,8 +119,8 @@ pub async fn said(
                     waiting.retain(|waiting| said.kept.contains_key(&waiting.node));
                     waiting.push(Waiting { node, quote, emoji });
                 }
-                for (question, recommended) in asked(entry) {
-                    if let Some(at) = answers.iter().position(|(q, _)| *q == question) {
+                for (call, recommended) in asked(entry) {
+                    if let Some(at) = answers.iter().position(|(answered, _)| *answered == call) {
                         let (_, node) = answers.remove(at);
                         said.amend(node, "recommended", json!(recommended));
                     }
@@ -195,12 +195,12 @@ pub async fn said(
 /// A message of the person's into the answer; an answer to an ask also
 /// waits for the ask, for what it recommended.
 fn admit(said: &mut Newest, answers: &mut Vec<(String, i64)>, node: i64, message: Value) {
-    let question = crate::asks::answered(message["text"].as_str().unwrap_or_default());
-    let question = question.map(str::to_owned);
+    let call = crate::asks::answered(message["text"].as_str().unwrap_or_default());
+    let call = call.map(str::to_owned);
     said.add(node, message);
-    if let Some(question) = question {
+    if let Some(call) = call {
         answers.retain(|(_, node)| said.kept.contains_key(node));
-        answers.push((question, node));
+        answers.push((call, node));
     }
 }
 
@@ -416,8 +416,8 @@ fn reaction(entry: &Value) -> Option<(i64, Option<String>, String)> {
     ))
 }
 
-/// The questions the bot's `ask` calls in an entry put, each with the
-/// label of the option it recommended, if any. An Anthropic message holds
+/// The bot's `ask` calls in an entry, by call ID, each with the label of
+/// the option it recommended, if any. An Anthropic message holds
 /// its calls as `tool_use` blocks, any number of them.
 fn asked(entry: &Value) -> Vec<(String, Option<String>)> {
     (crate::responses(&entry["item"]).iter())
@@ -426,9 +426,9 @@ fn asked(entry: &Value) -> Vec<(String, Option<String>)> {
                 return None;
             }
             let arguments = serde_json::from_str::<Value>(item["arguments"].as_str()?).ok()?;
-            let ask = crate::asks::call("", &arguments)?;
+            let ask = crate::asks::call(item["call_id"].as_str()?, &arguments)?;
             let recommended = (ask.recommended).map(|at| ask.options[at].label.clone());
-            Some((ask.question, recommended))
+            Some((ask.id, recommended))
         })
         .collect()
 }
