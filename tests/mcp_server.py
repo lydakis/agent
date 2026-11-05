@@ -1,7 +1,9 @@
 """A stand-in stdio MCP server for Sonny's tests: `echo`, `add` (with
 structured output), `fail` (a tool error) and `slow`. Each start appends
 its pid to $MCP_STARTS when that is set, and waits $MCP_START_MS before it
-answers; calls are answered at once, each on a thread of its own."""
+answers; calls are answered at once, each on a thread of its own, and each
+call's tool name is appended to $MCP_CALLS when that is set, as it
+arrives: what reached the server, whatever happens to the answer."""
 import json
 import os
 import sys
@@ -23,8 +25,8 @@ TOOLS = [
                      'required': ['a', 'b']},
      'outputSchema': {'type': 'object', 'properties': {'sum': {'type': 'number'}}, 'required': ['sum']}},
     {'name': 'fail', 'description': 'Always fails.', 'inputSchema': {'type': 'object'}},
-    {'name': 'slow', 'description': 'Sleeps for ms milliseconds.',
-     'inputSchema': {'type': 'object', 'properties': {'ms': {'type': 'number'}}}},
+    {'name': 'slow', 'description': 'Sleeps for ms milliseconds, or until the file until names exists.',
+     'inputSchema': {'type': 'object', 'properties': {'ms': {'type': 'number'}, 'until': {'type': 'string'}}}},
 ]
 
 
@@ -45,6 +47,8 @@ def result(name, arguments):
         return {'content': [{'type': 'text', 'text': str(total)}], 'structuredContent': {'sum': total}}
     if name == 'slow':
         time.sleep(arguments.get('ms', 0) / 1000)
+        while arguments.get('until') and not os.path.exists(arguments['until']):
+            time.sleep(0.01)
         return {'content': [{'type': 'text', 'text': 'slept'}]}
     return {'content': [{'type': 'text', 'text': 'it failed'}], 'isError': True}
 
@@ -64,6 +68,9 @@ for line in sys.stdin:
     elif method == 'tools/call':
         # Each call on a thread of its own, so calls overlap.
         params = message['params']
+        if os.environ.get('MCP_CALLS'):
+            with open(os.environ['MCP_CALLS'], 'a') as f:
+                f.write(f"{params['name']}\n")
         threading.Thread(target=lambda request=request, params=params: send(
             {'jsonrpc': '2.0', 'id': request, 'result': result(params['name'], params.get('arguments') or {})}),
             daemon=True).start()
