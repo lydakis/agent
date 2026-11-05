@@ -195,7 +195,7 @@ pub async fn said(
 /// A message of the person's into the answer; an answer to an ask also
 /// waits for the ask, for what it recommended.
 fn admit(said: &mut Newest, answers: &mut Vec<(String, i64)>, node: i64, message: Value) {
-    let call = crate::asks::answered(message["text"].as_str().unwrap_or_default());
+    let call = crate::asks::answer_of(message["text"].as_str().unwrap_or_default(), None);
     let call = call.map(str::to_owned);
     said.add(node, message);
     if let Some(call) = call {
