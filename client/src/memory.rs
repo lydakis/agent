@@ -2,10 +2,11 @@
 //! person's are in `~/.agents/memory`; a project's are in
 //! `~/.agents/memory/projects/NAME`, outside its checkout, so its lead and
 //! every task's worktree share one copy whatever is committed. Each folder's
-//! `MEMORY.md` is an index generated from the facts' front matter and kept
-//! within 16 KiB, so reading it at the start of every task stays cheap; a
-//! save that would pass that is refused until facts are merged or removed.
-//! The daemon knows nothing of memory.
+//! `MEMORY.md` is an index generated from the facts' front matter, every
+//! fact in it, most needed first; a new agent starts with its head
+//! ([`HEAD`]), as Claude Code loads the first 200 lines of its own, and
+//! `search` reaches the rest. A save is never refused for room: the
+//! nightly cleanup keeps memory small. The daemon knows nothing of memory.
 //!
 //! `~/.agent/memory`, a script Sonny writes, shows the indexes, reads,
 //! saves, removes, indexes and checks facts; the `memory` skill Sonny
@@ -22,15 +23,24 @@ use std::{
     path::{Path, PathBuf},
 };
 
-/// A fact file, front matter included, and a folder's index: each at most
-/// this. Bounded, so every task can read the index whole, and roomy enough
-/// that a busy project's leads and tasks do not spend turns trimming it.
+/// A fact file, front matter included: at most this.
 const LIMIT: usize = 16 * 1024;
+/// How much of an index a new agent's instructions take, and `show` gives:
+/// its head, whole lines in the index's order, then a line saying how many
+/// facts it leaves out, which `search` finds. Both indexes' heads fit an
+/// agent's instructions (60 KiB) beside its AGENTS.md files and role.
+pub const HEAD: usize = 16 * 1024;
+/// Days a `work` fact may go unsaved before the cleanup is asked to retire
+/// it: work under way is saved again as it moves.
+const WORK_DAYS: i64 = 3;
+/// The most facts a search gives, best first.
+const FOUND: usize = 20;
 /// Entries a folder may hold, facts or not, before it is refused as not a
-/// memory folder.
-const MAX_ENTRIES: usize = 1024;
+/// memory folder. A save never takes a folder past it, so one at the bound
+/// can still be read, searched, cleaned up and removed from.
+const MAX_ENTRIES: usize = 16 * 1024;
 const INDEX: &str = "MEMORY.md";
-const TYPES: [&str; 4] = ["user", "feedback", "project", "reference"];
+const TYPES: [&str; 5] = ["user", "feedback", "project", "reference", "work"];
 /// Each folder's record of when agents last read each of its facts, and
 /// how often, by name. It is kept apart from the facts and out of git, so a
 /// read changes no fact, no index, no agent's cached instructions, and no
@@ -40,7 +50,7 @@ const READS: &str = ".reads";
 /// asked to check that it still holds: Codex drops a memory unused for 30,
 /// Copilot one unused for 28.
 const UNREAD_DAYS: i64 = 30;
-const USAGE: &str = "usage: memory show [SCOPE]\n       memory read NAME [SCOPE]\n       memory save NAME --type user|feedback|project|reference --description TEXT --source TEXT [--external] [--confirmed N] [--pushed-back N] [SCOPE] -- TEXT|-\n       memory rm NAME [SCOPE]\n       memory index [SCOPE]\n       memory check [SCOPE]\n       memory said [SINCE_MS]   (Sonny: what the person wrote to any agent since then)\n       memory changed | cleanup start | cleanup finish\n       memory schedule [--model PROVIDER/MODEL [--effort LEVEL]] [--cron 'MIN HOUR DAY MONTH WEEKDAY']\n         --model starts the memory-cleanup agent; without it, the existing one\n         SCOPE: --user | --project NAME; none: the project of this folder";
+const USAGE: &str = "usage: memory show [SCOPE]\n       memory read NAME [SCOPE]\n       memory search WORDS... [SCOPE]\n       memory save NAME --type user|feedback|project|reference|work --description TEXT --source TEXT [--external] [--confirmed N] [--pushed-back N] [SCOPE] -- TEXT|-\n       memory rm NAME [SCOPE]\n       memory index [SCOPE]\n       memory check [SCOPE]\n       memory said [SINCE_MS]   (Sonny: what the person wrote to any agent since then)\n       memory changed | cleanup start | cleanup finish\n       memory schedule [--model PROVIDER/MODEL [--effort LEVEL]] [--cron 'MIN HOUR DAY MONTH WEEKDAY']\n         --model starts the memory-cleanup agent; without it, the existing one\n         SCOPE: --user | --project NAME; none: the project of this folder";
 
 /// `memory show|save|rm|index|check|changed|cleanup|schedule`, as
 /// `~/.agent/memory` runs it.
@@ -103,6 +113,8 @@ pub fn call(home: &Path, cwd: &Path, arguments: &Value) -> Result<Value, String>
         args
     } else if let Some(name) = arguments["read"].as_str() {
         vec!["read".to_owned(), name.to_owned()]
+    } else if let Some(words) = arguments["search"].as_str() {
+        vec!["search".to_owned(), words.to_owned()]
     } else if let Some(name) = arguments["remove"].as_str() {
         vec!["rm".to_owned(), name.to_owned()]
     } else if let Some(step) = arguments["cleanup"].as_str() {
@@ -221,6 +233,15 @@ fn run_as(
                 name = Some(arg.clone());
                 continue;
             }
+            // A search's words, each argument one or more of them.
+            _ if verb == "search" => {
+                let words = name.get_or_insert_with(String::new);
+                if !words.is_empty() {
+                    words.push(' ');
+                }
+                words.push_str(arg);
+                continue;
+            }
             _ => return Err(usage()),
         };
         if slot.is_some() {
@@ -260,7 +281,7 @@ fn run_as(
             };
             let index = |dir: PathBuf| {
                 let text = std::fs::read_to_string(dir.join(INDEX)).unwrap_or_default();
-                json!({"dir": dir, "index": text})
+                json!({"dir": dir, "index": head(&text)})
             };
             let mut shown = json!({"user": index(root.to_path_buf()), "project": null});
             if let Some(name) = project {
@@ -324,16 +345,27 @@ fn run_as(
             let _lock = lock(&dir)?;
             let all = facts(&dir)?;
             let text = render_index(&dir, &all);
-            if text.len() > LIMIT {
-                return Err(format!(
-                    "memory_full: the index would be {} bytes, above {LIMIT}; merge facts or remove one with memory rm NAME first",
-                    text.len()
-                ));
-            }
             write(&dir.join(INDEX), &text)?;
-            Ok(
-                json!({"index": dir.join(INDEX), "bytes": text.len(), "facts": all.len(), "limit": LIMIT}),
-            )
+            Ok(json!({"index": dir.join(INDEX), "bytes": text.len(), "facts": all.len()}))
+        }
+        ("search", Some(words), [None, None, None], None) => {
+            // Unscoped, both indexes, as `show` gives them.
+            let mut dirs = Vec::new();
+            if scoped {
+                dirs.push((project()?, scope()?));
+            } else {
+                dirs.push((None, root.to_path_buf()));
+                match project() {
+                    Err(error) if error.starts_with("project_unknown: ") => {}
+                    Err(error) => return Err(error),
+                    Ok(None) => {}
+                    Ok(Some(name)) => {
+                        let dir = root.join("projects").join(&name);
+                        dirs.push((Some(name), dir));
+                    }
+                }
+            }
+            search(&dirs, &words)
         }
         ("check", None, [None, None, None], None) => Ok(check(&scope()?)),
         _ => Err(usage()),
@@ -562,6 +594,15 @@ fn write(path: &Path, text: &str) -> Result<(), String> {
 
 /// Every fact in the folder, sorted by name, or the first file that is not
 /// one: a fact the index would leave out is refused, not skipped.
+/// How many entries `dir` holds, facts or not, as [`facts`] counts them.
+fn entries(dir: &Path) -> Result<usize, String> {
+    match std::fs::read_dir(dir) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(e) => Err(format!("memory_failed: {}: {e}", dir.display())),
+        Ok(entries) => Ok(entries.count()),
+    }
+}
+
 fn facts(dir: &Path) -> Result<Vec<Fact>, String> {
     let failed = |e: std::io::Error| format!("memory_failed: {}: {e}", dir.display());
     let entries = match std::fs::read_dir(dir) {
@@ -597,12 +638,114 @@ fn facts(dir: &Path) -> Result<Vec<Fact>, String> {
     Ok(found)
 }
 
+/// A folder's index, most needed first, since a new agent reads only its
+/// head: work under way by name, newest first; then the person's own facts
+/// (`user`, `feedback`) before the rest; within each, the most confirmed,
+/// then the most recently saved.
 fn render_index(dir: &Path, facts: &[Fact]) -> String {
     let mut text = format!("# Memory in {}\n\n", dir.display());
-    for fact in facts {
+    // Newest first, each by name and date alone: open it with `read`.
+    let mut work: Vec<&Fact> = facts.iter().filter(|fact| fact.kind == "work").collect();
+    work.sort_by(|a, b| b.verified.cmp(&a.verified).then(a.name.cmp(&b.name)));
+    for fact in work {
+        text.push_str(&format!(
+            "- {} (work, verified {})\n",
+            fact.name, fact.verified
+        ));
+    }
+    let mut lasting: Vec<&Fact> = facts.iter().filter(|fact| fact.kind != "work").collect();
+    let persons = |fact: &Fact| !matches!(fact.kind.as_str(), "user" | "feedback");
+    lasting.sort_by(|a, b| {
+        (persons(a).cmp(&persons(b)))
+            .then(b.confirmed.cmp(&a.confirmed))
+            .then(b.verified.cmp(&a.verified))
+            .then(a.name.cmp(&b.name))
+    });
+    for fact in lasting {
         text.push_str(&fact.line());
     }
     text
+}
+
+/// What a new agent reads of an index: whole lines from the top, each that
+/// still fits within [`HEAD`], then how many facts it leaves out and how
+/// to find them.
+pub fn head(index: &str) -> String {
+    if index.len() <= HEAD {
+        return index.to_owned();
+    }
+    // Room for the closing line.
+    let room = HEAD - 256;
+    let mut kept = String::new();
+    let mut left = 0;
+    for line in index.split_inclusive('\n') {
+        if kept.len() + line.len() <= room {
+            kept.push_str(line);
+        } else if line.starts_with("- ") {
+            left += 1;
+        }
+    }
+    if left > 0 {
+        kept.push_str(&format!(
+            "\n{left} more facts are in this folder's MEMORY.md, not shown here; the memory tool's search finds them.\n"
+        ));
+    }
+    kept
+}
+
+/// The facts in `dirs` (each a scope: the person's, or a project's by
+/// name) that hold every one of `words`, case aside, in their file; best
+/// first, by how often the words come in the name and description, then in
+/// the text; each with its index line and the first lines that hold a word.
+fn search(dirs: &[(Option<String>, PathBuf)], words: &str) -> Result<Value, String> {
+    let words: Vec<String> = words.split_whitespace().map(str::to_lowercase).collect();
+    if words.is_empty() {
+        return Err(format!("usage: {USAGE}"));
+    }
+    let mut found = Vec::new();
+    for (project, dir) in dirs {
+        for fact in facts(dir)? {
+            let path = dir.join(format!("{}.md", fact.name));
+            let text = std::fs::read_to_string(&path)
+                .map_err(|e| format!("memory_failed: {}: {e}", path.display()))?;
+            let lower = text.to_lowercase();
+            if !words.iter().all(|word| lower.contains(word.as_str())) {
+                continue;
+            }
+            let head = format!("{} {}", fact.name, fact.description).to_lowercase();
+            let score: usize = (words.iter())
+                .map(|word| {
+                    head.matches(word.as_str()).count() * 4 + lower.matches(word.as_str()).count()
+                })
+                .sum();
+            let body = text
+                .split_once("\n---\n")
+                .map_or(text.as_str(), |(_, body)| body);
+            let lines: Vec<String> = (body.lines())
+                .filter(|line| {
+                    let line = line.to_lowercase();
+                    words.iter().any(|word| line.contains(word.as_str()))
+                })
+                .take(3)
+                .map(|line| line.trim().chars().take(200).collect())
+                .collect();
+            found.push((
+                score,
+                json!({"name": fact.name, "project": project, "line": fact.line().trim_end(),
+                    "lines": lines}),
+            ));
+        }
+    }
+    found.sort_by(|a, b| {
+        (b.0.cmp(&a.0)).then_with(|| a.1["name"].as_str().cmp(&b.1["name"].as_str()))
+    });
+    let more = found.len().saturating_sub(FOUND);
+    let found: Vec<Value> = found
+        .into_iter()
+        .take(FOUND)
+        .map(|(_, fact)| fact)
+        .collect();
+    Ok(json!({"found": found, "more": more}))
 }
 
 /// Save `fact`; a count left out (`None` in `counts`) keeps the one the
@@ -641,17 +784,17 @@ fn save(
     // Index the folder as it will be before writing anything, so a save
     // that does not fit changes nothing.
     let mut all = facts(dir)?;
+    if before.is_none() && entries(dir)? >= MAX_ENTRIES {
+        return Err(format!(
+            "too_many_facts: {} holds {MAX_ENTRIES} entries, the most a memory folder may; save under an existing name",
+            dir.display()
+        ));
+    }
     all.retain(|other| other.name != fact.name);
     let at = all.partition_point(|other| other.name < fact.name);
     all.insert(at, fact.clone());
     let index = render_index(dir, &all);
     let duplicate = before.as_deref() == Some(text.as_str());
-    if !duplicate && index.len() > LIMIT {
-        return Err(format!(
-            "memory_full: the index would be {} bytes, above {LIMIT}; merge facts or remove one with memory rm NAME first",
-            index.len()
-        ));
-    }
     if !duplicate {
         write(&path, &text)?;
     }
@@ -752,11 +895,7 @@ fn check(dir: &Path) -> Value {
             }
         }
     }
-    if bytes > LIMIT {
-        problems
-            .push(json!({"problem": format!("{}: larger than {LIMIT} bytes", index.display())}));
-    }
-    json!({"dir": dir, "facts": count, "index_bytes": bytes, "limit": LIMIT, "problems": problems})
+    json!({"dir": dir, "facts": count, "index_bytes": bytes, "problems": problems})
 }
 
 /// Cleanup: a nightly agent merges duplicate facts and drops superseded
@@ -903,7 +1042,7 @@ fn unread(root: &Path) -> Result<Vec<Value>, String> {
     let mut found = Vec::new();
     for dir in scopes(root)? {
         let reads = reads(&dir);
-        for fact in facts(&dir)? {
+        for fact in facts(&dir)?.into_iter().filter(|fact| fact.kind != "work") {
             let last_read = reads
                 .get(&fact.name)
                 .and_then(|read| read["last"].as_str())
@@ -930,8 +1069,29 @@ fn unread(root: &Path) -> Result<Vec<Value>, String> {
     Ok(found.into_iter().map(|(_, fact)| fact).collect())
 }
 
-/// Whether anything was saved or removed since the last cleanup, or a
-/// cleanup is open, for an automation's `--if`: exit 0 when so, else
+/// Every `work` fact, by path under the memory folder, with its last save
+/// and whether that is more than [`WORK_DAYS`] ago, which is when the
+/// cleanup is asked to retire it.
+fn work(root: &Path) -> Result<Vec<(String, String, bool)>, String> {
+    let now = day_number(&today());
+    let mut found = Vec::new();
+    for dir in scopes(root)? {
+        for fact in facts(&dir)?.into_iter().filter(|fact| fact.kind == "work") {
+            let path = dir.join(format!("{}.md", fact.name));
+            let path = path.strip_prefix(root).unwrap_or(&path);
+            let stale = match (now, day_number(&fact.verified)) {
+                (Some(now), Some(saved)) => now - saved > WORK_DAYS,
+                _ => false,
+            };
+            found.push((path.display().to_string(), fact.verified, stale));
+        }
+    }
+    found.sort();
+    Ok(found)
+}
+
+/// Whether anything was saved or removed since the last cleanup, a
+/// cleanup is open, or work went stale, for an automation's `--if`: exit 0 when so, else
 /// `unchanged` and exit 1.
 fn changed(root: &Path) -> Result<Value, String> {
     // A cleanup cut short counts too, so the next night finishes it.
@@ -949,10 +1109,14 @@ fn changed(root: &Path) -> Result<Value, String> {
     } else {
         all_facts(root)? > 0
     };
-    if !saved {
-        return Err("unchanged: nothing saved or removed since the last cleanup".into());
+    if saved {
+        return Ok(json!({"changed": true}));
     }
-    Ok(json!({"changed": true}))
+    // Work goes stale with nothing saved, and the cleanup retires it.
+    if work(root)?.iter().any(|(_, _, stale)| *stale) {
+        return Ok(json!({"changed": true, "stale_work": true}));
+    }
+    Err("unchanged: nothing saved or removed since the last cleanup".into())
 }
 
 /// Commit what agents saved since the last cleanup and remember where the
@@ -986,16 +1150,21 @@ fn cleanup_start(root: &Path, caller: Option<&str>) -> Result<Value, String> {
         }
         _ => {}
     }
+    // Work under way ends, so retiring it is not a loss the guard counts.
+    let work: Vec<String> = work(root)?.into_iter().map(|(path, _, _)| path).collect();
     write(
         &state,
-        &json!({"commit": commit, "facts": count, "at_ms": at_ms, "by": caller}).to_string(),
+        &json!({"commit": commit, "facts": count, "work": work, "at_ms": at_ms, "by": caller})
+            .to_string(),
     )?;
     started(root, &commit, count as u64, false)
 }
 
 /// A started cleanup, with the facts saved and removed since the last one,
 /// which are what it reads first, those no agent has read in a while,
-/// which it checks still hold, and when the last finished one started
+/// which it checks still hold, the `work` facts not saved in over
+/// [`WORK_DAYS`] days (`stale_work`), which it retires, and when the last
+/// finished one started
 /// (`since_ms`, null before the first), from which it reads what the person
 /// wrote: a turn that ended while that one ran is read again rather than
 /// missed.
@@ -1007,9 +1176,14 @@ fn started(root: &Path, commit: &str, facts: u64, duplicate: bool) -> Result<Val
     let (removed, added, changed) = fact_changes(&since);
     let saved: Vec<_> = added.into_iter().chain(changed).collect();
     let since_ms = said_since(root);
+    let stale_work: Vec<Value> = (work(root)?.into_iter())
+        .filter(|(_, _, stale)| *stale)
+        .map(|(path, verified, _)| json!({"path": path, "verified": verified}))
+        .collect();
     Ok(
         json!({"started": commit, "facts": facts, "saved": saved, "removed": removed,
-        "unread": unread(root)?, "since_ms": since_ms, "duplicate": duplicate}),
+        "unread": unread(root)?, "stale_work": stale_work, "since_ms": since_ms,
+        "duplicate": duplicate}),
     )
 }
 
@@ -1078,10 +1252,10 @@ fn noted(root: &Path, caller: Option<&str>, path: &Path, now: Option<&str>) -> R
 /// index is now past the limit (the cleanup's removals had made room for
 /// saves the revert brings back beside). Nothing saved is dropped to fit.
 /// The caller holds every folder's lock.
-fn put_back(root: &Path) -> Result<(usize, Vec<PathBuf>), String> {
+fn put_back(root: &Path) -> Result<usize, String> {
     let others = root.join(OTHERS);
     let Ok(listed) = std::fs::read_to_string(&others) else {
-        return Ok((0, Vec::new()));
+        return Ok(0);
     };
     let mut last: Vec<(PathBuf, Option<String>)> = Vec::new();
     for line in listed.lines() {
@@ -1120,13 +1294,8 @@ fn put_back(root: &Path) -> Result<(usize, Vec<PathBuf>), String> {
             dirs.push(dir.to_owned());
         }
     }
-    let mut full = Vec::new();
     for dir in &dirs {
-        let index = render_index(dir, &facts(dir)?);
-        if index.len() > LIMIT {
-            full.push(dir.clone());
-        }
-        write(&dir.join(INDEX), &index)?;
+        write(&dir.join(INDEX), &render_index(dir, &facts(dir)?))?;
     }
     if !last.is_empty() {
         git(root, &["add", "-A"])?;
@@ -1135,7 +1304,7 @@ fn put_back(root: &Path) -> Result<(usize, Vec<PathBuf>), String> {
     }
     std::fs::remove_file(&others)
         .map_err(|e| format!("memory_failed: {}: {e}", others.display()))?;
-    Ok((last.len(), full))
+    Ok(last.len())
 }
 
 /// Commit the cleanup, or revert it when it removed more than a quarter of
@@ -1178,25 +1347,26 @@ fn cleanup_finish(root: &Path) -> Result<Value, String> {
         &["diff", "--name-status", "--no-renames", start, &head],
     )?;
     let (removed, added, changed) = fact_changes(&diff);
-    let limit = (before as usize / 4).max(2);
-    if removed.len() > limit {
+    // Work facts it retired are not counted: work under way ends.
+    let work: Vec<&str> = (open["work"].as_array().into_iter().flatten())
+        .filter_map(Value::as_str)
+        .collect();
+    let lost = (removed.iter())
+        .filter(|path| !work.contains(&path.as_str()))
+        .count();
+    let before = (before as usize).saturating_sub(work.len());
+    let limit = (before / 4).max(2);
+    if lost > limit {
         git(root, &["revert", "--no-edit", &head])?;
         private(root)?;
-        let (kept, full) = put_back(root)?;
+        let kept = put_back(root)?;
         let _ = std::fs::remove_file(&state);
-        let mut others = match kept {
+        let others = match kept {
             0 => String::new(),
             n => format!(" with the {n} facts other agents saved or removed meanwhile"),
         };
-        for dir in full {
-            others += &format!(
-                " ({} is now past {LIMIT} bytes of index: merge facts there first)",
-                dir.display()
-            );
-        }
         return Err(format!(
-            "loss_guard: the cleanup removed {} of {before} facts, above {limit}; memory is back as it was at {start}{others}, and the refused cleanup is commit {head}",
-            removed.len()
+            "loss_guard: the cleanup removed {lost} of {before} lasting facts, above {limit}; memory is back as it was at {start}{others}, and the refused cleanup is commit {head}"
         ));
     }
     let _ = std::fs::remove_file(root.join(OTHERS));
@@ -1542,28 +1712,32 @@ mod tests {
             &no_stdin,
         );
         assert_eq!(code(wrong_type), "invalid_type");
-        let mut n = 0;
-        let full = loop {
-            match save_user(
+        // An index is never full: every save lands, and a new agent reads
+        // its head, which says how many facts it leaves out.
+        let n = 400;
+        for i in 0..n {
+            let name = format!("fact-{i:03}");
+            save_user(
                 &root,
-                &format!("fact-{n:03}"),
+                &name,
                 "a description of some length ".repeat(3).trim(),
                 "x",
-            ) {
-                Ok(_) => n += 1,
-                Err(error) => break error,
-            }
-        };
-        assert!(
-            full.starts_with("memory_full: the index would be "),
-            "{full}"
-        );
+            )
+            .unwrap();
+        }
         let index = std::fs::read_to_string(root.join(INDEX)).unwrap();
-        assert!(index.len() <= LIMIT && !index.contains(&format!("fact-{n:03}")));
-        assert!(!root.join(format!("fact-{n:03}.md")).exists());
-        // Replacing a fact with one no longer still fits.
-        assert!(save_user(&root, "fact-000", "shorter", "x").is_ok());
-        // A rebuild that would pass the limit is refused too.
+        assert!(index.len() > HEAD && index.contains(&format!("fact-{:03}", n - 1)));
+        let top = head(&index);
+        assert!(top.len() <= HEAD, "{}", top.len());
+        let shown = top.lines().filter(|line| line.starts_with("- ")).count();
+        assert!(
+            top.ends_with(&format!(
+                "\n{} more facts are in this folder's MEMORY.md, not shown here; the memory tool's search finds them.\n",
+                n - shown
+            )),
+            "{top}"
+        );
+        // A rebuild of hand-added facts is not refused either.
         let fact = std::fs::read_to_string(root.join("fact-001.md")).unwrap();
         for extra in n..n + 4 {
             std::fs::write(
@@ -1572,10 +1746,8 @@ mod tests {
             )
             .unwrap();
         }
-        let before = std::fs::read_to_string(root.join(INDEX)).unwrap();
-        let rebuilt = run(&root, &root, &args(&["index", "--user"]), &no_stdin);
-        assert_eq!(code(rebuilt), "memory_full");
-        assert_eq!(std::fs::read_to_string(root.join(INDEX)).unwrap(), before);
+        let rebuilt = run(&root, &root, &args(&["index", "--user"]), &no_stdin).unwrap();
+        assert_eq!(rebuilt["facts"], n + 4);
         // Text read from stdin past the limit is refused, not cut short.
         let long = format!("x{}y", " ".repeat(LIMIT));
         let piped = run(
@@ -2166,7 +2338,7 @@ mod tests {
         }
         let refused = run_(&["cleanup", "finish"]).unwrap_err();
         assert!(
-            refused.starts_with("loss_guard: the cleanup removed 3 of 4 facts, above 2"),
+            refused.starts_with("loss_guard: the cleanup removed 3 of 4 lasting facts, above 2"),
             "{refused}"
         );
         use std::os::unix::fs::PermissionsExt;
@@ -2250,46 +2422,154 @@ mod tests {
     }
 
     #[test]
-    fn a_refused_cleanup_says_when_what_it_kept_overfills_the_index() {
-        let root = temp("cleanup-full");
-        let long = "d".repeat(3500);
-        let save = |caller: Option<&str>, name: &str| {
+    fn work_leads_the_index_by_name_and_the_cleanup_retires_it_uncounted() {
+        let root = temp("cleanup-work");
+        let save = |name: &str, kind: &str| {
             let line = [
                 "save",
                 name,
                 "--type",
-                "feedback",
+                kind,
                 "--description",
-                &long,
+                &format!("about {name}"),
                 "--source",
                 "test",
                 "--user",
                 "--",
                 "text",
             ];
-            run_as(&root, &root, &args(&line), &|| Ok("-".into()), caller).unwrap();
+            run_as(&root, &root, &args(&line), &|| Ok("-".into()), None).unwrap();
         };
         repo(&root).unwrap();
-        for name in ["a", "b", "c", "d"] {
-            save(None, name);
+        save("a-rule", "project");
+        save("b-taste", "feedback");
+        for name in ["port-sky", "fix-scroll", "ship-docs"] {
+            save(name, "work");
         }
-        let as_7 = |line: &[&str]| run_as(&root, &root, &args(line), &|| Ok("-".into()), Some("7"));
-        as_7(&["cleanup", "start"]).unwrap();
-        for name in ["b", "c", "d"] {
-            as_7(&["rm", name, "--user"]).unwrap();
+        // Work comes first, by name only, then the person's own facts.
+        let index = std::fs::read_to_string(root.join(INDEX)).unwrap();
+        let lines: Vec<&str> = index.lines().skip(2).collect();
+        let day = today();
+        for (at, name) in ["fix-scroll", "port-sky", "ship-docs"].iter().enumerate() {
+            assert_eq!(lines[at], format!("- {name} (work, verified {day})"));
         }
-        // Each save fits in the room the cleanup made.
-        for name in ["e", "f", "g"] {
-            save(Some("8"), name);
+        assert!(lines[3].starts_with("- b-taste (feedback") && lines[4].starts_with("- a-rule ("));
+        assert_eq!(lines.len(), 5, "{index}");
+        // Work not saved in over three days is for the cleanup to retire.
+        for name in ["port-sky", "fix-scroll"] {
+            let path = root.join(format!("{name}.md"));
+            let text = std::fs::read_to_string(&path).unwrap();
+            let old = text.replace(&format!("verified: {}", today()), "verified: 2026-01-01");
+            std::fs::write(&path, old).unwrap();
         }
-        let refused = as_7(&["cleanup", "finish"]).unwrap_err();
-        assert!(refused.contains("with the 3 facts"), "{refused}");
-        assert!(refused.contains("merge facts there first"), "{refused}");
-        // Nothing saved is dropped to fit.
-        for name in ["a", "b", "c", "d", "e", "f", "g"] {
-            assert!(root.join(format!("{name}.md")).exists(), "{name}");
+        let run_ = |line: &[&str]| run(&root, &root, &args(line), &|| Ok("-".into()));
+        // Stale work wakes the cleanup though nothing else changed.
+        git(&root, &["add", "-A"]).unwrap();
+        git(&root, &["commit", "-q", "-m", "quiet"]).unwrap();
+        assert_eq!(
+            changed(&root).unwrap(),
+            json!({"changed": true, "stale_work": true})
+        );
+        let started = run_(&["cleanup", "start"]).unwrap();
+        assert_eq!(
+            started["stale_work"],
+            json!([{"path": "fix-scroll.md", "verified": "2026-01-01"},
+                {"path": "port-sky.md", "verified": "2026-01-01"}])
+        );
+        assert_eq!(started["unread"], json!([]));
+        // Retiring all three is no loss: two lasting facts stay.
+        for name in ["port-sky", "fix-scroll", "ship-docs"] {
+            run_(&["rm", name, "--user"]).unwrap();
         }
+        let done = run_(&["cleanup", "finish"]).unwrap();
+        assert_eq!(done["removed"].as_array().unwrap().len(), 3);
+        assert!(
+            !std::fs::read_to_string(root.join(INDEX))
+                .unwrap()
+                .contains("(work, ")
+        );
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_save_never_takes_a_folder_past_its_entries() {
+        let root = temp("entries");
+        save_user(&root, "kept", "a fact", "x").unwrap();
+        // Others up to the bound, beside the fact, its index and lock.
+        for n in entries(&root).unwrap()..MAX_ENTRIES {
+            std::fs::write(root.join(format!("other-{n}.txt")), "").unwrap();
+        }
+        let refused = save_user(&root, "one-more", "a fact", "x").unwrap_err();
+        assert!(refused.starts_with("too_many_facts: "), "{refused}");
+        assert!(!root.join("one-more.md").exists());
+        // The folder still reads, saves under a name it has, and removes.
+        save_user(&root, "kept", "a fact, again", "y").unwrap();
+        run(&root, &root, &args(&["rm", "kept", "--user"]), &|| {
+            Ok("-".into())
+        })
+        .unwrap();
+        save_user(&root, "one-more", "a fact", "x").unwrap();
+        assert_eq!(entries(&root).unwrap(), MAX_ENTRIES);
+        let found = run(&root, &root, &args(&["search", "fact"]), &|| Ok("-".into())).unwrap();
+        assert_eq!(found["found"][0]["name"], "one-more");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn search_finds_facts_holding_every_word_best_first() {
+        let home = temp("search");
+        let root = home.join(".agents/memory");
+        std::fs::create_dir_all(&root).unwrap();
+        let save = |name: &str, description: &str, text: &str| {
+            let line = [
+                "save",
+                name,
+                "--type",
+                "project",
+                "--description",
+                description,
+                "--source",
+                "test",
+                "--user",
+                "--",
+                text,
+            ];
+            run(&root, &root, &args(&line), &|| Ok("-".into())).unwrap();
+        };
+        save(
+            "release-tags",
+            "George tags releases",
+            "The cloud cannot push tags.\nOther line.",
+        );
+        save(
+            "ci-flakes",
+            "Known flaky tests",
+            "A release waits for no flake.\nTags are fine.",
+        );
+        save("unrelated", "Nothing here", "Only words.");
+        let found = run(&root, &root, &args(&["search", "TAGS", "release"]), &|| {
+            Ok("-".into())
+        })
+        .unwrap();
+        let names: Vec<&str> = (found["found"].as_array().unwrap().iter())
+            .map(|fact| fact["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["release-tags", "ci-flakes"]);
+        assert_eq!(
+            found["found"][0]["lines"],
+            json!(["The cloud cannot push tags."])
+        );
+        assert!(
+            found["found"][0]["line"]
+                .as_str()
+                .unwrap()
+                .starts_with("- release-tags (project")
+        );
+        assert_eq!(found["more"], 0);
+        // From the tool, one string of words.
+        let tool = call(&home, &home, &json!({"search": "flake"})).unwrap();
+        assert_eq!(tool["found"][0]["name"], "ci-flakes");
+        std::fs::remove_dir_all(home).unwrap();
     }
 
     #[test]

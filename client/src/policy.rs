@@ -1246,6 +1246,40 @@ fn append(text: &mut String, path: PathBuf, header: &str) -> Result<Option<Sourc
             total: text.len() + header.len() + size,
         });
     };
+    push(text, path, header, &body)
+}
+
+/// Append a memory index's head ([`crate::memory::head`]): an index holds
+/// every fact, and a new bot starts with the most needed and searches for
+/// the rest. Reads at most [`MEMORY_READ`] of it, enough for thousands of
+/// facts; past that, only those count toward the facts it leaves out.
+fn append_memory(text: &mut String, path: PathBuf) -> Result<Option<Source>, Failure> {
+    let mut bytes = read_head(&path, MEMORY_READ)?;
+    if bytes.len() > MEMORY_READ {
+        let end = bytes
+            .iter()
+            .rposition(|&b| b == b'\n')
+            .map_or(0, |at| at + 1);
+        bytes.truncate(end);
+    }
+    let index = String::from_utf8(bytes).map_err(|e| Failure::Unreadable {
+        path: path.clone(),
+        reason: e.utf8_error().to_string(),
+    })?;
+    push(text, path, "\n\n", &crate::memory::head(&index))
+}
+
+/// How much of a memory index composing reads.
+const MEMORY_READ: usize = 4 * 1024 * 1024;
+
+/// Push `body` read from `path` under `header`, unless it is empty, or fail
+/// when it does not fit.
+fn push(
+    text: &mut String,
+    path: PathBuf,
+    header: &str,
+    body: &str,
+) -> Result<Option<Source>, Failure> {
     let body = body.trim();
     if body.is_empty() {
         return Ok(None);
@@ -1341,13 +1375,13 @@ pub fn instructions(
     // lists. The text keeps its order: files, lists, memory, role.
     let mut after = text.clone();
     // Memory follows: what earlier agents saved, as it stands when the bot
-    // is made. An index carries its own heading, so it goes in as it is;
-    // one not written yet is none.
+    // is made. An index carries its own heading, so its head goes in as it
+    // is; one not written yet is none.
     let mut indexes = Vec::new();
     for path in memory {
         match std::fs::symlink_metadata(path) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => not_dangling(path)?,
-            _ => indexes.extend(append(&mut after, path.clone(), "\n\n")?),
+            _ => indexes.extend(append_memory(&mut after, path.clone())?),
         }
     }
     // The role comes last: the most specific text a bot is given.
@@ -1818,6 +1852,33 @@ mod tests {
         let behind = [root.join("link/MEMORY.md")];
         let error = instructions(&root, None, &behind).unwrap_err();
         assert_eq!(error.code(), "instructions_unreadable");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_long_memory_index_goes_in_as_its_head() {
+        let root = temp("memory-head");
+        let user = root.join("MEMORY.md");
+        let mut index = "# Memory in /u\n\n".to_owned();
+        for n in 0..2000 {
+            index +=
+                &format!("- fact-{n:04} (project, verified 2026-11-05): a fact of some length\n");
+        }
+        std::fs::write(&user, &index).unwrap();
+        let composed = instructions(&root, None, std::slice::from_ref(&user)).unwrap();
+        let head = crate::memory::head(&index);
+        assert!(head.len() <= crate::memory::HEAD && head.contains("- fact-0000 ("));
+        assert!(
+            composed.text.ends_with(head.trim()),
+            "{}",
+            composed.text.len()
+        );
+        assert!(!composed.text.contains("- fact-1999 ("));
+        assert!(
+            composed
+                .text
+                .contains("more facts are in this folder's MEMORY.md")
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

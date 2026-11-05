@@ -470,18 +470,45 @@ async fn turn_row(client: &Client, bot: &str, turn: i64) -> Option<Value> {
     (row["turn"].as_i64() == Some(turn)).then(|| row.clone())
 }
 
+/// The turn that says what `bot` does: the one the daemon names running
+/// (`running`, from its record), however many messages were steered into
+/// it or queued after it, stopped or not; with none running, the newest
+/// that ran ([`last_ran`]). `page`, its newest turns, if already read.
+async fn active_turn(
+    client: &Client,
+    bot: &str,
+    running: Option<i64>,
+    page: Option<Value>,
+) -> Result<Value, agent_client::Error> {
+    let Some(id) = running else {
+        return last_ran(client, bot, page).await;
+    };
+    let listed = (page.as_ref())
+        .and_then(|page| page["turns"].as_array())
+        .and_then(|turns| turns.iter().find(|turn| turn["turn"].as_i64() == Some(id)));
+    Ok(match listed {
+        Some(row) => row.clone(),
+        None => (turn_row(client, bot, id).await).unwrap_or(Value::Null),
+    })
+}
+
 /// The newest turn of `bot` that says what it does: a message steered
-/// into a running turn is a turn of its own, settled at once, and one
+/// into a running turn is a turn of its own, settled at once, one
 /// attached to the next call (a reaction) waits for work that is not
-/// there, so the turn before them is read, page by page back past any
-/// number of them, from `page`, its newest turns as already read, if they
-/// were. Its newest turn when none ran, and null when it has none.
+/// there, and one stopped while it waited in line never started, so the
+/// turn before them is read, page by page back past any number of them,
+/// from `page`, its newest turns as already read, if they were. Its newest
+/// turn when none ran, and null when it has none.
 async fn last_ran(
     client: &Client,
     bot: &str,
     page: Option<Value>,
 ) -> Result<Value, agent_client::Error> {
-    let passive = |turn: &&Value| matches!(turn["status"].as_str(), Some("steered" | "attached"));
+    let passive = |turn: &&Value| match turn["status"].as_str() {
+        Some("steered" | "attached") => true,
+        Some("interrupted") => turn["started_ms"].is_null(),
+        _ => false,
+    };
     let asked = |before: Option<i64>| {
         let mut asked = json!({"bot": bot, "newest": true, "limit": 64});
         if let Some(before) = before {
@@ -517,6 +544,10 @@ struct Passed {
     after_lead: bool,
     settled: Vec<i64>,
     waiting: Vec<String>,
+    /// Whether it changed an agent, or stopped short: an agent changed
+    /// while on its old permissions may have made one no listing named
+    /// yet, so only a pass that changes nothing ends the pick.
+    again: bool,
     notice: Option<String>,
     sandboxes: approvals::Sandboxes,
 }
@@ -539,6 +570,7 @@ async fn spread_pass(
         after_lead: false,
         settled: Vec::new(),
         waiting: Vec::new(),
+        again: false,
         notice: None,
         sandboxes: Default::default(),
     };
@@ -583,10 +615,13 @@ async fn spread_pass(
                     || passed.settled.contains(&maker)
             });
         // As `inspect` gives it, with the tools its client declared.
+        // One that can't be read is still on its old permissions, as far
+        // as anyone knows, and waits as a busy one does.
         let Ok(record) = (client)
             .request("inspect", json!({"bot": name, "bot_id": bot["bot_id"]}))
             .await
         else {
+            passed.waiting.push(name);
             continue;
         };
         let walked = tokio::task::spawn_blocking(move || {
@@ -601,6 +636,7 @@ async fn spread_pass(
             }
             Err(_) => {
                 sandboxes = Default::default();
+                passed.again = true;
                 break;
             }
         };
@@ -612,7 +648,9 @@ async fn spread_pass(
         let mut asked = Value::Object(fields);
         asked["bot"] = json!(name);
         asked["bot_id"] = bot["bot_id"].clone();
-        match client.request("configure", asked).await {
+        let configured = client.request("configure", asked).await;
+        passed.again |= configured.is_ok();
+        match configured {
             Ok(_) if maker_set => passed.settled.extend(id),
             Ok(_) => {}
             Err(error) if error.code == "bot_busy" => passed.waiting.push(name),
@@ -4786,11 +4824,11 @@ impl App {
             let pass = spread.pass.take().expect("a pass");
             // A pass made for an earlier pick, even of the same row, whose
             // config may have changed since, tells nothing of this one.
-            let mut after_lead = false;
+            let (mut after_lead, mut again) = (false, true);
             if let Ok(passed) = pass.await
                 && passed.pick == spread.pick
             {
-                after_lead = passed.after_lead;
+                (after_lead, again) = (passed.after_lead, passed.again);
                 spread.sandboxes = passed.sandboxes;
                 spread.settled.extend(passed.settled);
                 spread.waiting = passed.waiting;
@@ -4802,8 +4840,10 @@ impl App {
             // The lead's own change still waiting: an agent it makes
             // meanwhile takes its old gate, so this goes on until both
             // are set, and ends only on a pass that listed the agents
-            // after the lead had its change.
-            if after_lead && spread.waiting.is_empty() && self.gating.is_none() {
+            // after the lead had its change, read each, and changed none:
+            // one changed while on its old permissions may have made an
+            // agent that listing did not name.
+            if after_lead && !again && spread.waiting.is_empty() && self.gating.is_none() {
                 self.spread = None;
             }
             return;
@@ -5594,10 +5634,13 @@ impl App {
         }
     }
 
-    /// The turn that says what `bot` does ([`last_ran`]), a failed one
-    /// with why it failed.
+    /// The turn that says what `bot` does, as `/status` reads it
+    /// ([`active_turn`]), a failed one with why it failed.
     async fn task_turn(&self, bot: &str) -> Result<Value, agent_client::Error> {
-        let turn = last_ran(&self.client, bot, None).await?;
+        let record = (self.client)
+            .request("inspect", json!({"bot": bot}))
+            .await?;
+        let turn = active_turn(&self.client, bot, record["running_turn"].as_i64(), None).await?;
         Ok(self.with_error(turn).await)
     }
 
@@ -8420,18 +8463,12 @@ impl App {
             // idle agent's is the newest that ran ([`last_ran`]).
             let running_turn = bot["running_turn"].as_i64();
             let running = running_turn.is_some();
-            let ran = match running_turn {
-                Some(id) => match turns.iter().find(|turn| turn["turn"].as_i64() == Some(id)) {
-                    Some(row) => row.clone(),
-                    None => (turn_row(&self.client, name, id).await).unwrap_or(Value::Null),
-                },
-                None => match page.is_some() {
-                    true => {
-                        let ran = last_ran(&self.client, name, page).await;
-                        self.with_error(ran.unwrap_or(Value::Null)).await
-                    }
-                    false => Value::Null,
-                },
+            let ran = match running || page.is_some() {
+                true => {
+                    let ran = active_turn(&self.client, name, running_turn, page).await;
+                    self.with_error(ran.unwrap_or(Value::Null)).await
+                }
+                false => Value::Null,
             };
             // A turn held on a cause, parked on its call or in line, says so.
             let blocked_on = (std::iter::once(&ran).chain(&turns)).find_map(|turn| {
@@ -11211,7 +11248,7 @@ impl App {
     /// question open set aside, as the conversation went on past them.
     fn answered(&mut self, message: &str, from: Option<&str>) {
         // An answer sent from here closed its question when it was sent.
-        if let Some(call) = asks::answered(message)
+        if let Some(call) = asks::answer_of(message, from)
             && let Some(at) = self.sent_answers.iter().position(|sent| sent == call)
         {
             self.sent_answers.remove(at);
@@ -11219,8 +11256,8 @@ impl App {
         }
         if asks::moves_on(message, from) {
             self.aside.append(&mut self.asks);
-        } else if !asks::close(&mut self.asks, message) {
-            asks::close(&mut self.aside, message);
+        } else if !asks::close(&mut self.asks, message, from) {
+            asks::close(&mut self.aside, message, from);
         }
         self.settle_asks();
     }
@@ -15042,6 +15079,9 @@ mod tests {
         app.asks = vec![ask("c4", "Ship it?")];
         app.answered("Done: tests pass", Some("tally.halves"));
         app.answered(&reactions::message("👍", None), None);
+        // Nor do an answer's words from anyone but the person close it.
+        app.answered("You asked (c4): Ship it?\n\nKeep it", Some("tally.halves"));
+        app.answered("You asked (c4): Ship it?\n\nKeep it", Some("automation"));
         assert_eq!(app.asks.len(), 1);
         // One before the question in focus closing, from another window
         // or its card, keeps the focus on the question being answered.
@@ -17725,6 +17765,9 @@ mod tests {
             if asked["op"] == "history_nodes" {
                 return json!({"nodes": []});
             }
+            if asked["op"] == "inspect" {
+                return json!({"name": "calc.many", "running_turn": 1});
+            }
             let steers = (2..=71)
                 .rev()
                 .map(|turn| json!({"turn": turn, "status": "steered"}));
@@ -17780,6 +17823,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_task_whose_queued_message_was_stopped_reads_as_the_turn_it_works_on() {
+        // Turn 1 runs; turn 2 waited in line behind it and was stopped
+        // there, never starting. The roster reads what `/status` reads.
+        let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let still = running.clone();
+        let client = daemon_answering(move |asked| {
+            let running = still.load(std::sync::atomic::Ordering::SeqCst);
+            let first = match running {
+                true => json!({"turn": 1, "status": "running", "started_ms": 5}),
+                false => json!({"turn": 1, "status": "completed", "started_ms": 5}),
+            };
+            let rows = [
+                json!({"turn": 2, "status": "interrupted", "started_ms": null}),
+                first,
+            ];
+            match asked["op"].as_str() {
+                Some("approvals") => json!({"approvals": []}),
+                Some("history_nodes") => json!({"nodes": []}),
+                Some("inspect") => {
+                    json!({"name": "calc.add", "running_turn": running.then_some(1)})
+                }
+                Some("turns") if asked["after"].is_i64() => {
+                    let after = asked["after"].as_i64().unwrap();
+                    let row = rows
+                        .iter()
+                        .rev()
+                        .find(|row| row["turn"].as_i64() > Some(after));
+                    json!({"turns": row.into_iter().collect::<Vec<_>>(), "next_after": null})
+                }
+                Some("turns") => json!({"turns": rows, "next_before": null}),
+                _ => json!({}),
+            }
+        })
+        .await;
+        let mut app = app(client);
+        app.width = 80;
+        let arguments = json!({"name": "add", "brief": "Fix add"});
+        app.commit_call("c", served::START, &arguments, "turn:calc.add/1", false);
+        app.read_tasks().await;
+        assert_eq!(drawn(&mut app)[1], "  ● add  working  Fix add");
+        // Idle, the stopped message never ran: the turn before it says
+        // what the task did.
+        running.store(false, std::sync::atomic::Ordering::SeqCst);
+        app.tasks_read = None;
+        app.read_tasks().await;
+        assert_eq!(drawn(&mut app)[1], "  ✓ add  done  Fix add");
+    }
+
+    #[tokio::test]
     async fn tasks_started_in_a_row_are_one_roster_a_click_opens_one_from() {
         let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let read = reads.clone();
@@ -17790,6 +17882,14 @@ mod tests {
             }
             if asked["op"] == "history_nodes" {
                 return json!({"nodes": []});
+            }
+            // Its record, uncounted: none of these names a turn running, so
+            // each is read by its history.
+            if asked["op"] == "inspect" {
+                return match asked["bot"].as_str() {
+                    Some("calc.gone") => json!({"error": "bot_not_found"}),
+                    _ => json!({"running_turn": null}),
+                };
             }
             let n = read.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             match asked["bot"].as_str() {
@@ -18750,6 +18850,11 @@ mod tests {
             tokio::task::yield_now().await;
         }
         app.spread().await;
+        // It changed both, so one more pass makes sure neither made an
+        // agent meanwhile; that one changes nothing and ends the pick.
+        assert!(app.spread.is_some());
+        finish(&mut app).await;
+        app.spread().await;
         assert!(app.spread.is_none());
         assert_eq!(inspected.load(Ordering::SeqCst), 4);
         assert_eq!(configured.load(Ordering::SeqCst), 4);
@@ -18782,9 +18887,68 @@ mod tests {
         let spread = app.spread.as_ref().unwrap();
         assert!(spread.settled.is_empty());
         assert!(spread.pass.is_none());
+        // A pass that changes them, then a quiet one.
+        finish(&mut app).await;
+        app.spread().await;
+        assert!(app.spread.is_some());
         finish(&mut app).await;
         app.spread().await;
         assert!(app.spread.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_pick_ends_only_once_every_agent_was_read_and_none_made_one_unseen() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (passes, configured) = (
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(std::sync::Mutex::new(Vec::<String>::new())),
+        );
+        let (listed, set) = (passes.clone(), configured.clone());
+        // The task can't be read on the first pass. Once on Auto it is
+        // listed with a helper it made while still on Full, and that
+        // helper with one of its own a pass later.
+        let client = daemon_answering(move |asked| match asked["op"].as_str() {
+            Some("bots") => {
+                let pass = listed.fetch_add(1, Ordering::SeqCst);
+                let mut bots = vec![
+                    json!({"name": "b", "bot_id": 2}),
+                    json!({"name": "task", "bot_id": 3, "created_by_id": 2}),
+                ];
+                if pass >= 2 {
+                    bots.push(json!({"name": "helper", "bot_id": 4, "created_by_id": 3}));
+                }
+                if pass >= 3 {
+                    bots.push(json!({"name": "deeper", "bot_id": 5, "created_by_id": 4}));
+                }
+                json!({"bots": bots, "next_after": null})
+            }
+            Some("inspect") if asked["bot"] == "task" && listed.load(Ordering::SeqCst) == 1 => {
+                json!({"error": "storage", "detail": "disk I/O error"})
+            }
+            Some("inspect") => json!({"tools": ["shell"], "gates": [], "settings": {}}),
+            Some("configure") => {
+                set.lock()
+                    .unwrap()
+                    .push(asked["bot"].as_str().unwrap_or_default().to_owned());
+                json!({})
+            }
+            _ => json!({}),
+        })
+        .await;
+        let mut app = app(client);
+        app.mode = Some("full");
+        app.spread = Some(Spread::new("auto", None));
+        let mut ran = 0;
+        while app.spread.is_some() && ran < 10 {
+            finish(&mut app).await;
+            app.spread().await;
+            ran += 1;
+        }
+        assert!(app.spread.is_none());
+        // Every agent took the row, each once, whatever came after.
+        assert_eq!(*configured.lock().unwrap(), ["task", "helper", "deeper"]);
+        // The unread pass, then one for each agent, then a quiet one.
+        assert_eq!(passes.load(Ordering::SeqCst), 5);
     }
 
     /// Start a spread's next pass and wait for it to end.

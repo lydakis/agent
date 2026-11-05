@@ -697,7 +697,9 @@ class WaitTests(ModelFixture):
             if bot not in (cancelled, deleted):
                 self.assertEqual(client.finished(turn)['data']['status'], 'completed')
         self.assertEqual(client.request('inspect', bot=deleted)['error'], 'bot_not_found')
-        fresh = client.request('submit', bot=cancelled, request_id='fresh', prompt='hello')['result']['turn']
+        answer = client.request('submit', bot=cancelled, request_id='fresh', prompt='hello')
+        self.assertIn('result', answer, answer)
+        fresh = answer['result']['turn']
         self.assertEqual(client.finished(fresh)['data']['status'], 'completed')
 
     def test_round_budget_survives_parking_and_daemon_restart(self):

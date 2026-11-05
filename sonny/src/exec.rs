@@ -731,7 +731,7 @@ pub fn whole_file() -> Option<PathBuf> {
 
 /// Run a script against the servers `hub` serves, keeping what it saves
 /// under `dir`.
-async fn run(
+pub(crate) async fn run(
     hub: &Hub,
     dir: Option<&Path>,
     bot: &str,
@@ -801,12 +801,11 @@ async fn run_keeping(
         said: Arc::default(),
         pictures: Arc::default(),
         calls: Arc::default(),
-        stopped: Arc::default(),
+        halt: Arc::default(),
         steps: steps.map(Arc::new),
         clock: Clock::new(deadline, running),
     };
-    let stopped = Arc::clone(&run.stopped);
-    let _stop = Stop(Arc::clone(&stopped));
+    let _stop = Stop(Arc::clone(&run.halt));
     let (output, calls, pictures) = (
         Arc::clone(&run.said),
         Arc::clone(&run.calls),
@@ -1071,11 +1070,52 @@ fn ceil(text: &str, mut at: usize) -> usize {
     at
 }
 
-/// Sets the script's stop flag when the answer is dropped or done.
-struct Stop(Arc<AtomicBool>);
+/// Halts the script when the answer is dropped or done.
+struct Stop(Arc<Halt>);
 impl Drop for Stop {
     fn drop(&mut self) {
-        self.0.store(true, Ordering::SeqCst);
+        self.0.stop();
+    }
+}
+
+/// Whether a script was stopped, its answer dropped as an interrupted or
+/// paused turn drops it: from then on it makes no call and stores nothing,
+/// whatever its JavaScript does before the interrupt ends it, and its run
+/// ends at once rather than at the next look.
+#[derive(Default)]
+struct Halt {
+    stopped: AtomicBool,
+    woken: tokio::sync::Notify,
+}
+
+impl Halt {
+    fn stop(&self) {
+        self.stopped.store(true, Ordering::SeqCst);
+        self.woken.notify_waiters();
+    }
+
+    fn is_stopped(&self) -> bool {
+        self.stopped.load(Ordering::SeqCst)
+    }
+
+    /// Done once the script is stopped.
+    async fn stopped(&self) {
+        loop {
+            // Made before the look, so a stop between the two still wakes it.
+            let woken = self.woken.notified();
+            if self.is_stopped() {
+                return;
+            }
+            woken.await;
+        }
+    }
+
+    /// The refusal of what a stopped script asks for.
+    fn refuse(&self, what: &str) -> Result<(), String> {
+        match self.is_stopped() {
+            true => Err(format!("{what} refused: its turn ended")),
+            false => Ok(()),
+        }
     }
 }
 
@@ -1166,7 +1206,7 @@ struct Run {
     said: Arc<Mutex<Output>>,
     pictures: Arc<Mutex<Vec<Picture>>>,
     calls: Arc<Mutex<BTreeMap<String, usize>>>,
-    stopped: Arc<AtomicBool>,
+    halt: Arc<Halt>,
     steps: Option<Arc<Steps>>,
     clock: Arc<Clock>,
 }
@@ -1342,25 +1382,23 @@ impl Run {
     async fn script(self, code: String) -> Result<Ended, String> {
         let runtime = AsyncRuntime::new().map_err(|e| e.to_string())?;
         runtime.set_memory_limit(MEMORY).await;
-        let (stopped, clock) = (Arc::clone(&self.stopped), Arc::clone(&self.clock));
+        let (halt, clock) = (Arc::clone(&self.halt), Arc::clone(&self.clock));
         runtime
-            .set_interrupt_handler(Some(Box::new(move || {
-                stopped.load(Ordering::SeqCst) || clock.check()
-            })))
+            .set_interrupt_handler(Some(Box::new(move || halt.is_stopped() || clock.check())))
             .await;
         let context = AsyncContext::full(&runtime)
             .await
             .map_err(|e| e.to_string())?;
-        let stopped = Arc::clone(&self.stopped);
+        let halt = Arc::clone(&self.halt);
         let ran = context.async_with(async |ctx| self.evaluate(ctx, &code).await);
         let ended = tokio::select! {
             ended = ran => ended,
             _ = self.clock.run_out() => Ended::Terminated("it ran out of time".into()),
-            _ = stopped_flag(&stopped) => Ended::Terminated("its turn ended".into()),
+            _ = halt.stopped() => Ended::Terminated("its turn ended".into()),
         };
         Ok(match ended {
             // An interrupt ends the evaluation as an uncatchable error.
-            Ended::Failed(_) if self.stopped.load(Ordering::SeqCst) => {
+            Ended::Failed(_) if self.halt.is_stopped() => {
                 Ended::Terminated("its turn ended".into())
             }
             Ended::Failed(_) if self.clock.out() => Ended::Terminated("it ran out of time".into()),
@@ -1429,6 +1467,7 @@ impl Run {
             steps: self.steps.clone(),
             clock: Arc::clone(&self.clock),
             at_once: Arc::new(tokio::sync::Semaphore::new(CALLS)),
+            halt: Arc::clone(&self.halt),
         };
         globals.set(
             "__call",
@@ -1471,14 +1510,13 @@ impl Run {
                 }))
             })?,
         )?;
-        let store = self.store.clone();
+        let (store, halt) = (self.store.clone(), Arc::clone(&self.halt));
         globals.set(
             "__store",
             Function::new(ctx.clone(), move |key: String, value: String| {
                 said_of(
-                    store
-                        .as_deref()
-                        .ok_or("no HOME".into())
+                    (halt.refuse("store()"))
+                        .and_then(|()| store.as_deref().ok_or("no HOME".into()))
                         .and_then(|file| keep(file, &key, &value))
                         .map(|()| "stored".to_owned()),
                 )
@@ -1493,12 +1531,6 @@ impl Run {
             })?,
         )?;
         Ok(())
-    }
-}
-
-async fn stopped_flag(stopped: &AtomicBool) {
-    while !stopped.load(Ordering::SeqCst) {
-        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 
@@ -1523,6 +1555,7 @@ struct Caller {
     clock: Arc<Clock>,
     /// Places for the script's calls in flight.
     at_once: Arc<tokio::sync::Semaphore>,
+    halt: Arc<Halt>,
 }
 
 impl Caller {
@@ -1536,6 +1569,8 @@ impl Caller {
     }
 
     async fn called(&self, id: String, arguments: String) -> Result<crate::mcp::Called, String> {
+        let named = format!("tools.{id}");
+        self.halt.refuse(&named)?;
         let Some(nested) = self.nested.get(&id).cloned() else {
             let mut error = format!("tools.{id} is not a tool; ALL_TOOLS lists them");
             if !self.failed.is_empty() {
@@ -1575,6 +1610,10 @@ impl Caller {
         // A place among the script's calls in flight, held until its
         // result is the script's.
         let _place = self.at_once.acquire().await.map_err(|e| e.to_string())?;
+        // The last look before the call reaches its server: a script
+        // stopped meanwhile, though its JavaScript runs on until the
+        // interrupt ends it, makes none.
+        self.halt.refuse(&named)?;
         *self
             .calls
             .lock()

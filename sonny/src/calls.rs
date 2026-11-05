@@ -276,6 +276,13 @@ fn memory(words: &[String], output: &str, failed: bool) -> Said {
         }
         Some("rm") => ("Removed from memory".into(), name()),
         Some("read") => ("Read from memory".into(), name()),
+        Some("search") => {
+            let searched: Vec<&str> = (words[1..].iter())
+                .map(String::as_str)
+                .take_while(|word| !word.starts_with("--"))
+                .collect();
+            ("Searched memory".into(), searched.join(" "))
+        }
         Some("said") => ("Read what the person wrote".into(), String::new()),
         Some(other) => (format!("Used memory {other}"), String::new()),
     };
@@ -797,6 +804,9 @@ pub fn declared(name: &str, arguments: &Value, failed: bool) -> Option<Said> {
                 }
                 (None, Some(removed), _) => said("Removed from memory", removed),
                 (None, None, Some(read)) => said("Read from memory", read),
+                _ if field("search").is_some() => {
+                    said("Searched memory", field("search").unwrap_or_default())
+                }
                 _ if arguments["index"] == true => said("Indexed memory", ""),
                 _ if arguments["check"] == true => said("Checked memory", ""),
                 _ if arguments["said"] == true => said("Read what the person wrote", ""),
