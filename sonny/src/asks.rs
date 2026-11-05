@@ -823,7 +823,11 @@ struct Reading {
 }
 
 impl Reading {
-    fn entry(&mut self, entry: &Value, asked: &str, call: &str) -> Option<bool> {
+    /// Reads `entry`, of turn `at`, newest first, for ask `call` of turn
+    /// `turn`: whether it is open once its call is reached. A provider's
+    /// call IDs are unique only within a turn, so another turn's call of
+    /// the same ID is not the ask, and the reading goes on past it.
+    fn entry(&mut self, at: i64, entry: &Value, turn: i64, call: &str) -> Option<bool> {
         if crate::lookout::said_by_person(entry).is_some() {
             let text = crate::text(&entry["item"]);
             match answer_of(&text, None) {
@@ -832,6 +836,9 @@ impl Reading {
                 None => {}
             }
         }
+        if at != turn {
+            return None;
+        }
         let made = crate::responses(&entry["item"])
             .into_iter()
             .find(|item| item["type"] == "function_call" && item["call_id"] == call)?;
@@ -839,7 +846,8 @@ impl Reading {
             .and_then(|a| serde_json::from_str::<Value>(a).ok())
             .and_then(|arguments| self::call("", &arguments))
             .is_some();
-        Some(asks && !self.answers.iter().any(|answered| answered == asked))
+        let asked = id(turn, call);
+        Some(asks && !self.answers.iter().any(|answered| *answered == asked))
     }
 }
 
@@ -849,9 +857,8 @@ pub async fn still_open(bot: &str, turn: i64, call: &str) -> Result<bool, String
     let socket = daemon.socket()?;
     let client = crate::trigger::connect(&socket, &daemon).await?;
     let (mut reading, mut found) = (Reading::default(), None);
-    let asked = id(turn, call);
-    crate::said::walk(&client, bot, turn, |_, entry| {
-        found = reading.entry(entry, &asked, call);
+    crate::said::walk(&client, bot, turn, |at, entry| {
+        found = reading.entry(at, entry, turn, call);
         found.is_some()
     })
     .await
@@ -1626,9 +1633,13 @@ mod tests {
             json!({"node": 9, "from": null, "origin": null,
             "item": {"role": "user", "content": [{"type": "input_text", "text": text}]}})
         };
+        // Each entry of turn 2 unless it says another.
         let read = |entries: &[Value]| {
             let mut reading = Reading::default();
-            (entries.iter()).find_map(|entry| reading.entry(entry, &id(2, "a1"), "a1"))
+            (entries.iter()).find_map(|entry| {
+                let at = entry["turn"].as_i64().unwrap_or(2);
+                reading.entry(at, entry, 2, "a1")
+            })
         };
         assert_eq!(read(std::slice::from_ref(&asking)), Some(true));
         // Words of their own after it: the conversation moved on.
@@ -1655,6 +1666,20 @@ mod tests {
         assert_eq!(
             read(&[person(&answer(&earlier, "1")), asking.clone()]),
             Some(true)
+        );
+        // A later turn's ask reusing the call, answered too, is another
+        // ask: the reading goes on past it to this one's answer.
+        let mut reused = asking.clone();
+        reused["turn"] = json!(5);
+        let later = call(&id(5, "a1"), &asked("go_later")).unwrap();
+        assert_eq!(
+            read(&[
+                person(&answer(&later, "1")),
+                reused,
+                person(&answer(&ask, "1")),
+                asking.clone()
+            ]),
+            Some(false)
         );
         // Nor does the answer to another ask of the same words: its
         // deadline still holds.
@@ -1726,7 +1751,7 @@ mod tests {
             let mut reading = Reading::default();
             let deadline = [entry, asking.clone()]
                 .iter()
-                .find_map(|entry| reading.entry(entry, &ask.id, "a1"));
+                .find_map(|entry| reading.entry(2, entry, 2, "a1"));
             assert_eq!(deadline, Some(!theirs), "{sender}");
             // The card pinned live.
             let mut pinned = vec![ask.clone()];
