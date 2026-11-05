@@ -147,7 +147,7 @@ pub async fn scan(client: &Client, bot: &str, last: Option<i64>) -> Option<Seen>
         }
     }
     Some(Seen {
-        ask: crate::asks::open(bot, &items),
+        ask: crate::asks::open(&items),
         itself: resolved_itself(&turn, bot),
         turn: last,
     })

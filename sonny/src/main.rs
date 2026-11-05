@@ -5308,7 +5308,7 @@ impl App {
         // option a button that answers with it.
         if name == asks::TOOL
             && !failed
-            && let Some(ask) = asks::call(&self.ask_id(turn, id), arguments)
+            && let Some(ask) = asks::call(&Self::ask_id(turn, id), arguments)
         {
             let ask = asks::settled(ask, output);
             let card = asks::card(&ask, self.width);
@@ -8775,7 +8775,7 @@ impl App {
             })
             .collect();
         Some(Latest {
-            ask: asks::open(bot, &flat),
+            ask: asks::open(&flat),
             pr,
             step: Self::step(&entries),
         })
@@ -11231,12 +11231,12 @@ impl App {
         }
     }
 
-    /// The ask this window's agent made as call `call` in its turn `turn`,
-    /// as [`asks::id`] names it; one whose turn is not known by its call
-    /// alone, which no answer names.
-    fn ask_id(&self, turn: Option<i64>, call: &str) -> String {
+    /// The ask made as call `call` in turn `turn`, as [`asks::id`] names
+    /// it; one whose turn is not known by its call alone, which no answer
+    /// names.
+    fn ask_id(turn: Option<i64>, call: &str) -> String {
         match turn {
-            Some(turn) => asks::id(&self.bot, turn, call),
+            Some(turn) => asks::id(turn, call),
             None => call.to_owned(),
         }
     }
@@ -11245,7 +11245,7 @@ impl App {
     /// conversation goes on past it. One newly asked takes no focus from
     /// the one being answered, as Codex's questions take none.
     fn asked(&mut self, id: &str, turn: Option<i64>, arguments: &Value) {
-        if let Some(ask) = asks::call(&self.ask_id(turn, id), arguments)
+        if let Some(ask) = asks::call(&Self::ask_id(turn, id), arguments)
             && !(self.asks.iter().chain(&self.aside)).any(|open| open.id == ask.id)
         {
             self.asks.push(ask);
@@ -14427,7 +14427,7 @@ mod tests {
             "options": [{"label": "Now"}, {"label": "Later"}], "recommended": 1});
         let items = json!([
             // An answer to an ask, with what the ask recommended.
-            {"node": 17, "item": message("user", "You asked (ask:shop.lead/4/c1): Ship it now?\n\nLater")},
+            {"node": 17, "item": message("user", "You asked (ask:4/c1): Ship it now?\n\nLater")},
             {"node": 16, "item": {"type": "function_call", "name": "ask", "call_id": "c1",
                 "arguments": ask.to_string()}},
             // One to an older reply names it; one to the last reply is the
@@ -14456,7 +14456,7 @@ mod tests {
             .await;
         let read = said::said(&client, None, 1000).await.unwrap();
         let entry = |turn: i64, text: &str| json!({"bot": "shop.lead", "turn": turn, "text": text, "project": null});
-        let mut answer = entry(4, "You asked (ask:shop.lead/4/c1): Ship it now?\n\nLater");
+        let mut answer = entry(4, "You asked (ask:4/c1): Ship it now?\n\nLater");
         answer["recommended"] = json!("Now");
         let mut older = entry(4, "🎉");
         older["reacted_to"] = json!("Tagged 0.6.0.");
@@ -14477,14 +14477,14 @@ mod tests {
             "recommended": 1});
         let items = json!([
             // An answer against what the ask recommended.
-            {"node": 13, "item": message("user", "You asked (ask:shop.lead/2/t2): Tag it too?\n\nNo")},
+            {"node": 13, "item": message("user", "You asked (ask:2/t2): Tag it too?\n\nNo")},
             // A 🙌 on the last finished reply, which waited for its call
             // while another reply was written.
             {"node": 12, "item": message("user", "🙌")},
             {"node": 11, "item": message("assistant", "Still working.")},
             // A 🚀 on the older of two replies that begin alike.
             {"node": 10, "item": message("user", "> Done.\n\n🚀")},
-            {"node": 9, "item": message("user", "You asked (ask:shop.lead/2/t1): Ship it now?\n\nNow")},
+            {"node": 9, "item": message("user", "You asked (ask:2/t1): Ship it now?\n\nNow")},
             // A 👍 on the ask's reply, taken off and put on again: once.
             {"node": 8, "item": message("user", "👍")},
             {"node": 7, "item": message("user", "👍")},
@@ -14532,7 +14532,7 @@ mod tests {
             .unwrap();
         let entry =
             |text: &str| json!({"bot": "shop.lead", "turn": 2, "text": text, "project": null});
-        let mut answer = entry("You asked (ask:shop.lead/2/t1): Ship it now?\n\nNow");
+        let mut answer = entry("You asked (ask:2/t1): Ship it now?\n\nNow");
         answer["recommended"] = json!("Now");
         let mut liked = entry("👍");
         liked["reacted_to"] = json!("Ready to ship.");
@@ -14540,7 +14540,7 @@ mod tests {
         launched["reacted_to"] = json!("Done.");
         let mut cheered = entry("🙌");
         cheered["reacted_to"] = json!("Ready to ship.");
-        let mut against = entry("You asked (ask:shop.lead/2/t2): Tag it too?\n\nNo");
+        let mut against = entry("You asked (ask:2/t2): Tag it too?\n\nNo");
         against["recommended"] = json!("Yes");
         assert_eq!(
             read["said"],
@@ -15067,14 +15067,14 @@ mod tests {
             .unwrap()
         };
         app.asks = vec![
-            ask("ask:b/1/c1", "Keep the old API?"),
-            ask("ask:b/1/c2", "Tag it?"),
-            ask("ask:b/1/c3", "Keep the old API?"),
+            ask("ask:1/c1", "Keep the old API?"),
+            ask("ask:1/c2", "Tag it?"),
+            ask("ask:1/c3", "Keep the old API?"),
         ];
         app.input.set("2");
         app.submit().await;
         // Its answer landing leaves the other question asked the same open.
-        app.answered("You asked (ask:b/1/c1): Keep the old API?\n\nDrop it", None);
+        app.answered("You asked (ask:1/c1): Keep the old API?\n\nDrop it", None);
         // Words typed while one is open are the person's own, sent as they
         // wrote them: no question is named over them, nor answered.
         app.input.set("how is it going?");
@@ -15083,66 +15083,66 @@ mod tests {
         assert_eq!(
             *sent.lock().unwrap(),
             [
-                "You asked (ask:b/1/c1): Keep the old API?\n\nDrop it",
+                "You asked (ask:1/c1): Keep the old API?\n\nDrop it",
                 "how is it going?"
             ]
         );
         assert_eq!(
             app.asks,
             [
-                ask("ask:b/1/c2", "Tag it?"),
-                ask("ask:b/1/c3", "Keep the old API?")
+                ask("ask:1/c2", "Tag it?"),
+                ask("ask:1/c3", "Keep the old API?")
             ]
         );
         // Down picks the next to answer; an option's number then picks on
         // it, named over it as the sent answer will be.
         app.step_ask(true);
-        assert_eq!(app.asking().map(|a| a.id.as_str()), Some("ask:b/1/c3"));
+        assert_eq!(app.asking().map(|a| a.id.as_str()), Some("ask:1/c3"));
         app.input.set("1");
         assert_eq!(
             app.answering_over(80).unwrap().to_string(),
             "  answering “Keep the old API?” (2 of 2)"
         );
         app.step_ask(true);
-        assert_eq!(app.asking().map(|a| a.id.as_str()), Some("ask:b/1/c2"));
+        assert_eq!(app.asking().map(|a| a.id.as_str()), Some("ask:1/c2"));
         // The person's own words landing move on past them: out of the
         // composer and the count, their options still answering them.
         app.answered("how is it going?", None);
         assert!(app.asks.is_empty() && app.asking().is_none());
         assert_eq!(app.aside.len(), 2);
         app.input.clear();
-        app.press("answer/0/ask:b/1/c2").await;
+        app.press("answer/0/ask:1/c2").await;
         assert_eq!(
             sent.lock().unwrap().last().unwrap(),
-            "You asked (ask:b/1/c2): Tag it?\n\nKeep it"
+            "You asked (ask:1/c2): Tag it?\n\nKeep it"
         );
-        assert_eq!(app.aside, [ask("ask:b/1/c3", "Keep the old API?")]);
+        assert_eq!(app.aside, [ask("ask:1/c3", "Keep the old API?")]);
         // Another agent's words, or a reaction, move nothing on.
-        app.asks = vec![ask("ask:b/1/c4", "Ship it?")];
+        app.asks = vec![ask("ask:1/c4", "Ship it?")];
         app.answered("Done: tests pass", Some("tally.halves"));
         app.answered(&reactions::message("👍", None), None);
         // Nor do an answer's words from anyone but the person close it.
         app.answered(
-            "You asked (ask:b/1/c4): Ship it?\n\nKeep it",
+            "You asked (ask:1/c4): Ship it?\n\nKeep it",
             Some("tally.halves"),
         );
         app.answered(
-            "You asked (ask:b/1/c4): Ship it?\n\nKeep it",
+            "You asked (ask:1/c4): Ship it?\n\nKeep it",
             Some("automation"),
         );
         assert_eq!(app.asks.len(), 1);
         // One before the question in focus closing, from another window
         // or its card, keeps the focus on the question being answered.
         app.asks = vec![
-            ask("ask:b/1/c5", "Tag it?"),
-            ask("ask:b/1/c6", "Bump?"),
-            ask("ask:b/1/c7", "Notes?"),
+            ask("ask:1/c5", "Tag it?"),
+            ask("ask:1/c6", "Bump?"),
+            ask("ask:1/c7", "Notes?"),
         ];
-        app.focus = Some("ask:b/1/c6".into());
-        app.answered("You asked (ask:b/1/c5): Tag it?\n\nKeep it", None);
-        assert_eq!(app.asking().map(|a| a.id.as_str()), Some("ask:b/1/c6"));
-        app.press("answer/0/ask:b/1/c7").await;
-        assert_eq!(app.asking().map(|a| a.id.as_str()), Some("ask:b/1/c6"));
+        app.focus = Some("ask:1/c6".into());
+        app.answered("You asked (ask:1/c5): Tag it?\n\nKeep it", None);
+        assert_eq!(app.asking().map(|a| a.id.as_str()), Some("ask:1/c6"));
+        app.press("answer/0/ask:1/c7").await;
+        assert_eq!(app.asking().map(|a| a.id.as_str()), Some("ask:1/c6"));
     }
 
     #[tokio::test]
@@ -15743,7 +15743,7 @@ mod tests {
                   "arguments": "{\"question\":\"Write notes?\"}"},
             "7": {"type": "function_call_output", "call_id": "a3", "output": "Asked."},
             "8": {"type": "message", "role": "user",
-                  "content": [{"type": "input_text", "text": "You asked (ask:b/1/a3): Write notes?\n\nyes"}]},
+                  "content": [{"type": "input_text", "text": "You asked (ask:1/a3): Write notes?\n\nyes"}]},
         });
         let client = daemon_answering(move |asked| match asked["op"].as_str() {
             Some("history_nodes") => {
@@ -15760,7 +15760,7 @@ mod tests {
         // The refused one was never asked, and the answered one is closed.
         assert_eq!(
             app.asks.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(),
-            ["ask:b/1/a1"]
+            ["ask:1/a1"]
         );
         // Drawn where it was asked, with what each option means.
         let rows: Vec<String> = app.pending.iter().map(|l| l.to_string()).collect();
@@ -15771,7 +15771,7 @@ mod tests {
         assert_eq!(rows[at + 4], "┃    Brew gets it tonight.");
         assert_eq!(rows[at + 8], "┃ Why 1: Nothing else is due.");
         // Its answer landing, sent from here or another window, closes it.
-        app.answered("You asked (ask:b/1/a1): Tag 0.4.1?\n\nYes", None);
+        app.answered("You asked (ask:1/a1): Tag 0.4.1?\n\nYes", None);
         assert!(app.asks.is_empty());
         // Live, a question is pinned once the daemon took the call.
         let arguments = json!({"question": "Merge?"}).to_string();
@@ -18416,11 +18416,11 @@ mod tests {
         }
         assert_eq!(
             sent.lock().unwrap()[..],
-            [json!("You asked (ask:b/4/a4): Merge?\n\nNo")]
+            [json!("You asked (ask:4/a4): Merge?\n\nNo")]
         );
         assert!(app.asks.is_empty());
         // Once answered, another click sends nothing.
-        app.press("answer/0/ask:b/4/a4").await;
+        app.press("answer/0/ask:4/a4").await;
         assert_eq!(sent.lock().unwrap().len(), 1);
         assert_eq!(
             app.notice.as_deref(),
