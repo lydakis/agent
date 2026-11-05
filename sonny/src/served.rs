@@ -1004,7 +1004,9 @@ impl Server {
             && let Some(turn) = event["turn"].as_i64()
         {
             self.serving.lock().unwrap().retain(|key, job| {
-                if key.0 == turn {
+                if key.0 == turn
+                    && let Job::Running(job) = job
+                {
                     job.abort();
                 }
                 key.0 != turn
@@ -1013,8 +1015,19 @@ impl Server {
     }
 }
 
+/// A call Sonny answers: running, or answered with the result the daemon
+/// has not taken yet. A call answered is never run again: its result is
+/// handed in again until the daemon takes it or says the call wants none.
+enum Job {
+    Running(tokio::task::AbortHandle),
+    Answered(Value),
+}
+
 /// The calls being answered, by their turn and ID.
-type Serving = Arc<Mutex<HashMap<(i64, String), tokio::task::AbortHandle>>>;
+type Serving = Arc<Mutex<HashMap<(i64, String), Job>>>;
+
+/// How soon a result the daemon did not take is handed in again.
+const RESEND: Duration = Duration::from_secs(2);
 
 async fn serve(store: PathBuf, socket: PathBuf, nudge: Arc<Notify>, serving: Serving) {
     let Ok(me) = std::env::current_exe() else {
@@ -1028,24 +1041,24 @@ async fn serve(store: PathBuf, socket: PathBuf, nudge: Arc<Notify>, serving: Ser
         if let Ok((client, _events)) = Client::connect(&socket).await {
             crate::trusted::against(client.clone());
             loop {
-                let Ok(calls) = waiting(&client).await else {
-                    break;
-                };
-                for call in calls {
-                    let key = (call["turn"].as_i64().unwrap_or(0), str_of(&call["call_id"]));
-                    let mut jobs = serving.lock().unwrap();
-                    if !jobs.contains_key(&key) {
-                        let (client, me, store, socket, serving, hub) = (
+                let run = {
+                    let (client, me, store, socket, hub) = (
+                        client.clone(),
+                        me.clone(),
+                        store.clone(),
+                        socket.clone(),
+                        hub.clone(),
+                    );
+                    move |call: Value| {
+                        let (client, me, store, socket, hub) = (
                             client.clone(),
                             me.clone(),
                             store.clone(),
                             socket.clone(),
-                            serving.clone(),
                             hub.clone(),
                         );
-                        let held = key.clone();
-                        let job = tokio::spawn(async move {
-                            let answer = match call["name"].as_str() {
+                        async move {
+                            match call["name"].as_str() {
                                 // In the host, where the servers stay up.
                                 Some(EXEC) => script(&hub, &client, &call).await,
                                 Some(BROWSER) => browse(&client, &call).await,
@@ -1053,26 +1066,17 @@ async fn serve(store: PathBuf, socket: PathBuf, nudge: Arc<Notify>, serving: Ser
                                 _ => answer(&client, &call, &me, &store, &socket)
                                     .await
                                     .map(Value::String),
-                            };
-                            let mut asked = json!({"bot": call["bot"], "turn": call["turn"],
-                                "call_id": call["call_id"]});
-                            match answer {
-                                Ok(output) => asked["output"] = cut_parts(output),
-                                Err((code, detail)) => {
-                                    asked["error"] = json!({"code": code, "detail": cut(detail)})
-                                }
                             }
-                            // One out of time, interrupted or answered already
-                            // waits for nothing more.
-                            let _ = client.request("tool_result", asked).await;
-                            serving.lock().unwrap().remove(&key);
-                        });
-                        jobs.insert(held, job.abort_handle());
+                        }
                     }
-                }
+                };
+                let Ok(unsent) = sweep(&client, &serving, run).await else {
+                    break;
+                };
+                let again = if unsent { RESEND } else { SWEEP };
                 tokio::select! {
                     _ = nudge.notified() => {}
-                    _ = tokio::time::sleep(SWEEP) => {
+                    _ = tokio::time::sleep(again) => {
                         let hub = hub.clone();
                         tokio::spawn(async move { hub.reap(crate::mcp::IDLE).await });
                     }
@@ -1081,6 +1085,93 @@ async fn serve(store: PathBuf, socket: PathBuf, nudge: Arc<Notify>, serving: Ser
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
+}
+
+/// One look at what waits on Sonny: the results the daemon has not taken
+/// handed in again, then each waiting call not already served started
+/// with `run`. Whether results remain unsent; an error when the calls
+/// could not be listed.
+async fn sweep<Run, Ran>(
+    client: &Arc<Client>,
+    serving: &Serving,
+    run: Run,
+) -> Result<bool, agent_client::Error>
+where
+    Run: Fn(Value) -> Ran,
+    Ran: std::future::Future<Output = Result<Value, (&'static str, String)>> + Send + 'static,
+{
+    let unsent: Vec<(i64, String)> = (serving.lock().unwrap().iter())
+        .filter(|(_, job)| matches!(job, Job::Answered(_)))
+        .map(|(key, _)| key.clone())
+        .collect();
+    for key in unsent {
+        hand_in(client, serving, &key).await;
+    }
+    let calls = waiting(client).await?;
+    for call in calls {
+        let key = (call["turn"].as_i64().unwrap_or(0), str_of(&call["call_id"]));
+        let mut jobs = serving.lock().unwrap();
+        if jobs.contains_key(&key) {
+            continue;
+        }
+        let (client, serving, held) = (client.clone(), serving.clone(), key.clone());
+        let ran = run(call.clone());
+        let job = tokio::spawn(async move {
+            let answer = ran.await;
+            let mut asked = json!({"bot": call["bot"], "turn": call["turn"],
+                "call_id": call["call_id"]});
+            match answer {
+                Ok(output) => asked["output"] = cut_parts(output),
+                Err((code, detail)) => {
+                    asked["error"] = json!({"code": code, "detail": cut(detail)})
+                }
+            }
+            // Kept before it is handed in: a call that ran never runs again
+            // because recording its result failed. One whose turn ended
+            // meanwhile is let go.
+            {
+                let mut jobs = serving.lock().unwrap();
+                if !jobs.contains_key(&key) {
+                    return;
+                }
+                jobs.insert(key.clone(), Job::Answered(asked));
+            }
+            hand_in(&client, &serving, &key).await;
+        });
+        jobs.insert(held, Job::Running(job.abort_handle()));
+    }
+    Ok((serving.lock().unwrap().values()).any(|job| matches!(job, Job::Answered(_))))
+}
+
+/// Hand the daemon the result kept for `key`, and let it go once the
+/// daemon has it or says the call wants none: answered already, out of
+/// time, its turn over. Anything else, such as a lost connection or a
+/// store that could not write, keeps it to be handed in again.
+async fn hand_in(client: &Client, serving: &Serving, key: &(i64, String)) {
+    let asked = match serving.lock().unwrap().get(key) {
+        Some(Job::Answered(asked)) => asked.clone(),
+        _ => return,
+    };
+    let taken = match client.request("tool_result", asked).await {
+        Ok(_) => true,
+        Err(error) => wants_none(&error.code),
+    };
+    if taken {
+        serving.lock().unwrap().remove(key);
+    }
+}
+
+/// Whether the daemon's refusal of a result says the call wants none, so
+/// handing it in again would change nothing.
+fn wants_none(code: &str) -> bool {
+    matches!(
+        code,
+        "no_pending_call"
+            | "call_already_answered"
+            | "turn_not_found"
+            | "bot_not_found"
+            | "tool_output_limit"
+    ) || code.starts_with("invalid_")
 }
 
 fn str_of(value: &Value) -> String {
@@ -1540,6 +1631,66 @@ fn code(said: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_call_that_ran_is_never_run_again_when_its_result_was_not_recorded() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let handed = Arc::new(AtomicUsize::new(0));
+        let tries = handed.clone();
+        // The daemon lists the call until it takes a result; the first two
+        // results are lost to a store that could not write.
+        let client = crate::tests::daemon_answering(move |asked| match asked["op"].as_str() {
+            Some("tool_calls") if tries.load(Ordering::SeqCst) < 3 => json!({
+                "calls": [{"bot": "b", "turn": 1, "call_id": "c1", "name": RUN}],
+                "next_after": null}),
+            Some("tool_calls") => json!({"calls": [], "next_after": null}),
+            Some("tool_result") if tries.fetch_add(1, Ordering::SeqCst) < 2 => {
+                json!({"error": "storage", "detail": "disk I/O error"})
+            }
+            _ => json!({}),
+        })
+        .await;
+        let serving: Serving = Default::default();
+        let effects = Arc::new(AtomicUsize::new(0));
+        let ran = effects.clone();
+        let run = move |_call: Value| {
+            let ran = ran.clone();
+            async move {
+                ran.fetch_add(1, Ordering::SeqCst);
+                Ok(json!("written"))
+            }
+        };
+        sweep(&client, &serving, run.clone()).await.unwrap();
+        // It runs and its result is handed in, and lost.
+        while handed.load(Ordering::SeqCst) < 1 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(matches!(
+            serving.lock().unwrap().values().next(),
+            Some(Job::Answered(_))
+        ));
+        // Recording failed again: the result is still kept, and the call,
+        // listed again, is not run again.
+        assert!(sweep(&client, &serving, run.clone()).await.unwrap());
+        assert_eq!(handed.load(Ordering::SeqCst), 2);
+        assert_eq!(effects.load(Ordering::SeqCst), 1);
+        // Taken at last, it is let go: one effect in all.
+        assert!(!sweep(&client, &serving, run).await.unwrap());
+        assert_eq!(handed.load(Ordering::SeqCst), 3);
+        assert!(serving.lock().unwrap().is_empty());
+        assert_eq!(effects.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_result_is_handed_in_again_unless_the_call_wants_none() {
+        for code in ["no_pending_call", "call_already_answered", "turn_not_found"] {
+            assert!(wants_none(code), "{code}");
+        }
+        for code in ["io", "storage", "store_busy", "overloaded"] {
+            assert!(!wants_none(code), "{code}");
+        }
+    }
 
     #[tokio::test]
     async fn a_confined_agent_no_one_reviews_is_refused_a_pane() {
