@@ -663,8 +663,10 @@ fn html_tag(text: &str) -> Option<(usize, Tag)> {
     if !rest.starts_with(|c: char| c == '>' || c == '/' || c.is_whitespace()) {
         return None;
     }
-    let end = rest.find('>')?;
-    if rest[..end].contains('<') {
+    // Its end before any other tag opens: read to the first of either,
+    // so a run of openers that never close is read once, not once each.
+    let end = rest.find(['<', '>'])?;
+    if rest.as_bytes()[end] == b'<' {
         return None;
     }
     let taken = text.len() - rest.len() + end + 1;
@@ -679,13 +681,30 @@ fn html_tag(text: &str) -> Option<(usize, Tag)> {
     ))
 }
 
-/// Where the element `name` that opened just before `text` closes: the
-/// text inside it, and how far past its closing tag is.
-fn inside<'a>(text: &'a str, name: &str) -> Option<(&'a str, usize)> {
-    let lower = text.to_ascii_lowercase();
-    let close = format!("</{name}>");
-    let end = lower.find(&close)?;
-    Some((&text[..end], end + close.len()))
+/// Where each mark is next found in a text, from where a search starts:
+/// as a line is read left to right, each mark's searches together read
+/// it once, not once per place that mark opens without closing.
+#[derive(Default)]
+struct Next(Vec<(String, Option<usize>)>);
+
+impl Next {
+    /// Where `needle` is next in `text` at or after `from`, which only
+    /// grows from one search of the same needle to the next.
+    fn find(&mut self, text: &str, needle: &str, from: usize) -> Option<usize> {
+        let known = self.0.iter_mut().find(|(n, _)| n == needle);
+        match known.as_deref() {
+            // Not in the rest of the text: nor in any later part of it.
+            Some((_, None)) => return None,
+            Some((_, Some(found))) if *found >= from => return Some(*found),
+            _ => {}
+        }
+        let found = (text.get(from..)?.find(needle)).map(|i| from + i);
+        match known {
+            Some(entry) => entry.1 = found,
+            None => self.0.push((needle.to_owned(), found)),
+        }
+        found
+    }
 }
 
 /// A rule's width: no wider than a turn's closing rule.
@@ -705,10 +724,20 @@ pub fn inline(text: &str, base: Style) -> Vec<Span<'static>> {
             spans.push(Span::styled(std::mem::take(plain), base));
         }
     };
+    // Every closer is looked for through these, so a line of openers that
+    // never close is read once for each kind of closer, not once each.
+    let (mut next, mut next_lower) = (Next::default(), Next::default());
+    let lower = text.to_ascii_lowercase();
     while let Some(c) = rest.chars().next() {
+        let at = text.len() - rest.len();
+        // Where `needle` next is after the `skip` bytes that open at `at`,
+        // from there.
+        let mut after_open = |skip: usize, needle: &str| {
+            (next.find(text, needle, at + skip)).map(|found| found - at - skip)
+        };
         // \(math\), as many models write it.
         if let Some(after) = rest.strip_prefix("\\(")
-            && let Some(end) = after.find("\\)")
+            && let Some(end) = after_open(2, "\\)")
             && end > 0
         {
             flush(&mut plain, &mut spans);
@@ -746,7 +775,7 @@ pub fn inline(text: &str, base: Style) -> Vec<Span<'static>> {
             {
                 return None;
             }
-            let end = after.find(close)?;
+            let end = after_open(open.len(), close)?;
             (end > 0).then(|| {
                 (
                     open.len() + end + close.len(),
@@ -767,7 +796,7 @@ pub fn inline(text: &str, base: Style) -> Vec<Span<'static>> {
             continue;
         }
         if let Some(after) = rest.strip_prefix("<kbd>")
-            && let Some(end) = after.find("</kbd>")
+            && let Some(end) = after_open(5, "</kbd>")
         {
             flush(&mut plain, &mut spans);
             spans.push(Span::styled(
@@ -785,8 +814,16 @@ pub fn inline(text: &str, base: Style) -> Vec<Span<'static>> {
             rest = after;
             continue;
         }
+        // A comment, read past.
+        if let Some(after) = rest.strip_prefix("<!--") {
+            if let Some(end) = after_open(4, "-->") {
+                flush(&mut plain, &mut spans);
+                rest = &after[end + 3..];
+                continue;
+            }
+        }
         // Other HTML a README is written with, read for what it means.
-        if c == '<'
+        else if c == '<'
             && let Some((taken, tag)) = html_tag(rest)
         {
             flush(&mut plain, &mut spans);
@@ -794,11 +831,15 @@ pub fn inline(text: &str, base: Style) -> Vec<Span<'static>> {
             if tag.closing {
                 continue;
             }
+            // Where the element closes: the text inside it, and past its
+            // closing tag.
+            let from = at + taken;
+            let close = format!("</{}>", tag.name);
             let mut within = |style: Style, spans: &mut Vec<Span<'static>>| -> bool {
-                match inside(rest, &tag.name) {
-                    Some((inner, taken)) => {
-                        spans.extend(inline(inner, style));
-                        rest = &rest[taken..];
+                match next_lower.find(&lower, &close, from) {
+                    Some(end) => {
+                        spans.extend(inline(&text[from..end], style));
+                        rest = &text[end + close.len()..];
                         true
                     }
                     None => false,
@@ -850,9 +891,10 @@ pub fn inline(text: &str, base: Style) -> Vec<Span<'static>> {
             Some(_) => &rest[1..],
             None => rest,
         };
+        let skip = rest.len() - link.len();
         if link.starts_with('[')
-            && let Some(close) = link.find("](")
-            && let Some(end) = link[close + 2..].find(')')
+            && let Some(close) = after_open(skip, "](")
+            && let Some(end) = after_open(skip + close + 2, ")")
         {
             let label = &link[1..close];
             let url = &link[close + 2..close + 2 + end];
@@ -871,7 +913,7 @@ pub fn inline(text: &str, base: Style) -> Vec<Span<'static>> {
         }
         // $math$, not a price: no space just inside either dollar.
         if c == '$'
-            && let Some(end) = rest[1..].find('$')
+            && let Some(end) = after_open(1, "$")
             && end > 0
             && !rest[1..].starts_with(' ')
             && !rest[..end + 1].ends_with(' ')
@@ -1035,7 +1077,7 @@ pub fn wrap_lines(
     for span in line.spans {
         let style = line.style.patch(span.style);
         for word in words(&span.content) {
-            let mut word = word.to_owned();
+            let mut word: &str = word;
             let mut wide = word.width();
             // A word's trailing spaces may hang past the edge.
             if used + word.trim_end().width() > room && used > 0 {
@@ -1046,7 +1088,9 @@ pub fn wrap_lines(
                     continue;
                 }
             }
-            // A word wider than a row is cut where the row ends.
+            // A word wider than a row is cut where the row ends, each cut
+            // read on from the last: a long word is read once, not once
+            // for each row it fills.
             while wide > room {
                 let mut cut = 0;
                 let mut cols = 0;
@@ -1068,11 +1112,11 @@ pub fn wrap_lines(
                 rows.push((rest.clone(), true));
                 room = rest_room;
                 used = 0;
-                word = word[cut..].to_owned();
-                wide = word.width();
+                word = &word[cut..];
+                wide = wide.saturating_sub(cols);
             }
             used += wide;
-            rows.last_mut().unwrap().0.push(Span::styled(word, style));
+            (rows.last_mut().unwrap().0).push(Span::styled(word.to_owned(), style));
         }
     }
     rows.into_iter()
@@ -3224,6 +3268,68 @@ mod tests {
         let shown: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
         assert!(shown.iter().any(|l| l.contains("-old")), "{shown:?}");
         assert!(shown.iter().any(|l| l.contains("+new")), "{shown:?}");
+    }
+
+    /// How long `draw` takes on `unit` repeated to `n` bytes, and on twice
+    /// that: work in proportion to the text takes about twice as long, where
+    /// work as its square takes four times.
+    fn scales(
+        unit: &str,
+        n: usize,
+        draw: impl Fn(&str),
+    ) -> (std::time::Duration, std::time::Duration) {
+        let timed = |len: usize| {
+            let text = unit.repeat(len / unit.len());
+            let started = std::time::Instant::now();
+            draw(&text);
+            started.elapsed()
+        };
+        (timed(n), timed(2 * n))
+    }
+
+    #[test]
+    fn marks_that_never_close_are_read_once() {
+        // Each opener once looked for its closer through the rest of the
+        // line, so a line of them took time as its length squared.
+        for unit in [
+            "[a", "\\(", "`", "**a", "~~", "*a ", "_a ", "$a", "<b>", "<kbd>", "<!--", "<a x",
+            "<del>", "<b x", "![a](",
+        ] {
+            let (once, twice) = scales(unit, 1 << 17, |text| {
+                inline(text, Style::new());
+            });
+            assert!(
+                twice < once * 3 + std::time::Duration::from_millis(50),
+                "{unit}: {once:?} then {twice:?}"
+            );
+        }
+        // What does close still reads as it did.
+        let spans = inline(
+            "[a [b](u) <kbd>K</kbd> <b>x</b> \\(y\\) <!-- c --> $z$",
+            Style::new(),
+        );
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "[a b (u)  K  x y  z");
+    }
+
+    #[test]
+    fn a_long_word_is_wrapped_in_time_as_its_length() {
+        let (once, twice) = scales("abcdefgh", 1 << 18, |text| {
+            let rows = wrap(
+                Line::from(text.to_owned()),
+                80,
+                Span::raw(""),
+                Span::raw(""),
+            );
+            let kept: String = (rows.iter())
+                .flat_map(|row| row.spans.iter().map(|s| s.content.as_ref()))
+                .collect();
+            assert_eq!(kept, text);
+        });
+        assert!(
+            twice < once * 3 + std::time::Duration::from_millis(50),
+            "{once:?} then {twice:?}"
+        );
     }
 
     #[test]
