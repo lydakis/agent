@@ -1033,17 +1033,15 @@ impl Server {
             && let Some(turn) = event["turn"].as_i64()
         {
             let mut calls = self.serving.lock().unwrap();
-            let before = calls.jobs.len();
-            calls.jobs.retain(|key, job| {
-                if key.0 == turn
-                    && let Job::Running { job, .. } = job
-                {
+            let ended: Vec<(i64, String)> = (calls.jobs.keys())
+                .filter(|key| key.0 == turn)
+                .cloned()
+                .collect();
+            for key in ended {
+                if let Some(Job::Running { job, .. }) = calls.jobs.get(&key) {
                     job.abort();
                 }
-                key.0 != turn
-            });
-            if calls.jobs.len() < before {
-                calls.stops += 1;
+                calls.retire(&key);
             }
         }
     }
@@ -1069,10 +1067,26 @@ enum Job {
 struct Calls {
     jobs: HashMap<(i64, String), Job>,
     paused: bool,
-    /// How many times calls were let go, stopped by a pause or with their
-    /// turn's end: a listing read across one may name a call let go since,
-    /// which must not start again.
+    /// How many times a pause halted the calls: a listing read across one
+    /// may name a call it halted that had not started here, which must
+    /// not start after it.
     stops: u64,
+    /// The calls let go, their result taken or their turn over, each with
+    /// the listing under way when it was ([`Calls::looks`]): a listing read
+    /// before may still name it, so it is kept until one begun after has
+    /// been read, and never starts again.
+    retired: HashMap<(i64, String), u64>,
+    /// How many listings of the waiting calls were begun.
+    looks: u64,
+}
+
+impl Calls {
+    /// Let go of the call `key`: forgotten only once no listing read
+    /// before could still start it again.
+    fn retire(&mut self, key: &(i64, String)) {
+        self.jobs.remove(key);
+        self.retired.insert(key.clone(), self.looks);
+    }
 }
 
 type Serving = Arc<Mutex<Calls>>;
@@ -1206,18 +1220,25 @@ where
     for key in unsent {
         hand_in(client, serving, &key).await;
     }
-    let stops = serving.lock().unwrap().stops;
+    let (stops, look) = {
+        let mut calls = serving.lock().unwrap();
+        calls.looks += 1;
+        (calls.stops, calls.looks)
+    };
     let listed = waiting(client).await?;
+    // A call let go before this listing began is on no listing from now
+    // on; one let go while it was read may be on it, and is kept.
+    serving.lock().unwrap().retired.retain(|_, at| *at >= look);
     for call in listed {
         let key = (call["turn"].as_i64().unwrap_or(0), str_of(&call["call_id"]));
         let mut calls = serving.lock().unwrap();
-        // A call stopped while the listing was read may be on it: the next
-        // sweep reads one the stop came before.
+        // A call a pause halted while the listing was read may be on it:
+        // the next sweep reads one the pause came before.
         if calls.stops != stops {
             nudge.notify_one();
             break;
         }
-        if calls.paused || calls.jobs.contains_key(&key) {
+        if calls.paused || calls.jobs.contains_key(&key) || calls.retired.contains_key(&key) {
             continue;
         }
         let (client, serving, held) = (client.clone(), serving.clone(), key.clone());
@@ -1270,7 +1291,7 @@ async fn hand_in(client: &Client, serving: &Serving, key: &(i64, String)) -> boo
         Err(error) => wants_none(&error.code),
     };
     if taken {
-        serving.lock().unwrap().jobs.remove(key);
+        serving.lock().unwrap().retire(key);
     }
     taken
 }
@@ -1796,6 +1817,66 @@ mod tests {
         assert_eq!(handed.load(Ordering::SeqCst), 3);
         assert!(serving.lock().unwrap().jobs.is_empty());
         assert_eq!(effects.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_call_whose_result_was_taken_while_the_calls_were_listed_does_not_run_again() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let took = Arc::new(AtomicBool::new(false));
+        let (taken, listing) = (took.clone(), Arc::new(AtomicUsize::new(0)));
+        let finish = Arc::new(Notify::new());
+        let release = finish.clone();
+        // The daemon lists the call until its result is taken. The second
+        // sweep's listing names it on its first page and lets it finish;
+        // its later pages come only once the result is taken.
+        let client = crate::tests::daemon_answering(move |asked| match asked["op"].as_str() {
+            Some("tool_calls") if asked["after"] == 0 && !taken.load(Ordering::SeqCst) => {
+                if listing.fetch_add(1, Ordering::SeqCst) == 1 {
+                    release.notify_one();
+                    return json!({"calls": [{"bot": "b", "turn": 1, "call_id": "c1",
+                        "name": EXEC}], "next_after": 1});
+                }
+                json!({"calls": [{"bot": "b", "turn": 1, "call_id": "c1", "name": EXEC}],
+                    "next_after": null})
+            }
+            Some("tool_calls") if asked["after"] != 0 && !taken.load(Ordering::SeqCst) => {
+                std::thread::sleep(Duration::from_millis(1));
+                json!({"calls": [], "next_after": 1})
+            }
+            Some("tool_calls") => json!({"calls": [], "next_after": null}),
+            Some("tool_result") => {
+                taken.store(true, Ordering::SeqCst);
+                json!({})
+            }
+            _ => json!({}),
+        })
+        .await;
+        let serving: Serving = Default::default();
+        let effects = Arc::new(AtomicUsize::new(0));
+        let (ran, finished) = (effects.clone(), finish.clone());
+        let run = move |_call: Value| {
+            let (ran, finished) = (ran.clone(), finished.clone());
+            async move {
+                // The write happens as the call starts; the first waits to
+                // end until the listing that crosses it is under way.
+                if ran.fetch_add(1, Ordering::SeqCst) == 0 {
+                    finished.notified().await;
+                }
+                Ok(json!("written"))
+            }
+        };
+        let nudge = Arc::new(Notify::new());
+        sweep(&client, &serving, &nudge, run.clone()).await.unwrap();
+        // Read across the call's end: its first page names it, and its
+        // result is taken before the listing is read to its end.
+        sweep(&client, &serving, &nudge, run.clone()).await.unwrap();
+        assert!(took.load(Ordering::SeqCst));
+        assert!(serving.lock().unwrap().jobs.is_empty());
+        sweep(&client, &serving, &nudge, run).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(effects.load(Ordering::SeqCst), 1);
+        // Once a listing begun after it has been read, it is forgotten.
+        assert!(serving.lock().unwrap().retired.is_empty());
     }
 
     #[tokio::test]
