@@ -464,7 +464,7 @@ Memory is what earlier agents learned that a later one needs: decisions,
 the person's preferences, what they corrected and what they confirmed
 worked, traps, pointers. Each fact is one
 Markdown file of at most 16 KiB with front matter (`name`, `description`,
-`type` of `user`, `feedback`, `project` or `reference`, `source`,
+`type` of `user`, `feedback`, `project`, `reference` or `work`, `source`,
 `verified`, `external` when it is so, and `confirmed` and `pushed_back`,
 how many times the person confirmed or pushed back on it, when not zero, as
 ExpeL's insights and ACE's playbook bullets keep helpful and harmful
@@ -473,12 +473,25 @@ counts; a save that leaves a count out keeps it). The person's facts are in `~/.
 task's worktree share one copy whatever is committed (a task's worktree
 starts at the last commit, so an uncommitted AGENTS.md line never reaches
 it). Each folder's `MEMORY.md` is an index generated from the front matter,
-one line per fact, and is held to 16 KiB so reading it at the start of
-every task stays cheap. The daemon knows nothing of memory.
+every fact in it, the most needed first: the folder's `work` facts by name
+and date alone, newest first, then the person's own (`user`, `feedback`), then the rest,
+each group by `confirmed` count, then `verified` date, newest first. An
+index has no limit and a save is never refused for room. A new agent's
+instructions, and `show`, take each index's head
+([`memory::head`](../client/src/memory.rs)): whole lines from the top
+within 16 KiB, then a line saying how many facts it leaves out, which
+`search` finds, as Claude Code loads the first 200 lines of its MEMORY.md
+and reads the rest on demand. Both heads fit an agent's instructions
+beside its AGENTS.md files and role. Keeping memory small is the nightly
+cleanup's job, never a working agent's. A `work` fact is work under way
+that a later agent may pick up, saved again as it moves; the cleanup
+retires one not saved in over three days, as Codex and Copilot drop
+memories by age, after keeping any lesson in it as a lasting fact. The
+daemon knows nothing of memory.
 
 Sonny's agents read and save memory with the `memory` tool, which Sonny's
 tool host answers outside the agent's sandbox, so a sandboxed agent still
-saves to `~/.agents/memory`: `read` NAME, `save {name, type,
+saves to `~/.agents/memory`: `read` NAME, `search` WORDS, `save {name, type,
 description, source, text}`, `remove`, `index`, `check`, `changed` or `cleanup`, scoped by `user`
 or `project`, or nothing to show both indexes. It waits for no verdict.
 For people, scripts and other harnesses, Sonny writes `~/.agent/memory`
@@ -488,6 +501,7 @@ each time it starts, a script that runs it as
 ```sh
 ~/.agent/memory show [SCOPE]
 ~/.agent/memory read NAME [SCOPE]
+~/.agent/memory search WORDS... [SCOPE]
 ~/.agent/memory save NAME --type TYPE --description TEXT --source TEXT [--external] [SCOPE] -- TEXT|-
 ~/.agent/memory rm NAME [SCOPE]
 ~/.agent/memory index [SCOPE]
@@ -506,15 +520,20 @@ Every reply is one JSON value on stdout; a failure is one `{"error": CODE,
 exit 1 is `unchanged` and any other failure exit 2. `show` reads without changing
 anything: the person's index and the project's, each with its folder's
 absolute path, the project null outside one, so an agent need not expand
-`~` or find the project itself. A save writes the fact and the
+`~` or find the project itself. `search` reads every fact of both, or of
+the scope given, and gives at most 20 whose file holds every word, case
+aside, best first by how often the words come (four times as much in the
+name and description), each with its index line and up to three lines
+that hold a word, and `more`, how many it left out; grep-like matching,
+since lexical search does as well as embeddings on short literal facts and
+needs no index to keep. A save writes the fact and the
 index under the folder's lock, so two agents saving at once cannot leave
 an index that misses one. Saving a fact unchanged is `"duplicate": true`,
-and so is removing one already gone. A save that would push the index past
-16 KiB is `memory_full` and changes nothing; so is a folder holding a `.md`
-file that is not a valid fact (`memory_invalid` names it), rather than an
-index that quietly leaves it out. `check` reports such a file and an index
-that is out of date without changing anything; `index` rewrites the index,
-and refuses with `memory_full` an index of hand-added facts past 16 KiB. A
+and so is removing one already gone. A save in a folder holding a `.md`
+file that is not a valid fact is `memory_invalid`, naming it, and changes
+nothing, rather than writing an index that quietly leaves it out. `check`
+reports such a file and an index that is out of date without changing
+anything; `index` rewrites the index. A
 removal reads the folder before deleting anything, and text piped on stdin
 past 16 KiB is `fact_too_large` rather than cut.
 
@@ -581,7 +600,12 @@ and no night's `changed`. Removing a fact drops its record. `cleanup start`
 lists as `unread` the facts no agent has read or saved in 30 days, oldest
 first, each with its `last_read` and `verified`, and the cleanup checks
 that they still hold, as Codex drops memories unused for 30 days and
-Copilot those unused for 28; unread alone removes nothing. Reads with the
+Copilot those unused for 28; unread alone removes nothing. Work facts are
+not in it: it lists as `stale_work` those not saved in over three days,
+which the cleanup retires, and `changed` is true while one is, so a quiet
+night still wakes the cleanup. A save of a new fact into a folder already
+holding 16,384 entries is `too_many_facts`, so a folder every command can
+read is never made one none can. Reads with the
 `read` tool are not counted, which is why the memory skill opens facts with
 the memory tool.
 
@@ -630,16 +654,17 @@ agent exists, `schedule` is `bot_exists`: it only starts that agent, and
 never changes the model of one it already started. The `memory-cleanup` skill
 ([SKILL.md](../sonny/skills/memory-cleanup/SKILL.md)) merges duplicates,
 drops superseded facts and dates relative ones, with `save` and `rm` only,
-and never removes a fact for its age alone.
+and never removes a lasting fact for its age alone.
 
 `~/.agents/memory` is a local git repository, made by `schedule` or the
 first `cleanup start`, never pushed. `cleanup start` commits what agents
-saved since the last cleanup, records that commit and the fact count in
-`.cleanup`, and lists the facts saved and removed since then, which the
+saved since the last cleanup, records that commit, the fact count and the
+paths of the `work` facts in `.cleanup`, and lists the facts saved and removed since then, which the
 agent reads first rather than every fact; a second `start` before `finish` says `"duplicate": true` and
 keeps the first. `cleanup finish` commits the cleanup and returns what it
 removed, added and changed. A cleanup that removed more than a quarter of
-the facts, and more than two, is `loss_guard`: `finish` reverts it with a
+the lasting facts, and more than two, is `loss_guard` (the `work` facts it
+started with are left out of both counts, since work under way ends): `finish` reverts it with a
 new commit, so memory is as it was at the start and the refused cleanup
 stays in history for the person to read. `changed` fails with `unchanged`
 when the folder matches the last commit, which is what keeps the automation
