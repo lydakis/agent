@@ -518,7 +518,7 @@ class TriggerFireTests(ModelFixture):
         # No turn ran; the agent has one note, attached to its next call.
         notes = [t for t in self.turns('p.task') if t['turn'] > 1]
         self.assertEqual([t['status'] for t in notes], ['attached'], notes)
-        self.assertIn('its --if could not run', notes[0]['prompt_preview'])
+        self.assertIn('its --if could not check', notes[0]['prompt_preview'])
         self.assertTrue(failed['checked']['told'], failed)
         # Told once: the next failure adds nothing; working again is one more note.
         generation = failed['generation']
@@ -531,6 +531,18 @@ class TriggerFireTests(ModelFixture):
         notes = [t for t in self.turns('p.task') if t['turn'] > 1]
         self.assertEqual(len(notes), 2, notes)
         self.assertRegex(notes[1]['prompt_preview'], r' · its --if works again\]$')
+
+    def test_a_gate_that_ends_past_one_could_not_check(self):
+        self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
+        # A command that is not there is a check that failed, not a quiet no,
+        # and the fire says what the shell said.
+        failed = self.fire('p.task', 'x', extra=['--if', 'no-such-gate-here', '--dir', str(self.path)])
+        self.assertEqual((failed['last']['outcome'], failed['checked']['gate']), ('failed', 'failed'), failed)
+        self.assertIn('127', failed['last']['detail'])
+        self.assertIn('no-such-gate-here', failed['last']['detail'])
+        notes = [t for t in self.turns('p.task') if t['turn'] > 1]
+        self.assertEqual([t['status'] for t in notes], ['attached'], notes)
+        self.assertIn('its --if could not check', notes[0]['prompt_preview'])
 
     def test_a_gate_waits_out_a_pause_before_it_runs(self):
         self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
