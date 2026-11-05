@@ -1024,7 +1024,9 @@ impl Server {
         if event["event"] == "turn_finished"
             && let Some(turn) = event["turn"].as_i64()
         {
-            self.serving.lock().unwrap().jobs.retain(|key, job| {
+            let mut calls = self.serving.lock().unwrap();
+            calls.stops += 1;
+            calls.jobs.retain(|key, job| {
                 if key.0 == turn
                     && let Job::Running(job) = job
                 {
@@ -1050,6 +1052,10 @@ enum Job {
 struct Calls {
     jobs: HashMap<(i64, String), Job>,
     paused: bool,
+    /// How many times calls were stopped and let go unanswered, by a pause
+    /// or their turn's end: a listing read across one may name a call
+    /// stopped since, which must not start again.
+    stops: u64,
 }
 
 type Serving = Arc<Mutex<Calls>>;
@@ -1061,6 +1067,7 @@ fn pause(serving: &Serving, paused: bool) {
     let mut calls = serving.lock().unwrap();
     calls.paused = paused;
     if paused {
+        calls.stops += 1;
         calls.jobs.retain(|_, job| match job {
             Job::Running(job) => {
                 job.abort();
@@ -1154,10 +1161,17 @@ where
     for key in unsent {
         hand_in(client, serving, &key).await;
     }
-    let calls = waiting(client).await?;
-    for call in calls {
+    let stops = serving.lock().unwrap().stops;
+    let listed = waiting(client).await?;
+    for call in listed {
         let key = (call["turn"].as_i64().unwrap_or(0), str_of(&call["call_id"]));
         let mut calls = serving.lock().unwrap();
+        // A call stopped while the listing was read may be on it: the next
+        // sweep reads one the stop came before.
+        if calls.stops != stops {
+            nudge.notify_one();
+            break;
+        }
         if calls.paused || calls.jobs.contains_key(&key) {
             continue;
         }
@@ -1795,6 +1809,52 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(server.serving.lock().unwrap().jobs.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_call_stopped_while_the_calls_were_listed_does_not_start_again() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let serving: Serving = Default::default();
+        let listings = Arc::new(AtomicUsize::new(0));
+        let (held, listed) = (serving.clone(), listings.clone());
+        // A pause, and a resume, while the listing is read: it names a call
+        // the pause stopped.
+        let client = crate::tests::daemon_answering(move |asked| match asked["op"].as_str() {
+            Some("tool_calls") => {
+                if listed.fetch_add(1, Ordering::SeqCst) == 1 {
+                    pause(&held, true);
+                    pause(&held, false);
+                }
+                json!({"calls": [{"bot": "b", "turn": 1, "call_id": "c1", "name": EXEC}],
+                    "next_after": null})
+            }
+            _ => json!({}),
+        })
+        .await;
+        let ran = Arc::new(AtomicUsize::new(0));
+        let runs = ran.clone();
+        let run = move |_call: Value| {
+            let runs = runs.clone();
+            async move {
+                runs.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                Ok(json!("written"))
+            }
+        };
+        let nudge = Arc::new(Notify::new());
+        sweep(&client, &serving, &nudge, run.clone()).await.unwrap();
+        while ran.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+        // The pause stops it; the listing read across the pause starts
+        // nothing, and the host looks again soon.
+        sweep(&client, &serving, &nudge, run).await.unwrap();
+        assert!(serving.lock().unwrap().jobs.is_empty());
+        tokio::time::timeout(Duration::from_secs(1), nudge.notified())
+            .await
+            .expect("woken to look again");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(ran.load(Ordering::SeqCst), 1);
     }
 
     #[test]
