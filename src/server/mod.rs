@@ -1,5 +1,6 @@
 //! One process hosts every bot. Client sessions (stdio or Unix socket) speak
 //! the same JSONL protocol; turns run as tasks; events fan out through a hub.
+mod actives;
 mod companions;
 mod handles;
 mod hub;
@@ -8,6 +9,7 @@ mod session;
 mod socket;
 mod turn;
 
+use actives::{Actives, Slot};
 use agent_runtime::{
     Error, Result,
     codec::{Family, split_model},
@@ -1160,7 +1162,7 @@ struct Service {
     limit_active: usize,
     /// Per bot: the live turn. A parked turn's task ends while a resumed
     /// task may already own the slot.
-    active: HashMap<String, Active>,
+    active: Actives,
     next_task: u64,
     jobs: JoinSet<(String, i64, u64, Result<turn::Exit>)>,
     replays: JoinSet<()>,
@@ -1330,16 +1332,14 @@ struct Active {
     compact: Arc<std::sync::atomic::AtomicBool>,
     /// Armed by a `steer` alone, never by other deliveries.
     lift: Arc<turn::Lift>,
-    /// Set by the task before it submits its finish: from then on the store,
-    /// whose finishing commit also publishes `turn_finished`, says whether
-    /// the bot is still busy, though the task is not reaped yet.
-    ending: Arc<std::sync::atomic::AtomicBool>,
+    /// Released by the task before it submits its finish ([`Slot::release`]).
+    slot: Slot,
 }
 impl Active {
     /// The running turn, unless it has committed or is committing its end;
     /// then a busy check asks the store.
     fn running(&self) -> Option<i64> {
-        (!self.ending.load(std::sync::atomic::Ordering::Acquire)).then_some(self.turn)
+        self.slot.held().then_some(self.turn)
     }
     /// Cancel the turn with `code` unless a cause is already set: the first
     /// cause wins, so shutdown never relabels a client's pending interrupt.
@@ -1762,7 +1762,7 @@ pub async fn run(config: Configuration) -> Result<()> {
         limits,
         sessions: sessions.len(),
         limit_active: limits.active,
-        active: HashMap::new(),
+        active: Actives::default(),
         next_task: 0,
         jobs: JoinSet::new(),
         replays: JoinSet::new(),
@@ -2085,7 +2085,7 @@ pub async fn run(config: Configuration) -> Result<()> {
     // turn back on its own.
     let planned = served.is_ok();
     let cause = if planned { turn::SHUTDOWN } else { turn::DIED };
-    for active in std::mem::take(&mut service.active).into_values() {
+    for active in service.active.drain() {
         active.cancel(cause);
     }
     // A completion that could not commit leaves its turn for the next start
@@ -2424,16 +2424,7 @@ impl Service {
     }
     fn has_capacity(&self) -> bool {
         self.held().is_none()
-            && (self.limit_active == 0 || self.running() + self.reserved < self.limit_active)
-    }
-    /// The turns that hold a slot: one that has committed or is committing
-    /// its end holds none, though its task is not reaped yet, as its bot is
-    /// no longer busy then ([`Active::running`]): a client that saw its
-    /// `turn_finished` may start the next.
-    fn running(&self) -> usize {
-        (self.active.values())
-            .filter(|active| active.running().is_some())
-            .count()
+            && (self.limit_active == 0 || self.active.holding() + self.reserved < self.limit_active)
     }
 
     /// Why no turn may start, if none may: the daemon is shutting down or
@@ -2500,7 +2491,7 @@ impl Service {
                     || (self.held().is_none()
                         && self.limit_active != 0
                         && self.reserved > 0
-                        && self.running() + self.reserved >= self.limit_active)
+                        && self.active.holding() + self.reserved >= self.limit_active)
             }
             _ => true,
         }
@@ -3123,19 +3114,18 @@ impl Service {
         if lifted {
             lift.arm();
         }
-        let ending: Arc<std::sync::atomic::AtomicBool> = Arc::default();
-        self.active.insert(
-            bot.clone(),
-            Active {
+        let slot = (self.active)
+            .start(bot.clone(), |slot| Active {
                 turn,
                 task: task_id,
                 cancel,
                 steers: steers.clone(),
                 compact: compact.clone(),
                 lift: lift.clone(),
-                ending: ending.clone(),
-            },
-        );
+                slot,
+            })
+            .slot
+            .clone();
         let task = Turn {
             bot,
             turn,
@@ -3174,7 +3164,7 @@ impl Service {
             }
             let result = match &exit {
                 turn::Exit::Finished(error) => {
-                    ending.store(true, std::sync::atomic::Ordering::Release);
+                    slot.release();
                     commit_finish(&task.store, &bot, id, error.as_ref(), &mut cancelled)
                         .await
                         .map(|()| exit)
@@ -3954,7 +3944,7 @@ impl Service {
                     .collect();
                 Ok(json!({
                     "sessions": self.sessions,
-                    "active_turns": self.active.len(),
+                    "active_turns": self.active.holding(),
                     "active_limit": self.limit_active,
                     "waiting_turns": waiting,
                     "paced_turns": paced,
@@ -5194,7 +5184,7 @@ mod tests {
             steers: Arc::default(),
             compact: Arc::default(),
             lift: Arc::default(),
-            ending: Arc::default(),
+            slot: Slot::alone(),
         };
         assert!(active.cancel(turn::INTERRUPTED));
         assert!(active.cancel(turn::SHUTDOWN));
@@ -5463,7 +5453,6 @@ mod tests {
             })
             .await
             .unwrap();
-        let ending: Arc<std::sync::atomic::AtomicBool> = Arc::default();
         let mut service = Service {
             store: store.clone(),
             stepping: HashMap::new(),
@@ -5494,18 +5483,15 @@ mod tests {
             sessions: 0,
             background_failures: mpsc::unbounded_channel().0,
             limit_active: 1,
-            active: HashMap::from([(
-                "Bob".into(),
-                Active {
-                    turn,
-                    task: 1,
-                    cancel: watch::channel(None).0,
-                    steers: Arc::default(),
-                    compact: Arc::default(),
-                    lift: Arc::default(),
-                    ending: ending.clone(),
-                },
-            )]),
+            active: Actives::default().with("Bob".into(), |slot| Active {
+                turn,
+                task: 1,
+                cancel: watch::channel(None).0,
+                steers: Arc::default(),
+                compact: Arc::default(),
+                lift: Arc::default(),
+                slot,
+            }),
             next_task: 1,
             jobs: JoinSet::new(),
             replays: JoinSet::new(),
@@ -5543,7 +5529,7 @@ mod tests {
         // The task is submitting its end: the store decides, and the turn is
         // still running there. It holds no slot: another bot's turn may
         // start as a client that saw its end would start one.
-        ending.store(true, std::sync::atomic::Ordering::Release);
+        service.active["Bob"].slot.release();
         assert!(service.has_capacity());
         assert_eq!(
             service
@@ -5590,7 +5576,7 @@ mod tests {
             steers: Arc::default(),
             compact: Arc::default(),
             lift: Arc::default(),
-            ending: Arc::default(),
+            slot: Slot::alone(),
         };
         // A pause only parks the turn: an interrupt after it ends it.
         let (cancel, cause) = watch::channel(None);
@@ -5704,18 +5690,15 @@ mod tests {
             sessions: 0,
             background_failures: mpsc::unbounded_channel().0,
             limit_active: 1,
-            active: HashMap::from([(
-                "Bob".into(),
-                Active {
-                    turn,
-                    task: 1,
-                    cancel,
-                    steers: Arc::default(),
-                    compact: Arc::default(),
-                    lift: Arc::default(),
-                    ending: Arc::default(),
-                },
-            )]),
+            active: Actives::default().with("Bob".into(), |slot| Active {
+                turn,
+                task: 1,
+                cancel,
+                steers: Arc::default(),
+                compact: Arc::default(),
+                lift: Arc::default(),
+                slot,
+            }),
             next_task: 1,
             jobs: JoinSet::new(),
             replays: JoinSet::new(),
@@ -5926,22 +5909,17 @@ mod tests {
             sessions: 0,
             background_failures: mpsc::unbounded_channel().0,
             limit_active: 1024,
-            active: (0..1024)
-                .map(|index| {
-                    (
-                        index.to_string(),
-                        Active {
-                            turn,
-                            task: 0,
-                            cancel: watch::channel(None).0,
-                            steers: Arc::default(),
-                            compact: Arc::default(),
-                            lift: Arc::default(),
-                            ending: Arc::default(),
-                        },
-                    )
+            active: (0..1024).fold(Actives::default(), |active, index| {
+                active.with(index.to_string(), |slot| Active {
+                    turn,
+                    task: 0,
+                    cancel: watch::channel(None).0,
+                    steers: Arc::default(),
+                    compact: Arc::default(),
+                    lift: Arc::default(),
+                    slot,
                 })
-                .collect(),
+            }),
             next_task: 0,
             jobs: JoinSet::new(),
             replays: JoinSet::new(),
@@ -6176,7 +6154,7 @@ mod tests {
             sessions: 0,
             background_failures: mpsc::unbounded_channel().0,
             limit_active: 1024,
-            active: HashMap::new(),
+            active: Actives::default(),
             next_task: 0,
             jobs: JoinSet::new(),
             replays: JoinSet::new(),
@@ -6723,7 +6701,7 @@ mod tests {
         // the slot still stops the retries.
         assert!(service.active["Bob"].cancel(turn::INTERRUPTED));
         finish_errors(&store, 2).await;
-        for active in std::mem::take(&mut service.active).into_values() {
+        for active in service.active.drain() {
             active.cancel(turn::SHUTDOWN);
         }
         let (bot, turn, task, exit) = service.jobs.join_next().await.unwrap().unwrap();
