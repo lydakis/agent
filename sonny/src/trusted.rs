@@ -332,9 +332,13 @@ mod tests {
     use super::*;
 
     fn temp() -> PathBuf {
+        // A clock alone can give two tests started together one folder
+        // (macOS reads it to the microsecond).
+        static TEMPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "sonny-trusted-{}-{}",
+            "sonny-trusted-{}-{}-{}",
             std::process::id(),
+            TEMPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
