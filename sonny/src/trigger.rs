@@ -5145,9 +5145,6 @@ fn fire(places: &Places, trigger: &Trigger, ask: Option<&Asked>) {
         .gate
         .as_deref()
         .map(|c| gate(c, trigger.dir.as_deref(), &trigger.daemon));
-    let checked = |gate: &str, detail: Option<&String>| {
-        named(json!({"checked_ms": now * 1000, "gate": gate, "detail": detail}))
-    };
     // A check that broke is told once, and that it works again once: an
     // `--if` that fails every minute is one note, not one a minute.
     let news = said
@@ -5160,12 +5157,9 @@ fn fire(places: &Places, trigger: &Trigger, ask: Option<&Asked>) {
         Some(news @ GateNews::Works) => !tell_gate(trigger, &kept, news),
         None => kept.checked["told"] == true,
     };
+    let before = kept.checked.clone();
     let checked = |gate: &str, detail: Option<&String>| {
-        let mut checked = checked(gate, detail);
-        if told {
-            checked["told"] = json!(true);
-        }
-        checked
+        named(checked_now(&before, gate, detail, now * 1000, told))
     };
     match said {
         None => {}
@@ -5191,7 +5185,9 @@ fn fire(places: &Places, trigger: &Trigger, ask: Option<&Asked>) {
         }
         Some(Err(broken)) => {
             kept.checked = checked("failed", Some(&broken));
-            let failed = named(json!({"outcome": "failed", "detail": broken}));
+            // Its `--if` could not answer: no run, and a later check that
+            // answers ends this failure (the person's `/background` says so).
+            let failed = named(json!({"outcome": "failed", "detail": broken, "gate": "failed"}));
             settle(places, trigger, &failed, &kept);
             return;
         }
@@ -5201,6 +5197,34 @@ fn fire(places: &Places, trigger: &Trigger, ask: Option<&Asked>) {
     });
     let (Ok(outcome) | Err(outcome)) = outcome;
     settle(places, trigger, &named(outcome), &kept);
+}
+
+/// What a check of an `--if` leaves on the trigger's row (`checked`): when
+/// it ran (`now_ms`), what it said (`go`, `no` or `failed`), why, and
+/// whether a break is told. One that could not answer keeps when the checks
+/// first could not (`since_ms`), so a gate that fails every minute is one
+/// break, not one a minute.
+fn checked_now(
+    before: &Value,
+    gate: &str,
+    detail: Option<&String>,
+    now_ms: i64,
+    told: bool,
+) -> Value {
+    let mut checked = json!({"checked_ms": now_ms, "gate": gate, "detail": detail});
+    if told {
+        checked["told"] = json!(true);
+    }
+    if gate == "failed" {
+        checked["since_ms"] = match before["gate"] == "failed" {
+            true => before["since_ms"].clone(),
+            false => Value::Null,
+        };
+        if checked["since_ms"].is_null() {
+            checked["since_ms"] = json!(now_ms);
+        }
+    }
+    checked
 }
 
 /// A repeating trigger's `--if` that said no: its row says so, its last
@@ -5526,6 +5550,23 @@ pub(crate) mod tests {
                 .prompt(&s)
                 .ends_with(" · its --if works again]")
         );
+    }
+
+    #[test]
+    fn a_check_that_cannot_answer_keeps_when_the_break_began() {
+        let why = "--if: exit status: 2".to_owned();
+        let first = checked_now(&Value::Null, "failed", Some(&why), 1_000, true);
+        assert_eq!(
+            (&first["since_ms"], &first["told"]),
+            (&json!(1_000), &json!(true))
+        );
+        let again = checked_now(&first, "failed", Some(&why), 61_000, true);
+        assert_eq!(again["checked_ms"], 61_000);
+        assert_eq!(again["since_ms"], 1_000, "one break, however many checks");
+        let works = checked_now(&again, "no", None, 121_000, false);
+        assert!(works["since_ms"].is_null());
+        let next = checked_now(&works, "failed", Some(&why), 181_000, false);
+        assert_eq!(next["since_ms"], 181_000, "a new break");
     }
 
     #[test]
