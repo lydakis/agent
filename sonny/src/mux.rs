@@ -2063,7 +2063,12 @@ mod tests {
             (tab(&read, "shop.a"), tab(&read, "shop.b")),
             (Some(1), Some(2))
         );
-        // `shop.a`'s window closed for room and `shop.c`'s opened.
+        // `shop.a`'s window closed for room and `shop.c`'s opened, the
+        // worker held until what was kept is read, so it can't run first.
+        let (go, wait) = std::sync::mpsc::channel::<()>();
+        worker.send(move |_| {
+            let _ = wait.recv();
+        });
         let sonny = ["sonny".to_owned()];
         worker.send(move |layout| {
             layout.close("shop.a");
@@ -2075,6 +2080,7 @@ mod tests {
             (tab(&kept, "shop.a"), tab(&kept, "shop.c")),
             (Some(1), None)
         );
+        go.send(()).unwrap();
         // Read now, after the jobs before it: as the windows are.
         let now = worker.places_now(limit).await;
         assert_eq!(
