@@ -11133,24 +11133,49 @@ impl App {
             Some(_) => prompt.clone(),
         };
         // An answer goes once, whichever window sends it: the daemon takes
-        // the first answer to an ask and refuses another.
+        // the first answer to an ask and refuses another. One taken back
+        // from the queue before the agent read it answered nothing, so the
+        // next goes as the next attempt.
         let answering = asks::answer_of(&prompt, origin);
-        let request_id = answering.map_or_else(|| unique("tui"), asks::request_id);
-        let reply = self
-            .client
-            .request(
-                "submit",
-                json!({"bot": self.bot, "request_id": request_id, "prompt": sent,
-                    "delivery": delivery, "model": model, "workspace": workspace,
-                    "effort": effort, "origin": origin, "images": attach::submitted(pictures)}),
-            )
-            .await
-            .map_err(|error| match error.code.as_str() {
-                "idempotency_conflict" if answering.is_some() => {
-                    "that question was answered already".to_owned()
-                }
+        let mut attempt = 0;
+        let reply = loop {
+            let request_id =
+                answering.map_or_else(|| unique("tui"), |ask| asks::request_id(ask, attempt));
+            let reply = self
+                .client
+                .request(
+                    "submit",
+                    json!({"bot": self.bot, "request_id": request_id, "prompt": sent,
+                        "delivery": delivery, "model": model, "workspace": workspace,
+                        "effort": effort, "origin": origin,
+                        "images": attach::submitted(pictures)}),
+                )
+                .await;
+            if answering.is_none() {
+                break reply.map_err(|error| error.to_string())?;
+            }
+            // The turn this attempt's answer started already, if one did.
+            let before = match &reply {
+                Ok(reply) if reply["duplicate"] == true => reply["turn"].as_i64(),
+                Err(error) if error.code == "idempotency_conflict" => (error.facts.as_ref())
+                    .and_then(|facts| facts.get("turn"))
+                    .and_then(Value::as_i64),
+                _ => None,
+            };
+            let taken_back = match before {
+                Some(turn) => (turn_row(&self.client, &self.bot, turn).await)
+                    .is_some_and(|row| asks::undelivered(&row)),
+                None => false,
+            };
+            if taken_back && attempt < asks::ATTEMPTS {
+                attempt += 1;
+                continue;
+            }
+            break reply.map_err(|error| match error.code.as_str() {
+                "idempotency_conflict" => "that question was answered already".to_owned(),
                 _ => error.to_string(),
             })?;
+        };
         if effort.is_some() {
             self.boost = None;
         }
@@ -18425,6 +18450,55 @@ mod tests {
         assert_eq!(
             app.notice.as_deref(),
             Some("that question was answered already")
+        );
+    }
+
+    #[tokio::test]
+    async fn an_answer_taken_back_unread_leaves_its_question_to_answer_again() {
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = sent.clone();
+        let client = daemon_answering(move |asked| match asked["op"].as_str() {
+            Some("submit") => {
+                // As the daemon keeps them: a request's first send starts a
+                // turn, the first answer's turn 5, and a later one with
+                // other words is refused, naming it.
+                let mut seen = seen.lock().unwrap();
+                let request = asked["request_id"].as_str().unwrap().to_owned();
+                let again = seen.contains(&request);
+                let turn = if request.ends_with(".1") { 9 } else { 5 };
+                seen.push(request);
+                match again {
+                    false => json!({"turn": turn}),
+                    true => json!({"error": "idempotency_conflict", "turn": turn}),
+                }
+            }
+            Some("turns") => match asked["after"].as_i64() {
+                Some(4) => json!({"turns": [{"turn": 5, "status": "interrupted",
+                    "started_ms": null}]}),
+                _ => json!({"turns": [{"turn": 9, "status": "done", "started_ms": 1}]}),
+            },
+            _ => json!({}),
+        })
+        .await;
+        let mut app = app(client);
+        for pick in ["No", "Yes"] {
+            let answer = format!("You asked (ask:4/a4): Merge?\n\n{pick}");
+            app.send(answer, None, false, true, &[]).await.unwrap();
+        }
+        let answer = "You asked (ask:4/a4): Merge?\n\nNo".to_owned();
+        assert_eq!(
+            app.send(answer, None, false, true, &[]).await,
+            Err("that question was answered already".to_owned())
+        );
+        assert_eq!(
+            sent.lock().unwrap()[..],
+            [
+                asks::request_id("ask:4/a4", 0),
+                asks::request_id("ask:4/a4", 0),
+                asks::request_id("ask:4/a4", 1),
+                asks::request_id("ask:4/a4", 0),
+                asks::request_id("ask:4/a4", 1),
+            ]
         );
     }
 

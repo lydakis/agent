@@ -108,15 +108,32 @@ pub fn id(turn: i64, call: &str) -> String {
     format!("ask:{turn}/{call}")
 }
 
-/// The `request_id` the person's answer to ask `id` is sent with, the same
-/// from every window and on every resend: the daemon takes one answer to
-/// an ask and refuses another (`idempotency_conflict`), so two windows
-/// showing it can't both answer.
-pub fn request_id(id: &str) -> String {
+/// The `request_id` the person's answer to ask `id` goes with on its
+/// `attempt`th sending, from 0: the same from every window and on every
+/// resend, so the daemon takes one answer to an ask and refuses another
+/// (`idempotency_conflict`), and two windows showing it can't both answer.
+/// An answer taken back from the queue before the agent read it answered
+/// nothing ([`undelivered`]): the next one goes as the next attempt.
+pub fn request_id(id: &str, attempt: u32) -> String {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(id.as_bytes());
     let hex: String = digest[..16].iter().map(|b| format!("{b:02x}")).collect();
-    format!("answer-{hex}")
+    match attempt {
+        0 => format!("answer-{hex}"),
+        attempt => format!("answer-{hex}.{attempt}"),
+    }
+}
+
+/// The most attempts one ask's answer is sent under, each after the one
+/// before was taken back unread.
+pub const ATTEMPTS: u32 = 1000;
+
+/// Whether a turn, as `turns` lists it, ended before its message reached
+/// the agent: taken back or bounced while it waited in line. An answer so
+/// ended answered nothing.
+pub fn undelivered(turn: &Value) -> bool {
+    matches!(turn["status"].as_str(), Some("interrupted" | "failed"))
+        && turn["started_ms"].is_null()
 }
 
 /// The `ask` tool as Sonny declares it on a bot, answered by its tool
@@ -1272,11 +1289,16 @@ mod tests {
         assert_eq!(split(old), Some(("Publish it?", "Yes")));
         // Every window sends one ask's answer under the same request,
         // and another ask's under another, within the daemon's names.
-        let request = request_id(&ask.id);
-        assert_eq!(request, request_id("ask:12/toolu_1"));
-        assert_ne!(request, request_id("ask:13/toolu_1"));
-        assert!(request.len() <= 128);
-        assert!((request.bytes()).all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b)));
+        let request = request_id(&ask.id, 0);
+        assert_eq!(request, request_id("ask:12/toolu_1", 0));
+        assert_ne!(request, request_id("ask:13/toolu_1", 0));
+        // One taken back unread goes again as the next attempt.
+        let again = request_id(&ask.id, ATTEMPTS);
+        assert_ne!(request_id(&ask.id, 1), request);
+        for request in [&request, &again] {
+            assert!(request.len() <= 128);
+            assert!((request.bytes()).all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b)));
+        }
     }
 
     /// The card's rows as a screen draws them at `width`, laid at `made`.
