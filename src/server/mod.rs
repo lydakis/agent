@@ -2424,7 +2424,16 @@ impl Service {
     }
     fn has_capacity(&self) -> bool {
         self.held().is_none()
-            && (self.limit_active == 0 || self.active.len() + self.reserved < self.limit_active)
+            && (self.limit_active == 0 || self.running() + self.reserved < self.limit_active)
+    }
+    /// The turns that hold a slot: one that has committed or is committing
+    /// its end holds none, though its task is not reaped yet, as its bot is
+    /// no longer busy then ([`Active::running`]): a client that saw its
+    /// `turn_finished` may start the next.
+    fn running(&self) -> usize {
+        (self.active.values())
+            .filter(|active| active.running().is_some())
+            .count()
     }
 
     /// Why no turn may start, if none may: the daemon is shutting down or
@@ -2491,7 +2500,7 @@ impl Service {
                     || (self.held().is_none()
                         && self.limit_active != 0
                         && self.reserved > 0
-                        && self.active.len() + self.reserved >= self.limit_active)
+                        && self.running() + self.reserved >= self.limit_active)
             }
             _ => true,
         }
@@ -5412,7 +5421,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_turn_that_committed_its_end_does_not_hold_its_bot_busy_until_reaped() {
+    async fn a_turn_that_committed_its_end_holds_neither_its_bot_nor_a_slot_until_reaped() {
         let dir =
             std::env::temp_dir().join(format!("agent-ending-busy-test-{}", std::process::id()));
         let (store, _publications) = Store::open(&dir.join("state.sqlite")).await.unwrap();
@@ -5523,15 +5532,19 @@ mod tests {
             bot: "Bob".into(),
             bot_id: None,
         };
-        // Running: refused at once, without asking the store.
+        // Running: refused at once, without asking the store, and its slot
+        // the one there is.
+        assert!(!service.has_capacity());
         let busy = service
             .dispatch(delete(), 0, &output, Value::Null, Bound::default())
             .await
             .unwrap_err();
         assert_eq!(busy.code, "bot_busy");
         // The task is submitting its end: the store decides, and the turn is
-        // still running there.
+        // still running there. It holds no slot: another bot's turn may
+        // start as a client that saw its end would start one.
         ending.store(true, std::sync::atomic::Ordering::Release);
+        assert!(service.has_capacity());
         assert_eq!(
             service
                 .dispatch(delete(), 0, &output, Value::Null, Bound::default())
