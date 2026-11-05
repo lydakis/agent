@@ -307,6 +307,7 @@ mod tests {
                 reasoning: None,
                 tools: &tools,
                 allow_tool_calls: true,
+                output_schema: None,
                 web_search,
                 fallback_credit: None,
                 cache_key: None,

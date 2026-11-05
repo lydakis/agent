@@ -67,6 +67,9 @@ const EXPIRY_SWEEP: usize = 16;
 /// The longest an attached message may wait for a call before it goes as a
 /// steer: a year, as the clients' `attach_wait` bounds it.
 const MAX_WAIT_MS: u64 = agent_client::config::MAX_ATTACH_WAIT_MS;
+/// The most a turn's output schema may be, as JSON: well past any reply
+/// shape a client asks for, and small beside the prompt's own limit.
+const MAX_OUTPUT_SCHEMA_BYTES: usize = 64 * 1024;
 /// Attached messages one look delivers at most; the rest follow at once.
 const LAPSE_SWEEP: usize = 64;
 
@@ -422,6 +425,9 @@ enum Command {
         /// With `attach`: the most milliseconds it waits for a call to take
         /// it in before it goes as a steer; absent waits as long as it takes.
         wait_ms: Option<u64>,
+        /// A JSON Schema the turn's reply follows, which the provider
+        /// enforces as structured output; absent leaves it free text.
+        output_schema: Option<Value>,
     },
     Interrupt {
         bot: String,
@@ -4585,6 +4591,7 @@ impl Service {
                 budget_tokens,
                 images,
                 wait_ms,
+                output_schema,
             } => {
                 name("request_id", &request_id)?;
                 let images = images_checked(
@@ -4664,6 +4671,36 @@ impl Service {
                         "attach joins the bot's next model call, so it takes no workspace, model, effort or budget_tokens",
                     );
                 }
+                // A steer or an attached message joins a turn whose reply
+                // was asked for already.
+                if output_schema.is_some() && matches!(delivery, Delivery::Steer | Delivery::Attach)
+                {
+                    return fail_with(
+                        "invalid_delivery",
+                        "output_schema shapes the reply of the turn it starts; a steer or an attached message joins one, so send it with reject or queue",
+                    );
+                }
+                let output_schema = match output_schema {
+                    None => None,
+                    Some(schema @ Value::Object(_)) => {
+                        let text = schema.to_string();
+                        if text.len() > MAX_OUTPUT_SCHEMA_BYTES {
+                            return fail_with(
+                                "invalid_output_schema",
+                                format!(
+                                    "output_schema may be up to {MAX_OUTPUT_SCHEMA_BYTES} bytes as JSON"
+                                ),
+                            );
+                        }
+                        Some(text)
+                    }
+                    Some(_) => {
+                        return fail_with(
+                            "invalid_output_schema",
+                            "output_schema is a JSON Schema object",
+                        );
+                    }
+                };
                 if wait_ms.is_some() && delivery != Delivery::Attach {
                     return fail_with(
                         "invalid_delivery",
@@ -4697,6 +4734,7 @@ impl Service {
                     budget_tokens,
                     images,
                     wait_ms,
+                    output_schema,
                 };
                 // A slot is promised before the commit that may take it, so
                 // admissions queued together cannot start more turns than
@@ -6025,6 +6063,7 @@ mod tests {
             budget_tokens: None,
             images: None,
             wait_ms: None,
+            output_schema: None,
         }
     }
     /// Take requests the way the run loop does: an admission with room joins

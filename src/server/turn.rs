@@ -334,6 +334,8 @@ struct Warm<'a> {
     instructions: &'a str,
     reasoning: Option<&'a str>,
     tools: &'a serde_json::value::RawValue,
+    /// The schema the call's reply followed; a refresh asks for the same.
+    output_schema: Option<&'a serde_json::value::RawValue>,
     context: &'a Context,
     /// The items the call sent without thinking: a refresh sends the same.
     thinking: Strip,
@@ -2166,6 +2168,10 @@ impl Turn {
         // A turn may run at its own effort; everything after reads the record.
         record.effort = context.effort.clone();
         record.turn_budget = context.budget;
+        record.output_schema = (context.output_schema.clone())
+            .map(serde_json::value::RawValue::from_string)
+            .transpose()
+            .map_err(|_| Error::new("store_corrupt"))?;
         let (provider, model) = split_model(&context.model)?;
         let Some(provider) = self.providers.get(provider) else {
             let error = Error::with("provider_unavailable", provider);
@@ -2874,6 +2880,7 @@ impl Turn {
                     instructions: &record.instructions,
                     reasoning: record.effort.as_deref(),
                     tools: &tools,
+                    output_schema: record.output_schema.as_deref(),
                     context: &context,
                     thinking: context.thinking,
                     web_search: searches(&record),
@@ -3165,6 +3172,8 @@ impl Turn {
                         reasoning: record.effort.as_deref(),
                         tools,
                         allow_tool_calls: tool_calls && !matches!(body, Body::Span(..)),
+                        // The turn's own reply; a summary is free text.
+                        output_schema: record.output_schema.as_deref().filter(|_| !summary),
                         // A summary offers it too, so its request reads
                         // the cache the bot's calls write.
                         web_search: searches(record),
@@ -3201,6 +3210,7 @@ impl Turn {
                         instructions,
                         reasoning: record.effort.as_deref(),
                         tools,
+                        output_schema: record.output_schema.as_deref(),
                         context,
                         thinking: withheld.unwrap_or(context.thinking),
                         web_search: searches(record),
@@ -3713,6 +3723,7 @@ impl Turn {
         let (model, instructions) = (warm.model.to_owned(), warm.instructions.to_owned());
         let reasoning = warm.reasoning.map(str::to_owned);
         let tools = warm.tools.to_owned();
+        let output_schema = warm.output_schema.map(ToOwned::to_owned);
         let web_search = warm.web_search;
         let items = self.items(warm.context, warm.thinking);
         let sent = refresh.clone();
@@ -3724,6 +3735,7 @@ impl Turn {
                 reasoning: reasoning.as_deref(),
                 tools: &tools,
                 allow_tool_calls: true,
+                output_schema: output_schema.as_deref(),
                 web_search,
                 fallback_credit: None,
                 cache_key: None,

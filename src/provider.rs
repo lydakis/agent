@@ -402,6 +402,9 @@ pub struct Request<'a> {
     pub tools: &'a RawValue,
     /// Keep schemas needed to interpret history while disabling new calls.
     pub allow_tool_calls: bool,
+    /// A JSON Schema the reply's text must follow, which the provider
+    /// enforces as it writes: its structured output. Tool calls still go.
+    pub output_schema: Option<&'a RawValue>,
     /// Offer the provider's web search beside `tools`, as it declares it.
     pub web_search: bool,
     /// The credit a refusal minted, sent with this retry of the refused
@@ -813,6 +816,9 @@ impl Provider {
             tool_choice: Option<&'static str>,
             #[serde(skip_serializing_if = "Option::is_none")]
             reasoning: Option<Value>,
+            /// The reply's structured output, when the turn asks for one.
+            #[serde(skip_serializing_if = "Option::is_none")]
+            text: Option<Value>,
             #[serde(skip_serializing_if = "Option::is_none")]
             prompt_cache_key: Option<&'a str>,
             #[serde(skip_serializing_if = "Option::is_none")]
@@ -899,6 +905,12 @@ impl Provider {
                     reasoning: request
                         .reasoning
                         .map(|effort| json!({"effort":effort,"summary":"auto"})),
+                    // Strict, as Codex sends a turn's output schema: the
+                    // reply follows the schema exactly.
+                    text: request.output_schema.map(|schema| {
+                        json!({"format":{"type":"json_schema","name":"output",
+                            "schema":schema,"strict":true}})
+                    }),
                     prompt_cache_key: request.cache_key,
                     // Fast is OpenAI's priority tier, by the name every
                     // model that has one takes.
@@ -941,10 +953,23 @@ impl Provider {
                                 "block_binding":{"prefix_mismatch_behavior":"drop_block"}})
                         }
                     }),
-                    output_config: request
-                        .reasoning
-                        .filter(|_| !legacy_thinking(request.model))
-                        .map(|level| json!({"effort":level})),
+                    // Effort, where the model takes it, and the reply's
+                    // structured output, when the turn asks for one.
+                    output_config: {
+                        let mut config = serde_json::Map::new();
+                        if let Some(level) =
+                            (request.reasoning).filter(|_| !legacy_thinking(request.model))
+                        {
+                            config.insert("effort".into(), json!(level));
+                        }
+                        if let Some(schema) = request.output_schema {
+                            config.insert(
+                                "format".into(),
+                                json!({"type":"json_schema","schema":schema}),
+                            );
+                        }
+                        (!config.is_empty()).then_some(Value::Object(config))
+                    },
                     fallback_credit_token: request.fallback_credit.filter(|_| !self.bedrock),
                     speed: self.speed.map(Speed::name),
                 })?,
@@ -2172,6 +2197,7 @@ mod tests {
                 reasoning: Some("high"),
                 tools: &none(),
                 allow_tool_calls: true,
+                output_schema: None,
                 web_search: false,
                 fallback_credit: None,
                 cache_key: None,
@@ -2204,6 +2230,7 @@ mod tests {
                 reasoning: Some("low"),
                 tools: &none(),
                 allow_tool_calls: true,
+                output_schema: None,
                 web_search: false,
                 fallback_credit: Some("credit"),
                 cache_key: Some("k"),
@@ -2230,6 +2257,7 @@ mod tests {
                     reasoning: None,
                     tools: &none(),
                     allow_tool_calls: true,
+                    output_schema: None,
                     web_search: false,
                     fallback_credit: None,
                     cache_key: None,
@@ -2251,6 +2279,7 @@ mod tests {
                 reasoning: Some("low"),
                 tools: &none(),
                 allow_tool_calls: true,
+                output_schema: None,
                 web_search: false,
                 fallback_credit: None,
                 cache_key: None,
@@ -2274,6 +2303,7 @@ mod tests {
                 reasoning: None,
                 tools: &none(),
                 allow_tool_calls: true,
+                output_schema: None,
                 web_search: false,
                 fallback_credit: None,
                 cache_key: None,
@@ -2301,6 +2331,7 @@ mod tests {
                 reasoning: None,
                 tools: &none(),
                 allow_tool_calls: true,
+                output_schema: None,
                 web_search: false,
                 fallback_credit: None,
                 cache_key: Some("k"),
@@ -2337,6 +2368,7 @@ mod tests {
                             reasoning: None,
                             tools,
                             allow_tool_calls: allow,
+                            output_schema: None,
                             web_search: false,
                             fallback_credit: None,
                             cache_key: None,
@@ -2365,6 +2397,73 @@ mod tests {
                             }
                         );
                     }
+                }
+            }
+        }
+    }
+
+    /// A turn's output schema goes as each family's structured output,
+    /// beside the effort and the tools; without one the request is as
+    /// before.
+    #[test]
+    fn an_output_schema_is_each_familys_structured_output() {
+        let transport = Transport::new(64, 1).unwrap();
+        let schema = RawValue::from_string(
+            r#"{"type":"object","additionalProperties":false,"required":["a"],"properties":{"a":{"type":"string"}}}"#
+                .into(),
+        )
+        .unwrap();
+        let parsed: Value = serde_json::from_str(schema.get()).unwrap();
+        let tools = crate::tools::Registry::all().unwrap();
+        for family in [Family::Anthropic, Family::Responses] {
+            let provider =
+                Provider::new(transport.clone(), family, "http://example.test", None).unwrap();
+            let schemas = tools.encoded(family, &["echo".into()], &[], false).unwrap();
+            let body = |output_schema, reasoning| {
+                let mut prefix = provider
+                    .prefix(&Request {
+                        model: "claude-sonnet-5",
+                        instructions: "i",
+                        reasoning,
+                        tools: &schemas,
+                        allow_tool_calls: true,
+                        output_schema,
+                        web_search: false,
+                        fallback_credit: None,
+                        cache_key: None,
+                        items: Items::empty(),
+                        chain: None,
+                        route: None,
+                        sent: None,
+                    })
+                    .unwrap();
+                prefix.extend_from_slice(b"]}");
+                serde_json::from_slice::<Value>(&prefix).unwrap()
+            };
+            let asked = body(Some(&*schema), Some("low"));
+            // The tools stay callable: the schema holds the reply's text.
+            assert!(asked.get("tool_choice").is_none());
+            assert!(asked["tools"].is_array());
+            let plain = body(None, Some("low"));
+            match family {
+                Family::Anthropic => {
+                    assert_eq!(
+                        asked["output_config"],
+                        json!({"effort":"low","format":{"type":"json_schema","schema":parsed}})
+                    );
+                    assert_eq!(
+                        body(Some(&*schema), None)["output_config"],
+                        json!({"format":{"type":"json_schema","schema":parsed}})
+                    );
+                    assert_eq!(plain["output_config"], json!({"effort":"low"}));
+                }
+                Family::Responses => {
+                    assert_eq!(
+                        asked["text"],
+                        json!({"format":{"type":"json_schema","name":"output",
+                            "schema":parsed,"strict":true}})
+                    );
+                    assert!(plain.get("text").is_none());
                 }
             }
         }
@@ -2420,6 +2519,7 @@ mod tests {
                     reasoning: Some("high"),
                     tools: &none(),
                     allow_tool_calls: true,
+                    output_schema: None,
                     web_search: false,
                     fallback_credit: None,
                     cache_key: None,
@@ -2520,6 +2620,7 @@ mod tests {
                     reasoning: Some("high"),
                     tools: &none(),
                     allow_tool_calls: true,
+                    output_schema: None,
                     web_search: false,
                     fallback_credit: Some("credit"),
                     cache_key: None,
@@ -2554,6 +2655,7 @@ mod tests {
             reasoning: Some("high"),
             tools: &tools,
             allow_tool_calls: true,
+            output_schema: None,
             web_search: false,
             fallback_credit: None,
             cache_key: None,
@@ -2597,6 +2699,7 @@ mod tests {
             reasoning: None,
             tools: &tools,
             allow_tool_calls: true,
+            output_schema: None,
             web_search: false,
             fallback_credit: None,
             cache_key: None,
@@ -2664,6 +2767,7 @@ mod tests {
                 reasoning: None,
                 tools: &tools,
                 allow_tool_calls: true,
+                output_schema: None,
                 web_search: false,
                 fallback_credit: None,
                 cache_key: None,
@@ -2882,6 +2986,7 @@ mod tests {
                     reasoning: None,
                     tools: &none(),
                     allow_tool_calls: true,
+                    output_schema: None,
                     web_search: false,
                     fallback_credit: None,
                     cache_key: None,
@@ -2981,6 +3086,7 @@ mod tests {
                 reasoning: None,
                 tools: &tools,
                 allow_tool_calls: true,
+                output_schema: None,
                 web_search: false,
                 fallback_credit: None,
                 cache_key: None,
@@ -3049,6 +3155,7 @@ mod tests {
                 reasoning: None,
                 tools: &tools,
                 allow_tool_calls: true,
+                output_schema: None,
                 web_search: false,
                 fallback_credit: None,
                 cache_key: None,
@@ -3118,6 +3225,7 @@ mod tests {
             reasoning: None,
             tools: &tools,
             allow_tool_calls: true,
+            output_schema: None,
             web_search: false,
             fallback_credit: None,
             cache_key: None,
@@ -3192,6 +3300,7 @@ mod tests {
             reasoning: None,
             tools: &tools,
             allow_tool_calls: true,
+            output_schema: None,
             web_search: false,
             fallback_credit: None,
             cache_key: None,
@@ -3301,6 +3410,7 @@ mod tests {
             reasoning: None,
             tools: &tools,
             allow_tool_calls: true,
+            output_schema: None,
             web_search: false,
             fallback_credit: None,
             cache_key: None,
@@ -3389,6 +3499,7 @@ mod tests {
             reasoning: None,
             tools: &tools,
             allow_tool_calls: true,
+            output_schema: None,
             web_search: false,
             fallback_credit: None,
             cache_key: None,
@@ -3441,6 +3552,7 @@ mod tests {
             reasoning: None,
             tools: &tools,
             allow_tool_calls: true,
+            output_schema: None,
             web_search: false,
             fallback_credit: None,
             cache_key: None,
@@ -3492,6 +3604,7 @@ mod tests {
             reasoning: None,
             tools: &tools,
             allow_tool_calls: true,
+            output_schema: None,
             web_search: false,
             fallback_credit: None,
             cache_key: None,
@@ -3547,6 +3660,7 @@ mod tests {
             reasoning: None,
             tools: &tools,
             allow_tool_calls: true,
+            output_schema: None,
             web_search: false,
             fallback_credit: None,
             cache_key: None,
@@ -3600,6 +3714,7 @@ mod tests {
             reasoning: None,
             tools: &tools,
             allow_tool_calls: true,
+            output_schema: None,
             web_search: false,
             fallback_credit: None,
             items: Items::empty(),
@@ -3668,6 +3783,7 @@ mod tests {
             reasoning: None,
             tools: &tools,
             allow_tool_calls: true,
+            output_schema: None,
             web_search: false,
             fallback_credit: None,
             items: Items::empty(),
@@ -3718,6 +3834,7 @@ mod tests {
             reasoning: None,
             tools: &tools,
             allow_tool_calls: true,
+            output_schema: None,
             web_search: false,
             fallback_credit: None,
             items: Items::empty(),
@@ -3764,6 +3881,7 @@ mod tests {
                 reasoning: None,
                 tools: &tools,
                 allow_tool_calls: true,
+                output_schema: None,
                 web_search: false,
                 fallback_credit: None,
                 items: Items::empty(),
@@ -3801,6 +3919,7 @@ mod tests {
             reasoning: None,
             tools: &tools,
             allow_tool_calls: true,
+            output_schema: None,
             web_search: false,
             fallback_credit: None,
             items: Items::empty(),
@@ -3850,6 +3969,7 @@ mod tests {
             reasoning: None,
             tools: &tools,
             allow_tool_calls: true,
+            output_schema: None,
             web_search: false,
             fallback_credit: None,
             cache_key: None,
@@ -3921,6 +4041,7 @@ mod tests {
                     reasoning: None,
                     tools: &none(),
                     allow_tool_calls: true,
+                    output_schema: None,
                     web_search: false,
                     fallback_credit: None,
                     cache_key: None,

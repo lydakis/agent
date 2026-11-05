@@ -165,6 +165,13 @@ enum Judged {
     Failed { why: String, reply: Option<String> },
 }
 
+/// The judge's reply: held to the verdict's schema by its provider, then
+/// read whole, an assessment for each call asked and no other.
+const VERDICT: judge::Reply = judge::Reply {
+    schema: policy::VERDICT_SCHEMA,
+    parse: policy::assessments,
+};
+
 struct Judge {
     base: judge::Base,
     /// How long a round may wait for its verdict, from its announcement.
@@ -185,14 +192,7 @@ impl Judge {
         let prompt = policy::model_prompt(state, ids);
         let answered = self
             .base
-            .ask_with(
-                client,
-                &prompt,
-                ids,
-                policy::assessments,
-                workspace,
-                deadline,
-            )
+            .ask_with(client, &prompt, ids, &VERDICT, workspace, deadline)
             .await;
         match answered {
             Ok((answers, usage)) => Judged::Answers {

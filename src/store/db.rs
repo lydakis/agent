@@ -42,6 +42,10 @@ pub struct Bot {
     /// The cap its running turn was submitted with, while that turn runs.
     #[serde(skip)]
     pub turn_budget: Option<TurnBudget>,
+    /// The JSON Schema its running turn's reply follows, while that turn
+    /// runs and when it was submitted with one.
+    #[serde(skip)]
+    pub output_schema: Option<Box<serde_json::value::RawValue>>,
     /// Input tokens sent and, of those, the ones the provider served from
     /// its prompt cache. Their ratio is what the context window's hysteresis
     /// exists to keep high.
@@ -764,6 +768,9 @@ pub struct TurnOptions {
     /// in before it is delivered as a steer; none waits for as long as it
     /// takes.
     pub wait_ms: Option<u64>,
+    /// A JSON Schema, as JSON text, the turn's reply follows: the
+    /// provider's structured output. None leaves the reply free text.
+    pub output_schema: Option<String>,
 }
 /// An attached message whose wait ran out, delivered now as a steer.
 #[derive(Debug)]
@@ -1630,6 +1637,9 @@ pub struct TurnContext {
     pub effort: Option<String>,
     /// The token cap it was submitted with.
     pub budget: Option<TurnBudget>,
+    /// The JSON Schema its reply follows, as JSON text, when it was
+    /// submitted with one.
+    pub output_schema: Option<String>,
     /// The model and effort of the bot's latest earlier turn that started,
     /// when its calls sent the history this turn starts from: a call sent
     /// its view last, and something follows its prompt. `None` otherwise,
@@ -2166,7 +2176,7 @@ impl Database {
                 cached_input_tokens INTEGER NOT NULL DEFAULT 0,
                 from_bot TEXT, from_turn INTEGER, from_id INTEGER, origin TEXT, reasoning TEXT, inherited_reasoning TEXT,
                 bot_model TEXT, bot_reasoning TEXT, images TEXT, person TEXT, quotes TEXT, reply_node INTEGER,
-                wait_ms INTEGER, due_ms INTEGER, held TEXT,
+                wait_ms INTEGER, due_ms INTEGER, held TEXT, output_schema TEXT,
                 UNIQUE(bot,request_id));
             CREATE INDEX IF NOT EXISTS turns_bot_id ON turns(bot,id);
             CREATE INDEX IF NOT EXISTS turns_started ON turns(bot,id) WHERE started_ms IS NOT NULL;
@@ -2602,6 +2612,7 @@ impl Database {
             budget_tokens: r.get::<_, Option<i64>>(10)?.map(|b| b.max(0) as u64),
             tokens_used: r.get::<_, i64>(11)?.max(0) as u64,
             turn_budget: None,
+            output_schema: None,
             workspace: r.get(2)?,
             status: r.get(3)?,
             running_turn: r.get(4)?,
@@ -5769,7 +5780,7 @@ impl Database {
             .conn
             .query_row(
                 "SELECT id,prompt,status,workspace,model,delivery,expected_turn,prompt_node,from_bot,from_turn,origin,reasoning,budget_tokens,images,
-                    person,quotes,wait_ms
+                    person,quotes,wait_ms,output_schema
                  FROM turns WHERE bot=? AND request_id=?",
                 params![name, request_id],
                 |r| {
@@ -5818,6 +5829,7 @@ impl Database {
                             // Checked by their digest below.
                             images: Vec::new(),
                             wait_ms: r.get::<_, Option<i64>>(16)?.map(|n| n as u64),
+                            output_schema: r.get(17)?,
                         },
                         r.get(7)?,
                         r.get(13)?,
@@ -5855,6 +5867,7 @@ impl Database {
                 budget_tokens,
                 images: _,
                 wait_ms,
+                output_schema,
             } = &saved_options;
             let images = saved_images.map(|kept| pictures_digest(&kept));
             let differs = [
@@ -5870,6 +5883,7 @@ impl Database {
                 ("quotes", *quotes != same.quotes),
                 ("budget_tokens", *budget_tokens != same.budget_tokens),
                 ("wait_ms", *wait_ms != same.wait_ms),
+                ("output_schema", *output_schema != same.output_schema),
                 (
                     "images",
                     images != stored_images(&same.images)?.map(|json| pictures_digest(&json)),
@@ -6040,8 +6054,8 @@ impl Database {
             .query_row([], |r| r.get(0))?;
         tx.prepare_cached(
             "INSERT INTO turns(id,bot,request_id,prompt,status,workspace,model,delivery,expected_turn,from_bot,from_turn,from_id,origin,reasoning,budget_tokens,images,person,quotes,
-                wait_ms,due_ms)
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                wait_ms,due_ms,output_schema)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         )?.execute(
             // Queued work keeps the folder it was sent to even if the bot
             // moves before it starts; a steer without one joins any turn.
@@ -6052,7 +6066,8 @@ impl Database {
                 options.effort, options.budget_tokens.map(|n| n as i64),
                 stored_images(&options.images)?, options.person, quotes,
                 options.wait_ms.map(|n| n as i64),
-                options.wait_ms.map(|n| epoch_ms().saturating_add(n as i64))],
+                options.wait_ms.map(|n| epoch_ms().saturating_add(n as i64)),
+                options.output_schema],
         )?;
         if moved {
             tx.prepare_cached("UPDATE bots SET workspace=? WHERE name=?")?
@@ -8891,7 +8906,8 @@ impl Database {
     }
     /// The workspace and model reference a running turn must use.
     pub fn context(&self, turn: i64) -> Result<TurnContext> {
-        // Workspace, model, rounds, view sent, effort, cap, and tokens spent.
+        // Workspace, model, rounds, view sent, effort, cap, tokens spent,
+        // and the schema its reply follows.
         type Row = (
             Option<String>,
             Option<String>,
@@ -8900,9 +8916,10 @@ impl Database {
             Option<String>,
             Option<i64>,
             i64,
+            Option<String>,
         );
-        let (workspace, model, model_rounds, view_sent, reasoning, budget, spent): Row = self.conn.query_row(
-            "SELECT workspace,model,model_rounds,view_sent,reasoning,budget_tokens,input_tokens+output_tokens
+        let (workspace, model, model_rounds, view_sent, reasoning, budget, spent, output_schema): Row = self.conn.query_row(
+            "SELECT workspace,model,model_rounds,view_sent,reasoning,budget_tokens,input_tokens+output_tokens,output_schema
                FROM turns WHERE id=?",
             [turn],
             |r| {
@@ -8914,6 +8931,7 @@ impl Database {
                     r.get(4)?,
                     r.get(5)?,
                     r.get(6)?,
+                    r.get(7)?,
                 ))
             },
         )?;
@@ -8958,6 +8976,7 @@ impl Database {
                     .saturating_add(tokens as u64),
             }),
             previous_call,
+            output_schema,
             created_by: bot.created_by,
             created_by_id: bot.created_by_id,
             bot: bot.name,
@@ -13654,6 +13673,18 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
         )?
     {
         conn.execute("ALTER TABLE turns ADD COLUMN held TEXT", [])?;
+    }
+    // Schema 79: a turn may ask that its reply follow a JSON Schema. Those
+    // sent before asked for none.
+    if from < 79
+        && conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='turns')
+             AND NOT EXISTS(SELECT 1 FROM pragma_table_info('turns') WHERE name='output_schema')",
+            [],
+            |r| r.get::<_, bool>(0),
+        )?
+    {
+        conn.execute("ALTER TABLE turns ADD COLUMN output_schema TEXT", [])?;
     }
     Ok(())
 }

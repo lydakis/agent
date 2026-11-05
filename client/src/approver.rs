@@ -167,8 +167,14 @@ pub const JUDGE_INSTRUCTIONS: &str = concat!(
     r#"
 
 # Reply
-You get a JSON object: `state` describes the turn and its planned calls, and `assess` lists the ids of the planned calls to judge. Reply with one JSON object mapping every id in `assess` to its assessment, and nothing else. For a low-risk call give just {"outcome":"allow"}. For anything else give {"risk_level":"low"|"medium"|"high"|"critical","user_authorization":"unknown"|"low"|"medium"|"high","outcome":"allow"|"deny","rationale":"..."}."#
+You get a JSON object: `state` describes the turn and its planned calls, and `assess` lists the ids of the planned calls to judge. Reply with one JSON object whose `assessments` list holds one assessment for each id in `assess`, each id exactly once: {"assessments":[{"id":"...","risk_level":"low"|"medium"|"high"|"critical","user_authorization":"unknown"|"low"|"medium"|"high","outcome":"allow"|"deny","rationale":"..."}]}. For a call that is clearly low risk, `rationale` is empty."#
 );
+
+/// The JSON Schema a judge's reply follows, which the provider enforces:
+/// one assessment per call, every field given. Fixed whatever calls are
+/// judged, so a provider compiles it once and keeps it; which ids it holds
+/// is checked by [`assessments`].
+pub const VERDICT_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["assessments"],"properties":{"assessments":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["id","risk_level","user_authorization","outcome","rationale"],"properties":{"id":{"type":"string"},"risk_level":{"type":"string","enum":["low","medium","high","critical"]},"user_authorization":{"type":"string","enum":["unknown","low","medium","high"]},"outcome":{"type":"string","enum":["allow","deny"]},"rationale":{"type":"string"}}}}}}"#;
 
 /// The state's fields in the order the judge reads them: what holds for the
 /// whole turn first and the calls being judged last, so consecutive rounds
@@ -231,22 +237,31 @@ pub enum Verdict {
     Doubt(String),
 }
 
-/// A general model's reply as assessments: its JSON object, found in the
-/// reply, with an `outcome` of allow or deny for every id asked. `None`
-/// when any is missing, a failed check.
-pub fn assessments(reply: &str, ids: &[&str]) -> Option<Map<String, Value>> {
-    let start = reply.find('{')?;
-    let end = reply.rfind('}')?;
-    let given: Map<String, Value> = serde_json::from_str(reply.get(start..=end)?).ok()?;
+/// A judge's reply as assessments by call id: the whole reply is the
+/// JSON [`VERDICT_SCHEMA`] asks for, and it assesses every id asked
+/// exactly once, with an `outcome` of allow or deny, and no other. Else
+/// why not, a failed check.
+pub fn assessments(reply: &str, ids: &[&str]) -> Result<Map<String, Value>, String> {
+    let malformed = || "the judge's answer was not the JSON asked for".to_owned();
+    let given: Value = serde_json::from_str(reply).map_err(|_| malformed())?;
+    let listed = given["assessments"].as_array().ok_or_else(malformed)?;
     let mut kept = Map::new();
-    for &id in ids {
-        let assessment = given.get(id)?;
+    for assessment in listed {
+        let id = assessment["id"].as_str().ok_or_else(malformed)?;
         if !matches!(assessment["outcome"].as_str(), Some("allow" | "deny")) {
-            return None;
+            return Err(malformed());
         }
-        kept.insert(id.to_owned(), assessment.clone());
+        if !ids.contains(&id) {
+            return Err("the judge's answer named a call it was not asked about".into());
+        }
+        if kept.insert(id.to_owned(), assessment.clone()).is_some() {
+            return Err("the judge's answer assessed a call twice".into());
+        }
     }
-    Some(kept)
+    match ids.iter().all(|id| kept.contains_key(*id)) {
+        true => Ok(kept),
+        false => Err("the judge's answer left out a call".into()),
+    }
 }
 
 /// A call's verdict from its assessment, as Codex reads one: the outcome
@@ -1392,17 +1407,92 @@ mod tests {
         // The policy and the reply format are in the fixed instructions.
         assert!(JUDGE_INSTRUCTIONS.contains("# Outcome policy"));
         assert!(JUDGE_INSTRUCTIONS.contains("The approval channel"));
-        assert!(JUDGE_INSTRUCTIONS.ends_with(r#""rationale":"..."}."#));
-        let reply = "Here you go:\n```json\n{\"c1\":{\"outcome\":\"allow\"},\"c2\":{\"risk_level\":\"critical\",\"user_authorization\":\"unknown\",\"outcome\":\"deny\",\"rationale\":\"It answers its own approvals.\"}}\n```";
+        assert!(JUDGE_INSTRUCTIONS.contains(r#"{"assessments":[{"id":"...""#));
+        let reply = r#"{"assessments":[{"id":"c1","risk_level":"low","user_authorization":"unknown","outcome":"allow","rationale":""},{"id":"c2","risk_level":"critical","user_authorization":"unknown","outcome":"deny","rationale":"It answers its own approvals."}]}"#;
         let assessed = assessments(reply, &["c1", "c2"]).unwrap();
         assert_eq!(verdict(&assessed["c1"]), Some(Verdict::Allow));
         assert!(
             matches!(verdict(&assessed["c2"]), Some(Verdict::Deny(r)) if r.contains("its own approvals"))
         );
-        // A call left out, or one without an outcome, fails the check.
-        assert!(assessments(reply, &["c1", "c3"]).is_none());
-        assert!(assessments(r#"{"c1":{"risk_level":"low"}}"#, &["c1"]).is_none());
-        assert!(assessments("They look fine.", &["c1"]).is_none());
+    }
+
+    #[test]
+    fn a_verdict_counts_only_whole_and_for_exactly_the_calls_asked() {
+        let one = |id: &str, outcome: &str| {
+            json!({"id":id,"risk_level":"low","user_authorization":"unknown",
+                "outcome":outcome,"rationale":""})
+        };
+        let reply = |items: Vec<Value>| json!({ "assessments": items }).to_string();
+        let ids = ["c1", "c2"];
+        let why = |text: &str| assessments(text, &ids).unwrap_err();
+        // Every call asked, once each, in any order.
+        let both = reply(vec![one("c2", "deny"), one("c1", "allow")]);
+        assert_eq!(assessments(&both, &ids).unwrap().len(), 2);
+        assert_eq!(
+            why(&reply(vec![one("c1", "allow")])),
+            "the judge's answer left out a call"
+        );
+        assert_eq!(
+            why(&reply(vec![
+                one("c1", "allow"),
+                one("c2", "allow"),
+                one("c9", "deny")
+            ])),
+            "the judge's answer named a call it was not asked about"
+        );
+        assert_eq!(
+            why(&reply(vec![
+                one("c1", "allow"),
+                one("c2", "allow"),
+                one("c1", "deny")
+            ])),
+            "the judge's answer assessed a call twice"
+        );
+        // Only the whole reply as the schema's JSON counts: no object found
+        // inside prose, no other shape, no outcome outside the two.
+        let malformed = "the judge's answer was not the JSON asked for";
+        assert_eq!(
+            why(&format!("Here you go:\n```json\n{both}\n```")),
+            malformed
+        );
+        assert_eq!(
+            why(r#"{"c1":{"outcome":"allow"},"c2":{"outcome":"allow"}}"#),
+            malformed
+        );
+        assert_eq!(
+            why(&reply(vec![one("c1", "allow"), one("c2", "maybe")])),
+            malformed
+        );
+        assert_eq!(why(&reply(vec![json!({"outcome":"allow"})])), malformed);
+        assert_eq!(why("They look fine."), malformed);
+    }
+
+    #[test]
+    fn the_verdict_schema_is_one_a_provider_holds_strictly() {
+        let schema: Value = serde_json::from_str(VERDICT_SCHEMA).unwrap();
+        // Strict structured output: every object closed and every field
+        // required, and no numeric or length bounds.
+        fn closed(schema: &Value) {
+            if schema["type"] == "object" {
+                assert_eq!(schema["additionalProperties"], false);
+                let properties = schema["properties"].as_object().unwrap();
+                let required: Vec<&str> = (schema["required"].as_array().unwrap().iter())
+                    .map(|key| key.as_str().unwrap())
+                    .collect();
+                assert_eq!(required.len(), properties.len());
+                for (key, property) in properties {
+                    assert!(required.contains(&key.as_str()));
+                    closed(property);
+                }
+            }
+            if schema["type"] == "array" {
+                closed(&schema["items"]);
+            }
+        }
+        closed(&schema);
+        assert!(!VERDICT_SCHEMA.contains("min") && !VERDICT_SCHEMA.contains("max"));
+        let item = &schema["properties"]["assessments"]["items"]["properties"];
+        assert_eq!(item["outcome"]["enum"], json!(["allow", "deny"]));
     }
 
     #[test]

@@ -167,6 +167,7 @@ fn historical_fork_and_exact_resume_preserve_independent_lineage() {
         budget_tokens: None,
         images: Vec::new(),
         wait_ms: None,
+        output_schema: None,
     };
     let alt = db
         .begin("Alternative", "r1", "different", true, &branch, |_, _| {
@@ -3275,6 +3276,83 @@ fn schema_77_holds_a_refused_start_in_line() {
 }
 
 #[test]
+fn a_turn_keeps_the_schema_its_reply_follows() {
+    let path = std::env::temp_dir().join(format!(
+        "agent-schema78-output-schema-{}.sqlite",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let schema = r#"{"type":"object"}"#;
+    let shaped = |schema: Option<&str>| TurnOptions {
+        output_schema: schema.map(Into::into),
+        ..TurnOptions::default()
+    };
+    let earlier = {
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        db.create("Ann", Some("/synthetic"), binding()).unwrap();
+        db.create("Bob", Some("/synthetic"), binding()).unwrap();
+        db.begin("Ann", "r0", "go", true, &shaped(None), allow_provider)
+            .unwrap()
+            .turn
+    };
+    // A store from before schema 79: its turns asked for no schema.
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch("ALTER TABLE turns DROP COLUMN output_schema; PRAGMA user_version=78;")
+        .unwrap();
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    let started = db
+        .begin(
+            "Bob",
+            "r1",
+            "go",
+            true,
+            &shaped(Some(schema)),
+            allow_provider,
+        )
+        .unwrap();
+    assert_eq!(
+        db.context(started.turn).unwrap().output_schema.as_deref(),
+        Some(schema)
+    );
+    // Kept with the turn, which a resumed turn reads its context from.
+    drop(db);
+    let kept = |turn: i64| -> Option<String> {
+        Connection::open(&path)
+            .unwrap()
+            .query_row("SELECT output_schema FROM turns WHERE id=?", [turn], |r| {
+                r.get(0)
+            })
+            .unwrap()
+    };
+    assert_eq!(kept(earlier), None);
+    assert_eq!(kept(started.turn).as_deref(), Some(schema));
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    // Part of the request: a retry names the same one.
+    assert!(
+        !db.begin(
+            "Bob",
+            "r1",
+            "go",
+            true,
+            &shaped(Some(schema)),
+            allow_provider
+        )
+        .unwrap()
+        .fresh
+    );
+    for other in [None, Some(r#"{"type":"array"}"#)] {
+        let conflict = db
+            .begin("Bob", "r1", "go", false, &shaped(other), allow_provider)
+            .unwrap_err();
+        assert_eq!(conflict.code, "idempotency_conflict");
+        assert_eq!(conflict.facts.unwrap()["field"], "output_schema");
+    }
+    drop(db);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn schema_70_finds_each_attached_message_from_its_event() {
     let path = std::env::temp_dir().join(format!(
         "agent-schema70-attached-{}.sqlite",
@@ -5343,6 +5421,7 @@ fn turn_options_are_recorded_and_part_of_idempotency() {
         budget_tokens: None,
         images: Vec::new(),
         wait_ms: None,
+        output_schema: None,
     };
     let started = db
         .begin("Bob", "r1", "work", true, &options, allow_provider)
@@ -5476,6 +5555,7 @@ fn a_bot_without_a_default_workspace_needs_one_per_submission() {
         budget_tokens: None,
         images: Vec::new(),
         wait_ms: None,
+        output_schema: None,
     };
     let turn = db
         .begin("Nomad", "r1", "work", true, &options, allow_provider)
@@ -6666,6 +6746,7 @@ fn forks_start_at_any_answered_message_and_default_to_the_head() {
                 budget_tokens: None,
                 images: Vec::new(),
                 wait_ms: None,
+                output_schema: None,
             },
             allow_provider,
         )
