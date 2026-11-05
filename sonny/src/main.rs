@@ -2409,8 +2409,8 @@ struct App {
     /// The line each ask for a step of the person's gave them to run, by
     /// its call: a click on its card copies it.
     commands: HashMap<String, String>,
-    /// Questions this window answered and closed, until their answers
-    /// land, so landing does not close another asked the same.
+    /// The asks this window answered and closed, by call, until their
+    /// answers land.
     sent_answers: Vec<String>,
     /// Where the person's reactions to the bot are kept, once its id is
     /// known.
@@ -11030,7 +11030,7 @@ impl App {
     fn close_ask(&mut self, ask: &asks::Ask) {
         self.asks.retain(|open| open.id != ask.id);
         self.aside.retain(|open| open.id != ask.id);
-        self.sent_answers.push(ask.question.clone());
+        self.sent_answers.push(ask.id.clone());
         self.settle_asks();
     }
 
@@ -11046,8 +11046,8 @@ impl App {
     /// question open set aside, as the conversation went on past them.
     fn answered(&mut self, message: &str, from: Option<&str>) {
         // An answer sent from here closed its question when it was sent.
-        if let Some(question) = asks::answered(message)
-            && let Some(at) = self.sent_answers.iter().position(|q| q == question)
+        if let Some(call) = asks::answered(message)
+            && let Some(at) = self.sent_answers.iter().position(|sent| sent == call)
         {
             self.sent_answers.remove(at);
             return;
@@ -14173,7 +14173,7 @@ mod tests {
             "options": [{"label": "Now"}, {"label": "Later"}], "recommended": 1});
         let items = json!([
             // An answer to an ask, with what the ask recommended.
-            {"node": 17, "item": message("user", "You asked: Ship it now?\n\nLater")},
+            {"node": 17, "item": message("user", "You asked (c1): Ship it now?\n\nLater")},
             {"node": 16, "item": {"type": "function_call", "name": "ask", "call_id": "c1",
                 "arguments": ask.to_string()}},
             // One to an older reply names it; one to the last reply is the
@@ -14202,7 +14202,7 @@ mod tests {
             .await;
         let read = said::said(&client, None, 1000).await.unwrap();
         let entry = |turn: i64, text: &str| json!({"bot": "shop.lead", "turn": turn, "text": text, "project": null});
-        let mut answer = entry(4, "You asked: Ship it now?\n\nLater");
+        let mut answer = entry(4, "You asked (c1): Ship it now?\n\nLater");
         answer["recommended"] = json!("Now");
         let mut older = entry(4, "🎉");
         older["reacted_to"] = json!("Tagged 0.6.0.");
@@ -14223,14 +14223,14 @@ mod tests {
             "recommended": 1});
         let items = json!([
             // An answer against what the ask recommended.
-            {"node": 13, "item": message("user", "You asked: Tag it too?\n\nNo")},
+            {"node": 13, "item": message("user", "You asked (t2): Tag it too?\n\nNo")},
             // A 🙌 on the last finished reply, which waited for its call
             // while another reply was written.
             {"node": 12, "item": message("user", "🙌")},
             {"node": 11, "item": message("assistant", "Still working.")},
             // A 🚀 on the older of two replies that begin alike.
             {"node": 10, "item": message("user", "> Done.\n\n🚀")},
-            {"node": 9, "item": message("user", "You asked: Ship it now?\n\nNow")},
+            {"node": 9, "item": message("user", "You asked (t1): Ship it now?\n\nNow")},
             // A 👍 on the ask's reply, taken off and put on again: once.
             {"node": 8, "item": message("user", "👍")},
             {"node": 7, "item": message("user", "👍")},
@@ -14278,7 +14278,7 @@ mod tests {
             .unwrap();
         let entry =
             |text: &str| json!({"bot": "shop.lead", "turn": 2, "text": text, "project": null});
-        let mut answer = entry("You asked: Ship it now?\n\nNow");
+        let mut answer = entry("You asked (t1): Ship it now?\n\nNow");
         answer["recommended"] = json!("Now");
         let mut liked = entry("👍");
         liked["reacted_to"] = json!("Ready to ship.");
@@ -14286,7 +14286,7 @@ mod tests {
         launched["reacted_to"] = json!("Done.");
         let mut cheered = entry("🙌");
         cheered["reacted_to"] = json!("Ready to ship.");
-        let mut against = entry("You asked: Tag it too?\n\nNo");
+        let mut against = entry("You asked (t2): Tag it too?\n\nNo");
         against["recommended"] = json!("Yes");
         assert_eq!(
             read["said"],
@@ -14820,7 +14820,7 @@ mod tests {
         app.input.set("2");
         app.submit().await;
         // Its answer landing leaves the other question asked the same open.
-        app.answered("You asked: Keep the old API?\n\nDrop it", None);
+        app.answered("You asked (c1): Keep the old API?\n\nDrop it", None);
         // Words typed while one is open are the person's own, sent as they
         // wrote them: no question is named over them, nor answered.
         app.input.set("how is it going?");
@@ -14829,7 +14829,7 @@ mod tests {
         assert_eq!(
             *sent.lock().unwrap(),
             [
-                "You asked: Keep the old API?\n\nDrop it",
+                "You asked (c1): Keep the old API?\n\nDrop it",
                 "how is it going?"
             ]
         );
@@ -14857,7 +14857,7 @@ mod tests {
         app.press("answer/0/c2").await;
         assert_eq!(
             sent.lock().unwrap().last().unwrap(),
-            "You asked: Tag it?\n\nKeep it"
+            "You asked (c2): Tag it?\n\nKeep it"
         );
         assert_eq!(app.aside, [ask("c3", "Keep the old API?")]);
         // Another agent's words, or a reaction, move nothing on.
@@ -14873,7 +14873,7 @@ mod tests {
             ask("c7", "Notes?"),
         ];
         app.focus = Some("c6".into());
-        app.answered("You asked: Tag it?\n\nKeep it", None);
+        app.answered("You asked (c5): Tag it?\n\nKeep it", None);
         assert_eq!(app.asking().map(|a| a.id.as_str()), Some("c6"));
         app.press("answer/0/c7").await;
         assert_eq!(app.asking().map(|a| a.id.as_str()), Some("c6"));
@@ -15477,7 +15477,7 @@ mod tests {
                   "arguments": "{\"question\":\"Write notes?\"}"},
             "7": {"type": "function_call_output", "call_id": "a3", "output": "Asked."},
             "8": {"type": "message", "role": "user",
-                  "content": [{"type": "input_text", "text": "You asked: Write notes?\n\nyes"}]},
+                  "content": [{"type": "input_text", "text": "You asked (a3): Write notes?\n\nyes"}]},
         });
         let client = daemon_answering(move |asked| match asked["op"].as_str() {
             Some("history_nodes") => {
@@ -15505,7 +15505,7 @@ mod tests {
         assert_eq!(rows[at + 4], "┃    Brew gets it tonight.");
         assert_eq!(rows[at + 8], "┃ Why 1: Nothing else is due.");
         // Its answer landing, sent from here or another window, closes it.
-        app.answered("You asked: Tag 0.4.1?\n\nYes", None);
+        app.answered("You asked (a1): Tag 0.4.1?\n\nYes", None);
         assert!(app.asks.is_empty());
         // Live, a question is pinned once the daemon took the call.
         let arguments = json!({"question": "Merge?"}).to_string();
@@ -17986,7 +17986,10 @@ mod tests {
             };
             app.key(Event::Mouse(click)).await;
         }
-        assert_eq!(sent.lock().unwrap()[..], [json!("You asked: Merge?\n\nNo")]);
+        assert_eq!(
+            sent.lock().unwrap()[..],
+            [json!("You asked (a4): Merge?\n\nNo")]
+        );
         assert!(app.asks.is_empty());
         // Once answered, another click sends nothing.
         app.press("answer/0/a4").await;

@@ -1019,7 +1019,7 @@ way `/react` does, and each note in the margin has its own `↩`.
   decision in the conversation where it was asked, its words read as
   Markdown with the same renderer a reply uses, and the composer's hint
   names it: a pick answers it (an option's number, or a click on the
-  option), and goes to the lead as `You asked: QUESTION` and the option.
+  option), and goes to the lead as `You asked (CALL_ID): QUESTION` and the option, by the ask's call so another asking the same words stays open.
   While you type a number, the composer's band names the question over
   it, as the sent answer shows it. Words you type are your own message,
   sent as you wrote them and never framed as an answer, so something
