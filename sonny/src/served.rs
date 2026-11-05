@@ -1032,17 +1032,7 @@ impl Server {
         if event["event"] == "turn_finished"
             && let Some(turn) = event["turn"].as_i64()
         {
-            let mut calls = self.serving.lock().unwrap();
-            let ended: Vec<(i64, String)> = (calls.jobs.keys())
-                .filter(|key| key.0 == turn)
-                .cloned()
-                .collect();
-            for key in ended {
-                if let Some(Job::Running { job, .. }) = calls.jobs.get(&key) {
-                    job.abort();
-                }
-                calls.retire(&key);
-            }
+            self.serving.lock().unwrap().finish(turn);
         }
     }
 }
@@ -1076,6 +1066,10 @@ struct Calls {
     /// before may still name it, so it is kept until one begun after has
     /// been read, and never starts again.
     retired: HashMap<(i64, String), u64>,
+    /// The turns that ended, each with the listing under way when it did:
+    /// a listing read before may name a call of it, one Sonny never
+    /// started too, and none of them starts.
+    ended: HashMap<i64, u64>,
     /// How many listings of the waiting calls were begun.
     looks: u64,
 }
@@ -1086,6 +1080,28 @@ impl Calls {
     fn retire(&mut self, key: &(i64, String)) {
         self.jobs.remove(key);
         self.retired.insert(key.clone(), self.looks);
+    }
+
+    /// The turn `turn` ended: what its calls run stops, and no call of it
+    /// starts, from a listing read before its end either.
+    fn finish(&mut self, turn: i64) {
+        let ended: Vec<(i64, String)> = (self.jobs.keys())
+            .filter(|key| key.0 == turn)
+            .cloned()
+            .collect();
+        for key in ended {
+            if let Some(Job::Running { job, .. }) = self.jobs.get(&key) {
+                job.abort();
+            }
+            self.retire(&key);
+        }
+        self.ended.insert(turn, self.looks);
+    }
+
+    /// Whether the call `key` was let go, or its turn ended, since a
+    /// listing that may name it began.
+    fn over(&self, key: &(i64, String)) -> bool {
+        self.retired.contains_key(key) || self.ended.contains_key(&key.0)
     }
 }
 
@@ -1228,7 +1244,11 @@ where
     let listed = waiting(client).await?;
     // A call let go before this listing began is on no listing from now
     // on; one let go while it was read may be on it, and is kept.
-    serving.lock().unwrap().retired.retain(|_, at| *at >= look);
+    {
+        let mut calls = serving.lock().unwrap();
+        calls.retired.retain(|_, at| *at >= look);
+        calls.ended.retain(|_, at| *at >= look);
+    }
     for call in listed {
         let key = (call["turn"].as_i64().unwrap_or(0), str_of(&call["call_id"]));
         let mut calls = serving.lock().unwrap();
@@ -1238,7 +1258,7 @@ where
             nudge.notify_one();
             break;
         }
-        if calls.paused || calls.jobs.contains_key(&key) || calls.retired.contains_key(&key) {
+        if calls.paused || calls.jobs.contains_key(&key) || calls.over(&key) {
             continue;
         }
         let (client, serving, held) = (client.clone(), serving.clone(), key.clone());
@@ -1877,6 +1897,48 @@ mod tests {
         assert_eq!(effects.load(Ordering::SeqCst), 1);
         // Once a listing begun after it has been read, it is forgotten.
         assert!(serving.lock().unwrap().retired.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_call_of_a_turn_that_ended_while_the_calls_were_listed_does_not_start() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let serving: Serving = Default::default();
+        let listings = Arc::new(AtomicUsize::new(0));
+        let (held, listed) = (serving.clone(), listings.clone());
+        // The turn's first call runs here; while the next listing is read,
+        // the turn ends, and the listing names its next call, which the
+        // daemon had moved on to.
+        let client = crate::tests::daemon_answering(move |asked| match asked["op"].as_str() {
+            Some("tool_calls") => match listed.fetch_add(1, Ordering::SeqCst) {
+                0 => json!({"calls": [{"bot": "b", "turn": 1, "call_id": "c1", "name": EXEC}],
+                    "next_after": null}),
+                1 => {
+                    held.lock().unwrap().finish(1);
+                    json!({"calls": [{"bot": "b", "turn": 1, "call_id": "c2", "name": EXEC}],
+                        "next_after": null})
+                }
+                _ => json!({"calls": [], "next_after": null}),
+            },
+            _ => json!({}),
+        })
+        .await;
+        let started = Arc::new(Mutex::new(Vec::<String>::new()));
+        let starts = started.clone();
+        let run = move |call: Value| {
+            starts.lock().unwrap().push(str_of(&call["call_id"]));
+            async move {
+                std::future::pending::<()>().await;
+                Ok(json!("never"))
+            }
+        };
+        let nudge = Arc::new(Notify::new());
+        sweep(&client, &serving, &nudge, run.clone()).await.unwrap();
+        sweep(&client, &serving, &nudge, run.clone()).await.unwrap();
+        assert_eq!(*started.lock().unwrap(), ["c1"]);
+        assert!(serving.lock().unwrap().jobs.is_empty());
+        // A listing begun after the end lets the turn go.
+        sweep(&client, &serving, &nudge, run).await.unwrap();
+        assert!(serving.lock().unwrap().ended.is_empty());
     }
 
     #[tokio::test]
