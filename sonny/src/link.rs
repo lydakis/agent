@@ -327,19 +327,32 @@ struct Out {
     held: Held,
 }
 
-/// A short line queued, and who hears once it is written.
-type Short = (String, Option<Written>);
-/// A long line queued: the call it is, if one, the room it holds, and who
-/// hears once it is written.
+/// A short line queued, and the gate it waits at, if a call's.
+type Short = (String, Option<Gate>);
+/// A long line queued: the call it is, if one, the room it holds, and the
+/// gate it waits at.
 type Long = (
     Option<u64>,
     String,
     tokio::sync::OwnedSemaphorePermit,
-    Option<Written>,
+    Option<Gate>,
 );
-/// Told once a line is handed to the other end: from then on, it may be
-/// read there.
-type Written = oneshot::Sender<()>;
+
+/// What a call's line waits on before it is written, so that whoever made
+/// the call hears it may be sent before it may be read at the other end:
+/// asked with a sender for the go-ahead, the line is written only on a
+/// yes, and `written` is told once it is.
+struct Gate {
+    ready: oneshot::Sender<oneshot::Sender<bool>>,
+    written: oneshot::Sender<()>,
+}
+
+/// The call's side of its gate: asked for the go-ahead, then told the
+/// line is written.
+struct Gated {
+    ready: oneshot::Receiver<oneshot::Sender<bool>>,
+    written: oneshot::Receiver<()>,
+}
 type Held = Arc<Mutex<HashMap<u64, bool>>>;
 
 impl Out {
@@ -367,15 +380,20 @@ impl Out {
     }
 
     /// Send call `id`, `value`, as `send` does, for `cancel` to take back
-    /// while it waits: what hears once it is written, and so may have
-    /// reached the other end.
-    async fn call(&self, id: u64, value: &Value) -> oneshot::Receiver<()> {
-        let (written, heard) = oneshot::channel();
-        self.queue(Some((id, written)), value).await;
-        heard
+    /// while it waits: its gate, which asks before the line is written and
+    /// tells once it is.
+    async fn call(&self, id: u64, value: &Value) -> Gated {
+        let (ready, asked) = oneshot::channel();
+        let (written, told) = oneshot::channel();
+        let gate = Gate { ready, written };
+        self.queue(Some((id, gate)), value).await;
+        Gated {
+            ready: asked,
+            written: told,
+        }
     }
 
-    async fn queue(&self, call: Option<(u64, Written)>, value: &Value) {
+    async fn queue(&self, call: Option<(u64, Gate)>, value: &Value) {
         let (call, written) = call.unzip();
         // Measured before it is written out, so that what waits for room
         // holds no copy of it.
@@ -454,10 +472,22 @@ async fn write_out<W: AsyncWrite + Unpin>(
             }
             else => return,
         };
+        // A call goes only once its caller has heard it may: one let go
+        // meanwhile never does.
+        let gate = match written {
+            Some(Gate { ready, written }) => {
+                let (go, going) = oneshot::channel();
+                if ready.send(go).is_err() || going.await != Ok(true) {
+                    continue;
+                }
+                Some(written)
+            }
+            None => None,
+        };
         if writer.write_all(text.as_bytes()).await.is_err() || writer.flush().await.is_err() {
             return;
         }
-        if let Some(written) = written {
+        if let Some(written) = gate {
             let _ = written.send(());
         }
     }
@@ -597,7 +627,7 @@ async fn call_in(
                 (false, _) => not_connected(machine),
                 (true, false) => unknown(
                     machine,
-                    "was sent the call, then its link closed before it took it",
+                    "may have been sent the call, and its link closed before it took it",
                 ),
                 (true, true) => unknown(
                     machine,
@@ -921,15 +951,15 @@ async fn borrow(stream: tokio::net::UnixStream, link: Session<'_>) -> std::io::R
     // its caller watched the while: one gone takes it back before it goes.
     let mut queued = send(&mut write, &json!({"queued": true})).await.is_ok();
     let mut early = Vec::new();
-    let mut written = None;
+    let mut gated = None;
     if queued {
         let call = json!({"id": id, "call": called["call"]});
         let sending = out.call(id, &call);
         tokio::pin!(sending);
         loop {
             tokio::select! {
-                heard = &mut sending => {
-                    written = Some(heard);
+                gate = &mut sending => {
+                    gated = Some(gate);
                     break;
                 }
                 said = read.recv() => match said {
@@ -952,10 +982,16 @@ async fn borrow(stream: tokio::net::UnixStream, link: Session<'_>) -> std::io::R
     }
     // From here the call is the link's: whatever ends this connection,
     // its entry goes and, unless it finished, the other end hears to stop.
-    // Once written, it is the machine's to take: its caller hears so, and
-    // a machine that then says nothing for `ACK`, neither taking it nor
-    // carrying anything else, has gone quiet with the call. Whether it ran
-    // is then not known, and the caller hears that, not to call again.
+    // Before it is written its caller hears it may be sent, so a link gone
+    // after is never taken for one the call never left by. Once written,
+    // it is the machine's to take, and a machine that then says nothing
+    // for `ACK`, neither taking it nor carrying anything else, has gone
+    // quiet with the call. Whether it ran is then not known, and the
+    // caller hears that, not to call again.
+    let (mut ready, mut written) = match gated {
+        Some(Gated { ready, written }) => (Some(ready), Some(written)),
+        None => (None, None),
+    };
     let mut sent: Option<u64> = None;
     let mut taken = false;
     let ended = loop {
@@ -969,13 +1005,20 @@ async fn borrow(stream: tokio::net::UnixStream, link: Session<'_>) -> std::io::R
             _ => None,
         };
         tokio::select! {
-            went = async { written.as_mut().unwrap().await }, if written.is_some() => {
-                written = None;
-                if went.is_ok() && sent.is_none() {
-                    sent = Some(now_ms());
-                    if send(&mut write, &json!({"sent": true})).await.is_err() {
+            asked = async { ready.as_mut().unwrap().await }, if ready.is_some() => {
+                ready = None;
+                if let Ok(go) = asked {
+                    let told = send(&mut write, &json!({"sent": true})).await.is_ok();
+                    let _ = go.send(told);
+                    if !told {
                         break false;
                     }
+                }
+            }
+            went = async { written.as_mut().unwrap().await }, if written.is_some() => {
+                written = None;
+                if went.is_ok() {
+                    sent.get_or_insert_with(now_ms);
                 }
             }
             () = tokio::time::sleep(quiet_by.unwrap_or_default()), if quiet_by.is_some() => {
@@ -1845,11 +1888,19 @@ mod tests {
         let (out, _writing) = Out::to(write);
         let long = |n: u64| json!({"id": n, "call": {"input": "x".repeat(QUEUED_BYTES / 3)}});
         out.send(&long(1)).await;
-        out.call(5, &long(5)).await;
+        let five = out.call(5, &long(5)).await;
         // Its cancel would go ahead of it: it takes it out instead.
         out.cancel(5);
-        out.call(6, &json!({"id": 6, "call": {}})).await;
+        let six = out.call(6, &json!({"id": 6, "call": {}})).await;
         out.cancel(6);
+        for gated in [five, six] {
+            tokio::spawn(async move {
+                // One let go never asks.
+                if let Ok(go) = gated.ready.await {
+                    let _ = go.send(true);
+                }
+            });
+        }
         let mut said = lines(BufReader::new(read), LINE_BYTES, None);
         assert_eq!(
             said.recv().await.unwrap().unwrap(),
@@ -1873,6 +1924,7 @@ mod tests {
         machine: mpsc::Receiver<std::io::Result<Value>>,
         waiting: Waiting,
         session: tokio::task::JoinHandle<()>,
+        out: Out,
         _writing: AbortOnDrop,
     }
 
@@ -1886,8 +1938,9 @@ mod tests {
             let (write, read) = tokio::io::duplex(1);
             let (out, writing) = Out::to(write);
             let waiting: Waiting = Arc::default();
-            let (owned, kept) = (dir.clone(), waiting.clone());
+            let (owned, kept, lent) = (dir.clone(), waiting.clone(), out.clone());
             let session = tokio::spawn(async move {
+                let out = lent;
                 let (stream, _) = listener.accept().await.unwrap();
                 let link = Session {
                     machine: "m",
@@ -1913,13 +1966,14 @@ mod tests {
                 machine,
                 waiting,
                 session,
+                out,
                 _writing: AbortOnDrop(writing),
             }
         }
 
-        fn call(&self) -> tokio::task::JoinHandle<Result<Value, Failed>> {
+        fn call(&self, payload: Value) -> tokio::task::JoinHandle<Result<Value, Failed>> {
             let dir = self.dir.clone();
-            tokio::spawn(async move { call_in(&dir, "m", "open", json!({}), None).await })
+            tokio::spawn(async move { call_in(&dir, "m", "open", payload, None).await })
         }
     }
 
@@ -1941,7 +1995,7 @@ mod tests {
     #[tokio::test]
     async fn a_call_sent_to_a_machine_gone_quiet_ends_unknown_within_ack_and_is_let_go() {
         let mut lab = Lab::new(true);
-        let call = lab.call();
+        let call = lab.call(json!({}));
         let sent = lab.machine.recv().await.unwrap().unwrap();
         assert_eq!(sent["id"], 1);
         let started = Instant::now();
@@ -1955,21 +2009,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_link_gone_before_the_call_is_sent_is_not_connected() {
-        // The machine reads nothing: the call is never written.
-        let lab = Lab::new(false);
-        let call = lab.call();
+    async fn a_link_gone_before_the_call_is_sent_is_not_connected_and_after_unknown() {
+        // A long call waits for room behind other long lines: never written.
+        let lab = Lab::new(true);
+        let full = lab.out.room.clone().acquire_many_owned(QUEUED_BYTES as u32);
+        let _full = full.await.unwrap();
+        let call = lab.call(json!({"file": "x".repeat(SMALL)}));
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert_eq!(lab.waiting.lock().unwrap().len(), 1);
         lab.session.abort();
         let (code, detail) = ended_by(call).await;
         assert_eq!(code, "not_connected", "{detail}");
+        // One whose writing began, though the machine has read none of it,
+        // may have been sent.
+        let lab = Lab::new(false);
+        let call = lab.call(json!({}));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        lab.session.abort();
+        let (code, detail) = ended_by(call).await;
+        assert_eq!(code, "tool_outcome_unknown", "{detail}");
     }
 
     #[tokio::test]
     async fn a_link_gone_after_the_machine_took_the_call_leaves_its_outcome_unknown() {
         let mut lab = Lab::new(true);
-        let call = lab.call();
+        let call = lab.call(json!({}));
         lab.machine.recv().await.unwrap().unwrap();
         let to = lab.waiting.lock().unwrap().get(&1).cloned().unwrap();
         to.send(json!({"ack": true})).unwrap();
