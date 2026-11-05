@@ -26,6 +26,16 @@ use std::{
 /// this. Bounded, so every task can read the index whole, and roomy enough
 /// that a busy project's leads and tasks do not spend turns trimming it.
 const LIMIT: usize = 16 * 1024;
+/// The longest index line a save may add: an eightieth of the index, so
+/// any index holds at least eighty facts, near the 150 characters Claude
+/// Code asks of an index line. A fact whose line is already longer may be
+/// saved again with a line no longer than it had.
+const LINE_LIMIT: usize = LIMIT / 80;
+/// How full an index is, in percent, when a save or removal starts naming
+/// facts that look mergeable, as Claude Code warns near its index limit.
+const NEAR_FULL: usize = 90;
+/// How many facts of each sort [`merge_candidates`] names.
+const CANDIDATES: usize = 3;
 /// Entries a folder may hold, facts or not, before it is refused as not a
 /// memory folder.
 const MAX_ENTRIES: usize = 1024;
@@ -325,15 +335,12 @@ fn run_as(
             let all = facts(&dir)?;
             let text = render_index(&dir, &all);
             if text.len() > LIMIT {
-                return Err(format!(
-                    "memory_full: the index would be {} bytes, above {LIMIT}; merge facts or remove one with memory rm NAME first",
-                    text.len()
-                ));
+                return Err(full(&dir, &all, text.len()));
             }
             write(&dir.join(INDEX), &text)?;
-            Ok(
-                json!({"index": dir.join(INDEX), "bytes": text.len(), "facts": all.len(), "limit": LIMIT}),
-            )
+            let mut done = json!({"index": dir.join(INDEX), "bytes": text.len(), "facts": all.len(), "limit": LIMIT});
+            fullness(&mut done, &dir, &all, text.len());
+            Ok(done)
         }
         ("check", None, [None, None, None], None) => Ok(check(&scope()?)),
         _ => Err(usage()),
@@ -625,11 +632,21 @@ fn save(
     let _lock = lock(dir)?;
     let path = dir.join(format!("{}.md", fact.name));
     let before = std::fs::read_to_string(&path).ok();
-    if let Some(had) =
-        (before.as_deref()).and_then(|text| Fact::parse(&format!("{}.md", fact.name), text).ok())
-    {
+    let had =
+        (before.as_deref()).and_then(|text| Fact::parse(&format!("{}.md", fact.name), text).ok());
+    if let Some(had) = &had {
         fact.confirmed = counts[0].unwrap_or(had.confirmed);
         fact.pushed_back = counts[1].unwrap_or(had.pushed_back);
+    }
+    // A long line stays as long as it was at most, so a fact saved before
+    // the limit can still be saved again, but no line grows past it.
+    let line = fact.line().len();
+    if line > LINE_LIMIT.max(had.as_ref().map_or(0, |had| had.line().len())) {
+        let over = line - LINE_LIMIT;
+        return Err(format!(
+            "description_too_long: its index line would be {line} bytes, above {LINE_LIMIT}; shorten the description by {over} bytes, to {} at most",
+            fact.description.len().saturating_sub(over)
+        ));
     }
     let text = fact.render(body);
     if text.len() > LIMIT {
@@ -647,21 +664,125 @@ fn save(
     let index = render_index(dir, &all);
     let duplicate = before.as_deref() == Some(text.as_str());
     if !duplicate && index.len() > LIMIT {
-        return Err(format!(
-            "memory_full: the index would be {} bytes, above {LIMIT}; merge facts or remove one with memory rm NAME first",
-            index.len()
-        ));
+        return Err(full(dir, &all, index.len()));
     }
     if !duplicate {
         write(&path, &text)?;
     }
     note(Some(&text))?;
     write(&dir.join(INDEX), &index)?;
-    Ok(
-        json!({"saved": fact.name, "path": path, "replaced": before.is_some(),
+    let mut saved = json!({"saved": fact.name, "path": path, "replaced": before.is_some(),
         "duplicate": duplicate, "index": dir.join(INDEX), "index_bytes": index.len(),
-        "facts": all.len()}),
-    )
+        "limit": LIMIT, "facts": all.len()});
+    fullness(&mut saved, dir, &all, index.len());
+    Ok(saved)
+}
+
+/// `memory_full` for an index of `all` that would be `bytes`, naming the
+/// facts [`merge_candidates`] finds.
+fn full(dir: &Path, all: &[Fact], bytes: usize) -> String {
+    let mut detail = format!(
+        "memory_full: the index would be {bytes} bytes, above {LIMIT}; merge facts or remove one with memory rm NAME first"
+    );
+    let found = merge_candidates(dir, all);
+    let mut parts = Vec::new();
+    let names = |key: &str| -> Vec<String> {
+        found[key]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|v| v.as_str().map(str::to_owned))
+            .collect()
+    };
+    let pairs: Vec<String> = (found["alike"].as_array().into_iter().flatten())
+        .filter_map(|pair| {
+            let pair: Vec<&str> = pair.as_array()?.iter().filter_map(Value::as_str).collect();
+            Some(pair.join(" + "))
+        })
+        .collect();
+    if !pairs.is_empty() {
+        parts.push(format!("alike: {}", pairs.join(", ")));
+    }
+    for (key, label) in [
+        ("longest", "longest lines"),
+        ("unread", "unread 30 days or more"),
+    ] {
+        let names = names(key);
+        if !names.is_empty() {
+            parts.push(format!("{label}: {}", names.join(", ")));
+        }
+    }
+    if !parts.is_empty() {
+        detail += &format!("; to look at first, {}", parts.join("; "));
+    }
+    detail
+}
+
+/// Adds `merge_candidates` to a save's, removal's or rewrite's `reply`
+/// once the index it left, `bytes` long, is [`NEAR_FULL`] percent of the
+/// limit or more.
+fn fullness(reply: &mut Value, dir: &Path, all: &[Fact], bytes: usize) {
+    if bytes * 100 >= LIMIT * NEAR_FULL {
+        reply["merge_candidates"] = merge_candidates(dir, all);
+    }
+}
+
+/// Facts worth looking at before an index fills, found without a model,
+/// [`CANDIDATES`] of each: `alike`, pairs whose names and descriptions
+/// share the most words (at least a third of them); `longest`, the
+/// longest index lines; and `unread`, facts no agent has read or saved in
+/// [`UNREAD_DAYS`], oldest first.
+fn merge_candidates(dir: &Path, all: &[Fact]) -> Value {
+    let words = |fact: &Fact| -> std::collections::BTreeSet<String> {
+        format!("{} {}", fact.name, fact.description)
+            .to_lowercase()
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|word| word.chars().count() >= 3)
+            .map(str::to_owned)
+            .collect()
+    };
+    let sets: Vec<_> = all.iter().map(words).collect();
+    let mut alike = Vec::new();
+    for (i, a) in sets.iter().enumerate() {
+        for (j, b) in sets.iter().enumerate().skip(i + 1) {
+            let shared = a.intersection(b).count();
+            let union = a.union(b).count();
+            // At least a third of the words both use, compared exactly.
+            if union > 0 && shared * 3 >= union && shared >= 2 {
+                alike.push((shared * 1000 / union, i, j));
+            }
+        }
+    }
+    alike.sort_by(|x, y| y.0.cmp(&x.0).then((x.1, x.2).cmp(&(y.1, y.2))));
+    let alike: Vec<Value> = (alike.iter().take(CANDIDATES))
+        .map(|&(_, i, j)| json!([all[i].name, all[j].name]))
+        .collect();
+    let mut longest: Vec<&Fact> = all.iter().collect();
+    longest.sort_by(|a, b| (b.line().len().cmp(&a.line().len())).then(a.name.cmp(&b.name)));
+    let longest: Vec<Value> = (longest.iter().take(CANDIDATES))
+        .filter(|fact| fact.line().len() > LINE_LIMIT)
+        .map(|fact| json!(fact.name))
+        .collect();
+    let reads = reads(dir);
+    let mut unread = Vec::new();
+    if let Some(now) = day_number(&today()) {
+        for fact in all {
+            let last_read = reads.get(&fact.name).and_then(|read| read["last"].as_str());
+            let last = [Some(fact.verified.as_str()), last_read]
+                .into_iter()
+                .flatten()
+                .filter_map(day_number)
+                .max();
+            if let Some(last) = last.filter(|last| now - last >= UNREAD_DAYS) {
+                unread.push((last, fact.name.clone()));
+            }
+        }
+    }
+    unread.sort();
+    let unread: Vec<Value> = (unread.into_iter().take(CANDIDATES))
+        .map(|(_, name)| json!(name))
+        .collect();
+    json!({"alike": alike, "longest": longest, "unread": unread})
 }
 
 /// A folder's reads. Reads are bookkeeping, not memory: a record that is
@@ -728,9 +849,10 @@ fn remove(dir: &Path, name: &str, note: Note) -> Result<Value, String> {
     if all_reads.remove(name).is_some() {
         write(&dir.join(READS), &Value::Object(all_reads).to_string())?;
     }
-    Ok(
-        json!({"removed": name, "duplicate": duplicate, "index_bytes": index.len(), "facts": all.len()}),
-    )
+    let mut removed = json!({"removed": name, "duplicate": duplicate, "index_bytes": index.len(),
+        "limit": LIMIT, "facts": all.len()});
+    fullness(&mut removed, dir, &all, index.len());
+    Ok(removed)
 }
 
 /// What is wrong in a folder, without changing it: the first file that is
@@ -2250,9 +2372,85 @@ mod tests {
     }
 
     #[test]
+    fn a_new_index_line_past_the_line_limit_is_refused_and_an_old_one_may_not_grow() {
+        let root = temp("line-limit");
+        let code = |r: Result<Value, String>| error_json(&r.unwrap_err())["error"].clone();
+        let at_most =
+            |line: usize| "d".repeat(line - "- x (feedback, verified 2026-01-01): \n".len());
+        assert!(save_user(&root, "x", &at_most(LINE_LIMIT), "t").is_ok());
+        let long = save_user(&root, "x", &at_most(LINE_LIMIT + 5), "t").unwrap_err();
+        assert!(
+            long.starts_with(&format!(
+                "description_too_long: its index line would be {} bytes, above {LINE_LIMIT}; shorten the description by 5 bytes",
+                LINE_LIMIT + 5
+            )),
+            "{long}"
+        );
+        // A fact saved before the limit keeps its line, or a shorter one.
+        let fact = std::fs::read_to_string(root.join("x.md")).unwrap();
+        let old = at_most(LINE_LIMIT + 40);
+        std::fs::write(root.join("x.md"), fact.replace(&at_most(LINE_LIMIT), &old)).unwrap();
+        assert!(save_user(&root, "x", &old, "changed text").is_ok());
+        assert!(save_user(&root, "x", &at_most(LINE_LIMIT + 20), "t").is_ok());
+        assert_eq!(
+            code(save_user(&root, "x", &at_most(LINE_LIMIT + 30), "t")),
+            "description_too_long"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_nearly_full_index_names_facts_to_merge_and_a_full_one_names_them_too() {
+        let root = temp("candidates");
+        let first = save_user(&root, "release-signing", "release signing for builds", "t").unwrap();
+        assert_eq!(first["limit"], LIMIT);
+        assert!(first.get("merge_candidates").is_none(), "{first}");
+        save_user(
+            &root,
+            "release-signing-keys",
+            "release signing keys for builds",
+            "t",
+        )
+        .unwrap();
+        // Unrelated filler, each line distinct, until the index is near full.
+        let mut n = 0;
+        let near = loop {
+            let words: Vec<String> = (0..12).map(|k| format!("w{n}x{k}")).collect();
+            let saved = save_user(&root, &format!("f{n:03}"), &words.join(" "), "t").unwrap();
+            n += 1;
+            if saved.get("merge_candidates").is_some() {
+                break saved;
+            }
+        };
+        assert!(near["index_bytes"].as_u64().unwrap() as usize * 100 >= LIMIT * NEAR_FULL);
+        assert_eq!(
+            near["merge_candidates"]["alike"][0],
+            json!(["release-signing", "release-signing-keys"]),
+            "{near}"
+        );
+        let full = loop {
+            match save_user(&root, &format!("f{n:03}"), &format!("y{n}"), "t") {
+                Ok(_) => n += 1,
+                Err(error) => break error,
+            }
+        };
+        assert!(full.starts_with("memory_full: "), "{full}");
+        assert!(
+            full.contains("; to look at first, alike: release-signing + release-signing-keys"),
+            "{full}"
+        );
+        // A removal reports the same while the index stays near full.
+        let removed = run(&root, &root, &args(&["rm", "f000", "--user"]), &no_stdin).unwrap();
+        assert_eq!(removed["limit"], LIMIT);
+        assert!(removed.get("merge_candidates").is_some(), "{removed}");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn a_refused_cleanup_says_when_what_it_kept_overfills_the_index() {
         let root = temp("cleanup-full");
-        let long = "d".repeat(3500);
+        // Lines near the line limit: the index holds about eighty.
+        let long = "d".repeat(160);
         let save = |caller: Option<&str>, name: &str| {
             let line = [
                 "save",
@@ -2269,24 +2467,26 @@ mod tests {
             ];
             run_as(&root, &root, &args(&line), &|| Ok("-".into()), caller).unwrap();
         };
+        let before: Vec<String> = (0..48).map(|n| format!("a{n:02}")).collect();
+        let during: Vec<String> = (0..36).map(|n| format!("e{n:02}")).collect();
         repo(&root).unwrap();
-        for name in ["a", "b", "c", "d"] {
+        for name in &before {
             save(None, name);
         }
         let as_7 = |line: &[&str]| run_as(&root, &root, &args(line), &|| Ok("-".into()), Some("7"));
         as_7(&["cleanup", "start"]).unwrap();
-        for name in ["b", "c", "d"] {
+        for name in &before[12..] {
             as_7(&["rm", name, "--user"]).unwrap();
         }
         // Each save fits in the room the cleanup made.
-        for name in ["e", "f", "g"] {
+        for name in &during {
             save(Some("8"), name);
         }
         let refused = as_7(&["cleanup", "finish"]).unwrap_err();
-        assert!(refused.contains("with the 3 facts"), "{refused}");
+        assert!(refused.contains("with the 36 facts"), "{refused}");
         assert!(refused.contains("merge facts there first"), "{refused}");
         // Nothing saved is dropped to fit.
-        for name in ["a", "b", "c", "d", "e", "f", "g"] {
+        for name in before.iter().chain(&during) {
             assert!(root.join(format!("{name}.md")).exists(), "{name}");
         }
         std::fs::remove_dir_all(root).unwrap();

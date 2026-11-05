@@ -89,7 +89,11 @@ EOF
   - `project`: decisions, constraints and state that the code does not show
   - `reference`: where to find something outside this folder
 - DESCRIPTION is one line. It is all a later agent sees in the index, so
-  make it say enough to decide whether to open the file.
+  make it say enough to decide whether to open the file, and no more: its
+  index line is at most 204 bytes, an eightieth of the index. A longer one
+  is refused with `description_too_long`, which says how much to cut. A fact
+  whose line was already longer can be saved with a line no longer than it
+  had.
 - `--external` marks a fact saved after reading a web page, a search or
   an MCP server's output. Sonny marks the memory tool's saves itself, so
   only the script needs it.
@@ -99,10 +103,17 @@ EOF
   helps, **How to apply:**. Write dates as dates, not "today" or "last
   week".
 
-A fact file is at most 16 KiB, and so is each index. A save that would push
-the index past that is refused with `memory_full`, and nothing changes.
-Merge related facts into one, or remove one that no longer holds, then
-save again. `check` reports any file that is not a valid fact and an index
+A fact file is at most 16 KiB, and so is each index. Every save and
+removal answers with `index_bytes` and `limit`; from 90% full it adds
+`merge_candidates`: `alike`, pairs of facts whose names and descriptions
+share most of their words; `longest`, the longest index lines; and
+`unread`, facts no agent has read or saved in 30 days. A save that would
+push the index past the limit is refused with `memory_full`, which names
+the same facts, and nothing changes. When either names facts, look at
+those first: merge two that say one thing into one fact that keeps what
+both said, shorten a long description, or remove a fact that no longer
+holds. Never remove a fact that still holds just to make room. Then save
+again. `check` reports any file that is not a valid fact and an index
 that is out of date; `index` rewrites the index from the facts.
 
 When the person has run `"$HOME/.agent/memory" schedule`, a nightly agent

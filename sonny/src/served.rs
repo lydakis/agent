@@ -423,7 +423,7 @@ fn memory() -> Value {
                     "description": "The fact's file name; saving under one that exists replaces it."},
                 "type": {"type": "string", "enum": ["user", "feedback", "project", "reference"]},
                 "description": {"type": "string", "minLength": 1,
-                    "description": "One line, all a later agent sees in the index."},
+                    "description": "One line, all a later agent sees in the index: its index line is at most 204 bytes."},
                 "source": {"type": "string", "minLength": 1,
                     "description": "Where it comes from: turn:BOT/N, a commit, path:line, or the person and a date."},
                 "text": {"type": "string", "minLength": 1,
@@ -459,8 +459,10 @@ fn memory() -> Value {
             says how to read and what to save, what the person confirmed worked as well as what they \
             corrected. Read one fact, save one, or remove one; index or check a folder's facts; \
             with none of these, the result shows both indexes (the person's and this project's), each with its \
-            folder. A save that would push an index past 16 KiB is refused with memory_full and changes \
-            nothing: merge or remove facts first.",
+            folder. A save or removal says how full the index is (index_bytes of limit), and from 90% on names \
+            merge_candidates: facts alike, the longest lines, facts unread 30 days. A save that would push an index \
+            past 16 KiB is refused with memory_full, names the same facts and changes nothing: merge or remove facts \
+            first.",
         "parameters": {
             "type": "object",
             "properties": properties,

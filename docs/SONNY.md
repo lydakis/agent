@@ -509,8 +509,16 @@ absolute path, the project null outside one, so an agent need not expand
 `~` or find the project itself. A save writes the fact and the
 index under the folder's lock, so two agents saving at once cannot leave
 an index that misses one. Saving a fact unchanged is `"duplicate": true`,
-and so is removing one already gone. A save that would push the index past
-16 KiB is `memory_full` and changes nothing; so is a folder holding a `.md`
+and so is removing one already gone. Every save and removal answers with the index's `index_bytes` and its
+`limit`, and from 90% full with `merge_candidates`: `alike`, up to three
+pairs of facts sharing at least a third of the words in their names and
+descriptions; `longest`, the longest index lines past the line limit; and
+`unread`, facts no agent has read or saved in 30 days, found without a model.
+An index line is at most 204 bytes, an eightieth of the index, so any index
+holds at least eighty facts: a save whose line would be longer is
+`description_too_long`, unless the fact's line was already that long or
+longer. A save that would push the index past
+16 KiB is `memory_full`, names the same facts, and changes nothing; so is a folder holding a `.md`
 file that is not a valid fact (`memory_invalid` names it), rather than an
 index that quietly leaves it out. `check` reports such a file and an index
 that is out of date without changing anything; `index` rewrites the index,

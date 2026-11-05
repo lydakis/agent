@@ -52,6 +52,9 @@ of it ends `tool_unserved`, run the same command with
    - **Unread facts.** An `unread` fact that a newer fact, or the file,
      command or setting it names, shows no longer holds: remove it. One
      that may still hold stays as it is; some facts are needed rarely.
+   - **Long lines.** A fact whose index line is longer than 204 bytes:
+     save it with a shorter description that still says when to open it.
+
 4. Call it with `said` true and `since_ms` as `start` gave it (leave it
    out when that is null). It lists what the person wrote to any agent
    since the last cleanup, newest first, each message with its agent
