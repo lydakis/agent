@@ -284,8 +284,22 @@ fn shifted(text: &str, map: fn(char) -> Option<char>, mark: char) -> String {
     }
 }
 
+/// How deep groups inside groups are read: past it, a group is kept as
+/// it is written. Each level reads its group once, so this bounds both
+/// the stack and the work a reply's math takes, whatever it nests.
+const DEEPEST: usize = 8;
+
 /// Inline LaTeX as Unicode text, as near as text gets.
 pub fn unicode(tex: &str) -> String {
+    within(tex, 0)
+}
+
+/// [`unicode`] for a group `depth` groups in.
+fn within(tex: &str, depth: usize) -> String {
+    if depth > DEEPEST {
+        return tex.to_owned();
+    }
+    let unicode = |tex: &str| within(tex, depth + 1);
     let mut out = String::new();
     let mut rest = tex;
     while let Some(c) = rest.chars().next() {
@@ -366,9 +380,13 @@ pub fn unicode(tex: &str) -> String {
                             "tilde" => '\u{0303}',
                             _ => '\u{0307}',
                         };
+                        // On each character, not on the marks an accent
+                        // inside it already put there.
                         for c in unicode(&arg).chars() {
                             out.push(c);
-                            out.push(mark);
+                            if unicode_width::UnicodeWidthChar::width(c) != Some(0) {
+                                out.push(mark);
+                            }
                         }
                         rest = after;
                     }
@@ -387,7 +405,7 @@ pub fn unicode(tex: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::unicode;
+    use super::{DEEPEST, unicode};
 
     #[test]
     fn display_math_draws() {
@@ -414,5 +432,29 @@ mod tests {
         assert_eq!(unicode(r"e^{i\pi}"), "e^(iπ)");
         // A backslash before a character no command starts with keeps it.
         assert_eq!(unicode("x^\\α"), "x^α");
+    }
+
+    #[test]
+    fn math_that_nests_deep_takes_work_in_proportion_to_its_length() {
+        // An accent marks each character once, not the marks inside it:
+        // twenty hats were a million characters from 120 bytes.
+        let hats = format!("{}x{}", r"\hat{".repeat(8), "}".repeat(8));
+        assert_eq!(unicode(&hats), format!("x{}", "\u{302}".repeat(8)));
+        assert_eq!(unicode(r"\hat{\hat{x}}"), "x\u{302}\u{302}");
+        assert_eq!(unicode(r"\bar{ab}"), "a\u{304}b\u{304}");
+        // Groups nested past any reading are kept as written, with no
+        // stack or time to spend on them.
+        for open in [r"^{", r"\sqrt{", r"\frac{", r"\text{", r"\hat{"] {
+            let deep = format!("{}x{}", open.repeat(20_000), "}".repeat(20_000));
+            let started = std::time::Instant::now();
+            let drawn = unicode(&deep);
+            // Each level adds at most a mark to each character.
+            assert!(drawn.len() <= 4 * (DEEPEST + 2) * deep.len(), "{open}");
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(2),
+                "{open}: {:?}",
+                started.elapsed()
+            );
+        }
     }
 }
