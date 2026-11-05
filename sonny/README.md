@@ -469,7 +469,7 @@ the first starting a word, as the slash menu finds commands). Ctrl+R again
 or the arrows pick, Enter or Tab puts the pick in the composer to edit (Up
 and Down go on from it), and Esc leaves the composer as it was.
 
-![Ctrl+R lists the prompts sent before, newest first; fix narrows it to two with the letters bold; Enter puts the picked one in the composer](../docs/sonny/prompt-search.png)
+![Ctrl+R lists the prompts sent before over the composer, the draft still in it; fix, typed under the composer, narrows the list to two with the letters bold](../docs/sonny/prompt-search.png)
 A prompt this window sent comes back with its pictures (the newest as many
 as one message may carry; older ones let theirs go), and the draft with its
 own; one from the file comes back as text alone.
