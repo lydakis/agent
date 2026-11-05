@@ -421,7 +421,7 @@ fn memory() -> Value {
             "properties": {
                 "name": {"type": "string", "pattern": "^[a-z0-9-]{1,64}$",
                     "description": "The fact's file name; saving under one that exists replaces it."},
-                "type": {"type": "string", "enum": ["user", "feedback", "project", "reference"]},
+                "type": {"type": "string", "enum": ["user", "feedback", "project", "reference", "work"]},
                 "description": {"type": "string", "minLength": 1,
                     "description": "One line, all a later agent sees in the index."},
                 "source": {"type": "string", "minLength": 1,
@@ -440,6 +440,8 @@ fn memory() -> Value {
         },
         "read": {"type": "string", "minLength": 1,
             "description": "The name of a fact to open: its whole file. The read is recorded, so the nightly cleanup can check facts no agent has read in 30 days."},
+        "search": {"type": "string", "minLength": 1,
+            "description": "Words to find in facts, case aside: those holding every word, best first, with their index line and the lines that hold them. Searches the person's facts and this project's, or the scope given."},
         "remove": {"type": "string", "minLength": 1, "description": "The name of a fact to remove."},
         "index": {"type": "boolean", "description": "Rewrite the index from the facts."},
         "check": {"type": "boolean",
@@ -457,10 +459,10 @@ fn memory() -> Value {
         "name": MEMORY,
         "description": "Memory: facts earlier agents saved for this person and project, which the memory skill \
             says how to read and what to save, what the person confirmed worked as well as what they \
-            corrected. Read one fact, save one, or remove one; index or check a folder's facts; \
+            corrected. Read one fact, search them, save one, or remove one; index or check a folder's facts; \
             with none of these, the result shows both indexes (the person's and this project's), each with its \
-            folder. A save that would push an index past 16 KiB is refused with memory_full and changes \
-            nothing: merge or remove facts first.",
+            folder, the most needed facts first; an index too long to show whole says how many it leaves out, \
+            which search finds.",
         "parameters": {
             "type": "object",
             "properties": properties,
