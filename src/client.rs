@@ -1498,17 +1498,18 @@ fn models(options: &Options) -> Result<i32> {
                 None => say!("{}", visible(&model.id)),
             }
         }
-        if models.is_empty() {
-            eprintln!(
-                "no models listed in {}; agent models --discover writes a first list",
-                path.display()
-            );
-        }
     } else {
         print_json(
             &Value::Array(models.iter().map(|model| model.json()).collect()),
             false,
         )?;
+    }
+    // On stderr, so `[]` on stdout stays what a program reads.
+    if models.is_empty() {
+        eprintln!(
+            "no models listed in {}; agent models --discover writes a first list",
+            path.display()
+        );
     }
     Ok(0)
 }
@@ -2067,6 +2068,18 @@ fn wait(options: &Options) -> Result<i32> {
         };
         enough && completed.all(|v| v.get("error").is_none_or(Value::is_null))
     });
+    if !clean {
+        // Why, on stderr, as a failed run says it.
+        let results = result["results"].as_object().into_iter().flatten();
+        for (handle, end) in results.filter(|(_, v)| v["error"].is_string()) {
+            eprintln!("agent: {handle} {}", ended(end, ""));
+        }
+        let pending = result["pending"].as_array().into_iter().flatten();
+        let pending: Vec<&str> = pending.filter_map(Value::as_str).collect();
+        if !pending.is_empty() {
+            eprintln!("agent: still pending: {}", pending.join(" "));
+        }
+    }
     Ok(if clean { 0 } else { 1 })
 }
 
@@ -2527,7 +2540,13 @@ impl Renderer {
         if !self.pretty {
             say!("{event}");
             let _ = std::io::stdout().flush();
-            return Ok(finished.then(|| exit_code(&event["data"])));
+            let code = finished.then(|| exit_code(&event["data"]));
+            // A run that fails says why where a caller looks for it, not
+            // only in the event on stdout.
+            if code.is_some_and(|code| code != 0) {
+                eprintln!("agent: {}", ended(&event["data"], ""));
+            }
+            return Ok(code);
         }
         if let Some(turn) = self.turn
             && event
@@ -2628,17 +2647,7 @@ impl Renderer {
                 match status {
                     "completed" => eprintln!("agent: ✔ completed{tokens}"),
                     "steered" => eprintln!("agent: ✔ steered into turn {}", data["into"]),
-                    _ => eprintln!(
-                        "agent: ✘ {status}{}{}{tokens}",
-                        data["error"]
-                            .as_str()
-                            .map(|e| format!(": {e}"))
-                            .unwrap_or_default(),
-                        data["detail"]
-                            .as_str()
-                            .map(|d| format!(" ({d})"))
-                            .unwrap_or_default()
-                    ),
+                    _ => eprintln!("agent: ✘ {}", ended(data, &tokens)),
                 }
                 return Ok(Some(exit_code(data)));
             }
@@ -2825,6 +2834,23 @@ fn report(per_bot: bool, bot: &str, state: &str) -> String {
         body.push_str(&format!(":app=agent:title={title}"));
     }
     format!("\x1b]7501;{body}\x1b\\")
+}
+
+/// How a turn that did not complete ended, from its `turn_finished`:
+/// its status, error and detail, then `tokens`.
+fn ended(data: &Value, tokens: &str) -> String {
+    format!(
+        "{}{}{}{tokens}",
+        data["status"].as_str().unwrap_or("unknown"),
+        data["error"]
+            .as_str()
+            .map(|e| format!(": {e}"))
+            .unwrap_or_default(),
+        data["detail"]
+            .as_str()
+            .map(|d| format!(" ({d})"))
+            .unwrap_or_default()
+    )
 }
 
 fn exit_code(data: &Value) -> i32 {
