@@ -6463,7 +6463,9 @@ pub(crate) mod tests {
         // Its stderr is not read past the gate: something it started that
         // left its group and holds stderr open does not hold the check.
         let started = std::time::Instant::now();
-        let left = gate("setsid sleep 5 & echo gone >&2; exit 2", None).unwrap_err();
+        // (`setsid(1)` is Linux's; Python's `os.setsid` is on macOS too.)
+        let leave = "python3 -c 'import os, time; os.setsid(); time.sleep(5)'";
+        let left = gate(&format!("{leave} & echo gone >&2; exit 2"), None).unwrap_err();
         assert!(left.ends_with("gone"), "{left}");
         assert!(
             started.elapsed() < Duration::from_secs(3),
