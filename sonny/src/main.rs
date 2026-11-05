@@ -11224,7 +11224,7 @@ impl App {
     /// question open set aside, as the conversation went on past them.
     fn answered(&mut self, message: &str, from: Option<&str>) {
         // An answer sent from here closed its question when it was sent.
-        if let Some(call) = asks::answered(message)
+        if let Some(call) = asks::answer_of(message, from)
             && let Some(at) = self.sent_answers.iter().position(|sent| sent == call)
         {
             self.sent_answers.remove(at);
@@ -11232,8 +11232,8 @@ impl App {
         }
         if asks::moves_on(message, from) {
             self.aside.append(&mut self.asks);
-        } else if !asks::close(&mut self.asks, message) {
-            asks::close(&mut self.aside, message);
+        } else if !asks::close(&mut self.asks, message, from) {
+            asks::close(&mut self.aside, message, from);
         }
         self.settle_asks();
     }
@@ -15055,6 +15055,9 @@ mod tests {
         app.asks = vec![ask("c4", "Ship it?")];
         app.answered("Done: tests pass", Some("tally.halves"));
         app.answered(&reactions::message("👍", None), None);
+        // Nor do an answer's words from anyone but the person close it.
+        app.answered("You asked (c4): Ship it?\n\nKeep it", Some("tally.halves"));
+        app.answered("You asked (c4): Ship it?\n\nKeep it", Some("automation"));
         assert_eq!(app.asks.len(), 1);
         // One before the question in focus closing, from another window
         // or its card, keeps the focus on the question being answered.
