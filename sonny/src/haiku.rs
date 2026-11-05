@@ -322,7 +322,13 @@ pub fn upgrade(store: &Store) {
         let Some(_lock) = store.lock() else {
             return false;
         };
-        let mut all = store.all();
+        // A file that can't be read as one is left as it is, and tried
+        // again at the next sky, rather than written over empty.
+        let Some(Value::Object(mut all)) = (std::fs::read(&file).ok())
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        else {
+            return false;
+        };
         for kept in all.values_mut().filter_map(Value::as_object_mut) {
             if kept.contains_key("claim") {
                 continue;
@@ -931,6 +937,28 @@ mod tests {
         assert!(Kept::publish(&store, socket, "b", ms + 5, &lines, ms + 20));
         upgrade(&store);
         assert_eq!(Kept::load(&store, socket).lines, lines);
+        let _ = std::fs::remove_dir_all(file.parent().unwrap());
+    }
+
+    #[test]
+    fn a_file_that_cannot_be_read_is_left_as_it_is_and_upgraded_once_it_can() {
+        let store = Store::new();
+        let file = store.file.clone().unwrap();
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, b"{\"/tmp/agent.sock\": {\"by\"").unwrap();
+        upgrade(&store);
+        assert_eq!(
+            std::fs::read(&file).unwrap(),
+            b"{\"/tmp/agent.sock\": {\"by\""
+        );
+        // Not counted done: once the file reads, it is upgraded.
+        let ms = 1_793_400_000_000_i64;
+        let old = json!({"/tmp/agent.sock": {"day": "2026-11-02", "written": 1,
+            "by": "a", "lines": ["x", "y", "z"], "at_ms": ms + 1, "since_ms": ms}});
+        std::fs::write(&file, old.to_string()).unwrap();
+        upgrade(&store);
+        let kept = Kept::load(&store, Path::new("/tmp/agent.sock"));
+        assert_eq!(kept.claim, ("a".to_owned(), ms));
         let _ = std::fs::remove_dir_all(file.parent().unwrap());
     }
 }
