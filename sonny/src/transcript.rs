@@ -26,8 +26,9 @@ pub struct Markdown {
     /// How far the last line's wrapped rows are indented: under a list
     /// item's text, so a continuation does not read as a new item.
     hang: usize,
-    /// The last line is a quote's, so its wrapped rows keep its bar.
-    quoted: bool,
+    /// How deep in quotes the last line is, so its wrapped rows keep
+    /// its bars.
+    quoted: usize,
     /// A table's rows, held until it ends, so its columns can be fitted.
     table: Vec<String>,
     /// Inside display math, gathered in `picture`: what closes it,
@@ -146,8 +147,8 @@ impl Markdown {
 
     /// What the last line's wrapped rows start with, inside a reply.
     pub fn rest(&self) -> Span<'static> {
-        if self.quoted {
-            return Span::raw("  ▌ ").dim();
+        if self.quoted > 0 {
+            return Span::raw(format!("  {}", "▌ ".repeat(self.quoted))).dim();
         }
         Span::raw(format!("  {}", " ".repeat(self.hang)))
     }
@@ -220,7 +221,7 @@ impl Markdown {
     pub fn line(&mut self, text: &str) -> Option<Line<'static>> {
         let trimmed = text.trim_start();
         self.hang = 0;
-        self.quoted = false;
+        self.quoted = 0;
         // $$ display math $$, on one line or around several, and the
         // \[ display math \] many models write.
         let line = trimmed.trim_end();
@@ -336,9 +337,14 @@ impl Markdown {
             spans.extend(inline(rest, Style::new()));
             return Some(Line::from(spans));
         }
-        if let Some(rest) = trimmed.strip_prefix("> ") {
-            self.quoted = true;
-            let mut spans = vec![Span::raw("▌ ").dim()];
+        if let Some(mut rest) = quote_line(trimmed) {
+            // A quote in a quote, `> >`, draws a bar for each.
+            let mut depth = 1;
+            while let Some(inner) = quote_line(rest.trim_start()) {
+                (rest, depth) = (inner, depth + 1);
+            }
+            self.quoted = depth;
+            let mut spans = vec![Span::raw("▌ ".repeat(depth)).dim()];
             spans.extend(inline(rest, Style::new().italic()));
             return Some(Line::from(spans));
         }
@@ -1354,10 +1360,12 @@ pub fn with_quotes(
     prompt
 }
 
-/// A line of quoted words, as Markdown marks one: `> ` before it, or a
-/// lone `>` for a blank line between them.
+/// A line of quoted words, as CommonMark marks one: `>` before it and
+/// at most one space after, so `> words`, `>words`, and a lone `>` for a
+/// blank line inside the quote all count.
 fn quote_line(line: &str) -> Option<&str> {
-    line.strip_prefix("> ").or((line == ">").then_some(""))
+    let rest = line.strip_prefix('>')?;
+    Some(rest.strip_prefix(' ').unwrap_or(rest))
 }
 
 /// What the shut row of words between agents says: who sent them, not
@@ -2931,6 +2939,29 @@ mod tests {
         for width in 0..8 {
             relayed("Tests pass.", Some("calc.neg"), false, width);
         }
+    }
+
+    #[test]
+    fn a_quote_keeps_its_bar_over_blank_lines_and_without_a_space() {
+        // CommonMark: `>` and at most one space; a lone `>` is the quote's
+        // blank line, and `> >` a quote inside it.
+        let reply = "> First paragraph.\n>\n>Second, no space.\n> > Nested.\nAfter.";
+        let lead = || Line::from("  ");
+        let rows = markdown(&mut Markdown::default(), reply, 80, (lead(), lead()));
+        assert_eq!(
+            text(&rows),
+            [
+                "  ▌ First paragraph.",
+                "  ▌ ",
+                "  ▌ Second, no space.",
+                "  ▌ ▌ Nested.",
+                "  After.",
+            ]
+        );
+        // A wrapped row keeps every bar its line has.
+        let mut quote = Markdown::default();
+        quote.line("> > a long nested quote");
+        assert_eq!(quote.rest().content, "  ▌ ▌ ");
     }
 
     #[test]
