@@ -73,8 +73,9 @@ sandboxed agent's commands still reach its daemon socket, which takes a
 message to another agent or a pause from a read-only agent too; so a dry run
 reads with the daemon's file tools and read-only MCP tools, not commands.
 
-**A broken `--if`.** A gate that cannot run, or runs past 60 s, fails the
-run. The agent that hears of the automation (`--reply-to`, else the agent
+**A broken `--if`.** A gate that cannot run, ends with anything but exit 0
+or 1, or runs past 60 s, fails the run, with the end of what it wrote to
+stderr. The agent that hears of the automation (`--reply-to`, else the agent
 that added a `--start` automation, else the agent it messages) is told once
 when it breaks, and once when it works again, as alerts fire on a change
 of state rather than on every check; the row's `checked.told` keeps
@@ -157,9 +158,11 @@ saying so, and one whose BOT is gone (`bot_not_found`: pinned by id, it
 never comes back) ends the automation. `--if CMD` runs `sh -c CMD` in the folder
 `add` ran in, with the `PATH` `add` ran with and `AGENT_SOCKET` and
 `AGENT_STORE` naming the automation's daemon, before anything else, for up
-to 60 s, in its own process group, which ends with it; any exit but 0
-skips that fire and records nothing but, for `--commit`, that its commit
-was seen, so a heartbeat whose check finds
+to 60 s, in its own process group, which ends with it. It answers as `test`
+and `grep -q` do: exit 0 sends, and exit 1 skips that fire and records
+nothing but, for `--commit`, that its commit was seen; any other exit, a
+signal or a command that is not there could not check, and fails the fire
+(below). So a heartbeat whose check finds
 nothing to do costs one process and no model call. A one-off whose check
 says no ends, listed as not sent.
 `--runs N` ends the automation once N messages went out; a fire after that
@@ -499,7 +502,8 @@ Without a scope, the project is found from the working folder: in a git
 worktree, the same place in the repository's main checkout, then the
 nearest `.agents/project.toml` at or above it; none is `project_unknown`.
 Every reply is one JSON value on stdout; a failure is one `{"error": CODE,
-"detail": ...}` on stderr with exit 1. `show` reads without changing
+"detail": ...}` on stderr with exit 1, except for `changed`, a gate, where
+exit 1 is `unchanged` and any other failure exit 2. `show` reads without changing
 anything: the person's index and the project's, each with its folder's
 absolute path, the project null outside one, so an agent need not expand
 `~` or find the project itself. A save writes the fact and the

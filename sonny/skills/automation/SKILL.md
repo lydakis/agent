@@ -119,8 +119,9 @@ in your own folder, hence the `cd`.
 instead, for example `*/10 8-18 * * 1-5` for every 10 minutes from 8:00 to
 18:50, Monday to Friday.
 
-Any exit but 0 from `if` skips the run with no model call, and one that
-runs past a minute is a failed run that the automations list shows. Each
+Exit 0 from `if` runs, exit 1 skips the run with no model call, and any
+other exit, or one that runs past a minute, is a failed run that the
+automations list shows. Each
 automation's row there has `checked`: when its `if` last ran and what it said
 (`go`, `no` or `failed`), so a skipped run shows there too. Write `quiet`
 at setup: a short script that only reads, and exits 0 only when it found

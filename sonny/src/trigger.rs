@@ -3356,10 +3356,16 @@ fn stamp(epoch: i64) -> String {
     )
 }
 
+/// How much of what a gate wrote to stderr its failure keeps: the end,
+/// where a shell says what it could not find.
+const GATE_SAID: usize = 300;
+
 /// `sh -c CMD` in the trigger's folder, on its daemon (`AGENT_SOCKET`,
-/// `AGENT_STORE`), given `GATE_TIMEOUT`: whether it said go, and why not when
-/// it said no; why it said nothing when it could not run or ran past its
-/// time, which is the fire failing, not a no.
+/// `AGENT_STORE`), given `GATE_TIMEOUT`, as `test` and `grep -q` answer:
+/// exit 0 says go, exit 1 says no (and why not), and anything else (a
+/// command not found, a crash, a signal, running past its time) says it
+/// could not check, which is the fire failing, not a no, with the end of
+/// what it wrote to stderr.
 fn gate(command: &str, dir: Option<&Path>, daemon: &Daemon) -> Result<Result<(), String>, String> {
     let mut sh = std::process::Command::new("/bin/sh");
     for (key, value) in [
@@ -3374,7 +3380,7 @@ fn gate(command: &str, dir: Option<&Path>, daemon: &Daemon) -> Result<Result<(),
     sh.args(["-c", command])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+        .stderr(std::process::Stdio::piped());
     if let Some(dir) = dir {
         sh.current_dir(dir);
     }
@@ -3383,6 +3389,26 @@ fn gate(command: &str, dir: Option<&Path>, daemon: &Daemon) -> Result<Result<(),
     use std::os::unix::process::CommandExt;
     sh.process_group(0);
     let mut child = sh.spawn().map_err(|e| format!("--if: {e}"))?;
+    // Read as it is written, so a gate that writes much never blocks on a
+    // full pipe; only its end is kept.
+    let wrote = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (read_all, all_read) = std::sync::mpsc::channel::<()>();
+    if let Some(mut stderr) = child.stderr.take() {
+        let wrote = wrote.clone();
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let _done = read_all;
+            let mut chunk = [0u8; 4096];
+            while let Ok(n @ 1..) = stderr.read(&mut chunk) {
+                let mut kept = wrote.lock().unwrap_or_else(|e| e.into_inner());
+                kept.extend_from_slice(&chunk[..n]);
+                if kept.len() > 2 * GATE_SAID {
+                    let cut = kept.len() - GATE_SAID;
+                    kept.drain(..cut);
+                }
+            }
+        });
+    }
     let group = child.id() as libc::pid_t;
     // SAFETY: a signal to the process group this function made.
     let end_group = || unsafe {
@@ -3393,7 +3419,10 @@ fn gate(command: &str, dir: Option<&Path>, daemon: &Daemon) -> Result<Result<(),
         match child.try_wait() {
             Err(e) => break Err(format!("--if: {e}")),
             Ok(Some(status)) if status.success() => break Ok(Ok(())),
-            Ok(Some(status)) => break Ok(Err(format!("--if: {status}"))),
+            Ok(Some(status)) if status.code() == Some(1) => {
+                break Ok(Err(format!("--if: {status}")));
+            }
+            Ok(Some(status)) => break Err(format!("--if: {status}")),
             Ok(None) if std::time::Instant::now() > until => {
                 end_group();
                 let _ = child.wait();
@@ -3402,8 +3431,19 @@ fn gate(command: &str, dir: Option<&Path>, daemon: &Daemon) -> Result<Result<(),
             Ok(None) => std::thread::sleep(Duration::from_millis(20)),
         }
     };
+    // With the group gone its stderr closes, unless something it started
+    // left the group; what was read by then is what it said.
     end_group();
-    said
+    let _ = all_read.recv_timeout(Duration::from_millis(200));
+    let wrote = wrote.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let wrote = String::from_utf8_lossy(&wrote);
+    let wrote = wrote.trim();
+    let tail = |at: usize| wrote.ceil_char_boundary(at);
+    let wrote = &wrote[tail(wrote.len().saturating_sub(GATE_SAID))..];
+    match said {
+        Err(why) if !wrote.is_empty() => Err(format!("{why}: {wrote}")),
+        said => said,
+    }
 }
 
 /// The first fire of a `--start` trigger: the agent is made as Sonny
@@ -4064,8 +4104,10 @@ impl GateNews {
         let (name, at) = (&trigger.name, stamp(now()));
         match self {
             Self::Broke(why) => format!(
-                "[automation {name} · {at} · its --if could not run, so {} sends nothing to {} \
-                 until it can: {why}. Told once; the next note says it works again.]",
+                "[automation {name} · {at} · its --if could not check, so {} sends nothing to {} \
+                 until it can: {why}. An --if says go with exit 0 and no with exit 1; any \
+                 other end is a check that failed. Told once; the next note says it works \
+                 again.]",
                 trigger.when,
                 trigger.bot()
             ),
@@ -4924,7 +4966,7 @@ pub(crate) mod tests {
         let prompt = GateNews::Broke("--if: ran past 60s".into()).prompt(&s);
         assert!(prompt.starts_with("[automation p.fix-login · "), "{prompt}");
         assert!(
-            prompt.contains(" · its --if could not run, so every 30m sends nothing to p.fix-login until it can: --if: ran past 60s. "),
+            prompt.contains(" · its --if could not check, so every 30m sends nothing to p.fix-login until it can: --if: ran past 60s. "),
             "{prompt}"
         );
         assert!(
@@ -6385,7 +6427,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_gate_says_no_with_any_exit_but_zero() {
+    fn a_gate_says_go_with_zero_no_with_one_and_could_not_check_with_anything_else() {
         let none = Daemon {
             store: None,
             socket: None,
@@ -6399,7 +6441,35 @@ pub(crate) mod tests {
         };
         let on = "test \"$AGENT_STORE\" = /s/state.sqlite && test -z \"$AGENT_SOCKET\"";
         assert_eq!(super::gate(on, None, &daemon), Ok(Ok(())));
-        assert!(gate("exit 3", None).unwrap().unwrap_err().contains('3'));
+        assert_eq!(gate("exit 1", None), Ok(Err("--if: exit status: 1".into())));
+        assert_eq!(gate("false", None), Ok(Err("--if: exit status: 1".into())));
+        // Any other end is no answer, not a no: a status past 1, a command
+        // that is not there, a crash, with the end of what it wrote.
+        assert_eq!(gate("exit 3", None), Err("--if: exit status: 3".into()));
+        let missing = gate("no-such-gate-here --flag", None).unwrap_err();
+        assert!(missing.starts_with("--if: exit status: 127: "), "{missing}");
+        assert!(missing.contains("no-such-gate-here"), "{missing}");
+        let killed = gate("kill -9 $$", None).unwrap_err();
+        assert!(killed.contains("signal: 9"), "{killed}");
+        // What it said is its end, kept short, whatever it wrote before.
+        let said = gate(
+            "yes early | head -c 200000 >&2; echo late >&2; exit 2",
+            None,
+        )
+        .unwrap_err();
+        assert!(said.starts_with("--if: exit status: 2: "), "{said}");
+        assert!(said.ends_with("late"), "{said}");
+        assert!(said.len() < GATE_SAID + 40, "{}", said.len());
+        // Its stderr is not read past the gate: something it started that
+        // left its group and holds stderr open does not hold the check.
+        let started = std::time::Instant::now();
+        let left = gate("setsid sleep 5 & echo gone >&2; exit 2", None).unwrap_err();
+        assert!(left.ends_with("gone"), "{left}");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
         // One that cannot run says nothing: that is no answer, not a no.
         assert!(gate("true", Some(Path::new("/nonexistent/agent-gate"))).is_err());
         // What it started in the background ends with it.
