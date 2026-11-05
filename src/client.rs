@@ -809,16 +809,57 @@ fn check_daemon(options: &Options, ready: &Value) -> Result<()> {
 
 fn ensure_daemon(options: &Options) -> Result<Connection> {
     match connect_or_start(options) {
-        // Only an agent that can start a daemon of its own stops the older
-        // one, or the socket would be left with none.
-        Err(error)
-            if !options.no_spawn
-                && !options.providers.is_empty()
-                && replace_older(&error, &options.socket)? =>
-        {
-            connect_or_start(options)
-        }
+        Err(error) if older_daemon(&error).is_some() => match kept_older(options) {
+            // The command, refused by the older daemon, goes to the new one.
+            None if replace_older(&error, &options.socket)? => connect_or_start(options),
+            None => Err(error),
+            Some(why) => Err(kept(error, why)),
+        },
         result => result,
+    }
+}
+
+/// A connection to the daemon already running, for a command on its bots,
+/// which never starts one where none runs: one older than this agent is
+/// replaced first, as `start` replaces it, and the command goes to the new
+/// one.
+fn connect_running(options: &Options) -> Result<Connection> {
+    match Connection::connect(&options.socket) {
+        Err(error) if older_daemon(&error).is_some() => ensure_existing_daemon(options),
+        result => result,
+    }
+}
+
+/// Why this agent leaves an older daemon running rather than replacing it:
+/// none when it may. Only an agent that can start a daemon of its own stops
+/// the older one, or the socket would be left with none, and never one a
+/// bot's own shell runs, since replacing it waits for that bot's turn.
+fn kept_older(options: &Options) -> Option<&'static str> {
+    if std::env::var_os("AGENT_BOT_ID").is_some() {
+        Some(
+            "this agent was upgraded while the daemon ran, and a command from inside a bot's \
+             turn does not replace the daemon running that turn, since replacing it waits for \
+             the turn. Nothing was sent. `agent start` from outside any bot's turn replaces \
+             it, as a client starting the daemon does, and the turn resumes on the new daemon",
+        )
+    } else if options.no_spawn {
+        Some("--no-spawn keeps it running. Nothing was sent; `agent start` replaces it")
+    } else if options.providers.is_empty() {
+        Some(
+            "nothing was sent: replacing it starts a new daemon, which needs a provider \
+             (--provider, AGENT_PROVIDER, a provider key, or `provider` in config.toml)",
+        )
+    } else {
+        None
+    }
+}
+
+/// `error`, the older daemon's refusal, saying why it was kept.
+fn kept(error: Error, why: &str) -> Error {
+    let said = error.detail.clone().unwrap_or_default();
+    Error {
+        detail: Some(format!("{said}: {why}")),
+        ..error
     }
 }
 
@@ -832,15 +873,12 @@ const REPLACE_GRACE: Duration = Duration::from_secs(120);
 /// Stop the older daemon `error` found on `socket`, once its running turns
 /// end or `REPLACE_GRACE` passes, so this agent's own can start: true once
 /// it is gone. The store keeps every chat, and the new daemon upgrades it
-/// as it opens. A newer daemon, or one an agent asks from inside its own
-/// turn, which would wait on itself, is left alone and `error` stands.
+/// as it opens. A newer daemon is left alone and `error` stands; who may
+/// replace one at all, `kept_older` says.
 fn replace_older(error: &Error, socket: &PathBuf) -> Result<bool> {
     let Some(pid) = older_daemon(error) else {
         return Ok(false);
     };
-    if std::env::var_os("AGENT_BOT_ID").is_some() {
-        return Ok(false);
-    }
     let grace_ms = REPLACE_GRACE.as_millis() as u64;
     // Daemons since 0.6.0 take shutdown with a grace; an older one refuses
     // the field, or does not answer in time, and is sent SIGTERM, which
@@ -1880,7 +1918,7 @@ fn follow(options: &Options) -> Result<i32> {
     if options.all {
         // Every bot's events from a store-wide cursor, then live, until the
         // connection ends: the fleet controller's view.
-        let mut connection = Connection::connect(&options.socket)?;
+        let mut connection = connect_running(options)?;
         let mut request = follow_from(options)?;
         request["bot"] = json!("*");
         connection.request("follow", request)?;
@@ -1894,7 +1932,7 @@ fn follow(options: &Options) -> Result<i32> {
         .bot
         .clone()
         .ok_or(Error::with("usage", "follow needs --bot or --all"))?;
-    let mut connection = Connection::connect(&options.socket)?;
+    let mut connection = connect_running(options)?;
     // Choose the turn before subscribing. If it finishes during attachment,
     // replay still delivers its terminal event; a later idle snapshot cannot
     // make us abandon events queued while waiting for an RPC response.
@@ -1927,7 +1965,7 @@ fn fork(options: &Options) -> Result<i32> {
             "fork needs --source and --bot; --checkpoint N picks a message, default is an idle source's head or a running turn's newest finished round",
         );
     };
-    let mut connection = Connection::connect(&options.socket)?;
+    let mut connection = connect_running(options)?;
     let result = make_fork(
         options,
         &mut connection,
@@ -1978,7 +2016,7 @@ fn interrupt(options: &Options) -> Result<i32> {
         .bot
         .clone()
         .ok_or(Error::with("usage", "interrupt needs --bot"))?;
-    let mut connection = Connection::connect(&options.socket)?;
+    let mut connection = connect_running(options)?;
     // A named turn may be one still queued, which then never runs.
     let turn = match options.turn {
         Some(turn) => turn,
@@ -2047,7 +2085,7 @@ fn wait(options: &Options) -> Result<i32> {
     if options.bot.is_some() == !options.positional.is_empty() {
         return fail_with("usage", "wait needs handles or --bot, not both");
     }
-    let mut connection = Connection::connect(&options.socket)?;
+    let mut connection = connect_running(options)?;
     let handles = match &options.bot {
         Some(bot) => vec![current_turn(&mut connection, bot, options.bot_id)?],
         None => options.positional.clone(),
@@ -2387,7 +2425,7 @@ fn turns(options: &Options) -> Result<i32> {
 /// The bots in name order, filtered by the daemon, paged through
 /// completely or up to `--limit`; JSON array or a table.
 fn list(options: &Options) -> Result<i32> {
-    let mut connection = Connection::connect(&options.socket)?;
+    let mut connection = connect_running(options)?;
     let mut after = Value::Null;
     let mut left = options.limit.unwrap_or(usize::MAX);
     let mut first = true;

@@ -1392,17 +1392,29 @@ class CliTests(ModelFixture):
         # or does not answer), waits for it to exit, then starts this one on
         # the same socket. One another client already replaced is not asked;
         # an agent asking from inside a turn, or one with no provider to
-        # start a daemon with, leaves it running and the error stands.
+        # start a daemon with, leaves it running and the error says why,
+        # and that nothing was sent. A command on the bots, which never
+        # starts a daemon where none runs, replaces it the same way, then
+        # goes to the new one.
         provider = ['--provider', 'openai=responses,http://127.0.0.1:9/v1']
-        cases = (('ok', False, provider), ('refused', False, provider), ('silent', False, provider),
-                 ('replaced', False, provider), ('ok', True, provider), ('ok', False, []))
-        for answer, inside, flags in cases:
-            with self.subTest(answer=answer, inside=inside, provider=bool(flags)), \
+        cases = (('ok', False, provider, 'start'), ('refused', False, provider, 'start'),
+                 ('silent', False, provider, 'start'), ('replaced', False, provider, 'start'),
+                 ('ok', True, provider, 'start'), ('ok', False, [], 'start'),
+                 ('ok', False, provider, 'ls'), ('ok', True, provider, 'ls'))
+        for answer, inside, flags, command in cases:
+            with self.subTest(answer=answer, inside=inside, provider=bool(flags), command=command), \
                     tempfile.TemporaryDirectory(dir='/tmp') as directory:
                 path, store = Path(directory)/'daemon.sock', Path(directory)/'state.db'
+                # The older daemon's store, which `ls` never creates.
+                store.touch()
                 daemon = subprocess.Popen(['sleep', '30'])
                 self.addCleanup(self.stop_process, daemon)
                 env = {**clean_env(), **({'AGENT_BOT_ID': '7'} if inside else {})}
+                if command == 'ls':
+                    # A command on the bots takes its provider as a default,
+                    # as the shells of agents do.
+                    env['AGENT_PROVIDER'] = ' '.join(flags[1:])
+                    flags = []
                 asked = []
                 listener = socket.socket(socket.AF_UNIX)
                 listener.bind(str(path))
@@ -1443,11 +1455,12 @@ class CliTests(ModelFixture):
                         pass
                 server = threading.Thread(target=older, daemon=True)
                 server.start()
-                result = subprocess.run([str(self.binary), 'start', '--store', str(store), '--socket', str(path), *flags],
+                result = subprocess.run([str(self.binary), command, '--store', str(store), '--socket', str(path), *flags],
                                         env=env, capture_output=True, timeout=40)
-                if inside or not flags:
+                if inside or not (flags or command == 'ls'):
                     self.assertEqual(result.returncode, 1)
                     self.assertIn(b'daemon_protocol_mismatch', result.stderr)
+                    self.assertIn(b'Nothing was sent' if inside else b'nothing was sent', result.stderr)
                     self.assertIsNone(daemon.poll())
                     self.assertEqual(asked, [])
                     continue
@@ -1460,7 +1473,11 @@ class CliTests(ModelFixture):
                 else:
                     self.assertEqual([(r['op'], r['grace_ms']) for r in asked], [('shutdown', 120000)])
                 self.assertEqual(daemon.wait(timeout=3), -15)
-                self.assertEqual(json.loads(result.stdout)['protocol'], PROTOCOL)
+                if command == 'ls':
+                    # Its listing came from the new daemon.
+                    self.assertEqual(json.loads(result.stdout), [])
+                else:
+                    self.assertEqual(json.loads(result.stdout)['protocol'], PROTOCOL)
 
     def test_explicit_store_overrides_inherited_socket(self):
         client = SocketClient(self.binary, self.path/'first.db', self.url, 'echo')
