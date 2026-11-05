@@ -91,6 +91,7 @@ async fn serve(store: PathBuf, socket: PathBuf) -> Result<(), String> {
     loop {
         if let Ok((client, mut events)) = Client::connect(&socket).await {
             gone = None;
+            server.connected(&client);
             // Once a host: a connection dropped and made again changes no
             // bot's tools.
             if started {
@@ -119,6 +120,7 @@ async fn serve(store: PathBuf, socket: PathBuf) -> Result<(), String> {
                     json!({"event": "follow_refused", "error": error.code, "after": cursor})
                 ),
             }
+            server.disconnected();
             following.abort();
         }
         if gone.get_or_insert_with(Instant::now).elapsed() >= GONE_AFTER {

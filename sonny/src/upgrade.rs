@@ -103,6 +103,12 @@ pub const MIGRATIONS: &[Migration] = &[
         id: crate::lookout::subs::STEER,
         retire: "0.10.0",
     },
+    // Each daemon's haiku claim is kept apart from the haiku shown, in
+    // `haiku.json` (0.8.1).
+    Migration {
+        id: crate::haiku::CLAIMS,
+        retire: "0.10.0",
+    },
 ];
 
 /// `run` once for each `record`: a file of the ids done, a line each,

@@ -1093,11 +1093,13 @@ pub fn told(replied: &Value, author: &str) -> String {
 }
 
 /// Wakes each of `tell` whose invite to the thread has tokens left with
-/// the reply `replied`: the note starts its turn, capped at what is left.
-/// The rest hear of it through their subscription to the thread, as the
-/// lookout tells the commons source (`news`). The ones woken.
+/// the reply `replied`, while it still listens to the thread: the note
+/// starts its turn, capped at what is left. The rest hear of it through
+/// their subscription to the thread, as the lookout tells the commons
+/// source (`news`), and one that removed it hears of it no more. The ones
+/// woken.
 pub async fn tell(home: &Path, replied: &Value, author: &str, tell: &Value) -> Vec<String> {
-    let Ok((_, socket)) = crate::daemon_paths(None, None) else {
+    let Ok((store, socket)) = crate::daemon_paths(None, None) else {
         return Vec::new();
     };
     let Ok((client, _events)) = agent_client::Client::connect(&socket).await else {
@@ -1117,6 +1119,9 @@ pub async fn tell(home: &Path, replied: &Value, author: &str, tell: &Value) -> V
             told_one["seen"]
         );
         let thread = replied["thread"].as_str().unwrap_or_default();
+        if !listens(&store, bot, thread) {
+            continue;
+        }
         let held = holds(&dir(home), thread, bot);
         let left = match &held {
             Some((turns, pays)) => left(&client, bot, turns, *pays).await,
@@ -1271,6 +1276,15 @@ pub fn news(home: &Path, cursor: &Path) -> News {
         lines,
         read: changed.then_some((path, read)),
     }
+}
+
+/// Whether `bot` holds a subscription that hears `thread`'s posts: the
+/// thread's own, as posting makes, or one to the whole commons.
+fn listens(store: &Path, bot: &str, thread: &str) -> bool {
+    let source = crate::lookout::subs::Sub::commons(thread, None).sources;
+    (crate::lookout::subs::read(store, bot).iter())
+        .flat_map(|sub| &sub.sources)
+        .any(|heard| source.contains(heard) || heard == agent_client::config::COMMONS_SOURCE)
 }
 
 /// Subscribes `bot` to the posts of `thread`, as posting in it does,
@@ -1749,6 +1763,23 @@ mod tests {
         std::fs::write(dir.join(WOKEN), mark.to_string()).unwrap();
         assert_eq!(look(&home, &cursor).len(), 1);
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn an_agent_that_unsubscribed_from_a_thread_is_not_woken_by_its_replies() {
+        let store = std::env::temp_dir().join(format!(
+            "sonny-commons-listens-{}/state.sqlite",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(store.parent().unwrap()).unwrap();
+        assert!(!listens(&store, "a.x", "t"));
+        subscribe(&store, "a.x", Some(1), "t").unwrap();
+        assert!(listens(&store, "a.x", "t"));
+        assert!(!listens(&store, "a.x", "other"));
+        let name = crate::lookout::subs::Sub::commons("t", None).name;
+        assert!(crate::lookout::subs::remove(&store, "a.x", &name).unwrap());
+        assert!(!listens(&store, "a.x", "t"));
+        let _ = std::fs::remove_dir_all(store.parent().unwrap());
     }
 
     #[test]

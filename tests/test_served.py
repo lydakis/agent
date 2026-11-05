@@ -420,7 +420,8 @@ print(json.dumps({{'version': '2.5', 'ok': True, 'command': command, 'data': dat
         self.desktop(settings={'sandbox': 'workspace-write'}, approve=['desktop'], approver='manual')
         refused = json.loads(self.call('calc.lead', 'desktop', {'commands': ['list-apps']}))
         self.assertEqual(refused['error'], 'desktop_refused')
-        self.assertIn('which the agent calc.lead writes, so it is not run', refused['detail'])
+        self.assertIn('which the agent calc.lead writes from its sandbox, so it could put a program', refused['detail'])
+        self.assertIn('Set calc.lead to Read only with /permissions', refused['detail'])
         # Nor for another agent, with no sandbox, while calc.lead could swap it.
         self.daemon.request('create', bot='free.lead', workspace=str(self.path / 'desktop-bin'),
                             model='openai/synthetic-model', instructions='Lead.',

@@ -485,8 +485,11 @@ pub struct View {
     reading: bool,
     /// Where the haikus are kept.
     store: haiku::Store,
-    /// The holder the kept haiku names, given the title once it is here.
+    /// The holder the kept claim names, given the title once it is here.
     heir: Option<(String, Instant)>,
+    /// The claim in the file last heard: one that is not it moves the
+    /// title, whether or not its haiku was written.
+    claimed: (String, i64),
     /// When the title was last weighed: once a second is enough.
     weighed: Option<Instant>,
     /// When the haiku rule was last read from the config.
@@ -520,7 +523,7 @@ enum Heard {
     /// was kept, in Unix ms, and its lines.
     Poem(String, i64, Vec<String>),
     /// The file as read, and the rule when it was read again too.
-    Read(haiku::Kept, Option<haiku::Rule>),
+    Read(Box<haiku::Kept>, Option<haiku::Rule>),
     /// The day's haikus, for a replay to show each when it was up.
     Poems(Vec<haiku::Poem>),
     /// The daemon's triggers as read, soonest first.
@@ -828,6 +831,7 @@ impl View {
         let now = Instant::now();
         // The haiku every sky of this daemon shows, while it is fresh.
         let store = haiku::Store::new();
+        haiku::upgrade(&store);
         let kept = haiku::Kept::load(&store, &socket);
         let ago = |ms: i64| {
             let ms = (wall_ms() - ms).max(0) as u64;
@@ -843,7 +847,7 @@ impl View {
             until: None,
             story: None,
         });
-        let heir = fresh.then(|| (kept.by.clone(), ago(kept.since_ms)));
+        let heir = (kept.holder(wall_ms(), HOUR)).map(|(holder, held)| (holder, ago(held)));
         Self {
             socket,
             resolved: PathBuf::new(),
@@ -886,6 +890,7 @@ impl View {
             reading: false,
             store,
             heir,
+            claimed: kept.claim.clone(),
             weighed: None,
             ruled: Some(now),
             runtime: tokio::runtime::Handle::current(),
@@ -1159,7 +1164,7 @@ impl View {
                     if let Some(rule) = rule {
                         self.title.rule = rule;
                     }
-                    self.heed(kept, now);
+                    self.heed(*kept, now);
                 }
             }
         }
@@ -1207,7 +1212,10 @@ impl View {
             let send = self.heard.0.clone();
             self.runtime.spawn_blocking(move || {
                 let rule = rule.then(haiku::Rule::load);
-                let _ = send.send(Heard::Read(haiku::Kept::load(&store, &socket), rule));
+                let _ = send.send(Heard::Read(
+                    Box::new(haiku::Kept::load(&store, &socket)),
+                    rule,
+                ));
             });
         }
         // The triggers read again: each tick's next time, and a schedule
@@ -1266,13 +1274,19 @@ impl View {
             if !matches!(claimed.await, Ok(true)) {
                 return;
             }
-            let Some(lines) = haiku::write(socket.clone(), name.clone()).await else {
-                return;
-            };
+            // One that writes none leaves the haiku before showing, here
+            // and in every sky, and says why in the file.
+            let written = haiku::write(socket.clone(), name.clone()).await;
             let kept = tokio::task::spawn_blocking(move || {
                 let at = wall_ms();
-                haiku::Kept::publish(&store, &socket, &name, since, &lines, at)
-                    .then_some(Heard::Poem(name, at, lines))
+                match written {
+                    Ok(lines) => haiku::Kept::publish(&store, &socket, &name, since, &lines, at)
+                        .then(|| Heard::Poem(name, at, lines.to_vec())),
+                    Err(why) => {
+                        haiku::Kept::unwritten(&store, &socket, &name, since, why, at);
+                        None
+                    }
+                }
             });
             if let Ok(Some(poem)) = kept.await {
                 let _ = send.send(poem);
@@ -1283,17 +1297,25 @@ impl View {
     /// The file as read: a haiku another sky wrote shows here too, and its
     /// writer holds the title here as there.
     fn heed(&mut self, kept: haiku::Kept, now: Instant) {
-        let new = (kept.by != self.shown.0 || kept.at_ms != self.shown.1)
-            && kept.lines.len() == 3
-            && self.live
-            && self.replay.is_none();
-        if !new {
+        if !self.live || self.replay.is_some() {
             return;
         }
-        if self.agent(&kept.by).is_some() {
-            let held = (wall_ms() - kept.since_ms).max(0) as u64;
-            let since = now.checked_sub(Duration::from_millis(held)).unwrap_or(now);
-            self.title.holder = Some((kept.by.clone(), since));
+        // The title follows the claim, not the haiku shown: a claim that
+        // wrote nothing still holds it.
+        if kept.claim != self.claimed {
+            self.claimed = kept.claim.clone();
+            if let Some((holder, held_ms)) = kept.holder(wall_ms(), HOUR) {
+                let held = (wall_ms() - held_ms).max(0) as u64;
+                let since = now.checked_sub(Duration::from_millis(held)).unwrap_or(now);
+                match self.agent(&holder) {
+                    Some(_) => self.title.holder = Some((holder, since)),
+                    None => self.heir = Some((holder, since)),
+                }
+            }
+        }
+        let new = (kept.by != self.shown.0 || kept.at_ms != self.shown.1) && kept.lines.len() == 3;
+        if !new {
+            return;
         }
         self.shown = (kept.by.clone(), kept.at_ms);
         self.recite(kept.by, kept.lines, kept.at_ms, now);
@@ -6687,6 +6709,7 @@ mod tests {
             (kept.by, kept.lines) = ("shop.lead".into(), lines.map(str::to_owned).to_vec());
             kept.at_ms = wall_ms();
             kept.since_ms = wall_ms() - 60_000;
+            kept.claim = ("shop.lead".into(), kept.since_ms);
         });
         // Read off the drawing thread, and heard back.
         view.weighed = None;
@@ -6706,6 +6729,30 @@ mod tests {
             view.drain();
         }
         assert!(view.fading.is_none());
+        // Another claims the title and writes nothing: it holds the title
+        // with the lead's haiku still up, and back from a replay too.
+        send.send(Feed::Roll(vec![
+            json!({"name": "shop.lead"}),
+            json!({"name": "shop.b"}),
+        ]))
+        .unwrap();
+        view.drain();
+        haiku::Kept::update(&view.store, &view.socket, |kept| {
+            kept.claim = ("shop.b".into(), wall_ms() - 1_000);
+        });
+        for back_from_replay in [false, true] {
+            if back_from_replay {
+                view.shown = (String::new(), 0);
+            }
+            view.weighed = None;
+            view.drain();
+            while view.reading {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                view.drain();
+            }
+            assert_eq!(view.title.holder.as_ref().unwrap().0, "shop.b");
+            assert_eq!(view.verse.as_ref().unwrap().lines, lines);
+        }
         // One written over an hour ago, however late it comes, shows not.
         let old = wall_ms() - 2 * HOUR.as_millis() as i64;
         let late = Heard::Poem(
