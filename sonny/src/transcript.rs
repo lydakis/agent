@@ -1090,7 +1090,15 @@ pub fn wrap_lines(
             }
             // A word wider than a row is cut where the row ends, each cut
             // read on from the last: a long word is read once, not once
-            // for each row it fills.
+            // for each row it fills. Its cuts and what is left are both
+            // measured a character at a time, which never counts less than
+            // the joined sequences (a family emoji) the terminal draws
+            // narrower, so no row runs past the edge.
+            if wide > room {
+                wide = (word.chars())
+                    .map(|c| unicode_width::UnicodeWidthChar::width(c).unwrap_or(0))
+                    .sum();
+            }
             while wide > room {
                 let mut cut = 0;
                 let mut cols = 0;
@@ -3330,6 +3338,17 @@ mod tests {
             twice < once * 3 + std::time::Duration::from_millis(50),
             "{once:?} then {twice:?}"
         );
+        // Joined emoji are measured alike when cut and after, so no row is
+        // wider than the room.
+        let family = "👨\u{200d}👩\u{200d}👧\u{200d}👦".repeat(12);
+        let rows = wrap(Line::from(family.clone()), 8, Span::raw(""), Span::raw(""));
+        let kept: String = (rows.iter())
+            .flat_map(|row| row.spans.iter().map(|s| s.content.as_ref()))
+            .collect();
+        assert_eq!(kept, family);
+        for row in &rows {
+            assert!(row.width() <= 8, "{}", row.width());
+        }
     }
 
     #[test]
