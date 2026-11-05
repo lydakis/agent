@@ -847,7 +847,7 @@ impl Reading {
             .and_then(|arguments| self::call("", &arguments))
             .is_some();
         let asked = id(turn, call);
-        Some(asks && !self.answers.iter().any(|answered| *answered == asked))
+        Some(asks && !self.answers.contains(&asked))
     }
 }
 
