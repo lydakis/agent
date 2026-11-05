@@ -9481,7 +9481,7 @@ impl App {
             ("ctrl+[ ctrl+]", "hide the pane, show it again"),
             ("ctrl+g", "open the pane's agent in the main view"),
             ("ctrl+t", "go to the pane's agent's own tab"),
-            ("alt+t", "boost the next message; again for more"),
+            ("alt+t ctrl+x", "boost the next message; again for more"),
             ("ctrl+v", "paste a picture"),
             ("ctrl+c", "copy the selection, clear, or quit"),
             ("ctrl+l", "draw the screen again"),
@@ -10456,7 +10456,10 @@ impl App {
                     KeyCode::Char('d') if alt => self.input.delete_word_forward(),
                     // Think harder for one message, as Claude Code's Alt+T
                     // toggles thinking: again for the most, again for none.
+                    // Ctrl+X too, for a terminal or window manager that
+                    // keeps Alt for itself: x as in xhigh.
                     KeyCode::Char('t') if alt => self.boost_step(),
+                    KeyCode::Char('x') if ctrl => self.boost_step(),
                     // With nothing typed, ? shows the keys, as it does in
                     // Codex and Claude Code.
                     KeyCode::Char('?')
@@ -10623,7 +10626,7 @@ impl App {
         }
     }
 
-    /// Alt+T: the next message's effort up a step from the agent's own,
+    /// Alt+T or Ctrl+X: the next message's effort up a step from the agent's own,
     /// to the most the model takes, then back to its own. The steps are
     /// the model's family's: `xhigh` (else `high`), then `max` where it
     /// has one, each only when above the effort set.
@@ -13951,6 +13954,23 @@ mod tests {
         assert_eq!(at("old/gpt", None), ["high"]);
         assert!(at("openai/gpt", Some("xhigh")).is_empty());
         assert!(at("nowhere/x", None).is_empty());
+    }
+
+    #[tokio::test]
+    async fn ctrl_x_boosts_as_alt_t_does() {
+        let providers = json!({"anthropic": {"family": "anthropic",
+            "efforts": ["low", "medium", "high", "xhigh", "max"]}});
+        let client = daemon_serving(providers, |_| json!({})).await;
+        let mut app = app(client);
+        app.model = "anthropic/opus".into();
+        let key = |c, modifiers| Event::Key(event::KeyEvent::new(KeyCode::Char(c), modifiers));
+        app.key(key('x', KeyModifiers::CONTROL)).await;
+        assert_eq!(app.boost.as_deref(), Some("xhigh"));
+        app.key(key('t', KeyModifiers::ALT)).await;
+        assert_eq!(app.boost.as_deref(), Some("max"));
+        app.key(key('x', KeyModifiers::CONTROL)).await;
+        assert!(app.boost.is_none(), "again goes back to the agent's own");
+        assert!(app.input.is_empty());
     }
 
     #[tokio::test]
