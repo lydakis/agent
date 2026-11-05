@@ -515,9 +515,22 @@ async fn spread_pass(
         false => Vec::new(),
     };
     passed.after_lead = listed && lead_set;
+    let lead_id = (bots.iter())
+        .find(|bot| bot["name"] == lead)
+        .and_then(|bot| bot["bot_id"].as_i64());
     for bot in made {
         let name = bot["name"].as_str().unwrap_or_default().to_owned();
         let id = bot["bot_id"].as_i64();
+        // The daemon bounds an agent's settings by its maker's, so a
+        // change taken before its maker had its own may not be the one
+        // asked for: only one taken after is the last it needs.
+        let maker = bot["created_by_id"].as_i64();
+        let maker_set = lead_set
+            && maker.is_some_and(|maker| {
+                Some(maker) == lead_id
+                    || settled.contains(&maker)
+                    || passed.settled.contains(&maker)
+            });
         // As `inspect` gives it, with the tools its client declared.
         let Ok(record) = (client)
             .request("inspect", json!({"bot": name, "bot_id": bot["bot_id"]}))
@@ -549,7 +562,8 @@ async fn spread_pass(
         asked["bot"] = json!(name);
         asked["bot_id"] = bot["bot_id"].clone();
         match client.request("configure", asked).await {
-            Ok(_) => passed.settled.extend(id),
+            Ok(_) if maker_set => passed.settled.extend(id),
+            Ok(_) => {}
             Err(error) if error.code == "bot_busy" => passed.waiting.push(name),
             Err(error) => {
                 passed.notice = Some(format!("{name}'s permissions: {error}"));
@@ -18629,6 +18643,9 @@ mod tests {
         app.spread().await;
         let spread = app.spread.as_ref().unwrap();
         assert_eq!(spread.waiting, ["task"]);
+        // The helper took its change while its maker still had the old
+        // one, which bounds it, so it is asked again after.
+        assert!(!spread.settled.contains(&4));
         // Not looked at again until a little after the pass.
         assert!(spread.at > Instant::now());
         let footer = app.footer(100).0.to_string();
@@ -18649,8 +18666,8 @@ mod tests {
         }
         app.spread().await;
         assert!(app.spread.is_none());
-        assert_eq!(inspected.load(Ordering::SeqCst), 3);
-        assert_eq!(configured.load(Ordering::SeqCst), 3);
+        assert_eq!(inspected.load(Ordering::SeqCst), 4);
+        assert_eq!(configured.load(Ordering::SeqCst), 4);
         // A pass that listed the agents before the lead had its own
         // change does not end the pick: the lead may have made one since.
         app.gating = Some("auto");
