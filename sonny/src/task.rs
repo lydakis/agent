@@ -1884,7 +1884,7 @@ pub fn remove(here: &Path, name: &str, discard: bool) -> Result<String, String> 
             .map_err(|e| format!("running {}: {e}", agent.display()))?;
         if !output.status.success() {
             let said = String::from_utf8_lossy(&output.stderr);
-            return Err(format!("{name} was not removed: {}", said.trim()));
+            return Err(not_removed(name, said.trim()));
         }
         kept().map_err(|e| format!("{name}'s bot was removed, but {e}"))?;
     }
@@ -1933,9 +1933,39 @@ pub fn remove(here: &Path, name: &str, discard: bool) -> Result<String, String> 
     Ok(format!("Removed {name}."))
 }
 
+/// Why `agent rm` did not remove `name`, from what it wrote to stderr: a
+/// task at work is removed only once its turn ends, which says how.
+fn not_removed(name: &str, said: &str) -> String {
+    let error: Value = serde_json::from_str(said).unwrap_or_default();
+    match error["error"].as_str() {
+        Some("bot_busy") => {
+            let turn = (error["running_turn"].as_i64())
+                .map_or(String::new(), |turn| format!(" (turn {turn})"));
+            format!(
+                "{name} was not removed: it is working{turn}, and only an idle agent is \
+                 removed. Its update reaches you when the turn ends; remove it then, or end the \
+                 turn first with `agent interrupt --bot {name}`"
+            )
+        }
+        _ => format!("{name} was not removed: {said}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_task_at_work_is_not_removed_and_says_how_it_can_be() {
+        let busy = r#"{"error":"bot_busy","detail":"turn 4 of fix is running","running_turn":4}"#;
+        let said = not_removed("fix", busy);
+        assert!(said.contains("it is working (turn 4)"), "{said}");
+        assert!(said.contains("`agent interrupt --bot fix`"), "{said}");
+        assert_eq!(
+            not_removed("fix", "bot_not_found"),
+            "fix was not removed: bot_not_found"
+        );
+    }
 
     /// Agent's binary built beside these tests, when it runs a sandbox
     /// here, and a folder beside it outside temporary storage, which every
