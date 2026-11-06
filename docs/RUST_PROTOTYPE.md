@@ -1057,7 +1057,9 @@ readers do not block each other or the writer). One reader opens with the
 store; another opens when a read is queued with no reader free to take
 it, and one past the first closes after 30 seconds without a read, so a
 quiet daemon holds one and a busy one widens on its own. The readers that
-are open share one 2 MiB page cache budget equally. They take at most all but one of
+are open share one 2 MiB page cache budget equally: an idle reader takes
+its new share as soon as one opens or closes, a busy one as its read ends
+(`stats` shows the shares held as `readers.cache_kib`). They take at most all but one of
 the connections, the rest waiting in the order they came, so a turn's own
 reads (its context, a compaction plan) always find one free, as Kubernetes'
 API Priority and Fairness keeps seats for each priority level. Meanwhile the loop serves every other

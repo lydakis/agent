@@ -73,8 +73,11 @@ pub fn default_readers() -> usize {
 const READER_IDLE: std::time::Duration = std::time::Duration::from_secs(30);
 /// SQLite page cache for every open reader together, in KiB: what one
 /// reader had alone. Each takes an equal share, so a wide pool holds no
-/// more than a narrow one. A write clears a WAL reader's cache anyway, so
-/// under load each reader's share outlives little more than one read.
+/// more than a narrow one: an idle reader takes its new share as soon as a
+/// reader opens or closes, a busy one when its read ends, since only the
+/// reader's own thread may touch its connection. A write clears a WAL
+/// reader's cache anyway, so under load each reader's share outlives little
+/// more than one read.
 const READER_CACHE_KIB: usize = 2048;
 
 /// The reader connections, on threads of their own: the first opens with
@@ -96,6 +99,8 @@ struct Readers {
     waiting: usize,
     /// Changes whenever `open` does, so each reader resizes its cache share.
     generation: u64,
+    /// The cache shares the open readers hold, together.
+    cache_kib: usize,
     closed: bool,
 }
 impl Pool {
@@ -111,6 +116,8 @@ impl Pool {
             state.open += 1;
             state.generation += 1;
             drop(state);
+            // The idle readers give up part of their share now.
+            self.wake.notify_all();
             let pool = self.clone();
             let spawned = std::thread::Builder::new()
                 .name("agent-storage-reader".into())
@@ -136,55 +143,77 @@ impl Pool {
         let mut state = self.state();
         state.open -= 1;
         state.generation += 1;
+        drop(state);
+        self.wake.notify_all();
+    }
+    /// Size this reader's cache to `kib`, its share of the budget, and count
+    /// it in the pool's. A failed resize keeps the share it had.
+    fn resize(&self, db: &Database, state: &mut Readers, mine: &mut usize, kib: usize) {
+        if db.cache_kib(kib).is_ok() {
+            state.cache_kib = state.cache_kib - *mine + kib;
+            *mine = kib;
+        }
     }
     /// Run queued reads until the store closes, or, for a reader past the
     /// first, until it has waited `idle` for one.
     fn serve(&self, db: Database, first: bool) {
+        // The generation this reader's share was last sized for, the share,
+        // and when it closes if no read comes first.
         let mut sized = None;
+        let mut mine = 0;
+        let mut idle_until = None;
         loop {
-            let (job, share) = {
+            let (job, generation, kib) = {
                 let mut state = self.state();
                 loop {
+                    let kib = READER_CACHE_KIB / state.open.max(1);
                     if let Some((job, place)) = state.jobs.pop_front() {
                         drop(place);
-                        let share = (sized != Some(state.generation))
-                            .then(|| (state.generation, READER_CACHE_KIB / state.open.max(1)));
-                        break (job, share);
+                        idle_until = None;
+                        break (job, state.generation, kib);
                     }
-                    if state.closed {
+                    if state.closed
+                        || (!first
+                            && idle_until.is_some_and(|until| std::time::Instant::now() >= until))
+                    {
                         if !first {
                             state.open -= 1;
                             state.generation += 1;
+                            state.cache_kib -= mine;
+                            drop(state);
+                            self.wake.notify_all();
                         }
                         return;
                     }
+                    if sized != Some(state.generation) {
+                        // Idle, the reader takes its new share at once, not at
+                        // its next read: the pool's budget holds while it waits.
+                        self.resize(&db, &mut state, &mut mine, kib);
+                        sized = Some(state.generation);
+                    }
                     state.waiting += 1;
-                    let timed_out;
-                    (state, timed_out) = if first {
-                        (
-                            self.wake.wait(state).unwrap_or_else(|e| e.into_inner()),
-                            false,
-                        )
+                    state = if first {
+                        self.wake.wait(state).unwrap_or_else(|e| e.into_inner())
                     } else {
-                        let (state, waited) = self
-                            .wake
-                            .wait_timeout(state, self.idle)
-                            .unwrap_or_else(|e| e.into_inner());
-                        (state, waited.timed_out())
+                        let until = *idle_until
+                            .get_or_insert_with(|| std::time::Instant::now() + self.idle);
+                        let left = until.saturating_duration_since(std::time::Instant::now());
+                        self.wake
+                            .wait_timeout(state, left)
+                            .unwrap_or_else(|e| e.into_inner())
+                            .0
                     };
                     state.waiting -= 1;
-                    if timed_out && state.jobs.is_empty() {
-                        state.open -= 1;
-                        state.generation += 1;
-                        return;
-                    }
                 }
             };
-            if let Some((generation, kib)) = share {
-                // A failed resize keeps the share it had; the read goes on.
+            if sized != Some(generation) {
+                // Sized outside the lock, so the read starts while others queue.
                 if db.cache_kib(kib).is_ok() {
-                    sized = Some(generation);
+                    let mut state = self.state();
+                    state.cache_kib = state.cache_kib - mine + kib;
+                    mine = kib;
                 }
+                sized = Some(generation);
             }
             job(&db);
         }
@@ -210,6 +239,7 @@ impl ReadQueue {
                 open: 1,
                 waiting: 0,
                 generation: 0,
+                cache_kib: 0,
                 closed: false,
             }),
             wake: std::sync::Condvar::new(),
@@ -764,6 +794,7 @@ impl Store {
                 open: 1,
                 waiting: 0,
                 generation: 0,
+                cache_kib: 0,
                 closed: false,
             }),
             wake: std::sync::Condvar::new(),
@@ -811,7 +842,11 @@ impl Store {
         };
         let mut stats = self.counters.snapshot();
         let readers = self.reader.0.state();
-        stats["readers"] = serde_json::json!({"open": readers.open, "most": self.reader.0.most});
+        stats["readers"] = serde_json::json!({
+            "open": readers.open,
+            "most": self.reader.0.most,
+            "cache_kib": readers.cache_kib,
+        });
         drop(readers);
         stats["bytes"] = size("").into();
         stats["wal_bytes"] = size("-wal").into();
@@ -1582,6 +1617,66 @@ mod tests {
         tokio::time::sleep(idle * 3).await;
         assert_eq!(open(&store), 1);
         assert_eq!(share(&store).await, -(READER_CACHE_KIB as i64));
+    }
+
+    #[tokio::test]
+    async fn the_readers_hold_one_cache_budget_once_their_reads_end() {
+        let path = scratch_path("reader-shares");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        let idle = std::time::Duration::from_millis(500);
+        let (store, _publications) = Store::open_pooled(&path, 4, idle).await.unwrap();
+        let held = |store: &Store| store.stats()["readers"]["cache_kib"].as_u64().unwrap();
+        let budget = READER_CACHE_KIB as u64;
+        store.read("warm", |_| Ok(())).await.unwrap();
+        assert_eq!(held(&store), budget);
+        // A long read on the first reader, sized while it was alone; a
+        // second read opens a second reader with half the budget.
+        let (release, hold) = std::sync::mpsc::channel::<()>();
+        let (began, started) = tokio::sync::oneshot::channel();
+        let long = {
+            let store = store.clone();
+            tokio::spawn(async move {
+                store
+                    .read("long", move |_| {
+                        let _ = began.send(());
+                        let _ = hold.recv();
+                        Ok(())
+                    })
+                    .await
+            })
+        };
+        started.await.unwrap();
+        store.read("short", |_| Ok(())).await.unwrap();
+        assert_eq!(store.stats()["readers"]["open"], 2);
+        // In flight, a read keeps the share it began with.
+        assert_eq!(held(&store), budget + budget / 2);
+        // Once it ends the first reader, idle, gives up the excess at once.
+        release.send(()).unwrap();
+        long.await.unwrap().unwrap();
+        let settled = |want: u64| {
+            let store = store.clone();
+            async move {
+                tokio::time::timeout(idle / 2, async {
+                    while held(&store) != want {
+                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+            }
+        };
+        settled(budget)
+            .await
+            .expect("both readers on half the budget");
+        // When the second closes, the first takes the whole budget back
+        // without waiting for a read.
+        tokio::time::sleep(idle * 2).await;
+        assert_eq!(store.stats()["readers"]["open"], 1);
+        settled(budget).await.unwrap();
+        let share = store
+            .read("pragma", |db| Ok(db.pragma("cache_size")))
+            .await
+            .unwrap();
+        assert_eq!(share, -(budget as i64));
     }
 
     #[tokio::test]

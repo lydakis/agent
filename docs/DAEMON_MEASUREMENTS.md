@@ -7087,7 +7087,11 @@ more opens when a read is queued with no reader waiting for it, up to
 `--max-readers`; one past the first closes after 30 seconds without a read
 (a pool's idle timeout, as HikariCP and Go's `database/sql` keep a floor
 and close the rest). The open readers share one 2 MiB page cache budget,
-each resizing its share when the pool changes. Since any write clears a WAL
+each resizing its share when the pool changes: an idle reader at once, a
+busy one as its read ends, since only its own thread may touch its
+connection. A read in flight keeps the share it began with, so staggered
+overlapping reads can briefly hold more than the budget, never more than
+each reader's share when its read began. Since any write clears a WAL
 reader's cache, under load a share outlives little more than one read.
 
 `bench.store_load` (added in the prompt-openings change), alternating
