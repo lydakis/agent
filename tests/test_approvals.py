@@ -443,6 +443,27 @@ class ApprovalTests(ModelFixture):
         self.assertEqual(list(outside.iterdir()), [])
 
     @unittest.skipUnless(shutil.which('bwrap') or sys.platform == 'darwin', 'sandboxes need bubblewrap')
+    def test_rules_given_while_a_turn_runs_rule_its_next_round(self):
+        rules = {'prefix_rules': [{'pattern': ['cp'], 'decision': 'prompt', 'source': 'default.rules:1'}]}
+        client = self.gated(settings={'sandbox': 'workspace-write', 'rules': rules})
+        self.model.call_script = [('shell', {'command': f'cp /dev/null {self.path}/asked'}),
+                                  ('shell', {'command': f'mkdir {self.path}/made'})]
+        turn = client.request('submit', bot='Bob', request_id='script', prompt='script')['result']['turn']
+        self.assertEqual([call['call_id'] for call in self.announced(client, turn)], ['script-0'])
+        # While its first round waits, a rule forbids what its next does.
+        given = {'prefix_rules': rules['prefix_rules'] + [
+            {'pattern': ['mkdir'], 'decision': 'forbidden', 'source': 'default.rules:2'}]}
+        self.assertEqual(client.request('configure', bot='Bob', settings={'rules': given})['result']['changed'],
+                         ['rules'])
+        # Nothing else about the bot changes while it works.
+        busy = client.request('configure', bot='Bob', settings={'rules': rules, 'approval_hold_ms': 5000})
+        self.assertEqual(busy['error'], 'bot_busy', busy)
+        self.answer(client, turn, 'script-0')
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        self.assertEqual(self.tool_output(client, 'script-1')[1]['error'], 'command_forbidden')
+        self.assertFalse((self.path / 'made').exists())
+
+    @unittest.skipUnless(shutil.which('bwrap') or sys.platform == 'darwin', 'sandboxes need bubblewrap')
     def test_command_rules_let_a_command_out_ask_about_it_or_forbid_it(self):
         (ROOT / '.local').mkdir(exist_ok=True)
         outside = Path(tempfile.mkdtemp(dir=ROOT / '.local'))

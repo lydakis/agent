@@ -1459,7 +1459,9 @@ name, the sandbox's four as `sandbox`) that differed; the same request again
 changes nothing, so a resend is harmless. A change is told to the bot's
 followers as a live `configured` event with the same fields, which is not
 kept, so a client that attaches later reads the bot as it is. It is refused with `bot_busy`
-while a turn runs or waits parked, and the next turn sends the
+while a turn runs or waits parked, except a change of `rules` alone, which
+the running turn's next round takes ([command rules](#command-rules));
+otherwise the next turn sends the
 new instructions: the provider's cache of the old ones is not read again,
 replayed thinking written after them is withheld as when any context in
 front of it changes, and a fork keys its own prompt cache from then on.
@@ -2842,8 +2844,9 @@ only as trusted as the folders there. A turn takes its bot's rules when
 its first round begins, and each call a round plans keeps what they made
 of it, which a parked turn reads back as it resumes: a call runs as its
 round was announced, also after a park or a restart and whatever the
-rules say by then. A turn started after a `configure` takes the new
-rules.
+rules say by then. A `configure` that changes only `rules` is taken while
+a turn runs: its next round, and every one after, rules its calls by the
+new ones; a turn parked then reads them as it resumes.
 
 A bot made by another (its `created_by`) goes by its creator's rules: it
 takes them when it is made, whatever its own client gives, and follows
