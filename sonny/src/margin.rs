@@ -23,35 +23,56 @@ use crate::transcript::Markdown;
 
 /// The name of the tool a bot keeps notes in the margin with.
 pub const TOOL: &str = "margin";
-/// The most notes a margin holds, as `[sonny] margin_notes` sets it: a
-/// new one past it lets the oldest go.
+/// The most notes a margin holds, as `[sonny] margin_notes` sets it,
+/// and the most lines a note's Markdown runs to, as `margin_note_lines`
+/// does: a call past either is refused, and says why.
 #[cfg(not(test))]
-static MOST_NOTES: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(agent_client::config::MARGIN_NOTES as usize);
+static MOST: [std::sync::atomic::AtomicUsize; 2] = [
+    std::sync::atomic::AtomicUsize::new(agent_client::config::MARGIN_NOTES as usize),
+    std::sync::atomic::AtomicUsize::new(agent_client::config::MARGIN_NOTE_LINES as usize),
+];
 
-// Each test's own, so one that sets it changes no other running beside it.
+// Each test's own, so one that sets them changes no other running beside it.
 #[cfg(test)]
 thread_local! {
-    static MOST_NOTES: std::cell::Cell<usize> =
-        const { std::cell::Cell::new(agent_client::config::MARGIN_NOTES as usize) };
+    static MOST: [std::cell::Cell<usize>; 2] = const {
+        [
+            std::cell::Cell::new(agent_client::config::MARGIN_NOTES as usize),
+            std::cell::Cell::new(agent_client::config::MARGIN_NOTE_LINES as usize),
+        ]
+    };
 }
 
-/// The most notes a margin holds; [`set_most_notes`] sets it.
+fn most(which: usize) -> usize {
+    #[cfg(not(test))]
+    return MOST[which].load(std::sync::atomic::Ordering::Relaxed);
+    #[cfg(test)]
+    return MOST.with(|most| most[which].get());
+}
+
+fn set_most(which: usize, to: u64) {
+    let to = usize::try_from(to).unwrap_or(usize::MAX).max(1);
+    #[cfg(not(test))]
+    MOST[which].store(to, std::sync::atomic::Ordering::Relaxed);
+    #[cfg(test)]
+    MOST.with(|most| most[which].set(to));
+}
+
+/// The most notes a margin holds; [`set_most`] sets it.
 pub fn most_notes() -> usize {
-    #[cfg(not(test))]
-    return MOST_NOTES.load(std::sync::atomic::Ordering::Relaxed);
-    #[cfg(test)]
-    return MOST_NOTES.with(std::cell::Cell::get);
+    most(0)
 }
 
-/// The most notes a margin holds, as `[sonny] margin_notes` says: at
-/// least one.
-pub fn set_most_notes(notes: u64) {
-    let notes = usize::try_from(notes).unwrap_or(usize::MAX).max(1);
-    #[cfg(not(test))]
-    MOST_NOTES.store(notes, std::sync::atomic::Ordering::Relaxed);
-    #[cfg(test)]
-    MOST_NOTES.with(|most| most.set(notes));
+/// The most lines a note's Markdown runs to.
+pub fn most_lines() -> usize {
+    most(1)
+}
+
+/// The margin's limits, as `[sonny] margin_notes` and
+/// `margin_note_lines` say: each at least one.
+pub fn set_limits(notes: u64, lines: u64) {
+    set_most(0, notes);
+    set_most(1, lines);
 }
 /// The most of a note's Markdown kept, and of a file read for one.
 const NOTE_BYTES: usize = 64 * 1024;
@@ -87,7 +108,10 @@ const DESCRIPTION: &str = "Keep something beside the conversation, in the margin
          post it again with the same id, rather than a second note about the change, or remove it \
          in that same turn, even while the change waits \
          on a task's branch, saying in the note which it shows, and remove a note once it \
-         no longer holds. Where whether a note is still current matters, such as a pull \
+         no longer holds. The margin holds a few notes of a few lines each, as the person \
+         sets it: a new note past the most, or text longer than a note takes, is refused, \
+         with the limit and the notes there; write a longer text to a file and show the file. \
+         Where whether a note is still current matters, such as a pull \
          request's state or a check you ran, say when it was last checked, in the person's \
          time zone, and change that as you check again; a note whose content does not age, \
          such as a design, needs no date. Give markdown (rendered as your replies are: tables, math, Mermaid, html \
@@ -124,8 +148,89 @@ pub fn tool() -> Value {
             "required": ["id"],
             "additionalProperties": false
         },
-        "result": "In the margin."
+        "answered_by": crate::served::TAG
     })
+}
+
+/// What a `margin` call is answered: "In the margin.", or refused, typed,
+/// as [`refusal`] says, by the margin of `bot` as its history stands,
+/// read from the margin a window kept under its key in `store` on, so a
+/// margin no window shows is read from the start. A window shows the same,
+/// since it refuses what this refuses.
+pub async fn answer(
+    client: &agent_client::Client,
+    store: &Path,
+    bot: &str,
+    arguments: &Value,
+) -> Result<String, (&'static str, String)> {
+    let unread = |e: agent_client::Error| ("margin_unread", e.to_string());
+    // As the person's config says now; one that does not read, the defaults.
+    let sonny = agent_client::config::load()
+        .map(|config| config.sonny)
+        .unwrap_or_default();
+    set_limits(sonny.margin_notes, sonny.margin_note_lines);
+    let page = (client
+        .request("bots", json!({"name": bot, "limit": 1}))
+        .await)
+        .map_err(unread)?;
+    let id = (page["bots"].get(0))
+        .filter(|record| record["name"] == bot)
+        .and_then(|record| record["bot_id"].as_i64())
+        .ok_or(("margin_unread", format!("{bot} is gone")))?;
+    let store = std::fs::canonicalize(store).unwrap_or_else(|_| store.to_owned());
+    let mut margin = Margin::load(Some(&crate::reactions::key(&store, id)));
+    // Read, never written here: the window's to keep.
+    margin.file = None;
+    let mut after = margin.through().unwrap_or(0);
+    let mut calls: HashMap<String, Value> = HashMap::new();
+    loop {
+        let asked = json!({"bot": bot, "limit": 400, "min_node": after + 1, "oldest_first": true});
+        let page = client
+            .request("history_nodes", asked)
+            .await
+            .map_err(unread)?;
+        let mut nodes: Vec<i64> = (page["nodes"].as_array().into_iter().flatten())
+            .filter_map(|node| node["node"].as_i64())
+            .collect();
+        nodes.sort_unstable();
+        let Some(&last) = nodes.last() else {
+            break;
+        };
+        let (items, short) = crate::needs::items(client, bot, &nodes).await;
+        if short {
+            return Err(("margin_unread", format!("{bot}'s history was read short")));
+        }
+        for (node, item) in items {
+            let call = item["call_id"].as_str().unwrap_or("").to_owned();
+            match (item["type"].as_str(), item["role"].as_str()) {
+                (_, Some("user")) => {
+                    if let Some((closed, _)) = changed(&item) {
+                        margin.remove(&closed, Some((node, &format!("m{node}"))));
+                    }
+                }
+                (Some("function_call"), _) if item["name"] == TOOL => {
+                    let arguments = (item["arguments"].as_str())
+                        .and_then(|a| serde_json::from_str(a).ok())
+                        .unwrap_or(Value::Null);
+                    calls.insert(call, arguments);
+                }
+                (Some("function_call_output"), _) => {
+                    if let Some(arguments) = calls.remove(&call)
+                        && item["failed"] != true
+                        && !crate::reactions::refused(&item)
+                    {
+                        margin.apply(&call, &arguments, None, None);
+                    }
+                }
+                _ => {}
+            }
+        }
+        after = last;
+    }
+    match margin.refusal(arguments) {
+        Some((code, why)) => Err((code, why)),
+        None => Ok("In the margin.".into()),
+    }
 }
 
 /// What a note shows.
@@ -319,6 +424,49 @@ fn changed(item: &Value) -> Option<(String, Value)> {
     Some((id, arguments))
 }
 
+/// Why a margin holding the notes `held`, by id, refuses the call
+/// `arguments`, typed,
+/// and in words for the agent: a new note once it holds the most
+/// notes, or Markdown longer than a note's most lines, counted in the
+/// text given rather than the rows drawn, so a window's width changes
+/// nothing. Taking a note away, and a note that shows a file or a
+/// task's note, are never refused for their length. Notes kept from
+/// before a lower limit stay; only new ones wait for room.
+pub fn refusal(held: &[&str], arguments: &Value) -> Option<(&'static str, String)> {
+    if arguments["remove"] == true {
+        return None;
+    }
+    let id = arguments["id"].as_str().map(str::trim).unwrap_or("");
+    let shows = arguments["from"].is_string() || arguments["file"].is_string();
+    let lines = (arguments["markdown"].as_str())
+        .filter(|_| !shows)
+        .map_or(0, |markdown| markdown.lines().count());
+    if lines > most_lines() {
+        return Some((
+            "margin_note_too_long",
+            format!(
+                "the note is {lines} lines and a margin note holds at most {}: keep it to \
+                 what the person looks at more than once, or write the longer text to a \
+                 file and show that file in the note",
+                most_lines()
+            ),
+        ));
+    }
+    if held.len() >= most_notes() && !held.contains(&id) {
+        return Some((
+            "margin_full",
+            format!(
+                "the margin holds {} notes and takes at most {}: {}. Post one of those \
+                 ids again to change that note, or remove one that no longer holds",
+                held.len(),
+                most_notes(),
+                held.join(", ")
+            ),
+        ));
+    }
+    None
+}
+
 /// The bot and the note a `from` names, as `bot/id`.
 pub fn from(text: &str) -> Option<(String, String)> {
     let (bot, id) = text.trim().rsplit_once('/')?;
@@ -350,7 +498,7 @@ pub struct Reference {
     /// Taken away there since it was last posted.
     removed: bool,
     /// The notes its margin holds, oldest first, as far as read: one
-    /// put there past [`most_notes`] takes the oldest away.
+    /// put there past [`most_notes`] is refused, there and here.
     held: Vec<String>,
     /// Notes read as taken away, the latest few: put there again, they
     /// are new ones.
@@ -373,24 +521,23 @@ impl Reference {
             let Some((at, arguments)) = changed(item) else {
                 continue;
             };
-            // Taken away there, by the bot, the person or one put there
-            // past the most it holds, it stays here, and a new one starts
-            // untitled.
+            // Taken away there, by the bot or the person, it stays here,
+            // and a new one starts untitled.
             if arguments["remove"] == true {
                 self.held.retain(|held| *held != at);
                 self.removed |= at == id;
                 self.left(at);
                 continue;
             }
+            // Refused there, as its own margin refuses it: nothing changes.
+            let held: Vec<&str> = self.held.iter().map(String::as_str).collect();
+            if refusal(&held, &arguments).is_some() {
+                continue;
+            }
             if !self.held.contains(&at) {
                 if self.whole || self.left.contains(&at) {
                     self.left.retain(|left| *left != at);
                     self.held.push(at.clone());
-                    let over = self.held.len().saturating_sub(most_notes());
-                    for gone in self.held.drain(..over).collect::<Vec<_>>() {
-                        self.removed |= gone == id;
-                        self.left(gone);
-                    }
                 } else if self.held.len() < most_notes() {
                     // Maybe one from before what was read, so older than
                     // the rest: never taken for a new one that puts the
@@ -722,7 +869,7 @@ impl Margin {
             .as_str()
             .map(str::trim)
             .filter(|id| is_id(id))?;
-        if self.seen(call) {
+        if self.refusal(arguments).is_some() || self.seen(call) {
             return None;
         }
         let change = self.change(id, call, arguments, after, turn);
@@ -737,6 +884,18 @@ impl Margin {
     /// read: a different count, something new to show.
     pub fn posted(&self) -> u64 {
         self.posted
+    }
+
+    /// Why the margin as it stands refuses the call `arguments`: see
+    /// [`refusal`].
+    pub fn refusal(&self, arguments: &Value) -> Option<(&'static str, String)> {
+        let held: Vec<&str> = self
+            .kept
+            .notes
+            .iter()
+            .map(|note| note.id.as_str())
+            .collect();
+        refusal(&held, arguments)
     }
 
     fn change(
@@ -821,8 +980,6 @@ impl Margin {
                     turn: None,
                     opens: opens.flatten(),
                 });
-                let over = self.kept.notes.len().saturating_sub(most_notes());
-                self.kept.notes.drain(..over);
                 Some(Change::Posted(id.to_owned()))
             }
         }
@@ -1400,9 +1557,8 @@ mod tests {
         reference.read("flow", &[call(json!({"id": "flow", "title": "Again"}))]);
         let (title, body, _) = reference.shown().unwrap();
         assert_eq!((title, body), ("Again", Body::Markdown(String::new())));
-        // Read from the start of its history, put out by as many newer
-        // ones as its margin holds, it goes as there; one fewer, taken
-        // away or changed again, keeps it.
+        // Read from the start of its history, a new one past as many as
+        // its margin holds is refused there, so it stays here too.
         let mut reference = Reference {
             whole: true,
             ..Default::default()
@@ -1419,10 +1575,11 @@ mod tests {
         reference.read("flow", &items);
         assert!(!reference.removed());
         reference.read("flow", &[call(json!({"id": "last", "markdown": "-"}))]);
-        assert!(reference.removed());
-        reference.read("flow", &[call(json!({"id": "flow", "title": "New"}))]);
-        let (title, body, _) = reference.shown().unwrap();
-        assert_eq!((title, body), ("New", Body::Markdown(String::new())));
+        assert!(!reference.removed());
+        // Too long, as there, it changes nothing.
+        let long = vec!["-"; most_lines() + 1].join("\n");
+        reference.read("flow", &[call(json!({"id": "flow", "markdown": long}))]);
+        assert_eq!(reference.shown().unwrap().1, Body::Markdown("one".into()));
         // Read from partway, notes it did not see put there may be older
         // ones changed: one new one puts out one of those, not this.
         let mut reference = Reference::default();
@@ -1607,8 +1764,8 @@ mod tests {
     }
 
     #[test]
-    fn margin_notes_sets_the_most_a_margin_holds_and_a_lower_one_trims() {
-        set_most_notes(3);
+    fn a_note_past_the_most_is_refused_and_says_what_it_can_change() {
+        set_limits(3, 12);
         let mut margin = margin();
         for n in 0..5 {
             let post = json!({"id": format!("n{n}"), "markdown": "x"});
@@ -1617,32 +1774,89 @@ mod tests {
         let ids = |margin: &Margin| -> Vec<String> {
             margin.notes().iter().map(|note| note.id.clone()).collect()
         };
-        assert_eq!(ids(&margin), ["n2", "n3", "n4"]);
-        // Set lower, the next note leaves only as many as it says.
-        set_most_notes(2);
-        let post = json!({"id": "n5", "markdown": "x"});
-        margin.apply("c5", &post, None, None);
-        assert_eq!(ids(&margin), ["n4", "n5"]);
+        // The first three stay; the rest were refused, not put over them.
+        assert_eq!(ids(&margin), ["n0", "n1", "n2"]);
+        // A note posted without a title goes by its id.
+        assert_eq!(margin.notes()[0].title, "n0");
+        let (code, why) = margin
+            .refusal(&json!({"id": "n3", "markdown": "x"}))
+            .unwrap();
+        assert_eq!(code, "margin_full");
+        assert_eq!(
+            why,
+            "the margin holds 3 notes and takes at most 3: n0, n1, n2. Post one of those ids \
+             again to change that note, or remove one that no longer holds"
+        );
+        // One already there changes, and taking one away makes room.
+        assert!(
+            margin
+                .refusal(&json!({"id": "n1", "markdown": "y"}))
+                .is_none()
+        );
+        margin.apply("c9", &json!({"id": "n1", "remove": true}), None, None);
+        margin.apply("c10", &json!({"id": "n3", "markdown": "x"}), None, None);
+        assert_eq!(ids(&margin), ["n0", "n2", "n3"]);
+        // Set lower, the notes there stay; only a new one waits.
+        set_limits(2, 12);
+        assert_eq!(ids(&margin), ["n0", "n2", "n3"]);
+        let (_, why) = margin.refusal(&json!({"id": "n4"})).unwrap();
+        assert!(
+            why.starts_with("the margin holds 3 notes and takes at most 2: "),
+            "{why}"
+        );
         // Never fewer than one.
-        set_most_notes(0);
-        assert_eq!(most_notes(), 1);
+        set_limits(0, 0);
+        assert_eq!((most_notes(), most_lines()), (1, 1));
     }
 
     #[test]
-    fn the_oldest_note_goes_past_the_most() {
+    fn a_note_is_as_long_as_its_text_says_not_as_it_is_drawn() {
+        set_limits(6, 3);
         let mut margin = margin();
-        for n in 0..=most_notes() {
-            let post = json!({"id": format!("n{n}"), "markdown": "x"});
-            margin.apply(&format!("c{n}"), &post, None, None);
+        let lines = |n: usize| vec!["a line long enough to wrap in a narrow margin"; n].join("\n");
+        assert!(
+            margin
+                .refusal(&json!({"id": "a", "markdown": lines(3)}))
+                .is_none()
+        );
+        let (code, why) = margin
+            .refusal(&json!({"id": "a", "markdown": lines(4)}))
+            .unwrap();
+        assert_eq!(code, "margin_note_too_long");
+        assert_eq!(
+            why,
+            "the note is 4 lines and a margin note holds at most 3: keep it to what the \
+             person looks at more than once, or write the longer text to a file and show \
+             that file in the note"
+        );
+        // Refused, a long note changes nothing there, a new one or an old one.
+        margin.apply("c1", &json!({"id": "a", "markdown": lines(4)}), None, None);
+        assert!(margin.notes().is_empty());
+        margin.apply("c2", &json!({"id": "a", "markdown": "short"}), None, None);
+        margin.apply("c3", &json!({"id": "a", "markdown": lines(4)}), None, None);
+        assert_eq!(margin.notes()[0].body, Body::Markdown("short".into()));
+        // A file or a task's note shows as long as it is; a removal is never refused.
+        for call in [
+            json!({"id": "b", "file": "src/main.rs"}),
+            json!({"id": "c", "from": "calc.add/flow"}),
+            json!({"id": "a", "remove": true}),
+        ] {
+            assert!(margin.refusal(&call).is_none(), "{call}");
         }
-        assert_eq!(margin.notes().len(), most_notes());
-        assert_eq!(margin.notes()[0].id, "n1");
-        // A note posted without a title goes by its id.
-        assert_eq!(margin.notes()[0].title, "n1");
+    }
+
+    #[test]
+    fn the_margin_is_answered_by_sonny_and_says_its_limits_are_told() {
+        let tool = tool();
+        assert_eq!(tool["answered_by"], crate::served::TAG);
+        assert!(tool.get("result").is_none());
+        assert!(DESCRIPTION.contains("refused"));
     }
 
     #[test]
     fn every_note_stays_drawn_however_long_they_all_are() {
+        // As long as the person lets them be, or kept from before a limit.
+        set_limits(agent_client::config::MARGIN_NOTES, 10_000);
         let mut margin = margin();
         let long = "a line\n\n".repeat(700);
         for n in 0..most_notes() {

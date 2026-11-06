@@ -759,6 +759,16 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                 .map(|said| said.to_string())
                 .map_err(|e| ("goal_refused", e))
         }
+        name if name == crate::margin::TOOL => {
+            let (store, socket) = crate::daemon_paths(None, None).map_err(|e| ("no_store", e))?;
+            let (client, _events) = Client::connect(&socket)
+                .await
+                .map_err(|e| ("margin_unread", e.to_string()))?;
+            // The margin is the conversation's whose turn called it, a side
+            // chat's its own.
+            let bot = std::env::var("AGENT_CALL_BOT").unwrap_or(caller);
+            crate::margin::answer(&client, &store, &bot, arguments).await
+        }
         MEMORY if arguments["said"] == true => crate::said::read(arguments["since_ms"].as_i64())
             .await
             .map(|said| said.to_string())
@@ -1761,7 +1771,7 @@ pub fn stop() {
 
 /// The error codes `sonny tool` answers with, as static names.
 fn code(said: &str) -> &'static str {
-    const CODES: [&str; 16] = [
+    const CODES: [&str; 19] = [
         "not_in_folder",
         "no_caller",
         "invalid_arguments",
@@ -1776,6 +1786,9 @@ fn code(said: &str) -> &'static str {
         "subscription_refused",
         "automation_refused",
         "memory_refused",
+        "margin_full",
+        "margin_note_too_long",
+        "margin_unread",
         "unknown_tool",
         "tool_failed",
     ];
@@ -2424,6 +2437,7 @@ mod tests {
         assert_eq!(parts.as_array().unwrap().len(), 4);
         assert_eq!(code("task_not_started"), "task_not_started");
         assert_eq!(code("tasks_exist"), "tasks_exist");
+        assert_eq!(code("margin_full"), "margin_full");
         assert_eq!(code("Anything Else"), "tool_failed");
     }
 }
