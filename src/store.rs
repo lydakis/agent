@@ -82,7 +82,7 @@ const READER_CACHE_KIB: usize = 2048;
 
 /// The reader connections, on threads of their own: the first opens with
 /// the store and stays; another opens when a read is queued with no reader
-/// waiting for it, up to `most`, and closes after `idle` without a read.
+/// free for it, up to `most`, and closes after `idle` without a read.
 struct Pool {
     path: std::path::PathBuf,
     most: usize,
@@ -94,9 +94,11 @@ struct Pool {
 }
 struct Readers {
     jobs: std::collections::VecDeque<(ReadJob, tokio::sync::OwnedSemaphorePermit)>,
-    /// Readers open, and of them those waiting for a read.
+    /// Readers open, and of them those free for a read: not running one,
+    /// including any still opening, which comes to take the read that
+    /// opened it.
     open: usize,
-    waiting: usize,
+    free: usize,
     /// Changes whenever `open` does, so each reader resizes its cache share.
     generation: u64,
     /// The cache shares the open readers hold, together.
@@ -107,13 +109,14 @@ impl Pool {
     fn state(&self) -> std::sync::MutexGuard<'_, Readers> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
-    /// Queue a read; open a reader for it if none is waiting for it.
+    /// Queue a read; open a reader for it if none is free for it.
     fn push(self: &std::sync::Arc<Self>, job: ReadJob, place: tokio::sync::OwnedSemaphorePermit) {
         let mut state = self.state();
         state.jobs.push_back((job, place));
-        let unclaimed = state.jobs.len() > state.waiting;
+        let unclaimed = state.jobs.len() > state.free;
         if unclaimed && state.open < self.most {
             state.open += 1;
+            state.free += 1;
             state.generation += 1;
             drop(state);
             // The idle readers give up part of their share now.
@@ -142,6 +145,7 @@ impl Pool {
     fn gone(&self) {
         let mut state = self.state();
         state.open -= 1;
+        state.free -= 1;
         state.generation += 1;
         drop(state);
         self.wake.notify_all();
@@ -162,13 +166,18 @@ impl Pool {
         let mut sized = None;
         let mut mine = 0;
         let mut idle_until = None;
+        let mut ran = false;
         loop {
             let (job, generation, kib) = {
                 let mut state = self.state();
+                if ran {
+                    state.free += 1;
+                }
                 loop {
                     let kib = READER_CACHE_KIB / state.open.max(1);
                     if let Some((job, place)) = state.jobs.pop_front() {
                         drop(place);
+                        state.free -= 1;
                         idle_until = None;
                         break (job, state.generation, kib);
                     }
@@ -178,6 +187,7 @@ impl Pool {
                     {
                         if !first {
                             state.open -= 1;
+                            state.free -= 1;
                             state.generation += 1;
                             state.cache_kib -= mine;
                             drop(state);
@@ -191,7 +201,6 @@ impl Pool {
                         self.resize(&db, &mut state, &mut mine, kib);
                         sized = Some(state.generation);
                     }
-                    state.waiting += 1;
                     state = if first {
                         self.wake.wait(state).unwrap_or_else(|e| e.into_inner())
                     } else {
@@ -203,7 +212,6 @@ impl Pool {
                             .unwrap_or_else(|e| e.into_inner())
                             .0
                     };
-                    state.waiting -= 1;
                 }
             };
             if sized != Some(generation) {
@@ -216,6 +224,7 @@ impl Pool {
                 sized = Some(generation);
             }
             job(&db);
+            ran = true;
         }
     }
     fn close(&self) {
@@ -237,7 +246,7 @@ impl ReadQueue {
             state: std::sync::Mutex::new(Readers {
                 jobs: std::collections::VecDeque::new(),
                 open: 1,
-                waiting: 0,
+                free: 0,
                 generation: 0,
                 cache_kib: 0,
                 closed: false,
@@ -792,7 +801,7 @@ impl Store {
             state: std::sync::Mutex::new(Readers {
                 jobs: std::collections::VecDeque::new(),
                 open: 1,
-                waiting: 0,
+                free: 1,
                 generation: 0,
                 cache_kib: 0,
                 closed: false,
@@ -1619,6 +1628,22 @@ mod tests {
         assert_eq!(share(&store).await, -(READER_CACHE_KIB as i64));
     }
 
+    /// Until every open reader is back from its last read: a read is
+    /// answered just before its reader is free for the next.
+    async fn readers_back(store: &Store) {
+        let back = || {
+            let state = store.reader.0.state();
+            state.free == state.open
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while !back() {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the readers come back");
+    }
+
     #[tokio::test]
     async fn the_readers_hold_one_cache_budget_once_their_reads_end() {
         let path = scratch_path("reader-shares");
@@ -1628,6 +1653,7 @@ mod tests {
         let held = |store: &Store| store.stats()["readers"]["cache_kib"].as_u64().unwrap();
         let budget = READER_CACHE_KIB as u64;
         store.read("warm", |_| Ok(())).await.unwrap();
+        readers_back(&store).await;
         assert_eq!(held(&store), budget);
         // A long read on the first reader, sized while it was alone; a
         // second read opens a second reader with half the budget.
