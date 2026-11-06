@@ -3326,21 +3326,52 @@ mod tests {
         assert!(shown.iter().any(|l| l.contains("+new")), "{shown:?}");
     }
 
-    /// How long `draw` takes on `unit` repeated to `n` bytes, and on twice
-    /// that: work in proportion to the text takes about twice as long, where
-    /// work as its square takes four times.
-    fn scales(
-        unit: &str,
-        n: usize,
-        draw: impl Fn(&str),
-    ) -> (std::time::Duration, std::time::Duration) {
-        let timed = |len: usize| {
-            let text = unit.repeat(len / unit.len());
+    /// Whether `draw` on `unit` repeated to twice `n` bytes takes about twice
+    /// as long as on `n`, not four times, as work as the text's square would:
+    /// under three times and 50 ms more. Each size is timed again, the two in
+    /// turn, up to five times while the fastest of each says otherwise, so a
+    /// busy machine pausing the test once is not read as the work growing.
+    #[track_caller]
+    fn assert_linear(unit: &str, n: usize, draw: impl Fn(&str)) {
+        let (small, large) = (unit.repeat(n / unit.len()), unit.repeat(2 * n / unit.len()));
+        let timed = |text: &str| {
             let started = std::time::Instant::now();
-            draw(&text);
+            draw(text);
             started.elapsed()
         };
-        (timed(n), timed(2 * n))
+        let (mut once, mut twice) = (std::time::Duration::MAX, std::time::Duration::MAX);
+        for _ in 0..5 {
+            once = once.min(timed(&small));
+            twice = twice.min(timed(&large));
+            if twice < once * 3 + std::time::Duration::from_millis(50) {
+                return;
+            }
+        }
+        panic!("{unit}: {once:?} then {twice:?}");
+    }
+
+    #[test]
+    #[should_panic(expected = "then")]
+    fn work_as_the_square_of_the_text_is_caught_however_often_it_is_timed() {
+        // 80 ms, then 320 ms: four times, against under three and 50 ms more.
+        assert_linear("ab", 1_000, |text| {
+            let times = text.len() as u32 / 1_000;
+            std::thread::sleep(std::time::Duration::from_millis(80) * times * times);
+        });
+    }
+
+    #[test]
+    fn a_pause_while_timed_once_is_not_read_as_the_work_growing() {
+        // Work in proportion to the text, the machine busy for 300 ms the
+        // first time the longer text is drawn.
+        let paused = std::cell::Cell::new(false);
+        assert_linear("ab", 1_000, |text| {
+            let times = text.len() as u32 / 1_000;
+            if times == 2 && !paused.replace(true) {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10) * times);
+        });
     }
 
     #[test]
@@ -3351,13 +3382,9 @@ mod tests {
             "[a", "\\(", "`", "**a", "~~", "*a ", "_a ", "$a", "<b>", "<kbd>", "<!--", "<a x",
             "<del>", "<b x", "![a](",
         ] {
-            let (once, twice) = scales(unit, 1 << 17, |text| {
+            assert_linear(unit, 1 << 17, |text| {
                 inline(text, Style::new());
             });
-            assert!(
-                twice < once * 3 + std::time::Duration::from_millis(50),
-                "{unit}: {once:?} then {twice:?}"
-            );
         }
         // What does close still reads as it did.
         let spans = inline(
@@ -3370,7 +3397,7 @@ mod tests {
 
     #[test]
     fn a_long_word_is_wrapped_in_time_as_its_length() {
-        let (once, twice) = scales("abcdefgh", 1 << 18, |text| {
+        assert_linear("abcdefgh", 1 << 18, |text| {
             let rows = wrap(
                 Line::from(text.to_owned()),
                 80,
@@ -3382,10 +3409,6 @@ mod tests {
                 .collect();
             assert_eq!(kept, text);
         });
-        assert!(
-            twice < once * 3 + std::time::Duration::from_millis(50),
-            "{once:?} then {twice:?}"
-        );
         // Joined emoji are measured alike when cut and after, so no row is
         // wider than the room.
         let family = "👨\u{200d}👩\u{200d}👧\u{200d}👦".repeat(12);
