@@ -1267,8 +1267,32 @@ where
         let nudge = nudge.clone();
         let ran = run(call.clone());
         let base = json!({"bot": call["bot"], "turn": call["turn"], "call_id": call["call_id"]});
+        let take = base.clone();
         let job = tokio::spawn(async move {
-            let answer = ran.await;
+            // Taken before it runs, so it runs at most once: a call another
+            // host took, or this one before it restarted, may have done its
+            // work already, and is answered that its outcome is unknown.
+            let taken = client.request("take_call", take).await;
+            let answer = match taken {
+                Ok(_) => ran.await,
+                Err(error) if error.code == "call_taken" => Err((
+                    "tool_outcome_unknown",
+                    "this call may have started before Sonny's tool host restarted or was \
+                     upgraded, and was not run again; whether it did its work is not known"
+                        .to_string(),
+                )),
+                // One that wants no answer is let go; one not known to be
+                // taken is looked at again at the next sweep.
+                Err(error) => {
+                    let mut calls = serving.lock().unwrap();
+                    if wants_none(&error.code) {
+                        calls.retire(&key);
+                    } else if matches!(calls.jobs.get(&key), Some(Job::Running { .. })) {
+                        calls.jobs.remove(&key);
+                    }
+                    return;
+                }
+            };
             let mut asked = json!({"bot": call["bot"], "turn": call["turn"],
                 "call_id": call["call_id"]});
             match answer {
@@ -1769,8 +1793,8 @@ fn kill(group: u32) {
 }
 
 /// Stop every call still being answered, as a tool host that gives way to
-/// another build's does: that one answers them again, and two of a call
-/// would run at once, as two setups in one task's folder.
+/// another build's does, so none goes on behind it. Each was taken, so
+/// that host answers that its outcome is unknown and never runs it again.
 pub fn stop() {
     for group in GROUPS.lock().unwrap().take().unwrap_or_default() {
         kill(group);
@@ -1858,6 +1882,60 @@ mod tests {
         assert_eq!(handed.load(Ordering::SeqCst), 3);
         assert!(serving.lock().unwrap().jobs.is_empty());
         assert_eq!(effects.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_call_taken_before_a_restart_is_answered_unknown_and_never_run_again() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        // The daemon lists two calls: c1 a host took before it restarted,
+        // c2 none took. It records what each is answered.
+        let answers = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let answered = answers.clone();
+        let client = crate::tests::daemon_answering(move |asked| match asked["op"].as_str() {
+            Some("tool_calls") if answered.lock().unwrap().len() < 2 => json!({"calls": [
+                {"bot": "b", "turn": 1, "call_id": "c1", "name": EXEC},
+                {"bot": "b", "turn": 1, "call_id": "c2", "name": EXEC}],
+                "next_after": null}),
+            Some("tool_calls") => json!({"calls": [], "next_after": null}),
+            Some("take_call") if asked["call_id"] == "c1" => {
+                json!({"error": "call_taken", "detail": "taken"})
+            }
+            Some("tool_result") => {
+                answered.lock().unwrap().push(asked.clone());
+                json!({})
+            }
+            _ => json!({}),
+        })
+        .await;
+        let serving: Serving = Default::default();
+        let effects = Arc::new(Mutex::new(Vec::<String>::new()));
+        let ran = effects.clone();
+        let run = move |call: Value| {
+            let ran = ran.clone();
+            async move {
+                ran.lock().unwrap().push(str_of(&call["call_id"]));
+                Ok(json!("written"))
+            }
+        };
+        let nudge = Arc::new(Notify::new());
+        let swept = Arc::new(AtomicUsize::new(0));
+        while answers.lock().unwrap().len() < 2 && swept.fetch_add(1, Ordering::SeqCst) < 50 {
+            sweep(&client, &serving, &nudge, run.clone()).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // c2 ran once; c1 never ran, and is answered that its outcome is
+        // unknown.
+        assert_eq!(*effects.lock().unwrap(), ["c2"]);
+        let answers = answers.lock().unwrap();
+        let of = |id: &str| {
+            answers
+                .iter()
+                .find(|a| a["call_id"] == id)
+                .cloned()
+                .unwrap()
+        };
+        assert_eq!(of("c1")["error"]["code"], "tool_outcome_unknown");
+        assert_eq!(of("c2")["output"], "written");
     }
 
     #[tokio::test]

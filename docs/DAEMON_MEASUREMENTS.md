@@ -7213,3 +7213,42 @@ the gate's 15% warning.
 | lifecycle | CPU, s | 1.185 | 1.135 | -4.2% |
 | lifecycle | p95 turn, ms | 587.629 | 589.372 | +0.3% |
 | lifecycle | peak RSS, MiB | 27.756 | 27.377 | -1.4% |
+## Taken calls
+
+`take_call` (protocol 49, schema 79) records when a client takes a
+client-answered call, before it runs it, so no call runs twice. On the
+daemon it is one keyed update of the call's `answers` row through the
+unique `(turn, call_id)` index, so its cost doesn't grow with the number of
+bots or waiting calls. Sonny's tool host adds one take, and so one commit,
+to each call it runs, on top of the about three that call already costs
+(start, answer, result). The daemon's own tools don't change. The upgrade
+marks the calls an older host left unanswered with one `UPDATE` in the
+migration, and nothing later.
+
+Measured directly on a file-backed store in a release build: 2,000 takes
+in 316 ms (0.16 ms and one commit each, about 6,000 a second on one
+writer), and a full `tool_calls` listing of 2,000 waiting calls, `taken_ms`
+included, in 6 ms.
+
+The Perf workflow's matched screen of this change against its base
+(`bench.perf_gate`, GitHub runner): store work per turn is the same. The
+gate's one warning, the lookout's note p95 at 100x10, is on a path that
+neither sends nor reads a take; the same measure at 10x100 moved +0.7%.
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 42.371 | 40.038 | -5.5% |
+| admission | burst submit p99, ms | 6.169 | 6.395 | +3.7% |
+| completion | release to terminal p99, ms | 14.419 | 14.132 | -2.0% |
+| footprint | idle RSS, MiB | 20.59 | 20.715 | +0.6% |
+| footprint | per idle bot, KiB | 1.406 | 1.492 | +6.1% |
+| footprint | RSS after a turn each, MiB | 29.342 | 30.562 | +4.2% |
+| footprint | CPU per turn, ms | 1.307 | 1.289 | -1.4% |
+| sonny | lookout CPU per 1k deltas at 10x100, ms | 11.815 | 11.0 | -6.9% |
+| sonny | lookout note p95 at 10x100, ms | 2655.5 | 2675.0 | +0.7% |
+| sonny | lookout note p95 at 100x10, ms | 2457.0 | 2920.5 | +18.9% |
+| sonny | quiet window CPU, ms/s | 4.95 | 4.31 | -12.9% |
+| sonny | sky replay CPU per 1k lines, ms | 13.73 | 13.645 | -0.6% |
+| lifecycle | CPU, s | 1.235 | 1.185 | -4.0% |
+| lifecycle | p95 turn, ms | 584.283 | 579.215 | -0.9% |
+| lifecycle | peak RSS, MiB | 27.512 | 27.596 | +0.3% |
