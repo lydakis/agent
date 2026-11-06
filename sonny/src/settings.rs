@@ -17,6 +17,8 @@ pub struct Settings {
     pub margin_opens: agent_client::config::MarginOpens,
     /// Where a click on an agent's name takes the person.
     pub agent_opens: agent_client::config::AgentOpens,
+    /// The most notes a margin holds.
+    pub margin_notes: u64,
 }
 
 impl Default for Settings {
@@ -38,6 +40,7 @@ impl Settings {
             text_width: sonny.text_width,
             margin_opens: sonny.margin_opens,
             agent_opens: sonny.agent_opens,
+            margin_notes: sonny.margin_notes,
         }
     }
 
