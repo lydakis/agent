@@ -1836,8 +1836,10 @@ fn claude_model(model: &str) -> &str {
 /// and `?` wildcards, as OpenCode sets a model's `limit.context` and
 /// Codex its `model_context_window`: for a model a provider does not list,
 /// or lists wrong, or to hold a bot under its model's full window. The
-/// most specific pattern a path matches wins: the one with the most
-/// characters that are not wildcards, then the first by name.
+/// most specific pattern a path matches wins: an exact path over every
+/// wildcard (a `*` can match nothing, so `a/*b` counts as many literal
+/// characters as `a/b`), then the one with the most characters that are
+/// not wildcards, then the first by name.
 #[derive(Debug, Default)]
 pub struct Windows(Vec<(String, u64)>);
 
@@ -1870,8 +1872,12 @@ impl Windows {
             }
             set.push((pattern, tokens));
         }
-        let literal = |pattern: &str| pattern.chars().filter(|c| !matches!(c, '*' | '?')).count();
-        set.sort_by(|(a, _), (b, _)| literal(b).cmp(&literal(a)).then_with(|| a.cmp(b)));
+        let wild = |c: char| matches!(c, '*' | '?');
+        let rank = |pattern: &str| {
+            let literal = pattern.chars().filter(|c| !wild(*c)).count();
+            (pattern.chars().any(wild), std::cmp::Reverse(literal))
+        };
+        set.sort_by(|(a, _), (b, _)| rank(a).cmp(&rank(b)).then_with(|| a.cmp(b)));
         Ok(Self(set))
     }
     /// The window set for `path`, `PROVIDER/MODEL`.
@@ -2245,6 +2251,19 @@ mod tests {
             );
         }
         assert!(Windows::parse(["a/b=2000", "a/b=3000"]).is_err());
+    }
+
+    #[test]
+    fn an_exact_window_beats_a_wildcard_that_matches_nothing() {
+        // `provider/*model` has as many literal characters as the exact
+        // path and sorts first by name; its `*` matches nothing here.
+        let windows = Windows::parse(["provider/*model=1000000", "provider/model=200000"]).unwrap();
+        assert_eq!(windows.get("provider/model"), Some(200_000));
+        assert_eq!(windows.get("provider/big-model"), Some(1_000_000));
+        let windows = Windows::parse(["a/b?=3000", "a/b=2000", "a/*=4000"]).unwrap();
+        assert_eq!(windows.get("a/b"), Some(2_000));
+        assert_eq!(windows.get("a/bc"), Some(3_000));
+        assert_eq!(windows.get("a/c"), Some(4_000));
     }
 
     #[test]
