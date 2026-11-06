@@ -399,6 +399,95 @@ class TriggerFireTests(ModelFixture):
         self.assertIn('bot_exists', taken['last']['detail'])
         self.assertEqual(len(self.turns('p.review')), 3)
 
+    def test_a_fresh_trigger_sends_each_run_to_a_new_agent(self):
+        self.agent('run', *self.common, '--new', '--bot', 'p.lead', 'hello')
+        lead = self.bot_id('p.lead')
+        work = self.path / 'work'
+        work.mkdir()
+        (work / 'AGENTS.md').write_text('Synthetic project rule.\n')
+        target = ['--start', 'p.review', '--model', 'openai/synthetic-model', '--by', 'p.lead', '--by-id', str(lead),
+                  '--fresh', '1']
+        extra = ['--dir', str(work)]
+        env = {'AGENT_PROVIDER': f'openai=responses,{self.url}'}
+        fire = lambda generation='g1': self.fire('p.review', 'Review the newest commit.', target=target,
+                                                 extra=extra, app=self.bundle(), env=env, generation=generation)
+        first = fire()
+        self.assertEqual(first['last']['outcome'], 'sent', first)
+        self.assertTrue(first['last']['started'])
+        one = self.bot_id('p.review-1')
+        self.assertEqual((first['run']['running']['bot'], first['run']['running']['id'], first['bot_id']),
+                         ('p.review-1', one, one))
+        record = next(b for b in json.loads(self.agent('ls', '--store', str(self.store)).stdout)
+                      if b['name'] == 'p.review-1')
+        # Made in the folder `add` ran in, under the agent that added it.
+        self.assertEqual((record['workspace'], record['created_by']), (str(work), 'p.lead'))
+        # With Sonny's tools, as an agent Sonny opens has them.
+        connection = Connection(str(self.store) + '.sock')
+        try:
+            made = connection.request('inspect', bot='p.review-1')['result']
+            self.assertIn('memory', [t['name'] for t in made.get('declared', [])])
+            # Gated and sandboxed as `sonny --new` makes one (#404).
+            self.assertEqual(made['settings']['sandbox'], 'workspace-write', made['settings'])
+            self.assertEqual([g['tag'] for g in made['gates']], ['auto'], made['gates'])
+        finally:
+            connection.close()
+        self.assertRegex(self.turns('p.review-1')[-1]['prompt_preview'],
+                         r'^\[automation p\.review · run 1 · ')
+        # Memory changed from a run's shell is the automation's, as through
+        # the memory tool; nobody's shell can claim it by its environment.
+        def cleanup_by(bot, bot_id):
+            shell = {**clean_env(), 'HOME': str(self.home), 'AGENT_STORE': str(self.store),
+                     'AGENT_BOT': bot, 'AGENT_BOT_ID': str(bot_id), 'AGENT_AUTOMATION': 'claimed'}
+            for verb in ('start', 'finish'):
+                done = subprocess.run([str(self.bundle()), 'memory', 'cleanup', verb], env=shell, cwd=work,
+                                      capture_output=True, text=True, timeout=60)
+                self.assertEqual(done.returncode, 0, done.stderr)
+                if verb == 'start':
+                    by = json.loads((self.home / '.agents/memory/.cleanup').read_text())['by']
+            return by
+        by = cleanup_by('p.review-1', one)
+        self.assertTrue(by.endswith('#automation:p.review'), by)
+        self.assertTrue(cleanup_by('p.lead', lead).endswith(f'#{lead}'))
+        self.settle('p.review-1')
+        # The next run is a new agent whose conversation holds its own message
+        # alone; the first, which finished, is kept as the latest that did.
+        again = fire()
+        self.assertEqual((again['last']['outcome'], again['sent']), ('sent', 2), again)
+        self.assertEqual(again['run']['running']['bot'], 'p.review-2')
+        self.assertEqual(again['run']['finished']['bot'], 'p.review-1')
+        self.assertEqual(again['run']['finished']['ended']['status'], 'completed')
+        self.settle('p.review-2')
+        self.assertEqual(len(self.turns('p.review-2')), 1)
+        self.assertEqual(len(self.turns('p.review-1')), 1)
+        # A run cut short after the daemon made its agent and took its message,
+        # before either was kept, is taken again: the same agent, and the
+        # message the daemon took once.
+        third = fire()
+        self.settle('p.review-3')
+        last = self.home / '.agent/automations/p.review.json'
+        kept = json.loads(last.read_text())
+        kept['run']['running'].update(id=None, handle=None)
+        last.write_text(json.dumps(kept))
+        retaken = fire()
+        self.assertEqual(retaken['run']['running']['id'], third['run']['running']['id'], retaken)
+        self.assertEqual(len(self.turns('p.review-3')), 1)
+        # Run 3 finished too: run 2's agent, which it replaced, is gone.
+        fourth = fire()
+        self.assertEqual(fourth['run']['finished']['bot'], 'p.review-3', fourth)
+        self.settle('p.review-4')
+        names = [b['name'] for b in json.loads(self.agent('ls', '--store', str(self.store)).stdout)]
+        self.assertNotIn('p.review-2', names)
+        self.assertIn('p.review-3', names)
+        # A trigger added again under the name numbers its runs from 1, and
+        # passes over the names its earlier runs' agents still hold.
+        for n in (1, 2):
+            fire('g2')
+            self.settle(f'p.review-{n}')
+        taken = fire('g2')
+        self.assertEqual(taken['last']['outcome'], 'sent', taken)
+        self.assertEqual(taken['run']['running']['bot'], 'p.review-5', taken)
+        self.assertEqual(len(self.turns('p.review-4')), 1, 'an agent it did not make is not messaged')
+
     def test_an_agent_made_in_full_access_starts_ungated(self):
         # `[sonny] default_permissions = "full"`: no sandbox and no one
         # approving, so the agent is made with no gate, which `create`

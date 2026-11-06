@@ -46,18 +46,14 @@ impl Slot {
 
 /// The order things give way: each step takes that item to its next
 /// form, and a step for an item absent or at its last form is passed.
-const LADDER: [Slot; 17] = [
+const LADDER: [Slot; 13] = [
     Slot::Folded,
-    Slot::Background,
     Slot::Access,
     Slot::Place,
     Slot::RoomyContext,
-    Slot::Working,
     Slot::Place,
     Slot::Notes,
     Slot::Background,
-    Slot::Failed,
-    Slot::Needs,
     Slot::LowContext,
     Slot::Place,
     Slot::Profile,
@@ -90,22 +86,13 @@ impl Item {
 }
 
 /// A count as the state table writes it: its mark in its hue, then the
-/// number and the word; the number alone when short, and gone last when
-/// `goes`.
-pub fn count(
-    mark: &'static str,
-    color: Color,
-    n: usize,
-    word: &str,
-    goes: bool,
-) -> Vec<Vec<Span<'static>>> {
-    let mut forms = vec![
-        vec![
-            Span::raw(mark).fg(color),
-            Span::raw(format!(" {n} {word}")).dim(),
-        ],
-        vec![Span::raw(mark).fg(color), Span::raw(format!(" {n}")).dim()],
-    ];
+/// number, no word (the marks differ, so they read without colour);
+/// gone last when `goes`.
+pub fn count(mark: &'static str, color: Color, n: usize, goes: bool) -> Vec<Vec<Span<'static>>> {
+    let mut forms = vec![vec![
+        Span::raw(mark).fg(color),
+        Span::raw(format!(" {n}")).dim(),
+    ]];
     if goes {
         forms.push(Vec::new());
     }
@@ -275,14 +262,10 @@ mod tests {
                     "",
                 ],
             ),
-            Item::new(
-                Slot::Needs,
-                count("?", Color::Yellow, 1, "needs you", false),
-            )
-            .opens("status"),
-            Item::new(Slot::Failed, count("✗", Color::Red, 1, "failed", false)).opens("background"),
-            Item::new(Slot::Working, count("●", Color::Cyan, 2, "working", true)).opens("status"),
-            word(Slot::Background, &["↻ 3 in background", "↻ 3", ""]),
+            Item::new(Slot::Needs, count("?", Color::Yellow, 1, false)).opens("status"),
+            Item::new(Slot::Failed, count("✗", Color::Red, 1, false)).opens("background"),
+            Item::new(Slot::Working, count("●", Color::Cyan, 2, true)).opens("status"),
+            word(Slot::Background, &["↻ 3", ""]),
             word(Slot::Notes, &["✎ 2", ""]),
             Item::new(
                 Slot::LowContext,
@@ -301,13 +284,14 @@ mod tests {
     #[test]
     fn a_busy_row_gives_way_by_the_ladder_and_keeps_what_needs_you() {
         let rows: Vec<String> = [100, 80, 60, 44].map(|w| row(busy(), w)).into();
+        // The counts are their marks and numbers alone, at every width.
         assert_eq!(
             rows[0].trim(),
-            "⏵⏵ GPT 6.1 Sol high · ~/D/agent on main       ? 1 needs you  ✗ 1 failed  ● 2  ↻ 3  ✎ 2  37% left"
+            "⏵⏵ full access · GPT 6.1 Sol high · ~/Developer/agent on main  ? 1  ✗ 1  ● 2  ↻ 3  ✎ 2  37% left"
         );
         assert_eq!(
             rows[1].trim(),
-            "⏵⏵ GPT 6.1 Sol high · agent on main        ? 1 needs you  ✗ 1  ● 2  37% left"
+            "⏵⏵ GPT 6.1 Sol high · ~/D/agent on main    ? 1  ✗ 1  ● 2  ↻ 3  ✎ 2  37% left"
         );
         assert_eq!(
             rows[2].trim(),
@@ -369,8 +353,8 @@ mod tests {
         assert_eq!(
             got,
             [
-                ("? 1 needs you".into(), "status"),
-                ("✗ 1 failed".into(), "background"),
+                ("? 1".into(), "status"),
+                ("✗ 1".into(), "background"),
                 ("● 2".into(), "status"),
             ]
         );
