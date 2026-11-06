@@ -4171,6 +4171,9 @@ impl Turn {
                             ControlFlow::Continue(outcome) => outcome,
                             ControlFlow::Break(stop) => return Ok(Some(stop)),
                         },
+                        Ran::Done(Err(error)) if error.code == "terminal_not_running" => {
+                            failure(self.no_terminal(handle, error).await?)
+                        }
                         Ran::Done(Err(error)) => failure(error),
                         Ran::Lifted(_) => unreachable!("only a command moves to the background"),
                     }
@@ -4193,6 +4196,9 @@ impl Turn {
                         Ran::Done(Ok(outcome)) => {
                             seen = Self::seen(handle, &outcome);
                             outcome
+                        }
+                        Ran::Done(Err(error)) if error.code == "terminal_not_running" => {
+                            failure(self.no_terminal(handle, error).await?)
                         }
                         Ran::Done(Err(error)) => failure(error),
                         Ran::Lifted(_) => unreachable!("only a command moves to the background"),
@@ -6125,6 +6131,26 @@ fn completion_text(items: &[Bytes]) -> String {
         }
     }
     text
+}
+
+impl Turn {
+    /// Why `write_stdin` found no terminal `handle`: `error`, unless the
+    /// handle is a command of this bot's that runs without a terminal.
+    async fn no_terminal(&self, handle: i64, error: Error) -> Result<Error> {
+        let bot = self.bot.clone();
+        let runs = (self.store)
+            .op("runs_for", move |db| db.runs_for(&bot, handle))
+            .await?;
+        Ok(match runs {
+            true => Error::with(
+                "not_a_terminal",
+                format!(
+                    "proc:{handle} is a background command, not a terminal: write_stdin types into and kills only commands started with tty=true; a background command runs until it exits or reaches its timeout_ms, and wait on it reports how it ended"
+                ),
+            ),
+            false => error,
+        })
+    }
 }
 
 fn failure(error: Error) -> Outcome {
