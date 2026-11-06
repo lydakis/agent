@@ -267,6 +267,31 @@ fn keys_apart(on: bool) {
 
 type Tui = Terminal<CrosstermBackend<std::io::Stdout>>;
 
+/// One frame written as the terminal is to show it, as Ink and Codex
+/// write theirs: inside a synchronized update (mode 2026), so a terminal
+/// that knows it shows the frame whole, never half written, and with the
+/// cursor hidden while cells land, shown again only where the frame puts
+/// it. Written cell by cell in view, the cursor flickered over the screen,
+/// and what follows the cursor (an emoji picker, an input method) could
+/// open wherever the cursor passed. A terminal that does not know the
+/// mode ignores it.
+fn synchronized<T, W: std::io::Write>(
+    target: &mut T,
+    out: impl Fn(&mut T) -> &mut W,
+    frame: impl FnOnce(&mut T) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    ratatui::crossterm::queue!(
+        out(target),
+        BeginSynchronizedUpdate,
+        ratatui::crossterm::cursor::Hide
+    )?;
+    let drawn = frame(target);
+    // Ended even after a failed write, so the terminal is never left
+    // holding frames back.
+    execute!(out(target), EndSynchronizedUpdate)?;
+    drawn
+}
+
 #[derive(Clone)]
 struct Options {
     store: PathBuf,
@@ -12032,17 +12057,16 @@ impl App {
         self.commit(lines);
     }
 
-    /// A frame drawn, the whole screen written again when it is stale:
-    /// cleared first, and shown at once with what replaces it where the
-    /// terminal holds a frame back until it is done.
+    /// A frame drawn, the whole screen written again when it is stale
+    /// (cleared first); every frame shown whole ([`synchronized`]).
     fn draw(&mut self, terminal: &mut Tui) -> std::io::Result<()> {
-        if !std::mem::take(&mut self.stale) {
-            return self.frame(terminal);
-        }
-        execute!(terminal.backend_mut(), BeginSynchronizedUpdate)?;
-        let drawn = terminal.clear().and_then(|()| self.frame(terminal));
-        execute!(terminal.backend_mut(), EndSynchronizedUpdate)?;
-        drawn
+        let stale = std::mem::take(&mut self.stale);
+        synchronized(terminal, Terminal::backend_mut, |terminal| {
+            if stale {
+                terminal.clear()?;
+            }
+            self.frame(terminal)
+        })
     }
 
     fn frame(&mut self, terminal: &mut Tui) -> std::io::Result<()> {
@@ -13533,6 +13557,27 @@ fn zen_notice(on: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_frame_is_shown_whole_with_the_cursor_hidden_while_it_lands() {
+        let mut out: Vec<u8> = Vec::new();
+        let drawn = synchronized(
+            &mut out,
+            |out| out,
+            |out| {
+                out.extend_from_slice(b"CELLS");
+                Ok(())
+            },
+        );
+        assert!(drawn.is_ok());
+        assert_eq!(out, b"\x1b[?2026h\x1b[?25lCELLS\x1b[?2026l");
+        // A frame that fails still ends the update, so the terminal never
+        // holds what comes after back.
+        let mut out: Vec<u8> = Vec::new();
+        let failed = synchronized(&mut out, |out| out, |_| Err(std::io::Error::other("gone")));
+        assert!(failed.is_err());
+        assert!(out.ends_with(b"\x1b[?2026l"));
+    }
 
     #[test]
     fn a_question_open_says_the_agent_needs_you_to_its_multiplexer() {
