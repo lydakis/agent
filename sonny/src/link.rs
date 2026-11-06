@@ -61,7 +61,7 @@ const VIEWED: [&str; 14] = [
 ];
 
 /// The codes a call's error may carry back, as typed here.
-const CODES: [&str; 11] = [
+const CODES: [&str; 12] = [
     "browser_refused",
     "desktop_refused",
     "exec_refused",
@@ -73,6 +73,7 @@ const CODES: [&str; 11] = [
     "caller_unknown",
     "escalation_refused",
     "link_busy",
+    "tool_outcome_unknown",
 ];
 
 type Failed = (&'static str, String);
@@ -203,6 +204,15 @@ fn seen(machine: &str) -> Option<u64> {
     text.trim().parse().ok()
 }
 
+/// Whether `machine` is connected: its session is serving here, and has
+/// heard from it lately. A session ends by removing its socket, so one
+/// just ended is not connected however lately it heard.
+fn up(machine: &str) -> bool {
+    let serving = here().is_some_and(|dir| dir.join(format!("{machine}.sock")).exists());
+    serving
+        && seen(machine).is_some_and(|ms| now_ms().saturating_sub(ms) < SILENT.as_millis() as u64)
+}
+
 /// How long ago `ms` was, in a few words.
 fn ago(ms: u64) -> String {
     let secs = now_ms().saturating_sub(ms) / 1000;
@@ -220,6 +230,17 @@ fn not_connected(machine: &str) -> Failed {
         None => String::new(),
     };
     ("not_connected", format!("{machine} is not connected{last}"))
+}
+
+/// A call sent to `machine` whose end never came back: it may have run,
+/// in part or whole, or not at all.
+fn unknown(machine: &str, how: &str) -> Failed {
+    (
+        "tool_outcome_unknown",
+        format!(
+            "{machine} {how}: whether the call ran is not known, so see whether it took effect before making it again"
+        ),
+    )
 }
 
 /// A line of JSON from `reader`, at most `max` bytes; none at its end.
@@ -299,15 +320,39 @@ fn lines<R: AsyncBufRead + Unpin + Send + 'static>(
 /// while it waits there.
 #[derive(Clone)]
 struct Out {
-    small: mpsc::UnboundedSender<String>,
+    small: mpsc::UnboundedSender<Short>,
     large: mpsc::UnboundedSender<Long>,
     room: Arc<tokio::sync::Semaphore>,
     /// The long calls queued, by number, and whether each was let go.
     held: Held,
 }
 
-/// A long line queued: the call it is, if one, and the room it holds.
-type Long = (Option<u64>, String, tokio::sync::OwnedSemaphorePermit);
+/// A short line queued, and the gate it waits at, if a call's.
+type Short = (String, Option<Gate>);
+/// A long line queued: the call it is, if one, the room it holds, and the
+/// gate it waits at.
+type Long = (
+    Option<u64>,
+    String,
+    tokio::sync::OwnedSemaphorePermit,
+    Option<Gate>,
+);
+
+/// What a call's line waits on before it is written, so that whoever made
+/// the call hears it may be sent before it may be read at the other end:
+/// asked with a sender for the go-ahead, the line is written only on a
+/// yes, and `written` is told once it is.
+struct Gate {
+    ready: oneshot::Sender<oneshot::Sender<bool>>,
+    written: oneshot::Sender<()>,
+}
+
+/// The call's side of its gate: asked for the go-ahead, then told the
+/// line is written.
+struct Gated {
+    ready: oneshot::Receiver<oneshot::Sender<bool>>,
+    written: oneshot::Receiver<()>,
+}
 type Held = Arc<Mutex<HashMap<u64, bool>>>;
 
 impl Out {
@@ -335,17 +380,28 @@ impl Out {
     }
 
     /// Send call `id`, `value`, as `send` does, for `cancel` to take back
-    /// while it waits.
-    async fn call(&self, id: u64, value: &Value) {
-        self.queue(Some(id), value).await;
+    /// while it waits: its gate, which asks before the line is written and
+    /// tells once it is.
+    async fn call(&self, id: u64, value: &Value) -> Gated {
+        let (ready, asked) = oneshot::channel();
+        let (written, told) = oneshot::channel();
+        let gate = Gate { ready, written };
+        self.queue(Some((id, gate)), value).await;
+        Gated {
+            ready: asked,
+            written: told,
+        }
     }
 
-    async fn queue(&self, call: Option<u64>, value: &Value) {
+    async fn queue(&self, call: Option<(u64, Gate)>, value: &Value) {
+        let (call, written) = call.unzip();
         // Measured before it is written out, so that what waits for room
         // holds no copy of it.
         let length = written_length(value) + 1;
         if length <= SMALL {
-            self.tell(value);
+            let mut text = value.to_string();
+            text.push('\n');
+            let _ = self.small.send((text, written));
             return;
         }
         let bytes = length.min(QUEUED_BYTES) as u32;
@@ -355,7 +411,7 @@ impl Out {
             if let Some(id) = call {
                 self.held.lock().unwrap().insert(id, false);
             }
-            let _ = self.large.send((call, text, room));
+            let _ = self.large.send((call, text, room, written));
         }
     }
 
@@ -374,7 +430,7 @@ impl Out {
     fn tell(&self, value: &Value) {
         let mut text = value.to_string();
         text.push('\n');
-        let _ = self.small.send(text);
+        let _ = self.small.send((text, None));
     }
 }
 
@@ -398,26 +454,41 @@ fn written_length(value: &Value) -> usize {
 /// Write the lines given, the small ones first, until the writer fails.
 async fn write_out<W: AsyncWrite + Unpin>(
     mut writer: W,
-    mut smalls: mpsc::UnboundedReceiver<String>,
+    mut smalls: mpsc::UnboundedReceiver<Short>,
     mut larges: mpsc::UnboundedReceiver<Long>,
     held: Held,
 ) {
     loop {
         // The room a long line holds is given back once it is written.
-        let (text, _room) = tokio::select! {
+        let (text, _room, written) = tokio::select! {
             biased;
-            Some(text) = smalls.recv() => (text, None),
-            Some((call, text, room)) = larges.recv() => {
+            Some((text, written)) = smalls.recv() => (text, None, written),
+            Some((call, text, room, written)) = larges.recv() => {
                 let let_go = call.is_some_and(|id| held.lock().unwrap().remove(&id) == Some(true));
                 if let_go {
                     continue;
                 }
-                (text, Some(room))
+                (text, Some(room), written)
             }
             else => return,
         };
+        // A call goes only once its caller has heard it may: one let go
+        // meanwhile never does.
+        let gate = match written {
+            Some(Gate { ready, written }) => {
+                let (go, going) = oneshot::channel();
+                if ready.send(go).is_err() || going.await != Ok(true) {
+                    continue;
+                }
+                Some(written)
+            }
+            None => None,
+        };
         if writer.write_all(text.as_bytes()).await.is_err() || writer.flush().await.is_err() {
             return;
+        }
+        if let Some(written) = gate {
+            let _ = written.send(());
         }
     }
 }
@@ -485,6 +556,17 @@ pub async fn call(
     steps: Option<&Steps>,
 ) -> Result<Value, Failed> {
     let dir = here().ok_or(("no_machine", "HOME is not set".to_owned()))?;
+    call_in(&dir, machine, tool, payload, steps).await
+}
+
+/// `call`, with the machines linked here kept in `dir`.
+async fn call_in(
+    dir: &Path,
+    machine: &str,
+    tool: &str,
+    payload: Value,
+    steps: Option<&Steps>,
+) -> Result<Value, Failed> {
     if !agent_client::config::named(machine) || !dir.join(format!("{machine}.json")).exists() {
         let linked: Vec<String> = machines().into_iter().map(|m| m.name).collect();
         return Err((
@@ -530,14 +612,33 @@ pub async fn call(
     // then takes to carry, and behind whatever else is on its way.
     let first = tokio::time::timeout(ACK, line(&mut read, LINE_BYTES, None)).await;
     let mut next = Some(first.map_err(|_| not_connected(machine))?.map_err(gone)?);
+    // How far the call went: one never sent down the link never ran there,
+    // so a link gone before then is a machine not connected; after, the
+    // call may have run.
+    let mut sent = false;
+    let mut taken = false;
     loop {
         let said = match next.take() {
-            Some(said) => said,
-            None => line(&mut read, LINE_BYTES, None).await.map_err(gone)?,
+            Some(said) => Ok(said),
+            None => line(&mut read, LINE_BYTES, None).await,
         };
-        let Some(said) = said else {
-            return Err(("link_refused", format!("{machine} dropped the call")));
+        let Ok(Some(said)) = said else {
+            return Err(match (sent, taken) {
+                (false, _) => not_connected(machine),
+                (true, false) => unknown(
+                    machine,
+                    "may have been sent the call, and its link closed before it took it",
+                ),
+                (true, true) => unknown(
+                    machine,
+                    "took the call, then its link closed before the call ended",
+                ),
+            });
         };
+        sent |= said.get("sent").is_some();
+        if said.get("ack").is_some() {
+            (sent, taken) = (true, true);
+        }
         if said.get("done").is_some() {
             return ended(&said["done"]);
         }
@@ -554,8 +655,9 @@ pub async fn call(
                 Ok(step) => json!({"allowed": step}),
                 Err(why) => json!({"refused": why}),
             };
+            // A link gone meanwhile ends the next read, which says how.
             let answer = json!({"verdict": verdict, "seq": said["seq"]});
-            send(&mut write, &answer).await.map_err(gone)?;
+            let _ = send(&mut write, &answer).await;
         }
         if let (Some(ran), Some(steps)) = (said.get("ran"), steps)
             && let Some(step) = ran["step"].as_str()
@@ -570,11 +672,7 @@ pub async fn call(
 pub fn open(target: &str) -> Result<String, String> {
     // Those heard from lately, each tried in turn while one is not there.
     let connected: Vec<Machine> = (machines().into_iter())
-        .filter(|machine| machine.open)
-        .filter(|machine| {
-            seen(&machine.name)
-                .is_some_and(|ms| now_ms().saturating_sub(ms) < SILENT.as_millis() as u64)
-        })
+        .filter(|machine| machine.open && up(&machine.name))
         .collect();
     if connected.is_empty() {
         return Err("no machine linked here is connected".into());
@@ -765,7 +863,9 @@ async fn serve(machine: String) -> Result<(), String> {
             }
         }
     }
-    let _ = replace(&dir.join(format!("{machine}.seen")), &now_ms().to_string());
+    // When it was last heard, which a session ended by its silence is not.
+    let last = heard.load(Ordering::Relaxed);
+    let _ = replace(&dir.join(format!("{machine}.seen")), &last.to_string());
     if std::fs::metadata(&path).map(|m| m.ino()).ok() == ours {
         let _ = std::fs::remove_file(&path);
     }
@@ -851,13 +951,17 @@ async fn borrow(stream: tokio::net::UnixStream, link: Session<'_>) -> std::io::R
     // its caller watched the while: one gone takes it back before it goes.
     let mut queued = send(&mut write, &json!({"queued": true})).await.is_ok();
     let mut early = Vec::new();
+    let mut gated = None;
     if queued {
         let call = json!({"id": id, "call": called["call"]});
         let sending = out.call(id, &call);
         tokio::pin!(sending);
         loop {
             tokio::select! {
-                () = &mut sending => break,
+                gate = &mut sending => {
+                    gated = Some(gate);
+                    break;
+                }
                 said = read.recv() => match said {
                     Some(Ok(said)) => early.push(said),
                     _ => {
@@ -878,11 +982,60 @@ async fn borrow(stream: tokio::net::UnixStream, link: Session<'_>) -> std::io::R
     }
     // From here the call is the link's: whatever ends this connection,
     // its entry goes and, unless it finished, the other end hears to stop.
+    // Before it is written its caller hears it may be sent, so a link gone
+    // after is never taken for one the call never left by. Once written,
+    // it is the machine's to take, and a machine that then says nothing
+    // for `ACK`, neither taking it nor carrying anything else, has gone
+    // quiet with the call. Whether it ran is then not known, and the
+    // caller hears that, not to call again.
+    let (mut ready, mut written) = match gated {
+        Some(Gated { ready, written }) => (Some(ready), Some(written)),
+        None => (None, None),
+    };
+    let mut sent: Option<u64> = None;
+    let mut taken = false;
     let ended = loop {
+        let quiet_by = match (sent, taken) {
+            (Some(at), false) => {
+                let last = at.max(heard.load(Ordering::Relaxed));
+                Some(Duration::from_millis(
+                    (last + ACK.as_millis() as u64).saturating_sub(now_ms()),
+                ))
+            }
+            _ => None,
+        };
         tokio::select! {
+            asked = async { ready.as_mut().unwrap().await }, if ready.is_some() => {
+                ready = None;
+                if let Ok(go) = asked {
+                    let told = send(&mut write, &json!({"sent": true})).await.is_ok();
+                    let _ = go.send(told);
+                    if !told {
+                        break false;
+                    }
+                }
+            }
+            went = async { written.as_mut().unwrap().await }, if written.is_some() => {
+                written = None;
+                if went.is_ok() {
+                    sent.get_or_insert_with(now_ms);
+                }
+            }
+            () = tokio::time::sleep(quiet_by.unwrap_or_default()), if quiet_by.is_some() => {
+                let last = sent.unwrap_or_default().max(heard.load(Ordering::Relaxed));
+                if now_ms() >= last + ACK.as_millis() as u64 {
+                    let lost = done(Err(unknown(machine, "was sent the call and went quiet before taking it")));
+                    let _ = send(&mut write, &json!({"done": lost})).await;
+                    break false;
+                }
+            }
             said = from.recv() => {
                 let Some(said) = said else { break false };
                 let finished = said.get("done").is_some();
+                if said.get("ack").is_some() || finished {
+                    taken = true;
+                    sent.get_or_insert_with(now_ms);
+                }
                 if send(&mut write, &said).await.is_err() {
                     break false;
                 }
@@ -1118,7 +1271,7 @@ async fn dial(
         let mut last = String::new();
         let mut lines = BufReader::new(stderr).lines();
         while let Ok(Some(said)) = lines.next_line().await {
-            if !said.trim().is_empty() {
+            if !notice(&said) {
                 last = said.chars().take(300).collect();
             }
         }
@@ -1212,6 +1365,11 @@ async fn dial(
             }
             _ = ping.tick() => {
                 out.tell(&json!({"ping": true}));
+                // Said again while the session is up, so how the link
+                // stands follows the session whatever wrote it last.
+                if told.is_some() && refused.is_none() {
+                    stood(key, link, true, None);
+                }
             }
             Some(lends) = freshened.recv() => {
                 if told.is_some() && refused.is_none() && told.as_ref() != Some(&lends) {
@@ -1229,6 +1387,14 @@ async fn dial(
         true => "the link closed".into(),
         false => said,
     }))
+}
+
+/// Whether ssh's line `said` says nothing of why a session ended: blank,
+/// or one of the notices it heads with `**`, as of a key exchange, which
+/// it prints on sessions that go on to work.
+fn notice(said: &str) -> bool {
+    let said = said.trim();
+    said.is_empty() || said.starts_with("**")
 }
 
 /// A task aborted when this is dropped.
@@ -1594,9 +1760,7 @@ fn list() {
     }
     for machine in machines() {
         let how = match seen(&machine.name) {
-            Some(ms) if now_ms().saturating_sub(ms) < SILENT.as_millis() as u64 => {
-                "connected".to_owned()
-            }
+            _ if up(&machine.name) => "connected".to_owned(),
             Some(ms) => format!("last connected {}", ago(ms)),
             None => "not connected yet".to_owned(),
         };
@@ -1724,11 +1888,19 @@ mod tests {
         let (out, _writing) = Out::to(write);
         let long = |n: u64| json!({"id": n, "call": {"input": "x".repeat(QUEUED_BYTES / 3)}});
         out.send(&long(1)).await;
-        out.call(5, &long(5)).await;
+        let five = out.call(5, &long(5)).await;
         // Its cancel would go ahead of it: it takes it out instead.
         out.cancel(5);
-        out.call(6, &json!({"id": 6, "call": {}})).await;
+        let six = out.call(6, &json!({"id": 6, "call": {}})).await;
         out.cancel(6);
+        for gated in [five, six] {
+            tokio::spawn(async move {
+                // One let go never asks.
+                if let Ok(go) = gated.ready.await {
+                    let _ = go.send(true);
+                }
+            });
+        }
         let mut said = lines(BufReader::new(read), LINE_BYTES, None);
         assert_eq!(
             said.recv().await.unwrap().unwrap(),
@@ -1742,6 +1914,145 @@ mod tests {
         out.tell(&json!({"ping": true}));
         assert_eq!(said.recv().await.unwrap().unwrap(), json!({"ping": true}));
         assert!(out.held.lock().unwrap().is_empty());
+    }
+
+    /// A host's end of a link to machine `m`, in a folder of its own: the
+    /// lines its session sends the machine, which take `room` bytes unread,
+    /// the calls waiting on the machine, and the session's connection.
+    struct Lab {
+        dir: PathBuf,
+        machine: mpsc::Receiver<std::io::Result<Value>>,
+        waiting: Waiting,
+        session: tokio::task::JoinHandle<()>,
+        out: Out,
+        _writing: AbortOnDrop,
+    }
+
+    impl Lab {
+        /// One whose machine reads what is sent it, or reads nothing.
+        fn new(reads: bool) -> Self {
+            let dir = std::env::temp_dir().join(format!("sl-{}", &nonce()[..8]));
+            private(&dir).unwrap();
+            std::fs::write(dir.join("m.json"), "{}").unwrap();
+            let listener = tokio::net::UnixListener::bind(dir.join("m.sock")).unwrap();
+            let (write, read) = tokio::io::duplex(1);
+            let (out, writing) = Out::to(write);
+            let waiting: Waiting = Arc::default();
+            let (owned, kept, lent) = (dir.clone(), waiting.clone(), out.clone());
+            let session = tokio::spawn(async move {
+                let out = lent;
+                let (stream, _) = listener.accept().await.unwrap();
+                let link = Session {
+                    machine: "m",
+                    dir: &owned,
+                    out,
+                    waiting: kept,
+                    ready: Arc::new(Mutex::new(Some(Ok(())))),
+                    next: Arc::new(AtomicU64::new(1)),
+                    heard: Arc::new(AtomicU64::new(now_ms())),
+                    calls: Arc::new(AtomicU64::new(8)),
+                };
+                let _ = borrow(stream, link).await;
+            });
+            let machine = match reads {
+                true => lines(BufReader::new(read), LINE_BYTES, None),
+                false => {
+                    std::mem::forget(read);
+                    mpsc::channel(1).1
+                }
+            };
+            Self {
+                dir,
+                machine,
+                waiting,
+                session,
+                out,
+                _writing: AbortOnDrop(writing),
+            }
+        }
+
+        fn call(&self, payload: Value) -> tokio::task::JoinHandle<Result<Value, Failed>> {
+            let dir = self.dir.clone();
+            tokio::spawn(async move { call_in(&dir, "m", "open", payload, None).await })
+        }
+    }
+
+    impl Drop for Lab {
+        fn drop(&mut self) {
+            self.session.abort();
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    async fn ended_by(call: tokio::task::JoinHandle<Result<Value, Failed>>) -> Failed {
+        let ended = tokio::time::timeout(Duration::from_secs(10), call).await;
+        ended
+            .expect("the call ends within seconds")
+            .unwrap()
+            .unwrap_err()
+    }
+
+    #[tokio::test]
+    async fn a_call_sent_to_a_machine_gone_quiet_ends_unknown_within_ack_and_is_let_go() {
+        let mut lab = Lab::new(true);
+        let call = lab.call(json!({}));
+        let sent = lab.machine.recv().await.unwrap().unwrap();
+        assert_eq!(sent["id"], 1);
+        let started = Instant::now();
+        let (code, detail) = ended_by(call).await;
+        assert_eq!(code, "tool_outcome_unknown", "{detail}");
+        assert!(detail.contains("went quiet before taking it"), "{detail}");
+        assert!(started.elapsed() < ACK + Duration::from_secs(2));
+        // Should it reach the machine yet, it is not to run.
+        let cancel = lab.machine.recv().await.unwrap().unwrap();
+        assert_eq!(cancel, json!({"id": 1, "cancel": true}));
+    }
+
+    #[tokio::test]
+    async fn a_link_gone_before_the_call_is_sent_is_not_connected_and_after_unknown() {
+        // A long call waits for room behind other long lines: never written.
+        let lab = Lab::new(true);
+        let full = lab.out.room.clone().acquire_many_owned(QUEUED_BYTES as u32);
+        let _full = full.await.unwrap();
+        let call = lab.call(json!({"file": "x".repeat(SMALL)}));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(lab.waiting.lock().unwrap().len(), 1);
+        lab.session.abort();
+        let (code, detail) = ended_by(call).await;
+        assert_eq!(code, "not_connected", "{detail}");
+        // One whose writing began, though the machine has read none of it,
+        // may have been sent.
+        let lab = Lab::new(false);
+        let call = lab.call(json!({}));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        lab.session.abort();
+        let (code, detail) = ended_by(call).await;
+        assert_eq!(code, "tool_outcome_unknown", "{detail}");
+    }
+
+    #[tokio::test]
+    async fn a_link_gone_after_the_machine_took_the_call_leaves_its_outcome_unknown() {
+        let mut lab = Lab::new(true);
+        let call = lab.call(json!({}));
+        lab.machine.recv().await.unwrap().unwrap();
+        let to = lab.waiting.lock().unwrap().get(&1).cloned().unwrap();
+        to.send(json!({"ack": true})).unwrap();
+        // Long past `ACK`: a machine that took the call is waited for.
+        tokio::time::sleep(ACK + Duration::from_secs(1)).await;
+        assert!(!call.is_finished());
+        lab.session.abort();
+        let (code, detail) = ended_by(call).await;
+        assert_eq!(code, "tool_outcome_unknown", "{detail}");
+        assert!(detail.contains("took the call"), "{detail}");
+    }
+
+    #[test]
+    fn ssh_s_notices_are_not_why_a_link_ended() {
+        assert!(notice(
+            "** WARNING: connection is not using a post-quantum key exchange algorithm."
+        ));
+        assert!(notice("   "));
+        assert!(!notice("Connection closed by 10.0.0.2 port 22"));
     }
 
     #[tokio::test]
