@@ -1214,6 +1214,20 @@ fn main() -> std::process::ExitCode {
                 }
                 _ => {}
             }
+            // A run of an automation works for the automation, from its
+            // shell as through the memory tool; no one else does.
+            let writes = rest
+                .first()
+                .is_some_and(|v| matches!(v.as_str(), "save" | "rm" | "cleanup"));
+            let automation = writes.then(trigger::shell_run).flatten();
+            // SAFETY: one thread: the daemon was asked on a runtime of
+            // this thread's own, gone by now.
+            unsafe {
+                match automation {
+                    Some(name) => std::env::set_var("AGENT_AUTOMATION", name),
+                    None => std::env::remove_var("AGENT_AUTOMATION"),
+                }
+            }
             return std::process::ExitCode::from(agent_client::memory::cli(rest) as u8);
         }
         // An ask's deadline trigger runs this as its `--if`.
@@ -2816,6 +2830,9 @@ struct App {
     /// What the terminal shows may not be the frame last drawn, so the
     /// next draw writes every cell again.
     stale: bool,
+    /// The links last written over the screen, written again only when
+    /// they or what is under them change.
+    links_written: screen::Written,
     /// The oldest node this window drew, which a repaint draws back to.
     first_node: Option<i64>,
     /// The node before it, while the bot has older ones.
@@ -4253,6 +4270,7 @@ impl App {
             down: false,
             repaint: false,
             stale: false,
+            links_written: screen::Written::default(),
             first_node: None,
             older: None,
             unpaired: Vec::new(),
@@ -5042,6 +5060,7 @@ impl App {
         if newest.is_none() {
             self.pages.clear();
         }
+        self.links_written.forget();
         wipe(terminal).map_err(|e| e.to_string())?;
         self.pending.clear();
         self.marks.clear();
@@ -12240,6 +12259,7 @@ impl App {
         let stale = std::mem::take(&mut self.stale);
         frames::frame(|| {
             if stale {
+                self.links_written.forget();
                 wipe(terminal)?;
             }
             self.frame(terminal)
@@ -12831,7 +12851,7 @@ impl App {
                 .collect();
         };
         let look = look::Look::now();
-        terminal.draw(|frame| {
+        let drawn = terminal.draw(|frame| {
             paint(frame, &mut linked);
             // A link something was drawn over since, as a list over the
             // conversation, is left as the frame drew it.
@@ -12840,11 +12860,13 @@ impl App {
             // The pictures it shows, sent before it is written.
             image::send_shown(frame.buffer_mut());
         })?;
+        linked.iter_mut().for_each(|(_, _, cell)| look.cell(cell));
+        // Only the links that changed, or that the frame drew over.
+        let linked = self.links_written.changed(linked, drawn.buffer);
         self.composer_at = composer_at;
         self.counter_at = counter_at;
         // Over themselves, the cursor kept where the frame left it.
         if !linked.is_empty() {
-            linked.iter_mut().for_each(|(_, _, cell)| look.cell(cell));
             execute!(
                 terminal.backend_mut(),
                 ratatui::crossterm::cursor::SavePosition
@@ -13296,17 +13318,17 @@ impl App {
             );
         }
         let (working, waiting) = self.agents();
-        // Marks as the roster and /status draw them, each with its word,
+        // Marks as the roster and /status draw them, each with its number,
         // so the counts read without colour.
         if waiting > 0 {
-            let forms = footer::count("?", Color::Yellow, waiting, "needs you", false);
+            let forms = footer::count("?", Color::Yellow, waiting, false);
             items.push(Item::new(Slot::Needs, forms).opens("status"));
         }
         // In zen, the focus, and only what needs the person besides.
         if let Some(focus) = &self.zen {
             let needs = match waiting {
                 0 => 0,
-                n => format!("  ? {n} needs you").width(),
+                n => format!("  ? {n}").width(),
             };
             // An armed boost too, quieter than the full footer's: an arrow
             // for each step above the agent's own effort, so ↑ then ↑↑.
@@ -13321,7 +13343,13 @@ impl App {
             });
             let marked = boost.as_ref().map_or(0, |boost| boost.width());
             let room = width.saturating_sub(4 + needs + marked + "zen · ".len());
-            let focus = format!("zen · {}", transcript::cut(&first_line(focus), room));
+            // As much of its first line as the row holds: the footer's own
+            // width, not a glance's.
+            let mut line = focus.lines().next().unwrap_or("").to_owned();
+            if focus.lines().nth(1).is_some() {
+                line.push('…');
+            }
+            let focus = format!("zen · {}", transcript::cut(&line, room));
             items.retain(|item| item.slot == Slot::Needs);
             let mut place = vec![Span::raw(focus).dim()];
             place.extend(boost.map(Span::raw));
@@ -13331,19 +13359,17 @@ impl App {
         // The margin's glance says these while it is in view.
         let glancing = (self.pane.as_ref()).is_some_and(|p| p.is_margin() && p.area.width > 0);
         if self.failed > 0 && !glancing {
-            let forms = footer::count("✗", Color::Red, self.failed, "failed", false);
+            let forms = footer::count("✗", Color::Red, self.failed, false);
             items.push(Item::new(Slot::Failed, forms).opens("background"));
         }
         if working > 0 {
-            let forms = footer::count("●", Color::Cyan, working, "working", true);
+            let forms = footer::count("●", Color::Cyan, working, true);
             items.push(Item::new(Slot::Working, forms).opens("status"));
         }
         // Something runs for it with no one typing: /background lists it.
         if self.behind.0 > 0 && !glancing {
             let n = self.behind.0;
-            let forms = [format!("↻ {n} in background"), format!("↻ {n}")]
-                .map(|text| vec![Span::raw(text).dim()]);
-            let forms = forms.into_iter().chain([Vec::new()]).collect();
+            let forms = vec![vec![Span::raw(format!("↻ {n}")).dim()], Vec::new()];
             items.push(Item::new(Slot::Background, forms).opens("background"));
         }
         let notes = self.margin.notes().len();
@@ -16057,6 +16083,14 @@ mod tests {
             footer.starts_with("  zen · the receipts' currency ↑") && !footer.contains("xhigh"),
             "{footer}"
         );
+        // A long focus runs to the row's end, not to a glance's length.
+        app.boost = None;
+        let long = "the receipts' currency, rounding each line in the store's own currency before it is converted and summed";
+        app.zen = Some(long.into());
+        let footer = app.footer_line(100).to_string();
+        assert!(footer.trim_end().width() >= 100 - 3, "{footer}");
+        assert!(footer.trim_end().ends_with('…'), "{footer}");
+        app.zen = Some("the receipts' currency".into());
         app.boost = Some("max".into());
         let line = app.footer_line(30);
         assert!(line.to_string().trim_end().ends_with(" ↑↑"), "{line}");
@@ -16084,7 +16118,7 @@ mod tests {
         let (footer, counter) = app.footer(60);
         let footer = footer.to_string();
         assert!(footer.starts_with("  zen · the rounding"), "{footer}");
-        assert!(footer.ends_with("? 1 needs you  "), "{footer}");
+        assert!(footer.ends_with("? 1  "), "{footer}");
         assert_eq!(footer.width(), 60);
         let [(counter, "status")] = &counter[..] else {
             panic!("{counter:?}")
@@ -16093,7 +16127,14 @@ mod tests {
         let counted: String = columns[counter.start as usize..counter.end as usize]
             .iter()
             .collect();
-        assert_eq!(counted, "? 1 needs you");
+        assert_eq!(counted, "? 1");
+        // The focus gets the room the count doesn't take: the mark and
+        // its number, not a word after them.
+        app.zen = Some("a long focus that cannot fit".into());
+        let footer = app.footer(30).0.to_string();
+        assert!(footer.starts_with("  zen · a long focus"), "{footer}");
+        assert!(footer.ends_with("? 1  "), "{footer}");
+        assert!(footer.width() <= 30, "{footer}");
     }
 
     #[test]
@@ -17063,22 +17104,18 @@ mod tests {
         app.failed = 1;
         let line = app.footer_line(140);
         let text = line.to_string();
-        assert!(text.contains("✗ 1 failed  ↻ 2 in background"), "{text}");
-        // The mark red at full strength, the words muted.
+        assert!(text.contains("✗ 1  ↻ 2"), "{text}");
+        // The mark red at full strength, the number muted.
         let mark = line.spans.iter().find(|s| s.content == "✗").unwrap();
         assert_eq!(mark.style.fg, Some(Color::Red));
         assert!(
             !mark.style.add_modifier.contains(Modifier::DIM),
             "red, not dimmed"
         );
-        let words = line
-            .spans
-            .iter()
-            .find(|s| s.content == " 1 failed")
-            .unwrap();
+        let words = line.spans.iter().find(|s| s.content == " 1").unwrap();
         assert!(words.style.add_modifier.contains(Modifier::DIM));
         app.failed = 2;
-        assert!(app.footer_line(140).to_string().contains("✗ 2 failed"));
+        assert!(app.footer_line(140).to_string().contains("✗ 2"));
         app.failed = 0;
         assert!(!app.footer_line(140).to_string().contains('✗'));
     }
@@ -19285,13 +19322,10 @@ mod tests {
             .collect();
         assert_eq!(
             shown,
-            [
-                ("? 2 needs you".to_owned(), "status"),
-                ("● 2 working".to_owned(), "status")
-            ]
+            [("? 2".to_owned(), "status"), ("● 2".to_owned(), "status")]
         );
         // The agent's name is the composer's to say, not the footer's.
-        assert!(text.contains("? 2 needs you  ● 2 working"), "{text}");
+        assert!(text.ends_with("  ? 2  ● 2  "), "{text}");
         assert!(!text.contains(&app.bot), "{text}");
         assert_eq!(text.width(), 100);
         let counter = opens[0].0.clone();
