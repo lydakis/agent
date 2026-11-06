@@ -77,8 +77,11 @@ pub fn paths(pasted: &str, workspace: &Path) -> Option<Vec<PathBuf>> {
         .collect()
 }
 
-/// `text` split as a shell splits words: at unquoted whitespace, with
-/// backslash escapes and quotes taken off. None for an unclosed quote.
+/// `text` split as a shell splits words: at unquoted spaces, tabs and
+/// line breaks (its field separators, not every Unicode space: a Mac's
+/// screenshot is named with a narrow no-break space before its AM or
+/// PM), with backslash escapes and quotes taken off. None for an
+/// unclosed quote.
 fn shell_words(text: &str) -> Option<Vec<String>> {
     let mut words = Vec::new();
     let mut word: Option<String> = None;
@@ -96,7 +99,7 @@ fn shell_words(text: &str) -> Option<Vec<String>> {
                     }
                 }
             }
-            c if c.is_whitespace() => words.extend(word.take()),
+            ' ' | '\t' | '\n' | '\r' => words.extend(word.take()),
             c => word.get_or_insert_default().push(c),
         }
     }
@@ -246,6 +249,17 @@ mod tests {
         );
         let url = format!("file://{}/Screen%20Shot%201.png", dir.display());
         assert_eq!(paths(&url, &dir), Some(vec![shot]));
+        // A Mac names a screenshot with a narrow no-break space before
+        // its PM, which a terminal drops unescaped: part of the name.
+        let mac = dir.join("Screenshot 2026-11-04 at 10.15.32\u{202f}PM.png");
+        std::fs::write(&mac, b"").unwrap();
+        let dropped = format!(
+            "{}/Screenshot\\ 2026-11-04\\ at\\ 10.15.32\u{202f}PM.png",
+            dir.display()
+        );
+        assert_eq!(paths(&dropped, &dir), Some(vec![mac.clone()]));
+        let two = format!("{dropped}\n{}\r\n", dir.join("b.JPG").display());
+        assert_eq!(paths(&two, &dir), Some(vec![mac, dir.join("b.JPG")]));
         // Words that are not all pictures there are text.
         assert_eq!(paths("notes.txt", &dir), None);
         assert_eq!(paths("b.JPG and more", &dir), None);

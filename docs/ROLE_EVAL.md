@@ -23,7 +23,7 @@ that HOME's own scheduler, one job in the user's launchd or systemd under a
 label tagged with that HOME (#453), so they never touch the user's own; each
 run still removes its automations when it ends, and the scheduler of a run that
 stopped early lets its job go once the run's HOME is gone (`launchctl list |
-grep me.lydakis.agent.scheduler` on a Mac lists them).
+grep sonny.scheduler` on a Mac lists them).
 
 Output goes under `.local/role-eval/<model>/`. Each run writes `acp.jsonl`,
 `transcript.md` (what the person saw), `usage.json`, `bots.txt`, `git.txt`,
