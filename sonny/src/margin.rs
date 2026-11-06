@@ -491,7 +491,11 @@ pub fn refusal(held: &[&str], arguments: &Value) -> Option<(&'static str, String
         return None;
     }
     let id = arguments["id"].as_str().map(str::trim).unwrap_or("");
-    let shows = arguments["from"].is_string() || arguments["file"].is_string();
+    // As the note will show it: a file or a task's note only when named.
+    let shows = arguments["from"].as_str().and_then(from).is_some()
+        || arguments["file"]
+            .as_str()
+            .is_some_and(|file| !file.trim().is_empty());
     let lines = (arguments["markdown"].as_str())
         .filter(|_| !shows)
         .map_or(0, |markdown| markdown.lines().count());
@@ -1945,6 +1949,14 @@ mod tests {
         // Taken before the limit was lowered, a long note stays as it was.
         margin.apply("c1", &json!({"id": "a", "markdown": lines(4)}), None, None);
         assert_eq!(margin.notes()[0].body, Body::Markdown(lines(4)));
+        // Named as no file or task's note, the Markdown shows, and counts.
+        for named in [json!({"file": " "}), json!({"from": "nowhere"})] {
+            let mut call = json!({"id": "a", "markdown": lines(4)});
+            call.as_object_mut()
+                .unwrap()
+                .extend(named.as_object().unwrap().clone());
+            assert!(margin.refusal(&call).is_some(), "{call}");
+        }
         // A file or a task's note shows as long as it is; a removal is never refused.
         for call in [
             json!({"id": "b", "file": "src/main.rs"}),
