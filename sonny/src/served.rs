@@ -1277,8 +1277,8 @@ where
                 Ok(_) => ran.await,
                 Err(error) if error.code == "call_taken" => Err((
                     "tool_outcome_unknown",
-                    "this call was started before Sonny's tool host restarted, and was not \
-                     run again; whether it did its work is not known"
+                    "this call may have started before Sonny's tool host restarted or was \
+                     upgraded, and was not run again; whether it did its work is not known"
                         .to_string(),
                 )),
                 // One that wants no answer is let go; one not known to be

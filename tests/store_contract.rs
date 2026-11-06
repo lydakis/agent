@@ -3389,27 +3389,87 @@ fn a_store_that_cannot_be_copied_is_not_migrated() {
 }
 
 #[test]
-fn schema_78_learns_when_a_call_was_taken() {
+fn schema_78_counts_a_call_left_unanswered_before_the_upgrade_as_taken() {
     let path = std::env::temp_dir().join(format!(
         "agent-schema78-taken-{}.sqlite",
         std::process::id()
     ));
     let _ = std::fs::remove_file(&path);
-    drop(Database::initialize(Connection::open(&path).unwrap()).unwrap());
+    // An older host was serving calls when the upgrade came: what it did
+    // with them is not known.
+    let turn = {
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        let start = Declared {
+            name: "start".into(),
+            description: "Start.".into(),
+            parameters: json!({"type":"object"}),
+            result: "ok".into(),
+            answered_by: Some("sonny".into()),
+            expire_ms: None,
+            grammar: None,
+            steps: false,
+            inherit: Inherit::All,
+        };
+        db.create(
+            "Lead",
+            Some("/synthetic"),
+            Binding {
+                declared: Some(std::slice::from_ref(&start)),
+                ..binding()
+            },
+        )
+        .unwrap();
+        let turn = db
+            .begin(
+                "Lead",
+                "request",
+                "work",
+                true,
+                &TurnOptions::default(),
+                allow_provider,
+            )
+            .unwrap()
+            .turn;
+        let calls: Vec<ToolCall> = (1..=3)
+            .map(|n| ToolCall {
+                name: "start".into(),
+                call_id: format!("c{n}"),
+                arguments: "{}".into(),
+                custom: false,
+            })
+            .collect();
+        db.append(turn, vec![], &calls, None).unwrap();
+        for call in &calls {
+            db.tool_start(turn, call).unwrap();
+        }
+        // The turn waits on c1's answer, as a turn waits across a restart.
+        assert!(
+            db.suspend_answer(turn, "c1", &calls[1..], 0, None, None)
+                .unwrap()
+                .is_some()
+        );
+        turn
+    };
     Connection::open(&path)
         .unwrap()
         .execute_batch("ALTER TABLE answers DROP COLUMN taken_ms; PRAGMA user_version=78;")
         .unwrap();
-    drop(Database::initialize(Connection::open(&path).unwrap()).unwrap());
-    let has: bool = Connection::open(&path)
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    // Each counts as taken, so no client runs it again.
+    let untaken: i64 = Connection::open(&path)
         .unwrap()
         .query_row(
-            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('answers') WHERE name='taken_ms')",
+            "SELECT COUNT(*) FROM answers WHERE taken_ms IS NULL",
             [],
             |r| r.get(0),
         )
         .unwrap();
-    assert!(has);
+    assert_eq!(untaken, 0);
+    let Err(taken) = db.take_call("Lead", turn, "c1", 0) else {
+        panic!("a call left unanswered was taken again after the upgrade");
+    };
+    assert_eq!(taken.code, "call_taken");
+    drop(db);
     std::fs::remove_file(path).unwrap();
 }
 

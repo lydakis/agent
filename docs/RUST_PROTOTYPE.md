@@ -2979,7 +2979,9 @@ is refused as an answer is: an answered call is `call_already_answered`,
 one that ended or ran out of time is `no_pending_call` or `stale_turn`.
 Taking is the client's choice and never expires; a taken call is answered
 with `tool_result` as before. The daemon never runs its own tools twice
-either: one a restart cut off ends `tool_outcome_unknown`.
+either: one a restart cut off ends `tool_outcome_unknown`. Schema 79 counts
+every call still unanswered when a store upgrades to it as taken, since an
+older client may have run it with nothing to say so.
 
 The call waits as a gated call waits for its verdict. Its turn holds live
 for the bot's `approval_hold_ms`, but at most 250 ms, and an answer in that

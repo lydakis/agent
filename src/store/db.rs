@@ -13855,6 +13855,14 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
         )?
     {
         conn.execute("ALTER TABLE answers ADD COLUMN taken_ms INTEGER", [])?;
+        // A call an older client left unanswered may have run before the
+        // upgrade, with nothing to say so: it counts as taken, so it is
+        // answered that its outcome is unknown and never runs again.
+        conn.execute(
+            "UPDATE answers SET taken_ms=CAST(unixepoch('subsec')*1000 AS INTEGER)
+             WHERE output IS NULL",
+            [],
+        )?;
     }
     Ok(())
 }
