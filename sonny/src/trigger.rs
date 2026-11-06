@@ -399,7 +399,7 @@ pub struct Trigger {
     pub gate: Option<String>,
     /// Ends once this many messages went out.
     pub runs: Option<u64>,
-    /// The most input plus output tokens each fire's turn may spend.
+    /// The most work, in tokens, each fire's turn may do.
     pub turn_budget_tokens: Option<u64>,
     /// The path `--file` watches, which each fire checks is still not one
     /// every fire writes.

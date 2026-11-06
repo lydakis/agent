@@ -314,32 +314,59 @@ totals: per turn (`input_tokens`, `output_tokens`, `cached_input_tokens`,
 input tokens the provider served from its prompt cache, to three places; it
 is the number the context window's hysteresis exists to keep high, and
 `stats` reports the same totals and ratio for every turn since the daemon
-started, from three atomics and no storage read. `create` and `fork` accept
-`budget_tokens`, a lifetime cap on input plus output tokens for that bot. The
-cap is checked before each model call and before each submission: a
-submission on an exhausted bot fails with `budget_exhausted`, and a turn whose
-next call would exceed the cap ends as `failed` with `budget_exhausted` after
-any tool already planned has run, so the bot is never left uncertain. One
-call may overshoot the cap. Forks start at zero with their own optional cap.
-Reported usage from failed or incomplete calls is charged without accepting their
-output into history. Such calls count in `model_rounds` when usage is reported.
-Failed-attempt usage also counts before a retry and later tool rounds: a retry
-cannot start after that usage exhausts the budget. This check uses the running
-total without another store read.
-Cancellation and failures before a usage report is returned can leave usage
-unaccounted for; these totals are not a reconciliation of provider billing.
-Successful calls retain their single atomic transcript/usage commit; budget
-checks use the turn's running total without an extra database read per round.
-`submit` also accepts `budget_tokens`, a cap on the input plus output tokens
-of the turn it starts, checked where the bot's cap is. A turn past it ends as
-`failed` with `turn_budget_exhausted` and the facts `turn_budget_tokens` and
-`turn_tokens_used`; when both caps are reached the bot's `budget_exhausted`
-is named, since it outlasts the turn. The cap is stored on the turn (`turns`
-lists it as `budget_tokens`), so a resumed turn counts what it spent before
-parking, and a resend naming another cap is an `idempotency_conflict`. A
-steer joins a turn that already has its cap: `budget_tokens` with
-`delivery: "steer"` is `invalid_delivery`. A summary held beside a call
-counts toward both caps.
+started, from three atomics and no storage read.
+
+Budgets count work, not usage. A call's work is its output, plus the input it
+sends past what the bot's previous call sent and got back on the same model:
+a history sent again, warm in the provider's cache or cold, is free, and what
+joins it (a prompt, a steer, a note, a tool's result) is charged once. Output
+is charged when it is made; sending it back is free. A summary or a
+prompt-cache refresh re-reads the history and is charged its output alone. A
+failed or incomplete call is charged as a call, its output not accepted into
+history, so its retry re-reads what it sent. A compaction or an elision makes
+the next call send less, which charges nothing and refunds nothing: the call
+after is measured from what that one sent. A call on another model than the
+one before counts the history in other tokens, so it is charged its output and
+the next is measured from it; so is a bot's first call on a history the
+measure has not seen, a fork's. A failed call whose provider named no model
+is taken to be on the one before. The store keeps the bot's work (`work_tokens`
+in `inspect`, beside `tokens_used`), what its last call carried, and each
+turn's (`work_tokens` in the turn view, and on each `usage` event what that
+call charged), so a park or a restart counts on. Cancellation and failures
+before a usage report is returned can leave usage and work unaccounted for;
+these totals are not a reconciliation of provider billing.
+
+`create` and `fork` accept `budget_tokens`, a lifetime cap on the bot's work.
+The cap is checked before each model call and before each submission: a
+submission on an exhausted bot fails with `budget_exhausted` and the facts
+`budget_tokens` and `work_tokens`. Forks start at zero with their own
+optional cap. `submit` also accepts `budget_tokens`, a cap on the work of the
+turn it starts, checked where the bot's cap is; past it the facts are
+`turn_budget_tokens` and `turn_work_tokens`, and when both caps are reached
+the bot's `budget_exhausted` is named, since it outlasts the turn. The cap is
+stored on the turn (`turns` lists it as `budget_tokens`), so a resumed turn
+counts what it did before parking, and a resend naming another cap is an
+`idempotency_conflict`. A steer joins a turn that already has its cap:
+`budget_tokens` with `delivery: "steer"` is `invalid_delivery`. A summary
+held beside a call counts toward both caps.
+
+A budget ends a turn as the round limit does: its last call goes with the
+tools shown and no call allowed, so the turn ends on a reply rather than
+failing with its work done and unreported. A call goes so once what is left
+of either cap would not cover it and one more like the turn's average call
+so far; and once any call of the turn (an answer, a summary, a failed
+attempt) has spent a cap and the turn goes on, for tool results or a steer,
+its next call goes so too, which may overshoot the cap. Either way the
+live `tool_calls_withheld` says why (`reason`: `budget`, `turn_budget` or
+`tool_round_limit`), and a turn that completes on such a call is `completed`
+with `limit` (`budget`, `turn_budget` or `rounds`) on its `turn_finished`
+and in its turn view. A retry of a failed attempt that spent a cap goes the
+same way. A cap spent before the turn made any call fails it with
+`budget_exhausted` or `turn_budget_exhausted`, as does one spent again after
+that last call. Usage and work from failed or incomplete calls count in
+`model_rounds` when usage is reported, and toward the caps before a retry and
+later tool rounds, from the running totals without another store read.
+Successful calls keep their single atomic transcript and usage commit.
 
 `submit` also accepts `images`, pictures sent with the prompt: up to 20 of
 `{"media_type", "data"}`, the type one of `image/png`, `image/jpeg`,

@@ -7913,7 +7913,18 @@ impl App {
                 let running = self.running.take();
                 let note = running.as_ref().is_some_and(|r| r.note);
                 let seconds = running.map(|r| r.started.elapsed().as_secs());
-                let shown = if empty { "" } else { detail };
+                // One that ended on the last call a limit left it says so,
+                // as a fact beside its time.
+                let limit = match data["limit"].as_str() {
+                    Some("budget" | "turn_budget") => "ended at its budget",
+                    Some("rounds") => "ended at its round limit",
+                    _ => "",
+                };
+                let shown = match (empty, status) {
+                    (true, _) => "",
+                    (false, "completed") => limit,
+                    _ => detail,
+                };
                 let line = transcript::finished(status, shown, seconds, self.prose());
                 self.close_live();
                 // A turn that only reacted ends as a reaction under the
@@ -16539,6 +16550,45 @@ mod tests {
         ))
         .await;
         assert!(lines(&app).iter().any(|row| row.contains("provider_error")));
+    }
+
+    #[tokio::test]
+    async fn a_turn_that_ended_at_its_budget_reads_as_done_with_the_fact() {
+        let client = daemon_answering(|_| {
+            json!({"items": [{"node": 4, "item": {"type": "message", "role": "assistant",
+                "content": [{"type": "output_text", "text": "Here is what I found."}]}}]})
+        })
+        .await;
+        let mut app = app(client);
+        app.daemon(turn_event("accepted", 1, json!({"request_id": "r1"})))
+            .await;
+        app.daemon(json!({"event": "text_delta", "bot": "b", "turn": 1,
+            "text": "Here is what I found."}))
+            .await;
+        app.daemon(turn_event("message", 1, json!({"node": 4})))
+            .await;
+        app.daemon(turn_event(
+            "turn_finished",
+            1,
+            json!({"status": "completed", "limit": "turn_budget"}),
+        ))
+        .await;
+        let rows: Vec<String> = app.pending.iter().map(|line| line.to_string()).collect();
+        let line = rows.iter().find(|row| row.starts_with("─ ")).unwrap();
+        assert!(line.starts_with("─ Worked"), "{line}");
+        assert!(line.contains("ended at its budget"), "{line}");
+        // Dim, as any turn that ended well: not the red of a failure.
+        let drawn = app
+            .pending
+            .iter()
+            .find(|l| l.to_string().starts_with("─ "))
+            .unwrap();
+        assert!(
+            drawn
+                .spans
+                .iter()
+                .all(|span| span.style.fg != Some(Color::Red))
+        );
     }
 
     #[tokio::test]

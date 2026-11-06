@@ -97,10 +97,10 @@ and a new `add` would lose it. `run` NAME runs it now, waits for the run,
 and returns its `outcome` and the `handle` of the turn it sent, to pass to
 `wait`; it says `pending` when the run has not said within 90 seconds.
 
-An automation's `turn_budget_tokens` caps each run on its own, and a run past
-it fails with `turn_budget_exhausted`. It counts every request's input, the
-agent's history included, so a cap below that history fails every run
-before it starts: set one only when the person asks for a spending limit.
+An automation's `turn_budget_tokens` caps each run on its own: near it the
+run's last call goes without tool calls, and the run ends on its reply. It
+counts what each run adds, its new input and its output, not the history it
+re-reads. Set one only when the person asks for a spending limit.
 
 ## Monitors
 

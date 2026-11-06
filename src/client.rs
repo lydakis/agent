@@ -3270,9 +3270,12 @@ mod tests {
     #[test]
     fn a_reported_error_keeps_every_fact() {
         let ended = json!({"status":"failed","turn":3,"error":"budget_exhausted",
-            "detail":"220 of 200 tokens used","budget_tokens":200,"tokens_used":220});
+            "detail":"220 of 200 tokens of work done","budget_tokens":200,"work_tokens":220});
         let error = Error::reported(&ended).unwrap();
-        assert_eq!(error.detail.as_deref(), Some("220 of 200 tokens used"));
+        assert_eq!(
+            error.detail.as_deref(),
+            Some("220 of 200 tokens of work done")
+        );
         let facts = error.facts.unwrap();
         assert_eq!(
             (&facts["budget_tokens"], &facts["turn"]),

@@ -624,8 +624,9 @@ async fn left(client: &agent_client::Client, bot: &str, turns: &[i64], pays: u64
         else {
             return 0;
         };
-        let used =
-            row["input_tokens"].as_u64().unwrap_or(0) + row["output_tokens"].as_u64().unwrap_or(0);
+        // Its work, as the turn's own budget counts it: what it added, not
+        // the history each of its calls sent again.
+        let used = row["work_tokens"].as_u64().unwrap_or(0);
         let holds = match row["finished_ms"].is_null() {
             true => row["budget_tokens"].as_u64().unwrap_or(u64::MAX).max(used),
             false => used,
@@ -1993,6 +1994,26 @@ mod tests {
         assert_eq!(listed["invites"]["a_day"], invites_a_day(0).max(10));
         assert_eq!(listed["invites"]["agents"], 100);
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[tokio::test]
+    async fn an_allowance_over_several_wakes_counts_their_work_not_the_history_they_resent() {
+        // An agent with a 1.4M history, woken three times on one invite:
+        // each turn sent that history again, and each did 30K of work. A
+        // 1M invite has 910K left, where its usage would have spent it on
+        // the first wake. The one still running holds its cap.
+        let client = crate::tests::daemon_answering(|asked| {
+            let turn = asked["before"].as_i64().unwrap_or(1) - 1;
+            let finished = match turn {
+                4 => Value::Null,
+                _ => json!(1),
+            };
+            json!({"turns": [{"turn": turn, "input_tokens": 1_400_000, "output_tokens": 5_000,
+                "work_tokens": 30_000, "budget_tokens": 200_000, "finished_ms": finished}]})
+        })
+        .await;
+        assert_eq!(left(&client, "a", &[1, 2, 3], 1_000_000).await, 910_000);
+        assert_eq!(left(&client, "a", &[1, 2, 3, 4], 1_000_000).await, 710_000);
     }
 
     #[test]

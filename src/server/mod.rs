@@ -413,7 +413,7 @@ enum Command {
         /// with who wrote them: a turn's prompt, or with `reply` the reply
         /// it ended with.
         quotes: Option<Vec<agent_runtime::store::QuoteRef>>,
-        /// The most input plus output tokens this turn may spend, beside
+        /// The most work, in tokens, this turn may do, beside
         /// the bot's own budget; absent leaves only that.
         budget_tokens: Option<u64>,
         /// Pictures sent with the prompt, each a media type and base64;
