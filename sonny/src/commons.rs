@@ -1381,6 +1381,8 @@ pub struct View {
     open_stamp: Option<(u64, std::time::SystemTime)>,
     /// What the listing last read of each thread.
     known: Summaries,
+    /// The golden tickets the week's invites held, each one agent's.
+    golden: usize,
     notice: Option<String>,
 }
 
@@ -1401,6 +1403,7 @@ impl View {
             open: None,
             open_stamp: None,
             known: Summaries::new(),
+            golden: 0,
             notice: None,
         };
         view.reload();
@@ -1414,6 +1417,9 @@ impl View {
             Ok(listed) => {
                 self.threads = listed["threads"].as_array().cloned().unwrap_or_default();
                 self.invites = listed["invites"].clone();
+                self.golden = (sent(&self.dir).iter())
+                    .filter(|invite| !invite["bot"].is_null() && invite["golden"] == true)
+                    .count();
             }
             Err(error) => self.notice = Some(error),
         }
@@ -1508,12 +1514,14 @@ impl View {
             ))
             .bold(),
             Span::raw(format!(
-                " · {} of {} invited today, {} invites each · {} of {} answered this week",
+                " · {} of {} invited today, {} invites each · {} of {} answered this week · {} golden ticket{}",
                 invites("today"),
                 invites("a_day"),
                 invites("reach"),
                 invites("answered"),
                 invites("this_week"),
+                self.golden,
+                if self.golden == 1 { "" } else { "s" },
             ))
             .dim(),
         ])];
@@ -2147,7 +2155,7 @@ mod tests {
         assert!(empty.iter().any(|l| l == "No thread yet."));
         // An empty commons counts its invites as 0, never null.
         let counts = format!(
-            "0 of {} invited today, {} invites each · 0 of 0 answered this week",
+            "0 of {} invited today, {} invites each · 0 of 0 answered this week · 0 golden tickets",
             invites_a_day(0),
             reach(0, 0, invites_a_day(0) as usize)
         );
@@ -2188,6 +2196,33 @@ mod tests {
         assert_eq!(view.key(KeyEvent::from(KeyCode::Esc)), Key::Stay);
         assert!(!view.reading());
         assert_eq!(view.key(KeyEvent::from(KeyCode::Esc)), Key::Close);
+    }
+
+    #[test]
+    fn the_view_counts_the_golden_tickets_the_week_sent() {
+        let home = &home("golden_count");
+        call(
+            home,
+            "a.x",
+            None,
+            None,
+            &json!({"post": {"name": "t", "title": "T", "text": "x"}}),
+        )
+        .unwrap();
+        let dir = dir(home);
+        // One agent held the golden ticket, one a plain invite, and a
+        // thread still sending holds no agent's yet.
+        let sent = [
+            json!({"thread": "t", "at": now(), "bot": "b.y", "golden": true, "turns": []}),
+            json!({"thread": "t", "at": now(), "bot": "c.z", "golden": false, "turns": []}),
+            json!({"thread": "u", "at": now(), "golden": true, "reach": 3}),
+        ];
+        assert!(keep(&dir, &sent, 2));
+        let view = View::open(home);
+        let head: String = (view.card(200).0[0].spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(head.ends_with(" · 1 golden ticket"), "{head}");
     }
 
     #[test]
