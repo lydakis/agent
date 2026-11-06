@@ -13336,17 +13336,17 @@ impl App {
             );
         }
         let (working, waiting) = self.agents();
-        // Marks as the roster and /status draw them, each with its word,
+        // Marks as the roster and /status draw them, each with its number,
         // so the counts read without colour.
         if waiting > 0 {
-            let forms = footer::count("?", Color::Yellow, waiting, "needs you", false);
+            let forms = footer::count("?", Color::Yellow, waiting, false);
             items.push(Item::new(Slot::Needs, forms).opens("status"));
         }
         // In zen, the focus, and only what needs the person besides.
         if let Some(focus) = &self.zen {
             let needs = match waiting {
                 0 => 0,
-                n => format!("  ? {n} needs you").width(),
+                n => format!("  ? {n}").width(),
             };
             // An armed boost too, quieter than the full footer's: an arrow
             // for each step above the agent's own effort, so ↑ then ↑↑.
@@ -13371,19 +13371,17 @@ impl App {
         // The margin's glance says these while it is in view.
         let glancing = (self.pane.as_ref()).is_some_and(|p| p.is_margin() && p.area.width > 0);
         if self.failed > 0 && !glancing {
-            let forms = footer::count("✗", Color::Red, self.failed, "failed", false);
+            let forms = footer::count("✗", Color::Red, self.failed, false);
             items.push(Item::new(Slot::Failed, forms).opens("background"));
         }
         if working > 0 {
-            let forms = footer::count("●", Color::Cyan, working, "working", true);
+            let forms = footer::count("●", Color::Cyan, working, true);
             items.push(Item::new(Slot::Working, forms).opens("status"));
         }
         // Something runs for it with no one typing: /background lists it.
         if self.behind.0 > 0 && !glancing {
             let n = self.behind.0;
-            let forms = [format!("↻ {n} in background"), format!("↻ {n}")]
-                .map(|text| vec![Span::raw(text).dim()]);
-            let forms = forms.into_iter().chain([Vec::new()]).collect();
+            let forms = vec![vec![Span::raw(format!("↻ {n}")).dim()], Vec::new()];
             items.push(Item::new(Slot::Background, forms).opens("background"));
         }
         let notes = self.margin.notes().len();
@@ -16145,7 +16143,7 @@ mod tests {
         let (footer, counter) = app.footer(60);
         let footer = footer.to_string();
         assert!(footer.starts_with("  zen · the rounding"), "{footer}");
-        assert!(footer.ends_with("? 1 needs you  "), "{footer}");
+        assert!(footer.ends_with("? 1  "), "{footer}");
         assert_eq!(footer.width(), 60);
         let [(counter, "status")] = &counter[..] else {
             panic!("{counter:?}")
@@ -16154,7 +16152,14 @@ mod tests {
         let counted: String = columns[counter.start as usize..counter.end as usize]
             .iter()
             .collect();
-        assert_eq!(counted, "? 1 needs you");
+        assert_eq!(counted, "? 1");
+        // The focus gets the room the count doesn't take: the mark and
+        // its number, not a word after them.
+        app.zen = Some("a long focus that cannot fit".into());
+        let footer = app.footer(30).0.to_string();
+        assert!(footer.starts_with("  zen · a long focus"), "{footer}");
+        assert!(footer.ends_with("? 1  "), "{footer}");
+        assert!(footer.width() <= 30, "{footer}");
     }
 
     #[test]
@@ -17124,22 +17129,18 @@ mod tests {
         app.failed = 1;
         let line = app.footer_line(140);
         let text = line.to_string();
-        assert!(text.contains("✗ 1 failed  ↻ 2 in background"), "{text}");
-        // The mark red at full strength, the words muted.
+        assert!(text.contains("✗ 1  ↻ 2"), "{text}");
+        // The mark red at full strength, the number muted.
         let mark = line.spans.iter().find(|s| s.content == "✗").unwrap();
         assert_eq!(mark.style.fg, Some(Color::Red));
         assert!(
             !mark.style.add_modifier.contains(Modifier::DIM),
             "red, not dimmed"
         );
-        let words = line
-            .spans
-            .iter()
-            .find(|s| s.content == " 1 failed")
-            .unwrap();
+        let words = line.spans.iter().find(|s| s.content == " 1").unwrap();
         assert!(words.style.add_modifier.contains(Modifier::DIM));
         app.failed = 2;
-        assert!(app.footer_line(140).to_string().contains("✗ 2 failed"));
+        assert!(app.footer_line(140).to_string().contains("✗ 2"));
         app.failed = 0;
         assert!(!app.footer_line(140).to_string().contains('✗'));
     }
@@ -19346,13 +19347,10 @@ mod tests {
             .collect();
         assert_eq!(
             shown,
-            [
-                ("? 2 needs you".to_owned(), "status"),
-                ("● 2 working".to_owned(), "status")
-            ]
+            [("? 2".to_owned(), "status"), ("● 2".to_owned(), "status")]
         );
         // The agent's name is the composer's to say, not the footer's.
-        assert!(text.contains("? 2 needs you  ● 2 working"), "{text}");
+        assert!(text.ends_with("  ? 2  ● 2  "), "{text}");
         assert!(!text.contains(&app.bot), "{text}");
         assert_eq!(text.width(), 100);
         let counter = opens[0].0.clone();
