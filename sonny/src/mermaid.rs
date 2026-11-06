@@ -57,8 +57,13 @@ fn resolve(svg: &str, theme: &[(&str, &str)]) -> String {
             if let Some((name, value)) = declaration.split_once(':')
                 && name.trim().starts_with("--")
             {
+                // A value that comes out longer than the whole style is
+                // built of itself, each variable doubling the last, and
+                // left unknown: written out, it would grow exponentially.
                 let value = substitute(value.trim(), &known);
-                known.entry(name.trim().to_owned()).or_insert(value);
+                if value.len() <= style.len() {
+                    known.entry(name.trim().to_owned()).or_insert(value);
+                }
             }
         }
     }
@@ -150,6 +155,34 @@ mod tests {
         let out = resolve(label, &DARK);
         assert!(out.contains(">var(--brand)</text>"), "{out}");
         assert!(!out.contains(r#"fill="var("#), "{out}");
+    }
+
+    #[test]
+    fn variables_built_of_themselves_stay_as_long_as_the_style() {
+        // Each variable twice the one before: written out, the last would
+        // be 2^24 characters from a style of a few hundred.
+        let mut style = String::from("--v0:#123456");
+        for level in 1..=24 {
+            style.push_str(&format!(
+                ";--v{level}:var(--v{})var(--v{})",
+                level - 1,
+                level - 1
+            ));
+        }
+        let svg =
+            format!(r#"<svg style="{style}"><rect fill="var(--v24)" stroke="var(--v3)"/></svg>"#);
+        let out = resolve(&svg, &DARK);
+        assert!(
+            out.len() < 4 * svg.len(),
+            "{} bytes from {}",
+            out.len(),
+            svg.len()
+        );
+        // What fits is written out as before.
+        assert!(
+            out.contains(&format!(r#"stroke="{}""#, "#123456".repeat(8))),
+            "{out}"
+        );
     }
 
     #[test]
