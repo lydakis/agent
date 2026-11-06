@@ -13283,7 +13283,7 @@ impl App {
             );
         }
         let (working, waiting) = self.agents();
-        // Marks as the roster and /status draw them, each with its word,
+        // Marks as the roster and /status draw them, each with its number,
         // so the counts read without colour.
         if waiting > 0 {
             let forms = footer::count("?", Color::Yellow, waiting, false);
@@ -13293,7 +13293,7 @@ impl App {
         if let Some(focus) = &self.zen {
             let needs = match waiting {
                 0 => 0,
-                n => format!("  ? {n} needs you").width(),
+                n => format!("  ? {n}").width(),
             };
             // An armed boost too, quieter than the full footer's: an arrow
             // for each step above the agent's own effort, so ↑ then ↑↑.
@@ -15994,6 +15994,13 @@ mod tests {
             .iter()
             .collect();
         assert_eq!(counted, "? 1");
+        // The focus gets the room the count doesn't take: the mark and
+        // its number, not a word after them.
+        app.zen = Some("a long focus that cannot fit".into());
+        let footer = app.footer(30).0.to_string();
+        assert!(footer.starts_with("  zen · a long focus"), "{footer}");
+        assert!(footer.ends_with("? 1  "), "{footer}");
+        assert!(footer.width() <= 30, "{footer}");
     }
 
     #[test]
