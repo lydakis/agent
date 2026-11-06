@@ -46,7 +46,9 @@ Cargo.lock hashes; observer fingerprints continue to cover the benchmark tools.
 ## Software first
 
 Programs are the clients. Every command below emits JSONL events on stdout by
-default; exit codes report the turn outcome. `--pretty` renders the same stream
+default; exit codes report the turn outcome, and a turn that failed says why
+in one line on stderr too (a `wait` that timed out says so in `pending` alone).
+`--pretty` renders the same stream
 for a human watching a terminal and is never the input protocol. The daemon's
 socket protocol is the contract; the `agent` client is one consumer of it.
 
@@ -3545,7 +3547,9 @@ converges while a step covers more than one round adds. The complete
 summarizer input is byte-bounded including its previous summary and request
 marker and the item count, and the final marker gives the summarizer its
 maximum summary size in UTF-8 bytes. Oversized summaries are rejected above a third of the byte budget
-or 64 KiB, whichever is smaller. At installation, verbatim prompt copies are further bounded so
+or 64 KiB, whichever is smaller; a rejected one is asked for again, in a request
+of its own, at half the size it was asked for, for as long as each comes back
+shorter than the one before (each a billed round). At installation, verbatim prompt copies are further bounded so
 they fit alongside the encoded summary within half the byte envelope. A middle
 range is removed, retaining the oldest and newest excerpts when they fit. Original prompts remain available through history; installed
 prefixes are unchanged until the next compaction. A replacement must reduce encoded bytes,
@@ -3555,7 +3559,16 @@ the old view intact. Such completed calls are still billed. `compacted` events
 include `context_before`, `context_after`, `input_limit`, `reclaimed_bytes`,
 `reclaimed_items`, `headroom_bytes`, and `headroom_items`. These describe the
 complete logical view since the cut; headroom can be negative during catch-up,
-while the actual request still uses a bounded window. These failures leave the bot usable and
+while the actual request still uses a bounded window. `trigger` says what
+started it: its `reason` (`bytes` or `items` past the threshold, `requested`
+by a client, or `overflow`, a view that could not be sent), the model's context
+`window` and the `compact_tokens` threshold it gives, what the last call `sent`
+in bytes and the tokens counted for it, the view's threshold in bytes
+(`at_bytes`), the instructions and tools sent beside the view
+(`overhead_bytes`), the room kept for the reply (`reserve_bytes`) and the
+newest bytes the summary was to leave whole (`keep_bytes`). `room_bytes` is
+`at_bytes` less the view after: how much the conversation can grow before the
+next compaction. These failures leave the bot usable and
 original history retrievable. The
 CLI ships a default compaction text for new bots and `--no-compaction`,
 `--compaction-instructions`, `--compaction-instructions-file`, and

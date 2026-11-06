@@ -139,6 +139,8 @@ class SocketAndCliTests(ModelFixture):
         self.assertEqual(failing.returncode, 1)
         last = json.loads(failing.stdout.splitlines()[-1])
         self.assertEqual((last['event'], last['data']['error']), ('turn_finished', 'missing_completion'))
+        # A failed run says why on stderr too, where a caller that checks the exit looks.
+        self.assertIn('agent: failed: missing_completion', failing.stderr)
         pretty = self.agent('run', '--store', str(self.store), '--bot', 'Bob', '--pretty', 'truncate', check=False)
         self.assertIn('missing_completion', pretty.stderr)
         self.agent('shutdown', '--store', str(self.store))
@@ -829,6 +831,8 @@ class SocketAndCliTests(ModelFixture):
         timed = self.agent('wait', '--store', str(self.store), '--timeout', '200ms', again, check=False)
         self.assertEqual(timed.returncode, 1)
         self.assertEqual(json.loads(timed.stdout)['pending'], [again])
+        # A timeout is no failure: `pending` says it, and stderr stays quiet.
+        self.assertEqual(timed.stderr, '')
         inside = subprocess.run([*self.base, 'wait', '--store', str(self.store), again],
                                 env={**clean_env(), 'AGENT_SHELL_CONTEXT': '1'}, capture_output=True, text=True, timeout=5)
         self.assertNotEqual(inside.returncode, 0)
@@ -1392,17 +1396,36 @@ class CliTests(ModelFixture):
         # or does not answer), waits for it to exit, then starts this one on
         # the same socket. One another client already replaced is not asked;
         # an agent asking from inside a turn, or one with no provider to
-        # start a daemon with, leaves it running and the error stands.
+        # start a daemon with, leaves it running and the error says why,
+        # and that nothing was sent. A command on the bots, which never
+        # starts a daemon where none runs, replaces it the same way, then
+        # goes to the new one.
         provider = ['--provider', 'openai=responses,http://127.0.0.1:9/v1']
-        cases = (('ok', False, provider), ('refused', False, provider), ('silent', False, provider),
-                 ('replaced', False, provider), ('ok', True, provider), ('ok', False, []))
-        for answer, inside, flags in cases:
-            with self.subTest(answer=answer, inside=inside, provider=bool(flags)), \
+        cases = (('ok', False, provider, 'start'), ('refused', False, provider, 'start'),
+                 ('silent', False, provider, 'start'), ('replaced', False, provider, 'start'),
+                 ('ok', True, provider, 'start'), ('ok', False, [], 'start'),
+                 ('ok', False, provider, 'ls'), ('ok', True, provider, 'ls'),
+                 ('ok', False, provider, 'ls --no-spawn'), ('ok', False, provider, 'ls elsewhere'))
+        for answer, inside, flags, command in cases:
+            with self.subTest(answer=answer, inside=inside, provider=bool(flags), command=command), \
                     tempfile.TemporaryDirectory(dir='/tmp') as directory:
-                path, store = Path(directory)/'daemon.sock', Path(directory)/'state.db'
+                store = Path(directory)/'state.db'
+                # The older daemon's store, which `ls` never creates.
+                store.touch()
+                command, *extra = command.split()
+                # A command on the bots replaces only the daemon on its
+                # store's own socket, which is the one it serves.
+                own = command == 'ls' and extra != ['elsewhere']
+                path = Path(directory)/('state.db.sock' if own else 'daemon.sock')
+                extra = [flag for flag in extra if flag.startswith('--')]
                 daemon = subprocess.Popen(['sleep', '30'])
                 self.addCleanup(self.stop_process, daemon)
                 env = {**clean_env(), **({'AGENT_BOT_ID': '7'} if inside else {})}
+                if command == 'ls':
+                    # A command on the bots takes its provider as a default,
+                    # as the shells of agents do.
+                    env['AGENT_PROVIDER'] = ' '.join(flags[1:])
+                    flags = []
                 asked = []
                 listener = socket.socket(socket.AF_UNIX)
                 listener.bind(str(path))
@@ -1443,11 +1466,12 @@ class CliTests(ModelFixture):
                         pass
                 server = threading.Thread(target=older, daemon=True)
                 server.start()
-                result = subprocess.run([str(self.binary), 'start', '--store', str(store), '--socket', str(path), *flags],
+                result = subprocess.run([str(self.binary), command, '--store', str(store), '--socket', str(path), *flags, *extra],
                                         env=env, capture_output=True, timeout=40)
-                if inside or not flags:
+                if inside or extra or not own and command == 'ls' or not (flags or command == 'ls'):
                     self.assertEqual(result.returncode, 1)
                     self.assertIn(b'daemon_protocol_mismatch', result.stderr)
+                    self.assertIn(b'nothing was sent', result.stderr.lower())
                     self.assertIsNone(daemon.poll())
                     self.assertEqual(asked, [])
                     continue
@@ -1460,7 +1484,11 @@ class CliTests(ModelFixture):
                 else:
                     self.assertEqual([(r['op'], r['grace_ms']) for r in asked], [('shutdown', 120000)])
                 self.assertEqual(daemon.wait(timeout=3), -15)
-                self.assertEqual(json.loads(result.stdout)['protocol'], PROTOCOL)
+                if command == 'ls':
+                    # Its listing came from the new daemon.
+                    self.assertEqual(json.loads(result.stdout), [])
+                else:
+                    self.assertEqual(json.loads(result.stdout)['protocol'], PROTOCOL)
 
     def test_explicit_store_overrides_inherited_socket(self):
         client = SocketClient(self.binary, self.path/'first.db', self.url, 'echo')
@@ -1666,7 +1694,9 @@ class ModelListTests(ModelFixture):
         self.assertFalse(self.list.exists())
 
     def test_discover_writes_a_first_list_that_clients_and_bots_read(self):
-        self.assertEqual(json.loads(self.agent('models').stdout), [])
+        bare = self.agent('models')
+        self.assertEqual(json.loads(bare.stdout), [])
+        self.assertIn('agent models --discover', bare.stderr)
         self.assertIn('agent models --discover', self.agent('models', '--pretty').stderr)
         self.assertFalse((self.path / 'state.sqlite').exists(), 'reading the list starts no daemon')
 
