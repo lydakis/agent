@@ -1238,7 +1238,7 @@ fn shown_lines(count: usize) -> usize {
 
 /// A prompt's `lines` on its band, the first of them its `at`th.
 fn prompt_rows(lines: &[&str], at: usize, width: usize) -> Vec<Line<'static>> {
-    let band = crate::look::band();
+    let band = crate::look::BAND;
     let mut out = Vec::new();
     for (i, line) in lines.iter().enumerate() {
         let lead = if at + i == 0 { "› " } else { "  " };
@@ -1257,7 +1257,7 @@ fn prompt_rows(lines: &[&str], at: usize, width: usize) -> Vec<Line<'static>> {
 /// (`open`, from its first hidden one) and the row under them, which a
 /// click shuts again.
 fn prompt_rest(more: usize, open: Option<&[&str]>, width: usize) -> Vec<Line<'static>> {
-    let band = crate::look::band();
+    let band = crate::look::BAND;
     let mut out = match open {
         Some(lines) => prompt_rows(lines, PROMPT_LINES, width),
         None => Vec::new(),
