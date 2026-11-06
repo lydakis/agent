@@ -38,7 +38,7 @@
 //! task_effort = "high"          # each new task's
 //! lead_profile = "my-lead"      # the role a new lead starts in, not lead
 //! task_profile = "worker"       # what every other agent is told, not task
-//! side_chat = "fork"            # "answer", the default, calls no tool
+//! side_chat = "answer"          # calls no tool; "fork", the default, may do anything its agent may
 //! chime = false                 # rings when work ends or waits, the default
 //! verbose = true                # every tool call drawn, not the clean view
 //! text_width = 0                # the widest the conversation is written, 100 by default; 0 the window's whole width
@@ -58,7 +58,6 @@
 //! sky_haiku_hold = 10           # minutes the title is held before it can pass
 //! tool_processes = 8            # processes Sonny runs for agents at once in all: tool calls 3/4, goal checks 1/4; 0, the default, four times the CPUs
 //! lookout_waiting = 4096        # events from sources that wait for one agent, 1024 by default; past it newer ones are not kept, and its next note says so; 0 no limit
-//! sent_days = 90                # days `sonny sent` keeps what agents sent through Sonny's tools, 30 by default; 0 keeps all
 //! default_permissions = "strict"   # the /permissions row a new lead starts in, auto by default
 //! browser_confirm = ["eval"]    # agent-browser actions the agent's gate approves; eval, download, upload and state by default
 //!
@@ -503,9 +502,6 @@ pub struct Sonny {
     /// newer ones are not kept, and its next note says how many, from
     /// where and when. 0 for no limit.
     pub lookout_waiting: u64,
-    /// How many days of the journal of what agents sent through Sonny's
-    /// tools are kept. 0 keeps all.
-    pub sent_days: u64,
     /// What the lookout runs for news from outside, by name.
     pub sources: Vec<Source>,
     /// The agent-browser action categories that the `browser` tool puts
@@ -609,7 +605,6 @@ impl Default for Sonny {
             sky_haiku_hold: 10,
             tool_processes: 0,
             lookout_waiting: 1024,
-            sent_days: 30,
             chime: true,
             verbose: false,
             text_width: TEXT_WIDTH,
@@ -624,13 +619,13 @@ impl Default for Sonny {
     }
 }
 
-/// What the copy `/side` talks to may do: `"answer"`, the default, from
-/// what its agent knows, calling no tool; or `"fork"`, anything its agent
-/// may, with its tools, in its folder, under its approvals.
+/// What the copy `/side` talks to may do: `"fork"`, the default, anything
+/// its agent may, with its tools, in its folder, under its approvals; or
+/// `"answer"`, from what its agent knows, calling no tool.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SideChat {
-    #[default]
     Answer,
+    #[default]
     Fork,
 }
 
@@ -1224,7 +1219,6 @@ fn parse(text: &str) -> Result<Config, String> {
                 "sky_haiku_hold",
                 "tool_processes",
                 "lookout_waiting",
-                "sent_days",
                 "unsandboxed",
                 "default_permissions",
                 "browser_confirm",
@@ -1307,7 +1301,6 @@ fn parse(text: &str) -> Result<Config, String> {
                 "sky_haiku_hold" => Some(&mut config.sonny.sky_haiku_hold),
                 "tool_processes" => Some(&mut config.sonny.tool_processes),
                 "lookout_waiting" => Some(&mut config.sonny.lookout_waiting),
-                "sent_days" => Some(&mut config.sonny.sent_days),
                 "text_width" => Some(&mut config.sonny.text_width),
                 "margin_notes" => Some(&mut config.sonny.margin_notes),
                 _ => None,
@@ -2011,9 +2004,9 @@ mod tests {
         let off = parse("web_search = \"disabled\"").unwrap();
         assert_eq!(off.web_search, WebSearch::Disabled);
         assert!(!config.hide_senders);
-        assert_eq!(config.sonny.side_chat, SideChat::Answer);
-        let fork = parse("[sonny]\nside_chat = \"fork\"").unwrap();
-        assert_eq!(fork.sonny.side_chat, SideChat::Fork);
+        assert_eq!(config.sonny.side_chat, SideChat::Fork);
+        let answer = parse("[sonny]\nside_chat = \"answer\"").unwrap();
+        assert_eq!(answer.sonny.side_chat, SideChat::Answer);
         assert_eq!(config.sonny.margin_opens, MarginOpens::Always);
         let never = parse("[sonny]\nmargin_opens = \"never\"").unwrap();
         assert_eq!(never.sonny.margin_opens, MarginOpens::Never);
