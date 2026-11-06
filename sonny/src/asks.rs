@@ -60,6 +60,8 @@ pub struct Ask {
     /// When it goes ahead or is raised again, in seconds since the epoch,
     /// as the call's result says.
     pub deadline: Option<i64>,
+    /// For an ask that approves an action, what a yes covers.
+    pub covers: Option<Covers>,
     /// The task that asked, when not the window's own agent: a lead's
     /// window shows its tasks' open questions too, and an answer to one
     /// goes to the task, the same answer to the same ask its own window
@@ -86,6 +88,41 @@ impl Ask {
 pub struct Asker {
     pub bot: String,
     pub name: String,
+}
+
+/// What a yes to an ask covers: one action, on one target, at one
+/// revision where the target has one. A yes covers that and nothing else,
+/// as a review's approval covers the commit it saw, so another target or
+/// revision needs another ask.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Covers {
+    pub action: String,
+    pub target: String,
+    pub revision: Option<String>,
+}
+
+impl Covers {
+    /// What an ask's `covers` names, when it names an action and a target.
+    fn of(covers: &Value) -> Option<Self> {
+        let word = |key: &str| {
+            let word = tidy(covers[key].as_str()).replace('\n', " ");
+            (!word.is_empty()).then_some(word)
+        };
+        Some(Self {
+            action: word("action")?,
+            target: word("target")?,
+            revision: word("revision"),
+        })
+    }
+
+    /// It in one line, as the card shows it and the answer repeats it:
+    /// `publish · lydakis/agent#12 · at 3f2a9c1`.
+    pub fn line(&self) -> String {
+        match &self.revision {
+            Some(revision) => format!("{} · {} · at {revision}", self.action, self.target),
+            None => format!("{} · {}", self.action, self.target),
+        }
+    }
 }
 
 /// What an agent does while the person has not answered.
@@ -179,8 +216,9 @@ pub fn tool() -> Value {
             with what happens if they pick it, the one you recommend and why, and what you do until \
             they answer. Options without what they mean are useless to the person, so say what each \
             one does to their goal. Ask once, one decision per call, and do not repeat it in your \
-            reply. A pick comes as their next message, starting \"You asked\", the ask's ID \
-            and your question; words they write instead come as they wrote them, so read whether they \
+            reply. When their pick approves an action, say in covers what: their yes covers that \
+            action, target and revision alone, so a new target or revision needs a new ask. A pick comes as their next message, starting \"You \
+            asked\", the ask's ID, your question and what it covers; words they write instead come as they wrote them, so read whether they \
             answer it. Say in if_unanswered what you do until then. go_now goes on with the option \
             you recommend at once, for a step you can undo once they have seen it. go_later goes \
             on with it once the wait passes with no word from them, for a step you can undo but \
@@ -224,6 +262,19 @@ pub fn tool() -> Value {
                     "description": "Why you recommend it, in one sentence; with options."},
                 "if_unanswered": {"type": "string", "enum": ["go_now", "go_later", "wait"],
                     "description": "What you do until they answer, as above."},
+                "covers": {"type": "object",
+                    "description": "What a yes approves.",
+                    "properties": {
+                        "action": {"type": "string",
+                            "description": "A word or two: publish, merge, send, delete."},
+                        "target": {"type": "string",
+                            "description": "What it acts on: a pull request, a path."},
+                        "revision": {"type": "string",
+                            "description": "The exact version, where one exists: a commit, a draft, \
+                                a hash."}
+                    },
+                    "required": ["action", "target"],
+                    "additionalProperties": false},
                 "wait_minutes": {"type": "integer", "minimum": 1, "maximum": MAX_MINUTES,
                     "description": "How long go_later waits before you go ahead, or wait before you \
                         are reminded, when the work runs on a clock, such as a meeting or a release; \
@@ -307,6 +358,7 @@ pub fn call(id: &str, arguments: &Value) -> Option<Ask> {
         reason: prose(arguments["reason"].as_str()),
         unanswered,
         deadline: None,
+        covers: Covers::of(&arguments["covers"]),
         task: None,
     })
 }
@@ -426,12 +478,16 @@ pub fn split(text: &str) -> Option<(&str, &str)> {
 }
 
 /// A person's message [`answer`] wrote, as the ask it names, the question
-/// and the answer.
+/// and the answer, past the line saying what it covers.
 fn parts(text: &str) -> Option<(&str, &str, &str)> {
     let (id, rest) = text.strip_prefix("You asked (")?.split_once("): ")?;
     let (question, answer) = rest.split_once("\n\n")?;
+    let question = (question.rsplit_once(COVERS)).map_or(question, |(question, _)| question);
     (!id.is_empty() && !id.contains(char::is_whitespace)).then_some((id, question, answer))
 }
+
+/// The line an answer says what its yes covers on, under the question.
+const COVERS: &str = "\nCovers: ";
 
 /// The row that says which question a message answers, above it.
 pub fn answering(question: &str, width: usize) -> Line<'static> {
@@ -471,7 +527,12 @@ pub fn answer(ask: &Ask, typed: &str) -> String {
         .and_then(|n| n.checked_sub(1))
         .and_then(|at| ask.options.get(at))
         .map_or(typed, |choice| choice.label.as_str());
-    format!("You asked ({}): {}\n\n{picked}", ask.id, ask.question)
+    let covers =
+        (ask.covers.as_ref()).map_or_else(String::new, |c| format!("{COVERS}{}", c.line()));
+    format!(
+        "You asked ({}): {}{covers}\n\n{picked}",
+        ask.id, ask.question
+    )
 }
 
 /// The decision as it is drawn where it was asked, as [`card`] lays it.
@@ -528,6 +589,13 @@ pub fn card(ask: &Ask, width: usize) -> Card {
         Line::from(indent()),
         Style::new().dim(),
     ));
+    // What a yes covers, muted under the why, as the answer repeats it.
+    if let Some(covers) = &ask.covers {
+        let row = Line::from(format!("Covers: {}", covers.line())).dim();
+        let wrapped =
+            crate::transcript::wrap_lines(row, width, Line::from(indent()), Line::from(indent()));
+        rows.extend(wrapped.into_iter().map(|row| (row, Line::from(indent()))));
+    }
     if !ask.options.is_empty() || ask.command.is_some() {
         rows.push(spacer());
     }
@@ -1150,6 +1218,57 @@ mod tests {
                 ),
             }
         }
+    }
+
+    #[test]
+    fn a_yes_says_what_it_covers_on_the_card_and_in_the_answer() {
+        let mut publish = keep_api();
+        publish["covers"] =
+            json!({"action": "publish", "target": "lydakis/agent#12", "revision": " 3f2a9c1 "});
+        let ask = call(&id(7, "c1"), &publish).unwrap();
+        let covers = ask.covers.clone().unwrap();
+        assert_eq!(covers.line(), "publish · lydakis/agent#12 · at 3f2a9c1");
+        // Under the why, muted, as the why is.
+        let rows = card(&ask, 60).rows;
+        assert_eq!(
+            rows[2].to_string(),
+            "┃ Covers: publish · lydakis/agent#12 · at 3f2a9c1"
+        );
+        let text = (rows[2].spans.iter())
+            .find(|span| span.content.contains("Covers"))
+            .unwrap();
+        let dim = text.style.patch(rows[2].style).add_modifier;
+        assert!(dim.contains(ratatui::style::Modifier::DIM), "{dim:?}");
+        // The answer repeats it under the question, and still names its ask,
+        // its question and its pick.
+        let sent = answer(&ask, "2");
+        assert_eq!(
+            sent,
+            "You asked (ask:7/c1): Keep the old API?\n\
+             Covers: publish · lydakis/agent#12 · at 3f2a9c1\n\nDrop it"
+        );
+        assert_eq!(answered(&sent), Some("ask:7/c1"));
+        assert_eq!(split(&sent), Some(("Keep the old API?", "Drop it")));
+        // A target with no revision says none; an action or a target
+        // missing covers nothing, so the card and answer say nothing.
+        publish["covers"] = json!({"action": "send", "target": "the release notes"});
+        let ask = call(&id(7, "c1"), &publish).unwrap();
+        assert_eq!(ask.covers.unwrap().line(), "send · the release notes");
+        publish["covers"] = json!({"action": "merge", "target": " "});
+        let ask = call(&id(7, "c1"), &publish).unwrap();
+        assert_eq!(ask.covers, None);
+        assert_eq!(
+            answer(&ask, "1"),
+            "You asked (ask:7/c1): Keep the old API?\n\nKeep it"
+        );
+        // The tool asks for it, and says what a yes covers.
+        let tool = tool();
+        let covers = &tool["parameters"]["properties"]["covers"];
+        assert_eq!(covers["required"], json!(["action", "target"]));
+        assert!(
+            (tool["description"].as_str().unwrap())
+                .contains("a new target or revision needs a new ask")
+        );
     }
 
     #[test]

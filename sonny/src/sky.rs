@@ -204,7 +204,7 @@ enum Feed {
     /// that ended unsure of them.
     Scans(mpsc::UnboundedSender<(String, Option<i64>)>),
     /// An agent's history read for its questions: none when it could not be.
-    Asked(String, Option<crate::needs::Seen>),
+    Asked(String, Option<Box<crate::needs::Seen>>),
     Live(Value),
     /// An agent's model, read again after it was configured.
     Model(String, String),
@@ -1107,7 +1107,7 @@ impl View {
                         && !self.agents[at].waits.unsure(&name)
                     {
                         let running = self.agents[at].running.is_some();
-                        let ask = seen.open(&self.resolved, &name, running);
+                        let ask = (*seen).open(&self.resolved, &name, running);
                         self.agents[at].waits.asked(&name, ask);
                     }
                 }
@@ -4765,7 +4765,7 @@ async fn follow(socket: PathBuf, send: mpsc::UnboundedSender<Feed>) {
     tokio::spawn(async move {
         while let Some((bot, turn)) = asked.recv().await {
             let seen = crate::needs::scan(&reader, &bot, turn).await;
-            if told.send(Feed::Asked(bot, seen)).is_err() {
+            if told.send(Feed::Asked(bot, seen.map(Box::new))).is_err() {
                 return;
             }
         }
@@ -7531,15 +7531,15 @@ mod tests {
         };
         // Its lead resolved the cart past the turn that asked; the login
         // still asks, as does the cart once a later turn reopens it.
-        send.send(Feed::Asked("shop.cart".into(), Some(seen(4))))
+        send.send(Feed::Asked("shop.cart".into(), Some(Box::new(seen(4)))))
             .unwrap();
-        send.send(Feed::Asked("shop.login".into(), Some(seen(4))))
+        send.send(Feed::Asked("shop.login".into(), Some(Box::new(seen(4)))))
             .unwrap();
         view.drain();
         let state = |view: &View, name: &str| view.agents[view.index[name]].state();
         assert_ne!(state(&view, "shop.cart"), Some(State::NeedsYou));
         assert_eq!(state(&view, "shop.login"), Some(State::NeedsYou));
-        send.send(Feed::Asked("shop.cart".into(), Some(seen(6))))
+        send.send(Feed::Asked("shop.cart".into(), Some(Box::new(seen(6)))))
             .unwrap();
         view.drain();
         assert_eq!(state(&view, "shop.cart"), Some(State::NeedsYou));
