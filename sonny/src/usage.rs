@@ -790,7 +790,7 @@ mod tests {
             let card = view.card(width);
             let bars = card
                 .into_iter()
-                .filter(|line| text(&[line.clone()]).ends_with('%'));
+                .filter(|line| text(std::slice::from_ref(line)).ends_with('%'));
             for line in bars {
                 assert!(
                     line.width() <= width,
