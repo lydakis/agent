@@ -448,6 +448,39 @@ fn file(store: &Path, subscriber: &str) -> PathBuf {
     dir(store).join(format!("{subscriber}.json"))
 }
 
+/// Where the lookout keeps when it took each subscriber's file.
+fn taken_file(store: &Path) -> PathBuf {
+    super::beside(store, ".lookout.taken.json")
+}
+
+/// Keep when the lookout took each subscriber's file as it now reads, in
+/// milliseconds since the epoch: written whenever one changes, not on
+/// every read.
+pub(super) fn took(store: &Path, taken: &std::collections::HashMap<String, u128>) {
+    let body = json!(taken).to_string();
+    let _ = agent_client::files::replace_mode(&taken_file(store), body.as_bytes(), 0o600);
+}
+
+/// What the lookout makes of `subscriber`'s file: whether one runs, when it
+/// took the file, and whether that was after the file last changed. A
+/// running lookout reads every file again within `REREAD`.
+pub fn taken(store: &Path, subscriber: &str) -> Value {
+    let running = super::running(store);
+    let took = (std::fs::read_to_string(taken_file(store)).ok())
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .and_then(|taken| taken[subscriber].as_u64());
+    let changed = (std::fs::metadata(file(store, subscriber)).ok())
+        .and_then(|meta| meta.modified().ok())
+        .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|at| at.as_millis() as u64);
+    json!({
+        "running": running,
+        "took_ms": took,
+        "current": running && took.is_some_and(|took| changed.is_none_or(|changed| changed <= took)),
+        "rereads_every_s": super::REREAD.as_secs(),
+    })
+}
+
 /// A subscriber's subscriptions, as its file holds them.
 pub fn read(store: &Path, subscriber: &str) -> Vec<Sub> {
     let Ok(text) = std::fs::read_to_string(file(store, subscriber)) else {
@@ -686,6 +719,8 @@ pub fn change(
         }
     }
     said["subscriptions"] = subs.iter().map(Sub::to_json).collect();
+    // Whether what it lists is what the lookout listens for.
+    said["lookout"] = taken(store, subscriber);
     // Examples come only from events these subscriptions hear, and are
     // what sources printed, as a note from them is.
     let (listed, examples) = super::sources::listed(store, sources, &subs);

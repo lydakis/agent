@@ -35,7 +35,7 @@ const SETTLE: Duration = Duration::from_secs(2);
 /// How long a note waits for messages still being read.
 const SETTLE_MAX: Duration = Duration::from_secs(15);
 /// How often subscription files are read again.
-const REREAD: Duration = Duration::from_secs(15);
+pub(crate) const REREAD: Duration = Duration::from_secs(15);
 /// How long a task waits on the person's approval before it is news.
 const APPROVAL_AFTER: Duration = Duration::from_secs(120);
 /// How long a running turn may print nothing before it is news.
@@ -725,6 +725,7 @@ async fn serve(settings: Settings) -> Result<(), String> {
         made: Made::default(),
         working: HashMap::new(),
         subscribers: HashMap::new(),
+        read_at: HashMap::new(),
         registry: Arc::default(),
         socket: settings.socket.clone(),
         lookouts: HashMap::new(),
@@ -850,6 +851,10 @@ struct Service {
     /// Subscriptions by subscriber, as their files held them at the last
     /// read.
     subscribers: HashMap<String, Vec<subs::Sub>>,
+    /// When the lookout took each subscriber's file as it last changed,
+    /// kept beside the store ([`subs::taken`]) for its `subscriptions`
+    /// listing to show.
+    read_at: HashMap<String, u128>,
     /// The subscribers' names, one set every lookout shares (Kubernetes'
     /// informer cache: one store, many readers), made again whenever
     /// subscriptions are worked out.
@@ -1136,6 +1141,11 @@ impl Service {
         }
         subs::steer_files(&self.store);
         self.subscribers = subs::all(&self.store).into_iter().collect();
+        let now = epoch_ms();
+        self.read_at = (self.subscribers.keys())
+            .map(|name| (name.clone(), now))
+            .collect();
+        subs::took(&self.store, &self.read_at);
         self.registry = watchers(&self.subscribers);
         for bot in &bots {
             self.seat(&client, bot).await;
@@ -1791,6 +1801,21 @@ impl Service {
         if read == self.subscribers {
             return;
         }
+        // Each file that changed, said once it is read, so a rewritten
+        // filter is known to be live before an event it hears comes.
+        let now = epoch_ms();
+        let changed: Vec<String> = (read.iter())
+            .filter(|(name, subs)| self.subscribers.get(*name) != Some(*subs))
+            .map(|(name, _)| name.clone())
+            .collect();
+        self.read_at.retain(|name, _| read.contains_key(name));
+        for name in &changed {
+            if self.subscribers.contains_key(name) {
+                self.write(&json!({"at_ms": now, "lead": name, "reloaded": true}));
+            }
+            self.read_at.insert(name.clone(), now);
+        }
+        subs::took(&self.store, &self.read_at);
         self.subscribers = read;
         self.registry = watchers(&self.subscribers);
         let records: Vec<Value> = (self.subscribers.keys())
@@ -4726,6 +4751,7 @@ mod tests {
             ),
             working: HashMap::new(),
             subscribers: HashMap::new(),
+            read_at: HashMap::new(),
             registry: Arc::default(),
             socket: PathBuf::new(),
             lookouts: HashMap::new(),

@@ -38,8 +38,14 @@ subscriptions on the daemon, whichever Sonny opened it, so a lead hears
 from its tasks even while no window shows that project. It exits
 once the daemon has been unreachable for 30 seconds, and the daemon stops
 it as it stops. Its own lines go to `STORE.companions/sonny-lookout.log`,
-and each subscriber it watches (`seated`) and each note it sends (`woke`)
-to `STORE.lookout.jsonl`.
+and each subscriber it watches (`seated`), each subscriber whose file it
+read again after a change (`reloaded`) and each note it sends (`woke`) to
+`STORE.lookout.jsonl`. When it took each subscriber's file is kept in
+`STORE.lookout.taken.json`, written only as one changes, and the
+`subscriptions` tool lists it as `lookout`: whether a lookout runs, when it
+took the file (`took_ms`), whether that was after the file last changed
+(`current`), and how often it reads the files again (`rereads_every_s`).
+A subscriber whose rewritten filter is not live yet sees `current: false`.
 
 The lookout only watches and tells. The tools Sonny gives its agents are
 answered by another companion, `sonny-tool-host` (`sonny tool-host`; see
