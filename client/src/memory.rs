@@ -526,11 +526,17 @@ impl Fact {
     fn valid(&self) -> Result<(), String> {
         valid_name(&self.name)?;
         if !TYPES.contains(&self.kind.as_str()) {
-            return Err(format!(
-                "invalid_type: {}: one of {}",
-                self.kind,
-                TYPES.join(", ")
-            ));
+            // An empty value is a missing one: say what the fact needs,
+            // not an empty name followed by a colon.
+            let types = TYPES.join(", ");
+            return Err(if self.kind.is_empty() {
+                format!("invalid_type: the fact needs a type: {types}")
+            } else {
+                format!(
+                    "invalid_type: {} is not a type; the fact needs one of {types}",
+                    self.kind
+                )
+            });
         }
         for (field, value) in [("description", &self.description), ("source", &self.source)] {
             if value.trim().is_empty() || value.contains('\n') || value.trim() != value {
@@ -563,9 +569,12 @@ fn valid_name(name: &str) -> Result<(), String> {
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
     {
-        return Err(format!(
-            "invalid_name: {name}: a fact's name is 1-64 of a-z 0-9 -, not starting with - and not memory"
-        ));
+        let rule = "1-64 of a-z 0-9 -, not starting with - and not memory";
+        return Err(if name.is_empty() {
+            format!("invalid_name: the fact needs a name: {rule}")
+        } else {
+            format!("invalid_name: {name}: a fact's name is {rule}")
+        });
     }
     Ok(())
 }
@@ -2108,6 +2117,41 @@ mod tests {
         git(&root, &["commit", "-q", "-am", "older ignore file"]).unwrap();
         run_(&["read", "a", "--user"]).unwrap();
         assert_eq!(code(changed(&root)), "unchanged");
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn a_save_missing_its_type_or_name_says_what_the_fact_needs() {
+        let home = temp("needs");
+        let detail = |r: Result<Value, String>| error_json(&r.unwrap_err());
+        // A tool call that leaves a field out sends it empty.
+        let save = json!({"save": {"name": "pinned-version", "description": "d",
+            "source": "s", "text": "x"}, "user": true});
+        let error = detail(call(&home, &home, &save));
+        assert_eq!(error["error"], "invalid_type");
+        assert_eq!(
+            error["detail"],
+            "the fact needs a type: user, feedback, project, reference, work"
+        );
+        let mut wrong = save.clone();
+        wrong["save"]["type"] = json!("note");
+        let error = detail(call(&home, &home, &wrong));
+        assert_eq!(
+            error["detail"],
+            "note is not a type; the fact needs one of user, feedback, project, reference, work"
+        );
+        let mut nameless = save.clone();
+        nameless["save"]["type"] = json!("user");
+        nameless["save"]["name"] = json!("");
+        let error = detail(call(&home, &home, &nameless));
+        assert_eq!(error["error"], "invalid_name");
+        assert!(
+            error["detail"]
+                .as_str()
+                .unwrap()
+                .starts_with("the fact needs a name: "),
+            "{error}"
+        );
         std::fs::remove_dir_all(home).unwrap();
     }
 
