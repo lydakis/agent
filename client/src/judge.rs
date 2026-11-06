@@ -131,21 +131,25 @@ fn tool_output(item: &Value) -> bool {
 /// was written and whether it is a tool's output. Empty when it could not
 /// be read: the time then reads as all the verdict's.
 async fn entries(client: &Client, bot: &str, turn: i64) -> Vec<(i64, bool)> {
-    let Ok(page) = client
-        .request("history_nodes", json!({"bot": bot, "limit": 400}))
-        .await
-    else {
-        return Vec::new();
-    };
-    let written: Map<String, Value> = (page["nodes"].as_array().into_iter().flatten())
-        .take_while(|node| node["turn"].as_i64() == Some(turn))
-        .filter_map(|node| {
-            Some((
-                node["node"].as_i64()?.to_string(),
-                node["written_ms"].clone(),
-            ))
-        })
-        .collect();
+    // Pages run newest first: they are read until one reaches an earlier
+    // turn, or the history's start.
+    let mut written = Map::new();
+    let mut from: Option<i64> = None;
+    loop {
+        let Ok(page) = client
+            .request(
+                "history_nodes",
+                json!({"bot": bot, "limit": 400, "from": from}),
+            )
+            .await
+        else {
+            return Vec::new();
+        };
+        match turn_nodes(&page, turn, &mut written) {
+            Some(next) => from = Some(next),
+            None => break,
+        }
+    }
     let mut left: Vec<i64> = written
         .keys()
         .filter_map(|node| node.parse().ok())
@@ -180,6 +184,25 @@ async fn entries(client: &Client, bot: &str, turn: i64) -> Vec<(i64, bool)> {
         .into_iter()
         .map(|(_, at, output)| (at, output))
         .collect()
+}
+
+/// Add the nodes of turn `turn` on a newest-first `page` to `written`, by
+/// node, as when each was written. Gives where the next page starts while
+/// the turn may go on past this one.
+fn turn_nodes(page: &Value, turn: i64, written: &mut Map<String, Value>) -> Option<i64> {
+    let nodes = page["nodes"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    for node in nodes {
+        if node["turn"].as_i64() != Some(turn) {
+            return None;
+        }
+        if let Some(id) = node["node"].as_i64() {
+            written.insert(id.to_string(), node["written_ms"].clone());
+        }
+    }
+    page["next_from"].as_i64()
 }
 
 /// The nodes of `wanted` a read's `page` left out, to ask for next; none
@@ -504,8 +527,10 @@ async fn usage(client: &Client, bot: &str, turn: i64, submitted_ms: i64) -> Usag
         .unwrap_or_default();
     let row = &read["turns"][0];
     let tokens = |key: &str| row[key].as_u64().unwrap_or(0);
-    // A turn of one round looked at nothing: its history says no more.
-    let entries = match tokens("model_rounds") > 1 {
+    // A turn that completed in one round looked at nothing: its history
+    // says no more. One that failed may have run tools its first round
+    // called, with no round after to count them.
+    let entries = match row["status"] != "completed" || tokens("model_rounds") > 1 {
         true => entries(client, bot, turn).await,
         false => Vec::new(),
     };
@@ -586,6 +611,32 @@ mod tests {
             Timing::of(&json!({"started_ms": 1}), 0, &[]),
             Timing::default()
         );
+    }
+
+    #[test]
+    fn a_turns_nodes_are_paged_until_an_earlier_turn() {
+        let mut written = Map::new();
+        let page = json!({"nodes": [
+            {"node": 9, "turn": 5, "written_ms": 90},
+            {"node": 8, "turn": 5, "written_ms": 80},
+        ], "next_from": 7});
+        // Every node is the turn's: it may go on in the next page.
+        assert_eq!(turn_nodes(&page, 5, &mut written), Some(7));
+        let page = json!({"nodes": [
+            {"node": 7, "turn": 5, "written_ms": 70},
+            {"node": 6, "turn": 4, "written_ms": 60},
+        ], "next_from": 5});
+        assert_eq!(turn_nodes(&page, 5, &mut written), None);
+        assert_eq!(
+            written,
+            json!({"7": 70, "8": 80, "9": 90})
+                .as_object()
+                .cloned()
+                .unwrap()
+        );
+        // The history's start ends it too.
+        let page = json!({"nodes": [{"node": 1, "turn": 1}], "next_from": null});
+        assert_eq!(turn_nodes(&page, 1, &mut written), None);
     }
 
     #[test]
