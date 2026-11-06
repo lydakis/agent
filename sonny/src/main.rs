@@ -53,6 +53,7 @@ mod mcp_import;
 mod mermaid;
 mod models;
 mod mux;
+mod named;
 mod needs;
 mod new;
 mod pane;
@@ -372,7 +373,7 @@ async fn show(
         ));
     }
     let (socket, project, chain) = agents_project(caller).await?;
-    let me = std::env::current_exe().map_err(|e| e.to_string())?;
+    let me = named::me().map_err(|e| e.to_string())?;
     if split.is_none()
         && let Some(other) = project::lead_project(bot).filter(|p| *p != project)
     {
@@ -779,7 +780,7 @@ async fn project_of(client: &Client, bot: &str) -> String {
 /// out), else Homebrew's `agent` formula when Sonny is its `sonny`. Not
 /// `agent` on PATH, which may be another program.
 fn agent_bin() -> Option<PathBuf> {
-    let me = std::env::current_exe().and_then(std::fs::canonicalize).ok();
+    let me = named::me().and_then(std::fs::canonicalize).ok();
     std::env::var_os("AGENT_BIN")
         .map(PathBuf::from)
         .into_iter()
@@ -855,10 +856,26 @@ async fn serve_auto(client: &Client, model: &str) -> Result<(), String> {
 /// the daemon keeps, so a Sonny upgraded in place has the daemon start the
 /// new ones, the approver too, with no window in `auto` needed.
 async fn start_companions(client: &Client) -> Result<(), String> {
-    let me = std::env::current_exe().map_err(|e| e.to_string())?;
-    let build = json!({"SONNY_BUILD": lookout::identity()});
-    keep(client, LOOKOUT, &me, daemon_args("lookout"), build.clone()).await?;
-    keep(client, TOOL_HOST, &me, daemon_args(tool_host::NAME), build).await?;
+    let me = named::me().map_err(|e| e.to_string())?;
+    let build = json!({"SONNY_BUILD": lookout::identity(), named::PROGRAM: me});
+    let lookout = named::named(&me, named::LOOKOUT);
+    keep(
+        client,
+        LOOKOUT,
+        &lookout,
+        daemon_args("lookout"),
+        build.clone(),
+    )
+    .await?;
+    let host = named::named(&me, named::TOOL_HOST);
+    keep(
+        client,
+        TOOL_HOST,
+        &host,
+        daemon_args(tool_host::NAME),
+        build,
+    )
+    .await?;
     keep_approver(client, None).await
 }
 
@@ -866,17 +883,19 @@ async fn start_companions(client: &Client) -> Result<(), String> {
 /// already with the judge it has, else, given a `model`, a new one judged
 /// by it. Without one kept or a model, nothing.
 async fn keep_approver(client: &Client, model: Option<&str>) -> Result<(), String> {
-    let me = std::env::current_exe().map_err(|e| e.to_string())?;
+    let me = named::me().map_err(|e| e.to_string())?;
     let listed = client
         .request("companions", json!({}))
         .await
         .map_err(|e| e.to_string())?;
     let kept =
         (listed["companions"].as_array().into_iter().flatten()).find(|c| c["name"] == APPROVER);
-    let Some(env) = approver_env(kept, model, &lookout::identity()) else {
+    let Some(mut env) = approver_env(kept, model, &lookout::identity()) else {
         return Ok(());
     };
-    keep(client, APPROVER, &me, daemon_args("approver"), env).await
+    env[named::PROGRAM] = json!(me);
+    let approver = named::named(&me, named::APPROVER);
+    keep(client, APPROVER, &approver, daemon_args("approver"), env).await
 }
 
 /// What the approver runs with: the judge the one `kept` has, else
@@ -1042,15 +1061,18 @@ fn start_daemon(
     // left in it when it ends: the daemon is started in a scope of its own,
     // as a desktop starts an app, so it outlives the fire.
     let scoped = login && cfg!(target_os = "linux") && std::env::var_os("INVOCATION_ID").is_some();
+    // Started by its own name, so a process list tells it from another
+    // program called `agent`; its agents still run Agent by its own.
+    let daemon = named::named(&bin, named::DAEMON);
     let mut command = match scoped {
         true => {
             let mut command = std::process::Command::new("systemd-run");
             command
                 .args(["--user", "--scope", "--quiet", "--collect", "--"])
-                .arg(&bin);
+                .arg(&daemon);
             command
         }
-        false => std::process::Command::new(&bin),
+        false => std::process::Command::new(&daemon),
     };
     if let Some(environment) = login.then(login::environment).flatten() {
         command.env_clear().envs(environment);
@@ -1060,6 +1082,7 @@ fn start_daemon(
         command.env("XDG_RUNTIME_DIR", runtime);
     }
     apply_env_file(&mut command)?;
+    command.env("AGENT_BIN", &bin).env_remove(named::PROGRAM);
     let out = command
         .arg("start")
         .arg("--store")
@@ -1637,7 +1660,7 @@ async fn run() -> Result<(), String> {
             marker.retire();
             place = marker.known();
         }
-        let me = std::env::current_exe().map_err(|e| e.to_string())?;
+        let me = named::me().map_err(|e| e.to_string())?;
         // Named by --agent, whatever folder this window is in.
         let mut args = reopen(&other).split_off(1);
         if let Some(at) = args.iter().position(|arg| arg == "--lead") {
@@ -3492,7 +3515,7 @@ impl Fleet {
         let (client, mut events) = Client::connect(&options.socket).await.ok()?;
         client.request("follow", fleet_follow()).await.ok()?;
         caught_up(&mut events).await;
-        let me = std::env::current_exe().ok()?;
+        let me = named::me().ok()?;
         // Rex starts a block without this process's environment.
         // The lead's Sonny rings for the whole project; a task's is quiet.
         let command = vec![
@@ -5827,7 +5850,7 @@ impl App {
     /// Sonny run with `args` in the pane, on a terminal of its own: a side
     /// chat, or a task opened to watch.
     fn embed(&mut self, title: &str, args: &[String]) -> Result<(), String> {
-        let me = std::env::current_exe().map_err(|e| e.to_string())?;
+        let me = named::me().map_err(|e| e.to_string())?;
         let mut command = std::process::Command::new(me);
         command
             .arg("--store")
@@ -18857,12 +18880,20 @@ mod tests {
         let added = added.lock().unwrap().clone();
         let names: Vec<&str> = added.iter().filter_map(|a| a["name"].as_str()).collect();
         assert_eq!(names, [LOOKOUT, TOOL_HOST, APPROVER]);
+        // Each by its own name, which is this binary.
         let me = std::env::current_exe().unwrap();
-        assert_eq!(added[2]["command"], json!(me));
+        for (add, name) in added
+            .iter()
+            .zip([named::LOOKOUT, named::TOOL_HOST, named::APPROVER])
+        {
+            assert_eq!(add["command"], json!(named::named(&me, name)));
+            assert_eq!(add["env"][named::PROGRAM], json!(me));
+        }
         assert_eq!(added[2]["args"], json!(["approver"]));
         assert_eq!(
             added[2]["env"],
-            json!({"AGENT_MODEL": "openai/gpt-6", "SONNY_BUILD": lookout::identity()})
+            json!({"AGENT_MODEL": "openai/gpt-6", "SONNY_BUILD": lookout::identity(),
+                named::PROGRAM: me})
         );
     }
 

@@ -1159,7 +1159,7 @@ fn hold(serving: &Serving, paused: bool, why: (&str, &str)) {
 const RESEND: Duration = Duration::from_secs(2);
 
 async fn serve(store: PathBuf, socket: PathBuf, nudge: Arc<Notify>, serving: Serving) {
-    let Ok(me) = std::env::current_exe() else {
+    let Ok(me) = crate::named::me() else {
         return;
     };
     // The MCP servers scripts call, kept up between calls.

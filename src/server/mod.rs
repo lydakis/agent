@@ -1538,7 +1538,7 @@ pub async fn run(config: Configuration) -> Result<()> {
     let mut environment = vec![
         (
             "AGENT_BIN".into(),
-            std::env::current_exe()?.to_string_lossy().into_owned(),
+            agent_bin()?.to_string_lossy().into_owned(),
         ),
         (
             "AGENT_STORE".into(),
@@ -5151,6 +5151,32 @@ fn fit_listings(
         answer.insert(name, entry);
     }
     Ok(answer)
+}
+
+/// The program this daemon hands its agents as `AGENT_BIN`: the one its
+/// starter named in `AGENT_BIN` when that is this same program (the same
+/// file under another name, or a copy of it of the same length and time of
+/// writing), as a client that starts the daemon by a name of its own
+/// gives it; else this daemon's own.
+fn agent_bin() -> std::io::Result<std::path::PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    let exe = std::env::current_exe()?;
+    let named = std::env::var_os("AGENT_BIN").map(std::path::PathBuf::from);
+    let same = |given: &std::path::Path| {
+        let (Ok(given), Ok(own)) = (std::fs::metadata(given), std::fs::metadata(&exe)) else {
+            return false;
+        };
+        (given.dev(), given.ino()) == (own.dev(), own.ino())
+            || (given.len() == own.len()
+                && given.modified().ok().is_some()
+                && given.modified().ok() == own.modified().ok())
+    };
+    Ok(
+        match named.filter(|given| given.is_absolute() && same(given)) {
+            Some(given) => given,
+            None => exe,
+        },
+    )
 }
 
 #[cfg(test)]

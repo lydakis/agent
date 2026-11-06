@@ -146,15 +146,25 @@ pub fn ensure() -> Result<(), String> {
         UserManager::find()?;
     }
     let sonny = crate::skills::sonny_path().ok_or("no path to this Sonny")?;
+    // Run by its own name, made again when Sonny changes, which a job
+    // running the old Sonny then starts again for.
+    let was = crate::named::current(&sonny, crate::named::SCHEDULER);
+    let job = crate::named::named(&sonny, crate::named::SCHEDULER);
+    let renamed = job != sonny && !was;
     let (file, label) = (job_file(scheduler, &home), label(&home));
     let there = std::fs::read_to_string(&file).ok();
-    if there
-        .as_deref()
-        .is_some_and(|text| text.contains(&program(scheduler, &sonny)))
+    if !renamed
+        && there
+            .as_deref()
+            .is_some_and(|text| text.contains(&program(scheduler, &job)))
     {
         return start(scheduler, &file, &label);
     }
-    let text = definition(scheduler, &label, &sonny, &trigger::environment());
+    let mut environment = trigger::environment();
+    if job != sonny {
+        environment.push((crate::named::PROGRAM, sonny.to_string_lossy().into_owned()));
+    }
+    let text = definition(scheduler, &label, &job, &environment);
     if let Some(dir) = file.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     }
@@ -165,14 +175,18 @@ pub fn ensure() -> Result<(), String> {
     start(scheduler, &file, &label)
 }
 
-/// Whether the job is there and runs another Sonny than this one.
+/// Whether the job is there and runs another Sonny than this one: by
+/// another path, or by its name while the name is not this Sonny.
 fn stale() -> bool {
     let (Some(home), Some(sonny)) = (std::env::var_os("HOME"), crate::skills::sonny_path()) else {
         return false;
     };
     let scheduler = Scheduler::here();
-    std::fs::read_to_string(job_file(scheduler, Path::new(&home)))
-        .is_ok_and(|text| !text.contains(&program(scheduler, &sonny)))
+    let job = crate::named::path(crate::named::SCHEDULER);
+    std::fs::read_to_string(job_file(scheduler, Path::new(&home))).is_ok_and(|text| {
+        !text.contains(&program(scheduler, &job))
+            || !crate::named::current(&sonny, crate::named::SCHEDULER)
+    })
 }
 
 /// Start a job the system has, else load it from its file.
