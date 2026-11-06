@@ -198,9 +198,13 @@ pub struct Turn {
     /// record when the turn's rounds begin.
     pub settings: std::sync::OnceLock<Settings>,
     /// The bot's command rules, read with its record as the turn's rounds
-    /// begin: every round rules its calls by them, so one that announces a
-    /// call and the run that starts it agree.
-    pub rules: std::sync::OnceLock<Arc<agent_runtime::rules::Rules>>,
+    /// begin and taken again from `given_rules` at the top of each round:
+    /// a round rules its calls by one set, so one that announces a call and
+    /// the run that starts it agree.
+    pub rules: std::sync::Mutex<Option<Arc<agent_runtime::rules::Rules>>>,
+    /// Rules a `configure` gave the bot while this turn runs, which its
+    /// next round takes.
+    pub given_rules: Arc<std::sync::Mutex<Option<Arc<agent_runtime::rules::Rules>>>>,
     /// While a resumed park's calls run, what the rules made of them as
     /// their round was announced; otherwise the turn's own `rules`.
     pub ruled: std::sync::Mutex<Option<Arc<agent_runtime::rules::Rules>>>,
@@ -810,18 +814,25 @@ impl Turn {
             .get()
             .expect("rounds read the bot's settings first")
     }
-    fn rules(&self) -> &agent_runtime::rules::Rules {
-        self.rules.get().expect("rounds read the rules first")
+    fn rules(&self) -> Arc<agent_runtime::rules::Rules> {
+        let rules = self.rules.lock().unwrap_or_else(|e| e.into_inner());
+        rules.clone().expect("rounds read the rules first")
+    }
+    /// Take the rules a `configure` gave since the last round, if any.
+    fn take_given_rules(&self) {
+        let given = self
+            .given_rules
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some(given) = given {
+            *self.rules.lock().unwrap_or_else(|e| e.into_inner()) = Some(given);
+        }
     }
     /// The rulings of the calls being run ([`Turn::ruled`]).
     fn ruled(&self) -> Arc<agent_runtime::rules::Rules> {
         let ruled = self.ruled.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        ruled.unwrap_or_else(|| {
-            self.rules
-                .get()
-                .expect("rounds read the rules first")
-                .clone()
-        })
+        ruled.unwrap_or_else(|| self.rules())
     }
     fn set_ruled(&self, ruled: Option<Arc<agent_runtime::rules::Rules>>) {
         *self.ruled.lock().unwrap_or_else(|e| e.into_inner()) = ruled;
@@ -2227,11 +2238,12 @@ impl Turn {
         let context = self.store.op("context", move |db| db.context(turn)).await?;
         self.settings
             .get_or_init(|| self.with_one_lifetime(&record, &context.model));
-        if self.rules.get().is_none() {
-            let policy = record.settings.rules.clone().unwrap_or_default();
-            let _ = self
-                .rules
-                .set(Arc::new(agent_runtime::rules::Rules::new(policy)));
+        {
+            let mut rules = self.rules.lock().unwrap_or_else(|e| e.into_inner());
+            if rules.is_none() {
+                let policy = record.settings.rules.clone().unwrap_or_default();
+                *rules = Some(Arc::new(agent_runtime::rules::Rules::new(policy)));
+            }
         }
         // A turn may run at its own effort; everything after reads the record.
         record.effort = context.effort.clone();
@@ -2488,6 +2500,8 @@ impl Turn {
             if self.stopping.load(Relaxed) {
                 return Ok(Round::Drained);
             }
+            // Rules given while the turn runs rule this round's calls on.
+            self.take_given_rules();
             // A refresh the last call left in flight ends here: the next call
             // reads the cache itself, and the budget counts what it billed.
             self.settle_refresh(&mut record, accounting).await?;
@@ -2819,14 +2833,10 @@ impl Turn {
                 });
             record.sent = sent.or(record.sent);
             let name = self.bot.clone();
+            let rules = self.rules();
             let gated = calls
                 .iter()
-                .any(|call| record.gated(call, &workspace, self.rules()));
-            let rules = self
-                .rules
-                .get()
-                .expect("rounds read the rules first")
-                .clone();
+                .any(|call| record.gated(call, &workspace, &rules));
             // Taken before the commit that stamps the gates' announcement,
             // so a gate's first lapse is never counted late.
             let planned = tokio::time::Instant::now();
@@ -6473,6 +6483,7 @@ mod tests {
             background_failures: mpsc::unbounded_channel().0,
             settings: Default::default(),
             rules: Default::default(),
+            given_rules: Default::default(),
             ruled: Default::default(),
             window: Default::default(),
             resumed: None,
@@ -6652,6 +6663,7 @@ mod tests {
             background_failures: mpsc::unbounded_channel().0,
             settings: Default::default(),
             rules: Default::default(),
+            given_rules: Default::default(),
             ruled: Default::default(),
             window: Default::default(),
             resumed: None,
@@ -6802,6 +6814,7 @@ mod tests {
             background_failures: mpsc::unbounded_channel().0,
             settings: Default::default(),
             rules: Default::default(),
+            given_rules: Default::default(),
             ruled: Default::default(),
             window: Default::default(),
             resumed: None,
@@ -6818,9 +6831,7 @@ mod tests {
             {"pattern": ["git", "push"], "decision": "prompt"},
         ]}))
         .unwrap();
-        let _ = task
-            .rules
-            .set(Arc::new(agent_runtime::rules::Rules::new(policy)));
+        *task.rules.lock().unwrap() = Some(Arc::new(agent_runtime::rules::Rules::new(policy)));
         let _ = task.settings.set(record.settings.clone());
         // A forbidden command starts nothing: it is refused at once,
         // however loaded the machine.

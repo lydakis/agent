@@ -218,14 +218,16 @@ async fn refresh_tools(client: Arc<Client>, bots: Vec<Value>) {
 }
 
 /// How often the host looks at `config.toml`, and asks a busy agent
-/// again: an agent takes a change at the first idle point after.
+/// again: an agent takes a change at the first idle point after, and the
+/// command rules at its next round.
 const CONFIG_EVERY: Duration = Duration::from_secs(5);
 
 /// Keep Sonny's agents on what `config.toml` gives an agent when it is
 /// made: each model's fallback and whether senders are named, and on the
 /// command rules in `~/.agent/rules`. Read at first and whenever either
-/// changes; an agent at work is asked again until it is idle, since
-/// `configure` waits for the turn to end.
+/// changes. The daemon takes the rules alone from an agent at work, for
+/// its next round; the rest it is asked again until it is idle, since
+/// `configure` otherwise waits for the turn to end.
 async fn follow_config(client: Arc<Client>) {
     let stamp = || {
         let found = agent_client::config::path().and_then(|path| std::fs::metadata(path).ok());
@@ -302,12 +304,30 @@ async fn apply_config(client: &Client, given: &Given<'_>, bots: Vec<Value>) -> V
         };
         fields.insert("bot".into(), bot["name"].clone());
         fields.insert("bot_id".into(), bot["bot_id"].clone());
+        let rules = (fields.get("settings"))
+            .and_then(|settings| settings.get("rules"))
+            .cloned();
         match client.request("configure", Value::Object(fields)).await {
             Ok(answer) => println!(
                 "{}",
                 json!({"event": "config_applied", "bot": bot["name"], "changed": answer["changed"]})
             ),
-            Err(error) if error.code == "bot_busy" => busy.push(bot),
+            Err(error) if error.code == "bot_busy" => {
+                // The rules alone reach an agent at work, at its next
+                // round; the rest waits for it to be idle.
+                if let Some(rules) = rules {
+                    let alone = json!({"bot": bot["name"], "bot_id": bot["bot_id"],
+                        "settings": {"rules": rules}});
+                    if let Ok(answer) = client.request("configure", alone).await {
+                        println!(
+                            "{}",
+                            json!({"event": "config_applied", "bot": bot["name"],
+                                "changed": answer["changed"]})
+                        );
+                    }
+                }
+                busy.push(bot)
+            }
             Err(error) => println!(
                 "{}",
                 json!({"event": "config_failed", "bot": bot["name"], "error": error.code})
