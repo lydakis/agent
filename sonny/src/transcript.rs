@@ -3327,51 +3327,74 @@ mod tests {
     }
 
     /// Whether `draw` on `unit` repeated to twice `n` bytes takes about twice
-    /// as long as on `n`, not four times, as work as the text's square would:
-    /// under three times and 50 ms more. Each size is timed again, the two in
-    /// turn, up to five times while the fastest of each says otherwise, so a
-    /// busy machine pausing the test once is not read as the work growing.
+    /// as long as on `n`, not four times, as work as the text's square would.
     #[track_caller]
     fn assert_linear(unit: &str, n: usize, draw: impl Fn(&str)) {
         let (small, large) = (unit.repeat(n / unit.len()), unit.repeat(2 * n / unit.len()));
-        let timed = |text: &str| {
+        let timed = |longer: bool| {
             let started = std::time::Instant::now();
-            draw(text);
+            draw(if longer { &large } else { &small });
             started.elapsed()
         };
+        if let Some((once, twice)) = outgrows(timed) {
+            panic!("{unit}: {once:?} then {twice:?}");
+        }
+    }
+
+    /// The fastest of each timing when the longer text took three times the
+    /// shorter and 50 ms more; none when it did not. Each size is timed again,
+    /// the two in turn, up to five times while the fastest of each says
+    /// otherwise, so a busy machine pausing the test once is not read as the
+    /// work growing. `timed(true)` times the longer text.
+    fn outgrows(
+        mut timed: impl FnMut(bool) -> std::time::Duration,
+    ) -> Option<(std::time::Duration, std::time::Duration)> {
         let (mut once, mut twice) = (std::time::Duration::MAX, std::time::Duration::MAX);
         for _ in 0..5 {
-            once = once.min(timed(&small));
-            twice = twice.min(timed(&large));
+            once = once.min(timed(false));
+            twice = twice.min(timed(true));
             if twice < once * 3 + std::time::Duration::from_millis(50) {
-                return;
+                return None;
             }
         }
-        panic!("{unit}: {once:?} then {twice:?}");
+        Some((once, twice))
     }
 
     #[test]
-    #[should_panic(expected = "then")]
     fn work_as_the_square_of_the_text_is_caught_however_often_it_is_timed() {
         // 80 ms, then 320 ms: four times, against under three and 50 ms more.
-        assert_linear("ab", 1_000, |text| {
-            let times = text.len() as u32 / 1_000;
-            std::thread::sleep(std::time::Duration::from_millis(80) * times * times);
+        let mut rounds = 0;
+        let caught = outgrows(|longer| {
+            rounds += usize::from(longer);
+            std::time::Duration::from_millis(if longer { 320 } else { 80 })
         });
+        assert_eq!(
+            caught,
+            Some((
+                std::time::Duration::from_millis(80),
+                std::time::Duration::from_millis(320)
+            ))
+        );
+        assert_eq!(rounds, 5);
     }
 
     #[test]
     fn a_pause_while_timed_once_is_not_read_as_the_work_growing() {
         // Work in proportion to the text, the machine busy for 300 ms the
         // first time the longer text is drawn.
-        let paused = std::cell::Cell::new(false);
-        assert_linear("ab", 1_000, |text| {
-            let times = text.len() as u32 / 1_000;
-            if times == 2 && !paused.replace(true) {
-                std::thread::sleep(std::time::Duration::from_millis(300));
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10) * times);
+        let mut paused = false;
+        let mut rounds = 0;
+        let caught = outgrows(|longer| {
+            rounds += usize::from(longer);
+            let pause = if longer && !std::mem::replace(&mut paused, true) {
+                300
+            } else {
+                0
+            };
+            std::time::Duration::from_millis(if longer { 20 } else { 10 } + pause)
         });
+        assert_eq!(caught, None);
+        assert_eq!(rounds, 2);
     }
 
     #[test]
