@@ -56,7 +56,7 @@ fn short(key: &str) -> &str {
 }
 
 /// Every key `agent_client::config` reads.
-pub const SETTINGS: [Setting; 32] = [
+pub const SETTINGS: &[Setting] = &[
     Setting {
         key: "model",
         about: "a new agent's model, when none is named (provider/model)",
@@ -119,9 +119,9 @@ pub const SETTINGS: [Setting; 32] = [
     },
     Setting {
         key: "sonny.side_chat",
-        about: "/side's copy answers calling no tool, or is a fork that can do anything its agent can",
-        values: &["answer", "fork"],
-        default: "answer",
+        about: "/side's copy is a fork that can do anything its agent can, or answers calling no tool",
+        values: &["fork", "answer"],
+        default: "fork",
     },
     Setting {
         key: "sonny.chime",
@@ -146,6 +146,12 @@ pub const SETTINGS: [Setting; 32] = [
         about: "when a note the agent puts up or changes opens the margin: always, unless you closed it with Esc, or never",
         values: &["always", "unless-closed", "never"],
         default: "always",
+    },
+    Setting {
+        key: "sonny.margin_notes",
+        about: "the most notes a margin holds; past it the oldest goes",
+        values: &[],
+        default: "20",
     },
     Setting {
         key: "sonny.agent_opens",
@@ -546,7 +552,7 @@ mod tests {
         assert!(skill.starts_with("---\nname: sonny-config\n"));
         assert!(!skill.contains("{{"));
         assert!(skill.contains(env!("CARGO_PKG_VERSION")));
-        for setting in &SETTINGS {
+        for setting in SETTINGS {
             assert!(
                 skill.contains(&format!("| `{}` |", setting.key)),
                 "{}",
@@ -646,14 +652,14 @@ mod tests {
         };
         view.values = view.read().unwrap();
         assert_eq!(view.values[6].as_deref(), Some("low"));
-        // The side chat: a fork, then its default again either way.
+        // The side chat: one that answers, then its default again either way.
         view.pick = 10;
         press(&mut view, KeyCode::Right);
-        assert_eq!(view.values[10].as_deref(), Some("fork"));
+        assert_eq!(view.values[10].as_deref(), Some("answer"));
         press(&mut view, KeyCode::Right);
         assert_eq!(view.values[10], None);
         press(&mut view, KeyCode::Left);
-        assert_eq!(view.values[10].as_deref(), Some("fork"));
+        assert_eq!(view.values[10].as_deref(), Some("answer"));
         // Efforts step through every level.
         view.pick = 5;
         press(&mut view, KeyCode::Left);
@@ -679,7 +685,7 @@ mod tests {
         press(&mut view, KeyCode::Backspace);
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
-            "# mine\n[sonny]\nside_chat = \"fork\"\n"
+            "# mine\n[sonny]\nside_chat = \"answer\"\n"
         );
         // A switch is written as TOML's own.
         view.pick = 11;

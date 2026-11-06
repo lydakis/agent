@@ -46,7 +46,9 @@ Cargo.lock hashes; observer fingerprints continue to cover the benchmark tools.
 ## Software first
 
 Programs are the clients. Every command below emits JSONL events on stdout by
-default; exit codes report the turn outcome. `--pretty` renders the same stream
+default; exit codes report the turn outcome, and a turn that failed says why
+in one line on stderr too (a `wait` that timed out says so in `pending` alone).
+`--pretty` renders the same stream
 for a human watching a terminal and is never the input protocol. The daemon's
 socket protocol is the contract; the `agent` client is one consumer of it.
 
@@ -2790,6 +2792,19 @@ command run by an absolute path that no rule matches as written is
 matched by its program's name, as Codex resolves it: when
 `host_executables` lists that path for the name, or lists nothing for it;
 by the name's `allow` rules, only at a path it lists.
+
+A command under a wrapper is also matched as the command the wrapper
+runs, read by the wrapper's own words: `timeout` (with its options and a
+duration), `nice` (with an adjustment), `nohup` and `time` run it as it
+would run alone, so `timeout 60 mcpx call` is allowed by an `mcpx` rule
+and `timeout 60 git push` refused by a `git push` one; `env` (bare, or
+with `-i`, `-u`, `-C` and assignments) and the shell's own `NAME=VALUE`
+before a command change what it runs with, so through them only the
+rules that ask or refuse match. Nor does a wrapper let out a program it
+runs by its path: the wrapper is found on `PATH`, so only a program by
+its name, found the same way, is allowed through it. A wrapper by its path, or in a form not
+read here (another option, such as `env -S`), is matched as written
+only. Rules for the wrapper itself still match too.
 `invalid`, with why, says the client couldn't read the rules: every shell
 call fails `rules_invalid` with it, where Codex would refuse to start. A
 pattern or list of choices that is empty, an empty justification, or a
@@ -2862,6 +2877,10 @@ Where this differs from Codex:
   host, which the daemon doesn't have; a sandbox's network is on or off.
   Sonny refuses a rules file that has one, so no rule is taken as kept
   that isn't.
+- Codex matches a command as written; here a wrapper read as above is
+  seen through, as Codex's own dangerous-command check sees through
+  `env` and `sudo`, so an agent that wraps a call in `timeout` is ruled as
+  it would be without it, a refusal included.
 - Codex lets a program run by any absolute path out by its name's
   `allow` rules when no `host_executable` names it. Here such a path is
   only asked about or refused by them, since a sandboxed bot could write
@@ -3528,7 +3547,9 @@ converges while a step covers more than one round adds. The complete
 summarizer input is byte-bounded including its previous summary and request
 marker and the item count, and the final marker gives the summarizer its
 maximum summary size in UTF-8 bytes. Oversized summaries are rejected above a third of the byte budget
-or 64 KiB, whichever is smaller. At installation, verbatim prompt copies are further bounded so
+or 64 KiB, whichever is smaller; a rejected one is asked for again, in a request
+of its own, at half the size it was asked for, for as long as each comes back
+shorter than the one before (each a billed round). At installation, verbatim prompt copies are further bounded so
 they fit alongside the encoded summary within half the byte envelope. A middle
 range is removed, retaining the oldest and newest excerpts when they fit. Original prompts remain available through history; installed
 prefixes are unchanged until the next compaction. A replacement must reduce encoded bytes,
@@ -3538,7 +3559,16 @@ the old view intact. Such completed calls are still billed. `compacted` events
 include `context_before`, `context_after`, `input_limit`, `reclaimed_bytes`,
 `reclaimed_items`, `headroom_bytes`, and `headroom_items`. These describe the
 complete logical view since the cut; headroom can be negative during catch-up,
-while the actual request still uses a bounded window. These failures leave the bot usable and
+while the actual request still uses a bounded window. `trigger` says what
+started it: its `reason` (`bytes` or `items` past the threshold, `requested`
+by a client, or `overflow`, a view that could not be sent), the model's context
+`window` and the `compact_tokens` threshold it gives, what the last call `sent`
+in bytes and the tokens counted for it, the view's threshold in bytes
+(`at_bytes`), the instructions and tools sent beside the view
+(`overhead_bytes`), the room kept for the reply (`reserve_bytes`) and the
+newest bytes the summary was to leave whole (`keep_bytes`). `room_bytes` is
+`at_bytes` less the view after: how much the conversation can grow before the
+next compaction. These failures leave the bot usable and
 original history retrievable. The
 CLI ships a default compaction text for new bots and `--no-compaction`,
 `--compaction-instructions`, `--compaction-instructions-file`, and

@@ -26,8 +26,9 @@ pub struct Markdown {
     /// How far the last line's wrapped rows are indented: under a list
     /// item's text, so a continuation does not read as a new item.
     hang: usize,
-    /// The last line is a quote's, so its wrapped rows keep its bar.
-    quoted: bool,
+    /// How deep in quotes the last line is, so its wrapped rows keep
+    /// its bars.
+    quoted: usize,
     /// A table's rows, held until it ends, so its columns can be fitted.
     table: Vec<String>,
     /// Inside display math, gathered in `picture`: what closes it,
@@ -146,8 +147,8 @@ impl Markdown {
 
     /// What the last line's wrapped rows start with, inside a reply.
     pub fn rest(&self) -> Span<'static> {
-        if self.quoted {
-            return Span::raw("  ▌ ").dim();
+        if self.quoted > 0 {
+            return Span::raw(format!("  {}", "▌ ".repeat(self.quoted))).dim();
         }
         Span::raw(format!("  {}", " ".repeat(self.hang)))
     }
@@ -220,7 +221,7 @@ impl Markdown {
     pub fn line(&mut self, text: &str) -> Option<Line<'static>> {
         let trimmed = text.trim_start();
         self.hang = 0;
-        self.quoted = false;
+        self.quoted = 0;
         // $$ display math $$, on one line or around several, and the
         // \[ display math \] many models write.
         let line = trimmed.trim_end();
@@ -336,9 +337,18 @@ impl Markdown {
             spans.extend(inline(rest, Style::new()));
             return Some(Line::from(spans));
         }
-        if let Some(rest) = trimmed.strip_prefix("> ") {
-            self.quoted = true;
-            let mut spans = vec![Span::raw("▌ ").dim()];
+        if let Some(mut rest) = quote_line(trimmed) {
+            // A quote in a quote, `> >`, draws a bar for each, up to
+            // `QUOTE_DEPTH`: marks past it are kept as written, so a line
+            // of a thousand `>` costs its length, not bars on every row.
+            let mut depth = 1;
+            while depth < QUOTE_DEPTH
+                && let Some(inner) = quote_line(rest.trim_start())
+            {
+                (rest, depth) = (inner, depth + 1);
+            }
+            self.quoted = depth;
+            let mut spans = vec![Span::raw("▌ ".repeat(depth)).dim()];
             spans.extend(inline(rest, Style::new().italic()));
             return Some(Line::from(spans));
         }
@@ -1211,20 +1221,37 @@ pub fn prompt(text: &str, from: Option<&str>, width: usize) -> Vec<Line<'static>
         Some((question, answer)) => (Some(crate::asks::answering(question, width)), answer),
         None => (None, text),
     };
-    // A long paste shows its start; the rest is in the conversation.
+    // A long paste shows its start, and a row a click opens to the rest.
     let lines: Vec<&str> = text.lines().collect();
-    let shown = if lines.len() > PROMPT_LINES + 2 {
-        PROMPT_LINES
-    } else {
-        lines.len()
-    };
+    let shown = shown_lines(lines.len());
     // On its band with a row of it above and below, as the composer it
     // was written in: the words sit in the middle, not on an edge.
-    let band = crate::look::band();
+    let band = crate::look::BAND;
     out.push(Line::default().bg(band));
     out.extend(answering.map(|row| row.bg(band)));
-    for (i, line) in lines[..shown].iter().enumerate() {
-        let lead = if i == 0 { "› " } else { "  " };
+    out.extend(prompt_rows(&lines[..shown], 0, width));
+    if lines.len() > shown {
+        out.extend(prompt_rest(lines.len() - shown, None, width));
+    }
+    out.push(Line::default().bg(band));
+    out
+}
+
+/// How many of a prompt's `count` lines show while it is folded: all of
+/// a short one, the first [`PROMPT_LINES`] of a long one.
+fn shown_lines(count: usize) -> usize {
+    match count > PROMPT_LINES + 2 {
+        true => PROMPT_LINES,
+        false => count,
+    }
+}
+
+/// A prompt's `lines` on its band, the first of them its `at`th.
+fn prompt_rows(lines: &[&str], at: usize, width: usize) -> Vec<Line<'static>> {
+    let band = crate::look::BAND;
+    let mut out = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        let lead = if at + i == 0 { "› " } else { "  " };
         out.extend(wrap(
             Line::from(line.to_string()).bg(band),
             width,
@@ -1232,15 +1259,46 @@ pub fn prompt(text: &str, from: Option<&str>, width: usize) -> Vec<Line<'static>
             Span::raw("  "),
         ));
     }
-    if lines.len() > shown {
-        out.push(
-            Line::from(format!("  … +{} lines", lines.len() - shown))
-                .dim()
-                .bg(band),
-        );
-    }
-    out.push(Line::default().bg(band));
     out
+}
+
+/// The rows of a long prompt past its first lines, `more` of them: its
+/// fold row alone while shut (`open` none), and open, those lines
+/// (`open`, from its first hidden one) and the row under them, which a
+/// click shuts again.
+fn prompt_rest(more: usize, open: Option<&[&str]>, width: usize) -> Vec<Line<'static>> {
+    let band = crate::look::BAND;
+    let mut out = match open {
+        Some(lines) => prompt_rows(lines, PROMPT_LINES, width),
+        None => Vec::new(),
+    };
+    let row = match open {
+        Some(_) => format!("  +{more} lines ▾"),
+        None => format!("  … +{more} lines ▸"),
+    };
+    out.push(Line::from(row).dim().bg(band));
+    out
+}
+
+/// Where a prompt drawn by [`prompt`] folds: its fold row's place among
+/// its rows, at `width`; none for one that shows whole.
+pub fn prompt_fold(text: &str, width: usize) -> Option<usize> {
+    let (_, body) = crate::asks::split(text).unwrap_or(("", text));
+    let count = body.lines().count();
+    if shown_lines(count) == count || news(text).is_some() {
+        return None;
+    }
+    // Its last row is the band's; the fold row is right over it.
+    Some(prompt(text, None, width).len() - 2)
+}
+
+/// A long prompt's rows past its first lines, open or shut: what
+/// replaces its fold row (or those rows) when the row is clicked.
+pub fn prompt_more(text: &str, width: usize, open: bool) -> Vec<Line<'static>> {
+    let (_, body) = crate::asks::split(text).unwrap_or(("", text));
+    let lines: Vec<&str> = body.lines().collect();
+    let shown = shown_lines(lines.len());
+    prompt_rest(lines.len() - shown, open.then_some(&lines[shown..]), width)
 }
 
 /// Whether a message is from another bot or tells the lead of its tasks:
@@ -1341,7 +1399,7 @@ pub fn with_quotes(
     quotes: &str,
     width: usize,
 ) -> Vec<Line<'static>> {
-    let band = crate::look::band();
+    let band = crate::look::BAND;
     let Some(end) = prompt.pop() else {
         return prompt;
     };
@@ -1354,10 +1412,16 @@ pub fn with_quotes(
     prompt
 }
 
-/// A line of quoted words, as Markdown marks one: `> ` before it, or a
-/// lone `>` for a blank line between them.
+/// The most bars a quote draws, as deep as it is nested; the rest of
+/// its marks are kept as written, as groups past eight deep are.
+const QUOTE_DEPTH: usize = 8;
+
+/// A line of quoted words, as CommonMark marks one: `>` before it and
+/// at most one space after, so `> words`, `>words`, and a lone `>` for a
+/// blank line inside the quote all count.
 fn quote_line(line: &str) -> Option<&str> {
-    line.strip_prefix("> ").or((line == ">").then_some(""))
+    let rest = line.strip_prefix('>')?;
+    Some(rest.strip_prefix(' ').unwrap_or(rest))
 }
 
 /// What the shut row of words between agents says: who sent them, not
@@ -2934,6 +2998,40 @@ mod tests {
     }
 
     #[test]
+    fn a_quote_keeps_its_bar_over_blank_lines_and_without_a_space() {
+        // CommonMark: `>` and at most one space; a lone `>` is the quote's
+        // blank line, and `> >` a quote inside it.
+        let reply = "> First paragraph.\n>\n>Second, no space.\n> > Nested.\nAfter.";
+        let lead = || Line::from("  ");
+        let rows = markdown(&mut Markdown::default(), reply, 80, (lead(), lead()));
+        assert_eq!(
+            text(&rows),
+            [
+                "  ▌ First paragraph.",
+                "  ▌ ",
+                "  ▌ Second, no space.",
+                "  ▌ ▌ Nested.",
+                "  After.",
+            ]
+        );
+        // A wrapped row keeps every bar its line has.
+        let mut quote = Markdown::default();
+        quote.line("> > a long nested quote");
+        assert_eq!(quote.rest().content, "  ▌ ▌ ");
+        // As deep as it goes, at most eight bars: the rest stays text, so
+        // a run of marks wraps as words do, its rows' leads no longer.
+        let deep = ">".repeat(10_000);
+        let rows = markdown(&mut Markdown::default(), &deep, 80, (lead(), lead()));
+        let bars = format!("  {}", "▌ ".repeat(8));
+        assert_eq!(rows[0].to_string(), bars);
+        assert!(rows[1].to_string().starts_with(&format!("{bars}>")));
+        assert!(rows.iter().all(|row| row.width() <= 80));
+        assert_eq!(quote_line(">"), Some(""));
+        quote.line(&deep);
+        assert_eq!(quote.rest().content.chars().count(), 2 + 2 * 8);
+    }
+
+    #[test]
     fn words_a_message_quotes_draw_as_their_reply_did_behind_a_quiet_bar() {
         let message = "Can this land?\n\ncalc.fix replied:\n> Fixed **it**:\n>\n> ```rust\n> let x = 1;\n> ```";
         let rows = relayed(message, Some("ana"), true, 80);
@@ -3088,7 +3186,13 @@ mod tests {
         assert_eq!(shown, ["", "  answering “Ship it?”", "› Not yet", ""]);
         let rows = prompt("You asked (c1): Ship **it**?\n\nNot yet", None, 80);
         assert_eq!(rows[1].to_string(), "  answering “Ship it?”");
-        assert!(rows.iter().all(|row| row.style.bg.is_some()));
+        // The band's role, made the theme's band as each frame is drawn,
+        // so a light/dark switch reaches these rows without drawing them
+        // again.
+        assert!(
+            rows.iter()
+                .all(|row| row.style.bg == Some(crate::look::BAND))
+        );
     }
 
     #[test]
@@ -3278,21 +3382,75 @@ mod tests {
         assert!(shown.iter().any(|l| l.contains("+new")), "{shown:?}");
     }
 
-    /// How long `draw` takes on `unit` repeated to `n` bytes, and on twice
-    /// that: work in proportion to the text takes about twice as long, where
-    /// work as its square takes four times.
-    fn scales(
-        unit: &str,
-        n: usize,
-        draw: impl Fn(&str),
-    ) -> (std::time::Duration, std::time::Duration) {
-        let timed = |len: usize| {
-            let text = unit.repeat(len / unit.len());
+    /// Whether `draw` on `unit` repeated to twice `n` bytes takes about twice
+    /// as long as on `n`, not four times, as work as the text's square would.
+    #[track_caller]
+    fn assert_linear(unit: &str, n: usize, draw: impl Fn(&str)) {
+        let (small, large) = (unit.repeat(n / unit.len()), unit.repeat(2 * n / unit.len()));
+        let timed = |longer: bool| {
             let started = std::time::Instant::now();
-            draw(&text);
+            draw(if longer { &large } else { &small });
             started.elapsed()
         };
-        (timed(n), timed(2 * n))
+        if let Some((once, twice)) = outgrows(timed) {
+            panic!("{unit}: {once:?} then {twice:?}");
+        }
+    }
+
+    /// The fastest of each timing when the longer text took three times the
+    /// shorter and 50 ms more; none when it did not. Each size is timed again,
+    /// the two in turn, up to five times while the fastest of each says
+    /// otherwise, so a busy machine pausing the test once is not read as the
+    /// work growing. `timed(true)` times the longer text.
+    fn outgrows(
+        mut timed: impl FnMut(bool) -> std::time::Duration,
+    ) -> Option<(std::time::Duration, std::time::Duration)> {
+        let (mut once, mut twice) = (std::time::Duration::MAX, std::time::Duration::MAX);
+        for _ in 0..5 {
+            once = once.min(timed(false));
+            twice = twice.min(timed(true));
+            if twice < once * 3 + std::time::Duration::from_millis(50) {
+                return None;
+            }
+        }
+        Some((once, twice))
+    }
+
+    #[test]
+    fn work_as_the_square_of_the_text_is_caught_however_often_it_is_timed() {
+        // 80 ms, then 320 ms: four times, against under three and 50 ms more.
+        let mut rounds = 0;
+        let caught = outgrows(|longer| {
+            rounds += usize::from(longer);
+            std::time::Duration::from_millis(if longer { 320 } else { 80 })
+        });
+        assert_eq!(
+            caught,
+            Some((
+                std::time::Duration::from_millis(80),
+                std::time::Duration::from_millis(320)
+            ))
+        );
+        assert_eq!(rounds, 5);
+    }
+
+    #[test]
+    fn a_pause_while_timed_once_is_not_read_as_the_work_growing() {
+        // Work in proportion to the text, the machine busy for 300 ms the
+        // first time the longer text is drawn.
+        let mut paused = false;
+        let mut rounds = 0;
+        let caught = outgrows(|longer| {
+            rounds += usize::from(longer);
+            let pause = if longer && !std::mem::replace(&mut paused, true) {
+                300
+            } else {
+                0
+            };
+            std::time::Duration::from_millis(if longer { 20 } else { 10 } + pause)
+        });
+        assert_eq!(caught, None);
+        assert_eq!(rounds, 2);
     }
 
     #[test]
@@ -3303,13 +3461,9 @@ mod tests {
             "[a", "\\(", "`", "**a", "~~", "*a ", "_a ", "$a", "<b>", "<kbd>", "<!--", "<a x",
             "<del>", "<b x", "![a](",
         ] {
-            let (once, twice) = scales(unit, 1 << 17, |text| {
+            assert_linear(unit, 1 << 17, |text| {
                 inline(text, Style::new());
             });
-            assert!(
-                twice < once * 3 + std::time::Duration::from_millis(50),
-                "{unit}: {once:?} then {twice:?}"
-            );
         }
         // What does close still reads as it did.
         let spans = inline(
@@ -3322,7 +3476,7 @@ mod tests {
 
     #[test]
     fn a_long_word_is_wrapped_in_time_as_its_length() {
-        let (once, twice) = scales("abcdefgh", 1 << 18, |text| {
+        assert_linear("abcdefgh", 1 << 18, |text| {
             let rows = wrap(
                 Line::from(text.to_owned()),
                 80,
@@ -3334,10 +3488,6 @@ mod tests {
                 .collect();
             assert_eq!(kept, text);
         });
-        assert!(
-            twice < once * 3 + std::time::Duration::from_millis(50),
-            "{once:?} then {twice:?}"
-        );
         // Joined emoji are measured alike when cut and after, so no row is
         // wider than the room.
         let family = "👨\u{200d}👩\u{200d}👧\u{200d}👦".repeat(12);

@@ -147,7 +147,8 @@ With flags it asks nothing: `--provider chatgpt|anthropic|openai|openrouter|bedr
 for Bedrock), `--model PROVIDER/MODEL`, `--import-mcp [codex,claude,...]`
 (never a folder's own servers), and `--json`, which prints what the machine
 has, what is set, the MCP servers to bring, missing tools and setup steps. Either step also suggests efforts, `[sonny] lead_effort =
-"medium"` and `task_effort = "high"`, unless the config already sets them.
+"medium"` and `task_effort = "high"`, unless the config already sets them,
+and says on stderr which it wrote.
 Outside a terminal both fail, naming what to set. The first start also writes
 `~/.agent/models`, the list agents read with `agent models`, when there is
 none, as `agent models --discover` does.
@@ -269,12 +270,13 @@ at its model's own effort (`AGENT_EFFORT` when its model is
 | Each new task's model | (the lead's) | `threads_model` |
 | Each new task's effort | `[sonny] task_effort` | `threads_effort` |
 | The approver's judge | `[judge] model`, `effort` | |
-| What `/side`'s copy may do | `[sonny] side_chat` (`answer` or `fork`) | |
+| What `/side`'s copy may do | `[sonny] side_chat` (`fork`, the default, or `answer`) | |
 | The chime, and every tool call drawn | `[sonny] chime`, `verbose` (true or false) | |
 | The widest the conversation is written | `[sonny] text_width` (100 by default, at least 40, 0 for the window's whole width) | |
 | A guess at your next message | `[sonny] suggest` (true, the default, or false) | |
 | Whether agents have the commons | `[sonny] commons` (true, the default, or false) | |
 | When a note opens the margin | `[sonny] margin_opens` (`always`, the default, `unless-closed` or `never`) | |
+| The most notes a margin holds | `[sonny] margin_notes` (20 by default, at least 1; past it the oldest goes) | |
 | Where a click on an agent's name goes | `[sonny] agent_opens` (`tab`, the default, or `beside`) | |
 | Task windows a lead keeps open | `[sonny] task_windows` (32 by default, 0 for no limit) | |
 | The daemon started with the machine | `[sonny] start_at_boot` (true or false, the default) | |
@@ -462,21 +464,23 @@ between, the arrows move through its rows. Every window keeps its prompts in
 first, newest first, then those any window sent before it opened. Edit a
 prompt brought back and it is yours to send, or Up starts again from it.
 Ctrl+R finds one by typing, as a shell's reverse search and Claude Code's
-do: the prompts sent before are a list over the composer, newest first,
-narrowed by the letters typed (in order, the first starting a word, as the
-slash menu finds commands). Ctrl+R again or the arrows pick, Enter or Tab puts
-the pick in the composer to edit (Up and Down go on from it), and Esc leaves
-the composer as it was.
+do: the prompts sent before are a list over the composer, newest first, as
+the slash menu is, and the draft stays in the composer under it. The letters
+typed show under the composer, after `find`, and narrow the list (in order,
+the first starting a word, as the slash menu finds commands). Ctrl+R again
+or the arrows pick, Enter or Tab puts the pick in the composer to edit (Up
+and Down go on from it), and Esc leaves the composer as it was.
 
-![Ctrl+R lists the prompts sent before, newest first; fix narrows it to two with the letters bold; Enter puts the picked one in the composer](../docs/sonny/prompt-search.png)
+![Ctrl+R lists the prompts sent before over the composer, the draft still in it; fix, typed under the composer, narrows the list to two with the letters bold](../docs/sonny/prompt-search.png)
 A prompt this window sent comes back with its pictures (the newest as many
 as one message may carry; older ones let theirs go), and the draft with its
 own; one from the file comes back as text alone.
 
 ![Up brings back a two-row prompt with the cursor at its top, Up again the one before, and Down twice returns the draft](../docs/sonny/prompt-history.png)
 
-Alt-T boosts the next message: the turn it starts runs at a higher effort
-(`xhigh`, or `high` where the model has no `xhigh`), Alt-T again at `max`
+Alt-T (or Ctrl-X, where something else takes Alt) boosts the next message:
+the turn it starts runs at a higher effort (`xhigh`, or `high` where the
+model has no `xhigh`), Alt-T again at `max`
 where the model takes it, and again back to the agent's own. The footer
 shows `↑xhigh` beside the effort until a message takes it (in zen, quieter, an
 arrow a step after the focus: `↑`, then `↑↑`); a message that
@@ -581,10 +585,10 @@ way `/react` does, and each note in the margin has its own `↩`.
 - `/side [QUESTION]` opens a side chat with a copy of the agent in this
   window, taken where it is now, mid-turn included, in the pane beside
   the conversation.
-  The copy answers from the agent's history and may call no tool, unless
-  `~/.agent/config.toml` sets `[sonny] side_chat = "fork"`: then it is a
-  full fork that can do anything the agent can, with its tools, in its
-  folder, under its approvals. Follow-ups stay with it, and Esc goes
+  The copy is a full fork that can do anything the agent can, with its
+  tools, in its folder, under its approvals, unless `~/.agent/config.toml`
+  sets `[sonny] side_chat = "answer"`: then it answers from the agent's
+  history and may call no tool. Follow-ups stay with it, and Esc goes
   back. In the pane, every key goes to the side chat but Ctrl+\, which
   goes back to the main composer while the side chat stays open. The agent
   carries on meanwhile, in view. The daemon deletes the copy once it has been idle 15
@@ -690,7 +694,11 @@ way `/react` does, and each note in the margin has its own `↩`.
   run it outside without asking, as Codex's rules do (Codex's own rules
   files work unchanged). A rule names a command's first words
   (`["docker", "compose"]`), and a call runs outside only when everything
-  it runs is allowed, so `mcpx … | jq` still asks. A rule can also always
+  it runs is allowed, so `mcpx … | jq` still asks. A wrapper is seen
+  through: `timeout 60 mcpx …`, `nice`, `nohup` and `time` match as the
+  command they run, and through `env` or `NAME=value`, which change what
+  it runs with, a rule may still ask or refuse but never lets it out.
+  A rule can also always
   ask (`"prompt"`) or never run a command (`"forbidden"`, with a
   `justification` the agent is told); `sonny rules check -- git push`
   shows what the rules say. The files are Starlark, as Codex runs them,
@@ -736,7 +744,9 @@ way `/react` does, and each note in the margin has its own `↩`.
   **Working** (a turn running, queued, rate limited, waiting on other
   tasks, or `waiting on its reviewer` while the approver weighs a call), **Ready for review** (finished, its last reply linking a pull
   request), **Done** (finished or stopped with nothing open), and
-  **Resolved**, only counted until `r` shows them. As threads in a
+  **Resolved**. Done and Resolved fold to their heading (`Done · 3 ▸`)
+  until a click on it, or `d` and `r` with the keys in the pane, opens
+  them, and the same folds them again. As threads in a
   claude.ai project do, a task resolves itself with the `resolve_task`
   tool once nothing is left to do in it, such as when its pull request
   merged or you dropped the work, and the lead can resolve any of its
@@ -820,7 +830,10 @@ way `/react` does, and each note in the margin has its own `↩`.
 - `/sky` draws every agent the daemon keeps, in the pane: leads on the inner
   ring, the agents each one made fanned out behind it, you in the middle,
   on a circle as 0.7.0 drew it, stretched to fill a wide pane (up to twice
-  as wide as high). Projects keep their places in the order they started,
+  as wide as high). It opens whole: "Catching up with who is here…" until
+  every agent, what each did and holds, and what each asks are read, then
+  the sky, its counts and its log at once. Projects keep their places in
+  the order they started,
   each arm as wide as the square root of its size, and the agents that made
   none sit on the outer edge, as a tree's leaves do, so the sky fills to
   its rim. Throwaway copies, such as the approver's judges or a
@@ -851,8 +864,8 @@ way `/react` does, and each note in the margin has its own `↩`.
   the bottom, fading as it rises; in a narrower pane the last few lines sit
   under it. `?` swaps the log for a legend of every mark and shape and a few
   numbers: projects, leads, agents, messages and tool calls a minute and
-  this hour, the busiest pair. `m` colours each agent by its model where it
-  stands, the footer naming each colour. `z` is zen: the sky alone, no log,
+  this hour, the busiest pair. `m` colours each agent, its star and its name,
+  by its model where it stands, the footer naming each colour. `z` is zen: the sky alone, no log,
   no footer, no names but what needs you or failed. The arrows pick a star
   and Enter puts it in the middle: its maker, what it made and whoever it
   talked to in the last hour on the first ring, two hops on the next, the
