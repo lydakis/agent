@@ -75,7 +75,8 @@ pub fn with_status(lookout: String, store: &Path) -> String {
 async fn serve(store: PathBuf, socket: PathBuf) -> Result<(), String> {
     println!("{}", json!({"event": "serving", "pid": std::process::id()}));
     // Asked to give way, as by another build's host: the calls it still
-    // answers stop first, since that one answers them again.
+    // answers stop first. They were taken, so that one answers that their
+    // outcome is unknown and never runs them again.
     if let Ok(mut term) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
     {
         tokio::spawn(async move {
