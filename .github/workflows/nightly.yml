@@ -1,7 +1,7 @@
-name: Sonny nightly
+name: Nightly
 
-# A source formula, as for stable releases, but with both binaries pinned to
-# one main commit. No release tag, version bump or Apple signing is needed.
+# A source formula that fetches main at installation and builds both binaries
+# together. No release tag, version bump or Apple signing is needed.
 on:
   schedule:
     - cron: "17 7 * * *"
@@ -65,6 +65,7 @@ jobs:
           name: sonny-nightly-formula
           path: ${{ runner.temp }}/nightly/Formula/sonny-nightly.rb
           if-no-files-found: error
+          overwrite: true
           retention-days: 7
 
   publish:
