@@ -958,7 +958,8 @@ parts. Like a file `read` sends, a picture is a PNG, JPEG, GIF or WebP by
 its own bytes, scaled to 1568 pixels on its longest side when larger; a
 result holds up to 20, 5 MB together, and `image()` throws past that. `store` and `load` keep small values for the agent's
 later scripts, `ALL_TOOLS` lists every tool, and `tools.tool_search` ranks
-them for a query. The description lists each server and declares its tools
+them for a query, a tool named exactly (its callable name, or its name on
+its server) first. The description lists each server and declares its tools
 in TypeScript up to about 3,000 tokens; the rest are found from a script. A
 script runs in QuickJS with no files, network or timers, at most 256 MB and
 10 minutes, four at once in the tool host and sixteen alive (more wait
