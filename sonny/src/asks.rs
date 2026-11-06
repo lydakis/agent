@@ -395,9 +395,22 @@ pub fn open(items: &[Value]) -> Option<String> {
 /// came in, or none while it is open. An answer names its ask whole
 /// ([`answer_of`]): another's words, or an old-form answer, answer none. A
 /// refused or failed ask was never put to the person.
+/// Whether a history item bears on the asks [`decisions`] reads: an ask
+/// call, a call's failed or refused result, or the person's answer.
+pub fn bears_on_asks(item: &Value) -> bool {
+    match item["type"].as_str() {
+        Some("function_call") => item["name"] == TOOL,
+        Some("function_call_output") => item["failed"] == true || crate::reactions::refused(item),
+        _ => {
+            item["role"] == "user" && answer_of(&crate::text(item), item["from"].as_str()).is_some()
+        }
+    }
+}
+
 pub fn decisions(items: &[(i64, Value)]) -> Vec<agent_client::approver::Decision> {
     let mut answers: Vec<(String, i64, String)> = Vec::new();
-    let mut refused = Vec::new();
+    // By turn and call: a provider's call IDs repeat across turns.
+    let mut refused: Vec<(i64, Value)> = Vec::new();
     let mut decisions = Vec::new();
     for (turn, item) in items {
         if item["role"] == "user" {
@@ -411,11 +424,11 @@ pub fn decisions(items: &[(i64, Value)]) -> Vec<agent_client::approver::Decision
         if item["type"] == "function_call_output"
             && (item["failed"] == true || crate::reactions::refused(item))
         {
-            refused.push(item["call_id"].clone());
+            refused.push((*turn, item["call_id"].clone()));
         }
         if item["type"] != "function_call"
             || item["name"] != TOOL
-            || refused.contains(&item["call_id"])
+            || refused.contains(&(*turn, item["call_id"].clone()))
         {
             continue;
         }
@@ -1928,6 +1941,11 @@ mod tests {
         from_lead["from"] = json!("shop.lead");
         // Newest first, as the approver reads history.
         let items = [
+            // A later turn's refused call with the same ID refuses only its own.
+            (
+                7,
+                json!({"type": "function_call_output", "call_id": "a1", "output": "", "failed": true}),
+            ),
             (6, words(answer(&shown, "2"))),
             (5, words(answer(&shown, "1"))),
             (4, from_lead),
@@ -1948,6 +1966,17 @@ mod tests {
                 ),
             ),
         ];
+        // Each of them bears on an ask but the lead's words; a reply or a
+        // plain output does not either.
+        let bearing: Vec<bool> = items.iter().map(|(_, item)| bears_on_asks(item)).collect();
+        assert_eq!(bearing, [true, true, true, false, true, true, true, true]);
+        let reply = json!({"role": "assistant", "content": [{"type": "output_text", "text": "x"}]});
+        let output = json!({"type": "function_call_output", "call_id": "c", "output": "big"});
+        assert!(
+            !bears_on_asks(&reply)
+                && !bears_on_asks(&output)
+                && !bears_on_asks(&words("hi".into()))
+        );
         let decisions = decisions(&items);
         let ids: Vec<&str> = decisions.iter().map(|d| d.id.as_str()).collect();
         assert_eq!(ids, ["ask:3/a1", "ask:2/a1"]);

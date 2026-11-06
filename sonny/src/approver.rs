@@ -1333,12 +1333,14 @@ async fn transcript(
                         entry["origin"].as_str(),
                         entry["person"].as_str(),
                     );
+                    // Only what bears on an ask is kept, so a long history's
+                    // outputs are let go page by page.
                     let parts = crate::responses(&entry["item"]).into_iter().rev();
-                    read_items.extend(parts.map(|mut part| {
+                    read_items.extend(parts.filter_map(|mut part| {
                         if let Some(from) = &from {
                             part["from"] = json!(from);
                         }
-                        (*turn, part)
+                        crate::asks::bears_on_asks(&part).then_some((*turn, part))
                     }));
                 }
                 // An item's entries newest first, as the transcript is read.
