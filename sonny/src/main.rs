@@ -11774,8 +11774,8 @@ impl App {
             }
         };
         // Its margin starts at the copy, empty: the notes it was copied
-        // with are its source's, and count for none of its own, before
-        // its window first shows it as well as after.
+        // with are its source's, and count for none of its own when Sonny
+        // answers its margin calls, as its window shows none of them.
         if let (Some(id), Some(head)) = (forked["bot_id"].as_i64(), forked["head"].as_i64()) {
             margin::start_at(&self.options.store, id, head);
         }
@@ -20470,6 +20470,9 @@ mod tests {
         let answer = || margin::answer(&client, &store, "calc.add.side-1", ("c99", &note));
         // Copied at node 12: none of its source's notes count for its own.
         margin::start_at(&store, 9, 12);
+        // A window read past the call waiting on its answer: its margin
+        // is its own, and the call still counts once answered.
+        margin::Margin::load(Some(&key)).advance(13);
         assert_eq!(answer().await, Ok("In the margin.".into()));
         // Each call reads on from the first one still waiting on its answer.
         last.store(15, SeqCst);

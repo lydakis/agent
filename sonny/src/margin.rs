@@ -154,9 +154,9 @@ pub fn tool() -> Value {
 
 /// What a `margin` call is answered: "In the margin.", or refused, typed,
 /// as [`refusal`] says, by the margin of `bot` as its history stands. It
-/// is read on from where it was last read here, or from the margin a
-/// window kept under its key in `store` when that one is further on, and
-/// kept beside it, so each call reads only what came since. The calls
+/// is read on from where it was last read here, kept under its key in
+/// `store` apart from a window's, so each call reads only what came
+/// since. The calls
 /// read are as they were answered: one answered then stays, whatever the
 /// limits are now.
 pub async fn answer(
@@ -181,12 +181,9 @@ pub async fn answer(
         .ok_or(("margin_unread", format!("{bot} is gone")))?;
     let store = std::fs::canonicalize(store).unwrap_or_else(|_| store.to_owned());
     let key = crate::reactions::key(&store, id);
-    // Kept apart from the window's, which only a window writes.
-    let mut margin = Margin::load(Some(&format!("{key}.answered")));
-    let window = Margin::load(Some(&key));
-    if window.through() > margin.through() {
-        margin.kept = window.kept;
-    }
+    // Its own, never a window's: a window reads past calls still waiting
+    // on their answers, which this one reads up to.
+    let mut margin = Margin::load(Some(&answers(&key)));
     let mut after = margin.through().unwrap_or(0);
     // Calls not answered yet, by id: where each was made, in what order,
     // and what it asked.
@@ -274,7 +271,13 @@ pub async fn answer(
 /// source's, and holds none of its own notes.
 pub fn start_at(store: &Path, id: i64, head: i64) {
     let store = std::fs::canonicalize(store).unwrap_or_else(|_| store.to_owned());
-    Margin::load(Some(&crate::reactions::key(&store, id))).advance(head);
+    Margin::load(Some(&answers(&crate::reactions::key(&store, id)))).advance(head);
+}
+
+/// Where [`answer`] keeps the margin of the bot kept under `key` as it
+/// was answered: apart from the window's, which only a window writes.
+fn answers(key: &str) -> String {
+    format!("{key}.answered")
 }
 
 /// Whether a call's `output` says it was taken: neither failed nor
