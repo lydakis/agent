@@ -5293,7 +5293,15 @@ impl App {
     /// verbose, else only those [`transcript::clean`] keeps.
     /// Calls like the one before it, with nothing drawn between, fold
     /// into one: several tasks started at once read as one row.
-    fn commit_call(&mut self, id: &str, name: &str, arguments: &Value, output: &str, failed: bool) {
+    fn commit_call(
+        &mut self,
+        id: &str,
+        turn: Option<i64>,
+        name: &str,
+        arguments: &Value,
+        output: &str,
+        failed: bool,
+    ) {
         // In zen the agent's questions are all of its calls drawn.
         if self.zen.is_some() && name != asks::TOOL {
             return;
@@ -5306,15 +5314,16 @@ impl App {
         // option a button that answers with it.
         if name == asks::TOOL
             && !failed
-            && let Some(ask) = asks::call(id, arguments)
+            && let Some(ask) = asks::call(&Self::ask_id(turn, id), arguments)
         {
             let ask = asks::settled(ask, output);
             let card = asks::card(&ask, self.width);
             let from = self.pending.len() + usize::from(self.any_history);
             self.commit(card.rows);
+            let asked = ask.id.clone();
             self.marks
                 .extend(card.options.into_iter().enumerate().map(|(at, row)| {
-                    let button = format!("{}answer/{at}/{id}", screen::BUTTON);
+                    let button = format!("{}answer/{at}/{asked}", screen::BUTTON);
                     (from + row, screen::Mark::Link(button))
                 }));
             // The line to run, a click on it copies.
@@ -7113,7 +7122,10 @@ impl App {
                                     self.commit_denied(&name, &arguments, &reason);
                                 }
                             }
-                            None => self.commit_call(id, &name, &arguments, &output, failed),
+                            None => {
+                                let turn = turns.get(&node).copied();
+                                self.commit_call(id, turn, &name, &arguments, &output, failed)
+                            }
                         }
                         if older {
                             continue;
@@ -7123,7 +7135,7 @@ impl App {
                                 .await;
                         }
                         if name == asks::TOOL && !failed && !reactions::refused(&item) {
-                            self.asked(id, &arguments);
+                            self.asked(id, turns.get(&node).copied(), &arguments);
                         }
                     }
                     _ => {}
@@ -7871,10 +7883,10 @@ impl App {
                     if name == margin::TOOL && !shown.1 {
                         self.note_call(id, &arguments, turn);
                     }
-                    self.commit_call(id, &name, &arguments, &shown.0, shown.1);
+                    self.commit_call(id, turn, &name, &arguments, &shown.0, shown.1);
                 }
                 if name == asks::TOOL && !shown.1 {
-                    self.asked(id, &arguments);
+                    self.asked(id, turn, &arguments);
                 }
                 if name == resolved::TOOL
                     && !shown.1
@@ -8764,6 +8776,10 @@ impl App {
             .flatten()
             .filter_map(|n| n["node"].as_i64())
             .collect();
+        // Each node's turn, which names an ask with its call.
+        let turns: HashMap<i64, i64> = (page["nodes"].as_array().into_iter().flatten())
+            .filter_map(|n| Some((n["node"].as_i64()?, n["turn"].as_i64()?)))
+            .collect();
         let read = self
             .client
             .request("history_items", json!({"bot": bot, "nodes": nodes}))
@@ -8786,12 +8802,16 @@ impl App {
                     entry["origin"].as_str(),
                     entry["person"].as_str(),
                 );
+                let turn = (entry["node"].as_i64()).and_then(|node| turns.get(&node).copied());
                 responses(&entry["item"])
                     .into_iter()
                     .rev()
                     .map(move |mut item| {
                         if let Some(from) = from.as_ref().filter(|_| item["role"] == "user") {
                             item["from"] = json!(from);
+                        }
+                        if let Some(turn) = turn {
+                            item["turn"] = json!(turn);
                         }
                         item
                     })
@@ -11158,16 +11178,50 @@ impl App {
             None => stamp::now(&prompt),
             Some(_) => prompt.clone(),
         };
-        let reply = self
-            .client
-            .request(
-                "submit",
-                json!({"bot": self.bot, "request_id": unique("tui"), "prompt": sent,
-                    "delivery": delivery, "model": model, "workspace": workspace,
-                    "effort": effort, "origin": origin, "images": attach::submitted(pictures)}),
-            )
-            .await
-            .map_err(|error| error.to_string())?;
+        // An answer goes once, whichever window sends it: the daemon takes
+        // the first answer to an ask and refuses another. One taken back
+        // from the queue before the agent read it answered nothing, so the
+        // next goes as the next attempt.
+        let answering = asks::answer_of(&prompt, origin);
+        let mut attempt = 0;
+        let reply = loop {
+            let request_id =
+                answering.map_or_else(|| unique("tui"), |ask| asks::request_id(ask, attempt));
+            let reply = self
+                .client
+                .request(
+                    "submit",
+                    json!({"bot": self.bot, "request_id": request_id, "prompt": sent,
+                        "delivery": delivery, "model": model, "workspace": workspace,
+                        "effort": effort, "origin": origin,
+                        "images": attach::submitted(pictures)}),
+                )
+                .await;
+            if answering.is_none() {
+                break reply.map_err(|error| error.to_string())?;
+            }
+            // The turn this attempt's answer started already, if one did.
+            let before = match &reply {
+                Ok(reply) if reply["duplicate"] == true => reply["turn"].as_i64(),
+                Err(error) if error.code == "idempotency_conflict" => (error.facts.as_ref())
+                    .and_then(|facts| facts.get("turn"))
+                    .and_then(Value::as_i64),
+                _ => None,
+            };
+            let taken_back = match before {
+                Some(turn) => (turn_row(&self.client, &self.bot, turn).await)
+                    .is_some_and(|row| asks::undelivered(&row)),
+                None => false,
+            };
+            if taken_back && attempt < asks::ATTEMPTS {
+                attempt += 1;
+                continue;
+            }
+            break reply.map_err(|error| match error.code.as_str() {
+                "idempotency_conflict" => "that question was answered already".to_owned(),
+                _ => error.to_string(),
+            })?;
+        };
         if effort.is_some() {
             self.boost = None;
         }
@@ -11248,11 +11302,21 @@ impl App {
         }
     }
 
+    /// The ask made as call `call` in turn `turn`, as [`asks::id`] names
+    /// it; one whose turn is not known by its call alone, which no answer
+    /// names.
+    fn ask_id(turn: Option<i64>, call: &str) -> String {
+        match turn {
+            Some(turn) => asks::id(turn, call),
+            None => call.to_owned(),
+        }
+    }
+
     /// The question an `ask` call put, open until it is answered or the
     /// conversation goes on past it. One newly asked takes no focus from
     /// the one being answered, as Codex's questions take none.
-    fn asked(&mut self, id: &str, arguments: &Value) {
-        if let Some(ask) = asks::call(id, arguments)
+    fn asked(&mut self, id: &str, turn: Option<i64>, arguments: &Value) {
+        if let Some(ask) = asks::call(&Self::ask_id(turn, id), arguments)
             && !(self.asks.iter().chain(&self.aside)).any(|open| open.id == ask.id)
         {
             self.asks.push(ask);
@@ -14451,7 +14515,7 @@ mod tests {
             "options": [{"label": "Now"}, {"label": "Later"}], "recommended": 1});
         let items = json!([
             // An answer to an ask, with what the ask recommended.
-            {"node": 17, "item": message("user", "You asked (c1): Ship it now?\n\nLater")},
+            {"node": 17, "item": message("user", "You asked (ask:4/c1): Ship it now?\n\nLater")},
             {"node": 16, "item": {"type": "function_call", "name": "ask", "call_id": "c1",
                 "arguments": ask.to_string()}},
             // One to an older reply names it; one to the last reply is the
@@ -14480,7 +14544,7 @@ mod tests {
             .await;
         let read = said::said(&client, None, 1000).await.unwrap();
         let entry = |turn: i64, text: &str| json!({"bot": "shop.lead", "turn": turn, "text": text, "project": null});
-        let mut answer = entry(4, "You asked (c1): Ship it now?\n\nLater");
+        let mut answer = entry(4, "You asked (ask:4/c1): Ship it now?\n\nLater");
         answer["recommended"] = json!("Now");
         let mut older = entry(4, "🎉");
         older["reacted_to"] = json!("Tagged 0.6.0.");
@@ -14501,14 +14565,14 @@ mod tests {
             "recommended": 1});
         let items = json!([
             // An answer against what the ask recommended.
-            {"node": 13, "item": message("user", "You asked (t2): Tag it too?\n\nNo")},
+            {"node": 13, "item": message("user", "You asked (ask:2/t2): Tag it too?\n\nNo")},
             // A 🙌 on the last finished reply, which waited for its call
             // while another reply was written.
             {"node": 12, "item": message("user", "🙌")},
             {"node": 11, "item": message("assistant", "Still working.")},
             // A 🚀 on the older of two replies that begin alike.
             {"node": 10, "item": message("user", "> Done.\n\n🚀")},
-            {"node": 9, "item": message("user", "You asked (t1): Ship it now?\n\nNow")},
+            {"node": 9, "item": message("user", "You asked (ask:2/t1): Ship it now?\n\nNow")},
             // A 👍 on the ask's reply, taken off and put on again: once.
             {"node": 8, "item": message("user", "👍")},
             {"node": 7, "item": message("user", "👍")},
@@ -14556,7 +14620,7 @@ mod tests {
             .unwrap();
         let entry =
             |text: &str| json!({"bot": "shop.lead", "turn": 2, "text": text, "project": null});
-        let mut answer = entry("You asked (t1): Ship it now?\n\nNow");
+        let mut answer = entry("You asked (ask:2/t1): Ship it now?\n\nNow");
         answer["recommended"] = json!("Now");
         let mut liked = entry("👍");
         liked["reacted_to"] = json!("Ready to ship.");
@@ -14564,7 +14628,7 @@ mod tests {
         launched["reacted_to"] = json!("Done.");
         let mut cheered = entry("🙌");
         cheered["reacted_to"] = json!("Ready to ship.");
-        let mut against = entry("You asked (t2): Tag it too?\n\nNo");
+        let mut against = entry("You asked (ask:2/t2): Tag it too?\n\nNo");
         against["recommended"] = json!("Yes");
         assert_eq!(
             read["said"],
@@ -15091,14 +15155,14 @@ mod tests {
             .unwrap()
         };
         app.asks = vec![
-            ask("c1", "Keep the old API?"),
-            ask("c2", "Tag it?"),
-            ask("c3", "Keep the old API?"),
+            ask("ask:1/c1", "Keep the old API?"),
+            ask("ask:1/c2", "Tag it?"),
+            ask("ask:1/c3", "Keep the old API?"),
         ];
         app.input.set("2");
         app.submit().await;
         // Its answer landing leaves the other question asked the same open.
-        app.answered("You asked (c1): Keep the old API?\n\nDrop it", None);
+        app.answered("You asked (ask:1/c1): Keep the old API?\n\nDrop it", None);
         // Words typed while one is open are the person's own, sent as they
         // wrote them: no question is named over them, nor answered.
         app.input.set("how is it going?");
@@ -15107,57 +15171,66 @@ mod tests {
         assert_eq!(
             *sent.lock().unwrap(),
             [
-                "You asked (c1): Keep the old API?\n\nDrop it",
+                "You asked (ask:1/c1): Keep the old API?\n\nDrop it",
                 "how is it going?"
             ]
         );
         assert_eq!(
             app.asks,
-            [ask("c2", "Tag it?"), ask("c3", "Keep the old API?")]
+            [
+                ask("ask:1/c2", "Tag it?"),
+                ask("ask:1/c3", "Keep the old API?")
+            ]
         );
         // Down picks the next to answer; an option's number then picks on
         // it, named over it as the sent answer will be.
         app.step_ask(true);
-        assert_eq!(app.asking().map(|a| a.id.as_str()), Some("c3"));
+        assert_eq!(app.asking().map(|a| a.id.as_str()), Some("ask:1/c3"));
         app.input.set("1");
         assert_eq!(
             app.answering_over(80).unwrap().to_string(),
             "  answering “Keep the old API?” (2 of 2)"
         );
         app.step_ask(true);
-        assert_eq!(app.asking().map(|a| a.id.as_str()), Some("c2"));
+        assert_eq!(app.asking().map(|a| a.id.as_str()), Some("ask:1/c2"));
         // The person's own words landing move on past them: out of the
         // composer and the count, their options still answering them.
         app.answered("how is it going?", None);
         assert!(app.asks.is_empty() && app.asking().is_none());
         assert_eq!(app.aside.len(), 2);
         app.input.clear();
-        app.press("answer/0/c2").await;
+        app.press("answer/0/ask:1/c2").await;
         assert_eq!(
             sent.lock().unwrap().last().unwrap(),
-            "You asked (c2): Tag it?\n\nKeep it"
+            "You asked (ask:1/c2): Tag it?\n\nKeep it"
         );
-        assert_eq!(app.aside, [ask("c3", "Keep the old API?")]);
+        assert_eq!(app.aside, [ask("ask:1/c3", "Keep the old API?")]);
         // Another agent's words, or a reaction, move nothing on.
-        app.asks = vec![ask("c4", "Ship it?")];
+        app.asks = vec![ask("ask:1/c4", "Ship it?")];
         app.answered("Done: tests pass", Some("tally.halves"));
         app.answered(&reactions::message("👍", None), None);
         // Nor do an answer's words from anyone but the person close it.
-        app.answered("You asked (c4): Ship it?\n\nKeep it", Some("tally.halves"));
-        app.answered("You asked (c4): Ship it?\n\nKeep it", Some("automation"));
+        app.answered(
+            "You asked (ask:1/c4): Ship it?\n\nKeep it",
+            Some("tally.halves"),
+        );
+        app.answered(
+            "You asked (ask:1/c4): Ship it?\n\nKeep it",
+            Some("automation"),
+        );
         assert_eq!(app.asks.len(), 1);
         // One before the question in focus closing, from another window
         // or its card, keeps the focus on the question being answered.
         app.asks = vec![
-            ask("c5", "Tag it?"),
-            ask("c6", "Bump?"),
-            ask("c7", "Notes?"),
+            ask("ask:1/c5", "Tag it?"),
+            ask("ask:1/c6", "Bump?"),
+            ask("ask:1/c7", "Notes?"),
         ];
-        app.focus = Some("c6".into());
-        app.answered("You asked (c5): Tag it?\n\nKeep it", None);
-        assert_eq!(app.asking().map(|a| a.id.as_str()), Some("c6"));
-        app.press("answer/0/c7").await;
-        assert_eq!(app.asking().map(|a| a.id.as_str()), Some("c6"));
+        app.focus = Some("ask:1/c6".into());
+        app.answered("You asked (ask:1/c5): Tag it?\n\nKeep it", None);
+        assert_eq!(app.asking().map(|a| a.id.as_str()), Some("ask:1/c6"));
+        app.press("answer/0/ask:1/c7").await;
+        assert_eq!(app.asking().map(|a| a.id.as_str()), Some("ask:1/c6"));
     }
 
     #[tokio::test]
@@ -15758,11 +15831,11 @@ mod tests {
                   "arguments": "{\"question\":\"Write notes?\"}"},
             "7": {"type": "function_call_output", "call_id": "a3", "output": "Asked."},
             "8": {"type": "message", "role": "user",
-                  "content": [{"type": "input_text", "text": "You asked (a3): Write notes?\n\nyes"}]},
+                  "content": [{"type": "input_text", "text": "You asked (ask:1/a3): Write notes?\n\nyes"}]},
         });
         let client = daemon_answering(move |asked| match asked["op"].as_str() {
             Some("history_nodes") => {
-                json!({"nodes": (1..=9).rev().map(|node| json!({"node": node}))
+                json!({"nodes": (1..=9).rev().map(|node| json!({"node": node, "turn": 1}))
                 .collect::<Vec<_>>(), "next_from": null})
             }
             _ => json!({"items": asked["nodes"].as_array().into_iter().flatten()
@@ -15775,7 +15848,7 @@ mod tests {
         // The refused one was never asked, and the answered one is closed.
         assert_eq!(
             app.asks.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(),
-            ["a1"]
+            ["ask:1/a1"]
         );
         // Drawn where it was asked, with what each option means.
         let rows: Vec<String> = app.pending.iter().map(|l| l.to_string()).collect();
@@ -15786,7 +15859,7 @@ mod tests {
         assert_eq!(rows[at + 4], "┃    Brew gets it tonight.");
         assert_eq!(rows[at + 8], "┃ Why 1: Nothing else is due.");
         // Its answer landing, sent from here or another window, closes it.
-        app.answered("You asked (a1): Tag 0.4.1?\n\nYes", None);
+        app.answered("You asked (ask:1/a1): Tag 0.4.1?\n\nYes", None);
         assert!(app.asks.is_empty());
         // Live, a question is pinned once the daemon took the call.
         let arguments = json!({"question": "Merge?"}).to_string();
@@ -17624,6 +17697,7 @@ mod tests {
             r#""$AGENT_BIN" run --detach --delivery steer --bot calc.neg -- 'Check div too.'"#;
         app.commit_call(
             "c1",
+            Some(1),
             "shell",
             &json!({"command": steer}),
             "turn:calc.neg/4",
@@ -17765,7 +17839,14 @@ mod tests {
         app.width = 80;
         let start = |app: &mut App, name: &str| {
             let command = format!("\"$AGENT_BIN\" run --bot {name} \"Fix {name}\"");
-            app.commit_call("c", "shell", &json!({"command": command}), "", false);
+            app.commit_call(
+                "c",
+                Some(1),
+                "shell",
+                &json!({"command": command}),
+                "",
+                false,
+            );
         };
         start(&mut app, "calc.add");
         start(&mut app, "calc.neg");
@@ -17799,7 +17880,14 @@ mod tests {
         app.width = 80;
         let start = |app: &mut App, name: &str| {
             let command = format!("\"$AGENT_BIN\" run --bot {name} \"Fix {name}\"");
-            app.commit_call("c", "shell", &json!({"command": command}), "", false);
+            app.commit_call(
+                "c",
+                Some(1),
+                "shell",
+                &json!({"command": command}),
+                "",
+                false,
+            );
         };
         app.commit(vec![Line::from("› fix the three bugs")]);
         start(&mut app, "calc.add");
@@ -17840,10 +17928,11 @@ mod tests {
         assert_eq!(drawn(&mut app).len(), 3);
         // Something drawn between, or another kind of call, starts anew;
         // a call the clean view hides does not.
-        app.commit_call("c", "shell", &json!({"command": "ls"}), "a", false);
+        app.commit_call("c", Some(1), "shell", &json!({"command": "ls"}), "a", false);
         start(&mut app, "calc.mul");
         app.commit_call(
             "c",
+            Some(1),
             served::REMOVE,
             &json!({"task": "calc.add"}),
             "{}",
@@ -17923,7 +18012,14 @@ mod tests {
         let mut app = app(client);
         app.width = 80;
         let arguments = json!({"name": "many", "brief": "Fix many"});
-        app.commit_call("c", served::START, &arguments, "turn:calc.many/1", false);
+        app.commit_call(
+            "c",
+            Some(1),
+            served::START,
+            &arguments,
+            "turn:calc.many/1",
+            false,
+        );
         app.read_tasks().await;
         let rows = drawn(&mut app);
         assert_eq!(rows[1], "  ● many  working  Fix many");
@@ -17967,7 +18063,14 @@ mod tests {
         let mut app = app(client);
         app.width = 80;
         let arguments = json!({"name": "add", "brief": "Fix add"});
-        app.commit_call("c", served::START, &arguments, "turn:calc.add/1", false);
+        app.commit_call(
+            "c",
+            Some(1),
+            served::START,
+            &arguments,
+            "turn:calc.add/1",
+            false,
+        );
         app.read_tasks().await;
         assert_eq!(drawn(&mut app)[1], "  ● add  working  Fix add");
         // Idle, the stopped message never ran: the turn before it says
@@ -18018,7 +18121,7 @@ mod tests {
         let start = |app: &mut App, name: &str| {
             let arguments = json!({"name": name, "brief": format!("Fix {name}")});
             let output = format!("turn:calc.{name}/1");
-            app.commit_call("c", served::START, &arguments, &output, false);
+            app.commit_call("c", Some(1), served::START, &arguments, &output, false);
         };
         start(&mut app, "add");
         start(&mut app, "neg");
@@ -18295,7 +18398,7 @@ mod tests {
         for name in ["quiet", "bad"] {
             let arguments = json!({"name": name, "brief": format!("Fix {name}")});
             let output = format!("turn:calc.{name}/1");
-            app.commit_call("c", served::START, &arguments, &output, false);
+            app.commit_call("c", Some(1), served::START, &arguments, &output, false);
         }
         app.read_tasks().await;
         let rows = drawn(&mut app);
@@ -18374,7 +18477,14 @@ mod tests {
         let mut app = app(client);
         app.width = 80;
         let arguments = json!({"name": "ask", "brief": "Fix ask"});
-        app.commit_call("c", served::START, &arguments, "turn:calc.ask/1", false);
+        app.commit_call(
+            "c",
+            Some(1),
+            served::START,
+            &arguments,
+            "turn:calc.ask/1",
+            false,
+        );
         app.read_tasks().await;
         assert_eq!(drawn(&mut app)[1], "  ? ask  needs you  Fix ask");
         // Its history is read once for the turn it ended.
@@ -18438,15 +18548,64 @@ mod tests {
         }
         assert_eq!(
             sent.lock().unwrap()[..],
-            [json!("You asked (a4): Merge?\n\nNo")]
+            [json!("You asked (ask:4/a4): Merge?\n\nNo")]
         );
         assert!(app.asks.is_empty());
         // Once answered, another click sends nothing.
-        app.press("answer/0/a4").await;
+        app.press("answer/0/ask:4/a4").await;
         assert_eq!(sent.lock().unwrap().len(), 1);
         assert_eq!(
             app.notice.as_deref(),
             Some("that question was answered already")
+        );
+    }
+
+    #[tokio::test]
+    async fn an_answer_taken_back_unread_leaves_its_question_to_answer_again() {
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = sent.clone();
+        let client = daemon_answering(move |asked| match asked["op"].as_str() {
+            Some("submit") => {
+                // As the daemon keeps them: a request's first send starts a
+                // turn, the first answer's turn 5, and a later one with
+                // other words is refused, naming it.
+                let mut seen = seen.lock().unwrap();
+                let request = asked["request_id"].as_str().unwrap().to_owned();
+                let again = seen.contains(&request);
+                let turn = if request.ends_with(".1") { 9 } else { 5 };
+                seen.push(request);
+                match again {
+                    false => json!({"turn": turn}),
+                    true => json!({"error": "idempotency_conflict", "turn": turn}),
+                }
+            }
+            Some("turns") => match asked["after"].as_i64() {
+                Some(4) => json!({"turns": [{"turn": 5, "status": "interrupted",
+                    "started_ms": null}]}),
+                _ => json!({"turns": [{"turn": 9, "status": "done", "started_ms": 1}]}),
+            },
+            _ => json!({}),
+        })
+        .await;
+        let mut app = app(client);
+        for pick in ["No", "Yes"] {
+            let answer = format!("You asked (ask:4/a4): Merge?\n\n{pick}");
+            app.send(answer, None, false, true, &[]).await.unwrap();
+        }
+        let answer = "You asked (ask:4/a4): Merge?\n\nNo".to_owned();
+        assert_eq!(
+            app.send(answer, None, false, true, &[]).await,
+            Err("that question was answered already".to_owned())
+        );
+        assert_eq!(
+            sent.lock().unwrap()[..],
+            [
+                asks::request_id("ask:4/a4", 0),
+                asks::request_id("ask:4/a4", 0),
+                asks::request_id("ask:4/a4", 1),
+                asks::request_id("ask:4/a4", 0),
+                asks::request_id("ask:4/a4", 1),
+            ]
         );
     }
 
@@ -18669,7 +18828,7 @@ mod tests {
         for name in ["ask", "new"] {
             let arguments = json!({"name": name, "brief": format!("Ask {name}")});
             let output = format!("turn:calc.{name}/2");
-            app.commit_call("c", served::START, &arguments, &output, false);
+            app.commit_call("c", Some(1), served::START, &arguments, &output, false);
         }
         app.read_tasks().await;
         let states: HashMap<_, _> = (app.tasks.values().flatten())
@@ -19261,7 +19420,14 @@ mod tests {
         app.width = 80;
         let start = |app: &mut App, name: &str| {
             let command = format!("\"$AGENT_BIN\" run --bot {name} \"Fix {name}\"");
-            app.commit_call("c", "shell", &json!({"command": command}), "", false);
+            app.commit_call(
+                "c",
+                Some(1),
+                "shell",
+                &json!({"command": command}),
+                "",
+                false,
+            );
         };
         start(&mut app, "calc.add");
         start(&mut app, "calc.neg");
@@ -19999,7 +20165,7 @@ mod tests {
             json!({"steps": ["[x] Read", "[>] Fix", "[ ] Test"]}),
         ];
         for (n, plan) in plans.iter().enumerate() {
-            app.commit_call(&format!("p{n}"), "plan", plan, "Plan set.", false);
+            app.commit_call(&format!("p{n}"), Some(1), "plan", plan, "Plan set.", false);
             app.commit(vec![Line::from(format!("reply {n}"))]);
         }
         app.flush();
@@ -20034,7 +20200,7 @@ mod tests {
         assert_eq!(rows.last().unwrap(), "reply 1");
         // A newer plan takes the full rows over.
         let done = json!({"steps": ["[x] Read", "[x] Fix", "[x] Test"]});
-        app.commit_call("p2", "plan", &done, "Plan set.", false);
+        app.commit_call("p2", Some(1), "plan", &done, "Plan set.", false);
         app.flush();
         app.fold_notes(false);
         let rows = texts(&app);
