@@ -2894,7 +2894,8 @@ pub fn at_start() {
 /// would. Once scheduled it is the person's: one they removed stays
 /// removed, since the memory folder it made a repository says it was
 /// scheduled ([`agent_client::memory::scheduled_once`]). One that could not
-/// be scheduled (no scheduler here) is tried again at the next start.
+/// be scheduled (no scheduler here) says why in `/background` until it is
+/// ([`cleanup_unscheduled`]), and is tried again at the next start.
 pub fn cleanup_by_default(lead: &Value, store: &Path, socket: &Path) {
     let (Some(home), Some(sonny)) = (
         std::env::var_os("HOME").map(PathBuf::from),
@@ -2904,9 +2905,70 @@ pub fn cleanup_by_default(lead: &Value, store: &Path, socket: &Path) {
     };
     if let Some(mut schedule) = cleanup_schedule(&home, &sonny, lead, store, socket) {
         std::thread::spawn(move || {
-            let _ = schedule.status();
+            let failure = cleanup_failure(schedule.output());
+            settle_cleanup(&home, failure.as_deref(), now());
         });
     }
+}
+
+/// Where why Sonny could not schedule the nightly cleanup is kept, until
+/// it can.
+fn cleanup_unscheduled_path(home: &Path) -> PathBuf {
+    home.join(".agent/sonny/cleanup-not-scheduled.json")
+}
+
+/// Why a `sonny memory schedule` did not schedule the cleanup: the error
+/// it printed, else how it ended. None when it did.
+fn cleanup_failure(said: std::io::Result<std::process::Output>) -> Option<String> {
+    let out = match said {
+        Ok(out) if out.status.success() => return None,
+        Ok(out) => out,
+        Err(error) => return Some(format!("could not run sonny memory schedule: {error}")),
+    };
+    let text = |bytes: &[u8]| String::from_utf8_lossy(bytes).trim().to_owned();
+    let printed = [text(&out.stderr), text(&out.stdout)]
+        .into_iter()
+        .find(|t| !t.is_empty());
+    let Some(printed) = printed else {
+        return Some(format!("sonny memory schedule ended: {}", out.status));
+    };
+    let last = printed.lines().last().unwrap_or_default();
+    Some(match serde_json::from_str::<Value>(last) {
+        Ok(error) if error["error"].is_string() => match error["detail"].as_str() {
+            Some(detail) => format!("{}: {detail}", error["error"].as_str().unwrap_or_default()),
+            None => error["error"].as_str().unwrap_or_default().to_owned(),
+        },
+        _ => last.to_owned(),
+    })
+}
+
+/// Keep why the cleanup could not be scheduled, or, once it was, forget it.
+fn settle_cleanup(home: &Path, failure: Option<&str>, at: i64) {
+    let path = cleanup_unscheduled_path(home);
+    match failure {
+        None => {
+            let _ = std::fs::remove_file(&path);
+        }
+        Some(why) => {
+            if let Some(dir) = path.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            let _ = replace(&path, &json!({"why": why, "at": at}).to_string());
+        }
+    }
+}
+
+/// Why the nightly cleanup Sonny turns on by default is not scheduled, and
+/// when it last tried, while it is not: none once it was scheduled, by
+/// Sonny or the person, and so none after the person removed it, which is
+/// their choice, not a failure. Each window's background count asks every
+/// ten seconds: mostly one open of a file that is not there.
+pub fn cleanup_unscheduled(home: &Path) -> Option<(String, i64)> {
+    let kept = read_json(&cleanup_unscheduled_path(home))?;
+    if agent_client::memory::scheduled_once(home) {
+        return None;
+    }
+    Some((kept["why"].as_str()?.to_owned(), kept["at"].as_i64()?))
 }
 
 /// The `sonny memory schedule` that turns the cleanup on, unless it was
@@ -2933,9 +2995,7 @@ fn cleanup_schedule(
         .env("AGENT_SOCKET", absolute(socket))
         .env_remove("AGENT_BOT")
         .env_remove("AGENT_BOT_ID")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+        .stdin(std::process::Stdio::null());
     Some(schedule)
 }
 
@@ -8388,6 +8448,60 @@ pub(crate) mod tests {
         )
         .unwrap();
         assert!(cleanup_schedule(&home, sonny, &lead, store, socket).is_none());
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn a_cleanup_that_could_not_be_scheduled_says_why_until_it_is() {
+        use std::os::unix::process::ExitStatusExt;
+        let home = std::env::temp_dir().join(format!("cleanup-unscheduled-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let ended = |code: i32, stdout: &str, stderr: &str| {
+            Ok(std::process::Output {
+                status: std::process::ExitStatus::from_raw(code << 8),
+                stdout: stdout.as_bytes().to_vec(),
+                stderr: stderr.as_bytes().to_vec(),
+            })
+        };
+        assert_eq!(cleanup_failure(ended(0, "{}", "")), None);
+        let refused = r#"{"error":"automations_unsupported","detail":"no scheduler here"}"#;
+        let why = cleanup_failure(ended(1, "", refused)).unwrap();
+        assert_eq!(why, "automations_unsupported: no scheduler here");
+        assert_eq!(
+            cleanup_failure(ended(1, "", "boom\nlast words")).as_deref(),
+            Some("last words")
+        );
+        assert!(
+            cleanup_failure(ended(1, "", ""))
+                .unwrap()
+                .starts_with("sonny memory schedule ended")
+        );
+        let missing = Err(std::io::Error::from(std::io::ErrorKind::NotFound));
+        assert!(
+            cleanup_failure(missing)
+                .unwrap()
+                .starts_with("could not run")
+        );
+        // Kept until a try goes, and shown while nothing is scheduled.
+        assert_eq!(cleanup_unscheduled(&home), None);
+        settle_cleanup(&home, Some(&why), 1_790_000_000);
+        assert_eq!(
+            cleanup_unscheduled(&home),
+            Some((why.clone(), 1_790_000_000))
+        );
+        settle_cleanup(&home, None, 1_790_000_100);
+        assert_eq!(cleanup_unscheduled(&home), None);
+        // Scheduled once, then removed by the person: their choice, never
+        // shown as a failure, whatever an older try kept.
+        settle_cleanup(&home, Some(&why), 1_790_000_200);
+        std::fs::create_dir_all(home.join(".agents/memory/.git")).unwrap();
+        std::fs::write(
+            home.join(".agents/memory/.git/HEAD"),
+            "ref: refs/heads/main\n",
+        )
+        .unwrap();
+        assert_eq!(cleanup_unscheduled(&home), None);
         std::fs::remove_dir_all(home).unwrap();
     }
 }

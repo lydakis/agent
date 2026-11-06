@@ -676,7 +676,10 @@ costs no turn. Each turn is capped at 1,000,000 tokens, and each night
 starts a conversation of its own, so a call carries only that night's work.
 It is on by default: the first Sonny to open a lead schedules it on that
 lead's model (`schedule --model`), in the background, and tries again at
-its next start if it could not (no scheduler). Once scheduled it is the
+its next start if it could not (no scheduler). Until it is, `/background`
+shows `memory-cleanup` as not scheduled, in every window, with the error
+the scheduling gave (kept in `~/.agent/sonny/cleanup-not-scheduled.json`).
+Once scheduled it is the
 person's: removed with `~/.agent/automation rm memory-cleanup`, it stays
 removed, since `~/.agents/memory` being a repository says it was scheduled
 once, and `schedule` turns it on again. `schedule` again replaces the automation:
