@@ -1924,7 +1924,13 @@ open. The schema version lives in SQLite's `user_version`; a store created
 before versioning is refused with `store_schema_unsupported`, one written by a
 newer binary with `store_schema_newer`, and an older versioned store is
 migrated inside the opening transaction when its data can be converted without
-guessing. Schema 18 requires each bot's tool selection. Older stores with bots
+guessing. Before it migrates, the store is copied with `VACUUM INTO` to
+`<store>.schema-<version>.backup` beside it, with the store's permissions,
+and the copy is checked (it opens, passes `PRAGMA integrity_check`, and is at
+that version); the two newest copies are kept. A store that cannot be copied,
+for a full disk say, is not migrated: opening fails with
+`store_backup_failed`, which says why, and the store stays as it was. To go
+back a release, stop the daemon and put the copy in the store's place. Schema 18 requires each bot's tool selection. Older stores with bots
 but no recorded selection are refused with `store_migration_tools_unknown`;
 their data and schema version remain intact. Keep those stores and use a new
 store path. Empty stores can migrate. Schema 19 rebuilds cache counters from
