@@ -1190,7 +1190,7 @@ async fn intent(
         .iter()
         .filter_map(|call| call["call_id"].as_str())
         .collect();
-    let transcript = transcript(client, &shared.redactor, bot, &judged).await?;
+    let (transcript, decisions) = transcript(client, &shared.redactor, bot, &judged).await?;
     let inspected = client.request("inspect", json!({"bot":bot})).await?;
     let settings = &inspected["settings"];
     let sandbox = matches!(
@@ -1274,19 +1274,23 @@ async fn intent(
         earlier,
         transcript,
         instructions,
+        decisions,
     })
 }
 
 /// The bot's own history the judge is shown, read newest first until the
 /// transcript is full: its messages, calls, and their outputs. The calls
-/// being judged are left to the state's own entries.
+/// being judged are left to the state's own entries. With it, the asks put
+/// to the person in what was read, and their answers ([`crate::asks::decisions`]).
 async fn transcript(
     client: &Client,
     redactor: &Redactor,
     bot: &str,
     judged: &[&str],
-) -> std::result::Result<Transcript, Unjudged> {
+) -> std::result::Result<(Transcript, Vec<policy::Decision>), Unjudged> {
     let mut transcript = Transcript::default();
+    // What was read, newest first, each item with its turn.
+    let mut read_items: Vec<(i64, Value)> = Vec::new();
     let mut from = Value::Null;
     let mut read = 0;
     'read: while read < HISTORY_NODES {
@@ -1302,6 +1306,9 @@ async fn transcript(
             .flatten()
             .filter_map(|node| node["node"].as_i64())
             .collect();
+        let turns: HashMap<i64, i64> = (page["nodes"].as_array().into_iter().flatten())
+            .filter_map(|node| Some((node["node"].as_i64()?, node["turn"].as_i64()?)))
+            .collect();
         read += nodes.len();
         let mut next = 0;
         while next < nodes.len() {
@@ -1314,11 +1321,25 @@ async fn transcript(
             if items.is_empty() {
                 return Err(Unjudged::Failed);
             }
-            next += items.len();
-            for entry in &items {
+            for (entry, node) in items.iter().zip(wanted) {
                 if entry.get("error").is_some() {
                     transcript.cut = true;
                     continue;
+                }
+                if let Some(turn) = turns.get(node) {
+                    // Who sent a message is the entry's, as the window reads it.
+                    let from = crate::transcript::sender(
+                        entry["from"]["bot"].as_str(),
+                        entry["origin"].as_str(),
+                        entry["person"].as_str(),
+                    );
+                    let parts = crate::responses(&entry["item"]).into_iter().rev();
+                    read_items.extend(parts.map(|mut part| {
+                        if let Some(from) = &from {
+                            part["from"] = json!(from);
+                        }
+                        (*turn, part)
+                    }));
                 }
                 // An item's entries newest first, as the transcript is read.
                 for said in policy::entries(&entry["item"], judged, redactor)
@@ -1330,14 +1351,15 @@ async fn transcript(
                     }
                 }
             }
+            next += items.len();
         }
         from = page["next_from"].clone();
         if from.is_null() {
-            return Ok(transcript.finish());
+            return Ok((transcript.finish(), crate::asks::decisions(&read_items)));
         }
     }
     transcript.cut = true;
-    Ok(transcript.finish())
+    Ok((transcript.finish(), crate::asks::decisions(&read_items)))
 }
 
 /// A `prompts` read's words with the bot's message before each, its

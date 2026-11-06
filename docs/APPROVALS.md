@@ -535,6 +535,19 @@ this replaced:
   Transcript entries are redacted
   whole before they are cut to size, so a cut never keeps an
   unrecognizable piece of a secret.
+- **The judge reads the asks put to the person, and what a yes covers**
+  (2026-11-06). Sonny's `ask` names what a yes covers (`covers`: an
+  action, its target, and the revision where there is one), and the
+  person's answer repeats it. The state gains `decisions`: the asks in the
+  history the transcript read covers, newest first and at most 16, each
+  with its ID (`ask:TURN/CALL`), question, `covers`, and the person's
+  first pick with the turn it came in, or null while it is open. Only the
+  person's own answer counts; another agent's words that look like one
+  count for nothing. The policy says an answer approves only what its
+  `covers` names, so a call on another target or revision is not approved
+  by it, and an open ask approves nothing whatever the agent said it would
+  do meanwhile. Code review's rule is the precedent: an approval covers
+  the commit it saw.
 - **Only escapes reach the judge, and it may look before it answers**
   (2026-10-28, once the daemon's sandbox landed). A sandboxed bot's
   commands, writes, and edits inside its sandbox run unjudged; the judge
