@@ -2220,6 +2220,42 @@ fn entry(cursor: i64, bot: &str, turn: Option<i64>, kind: &str, data: Value) -> 
 /// A stored event as read back: its entry with `written_ms`, the Unix ms
 /// it joined the store, when it has one (events from before the column
 /// existed have none).
+/// The most kinds `events_of_kinds` takes, each read from its place in the
+/// index (SQLite allows 500 arms in a compound). A follow of more pages
+/// every event and filters them as they are sent, which costs each page its
+/// limit however rare the kinds are.
+pub const EVENT_PAGE_KINDS: usize = 64;
+/// Every bot's next events of one kind (`?3`) after `?1`, at most `?2`,
+/// from the kind's place in the index.
+const KINDS_PAGE: &str = "SELECT id,turn,kind,data,bot,written_ms FROM events WHERE id IN
+    (SELECT id FROM events INDEXED BY events_kind_cursor WHERE kind=?3 AND id>?1 ORDER BY id LIMIT ?2)
+    ORDER BY id LIMIT ?2";
+const KIND_CURSORS: &str = "SELECT id FROM events INDEXED BY events_kind_cursor WHERE kind=?3 AND id>?1 ORDER BY id LIMIT ?2";
+/// One kind's cursors as an arm of a compound, which takes no `LIMIT` of
+/// its own unless wrapped (SQLite flattens the wrapper).
+const KIND_ARM: &str = "SELECT * FROM (SELECT id FROM events INDEXED BY events_kind_cursor
+    WHERE kind=?3 AND id>?1 ORDER BY id LIMIT ?2)";
+
+/// [`KINDS_PAGE`] for `kinds` distinct kinds bound from `?3` on, as one
+/// statement: the page's first `?2` are among each kind's first `?2`.
+fn kinds_page(kinds: usize) -> String {
+    let page = re_spaced(KINDS_PAGE);
+    let cursors = re_spaced(KIND_CURSORS);
+    let wanted = match kinds {
+        1 => return page,
+        _ => (0..kinds)
+            .map(|at| re_spaced(KIND_ARM).replace("kind=?3", &format!("kind=?{}", at + 3)))
+            .collect::<Vec<_>>()
+            .join(" UNION ALL "),
+    };
+    page.replace(&cursors, &wanted)
+}
+
+/// A statement on one line, as written across several.
+fn re_spaced(sql: &str) -> String {
+    sql.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 fn stored_entry(
     cursor: i64,
     bot: &str,
@@ -2488,6 +2524,7 @@ impl Database {
             INSERT OR IGNORE INTO event_retention VALUES (1,0);
             CREATE INDEX IF NOT EXISTS events_bot_cursor ON events(bot,id);
             CREATE INDEX IF NOT EXISTS events_turn_kind_cursor ON events(turn,kind,id);
+            CREATE INDEX IF NOT EXISTS events_kind_cursor ON events(kind,id);
             CREATE INDEX IF NOT EXISTS checkpoints_head ON checkpoints(head);
             CREATE INDEX IF NOT EXISTS turns_running ON turns(id) WHERE status='running';
             CREATE INDEX IF NOT EXISTS turns_waiting ON turns(id) WHERE status='waiting';
@@ -10710,31 +10747,40 @@ impl Database {
     }
     pub fn events(&self, name: &str, after: i64, limit: usize) -> Result<Value> {
         self.inspect(name)?;
-        self.event_page(Some(name), after, limit)
+        self.event_page(Some(name), None, after, limit)
     }
     /// Every bot's durable events after a store-wide cursor: what a fleet
     /// controller replays on one connection instead of one per bot.
     pub fn events_after(&self, after: i64, limit: usize) -> Result<Value> {
-        self.event_page(None, after, limit)
+        self.event_page(None, None, after, limit)
     }
-    fn event_page(&self, name: Option<&str>, after: i64, limit: usize) -> Result<Value> {
+    /// [`Self::events_after`], only of `kinds`. Each kind's next events
+    /// come from its own place in the `events_kind_cursor` index, in one
+    /// statement and so one snapshot, so a page costs the events it
+    /// returns, not every event written between them.
+    pub fn events_of_kinds(&self, kinds: &[&str], after: i64, limit: usize) -> Result<Value> {
+        self.event_page(None, Some(kinds), after, limit)
+    }
+    fn event_page(
+        &self,
+        name: Option<&str>,
+        kinds: Option<&[&str]>,
+        after: i64,
+        limit: usize,
+    ) -> Result<Value> {
         if after < 0 || !(1..=256).contains(&limit) {
             return fail_with(
                 "invalid_event_page",
                 "limit must be 1 to 256 and after 0 or more",
             );
         }
-        let mut stmt = self.conn.prepare_cached(match name {
-            Some(_) => "SELECT id,turn,kind,data,bot,written_ms FROM events WHERE bot=?1 AND id>?2 ORDER BY id LIMIT ?3",
-            None => "SELECT id,turn,kind,data,bot,written_ms FROM events WHERE ?1 IS NULL AND id>?2 ORDER BY id LIMIT ?3",
-        })?;
-        let mut rows = stmt.query(params![name, after, limit as i64])?;
         let mut events = Vec::new();
         let mut cursor = after;
         // Leave ample room for the response envelope and its caller-supplied ID.
         let mut bytes = 0;
         let byte_limit = crate::output::MAX_EVENT / 2;
-        while let Some(row) = rows.next()? {
+        // Takes one stored event onto the page, or says the page is full.
+        let mut take = |row: &rusqlite::Row| -> Result<bool> {
             let next: i64 = row.get(0)?;
             let data: String = row.get(3)?;
             let bot: String = row.get(4)?;
@@ -10751,11 +10797,40 @@ impl Database {
                 if events.is_empty() {
                     return fail("event_page_item_limit");
                 }
-                break;
+                return Ok(false);
             }
             bytes += size;
             cursor = next;
             events.push(item);
+            Ok(true)
+        };
+        let mut stmt;
+        let mut rows = match kinds {
+            None => {
+                stmt = self.conn.prepare_cached(match name {
+                    Some(_) => "SELECT id,turn,kind,data,bot,written_ms FROM events WHERE bot=?1 AND id>?2 ORDER BY id LIMIT ?3",
+                    None => "SELECT id,turn,kind,data,bot,written_ms FROM events WHERE ?1 IS NULL AND id>?2 ORDER BY id LIMIT ?3",
+                })?;
+                stmt.query(params![name, after, limit as i64])?
+            }
+            Some(kinds) => {
+                let mut kinds = kinds.to_vec();
+                kinds.sort_unstable();
+                kinds.dedup();
+                if !(1..=EVENT_PAGE_KINDS).contains(&kinds.len()) {
+                    return fail_with("invalid_event_page", "kinds must name 1 to 64 kinds");
+                }
+                stmt = self.conn.prepare_cached(&kinds_page(kinds.len()))?;
+                let most = limit as i64;
+                let mut values: Vec<&dyn rusqlite::ToSql> = vec![&after, &most];
+                values.extend(kinds.iter().map(|kind| kind as &dyn rusqlite::ToSql));
+                stmt.query(&values[..])?
+            }
+        };
+        while let Some(row) = rows.next()? {
+            if !take(row)? {
+                break;
+            }
         }
         let pruned: i64 = match name {
             Some(name) => {
@@ -14790,6 +14865,78 @@ mod tests {
             many <= few + 8,
             "{few} steps for 10 untold, {many} for 10,000"
         );
+    }
+
+    #[test]
+    fn a_page_of_rare_kinds_costs_what_it_returns() {
+        // Every bot's events of two rare kinds, among `common` others.
+        let store = |common: i64| {
+            let db = Database::initialize(Connection::open_in_memory().unwrap()).unwrap();
+            db.conn.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+            db.conn
+                .execute(
+                    "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<?1)
+                     INSERT INTO events(bot,turn,kind,data)
+                     SELECT CASE i%3 WHEN 0 THEN 'Ann' ELSE 'Bob' END,1,
+                      CASE WHEN i IN (2,?1/2,?1-1) THEN 'turn_finished'
+                           WHEN i=?1/3 THEN 'accepted' ELSE 'tool_started' END,
+                      '{\"pad\":\"'||printf('%.800c','x')||'\"}' FROM n",
+                    [common],
+                )
+                .unwrap();
+            db
+        };
+        let kinds = ["turn_finished", "accepted", "turn_finished"];
+        let steps = |common: i64| {
+            let db = store(common);
+            let page = db.events_of_kinds(&kinds, 0, 256).unwrap();
+            let got: Vec<&str> = (page["events"].as_array().unwrap().iter())
+                .map(|e| e["event"].as_str().unwrap())
+                .collect();
+            assert_eq!(
+                got,
+                [
+                    "turn_finished",
+                    "accepted",
+                    "turn_finished",
+                    "turn_finished"
+                ]
+            );
+            let step = |sql: &str| {
+                (db.conn.prepare_cached(sql).unwrap()).get_status(rusqlite::StatementStatus::VmStep)
+            };
+            step(&kinds_page(2))
+        };
+        let (few, many) = (steps(30), steps(30_000));
+        assert!(
+            many <= few + 8,
+            "{few} steps among 30 events, {many} among 30,000"
+        );
+        // As many kinds as a page takes, a page of a common one still
+        // stops at its limit; past them, none is read.
+        let names: Vec<String> = (1..EVENT_PAGE_KINDS)
+            .map(|at| format!("kind_{at}"))
+            .collect();
+        let mut common: Vec<&str> = std::iter::once("tool_started")
+            .chain(names.iter().map(String::as_str))
+            .collect();
+        let steps = |events: i64| {
+            let db = store(events);
+            let page = db.events_of_kinds(&common, 0, 1).unwrap();
+            assert_eq!(page["events"].as_array().unwrap().len(), 1);
+            (db.conn.prepare_cached(&kinds_page(common.len())).unwrap())
+                .get_status(rusqlite::StatementStatus::VmStep)
+        };
+        let (few, many) = (steps(30), steps(30_000));
+        assert!(
+            many <= few + 8,
+            "{few} steps among 30 events, {many} among 30,000"
+        );
+        common.push("one_too_many");
+        let db = store(30);
+        let refused = db.events_of_kinds(&common, 0, 1).unwrap_err();
+        assert_eq!(refused.code, "invalid_event_page");
+        assert!(db.events_of_kinds(&[], 0, 1).is_err());
     }
 
     #[test]
