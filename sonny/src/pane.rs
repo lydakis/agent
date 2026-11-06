@@ -50,6 +50,15 @@ pub fn margin_width(width: u16, prose: u16) -> Option<u16> {
     (rest >= MARGIN).then_some(rest)
 }
 
+/// The columns of a margin `width` wide its title and rows take: one
+/// short, so its text ends as far from the window's edge as it starts
+/// from the line between, two blank columns each side (the column after
+/// the line and a row's own opening space; the column a row leaves after
+/// itself and this one).
+pub fn margin_room(width: u16) -> u16 {
+    width.saturating_sub(1)
+}
+
 pub struct Pane {
     /// What the pane shows, as its first row says it.
     title: String,
@@ -550,6 +559,13 @@ impl Pane {
         // in from the line between; what is left of a wide pane stays
         // empty on the right, as beside the conversation alone.
         let measure = crate::measure() as u16 + 1;
+        let area = match self.margin {
+            true => Rect {
+                width: margin_room(area.width),
+                ..area
+            },
+            false => area,
+        };
         let area = match self.prose && self.program.is_none() {
             true => Rect {
                 width: area.width.min(measure),

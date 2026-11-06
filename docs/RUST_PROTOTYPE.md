@@ -2790,6 +2790,19 @@ command run by an absolute path that no rule matches as written is
 matched by its program's name, as Codex resolves it: when
 `host_executables` lists that path for the name, or lists nothing for it;
 by the name's `allow` rules, only at a path it lists.
+
+A command under a wrapper is also matched as the command the wrapper
+runs, read by the wrapper's own words: `timeout` (with its options and a
+duration), `nice` (with an adjustment), `nohup` and `time` run it as it
+would run alone, so `timeout 60 mcpx call` is allowed by an `mcpx` rule
+and `timeout 60 git push` refused by a `git push` one; `env` (bare, or
+with `-i`, `-u`, `-C` and assignments) and the shell's own `NAME=VALUE`
+before a command change what it runs with, so through them only the
+rules that ask or refuse match. Nor does a wrapper let out a program it
+runs by its path: the wrapper is found on `PATH`, so only a program by
+its name, found the same way, is allowed through it. A wrapper by its path, or in a form not
+read here (another option, such as `env -S`), is matched as written
+only. Rules for the wrapper itself still match too.
 `invalid`, with why, says the client couldn't read the rules: every shell
 call fails `rules_invalid` with it, where Codex would refuse to start. A
 pattern or list of choices that is empty, an empty justification, or a
@@ -2862,6 +2875,10 @@ Where this differs from Codex:
   host, which the daemon doesn't have; a sandbox's network is on or off.
   Sonny refuses a rules file that has one, so no rule is taken as kept
   that isn't.
+- Codex matches a command as written; here a wrapper read as above is
+  seen through, as Codex's own dangerous-command check sees through
+  `env` and `sudo`, so an agent that wraps a call in `timeout` is ruled as
+  it would be without it, a refusal included.
 - Codex lets a program run by any absolute path out by its name's
   `allow` rules when no `host_executable` names it. Here such a path is
   only asked about or refused by them, since a sandboxed bot could write
