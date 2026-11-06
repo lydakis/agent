@@ -2698,6 +2698,9 @@ struct App {
     /// read again.
     status_read: HashMap<String, (Value, Latest)>,
     sounds: sound::Sounds,
+    /// The footer's needs-you count, which beats a few times when it
+    /// rises; kept as the footer is drawn, from what it counts.
+    needs_pulse: std::cell::Cell<look::Pulse>,
     /// The reply text the current model call has streamed.
     said: String,
     /// Prompts sent and not in the conversation yet, by their turn: a
@@ -4166,6 +4169,7 @@ impl App {
             asks_seen: HashMap::new(),
             status_read: HashMap::new(),
             sounds: sound::Sounds::new(false),
+            needs_pulse: std::cell::Cell::default(),
             said: String::new(),
             staged: Vec::new(),
             queued: Vec::new(),
@@ -13108,8 +13112,16 @@ impl App {
         let (working, waiting) = self.agents();
         // Marks as the roster and /status draw them, each with its word,
         // so the counts read without colour.
+        // Something new to answer beats the count a few times, reversed,
+        // then it holds still (F12).
+        let mut pulse = self.needs_pulse.get();
+        pulse.see(waiting, Instant::now());
+        self.needs_pulse.set(pulse);
         if waiting > 0 {
-            let forms = footer::count("?", Color::Yellow, waiting, "needs you", false);
+            let mut forms = footer::count("?", Color::Yellow, waiting, "needs you", false);
+            if pulse.on(Instant::now()) {
+                forms.iter_mut().flatten().for_each(footer::beat);
+            }
             items.push(Item::new(Slot::Needs, forms).opens("status"));
         }
         // In zen, the focus, and only what needs the person besides.
@@ -15639,6 +15651,25 @@ mod tests {
             .map(|op| stamp::unstamped(op["prompt"].as_str().unwrap_or("")).to_owned())
             .collect();
         assert_eq!(prompts, ["/zen the receipts' currency", "/zen off"]);
+    }
+
+    #[tokio::test]
+    async fn a_new_question_beats_the_footer_count_and_then_it_holds() {
+        let mut app = app_in_zen(zen_daemon().await);
+        app.history().await;
+        let mark = |app: &App| {
+            let (line, _) = app.footer(60);
+            let span = (line.spans.into_iter()).find(|span| span.content == "?");
+            span.map(|span| span.style.add_modifier.contains(Modifier::REVERSED))
+        };
+        // Drawn first with one waiting: the count rose from none.
+        assert_eq!(mark(&app), Some(true));
+        // A second and a half on, it holds still, as wide as before.
+        let mut pulse = look::Pulse::default();
+        pulse.see(1, Instant::now() - Duration::from_secs(2));
+        app.needs_pulse.set(pulse);
+        assert_eq!(mark(&app), Some(false));
+        assert_eq!(app.footer(60).0.width(), 60);
     }
 
     #[tokio::test]

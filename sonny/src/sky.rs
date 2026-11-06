@@ -308,6 +308,9 @@ struct Agent {
     /// When it was last lit.
     lit: Option<Instant>,
     twinkle: Option<(Instant, Color, Work)>,
+    /// When it last came to need the person, live: its name's `?` beats
+    /// a few times from then, as the footer's count does.
+    asked: Option<Instant>,
     /// A commons post's ripple: when, and how far it spreads.
     ripple: Option<(Instant, f32)>,
     /// When one of its schedules last woke it: its tick flashes.
@@ -1842,6 +1845,9 @@ impl View {
         let waiting = self.agents[at].state() == Some(State::NeedsYou);
         if own && live {
             self.agents[at].waits.event(event);
+            if !waiting && self.agents[at].state() == Some(State::NeedsYou) {
+                self.agents[at].asked = Some(now);
+            }
         }
         match event["event"].as_str().unwrap_or("") {
             kind @ ("queued" | "accepted" | "steered") => {
@@ -3135,10 +3141,18 @@ impl View {
             let agent = &self.agents[at];
             // The mark says what the colour does: `? ` for an agent that
             // needs you, `✗ ` for one that failed. Bold while it works.
+            // A `?` new since a moment ago beats, reversed, then holds.
+            let beat = (agent.asked)
+                .is_some_and(|at| crate::look::beat(now.saturating_duration_since(at)));
             let mark = match agent.state() {
                 Some(state @ (State::NeedsYou | State::Failed)) => {
                     let (mark, color, _) = state.mark();
-                    Some((mark, Style::default().fg(color).bold()))
+                    let style = Style::default().fg(color).bold();
+                    let style = match beat && state == State::NeedsYou {
+                        true => style.reversed(),
+                        false => style,
+                    };
+                    Some((mark, style))
                 }
                 _ => None,
             };
@@ -4194,9 +4208,10 @@ impl Ink {
     }
 }
 
-/// The two ends a working star breathes between: the theme's text and the
-/// text taken further from the background, toward white on a dark theme
-/// and black on a light one. Where the theme's colours are not known, or
+/// The two ends a working star breathes between: muted text, as the theme
+/// draws it, and the text taken further from the background, toward white
+/// on a dark theme and black on a light one; wide enough apart to see from
+/// the corner of the eye (F12), smooth and slow, so it never blinks. Where the theme's colours are not known, or
 /// with `NO_COLOR`, the star holds still in bold: a breath stepped through
 /// bold and plain would blink, the most distracting motion there is.
 struct Shade(Option<(crate::term::Rgb, crate::term::Rgb)>);
@@ -4206,13 +4221,16 @@ impl Shade {
         let theme = crate::term::theme();
         Shade(
             match (crate::look::no_color(), theme.foreground, theme.background) {
-                (false, Some(foreground), Some(_)) => {
+                (false, Some(foreground), Some(background)) => {
                     let far = if crate::term::light() {
                         (0, 0, 0)
                     } else {
                         (255, 255, 255)
                     };
-                    Some((foreground, crate::look::blend(far, foreground, 0.6)))
+                    Some((
+                        crate::look::muted(foreground, background),
+                        crate::look::blend(far, foreground, 0.6),
+                    ))
                 }
                 _ => None,
             },
@@ -7181,6 +7199,18 @@ mod tests {
         let shown = text(&view.card(100, 40));
         assert!(shown.contains("? shop lead"), "{shown}");
         assert!(shown.contains("✗ cart"), "{shown}");
+        // A `?` just raised beats reversed, then holds still.
+        let beating = |view: &mut View| {
+            (view.card(100, 40).iter().flat_map(|line| line.spans.iter()))
+                .filter(|span| span.content.contains('?'))
+                .filter(|span| span.style.add_modifier.contains(Modifier::REVERSED))
+                .count()
+        };
+        assert_eq!(beating(&mut view), 2);
+        for agent in &mut view.agents {
+            agent.asked = agent.asked.map(|at| at - Duration::from_secs(2));
+        }
+        assert_eq!(beating(&mut view), 0);
         assert_eq!(
             text(&[view.footer(100)]),
             "  3 agents · ? 2 need you · ● 0 working · ✗ 1 failed · 3 messages in the last minute"
