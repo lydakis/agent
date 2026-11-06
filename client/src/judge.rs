@@ -146,17 +146,29 @@ async fn entries(client: &Client, bot: &str, turn: i64) -> Vec<(i64, bool)> {
             ))
         })
         .collect();
-    let nodes: Vec<i64> = written
+    let mut left: Vec<i64> = written
         .keys()
         .filter_map(|node| node.parse().ok())
         .collect();
-    let Ok(items) = client
-        .request("history_items", json!({"bot": bot, "nodes": nodes}))
-        .await
-    else {
-        return Vec::new();
-    };
-    let mut entries: Vec<(i64, i64, bool)> = (items["items"].as_array().into_iter().flatten())
+    // A read stops at a size, its items a prefix of those asked: the
+    // rest are asked for again until every one is read, or the split is
+    // left unsaid rather than given wrong.
+    let mut items = Vec::new();
+    while !left.is_empty() {
+        let Ok(page) = client
+            .request("history_items", json!({"bot": bot, "nodes": left}))
+            .await
+        else {
+            return Vec::new();
+        };
+        let page = page["items"].as_array().cloned().unwrap_or_default();
+        let Some(rest) = rest(&left, &page) else {
+            return Vec::new();
+        };
+        left = rest;
+        items.extend(page);
+    }
+    let mut entries: Vec<(i64, i64, bool)> = (items.iter())
         .filter_map(|entry| {
             let node = entry["node"].as_i64()?;
             let at = written.get(&node.to_string())?.as_i64()?;
@@ -168,6 +180,19 @@ async fn entries(client: &Client, bot: &str, turn: i64) -> Vec<(i64, bool)> {
         .into_iter()
         .map(|(_, at, output)| (at, output))
         .collect()
+}
+
+/// The nodes of `wanted` a read's `page` left out, to ask for next; none
+/// when it read none of them, as a read that makes no progress.
+fn rest(wanted: &[i64], page: &[Value]) -> Option<Vec<i64>> {
+    let read: std::collections::HashSet<i64> = page
+        .iter()
+        .filter_map(|entry| entry["node"].as_i64())
+        .collect();
+    let rest: Vec<i64> = (wanted.iter().copied())
+        .filter(|node| !read.contains(node))
+        .collect();
+    (rest.len() < wanted.len()).then_some(rest)
 }
 
 /// Why a judge gave no answers: what failed in this check.
@@ -561,6 +586,21 @@ mod tests {
             Timing::of(&json!({"started_ms": 1}), 0, &[]),
             Timing::default()
         );
+    }
+
+    #[test]
+    fn a_turn_read_in_parts_is_read_whole_or_not_at_all() {
+        let page = |nodes: &[i64]| -> Vec<Value> {
+            nodes
+                .iter()
+                .map(|node| json!({"node": node, "item": {}}))
+                .collect()
+        };
+        // Cut at its size: the rest is asked for next.
+        assert_eq!(rest(&[4, 5, 6], &page(&[4])), Some(vec![5, 6]));
+        assert_eq!(rest(&[5, 6], &page(&[5, 6])), Some(vec![]));
+        // A read that reads none of them ends the reading.
+        assert_eq!(rest(&[5, 6], &[]), None);
     }
 
     #[test]
