@@ -19,7 +19,7 @@ ROOT = Path(__file__).resolve().parent.parent
 SONNY = next((p for p in (ROOT / '.local/target/debug/sonny', ROOT / '.local/target/release/sonny') if p.exists()), None)
 # What a fire puts before the message: `[automation NAME · YYYY-MM-DD HH:MM · why]`.
 LINE = r'\[automation {} · \d{{4}}-\d\d-\d\d \d\d:\d\d · {}\]\n'
-SCHEDULER = 'me.lydakis.agent.scheduler.'
+SCHEDULER = 'sonny.scheduler.'
 
 
 def home_tag(home):
