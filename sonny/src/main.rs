@@ -267,6 +267,16 @@ fn keys_apart(on: bool) {
 
 type Tui = Terminal<CrosstermBackend<std::io::Stdout>>;
 
+/// The whole screen cleared, and drawn whole at the next frame, without
+/// asking the terminal where its cursor is as `Terminal::clear` does to put
+/// it back: an answer late through a multiplexer or a slow link ends Sonny
+/// with "the cursor position could not be read", and nothing here needs
+/// the cursor kept.
+fn wipe<B: Backend>(terminal: &mut Terminal<B>) -> Result<(), B::Error> {
+    let size = terminal.size()?;
+    terminal.resize(Rect::new(0, 0, size.width, size.height))
+}
+
 /// One frame written as the terminal is to show it, as Ink and Codex
 /// write theirs: inside a synchronized update (mode 2026), so a terminal
 /// that knows it shows the frame whole, never half written, and with the
@@ -1447,7 +1457,7 @@ async fn run() -> Result<(), String> {
     let mut terminal =
         Terminal::new(CrosstermBackend::new(std::io::stdout())).map_err(|e| e.to_string())?;
     // A side chat opens on its window's alternate screen, still drawn on.
-    let _ = terminal.clear();
+    let _ = wipe(&mut terminal);
     let mut app = App::new(client, &name, &bot, options.clone());
     app.context = caught.context;
     app.window = caught.window;
@@ -1607,7 +1617,7 @@ async fn run() -> Result<(), String> {
         app.notice = Some(error);
     }
     let result = app.main(&mut terminal, &mut events).await;
-    let _ = terminal.clear();
+    let _ = wipe(&mut terminal);
     own_screen(false);
     keys_apart(false);
     let _ = execute!(std::io::stdout(), DisableBracketedPaste);
@@ -5009,7 +5019,7 @@ impl App {
         if newest.is_none() {
             self.pages.clear();
         }
-        terminal.clear().map_err(|e| e.to_string())?;
+        wipe(terminal).map_err(|e| e.to_string())?;
         self.pending.clear();
         self.marks.clear();
         self.folds.clear();
@@ -12063,7 +12073,7 @@ impl App {
         let stale = std::mem::take(&mut self.stale);
         synchronized(terminal, Terminal::backend_mut, |terminal| {
             if stale {
-                terminal.clear()?;
+                wipe(terminal)?;
             }
             self.frame(terminal)
         })
@@ -13577,6 +13587,91 @@ mod tests {
         let failed = synchronized(&mut out, |out| out, |_| Err(std::io::Error::other("gone")));
         assert!(failed.is_err());
         assert!(out.ends_with(b"\x1b[?2026l"));
+    }
+
+    #[test]
+    fn the_screen_is_wiped_without_asking_the_terminal_anything() {
+        /// A terminal that never answers where its cursor is.
+        struct Mute(ratatui::backend::TestBackend);
+        impl Backend for Mute {
+            type Error = std::convert::Infallible;
+            fn draw<'a, I>(&mut self, content: I) -> Result<(), Self::Error>
+            where
+                I: Iterator<Item = (u16, u16, &'a ratatui::buffer::Cell)>,
+            {
+                self.0.draw(content)
+            }
+            fn hide_cursor(&mut self) -> Result<(), Self::Error> {
+                self.0.hide_cursor()
+            }
+            fn show_cursor(&mut self) -> Result<(), Self::Error> {
+                self.0.show_cursor()
+            }
+            fn get_cursor_position(&mut self) -> Result<ratatui::layout::Position, Self::Error> {
+                panic!("asked the terminal where its cursor is")
+            }
+            fn set_cursor_position<P: Into<ratatui::layout::Position>>(
+                &mut self,
+                position: P,
+            ) -> Result<(), Self::Error> {
+                self.0.set_cursor_position(position)
+            }
+            fn clear(&mut self) -> Result<(), Self::Error> {
+                self.0.clear()
+            }
+            fn clear_region(
+                &mut self,
+                clear_type: ratatui::backend::ClearType,
+            ) -> Result<(), Self::Error> {
+                self.0.clear_region(clear_type)
+            }
+            fn size(&self) -> Result<ratatui::layout::Size, Self::Error> {
+                self.0.size()
+            }
+            fn window_size(&mut self) -> Result<ratatui::backend::WindowSize, Self::Error> {
+                self.0.window_size()
+            }
+            fn flush(&mut self) -> Result<(), Self::Error> {
+                self.0.flush()
+            }
+            fn scroll_region_up(
+                &mut self,
+                region: std::ops::Range<u16>,
+                lines: u16,
+            ) -> Result<(), Self::Error> {
+                self.0.scroll_region_up(region, lines)
+            }
+            fn scroll_region_down(
+                &mut self,
+                region: std::ops::Range<u16>,
+                lines: u16,
+            ) -> Result<(), Self::Error> {
+                self.0.scroll_region_down(region, lines)
+            }
+        }
+        let mut terminal = Terminal::new(Mute(ratatui::backend::TestBackend::new(8, 2))).unwrap();
+        let draw = |terminal: &mut Terminal<Mute>| {
+            terminal
+                .draw(|frame| frame.render_widget(Paragraph::new("drawn"), frame.area()))
+                .unwrap();
+        };
+        draw(&mut terminal);
+        wipe(&mut terminal).unwrap();
+        assert!(
+            terminal
+                .backend()
+                .0
+                .buffer()
+                .content()
+                .iter()
+                .all(|cell| cell.symbol() == " ")
+        );
+        // What was drawn before is forgotten: the next frame writes it all.
+        draw(&mut terminal);
+        terminal
+            .backend()
+            .0
+            .assert_buffer_lines(["drawn   ", "        "]);
     }
 
     #[test]
