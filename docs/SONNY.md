@@ -298,10 +298,10 @@ with a notification, each time one is added or changed. Automations were once
 a LaunchAgent each, which a lead setting its next look rewrote every time;
 now the system has one job of Sonny's per HOME, written once and left as it
 is while Sonny stays where it is, as cron is one job for every crontab line.
-It is `me.lydakis.agent.scheduler.TAG`: a LaunchAgent,
-`~/Library/LaunchAgents/me.lydakis.agent.scheduler.TAG.plist`, run at
+It is `sonny.scheduler.TAG`: a LaunchAgent,
+`~/Library/LaunchAgents/sonny.scheduler.TAG.plist`, run at
 login and kept alive (`RunAtLoad`, `KeepAlive` on a failed exit), on a Mac;
-a systemd user service, `~/.config/systemd/user/me.lydakis.agent.scheduler.TAG.service`
+a systemd user service, `~/.config/systemd/user/sonny.scheduler.TAG.service`
 (under `XDG_CONFIG_HOME` when set), enabled for `default.target` and
 restarted on failure, on Linux. `TAG` is eight hex digits of a hash of
 HOME's path (64-bit FNV-1a, folded to 32 bits, a trailing `/` left out):
@@ -365,7 +365,10 @@ from before tags, when it runs with this HOME) becomes its definition, at
 the times it had, and the system lets go of the old job; another HOME's, in
 a unit folder they share, waits for that HOME's Sonny. The old backup
 (`me.lydakis.agent.backup`) and start-at-login (`me.lydakis.agent.boot`)
-jobs go the same way, for the scheduler runs both.
+jobs go the same way, for the scheduler runs both. The scheduler's own job
+was `me.lydakis.agent.scheduler.TAG` before 0.9.0; Sonny's start lets that
+go and makes the job again as `sonny.scheduler.TAG`, once (retired at
+0.11.0), so the label names no one.
 
 Automations were triggers before 0.8.0. The first Sonny, scheduler or
 script of 0.8.0 to look moves `~/.agent/triggers` to
