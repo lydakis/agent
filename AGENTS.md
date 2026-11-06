@@ -31,11 +31,15 @@ correctness, and performance; earlier Agent revisions impose no requirements.
 - Sonny's own one-off upgrade work (outside the store's schema) lives in
   [sonny/src/upgrade.rs](sonny/src/upgrade.rs) and names the release it
   retires at, two after the one it ships in; a test fails once Sonny reaches
-  it, and the work is deleted then. A mechanical rewrite of files Sonny
-  writes is a migration in code, run by `upgrade::once`. What needs judgment
-  or reaches the person's own things (config they wrote, skills they edited,
-  hosts this machine knows) is a step the folder's lead does from
-  `sonny/upgrades/ID.md`, with a check in code for done.
+  it, and the work is deleted then. A mechanical rewrite is a migration in
+  code, run by `upgrade::once`: of files Sonny writes, and of a key renamed
+  or retyped in the person's `~/.agent/config.toml`, kept only when the
+  rewritten file reads as the same settings and left alone otherwise, so an
+  upgrade never stops the whole config loading over one key. What needs
+  judgment or reaches the rest of the person's own things (what they wrote
+  in a setting's value or a command, skills they edited, hosts this machine
+  knows) is a step the folder's lead does from `sonny/upgrades/ID.md`, with
+  a check in code for done.
 - Update current callers, tests, and docs together.
 - Current-format durability, resumption, and fork correctness still matter.
 - Model/provider coverage is a product requirement, including older models.
