@@ -338,9 +338,13 @@ impl Markdown {
             return Some(Line::from(spans));
         }
         if let Some(mut rest) = quote_line(trimmed) {
-            // A quote in a quote, `> >`, draws a bar for each.
+            // A quote in a quote, `> >`, draws a bar for each, up to
+            // `QUOTE_DEPTH`: marks past it are kept as written, so a line
+            // of a thousand `>` costs its length, not bars on every row.
             let mut depth = 1;
-            while let Some(inner) = quote_line(rest.trim_start()) {
+            while depth < QUOTE_DEPTH
+                && let Some(inner) = quote_line(rest.trim_start())
+            {
                 (rest, depth) = (inner, depth + 1);
             }
             self.quoted = depth;
@@ -1359,6 +1363,10 @@ pub fn with_quotes(
     prompt.push(end);
     prompt
 }
+
+/// The most bars a quote draws, as deep as it is nested; the rest of
+/// its marks are kept as written, as groups past eight deep are.
+const QUOTE_DEPTH: usize = 8;
 
 /// A line of quoted words, as CommonMark marks one: `>` before it and
 /// at most one space after, so `> words`, `>words`, and a lone `>` for a
@@ -2962,6 +2970,17 @@ mod tests {
         let mut quote = Markdown::default();
         quote.line("> > a long nested quote");
         assert_eq!(quote.rest().content, "  ▌ ▌ ");
+        // As deep as it goes, at most eight bars: the rest stays text, so
+        // a run of marks wraps as words do, its rows' leads no longer.
+        let deep = ">".repeat(10_000);
+        let rows = markdown(&mut Markdown::default(), &deep, 80, (lead(), lead()));
+        let bars = format!("  {}", "▌ ".repeat(8));
+        assert_eq!(rows[0].to_string(), bars);
+        assert!(rows[1].to_string().starts_with(&format!("{bars}>")));
+        assert!(rows.iter().all(|row| row.width() <= 80));
+        assert_eq!(quote_line(">"), Some(""));
+        quote.line(&deep);
+        assert_eq!(quote.rest().content.chars().count(), 2 + 2 * 8);
     }
 
     #[test]
