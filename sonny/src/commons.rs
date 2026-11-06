@@ -1535,17 +1535,28 @@ impl View {
                 at = out.len();
             }
             let text = |key: &str| thread[key].as_str().unwrap_or_default().to_owned();
+            // A picked title is reversed on every row it wraps to, each a
+            // cell past its last word, which the wrap leaves room for so
+            // the band never spills onto a row of its own.
             let title = Span::raw(text("title")).bold();
-            let mut first = crate::transcript::wrap(
+            let mut rows = crate::transcript::wrap(
                 Line::from(vec![Span::raw("  "), title]),
-                width,
+                width.saturating_sub(1),
                 Span::raw(""),
                 Span::raw("  "),
             );
-            if picked && let Some(row) = first.first_mut() {
-                crate::list::pick(row);
+            if picked {
+                for row in &mut rows {
+                    // The space a wrap leaves after its last word, which
+                    // the band's own cell stands for.
+                    if let Some(last) = row.spans.last_mut() {
+                        let kept = last.content.trim_end().len();
+                        last.content.to_mut().truncate(kept);
+                    }
+                    crate::list::pick(row);
+                }
             }
-            out.extend(first);
+            out.extend(rows);
             let posts = thread["posts"].as_u64().unwrap_or(0);
             let mut facts = vec![
                 format!("{posts} post{}", if posts == 1 { "" } else { "s" }),
@@ -2188,6 +2199,48 @@ mod tests {
         assert_eq!(view.key(KeyEvent::from(KeyCode::Esc)), Key::Stay);
         assert!(!view.reading());
         assert_eq!(view.key(KeyEvent::from(KeyCode::Esc)), Key::Close);
+    }
+
+    #[test]
+    fn a_picked_title_is_reversed_on_every_row_and_fits_its_width() {
+        let home = &home("picked_title");
+        let title = "A rather long title about how refunds round across every region we sell in";
+        call(
+            home,
+            "a.x",
+            None,
+            None,
+            &json!({"post": {"name": "long", "title": title, "text": "first"}}),
+        )
+        .unwrap();
+        let view = View::open(home);
+        for width in 30..=80 {
+            let (lines, at) = view.card(width);
+            for line in &lines[at..] {
+                let words: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+                if !words.trim().is_empty()
+                    && line.spans.iter().any(|s| {
+                        s.style
+                            .add_modifier
+                            .contains(ratatui::style::Modifier::BOLD)
+                    })
+                {
+                    // A row of the title: reversed, and within the card.
+                    assert!(
+                        line.width() <= width,
+                        "{} in {width}: {words:?}",
+                        line.width()
+                    );
+                    assert!(
+                        line.spans.iter().any(|s| s
+                            .style
+                            .add_modifier
+                            .contains(ratatui::style::Modifier::REVERSED)),
+                        "{words:?} in {width}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
