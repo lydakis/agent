@@ -1,0 +1,105 @@
+name: Sonny nightly
+
+# A source formula, as for stable releases, but with both binaries pinned to
+# one main commit. No release tag, version bump or Apple signing is needed.
+on:
+  schedule:
+    - cron: "17 7 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sonny-nightly
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  NIGHTLY_COMMIT: ${{ github.sha }}
+  # Increasing across runs, including a retry of the same run. Unchanged
+  # commits and older runs do not update the tap.
+  NIGHTLY_VERSION: ${{ github.run_number }}.${{ github.run_attempt }}
+
+jobs:
+  validate:
+    # A manual dispatch from another branch must not publish its code.
+    if: github.repository == 'lydakis/agent' && github.ref == 'refs/heads/main'
+    runs-on: macos-26
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Test
+        run: |
+          python3 -m unittest discover -s release
+          cargo test --locked --workspace
+      - name: Generate nightly formula
+        run: |
+          test "$(git rev-parse HEAD)" = "$NIGHTLY_COMMIT"
+          mkdir -p "$RUNNER_TEMP/nightly/Formula"
+          python3 release/nightly_formula.py "$NIGHTLY_COMMIT" "$NIGHTLY_VERSION" \
+            "$RUNNER_TEMP/nightly/Formula/sonny-nightly.rb"
+      - name: Validate formula and matching daemon
+        env:
+          HOMEBREW_GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tap_parent="$(brew --repository)/Library/Taps/lydakis"
+          mkdir -p "$tap_parent"
+          ln -s "$RUNNER_TEMP/nightly" "$tap_parent/homebrew-agent"
+          brew trust --formula lydakis/agent/sonny-nightly
+          ruby -c "$RUNNER_TEMP/nightly/Formula/sonny-nightly.rb"
+          brew style --formula lydakis/agent/sonny-nightly
+          brew install --formula lydakis/agent/sonny-nightly
+          brew test lydakis/agent/sonny-nightly
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: sonny-nightly-formula
+          path: ${{ runner.temp }}/nightly/Formula/sonny-nightly.rb
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: lydakis/homebrew-agent
+          ref: main
+          path: tap
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: sonny-nightly-formula
+          path: ${{ runner.temp }}/validated
+      - name: Prepare validated tap update
+        id: prepare
+        run: |
+          python3 release/nightly_formula.py "$NIGHTLY_COMMIT" "$NIGHTLY_VERSION" \
+            tap/Formula/sonny-nightly.rb --request "$RUNNER_TEMP/tap-nightly.json"
+          if [ -f "$RUNNER_TEMP/tap-nightly.json" ]; then
+            cmp tap/Formula/sonny-nightly.rb "$RUNNER_TEMP/validated/sonny-nightly.rb"
+            echo 'changed=true' >> "$GITHUB_OUTPUT"
+          fi
+      - name: Publish nightly formula
+        if: steps.prepare.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo 'Set HOMEBREW_TAP_GITHUB_TOKEN with Contents write access to lydakis/homebrew-agent.' >&2
+            exit 1
+          fi
+          gh api --method PUT repos/lydakis/homebrew-agent/contents/Formula/sonny-nightly.rb \
+            --input "$RUNNER_TEMP/tap-nightly.json" --jq .commit.html_url
