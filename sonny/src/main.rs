@@ -13131,7 +13131,13 @@ impl App {
             });
             let marked = boost.as_ref().map_or(0, |boost| boost.width());
             let room = width.saturating_sub(4 + needs + marked + "zen · ".len());
-            let focus = format!("zen · {}", transcript::cut(&first_line(focus), room));
+            // As much of its first line as the row holds: the footer's own
+            // width, not a glance's.
+            let mut line = focus.lines().next().unwrap_or("").to_owned();
+            if focus.lines().nth(1).is_some() {
+                line.push('…');
+            }
+            let focus = format!("zen · {}", transcript::cut(&line, room));
             items.retain(|item| item.slot == Slot::Needs);
             let mut place = vec![Span::raw(focus).dim()];
             place.extend(boost.map(Span::raw));
@@ -15621,6 +15627,14 @@ mod tests {
             footer.starts_with("  zen · the receipts' currency ↑") && !footer.contains("xhigh"),
             "{footer}"
         );
+        // A long focus runs to the row's end, not to a glance's length.
+        app.boost = None;
+        let long = "the receipts' currency, rounding each line in the store's own currency before it is converted and summed";
+        app.zen = Some(long.into());
+        let footer = app.footer_line(100).to_string();
+        assert!(footer.trim_end().width() >= 100 - 3, "{footer}");
+        assert!(footer.trim_end().ends_with('…'), "{footer}");
+        app.zen = Some("the receipts' currency".into());
         app.boost = Some("max".into());
         let line = app.footer_line(30);
         assert!(line.to_string().trim_end().ends_with(" ↑↑"), "{line}");
