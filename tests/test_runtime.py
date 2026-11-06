@@ -503,6 +503,9 @@ class Model(http.server.BaseHTTPRequestHandler):
                            'content': [{'type': 'output_text', 'text': text}]}]
             if is_summary(request):
                 text = getattr(self.server, 'compaction_text', 'A short synthetic summary.')
+                if callable(text):
+                    # A summarizer that answers each request as it is asked.
+                    text = text(request)
                 output = [{'type': 'message', 'role': 'assistant',
                            'content': [{'type': 'output_text', 'text': text}]}]
                 if getattr(self.server, 'compaction_call', False) and request.get('tools'):

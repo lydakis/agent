@@ -4937,6 +4937,16 @@ impl Database {
             "UPDATE bots SET compaction=?,context_start=? WHERE name=?",
             params![bot.head, plan.cut, name],
         )?;
+        // What started it, which the request carries, goes beside it with
+        // the room left under its threshold.
+        let mut request = request;
+        let trigger = request
+            .as_object_mut()
+            .and_then(|request| request.remove("trigger"))
+            .filter(|trigger| !trigger.is_null());
+        let room = (trigger.as_ref())
+            .and_then(|trigger| trigger["at_bytes"].as_i64())
+            .map(|at| at - after.bytes as i64);
         let data = json!({"version":bot.head,"cut":plan.cut,"pinned":plan.pinned,"pinned_messages":pins,"previous":previous,"covered_turns":[covered_from, plan.covered.1],
             "span_turns":[plan.covered.0, plan.covered.1],
             "items":plan.ids.len(),"bytes":plan.sizes.iter().map(|s| *s as u64).sum::<u64>(),
@@ -4948,6 +4958,7 @@ impl Database {
             "headroom_items":input_limit.items as i64 - after.items as i64,
             "reclaimed_bytes":before.bytes - after.bytes,
             "reclaimed_items":before.items - after.items,
+            "trigger":trigger,"room_bytes":room,
             "request":request});
         // Successful summaries and their accounting share one fsync/commit.
         if let Some(turn) = bot.running_turn {
