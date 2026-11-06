@@ -767,7 +767,8 @@ async fn called(name: &str, arguments: &Value) -> Answer {
             // The margin is the conversation's whose turn called it, a side
             // chat's its own.
             let bot = std::env::var("AGENT_CALL_BOT").unwrap_or(caller);
-            crate::margin::answer(&client, &store, &bot, arguments).await
+            let call = std::env::var("AGENT_CALL").unwrap_or_default();
+            crate::margin::answer(&client, &store, &bot, (&call, arguments)).await
         }
         MEMORY if arguments["said"] == true => crate::said::read(arguments["since_ms"].as_i64())
             .await

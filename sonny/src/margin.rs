@@ -86,10 +86,6 @@ const NOTE_ROWS: usize = 600;
 /// How many of the calls and messages applied are remembered, so one
 /// read again as the conversation is drawn again is not applied twice.
 const SEEN: usize = 1024;
-
-/// The most margin calls read in another bot's history but not yet
-/// answered there that are kept for their answers.
-const WAITING: usize = 16;
 /// How often a file a note shows is looked at for changes.
 const FRESH: Duration = Duration::from_secs(1);
 
@@ -167,7 +163,7 @@ pub async fn answer(
     client: &agent_client::Client,
     store: &Path,
     bot: &str,
-    arguments: &Value,
+    (call_id, arguments): (&str, &Value),
 ) -> Result<String, (&'static str, String)> {
     let unread = |e: agent_client::Error| ("margin_unread", e.to_string());
     // As the person's config says now; one that does not read, the defaults.
@@ -192,8 +188,10 @@ pub async fn answer(
         margin.kept = window.kept;
     }
     let mut after = margin.through().unwrap_or(0);
-    // Calls not answered yet, by id: where each was made, and what it asked.
-    let mut calls: HashMap<String, (i64, Value)> = HashMap::new();
+    // Calls not answered yet, by id: where each was made, in what order,
+    // and what it asked.
+    let mut calls: HashMap<String, (i64, usize, Value)> = HashMap::new();
+    let mut made = 0;
     loop {
         let asked = json!({"bot": bot, "limit": 400, "min_node": after + 1, "oldest_first": true});
         let page = client
@@ -223,10 +221,11 @@ pub async fn answer(
                     let arguments = (item["arguments"].as_str())
                         .and_then(|a| serde_json::from_str(a).ok())
                         .unwrap_or(Value::Null);
-                    calls.insert(call, (node, arguments));
+                    calls.insert(call, (node, made, arguments));
+                    made += 1;
                 }
                 (Some("function_call_output"), _) => {
-                    if let Some((_, arguments)) = calls.remove(&call)
+                    if let Some((_, _, arguments)) = calls.remove(&call)
                         && answered(&item)
                     {
                         margin.apply(&call, &arguments, None, None);
@@ -241,12 +240,30 @@ pub async fn answer(
     // one among them: the next read takes it up again with its answer.
     let through = calls
         .values()
-        .map(|(node, _)| node - 1)
+        .map(|(node, ..)| node - 1)
         .fold(after, i64::min);
     if through > 0 {
         margin.advance(through);
     }
-    match margin.refusal(arguments) {
+    // Calls made before this one and not answered yet, as when one
+    // response makes several, are answered as this one is, in the order
+    // they were made: each taken if it fits, so calls made together never
+    // hold more than the margin takes. Kept nowhere: their answers do.
+    let mine = calls.get(call_id).map(|(_, made, _)| *made);
+    let mut before: Vec<(&String, &(i64, usize, Value))> = (calls.iter())
+        .filter(|(id, (_, made, _))| *id != call_id && mine.is_none_or(|mine| *made < mine))
+        .collect();
+    before.sort_by_key(|(_, (_, made, _))| *made);
+    let mut held = Margin {
+        kept: margin.kept.clone(),
+        ..Margin::default()
+    };
+    for (id, (.., arguments)) in before {
+        if held.refusal(arguments).is_none() {
+            held.apply(id, arguments, None, None);
+        }
+    }
+    match held.refusal(arguments) {
         Some((code, why)) => Err((code, why)),
         None => Ok("In the margin.".into()),
     }
@@ -316,7 +333,7 @@ pub enum Change {
     Removed(String),
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Kept {
     notes: Vec<Note>,
     /// The calls and messages applied, newest last.
@@ -530,10 +547,9 @@ pub struct Reference {
     file: Option<String>,
     /// Taken away there since it was last posted.
     removed: bool,
-    /// Its margin calls read but not yet answered there, the latest few:
-    /// each call's id, the note, and what it asked. One changes what is
-    /// shown once its answer says it was taken.
-    waiting: VecDeque<(String, String, Value)>,
+    /// Its margin calls for the note read but not yet answered there, by
+    /// id: one changes what is shown once its answer says it was taken.
+    waiting: HashMap<String, Value>,
     /// The note it shows of another bot's, when it shows one, as read
     /// from there: one step on, no further.
     pub through: Option<Box<Reference>>,
@@ -549,11 +565,10 @@ impl Reference {
         for item in items {
             if item["type"] == "function_call_output" {
                 let call = item["call_id"].as_str().unwrap_or("");
-                if let Some(at) = self.waiting.iter().position(|(c, ..)| c == call)
-                    && let Some((_, note, arguments)) = self.waiting.remove(at)
+                if let Some(arguments) = self.waiting.remove(call)
                     && answered(item)
                 {
-                    self.take(id, &note, &arguments);
+                    self.take(id, id, &arguments);
                 }
                 continue;
             }
@@ -561,13 +576,12 @@ impl Reference {
                 continue;
             };
             match item["type"] == "function_call" {
-                true => {
+                // Only its own: calls for other notes change nothing here.
+                true if note == id => {
                     let call = item["call_id"].as_str().unwrap_or("").to_owned();
-                    self.waiting.push_back((call, note, arguments));
-                    if self.waiting.len() > WAITING {
-                        self.waiting.pop_front();
-                    }
+                    self.waiting.insert(call, arguments);
                 }
+                true => {}
                 false => self.take(id, &note, &arguments),
             }
         }
@@ -1643,6 +1657,26 @@ mod tests {
         assert!(!Reference::starts("flow", std::slice::from_ref(&taken)));
         reference.read("flow", &[taken]);
         assert_eq!(reference.shown().unwrap().1, Body::Markdown("two".into()));
+        // Many made at once, every answer after them: its own is taken.
+        let mut asked: Vec<Value> = (0..20)
+            .map(|n| {
+                let mut other = call(json!({"id": format!("o{n}"), "markdown": "-"}));
+                other["call_id"] = json!(format!("o{n}"));
+                other
+            })
+            .collect();
+        let mut own = call(json!({"id": "flow", "markdown": "three"}));
+        own["call_id"] = json!("own");
+        asked.insert(0, own);
+        let answers: Vec<Value> = (asked.iter())
+            .map(|call| {
+                json!({"type": "function_call_output", "call_id": call["call_id"],
+                "output": "In the margin."})
+            })
+            .collect();
+        reference.read("flow", &asked);
+        reference.read("flow", &answers);
+        assert_eq!(reference.shown().unwrap().1, Body::Markdown("three".into()));
     }
 
     #[test]

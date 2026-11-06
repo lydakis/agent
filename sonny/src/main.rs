@@ -20467,7 +20467,7 @@ mod tests {
         let canonical = std::fs::canonicalize(&store).unwrap();
         let key = reactions::key(&canonical, 9);
         let note = json!({"id": "n15", "markdown": "-"});
-        let answer = || margin::answer(&client, &store, "calc.add.side-1", &note);
+        let answer = || margin::answer(&client, &store, "calc.add.side-1", ("c99", &note));
         // Copied at node 12: none of its source's notes count for its own.
         margin::start_at(&store, 9, 12);
         assert_eq!(answer().await, Ok("In the margin.".into()));
@@ -20494,6 +20494,55 @@ mod tests {
         for file in [format!("{key}.json"), format!("{key}.answered.json")] {
             let _ = std::fs::remove_file(home.join(file));
         }
+        let _ = std::fs::remove_dir_all(&store);
+    }
+
+    #[tokio::test]
+    async fn margin_calls_made_together_take_no_more_than_the_margin_holds() {
+        // Five notes taken, then one response's two new ones, neither
+        // answered yet.
+        let item = |node: i64| match node {
+            1..=10 if node % 2 == 0 => json!({"type": "function_call_output",
+                "call_id": format!("c{}", node - 1), "output": "In the margin."}),
+            _ => json!({"type": "function_call", "call_id": format!("c{node}"),
+                "name": margin::TOOL,
+                "arguments": json!({"id": format!("n{node}"), "markdown": "-"}).to_string()}),
+        };
+        let client = daemon_answering(move |asked| match asked["op"].as_str() {
+            Some("bots") => json!({"bots": [{"name": "calc.add", "bot_id": 10}]}),
+            Some("history_nodes") => {
+                let from = asked["min_node"].as_i64().unwrap();
+                json!({"nodes": (from..=12).map(|node| json!({"node": node}))
+                    .collect::<Vec<_>>()})
+            }
+            Some("history_items") => json!({"items": (asked["nodes"].as_array().unwrap().iter())
+                .map(|node| json!({"node": node, "item": item(node.as_i64().unwrap())}))
+                .collect::<Vec<_>>()}),
+            _ => json!({}),
+        })
+        .await;
+        let store = std::env::temp_dir().join(unique("together-store"));
+        std::fs::create_dir_all(&store).unwrap();
+        let key = reactions::key(&std::fs::canonicalize(&store).unwrap(), 10);
+        let answer = |call: &'static str, id: &'static str| {
+            let note = json!({"id": id, "markdown": "-"});
+            let (client, store) = (client.clone(), store.clone());
+            async move { margin::answer(&client, &store, "calc.add", (call, &note)).await }
+        };
+        // The first made takes the sixth place, whichever is answered first.
+        assert!(
+            answer("c12", "n12")
+                .await
+                .is_err_and(|(code, _)| code == "margin_full")
+        );
+        assert_eq!(answer("c11", "n11").await, Ok("In the margin.".into()));
+        assert!(
+            answer("c12", "n12")
+                .await
+                .is_err_and(|(code, _)| code == "margin_full")
+        );
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap()).join(".agent/sonny/margin");
+        let _ = std::fs::remove_file(home.join(format!("{key}.answered.json")));
         let _ = std::fs::remove_dir_all(&store);
     }
 
