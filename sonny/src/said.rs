@@ -119,7 +119,7 @@ pub async fn said(
                     waiting.retain(|waiting| said.kept.contains_key(&waiting.node));
                     waiting.push(Waiting { node, quote, emoji });
                 }
-                for (call, recommended) in asked(entry) {
+                for (call, recommended) in asked(turn, entry) {
                     if let Some(at) = answers.iter().position(|(answered, _)| *answered == call) {
                         let (_, node) = answers.remove(at);
                         said.amend(node, "recommended", json!(recommended));
@@ -416,17 +416,18 @@ fn reaction(entry: &Value) -> Option<(i64, Option<String>, String)> {
     ))
 }
 
-/// The bot's `ask` calls in an entry, by call ID, each with the label of
-/// the option it recommended, if any. An Anthropic message holds
+/// The `ask` calls in an entry of turn `turn`, by ask, each with the
+/// label of the option it recommended, if any. An Anthropic message holds
 /// its calls as `tool_use` blocks, any number of them.
-fn asked(entry: &Value) -> Vec<(String, Option<String>)> {
+fn asked(turn: i64, entry: &Value) -> Vec<(String, Option<String>)> {
     (crate::responses(&entry["item"]).iter())
         .filter_map(|item| {
             if item["type"] != "function_call" || item["name"] != crate::asks::TOOL {
                 return None;
             }
             let arguments = serde_json::from_str::<Value>(item["arguments"].as_str()?).ok()?;
-            let ask = crate::asks::call(item["call_id"].as_str()?, &arguments)?;
+            let id = crate::asks::id(turn, item["call_id"].as_str()?);
+            let ask = crate::asks::call(&id, &arguments)?;
             let recommended = (ask.recommended).map(|at| ask.options[at].label.clone());
             Some((ask.id, recommended))
         })

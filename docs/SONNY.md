@@ -958,7 +958,8 @@ parts. Like a file `read` sends, a picture is a PNG, JPEG, GIF or WebP by
 its own bytes, scaled to 1568 pixels on its longest side when larger; a
 result holds up to 20, 5 MB together, and `image()` throws past that. `store` and `load` keep small values for the agent's
 later scripts, `ALL_TOOLS` lists every tool, and `tools.tool_search` ranks
-them for a query. The description lists each server and declares its tools
+them for a query, a tool named exactly (its callable name, or its name on
+its server) first. The description lists each server and declares its tools
 in TypeScript up to about 3,000 tokens; the rest are found from a script. A
 script runs in QuickJS with no files, network or timers, at most 256 MB and
 10 minutes, four at once in the tool host and sixteen alive (more wait
@@ -1068,7 +1069,13 @@ about, an action in `browser_confirm`) comes back over the link to the
 calling agent's gate on the host, so you see it in the host's Sonny, where
 you are working. The linked machine's own settings decide what it
 confirms. A call to a machine that is asleep returns `not_connected` at
-once, or within 3 seconds, with when it was last connected. A machine runs
+once, or within 3 seconds, with when it was last connected. A call that
+was already sent down the link when the machine went quiet, before it took
+the call, or whose link closed while the machine ran it, returns
+`tool_outcome_unknown`: it may have run, so see whether it took effect
+before making it again. A machine that says nothing for 3 seconds after a
+call is sent, neither taking it nor carrying anything else, has gone
+quiet, and the call is let go there should it still arrive. A machine runs
 at most `calls` of the host's calls at once; one past that returns
 `link_busy`, to call again when one ends. On a slow link, each end holds at
 most one longest line (48 MB) of calls and answers queued, and the pings,

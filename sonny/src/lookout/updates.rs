@@ -195,10 +195,8 @@ impl News {
             self.notes.retain(|had| had.id != noted.id);
             self.notes.push(noted);
         }
-        if self.notes.len() > crate::margin::MOST_NOTES {
-            self.notes
-                .drain(..self.notes.len() - crate::margin::MOST_NOTES);
-        }
+        let over = self.notes.len().saturating_sub(crate::margin::most_notes());
+        self.notes.drain(..over);
         for asked in news.asks {
             self.asks.retain(|had| had.call != asked.call);
             self.asks.push(asked);
@@ -665,7 +663,7 @@ impl Updates {
                 if let (Some(call), Some((id, removed))) =
                     (data["call_id"].as_str(), crate::margin::called(data))
                 {
-                    if self.margin_calls.len() >= 4 * crate::margin::MOST_NOTES {
+                    if self.margin_calls.len() >= 4 * crate::margin::most_notes() {
                         self.margin_calls.clear();
                     }
                     (self.margin_calls).insert((name.to_owned(), call.to_owned()), (id, removed));
