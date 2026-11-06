@@ -1984,7 +1984,8 @@ fn kinds_page(kinds: usize) -> String {
             })
             .collect::<Vec<_>>()
             .join(" UNION ALL "),
-        false => "SELECT id FROM events WHERE id>?1 AND kind IN (SELECT value FROM json_each(?3))"
+        false => "SELECT * FROM (SELECT id FROM events WHERE id>?1
+             AND kind IN (SELECT value FROM json_each(?3)) ORDER BY id LIMIT ?2)"
             .to_owned(),
     };
     format!(
@@ -14506,6 +14507,24 @@ mod tests {
                 (db.conn.prepare_cached(sql).unwrap()).get_status(rusqlite::StatementStatus::VmStep)
             };
             step(&kinds_page(2))
+        };
+        let (few, many) = (steps(30), steps(30_000));
+        assert!(
+            many <= few + 8,
+            "{few} steps among 30 events, {many} among 30,000"
+        );
+        // Past the kinds read from the index, a page of a common kind
+        // still stops at its limit.
+        let names: Vec<String> = (0..70).map(|at| format!("kind_{at}")).collect();
+        let common: Vec<&str> = std::iter::once("tool_started")
+            .chain(names.iter().map(String::as_str))
+            .collect();
+        let steps = |events: i64| {
+            let db = store(events);
+            let page = db.events_of_kinds(&common, 0, 1).unwrap();
+            assert_eq!(page["events"].as_array().unwrap().len(), 1);
+            (db.conn.prepare_cached(&kinds_page(common.len())).unwrap())
+                .get_status(rusqlite::StatementStatus::VmStep)
         };
         let (few, many) = (steps(30), steps(30_000));
         assert!(
