@@ -201,6 +201,9 @@ pub struct Screen {
     width: usize,
     /// How many rows the view is scrolled up from the newest.
     back: usize,
+    /// How many rows tall the view was drawn last; none before its first
+    /// draw, as after a repaint.
+    tall: Option<usize>,
     /// Where the rows were drawn last, the first one drawn there, and
     /// how many.
     area: Rect,
@@ -1399,8 +1402,9 @@ impl Screen {
         // Scrolled up, the view keeps its top row when the rows under it
         // take more or less room, as a reply's open lines or a taller
         // composer do: only the newest rows, followed, stay at the bottom.
-        let before = self.area.height as usize;
-        if self.back > 0 && before > 0 {
+        if let Some(before) = self.tall.replace(height)
+            && self.back > 0
+        {
             self.back = self.back.saturating_add(before).saturating_sub(height);
         }
         if let Some((row, above)) = self.go_to.take() {
@@ -2764,6 +2768,10 @@ mod tests {
         let buf = drawn(&mut screen, at(10));
         assert_eq!(row(&buf, 0).trim_end(), "row 20");
         assert_eq!(row(&buf, 9).trim_end(), "row 29");
+        // Squeezed to nothing, as a composer taking all the room does, and
+        // back, it is where it was.
+        drawn(&mut screen, at(0));
+        assert_eq!(row(&drawn(&mut screen, at(10)), 0).trim_end(), "row 20");
         // Taller than the rows under it, it comes to the newest and follows.
         let buf = drawn(&mut screen, at(30));
         assert_eq!(row(&buf, 29).trim_end(), "row 43");
