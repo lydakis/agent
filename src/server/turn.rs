@@ -1080,6 +1080,31 @@ impl Turn {
         }
     }
 
+    /// What started a compaction, for its `compacted` event: the `reason`
+    /// (`bytes` or `items` past the threshold, `requested` by a client, or
+    /// `overflow`, a view that could not be sent), the model's context
+    /// window and the token threshold it gives, the last call's bytes and
+    /// the tokens the provider counted for them, the view's threshold in
+    /// bytes (`at_bytes`), the instructions and tools sent beside it
+    /// (`overhead_bytes`), the room kept for the reply (`reserve_bytes`)
+    /// and the newest bytes the summary leaves whole (`keep_bytes`). The
+    /// store adds `room_bytes`, what is left under `at_bytes` after it.
+    fn trigger(
+        &self,
+        record: &agent_runtime::store::Bot,
+        reason: &str,
+        at: Option<usize>,
+        overhead: usize,
+        reserve: usize,
+        keep: i64,
+    ) -> Value {
+        let window = self.window.get().copied();
+        json!({"reason": reason, "window": window,
+            "compact_tokens": window.and_then(|window| self.settings().compact_tokens(window)),
+            "sent": record.sent.map(|(bytes, tokens)| json!({"bytes": bytes, "tokens": tokens})),
+            "at_bytes": at, "overhead_bytes": overhead, "reserve_bytes": reserve, "keep_bytes": keep})
+    }
+
     /// Whether the window has reached the compaction threshold, the point
     /// where answered tool results start going as stubs.
     fn elision_due(&self, context: &Context, output_bytes: Option<usize>, budget: usize) -> bool {
@@ -1259,6 +1284,20 @@ impl Turn {
             route: accounting.route.clone(),
             ..Accounting::default()
         };
+        let at = (budget / 100 * self.settings().compact_at()).min(limit.bytes - reserve);
+        let reason = match () {
+            _ if requested => "requested",
+            _ if pressure.bytes >= at => "bytes",
+            _ => "items",
+        };
+        let trigger = self.trigger(
+            record,
+            reason,
+            Some(at),
+            record.instructions.len() + tools.get().len(),
+            reserve,
+            keep,
+        );
         let planned = self
             .plan(
                 record,
@@ -1272,7 +1311,8 @@ impl Turn {
             .await?;
         let compaction = match planned {
             None => Compaction::Skipped,
-            Some(planned) => {
+            Some(mut planned) => {
+                planned.choice.trigger = trigger;
                 // Under a budget it holds the most its calls may bill, read
                 // from the larger of the view and the view it copies.
                 let copied = planned
@@ -1426,6 +1466,14 @@ impl Turn {
                 model,
                 ahead: None,
             });
+            let trigger = self.trigger(
+                record,
+                "overflow",
+                None,
+                record.instructions.len() + tools.get().len(),
+                0,
+                1,
+            );
             match self
                 .compact(
                     record,
@@ -1436,6 +1484,7 @@ impl Turn {
                     (1, 1),
                     true,
                     sent,
+                    trigger,
                 )
                 .await?
             {
@@ -1476,13 +1525,15 @@ impl Turn {
         keeps: (i64, i64),
         again: bool,
         sent: Option<Sent<'_>>,
+        trigger: Value,
     ) -> Result<Compaction> {
         let _held = Held::from_now(&self.side.summary_ms);
         match self
             .plan(record, turn, accounting, tools, keeps, again, sent)
             .await?
         {
-            Some(planned) => {
+            Some(mut planned) => {
+                planned.choice.trigger = trigger;
                 self.summarize_now(planned, record, model_rounds, turn, accounting, tools)
                     .await
             }
@@ -1636,13 +1687,16 @@ impl Turn {
         tools: &serde_json::value::RawValue,
     ) -> Result<Summary> {
         let Planned {
-            plan,
+            mut plan,
             reference,
             summarizer,
             copy: mut made,
             mut choice,
         } = planned;
         let (name, model) = split_model(&reference)?;
+        // The most a summary may take, whatever a retry asks for, and the
+        // shortest one refused as longer.
+        let (limit, mut shortest) = (plan.summary_bytes, usize::MAX);
         let (summary, usage) = loop {
             let mut instructions = record.compaction_instructions.clone().unwrap();
             // Only the first attempt copies; what a park record keeps of
@@ -1758,8 +1812,11 @@ impl Turn {
             // A copy offers the bot's tools; a call there is not a summary.
             let invalid = if !completion.calls.is_empty() {
                 Error::new("compaction_tool_call")
-            } else if summary.len() > plan.summary_bytes {
-                Error::new("compaction_summary_limit")
+            } else if summary.len() > limit {
+                Error::with(
+                    "compaction_summary_limit",
+                    format!("{} bytes, asked for {}", summary.len(), plan.summary_bytes),
+                )
             } else if summary.trim().is_empty() {
                 Error::new("empty_summary")
             } else {
@@ -1770,20 +1827,33 @@ impl Turn {
                     db.compaction_usage(turn, usage.as_ref())
                 })
                 .await?;
+            // A summary longer than the limit is asked for again, in a
+            // request of its own, at half the size it was asked for, as
+            // long as each comes back shorter than the one before: a model
+            // that overshoots a target usually lands under a smaller one,
+            // and the turn is not left uncompacted for one long answer.
+            let smaller = invalid.code == "compaction_summary_limit" && summary.len() < shortest;
+            if invalid.code == "compaction_summary_limit" {
+                shortest = summary.len();
+            }
             // The request of its own is another call, checked as each is.
-            if !copied
-                || invalid.code == "compaction_summary_limit"
+            if !(copied || smaller)
+                || (invalid.code == "compaction_summary_limit" && !smaller)
                 || record.exhausted().is_some()
                 || *model_rounds >= self.settings().max_rounds()
             {
                 self.compaction_failed(turn, &invalid).await?;
                 return Ok(Summary::Skipped);
             }
+            if smaller {
+                plan.summary_bytes = (plan.summary_bytes / 2).max(1);
+            }
             self.hub
                 .live(
                     &self.bot,
                     json!({"event":"compaction_failed","bot":self.bot,"turn":turn,"durable":false,
-                        "error":invalid.code,"detail":invalid.detail,"fallback":true}),
+                        "error":invalid.code,"detail":invalid.detail,"fallback":true,
+                        "summary_bytes":plan.summary_bytes}),
                 )
                 .await?;
         };
@@ -5927,13 +5997,17 @@ struct Choice {
     copy: Option<usize>,
     copy_cost: Option<usize>,
     own_cost: Option<usize>,
+    /// What started it, from [`Turn::trigger`].
+    trigger: Value,
 }
 impl Choice {
-    /// The `request` field of the `compacted` event.
+    /// The `request` field of the `compacted` event, with the `trigger`
+    /// the store lifts out beside it.
     fn event(&self) -> Value {
         json!({"form": if self.copy.is_some() { "copy" } else { "own" },
             "items": self.copy,
-            "estimate": {"copy": self.copy_cost, "own": self.own_cost}})
+            "estimate": {"copy": self.copy_cost, "own": self.own_cost},
+            "trigger": self.trigger})
     }
 }
 
@@ -6029,6 +6103,7 @@ fn choose(shape: &Shape<'_>) -> Choice {
         copy: copy.filter(|(_, cost)| *cost < own).map(|(len, _)| len),
         copy_cost: copy.map(|(_, cost)| cost),
         own_cost: Some(own),
+        trigger: Value::Null,
     }
 }
 
