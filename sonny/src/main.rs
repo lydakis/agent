@@ -6964,9 +6964,7 @@ impl App {
             self.bot_reactions.clear();
             self.react_calls.clear();
             self.answering = None;
-            self.asks.clear();
-            self.aside.clear();
-            self.sent_answers.clear();
+            self.forget_asks();
         }
         self.seen_node = nodes.last().copied().unwrap_or(self.seen_node);
         if let Some(&first) = nodes.first() {
@@ -11576,6 +11574,16 @@ impl App {
         if self.asks.len() < before {
             self.settle_asks();
         }
+    }
+
+    /// Every open question let go, as a replay from the start reads its
+    /// own again: its tasks' are pinned again on the next pass, though
+    /// what they read has not changed.
+    fn forget_asks(&mut self) {
+        self.asks.clear();
+        self.aside.clear();
+        self.sent_answers.clear();
+        self.task_asks_read = None;
     }
 
     /// The ask made as call `call` in turn `turn`, as [`asks::id`] names
@@ -19366,6 +19374,11 @@ mod tests {
         // Pinned once, however often the fleet is read.
         app.pin_task_asks();
         assert_eq!((app.asks.len(), app.pending.len()), (1, rows.len()));
+        // Drawn again from the start, as a repaint does, it is pinned again.
+        app.forget_asks();
+        app.pin_task_asks();
+        assert_eq!(app.asks.len(), 1);
+        app.pending.truncate(rows.len());
         // The person's own words to the lead go past its questions, not
         // the task's.
         app.answered("Plan the release", None);
