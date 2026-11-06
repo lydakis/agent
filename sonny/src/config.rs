@@ -56,7 +56,7 @@ fn short(key: &str) -> &str {
 }
 
 /// Every key `agent_client::config` reads.
-pub const SETTINGS: [Setting; 33] = [
+pub const SETTINGS: &[Setting] = &[
     Setting {
         key: "model",
         about: "a new agent's model, when none is named (provider/model)",
@@ -558,7 +558,7 @@ mod tests {
         assert!(skill.starts_with("---\nname: sonny-config\n"));
         assert!(!skill.contains("{{"));
         assert!(skill.contains(env!("CARGO_PKG_VERSION")));
-        for setting in &SETTINGS {
+        for setting in SETTINGS {
             assert!(
                 skill.contains(&format!("| `{}` |", setting.key)),
                 "{}",
