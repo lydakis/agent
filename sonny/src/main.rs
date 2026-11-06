@@ -6807,9 +6807,6 @@ impl App {
                 break;
             }
         }
-        if reference.node.is_none() {
-            reference.whole = from.is_none();
-        }
         for items in pages.iter().rev() {
             reference.read(id, items);
         }
@@ -7919,9 +7916,8 @@ impl App {
                         _ => format!("Calling {name}"),
                     };
                 }
-                if name == margin::TOOL {
-                    self.note_call(id, &arguments, turn);
-                }
+                // A margin call shows once Sonny answers it, so one refused
+                // never shows.
                 self.calls.insert(id.to_owned(), (name, arguments));
             }
             "tool_completed" => {
@@ -7979,8 +7975,7 @@ impl App {
                         }
                     }
                 } else {
-                    // Started before this window read the conversation, it
-                    // ends here; once applied, it counts once.
+                    // Taken: the margin shows it, once.
                     if name == margin::TOOL && !shown.1 {
                         self.note_call(id, &arguments, turn);
                     }
@@ -11778,6 +11773,12 @@ impl App {
                 return;
             }
         };
+        // Its margin starts at the copy, empty: the notes it was copied
+        // with are its source's, and count for none of its own, before
+        // its window first shows it as well as after.
+        if let (Some(id), Some(head)) = (forked["bot_id"].as_i64(), forked["head"].as_i64()) {
+            margin::start_at(&self.options.store, id, head);
+        }
         // On the model this window's turns run on, whose cache is warm.
         if !question.is_empty()
             && let Err(error) = self
@@ -18564,10 +18565,11 @@ mod tests {
         std::fs::write(folder.join("flow.md"), "# Flow").unwrap();
         let workspace = folder.display().to_string();
         let folder_name = workspace.clone();
-        let call = |arguments: Value| {
-            json!({"type": "function_call", "call_id": "t", "name": margin::TOOL,
+        let call = |id: &str, arguments: Value| {
+            json!({"type": "function_call", "call_id": id, "name": margin::TOOL,
                 "arguments": arguments.to_string()})
         };
+        let answer = |id: &str| json!({"type": "function_call_output", "call_id": id, "output": "In the margin."});
         let gone = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let ended = gone.clone();
         let client = daemon_answering(move |asked| {
@@ -18579,13 +18581,14 @@ mod tests {
                 Some("history_nodes") if asked["min_node"].is_null() => {
                     json!({"nodes": [{"node": 2}, {"node": 1}]})
                 }
-                Some("history_nodes") => json!({"nodes": [{"node": 3}]}),
+                Some("history_nodes") => json!({"nodes": [{"node": 3}, {"node": 4}]}),
                 Some("history_items") => {
                     json!({"items": (asked["nodes"].as_array().unwrap().iter())
                     .map(|node| json!({"node": node, "item": match node.as_i64() {
-                        Some(1) => call(json!({"id": "flow", "title": "Flow", "markdown": "one"})),
-                        Some(2) => json!({"type": "message", "role": "assistant", "content": []}),
-                        _ => call(json!({"id": "flow", "file": "flow.md"})),
+                        Some(1) => call("t1", json!({"id": "flow", "title": "Flow", "markdown": "one"})),
+                        Some(2) => answer("t1"),
+                        Some(3) => call("t3", json!({"id": "flow", "file": "flow.md"})),
+                        _ => answer("t3"),
                     }}))
                     .collect::<Vec<_>>()})
                 }
@@ -18654,7 +18657,9 @@ mod tests {
                 Some("inspect") => json!({"bot_id": 1, "workspace": "/nowhere"}),
                 Some("history_nodes") => json!({"nodes": [{"node": node}]}),
                 _ => json!({"items": [{"node": node, "item": {"type": "function_call",
-                    "call_id": "t", "name": margin::TOOL, "arguments": arguments.to_string()}}]}),
+                    "call_id": "t", "name": margin::TOOL, "arguments": arguments.to_string()}},
+                    {"node": node, "item": {"type": "function_call_output", "call_id": "t",
+                    "output": "In the margin."}}]}),
             }
         })
         .await;
@@ -18695,9 +18700,11 @@ mod tests {
                 }
                 Some("history_nodes") => json!({"nodes": [{"node": if reused { 9 } else { 1 }}]}),
                 _ => json!({"items": (asked["nodes"].as_array().unwrap().iter())
-                    .map(|node| json!({"node": node, "item": {"type": "function_call",
+                    .flat_map(|node| [json!({"node": node, "item": {"type": "function_call",
                         "call_id": "t", "name": margin::TOOL, "arguments": json!({"id": "flow",
-                        "title": "Flow", "markdown": markdown}).to_string()}}))
+                        "title": "Flow", "markdown": markdown}).to_string()}}),
+                        json!({"node": node, "item": {"type": "function_call_output",
+                        "call_id": "t", "output": "In the margin."}})])
                     .collect::<Vec<_>>()}),
             }
         })
@@ -18740,7 +18747,7 @@ mod tests {
             }
             Some("history_items") => {
                 json!({"items": (asked["nodes"].as_array().unwrap().iter())
-                .map(|node| json!({"node": node, "item": match node.as_i64() {
+                .flat_map(|node| [json!({"node": node, "item": match node.as_i64() {
                     Some(3) => call(json!({"id": "flow", "title": "Flow", "markdown": "start"})),
                     // A call its own margin turns down.
                     Some(5) => call(json!({"id": "flow", "title": 1, "markdown": "wrong"})),
@@ -18752,7 +18759,14 @@ mod tests {
                             "input": {"id": "flow", "markdown": "b"}}]}),
                     Some(6) => call(json!({"id": "flow", "title": "Flow two", "markdown": "c"})),
                     _ => call(json!({"id": "flow", "title": "Flow three", "markdown": "d"})),
-                }}))
+                }}), json!({"node": node, "item": match node.as_i64() {
+                    // Each answered as taken.
+                    Some(4) => json!({"role": "user", "content": [
+                        {"type": "tool_result", "tool_use_id": "u1", "content": "In the margin."},
+                        {"type": "tool_result", "tool_use_id": "u2", "content": "In the margin."}]}),
+                    _ => json!({"type": "function_call_output", "call_id": "t",
+                        "output": "In the margin."}),
+                }})])
                 .collect::<Vec<_>>()})
             }
             _ => json!({}),
@@ -20362,17 +20376,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_note_shows_in_the_margin_as_its_call_starts_and_a_marker_pins_where() {
+    async fn a_note_shows_in_the_margin_once_taken_and_a_marker_pins_where() {
         let mut app = app(daemon_with(json!([])).await);
         app.any_history = true;
         let call = |id: &str, arguments: Value| json!({"call_id": id, "name": "margin", "arguments": arguments.to_string()});
         let post = json!({"id": "routing", "title": "Routing today", "markdown": "a → b"});
         app.daemon(turn_event("tool_started", 3, call("m1", post)))
             .await;
-        // In the margin before the call is done.
-        assert_eq!(app.margin.note("routing").unwrap().title, "Routing today");
+        // Not in the margin until Sonny takes it.
+        assert!(app.margin.note("routing").is_none());
         app.daemon(turn_event("tool_completed", 3, json!({"call_id": "m1"})))
             .await;
+        assert_eq!(app.margin.note("routing").unwrap().title, "Routing today");
         let rows: Vec<String> = app.pending.iter().map(|l| l.to_string()).collect();
         assert!(
             rows.iter()
@@ -20396,6 +20411,90 @@ mod tests {
             (note.call.as_str(), &note.body),
             ("m1", &margin::Body::Markdown("a → c".into()))
         );
+        // Refused, or failed, it changes nothing.
+        let refused = json!({"id": "routing", "markdown": "a → d"});
+        app.daemon(turn_event("tool_started", 3, call("m3", refused)))
+            .await;
+        app.daemon(turn_event(
+            "tool_completed",
+            3,
+            json!({"call_id": "m3", "failed": true}),
+        ))
+        .await;
+        assert_eq!(
+            app.margin.note("routing").unwrap().body,
+            margin::Body::Markdown("a → c".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_margin_call_is_answered_from_where_it_was_last_read_and_a_side_chat_s_from_its_copy()
+    {
+        use std::sync::atomic::{AtomicI64, Ordering::SeqCst};
+        // The source's six notes, copied with the side chat, then its own
+        // calls, each read before its answer is in.
+        let call = |n: i64, arguments: Value| {
+            json!({"type": "function_call", "call_id": format!("c{n}"), "name": margin::TOOL,
+                "arguments": arguments.to_string()})
+        };
+        let item = move |node: i64| match node {
+            1..=12 if node % 2 == 1 => {
+                call(node, json!({"id": format!("s{node}"), "markdown": "-"}))
+            }
+            _ if node % 2 == 0 => json!({"type": "function_call_output",
+                "call_id": format!("c{}", node - 1), "output": "In the margin."}),
+            _ => call(node, json!({"id": format!("n{node}"), "markdown": "-"})),
+        };
+        let last = Arc::new(AtomicI64::new(13));
+        let read_from = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (newest, asked_from) = (last.clone(), read_from.clone());
+        let client = daemon_answering(move |asked| match asked["op"].as_str() {
+            Some("bots") => json!({"bots": [{"name": "calc.add.side-1", "bot_id": 9}]}),
+            Some("history_nodes") => {
+                let from = asked["min_node"].as_i64().unwrap();
+                asked_from.lock().unwrap().push(from);
+                json!({"nodes": (from..=newest.load(SeqCst)).map(|node| json!({"node": node}))
+                    .collect::<Vec<_>>()})
+            }
+            Some("history_items") => json!({"items": (asked["nodes"].as_array().unwrap().iter())
+                .map(|node| json!({"node": node, "item": item(node.as_i64().unwrap())}))
+                .collect::<Vec<_>>()}),
+            _ => json!({}),
+        })
+        .await;
+        let store = std::env::temp_dir().join(unique("side-store"));
+        std::fs::create_dir_all(&store).unwrap();
+        let canonical = std::fs::canonicalize(&store).unwrap();
+        let key = reactions::key(&canonical, 9);
+        let note = json!({"id": "n15", "markdown": "-"});
+        let answer = || margin::answer(&client, &store, "calc.add.side-1", &note);
+        // Copied at node 12: none of its source's notes count for its own.
+        margin::start_at(&store, 9, 12);
+        assert_eq!(answer().await, Ok("In the margin.".into()));
+        // Each call reads on from the first one still waiting on its answer.
+        last.store(15, SeqCst);
+        assert_eq!(answer().await, Ok("In the margin.".into()));
+        last.store(17, SeqCst);
+        assert_eq!(answer().await, Ok("In the margin.".into()));
+        let firsts: Vec<i64> = {
+            let from = read_from.lock().unwrap();
+            // Each answer's first read, and the empty one that ends it.
+            from.iter().step_by(2).copied().collect()
+        };
+        assert_eq!(firsts, [13, 13, 15]);
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap()).join(".agent/sonny/margin");
+        let kept: Value = serde_json::from_slice(
+            &std::fs::read(home.join(format!("{key}.answered.json"))).unwrap(),
+        )
+        .unwrap();
+        let ids: Vec<&str> = (kept["notes"].as_array().unwrap().iter())
+            .filter_map(|note| note["id"].as_str())
+            .collect();
+        assert_eq!(ids, ["n13", "n15"]);
+        for file in [format!("{key}.json"), format!("{key}.answered.json")] {
+            let _ = std::fs::remove_file(home.join(file));
+        }
+        let _ = std::fs::remove_dir_all(&store);
     }
 
     #[tokio::test]
@@ -20546,6 +20645,8 @@ mod tests {
         let update = json!({"id": "routing", "markdown": "a to c"});
         app.daemon(turn_event("tool_started", 3, call("m2", update)))
             .await;
+        app.daemon(turn_event("tool_completed", 3, json!({"call_id": "m2"})))
+            .await;
         app.fold_notes(false);
         assert_eq!(texts(&app)[..], ["✎ Routing today", "a to c", "after"]);
         // With room for the margin, its marker alone again.
@@ -20558,6 +20659,8 @@ mod tests {
         // marker says so.
         let retitle = json!({"id": "routing", "title": "Routing now", "markdown": "a to c"});
         app.daemon(turn_event("tool_started", 3, call("m3", retitle)))
+            .await;
+        app.daemon(turn_event("tool_completed", 3, json!({"call_id": "m3"})))
             .await;
         app.fold_notes(true);
         assert_eq!(texts(&app)[..], ["✎ Routing now · in the margin", "after"]);
