@@ -847,9 +847,9 @@ impl Kept {
     }
 
     /// Whether a haiku may be written now, at `now_ms`, by `by`, holder
-    /// since `since_ms`: today's count is under the cap, if there is one,
-    /// and no sky wrote one for this same hold already. Counts it, when it
-    /// may.
+    /// since `since_ms`: haikus are on, today's count is under the cap, if
+    /// there is one, and no sky wrote one for this same hold already.
+    /// Counts it, when it may.
     pub fn claim(&mut self, rule: &Rule, by: &str, since_ms: i64, now_ms: i64) -> bool {
         let today = day(now_ms);
         if self.day != today {
@@ -858,7 +858,7 @@ impl Kept {
         }
         let (held_by, held_since) = &self.claim;
         let same = held_by == by && (since_ms - held_since).abs() < rule.hold.as_millis() as i64;
-        if same || (rule.daily > 0 && self.written >= rule.daily) {
+        if !rule.on || same || (rule.daily > 0 && self.written >= rule.daily) {
             return false;
         }
         self.written += 1;
@@ -1218,6 +1218,11 @@ mod tests {
             ..rule()
         };
         assert!(!kept.claim(&capped, "another", ms, ms));
+        // Switched off, as the rule a sky reads just before it claims says,
+        // nothing is claimed or counted, limit or none.
+        let off = Rule { on: false, ..free };
+        assert!(!kept.claim(&off, "one more", ms, ms));
+        assert_eq!(kept.written, 50);
     }
 
     #[test]
