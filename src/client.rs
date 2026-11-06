@@ -842,14 +842,19 @@ fn connect_running(options: &Options) -> Result<Connection> {
 fn serves(options: &Options) -> bool {
     // Where `path` is, its folder resolved, as a store's own socket is
     // named from its resolved path.
-    let resolved = |path: &Path| match (path.parent(), path.file_name()) {
-        (Some(folder), Some(name)) => (folder.canonicalize().ok()).map(|folder| folder.join(name)),
-        _ => None,
-    };
     crate::client_path::default_socket(&options.store)
-        .ok()
-        .and_then(|own| resolved(&own))
-        .is_some_and(|own| Some(own) == resolved(&options.socket))
+        .is_ok_and(|own| same_socket(&own, &options.socket))
+}
+
+/// Whether `a` and `b` name one socket: each made absolute, so a bare
+/// name's folder is the current one, and its folder resolved.
+fn same_socket(a: &Path, b: &Path) -> bool {
+    let resolved = |path: &Path| {
+        let path = std::path::absolute(path).ok()?;
+        let folder = path.parent()?.canonicalize().ok()?;
+        Some(folder.join(path.file_name()?))
+    };
+    resolved(a).is_some_and(|a| Some(a) == resolved(b))
 }
 
 /// Why this agent leaves an older daemon running rather than replacing it:
@@ -3326,6 +3331,15 @@ fn preview(output: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_socket_named_bare_or_in_full_is_the_same_socket() {
+        let here = std::env::current_dir().unwrap();
+        let bare = Path::new("state.db.sock");
+        assert!(same_socket(&here.join(bare), bare));
+        assert!(same_socket(&here.join(bare), &Path::new(".").join(bare)));
+        assert!(!same_socket(&here.join(bare), Path::new("other.sock")));
+    }
 
     #[test]
     fn a_reported_error_keeps_every_fact() {
