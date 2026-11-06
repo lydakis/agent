@@ -443,7 +443,8 @@ class TriggerFireTests(ModelFixture):
                                       capture_output=True, text=True, timeout=60)
                 self.assertEqual(done.returncode, 0, done.stderr)
                 if verb == 'start':
-                    by = json.loads((self.home / '.agents/memory/.cleanup').read_text())['by']
+                    # The open cleanup's owners: this one start's caller alone.
+                    [by] = json.loads((self.home / '.agents/memory/.cleanup').read_text())['by']
             return by
         by = cleanup_by('p.review-1', one)
         self.assertTrue(by.endswith('#automation:p.review'), by)
