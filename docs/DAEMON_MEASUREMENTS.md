@@ -7120,3 +7120,22 @@ daemon CPU 22.8 → 18.8 s, turn p95 171 → 157 ms, short read p95 13.2 →
 11.5 ms. Latency elsewhere stays within the runs' spread; the pool widened
 to what the reads asked for (7 threads at the 4-CPU points, 10 of 14 at
 `--max-readers 12`).
+
+The AGENTS.md hot-path screen (`bench.admission_burst`, `bench.completion_burst`
+and `bench.lifecycle` at `--repeat 5`, `bench.footprint` at `--repeat 2`,
+two rounds alternating with `main` on the same box, compared by
+`bench.perf_gate`): store work per turn is the same, and nothing passes
+the gate's 15% warning.
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 43.447 | 45.0 | +3.6% |
+| admission | burst submit p99, ms | 6.366 | 6.291 | -1.2% |
+| completion | release to terminal p99, ms | 13.144 | 12.338 | -6.1% |
+| footprint | idle RSS, MiB | 21.1 | 20.412 | -3.3% |
+| footprint | per idle bot, KiB | 1.488 | 1.51 | +1.5% |
+| footprint | RSS after a turn each, MiB | 30.205 | 30.449 | +0.8% |
+| footprint | CPU per turn, ms | 1.353 | 1.219 | -9.9% |
+| lifecycle | CPU, s | 1.185 | 1.135 | -4.2% |
+| lifecycle | p95 turn, ms | 587.629 | 589.372 | +0.3% |
+| lifecycle | peak RSS, MiB | 27.756 | 27.377 | -1.4% |
