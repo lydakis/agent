@@ -2069,15 +2069,11 @@ fn wait(options: &Options) -> Result<i32> {
         enough && completed.all(|v| v.get("error").is_none_or(Value::is_null))
     });
     if !clean {
-        // Why, on stderr, as a failed run says it.
+        // Why a turn failed, on stderr, as a failed run says it. A wait
+        // that timed out says so in `pending` alone: nothing went wrong.
         let results = result["results"].as_object().into_iter().flatten();
         for (handle, end) in results.filter(|(_, v)| v["error"].is_string()) {
             eprintln!("agent: {handle} {}", ended(end, ""));
-        }
-        let pending = result["pending"].as_array().into_iter().flatten();
-        let pending: Vec<&str> = pending.filter_map(Value::as_str).collect();
-        if !pending.is_empty() {
-            eprintln!("agent: still pending: {}", pending.join(" "));
         }
     }
     Ok(if clean { 0 } else { 1 })

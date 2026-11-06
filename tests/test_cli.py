@@ -831,7 +831,8 @@ class SocketAndCliTests(ModelFixture):
         timed = self.agent('wait', '--store', str(self.store), '--timeout', '200ms', again, check=False)
         self.assertEqual(timed.returncode, 1)
         self.assertEqual(json.loads(timed.stdout)['pending'], [again])
-        self.assertIn(f'agent: still pending: {again}', timed.stderr)
+        # A timeout is no failure: `pending` says it, and stderr stays quiet.
+        self.assertEqual(timed.stderr, '')
         inside = subprocess.run([*self.base, 'wait', '--store', str(self.store), again],
                                 env={**clean_env(), 'AGENT_SHELL_CONTEXT': '1'}, capture_output=True, text=True, timeout=5)
         self.assertNotEqual(inside.returncode, 0)

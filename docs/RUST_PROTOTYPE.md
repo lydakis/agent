@@ -46,8 +46,9 @@ Cargo.lock hashes; observer fingerprints continue to cover the benchmark tools.
 ## Software first
 
 Programs are the clients. Every command below emits JSONL events on stdout by
-default; exit codes report the turn outcome, and a command that exits
-non-zero says why in one line on stderr. `--pretty` renders the same stream
+default; exit codes report the turn outcome, and a turn that failed says why
+in one line on stderr too (a `wait` that timed out says so in `pending` alone).
+`--pretty` renders the same stream
 for a human watching a terminal and is never the input protocol. The daemon's
 socket protocol is the contract; the `agent` client is one consumer of it.
 
