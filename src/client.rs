@@ -1044,8 +1044,14 @@ fn connect_or_start(options: &Options) -> Result<Connection> {
     if let Some(run) = agent_client::config::run() {
         command.arg("--wall").arg(run);
     }
-    for pattern in config()?.shell_environment_policy.excludes() {
+    let file = config()?;
+    for pattern in file.shell_environment_policy.excludes() {
         command.arg("--shell-exclude").arg(pattern);
+    }
+    for (pattern, tokens) in &file.context_windows {
+        command
+            .arg("--context-window")
+            .arg(format!("{pattern}={tokens}"));
     }
     agent_client::own_session(&mut command);
     let mut child = command
