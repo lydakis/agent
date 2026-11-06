@@ -298,10 +298,10 @@ with a notification, each time one is added or changed. Automations were once
 a LaunchAgent each, which a lead setting its next look rewrote every time;
 now the system has one job of Sonny's per HOME, written once and left as it
 is while Sonny stays where it is, as cron is one job for every crontab line.
-It is `me.lydakis.agent.scheduler.TAG`: a LaunchAgent,
-`~/Library/LaunchAgents/me.lydakis.agent.scheduler.TAG.plist`, run at
+It is `sonny.scheduler.TAG`: a LaunchAgent,
+`~/Library/LaunchAgents/sonny.scheduler.TAG.plist`, run at
 login and kept alive (`RunAtLoad`, `KeepAlive` on a failed exit), on a Mac;
-a systemd user service, `~/.config/systemd/user/me.lydakis.agent.scheduler.TAG.service`
+a systemd user service, `~/.config/systemd/user/sonny.scheduler.TAG.service`
 (under `XDG_CONFIG_HOME` when set), enabled for `default.target` and
 restarted on failure, on Linux. `TAG` is eight hex digits of a hash of
 HOME's path (64-bit FNV-1a, folded to 32 bits, a trailing `/` left out):
@@ -365,7 +365,10 @@ from before tags, when it runs with this HOME) becomes its definition, at
 the times it had, and the system lets go of the old job; another HOME's, in
 a unit folder they share, waits for that HOME's Sonny. The old backup
 (`me.lydakis.agent.backup`) and start-at-login (`me.lydakis.agent.boot`)
-jobs go the same way, for the scheduler runs both.
+jobs go the same way, for the scheduler runs both. The scheduler's own job
+was `me.lydakis.agent.scheduler.TAG` before 0.9.0; Sonny's start lets that
+go and makes the job again as `sonny.scheduler.TAG`, once (retired at
+0.11.0), so the label names no one.
 
 Automations were triggers before 0.8.0. The first Sonny, scheduler or
 script of 0.8.0 to look moves `~/.agent/triggers` to
@@ -955,7 +958,8 @@ parts. Like a file `read` sends, a picture is a PNG, JPEG, GIF or WebP by
 its own bytes, scaled to 1568 pixels on its longest side when larger; a
 result holds up to 20, 5 MB together, and `image()` throws past that. `store` and `load` keep small values for the agent's
 later scripts, `ALL_TOOLS` lists every tool, and `tools.tool_search` ranks
-them for a query. The description lists each server and declares its tools
+them for a query, a tool named exactly (its callable name, or its name on
+its server) first. The description lists each server and declares its tools
 in TypeScript up to about 3,000 tokens; the rest are found from a script. A
 script runs in QuickJS with no files, network or timers, at most 256 MB and
 10 minutes, four at once in the tool host and sixteen alive (more wait
@@ -999,6 +1003,38 @@ its time. A denied call rejects with the reason, which the script can catch.
 Once a call a gate allowed has run, Sonny tells the daemon how it ended
 (`step_result`), so the judge of the agent's next call counts it among those
 the turn already ran.
+
+### What went out as you
+
+Sonny keeps a journal of the writes agents make through its tools
+([sent.rs](../sonny/src/sent.rs)): every call to an MCP server tool that
+does not say it only reads (`readOnlyHint`), from a script answered here or
+one a host's agent sent over a link. Each is noted before it leaves, with
+the line on disk first, and again as it ends: `completed` when its server
+answered, `failed` when its server refused it, and `unknown` when nothing
+will say whether it took effect (the call broke, or the script was stopped
+while it was out). A write noted only as it left, because the program
+stopped, is still listed. Each has an identity that holds across the
+attempts at its call: `TURN:CALL/N`, the agent's turn, the daemon's call
+and its place among the call's writes, and is listed once for each attempt,
+as when a restarted tool host answers the call again. A call lent over a
+link is noted on the machine that makes it, under the asking agent's turn
+and call. What a line keeps of the arguments, the first 120 characters, has
+credentials redacted first, as the approver redacts what it is shown.
+
+```sh
+sonny sent                  # today's, UTC
+sonny sent --since 2d --agent shop.lead
+sonny sent --json
+```
+
+`sonny sent` lists them as attempted, completed, failed or uncertain, with
+what it cannot see first: writes made by shell commands, as a CLI posting a
+comment, are not in it, and an approval is a decision, not proof that a
+write was sent. The journal is `~/.agent/sonny/sent/YYYY-MM-DD.jsonl`, one
+JSON line per change, readable by the person only. The tool host keeps
+`sonny.sent_days` days of it (30 by default, 0 keeps all) and removes the
+rest as it starts. Reads are not kept.
 
 ## Links
 
@@ -1065,7 +1101,13 @@ about, an action in `browser_confirm`) comes back over the link to the
 calling agent's gate on the host, so you see it in the host's Sonny, where
 you are working. The linked machine's own settings decide what it
 confirms. A call to a machine that is asleep returns `not_connected` at
-once, or within 3 seconds, with when it was last connected. A machine runs
+once, or within 3 seconds, with when it was last connected. A call that
+was already sent down the link when the machine went quiet, before it took
+the call, or whose link closed while the machine ran it, returns
+`tool_outcome_unknown`: it may have run, so see whether it took effect
+before making it again. A machine that says nothing for 3 seconds after a
+call is sent, neither taking it nor carrying anything else, has gone
+quiet, and the call is let go there should it still arrive. A machine runs
 at most `calls` of the host's calls at once; one past that returns
 `link_busy`, to call again when one ends. On a slow link, each end holds at
 most one longest line (48 MB) of calls and answers queued, and the pings,
