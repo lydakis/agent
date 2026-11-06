@@ -270,6 +270,68 @@ class LookoutTests(ModelFixture):
         self.assertIn('- ops.deploy: turn:ops.deploy/', woke)
         self.assertIn(' completed, asked by the person', woke)
 
+    def test_a_changed_subscription_is_said_once_read_and_its_listing_says_when(self):
+        tool = {'name': 'subscriptions', 'description': 'Subscribe.', 'answered_by': 'sonny',
+                'parameters': {'type': 'object', 'properties': {'add': {'type': 'object'}}}}
+        self.make('reviewer', declare=[tool])
+        self.make('ops.deploy')
+        self.start()
+        self.host()
+        log = self.path / 'state.sqlite.lookout.jsonl'
+        # The script runs on from the calls earlier turns made.
+        script, after = [], [0]
+
+        def listed(arguments):
+            script.append(('subscriptions', arguments))
+            self.model.call_script = list(script)
+            turn = self.daemon.request('submit', bot='reviewer', request_id=f'{time.monotonic()}',
+                                       prompt='script')['result']['turn']
+            self.assertEqual(self.daemon.finished(turn)['data']['status'], 'completed')
+            events = []
+            while page := self.daemon.request('events', bot='reviewer', after=after[0], limit=256)['result']['events']:
+                events += page
+                after[0] = page[-1]['cursor']
+            done = [e for e in events if e['event'] == 'tool_completed' and e['turn'] == turn][-1]
+            return json.loads(node_item(self.daemon, 'reviewer', done['data']['node'])['result']['output'])
+
+        def lines(key):
+            return [line for line in map(json.loads, log.read_text().splitlines())
+                    if line.get('lead') == 'reviewer' and line.get(key)]
+
+        listed({'add': {'name': 'deploys', 'bots': ['ops.*']}})
+        deadline = time.monotonic() + 20
+        while not (log.exists() and lines('seated')):
+            self.assertLess(time.monotonic(), deadline, 'the subscriber was never seated')
+            time.sleep(.1)
+        self.assertEqual(lines('reloaded'), [])
+        # Its file changed: said once the lookout reads it.
+        listed({'add': {'name': 'reviews', 'bots': ['ops.*']}})
+        deadline = time.monotonic() + 30
+        while not lines('reloaded'):
+            self.assertLess(time.monotonic(), deadline, 'the change was never said')
+            time.sleep(.1)
+        # The listing says the lookout took the file as it is now.
+        lookout = listed({})['lookout']
+        self.assertEqual((lookout['running'], lookout['current']), (True, True), lookout)
+        self.assertGreaterEqual(lookout['took_ms'], lines('reloaded')[-1]['at_ms'])
+
+        def taken(why):
+            deadline = time.monotonic() + 30
+            while not (lookout := listed({})['lookout'])['current']:
+                self.assertLess(time.monotonic(), deadline, why)
+                time.sleep(1)
+            return lookout
+
+        # A rewrite that changes no subscription is taken too: removing
+        # one it does not have writes the file again.
+        listed({'remove': 'none'})
+        self.assertGreater(taken('a rewrite was never taken')['took_ms'], lookout['took_ms'])
+        # Removing the last one takes the file away, and that is taken.
+        listed({'remove': 'deploys'})
+        listed({'remove': 'reviews'})
+        self.assertFalse((self.path / 'state.sqlite.lookout/reviewer.json').exists())
+        taken('a removed file was never taken')
+
     def test_what_a_source_prints_reaches_who_subscribed_to_it(self):
         # The person's poller prints a plain line and an event it gives an
         # ID, which it prints again on its next run.

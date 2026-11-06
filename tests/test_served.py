@@ -256,7 +256,10 @@ class ServedToolTests(ModelFixture):
         self.host()
         self.assertEqual(self.daemon.finished(turn)['data']['status'], 'completed')
         # The commons, on unless set off, is a source of Sonny's own.
-        self.assertEqual(json.loads(self.output('calc.lead', turn)), {'subscriptions': [], 'sources': [{'name': 'commons', 'events': 0}]})
+        # No lookout runs here, so none has taken them.
+        self.assertEqual(json.loads(self.output('calc.lead', turn)),
+                         {'subscriptions': [], 'sources': [{'name': 'commons', 'events': 0}],
+                          'lookout': {'running': False, 'current': False, 'took_ms': None, 'rereads_every_s': 15}})
 
     def test_an_agent_s_script_calls_an_mcp_server_the_host_keeps_up(self):
         server = Path(__file__).with_name('mcp_server.py')
@@ -1152,13 +1155,14 @@ there.wait()
             challenge = json.loads(reader.readline())['challenge']
             # As a sandboxed command would: it names the file but cannot write it.
             conn.sendall((json.dumps({'proof': challenge}) + '\n').encode())
-            conn.sendall((json.dumps({'call': {'tool': 'exec', 'payload': {'input': 'text(1)'}}}) + '\n').encode())
             conn.settimeout(10)
-            # Closed, unanswered: a close with the call still unread comes
-            # as a reset.
+            # Closed, unanswered. The host may close as soon as it reads the
+            # proof, before the call is even written (a broken pipe), or with
+            # the call still unread (a reset): either way no call is sent.
             try:
+                conn.sendall((json.dumps({'call': {'tool': 'exec', 'payload': {'input': 'text(1)'}}}) + '\n').encode())
                 said = reader.readline()
-            except ConnectionResetError:
+            except (BrokenPipeError, ConnectionResetError):
                 said = ''
             self.assertEqual(said, '')
 

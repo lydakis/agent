@@ -5800,6 +5800,76 @@ they measure the unfiltered path. Filtering pays off in
 of `*` no longer carries the deltas, and it hears all 6,000 task endings,
 where before the daemon dropped it.
 
+## A follow of some kinds reads only those
+
+A `follow` that names `kinds` (Sky reads the past this way, asking for how
+turns started and ended) paged through every event in the store and
+dropped the other kinds after reading and decoding each one. Now a follow
+of every bot reads only the kinds asked for: one statement, so one
+snapshot, takes each kind's next events from a new `events_kind_cursor`
+index on `(kind, id)` and reads them in cursor order. Going live checks
+for a wanted event behind the cursor with one index probe per kind, up to
+64 kinds (`EVENT_PAGE_KINDS`). A follow of one bot, or of every bot with
+more kinds than that, pages the events whole, as before, so each page
+costs its limit, its cursor passes what it skipped and going live looks at
+one event: going live runs on the writer, so it never scans the tail. The index is
+created when a store opens, so it needs no schema number.
+
+A page of some kinds ends at the last event of those kinds, which can sit
+far behind what the store has committed. Going live therefore moves the
+follow's cursor to the newest event already published, when that is
+newer, and `follow_live` reports that: nothing wanted lies between the
+two, and a follow resumed from it with wider kinds (Sky reads the past
+narrowly, then follows what animates it from where the past ended)
+replays nothing written before the switch. The published cursor is held
+in memory, so this adds no read, with a few bots or thousands.
+
+A store of 300,000 events of about 800 bytes each (307 MiB), six of them
+`turn_finished`, followed with `bot='*', kinds=[accepted, steered,
+turn_finished]` from cursor 0 until `follow_live`, three follows per open,
+two opens each, `main` (272fed4) against this branch, on one 4-CPU Linux
+box:
+
+| Measure | `main` | Kinds in the store |
+| --- | ---: | ---: |
+| Follow to live, ms | 1,986 to 2,158 | 1 to 2 |
+| First open of the existing store, ms | 186, 207 | 754, 775 (builds the index once) |
+| Store size after, MiB | 307 | 314 |
+
+The index adds about 24 bytes per event. In isolation (SQLite through
+Python, 200,000 inserts in groups of 32), it adds about 6 µs to each event
+written, on a cost of about 27 µs. In the daemon, where an event's write is
+part of a turn's group commit, it falls within the runs' spread.
+`bench.store_load --point heavy --idle-s 5`, twice each:
+
+| Measure | `main` | Kinds in the store |
+| --- | ---: | ---: |
+| Daemon CPU, s | 12.81, 11.44 | 12.48, 11.58 |
+| Turn p95, first burst, ms | 232, 209 | 241, 208 |
+| Short read p95, first burst, ms | 7.7, 7.7 | 8.5, 7.3 |
+| Store, MiB | 45 | 45 |
+
+The AGENTS.md hot-path screen (`bench.admission_burst`, `bench.completion_burst`
+and `bench.lifecycle` at `--repeat 5`, `bench.footprint` at `--repeat 2`,
+two rounds alternating with `main` on the same box, compared by
+`bench.perf_gate`): store work per turn is the same, and nothing passes
+the gate's 15% warning. The completion p99 and lone-submit CPU medians
+moved within overlapping runs (completion p99 10.4 to 20.8 ms here, 11.5
+to 16.4 ms on `main`).
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 43.447 | 48.831 | +12.4% |
+| admission | burst submit p99, ms | 6.366 | 6.785 | +6.6% |
+| completion | release to terminal p99, ms | 13.144 | 15.803 | +20.2% |
+| footprint | idle RSS, MiB | 21.1 | 20.975 | -0.6% |
+| footprint | per idle bot, KiB | 1.488 | 1.514 | +1.7% |
+| footprint | RSS after a turn each, MiB | 30.205 | 30.582 | +1.2% |
+| footprint | CPU per turn, ms | 1.353 | 1.173 | -13.3% |
+| lifecycle | CPU, s | 1.185 | 1.11 | -6.3% |
+| lifecycle | p95 turn, ms | 587.629 | 585.464 | -0.4% |
+| lifecycle | peak RSS, MiB | 27.756 | 27.617 | -0.5% |
+
 ## Approving each step of an exec script (#393)
 
 A client answering a declared call can ask the bot's gate about each step
@@ -7032,3 +7102,114 @@ d85dfd9 (the count, merged with `main`), on a GitHub runner:
 
 Nothing moved past noise, and the gate counted no more store work per
 turn. Sonny's rows moved within their noise.
+
+## Context windows by model, and what each compaction left (#718)
+
+A turn now reads the window the person set for its model before the
+provider's listing: one walk over the `--context-window` patterns, most
+specific first, and one `PROVIDER/MODEL` string, once per turn (the window
+is kept in a `OnceLock`, as before). Each compaction adds a small `trigger`
+object to its `compacted` event and the store a `room_bytes` beside it; a
+summary longer than its limit makes another model call only where it used
+to end the compaction. No store job is added on a turn's path.
+
+The Perf workflow's matched screen, base `main` (be1a3bb) against this
+branch at 64d82cd, on a GitHub runner:
+
+| Measure | Base | Head | Change |
+| --- | ---: | ---: | ---: |
+| Lone submit CPU, ms | 42.273 | 41.595 | -1.6% |
+| Burst submit p99, ms | 6.713 | 6.441 | -4.1% |
+| Release to terminal p99, ms | 14.704 | 14.241 | -3.2% |
+| Idle RSS, MiB | 20.941 | 20.912 | -0.1% |
+| Per idle bot, KiB | 1.5 | 1.372 | -8.5% |
+| RSS after a turn each, MiB | 30.283 | 28.785 | -4.9% |
+| Daemon CPU per turn, ms | 1.309 | 1.308 | -0.1% |
+| Lifecycle CPU, s | 1.235 | 1.215 | -1.6% |
+| Lifecycle p95 turn, ms | 583.926 | 583.07 | -0.1% |
+| Lifecycle peak RSS, MiB | 27.189 | 27.375 | +0.7% |
+
+Nothing moved past noise, and the gate counted no more store work per
+turn. Sonny's rows moved within their noise (this change does not touch
+Sonny's code).
+
+What a compaction leaves, from `tests/test_turn_compaction.py`'s drive (a
+lead's turns of four shell rounds, every summary the full 64 KiB it may
+take, the scripted model counting the bytes per token given):
+
+| Window | Bytes a token | Instructions | Round | Threshold | Kept target | View after | Room, 2nd to 20th |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 200K | 4 | 42 KB | 36 KB | 625 KB | 208 KB | 341 KB | 283 KB (~70K tokens) |
+| 1M | 1 | 17 KB | 63 KB | 882 KB | 294 KB | 620 KB | 262 KB |
+
+The room is the same after the twentieth compaction as after the second:
+the pinned prefix is bounded (summary, kept prompts, note). At 1M the kept
+tail ran past its target by about one turn, since a cut lands on a turn's
+prompt or a round start of the newest turn.
+
+## Readers opened as reads wait for them
+
+The store opened one reader connection per CPU at start, each on its own
+thread with its own 2 MiB SQLite page cache, so a quiet daemon paid for a
+pool sized for a busy one, and every reader's cache filled with whatever
+the deepest reads had paged in. Now one reader opens with the store; one
+more opens when a read is queued with no reader waiting for it, up to
+`--max-readers`; one past the first closes after 30 seconds without a read
+(a pool's idle timeout, as HikariCP and Go's `database/sql` keep a floor
+and close the rest). The open readers share one 2 MiB page cache budget,
+each resizing its share when the pool changes: an idle reader at once, a
+busy one as its read ends, since only its own thread may touch its
+connection. A read in flight keeps the share it began with, so staggered
+overlapping reads can briefly hold more than the budget, never more than
+each reader's share when its read began. Since any write clears a WAL
+reader's cache, under load a share outlives little more than one read.
+
+`bench.store_load` (added in the prompt-openings change), alternating
+`main` (be1a3bb) and this branch on one 4-CPU Linux box, 40 s idle between
+the bursts so extra readers close. 32 KiB prompts in a 128 KiB window, 12
+turns per live bot per burst; two runs each at `today` and `heavy`, one at
+`team`; threads are the daemon's:
+
+| Point | Measure | `main` | On demand |
+| --- | --- | ---: | ---: |
+| today (100 bots, 10 live) | RSS at start, MiB / threads | 21.4 / 6 | 20.8 / 3 |
+| today | Peak RSS, MiB | 31.3, 30.8 | 31.6, 30.9 |
+| today | Threads after 40 s idle | 6 | 3 |
+| today | Daemon CPU, s | 2.73, 2.85 | 2.66, 2.94 |
+| today | Short read p95 during the burst, ms | 4.2, 4.2 | 2.9, 3.8 |
+| heavy (100 bots, 50 live) | Peak RSS, MiB | 37.1, 36.8 | 33.8, 33.7 |
+| heavy | Daemon CPU, s | 11.8, 13.1 | 12.0, 13.7 |
+| heavy | Turn p95, ms | 236, 236 | 233, 279 |
+| heavy | Short read p95 during the burst, ms | 7.7, 8.3 | 8.1, 9.1 |
+| team (2,000 bots, 200 live) | Peak RSS, MiB | 41.4 | 34.6 |
+| team | Daemon CPU, s | 63.8 | 62.3 |
+| team | Turn p95, ms | 1,155 | 1,033 |
+| team | Short read p95 during the burst, ms | 19.3 | 17.6 |
+| team | Second Sky open under load, ms | 431 | 192 |
+
+With `--max-readers 12` (one per CPU on a 12-CPU machine), 32 live bots of
+32, 30 turns per burst, 64 KiB prompts in a 256 KiB window: peak RSS 62.9
+→ 38.2 MiB, RSS after 40 s idle 48.6 → 33.0 MiB with 14 → 3 threads,
+daemon CPU 22.8 → 18.8 s, turn p95 171 → 157 ms, short read p95 13.2 →
+11.5 ms. Latency elsewhere stays within the runs' spread; the pool widened
+to what the reads asked for (7 threads at the 4-CPU points, 10 of 14 at
+`--max-readers 12`).
+
+The AGENTS.md hot-path screen (`bench.admission_burst`, `bench.completion_burst`
+and `bench.lifecycle` at `--repeat 5`, `bench.footprint` at `--repeat 2`,
+two rounds alternating with `main` on the same box, compared by
+`bench.perf_gate`): store work per turn is the same, and nothing passes
+the gate's 15% warning.
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 43.447 | 45.0 | +3.6% |
+| admission | burst submit p99, ms | 6.366 | 6.291 | -1.2% |
+| completion | release to terminal p99, ms | 13.144 | 12.338 | -6.1% |
+| footprint | idle RSS, MiB | 21.1 | 20.412 | -3.3% |
+| footprint | per idle bot, KiB | 1.488 | 1.51 | +1.5% |
+| footprint | RSS after a turn each, MiB | 30.205 | 30.449 | +0.8% |
+| footprint | CPU per turn, ms | 1.353 | 1.219 | -9.9% |
+| lifecycle | CPU, s | 1.185 | 1.135 | -4.2% |
+| lifecycle | p95 turn, ms | 587.629 | 589.372 | +0.3% |
+| lifecycle | peak RSS, MiB | 27.756 | 27.377 | -1.4% |

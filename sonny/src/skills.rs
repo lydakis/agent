@@ -286,7 +286,7 @@ fn in_app_bundle(target: &Path) -> bool {
 /// link for a Sonny in its Cellar, which a scheduled fire still finds after
 /// the old version is cleaned up.
 pub fn sonny_path() -> Option<PathBuf> {
-    let me = std::env::current_exe().ok()?;
+    let me = crate::named::me().ok()?;
     Some(opt_path(&std::fs::canonicalize(&me).unwrap_or(me)))
 }
 

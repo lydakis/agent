@@ -20,6 +20,18 @@ latest one into `~/.local`:
 
     curl -fsSL https://raw.githubusercontent.com/lydakis/agent/main/install.sh | sh
 
+For main without a version tag, `brew install lydakis/agent/sonny-nightly`
+fetches current main and builds Sonny and its matching daemon together. If
+stable Sonny is installed, run `brew unlink sonny` first. Update with
+`brew update` and `brew reinstall lydakis/agent/sonny-nightly`: a reinstall
+fetches the latest main commit even when the formula's version is unchanged.
+No `--HEAD` or wait for a scheduled build is needed. `sonny --version` and
+`sonny agent --version` name the built commit. The
+[nightly workflow](../.github/workflows/nightly.yml) tests and installs the
+recipe at 07:17 UTC before updating the tap, and can also be run manually
+from main. Both channels build from source on macOS and Linux; stable
+`sonny` and `install.sh` continue to install versioned releases.
+
 With `cargo install`, build both (`--path .` for `agent` and
 `--path sonny`) and set `AGENT_BIN` to that `agent`; Sonny never takes an
 `agent` from `PATH`, which may be another program. `sonny agent ARGS` runs
@@ -147,7 +159,8 @@ With flags it asks nothing: `--provider chatgpt|anthropic|openai|openrouter|bedr
 for Bedrock), `--model PROVIDER/MODEL`, `--import-mcp [codex,claude,...]`
 (never a folder's own servers), and `--json`, which prints what the machine
 has, what is set, the MCP servers to bring, missing tools and setup steps. Either step also suggests efforts, `[sonny] lead_effort =
-"medium"` and `task_effort = "high"`, unless the config already sets them.
+"medium"` and `task_effort = "high"`, unless the config already sets them,
+and says on stderr which it wrote.
 Outside a terminal both fail, naming what to set. The first start also writes
 `~/.agent/models`, the list agents read with `agent models`, when there is
 none, as `agent models --discover` does.
@@ -269,12 +282,13 @@ at its model's own effort (`AGENT_EFFORT` when its model is
 | Each new task's model | (the lead's) | `threads_model` |
 | Each new task's effort | `[sonny] task_effort` | `threads_effort` |
 | The approver's judge | `[judge] model`, `effort` | |
-| What `/side`'s copy may do | `[sonny] side_chat` (`answer` or `fork`) | |
+| What `/side`'s copy may do | `[sonny] side_chat` (`fork`, the default, or `answer`) | |
 | The chime, and every tool call drawn | `[sonny] chime`, `verbose` (true or false) | |
 | The widest the conversation is written | `[sonny] text_width` (100 by default, at least 40, 0 for the window's whole width) | |
 | A guess at your next message | `[sonny] suggest` (true, the default, or false) | |
 | Whether agents have the commons | `[sonny] commons` (true, the default, or false) | |
 | When a note opens the margin | `[sonny] margin_opens` (`always`, the default, `unless-closed` or `never`) | |
+| The most notes a margin holds | `[sonny] margin_notes` (20 by default, at least 1; past it the oldest goes) | |
 | Where a click on an agent's name goes | `[sonny] agent_opens` (`tab`, the default, or `beside`) | |
 | Task windows a lead keeps open | `[sonny] task_windows` (32 by default, 0 for no limit) | |
 | The daemon started with the machine | `[sonny] start_at_boot` (true or false, the default) | |
@@ -462,21 +476,23 @@ between, the arrows move through its rows. Every window keeps its prompts in
 first, newest first, then those any window sent before it opened. Edit a
 prompt brought back and it is yours to send, or Up starts again from it.
 Ctrl+R finds one by typing, as a shell's reverse search and Claude Code's
-do: the prompts sent before are a list over the composer, newest first,
-narrowed by the letters typed (in order, the first starting a word, as the
-slash menu finds commands). Ctrl+R again or the arrows pick, Enter or Tab puts
-the pick in the composer to edit (Up and Down go on from it), and Esc leaves
-the composer as it was.
+do: the prompts sent before are a list over the composer, newest first, as
+the slash menu is, and the draft stays in the composer under it. The letters
+typed show under the composer, after `find`, and narrow the list (in order,
+the first starting a word, as the slash menu finds commands). Ctrl+R again
+or the arrows pick, Enter or Tab puts the pick in the composer to edit (Up
+and Down go on from it), and Esc leaves the composer as it was.
 
-![Ctrl+R lists the prompts sent before, newest first; fix narrows it to two with the letters bold; Enter puts the picked one in the composer](../docs/sonny/prompt-search.png)
+![Ctrl+R lists the prompts sent before over the composer, the draft still in it; fix, typed under the composer, narrows the list to two with the letters bold](../docs/sonny/prompt-search.png)
 A prompt this window sent comes back with its pictures (the newest as many
 as one message may carry; older ones let theirs go), and the draft with its
 own; one from the file comes back as text alone.
 
 ![Up brings back a two-row prompt with the cursor at its top, Up again the one before, and Down twice returns the draft](../docs/sonny/prompt-history.png)
 
-Alt-T boosts the next message: the turn it starts runs at a higher effort
-(`xhigh`, or `high` where the model has no `xhigh`), Alt-T again at `max`
+Alt-T (or Ctrl-X, where something else takes Alt) boosts the next message:
+the turn it starts runs at a higher effort (`xhigh`, or `high` where the
+model has no `xhigh`), Alt-T again at `max`
 where the model takes it, and again back to the agent's own. The footer
 shows `↑xhigh` beside the effort until a message takes it (in zen, quieter, an
 arrow a step after the focus: `↑`, then `↑↑`); a message that
@@ -581,10 +597,10 @@ way `/react` does, and each note in the margin has its own `↩`.
 - `/side [QUESTION]` opens a side chat with a copy of the agent in this
   window, taken where it is now, mid-turn included, in the pane beside
   the conversation.
-  The copy answers from the agent's history and may call no tool, unless
-  `~/.agent/config.toml` sets `[sonny] side_chat = "fork"`: then it is a
-  full fork that can do anything the agent can, with its tools, in its
-  folder, under its approvals. Follow-ups stay with it, and Esc goes
+  The copy is a full fork that can do anything the agent can, with its
+  tools, in its folder, under its approvals, unless `~/.agent/config.toml`
+  sets `[sonny] side_chat = "answer"`: then it answers from the agent's
+  history and may call no tool. Follow-ups stay with it, and Esc goes
   back. In the pane, every key goes to the side chat but Ctrl+\, which
   goes back to the main composer while the side chat stays open. The agent
   carries on meanwhile, in view. The daemon deletes the copy once it has been idle 15
@@ -690,7 +706,11 @@ way `/react` does, and each note in the margin has its own `↩`.
   run it outside without asking, as Codex's rules do (Codex's own rules
   files work unchanged). A rule names a command's first words
   (`["docker", "compose"]`), and a call runs outside only when everything
-  it runs is allowed, so `mcpx … | jq` still asks. A rule can also always
+  it runs is allowed, so `mcpx … | jq` still asks. A wrapper is seen
+  through: `timeout 60 mcpx …`, `nice`, `nohup` and `time` match as the
+  command they run, and through `env` or `NAME=value`, which change what
+  it runs with, a rule may still ask or refuse but never lets it out.
+  A rule can also always
   ask (`"prompt"`) or never run a command (`"forbidden"`, with a
   `justification` the agent is told); `sonny rules check -- git push`
   shows what the rules say. The files are Starlark, as Codex runs them,
@@ -736,7 +756,9 @@ way `/react` does, and each note in the margin has its own `↩`.
   **Working** (a turn running, queued, rate limited, waiting on other
   tasks, or `waiting on its reviewer` while the approver weighs a call), **Ready for review** (finished, its last reply linking a pull
   request), **Done** (finished or stopped with nothing open), and
-  **Resolved**, only counted until `r` shows them. As threads in a
+  **Resolved**. Done and Resolved fold to their heading (`Done · 3 ▸`)
+  until a click on it, or `d` and `r` with the keys in the pane, opens
+  them, and the same folds them again. As threads in a
   claude.ai project do, a task resolves itself with the `resolve_task`
   tool once nothing is left to do in it, such as when its pull request
   merged or you dropped the work, and the lead can resolve any of its
@@ -780,20 +802,19 @@ way `/react` does, and each note in the margin has its own `↩`.
   lookout's follows, with how many checks each asked for in the last
   day. `↑`/`↓` picks one, `r` runs an automation now, and `d` pressed twice
   removes it; the follow Sonny keeps for a lead's tasks stays. The
-  footer says `↻ 2 in background` while the window's agent has any.
+  footer says `↻ 2` while the window's agent has any.
   What failed is listed first, with a red `✗` and the error: an automation
   whose run failed (one that ended on it stays listed until `d` removes
   it), or whose run went out and whose turn then failed (as
   when the machine was offline or a login expired), and a server the
   nightly memory cleanup could not read. Your own agents' failures, such as
   the memory cleanup's, show in every window. The footer then says
-  `✗ 1 failed` with a red `✗`, left of the `↻`, and a click on either opens
+  `✗ 1` with a red `✗`, left of the `↻`, and a click on either opens
   `/background`. An agent sees the same in its `automations` tool, whose rows
   say how the turn their last run sent ended. Automations and follows are
   what the agents' `automations` and `subscriptions` tools make.
 
   ![/background listing a nightly run whose turn failed offline and a server the cleanup could not read](../docs/sonny/background-failed.png)
-  ![The footer: ✗ 1 failed with a red ✗, left of ↻ 3](../docs/sonny/footer-failed.png)
 
   ![/background in the pane](../docs/sonny/pane-background.png)
 - `/usage` shows, in the pane beside the conversation,
@@ -820,7 +841,10 @@ way `/react` does, and each note in the margin has its own `↩`.
 - `/sky` draws every agent the daemon keeps, in the pane: leads on the inner
   ring, the agents each one made fanned out behind it, you in the middle,
   on a circle as 0.7.0 drew it, stretched to fill a wide pane (up to twice
-  as wide as high). Projects keep their places in the order they started,
+  as wide as high). It opens whole: "Catching up with who is here…" until
+  every agent, what each did and holds, and what each asks are read, then
+  the sky, its counts and its log at once. Projects keep their places in
+  the order they started,
   each arm as wide as the square root of its size, and the agents that made
   none sit on the outer edge, as a tree's leaves do, so the sky fills to
   its rim. Throwaway copies, such as the approver's judges or a
@@ -829,9 +853,10 @@ way `/react` does, and each note in the margin has its own `↩`.
   reviewer's verdict is: a red streak onto the agent whose call it
   denied, a yellow one when it hands the call to you, nothing for an
   allow, whose call runs. What comes in from no agent flies in from the
-  edge only when it is from outside: a follow, another person, a
-  schedule (whose tick flashes as it fires), a reply's note from the
-  commons, task updates. A commons invite flies from whoever started the
+  edge only when it is from outside: news from its sources, another
+  person, a schedule (whose tick flashes as it fires), a reply's note
+  from the commons, task updates, a message that came back; the chat log
+  names each so (`its sources → inbox`, `task updates → shop lead`). A commons invite flies from whoever started the
   thread, a margin note you closed from you, and an agent's own goal only
   pulses its star. It is a
   calm window to keep open and watch: dim lines join who made whom, and
@@ -851,8 +876,8 @@ way `/react` does, and each note in the margin has its own `↩`.
   the bottom, fading as it rises; in a narrower pane the last few lines sit
   under it. `?` swaps the log for a legend of every mark and shape and a few
   numbers: projects, leads, agents, messages and tool calls a minute and
-  this hour, the busiest pair. `m` colours each agent by its model where it
-  stands, the footer naming each colour. `z` is zen: the sky alone, no log,
+  this hour, the busiest pair. `m` colours each agent, its star and its name,
+  by its model where it stands, the footer naming each colour. `z` is zen: the sky alone, no log,
   no footer, no names but what needs you or failed. The arrows pick a star
   and Enter puts it in the middle: its maker, what it made and whoever it
   talked to in the last hour on the first ring, two hops on the next, the
@@ -881,10 +906,12 @@ way `/react` does, and each note in the margin has its own `↩`.
   messages and tool calls over the last ten minutes; the title passes only
   to an agent half again as busy, once the holder has had it ten minutes,
   so it never flickers. Each new holder writes one, from a copy of itself
-  allowed no tool, eight a day at most, and every sky shows the same one;
-  a replay shows the one that was up at its time.
-  `[sonny]` sets `sky_haikus` (0 for none), `sky_haiku_window`,
-  `sky_haiku_margin` and `sky_haiku_hold`.
+  allowed no tool, as many a day as the title passes unless you set a
+  cap, and every sky shows the same one; a replay shows the one that was
+  up at its time, from the day's kept in `~/.agent/sonny/haikus.jsonl`.
+  `[sonny]` sets `sky_haikus` (false for none), `sky_haiku_daily` (the
+  most a day, 0 for no limit), `sky_haiku_keep` (hours kept, 24; 0 keeps
+  all), `sky_haiku_window`, `sky_haiku_margin` and `sky_haiku_hold`.
   An agent with a schedule (an automation that wakes it) carries a short tick
   just outside its star, out from the middle (inward at the pane's edge),
   plain once its next run is near (a tenth of the gap between runs, at
@@ -1450,8 +1477,9 @@ failed in the background and `↻` for its automations and follows (a
 click on either opens `/background`), and its context, each
 left out when there is nothing to say; the footer stops saying them while
 it shows. Under the composer, the footer counts the agents that need you
-and the other agents at work, each with its word (`? 1 needs you  ● 2 working`),
-marked as the roster and `/status` mark them, and a click on the count
+and the other agents at work by their marks and numbers alone (`? 1  ● 2`),
+marked as the roster and `/status` mark them, each mark its own shape so
+the counts read without colour, and a click on the count
 opens `/status`. Every surface reads what needs you one way: an agent
 needs you while a call of its waits on your approval (gated for you, or
 handed to you by the approver) or a question it asked you is still open,
@@ -1465,14 +1493,13 @@ right what wants you (needs you, failed, working, `↻`, `✎`, the
 context). The agent's name is left to the composer, which says it. When
 the window is too narrow for all of it, items give way in one order, as
 Powerline drops its lowest segments first: words before marks, marks
-before whole items, and what needs you never. `↻ 3 in background` goes to
-`↻ 3`, `⏵⏵ full access` to `⏵⏵`, the folder to `~/D/agent` as fish
+before whole items, and what needs you never. `⏵⏵ full access` goes to `⏵⏵`, the folder to `~/D/agent` as fish
 shortens it and then to `agent`, until at 44 columns a busy lead reads
 `⏵⏵ GPT 6.1 Sol high   ? 1  ✗ 1  ● 2  37%`. The hues on it are only for
 what asks something of you: the `?`, the `✗`, the `●` and a context half
 used.
 
-![The footer at 100, 80, 60 and 44 columns: words go first, what needs you stays](../docs/sonny/footer-widths.png) Under the glance are the notes the agent keeps there with its `margin`
+![The footer at 100, 80, 60 and 44 columns: counts are marks and numbers, what needs you stays](../docs/sonny/footer-widths.png) Under the glance are the notes the agent keeps there with its `margin`
 tool: a diagram, a table of findings, a file it is discussing (kept fresh
 as the file changes), or a live view it updates while it works. Each
 note is pinned where the agent first put it: a quiet `✎ title · in the

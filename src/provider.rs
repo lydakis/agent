@@ -257,6 +257,9 @@ pub struct Provider {
     bedrock: bool,
     /// The models this provider last listed, shared by every clone.
     listing: Arc<models::Listing>,
+    /// The windows the person set, with the name this provider is bound
+    /// to, which their model paths start with.
+    windows: Option<(Arc<str>, Arc<Windows>)>,
 }
 
 /// Streamed text or thinking, with the index of the response's output item
@@ -525,7 +528,14 @@ impl Provider {
             aws: None,
             bedrock,
             listing: Arc::default(),
+            windows: None,
         })
+    }
+    /// The context windows the person set, read for models of this
+    /// provider by `name/model`.
+    pub fn with_windows(mut self, name: &str, windows: Arc<Windows>) -> Self {
+        self.windows = Some((name.into(), windows));
+        self
     }
     /// Model pool levels behind this provider, for `stats`.
     pub fn status(&self) -> serde_json::Value {
@@ -1859,10 +1869,80 @@ fn claude_model(model: &str) -> &str {
         .unwrap_or(model)
 }
 
-/// The model's context window in tokens: what the provider's listing
-/// says, else the window Anthropic publishes for a Claude model (1M from
-/// Claude 5 on, 200K before), else 200K, the smallest a current model has.
+/// Context windows a person set by model path, `PROVIDER/MODEL` with `*`
+/// and `?` wildcards, as OpenCode sets a model's `limit.context` and
+/// Codex its `model_context_window`: for a model a provider does not list,
+/// or lists wrong, or to hold a bot under its model's full window. The
+/// most specific pattern a path matches wins: an exact path over every
+/// wildcard (a `*` can match nothing, so `a/*b` counts as many literal
+/// characters as `a/b`), then the one with the most characters that are
+/// not wildcards, then the first by name.
+#[derive(Debug, Default)]
+pub struct Windows(Vec<(String, u64)>);
+
+/// The least window a pattern may set: the least compaction threshold.
+pub const MIN_WINDOW: u64 = 1024;
+
+impl Windows {
+    /// `PATTERN=TOKENS`, each pattern once.
+    pub fn parse<'a>(specs: impl IntoIterator<Item = &'a str>) -> Result<Self> {
+        let mut set: Vec<(String, u64)> = Vec::new();
+        for spec in specs {
+            let parsed = spec.rsplit_once('=').and_then(|(pattern, tokens)| {
+                let tokens = tokens.parse::<u64>().ok().filter(|t| *t >= MIN_WINDOW)?;
+                (pattern.contains('/') && !pattern.chars().any(char::is_whitespace))
+                    .then(|| (pattern.to_owned(), tokens))
+            });
+            let Some((pattern, tokens)) = parsed else {
+                return fail_with(
+                    "usage",
+                    format!(
+                        "--context-window takes PROVIDER/MODEL=TOKENS, * and ? wildcards, at least {MIN_WINDOW} tokens, not {spec}"
+                    ),
+                );
+            };
+            if set.iter().any(|(given, _)| *given == pattern) {
+                return fail_with(
+                    "usage",
+                    format!("--context-window {pattern} is given twice"),
+                );
+            }
+            set.push((pattern, tokens));
+        }
+        let wild = |c: char| matches!(c, '*' | '?');
+        let rank = |pattern: &str| {
+            let literal = pattern.chars().filter(|c| !wild(*c)).count();
+            (pattern.chars().any(wild), std::cmp::Reverse(literal))
+        };
+        set.sort_by(|(a, _), (b, _)| rank(a).cmp(&rank(b)).then_with(|| a.cmp(b)));
+        Ok(Self(set))
+    }
+    /// The window set for `path`, `PROVIDER/MODEL`.
+    pub fn get(&self, path: &str) -> Option<u64> {
+        (self.0.iter())
+            .find(|(pattern, _)| crate::tools::name_matches(pattern, path))
+            .map(|(_, tokens)| *tokens)
+    }
+    /// Each pattern and its window, as the daemon announces them.
+    pub fn json(&self) -> Value {
+        Value::Object(
+            (self.0.iter())
+                .map(|(pattern, tokens)| (pattern.clone(), (*tokens).into()))
+                .collect(),
+        )
+    }
+}
+
+/// The model's context window in tokens: the window the person set for
+/// it, else what the provider's listing says, else the window Anthropic
+/// publishes for a Claude model (1M from Claude 5 on, 200K before), else
+/// 200K, the smallest a current model has.
 pub fn context_window(provider: &Provider, model: &str) -> u64 {
+    if let Some(tokens) = (provider.windows.as_ref())
+        .and_then(|(name, windows)| windows.get(&format!("{name}/{model}")))
+    {
+        return tokens;
+    }
     if let Some(tokens) = provider.listed_window(model) {
         return tokens;
     }
@@ -2149,6 +2229,78 @@ mod tests {
         ] {
             assert_eq!(context_window(&provider, model), window, "{model}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_window_the_person_set_beats_the_listing_most_specific_first() {
+        let transport = Transport::new(64, 1).unwrap();
+        let windows = Windows::parse([
+            "bedrock/*=400000",
+            "bedrock/*openai.*=1000000",
+            "bedrock/us.anthropic.claude-opus-5-5-v1:0=150000",
+            "anthropic/*=300000",
+        ])
+        .unwrap();
+        let windows = Arc::new(windows);
+        let bedrock = Provider::new(
+            transport.clone(),
+            Family::Responses,
+            "http://127.0.0.1:1/v1",
+            None,
+        )
+        .unwrap()
+        .with_windows("bedrock", windows.clone());
+        for (model, window) in [
+            ("openai.gpt-6-sol", 1_000_000),
+            ("us.anthropic.claude-opus-5-5-v1:0", 150_000),
+            ("us.anthropic.claude-sonnet-5-5-v1:0", 400_000),
+            ("meta.llama-5", 400_000),
+        ] {
+            assert_eq!(context_window(&bedrock, model), window, "{model}");
+        }
+        // A pattern for every provider's Claude, lower than its own window
+        // on purpose (the runtime test sets one under a listing).
+        let anthropic = Provider::new(
+            transport.clone(),
+            Family::Anthropic,
+            "http://127.0.0.1:1/v1",
+            None,
+        )
+        .unwrap()
+        .with_windows("anthropic", windows.clone());
+        assert_eq!(context_window(&anthropic, "claude-opus-5-5"), 300_000);
+        // A provider no pattern names keeps its own windows.
+        let other = Provider::new(transport, Family::Anthropic, "http://127.0.0.1:1/v1", None)
+            .unwrap()
+            .with_windows("work", windows);
+        assert_eq!(context_window(&other, "claude-opus-5-5"), 1_000_000);
+        assert_eq!(context_window(&other, "gpt-6-luna"), 200_000);
+        for wrong in [
+            "bedrock=1000000",
+            "bedrock/*=1000",
+            "bedrock/*=lots",
+            "a b/c=2000",
+        ] {
+            assert_eq!(
+                Windows::parse([wrong]).unwrap_err().code,
+                "usage",
+                "{wrong}"
+            );
+        }
+        assert!(Windows::parse(["a/b=2000", "a/b=3000"]).is_err());
+    }
+
+    #[test]
+    fn an_exact_window_beats_a_wildcard_that_matches_nothing() {
+        // `provider/*model` has as many literal characters as the exact
+        // path and sorts first by name; its `*` matches nothing here.
+        let windows = Windows::parse(["provider/*model=1000000", "provider/model=200000"]).unwrap();
+        assert_eq!(windows.get("provider/model"), Some(200_000));
+        assert_eq!(windows.get("provider/big-model"), Some(1_000_000));
+        let windows = Windows::parse(["a/b?=3000", "a/b=2000", "a/*=4000"]).unwrap();
+        assert_eq!(windows.get("a/b"), Some(2_000));
+        assert_eq!(windows.get("a/bc"), Some(3_000));
+        assert_eq!(windows.get("a/c"), Some(4_000));
     }
 
     #[test]

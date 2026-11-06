@@ -56,6 +56,25 @@ missing; `PREFIX` installs elsewhere, `SONNY_VERSION` picks a release and
 `SONNY_PACKAGES=0` leaves the system's packages alone. [install.sh](install.sh)
 is short enough to read first.
 
+For Sonny from main without a version tag, use the nightly Homebrew channel
+(macOS or Linux):
+
+```sh
+brew unlink sonny                         # if the stable formula is installed
+brew install lydakis/agent/sonny-nightly
+# Later:
+brew update
+brew reinstall lydakis/agent/sonny-nightly
+```
+
+Nightly fetches current main on every install or reinstall and builds Sonny
+and its daemon together from that checkout. No `--HEAD`, version tag or wait
+for the nightly workflow is needed. Use `reinstall` to update: Homebrew's
+`upgrade` can skip a formula whose version has not changed. `sonny --version`
+and `sonny agent --version` show the built commit. The nightly workflow checks
+the recipe at 07:17 UTC; stable `sonny` and the Linux installer above continue
+to install versioned releases. Both Homebrew channels build from source.
+
 ## Quickstart
 
 Set the key for any provider you use, and pick a default model as
@@ -265,7 +284,10 @@ limit, a provider that is down) waits for you rather than failing, for
 `agent held` lists what waits and `agent retry` tries it again now.
 A request Claude's safety classifiers decline ends the turn, unless
 `[fallbacks]` names another model for the bot's own; that model then answers
-that request alone ([CLI.md](docs/CLI.md)).
+that request alone ([CLI.md](docs/CLI.md)). A model's context window, which
+sets when its agents compact, is what its provider lists, else Anthropic's published one for Claude, else
+200K; `[context_windows]` sets it by model, as `"bedrock/*openai.*" =
+1000000`, the most specific pattern winning, also lower on purpose.
 
 ## How fast is it?
 

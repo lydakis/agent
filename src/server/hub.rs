@@ -6,7 +6,7 @@
 use agent_runtime::{
     Error, Result, fail,
     output::Output,
-    store::{Database, Served, Store},
+    store::{Database, EVENT_PAGE_KINDS, Served, Store},
 };
 use serde_json::{Value, json};
 use std::{
@@ -664,11 +664,27 @@ impl Hub {
 }
 
 /// `limit` of `bot`'s durable events after `after`, or every bot's for `*`.
-fn event_page(db: &Database, bot: &str, after: i64, limit: usize) -> Result<Value> {
-    if bot == ALL {
-        db.events_after(after, limit)
-    } else {
-        db.events(bot, after, limit)
+/// A page of `bot`'s events, or every bot's. A follow of every bot that
+/// names `kinds`, up to as many as a page takes, gets only those from the
+/// store, so a few rare kinds cost the events they are, not every event
+/// written since. One bot's events, or every bot's of more kinds, are paged
+/// whole and filtered as they are sent: each page costs its limit, so its
+/// cursor passes what it skipped and going live looks at no more than one
+/// event.
+fn event_page(
+    db: &Database,
+    bot: &str,
+    kinds: Option<&Arc<HashSet<String>>>,
+    after: i64,
+    limit: usize,
+) -> Result<Value> {
+    match (bot == ALL, kinds) {
+        (true, Some(kinds)) if (1..=EVENT_PAGE_KINDS).contains(&kinds.len()) => {
+            let kinds: Vec<&str> = kinds.iter().map(String::as_str).collect();
+            db.events_of_kinds(&kinds, after, limit)
+        }
+        (true, _) => db.events_after(after, limit),
+        (false, _) => db.events(bot, after, limit),
     }
 }
 
@@ -690,7 +706,7 @@ pub async fn replay(store: Store, hub: Hub, bot: String, sub: Sub) -> Result<()>
             }
             (s.session, s.output.clone(), s.last_cursor, s.kinds.clone())
         };
-        let page_bot = bot.clone();
+        let (page_bot, page_kinds) = (bot.clone(), kinds.clone());
         // The seat goes with the read itself: a replay cancelled while its
         // page waits or runs on a reader keeps it until the read is done.
         let seat = hub
@@ -702,7 +718,7 @@ pub async fn replay(store: Store, hub: Hub, bot: String, sub: Sub) -> Result<()>
         let mut page = reader
             .read("events_after", move |db| {
                 let _seat = seat;
-                event_page(db, &page_bot, after, 256)
+                event_page(db, &page_bot, page_kinds.as_ref(), after, 256)
             })
             .await?;
         let Value::Array(events) = page["events"].take() else {
@@ -710,21 +726,30 @@ pub async fn replay(store: Store, hub: Hub, bot: String, sub: Sub) -> Result<()>
         };
         let mut cursor = after;
         if events.is_empty() {
-            let (switch_sub, switch_bot) = (sub.clone(), bot.clone());
-            let (live, pruned) = store
+            let (switch_sub, switch_bot, switch_hub) = (sub.clone(), bot.clone(), hub.clone());
+            let (live, pruned, boundary) = store
                 .op("follow_live", move |db| {
                     let mut s = switch_sub.lock().unwrap();
-                    let behind = event_page(db, &switch_bot, s.last_cursor, 1)?;
+                    // Only a wanted event behind it keeps the follow paging:
+                    // for every bot's, one index probe a kind.
+                    let behind = event_page(db, &switch_bot, s.kinds.as_ref(), s.last_cursor, 1)?;
                     if s.cancelled || behind["events"].as_array().is_some_and(|e| !e.is_empty()) {
-                        return Ok((false, None));
+                        return Ok((false, None, s.last_cursor));
                     }
+                    // A page of some kinds ends at the last one it found,
+                    // which can sit far behind what was committed. Nothing
+                    // wanted lies past it, so the follow has seen everything
+                    // published: its boundary is the newer of the two, and a
+                    // follow resumed from it replays nothing from before.
+                    s.last_cursor = s.last_cursor.max(switch_hub.published());
                     s.live = true;
-                    Ok((true, behind["pruned_before"].as_i64()))
+                    Ok((true, behind["pruned_before"].as_i64(), s.last_cursor))
                 })
                 .await?;
             if !live {
                 continue;
             }
+            cursor = boundary;
             // A deletion since the empty page may have removed events past
             // the cursor: the switch's own check is the one to report.
             if let Some(before) = pruned {
@@ -818,6 +843,39 @@ mod tests {
         assert_eq!(got, event(2, "turn_finished"));
         // What it passed by still counts as seen: no replay sends it later.
         assert_eq!(sub.lock().unwrap().last_cursor, 2);
+    }
+
+    #[test]
+    fn a_page_of_more_kinds_than_the_index_reads_costs_its_limit() {
+        let path =
+            std::env::temp_dir().join(format!("agent-hub-kinds-{}.sqlite", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        drop(Database::initialize(rusqlite::Connection::open(&path).unwrap()).unwrap());
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "PRAGMA foreign_keys=OFF;
+                 WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<3000)
+                 INSERT INTO events(bot,turn,kind,data) SELECT 'B',1,'tool_started','{}' FROM n",
+            )
+            .unwrap();
+        let db = Database::initialize(rusqlite::Connection::open(&path).unwrap()).unwrap();
+        let few: Arc<HashSet<String>> = Arc::new(["turn_finished".to_owned()].into());
+        let many: Arc<HashSet<String>> = Arc::new(
+            (0..=EVENT_PAGE_KINDS)
+                .map(|at| format!("kind_{at}"))
+                .collect(),
+        );
+        // A few kinds, none written: the store says so from the index.
+        let page = event_page(&db, ALL, Some(&few), 0, 1).unwrap();
+        assert_eq!(page["events"], json!([]));
+        // More: the next event, wanted or not, so the follow keeps paging
+        // and going live reads one event, not the whole tail.
+        let page = event_page(&db, ALL, Some(&many), 0, 1).unwrap();
+        assert_eq!(page["events"].as_array().unwrap().len(), 1);
+        assert_eq!(page["next_cursor"], page["events"][0]["cursor"]);
+        drop(db);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[tokio::test]

@@ -11,7 +11,8 @@
 //! `~/.agent/memory`, a script Sonny writes, shows the indexes, reads,
 //! saves, removes, indexes and checks facts; the `memory` skill Sonny
 //! installs says what to save. A read is recorded beside the facts, so the
-//! cleanup can find facts no agent has opened in a while. `schedule` adds a nightly automation, through
+//! cleanup can find facts no agent has opened in a while. `schedule`, which Sonny
+//! runs when it first opens a lead, adds a nightly automation, through
 //! `~/.agent/automation`, whose agent follows the `memory-cleanup` skill
 //! between `cleanup start` and `cleanup finish`, which commit to a local
 //! git repository in `~/.agents/memory` and revert a cleanup that removed too
@@ -50,7 +51,7 @@ const READS: &str = ".reads";
 /// asked to check that it still holds: Codex drops a memory unused for 30,
 /// Copilot one unused for 28.
 const UNREAD_DAYS: i64 = 30;
-const USAGE: &str = "usage: memory show [SCOPE]\n       memory read NAME [SCOPE]\n       memory search WORDS... [SCOPE]\n       memory save NAME --type user|feedback|project|reference|work --description TEXT --source TEXT [--external] [--confirmed N] [--pushed-back N] [SCOPE] -- TEXT|-\n       memory rm NAME [SCOPE]\n       memory index [SCOPE]\n       memory check [SCOPE]\n       memory said [SINCE_MS]   (Sonny: what the person wrote to any agent since then)\n       memory changed | cleanup start | cleanup finish\n       memory schedule [--model PROVIDER/MODEL [--effort LEVEL]] [--cron 'MIN HOUR DAY MONTH WEEKDAY']\n         --model starts the memory-cleanup agent; without it, the existing one\n         SCOPE: --user | --project NAME; none: the project of this folder";
+const USAGE: &str = "usage: memory show [SCOPE]\n       memory read NAME [SCOPE]\n       memory search WORDS... [SCOPE]\n       memory save NAME --type user|feedback|project|reference|work --description TEXT --source TEXT [--external] [--confirmed N] [--pushed-back N] [SCOPE] -- TEXT|-\n       memory rm NAME [SCOPE]\n       memory index [SCOPE]\n       memory check [SCOPE]\n       memory said [SINCE_MS]   (Sonny: what the person wrote to any agent since then)\n       memory changed | cleanup start | cleanup finish\n       memory schedule [--model PROVIDER/MODEL [--effort LEVEL]] [--cron 'MIN HOUR DAY MONTH WEEKDAY']\n         each run starts an agent on --model; without it, the model scheduled before\n         SCOPE: --user | --project NAME; none: the project of this folder";
 
 /// `memory show|save|rm|index|check|changed|cleanup|schedule`, as
 /// `~/.agent/memory` runs it.
@@ -168,15 +169,32 @@ fn run(
     args: &[String],
     stdin: &dyn Fn() -> Result<String, String>,
 ) -> Result<Value, String> {
-    // Bot ids are each store's own, and stores under one HOME share its
-    // memory: the store names which bot.
-    let caller = std::env::var("AGENT_BOT_ID")
-        .ok()
-        .map(|id| match std::env::var("AGENT_STORE") {
-            Ok(store) => format!("{store}#{id}"),
-            Err(_) => id,
-        });
+    let var = |key: &str| std::env::var(key).ok();
+    let caller = caller(
+        var("AGENT_AUTOMATION"),
+        var("AGENT_BOT_ID"),
+        var("AGENT_STORE"),
+    );
     run_as(root, cwd, args, stdin, caller.as_deref())
+}
+
+/// Who changes memory, as an open cleanup tells its own changes from
+/// others': bot ids are each store's own, and stores under one HOME share
+/// its memory, so the store names which bot. A run of an automation is the
+/// automation (Sonny's tool host names it), so a cleanup one run started
+/// and a later run, in an agent of its own, carries on has one owner.
+fn caller(
+    automation: Option<String>,
+    bot_id: Option<String>,
+    store: Option<String>,
+) -> Option<String> {
+    let who = automation
+        .map(|name| format!("automation:{name}"))
+        .or(bot_id)?;
+    Some(match store {
+        Some(store) => format!("{store}#{who}"),
+        None => who,
+    })
 }
 
 /// [`run`] for `caller`, the agent's id, or none for the person.
@@ -526,11 +544,17 @@ impl Fact {
     fn valid(&self) -> Result<(), String> {
         valid_name(&self.name)?;
         if !TYPES.contains(&self.kind.as_str()) {
-            return Err(format!(
-                "invalid_type: {}: one of {}",
-                self.kind,
-                TYPES.join(", ")
-            ));
+            // An empty value is a missing one: say what the fact needs,
+            // not an empty name followed by a colon.
+            let types = TYPES.join(", ");
+            return Err(if self.kind.is_empty() {
+                format!("invalid_type: the fact needs a type: {types}")
+            } else {
+                format!(
+                    "invalid_type: {} is not a type; the fact needs one of {types}",
+                    self.kind
+                )
+            });
         }
         for (field, value) in [("description", &self.description), ("source", &self.source)] {
             if value.trim().is_empty() || value.contains('\n') || value.trim() != value {
@@ -563,9 +587,12 @@ fn valid_name(name: &str) -> Result<(), String> {
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
     {
-        return Err(format!(
-            "invalid_name: {name}: a fact's name is 1-64 of a-z 0-9 -, not starting with - and not memory"
-        ));
+        let rule = "1-64 of a-z 0-9 -, not starting with - and not memory";
+        return Err(if name.is_empty() {
+            format!("invalid_name: the fact needs a name: {rule}")
+        } else {
+            format!("invalid_name: {name}: a fact's name is {rule}")
+        });
     }
     Ok(())
 }
@@ -1381,10 +1408,11 @@ fn cleanup_finish(root: &Path) -> Result<Value, String> {
     )
 }
 
-/// The automation that runs the cleanup each night: an agent of its own,
-/// started on the first run in the memory folder, woken only when
-/// `changed` says so, and each turn capped.
-fn schedule_args(script: &Path, args: &[String]) -> Result<Vec<String>, String> {
+/// The automation that runs the cleanup each night: each run in an agent
+/// of its own in the memory folder, woken only when `changed` says so, and
+/// each turn capped. `kept` is the automation already there, as `show`
+/// gives it: scheduling again, say at another time, keeps its model.
+fn schedule_args(script: &Path, args: &[String], kept: &Value) -> Result<Vec<String>, String> {
     let usage = || format!("usage: {USAGE}");
     let (mut model, mut effort, mut cron) = (None, None, None);
     let mut it = args.iter();
@@ -1400,30 +1428,46 @@ fn schedule_args(script: &Path, args: &[String]) -> Result<Vec<String>, String> 
         }
         *slot = Some(it.next().ok_or_else(usage)?.clone());
     }
+    if model.is_none() && effort.is_some() {
+        return Err(usage());
+    }
     let quote = format!("'{}'", script.to_string_lossy().replace('\'', r"'\''"));
     let mut add = vec![
         "--name".into(),
-        "memory-cleanup".into(),
+        AGENT.into(),
         "--cron".into(),
         cron.unwrap_or_else(|| "30 3 * * *".into()),
     ];
-    // A first schedule starts the agent; scheduling again, say at another
-    // time, keeps the one it started, its model and its history.
-    match (model, effort) {
-        (Some(model), effort) => {
+    let text = |value: &Value| value.as_str().map(str::to_owned);
+    match (model, kept) {
+        (Some(model), _) => {
             add.extend(["--start".into(), AGENT.into(), "--model".into(), model]);
             if let Some(effort) = effort {
                 add.extend(["--effort".into(), effort]);
             }
         }
-        (None, None) => add.extend(["--bot".into(), AGENT.into()]),
-        (None, Some(_)) => return Err(usage()),
+        (None, kept) if kept["start"].is_object() => {
+            let model = text(&kept["start"]["model"]).ok_or_else(usage)?;
+            add.extend(["--start".into(), AGENT.into(), "--model".into(), model]);
+            if let Some(effort) = text(&kept["start"]["effort"]) {
+                add.extend(["--effort".into(), effort]);
+            }
+        }
+        (None, _) => {
+            return Err(format!(
+                "model_needed: there is no {AGENT} automation to keep the model of; schedule with --model PROVIDER/MODEL"
+            ));
+        }
     }
+    // A conversation of its own each night: the cleanup reads memory, not
+    // earlier nights.
+    add.push("--fresh".into());
     add.extend([
         "--if".into(),
         format!("{quote} changed"),
         "--turn-budget-tokens".into(),
         "1000000".into(),
+        "--replace".into(),
         "--".into(),
         "Clean up memory as the memory-cleanup skill says.".into(),
     ]);
@@ -1433,26 +1477,31 @@ fn schedule_args(script: &Path, args: &[String]) -> Result<Vec<String>, String> 
 const AGENT: &str = "memory-cleanup";
 
 fn schedule(home: &Path, args: &[String]) -> Result<Value, String> {
-    let add = schedule_args(&home.join(".agent/memory"), args)?;
-    // The agent the automation starts works in the memory folder.
+    let script = home.join(".agent/automation");
+    let kept = automation(&script, &["show".into(), AGENT.into()])?;
+    let add = schedule_args(&home.join(".agent/memory"), args, &kept)?;
+    // Each run's agent works in the memory folder, made a repository once
+    // the automation is there.
     let root = home.join(".agents/memory");
-    repo(&root)?;
+    std::fs::create_dir_all(&root)
+        .map_err(|e| format!("memory_failed: {}: {e}", root.display()))?;
     std::env::set_current_dir(&root)
         .map_err(|e| format!("memory_failed: {}: {e}", root.display()))?;
-    add_automation(&home.join(".agent/automation"), &add).map_err(|error| match error.split_once(':') {
-        Some(("bot_exists", _)) => format!(
-            "bot_exists: {AGENT} is an agent already: schedule without --model to keep it, or remove it with agent rm --bot {AGENT} to start it on another model"
-        ),
-        Some(("bot_not_found", _)) if !add.iter().any(|a| a == "--start") => format!(
-            "bot_not_found: there is no {AGENT} agent yet: schedule with --model to start one"
-        ),
-        _ => error,
-    })
+    let added = automation(&script, &[&["add".to_owned()][..], &add].concat())?;
+    repo(&root)?;
+    Ok(added)
 }
 
-/// `~/.agent/automation add ARGS`, run in this folder with this shell's
-/// daemon and agent: its JSON line, or its error as `CODE: detail`.
-fn add_automation(script: &Path, args: &[String]) -> Result<Value, String> {
+/// Whether the nightly cleanup was ever scheduled here, by the person or
+/// by Sonny: the memory folder is a repository from then on, also after
+/// the person removes the automation, which then stays removed.
+pub fn scheduled_once(home: &Path) -> bool {
+    crate::policy::git_entry(&home.join(".agents/memory"))
+}
+
+/// `~/.agent/automation ARGS`, run in this folder with this shell's daemon
+/// and agent: its JSON line, or its error as `CODE: detail`.
+fn automation(script: &Path, args: &[String]) -> Result<Value, String> {
     if !script.is_file() {
         return Err(format!(
             "automations_unsupported: {} is not there to add the nightly cleanup",
@@ -1460,7 +1509,6 @@ fn add_automation(script: &Path, args: &[String]) -> Result<Value, String> {
         ));
     }
     let out = std::process::Command::new(script)
-        .arg("add")
         .args(args)
         .stdin(std::process::Stdio::null())
         .output()
@@ -2112,6 +2160,41 @@ mod tests {
     }
 
     #[test]
+    fn a_save_missing_its_type_or_name_says_what_the_fact_needs() {
+        let home = temp("needs");
+        let detail = |r: Result<Value, String>| error_json(&r.unwrap_err());
+        // A tool call that leaves a field out sends it empty.
+        let save = json!({"save": {"name": "pinned-version", "description": "d",
+            "source": "s", "text": "x"}, "user": true});
+        let error = detail(call(&home, &home, &save));
+        assert_eq!(error["error"], "invalid_type");
+        assert_eq!(
+            error["detail"],
+            "the fact needs a type: user, feedback, project, reference, work"
+        );
+        let mut wrong = save.clone();
+        wrong["save"]["type"] = json!("note");
+        let error = detail(call(&home, &home, &wrong));
+        assert_eq!(
+            error["detail"],
+            "note is not a type; the fact needs one of user, feedback, project, reference, work"
+        );
+        let mut nameless = save.clone();
+        nameless["save"]["type"] = json!("user");
+        nameless["save"]["name"] = json!("");
+        let error = detail(call(&home, &home, &nameless));
+        assert_eq!(error["error"], "invalid_name");
+        assert!(
+            error["detail"]
+                .as_str()
+                .unwrap()
+                .starts_with("the fact needs a name: "),
+            "{error}"
+        );
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
     fn a_fact_saved_after_outside_content_says_so_in_its_file_and_the_index() {
         let home = temp("outside");
         let root = home.join(".agents/memory");
@@ -2422,6 +2505,66 @@ mod tests {
     }
 
     #[test]
+    fn a_cleanup_carried_on_by_a_later_run_is_the_automations_and_rolls_back_whole() {
+        let root = temp("cleanup-runs");
+        let store = || Some("/s/state.sqlite".to_owned());
+        // Runs A and B of the nightly cleanup are agents 7 and 9; both are
+        // the automation. Agent 8 is someone else.
+        let run_a = caller(Some("memory-cleanup".into()), Some("7".into()), store());
+        let run_b = caller(Some("memory-cleanup".into()), Some("9".into()), store());
+        let other = caller(None, Some("8".into()), store());
+        assert_eq!(run_a, run_b);
+        assert_eq!(
+            run_a.as_deref(),
+            Some("/s/state.sqlite#automation:memory-cleanup")
+        );
+        assert_eq!(other.as_deref(), Some("/s/state.sqlite#8"));
+        assert_eq!(caller(None, None, store()), None);
+        let as_ = |caller: &Option<String>, line: &[&str]| {
+            run_as(
+                &root,
+                &root,
+                &args(line),
+                &|| Ok("-".into()),
+                caller.as_deref(),
+            )
+        };
+        let save = |caller: &Option<String>, name: &str, text: &str| {
+            let mut line = vec!["save", name, "--type", "feedback", "--description"];
+            line.extend([name, "--source", "test", "--user", "--", text]);
+            as_(caller, &line).unwrap();
+        };
+        repo(&root).unwrap();
+        for name in ["a", "b", "c", "d", "e", "f"] {
+            save(&None, name, "before");
+        }
+        // Run A starts and removes one, then stops without finishing.
+        as_(&run_a, &["cleanup", "start"]).unwrap();
+        as_(&run_a, &["rm", "a", "--user"]).unwrap();
+        // Run B carries it on, another agent saves a fact, and B removes
+        // too much.
+        let resumed = as_(&run_b, &["cleanup", "start"]).unwrap();
+        assert_eq!(resumed["duplicate"], true);
+        save(&other, "g", "saved by another agent");
+        for name in ["b", "c", "d"] {
+            as_(&run_b, &["rm", name, "--user"]).unwrap();
+        }
+        let refused = as_(&run_b, &["cleanup", "finish"]).unwrap_err();
+        assert!(
+            refused.starts_with("loss_guard: the cleanup removed 4 of 6"),
+            "{refused}"
+        );
+        // Both runs' removals are taken back; the other agent's save stays.
+        let text = |name: &str| std::fs::read_to_string(root.join(format!("{name}.md"))).ok();
+        for name in ["a", "b", "c", "d"] {
+            assert!(text(name).unwrap().ends_with("before\n"), "{name}");
+        }
+        assert!(text("g").unwrap().ends_with("saved by another agent\n"));
+        assert_eq!(check(&root)["problems"], json!([]));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn work_leads_the_index_by_name_and_the_cleanup_retires_it_uncounted() {
         let root = temp("cleanup-work");
         let save = |name: &str, kind: &str| {
@@ -2573,10 +2716,11 @@ mod tests {
     }
 
     #[test]
-    fn the_schedule_is_a_gated_capped_automation_that_starts_or_keeps_its_own_agent() {
+    fn the_schedule_is_a_gated_capped_automation_whose_runs_keep_its_model() {
         let script = Path::new("/Users/g/.agent/memory");
-        let line = |rest: &[&str]| schedule_args(script, &args(rest));
-        let add = line(&["--model", "openai/mini"]).unwrap();
+        let none = Value::Null;
+        let line = |rest: &[&str], kept: &Value| schedule_args(script, &args(rest), kept);
+        let add = line(&["--model", "openai/mini"], &none).unwrap();
         assert_eq!(
             add,
             args(&[
@@ -2588,28 +2732,57 @@ mod tests {
                 "memory-cleanup",
                 "--model",
                 "openai/mini",
+                "--fresh",
                 "--if",
                 "'/Users/g/.agent/memory' changed",
                 "--turn-budget-tokens",
                 "1000000",
+                "--replace",
                 "--",
                 "Clean up memory as the memory-cleanup skill says.",
             ])
         );
-        let add = line(&["--model", "m", "--effort", "low", "--cron", "0 4 * * *"]).unwrap();
+        let add = line(
+            &["--model", "m", "--effort", "low", "--cron", "0 4 * * *"],
+            &none,
+        )
+        .unwrap();
         assert_eq!(add[3], "0 4 * * *");
         assert_eq!(add[8..10], args(&["--effort", "low"]));
-        // Without a model, the agent it started before.
-        let again = line(&["--cron", "0 5 * * *"]).unwrap();
-        assert_eq!(again[3..6], args(&["0 5 * * *", "--bot", "memory-cleanup"]));
-        assert_eq!(line(&[]).unwrap()[4..6], args(&["--bot", "memory-cleanup"]));
+        // Without a model, the one the automation there runs on: a new
+        // time is the same runs at another hour.
+        let kept = json!({"name": "memory-cleanup", "bot": "memory-cleanup",
+            "start": {"model": "anthropic/opus", "effort": "high"}});
+        let again = line(&["--cron", "0 5 * * *"], &kept).unwrap();
+        assert_eq!(
+            again[3..10],
+            args(&[
+                "0 5 * * *",
+                "--start",
+                "memory-cleanup",
+                "--model",
+                "anthropic/opus",
+                "--effort",
+                "high"
+            ])
+        );
+        // One scheduled to message the agent it started (`--bot`), as
+        // scheduling again without a model did before, has no model to
+        // keep: it is given one.
+        let old = json!({"name": "memory-cleanup", "bot": "memory-cleanup", "start": null});
+        assert!(line(&[], &old).unwrap_err().starts_with("model_needed: "));
+        let nothing = line(&["--cron", "0 5 * * *"], &none).unwrap_err();
+        assert!(nothing.starts_with("model_needed: "), "{nothing}");
         for bad in [
             &["--effort", "low"][..],
             &["--model"],
             &["--model", "m", "--model", "n"],
             &["--every", "1d"],
         ] {
-            assert!(line(bad).unwrap_err().starts_with("usage: "), "{bad:?}");
+            assert!(
+                line(bad, &kept).unwrap_err().starts_with("usage: "),
+                "{bad:?}"
+            );
         }
     }
 }

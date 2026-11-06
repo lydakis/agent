@@ -143,6 +143,32 @@ automation ends, keeping its row, as when its `--reply-to` agent is gone. The `c
 request id, so a fire cut short after the daemon made the agent asks again
 and gets that same agent, and no other.
 
+`--fresh` (with `--start`) makes a new agent for each run instead, `NAME-N`
+for run N, so no run reads another's conversation: what lasts between runs
+lives in files and memory, as a cron job's does. Sonny's own nightly memory
+cleanup runs so; an automation an agent sets up keeps one agent unless asked.
+Each is made as the one agent above is. A run is numbered when its time
+passes its `--if`, and the number is on the automation's row (`run`) before
+its agent is made: a fire cut short and taken again is another attempt at
+the same run, whose `create` (request id `trigger-GENERATION-N`) and
+message (`…ID.run`) the daemon takes once. Runs go one at a time: a run's
+fire waits for the run before to end (the daemon's `wait`, up to a day; a
+run still working then is skipped), reads how it ended, and says so on its
+first line when it did not finish (`[automation NAME · run N · TIME · WHY]`,
+then `Run N-1 did not finish: failed: provider_failed. Its conversation is
+NAME-(N-1).`). The row keeps three agents at most: the run under way, the
+latest that finished and the latest that did not; an agent a later run
+replaces there is deleted. An agent of a run deleted by hand ends that run,
+not the automation. A run passes over a `NAME-N` an agent already has, so
+NAME may be an agent's, and it is at most 117 bytes, so `NAME-N` fits the
+daemon's 128. A run's message is kept on the row before it goes, so an
+attempt cut short sends it again as it was. A memory tool call in a run's
+turn, and a change from a run's shell through `~/.agent/memory`, is the
+automation's, so an open memory cleanup belongs to the automation, and a run
+that carries on one cut short changes it as its own. `--fresh` and
+`--shadow` do not go together, and an automation replaced with or without
+`--fresh` starts its agents over.
+
 **What else.** `--reply-to BOT` keeps the fire's process until the turn it
 sent ends (the daemon's `wait`, up to a day), then queues that turn's
 answer to BOT, pinned by id; the scheduler starts no second fire of the automation
@@ -298,10 +324,10 @@ with a notification, each time one is added or changed. Automations were once
 a LaunchAgent each, which a lead setting its next look rewrote every time;
 now the system has one job of Sonny's per HOME, written once and left as it
 is while Sonny stays where it is, as cron is one job for every crontab line.
-It is `me.lydakis.agent.scheduler.TAG`: a LaunchAgent,
-`~/Library/LaunchAgents/me.lydakis.agent.scheduler.TAG.plist`, run at
+It is `sonny.scheduler.TAG`: a LaunchAgent,
+`~/Library/LaunchAgents/sonny.scheduler.TAG.plist`, run at
 login and kept alive (`RunAtLoad`, `KeepAlive` on a failed exit), on a Mac;
-a systemd user service, `~/.config/systemd/user/me.lydakis.agent.scheduler.TAG.service`
+a systemd user service, `~/.config/systemd/user/sonny.scheduler.TAG.service`
 (under `XDG_CONFIG_HOME` when set), enabled for `default.target` and
 restarted on failure, on Linux. `TAG` is eight hex digits of a hash of
 HOME's path (64-bit FNV-1a, folded to 32 bits, a trailing `/` left out):
@@ -365,7 +391,10 @@ from before tags, when it runs with this HOME) becomes its definition, at
 the times it had, and the system lets go of the old job; another HOME's, in
 a unit folder they share, waits for that HOME's Sonny. The old backup
 (`me.lydakis.agent.backup`) and start-at-login (`me.lydakis.agent.boot`)
-jobs go the same way, for the scheduler runs both.
+jobs go the same way, for the scheduler runs both. The scheduler's own job
+was `me.lydakis.agent.scheduler.TAG` before 0.9.0; Sonny's start lets that
+go and makes the job again as `sonny.scheduler.TAG`, once (retired at
+0.11.0), so the label names no one.
 
 Automations were triggers before 0.8.0. The first Sonny, scheduler or
 script of 0.8.0 to look moves `~/.agent/triggers` to
@@ -637,21 +666,26 @@ follow.
 
 Memory grows by saves, so a nightly cleanup keeps it small and true. It is
 a skill and an automation, not part of the daemon. `schedule` adds
-the automation `memory-cleanup`: at 03:30 by default (`--cron` moves it) it
-starts, on its first fire, an agent of that name in `~/.agents/memory` on
-the model given, and sends it "Clean up memory as the memory-cleanup skill
-says." The automation's `--if` runs `changed`, which Sonny answers true also
+the automation `memory-cleanup`: at 03:30 by default (`--cron` moves it)
+each run starts an agent of its own (`--fresh`), `memory-cleanup-N`, in
+`~/.agents/memory` on the model given, and sends it "Clean up memory as the
+memory-cleanup skill says." The automation's `--if` runs `changed`, which Sonny answers true also
 when the person wrote to any agent since the last finished cleanup
 started (starting a stopped daemon to read it, as a fire would), so a night after nothing was saved or removed and nothing said
-costs no turn. Each turn is capped at 1,000,000 tokens:
-the agent keeps one conversation, as every `--start` agent does, so each
-call carries earlier nights up to where compaction summarizes them.
-Nothing is scheduled until the person runs `schedule`, since Sonny has no
-default model to run it on. To move the time, `~/.agent/automation rm
-memory-cleanup` and `schedule` again without `--model`: that keeps the
-agent it started, with its model and history. With `--model`, while that
-agent exists, `schedule` is `bot_exists`: it only starts that agent, and
-never changes the model of one it already started. The `memory-cleanup` skill
+costs no turn. Each turn is capped at 1,000,000 tokens, and each night
+starts a conversation of its own, so a call carries only that night's work.
+It is on by default: the first Sonny to open a lead schedules it on that
+lead's model (`schedule --model`), in the background, and tries again at
+its next start if it could not (no scheduler). Until it is, `/background`
+shows `memory-cleanup` as not scheduled, in every window, with the error
+the scheduling gave (kept in `~/.agent/sonny/cleanup-not-scheduled.json`).
+Once scheduled it is the
+person's: removed with `~/.agent/automation rm memory-cleanup`, it stays
+removed, since `~/.agents/memory` being a repository says it was scheduled
+once, and `schedule` turns it on again. `schedule` again replaces the automation:
+without `--model` it keeps the model (and effort) it runs on, so moving the
+time is one call. A cleanup scheduled before 0.9.0 keeps its one agent
+until `schedule` runs again. The `memory-cleanup` skill
 ([SKILL.md](../sonny/skills/memory-cleanup/SKILL.md)) merges duplicates,
 drops superseded facts and dates relative ones, with `save` and `rm` only,
 and never removes a lasting fact for its age alone.
@@ -955,7 +989,8 @@ parts. Like a file `read` sends, a picture is a PNG, JPEG, GIF or WebP by
 its own bytes, scaled to 1568 pixels on its longest side when larger; a
 result holds up to 20, 5 MB together, and `image()` throws past that. `store` and `load` keep small values for the agent's
 later scripts, `ALL_TOOLS` lists every tool, and `tools.tool_search` ranks
-them for a query. The description lists each server and declares its tools
+them for a query, a tool named exactly (its callable name, or its name on
+its server) first. The description lists each server and declares its tools
 in TypeScript up to about 3,000 tokens; the rest are found from a script. A
 script runs in QuickJS with no files, network or timers, at most 256 MB and
 10 minutes, four at once in the tool host and sixteen alive (more wait
@@ -1065,7 +1100,13 @@ about, an action in `browser_confirm`) comes back over the link to the
 calling agent's gate on the host, so you see it in the host's Sonny, where
 you are working. The linked machine's own settings decide what it
 confirms. A call to a machine that is asleep returns `not_connected` at
-once, or within 3 seconds, with when it was last connected. A machine runs
+once, or within 3 seconds, with when it was last connected. A call that
+was already sent down the link when the machine went quiet, before it took
+the call, or whose link closed while the machine ran it, returns
+`tool_outcome_unknown`: it may have run, so see whether it took effect
+before making it again. A machine that says nothing for 3 seconds after a
+call is sent, neither taking it nor carrying anything else, has gone
+quiet, and the call is let go there should it still arrive. A machine runs
 at most `calls` of the host's calls at once; one past that returns
 `link_busy`, to call again when one ends. On a slow link, each end holds at
 most one longest line (48 MB) of calls and answers queued, and the pings,
