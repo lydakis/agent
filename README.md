@@ -64,17 +64,16 @@ brew unlink sonny                         # if the stable formula is installed
 brew install lydakis/agent/sonny-nightly
 # Later:
 brew update
-brew upgrade lydakis/agent/sonny-nightly
+brew reinstall lydakis/agent/sonny-nightly
 ```
 
-The nightly workflow updates the formula at 07:17 UTC when main has changed,
-after tests and a Homebrew install check pass. It builds Sonny and its daemon
-from the same pinned commit; `sonny --version` shows that commit. For main's
-latest commit between nightly runs, install with `--HEAD` (or use
-`brew reinstall --HEAD lydakis/agent/sonny-nightly` to switch an existing
-install), then `brew upgrade --fetch-HEAD lydakis/agent/sonny-nightly`.
-Nightlies build from source, as the stable formulas do. The Linux installer
-above continues to install versioned releases.
+Nightly fetches current main on every install or reinstall and builds Sonny
+and its daemon together from that checkout. No `--HEAD`, version tag or wait
+for the nightly workflow is needed. Use `reinstall` to update: Homebrew's
+`upgrade` can skip a formula whose version has not changed. `sonny --version`
+and `sonny agent --version` show the built commit. The nightly workflow checks
+the recipe at 07:17 UTC; stable `sonny` and the Linux installer above continue
+to install versioned releases. Both Homebrew channels build from source.
 
 ## Quickstart
 

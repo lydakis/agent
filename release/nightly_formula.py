@@ -1,4 +1,4 @@
-"""Pin Sonny and its daemon to one main commit, without a release tag."""
+"""Build Sonny and its daemon together from current main, without a release tag."""
 
 import argparse
 import base64
@@ -19,10 +19,10 @@ def render_formula(commit: str, version: str) -> str:
     return f'''class SonnyNightly < Formula
   desc "Nightly terminal coordinator with its matching agent daemon"
   homepage "https://github.com/lydakis/agent"
-  url "https://github.com/lydakis/agent.git", revision: "{commit}"
+  url "https://github.com/lydakis/agent.git", branch: "main"
   version "{version}"
+  # Generated from revision: "{commit}"
   license any_of: ["MIT", "Apache-2.0"]
-  head "https://github.com/lydakis/agent.git", branch: "main"
 
   livecheck do
     skip "Updated by the nightly workflow"
@@ -51,7 +51,6 @@ def render_formula(commit: str, version: str) -> str:
     assert_match(/^sonny [0-9][0-9A-Za-z.+-]* \\([0-9a-f]{{9,40}}\\)$/, sonny)
     assert_match(/^agent-runtime [0-9][0-9A-Za-z.+-]* \\([0-9a-f]{{9,40}}\\)$/, agent)
     assert_equal sonny[/\\(([0-9a-f]+)\\)$/, 1], agent[/\\(([0-9a-f]+)\\)$/, 1]
-    assert_match "({commit[:9]})", sonny unless build.head?
   end
 end
 '''
@@ -69,7 +68,7 @@ def prepare_update(commit: str, version: str, current: Path):
         versions = re.findall(r'^  version "(' + VERSION + r')"$', previous.decode(), re.MULTILINE)
         commits = re.findall(r'revision: "([0-9a-f]{40})"$', previous.decode(), re.MULTILINE)
         if len(versions) != 1 or len(commits) != 1:
-            raise ValueError("current nightly must have one pinned commit and version")
+            raise ValueError("current nightly must have one workflow revision and version")
         before, after = (tuple(map(int, value.split("."))) for value in (versions[0], version))
         if before > after or commits[0] == commit:
             return None
