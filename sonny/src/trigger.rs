@@ -2923,11 +2923,14 @@ fn cleanup_schedule(
         return None;
     }
     let mut schedule = std::process::Command::new(sonny);
+    // Absolute: `schedule` works in the memory folder, and adds the
+    // automation from there.
+    let absolute = |p: &Path| std::path::absolute(p).unwrap_or_else(|_| p.to_owned());
     // Sonny's own, not an agent's: the automation is no agent's.
     schedule
         .args(["memory", "schedule", "--model", &model])
-        .env("AGENT_STORE", store)
-        .env("AGENT_SOCKET", socket)
+        .env("AGENT_STORE", absolute(store))
+        .env("AGENT_SOCKET", absolute(socket))
         .env_remove("AGENT_BOT")
         .env_remove("AGENT_BOT_ID")
         .stdin(std::process::Stdio::null())
@@ -8366,6 +8369,16 @@ pub(crate) mod tests {
         assert!(env.contains(&("AGENT_BOT".into(), None)), "{env:?}");
         // A lead with no model says nothing to run it on.
         assert!(cleanup_schedule(&home, sonny, &json!({}), store, socket).is_none());
+        // A relative socket is the one Sonny was given, wherever the
+        // schedule then works.
+        let here = std::env::current_dir().unwrap();
+        let relative = cleanup_schedule(&home, sonny, &lead, store, Path::new("s.sock")).unwrap();
+        let socket_given = relative
+            .get_envs()
+            .find(|(k, _)| *k == "AGENT_SOCKET")
+            .unwrap()
+            .1;
+        assert_eq!(socket_given, Some(here.join("s.sock").as_os_str()));
         // Scheduled once, by Sonny or the person, the memory folder is a
         // repository: removed since, it is not scheduled again.
         std::fs::create_dir_all(home.join(".agents/memory/.git")).unwrap();
