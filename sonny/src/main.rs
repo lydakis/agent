@@ -71,6 +71,7 @@ mod said;
 mod scheduler;
 mod screen;
 mod seed;
+mod sent;
 mod served;
 mod settings;
 mod setup;
@@ -266,6 +267,41 @@ fn keys_apart(on: bool) {
 }
 
 type Tui = Terminal<CrosstermBackend<std::io::Stdout>>;
+
+/// The whole screen cleared, and drawn whole at the next frame, without
+/// asking the terminal where its cursor is as `Terminal::clear` does to put
+/// it back: an answer late through a multiplexer or a slow link ends Sonny
+/// with "the cursor position could not be read", and nothing here needs
+/// the cursor kept.
+fn wipe<B: Backend>(terminal: &mut Terminal<B>) -> Result<(), B::Error> {
+    let size = terminal.size()?;
+    terminal.resize(Rect::new(0, 0, size.width, size.height))
+}
+
+/// One frame written as the terminal is to show it, as Ink and Codex
+/// write theirs: inside a synchronized update (mode 2026), so a terminal
+/// that knows it shows the frame whole, never half written, and with the
+/// cursor hidden while cells land, shown again only where the frame puts
+/// it. Written cell by cell in view, the cursor flickered over the screen,
+/// and what follows the cursor (an emoji picker, an input method) could
+/// open wherever the cursor passed. A terminal that does not know the
+/// mode ignores it.
+fn synchronized<T, W: std::io::Write>(
+    target: &mut T,
+    out: impl Fn(&mut T) -> &mut W,
+    frame: impl FnOnce(&mut T) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    ratatui::crossterm::queue!(
+        out(target),
+        BeginSynchronizedUpdate,
+        ratatui::crossterm::cursor::Hide
+    )?;
+    let drawn = frame(target);
+    // Ended even after a failed write, so the terminal is never left
+    // holding frames back.
+    execute!(out(target), EndSynchronizedUpdate)?;
+    drawn
+}
 
 #[derive(Clone)]
 struct Options {
@@ -1228,6 +1264,7 @@ fn main() -> std::process::ExitCode {
         Some((verb, rest)) if verb == "approver" => approver::run(rest),
         Some((verb, rest)) if verb == "mcp" => mcp::cli(rest),
         Some((verb, rest)) if verb == "link" => link::cli(rest),
+        Some((verb, rest)) if verb == "sent" => sent::cli(rest),
         Some((verb, rest)) if verb == "rules" => {
             return std::process::ExitCode::from(rules::cli(rest) as u8);
         }
@@ -1422,7 +1459,7 @@ async fn run() -> Result<(), String> {
     let mut terminal =
         Terminal::new(CrosstermBackend::new(std::io::stdout())).map_err(|e| e.to_string())?;
     // A side chat opens on its window's alternate screen, still drawn on.
-    let _ = terminal.clear();
+    let _ = wipe(&mut terminal);
     let mut app = App::new(client, &name, &bot, options.clone());
     app.context = caught.context;
     app.window = caught.window;
@@ -1583,7 +1620,7 @@ async fn run() -> Result<(), String> {
         app.notice = Some(error);
     }
     let result = app.main(&mut terminal, &mut events).await;
-    let _ = terminal.clear();
+    let _ = wipe(&mut terminal);
     own_screen(false);
     keys_apart(false);
     let _ = execute!(std::io::stdout(), DisableBracketedPaste);
@@ -1822,7 +1859,7 @@ fn edge(frame: &mut ratatui::Frame, gap: Rect, composer: Rect, pad: Rect) {
     };
     frame
         .buffer_mut()
-        .set_style(band, Style::default().bg(look::band()));
+        .set_style(band, Style::default().bg(look::BAND));
 }
 
 /// The viewport's rows, top to bottom: the reply's open line (`live`
@@ -2566,6 +2603,10 @@ impl Watch {
     }
 }
 
+/// What leads the words typed to find an earlier prompt, under the
+/// composer.
+const SEARCH_LABEL: &str = "  find ";
+
 /// Ctrl+R's search of the prompts sent before.
 struct Search {
     /// Each prompt once, newest first: how far back, and its words on one
@@ -2588,6 +2629,15 @@ impl Search {
         };
         search.narrow();
         search
+    }
+
+    /// The row under the composer while it is open: what is typed to
+    /// find, then the keys; and the column the cursor goes in.
+    fn keys(&self) -> (Line<'static>, u16) {
+        let mut keys = vec![Span::raw(SEARCH_LABEL).dim(), Span::raw(self.typed.clone())];
+        keys.extend(hint::spans("  ↑↓ pick · enter edit · esc cancel"));
+        let cursor = SEARCH_LABEL.width() + self.typed.width();
+        (Line::from(keys), cursor as u16)
     }
 
     /// The matches for what is typed now, the best picked.
@@ -5021,7 +5071,7 @@ impl App {
         if newest.is_none() {
             self.pages.clear();
         }
-        terminal.clear().map_err(|e| e.to_string())?;
+        wipe(terminal).map_err(|e| e.to_string())?;
         self.pending.clear();
         self.marks.clear();
         self.folds.clear();
@@ -10691,7 +10741,7 @@ impl App {
         }
     }
 
-    /// Ctrl+R: the list of prompts sent before over the composer.
+    /// Ctrl+R: the list of prompts sent before, over the composer.
     fn search(&mut self) {
         let prompts = (self.recall.all().into_iter())
             .map(|(back, text)| (back, text.replace('\n', " ")))
@@ -11677,9 +11727,9 @@ impl App {
 
     /// `/side`: a side chat with a copy of this bot, taken where it is now,
     /// mid-turn included, and opened in a Sonny of its own on the alternate
-    /// screen. The copy may call no tool, so it answers from what the bot
-    /// knows, unless the config's `[sonny] side_chat` is `"fork"`: then it
-    /// may do anything the bot may. The daemon deletes it once it has been
+    /// screen. The copy may do anything the bot may, unless the config's
+    /// `[sonny] side_chat` is `"answer"`: then it calls no tool and answers
+    /// from what the bot knows. The daemon deletes it once it has been
     /// idle a quarter hour. This bot carries on, and its lines wait for the
     /// main screen.
     async fn side(&mut self, question: String, pictures: &[attach::Picture]) {
@@ -12212,17 +12262,16 @@ impl App {
         self.commit(lines);
     }
 
-    /// A frame drawn, the whole screen written again when it is stale:
-    /// cleared first, and shown at once with what replaces it where the
-    /// terminal holds a frame back until it is done.
+    /// A frame drawn, the whole screen written again when it is stale
+    /// (cleared first); every frame shown whole ([`synchronized`]).
     fn draw(&mut self, terminal: &mut Tui) -> std::io::Result<()> {
-        if !std::mem::take(&mut self.stale) {
-            return self.frame(terminal);
-        }
-        execute!(terminal.backend_mut(), BeginSynchronizedUpdate)?;
-        let drawn = terminal.clear().and_then(|()| self.frame(terminal));
-        execute!(terminal.backend_mut(), EndSynchronizedUpdate)?;
-        drawn
+        let stale = std::mem::take(&mut self.stale);
+        synchronized(terminal, Terminal::backend_mut, |terminal| {
+            if stale {
+                wipe(terminal)?;
+            }
+            self.frame(terminal)
+        })
     }
 
     fn frame(&mut self, terminal: &mut Tui) -> std::io::Result<()> {
@@ -12663,8 +12712,11 @@ impl App {
                 return;
             }
             if let Some(search) = &self.searching {
+                // Over the composer's band, as the slash menu is, the
+                // draft left in it as it was: what is typed to find goes
+                // under it, where the keys are, as a shell's
+                // reverse-i-search and Codex's are.
                 let found = &search.found;
-                let room = composer.y as usize;
                 let items: Vec<list::Item> = (found.iter())
                     .map(|(at, found)| {
                         let text = &search.prompts[*at].1;
@@ -12672,6 +12724,7 @@ impl App {
                             .found(found)
                     })
                     .collect();
+                let room = gap.y as usize;
                 let mut rows = list::lines(&items, search.pick, width, room);
                 if items.is_empty() && room > 1 {
                     rows.push(
@@ -12682,24 +12735,12 @@ impl App {
                         .dim(),
                     );
                 }
-                over(frame, rows, composer);
-                let line = match search.typed.is_empty() {
-                    true => Line::from(vec![
-                        Span::raw("› ").bold(),
-                        Span::raw("type to find a prompt").dim(),
-                    ]),
-                    false => Line::from(vec![
-                        Span::raw("› ").bold(),
-                        Span::raw(search.typed.clone()),
-                    ]),
-                };
-                frame.render_widget(Paragraph::new(line), composer);
-                frame.set_cursor_position((
-                    composer.x + 2 + search.typed.width() as u16,
-                    composer.y,
-                ));
-                let keys = Line::from(hint::spans("  ↑↓ pick · enter edit · esc cancel"));
+                over(frame, rows, gap);
+                edge(frame, gap, composer, pad);
+                frame.render_widget(Paragraph::new(composer_rows), composer);
+                let (keys, cursor) = search.keys();
                 frame.render_widget(Paragraph::new(keys), footer);
+                frame.set_cursor_position((footer.x + cursor, footer.y));
                 return;
             }
             if let Some((items, list)) = (self.making.as_ref()).and_then(new::Making::listed)
@@ -13758,6 +13799,112 @@ fn zen_notice(on: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_frame_is_shown_whole_with_the_cursor_hidden_while_it_lands() {
+        let mut out: Vec<u8> = Vec::new();
+        let drawn = synchronized(
+            &mut out,
+            |out| out,
+            |out| {
+                out.extend_from_slice(b"CELLS");
+                Ok(())
+            },
+        );
+        assert!(drawn.is_ok());
+        assert_eq!(out, b"\x1b[?2026h\x1b[?25lCELLS\x1b[?2026l");
+        // A frame that fails still ends the update, so the terminal never
+        // holds what comes after back.
+        let mut out: Vec<u8> = Vec::new();
+        let failed = synchronized(&mut out, |out| out, |_| Err(std::io::Error::other("gone")));
+        assert!(failed.is_err());
+        assert!(out.ends_with(b"\x1b[?2026l"));
+    }
+
+    #[test]
+    fn the_screen_is_wiped_without_asking_the_terminal_anything() {
+        /// A terminal that never answers where its cursor is.
+        struct Mute(ratatui::backend::TestBackend);
+        impl Backend for Mute {
+            type Error = std::convert::Infallible;
+            fn draw<'a, I>(&mut self, content: I) -> Result<(), Self::Error>
+            where
+                I: Iterator<Item = (u16, u16, &'a ratatui::buffer::Cell)>,
+            {
+                self.0.draw(content)
+            }
+            fn hide_cursor(&mut self) -> Result<(), Self::Error> {
+                self.0.hide_cursor()
+            }
+            fn show_cursor(&mut self) -> Result<(), Self::Error> {
+                self.0.show_cursor()
+            }
+            fn get_cursor_position(&mut self) -> Result<ratatui::layout::Position, Self::Error> {
+                panic!("asked the terminal where its cursor is")
+            }
+            fn set_cursor_position<P: Into<ratatui::layout::Position>>(
+                &mut self,
+                position: P,
+            ) -> Result<(), Self::Error> {
+                self.0.set_cursor_position(position)
+            }
+            fn clear(&mut self) -> Result<(), Self::Error> {
+                self.0.clear()
+            }
+            fn clear_region(
+                &mut self,
+                clear_type: ratatui::backend::ClearType,
+            ) -> Result<(), Self::Error> {
+                self.0.clear_region(clear_type)
+            }
+            fn size(&self) -> Result<ratatui::layout::Size, Self::Error> {
+                self.0.size()
+            }
+            fn window_size(&mut self) -> Result<ratatui::backend::WindowSize, Self::Error> {
+                self.0.window_size()
+            }
+            fn flush(&mut self) -> Result<(), Self::Error> {
+                self.0.flush()
+            }
+            fn scroll_region_up(
+                &mut self,
+                region: std::ops::Range<u16>,
+                lines: u16,
+            ) -> Result<(), Self::Error> {
+                self.0.scroll_region_up(region, lines)
+            }
+            fn scroll_region_down(
+                &mut self,
+                region: std::ops::Range<u16>,
+                lines: u16,
+            ) -> Result<(), Self::Error> {
+                self.0.scroll_region_down(region, lines)
+            }
+        }
+        let mut terminal = Terminal::new(Mute(ratatui::backend::TestBackend::new(8, 2))).unwrap();
+        let draw = |terminal: &mut Terminal<Mute>| {
+            terminal
+                .draw(|frame| frame.render_widget(Paragraph::new("drawn"), frame.area()))
+                .unwrap();
+        };
+        draw(&mut terminal);
+        wipe(&mut terminal).unwrap();
+        assert!(
+            terminal
+                .backend()
+                .0
+                .buffer()
+                .content()
+                .iter()
+                .all(|cell| cell.symbol() == " ")
+        );
+        // What was drawn before is forgotten: the next frame writes it all.
+        draw(&mut terminal);
+        terminal
+            .backend()
+            .0
+            .assert_buffer_lines(["drawn   ", "        "]);
+    }
 
     #[test]
     fn a_question_open_says_the_agent_needs_you_to_its_multiplexer() {
@@ -19837,6 +19984,14 @@ mod tests {
         }
         assert_eq!(shown(&app), ["fix the readme", "fix the rounding"]);
         assert_eq!(&*app.input, "draft", "typing goes to the search");
+        // The draft keeps the composer: what is typed to find shows
+        // under it, with the keys, the cursor after it.
+        let (keys, cursor) = app.searching.as_ref().unwrap().keys();
+        assert_eq!(
+            keys.to_string(),
+            "  find fix  ↑↓ pick · enter edit · esc cancel"
+        );
+        assert_eq!(cursor, 10);
         // Ctrl+R again goes further back, as a shell's does.
         app.key(ctrl('r')).await;
         app.key(key(KeyCode::Enter)).await;
