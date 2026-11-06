@@ -468,7 +468,11 @@ async fn round(shared: Arc<Shared>, bot: String, turn: i64, calls: Vec<Value>) {
         counts["recent"].as_u64().unwrap_or(0),
     );
     let key = (bot.clone(), turn);
-    let mut usage = Usage::default();
+    // Where the check's time went: reading the turn for the evidence, the
+    // judge's turn, and the attempts before the last, each a check that
+    // failed and was tried again.
+    let (mut usage, mut evidence) = (Usage::default(), Duration::ZERO);
+    let (mut attempts, mut last) = (0, started);
     let verdicts: Vec<Verdict> = if shared.tripped.lock().unwrap().contains(&key) {
         // The turn kept going after it was told to stop: end it now.
         interrupt(&shared, &bot, turn).await;
@@ -489,18 +493,16 @@ async fn round(shared: Arc<Shared>, bot: String, turn: i64, calls: Vec<Value>) {
     } else {
         // A check that failed is tried again while the round has time, up
         // to Codex's attempts: a failure is the approver's, not the call's.
-        let mut attempt = 1;
         loop {
+            attempts += 1;
+            last = Instant::now();
             match judge(&shared, &bot, turn, &calls, deadline).await {
-                Ok((verdicts, used)) => {
-                    usage = used;
+                Ok((verdicts, used, read)) => {
+                    (usage, evidence) = (used, read);
                     break verdicts;
                 }
                 Err(Unreviewed::Failed(_))
-                    if attempt < policy::ATTEMPTS && Instant::now() < deadline =>
-                {
-                    attempt += 1
-                }
+                    if attempts < policy::ATTEMPTS && Instant::now() < deadline => {}
                 Err(Unreviewed::Failed(_)) if Instant::now() >= deadline => {
                     break vec![policy::timed_out(); calls.len()];
                 }
@@ -543,10 +545,16 @@ async fn round(shared: Arc<Shared>, bot: String, turn: i64, calls: Vec<Value>) {
         answered.push(json!({"call_id":call["call_id"],"request":call["request"],
             "decision":decision,"reason":reason,"error":error}));
     }
+    let timing = usage.timing;
     report(
         json!({"event":"judged","bot":bot,"turn":turn,"calls":answered,
         "judge_ms":judge_ms,"input_tokens":usage.input,"cached_tokens":usage.cached,
-        "output_tokens":usage.output}),
+        "output_tokens":usage.output,"attempts":attempts,
+        "retried_ms":(last - started).as_millis() as u64,
+        "evidence_ms":evidence.as_millis() as u64,"queued_ms":timing.queued_ms,
+        "looking_ms":timing.looking_ms,"tools_ms":timing.tools_ms,
+        "verdict_ms":timing.verdict_ms,"paced_ms":timing.paced_ms,
+        "model_rounds":timing.rounds,"provider_retries":timing.retries}),
     );
 }
 
@@ -603,8 +611,9 @@ async fn judge(
     turn: i64,
     calls: &[Value],
     deadline: Instant,
-) -> std::result::Result<(Vec<Verdict>, Usage), Unreviewed> {
+) -> std::result::Result<(Vec<Verdict>, Usage, Duration), Unreviewed> {
     let late = || Unreviewed::Not(policy::timed_out());
+    let reading = Instant::now();
     let long = |why: &str| Unreviewed::Not(policy::too_long(why));
     let intent =
         match tokio::time::timeout_at(deadline.into(), intent(shared, bot, turn, calls)).await {
@@ -625,6 +634,7 @@ async fn judge(
         State::Built { state, .. } => state,
     };
     let ids: Vec<&str> = intent.planned.iter().map(|call| call.id.as_str()).collect();
+    let evidence = reading.elapsed();
     match shared
         .judge
         .ask(
@@ -661,7 +671,7 @@ async fn judge(
                 })
                 .collect::<Option<Vec<_>>>()
                 .ok_or_else(|| Unreviewed::Failed("the judge's answer did not parse".into()))?;
-            Ok((verdicts, usage))
+            Ok((verdicts, usage, evidence))
         }
     }
 }

@@ -17,8 +17,9 @@ Input, one JSON object a line (real prompts and calls stay in `.local/`):
 
 `expected` is the decision the labels call for, per call. Reported per
 judge: decisions against it (right, false allows, false denials, not
-reviewed), the approver's judge time (p50, p90, p99), tokens, and the
-rounds judged more than once (a denial re-announces the rest of a round).
+reviewed), the approver's judge time (p50, p90, p99) and where it went
+(evidence, waiting for a slot, looking, tools, the verdict, retries),
+tokens, and the rounds judged more than once (a denial re-announces the rest of a round).
 Each pass writes the approver's own lines next to the report.
 """
 import argparse
@@ -202,6 +203,17 @@ def run(binary, rounds, judge, *, providers, reasoning, note, parallel, out):
         'judge_failed': len(failures), 'judged_again': extra,
         'judge_ms': {q: percentile(times, f) for q, f in (('p50', .5), ('p90', .9), ('p99', .99))},
         'judge_ms_max': max(times) if times else None,
+        # Where the judge time went, each part's p50 and p90: reading the
+        # turn for evidence, waiting for a slot, the model's rounds before
+        # its answer, the tools it looked with, the answering round, the
+        # attempts before the last; and the rounds and retries counted.
+        'split_ms': {part: {q: percentile([line.get(part, 0) for line in judged.values()], f)
+                            for q, f in (('p50', .5), ('p90', .9))}
+                     for part in ('evidence_ms', 'queued_ms', 'looking_ms', 'tools_ms',
+                                  'verdict_ms', 'paced_ms', 'retried_ms')},
+        'counts': {part: {q: percentile([line.get(part, 0) for line in judged.values()], f)
+                          for q, f in (('p50', .5), ('p90', .9))}
+                   for part in ('model_rounds', 'provider_retries', 'attempts')},
         'tokens': tokens, 'wall_s': round(wall, 1),
     }
 
