@@ -20,6 +20,11 @@
 //! [fallbacks]                   # the model a declined request goes to, by model
 //! "anthropic/claude-opus-5-5" = "anthropic/claude-opus-4-8"
 //!
+//! [context_windows]             # tokens a model's context holds, over its provider's listing; restart the daemon to apply
+//! "bedrock/*" = 400000          # by PROVIDER/MODEL, * and ? wildcards; the most specific pattern wins
+//! "bedrock/*openai.*" = 1000000 # every OpenAI model on Bedrock
+//! "anthropic/claude-opus-5-5" = 500000  # lower than the model's own on purpose
+//!
 //! [judge]
 //! model = "openai/gpt-6-luna"   # who judges for the approver and the lookout
 //! effort = "low"                # a model judge's effort
@@ -33,7 +38,7 @@
 //! task_effort = "high"          # each new task's
 //! lead_profile = "my-lead"      # the role a new lead starts in, not lead
 //! task_profile = "worker"       # what every other agent is told, not task
-//! side_chat = "fork"            # "answer", the default, calls no tool
+//! side_chat = "answer"          # calls no tool; "fork", the default, may do anything its agent may
 //! chime = false                 # rings when work ends or waits, the default
 //! verbose = true                # every tool call drawn, not the clean view
 //! text_width = 0                # the widest the conversation is written, 100 by default; 0 the window's whole width
@@ -55,6 +60,7 @@
 //! sky_haiku_hold = 10           # minutes the title is held before it can pass
 //! tool_processes = 8            # processes Sonny runs for agents at once in all: tool calls 3/4, goal checks 1/4; 0, the default, four times the CPUs
 //! lookout_waiting = 4096        # events from sources that wait for one agent, 1024 by default; past it newer ones are not kept, and its next note says so; 0 no limit
+//! sent_days = 90                # days `sonny sent` keeps what agents sent through Sonny's tools, 30 by default; 0 keeps all
 //! default_permissions = "strict"   # the /permissions row a new lead starts in, auto by default
 //! browser_confirm = ["eval"]    # agent-browser actions the agent's gate approves; eval, download, upload and state by default
 //!
@@ -92,6 +98,9 @@ use std::path::{Path, PathBuf};
 /// The largest file the reader takes.
 pub const LIMIT: u64 = 64 * 1024;
 
+/// The least context window `[context_windows]` sets, as the daemon takes it.
+pub const MIN_WINDOW: u64 = 1024;
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Config {
     /// `provider/model` for a new agent that names none.
@@ -120,6 +129,12 @@ pub struct Config {
     /// agent on that model that names none sends a request a safety
     /// classifier declined to it, that request alone.
     pub fallbacks: BTreeMap<String, String>,
+    /// `[context_windows]`: the context window, in tokens, of each model
+    /// whose `PROVIDER/MODEL` path a pattern matches, `*` and `?` wildcards,
+    /// the most specific pattern winning, over what its provider lists.
+    /// Unset, the provider's listing, else the daemon's own default. The
+    /// agent CLI starts the daemon with them.
+    pub context_windows: BTreeMap<String, u64>,
     pub judge: Judge,
     pub shell_environment_policy: ShellEnvironmentPolicy,
     pub sonny: Sonny,
@@ -495,6 +510,9 @@ pub struct Sonny {
     /// newer ones are not kept, and its next note says how many, from
     /// where and when. 0 for no limit.
     pub lookout_waiting: u64,
+    /// How many days of the journal of what agents sent through Sonny's
+    /// tools are kept. 0 keeps all.
+    pub sent_days: u64,
     /// What the lookout runs for news from outside, by name.
     pub sources: Vec<Source>,
     /// The agent-browser action categories that the `browser` tool puts
@@ -600,6 +618,7 @@ impl Default for Sonny {
             sky_haiku_hold: 10,
             tool_processes: 0,
             lookout_waiting: 1024,
+            sent_days: 30,
             chime: true,
             verbose: false,
             text_width: TEXT_WIDTH,
@@ -614,13 +633,13 @@ impl Default for Sonny {
     }
 }
 
-/// What the copy `/side` talks to may do: `"answer"`, the default, from
-/// what its agent knows, calling no tool; or `"fork"`, anything its agent
-/// may, with its tools, in its folder, under its approvals.
+/// What the copy `/side` talks to may do: `"fork"`, the default, anything
+/// its agent may, with its tools, in its folder, under its approvals; or
+/// `"answer"`, from what its agent knows, calling no tool.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SideChat {
-    #[default]
     Answer,
+    #[default]
     Fork,
 }
 
@@ -1103,6 +1122,28 @@ fn parse(text: &str) -> Result<Config, String> {
             config.attach_wait_ms = Some(ms);
             continue;
         }
+        if name == "context_windows" {
+            let models = value.as_table().ok_or("context_windows must be a table")?;
+            for (pattern, tokens) in models {
+                let tokens = tokens
+                    .as_integer()
+                    .filter(|tokens| *tokens >= MIN_WINDOW as i64)
+                    .ok_or_else(|| {
+                        format!(
+                            "context_windows.{pattern} is a number of tokens, at least {MIN_WINDOW}"
+                        )
+                    })?;
+                if !pattern.contains('/') || pattern.contains(char::is_whitespace) {
+                    return Err(format!(
+                        "context_windows keys are PROVIDER/MODEL, * and ? wildcards, as \"bedrock/*\", not {pattern:?}"
+                    ));
+                }
+                config
+                    .context_windows
+                    .insert(pattern.clone(), tokens as u64);
+            }
+            continue;
+        }
         if name == "fallbacks" {
             let models = value.as_table().ok_or("fallbacks must be a table")?;
             for (model, fallback) in models {
@@ -1194,6 +1235,7 @@ fn parse(text: &str) -> Result<Config, String> {
                 "sky_haiku_hold",
                 "tool_processes",
                 "lookout_waiting",
+                "sent_days",
                 "unsandboxed",
                 "default_permissions",
                 "browser_confirm",
@@ -1286,6 +1328,7 @@ fn parse(text: &str) -> Result<Config, String> {
                 "sky_haiku_hold" => Some(&mut config.sonny.sky_haiku_hold),
                 "tool_processes" => Some(&mut config.sonny.tool_processes),
                 "lookout_waiting" => Some(&mut config.sonny.lookout_waiting),
+                "sent_days" => Some(&mut config.sonny.sent_days),
                 "text_width" => Some(&mut config.sonny.text_width),
                 "margin_notes" => Some(&mut config.sonny.margin_notes),
                 _ => None,
@@ -2001,9 +2044,9 @@ mod tests {
         let off = parse("web_search = \"disabled\"").unwrap();
         assert_eq!(off.web_search, WebSearch::Disabled);
         assert!(!config.hide_senders);
-        assert_eq!(config.sonny.side_chat, SideChat::Answer);
-        let fork = parse("[sonny]\nside_chat = \"fork\"").unwrap();
-        assert_eq!(fork.sonny.side_chat, SideChat::Fork);
+        assert_eq!(config.sonny.side_chat, SideChat::Fork);
+        let answer = parse("[sonny]\nside_chat = \"answer\"").unwrap();
+        assert_eq!(answer.sonny.side_chat, SideChat::Answer);
         assert_eq!(config.sonny.margin_opens, MarginOpens::Always);
         let never = parse("[sonny]\nmargin_opens = \"never\"").unwrap();
         assert_eq!(never.sonny.margin_opens, MarginOpens::Never);
@@ -2024,6 +2067,19 @@ mod tests {
         assert_eq!(fallbacks.get("a/big").map(String::as_str), Some("a/other"));
         assert!(parse("[fallbacks]\n\"a/big\" = 1\n").is_err());
         assert!(parse("fallbacks = \"a/other\"").is_err());
+        let windows = parse("[context_windows]\n\"bedrock/*\" = 400000\n\"a/b\" = 1024\n")
+            .unwrap()
+            .context_windows;
+        assert_eq!(windows.get("bedrock/*"), Some(&400_000));
+        assert_eq!(windows.get("a/b"), Some(&1024));
+        for wrong in [
+            "[context_windows]\n\"bedrock\" = 400000\n",
+            "[context_windows]\n\"a/b\" = 1000\n",
+            "[context_windows]\n\"a/b\" = \"1M\"\n",
+            "context_windows = 400000\n",
+        ] {
+            assert!(parse(wrong).is_err(), "{wrong}");
+        }
         for (text, error) in [
             (
                 "web_search = \"cached\"",
