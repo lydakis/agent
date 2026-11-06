@@ -82,7 +82,7 @@ const DESCRIPTION: &str = r#"Run JavaScript code to orchestrate/compose MCP tool
 
 Some nested tools may be omitted from this description. They are still available on the global `tools` object and listed in `ALL_TOOLS`.
 
-Use `await tools.tool_search({query: "...", limit: 8})` for BM25-ranked discovery of tools (up to `limit` matches; 8 by default). It returns `{tools: [{name, description}]}` with callable names and full TypeScript declarations. Print results with `text()` and inspect unfamiliar declarations before calling `tools[result.name](arguments)` in a later execution."#;
+Use `await tools.tool_search({query: "...", limit: 8})` for BM25-ranked discovery of tools, a tool named exactly first (up to `limit` matches; 8 by default). It returns `{tools: [{name, description}]}` with callable names and full TypeScript declarations. Print results with `text()` and inspect unfamiliar declarations before calling `tools[result.name](arguments)` in a later execution."#;
 
 /// The MCP result types the declarations name, after Codex's.
 const TYPES: &str = r#"Shared MCP Types:
@@ -1658,8 +1658,9 @@ impl<T> Drop for Abort<T> {
     }
 }
 
-/// `tools.tool_search`: the tools BM25 ranks first for the query, by
-/// their names and descriptions.
+/// `tools.tool_search`: the tools named exactly by the query (a callable
+/// name, or a tool's own name on its server, in any case) first, then
+/// those BM25 ranks first for it, by their names and descriptions.
 fn search(nested: &BTreeMap<String, Nested>, arguments: &str) -> Value {
     let arguments: Value = serde_json::from_str(arguments).unwrap_or_default();
     let Some(query) = arguments["query"].as_str() else {
@@ -1696,6 +1697,13 @@ fn search(nested: &BTreeMap<String, Nested>, arguments: &str) -> Value {
         }
     }
     let (k1, b) = (1.2, 0.75);
+    let wanted = query.trim().to_lowercase();
+    let named =
+        |id: &str, tool: &Nested| id.to_lowercase() == wanted || tool.tool.to_lowercase() == wanted;
+    let exact: Vec<&String> = (nested.iter())
+        .filter(|(id, tool)| named(id, tool))
+        .map(|(id, _)| id)
+        .collect();
     let query = words(query);
     let mut ranked: Vec<(f64, &String)> = documents
         .iter()
@@ -1712,13 +1720,13 @@ fn search(nested: &BTreeMap<String, Nested>, arguments: &str) -> Value {
                 .sum();
             (score, *id)
         })
-        .filter(|(score, _)| *score > 0.0)
+        .filter(|(score, id)| *score > 0.0 && !exact.contains(id))
         .collect();
     ranked.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(b.1)));
-    let tools: Vec<Value> = ranked
-        .into_iter()
+    let tools: Vec<Value> = (exact.into_iter())
+        .chain(ranked.into_iter().map(|(_, id)| id))
         .take(limit)
-        .map(|(_, id)| json!({"name": id, "description": nested[id].description}))
+        .map(|id| json!({"name": id, "description": nested[id].description}))
         .collect();
     json!({"ok": {"tools": tools}})
 }
@@ -2656,6 +2664,57 @@ text(ALL_TOOLS.map(t => t.name).join(","));"#,
             started.elapsed()
         );
         hub.stop().await;
+    }
+
+    #[test]
+    fn a_tool_named_exactly_comes_first() {
+        let tool = |server: &str, name: &str, description: &str| Nested {
+            server: server.into(),
+            tool: name.into(),
+            description: description.into(),
+            asks: false,
+            reads: false,
+            refused: false,
+        };
+        let nested: BTreeMap<String, Nested> = [
+            (
+                "mcp__notes__list",
+                tool(
+                    "notes",
+                    "list",
+                    "Returns every note in the store with its title, date, tags and body.",
+                ),
+            ),
+            (
+                "mcp__notes__search",
+                tool(
+                    "notes",
+                    "search",
+                    "Search notes: list notes list notes list matching.",
+                ),
+            ),
+            (
+                "mcp__files__read_file",
+                tool("files", "read_file", "Read a file."),
+            ),
+        ]
+        .into_iter()
+        .map(|(id, tool)| (id.to_owned(), tool))
+        .collect();
+        let names = |query: &str| -> Vec<String> {
+            let found = search(&nested, &json!({"query": query}).to_string());
+            (found["ok"]["tools"].as_array().unwrap().iter())
+                .map(|tool| tool["name"].as_str().unwrap().to_owned())
+                .collect()
+        };
+        // BM25 alone ranks the search tool first for "list": it says it
+        // more often.
+        assert_eq!(names("list")[0], "mcp__notes__list");
+        assert_eq!(names("mcp__notes__list")[0], "mcp__notes__list");
+        assert_eq!(names(" MCP__FILES__READ_FILE ")[0], "mcp__files__read_file");
+        assert_eq!(names("read_file"), ["mcp__files__read_file"]);
+        // Named once, not again among the ranked.
+        assert_eq!(names("list").len(), 2);
     }
 
     #[tokio::test]

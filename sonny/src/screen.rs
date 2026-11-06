@@ -83,6 +83,9 @@ pub enum Tag {
     Streamed(u64),
     /// The welcome's line Sonny's eyes are on, for a blink drawn over it.
     Eyes,
+    /// The rows of the person's long message at this node past its first
+    /// lines: its fold row, and the rest of its lines while open.
+    More(i64),
 }
 
 /// Buttons on a row: the columns each takes, and what it does.
@@ -491,6 +494,11 @@ impl Screen {
         }
         self.relay(at, shown);
         true
+    }
+
+    /// How many rows are tagged `tag`.
+    pub fn count_tagged(&self, tag: Tag) -> usize {
+        self.rows.iter().filter(|row| row.tag == Some(tag)).count()
     }
 
     /// The rows tagged `tag` replaced by `lines`, each line's `marks` on
