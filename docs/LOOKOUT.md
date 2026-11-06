@@ -40,12 +40,14 @@ once the daemon has been unreachable for 30 seconds, and the daemon stops
 it as it stops. Its own lines go to `STORE.companions/sonny-lookout.log`,
 and each subscriber it watches (`seated`), each subscriber whose file it
 read again after a change (`reloaded`) and each note it sends (`woke`) to
-`STORE.lookout.jsonl`. When it took each subscriber's file is kept in
-`STORE.lookout.taken.json`, written only as one changes, and the
+`STORE.lookout.jsonl`. Which revision of each subscriber's file it took
+(the file's modification time, or none for a file it saw go) and when is
+kept in `STORE.lookout.taken.json`, written only as one changes, and the
 `subscriptions` tool lists it as `lookout`: whether a lookout runs, when it
-took the file (`took_ms`), whether that was after the file last changed
+took the file (`took_ms`), whether what it took is the file as it is now
 (`current`), and how often it reads the files again (`rereads_every_s`).
-A subscriber whose rewritten filter is not live yet sees `current: false`.
+A subscriber whose rewritten filter, or removed last subscription, is not
+live yet sees `current: false`.
 
 The lookout only watches and tells. The tools Sonny gives its agents are
 answered by another companion, `sonny-tool-host` (`sonny tool-host`; see

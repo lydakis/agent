@@ -851,10 +851,10 @@ struct Service {
     /// Subscriptions by subscriber, as their files held them at the last
     /// read.
     subscribers: HashMap<String, Vec<subs::Sub>>,
-    /// When the lookout took each subscriber's file as it last changed,
+    /// Which revision of each subscriber's file the lookout took and when,
     /// kept beside the store ([`subs::taken`]) for its `subscriptions`
     /// listing to show.
-    read_at: HashMap<String, u128>,
+    read_at: HashMap<String, subs::Took>,
     /// The subscribers' names, one set every lookout shares (Kubernetes'
     /// informer cache: one store, many readers), made again whenever
     /// subscriptions are worked out.
@@ -1140,11 +1140,10 @@ impl Service {
             crate::commons::subscribe_posters(&home, &self.store, &names);
         }
         subs::steer_files(&self.store);
+        let revisions = subs::revisions(&self.store);
         self.subscribers = subs::all(&self.store).into_iter().collect();
-        let now = epoch_ms();
-        self.read_at = (self.subscribers.keys())
-            .map(|name| (name.clone(), now))
-            .collect();
+        self.read_at.clear();
+        subs::take(&mut self.read_at, &revisions, epoch_ms());
         subs::took(&self.store, &self.read_at);
         self.registry = watchers(&self.subscribers);
         for bot in &bots {
@@ -1797,25 +1796,24 @@ impl Service {
     /// The subscription files as they are now: a bot that subscribed is
     /// watched, and each lookout watches what its file says.
     async fn reread(&mut self, client: &Client) {
+        let revisions = subs::revisions(&self.store);
         let read: HashMap<String, Vec<subs::Sub>> = subs::all(&self.store).into_iter().collect();
+        // Every revision read is kept, one that changes nothing and a
+        // file that went included, so the listing knows it was taken.
+        let now = epoch_ms();
+        if subs::take(&mut self.read_at, &revisions, now) {
+            subs::took(&self.store, &self.read_at);
+        }
         if read == self.subscribers {
             return;
         }
-        // Each file that changed, said once it is read, so a rewritten
-        // filter is known to be live before an event it hears comes.
-        let now = epoch_ms();
-        let changed: Vec<String> = (read.iter())
-            .filter(|(name, subs)| self.subscribers.get(*name) != Some(*subs))
-            .map(|(name, _)| name.clone())
-            .collect();
-        self.read_at.retain(|name, _| read.contains_key(name));
-        for name in &changed {
-            if self.subscribers.contains_key(name) {
-                self.write(&json!({"at_ms": now, "lead": name, "reloaded": true}));
-            }
-            self.read_at.insert(name.clone(), now);
+        // Each file whose subscriptions changed, said once it is read, so a
+        // rewritten filter is known to be live before an event it hears comes.
+        let changed = (read.iter())
+            .filter(|(name, subs)| self.subscribers.get(*name).is_some_and(|was| was != *subs));
+        for (name, _) in changed {
+            self.write(&json!({"at_ms": now, "lead": name, "reloaded": true}));
         }
-        subs::took(&self.store, &self.read_at);
         self.subscribers = read;
         self.registry = watchers(&self.subscribers);
         let records: Vec<Value> = (self.subscribers.keys())

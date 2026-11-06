@@ -453,30 +453,102 @@ fn taken_file(store: &Path) -> PathBuf {
     super::beside(store, ".lookout.taken.json")
 }
 
-/// Keep when the lookout took each subscriber's file as it now reads, in
-/// milliseconds since the epoch: written whenever one changes, not on
-/// every read.
-pub(super) fn took(store: &Path, taken: &std::collections::HashMap<String, u128>) {
-    let body = json!(taken).to_string();
+/// What the lookout took of one subscriber's file: the file's revision,
+/// its modification time in nanoseconds since the epoch, or none for a
+/// file it saw go; and when it took it, in milliseconds since the epoch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct Took {
+    pub revision: Option<u64>,
+    pub at_ms: u128,
+}
+
+/// Each subscriber file's revision as it is now, looked at before the
+/// files are read: a write after the look leaves the file newer than what
+/// is kept, so it is taken again at the next read, never missed.
+pub(super) fn revisions(store: &Path) -> std::collections::HashMap<String, u64> {
+    let Ok(entries) = std::fs::read_dir(dir(store)) else {
+        return Default::default();
+    };
+    (entries.filter_map(Result::ok))
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let bot = name.strip_suffix(".json")?.to_owned();
+            Some((bot, revision(&entry.path())?))
+        })
+        .collect()
+}
+
+fn revision(path: &Path) -> Option<u64> {
+    let at = std::fs::metadata(path).ok()?.modified().ok()?;
+    Some(at.duration_since(std::time::UNIX_EPOCH).ok()?.as_nanos() as u64)
+}
+
+/// Bring what the lookout took up to the files' `revisions`, as of `now`:
+/// whether anything changed, so the file beside the store is written only
+/// then.
+pub(super) fn take(
+    taken: &mut std::collections::HashMap<String, Took>,
+    revisions: &std::collections::HashMap<String, u64>,
+    now: u128,
+) -> bool {
+    let mut changed = false;
+    for (name, &revision) in revisions {
+        if taken.get(name).and_then(|took| took.revision) != Some(revision) {
+            let revision = Some(revision);
+            taken.insert(
+                name.clone(),
+                Took {
+                    revision,
+                    at_ms: now,
+                },
+            );
+            changed = true;
+        }
+    }
+    for (name, took) in taken.iter_mut() {
+        if took.revision.is_some() && !revisions.contains_key(name) {
+            *took = Took {
+                revision: None,
+                at_ms: now,
+            };
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// Keep what the lookout took of each subscriber's file beside the store.
+pub(super) fn took(store: &Path, taken: &std::collections::HashMap<String, Took>) {
+    let body: serde_json::Map<String, Value> = (taken.iter())
+        .map(|(name, took)| {
+            let took = json!({"revision_ns": took.revision, "at_ms": took.at_ms as u64});
+            (name.clone(), took)
+        })
+        .collect();
+    let body = Value::Object(body).to_string();
     let _ = agent_client::files::replace_mode(&taken_file(store), body.as_bytes(), 0o600);
 }
 
 /// What the lookout makes of `subscriber`'s file: whether one runs, when it
-/// took the file, and whether that was after the file last changed. A
-/// running lookout reads every file again within `REREAD`.
+/// took the file, and whether what it took is the file as it is now, a
+/// removed file included. A running lookout reads every file again within
+/// `REREAD`.
 pub fn taken(store: &Path, subscriber: &str) -> Value {
     let running = super::running(store);
     let took = (std::fs::read_to_string(taken_file(store)).ok())
         .and_then(|text| serde_json::from_str::<Value>(&text).ok())
-        .and_then(|taken| taken[subscriber].as_u64());
-    let changed = (std::fs::metadata(file(store, subscriber)).ok())
-        .and_then(|meta| meta.modified().ok())
-        .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|at| at.as_millis() as u64);
+        .map(|taken| taken[subscriber].clone())
+        .unwrap_or_default();
+    let now = revision(&file(store, subscriber));
+    // A subscriber with no file and nothing taken has nothing to hear.
+    let same = match now {
+        Some(now) => took["revision_ns"].as_u64() == Some(now),
+        None => took["revision_ns"].is_null(),
+    };
     json!({
         "running": running,
-        "took_ms": took,
-        "current": running && took.is_some_and(|took| changed.is_none_or(|changed| changed <= took)),
+        "took_ms": took["at_ms"].as_u64(),
+        "current": running && same,
         "rereads_every_s": super::REREAD.as_secs(),
     })
 }
