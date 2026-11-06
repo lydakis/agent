@@ -57,6 +57,9 @@ pub struct Item {
     /// When a trigger last fired, in ms: a fire that sent no turn is still
     /// a fire of its own.
     pub fired_ms: Option<u64>,
+    /// What makes its failure the same one when `failed`'s words change:
+    /// a broken `--if`'s break, whatever each failed check printed.
+    pub episode: Option<String>,
 }
 
 /// Every trigger made on the daemon whose store is `store_id` and every
@@ -105,6 +108,7 @@ pub fn read(
                 failed: None,
                 handle: None,
                 fired_ms: None,
+                episode: None,
             });
         }
     }
@@ -196,6 +200,7 @@ fn servers(root: &Path, project: &str) -> Vec<Item> {
                 }),
                 handle: None,
                 fired_ms: None,
+                episode: None,
             });
         }
     }
@@ -210,6 +215,7 @@ pub fn failures(items: &[Item]) -> Vec<String> {
     (items.iter())
         .filter_map(|item| {
             let why = item.failed.as_ref()?;
+            let why = item.episode.as_ref().unwrap_or(why);
             let turn = item.handle.as_deref().unwrap_or("");
             let at = item.fired_ms.unwrap_or(0);
             Some(format!("{:?}/{}/{at}/{turn}/{why}", item.kind, item.name))
@@ -230,8 +236,14 @@ fn trigger_item(row: &Value, bots: Vec<String>) -> Item {
     let mut facts = Vec::new();
     let sent = row["sent"].as_u64().unwrap_or(0);
     let last = &row["last"];
-    let checked = &row["checked"];
+    // What its `--if` said, while it has one: one removed since says
+    // nothing about it now.
+    let checked = match row["if"].is_string() {
+        true => &row["checked"],
+        false => &Value::Null,
+    };
     let mut failed = None;
+    let mut episode = None;
     // A last fire that failed because its `--if` could not answer is over
     // once a later check answers: the check, not that fire, is what holds.
     let gate_broke = last["gate"] == "failed";
@@ -296,8 +308,10 @@ fn trigger_item(row: &Value, bots: Vec<String>) -> Item {
                 Some(detail) if !detail.is_empty() => first_line(detail),
                 _ => "could not check".into(),
             });
-            // One break, however many checks it failed.
+            // One break, however many checks it failed and whatever each
+            // printed.
             fired_ms = checked["since_ms"].as_u64().or(fired_ms);
+            episode = Some("could not check".into());
         }
         _ => {}
     }
@@ -323,6 +337,7 @@ fn trigger_item(row: &Value, bots: Vec<String>) -> Item {
         failed,
         handle: trigger::sent(row),
         fired_ms,
+        episode,
     }
 }
 
@@ -752,6 +767,7 @@ mod tests {
             failed: None,
             handle: None,
             fired_ms: None,
+            episode: None,
         }
     }
 
@@ -850,10 +866,17 @@ mod tests {
             unhealthy.facts[..2],
             ["sent 3", "could not check since 15m ago"]
         );
-        // Each check that fails again is the same break, not news.
+        // Each check that fails again is the same break, not news, though
+        // what it printed changed.
+        let mut again = checking(at + 60_000);
         assert_eq!(
             failures(std::slice::from_ref(&unhealthy)),
-            failures(&[checking(at + 60_000)])
+            failures(std::slice::from_ref(&again))
+        );
+        again.failed = Some("--if: exit status: 2: quiet: request 7f3a timed out".into());
+        assert_eq!(
+            failures(std::slice::from_ref(&unhealthy)),
+            failures(&[again])
         );
         // A check that answers again ends it, though no run went since.
         let back = trigger_item(
@@ -862,6 +885,17 @@ mod tests {
         );
         assert_eq!(back.failed, None);
         assert_eq!(back.facts[..2], ["sent 3", "checked 3m ago, nothing new"]);
+        // Its `--if` removed since: what the old one said last is not its
+        // health now.
+        let mut ungated = row(
+            json!({"gate": "failed", "checked_ms": at, "since_ms": at,
+                "detail": "--if: exit status: 2"}),
+            sent,
+        );
+        ungated["if"] = Value::Null;
+        let ungated = trigger_item(&ungated, vec!["p.triage".into()]);
+        assert_eq!(ungated.failed, None);
+        assert_eq!(ungated.facts, ["sent 3", "last sent 1h ago"]);
     }
 
     #[test]
