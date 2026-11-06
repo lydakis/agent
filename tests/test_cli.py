@@ -1400,13 +1400,20 @@ class CliTests(ModelFixture):
         cases = (('ok', False, provider, 'start'), ('refused', False, provider, 'start'),
                  ('silent', False, provider, 'start'), ('replaced', False, provider, 'start'),
                  ('ok', True, provider, 'start'), ('ok', False, [], 'start'),
-                 ('ok', False, provider, 'ls'), ('ok', True, provider, 'ls'))
+                 ('ok', False, provider, 'ls'), ('ok', True, provider, 'ls'),
+                 ('ok', False, provider, 'ls --no-spawn'), ('ok', False, provider, 'ls elsewhere'))
         for answer, inside, flags, command in cases:
             with self.subTest(answer=answer, inside=inside, provider=bool(flags), command=command), \
                     tempfile.TemporaryDirectory(dir='/tmp') as directory:
-                path, store = Path(directory)/'daemon.sock', Path(directory)/'state.db'
+                store = Path(directory)/'state.db'
                 # The older daemon's store, which `ls` never creates.
                 store.touch()
+                command, *extra = command.split()
+                # A command on the bots replaces only the daemon on its
+                # store's own socket, which is the one it serves.
+                own = command == 'ls' and extra != ['elsewhere']
+                path = Path(directory)/('state.db.sock' if own else 'daemon.sock')
+                extra = [flag for flag in extra if flag.startswith('--')]
                 daemon = subprocess.Popen(['sleep', '30'])
                 self.addCleanup(self.stop_process, daemon)
                 env = {**clean_env(), **({'AGENT_BOT_ID': '7'} if inside else {})}
@@ -1455,12 +1462,12 @@ class CliTests(ModelFixture):
                         pass
                 server = threading.Thread(target=older, daemon=True)
                 server.start()
-                result = subprocess.run([str(self.binary), command, '--store', str(store), '--socket', str(path), *flags],
+                result = subprocess.run([str(self.binary), command, '--store', str(store), '--socket', str(path), *flags, *extra],
                                         env=env, capture_output=True, timeout=40)
-                if inside or not (flags or command == 'ls'):
+                if inside or extra or not own and command == 'ls' or not (flags or command == 'ls'):
                     self.assertEqual(result.returncode, 1)
                     self.assertIn(b'daemon_protocol_mismatch', result.stderr)
-                    self.assertIn(b'Nothing was sent' if inside else b'nothing was sent', result.stderr)
+                    self.assertIn(b'nothing was sent', result.stderr.lower())
                     self.assertIsNone(daemon.poll())
                     self.assertEqual(asked, [])
                     continue

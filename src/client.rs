@@ -825,9 +825,31 @@ fn ensure_daemon(options: &Options) -> Result<Connection> {
 /// one.
 fn connect_running(options: &Options) -> Result<Connection> {
     match Connection::connect(&options.socket) {
+        Err(error) if older_daemon(&error).is_some() && !serves(options) => Err(kept(
+            error,
+            "nothing was sent: the socket is not the store's own, so which store the daemon \
+             serves is not known here; `agent start` with its --store and --socket replaces it",
+        )),
         Err(error) if older_daemon(&error).is_some() => ensure_existing_daemon(options),
         result => result,
     }
+}
+
+/// Whether the daemon on this agent's socket serves its store: the socket
+/// is the one a daemon of that store listens on unless told otherwise. A
+/// replacement starts on the store, so one for another store's daemon
+/// would put this store's daemon in its place.
+fn serves(options: &Options) -> bool {
+    // Where `path` is, its folder resolved, as a store's own socket is
+    // named from its resolved path.
+    let resolved = |path: &Path| match (path.parent(), path.file_name()) {
+        (Some(folder), Some(name)) => (folder.canonicalize().ok()).map(|folder| folder.join(name)),
+        _ => None,
+    };
+    crate::client_path::default_socket(&options.store)
+        .ok()
+        .and_then(|own| resolved(&own))
+        .is_some_and(|own| Some(own) == resolved(&options.socket))
 }
 
 /// Why this agent leaves an older daemon running rather than replacing it:
@@ -843,7 +865,7 @@ fn kept_older(options: &Options) -> Option<&'static str> {
              it, as a client starting the daemon does, and the turn resumes on the new daemon",
         )
     } else if options.no_spawn {
-        Some("--no-spawn keeps it running. Nothing was sent; `agent start` replaces it")
+        Some("nothing was sent: --no-spawn keeps it running, and `agent start` replaces it")
     } else if options.providers.is_empty() {
         Some(
             "nothing was sent: replacing it starts a new daemon, which needs a provider \
