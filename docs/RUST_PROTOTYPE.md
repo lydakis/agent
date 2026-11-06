@@ -46,7 +46,9 @@ Cargo.lock hashes; observer fingerprints continue to cover the benchmark tools.
 ## Software first
 
 Programs are the clients. Every command below emits JSONL events on stdout by
-default; exit codes report the turn outcome. `--pretty` renders the same stream
+default; exit codes report the turn outcome, and a turn that failed says why
+in one line on stderr too (a `wait` that timed out says so in `pending` alone).
+`--pretty` renders the same stream
 for a human watching a terminal and is never the input protocol. The daemon's
 socket protocol is the contract; the `agent` client is one consumer of it.
 
@@ -171,7 +173,9 @@ submitting client. `--delivery queue` or `steer` hands a busy bot the work
 instead of getting `bot_busy` ([delivery modes](#delivery-modes)). A controller can inspect metadata through `ls` or observe events through
 `follow` from outside a shell tool. Full records remain available via the protocol.
 
-Shell tool processes receive `AGENT_BIN`, an absolute `AGENT_STORE`,
+Shell tool processes receive `AGENT_BIN` (the daemon's own program, or the
+path its starter gave in `AGENT_BIN` when that names the same program, as a
+client that starts the daemon under a name of its own does), an absolute `AGENT_STORE`,
 `AGENT_SOCKET` when a socket is configured, and `AGENT_MODEL`, the running
 turn's effective model, so newly created peers default to its model.
 Continuing an existing peer keeps that peer's stored model unless `--model`
@@ -341,7 +345,7 @@ steer joins a turn that already has its cap: `budget_tokens` with
 `delivery: "steer"` is `invalid_delivery`. A summary held beside a call
 counts toward both caps.
 
-`submit` also accepts `output_schema` (protocol 49), a JSON Schema object
+`submit` also accepts `output_schema` (protocol 51), a JSON Schema object
 the reply of the turn it starts follows, as Codex's turn output schema:
 each of the turn's model calls asks its provider for structured output,
 `text.format` with a strict `json_schema` for Responses (the ChatGPT plan
@@ -353,7 +357,7 @@ output. The daemon checks
 only that it is an object of at most 64 KiB as JSON
 (`invalid_output_schema`): which schemas a model takes is its provider's to
 say, as a failed call. It is stored on the turn (`turns.output_schema`,
-schema 79), so a resumed turn asks for it too and a resend naming another is
+schema 81), so a resumed turn asks for it too and a resend naming another is
 an `idempotency_conflict`. It shapes the turn it starts: with `steer` or
 `attach` it is `invalid_delivery`. The judge `sonny approver` runs asks its
 verdict this way.
@@ -443,7 +447,7 @@ keeps what it started with; the next start takes a change.
 | `--max-pending` | Submissions waiting to start: queued behind a bot's own work or ready for a slot, daemon-wide. A submission that would wait past the bound answers `pending_limit` and writes nothing; one that starts at once is never refused by it. | none |
 | `--max-pending-bytes` | UTF-8 bytes of those waiting submissions: their prompts and the words they quote, which wait with them. | none |
 | `--max-input-bytes` | Bytes of request lines every session together has read and the daemon has not yet taken up. A line is read on credit for its first 4 KiB, and one that goes on waits for credit for the longest line (8 MiB) at once and gives back what it did not use, so readers never each hold part of what they need; an eighth of the bound is kept for lines that end within 4 KiB, so interrupts, renewals and status reads get in while long submits wait. At least one longest line and its reserve. Zero is unbounded. | a sixteenth of physical memory, at least 64 MiB |
-| `--max-readers` | Store reader connections, each on its own thread, for the reads clients ask for that decide nothing ([observation reads](#observation-reads)), which take all but one, and for turns' own reads. At least 1. | one per logical CPU |
+| `--max-readers` | Most store reader connections, each on its own thread and opened as reads wait for one, for the reads clients ask for that decide nothing ([observation reads](#observation-reads)), which take all but one, and for turns' own reads. At least 1. | one per logical CPU |
 | `--max-load` | The 1-minute load average at which new foreground and background commands wait while one of the daemon's is running, as make's `-l`: never while none is, so a loaded machine slows the fleet and never stops it, and `--max-processes` stays the bound behind it. One thread reads the load each second; waiters hold no slot, go in the order they came, and take a freed slot only if the gate still admits them. A call that would be refused (forbidden, asked about with no gate, an escape no gate allows) is answered at once, never held; a gated one waits for its verdict instead, so a denial comes back as soon as it is given, and one allowed starts then. A round's calls that run together are let in or held whole. A foreground command held past 1.5 s parks its turn before the call (or the batch it starts with) starts: one commit, `turn_waiting` with `{call_id, load: true, deadline_ms}` (also its view's `waiting_on`), no task, no active slot, and it survives restart. The gate's next admitting reading wakes every parked turn once the load falls, or the oldest alone on a loaded machine where none of the daemon's commands runs; a turn whose round has a later gated call is woken at that call's lapse too. A fraction is kept. Zero is no gate. Reported in `ready` as `limits.load`, `null` for none (protocol 44). | none (the agent CLI passes `cpus * 2`) |
 | `--max-connecting` | Provider requests awaiting response headers, a Bedrock Runtime call's body digest included. Established streams are not capped. Both providers hold headers until the first token, so a permit is held for the whole time to first token; a bound of N caps throughput at N calls per first-token latency. | none |
 | `--stall-timeout` | How long an established provider stream may go without a content frame before the attempt fails as `provider_stream_stalled` and is retried. Keepalives do not count; a connection that sends no bytes at all, keepalives included, fails sooner, after 2 minutes. Whole seconds, `1s` to `24h`. `[daemon] stall_timeout` in `~/.agent/config.toml` sets it, as a duration such as `"15m"`. | `10m` |
@@ -1068,8 +1072,14 @@ operations.
 Reads that decide nothing run beside the service loop, not in it:
 `history_nodes`, `history_items`, `history_search`, `turns`, `bots`,
 `events`, `usage` and `prompts`. Each runs on one of the store's reader
-connections (`--max-readers`, one per logical CPU by default; WAL readers
-do not block each other or the writer). They take at most all but one of
+connections (at most `--max-readers`, one per logical CPU by default; WAL
+readers do not block each other or the writer). One reader opens with the
+store; another opens when a read is queued with no reader free to take
+it, and one past the first closes after 30 seconds without a read, so a
+quiet daemon holds one and a busy one widens on its own. The readers that
+are open share one 2 MiB page cache budget equally: an idle reader takes
+its new share as soon as one opens or closes, a busy one as its read ends
+(`stats` shows the shares held as `readers.cache_kib`). They take at most all but one of
 the connections, the rest waiting in the order they came, so a turn's own
 reads (its context, a compaction plan) always find one free, as Kubernetes'
 API Priority and Fairness keeps seats for each priority level. Meanwhile the loop serves every other
@@ -1549,7 +1559,9 @@ halving the cursor range, a few point reads however many events are kept;
 events with no time count as older. It is the `usage` op's word for a start
 time, and `agent follow --since 1h` sends it.
 `follow` replays durable events after the cursor as notifications, emits
-`follow_live` with the cursor reached, and then delivers live events. The
+`follow_live` with the cursor reached (at least the newest event already
+published, so a follow resumed from it repeats nothing from before the
+switch, whatever kinds it names), and then delivers live events. The
 switch happens inside a storage job, so no committed event falls between the
 last replayed page and the first live delivery, and replayed cursors are never
 repeated live. Non-durable `text_delta` and `thinking_delta` notifications are
@@ -1940,7 +1952,13 @@ open. The schema version lives in SQLite's `user_version`; a store created
 before versioning is refused with `store_schema_unsupported`, one written by a
 newer binary with `store_schema_newer`, and an older versioned store is
 migrated inside the opening transaction when its data can be converted without
-guessing. Schema 18 requires each bot's tool selection. Older stores with bots
+guessing. Before it migrates, the store is copied with `VACUUM INTO` to
+`<store>.schema-<version>.backup` beside it, with the store's permissions,
+and the copy is checked (it opens, passes `PRAGMA integrity_check`, and is at
+that version); the two newest copies are kept. A store that cannot be copied,
+for a full disk say, is not migrated: opening fails with
+`store_backup_failed`, which says why, and the store stays as it was. To go
+back a release, stop the daemon and put the copy in the store's place. Schema 18 requires each bot's tool selection. Older stores with bots
 but no recorded selection are refused with `store_migration_tools_unknown`;
 their data and schema version remain intact. Keep those stores and use a new
 store path. Empty stores can migrate. Schema 19 rebuilds cache counters from
@@ -2611,7 +2629,8 @@ SIGHUP, does not outlive it. Each bot keeps at most 16; starting another
 first kills the one it used least recently, as Codex prunes its sessions,
 so that one's slot is free for it. Only the
 bot that started a terminal types into it (`terminal_not_running` for any
-other, and for one that ended), and terminals end when the daemon stops. A
+other, and for one that ended; `not_a_terminal` for its own background
+command, which takes no input), and terminals end when the daemon stops. A
 terminal never leaves its bot's sandbox (`tty` with `require_escalated` is
 refused), so input to a sandboxed bot's terminal runs without review, as its
 commands do; an unsandboxed bot's `write_stdin` is gated like `shell`.
@@ -2808,6 +2827,19 @@ command run by an absolute path that no rule matches as written is
 matched by its program's name, as Codex resolves it: when
 `host_executables` lists that path for the name, or lists nothing for it;
 by the name's `allow` rules, only at a path it lists.
+
+A command under a wrapper is also matched as the command the wrapper
+runs, read by the wrapper's own words: `timeout` (with its options and a
+duration), `nice` (with an adjustment), `nohup` and `time` run it as it
+would run alone, so `timeout 60 mcpx call` is allowed by an `mcpx` rule
+and `timeout 60 git push` refused by a `git push` one; `env` (bare, or
+with `-i`, `-u`, `-C` and assignments) and the shell's own `NAME=VALUE`
+before a command change what it runs with, so through them only the
+rules that ask or refuse match. Nor does a wrapper let out a program it
+runs by its path: the wrapper is found on `PATH`, so only a program by
+its name, found the same way, is allowed through it. A wrapper by its path, or in a form not
+read here (another option, such as `env -S`), is matched as written
+only. Rules for the wrapper itself still match too.
 `invalid`, with why, says the client couldn't read the rules: every shell
 call fails `rules_invalid` with it, where Codex would refuse to start. A
 pattern or list of choices that is empty, an empty justification, or a
@@ -2880,6 +2912,10 @@ Where this differs from Codex:
   host, which the daemon doesn't have; a sandbox's network is on or off.
   Sonny refuses a rules file that has one, so no rule is taken as kept
   that isn't.
+- Codex matches a command as written; here a wrapper read as above is
+  seen through, as Codex's own dangerous-command check sees through
+  `env` and `sudo`, so an agent that wraps a call in `timeout` is ruled as
+  it would be without it, a refusal included.
 - Codex lets a program run by any absolute path out by its name's
   `allow` rules when no `host_executable` names it. Here such a path is
   only asked about or refused by them, since a sandboxed bot could write
@@ -3546,7 +3582,9 @@ converges while a step covers more than one round adds. The complete
 summarizer input is byte-bounded including its previous summary and request
 marker and the item count, and the final marker gives the summarizer its
 maximum summary size in UTF-8 bytes. Oversized summaries are rejected above a third of the byte budget
-or 64 KiB, whichever is smaller. At installation, verbatim prompt copies are further bounded so
+or 64 KiB, whichever is smaller; a rejected one is asked for again, in a request
+of its own, at half the size it was asked for, for as long as each comes back
+shorter than the one before (each a billed round). At installation, verbatim prompt copies are further bounded so
 they fit alongside the encoded summary within half the byte envelope. A middle
 range is removed, retaining the oldest and newest excerpts when they fit. Original prompts remain available through history; installed
 prefixes are unchanged until the next compaction. A replacement must reduce encoded bytes,
@@ -3556,7 +3594,16 @@ the old view intact. Such completed calls are still billed. `compacted` events
 include `context_before`, `context_after`, `input_limit`, `reclaimed_bytes`,
 `reclaimed_items`, `headroom_bytes`, and `headroom_items`. These describe the
 complete logical view since the cut; headroom can be negative during catch-up,
-while the actual request still uses a bounded window. These failures leave the bot usable and
+while the actual request still uses a bounded window. `trigger` says what
+started it: its `reason` (`bytes` or `items` past the threshold, `requested`
+by a client, or `overflow`, a view that could not be sent), the model's context
+`window` and the `compact_tokens` threshold it gives, what the last call `sent`
+in bytes and the tokens counted for it, the view's threshold in bytes
+(`at_bytes`), the instructions and tools sent beside the view
+(`overhead_bytes`), the room kept for the reply (`reserve_bytes`) and the
+newest bytes the summary was to leave whole (`keep_bytes`). `room_bytes` is
+`at_bytes` less the view after: how much the conversation can grow before the
+next compaction. These failures leave the bot usable and
 original history retrievable. The
 CLI ships a default compaction text for new bots and `--no-compaction`,
 `--compaction-instructions`, `--compaction-instructions-file`, and

@@ -9,6 +9,7 @@
 //! as written: a line wrapped over rows comes back as one line, without
 //! the rows' leads or the indent every copied line shares.
 use std::{
+    collections::HashMap,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -82,6 +83,9 @@ pub enum Tag {
     Streamed(u64),
     /// The welcome's line Sonny's eyes are on, for a blink drawn over it.
     Eyes,
+    /// The rows of the person's long message at this node past its first
+    /// lines: its fold row, and the rest of its lines while open.
+    More(i64),
 }
 
 /// Buttons on a row: the columns each takes, and what it does.
@@ -198,6 +202,9 @@ pub struct Screen {
     width: usize,
     /// How many rows the view is scrolled up from the newest.
     back: usize,
+    /// How many rows tall the view was drawn last; none before its first
+    /// draw, as after a repaint.
+    tall: Option<usize>,
     /// Where the rows were drawn last, the first one drawn there, and
     /// how many.
     area: Rect,
@@ -490,6 +497,11 @@ impl Screen {
         }
         self.relay(at, shown);
         true
+    }
+
+    /// How many rows are tagged `tag`.
+    pub fn count_tagged(&self, tag: Tag) -> usize {
+        self.rows.iter().filter(|row| row.tag == Some(tag)).count()
     }
 
     /// The rows tagged `tag` replaced by `lines`, each line's `marks` on
@@ -1388,6 +1400,14 @@ impl Screen {
     pub fn render(&mut self, area: Rect, buf: &mut Buffer, file: impl Fn(&str) -> Option<String>) {
         self.layout(area.width as usize);
         let height = area.height as usize;
+        // Scrolled up, the view keeps its top row when the rows under it
+        // take more or less room, as a reply's open lines or a taller
+        // composer do: only the newest rows, followed, stay at the bottom.
+        if let Some(before) = self.tall.replace(height)
+            && self.back > 0
+        {
+            self.back = self.back.saturating_add(before).saturating_sub(height);
+        }
         if let Some((row, above)) = self.go_to.take() {
             let at = (self.shown.iter().enumerate())
                 .filter(|(_, shown)| shown.first)
@@ -2156,9 +2176,100 @@ pub fn keep_shown(cells: &mut Vec<(u16, u16, Cell)>, buf: &Buffer) {
     *cells = kept;
 }
 
+/// The links written over the screen last frame: each link's cells, and
+/// the cell the frame drew under each, by where the link starts; and the
+/// screen's size then.
+#[derive(Default)]
+pub struct Written {
+    area: Rect,
+    links: HashMap<(u16, u16), WrittenLink>,
+}
+
+/// A link's cells as written, each with the frame's cell under it.
+type WrittenLink = Vec<((u16, u16, Cell), Cell)>;
+
+impl Written {
+    /// The screen was cleared: every link is to be written again.
+    pub fn forget(&mut self) {
+        self.links.clear();
+    }
+
+    /// Of the links in `cells`, as [`keep_shown`] leaves them, those to
+    /// write over the frame just drawn, `under`: each that is new, or
+    /// whose cells, or the frame's cells under them, changed since it was
+    /// last written. One the frame left alone is still on the terminal as
+    /// it was written, so it is not written again: an idle window writes
+    /// nothing at all, where it wrote every link on screen ten times a
+    /// second. A link is written whole or not at all, so its opening and
+    /// closing go with it.
+    pub fn changed(
+        &mut self,
+        cells: Vec<(u16, u16, Cell)>,
+        under: &Buffer,
+    ) -> Vec<(u16, u16, Cell)> {
+        const CLOSE: &str = "\x1b]8;;\x1b\\";
+        if under.area != self.area {
+            (self.area, self.links) = (under.area, HashMap::new());
+        }
+        let mut last = std::mem::take(&mut self.links);
+        let mut out = Vec::new();
+        let mut link: WrittenLink = Vec::new();
+        for cell in cells {
+            let ends = cell.2.symbol().ends_with(CLOSE);
+            let drawn = match under.area.contains((cell.0, cell.1).into()) {
+                true => under[(cell.0, cell.1)].clone(),
+                false => Cell::default(),
+            };
+            link.push((cell, drawn));
+            if ends {
+                let at = (link[0].0.0, link[0].0.1);
+                if last.remove(&at).as_ref() != Some(&link) {
+                    out.extend(link.iter().map(|(cell, _)| cell.clone()));
+                }
+                self.links.insert(at, std::mem::take(&mut link));
+            }
+        }
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_link_is_written_again_only_when_it_or_what_is_under_it_changed() {
+        let cell = |symbol: &str| {
+            let mut cell = Cell::default();
+            cell.set_symbol(symbol);
+            cell
+        };
+        let link = || {
+            vec![
+                (0, 0, cell("\x1b]8;;https://a.b\x1b\\a")),
+                (1, 0, cell("b\x1b]8;;\x1b\\")),
+                (3, 0, cell("\x1b]8;;https://c.d\x1b\\c\x1b]8;;\x1b\\")),
+            ]
+        };
+        let mut under = Buffer::empty(Rect::new(0, 0, 6, 1));
+        under.set_string(0, 0, "ab c", Style::new());
+        let mut written = Written::default();
+        assert_eq!(written.changed(link(), &under).len(), 3, "all new");
+        assert!(written.changed(link(), &under).is_empty(), "idle: nothing");
+        // The frame drew over `c`: that link, whole, and only it.
+        under.set_string(3, 0, "c", Style::new().bold());
+        let again = written.changed(link(), &under);
+        assert_eq!(again.iter().map(|c| c.0).collect::<Vec<_>>(), [3]);
+        // Its address changed: written again, both its cells.
+        let mut moved = link();
+        moved[0].2 = cell("\x1b]8;;https://e.f\x1b\\a");
+        assert_eq!(written.changed(moved.clone(), &under).len(), 2);
+        // A cleared screen, or a resized one, has none of them.
+        written.forget();
+        assert_eq!(written.changed(moved.clone(), &under).len(), 3);
+        let wider = Buffer::empty(Rect::new(0, 0, 7, 1));
+        assert_eq!(written.changed(moved, &wider).len(), 3);
+    }
 
     #[test]
     fn a_link_drawn_over_is_dropped_whole_and_one_still_shown_kept() {
@@ -2731,6 +2842,34 @@ mod tests {
         let mut buf = Buffer::empty(area);
         screen.render(area, &mut buf, |_| None);
         assert_eq!(row(&buf, 4).trim_end(), "row 20");
+    }
+
+    #[test]
+    fn scrolled_up_the_view_keeps_its_top_row_as_its_height_changes() {
+        let lines: Vec<Line> = (0..40).map(|i| Line::from(format!("row {i}"))).collect();
+        let (mut screen, _) = screen(lines, 20, 10);
+        screen.scroll(10);
+        let at = |height| Rect::new(0, 0, 20, height);
+        assert_eq!(row(&drawn(&mut screen, at(10)), 0).trim_end(), "row 20");
+        // A reply's open lines grow under it, row by row.
+        for height in (6..10).rev() {
+            assert_eq!(row(&drawn(&mut screen, at(height)), 0).trim_end(), "row 20");
+        }
+        // Then they are written into it, and their room comes back.
+        screen.push((40..44).map(|i| Line::from(format!("row {i}"))).collect());
+        let buf = drawn(&mut screen, at(10));
+        assert_eq!(row(&buf, 0).trim_end(), "row 20");
+        assert_eq!(row(&buf, 9).trim_end(), "row 29");
+        // Squeezed to nothing, as a composer taking all the room does, and
+        // back, it is where it was.
+        drawn(&mut screen, at(0));
+        assert_eq!(row(&drawn(&mut screen, at(10)), 0).trim_end(), "row 20");
+        // Taller than the rows under it, it comes to the newest and follows.
+        let buf = drawn(&mut screen, at(30));
+        assert_eq!(row(&buf, 29).trim_end(), "row 43");
+        assert_eq!(screen.back(), 0);
+        let buf = drawn(&mut screen, at(25));
+        assert_eq!(row(&buf, 24).trim_end(), "row 43");
     }
 
     #[test]

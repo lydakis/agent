@@ -865,6 +865,8 @@ pub struct Configuration {
     /// Folders whose Unix sockets no sandboxed command reaches, made if
     /// missing, private to the daemon's user.
     pub walled: Vec<PathBuf>,
+    /// The context windows the person set, by model path.
+    pub context_windows: Arc<agent_runtime::provider::Windows>,
 }
 
 /// `path` by its real path, or, while it doesn't exist, by the real path
@@ -1510,7 +1512,9 @@ pub async fn run(config: Configuration) -> Result<()> {
         if spec.socket {
             provider = provider.with_socket()?;
         }
-        let provider = provider.with_stall_timeout(stall_timeout)?;
+        let provider = provider
+            .with_stall_timeout(stall_timeout)?
+            .with_windows(&spec.name, config.context_windows.clone());
         let (searches, speeds) = (provider.searches(), provider.speeds());
         if providers.insert(spec.name.clone(), provider).is_some() {
             return fail_with("duplicate_provider", spec.name.as_str());
@@ -1540,7 +1544,7 @@ pub async fn run(config: Configuration) -> Result<()> {
     let mut environment = vec![
         (
             "AGENT_BIN".into(),
-            std::env::current_exe()?.to_string_lossy().into_owned(),
+            agent_bin()?.to_string_lossy().into_owned(),
         ),
         (
             "AGENT_STORE".into(),
@@ -1640,6 +1644,7 @@ pub async fn run(config: Configuration) -> Result<()> {
             "stall_timeout_seconds":stall_timeout.as_secs()},
         "schema":agent_runtime::store::Database::SCHEMA,
         "tools":registry.names(),"providers":bindings,
+        "context_windows":config.context_windows.json(),
         "durability":"sqlite_full","partial_text_durable":false});
     let mut sessions: HashMap<u64, Output> = HashMap::new();
     // The sandboxed bot each session on a bot's own socket answers as.
@@ -5184,6 +5189,32 @@ fn fit_listings(
         answer.insert(name, entry);
     }
     Ok(answer)
+}
+
+/// The program this daemon hands its agents as `AGENT_BIN`: the one its
+/// starter named in `AGENT_BIN` when that is this same program (the same
+/// file under another name, or a copy of it of the same length and time of
+/// writing), as a client that starts the daemon by a name of its own
+/// gives it; else this daemon's own.
+fn agent_bin() -> std::io::Result<std::path::PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    let exe = std::env::current_exe()?;
+    let named = std::env::var_os("AGENT_BIN").map(std::path::PathBuf::from);
+    let same = |given: &std::path::Path| {
+        let (Ok(given), Ok(own)) = (std::fs::metadata(given), std::fs::metadata(&exe)) else {
+            return false;
+        };
+        (given.dev(), given.ino()) == (own.dev(), own.ino())
+            || (given.len() == own.len()
+                && given.modified().ok().is_some()
+                && given.modified().ok() == own.modified().ok())
+    };
+    Ok(
+        match named.filter(|given| given.is_absolute() && same(given)) {
+            Some(given) => given,
+            None => exe,
+        },
+    )
 }
 
 #[cfg(test)]

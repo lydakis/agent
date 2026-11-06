@@ -189,9 +189,14 @@ class AcpTests(ModelFixture):
         # The tool host that answered it is the daemon's, not the thread's,
         # as is the lookout.
         companions = self.daemon.request('companions')['result']['companions']
+        # Each runs by a name of its own, which is Sonny's program.
+        names = self.path / '.agent/sonny/programs/names'
         self.assertEqual(sorted((c['name'], c['command'], c['args'][0]) for c in companions),
-                         [('sonny-lookout', str(self.sonny.resolve()), 'lookout'),
-                          ('sonny-tool-host', str(self.sonny.resolve()), 'tool-host')])
+                         [('sonny-lookout', str(names / 'sonny-lookout'), 'lookout'),
+                          ('sonny-tool-host', str(names / 'sonny-tool-host'), 'tool-host')])
+        for companion in companions:
+            self.assertTrue(os.path.samefile(companion['command'], self.sonny.resolve()))
+            self.assertEqual(companion['env']['SONNY_PROGRAM'], str(self.sonny.resolve()))
         # The task was T3 Code's child of this prompt before it was answered.
         delegated = self.t3.calls.get_nowait()
         kinds = [u['sessionUpdate'] for u in updates]

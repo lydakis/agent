@@ -35,7 +35,7 @@ const SETTLE: Duration = Duration::from_secs(2);
 /// How long a note waits for messages still being read.
 const SETTLE_MAX: Duration = Duration::from_secs(15);
 /// How often subscription files are read again.
-const REREAD: Duration = Duration::from_secs(15);
+pub(crate) const REREAD: Duration = Duration::from_secs(15);
 /// How long a task waits on the person's approval before it is news.
 const APPROVAL_AFTER: Duration = Duration::from_secs(120);
 /// How long a running turn may print nothing before it is news.
@@ -56,12 +56,16 @@ const NOTE_ITEMS: usize = 16;
 /// them newer ones are not kept, and its next note says so.
 const WAITING: usize = 1024;
 
-/// What `sonny.lookout_waiting` says now, 0 for no limit. Settings that do
-/// not read keep the default.
+/// What `sonny.lookout_waiting` says now, 0 for no limit; and, read with
+/// it, the most notes a margin holds, the most of a task's notes its lead
+/// hears of at once. Settings that do not read keep the defaults.
 fn waiting() -> usize {
-    (agent_client::config::load()).map_or(WAITING, |config| {
-        usize::try_from(config.sonny.lookout_waiting).unwrap_or(usize::MAX)
-    })
+    let Ok(sonny) = agent_client::config::load().map(|config| config.sonny) else {
+        crate::margin::set_most_notes(agent_client::config::MARGIN_NOTES);
+        return WAITING;
+    };
+    crate::margin::set_most_notes(sonny.margin_notes);
+    usize::try_from(sonny.lookout_waiting).unwrap_or(usize::MAX)
 }
 
 /// Events from sources a subscriber's full lookout did not keep: how many,
@@ -632,7 +636,7 @@ pub(crate) fn write_moved(partial: &Path, path: &Path, text: &str) -> std::io::R
 /// This Sonny, told apart from another build of it: its version and when
 /// its binary was written.
 pub(crate) fn identity() -> String {
-    let written = std::env::current_exe()
+    let written = crate::named::me()
         .and_then(std::fs::metadata)
         .and_then(|meta| meta.modified())
         .ok()
@@ -725,6 +729,7 @@ async fn serve(settings: Settings) -> Result<(), String> {
         made: Made::default(),
         working: HashMap::new(),
         subscribers: HashMap::new(),
+        read_at: HashMap::new(),
         registry: Arc::default(),
         socket: settings.socket.clone(),
         lookouts: HashMap::new(),
@@ -850,6 +855,10 @@ struct Service {
     /// Subscriptions by subscriber, as their files held them at the last
     /// read.
     subscribers: HashMap<String, Vec<subs::Sub>>,
+    /// Which revision of each subscriber's file the lookout took and when,
+    /// kept beside the store ([`subs::taken`]) for its `subscriptions`
+    /// listing to show.
+    read_at: HashMap<String, subs::Took>,
     /// The subscribers' names, one set every lookout shares (Kubernetes'
     /// informer cache: one store, many readers), made again whenever
     /// subscriptions are worked out.
@@ -1135,7 +1144,11 @@ impl Service {
             crate::commons::subscribe_posters(&home, &self.store, &names);
         }
         subs::steer_files(&self.store);
+        let revisions = subs::revisions(&self.store);
         self.subscribers = subs::all(&self.store).into_iter().collect();
+        self.read_at.clear();
+        subs::take(&mut self.read_at, &revisions, epoch_ms());
+        subs::took(&self.store, &self.read_at);
         self.registry = watchers(&self.subscribers);
         for bot in &bots {
             self.seat(&client, bot).await;
@@ -1787,9 +1800,23 @@ impl Service {
     /// The subscription files as they are now: a bot that subscribed is
     /// watched, and each lookout watches what its file says.
     async fn reread(&mut self, client: &Client) {
+        let revisions = subs::revisions(&self.store);
         let read: HashMap<String, Vec<subs::Sub>> = subs::all(&self.store).into_iter().collect();
+        // Every revision read is kept, one that changes nothing and a
+        // file that went included, so the listing knows it was taken.
+        let now = epoch_ms();
+        if subs::take(&mut self.read_at, &revisions, now) {
+            subs::took(&self.store, &self.read_at);
+        }
         if read == self.subscribers {
             return;
+        }
+        // Each file whose subscriptions changed, said once it is read, so a
+        // rewritten filter is known to be live before an event it hears comes.
+        let changed = (read.iter())
+            .filter(|(name, subs)| self.subscribers.get(*name).is_some_and(|was| was != *subs));
+        for (name, _) in changed {
+            self.write(&json!({"at_ms": now, "lead": name, "reloaded": true}));
         }
         self.subscribers = read;
         self.registry = watchers(&self.subscribers);
@@ -4726,6 +4753,7 @@ mod tests {
             ),
             working: HashMap::new(),
             subscribers: HashMap::new(),
+            read_at: HashMap::new(),
             registry: Arc::default(),
             socket: PathBuf::new(),
             lookouts: HashMap::new(),

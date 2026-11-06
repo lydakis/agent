@@ -1,10 +1,12 @@
 //! One-off work an upgrade brings, each retired two releases after it
-//! ships. What needs judgment, or reaches what is the person's own (config
-//! they wrote, skills they changed, hosts this machine knows), is a step:
-//! words in `sonny/upgrades/ID.md` that the upgrade note hands the folder's
-//! lead, as release notes hand an operator, with a check in code that says
-//! when it is done. What a script does the same everywhere (a rewrite of
-//! Sonny's own files) is a migration: code that runs once, through
+//! ships. What needs judgment, or reaches what is the person's own (what
+//! they wrote in a setting's value or a command, skills they changed,
+//! hosts this machine knows), is a step: words in `sonny/upgrades/ID.md`
+//! that the upgrade note hands the folder's lead, as release notes hand an
+//! operator, with a check in code that says when it is done. What a script
+//! does the same everywhere (a rewrite of Sonny's own files, or a key
+//! renamed in the person's config, kept only when the file reads as the
+//! same settings after) is a migration: code that runs once, through
 //! [`once`]. The store's schema is neither; its migrations stay in the
 //! daemon for good, since each new store replays them.
 //!
@@ -50,7 +52,29 @@ impl Step {
 
 /// What this Sonny's upgrade asks agents to do. A new one is a file in
 /// `sonny/upgrades` and a row here, named in its feature's history.
-pub const STEPS: &[Step] = &[];
+pub const STEPS: &[Step] = &[
+    // A reviewer model set as `AGENT_JUDGE` in ~/.agent/env, unread since
+    // 0.8.0, moves to `[judge] model` (0.9.0).
+    Step {
+        id: "judge-env",
+        text: include_str!("../upgrades/judge-env.md"),
+        done: judge_env_done,
+        retire: "0.11.0",
+    },
+];
+
+/// Whether `~/.agent/env` sets no `AGENT_JUDGE`, the reviewer's model
+/// before 0.8.0 read it from `[judge] model`.
+fn judge_env_done() -> bool {
+    agent_client::env_file::path().is_none_or(|file| no_judge_in(&file))
+}
+
+/// Whether the env file at `file` sets no `AGENT_JUDGE`.
+fn no_judge_in(file: &Path) -> bool {
+    agent_client::env_file::read(file).map_or(true, |pairs| {
+        pairs.iter().all(|(key, _)| key != "AGENT_JUDGE")
+    })
+}
 
 /// Something Sonny does once itself, by [`once`], for as long as it is
 /// listed.
@@ -103,11 +127,28 @@ pub const MIGRATIONS: &[Migration] = &[
         id: crate::lookout::subs::STEER,
         retire: "0.10.0",
     },
+    // Sonny's scheduler job moves to a label that names no one (0.9.0).
+    Migration {
+        id: crate::scheduler::RELABELED,
+        retire: "0.11.0",
+    },
     // Each daemon's haiku claim is kept apart from the haiku shown, in
     // `haiku.json` (0.8.1).
     Migration {
         id: crate::haiku::CLAIMS,
         retire: "0.10.0",
+    },
+    // Each daemon's past haikus move from `haiku.json` to `haikus.jsonl`
+    // (0.9.0).
+    Migration {
+        id: crate::haiku::PAST,
+        retire: "0.11.0",
+    },
+    // `[sonny] sky_haikus`, a count, becomes the switch it is and the
+    // day's most, `sky_haiku_daily` (0.9.0).
+    Migration {
+        id: crate::haiku::DAILY,
+        retire: "0.11.0",
     },
 ];
 
@@ -186,6 +227,21 @@ fn overdue(now: &str, steps: &[Step], migrations: &[Migration]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_judge_set_in_the_env_file_is_a_step_until_it_goes() {
+        let dir = std::env::temp_dir().join(format!("judge-env-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("env");
+        assert!(no_judge_in(&file), "no file, nothing to do");
+        std::fs::write(&file, "OPENAI_API_KEY=k\nAGENT_JUDGE=openai/x\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(!no_judge_in(&file));
+        std::fs::write(&file, "OPENAI_API_KEY=k\n").unwrap();
+        assert!(no_judge_in(&file));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn nothing_outlives_its_release() {

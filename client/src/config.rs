@@ -20,6 +20,11 @@
 //! [fallbacks]                   # the model a declined request goes to, by model
 //! "anthropic/claude-opus-5-5" = "anthropic/claude-opus-4-8"
 //!
+//! [context_windows]             # tokens a model's context holds, over its provider's listing; restart the daemon to apply
+//! "bedrock/*" = 400000          # by PROVIDER/MODEL, * and ? wildcards; the most specific pattern wins
+//! "bedrock/*openai.*" = 1000000 # every OpenAI model on Bedrock
+//! "anthropic/claude-opus-5-5" = 500000  # lower than the model's own on purpose
+//!
 //! [judge]
 //! model = "openai/gpt-6-luna"   # who judges for the approver and the lookout
 //! effort = "low"                # a model judge's effort
@@ -33,11 +38,12 @@
 //! task_effort = "high"          # each new task's
 //! lead_profile = "my-lead"      # the role a new lead starts in, not lead
 //! task_profile = "worker"       # what every other agent is told, not task
-//! side_chat = "fork"            # "answer", the default, calls no tool
+//! side_chat = "answer"          # calls no tool; "fork", the default, may do anything its agent may
 //! chime = false                 # rings when work ends or waits, the default
 //! verbose = true                # every tool call drawn, not the clean view
 //! text_width = 0                # the widest the conversation is written, 100 by default; 0 the window's whole width
 //! margin_opens = "never"         # "always", the default, or "unless-closed"
+//! margin_notes = 40             # the most notes a margin holds, 20 by default; past it the oldest goes
 //! agent_opens = "beside"        # a click on an agent's name: "tab", the default, or "beside"
 //! suggest = false               # no guess at the next message, on by default
 //! commons = false               # agents go without the commons, on by default
@@ -46,7 +52,9 @@
 //! ask_wait_minutes = 60         # how long an unanswered ask waits to go ahead or remind; 0 never
 //! task_windows = 64            # task windows a lead keeps open, 32 by default; past it the least recently used closes, never one not looked at yet; 0 no limit
 //! task_depth = 3                # generations of tasks below a lead, 2 by default (tasks' own start none); 0 no end
-//! sky_haikus = 0                # haikus a day from the sky's busiest agent, 8 by default; 0 none
+//! sky_haikus = false            # no haikus from the sky's busiest agent, on by default
+//! sky_haiku_daily = 8           # haikus a day at most; 0, the default, no limit but the title's hold
+//! sky_haiku_keep = 168          # hours haikus are kept for replays, 24 by default; 0 keeps all
 //! sky_haiku_window = 10         # minutes of messages and tool calls that make an agent busiest
 //! sky_haiku_margin = 50         # how much busier, in percent, a challenger must be to take the title
 //! sky_haiku_hold = 10           # minutes the title is held before it can pass
@@ -89,6 +97,9 @@ use std::path::{Path, PathBuf};
 /// The largest file the reader takes.
 pub const LIMIT: u64 = 64 * 1024;
 
+/// The least context window `[context_windows]` sets, as the daemon takes it.
+pub const MIN_WINDOW: u64 = 1024;
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Config {
     /// `provider/model` for a new agent that names none.
@@ -117,6 +128,12 @@ pub struct Config {
     /// agent on that model that names none sends a request a safety
     /// classifier declined to it, that request alone.
     pub fallbacks: BTreeMap<String, String>,
+    /// `[context_windows]`: the context window, in tokens, of each model
+    /// whose `PROVIDER/MODEL` path a pattern matches, `*` and `?` wildcards,
+    /// the most specific pattern winning, over what its provider lists.
+    /// Unset, the provider's listing, else the daemon's own default. The
+    /// agent CLI starts the daemon with them.
+    pub context_windows: BTreeMap<String, u64>,
     pub judge: Judge,
     pub shell_environment_policy: ShellEnvironmentPolicy,
     pub sonny: Sonny,
@@ -433,6 +450,9 @@ pub struct Sonny {
     pub text_width: u64,
     /// When a note the agent puts up or changes opens the margin.
     pub margin_opens: MarginOpens,
+    /// The most notes a margin holds: a new one past it lets the oldest
+    /// go. At least 1.
+    pub margin_notes: u64,
     /// Where a click on an agent's name takes the person; a right click
     /// takes them to the other.
     pub agent_opens: AgentOpens,
@@ -466,9 +486,14 @@ pub struct Sonny {
     /// How many generations below a lead its line goes: a lead's tasks
     /// are the first, and an agent of the last starts none; 0 for no end.
     pub task_depth: u64,
-    /// The haikus a day the sky's busiest agent writes, each time the
-    /// title passes; 0 for none.
-    pub sky_haikus: u64,
+    /// Whether the sky's busiest agent writes a haiku each time the title
+    /// passes.
+    pub sky_haikus: bool,
+    /// The most haikus a day; 0 for no limit, the title's hold being
+    /// bound enough.
+    pub sky_haiku_daily: u64,
+    /// The hours haikus are kept for replays; 0 keeps them all.
+    pub sky_haiku_keep: u64,
     /// The minutes of messages and tool calls that make an agent busiest.
     pub sky_haiku_window: u64,
     /// How much busier, in percent, a challenger must be to take the
@@ -531,6 +556,11 @@ pub const COMMONS_DIGEST: &str = "15m";
 /// 100 (rustfmt's own width), so they stay whole at 100.
 pub const TEXT_WIDTH: u64 = 100;
 
+/// The most notes a margin holds unless `margin_notes` says otherwise:
+/// a working set to glance at, as Codex's plan and Claude Code's todo
+/// list are, not an archive.
+pub const MARGIN_NOTES: u64 = 20;
+
 /// The narrowest `text_width` other than 0, the margin's own least width:
 /// a narrower column wraps a path or a line of code at every turn.
 pub const TEXT_WIDTH_LEAST: u64 = 40;
@@ -576,7 +606,9 @@ impl Default for Sonny {
             ask_wait_minutes: 60,
             task_windows: 32,
             task_depth: 2,
-            sky_haikus: 8,
+            sky_haikus: true,
+            sky_haiku_daily: 0,
+            sky_haiku_keep: 24,
             sky_haiku_window: 10,
             sky_haiku_margin: 50,
             sky_haiku_hold: 10,
@@ -587,6 +619,7 @@ impl Default for Sonny {
             text_width: TEXT_WIDTH,
             start_at_boot: false,
             margin_opens: MarginOpens::default(),
+            margin_notes: MARGIN_NOTES,
             agent_opens: AgentOpens::default(),
             sources: Vec::new(),
             browser_confirm: BROWSER_CONFIRM.map(str::to_owned).to_vec(),
@@ -595,13 +628,13 @@ impl Default for Sonny {
     }
 }
 
-/// What the copy `/side` talks to may do: `"answer"`, the default, from
-/// what its agent knows, calling no tool; or `"fork"`, anything its agent
-/// may, with its tools, in its folder, under its approvals.
+/// What the copy `/side` talks to may do: `"fork"`, the default, anything
+/// its agent may, with its tools, in its folder, under its approvals; or
+/// `"answer"`, from what its agent knows, calling no tool.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SideChat {
-    #[default]
     Answer,
+    #[default]
     Fork,
 }
 
@@ -1084,6 +1117,28 @@ fn parse(text: &str) -> Result<Config, String> {
             config.attach_wait_ms = Some(ms);
             continue;
         }
+        if name == "context_windows" {
+            let models = value.as_table().ok_or("context_windows must be a table")?;
+            for (pattern, tokens) in models {
+                let tokens = tokens
+                    .as_integer()
+                    .filter(|tokens| *tokens >= MIN_WINDOW as i64)
+                    .ok_or_else(|| {
+                        format!(
+                            "context_windows.{pattern} is a number of tokens, at least {MIN_WINDOW}"
+                        )
+                    })?;
+                if !pattern.contains('/') || pattern.contains(char::is_whitespace) {
+                    return Err(format!(
+                        "context_windows keys are PROVIDER/MODEL, * and ? wildcards, as \"bedrock/*\", not {pattern:?}"
+                    ));
+                }
+                config
+                    .context_windows
+                    .insert(pattern.clone(), tokens as u64);
+            }
+            continue;
+        }
         if name == "fallbacks" {
             let models = value.as_table().ok_or("fallbacks must be a table")?;
             for (model, fallback) in models {
@@ -1157,6 +1212,7 @@ fn parse(text: &str) -> Result<Config, String> {
                 "verbose",
                 "text_width",
                 "margin_opens",
+                "margin_notes",
                 "agent_opens",
                 "suggest",
                 "start_at_boot",
@@ -1167,6 +1223,8 @@ fn parse(text: &str) -> Result<Config, String> {
                 "task_windows",
                 "task_depth",
                 "sky_haikus",
+                "sky_haiku_daily",
+                "sky_haiku_keep",
                 "sky_haiku_window",
                 "sky_haiku_margin",
                 "sky_haiku_hold",
@@ -1235,8 +1293,17 @@ fn parse(text: &str) -> Result<Config, String> {
                 "commons" => Some(&mut config.sonny.commons),
                 "verbose" => Some(&mut config.sonny.verbose),
                 "start_at_boot" => Some(&mut config.sonny.start_at_boot),
+                "sky_haikus" => Some(&mut config.sonny.sky_haikus),
                 _ => None,
             } {
+                // A count was 0.8's: the switch and the day's most are two
+                // keys now, and 0 says "no limit" where it said "none".
+                if key == "sky_haikus" && value.is_integer() {
+                    return Err(format!(
+                        "{name}.{key} is true or false; the most haikus a day is \
+                         {name}.sky_haiku_daily, 0 for no limit"
+                    ));
+                }
                 *switch = value
                     .as_bool()
                     .ok_or_else(|| format!("{name}.{key} must be true or false"))?;
@@ -1248,13 +1315,15 @@ fn parse(text: &str) -> Result<Config, String> {
                 "ask_wait_minutes" => Some(&mut config.sonny.ask_wait_minutes),
                 "task_windows" => Some(&mut config.sonny.task_windows),
                 "task_depth" => Some(&mut config.sonny.task_depth),
-                "sky_haikus" => Some(&mut config.sonny.sky_haikus),
+                "sky_haiku_daily" => Some(&mut config.sonny.sky_haiku_daily),
+                "sky_haiku_keep" => Some(&mut config.sonny.sky_haiku_keep),
                 "sky_haiku_window" => Some(&mut config.sonny.sky_haiku_window),
                 "sky_haiku_margin" => Some(&mut config.sonny.sky_haiku_margin),
                 "sky_haiku_hold" => Some(&mut config.sonny.sky_haiku_hold),
                 "tool_processes" => Some(&mut config.sonny.tool_processes),
                 "lookout_waiting" => Some(&mut config.sonny.lookout_waiting),
                 "text_width" => Some(&mut config.sonny.text_width),
+                "margin_notes" => Some(&mut config.sonny.margin_notes),
                 _ => None,
             } {
                 *count = (value.as_integer())
@@ -1265,6 +1334,11 @@ fn parse(text: &str) -> Result<Config, String> {
                     return Err(format!(
                         "{name}.{key} must be 0, for the window's whole width, \
                          or at least {TEXT_WIDTH_LEAST}, not {width}"
+                    ));
+                }
+                if key == "margin_notes" && config.sonny.margin_notes == 0 {
+                    return Err(format!(
+                        "{name}.{key} is the most notes a margin holds, at least 1, not 0"
                     ));
                 }
                 continue;
@@ -1909,14 +1983,26 @@ mod tests {
         assert!(parse("[sonny]\nbrowser_confirm = \"eval\"").is_err());
         assert!(parse("[sonny]\ncommons_invites = -1").is_err());
         assert!(parse("[sonny]\ncommons_invites = \"3\"").is_err());
-        let sky = (config.sonny.sky_haikus, config.sonny.sky_haiku_window);
-        assert_eq!(sky, (8, 10));
+        let sky = (config.sonny.sky_haikus, config.sonny.sky_haiku_daily);
+        assert_eq!(sky, (true, 0));
+        assert_eq!(config.sonny.sky_haiku_keep, 24);
+        assert_eq!(config.sonny.sky_haiku_window, 10);
         let sky = (config.sonny.sky_haiku_margin, config.sonny.sky_haiku_hold);
         assert_eq!(sky, (50, 10));
-        assert_eq!(
-            parse("[sonny]\nsky_haikus = 0").unwrap().sonny.sky_haikus,
-            0
+        assert!(
+            !(parse("[sonny]\nsky_haikus = false")
+                .unwrap()
+                .sonny
+                .sky_haikus)
         );
+        let daily = parse("[sonny]\nsky_haiku_daily = 8\nsky_haiku_keep = 0").unwrap();
+        assert_eq!(
+            (daily.sonny.sky_haiku_daily, daily.sonny.sky_haiku_keep),
+            (8, 0)
+        );
+        // 0.8's count is refused by name, never read as "no limit".
+        let old = parse("[sonny]\nsky_haikus = 0").unwrap_err();
+        assert!(old.contains("sky_haiku_daily"), "{old}");
         assert!(parse("[sonny]\nsky_haiku_margin = 1.5").is_err());
         assert_eq!(config.sonny.text_width, 100);
         let text_width = |text: &str| parse(text).map(|config| config.sonny.text_width);
@@ -1931,6 +2017,13 @@ mod tests {
             )
         );
         assert!(text_width("[sonny]\ntext_width = -1").is_err());
+        let notes = |text: &str| parse(text).map(|config| config.sonny.margin_notes);
+        assert_eq!(notes(""), Ok(MARGIN_NOTES));
+        assert_eq!(notes("[sonny]\nmargin_notes = 40"), Ok(40));
+        assert_eq!(
+            notes("[sonny]\nmargin_notes = 0"),
+            Err("sonny.margin_notes is the most notes a margin holds, at least 1, not 0".into())
+        );
         assert_eq!(config.sonny.task_depth, 2);
         assert_eq!(
             parse("[sonny]\ntask_depth = 0").unwrap().sonny.task_depth,
@@ -1944,9 +2037,9 @@ mod tests {
         let off = parse("web_search = \"disabled\"").unwrap();
         assert_eq!(off.web_search, WebSearch::Disabled);
         assert!(!config.hide_senders);
-        assert_eq!(config.sonny.side_chat, SideChat::Answer);
-        let fork = parse("[sonny]\nside_chat = \"fork\"").unwrap();
-        assert_eq!(fork.sonny.side_chat, SideChat::Fork);
+        assert_eq!(config.sonny.side_chat, SideChat::Fork);
+        let answer = parse("[sonny]\nside_chat = \"answer\"").unwrap();
+        assert_eq!(answer.sonny.side_chat, SideChat::Answer);
         assert_eq!(config.sonny.margin_opens, MarginOpens::Always);
         let never = parse("[sonny]\nmargin_opens = \"never\"").unwrap();
         assert_eq!(never.sonny.margin_opens, MarginOpens::Never);
@@ -1967,6 +2060,19 @@ mod tests {
         assert_eq!(fallbacks.get("a/big").map(String::as_str), Some("a/other"));
         assert!(parse("[fallbacks]\n\"a/big\" = 1\n").is_err());
         assert!(parse("fallbacks = \"a/other\"").is_err());
+        let windows = parse("[context_windows]\n\"bedrock/*\" = 400000\n\"a/b\" = 1024\n")
+            .unwrap()
+            .context_windows;
+        assert_eq!(windows.get("bedrock/*"), Some(&400_000));
+        assert_eq!(windows.get("a/b"), Some(&1024));
+        for wrong in [
+            "[context_windows]\n\"bedrock\" = 400000\n",
+            "[context_windows]\n\"a/b\" = 1000\n",
+            "[context_windows]\n\"a/b\" = \"1M\"\n",
+            "context_windows = 400000\n",
+        ] {
+            assert!(parse(wrong).is_err(), "{wrong}");
+        }
         for (text, error) in [
             (
                 "web_search = \"cached\"",

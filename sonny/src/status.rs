@@ -142,16 +142,25 @@ pub fn plain_line(text: &str) -> String {
     String::new()
 }
 
-/// The lead, then its tasks by group, resolved ones only counted unless
-/// `resolved` shows them; and the line each agent's rows start on, with
-/// its bot, for a click there to open it.
-pub fn card(
-    project: &str,
-    rows: &[Row],
-    width: usize,
-    resolved: bool,
-) -> (Vec<Line<'static>>, Vec<(usize, String)>) {
+/// The groups `/status` folds to their heading until opened: those the
+/// person has nothing to do for, and a click or a key opens.
+pub const FOLDS: [Group; 2] = [Group::Done, Group::Resolved];
+
+/// What `/status` shows of a project: the lead, then its tasks by group,
+/// done and resolved ones folded to their heading unless `open` holds
+/// their group; the line each agent's rows start on, with its bot, for a
+/// click there to open it; and the heading of each group that folds, for
+/// a click there to open or fold it.
+pub struct Card {
+    pub lines: Vec<Line<'static>>,
+    pub named: Vec<(usize, String)>,
+    pub folds: Vec<(usize, Group)>,
+}
+
+/// See [`Card`].
+pub fn card(project: &str, rows: &[Row], width: usize, open: &[Group]) -> Card {
     let mut named = Vec::new();
+    let mut folds = Vec::new();
     let tasks: Vec<&Row> = rows.iter().filter(|r| r.name != "lead").collect();
     let count = |group: Group| tasks.iter().filter(|r| r.group == group).count();
     let mut head = format!(
@@ -185,20 +194,31 @@ pub fn card(
             continue;
         }
         out.push(Line::default());
-        if group == Group::Resolved && !resolved {
-            out.push(Line::from(format!("{n} resolved · r shows them")).dim());
-            continue;
-        }
-        out.push(Line::from(vec![
+        let mut heading = vec![
             Span::raw(group.heading()).bold(),
             Span::raw(format!(" · {n}")).dim(),
-        ]));
+        ];
+        // A group with nothing for the person folds to its heading, as
+        // a fold of calls does: ▸ shut, ▾ open.
+        let shut = FOLDS.contains(&group) && !open.contains(&group);
+        if FOLDS.contains(&group) {
+            folds.push((out.len(), group));
+            heading.push(Span::raw(if shut { " ▸" } else { " ▾" }).dim());
+        }
+        out.push(Line::from(heading));
+        if shut {
+            continue;
+        }
         for row in tasks.iter().filter(|r| r.group == group) {
             named.push((out.len(), row.bot.clone()));
             out.extend(row_lines(row, width));
         }
     }
-    (out, named)
+    Card {
+        lines: out,
+        named,
+        folds,
+    }
 }
 
 /// Something wrong around the agents, which `/status` says under its
@@ -666,14 +686,14 @@ mod tests {
             },
             row("old", "done", Group::Resolved),
         ];
-        let text = |resolved| -> Vec<String> {
-            card("calc", &rows, 100, resolved)
-                .0
+        let text = |open: &[Group]| -> Vec<String> {
+            card("calc", &rows, 100, open)
+                .lines
                 .iter()
                 .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
                 .collect()
         };
-        let folded = text(false);
+        let folded = text(&[]);
         assert_eq!(folded[0], "calc · 3 tasks · 1 need you · 1 to review");
         assert_eq!(folded[1], " ● lead working · 42s");
         // The profile is said even when it is the seat's own.
@@ -689,15 +709,57 @@ mod tests {
             folded[10],
             "   GPT 6.1 Sol · chatgpt · task profile · tab 1 · o/r#9 · ↻ 1 automation"
         );
-        assert_eq!(folded.last().unwrap(), "1 resolved · r shows them");
-        let (_, named) = card("calc", &rows, 100, false);
-        let named: Vec<(usize, &str)> = named.iter().map(|(at, n)| (*at, n.as_str())).collect();
+        assert_eq!(folded.last().unwrap(), "Resolved · 1 ▸");
+        let card_of = card("calc", &rows, 100, &[]);
+        let named: Vec<(usize, &str)> = (card_of.named.iter())
+            .map(|(at, n)| (*at, n.as_str()))
+            .collect();
         assert_eq!(
             named,
             [(1, "calc.lead"), (5, "calc.zero"), (9, "calc.equal")]
         );
-        let shown = text(true);
-        assert_eq!(shown[shown.len() - 3], "Resolved · 1");
+        assert_eq!(card_of.folds, [(folded.len() - 1, Group::Resolved)]);
+        let shown = text(&[Group::Resolved]);
+        assert_eq!(shown[shown.len() - 3], "Resolved · 1 ▾");
         assert_eq!(shown[shown.len() - 2], " ✓ old done · took 42s");
+    }
+
+    #[test]
+    fn done_tasks_fold_to_their_heading_until_opened() {
+        let row = |name: &str, group: Group| Row {
+            name: name.into(),
+            bot: format!("calc.{name}"),
+            state: "done".into(),
+            seconds: Some(42),
+            group,
+            ..Row::default()
+        };
+        let rows = [
+            row("lead", Group::Done),
+            Row {
+                running: true,
+                state: "working".into(),
+                ..row("busy", Group::Working)
+            },
+            row("one", Group::Done),
+            row("two", Group::Done),
+        ];
+        let text = |card: &Card| -> Vec<String> {
+            (card.lines.iter())
+                .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+                .collect()
+        };
+        let shut = card("calc", &rows, 100, &[]);
+        let lines = text(&shut);
+        assert_eq!(lines.last().unwrap(), "Done · 2 ▸");
+        assert!(!lines.iter().any(|line| line.contains("one done")));
+        let heading = lines.len() - 1;
+        assert_eq!(shut.folds, [(heading, Group::Done)]);
+        assert!(shut.named.iter().all(|(_, bot)| bot != "calc.one"));
+        let open = card("calc", &rows, 100, &[Group::Done]);
+        let lines = text(&open);
+        assert_eq!(lines[heading], "Done · 2 ▾");
+        assert!(lines.iter().any(|line| line.contains("one done")));
+        assert_eq!(open.folds, [(heading, Group::Done)]);
     }
 }

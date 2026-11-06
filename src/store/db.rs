@@ -1975,6 +1975,42 @@ fn entry(cursor: i64, bot: &str, turn: Option<i64>, kind: &str, data: Value) -> 
 /// A stored event as read back: its entry with `written_ms`, the Unix ms
 /// it joined the store, when it has one (events from before the column
 /// existed have none).
+/// The most kinds `events_of_kinds` takes, each read from its place in the
+/// index (SQLite allows 500 arms in a compound). A follow of more pages
+/// every event and filters them as they are sent, which costs each page its
+/// limit however rare the kinds are.
+pub const EVENT_PAGE_KINDS: usize = 64;
+/// Every bot's next events of one kind (`?3`) after `?1`, at most `?2`,
+/// from the kind's place in the index.
+const KINDS_PAGE: &str = "SELECT id,turn,kind,data,bot,written_ms FROM events WHERE id IN
+    (SELECT id FROM events INDEXED BY events_kind_cursor WHERE kind=?3 AND id>?1 ORDER BY id LIMIT ?2)
+    ORDER BY id LIMIT ?2";
+const KIND_CURSORS: &str = "SELECT id FROM events INDEXED BY events_kind_cursor WHERE kind=?3 AND id>?1 ORDER BY id LIMIT ?2";
+/// One kind's cursors as an arm of a compound, which takes no `LIMIT` of
+/// its own unless wrapped (SQLite flattens the wrapper).
+const KIND_ARM: &str = "SELECT * FROM (SELECT id FROM events INDEXED BY events_kind_cursor
+    WHERE kind=?3 AND id>?1 ORDER BY id LIMIT ?2)";
+
+/// [`KINDS_PAGE`] for `kinds` distinct kinds bound from `?3` on, as one
+/// statement: the page's first `?2` are among each kind's first `?2`.
+fn kinds_page(kinds: usize) -> String {
+    let page = re_spaced(KINDS_PAGE);
+    let cursors = re_spaced(KIND_CURSORS);
+    let wanted = match kinds {
+        1 => return page,
+        _ => (0..kinds)
+            .map(|at| re_spaced(KIND_ARM).replace("kind=?3", &format!("kind=?{}", at + 3)))
+            .collect::<Vec<_>>()
+            .join(" UNION ALL "),
+    };
+    page.replace(&cursors, &wanted)
+}
+
+/// A statement on one line, as written across several.
+fn re_spaced(sql: &str) -> String {
+    sql.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 fn stored_entry(
     cursor: i64,
     bot: &str,
@@ -1994,7 +2030,7 @@ impl Database {
     /// Stored schema version, kept in `PRAGMA user_version`. Stores created
     /// before versioning and stores from newer binaries are rejected; an older
     /// versioned store is migrated forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 79;
+    pub const SCHEMA: i32 = 81;
     /// Verbatim user prompts a compaction keeps: per-prompt text, and the
     /// total text plus `(ordinal, String)` entry metadata. Empty entries cost
     /// space too, so the retained list cannot grow with conversation length.
@@ -2034,6 +2070,14 @@ impl Database {
         })
     }
 
+    /// Set this connection's page cache to `kib`, as a reader's share of
+    /// the readers' budget.
+    pub fn cache_kib(&self, kib: usize) -> Result<()> {
+        self.conn
+            .execute_batch(&format!("PRAGMA cache_size=-{}", kib.max(1)))?;
+        Ok(())
+    }
+
     pub fn initialize(conn: Connection) -> Result<Self> {
         // FULL syncs the WAL before a commit is answered. An answer survives
         // a daemon crash, but on macOS plain fsync can leave writes in the
@@ -2063,6 +2107,11 @@ impl Database {
             [],
             |r| r.get(0),
         )?;
+        // An older store is copied and the copy checked before migrating,
+        // so a release can go back to the store as it was.
+        if version != 0 && version < Self::SCHEMA {
+            back_up(&conn, version)?;
+        }
         // Initialize a fresh store atomically; existing stores must match.
         let tx = conn.unchecked_transaction()?;
         match version {
@@ -2228,6 +2277,7 @@ impl Database {
             INSERT OR IGNORE INTO event_retention VALUES (1,0);
             CREATE INDEX IF NOT EXISTS events_bot_cursor ON events(bot,id);
             CREATE INDEX IF NOT EXISTS events_turn_kind_cursor ON events(turn,kind,id);
+            CREATE INDEX IF NOT EXISTS events_kind_cursor ON events(kind,id);
             CREATE INDEX IF NOT EXISTS checkpoints_head ON checkpoints(head);
             CREATE INDEX IF NOT EXISTS turns_running ON turns(id) WHERE status='running';
             CREATE INDEX IF NOT EXISTS turns_waiting ON turns(id) WHERE status='waiting';
@@ -4639,6 +4689,16 @@ impl Database {
             "UPDATE bots SET compaction=?,context_start=? WHERE name=?",
             params![bot.head, plan.cut, name],
         )?;
+        // What started it, which the request carries, goes beside it with
+        // the room left under its threshold.
+        let mut request = request;
+        let trigger = request
+            .as_object_mut()
+            .and_then(|request| request.remove("trigger"))
+            .filter(|trigger| !trigger.is_null());
+        let room = (trigger.as_ref())
+            .and_then(|trigger| trigger["at_bytes"].as_i64())
+            .map(|at| at - after.bytes as i64);
         let data = json!({"version":bot.head,"cut":plan.cut,"pinned":plan.pinned,"pinned_messages":pins,"previous":previous,"covered_turns":[covered_from, plan.covered.1],
             "span_turns":[plan.covered.0, plan.covered.1],
             "items":plan.ids.len(),"bytes":plan.sizes.iter().map(|s| *s as u64).sum::<u64>(),
@@ -4650,6 +4710,7 @@ impl Database {
             "headroom_items":input_limit.items as i64 - after.items as i64,
             "reclaimed_bytes":before.bytes - after.bytes,
             "reclaimed_items":before.items - after.items,
+            "trigger":trigger,"room_bytes":room,
             "request":request});
         // Successful summaries and their accounting share one fsync/commit.
         if let Some(turn) = bot.running_turn {
@@ -10017,6 +10078,18 @@ impl Database {
             |r| r.get(0),
         )?)
     }
+    /// Whether `id` is a command of `bot`'s that runs now.
+    pub fn runs_for(&self, bot: &str, id: i64) -> Result<bool> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT 1 FROM processes WHERE id=? AND bot=? AND status='running'",
+                params![id, bot],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
     /// `None` for an unknown id; otherwise the status and any recorded result.
     pub fn process_result(&self, id: i64) -> Result<Option<(String, Option<Value>)>> {
         let row: Option<(String, Option<String>)> = self
@@ -10346,31 +10419,40 @@ impl Database {
     }
     pub fn events(&self, name: &str, after: i64, limit: usize) -> Result<Value> {
         self.inspect(name)?;
-        self.event_page(Some(name), after, limit)
+        self.event_page(Some(name), None, after, limit)
     }
     /// Every bot's durable events after a store-wide cursor: what a fleet
     /// controller replays on one connection instead of one per bot.
     pub fn events_after(&self, after: i64, limit: usize) -> Result<Value> {
-        self.event_page(None, after, limit)
+        self.event_page(None, None, after, limit)
     }
-    fn event_page(&self, name: Option<&str>, after: i64, limit: usize) -> Result<Value> {
+    /// [`Self::events_after`], only of `kinds`. Each kind's next events
+    /// come from its own place in the `events_kind_cursor` index, in one
+    /// statement and so one snapshot, so a page costs the events it
+    /// returns, not every event written between them.
+    pub fn events_of_kinds(&self, kinds: &[&str], after: i64, limit: usize) -> Result<Value> {
+        self.event_page(None, Some(kinds), after, limit)
+    }
+    fn event_page(
+        &self,
+        name: Option<&str>,
+        kinds: Option<&[&str]>,
+        after: i64,
+        limit: usize,
+    ) -> Result<Value> {
         if after < 0 || !(1..=256).contains(&limit) {
             return fail_with(
                 "invalid_event_page",
                 "limit must be 1 to 256 and after 0 or more",
             );
         }
-        let mut stmt = self.conn.prepare_cached(match name {
-            Some(_) => "SELECT id,turn,kind,data,bot,written_ms FROM events WHERE bot=?1 AND id>?2 ORDER BY id LIMIT ?3",
-            None => "SELECT id,turn,kind,data,bot,written_ms FROM events WHERE ?1 IS NULL AND id>?2 ORDER BY id LIMIT ?3",
-        })?;
-        let mut rows = stmt.query(params![name, after, limit as i64])?;
         let mut events = Vec::new();
         let mut cursor = after;
         // Leave ample room for the response envelope and its caller-supplied ID.
         let mut bytes = 0;
         let byte_limit = crate::output::MAX_EVENT / 2;
-        while let Some(row) = rows.next()? {
+        // Takes one stored event onto the page, or says the page is full.
+        let mut take = |row: &rusqlite::Row| -> Result<bool> {
             let next: i64 = row.get(0)?;
             let data: String = row.get(3)?;
             let bot: String = row.get(4)?;
@@ -10387,11 +10469,40 @@ impl Database {
                 if events.is_empty() {
                     return fail("event_page_item_limit");
                 }
-                break;
+                return Ok(false);
             }
             bytes += size;
             cursor = next;
             events.push(item);
+            Ok(true)
+        };
+        let mut stmt;
+        let mut rows = match kinds {
+            None => {
+                stmt = self.conn.prepare_cached(match name {
+                    Some(_) => "SELECT id,turn,kind,data,bot,written_ms FROM events WHERE bot=?1 AND id>?2 ORDER BY id LIMIT ?3",
+                    None => "SELECT id,turn,kind,data,bot,written_ms FROM events WHERE ?1 IS NULL AND id>?2 ORDER BY id LIMIT ?3",
+                })?;
+                stmt.query(params![name, after, limit as i64])?
+            }
+            Some(kinds) => {
+                let mut kinds = kinds.to_vec();
+                kinds.sort_unstable();
+                kinds.dedup();
+                if !(1..=EVENT_PAGE_KINDS).contains(&kinds.len()) {
+                    return fail_with("invalid_event_page", "kinds must name 1 to 64 kinds");
+                }
+                stmt = self.conn.prepare_cached(&kinds_page(kinds.len()))?;
+                let most = limit as i64;
+                let mut values: Vec<&dyn rusqlite::ToSql> = vec![&after, &most];
+                values.extend(kinds.iter().map(|kind| kind as &dyn rusqlite::ToSql));
+                stmt.query(&values[..])?
+            }
+        };
+        while let Some(row) = rows.next()? {
+            if !take(row)? {
+                break;
+            }
         }
         let pruned: i64 = match name {
             Some(name) => {
@@ -12650,6 +12761,98 @@ fn turn_status_name(status: &str) -> &'static str {
 fn node(conn: &Connection, parent: Option<i64>, item: &[u8]) -> Result<i64> {
     node_with_turn(conn, parent, item, None)
 }
+
+/// How many copies of the store, one per schema it migrated from, are kept.
+const BACKUPS: usize = 2;
+
+/// Copy the store at `version`, before it migrates, to
+/// `<store>.schema-<version>.backup` beside it, with the store's
+/// permissions, and check the copy: it opens, passes SQLite's integrity
+/// check and is at `version`. Only the newest [`BACKUPS`] are kept. A store
+/// that cannot be copied is not migrated: `store_backup_failed` says why.
+fn back_up(conn: &Connection, version: i32) -> Result<()> {
+    let Some(store) = conn
+        .path()
+        .filter(|path| !path.is_empty())
+        .map(std::path::PathBuf::from)
+    else {
+        return Ok(());
+    };
+    let failed = |why: String| Error::with("store_backup_failed", why);
+    let name = store
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned());
+    let (Some(folder), Some(name)) = (store.parent(), name) else {
+        return Ok(());
+    };
+    let copy = folder.join(format!("{name}.schema-{version}.backup"));
+    let partial = folder.join(format!("{name}.schema-{version}.backup.partial"));
+    let _ = std::fs::remove_file(&partial);
+    // Made empty first with the store's permissions, since the copy holds
+    // everything the store does.
+    let checked = std::fs::File::create_new(&partial)
+        .and_then(|file| file.set_permissions(std::fs::metadata(&store)?.permissions()))
+        .map_err(|error| format!("could not create {}: {error}", partial.display()))
+        .and_then(|_| {
+            conn.execute("VACUUM INTO ?1", [partial.to_string_lossy()])
+                .map_err(|error| {
+                    format!("could not copy the store to {}: {error}", partial.display())
+                })
+        })
+        .and_then(|_| {
+            let copied =
+                Connection::open_with_flags(&partial, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                    .map_err(|error| error.to_string())?;
+            let check: String = copied
+                .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+                .map_err(|error| error.to_string())?;
+            let at: i32 = copied
+                .query_row("PRAGMA user_version", [], |r| r.get(0))
+                .map_err(|error| error.to_string())?;
+            if check != "ok" || at != version {
+                return Err(format!(
+                    "the copy at {} did not check out: integrity {check}, schema {at}",
+                    partial.display()
+                ));
+            }
+            Ok(())
+        })
+        .and_then(|_| {
+            std::fs::rename(&partial, &copy)
+                .map_err(|error| format!("could not name the copy {}: {error}", copy.display()))
+        });
+    if let Err(why) = checked {
+        // Only a file this attempt made: what stood there before is left.
+        if std::fs::metadata(&partial).is_ok_and(|meta| meta.is_file()) {
+            let _ = std::fs::remove_file(&partial);
+        }
+        return Err(failed(format!(
+            "{why}; the store was left at schema {version}"
+        )));
+    }
+    // The newest copies by the schema they were taken at; the rest go.
+    let prefix = format!("{name}.schema-");
+    let mut kept: Vec<(i32, std::path::PathBuf)> = std::fs::read_dir(folder)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let file = entry.file_name().to_string_lossy().into_owned();
+            let at = file
+                .strip_prefix(&prefix)?
+                .strip_suffix(".backup")?
+                .parse()
+                .ok()?;
+            Some((at, entry.path()))
+        })
+        .collect();
+    kept.sort_by_key(|(at, _)| std::cmp::Reverse(*at));
+    for (_, old) in kept.into_iter().skip(BACKUPS) {
+        let _ = std::fs::remove_file(old);
+    }
+    Ok(())
+}
+
 /// Bring an older versioned store forward to the current schema inside the
 /// caller's transaction. Each step converts stored data once; the runtime has
 /// no other knowledge of earlier formats.
@@ -13674,9 +13877,9 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
     {
         conn.execute("ALTER TABLE turns ADD COLUMN held TEXT", [])?;
     }
-    // Schema 79: a turn may ask that its reply follow a JSON Schema. Those
+    // Schema 81: a turn may ask that its reply follow a JSON Schema. Those
     // sent before asked for none.
-    if from < 79
+    if from < 81
         && conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='turns')
              AND NOT EXISTS(SELECT 1 FROM pragma_table_info('turns') WHERE name='output_schema')",
@@ -14301,6 +14504,78 @@ mod tests {
             many <= few + 8,
             "{few} steps for 10 untold, {many} for 10,000"
         );
+    }
+
+    #[test]
+    fn a_page_of_rare_kinds_costs_what_it_returns() {
+        // Every bot's events of two rare kinds, among `common` others.
+        let store = |common: i64| {
+            let db = Database::initialize(Connection::open_in_memory().unwrap()).unwrap();
+            db.conn.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+            db.conn
+                .execute(
+                    "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<?1)
+                     INSERT INTO events(bot,turn,kind,data)
+                     SELECT CASE i%3 WHEN 0 THEN 'Ann' ELSE 'Bob' END,1,
+                      CASE WHEN i IN (2,?1/2,?1-1) THEN 'turn_finished'
+                           WHEN i=?1/3 THEN 'accepted' ELSE 'tool_started' END,
+                      '{\"pad\":\"'||printf('%.800c','x')||'\"}' FROM n",
+                    [common],
+                )
+                .unwrap();
+            db
+        };
+        let kinds = ["turn_finished", "accepted", "turn_finished"];
+        let steps = |common: i64| {
+            let db = store(common);
+            let page = db.events_of_kinds(&kinds, 0, 256).unwrap();
+            let got: Vec<&str> = (page["events"].as_array().unwrap().iter())
+                .map(|e| e["event"].as_str().unwrap())
+                .collect();
+            assert_eq!(
+                got,
+                [
+                    "turn_finished",
+                    "accepted",
+                    "turn_finished",
+                    "turn_finished"
+                ]
+            );
+            let step = |sql: &str| {
+                (db.conn.prepare_cached(sql).unwrap()).get_status(rusqlite::StatementStatus::VmStep)
+            };
+            step(&kinds_page(2))
+        };
+        let (few, many) = (steps(30), steps(30_000));
+        assert!(
+            many <= few + 8,
+            "{few} steps among 30 events, {many} among 30,000"
+        );
+        // As many kinds as a page takes, a page of a common one still
+        // stops at its limit; past them, none is read.
+        let names: Vec<String> = (1..EVENT_PAGE_KINDS)
+            .map(|at| format!("kind_{at}"))
+            .collect();
+        let mut common: Vec<&str> = std::iter::once("tool_started")
+            .chain(names.iter().map(String::as_str))
+            .collect();
+        let steps = |events: i64| {
+            let db = store(events);
+            let page = db.events_of_kinds(&common, 0, 1).unwrap();
+            assert_eq!(page["events"].as_array().unwrap().len(), 1);
+            (db.conn.prepare_cached(&kinds_page(common.len())).unwrap())
+                .get_status(rusqlite::StatementStatus::VmStep)
+        };
+        let (few, many) = (steps(30), steps(30_000));
+        assert!(
+            many <= few + 8,
+            "{few} steps among 30 events, {many} among 30,000"
+        );
+        common.push("one_too_many");
+        let db = store(30);
+        let refused = db.events_of_kinds(&common, 0, 1).unwrap_err();
+        assert_eq!(refused.code, "invalid_event_page");
+        assert!(db.events_of_kinds(&[], 0, 1).is_err());
     }
 
     #[test]
