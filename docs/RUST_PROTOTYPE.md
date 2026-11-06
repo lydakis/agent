@@ -2950,7 +2950,8 @@ stops waiting: `expire_ms` after it started (1 to 3,600,000, default
 60,000). A client finds such calls by following the bot, or every bot with
 `*`, and lists those still waiting with
 `{"op":"tool_calls","tag","after"?,"limit"?}`: oldest first, each with
-`bot`, `turn`, `call_id`, `name`, `arguments` and `expires_ms`, at most
+`bot`, `turn`, `call_id`, `name`, `arguments`, `expires_ms` and
+`taken_ms`, at most
 `limit` (1 to 256, default 64) and 256 KiB a page, continued from
 `next_after`. It answers with
 `{"op":"tool_result","bot","turn","call_id","output"}`, the text the model
@@ -2969,6 +2970,22 @@ picture does. The client scales a picture; the daemon sends it as given. The fir
 `call_already_answered`, one for a call that ended or ran out of time is
 `no_pending_call` or, once its turn ended, `stale_turn`. There is no lease: a tag is the client's
 to serve.
+
+Protocol version 49 lets a client take a call before it runs it, so that
+no call runs twice: `{"op":"take_call","bot","turn","call_id"}` records
+when (`taken_ms`, returned with `bot`, `turn` and `call_id`), and the
+calls `tool_calls` lists say it, `null` for one not taken. A second take,
+by a client that restarted or by another one, is `call_taken` with the
+first take's `taken_ms` beside its detail; the call may have done its work,
+and only the client that took it knows, so a client answers such a call
+rather than running it again (Sonny answers `tool_outcome_unknown`). A take
+is refused as an answer is: an answered call is `call_already_answered`,
+one that ended or ran out of time is `no_pending_call` or `stale_turn`.
+Taking is the client's choice and never expires; a taken call is answered
+with `tool_result` as before. The daemon never runs its own tools twice
+either: one a restart cut off ends `tool_outcome_unknown`. Schema 79 counts
+every call still unanswered when a store upgrades to it as taken, since an
+older client may have run it with nothing to say so.
 
 The call waits as a gated call waits for its verdict. Its turn holds live
 for the bot's `approval_hold_ms`, but at most 250 ms, and an answer in that
