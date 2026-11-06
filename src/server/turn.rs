@@ -2802,10 +2802,10 @@ impl Turn {
             sent_here = true;
             accounting.answered = true;
             model_rounds += 1;
-            let added = response.usage.as_ref().map_or(0, |usage| {
-                let (added, _) = added_input(&record, &context, &tools, usage);
+            let (added, read_through) = response.usage.as_ref().map_or((0, None), |usage| {
+                let (added, through) = added_input(&record, &context, &tools, usage);
                 record.charge(usage, Charge::Round { added });
-                added
+                (added, through)
             });
             let items = response.items;
             let calls: Vec<ToolCall> = response.calls.clone();
@@ -2866,14 +2866,15 @@ impl Turn {
                         .filter(|entry| entry["event"] == "message")
                         .filter_map(|entry| entry["data"]["node"].as_i64())
                         .collect();
-                    // Its history is read through its own items, as the
-                    // store recorded with its usage.
+                    // Its history is read through its own items, or with
+                    // none through what it sent, the head then: as the store
+                    // recorded with its usage.
                     if response.usage.is_some() {
                         record.work.read = nodes
                             .iter()
                             .copied()
                             .max()
-                            .or(record.head)
+                            .or(read_through)
                             .or(record.work.read);
                     }
                     provider.recorded(&self.bot, &nodes);
