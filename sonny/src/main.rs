@@ -2763,8 +2763,8 @@ struct App {
     /// The asks this window answered and closed, by call, until their
     /// answers land.
     sent_answers: Vec<String>,
-    /// The tasks' asks this window answered, by ID, until their tasks
-    /// read them: none is pinned again meanwhile.
+    /// The tasks' asks this window answered, by [`asks::Ask::key`], until
+    /// their tasks read them: none is pinned again meanwhile.
     task_answers: Vec<String>,
     /// What the tasks this window started wait on, as their rows last
     /// read it: with no multiplexer, and so no fleet, their questions are
@@ -5728,7 +5728,11 @@ impl App {
                         _ => state,
                     }
                 }
-                Err(error) if error.code == "bot_not_found" => "removed".to_owned(),
+                Err(error) if error.code == "bot_not_found" => {
+                    // A removed task asks nothing.
+                    self.task_needs.forget(&bot);
+                    "removed".to_owned()
+                }
                 // Not read this time: it stays as it was.
                 Err(_) => continue,
             };
@@ -6004,14 +6008,18 @@ impl App {
         {
             // One set aside is still answered by its options.
             let Some(ask) = (self.asks.iter().chain(&self.aside))
-                .find(|ask| ask.id == id)
+                .find(|ask| ask.key() == id)
                 .cloned()
             else {
                 self.notice = Some("that question was answered already".into());
                 return;
             };
             let answer = asks::answer(&ask, &(at + 1).to_string());
-            match self.send(answer, None, false, false, &[]).await {
+            let sent = match &ask.task {
+                Some(task) => self.answer_task(task.clone(), &ask.id, &answer).await,
+                None => self.send(answer, None, false, false, &[]).await,
+            };
+            match sent {
                 Ok(()) => {
                     self.notice = None;
                     self.close_ask(&ask);
@@ -11228,6 +11236,21 @@ impl App {
             Some(ask) => asks::answer(ask, &prompt),
             None => prompt,
         };
+        // An answer to a task's question goes to the task, alone.
+        if let Some(ask) = &answering
+            && let Some(task) = &ask.task
+        {
+            match self.answer_task(task.clone(), &ask.id, &prompt).await {
+                Ok(()) => {
+                    self.input.clear();
+                    self.notice = None;
+                    self.pictures.clear();
+                    self.close_ask(ask);
+                }
+                Err(error) => self.notice = Some(error),
+            }
+            return;
+        }
         if answering.is_none()
             && let Some(emoji) = transcript::shortcodes(&prompt)
                 .or_else(|| transcript::reaction(&prompt).map(str::to_owned))
@@ -11296,12 +11319,6 @@ impl App {
         queue: bool,
         pictures: &[attach::Picture],
     ) -> Result<(), String> {
-        // An answer to a task's question goes to the task.
-        if let Some(ask) = asks::answer_of(&prompt, origin)
-            && let Some(task) = self.asker(ask)
-        {
-            return self.answer_task(task, ask, &prompt).await;
-        }
         // A message to a busy bot joins its running turn, on that turn's model.
         let delivery = match queue {
             true => "queue",
@@ -11457,7 +11474,7 @@ impl App {
         let from = self.pending.len() + usize::from(self.any_history) + rows.len();
         rows.extend(card.rows);
         self.commit(rows);
-        let asked = ask.id.clone();
+        let asked = ask.key();
         self.marks
             .extend(card.options.into_iter().enumerate().map(|(at, row)| {
                 let button = format!("{}answer/{at}/{asked}", screen::BUTTON);
@@ -11494,16 +11511,19 @@ impl App {
             });
             ask
         };
+        // With no multiplexer, the tasks this window started and tracks
+        // still, as their rows read them.
+        let tracked: std::collections::HashSet<&str> = (self.tasks.values().flatten())
+            .map(|task| task.bot.as_str())
+            .collect();
         let mut open: Vec<asks::Ask> = match &self.fleet {
             Some(fleet) => (fleet.needs.asks())
                 .filter(|(bot, _)| *bot != self.bot && *bot != fleet.lead)
                 .filter(|(bot, _)| fleet.lineage.contains(*bot))
                 .map(|(bot, ask)| pinned(bot, ask, fleet.short(bot).to_owned()))
                 .collect(),
-            // With no multiplexer, the tasks this window started, as their
-            // rows read them.
             None => (self.task_needs.asks())
-                .filter(|(bot, _)| *bot != self.bot)
+                .filter(|(bot, _)| *bot != self.bot && tracked.contains(bot))
                 .map(|(bot, ask)| {
                     let name = (self.project.as_deref())
                         .map_or_else(|| bot.to_owned(), |project| short(bot, project, &self.bot));
@@ -11511,40 +11531,37 @@ impl App {
                 })
                 .collect(),
         };
-        open.sort_by(|a, b| a.id.cmp(&b.id));
-        let still = |ask: &asks::Ask| ask.task.is_none() || open.iter().any(|o| o.id == ask.id);
+        open.sort_by_key(asks::Ask::key);
+        let keys: std::collections::HashSet<String> = open.iter().map(asks::Ask::key).collect();
+        // The question being answered stays the one in focus, whatever
+        // comes in ahead of it: one whose focus closed answers the one
+        // the composer shows now.
+        self.focus = self.asks.get(self.at()).map(asks::Ask::key);
         let before = self.asks.len();
+        let still = |ask: &asks::Ask| ask.task.is_none() || keys.contains(&ask.key());
         self.asks.retain(still);
         self.aside.retain(still);
-        self.task_answers
-            .retain(|id| open.iter().any(|o| &o.id == id));
+        self.task_answers.retain(|key| keys.contains(key));
         for ask in open {
-            let known = (self.asks.iter().chain(&self.aside)).any(|have| have.id == ask.id)
-                || self.task_answers.contains(&ask.id);
+            let key = ask.key();
+            let known = (self.asks.iter().chain(&self.aside)).any(|have| have.key() == key)
+                || self.task_answers.contains(&key);
             if !known {
                 self.commit_ask(&ask);
                 // Oldest first, as the turns that asked them count, as the
-                // lead's own are: one read late goes where it was asked,
-                // and takes the focus from none being answered.
-                if self.focus.is_none() {
-                    self.focus = self.asks.first().map(|first| first.id.clone());
-                }
+                // lead's own are: one read late goes where it was asked.
                 let at = (self.asks.iter())
                     .position(|open| asks::turn_of(&open.id) > asks::turn_of(&ask.id))
                     .unwrap_or(self.asks.len());
                 self.asks.insert(at, ask);
             }
         }
+        if self.focus.is_none() {
+            self.focus = self.asks.first().map(asks::Ask::key);
+        }
         if self.asks.len() < before {
             self.settle_asks();
         }
-    }
-
-    /// The task whose open question `id` names, pinned here.
-    fn asker(&self, id: &str) -> Option<asks::Asker> {
-        (self.asks.iter().chain(&self.aside))
-            .find(|ask| ask.id == id)
-            .and_then(|ask| ask.task.clone())
     }
 
     /// The ask made as call `call` in turn `turn`, as [`asks::id`] names
@@ -11576,20 +11593,20 @@ impl App {
 
     /// Where the question in focus is among those open, from 0.
     fn at(&self) -> usize {
-        let picked = self.focus.as_ref();
+        let picked = self.focus.as_deref();
         (self.asks.iter())
-            .position(|ask| Some(&ask.id) == picked)
+            .position(|ask| Some(ask.key().as_str()) == picked)
             .unwrap_or(0)
     }
 
     /// `ask` answered from here: closed now, its answer kept until it
     /// lands so landing closes no other asked the same.
     fn close_ask(&mut self, ask: &asks::Ask) {
-        self.asks.retain(|open| open.id != ask.id);
-        self.aside.retain(|open| open.id != ask.id);
+        self.asks.retain(|open| open.key() != ask.key());
+        self.aside.retain(|open| open.key() != ask.key());
         // A task's answer lands in the task's conversation, not this one.
         match ask.task {
-            Some(_) => self.task_answers.push(ask.id.clone()),
+            Some(_) => self.task_answers.push(ask.key()),
             None => self.sent_answers.push(ask.id.clone()),
         }
         self.settle_asks();
@@ -11635,7 +11652,7 @@ impl App {
             true => (at + 1) % count,
             false => (at + count - 1) % count,
         };
-        self.focus = self.asks.get(to).map(|ask| ask.id.clone());
+        self.focus = self.asks.get(to).map(asks::Ask::key);
     }
 
     /// The bot's reactions so far to the person's message, right under
@@ -19369,11 +19386,82 @@ mod tests {
         let own = asks::call(&asks::id(5, "c9"), &json!({"question": "Tag it?"})).unwrap();
         app.asks = vec![own];
         let fleet = app.fleet.as_mut().unwrap();
-        fleet.needs.asked("calc.ask", Some(ask));
+        fleet.needs.asked("calc.ask", Some(ask.clone()));
         app.pin_task_asks();
         let order: Vec<&str> = app.asks.iter().map(|ask| ask.id.as_str()).collect();
         assert_eq!(order, ["ask:2/q1", "ask:5/c9"]);
         assert_eq!(app.asking().map(|ask| ask.id.as_str()), Some("ask:5/c9"));
+        // The one in focus answered, the composer shows the task's; an
+        // older one read after leaves it there.
+        let own = app.asks[1].clone();
+        app.close_ask(&own);
+        let fleet = app.fleet.as_mut().unwrap();
+        fleet.lineage.insert("calc.fork".into());
+        let older = asks::call(&asks::id(1, "q0"), &json!({"question": "Older?"}));
+        fleet.needs.asked("calc.fork", older);
+        app.pin_task_asks();
+        let order: Vec<&str> = app.asks.iter().map(|ask| ask.id.as_str()).collect();
+        assert_eq!(order, ["ask:1/q0", "ask:2/q1"]);
+        let whose = |ask: Option<&asks::Ask>| ask.and_then(|ask| ask.task.clone()).unwrap().bot;
+        assert_eq!(whose(app.asking()), "calc.ask");
+        // A fork asks under its source's id: each is pinned, and each
+        // answered alone, by the id its own window answers.
+        let fleet = app.fleet.as_mut().unwrap();
+        fleet.needs.asked("calc.fork", Some(ask));
+        app.pin_task_asks();
+        let pinned: Vec<String> = app.asks.iter().map(asks::Ask::key).collect();
+        assert_eq!(pinned, ["@calc.ask/ask:2/q1", "@calc.fork/ask:2/q1"]);
+        app.press("answer/0/@calc.fork/ask:2/q1").await;
+        let to = sent.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(to["bot"], "calc.fork");
+        assert_eq!(to["request_id"], json!(asks::request_id("ask:2/q1", 0)));
+        app.pin_task_asks();
+        assert_eq!(whose(app.asking()), "calc.ask");
+        assert_eq!(app.asks.len(), 1);
+    }
+
+    /// Without a multiplexer, a task's question goes with the task: one
+    /// removed, or no longer tracked here, is pinned no more.
+    #[tokio::test]
+    async fn a_removed_tasks_question_is_let_go() {
+        let gone = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let removed = gone.clone();
+        let (client, _) = daemon_with_events(json!({}), move |asked| match asked["op"].as_str() {
+            Some("inspect") if removed.load(std::sync::atomic::Ordering::SeqCst) => {
+                json!({"error": "bot_not_found"})
+            }
+            Some("inspect") => json!({"name": "calc.ask"}),
+            Some("turns") => json!({"turns": [{"turn": 2, "status": "running"}]}),
+            _ => json!({}),
+        })
+        .await;
+        let mut app = app(client);
+        app.bot = "calc.lead".into();
+        app.width = 80;
+        let ask = asks::call(&asks::id(2, "q1"), &json!({"question": "Ship it?"}));
+        app.task_needs.asked("calc.ask", ask.clone());
+        // Not a task this window tracks: nothing pinned.
+        app.pin_task_asks();
+        assert!(app.asks.is_empty());
+        let arguments = json!({"name": "ask", "brief": "Ask"});
+        app.commit_call(
+            "c",
+            Some(1),
+            served::START,
+            &arguments,
+            "turn:calc.ask/1",
+            false,
+        );
+        drawn(&mut app);
+        app.pin_task_asks();
+        assert_eq!(app.asks.len(), 1);
+        // Removed, it asks nothing.
+        gone.store(true, std::sync::atomic::Ordering::SeqCst);
+        app.read_tasks().await;
+        let rows = drawn(&mut app);
+        assert!(rows[1].ends_with("ask  removed  Ask"), "{rows:?}");
+        app.pin_task_asks();
+        assert!(app.asks.is_empty());
     }
 
     #[tokio::test]

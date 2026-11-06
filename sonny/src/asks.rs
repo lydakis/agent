@@ -67,6 +67,19 @@ pub struct Ask {
     pub task: Option<Asker>,
 }
 
+impl Ask {
+    /// Which open question this is in a window: its id, and for a task's
+    /// the task too, as a task and its fork ask under the same id (a
+    /// fork keeps its source's turns) and each takes its own answer. Bot
+    /// names hold no `@` or `/`.
+    pub fn key(&self) -> String {
+        match &self.task {
+            Some(task) => format!("@{}/{}", task.bot, self.id),
+            None => self.id.clone(),
+        }
+    }
+}
+
 /// A task whose question a lead's window shows: the agent its answer goes
 /// to, and its name as the window says it.
 #[derive(Clone, Debug, PartialEq)]
@@ -321,8 +334,12 @@ pub fn settled(mut ask: Ask, output: &str) -> Ask {
 /// asking the same question are two decisions.
 pub fn open(items: &[Value]) -> Option<Ask> {
     let (mut answers, mut refused, mut open) = (Vec::new(), Vec::new(), None);
+    // Each call's result, by turn and call, as provider IDs repeat across
+    // turns: what Sonny took an ask as, its plan and deadline, is there.
+    let mut results: Vec<((Value, Value), String)> = Vec::new();
     let mut moved_on = false;
     for item in items {
+        let at = (item["turn"].clone(), item["call_id"].clone());
         if item["role"] == "user" {
             let text = crate::text(item);
             match answer_of(&text, item["from"].as_str()) {
@@ -330,14 +347,15 @@ pub fn open(items: &[Value]) -> Option<Ask> {
                 None => moved_on |= moves_on(&text, item["from"].as_str()),
             }
         }
-        if item["type"] == "function_call_output"
-            && (item["failed"] == true || crate::reactions::refused(item))
-        {
-            refused.push(item["call_id"].clone());
+        if item["type"] == "function_call_output" {
+            match item["failed"] == true || crate::reactions::refused(item) {
+                true => refused.push(at.clone()),
+                false => results.push((at.clone(), crate::output(item).0)),
+            }
         }
         if item["type"] == "function_call"
             && item["name"] == TOOL
-            && !refused.contains(&item["call_id"])
+            && !refused.contains(&at)
             && let Some(mut ask) = item["arguments"]
                 .as_str()
                 .and_then(|a| serde_json::from_str::<Value>(a).ok())
@@ -354,6 +372,9 @@ pub fn open(items: &[Value]) -> Option<Ask> {
                     // One whose turn is not known no answer names.
                     ask.id = (asked.or_else(|| item["call_id"].as_str().map(str::to_owned)))
                         .unwrap_or_default();
+                    if let Some((_, said)) = results.iter().find(|(of, _)| *of == at) {
+                        ask = settled(ask, said);
+                    }
                     open = Some(ask);
                 }
                 None => {}
@@ -427,7 +448,9 @@ fn answering_row(question: &str, place: &str, width: usize) -> Line<'static> {
 
 /// `asks` without the one `text` answers; whether it was there.
 pub fn close(asks: &mut Vec<Ask>, text: &str, from: Option<&str>) -> bool {
-    let at = answer_of(text, from).and_then(|call| asks.iter().position(|ask| ask.id == call));
+    // A task's question is answered in the task's conversation, not here.
+    let at = answer_of(text, from)
+        .and_then(|call| (asks.iter()).position(|ask| ask.id == call && ask.task.is_none()));
     at.map(|at| asks.remove(at)).is_some()
 }
 
@@ -1238,6 +1261,20 @@ mod tests {
         // Whole, under the ID its answer names.
         let whole = super::open(&[reply.clone(), asked.clone()]).unwrap();
         assert_eq!((whole.id.as_str(), whole.options.len()), ("ask:3/a1", 1));
+        // As Sonny took it, by its own call's result: what the agent does
+        // meanwhile, and when. Another turn's result under the same call
+        // is another ask's.
+        let took = |turn: i64| {
+            json!({"type": "function_call_output", "call_id": "a1", "turn": turn,
+                "output": json!({"if_unanswered": "go_later", "deadline_s": 1700}).to_string()})
+        };
+        let taken = super::open(&[reply.clone(), took(3), asked.clone()]).unwrap();
+        assert_eq!(
+            (taken.unanswered, taken.deadline),
+            (Some(Unanswered::Later), Some(1700))
+        );
+        let other = super::open(&[reply.clone(), took(7), asked.clone()]).unwrap();
+        assert_eq!(other.deadline, None);
         let open = |items: &[Value]| super::open(items).map(|ask| ask.question);
         // Newest first.
         assert_eq!(
@@ -1294,7 +1331,7 @@ mod tests {
         // same ask in the fork's history.
         assert_eq!(id(3, "a1"), "ask:3/a1");
         assert_eq!((turn_of("ask:3/a1"), turn_of("a1")), (Some(3), None));
-        let unknown = json!({"type": "function_call_output", "call_id": "a1",
+        let unknown = json!({"type": "function_call_output", "call_id": "a1", "turn": 3,
             "output": json!({"error": "unknown_tool"}).to_string()});
         assert_eq!(open(&[unknown, asked]), None);
     }

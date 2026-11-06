@@ -354,7 +354,8 @@ impl Needs {
         let was = self.waits(bot);
         let data = &event["data"];
         let turn = event["turn"].as_i64().unwrap_or(-1);
-        match event["event"].as_str().unwrap_or("") {
+        let kind = event["event"].as_str().unwrap_or("");
+        match kind {
             "approval_requested" => {
                 for call in data["calls"].as_array().into_iter().flatten() {
                     if person_call(call)
@@ -381,16 +382,7 @@ impl Needs {
             }
             "tool_started" => {
                 let call = data["call_id"].as_str().map(str::to_owned);
-                // Whole, unless the event cut its arguments short: then
-                // its history, read once the turn ends, says it whole.
-                let ask = (call.as_deref())
-                    .zip(event["turn"].as_i64())
-                    .filter(|_| data["arguments_truncated"] != true)
-                    .and_then(|(call, turn)| {
-                        let arguments = serde_json::from_str(data["arguments"].as_str()?).ok()?;
-                        crate::asks::call(&crate::asks::id(turn, call), &arguments)
-                    });
-                self.asks.insert(bot.to_owned(), Open { call, ask });
+                self.asks.insert(bot.to_owned(), Open { call, ask: None });
                 self.unsure.insert(bot.to_owned());
             }
             // Each answer lets go of its call alone; a question refused
@@ -401,10 +393,16 @@ impl Needs {
                         calls.retain(|(_, call)| call != id);
                     }
                     let refused = data["failed"] == true || data["denied"] == true;
-                    if refused
-                        && (self.asks.get(bot)).is_some_and(|a| a.call.as_deref() == Some(id))
-                    {
+                    let asking =
+                        (self.asks.get(bot)).is_some_and(|a| a.call.as_deref() == Some(id));
+                    if refused && asking {
                         self.asks.remove(bot);
+                    }
+                    // Taken, the question is in its history whole, with what
+                    // Sonny took it as: read now, not when the turn ends,
+                    // as a turn may go on meanwhile.
+                    if asking && !refused && kind == "tool_completed" {
+                        self.due.push((bot.to_owned(), event["turn"].as_i64()));
                     }
                 }
             }
@@ -540,22 +538,17 @@ mod tests {
         needs.event(&event("p.fix", 2, "tool_started", ask("q1", "Ship it?")));
         assert!(needs.waits("p.fix"));
         assert_eq!(needs.asks["p.fix"].call.as_deref(), Some("q1"));
-        // Whole from its event, as a lead's window pins it.
-        let read: Vec<_> = needs.asks().map(|(bot, a)| (bot, a.id.as_str())).collect();
-        assert_eq!(read, [("p.fix", "ask:2/q1")]);
-        // Cut short there, it waits for its history to say it whole.
-        let mut cut = ask("q2", "Tag it?");
-        cut["arguments_truncated"] = json!(true);
-        let mut other = Needs::default();
-        other.event(&event("p.cut", 2, "tool_started", cut));
-        assert!(other.waits("p.cut") && other.asks().next().is_none());
+        // Not whole yet: its history says it, with what Sonny took it as,
+        // once the call is taken.
+        assert!(needs.asks().next().is_none());
         needs.event(&event(
             "p.fix",
             2,
             "tool_completed",
             json!({"call_id": "q1"}),
         ));
-        assert!(needs.due().is_empty(), "read again once the turn ends");
+        // Taken, it is read at once, its turn going on or not.
+        assert_eq!(needs.due(), vec![("p.fix".to_owned(), Some(2))]);
         needs.event(&event(
             "p.fix",
             2,
@@ -569,6 +562,11 @@ mod tests {
         assert_eq!(needs.due(), vec![("p.fix".to_owned(), Some(2))]);
         needs.asked("p.fix", Some(whole("Ship it?")));
         assert!(needs.waits("p.fix"));
+        let read: Vec<_> = needs
+            .asks()
+            .map(|(bot, a)| (bot, a.question.as_str()))
+            .collect();
+        assert_eq!(read, [("p.fix", "Ship it?")]);
     }
 
     #[test]
