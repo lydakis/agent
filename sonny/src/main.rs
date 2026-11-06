@@ -1241,6 +1241,20 @@ fn main() -> std::process::ExitCode {
                 }
                 _ => {}
             }
+            // A run of an automation works for the automation, from its
+            // shell as through the memory tool; no one else does.
+            let writes = rest
+                .first()
+                .is_some_and(|v| matches!(v.as_str(), "save" | "rm" | "cleanup"));
+            let automation = writes.then(trigger::shell_run).flatten();
+            // SAFETY: one thread: the daemon was asked on a runtime of
+            // this thread's own, gone by now.
+            unsafe {
+                match automation {
+                    Some(name) => std::env::set_var("AGENT_AUTOMATION", name),
+                    None => std::env::remove_var("AGENT_AUTOMATION"),
+                }
+            }
             return std::process::ExitCode::from(agent_client::memory::cli(rest) as u8);
         }
         // An ask's deadline trigger runs this as its `--if`.
