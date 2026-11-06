@@ -1146,22 +1146,49 @@ fn changed(root: &Path) -> Result<Value, String> {
     Err("unchanged: nothing saved or removed since the last cleanup".into())
 }
 
+/// Who an open cleanup belongs to: every caller that started or carried
+/// it on, `null` for the person. A `by` that is one caller, as a cleanup
+/// opened before callers joined wrote it, is that one.
+fn owners(open: &Value) -> Vec<Value> {
+    match &open["by"] {
+        Value::Array(owners) => owners.clone(),
+        one => vec![one.clone()],
+    }
+}
+
 /// Commit what agents saved since the last cleanup and remember where the
 /// cleanup starts. A start while one is open returns that one, so a
-/// cleanup cut short is measured from where it began.
+/// cleanup cut short is measured from where it began, and the caller
+/// joins its owners: what it changes from then on is the cleanup's, which
+/// a refused cleanup takes back, and not another agent's, which it keeps.
+/// Earlier owners stay owners, so a run that stopped mid-cleanup and wakes
+/// later is still the cleanup too.
 fn cleanup_start(root: &Path, caller: Option<&str>) -> Result<Value, String> {
     repo(root)?;
+    // The memory folder's lock, which a finish holds too: two starts, or a
+    // start and a finish, never both read the open cleanup and write it.
+    let _lock = lock(root)?;
     let state = root.join(CLEANUP);
     if let Ok(text) = std::fs::read_to_string(&state) {
-        let open: Value = serde_json::from_str(&text)
+        let mut open: Value = serde_json::from_str(&text)
             .map_err(|e| format!("memory_invalid: {}: {e}", state.display()))?;
-        let (Some(commit), Some(facts)) = (open["commit"].as_str(), open["facts"].as_u64()) else {
+        let (Some(commit), Some(facts)) = (
+            open["commit"].as_str().map(str::to_owned),
+            open["facts"].as_u64(),
+        ) else {
             return Err(format!(
                 "memory_invalid: {}: no commit or facts",
                 state.display()
             ));
         };
-        return started(root, commit, facts, true);
+        let mut by = owners(&open);
+        let caller = json!(caller);
+        if !by.contains(&caller) {
+            by.push(caller);
+            open["by"] = Value::Array(by);
+            write(&state, &open.to_string())?;
+        }
+        return started(root, &commit, facts, true);
     }
     let count = all_facts(root)?;
     git(root, &["add", "-A"])?;
@@ -1181,7 +1208,7 @@ fn cleanup_start(root: &Path, caller: Option<&str>) -> Result<Value, String> {
     let work: Vec<String> = work(root)?.into_iter().map(|(path, _, _)| path).collect();
     write(
         &state,
-        &json!({"commit": commit, "facts": count, "work": work, "at_ms": at_ms, "by": caller})
+        &json!({"commit": commit, "facts": count, "work": work, "at_ms": at_ms, "by": [caller]})
             .to_string(),
     )?;
     started(root, &commit, count as u64, false)
@@ -1246,15 +1273,15 @@ fn fact_changes(listing: &str) -> (Vec<String>, Vec<String>, Vec<String>) {
 }
 
 /// Note a fact another agent saved (`now` its text) or removed (none)
-/// while a cleanup is open, for [`put_back`]. The cleanup's own agent's
-/// changes are the cleanup's. Called under the fact's folder lock, so the
-/// notes are in the order the changes were made.
+/// while a cleanup is open, for [`put_back`]. Its owners' changes are the
+/// cleanup's. Called under the fact's folder lock, so the notes are in the
+/// order the changes were made.
 fn noted(root: &Path, caller: Option<&str>, path: &Path, now: Option<&str>) -> Result<(), String> {
     let Ok(open) = std::fs::read_to_string(root.join(CLEANUP)) else {
         return Ok(());
     };
-    let by = serde_json::from_str::<Value>(&open).unwrap_or_default()["by"].clone();
-    if by.as_str() == caller {
+    let open = serde_json::from_str::<Value>(&open).unwrap_or_default();
+    if owners(&open).contains(&json!(caller)) {
         return Ok(());
     }
     let Ok(relative) = path.strip_prefix(root) else {
@@ -2561,6 +2588,109 @@ mod tests {
         }
         assert!(text("g").unwrap().ends_with("saved by another agent\n"));
         assert_eq!(check(&root)["problems"], json!([]));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_cleanup_another_caller_takes_over_rolls_back_whole_and_keeps_others_saves() {
+        let root = temp("cleanup-takeover");
+        let store = || Some("/s/state.sqlite".to_owned());
+        // A is an agent that started a cleanup by hand; B the nightly
+        // automation, which carries it on; C another agent.
+        let a = caller(None, Some("7".into()), store());
+        let b = caller(Some("memory-cleanup".into()), Some("9".into()), store());
+        let c = caller(None, Some("8".into()), store());
+        let as_ = |caller: &Option<String>, line: &[&str]| {
+            run_as(
+                &root,
+                &root,
+                &args(line),
+                &|| Ok("-".into()),
+                caller.as_deref(),
+            )
+        };
+        let save = |caller: &Option<String>, name: &str, text: &str| {
+            let mut line = vec!["save", name, "--type", "feedback", "--description"];
+            line.extend([name, "--source", "test", "--user", "--", text]);
+            as_(caller, &line).unwrap();
+        };
+        repo(&root).unwrap();
+        for name in ["a", "b", "c", "d", "e", "f"] {
+            save(&None, name, "before");
+        }
+        // A starts and removes one, then stops.
+        as_(&a, &["cleanup", "start"]).unwrap();
+        as_(&a, &["rm", "a", "--user"]).unwrap();
+        // B carries it on and owns it beside A.
+        let resumed = as_(&b, &["cleanup", "start"]).unwrap();
+        assert_eq!(resumed["duplicate"], true);
+        let open: Value =
+            serde_json::from_str(&std::fs::read_to_string(root.join(CLEANUP)).unwrap()).unwrap();
+        assert_eq!(open["by"], json!([a, b]));
+        // Starting again adds no owner twice.
+        as_(&b, &["cleanup", "start"]).unwrap();
+        let again: Value =
+            serde_json::from_str(&std::fs::read_to_string(root.join(CLEANUP)).unwrap()).unwrap();
+        assert_eq!(again["by"], json!([a, b]));
+        // C saves an unrelated fact; B removes too much, and A, waking
+        // late, removes one more.
+        save(&c, "g", "saved by C");
+        for name in ["b", "c"] {
+            as_(&b, &["rm", name, "--user"]).unwrap();
+        }
+        as_(&a, &["rm", "d", "--user"]).unwrap();
+        let refused = as_(&b, &["cleanup", "finish"]).unwrap_err();
+        assert!(
+            refused.starts_with("loss_guard: the cleanup removed 4 of 6"),
+            "{refused}"
+        );
+        assert!(
+            refused.contains("with the 1 facts other agents saved or removed meanwhile"),
+            "{refused}"
+        );
+        // Every removal of the cleanup is taken back; C's save stays.
+        let text = |name: &str| std::fs::read_to_string(root.join(format!("{name}.md"))).ok();
+        for name in ["a", "b", "c", "d"] {
+            assert!(text(name).unwrap().ends_with("before\n"), "{name}");
+        }
+        assert!(text("g").unwrap().ends_with("saved by C\n"));
+        assert_eq!(check(&root)["problems"], json!([]));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_cleanup_opened_with_one_owner_takes_a_new_one_beside_it() {
+        let root = temp("cleanup-one-owner");
+        let as_ = |caller: Option<&str>, line: &[&str]| {
+            run_as(&root, &root, &args(line), &|| Ok("-".into()), caller)
+        };
+        repo(&root).unwrap();
+        for name in ["a", "b", "c", "d"] {
+            let mut line = vec!["save", name, "--type", "feedback", "--description"];
+            line.extend([name, "--source", "test", "--user", "--", "before"]);
+            as_(None, &line).unwrap();
+        }
+        // An open cleanup whose `by` is one caller, as one opened before
+        // callers joined it wrote it.
+        as_(Some("s#7"), &["cleanup", "start"]).unwrap();
+        let mut open: Value =
+            serde_json::from_str(&std::fs::read_to_string(root.join(CLEANUP)).unwrap()).unwrap();
+        open["by"] = json!("s#7");
+        write(&root.join(CLEANUP), &open.to_string()).unwrap();
+        as_(Some("s#automation:memory-cleanup"), &["cleanup", "start"]).unwrap();
+        let open: Value =
+            serde_json::from_str(&std::fs::read_to_string(root.join(CLEANUP)).unwrap()).unwrap();
+        assert_eq!(open["by"], json!(["s#7", "s#automation:memory-cleanup"]));
+        for (who, name) in [("s#7", "a"), ("s#automation:memory-cleanup", "b")] {
+            as_(Some(who), &["rm", name, "--user"]).unwrap();
+        }
+        as_(Some("s#automation:memory-cleanup"), &["rm", "c", "--user"]).unwrap();
+        let refused = as_(None, &["cleanup", "finish"]).unwrap_err();
+        assert!(refused.starts_with("loss_guard: "), "{refused}");
+        assert!(!refused.contains("other agents"), "{refused}");
+        for name in ["a", "b", "c"] {
+            assert!(root.join(format!("{name}.md")).exists(), "{name}");
+        }
         std::fs::remove_dir_all(root).unwrap();
     }
 
