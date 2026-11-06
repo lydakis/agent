@@ -176,17 +176,20 @@ const FAILED: Color = Color::Red;
 const AGENTS: Color = Color::Blue;
 const YOU: Color = Color::Magenta;
 /// The models' colours on `m`, an exception to one meaning per hue as the
-/// usage chart's are: telling models apart needs a fill each. Hues the
-/// sky's messages and tools don't take first, then the bright twins.
+/// usage chart's are: telling models apart needs a fill each. The six
+/// hues first, those the sky's messages and tools don't take leading, and
+/// only then the bright twins, which many themes draw as a duller shade of
+/// the same hue (Flexoki's bright green is an olive beside its green) or
+/// as grays (Solarized), so two models in neighbouring hues stay apart.
 const MODEL_HUES: [Color; 8] = [
     Color::Green,
     Color::Yellow,
-    Color::LightGreen,
-    Color::LightYellow,
+    Color::Blue,
+    Color::Magenta,
+    Color::Cyan,
+    Color::Red,
     Color::LightBlue,
     Color::LightMagenta,
-    Color::LightCyan,
-    Color::LightRed,
 ];
 
 /// What the follow brings the view.
@@ -1454,8 +1457,9 @@ impl View {
     }
 
     /// The haiku's rows: its three lines streaming in a word at a time,
-    /// muted, each word up from faint, then its writer signed in faint;
-    /// the one before all faint as it fades; in a replay, the one up then.
+    /// in the text's own weight, each word up from faint through muted,
+    /// then its writer signed muted; the one before all faint as it fades;
+    /// in a replay, the one up then.
     fn haiku(&self, now: Instant) -> Vec<Line<'static>> {
         let showing = self.verse.as_ref().filter(|verse| now >= verse.from);
         let (verse, faded) = match (showing, &self.fading) {
@@ -1478,9 +1482,10 @@ impl View {
                 if !faded && t < shows {
                     continue;
                 }
-                let ink = match faded || t < shows + WORD {
-                    true => Ink::Faint,
-                    false => Ink::Muted,
+                let ink = match () {
+                    _ if faded || t < shows + WORD / 2.0 => Ink::Faint,
+                    _ if t < shows + WORD => Ink::Muted,
+                    _ => Ink::Plain,
                 };
                 if !spans.is_empty() {
                     spans.push(Span::raw(" "));
@@ -1499,8 +1504,9 @@ impl View {
                 .saturating_duration_since(verse.since);
             let minutes = (held.as_secs() / 60).max(1);
             lines.push(Line::default());
+            let ink = if faded { Ink::Faint } else { Ink::Muted };
             for signed in signature(&name, minutes, haiku::WIDTH) {
-                lines.push(Line::from(Span::styled(signed, Ink::Faint.style())));
+                lines.push(Line::from(Span::styled(signed, ink.style())));
             }
         }
         lines
@@ -3079,8 +3085,8 @@ impl View {
             // What needs the person or failed, still in its colour; a
             // working star breathes. As in 0.7.0, those are blobs, and so
             // is one a message lights; one at rest is a single dot.
-            // On `m`, each in its model's colour instead, bold while it
-            // works.
+            // On `m`, each a blob in its model's colour instead, bold, so a
+            // hue reads on a star at rest too.
             let hue = (self.models)
                 .then(|| hues.get(agent.model_or_unknown()).copied())
                 .flatten();
@@ -3091,10 +3097,7 @@ impl View {
                 // The stop holds the rest still, as it reaches them; what
                 // needs the person or failed keeps its colour.
                 (_, None | Some(State::Working)) if stilled => (Ink::Muted, false),
-                (Some(hue), state) => {
-                    let big = state.is_some() || agent.glow(now) > 0.4;
-                    (Ink::Color(hue, big), big)
-                }
+                (Some(hue), _) => (Ink::Color(hue, true), true),
                 (None, Some(State::Working)) => {
                     (shade.breathe(agent.breath(now, self.opened)), true)
                 }
@@ -3179,7 +3182,12 @@ impl View {
                 // The pick reversed, as a picker's selection is.
                 (true, _) => Style::default().reversed(),
                 (_, true) => Style::default().bold(),
-                _ => name_style(agent.state(), agent.glow(now)),
+                // On `m`, the name in its star's colour too: a star's mark
+                // is a few dots, its name the most of it there is.
+                _ => match hues.get(agent.model_or_unknown()) {
+                    Some(&hue) => name_style(agent.state(), 1.0).fg(hue),
+                    None => name_style(agent.state(), agent.glow(now)),
+                },
             };
             if !sky.label(agent.at, mark, &short(&agent.name), style)
                 && agent.state() == Some(State::NeedsYou)
@@ -3221,7 +3229,10 @@ impl View {
                     // The haiku at the top, in the blank the log leaves.
                     // A blank under its newest line, as over the haiku: two
                     // from the footer, as two from the key hints.
-                    let mut column = self.ticked(now, LOG_COLS, rows.saturating_sub(1), true);
+                    // As wide as the haiku over it, so both keep the same
+                    // margin from the pane's edge.
+                    let room = rows.saturating_sub(1);
+                    let mut column = self.ticked(now, haiku::WIDTH, room, true);
                     column.push(Line::default());
                     for (row, line) in self.haiku(now).into_iter().enumerate() {
                         let row = HAIKU_TOP + row;
@@ -3305,13 +3316,15 @@ impl View {
                 _ => Ink::Muted.style(),
             };
             // A replay says when it happened, as a chat log's time does.
+            // Its time starts where the haiku does, two cells from its words.
             let when = match written {
                 Some(written) => format!("{} ", clock(*written)),
-                None => format!("{:>4}  ", ago(now, *at)),
+                None => format!("{:>3}  ", ago(now, *at)),
             };
+            let room = cols.saturating_sub(when.width());
             lines.push(Line::from(vec![
                 Span::styled(when, age),
-                Span::styled(cut(text, cols.saturating_sub(6)), words),
+                Span::styled(cut(text, room), words),
             ]));
         }
         if let Some(why) = &self.down {
@@ -3706,7 +3719,7 @@ impl View {
                 }
                 spans.push(Span::raw(" ·").dim());
                 spans.push(Span::raw(" ⠛").fg(hue));
-                spans.push(Span::raw(format!(" {model}")).dim());
+                spans.push(Span::raw(format!(" {model}")).fg(hue));
             }
         }
         let states = match self.models {
@@ -6851,6 +6864,72 @@ mod tests {
             .unwrap();
         view.drain();
         assert!(view.copied("shop.lead.side").is_none());
+    }
+
+    #[tokio::test]
+    async fn the_haiku_reads_as_text_the_log_keeps_its_margin_and_models_colour_names() {
+        let (mut view, send) = view();
+        let long = "shop.a-long-task-name-for-the-log";
+        send.send(Feed::Roll(vec![
+            json!({"name": "shop.lead", "model": "openai/m1"}),
+            json!({"name": long, "created_by": "shop.lead", "model": "anthropic/m2"}),
+        ]))
+        .unwrap();
+        send.send(Feed::Ready).unwrap();
+        send.send(Feed::Live(
+            json!({"event": "accepted", "bot": long, "turn": 1,
+            "data": {"from": {"bot": "shop.lead"}}}),
+        ))
+        .unwrap();
+        view.drain();
+        let now = Instant::now();
+        view.verse = Some(Verse {
+            by: "shop.lead".into(),
+            lines: vec!["stars wake one by one".into(), "b".into(), "c".into()],
+            from: now - Duration::from_secs(60),
+            written: now - Duration::from_secs(60),
+            since: now - Duration::from_secs(600),
+            until: None,
+            story: None,
+        });
+        for note in view.ticker.iter_mut() {
+            note.at = now - Duration::from_secs(20);
+        }
+        // Once in, the haiku's words are in the text's own weight.
+        let haiku = view.haiku(now);
+        assert!(
+            (haiku[0].spans.iter())
+                .filter(|span| !span.content.trim().is_empty())
+                .all(|span| span.style == Style::default()),
+            "{:?}",
+            haiku[0]
+        );
+        // The log's time starts where the haiku does, and its words end
+        // within the haiku's width: the same margin from the edge.
+        let card = text(&view.card(140, 40));
+        let rows: Vec<&str> = card.lines().collect();
+        let col = |row: &str, at: usize| row[..at].width();
+        let poem = rows
+            .iter()
+            .find_map(|row| Some(col(row, row.find("stars wake")?)));
+        let start = poem.expect("the haiku beside the sky");
+        let logged = (rows.iter())
+            .find(|row| row.contains("20s  shop lead → "))
+            .expect("the log line");
+        let time = logged.find("20s").unwrap();
+        assert_eq!(col(logged, time), start, "{logged}");
+        assert!(
+            logged.trim_end().width() <= start + haiku::WIDTH,
+            "{logged}"
+        );
+        // On `m`, a name takes its star's colour.
+        assert!(view.press(ratatui::crossterm::event::KeyCode::Char('m')));
+        let hues: HashMap<String, Color> = view.hues().into_iter().collect();
+        let lines = view.card(140, 40);
+        let named = (lines.iter().flat_map(|line| &line.spans))
+            .find(|span| span.content.contains("lead"))
+            .expect("the lead's name");
+        assert_eq!(named.style.fg, hues.get("m1").copied(), "{named:?}");
     }
 
     #[tokio::test]
