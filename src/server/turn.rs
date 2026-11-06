@@ -4101,6 +4101,9 @@ impl Turn {
                             ControlFlow::Continue(outcome) => outcome,
                             ControlFlow::Break(stop) => return Ok(Some(stop)),
                         },
+                        Ran::Done(Err(error)) if error.code == "terminal_not_running" => {
+                            failure(self.no_terminal(handle, error).await?)
+                        }
                         Ran::Done(Err(error)) => failure(error),
                         Ran::Lifted(_) => unreachable!("only a command moves to the background"),
                     }
