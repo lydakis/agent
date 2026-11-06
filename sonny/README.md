@@ -21,20 +21,16 @@ latest one into `~/.local`:
     curl -fsSL https://raw.githubusercontent.com/lydakis/agent/main/install.sh | sh
 
 For main without a version tag, `brew install lydakis/agent/sonny-nightly`
-builds Sonny and its matching daemon together from one pinned commit. If
+fetches current main and builds Sonny and its matching daemon together. If
 stable Sonny is installed, run `brew unlink sonny` first. Update with
-`brew update` and `brew upgrade lydakis/agent/sonny-nightly`. The
-[nightly workflow](../.github/workflows/nightly.yml) checks main at 07:17 UTC,
-tests it and installs the formula before updating the tap; an unchanged
-commit leaves the formula alone. It can also be run manually from main.
-`sonny --version` and `sonny agent --version` name the built commit.
-
-For the newest main commit between nightly runs, use
-`brew install --HEAD lydakis/agent/sonny-nightly` (or
-`brew reinstall --HEAD lydakis/agent/sonny-nightly` to switch an existing
-install), then `brew upgrade --fetch-HEAD lydakis/agent/sonny-nightly`.
-These installs build from source on macOS and Linux; `install.sh` continues
-to install versioned Linux releases.
+`brew update` and `brew reinstall lydakis/agent/sonny-nightly`: a reinstall
+fetches the latest main commit even when the formula's version is unchanged.
+No `--HEAD` or wait for a scheduled build is needed. `sonny --version` and
+`sonny agent --version` name the built commit. The
+[nightly workflow](../.github/workflows/nightly.yml) tests and installs the
+recipe at 07:17 UTC before updating the tap, and can also be run manually
+from main. Both channels build from source on macOS and Linux; stable
+`sonny` and `install.sh` continue to install versioned releases.
 
 With `cargo install`, build both (`--path .` for `agent` and
 `--path sonny`) and set `AGENT_BIN` to that `agent`; Sonny never takes an
@@ -911,10 +907,12 @@ way `/react` does, and each note in the margin has its own `↩`.
   messages and tool calls over the last ten minutes; the title passes only
   to an agent half again as busy, once the holder has had it ten minutes,
   so it never flickers. Each new holder writes one, from a copy of itself
-  allowed no tool, eight a day at most, and every sky shows the same one;
-  a replay shows the one that was up at its time.
-  `[sonny]` sets `sky_haikus` (0 for none), `sky_haiku_window`,
-  `sky_haiku_margin` and `sky_haiku_hold`.
+  allowed no tool, as many a day as the title passes unless you set a
+  cap, and every sky shows the same one; a replay shows the one that was
+  up at its time, from the day's kept in `~/.agent/sonny/haikus.jsonl`.
+  `[sonny]` sets `sky_haikus` (false for none), `sky_haiku_daily` (the
+  most a day, 0 for no limit), `sky_haiku_keep` (hours kept, 24; 0 keeps
+  all), `sky_haiku_window`, `sky_haiku_margin` and `sky_haiku_hold`.
   An agent with a schedule (an automation that wakes it) carries a short tick
   just outside its star, out from the middle (inward at the pane's edge),
   plain once its next run is near (a tenth of the gap between runs, at

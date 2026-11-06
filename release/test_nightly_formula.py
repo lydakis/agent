@@ -14,11 +14,13 @@ COMMIT = "a" * 40
 
 
 class NightlyFormulaTest(unittest.TestCase):
-    def test_pins_both_binaries_to_one_checkout(self):
+    def test_default_install_tracks_main_and_builds_both_binaries_together(self):
         formula = render_formula(COMMIT, "12.1")
-        self.assertIn(f'revision: "{COMMIT}"', formula)
+        self.assertIn('url "https://github.com/lydakis/agent.git", branch: "main"', formula)
+        self.assertNotIn(', revision:', formula)
+        self.assertNotIn('  head ', formula)
+        self.assertIn(f'# Generated from revision: "{COMMIT}"', formula)
         self.assertIn('version "12.1"', formula)
-        self.assertIn('head "https://github.com/lydakis/agent.git", branch: "main"', formula)
         self.assertIn('std_cargo_args(root: libexec)', formula)
         self.assertIn('libexec.install libexec/"bin/agent"', formula)
         self.assertIn('std_cargo_args(path: "sonny")', formula)
@@ -30,7 +32,7 @@ class NightlyFormulaTest(unittest.TestCase):
         # Both the client and its bundled daemon are exercised by brew test.
         self.assertIn('#{bin}/sonny --version', formula)
         self.assertIn('#{bin}/sonny agent --version', formula)
-        self.assertIn(COMMIT[:9], formula)
+        self.assertNotIn('assert_match "(aaaaaaaaa)"', formula)
 
     def test_rejects_invalid_or_executable_inputs(self):
         for commit, version in [("main", "1.1"), ("a" * 39, "1.1"),
@@ -50,6 +52,17 @@ class NightlyFormulaTest(unittest.TestCase):
             expected = hashlib.sha1(b"blob " + str(len(previous)).encode() + b"\0" + previous).hexdigest()
             self.assertEqual(request["sha"], expected)
             self.assertEqual(base64.b64decode(request["content"]), current.read_bytes())
+
+    def test_published_snapshot_is_replaced_by_main_tracking_recipe(self):
+        with tempfile.TemporaryDirectory() as directory:
+            current = Path(directory) / "sonny-nightly.rb"
+            current.write_text(
+                f'  url "https://github.com/lydakis/agent.git", revision: "{"b" * 40}"\n'
+                '  version "3.1"\n'
+            )
+            request = prepare_update(COMMIT, "3.2", current)
+            self.assertIn("sha", request)
+            self.assertEqual(current.read_text(), render_formula(COMMIT, "3.2"))
 
     def test_reruns_unchanged_commits_and_older_runs_do_not_publish(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -74,6 +87,7 @@ class NightlyWorkflowTest(unittest.TestCase):
         self.assertIn("workflow_dispatch:", workflow)
         # A failed publish job can be retried without rebuilding its artifact.
         self.assertNotIn("github.run_attempt", workflow)
+        self.assertIn("overwrite: true", workflow)
         # The test tap contains only nightly; stable's formula is absent.
         self.assertIn("brew install --formula --skip-link lydakis/agent/sonny-nightly", workflow)
         self.assertIn("brew test --force lydakis/agent/sonny-nightly", workflow)

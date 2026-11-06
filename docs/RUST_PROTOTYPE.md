@@ -428,7 +428,7 @@ keeps what it started with; the next start takes a change.
 | `--max-pending` | Submissions waiting to start: queued behind a bot's own work or ready for a slot, daemon-wide. A submission that would wait past the bound answers `pending_limit` and writes nothing; one that starts at once is never refused by it. | none |
 | `--max-pending-bytes` | UTF-8 bytes of those waiting submissions: their prompts and the words they quote, which wait with them. | none |
 | `--max-input-bytes` | Bytes of request lines every session together has read and the daemon has not yet taken up. A line is read on credit for its first 4 KiB, and one that goes on waits for credit for the longest line (8 MiB) at once and gives back what it did not use, so readers never each hold part of what they need; an eighth of the bound is kept for lines that end within 4 KiB, so interrupts, renewals and status reads get in while long submits wait. At least one longest line and its reserve. Zero is unbounded. | a sixteenth of physical memory, at least 64 MiB |
-| `--max-readers` | Store reader connections, each on its own thread, for the reads clients ask for that decide nothing ([observation reads](#observation-reads)), which take all but one, and for turns' own reads. At least 1. | one per logical CPU |
+| `--max-readers` | Most store reader connections, each on its own thread and opened as reads wait for one, for the reads clients ask for that decide nothing ([observation reads](#observation-reads)), which take all but one, and for turns' own reads. At least 1. | one per logical CPU |
 | `--max-load` | The 1-minute load average at which new foreground and background commands wait while one of the daemon's is running, as make's `-l`: never while none is, so a loaded machine slows the fleet and never stops it, and `--max-processes` stays the bound behind it. One thread reads the load each second; waiters hold no slot, go in the order they came, and take a freed slot only if the gate still admits them. A call that would be refused (forbidden, asked about with no gate, an escape no gate allows) is answered at once, never held; a gated one waits for its verdict instead, so a denial comes back as soon as it is given, and one allowed starts then. A round's calls that run together are let in or held whole. A foreground command held past 1.5 s parks its turn before the call (or the batch it starts with) starts: one commit, `turn_waiting` with `{call_id, load: true, deadline_ms}` (also its view's `waiting_on`), no task, no active slot, and it survives restart. The gate's next admitting reading wakes every parked turn once the load falls, or the oldest alone on a loaded machine where none of the daemon's commands runs; a turn whose round has a later gated call is woken at that call's lapse too. A fraction is kept. Zero is no gate. Reported in `ready` as `limits.load`, `null` for none (protocol 44). | none (the agent CLI passes `cpus * 2`) |
 | `--max-connecting` | Provider requests awaiting response headers, a Bedrock Runtime call's body digest included. Established streams are not capped. Both providers hold headers until the first token, so a permit is held for the whole time to first token; a bound of N caps throughput at N calls per first-token latency. | none |
 | `--stall-timeout` | How long an established provider stream may go without a content frame before the attempt fails as `provider_stream_stalled` and is retried. Keepalives do not count; a connection that sends no bytes at all, keepalives included, fails sooner, after 2 minutes. Whole seconds, `1s` to `24h`. `[daemon] stall_timeout` in `~/.agent/config.toml` sets it, as a duration such as `"15m"`. | `10m` |
@@ -1052,8 +1052,14 @@ operations.
 Reads that decide nothing run beside the service loop, not in it:
 `history_nodes`, `history_items`, `history_search`, `turns`, `bots`,
 `events`, `usage` and `prompts`. Each runs on one of the store's reader
-connections (`--max-readers`, one per logical CPU by default; WAL readers
-do not block each other or the writer). They take at most all but one of
+connections (at most `--max-readers`, one per logical CPU by default; WAL
+readers do not block each other or the writer). One reader opens with the
+store; another opens when a read is queued with no reader free to take
+it, and one past the first closes after 30 seconds without a read, so a
+quiet daemon holds one and a busy one widens on its own. The readers that
+are open share one 2 MiB page cache budget equally: an idle reader takes
+its new share as soon as one opens or closes, a busy one as its read ends
+(`stats` shows the shares held as `readers.cache_kib`). They take at most all but one of
 the connections, the rest waiting in the order they came, so a turn's own
 reads (its context, a compaction plan) always find one free, as Kubernetes'
 API Priority and Fairness keeps seats for each priority level. Meanwhile the loop serves every other
@@ -1533,7 +1539,9 @@ halving the cursor range, a few point reads however many events are kept;
 events with no time count as older. It is the `usage` op's word for a start
 time, and `agent follow --since 1h` sends it.
 `follow` replays durable events after the cursor as notifications, emits
-`follow_live` with the cursor reached, and then delivers live events. The
+`follow_live` with the cursor reached (at least the newest event already
+published, so a follow resumed from it repeats nothing from before the
+switch, whatever kinds it names), and then delivers live events. The
 switch happens inside a storage job, so no committed event falls between the
 last replayed page and the first live delivery, and replayed cursors are never
 repeated live. Non-durable `text_delta` and `thinking_delta` notifications are

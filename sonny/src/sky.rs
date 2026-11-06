@@ -536,7 +536,7 @@ enum Heard {
     Poem(String, i64, Vec<String>),
     /// The file as read, and the rule when it was read again too.
     Read(Box<haiku::Kept>, Option<haiku::Rule>),
-    /// The day's haikus, for a replay to show each when it was up.
+    /// The haikus of a replay's span, for it to show each when it was up.
     Poems(Vec<haiku::Poem>),
     /// The daemon's triggers as read, soonest first.
     Schedules(Vec<crate::trigger::Upcoming>),
@@ -598,8 +598,9 @@ struct Replay {
     /// talked is whole from the first frame, as live; what goes off the
     /// tape's start joins it.
     prior: Prior,
-    /// The day's haikus, and when the one shown was written: the one up
-    /// at the replay's time shows, as it did then.
+    /// The haikus of its span, read as it plays, and when the one shown
+    /// was written: the one up at the replay's time shows, as it did then.
+    past: std::sync::Arc<std::sync::Mutex<haiku::Past>>,
     poems: Vec<haiku::Poem>,
     poem: Option<i64>,
 }
@@ -735,7 +736,7 @@ impl Replay {
         }
     }
 
-    fn new(from: i64) -> Self {
+    fn new(from: i64, socket: &std::path::Path) -> Self {
         Replay {
             from,
             at: from as f64,
@@ -749,6 +750,7 @@ impl Replay {
             cut: false,
             folded: Vec::new(),
             prior: Prior::default(),
+            past: std::sync::Arc::new(std::sync::Mutex::new(haiku::Past::new(socket, from))),
             poems: Vec::new(),
             poem: None,
         }
@@ -980,7 +982,7 @@ impl View {
     /// Play the past back from `from` (Unix ms), or, with none, watch live
     /// again. Either way the sky is read anew, and the chat log with it.
     pub fn replay(&mut self, from: Option<i64>) {
-        self.replay = from.map(Replay::new);
+        self.replay = from.map(|from| Replay::new(from, &self.socket));
         self.ticker.clear();
         self.recent.clear();
         self.calls.clear();
@@ -988,7 +990,7 @@ impl View {
         // file's shows anew.
         (self.verse, self.fading) = (None, None);
         self.shown = (String::new(), 0);
-        // Read at once, the day's haikus or the file's.
+        // Read at once, the replay's haikus or the file's.
         self.weighed = None;
         self.restart();
     }
@@ -1212,13 +1214,22 @@ impl View {
         // /config says now and then: haikus turned on or off, or the cap
         // moved, since the sky opened.
         if !self.reading && self.replay.is_some() {
-            // A replay reads the day's haikus again as it goes: one another
-            // sky writes while it plays shows when the replay reaches it.
+            // A replay reads the haikus written since it last read as it
+            // goes: one another sky writes while it plays shows when the
+            // replay reaches it.
             self.reading = true;
-            let (store, socket) = (self.store.clone(), self.socket.clone());
+            let store = self.store.clone();
+            let past = (self.replay.as_ref()).map(|replay| replay.past.clone());
             let send = self.heard.0.clone();
             self.runtime.spawn_blocking(move || {
-                let _ = send.send(Heard::Poems(haiku::Kept::load(&store, &socket).past));
+                let Some(past) = past else {
+                    return;
+                };
+                let Ok(mut past) = past.lock() else {
+                    return;
+                };
+                past.read(&store);
+                let _ = send.send(Heard::Poems(past.poems.clone()));
             });
         } else if !self.reading {
             self.reading = true;
@@ -1257,7 +1268,7 @@ impl View {
                 let _ = send.send(Heard::Schedules(found));
             });
         }
-        if self.replay.is_some() || self.title.rule.daily == 0 {
+        if self.replay.is_some() || !self.title.rule.on {
             return;
         }
         if let Some((name, since)) = self.heir.take()
@@ -1290,18 +1301,21 @@ impl View {
                     kept.claim(&rule, &claim_name, since, since)
                 })
                 .is_some_and(|(claimed, _)| claimed)
+                .then_some(rule.keep)
             });
-            if !matches!(claimed.await, Ok(true)) {
+            let Ok(Some(keep)) = claimed.await else {
                 return;
-            }
+            };
             // One that writes none leaves the haiku before showing, here
             // and in every sky, and says why in the file.
             let written = haiku::write(socket.clone(), name.clone()).await;
             let kept = tokio::task::spawn_blocking(move || {
                 let at = wall_ms();
                 match written {
-                    Ok(lines) => haiku::Kept::publish(&store, &socket, &name, since, &lines, at)
-                        .then(|| Heard::Poem(name, at, lines.to_vec())),
+                    Ok(lines) => {
+                        haiku::Kept::publish(&store, &socket, &name, since, &lines, at, keep)
+                            .then(|| Heard::Poem(name, at, lines.to_vec()))
+                    }
                     Err(why) => {
                         haiku::Kept::unwritten(&store, &socket, &name, since, why, at);
                         None
@@ -5728,7 +5742,7 @@ mod tests {
         use ratatui::crossterm::event::KeyCode;
         let (mut view, send) = view();
         let from = wall_ms() - 3_600_000;
-        view.replay = Some(Replay::new(from));
+        view.replay = Some(Replay::new(from, &view.socket));
         send.send(Feed::Roll(vec![
             json!({"name": "shop.lead", "running_turn": 4}),
             json!({"name": "shop.login", "created_by": "shop.lead"}),
@@ -5812,7 +5826,7 @@ mod tests {
     async fn a_replay_draws_who_had_talked_before_it_and_the_haiku_up_then() {
         let (mut view, send) = view();
         let from = wall_ms() - 2 * 3_600_000;
-        view.replay = Some(Replay::new(from));
+        view.replay = Some(Replay::new(from, &view.socket));
         send.send(Feed::Roll(vec![
             json!({"name": "shop.lead"}),
             json!({"name": "shop.login", "created_by": "shop.lead"}),
@@ -5836,7 +5850,7 @@ mod tests {
         assert_eq!(prior.told.len(), 2);
         assert!(prior.told.values().all(|e| e["data"]["prompt"].is_null()));
         send.send(Feed::Prior(prior)).unwrap();
-        // The day's haikus as the file keeps them.
+        // Haikus as the past file keeps them.
         let lines = |first: &str| vec![first.to_owned(), "b".into(), "c".into()];
         let poem = |by: &str, at: i64, first: &str| haiku::Poem {
             by: by.into(),
@@ -5844,12 +5858,13 @@ mod tests {
             at_ms: at,
             since_ms: at - 300_000,
         };
-        haiku::Kept::update(&view.store, &view.socket, |kept| {
-            kept.past = vec![
-                poem("shop.cart", from - 2 * 3_600_000, "old"),
-                poem("shop.lead", from + 1_800_000, "dawn"),
-            ];
-        });
+        let socket = view.socket.display().to_string();
+        for poem in [
+            poem("shop.cart", from - 2 * 3_600_000, "old"),
+            poem("shop.lead", from + 1_800_000, "dawn"),
+        ] {
+            view.store.remember(&socket, &poem, None).unwrap();
+        }
         send.send(Feed::Ready).unwrap();
         view.drain();
         // The web of who had talked is there from the first frame, as live.
@@ -5868,7 +5883,8 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
             view.drain();
         }
-        assert_eq!(view.replay.as_ref().unwrap().poems.len(), 2);
+        // Its span's, and the hour before it: not the one written before.
+        assert_eq!(view.replay.as_ref().unwrap().poems.len(), 1);
         assert!(view.verse.is_none());
         view.seek(from as f64 + 1_860_000.0, Instant::now());
         view.drain();
@@ -5905,9 +5921,8 @@ mod tests {
         assert!(text(&view.haiku(Instant::now())).contains("busiest for 5m"));
         // One another sky writes while the replay plays is read as it goes,
         // and shows when the replay reaches it.
-        haiku::Kept::update(&view.store, &view.socket, |kept| {
-            kept.past.push(poem("shop.cart", from + 5_700_000, "late"));
-        });
+        let late = poem("shop.cart", from + 5_700_000, "late");
+        view.store.remember(&socket, &late, None).unwrap();
         view.weighed = None;
         view.drain();
         while view.reading {
@@ -5929,7 +5944,7 @@ mod tests {
         assert_eq!((prior.told.len(), prior.pairs.len()), (PRIOR, PRIOR));
         assert_eq!(prior.told.values().next().unwrap()["bot"], "a5");
         // What goes off the tape's start joins it.
-        let mut replay = Replay::new(0);
+        let mut replay = Replay::new(0, std::path::Path::new("/tmp/agent.sock"));
         replay.keep(json!({"event": "accepted", "bot": "b", "written_ms": 0,
             "data": {"from": {"bot": "lead"}}}));
         for at in 1..=TAPE as i64 {
@@ -6133,7 +6148,7 @@ mod tests {
 
     #[test]
     fn a_replay_s_tape_lets_its_oldest_tenth_go_past_its_bound() {
-        let mut replay = Replay::new(0);
+        let mut replay = Replay::new(0, std::path::Path::new("/tmp/agent.sock"));
         for at in 0..TAPE as i64 {
             replay.keep(json!({"event": "queued", "written_ms": at}));
         }
@@ -6145,7 +6160,7 @@ mod tests {
         assert!(!replay.cut);
         // Loading the past, nothing played: twice the bound is kept to it,
         // the newest of it, and the replay starts where that does.
-        let mut replay = Replay::new(0);
+        let mut replay = Replay::new(0, std::path::Path::new("/tmp/agent.sock"));
         for at in 0..2 * TAPE as i64 {
             replay.keep(json!({"event": "queued", "written_ms": at}));
         }
@@ -6158,7 +6173,7 @@ mod tests {
             2 * TAPE as i64 - 1
         );
         // Paused with a fifth played, twice the bound more stays bound too.
-        let mut replay = Replay::new(0);
+        let mut replay = Replay::new(0, std::path::Path::new("/tmp/agent.sock"));
         for at in 0..TAPE as i64 {
             replay.keep(json!({"event": "queued", "written_ms": at}));
         }
@@ -6168,7 +6183,7 @@ mod tests {
         }
         assert!(replay.tape.len() <= TAPE);
         // Who was made, or removed, in what went is in the cast now.
-        let mut replay = Replay::new(0);
+        let mut replay = Replay::new(0, std::path::Path::new("/tmp/agent.sock"));
         replay.cast = vec![json!({"name": "old"})];
         replay.keep(json!({"event": "created", "bot": "new", "data": {"bot_id": 9}}));
         replay.keep(json!({"event": "deleted", "bot": "old"}));
@@ -6210,7 +6225,7 @@ mod tests {
     #[tokio::test]
     async fn who_the_tape_let_go_of_stays_in_the_cast_past_the_last_listing() {
         let (mut view, send) = view();
-        let mut replay = Replay::new(0);
+        let mut replay = Replay::new(0, std::path::Path::new("/tmp/agent.sock"));
         // Made at the tape's start, deleted after it: the listing of now
         // no longer names it.
         replay.keep(json!({"event": "created", "bot": "shop.x", "data": {"bot_id": 4}}));
@@ -6232,7 +6247,7 @@ mod tests {
     #[tokio::test]
     async fn who_the_tape_let_go_of_stays_though_its_name_is_used_again() {
         let (mut view, send) = view();
-        let mut replay = Replay::new(0);
+        let mut replay = Replay::new(0, std::path::Path::new("/tmp/agent.sock"));
         // Made at the tape's start; deleted, and its name used again, after.
         replay.keep(json!({"event": "created", "bot": "shop.x", "data": {"bot_id": 4}}));
         for at in 0..TAPE as i64 {
@@ -6255,7 +6270,7 @@ mod tests {
 
     #[test]
     fn a_replay_seats_an_agent_with_its_new_model_after_a_step_back() {
-        let mut replay = Replay::new(0);
+        let mut replay = Replay::new(0, std::path::Path::new("/tmp/agent.sock"));
         replay.cast = vec![json!({"name": "a", "model": "m1"})];
         replay.keep(json!({"event": "created", "bot": "b", "data": {"model": "m1"}}));
         replay.remodel(&HashMap::from([("a", "m2"), ("b", "m3")]));
@@ -6267,7 +6282,7 @@ mod tests {
     async fn a_replay_keeps_who_had_a_name_before_it_was_used_again() {
         let (mut view, send) = view();
         let from = wall_ms() - 3_600_000;
-        view.replay = Some(Replay::new(from));
+        view.replay = Some(Replay::new(from, &view.socket));
         send.send(Feed::Roll(vec![json!({"name": "shop.a", "bot_id": 1})]))
             .unwrap();
         send.send(Feed::Tape(json!({"event": "deleted", "bot": "shop.a",
@@ -6285,7 +6300,7 @@ mod tests {
     #[tokio::test]
     async fn a_replay_takes_the_listing_s_model_for_an_agent_it_saw_made() {
         let (mut view, send) = view();
-        view.replay = Some(Replay::new(0));
+        view.replay = Some(Replay::new(0, &view.socket));
         send.send(Feed::Tape(
             json!({"event": "created", "bot": "b", "written_ms": 1, "data": {"model": "m1"}}),
         ))
@@ -8002,7 +8017,10 @@ mod scale {
         // A replay's tape, full, with the view let go first.
         drop(view);
         let live_gone = rss_kib();
-        let mut replay = Replay::new(wall_ms() - 3_600_000);
+        let mut replay = Replay::new(
+            wall_ms() - 3_600_000,
+            std::path::Path::new("/tmp/agent.sock"),
+        );
         let start = Instant::now();
         for n in 0..TAPE + TAPE / 20 {
             replay.keep(slim(busy(n, count, projects)));
