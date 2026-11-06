@@ -202,6 +202,9 @@ pub struct Screen {
     width: usize,
     /// How many rows the view is scrolled up from the newest.
     back: usize,
+    /// How many rows tall the view was drawn last; none before its first
+    /// draw, as after a repaint.
+    tall: Option<usize>,
     /// Where the rows were drawn last, the first one drawn there, and
     /// how many.
     area: Rect,
@@ -1397,6 +1400,14 @@ impl Screen {
     pub fn render(&mut self, area: Rect, buf: &mut Buffer, file: impl Fn(&str) -> Option<String>) {
         self.layout(area.width as usize);
         let height = area.height as usize;
+        // Scrolled up, the view keeps its top row when the rows under it
+        // take more or less room, as a reply's open lines or a taller
+        // composer do: only the newest rows, followed, stay at the bottom.
+        if let Some(before) = self.tall.replace(height)
+            && self.back > 0
+        {
+            self.back = self.back.saturating_add(before).saturating_sub(height);
+        }
         if let Some((row, above)) = self.go_to.take() {
             let at = (self.shown.iter().enumerate())
                 .filter(|(_, shown)| shown.first)
@@ -2831,6 +2842,34 @@ mod tests {
         let mut buf = Buffer::empty(area);
         screen.render(area, &mut buf, |_| None);
         assert_eq!(row(&buf, 4).trim_end(), "row 20");
+    }
+
+    #[test]
+    fn scrolled_up_the_view_keeps_its_top_row_as_its_height_changes() {
+        let lines: Vec<Line> = (0..40).map(|i| Line::from(format!("row {i}"))).collect();
+        let (mut screen, _) = screen(lines, 20, 10);
+        screen.scroll(10);
+        let at = |height| Rect::new(0, 0, 20, height);
+        assert_eq!(row(&drawn(&mut screen, at(10)), 0).trim_end(), "row 20");
+        // A reply's open lines grow under it, row by row.
+        for height in (6..10).rev() {
+            assert_eq!(row(&drawn(&mut screen, at(height)), 0).trim_end(), "row 20");
+        }
+        // Then they are written into it, and their room comes back.
+        screen.push((40..44).map(|i| Line::from(format!("row {i}"))).collect());
+        let buf = drawn(&mut screen, at(10));
+        assert_eq!(row(&buf, 0).trim_end(), "row 20");
+        assert_eq!(row(&buf, 9).trim_end(), "row 29");
+        // Squeezed to nothing, as a composer taking all the room does, and
+        // back, it is where it was.
+        drawn(&mut screen, at(0));
+        assert_eq!(row(&drawn(&mut screen, at(10)), 0).trim_end(), "row 20");
+        // Taller than the rows under it, it comes to the newest and follows.
+        let buf = drawn(&mut screen, at(30));
+        assert_eq!(row(&buf, 29).trim_end(), "row 43");
+        assert_eq!(screen.back(), 0);
+        let buf = drawn(&mut screen, at(25));
+        assert_eq!(row(&buf, 24).trim_end(), "row 43");
     }
 
     #[test]
