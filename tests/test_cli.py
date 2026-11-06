@@ -139,6 +139,8 @@ class SocketAndCliTests(ModelFixture):
         self.assertEqual(failing.returncode, 1)
         last = json.loads(failing.stdout.splitlines()[-1])
         self.assertEqual((last['event'], last['data']['error']), ('turn_finished', 'missing_completion'))
+        # A failed run says why on stderr too, where a caller that checks the exit looks.
+        self.assertIn('agent: failed: missing_completion', failing.stderr)
         pretty = self.agent('run', '--store', str(self.store), '--bot', 'Bob', '--pretty', 'truncate', check=False)
         self.assertIn('missing_completion', pretty.stderr)
         self.agent('shutdown', '--store', str(self.store))
@@ -829,6 +831,8 @@ class SocketAndCliTests(ModelFixture):
         timed = self.agent('wait', '--store', str(self.store), '--timeout', '200ms', again, check=False)
         self.assertEqual(timed.returncode, 1)
         self.assertEqual(json.loads(timed.stdout)['pending'], [again])
+        # A timeout is no failure: `pending` says it, and stderr stays quiet.
+        self.assertEqual(timed.stderr, '')
         inside = subprocess.run([*self.base, 'wait', '--store', str(self.store), again],
                                 env={**clean_env(), 'AGENT_SHELL_CONTEXT': '1'}, capture_output=True, text=True, timeout=5)
         self.assertNotEqual(inside.returncode, 0)
@@ -1666,7 +1670,9 @@ class ModelListTests(ModelFixture):
         self.assertFalse(self.list.exists())
 
     def test_discover_writes_a_first_list_that_clients_and_bots_read(self):
-        self.assertEqual(json.loads(self.agent('models').stdout), [])
+        bare = self.agent('models')
+        self.assertEqual(json.loads(bare.stdout), [])
+        self.assertIn('agent models --discover', bare.stderr)
         self.assertIn('agent models --discover', self.agent('models', '--pretty').stderr)
         self.assertFalse((self.path / 'state.sqlite').exists(), 'reading the list starts no daemon')
 
