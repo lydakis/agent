@@ -5751,11 +5751,14 @@ impl App {
                         && head.is_some()
                         && self.running_heads.get(&bot) != head.as_ref()
                     {
-                        let seen = self.scan(&bot, None).await;
-                        self.running_heads
-                            .insert(bot.clone(), head.unwrap_or_default());
-                        needs.asked(&bot, seen.open(&store, &bot, true));
-                        asked.push(bot.clone());
+                        // One that could not be read is read again next pass,
+                        // keeping what it asked meanwhile.
+                        if let Some(seen) = needs::scan(&self.client, &bot, None).await {
+                            self.running_heads
+                                .insert(bot.clone(), head.unwrap_or_default());
+                            needs.asked(&bot, seen.open(&store, &bot, true));
+                            asked.push(bot.clone());
+                        }
                     }
                     // A turn that ended on a question waits on the person;
                     // read once per turn it ended.
@@ -5774,7 +5777,10 @@ impl App {
                         asked.push(bot.clone());
                     }
                     read.push(bot.clone());
-                    match (needs.waits(&bot), state.as_str(), turn["turn"].as_i64()) {
+                    // One not read again this pass waits on what it asked.
+                    let waits =
+                        needs.waits(&bot) || (!asked.contains(&bot) && self.task_needs.waits(&bot));
+                    match (waits, state.as_str(), turn["turn"].as_i64()) {
                         (true, ..) => "needs you".to_owned(),
                         // One with a goal says whether that turn met it.
                         (false, "done", Some(last)) => {
@@ -19597,8 +19603,12 @@ mod tests {
         let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen = sent.clone();
         let asked = json!({"question": "Signed in?", "why": "w", "command": "gh auth login"});
+        let down = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let unreadable = down.clone();
         let (client, _) = daemon_with_events(json!({}), move |asked_for| {
+            let unreadable = unreadable.load(std::sync::atomic::Ordering::SeqCst);
             match asked_for["op"].as_str().unwrap_or("") {
+                "history_nodes" if unreadable => json!({"error": "unavailable"}),
                 "inspect" => json!({"name": "calc.ask", "head": 7, "running_turn": 2}),
                 "submit" => {
                     seen.lock().unwrap().push(asked_for.clone());
@@ -19630,9 +19640,20 @@ mod tests {
             false,
         );
         drawn(&mut app);
+        // Its history could not be read: read again on the next slow pass.
+        app.read_tasks().await;
+        app.pin_task_asks();
+        assert!(app.asks.is_empty());
+        down.store(false, std::sync::atomic::Ordering::SeqCst);
+        app.tasks_read = Some(Instant::now() - Duration::from_secs(5));
+        app.tasks_all_read = None;
         app.read_tasks().await;
         app.pin_task_asks();
         assert_eq!(app.asks.len(), 1, "read while it runs");
+        // A quick pass that does not read it again still says it needs you.
+        app.tasks_read = Some(Instant::now() - Duration::from_secs(5));
+        app.read_tasks().await;
+        assert!(drawn(&mut app)[1].contains("needs you"));
         app.input.set("done");
         app.submit().await;
         let to = sent.lock().unwrap().last().cloned().unwrap();
