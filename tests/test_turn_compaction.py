@@ -3,6 +3,7 @@ earlier rounds and finishes, its prompt kept whole."""
 from contextlib import closing
 import json
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -11,6 +12,12 @@ from tests.test_runtime import AnthropicModel, ModelFixture, is_summary
 from tests.test_elision import drain, encoded
 from bench.runtime_client import Client, node_item
 from bench.targets import clean_env
+
+
+def asked_bytes(request):
+    """The size a summary request asks for."""
+    items = request.get('input') or request.get('messages')
+    return int(re.search(r'within ([0-9]+) UTF-8 bytes', items[-1]['content'][-1]['text']).group(1))
 
 
 def all_events(client, bot):
@@ -259,6 +266,26 @@ class TurnCompactionTests(ModelFixture):
         work = [r for r in drain(self.model) if not is_summary(r)]
         self.assertLess(max(len(json.dumps(r)) for r in work), 7000 * 4 + 24576)
 
+    def test_a_window_the_person_set_beats_the_models_listing(self):
+        # The listing says a million tokens and the person 40,000, on
+        # purpose: the bot compacts at 7,000 tokens, about 28 KiB at four
+        # bytes a token, as with a listed 40,000.
+        self.model.bytes_per_token, self.model.context_window = 4, 1_000_000
+        client = self.client(tools='shell', extra=('--context-window', 'openai/*=40000',
+                                                   '--context-window', 'other/*=2000'))
+        self.assertEqual(client.ready['context_windows'], {'openai/*': 40000, 'other/*': 2000})
+        client.request('provider_models')
+        client.request('create', bot='Bob', workspace=str(self.path), tools=['shell'],
+                       compaction_instructions='Summarize.')
+        turn = client.request('submit', bot='Bob', request_id='1', prompt='long:40')['result']['turn']
+        self.assertEqual(client.finished(turn, timeout=60)['data']['status'], 'completed')
+        events = all_events(client, 'Bob')
+        self.assertTrue([e for e in events if e['event'] == 'compacted'])
+        windows = {e['data'].get('context_window') for e in events if e['event'] == 'usage'}
+        self.assertEqual(windows, {40000})
+        work = [r for r in drain(self.model) if not is_summary(r)]
+        self.assertLess(max(len(json.dumps(r)) for r in work), 7000 * 4 + 24576)
+
     def test_a_compaction_a_client_asks_for_runs_before_the_next_call(self):
         client = self.client(tools='shell')
         client.request('create', bot='Plain', workspace=str(self.path), tools=['shell'])
@@ -445,6 +472,81 @@ class TurnCompactionTests(ModelFixture):
         self.assertEqual(len({c['version'] for c in steps}), 1)
         self.assertEqual([c['cut'] for c in steps], sorted({c['cut'] for c in steps}))
         self.assertEqual(sum(is_summary(r) for r in requests), len(compacted))
+
+
+    def test_a_summary_longer_than_asked_is_asked_again_smaller(self):
+        # A summarizer that writes half again what it is asked for: refused
+        # at the 32 KiB limit, it is asked for 16 KiB and writes 24 KiB,
+        # which the limit takes, so the turn is compacted, not left as it is.
+        self.model.compaction_text = lambda request: 's' * (asked_bytes(request) * 3 // 2)
+        client = self.client(tools='shell', settings={'context_bytes': 98304})
+        client.request('create', bot='Bob', workspace=str(self.path), tools=['shell'],
+                       compaction_instructions='Summarize.')
+        turn = client.request('submit', bot='Bob', request_id='1', prompt='long:40')['result']['turn']
+        self.assertEqual(client.finished(turn, timeout=60)['data']['status'], 'completed')
+        compacted = [e['data'] for e in all_events(client, 'Bob') if e['event'] == 'compacted']
+        self.assertTrue(compacted)
+        self.assertTrue(all(c['summary_bytes'] == 24576 for c in compacted), compacted)
+        asks = [asked_bytes(r) for r in drain(self.model) if is_summary(r)]
+        self.assertEqual(asks[:2], [32768, 16384])
+        self.assertEqual(asks.count(16384), len(compacted))
+        # One that comes back no shorter is not asked again.
+        self.model.compaction_text = 's' * 40000
+        client.request('create', bot='Ann', workspace=str(self.path), tools=['shell'],
+                       compaction_instructions='Summarize.')
+        turn = client.request('submit', bot='Ann', request_id='1', prompt='long:12')['result']['turn']
+        client.finished(turn, timeout=60)
+        asks = [asked_bytes(r) for r in drain(self.model) if is_summary(r)]
+        self.assertEqual(asks[:2], [32768, 16384])
+        self.assertNotIn(8192, asks)
+        self.assertFalse([e for e in all_events(client, 'Ann') if e['event'] == 'compacted'])
+
+    def drive(self, window, per_token, overhead, lines, compactions=20):
+        """A lead's many turns at a `window`-token context, `per_token` bytes a
+        token, with `overhead` bytes of instructions, each turn four rounds
+        of `lines` lines, until it has compacted `compactions` times; each
+        summary as long as it is asked for, the least room it can leave.
+        The compacted events, oldest first."""
+        self.model.bytes_per_token = per_token
+        self.model.compaction_text = lambda request: 's' * asked_bytes(request)
+        client = self.client(tools='shell', extra=('--context-window', f'openai/*={window}'))
+        client.request('create', bot='Lead', workspace=str(self.path), tools=['shell'],
+                       instructions='i' * overhead, compaction_instructions='Summarize.')
+        compacted = []
+        for n in range(400):
+            turn = client.request('submit', bot='Lead', request_id=str(n),
+                                  prompt=f'long:4x{lines}')['result']['turn']
+            self.assertEqual(client.finished(turn, timeout=60)['data']['status'], 'completed')
+            drain(self.model)
+            compacted = [e['data'] for e in all_events(client, 'Lead') if e['event'] == 'compacted']
+            if len(compacted) >= compactions:
+                break
+        self.assertGreaterEqual(len(compacted), compactions)
+        return compacted
+
+    def assert_room(self, compacted, window):
+        for n, data in enumerate(compacted):
+            trigger = data['trigger']
+            self.assertEqual((trigger['reason'], trigger['window']), ('bytes', window), data)
+            # The summary, kept prompts and the kept tail leave at least a
+            # quarter of the view's threshold: a third is the keep target's
+            # share, and a cut lands on a turn's prompt or a round start of
+            # the newest turn, so the tail may keep one older turn whole.
+            self.assertGreaterEqual(data['room_bytes'], trigger['at_bytes'] // 4, (n, data))
+        # Nothing piles up: the twentieth leaves the room the second did.
+        rooms = [data['room_bytes'] for data in compacted[1:]]
+        self.assertGreaterEqual(min(rooms), rooms[0] * 95 // 100, rooms)
+
+    def test_a_lead_keeps_room_to_work_across_twenty_compactions_at_200k(self):
+        # Four bytes a token, 40 KB of instructions and tools, rounds of
+        # about 36 KB, each summary a full 64 KiB.
+        compacted = self.drive(200_000, 4, 40_000, 2000)
+        self.assert_room(compacted, 200_000)
+
+    def test_a_lead_keeps_room_to_work_across_twenty_compactions_at_1m(self):
+        # A byte a token, so the test sends a million bytes, not four.
+        compacted = self.drive(1_000_000, 1, 15_000, 3500)
+        self.assert_room(compacted, 1_000_000)
 
 
 @skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'requires release binary')
