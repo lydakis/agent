@@ -12392,8 +12392,10 @@ impl App {
             };
             // The sky fills the pane, however wide; the other cards are
             // prose, read at the conversation's measure.
+            // Each card row is drawn a column in from the line between, so
+            // a card is laid that column narrower than where it is drawn.
             let full = wide.saturating_sub(2) as usize;
-            let width = full.min(measure());
+            let width = full.min(measure()).saturating_sub(1);
             pane.prose = watch.sky.is_none();
             if let Some(view) = &mut watch.sky {
                 let width = full;
