@@ -2024,6 +2024,14 @@ impl Database {
         })
     }
 
+    /// Set this connection's page cache to `kib`, as a reader's share of
+    /// the readers' budget.
+    pub fn cache_kib(&self, kib: usize) -> Result<()> {
+        self.conn
+            .execute_batch(&format!("PRAGMA cache_size=-{}", kib.max(1)))?;
+        Ok(())
+    }
+
     pub fn initialize(conn: Connection) -> Result<Self> {
         // FULL syncs the WAL before a commit is answered. An answer survives
         // a daemon crash, but on macOS plain fsync can leave writes in the
