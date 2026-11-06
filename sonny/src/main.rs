@@ -16582,11 +16582,7 @@ mod tests {
             !mark.style.add_modifier.contains(Modifier::DIM),
             "red, not dimmed"
         );
-        let words = line
-            .spans
-            .iter()
-            .find(|s| s.content == " 1")
-            .unwrap();
+        let words = line.spans.iter().find(|s| s.content == " 1").unwrap();
         assert!(words.style.add_modifier.contains(Modifier::DIM));
         app.failed = 2;
         assert!(app.footer_line(140).to_string().contains("✗ 2"));
@@ -18653,10 +18649,7 @@ mod tests {
             .collect();
         assert_eq!(
             shown,
-            [
-                ("? 2".to_owned(), "status"),
-                ("● 2".to_owned(), "status")
-            ]
+            [("? 2".to_owned(), "status"), ("● 2".to_owned(), "status")]
         );
         // The agent's name is the composer's to say, not the footer's.
         assert!(text.ends_with("  ? 2  ● 2  "), "{text}");
