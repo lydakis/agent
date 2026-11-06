@@ -2128,7 +2128,7 @@ impl Database {
     /// Stored schema version, kept in `PRAGMA user_version`. Stores created
     /// before versioning and stores from newer binaries are rejected; an older
     /// versioned store is migrated forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 81;
+    pub const SCHEMA: i32 = 79;
     /// Verbatim user prompts a compaction keeps: per-prompt text, and the
     /// total text plus `(ordinal, String)` entry metadata. Empty entries cost
     /// space too, so the retained list cannot grow with conversation length.
@@ -13834,12 +13834,12 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
     {
         conn.execute("ALTER TABLE turns ADD COLUMN held TEXT", [])?;
     }
-    // Schema 81: budgets count work, not every token a call sends. What was
+    // Schema 79: budgets count work, not every token a call sends. What was
     // counted before stays counted: a bot's work and its turns' start from
     // their usage, so no budget is refilled and a parked turn counts on. A
     // bot with a history re-bases on its next call, which the measure has
     // not seen the history of.
-    if from < 81
+    if from < 79
         && conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='turns')
              AND NOT EXISTS(SELECT 1 FROM pragma_table_info('turns') WHERE name='work')",
