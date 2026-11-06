@@ -5815,6 +5815,15 @@ costs its limit, its cursor passes what it skipped and going live looks at
 one event: going live runs on the writer, so it never scans the tail. The index is
 created when a store opens, so it needs no schema number.
 
+A page of some kinds ends at the last event of those kinds, which can sit
+far behind what the store has committed. Going live therefore moves the
+follow's cursor to the newest event already published, when that is
+newer, and `follow_live` reports that: nothing wanted lies between the
+two, and a follow resumed from it with wider kinds (Sky reads the past
+narrowly, then follows what animates it from where the past ended)
+replays nothing written before the switch. The published cursor is held
+in memory, so this adds no read, with a few bots or thousands.
+
 A store of 300,000 events of about 800 bytes each (307 MiB), six of them
 `turn_finished`, followed with `bot='*', kinds=[accepted, steered,
 turn_finished]` from cursor 0 until `follow_live`, three follows per open,

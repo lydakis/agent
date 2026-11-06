@@ -726,23 +726,30 @@ pub async fn replay(store: Store, hub: Hub, bot: String, sub: Sub) -> Result<()>
         };
         let mut cursor = after;
         if events.is_empty() {
-            let (switch_sub, switch_bot) = (sub.clone(), bot.clone());
-            let (live, pruned) = store
+            let (switch_sub, switch_bot, switch_hub) = (sub.clone(), bot.clone(), hub.clone());
+            let (live, pruned, boundary) = store
                 .op("follow_live", move |db| {
                     let mut s = switch_sub.lock().unwrap();
                     // Only a wanted event behind it keeps the follow paging:
                     // for every bot's, one index probe a kind.
                     let behind = event_page(db, &switch_bot, s.kinds.as_ref(), s.last_cursor, 1)?;
                     if s.cancelled || behind["events"].as_array().is_some_and(|e| !e.is_empty()) {
-                        return Ok((false, None));
+                        return Ok((false, None, s.last_cursor));
                     }
+                    // A page of some kinds ends at the last one it found,
+                    // which can sit far behind what was committed. Nothing
+                    // wanted lies past it, so the follow has seen everything
+                    // published: its boundary is the newer of the two, and a
+                    // follow resumed from it replays nothing from before.
+                    s.last_cursor = s.last_cursor.max(switch_hub.published());
                     s.live = true;
-                    Ok((true, behind["pruned_before"].as_i64()))
+                    Ok((true, behind["pruned_before"].as_i64(), s.last_cursor))
                 })
                 .await?;
             if !live {
                 continue;
             }
+            cursor = boundary;
             // A deletion since the empty page may have removed events past
             // the cursor: the switch's own check is the one to report.
             if let Some(before) = pruned {

@@ -1539,7 +1539,9 @@ halving the cursor range, a few point reads however many events are kept;
 events with no time count as older. It is the `usage` op's word for a start
 time, and `agent follow --since 1h` sends it.
 `follow` replays durable events after the cursor as notifications, emits
-`follow_live` with the cursor reached, and then delivers live events. The
+`follow_live` with the cursor reached (at least the newest event already
+published, so a follow resumed from it repeats nothing from before the
+switch, whatever kinds it names), and then delivers live events. The
 switch happens inside a storage job, so no committed event falls between the
 last replayed page and the first live delivery, and replayed cursors are never
 repeated live. Non-durable `text_delta` and `thinking_delta` notifications are

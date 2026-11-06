@@ -222,6 +222,29 @@ class DaemonTests(ModelFixture):
         refused = ends.request('follow', bot='*', after=0, kinds=[])
         self.assertEqual(refused['error'], 'invalid_follow_kinds')
 
+    def test_a_follow_widened_from_where_a_narrow_replay_ended_repeats_nothing(self):
+        client = SocketClient(self.binary, self.path/'state.db', self.url, 'echo')
+        self.addCleanup(client.close)
+        client.request('create', bot='Alice', workspace=str(self.path))
+        first = client.request('submit', bot='Alice', request_id='a', prompt='hi')['result']['turn']
+        client.finished(first)
+        history = client.request('events', bot='Alice', after=0, limit=256)['result']['events']
+        # A rare kind, written first: everything the turn wrote follows it.
+        sky = Connection(client.socket_path)
+        self.addCleanup(sky.close)
+        sky.request('follow', bot='*', after=0, kinds=['created'])
+        live = sky.receive(lambda e: e.get('event') == 'follow_live')
+        self.assertEqual([e['event'] for e in sky.durable], ['created'])
+        self.assertGreaterEqual(live['cursor'], history[-1]['cursor'])
+        # Widened from where the past ended, as a client does once it has
+        # drawn it: nothing written before the boundary comes back.
+        sky.request('follow', bot='*', after=live['cursor'], kinds=['created', 'turn_started', 'turn_finished'])
+        sky.receive(lambda e: e.get('event') == 'follow_live')
+        self.assertEqual([e['event'] for e in sky.durable], ['created'])
+        second = client.request('submit', bot='Alice', request_id='b', prompt='hi')['result']['turn']
+        sky.receive(lambda e: e.get('event') == 'turn_finished' and e.get('turn') == second)
+        self.assertEqual({e['turn'] for e in sky.durable if e['event'] != 'created'}, {second})
+
     def test_a_follow_from_a_time_replays_what_was_written_since(self):
         client = SocketClient(self.binary, self.path/'state.db', self.url, 'echo')
         self.addCleanup(client.close)
