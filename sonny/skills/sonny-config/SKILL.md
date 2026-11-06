@@ -56,6 +56,39 @@ each setting is; what to set is the person's call.
   are Starlark, as in Codex (`host_executable` works; `network_rule`
   is refused).
 
+## The browser's profile
+
+The `browser` tool runs this machine's agent-browser; `machine` is only
+for another machine linked here. Which Chrome profile a session starts
+from is agent-browser's own setting, not Sonny's:
+`~/.agent-browser/config.json` (or the file `AGENT_BROWSER_CONFIG` names),
+key `profile`:
+
+```json
+{"profile": "Default"}
+```
+
+- `"Default"` starts each session from a copy of the person's own Chrome
+  profile, signed in where they are; their Chrome is left alone. Another
+  profile's name starts from that one; leave the key out for a fresh
+  browser, signed in nowhere. Keep the file's other keys as they are.
+- `sonny setup --browser-signed-in` writes `"Default"` when the file names
+  no profile, and changes nothing when it names one.
+- The file is outside an agent's sandbox, and Sonny runs no browser for
+  an agent whose sandbox can write that folder: change it through a
+  command the agent's approvals allow, or ask the person to.
+- A session copies the profile when its browser starts: after the file
+  changes, or after the person signs in to a site, `close` the browser and
+  open the page again.
+- agent-browser's `--profile` flag is refused in the tool (it can start
+  programs or change where the browser connects), so the file is the way.
+- Sign-ins a command-line tool keeps for itself (its own cookie file or
+  token) are not the browser's, and expire on their own; each signs in
+  its own way, so keep their credentials where they are.
+- A link's browser starts from `[sonny.links.NAME] browser_profile`
+  (below), which `sonny setup --json` lists under `links_differ` where it
+  is not the profile a session here starts from.
+
 ## ~/.agent/config.toml
 
 A key `table.key` goes under `[table]`; a bare key goes at the top.

@@ -146,7 +146,11 @@ ends with what it chose and with any tool agents need that is missing
 agent-desktop where there is a desktop), with the command that installs
 it. When agent-browser finds no Chrome to drive, setup offers to download
 Chrome for Testing for it (`agent-browser install`), and where npm is
-there and agent-desktop is not, it offers `npm install -g agent-desktop`. When Claude Code, Codex, OpenCode or Kiro have MCP servers set
+there and agent-desktop is not, it offers `npm install -g agent-desktop`.
+Where agent-browser's own `~/.agent-browser/config.json` names no Chrome
+profile, it offers to name `"Default"` there, so agents' browsers start
+from a copy of your Chrome profile, signed in where you are (`sonny setup
+--browser-signed-in` does the same; a profile you set is kept). When Claude Code, Codex, OpenCode or Kiro have MCP servers set
 up (in your home or this folder), setup offers them too, all ticked, as
 `sonny mcp import` does. When no way to reach a model is ready, setup also
 offers each of those agents found on `PATH` ("Let Claude Code set up
