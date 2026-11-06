@@ -56,12 +56,16 @@ const NOTE_ITEMS: usize = 16;
 /// them newer ones are not kept, and its next note says so.
 const WAITING: usize = 1024;
 
-/// What `sonny.lookout_waiting` says now, 0 for no limit. Settings that do
-/// not read keep the default.
+/// What `sonny.lookout_waiting` says now, 0 for no limit; and, read with
+/// it, the most notes a margin holds, the most of a task's notes its lead
+/// hears of at once. Settings that do not read keep the defaults.
 fn waiting() -> usize {
-    (agent_client::config::load()).map_or(WAITING, |config| {
-        usize::try_from(config.sonny.lookout_waiting).unwrap_or(usize::MAX)
-    })
+    let Ok(sonny) = agent_client::config::load().map(|config| config.sonny) else {
+        crate::margin::set_most_notes(agent_client::config::MARGIN_NOTES);
+        return WAITING;
+    };
+    crate::margin::set_most_notes(sonny.margin_notes);
+    usize::try_from(sonny.lookout_waiting).unwrap_or(usize::MAX)
 }
 
 /// Events from sources a subscriber's full lookout did not keep: how many,

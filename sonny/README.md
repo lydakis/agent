@@ -276,6 +276,7 @@ at its model's own effort (`AGENT_EFFORT` when its model is
 | A guess at your next message | `[sonny] suggest` (true, the default, or false) | |
 | Whether agents have the commons | `[sonny] commons` (true, the default, or false) | |
 | When a note opens the margin | `[sonny] margin_opens` (`always`, the default, `unless-closed` or `never`) | |
+| The most notes a margin holds | `[sonny] margin_notes` (20 by default, at least 1; past it the oldest goes) | |
 | Where a click on an agent's name goes | `[sonny] agent_opens` (`tab`, the default, or `beside`) | |
 | Task windows a lead keeps open | `[sonny] task_windows` (32 by default, 0 for no limit) | |
 | The daemon started with the machine | `[sonny] start_at_boot` (true or false, the default) | |
@@ -742,7 +743,9 @@ way `/react` does, and each note in the margin has its own `↩`.
   **Working** (a turn running, queued, rate limited, waiting on other
   tasks, or `waiting on its reviewer` while the approver weighs a call), **Ready for review** (finished, its last reply linking a pull
   request), **Done** (finished or stopped with nothing open), and
-  **Resolved**, only counted until `r` shows them. As threads in a
+  **Resolved**. Done and Resolved fold to their heading (`Done · 3 ▸`)
+  until a click on it, or `d` and `r` with the keys in the pane, opens
+  them, and the same folds them again. As threads in a
   claude.ai project do, a task resolves itself with the `resolve_task`
   tool once nothing is left to do in it, such as when its pull request
   merged or you dropped the work, and the lead can resolve any of its
@@ -826,7 +829,10 @@ way `/react` does, and each note in the margin has its own `↩`.
 - `/sky` draws every agent the daemon keeps, in the pane: leads on the inner
   ring, the agents each one made fanned out behind it, you in the middle,
   on a circle as 0.7.0 drew it, stretched to fill a wide pane (up to twice
-  as wide as high). Projects keep their places in the order they started,
+  as wide as high). It opens whole: "Catching up with who is here…" until
+  every agent, what each did and holds, and what each asks are read, then
+  the sky, its counts and its log at once. Projects keep their places in
+  the order they started,
   each arm as wide as the square root of its size, and the agents that made
   none sit on the outer edge, as a tree's leaves do, so the sky fills to
   its rim. Throwaway copies, such as the approver's judges or a
