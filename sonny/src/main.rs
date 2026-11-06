@@ -1453,6 +1453,7 @@ async fn run() -> Result<(), String> {
     app.sounds.chime = settings.chime;
     app.verbose = settings.verbose;
     set_measure(settings.text_width);
+    margin::set_most_notes(settings.margin_notes);
     app.zen = zen::focus(app.reactions_key.as_deref());
     app.margin_opens = settings.margin_opens;
     app.agent_opens = settings.agent_opens;
@@ -2212,6 +2213,12 @@ struct Fold {
 }
 
 /// The button that opens or shuts the message between agents at `node`.
+/// What a click on the fold row of the person's long message at `node`
+/// does: opens the rest of it, or shuts it again.
+fn more_button(node: i64) -> screen::Mark {
+    screen::Mark::Link(format!("{}more/{node}", screen::BUTTON))
+}
+
 fn said_button(node: i64) -> screen::Mark {
     screen::Mark::Link(format!("{}said/{node}", screen::BUTTON))
 }
@@ -2528,8 +2535,8 @@ struct Watch {
     lookout: String,
     /// What is wrong around the agents, under the lookout's line.
     alerts: Vec<status::Alert>,
-    /// The resolved tasks are listed, not only counted.
-    resolved: bool,
+    /// The groups that fold, opened with a click or their key.
+    open: Vec<status::Group>,
     /// `/background` holds the screen instead of the card.
     background: Option<background::View>,
     /// `/usage` holds it instead.
@@ -2545,6 +2552,18 @@ struct Watch {
     /// The agent `/status` has picked from the keys, by its place among
     /// the agents it lists: ↑ and ↓ move it, Enter opens it.
     pick: Option<usize>,
+}
+
+impl Watch {
+    /// The group `group` opened, or folded again.
+    fn toggle(&mut self, group: status::Group) {
+        match self.open.iter().position(|open| *open == group) {
+            Some(at) => {
+                self.open.remove(at);
+            }
+            None => self.open.push(group),
+        }
+    }
 }
 
 /// Ctrl+R's search of the prompts sent before.
@@ -2707,6 +2726,9 @@ struct App {
     /// The staged turns sent with Tab to run after the running one, which
     /// they do not join.
     queued: Vec<i64>,
+    /// The staged steers of the running turn, which it takes in once the
+    /// call under way ends: a model's answer, or a tool's run.
+    steering: Vec<i64>,
     /// Pictures given with the message being written, each behind its
     /// placeholder in the composer: [`attach::placeholder`] of its place
     /// here, from 1.
@@ -2760,8 +2782,9 @@ struct App {
     /// The reasoning streamed since the bot last spoke or called a tool,
     /// whose latest heading the status row shows, as Codex does.
     thought: String,
-    /// What a retried call will stream again, not to be shown twice.
-    replay: Option<String>,
+    /// What a retried call will stream again, not to be shown twice, and
+    /// how much of it the retry has streamed so far.
+    replay: Option<(String, usize)>,
     /// How to reach the daemon again when the connection drops.
     options: Options,
     /// The lead's connection dropped.
@@ -3257,6 +3280,13 @@ fn kin(
 /// it or by one of its, or, for the folder's first lead, made by no agent
 /// at all; never another lead.
 fn lineage_of(bots: &[Value], lead: &str, first: bool) -> std::collections::HashSet<String> {
+    lineage(bots, lead, first).0
+}
+
+/// [`lineage_of`], and how many makers it looked up: each bot's answer is
+/// worked out once, so a line of makers is walked by the first bot on it
+/// and every later one stops where it meets a bot already answered.
+fn lineage(bots: &[Value], lead: &str, first: bool) -> (std::collections::HashSet<String>, usize) {
     let made_by: HashMap<&str, &str> = (bots.iter())
         .filter_map(|bot| {
             Some((
@@ -3265,37 +3295,43 @@ fn lineage_of(bots: &[Value], lead: &str, first: bool) -> std::collections::Hash
             ))
         })
         .collect();
-    let mut mine = std::collections::HashSet::new();
+    let mut answered: HashMap<&str, bool> = HashMap::with_capacity(made_by.len());
+    let mut line: Vec<&str> = Vec::new();
+    let mut on_line = std::collections::HashSet::new();
+    let mut looked = 0;
     for &name in made_by.keys() {
-        if name == lead || project::is_lead(name) {
+        if name == lead || project::is_lead(name) || answered.contains_key(name) {
             continue;
         }
         let mut at = name;
-        // A chain of makers no longer than the daemon lists bots.
-        for _ in 0..=made_by.len() {
-            match made_by.get(at).copied() {
-                Some(by) if by == lead => {
-                    mine.insert(name.to_owned());
-                    break;
-                }
-                Some(by) if by.is_empty() || project::is_lead(by) => {
-                    if by.is_empty() && first {
-                        mine.insert(name.to_owned());
-                    }
-                    break;
-                }
-                Some(by) => at = by,
-                None => {
-                    // Made by a bot no longer listed: the first lead's.
-                    if first && at != name {
-                        mine.insert(name.to_owned());
-                    }
-                    break;
-                }
+        let theirs = loop {
+            if let Some(&known) = answered.get(at) {
+                break known;
             }
+            // A ring of makers leads to no lead.
+            if !on_line.insert(at) {
+                break false;
+            }
+            line.push(at);
+            looked += 1;
+            match made_by[at] {
+                by if by == lead => break true,
+                by if by.is_empty() || project::is_lead(by) => break by.is_empty() && first,
+                by if made_by.contains_key(by) => at = by,
+                // Made by a bot no longer listed: the first lead's.
+                _ => break first,
+            }
+        };
+        for bot in line.drain(..) {
+            answered.insert(bot, theirs);
         }
+        on_line.clear();
     }
-    mine
+    let mine = (answered.into_iter())
+        .filter(|&(_, theirs)| theirs)
+        .map(|(name, _)| name.to_owned())
+        .collect();
+    (mine, looked)
 }
 
 /// What a lead's windows are named from: its project, the lead, what
@@ -4169,6 +4205,7 @@ impl App {
             said: String::new(),
             staged: Vec::new(),
             queued: Vec::new(),
+            steering: Vec::new(),
             pictures: Vec::new(),
             reactions: reactions::Reactions::default(),
             picks: fuzzy::Picks::default(),
@@ -5287,7 +5324,15 @@ impl App {
     /// verbose, else only those [`transcript::clean`] keeps.
     /// Calls like the one before it, with nothing drawn between, fold
     /// into one: several tasks started at once read as one row.
-    fn commit_call(&mut self, id: &str, name: &str, arguments: &Value, output: &str, failed: bool) {
+    fn commit_call(
+        &mut self,
+        id: &str,
+        turn: Option<i64>,
+        name: &str,
+        arguments: &Value,
+        output: &str,
+        failed: bool,
+    ) {
         // In zen the agent's questions are all of its calls drawn.
         if self.zen.is_some() && name != asks::TOOL {
             return;
@@ -5300,15 +5345,16 @@ impl App {
         // option a button that answers with it.
         if name == asks::TOOL
             && !failed
-            && let Some(ask) = asks::call(id, arguments)
+            && let Some(ask) = asks::call(&Self::ask_id(turn, id), arguments)
         {
             let ask = asks::settled(ask, output);
             let card = asks::card(&ask, self.width);
             let from = self.pending.len() + usize::from(self.any_history);
             self.commit(card.rows);
+            let asked = ask.id.clone();
             self.marks
                 .extend(card.options.into_iter().enumerate().map(|(at, row)| {
-                    let button = format!("{}answer/{at}/{id}", screen::BUTTON);
+                    let button = format!("{}answer/{at}/{asked}", screen::BUTTON);
                     (from + row, screen::Mark::Link(button))
                 }));
             // The line to run, a click on it copies.
@@ -5866,6 +5912,12 @@ impl App {
                 self.draw_cluster(at);
             }
         }
+        if let Some(node) = button
+            .strip_prefix("more/")
+            .and_then(|node| node.parse::<i64>().ok())
+        {
+            self.toggle_more(node).await;
+        }
         if let Some(command) = (button.strip_prefix("copy/")).and_then(|id| self.commands.get(id)) {
             term::copy(command);
             self.notice = Some("copied".into());
@@ -5892,6 +5944,26 @@ impl App {
                 Err(error) => self.notice = Some(error),
             }
         }
+    }
+
+    /// The person's long message at `node` opened past its first lines,
+    /// or shut again: its fold row and what it hid drawn anew from the
+    /// message as stored, so nothing of it is kept but its rows drawn.
+    async fn toggle_more(&mut self, node: i64) {
+        let Some(item) = self.items(&[node]).await.first().cloned() else {
+            self.notice = Some("could not read that message".into());
+            return;
+        };
+        // Shut, it is its fold row alone.
+        let open = self.screen.count_tagged(screen::Tag::More(node)) == 1;
+        let rows = transcript::prompt_more(&text(&item), self.prose(), open);
+        let last = rows.len().saturating_sub(1);
+        self.flush();
+        self.screen.replace_tagged(
+            screen::Tag::More(node),
+            rows,
+            vec![(last, more_button(node))],
+        );
     }
 
     /// A `margin` call where it was made: the note's first post as a
@@ -6112,11 +6184,22 @@ impl App {
                 false => landed(said, &mut self.ran_here, prose),
             };
             if !lines.is_empty() {
+                // A long message's fold row opens the rest of it.
+                let fold = (user_shell::read(said).is_none())
+                    .then(|| transcript::prompt_fold(said, prose))
+                    .flatten();
                 let lines = match quotes.is_empty() {
                     true => lines,
                     false => transcript::with_quotes(lines, quotes, prose),
                 };
+                let count = lines.len();
                 self.commit(lines);
+                if let Some(fold) = fold {
+                    let at = self.pending.len() - count + fold;
+                    self.marks
+                        .push((at, screen::Mark::Tag(screen::Tag::More(node))));
+                    self.marks.push((at, more_button(node)));
+                }
                 self.mark_last(screen::Mark::Tag(screen::Tag::End(node)));
                 // What another agent reacted with before it was drawn.
                 if !self.picked.on(node).is_empty() {
@@ -7070,7 +7153,10 @@ impl App {
                                     self.commit_denied(&name, &arguments, &reason);
                                 }
                             }
-                            None => self.commit_call(id, &name, &arguments, &output, failed),
+                            None => {
+                                let turn = turns.get(&node).copied();
+                                self.commit_call(id, turn, &name, &arguments, &output, failed)
+                            }
                         }
                         if older {
                             continue;
@@ -7080,7 +7166,7 @@ impl App {
                                 .await;
                         }
                         if name == asks::TOOL && !failed && !reactions::refused(&item) {
-                            self.asked(id, &arguments);
+                            self.asked(id, turns.get(&node).copied(), &arguments);
                         }
                     }
                     _ => {}
@@ -7180,8 +7266,17 @@ impl App {
                             .collect()
                     }
                 };
+                // What it waits for, as the person who sent it would ask:
+                // a queued message the turn's end, a steer the end of the
+                // call under way, however long that runs.
                 if self.queued.contains(turn) {
                     shown.push(Line::from("  queued for after this turn").dim().italic());
+                } else if self.steering.contains(turn) && self.running.is_some() {
+                    shown.push(
+                        Line::from("  steer waiting for the current call to end")
+                            .dim()
+                            .italic(),
+                    );
                 }
                 std::iter::once(Line::default()).chain(shown)
             })
@@ -7556,17 +7651,25 @@ impl App {
                 let mut delta = event["text"].as_str().unwrap_or("");
                 // A retried call streams its reply again from the start:
                 // what was already shown is not shown twice.
-                if let Some(replay) = &mut self.replay {
-                    if let Some(left) = replay.strip_prefix(delta) {
+                if let Some((replay, at)) = &mut self.replay {
+                    // A cursor through what was shown, not a copy of the rest
+                    // per piece: a long reply streamed again costs its length.
+                    let left = &replay[*at..];
+                    if left.starts_with(delta) {
                         self.said.push_str(delta);
-                        *replay = left.to_owned();
-                        if replay.is_empty() {
+                        *at += delta.len();
+                        if *at == replay.len() {
                             self.replay = None;
                         }
                         return;
                     }
-                    match delta.strip_prefix(replay.as_str()) {
-                        Some(rest) => delta = rest,
+                    match delta.strip_prefix(left) {
+                        // What the retry said past what was shown: the
+                        // shown part still counts as said.
+                        Some(rest) => {
+                            self.said.push_str(left);
+                            delta = rest;
+                        }
                         None => {
                             self.notice = Some("the model retried; its reply may repeat".into())
                         }
@@ -7588,10 +7691,15 @@ impl App {
                         Live::new(self.any_history, &self.workspace)
                     }
                 };
-                live.partial.push_str(delta);
-                while let Some(at) = live.partial.find('\n') {
-                    let line: String = live.partial.drain(..=at).collect();
-                    self.live_line(&mut live, line.trim_end_matches('\n'));
+                // Only the new words are searched for a line's end, and an
+                // ended line leaves whole: a long line streamed in small
+                // pieces costs its length once.
+                for piece in delta.split_inclusive('\n') {
+                    live.partial.push_str(piece);
+                    if piece.ends_with('\n') {
+                        let line = std::mem::take(&mut live.partial);
+                        self.live_line(&mut live, line.trim_end_matches('\n'));
+                    }
                 }
                 self.live = Some(live);
             }
@@ -7704,7 +7812,7 @@ impl App {
                     self.notice = Some("the model retried; its reply may repeat".into());
                 }
                 if !self.said.is_empty() {
-                    self.replay = Some(std::mem::take(&mut self.said));
+                    self.replay = Some((std::mem::take(&mut self.said), 0));
                 }
                 if let Some(running) = &mut self.running {
                     running.phase = "Retrying".into();
@@ -7828,10 +7936,10 @@ impl App {
                     if name == margin::TOOL && !shown.1 {
                         self.note_call(id, &arguments, turn);
                     }
-                    self.commit_call(id, &name, &arguments, &shown.0, shown.1);
+                    self.commit_call(id, turn, &name, &arguments, &shown.0, shown.1);
                 }
                 if name == asks::TOOL && !shown.1 {
-                    self.asked(id, &arguments);
+                    self.asked(id, turn, &arguments);
                 }
                 if name == resolved::TOOL
                     && !shown.1
@@ -8088,7 +8196,7 @@ impl App {
             read: Instant::now(),
             lookout: self.lookout_line(),
             alerts,
-            resolved: false,
+            open: Vec::new(),
             background: None,
             usage: None,
             commons: None,
@@ -8129,7 +8237,7 @@ impl App {
             read: Instant::now(),
             lookout: String::new(),
             alerts: Vec::new(),
-            resolved: false,
+            open: Vec::new(),
             background: Some(view),
             usage: None,
             commons: None,
@@ -8153,7 +8261,7 @@ impl App {
             read: Instant::now(),
             lookout: String::new(),
             alerts: Vec::new(),
-            resolved: false,
+            open: Vec::new(),
             background: None,
             usage: Some(view),
             commons: None,
@@ -8177,7 +8285,7 @@ impl App {
             read: Instant::now(),
             lookout: String::new(),
             alerts: Vec::new(),
-            resolved: false,
+            open: Vec::new(),
             background: None,
             usage: None,
             commons: Some(commons::View::open(&home)),
@@ -8197,7 +8305,7 @@ impl App {
             read: Instant::now(),
             lookout: String::new(),
             alerts: Vec::new(),
-            resolved: false,
+            open: Vec::new(),
             background: None,
             usage: None,
             commons: None,
@@ -8732,6 +8840,10 @@ impl App {
             .flatten()
             .filter_map(|n| n["node"].as_i64())
             .collect();
+        // Each node's turn, which names an ask with its call.
+        let turns: HashMap<i64, i64> = (page["nodes"].as_array().into_iter().flatten())
+            .filter_map(|n| Some((n["node"].as_i64()?, n["turn"].as_i64()?)))
+            .collect();
         let read = self
             .client
             .request("history_items", json!({"bot": bot, "nodes": nodes}))
@@ -8754,12 +8866,16 @@ impl App {
                     entry["origin"].as_str(),
                     entry["person"].as_str(),
                 );
+                let turn = (entry["node"].as_i64()).and_then(|node| turns.get(&node).copied());
                 responses(&entry["item"])
                     .into_iter()
                     .rev()
                     .map(move |mut item| {
                         if let Some(from) = from.as_ref().filter(|_| item["role"] == "user") {
                             item["from"] = json!(from);
+                        }
+                        if let Some(turn) = turn {
+                            item["turn"] = json!(turn);
                         }
                         item
                     })
@@ -9325,12 +9441,15 @@ impl App {
                         && !switches(key)
                         && let Some(view) = self.watch.as_mut().and_then(|w| w.sky.as_mut())
                         && view.press(key.code) => {}
-                    // `/status` lists the resolved tasks, or only counts them.
-                    KeyCode::Char('r')
+                    // `/status` opens or folds its done and resolved tasks.
+                    KeyCode::Char(key @ ('d' | 'r'))
                         if pane.is_card()
                             && let Some(watch) = &mut self.watch =>
                     {
-                        watch.resolved = !watch.resolved
+                        watch.toggle(match key {
+                            'd' => status::Group::Done,
+                            _ => status::Group::Resolved,
+                        })
                     }
                     _ if switches(key) || key.code == KeyCode::Tab => self.pane_keys = false,
                     _ if copy && let Some(text) = pane.screen.selected() => {
@@ -9492,7 +9611,7 @@ impl App {
             ("ctrl+[ ctrl+]", "hide the pane, show it again"),
             ("ctrl+g", "open the pane's agent in the main view"),
             ("ctrl+t", "go to the pane's agent's own tab"),
-            ("alt+t", "boost the next message; again for more"),
+            ("alt+t ctrl+x", "boost the next message; again for more"),
             ("ctrl+v", "paste a picture"),
             ("ctrl+c", "copy the selection, clear, or quit"),
             ("ctrl+l", "draw the screen again"),
@@ -9702,6 +9821,15 @@ impl App {
                 self.jump = Some((pin, JUMP_PAGES));
             }
             "back" => self.close_pane(true),
+            // A folding group's heading in `/status`: opened or folded.
+            "group" => {
+                if let Some(watch) = &mut self.watch {
+                    watch.toggle(match id {
+                        "r" => status::Group::Resolved,
+                        _ => status::Group::Done,
+                    });
+                }
+            }
             // The pane's switch hint, or the footer's for a pane folded
             // away: the keys, and in a window with room for one, the view,
             // over to the other.
@@ -10265,6 +10393,7 @@ impl App {
             self.sounds.chime = settings.chime;
             self.margin_opens = settings.margin_opens;
             self.agent_opens = settings.agent_opens;
+            margin::set_most_notes(settings.margin_notes);
             if self.verbose != settings.verbose {
                 self.verbose = settings.verbose;
                 self.repaint = true;
@@ -10467,7 +10596,10 @@ impl App {
                     KeyCode::Char('d') if alt => self.input.delete_word_forward(),
                     // Think harder for one message, as Claude Code's Alt+T
                     // toggles thinking: again for the most, again for none.
+                    // Ctrl+X too, for a terminal or window manager that
+                    // keeps Alt for itself: x as in xhigh.
                     KeyCode::Char('t') if alt => self.boost_step(),
+                    KeyCode::Char('x') if ctrl => self.boost_step(),
                     // With nothing typed, ? shows the keys, as it does in
                     // Codex and Claude Code.
                     KeyCode::Char('?')
@@ -10634,7 +10766,7 @@ impl App {
         }
     }
 
-    /// Alt+T: the next message's effort up a step from the agent's own,
+    /// Alt+T or Ctrl+X: the next message's effort up a step from the agent's own,
     /// to the most the model takes, then back to its own. The steps are
     /// the model's family's: `xhigh` (else `high`), then `max` where it
     /// has one, each only when above the effort set.
@@ -11123,16 +11255,50 @@ impl App {
             None => stamp::now(&prompt),
             Some(_) => prompt.clone(),
         };
-        let reply = self
-            .client
-            .request(
-                "submit",
-                json!({"bot": self.bot, "request_id": unique("tui"), "prompt": sent,
-                    "delivery": delivery, "model": model, "workspace": workspace,
-                    "effort": effort, "origin": origin, "images": attach::submitted(pictures)}),
-            )
-            .await
-            .map_err(|error| error.to_string())?;
+        // An answer goes once, whichever window sends it: the daemon takes
+        // the first answer to an ask and refuses another. One taken back
+        // from the queue before the agent read it answered nothing, so the
+        // next goes as the next attempt.
+        let answering = asks::answer_of(&prompt, origin);
+        let mut attempt = 0;
+        let reply = loop {
+            let request_id =
+                answering.map_or_else(|| unique("tui"), |ask| asks::request_id(ask, attempt));
+            let reply = self
+                .client
+                .request(
+                    "submit",
+                    json!({"bot": self.bot, "request_id": request_id, "prompt": sent,
+                        "delivery": delivery, "model": model, "workspace": workspace,
+                        "effort": effort, "origin": origin,
+                        "images": attach::submitted(pictures)}),
+                )
+                .await;
+            if answering.is_none() {
+                break reply.map_err(|error| error.to_string())?;
+            }
+            // The turn this attempt's answer started already, if one did.
+            let before = match &reply {
+                Ok(reply) if reply["duplicate"] == true => reply["turn"].as_i64(),
+                Err(error) if error.code == "idempotency_conflict" => (error.facts.as_ref())
+                    .and_then(|facts| facts.get("turn"))
+                    .and_then(Value::as_i64),
+                _ => None,
+            };
+            let taken_back = match before {
+                Some(turn) => (turn_row(&self.client, &self.bot, turn).await)
+                    .is_some_and(|row| asks::undelivered(&row)),
+                None => false,
+            };
+            if taken_back && attempt < asks::ATTEMPTS {
+                attempt += 1;
+                continue;
+            }
+            break reply.map_err(|error| match error.code.as_str() {
+                "idempotency_conflict" => "that question was answered already".to_owned(),
+                _ => error.to_string(),
+            })?;
+        };
         if effort.is_some() {
             self.boost = None;
         }
@@ -11153,10 +11319,14 @@ impl App {
             }
             self.staged.push((turn, prompt));
             let staged = &self.staged;
-            self.queued
-                .retain(|queued| staged.iter().any(|(turn, _)| turn == queued));
+            let waiting = |sent: &i64| staged.iter().any(|(turn, _)| turn == sent);
+            self.queued.retain(waiting);
+            self.steering.retain(waiting);
             if queue {
                 self.queued.push(turn);
+            }
+            if steer && self.running.is_some() {
+                self.steering.push(turn);
             }
         }
         if workspace.is_some() {
@@ -11213,11 +11383,21 @@ impl App {
         }
     }
 
+    /// The ask made as call `call` in turn `turn`, as [`asks::id`] names
+    /// it; one whose turn is not known by its call alone, which no answer
+    /// names.
+    fn ask_id(turn: Option<i64>, call: &str) -> String {
+        match turn {
+            Some(turn) => asks::id(turn, call),
+            None => call.to_owned(),
+        }
+    }
+
     /// The question an `ask` call put, open until it is answered or the
     /// conversation goes on past it. One newly asked takes no focus from
     /// the one being answered, as Codex's questions take none.
-    fn asked(&mut self, id: &str, arguments: &Value) {
-        if let Some(ask) = asks::call(id, arguments)
+    fn asked(&mut self, id: &str, turn: Option<i64>, arguments: &Value) {
+        if let Some(ask) = asks::call(&Self::ask_id(turn, id), arguments)
             && !(self.asks.iter().chain(&self.aside)).any(|open| open.id == ask.id)
         {
             self.asks.push(ask);
@@ -12136,7 +12316,7 @@ impl App {
             && self.pane.as_ref().is_some_and(pane::Pane::is_margin)
         {
             let live = self.running.as_ref().map(|running| running.turn);
-            let width = (at.width.saturating_sub(1) as usize).min(measure());
+            let width = (pane::margin_room(at.width).saturating_sub(1) as usize).min(measure());
             let (lines, marks) = self.margin.lines(width, &workspace, live);
             let glance = self.glance().line();
             if let Some(pane) = &mut self.pane {
@@ -12232,7 +12412,7 @@ impl App {
                 pane.set_card(lines, &view.keys());
                 pane.foot = None;
             } else {
-                let (mut lines, any_resolved, marks) = watch_card(watch, width, &self.bot);
+                let (mut lines, fold_keys, marks) = watch_card(watch, width, &self.bot);
                 let mut picked = None;
                 // The agent picked from the keys is drawn as the picker
                 // draws its pick, reversed.
@@ -12242,11 +12422,8 @@ impl App {
                     list::pick(line);
                     picked = Some(row);
                 }
-                let keys = match any_resolved && watch.resolved {
-                    true => "↑↓ pick · enter open · r hide resolved · esc close",
-                    false => PICK_KEYS,
-                };
-                pane.set_card_marked(lines, marks, keys);
+                let keys = status_keys(watch, &fold_keys);
+                pane.set_card_marked(lines, marks, &keys);
                 // Scrolled to once, as a new pick, so the page keys still
                 // move away from it; after the card, whose swap would
                 // drop the request.
@@ -13238,14 +13415,19 @@ fn card_bots(watch: &Watch, width: usize, me: &str) -> Vec<String> {
 }
 
 /// `/status`'s card at `width`, each line after a space, its times
-/// running turns counted on from when its rows were read; whether any task in it
-/// is resolved; and the line each agent but `me` starts on, which a click
-/// opens in the pane.
+/// running turns counted on from when its rows were read; the keys of the
+/// groups in it that fold; and the line each agent but `me` starts on,
+/// which a click opens in the pane, then each folding group's heading,
+/// which a click opens or folds.
 fn watch_card(
     watch: &Watch,
     width: usize,
     me: &str,
-) -> (Vec<Line<'static>>, bool, Vec<(usize, screen::Mark)>) {
+) -> (
+    Vec<Line<'static>>,
+    Vec<&'static str>,
+    Vec<(usize, screen::Mark)>,
+) {
     let since = watch.read.elapsed().as_secs();
     let rows: Vec<status::Row> = watch
         .rows
@@ -13258,8 +13440,11 @@ fn watch_card(
             row
         })
         .collect();
-    let any_resolved = rows.iter().any(|row| row.group == status::Group::Resolved);
-    let (mut card, named) = status::card(&watch.project, &rows, width, watch.resolved);
+    let status::Card {
+        lines: mut card,
+        named,
+        folds,
+    } = status::card(&watch.project, &rows, width, &watch.open);
     // The lookout's line goes under the heading, what is wrong under it,
     // and the agents' under that.
     let mut above: Vec<Line<'static>> = Vec::new();
@@ -13271,8 +13456,11 @@ fn watch_card(
     }
     let added = above.len();
     card.splice(1..1, above);
-    let marks = (named.into_iter())
-        .map(|(at, bot)| (at + if at >= 1 { added } else { 0 }, bot))
+    let below = |at: usize| at + if at >= 1 { added } else { 0 };
+    // The agents first, in their order, which the keys pick by; then the
+    // headings that open and fold their groups.
+    let mut marks: Vec<(usize, screen::Mark)> = (named.into_iter())
+        .map(|(at, bot)| (below(at), bot))
         .filter(|(_, bot)| bot != me)
         .map(|(at, bot)| {
             (
@@ -13281,6 +13469,11 @@ fn watch_card(
             )
         })
         .collect();
+    let fold_keys: Vec<&str> = folds.iter().map(|(_, group)| group_key(*group)).collect();
+    marks.extend(folds.into_iter().map(|(at, group)| {
+        let link = format!("{}group/{}", screen::BUTTON, group_key(group));
+        (below(at), screen::Mark::Link(link))
+    }));
     let lines = card
         .into_iter()
         .map(|line| {
@@ -13289,7 +13482,39 @@ fn watch_card(
             Line::from(spans).style(line.style)
         })
         .collect();
-    (lines, any_resolved, marks)
+    (lines, fold_keys, marks)
+}
+
+/// The key that opens or folds `group` in `/status`, and its name in a
+/// button: `d` done, `r` resolved.
+fn group_key(group: status::Group) -> &'static str {
+    match group {
+        status::Group::Resolved => "r",
+        _ => "d",
+    }
+}
+
+/// The keys `/status`'s title row names: the picks, then the key of
+/// each group that folds there (`keys`), as it would change it.
+fn status_keys(watch: &Watch, keys: &[&str]) -> String {
+    let mut said = String::from("↑↓ pick · enter open");
+    for key in keys {
+        let group = match *key {
+            "r" => status::Group::Resolved,
+            _ => status::Group::Done,
+        };
+        let verb = match watch.open.contains(&group) {
+            true => "fold",
+            false => "show",
+        };
+        let name = match group {
+            status::Group::Resolved => "resolved",
+            _ => "done",
+        };
+        said.push_str(&format!(" · {key} {verb} {name}"));
+    }
+    said.push_str(" · esc close");
+    said
 }
 
 /// Codex's sweep: a brighter band moving across the phase every two seconds.
@@ -13575,6 +13800,93 @@ mod tests {
         // A closed window says nothing more.
         reported = Some(("shop.a".into(), "clear".into(), false));
         assert_eq!(asked_now(&mut reported, "shop.a", true), None);
+    }
+
+    /// [`lineage_of`] as it was: each bot's line of makers walked afresh.
+    fn lineage_by_walks(
+        bots: &[Value],
+        lead: &str,
+        first: bool,
+    ) -> std::collections::HashSet<String> {
+        let made_by: HashMap<&str, &str> = (bots.iter())
+            .filter_map(|bot| {
+                Some((
+                    bot["name"].as_str()?,
+                    bot["created_by"].as_str().unwrap_or(""),
+                ))
+            })
+            .collect();
+        let mut mine = std::collections::HashSet::new();
+        for &name in made_by.keys() {
+            if name == lead || project::is_lead(name) {
+                continue;
+            }
+            let mut at = name;
+            for _ in 0..=made_by.len() {
+                match made_by.get(at).copied() {
+                    Some(by) if by == lead => {
+                        mine.insert(name.to_owned());
+                        break;
+                    }
+                    Some(by) if by.is_empty() || project::is_lead(by) => {
+                        if by.is_empty() && first {
+                            mine.insert(name.to_owned());
+                        }
+                        break;
+                    }
+                    Some(by) => at = by,
+                    None => {
+                        if first && at != name {
+                            mine.insert(name.to_owned());
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+        mine
+    }
+
+    #[test]
+    fn a_leads_lineage_reads_each_maker_once() {
+        let bot = |name: &str, by: &str| json!({"name": name, "created_by": by});
+        // Every case the walk had: made by the lead, through others, by
+        // another lead, by nobody, by a bot gone, in a ring, by itself.
+        let mut bots = vec![
+            bot("shop.lead", ""),
+            bot("shop.lead.b", ""),
+            bot("shop.a", "shop.lead"),
+            bot("shop.a1", "shop.a"),
+            bot("shop.a2", "shop.a1"),
+            bot("shop.x", "shop.lead.b"),
+            bot("shop.x1", "shop.x"),
+            bot("loose", ""),
+            bot("orphan", "gone"),
+            bot("orphan1", "orphan"),
+            bot("ring1", "ring2"),
+            bot("ring2", "ring1"),
+            bot("into-ring", "ring1"),
+            bot("self", "self"),
+        ];
+        for first in [true, false] {
+            for lead in ["shop.lead", "shop.lead.b"] {
+                assert_eq!(
+                    lineage_of(&bots, lead, first),
+                    lineage_by_walks(&bots, lead, first),
+                    "{lead} first={first}"
+                );
+            }
+        }
+        // A line of makers 20,000 long: walked once, not once per bot on it.
+        bots = (0..20_000)
+            .map(|n| match n {
+                0 => bot("shop.t0", "shop.lead"),
+                n => bot(&format!("shop.t{n}"), &format!("shop.t{}", n - 1)),
+            })
+            .collect();
+        let (mine, looked) = lineage(&bots, "shop.lead", true);
+        assert_eq!(mine.len(), 20_000);
+        assert_eq!(looked, 20_000);
     }
 
     #[test]
@@ -13962,6 +14274,23 @@ mod tests {
         assert_eq!(at("old/gpt", None), ["high"]);
         assert!(at("openai/gpt", Some("xhigh")).is_empty());
         assert!(at("nowhere/x", None).is_empty());
+    }
+
+    #[tokio::test]
+    async fn ctrl_x_boosts_as_alt_t_does() {
+        let providers = json!({"anthropic": {"family": "anthropic",
+            "efforts": ["low", "medium", "high", "xhigh", "max"]}});
+        let client = daemon_serving(providers, |_| json!({})).await;
+        let mut app = app(client);
+        app.model = "anthropic/opus".into();
+        let key = |c, modifiers| Event::Key(event::KeyEvent::new(KeyCode::Char(c), modifiers));
+        app.key(key('x', KeyModifiers::CONTROL)).await;
+        assert_eq!(app.boost.as_deref(), Some("xhigh"));
+        app.key(key('t', KeyModifiers::ALT)).await;
+        assert_eq!(app.boost.as_deref(), Some("max"));
+        app.key(key('x', KeyModifiers::CONTROL)).await;
+        assert!(app.boost.is_none(), "again goes back to the agent's own");
+        assert!(app.input.is_empty());
     }
 
     #[tokio::test]
@@ -14399,7 +14728,7 @@ mod tests {
             "options": [{"label": "Now"}, {"label": "Later"}], "recommended": 1});
         let items = json!([
             // An answer to an ask, with what the ask recommended.
-            {"node": 17, "item": message("user", "You asked (c1): Ship it now?\n\nLater")},
+            {"node": 17, "item": message("user", "You asked (ask:4/c1): Ship it now?\n\nLater")},
             {"node": 16, "item": {"type": "function_call", "name": "ask", "call_id": "c1",
                 "arguments": ask.to_string()}},
             // One to an older reply names it; one to the last reply is the
@@ -14428,7 +14757,7 @@ mod tests {
             .await;
         let read = said::said(&client, None, 1000).await.unwrap();
         let entry = |turn: i64, text: &str| json!({"bot": "shop.lead", "turn": turn, "text": text, "project": null});
-        let mut answer = entry(4, "You asked (c1): Ship it now?\n\nLater");
+        let mut answer = entry(4, "You asked (ask:4/c1): Ship it now?\n\nLater");
         answer["recommended"] = json!("Now");
         let mut older = entry(4, "🎉");
         older["reacted_to"] = json!("Tagged 0.6.0.");
@@ -14449,14 +14778,14 @@ mod tests {
             "recommended": 1});
         let items = json!([
             // An answer against what the ask recommended.
-            {"node": 13, "item": message("user", "You asked (t2): Tag it too?\n\nNo")},
+            {"node": 13, "item": message("user", "You asked (ask:2/t2): Tag it too?\n\nNo")},
             // A 🙌 on the last finished reply, which waited for its call
             // while another reply was written.
             {"node": 12, "item": message("user", "🙌")},
             {"node": 11, "item": message("assistant", "Still working.")},
             // A 🚀 on the older of two replies that begin alike.
             {"node": 10, "item": message("user", "> Done.\n\n🚀")},
-            {"node": 9, "item": message("user", "You asked (t1): Ship it now?\n\nNow")},
+            {"node": 9, "item": message("user", "You asked (ask:2/t1): Ship it now?\n\nNow")},
             // A 👍 on the ask's reply, taken off and put on again: once.
             {"node": 8, "item": message("user", "👍")},
             {"node": 7, "item": message("user", "👍")},
@@ -14504,7 +14833,7 @@ mod tests {
             .unwrap();
         let entry =
             |text: &str| json!({"bot": "shop.lead", "turn": 2, "text": text, "project": null});
-        let mut answer = entry("You asked (t1): Ship it now?\n\nNow");
+        let mut answer = entry("You asked (ask:2/t1): Ship it now?\n\nNow");
         answer["recommended"] = json!("Now");
         let mut liked = entry("👍");
         liked["reacted_to"] = json!("Ready to ship.");
@@ -14512,7 +14841,7 @@ mod tests {
         launched["reacted_to"] = json!("Done.");
         let mut cheered = entry("🙌");
         cheered["reacted_to"] = json!("Ready to ship.");
-        let mut against = entry("You asked (t2): Tag it too?\n\nNo");
+        let mut against = entry("You asked (ask:2/t2): Tag it too?\n\nNo");
         against["recommended"] = json!("Yes");
         assert_eq!(
             read["said"],
@@ -15039,14 +15368,14 @@ mod tests {
             .unwrap()
         };
         app.asks = vec![
-            ask("c1", "Keep the old API?"),
-            ask("c2", "Tag it?"),
-            ask("c3", "Keep the old API?"),
+            ask("ask:1/c1", "Keep the old API?"),
+            ask("ask:1/c2", "Tag it?"),
+            ask("ask:1/c3", "Keep the old API?"),
         ];
         app.input.set("2");
         app.submit().await;
         // Its answer landing leaves the other question asked the same open.
-        app.answered("You asked (c1): Keep the old API?\n\nDrop it", None);
+        app.answered("You asked (ask:1/c1): Keep the old API?\n\nDrop it", None);
         // Words typed while one is open are the person's own, sent as they
         // wrote them: no question is named over them, nor answered.
         app.input.set("how is it going?");
@@ -15055,57 +15384,66 @@ mod tests {
         assert_eq!(
             *sent.lock().unwrap(),
             [
-                "You asked (c1): Keep the old API?\n\nDrop it",
+                "You asked (ask:1/c1): Keep the old API?\n\nDrop it",
                 "how is it going?"
             ]
         );
         assert_eq!(
             app.asks,
-            [ask("c2", "Tag it?"), ask("c3", "Keep the old API?")]
+            [
+                ask("ask:1/c2", "Tag it?"),
+                ask("ask:1/c3", "Keep the old API?")
+            ]
         );
         // Down picks the next to answer; an option's number then picks on
         // it, named over it as the sent answer will be.
         app.step_ask(true);
-        assert_eq!(app.asking().map(|a| a.id.as_str()), Some("c3"));
+        assert_eq!(app.asking().map(|a| a.id.as_str()), Some("ask:1/c3"));
         app.input.set("1");
         assert_eq!(
             app.answering_over(80).unwrap().to_string(),
             "  answering “Keep the old API?” (2 of 2)"
         );
         app.step_ask(true);
-        assert_eq!(app.asking().map(|a| a.id.as_str()), Some("c2"));
+        assert_eq!(app.asking().map(|a| a.id.as_str()), Some("ask:1/c2"));
         // The person's own words landing move on past them: out of the
         // composer and the count, their options still answering them.
         app.answered("how is it going?", None);
         assert!(app.asks.is_empty() && app.asking().is_none());
         assert_eq!(app.aside.len(), 2);
         app.input.clear();
-        app.press("answer/0/c2").await;
+        app.press("answer/0/ask:1/c2").await;
         assert_eq!(
             sent.lock().unwrap().last().unwrap(),
-            "You asked (c2): Tag it?\n\nKeep it"
+            "You asked (ask:1/c2): Tag it?\n\nKeep it"
         );
-        assert_eq!(app.aside, [ask("c3", "Keep the old API?")]);
+        assert_eq!(app.aside, [ask("ask:1/c3", "Keep the old API?")]);
         // Another agent's words, or a reaction, move nothing on.
-        app.asks = vec![ask("c4", "Ship it?")];
+        app.asks = vec![ask("ask:1/c4", "Ship it?")];
         app.answered("Done: tests pass", Some("tally.halves"));
         app.answered(&reactions::message("👍", None), None);
         // Nor do an answer's words from anyone but the person close it.
-        app.answered("You asked (c4): Ship it?\n\nKeep it", Some("tally.halves"));
-        app.answered("You asked (c4): Ship it?\n\nKeep it", Some("automation"));
+        app.answered(
+            "You asked (ask:1/c4): Ship it?\n\nKeep it",
+            Some("tally.halves"),
+        );
+        app.answered(
+            "You asked (ask:1/c4): Ship it?\n\nKeep it",
+            Some("automation"),
+        );
         assert_eq!(app.asks.len(), 1);
         // One before the question in focus closing, from another window
         // or its card, keeps the focus on the question being answered.
         app.asks = vec![
-            ask("c5", "Tag it?"),
-            ask("c6", "Bump?"),
-            ask("c7", "Notes?"),
+            ask("ask:1/c5", "Tag it?"),
+            ask("ask:1/c6", "Bump?"),
+            ask("ask:1/c7", "Notes?"),
         ];
-        app.focus = Some("c6".into());
-        app.answered("You asked (c5): Tag it?\n\nKeep it", None);
-        assert_eq!(app.asking().map(|a| a.id.as_str()), Some("c6"));
-        app.press("answer/0/c7").await;
-        assert_eq!(app.asking().map(|a| a.id.as_str()), Some("c6"));
+        app.focus = Some("ask:1/c6".into());
+        app.answered("You asked (ask:1/c5): Tag it?\n\nKeep it", None);
+        assert_eq!(app.asking().map(|a| a.id.as_str()), Some("ask:1/c6"));
+        app.press("answer/0/ask:1/c7").await;
+        assert_eq!(app.asking().map(|a| a.id.as_str()), Some("ask:1/c6"));
     }
 
     #[tokio::test]
@@ -15706,11 +16044,11 @@ mod tests {
                   "arguments": "{\"question\":\"Write notes?\"}"},
             "7": {"type": "function_call_output", "call_id": "a3", "output": "Asked."},
             "8": {"type": "message", "role": "user",
-                  "content": [{"type": "input_text", "text": "You asked (a3): Write notes?\n\nyes"}]},
+                  "content": [{"type": "input_text", "text": "You asked (ask:1/a3): Write notes?\n\nyes"}]},
         });
         let client = daemon_answering(move |asked| match asked["op"].as_str() {
             Some("history_nodes") => {
-                json!({"nodes": (1..=9).rev().map(|node| json!({"node": node}))
+                json!({"nodes": (1..=9).rev().map(|node| json!({"node": node, "turn": 1}))
                 .collect::<Vec<_>>(), "next_from": null})
             }
             _ => json!({"items": asked["nodes"].as_array().into_iter().flatten()
@@ -15723,7 +16061,7 @@ mod tests {
         // The refused one was never asked, and the answered one is closed.
         assert_eq!(
             app.asks.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(),
-            ["a1"]
+            ["ask:1/a1"]
         );
         // Drawn where it was asked, with what each option means.
         let rows: Vec<String> = app.pending.iter().map(|l| l.to_string()).collect();
@@ -15734,7 +16072,7 @@ mod tests {
         assert_eq!(rows[at + 4], "┃    Brew gets it tonight.");
         assert_eq!(rows[at + 8], "┃ Why 1: Nothing else is due.");
         // Its answer landing, sent from here or another window, closes it.
-        app.answered("You asked (a1): Tag 0.4.1?\n\nYes", None);
+        app.answered("You asked (ask:1/a1): Tag 0.4.1?\n\nYes", None);
         assert!(app.asks.is_empty());
         // Live, a question is pinned once the daemon took the call.
         let arguments = json!({"question": "Merge?"}).to_string();
@@ -16131,7 +16469,11 @@ mod tests {
             app.submit().await;
         }
         assert_eq!(staged(&app), [2, 3]);
-        assert_eq!(app.staged_rows(80).len(), 5, "each with a blank row above");
+        assert_eq!(
+            app.staged_rows(80).len(),
+            7,
+            "each with a blank row above and what it waits for"
+        );
         // Turn 1 takes in the first; its own turn ends as steered.
         app.daemon(turn_event("turn_finished", 2, json!({"status": "steered"})))
             .await;
@@ -16349,6 +16691,53 @@ mod tests {
         );
         assert!(app.ahead.is_empty());
         assert!(!app.kept(screen::Tag::Streamed(1)));
+    }
+
+    #[tokio::test]
+    async fn a_retry_streamed_again_in_other_pieces_is_drawn_once() {
+        let text = "First line.\nSecond line,\nthird.";
+        let client = daemon_with(json!({
+            "2": {"type": "message", "role": "assistant",
+                  "content": [{"type": "output_text", "text": text}]}
+        }))
+        .await;
+        let mut app = app(client);
+        let event =
+            |event: &str, data: Value| json!({"event": event, "bot": "b", "turn": 1, "data": data});
+        app.daemon(event("accepted", json!({}))).await;
+        let said = |text: &str| {
+            let mut delta = event("text_delta", json!({}));
+            (delta["item"], delta["text"]) = (json!(1), json!(text));
+            delta
+        };
+        // Lines ending inside a piece, and pieces of one character.
+        for piece in ["Fir", "st line.\nSec", "ond line,\n", "t", "h"] {
+            app.daemon(said(piece)).await;
+        }
+        app.daemon(event("retry", json!({"error": "provider_http_529"})))
+            .await;
+        // The retry streams it all again, cut elsewhere: shown once, with
+        // nothing said of a repeat.
+        let mut at = 0;
+        for size in [1, 4, 9, 2, 30] {
+            let end = (at + size).min(text.len());
+            app.daemon(said(&text[at..end])).await;
+            at = end;
+        }
+        app.daemon(event("message", json!({"node": 2}))).await;
+        let open = app.open_rows(80);
+        let drawn: Vec<String> = (app.pending.iter().chain(&open))
+            .map(|line| line.to_string())
+            .collect();
+        for line in ["First line.", "Second line,", "third."] {
+            assert_eq!(
+                drawn.iter().filter(|l| l.contains(line)).count(),
+                1,
+                "{line}: {drawn:?}"
+            );
+        }
+        assert!(app.notice.is_none(), "{:?}", app.notice);
+        assert!(app.replay.is_none());
     }
 
     #[test]
@@ -16813,6 +17202,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_long_message_s_fold_row_opens_the_rest_and_shuts_it_again() {
+        let long: String = (1..=12).map(|n| format!("line {n}\n")).collect();
+        let stored = long.clone();
+        let client = daemon_answering(move |asked| match asked["op"].as_str() {
+            Some("history_items") => json!({"items": [{"node": 5, "item": {
+                "type": "message", "role": "user",
+                "content": [{"type": "input_text", "text": stored}]}}]}),
+            _ => json!({}),
+        })
+        .await;
+        let mut app = app(client);
+        app.land(5, (&long, ""), (None, false, false), false);
+        let texts = |app: &mut App| -> Vec<String> {
+            (drawn(app).into_iter())
+                .map(|row| row.trim_end().to_owned())
+                .filter(|row| !row.is_empty())
+                .collect()
+        };
+        let shut: Vec<String> = (1..=6)
+            .map(|n| format!("{} line {n}", if n == 1 { "›" } else { " " }))
+            .chain(["  … +6 lines ▸".to_owned()])
+            .collect();
+        assert_eq!(texts(&mut app), shut);
+        let links = app.screen.links();
+        let fold = (links.iter()).position(|link| link.is_some()).unwrap();
+        assert_eq!(links[fold], Some(format!("{}more/5", screen::BUTTON)));
+        // A click opens the rest of it, and the row stays to shut it.
+        app.press_row("more/5").await;
+        let open: Vec<String> = (1..=12)
+            .map(|n| format!("{} line {n}", if n == 1 { "›" } else { " " }))
+            .chain(["  +6 lines ▾".to_owned()])
+            .collect();
+        assert_eq!(texts(&mut app), open);
+        let links = app.screen.links();
+        assert_eq!(
+            links.iter().flatten().collect::<Vec<_>>(),
+            [&format!("{}more/5", screen::BUTTON)],
+            "only the row under them opens and shuts it"
+        );
+        app.press_row("more/5").await;
+        assert_eq!(texts(&mut app), shut);
+    }
+
+    #[tokio::test]
     async fn the_react_mark_picks_a_reply_and_a_click_on_a_reaction_takes_it_off() {
         let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen = sent.clone();
@@ -17261,6 +17694,19 @@ mod tests {
         let steer = sent.lock().unwrap()[1].clone();
         assert_eq!(steer["delivery"], "steer");
         let staged: Vec<String> = app.staged_rows(80).iter().map(|l| l.to_string()).collect();
+        assert_eq!(
+            staged[3..],
+            [
+                "",
+                "› now",
+                "  steer waiting for the current call to end",
+                ""
+            ],
+            "a steer says what it waits for, as a queued message does"
+        );
+        // Sent with no turn running, a message waits for nothing.
+        app.running = None;
+        let staged: Vec<String> = app.staged_rows(80).iter().map(|l| l.to_string()).collect();
         assert_eq!(staged[3..], ["", "› now", ""]);
         // Once its turn starts it is no longer waiting.
         app.daemon(turn_event("turn_finished", 3, json!({}))).await;
@@ -17567,6 +18013,7 @@ mod tests {
             r#""$AGENT_BIN" run --detach --delivery steer --bot calc.neg -- 'Check div too.'"#;
         app.commit_call(
             "c1",
+            Some(1),
             "shell",
             &json!({"command": steer}),
             "turn:calc.neg/4",
@@ -17708,7 +18155,14 @@ mod tests {
         app.width = 80;
         let start = |app: &mut App, name: &str| {
             let command = format!("\"$AGENT_BIN\" run --bot {name} \"Fix {name}\"");
-            app.commit_call("c", "shell", &json!({"command": command}), "", false);
+            app.commit_call(
+                "c",
+                Some(1),
+                "shell",
+                &json!({"command": command}),
+                "",
+                false,
+            );
         };
         start(&mut app, "calc.add");
         start(&mut app, "calc.neg");
@@ -17742,7 +18196,14 @@ mod tests {
         app.width = 80;
         let start = |app: &mut App, name: &str| {
             let command = format!("\"$AGENT_BIN\" run --bot {name} \"Fix {name}\"");
-            app.commit_call("c", "shell", &json!({"command": command}), "", false);
+            app.commit_call(
+                "c",
+                Some(1),
+                "shell",
+                &json!({"command": command}),
+                "",
+                false,
+            );
         };
         app.commit(vec![Line::from("› fix the three bugs")]);
         start(&mut app, "calc.add");
@@ -17783,10 +18244,11 @@ mod tests {
         assert_eq!(drawn(&mut app).len(), 3);
         // Something drawn between, or another kind of call, starts anew;
         // a call the clean view hides does not.
-        app.commit_call("c", "shell", &json!({"command": "ls"}), "a", false);
+        app.commit_call("c", Some(1), "shell", &json!({"command": "ls"}), "a", false);
         start(&mut app, "calc.mul");
         app.commit_call(
             "c",
+            Some(1),
             served::REMOVE,
             &json!({"task": "calc.add"}),
             "{}",
@@ -17866,7 +18328,14 @@ mod tests {
         let mut app = app(client);
         app.width = 80;
         let arguments = json!({"name": "many", "brief": "Fix many"});
-        app.commit_call("c", served::START, &arguments, "turn:calc.many/1", false);
+        app.commit_call(
+            "c",
+            Some(1),
+            served::START,
+            &arguments,
+            "turn:calc.many/1",
+            false,
+        );
         app.read_tasks().await;
         let rows = drawn(&mut app);
         assert_eq!(rows[1], "  ● many  working  Fix many");
@@ -17910,7 +18379,14 @@ mod tests {
         let mut app = app(client);
         app.width = 80;
         let arguments = json!({"name": "add", "brief": "Fix add"});
-        app.commit_call("c", served::START, &arguments, "turn:calc.add/1", false);
+        app.commit_call(
+            "c",
+            Some(1),
+            served::START,
+            &arguments,
+            "turn:calc.add/1",
+            false,
+        );
         app.read_tasks().await;
         assert_eq!(drawn(&mut app)[1], "  ● add  working  Fix add");
         // Idle, the stopped message never ran: the turn before it says
@@ -17961,7 +18437,7 @@ mod tests {
         let start = |app: &mut App, name: &str| {
             let arguments = json!({"name": name, "brief": format!("Fix {name}")});
             let output = format!("turn:calc.{name}/1");
-            app.commit_call("c", served::START, &arguments, &output, false);
+            app.commit_call("c", Some(1), served::START, &arguments, &output, false);
         };
         start(&mut app, "add");
         start(&mut app, "neg");
@@ -18238,7 +18714,7 @@ mod tests {
         for name in ["quiet", "bad"] {
             let arguments = json!({"name": name, "brief": format!("Fix {name}")});
             let output = format!("turn:calc.{name}/1");
-            app.commit_call("c", served::START, &arguments, &output, false);
+            app.commit_call("c", Some(1), served::START, &arguments, &output, false);
         }
         app.read_tasks().await;
         let rows = drawn(&mut app);
@@ -18317,7 +18793,14 @@ mod tests {
         let mut app = app(client);
         app.width = 80;
         let arguments = json!({"name": "ask", "brief": "Fix ask"});
-        app.commit_call("c", served::START, &arguments, "turn:calc.ask/1", false);
+        app.commit_call(
+            "c",
+            Some(1),
+            served::START,
+            &arguments,
+            "turn:calc.ask/1",
+            false,
+        );
         app.read_tasks().await;
         assert_eq!(drawn(&mut app)[1], "  ? ask  needs you  Fix ask");
         // Its history is read once for the turn it ended.
@@ -18381,15 +18864,64 @@ mod tests {
         }
         assert_eq!(
             sent.lock().unwrap()[..],
-            [json!("You asked (a4): Merge?\n\nNo")]
+            [json!("You asked (ask:4/a4): Merge?\n\nNo")]
         );
         assert!(app.asks.is_empty());
         // Once answered, another click sends nothing.
-        app.press("answer/0/a4").await;
+        app.press("answer/0/ask:4/a4").await;
         assert_eq!(sent.lock().unwrap().len(), 1);
         assert_eq!(
             app.notice.as_deref(),
             Some("that question was answered already")
+        );
+    }
+
+    #[tokio::test]
+    async fn an_answer_taken_back_unread_leaves_its_question_to_answer_again() {
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = sent.clone();
+        let client = daemon_answering(move |asked| match asked["op"].as_str() {
+            Some("submit") => {
+                // As the daemon keeps them: a request's first send starts a
+                // turn, the first answer's turn 5, and a later one with
+                // other words is refused, naming it.
+                let mut seen = seen.lock().unwrap();
+                let request = asked["request_id"].as_str().unwrap().to_owned();
+                let again = seen.contains(&request);
+                let turn = if request.ends_with(".1") { 9 } else { 5 };
+                seen.push(request);
+                match again {
+                    false => json!({"turn": turn}),
+                    true => json!({"error": "idempotency_conflict", "turn": turn}),
+                }
+            }
+            Some("turns") => match asked["after"].as_i64() {
+                Some(4) => json!({"turns": [{"turn": 5, "status": "interrupted",
+                    "started_ms": null}]}),
+                _ => json!({"turns": [{"turn": 9, "status": "done", "started_ms": 1}]}),
+            },
+            _ => json!({}),
+        })
+        .await;
+        let mut app = app(client);
+        for pick in ["No", "Yes"] {
+            let answer = format!("You asked (ask:4/a4): Merge?\n\n{pick}");
+            app.send(answer, None, false, true, &[]).await.unwrap();
+        }
+        let answer = "You asked (ask:4/a4): Merge?\n\nNo".to_owned();
+        assert_eq!(
+            app.send(answer, None, false, true, &[]).await,
+            Err("that question was answered already".to_owned())
+        );
+        assert_eq!(
+            sent.lock().unwrap()[..],
+            [
+                asks::request_id("ask:4/a4", 0),
+                asks::request_id("ask:4/a4", 0),
+                asks::request_id("ask:4/a4", 1),
+                asks::request_id("ask:4/a4", 0),
+                asks::request_id("ask:4/a4", 1),
+            ]
         );
     }
 
@@ -18612,7 +19144,7 @@ mod tests {
         for name in ["ask", "new"] {
             let arguments = json!({"name": name, "brief": format!("Ask {name}")});
             let output = format!("turn:calc.{name}/2");
-            app.commit_call("c", served::START, &arguments, &output, false);
+            app.commit_call("c", Some(1), served::START, &arguments, &output, false);
         }
         app.read_tasks().await;
         let states: HashMap<_, _> = (app.tasks.values().flatten())
@@ -18756,7 +19288,7 @@ mod tests {
             read: Instant::now(),
             lookout: "Lookout · on".into(),
             alerts: Vec::new(),
-            resolved: false,
+            open: Vec::new(),
             background: None,
             usage: None,
             commons: None,
@@ -19204,7 +19736,14 @@ mod tests {
         app.width = 80;
         let start = |app: &mut App, name: &str| {
             let command = format!("\"$AGENT_BIN\" run --bot {name} \"Fix {name}\"");
-            app.commit_call("c", "shell", &json!({"command": command}), "", false);
+            app.commit_call(
+                "c",
+                Some(1),
+                "shell",
+                &json!({"command": command}),
+                "",
+                false,
+            );
         };
         start(&mut app, "calc.add");
         start(&mut app, "calc.neg");
@@ -19235,7 +19774,7 @@ mod tests {
             read: Instant::now(),
             lookout: String::new(),
             alerts: Vec::new(),
-            resolved: false,
+            open: Vec::new(),
             background: None,
             usage: None,
             commons: None,
@@ -19942,7 +20481,7 @@ mod tests {
             json!({"steps": ["[x] Read", "[>] Fix", "[ ] Test"]}),
         ];
         for (n, plan) in plans.iter().enumerate() {
-            app.commit_call(&format!("p{n}"), "plan", plan, "Plan set.", false);
+            app.commit_call(&format!("p{n}"), Some(1), "plan", plan, "Plan set.", false);
             app.commit(vec![Line::from(format!("reply {n}"))]);
         }
         app.flush();
@@ -19977,7 +20516,7 @@ mod tests {
         assert_eq!(rows.last().unwrap(), "reply 1");
         // A newer plan takes the full rows over.
         let done = json!({"steps": ["[x] Read", "[x] Fix", "[x] Test"]});
-        app.commit_call("p2", "plan", &done, "Plan set.", false);
+        app.commit_call("p2", Some(1), "plan", &done, "Plan set.", false);
         app.flush();
         app.fold_notes(false);
         let rows = texts(&app);

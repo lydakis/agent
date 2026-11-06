@@ -1087,9 +1087,36 @@ const TEMPLATE: &str = "\
 ";
 
 /// `chosen` into the config file at `file`, with the efforts a first run
-/// suggests where the file names none; the person may edit them after. A
-/// new file starts with [`TEMPLATE`].
+/// suggests where the file names none, which it says it wrote (on stderr,
+/// so `--json` keeps stdout); the person may edit them after. A new file
+/// starts with [`TEMPLATE`].
 fn save(file: &Path, chosen: Option<(&str, &str)>) -> Result<(), String> {
+    let suggested = save_quietly(file, chosen)?;
+    if let Some(said) = wrote_defaults(file, &suggested) {
+        eprintln!("{said}");
+    }
+    Ok(())
+}
+
+/// What setup says of the defaults it wrote to `file` unasked, if any.
+fn wrote_defaults(file: &Path, suggested: &[(&str, &str)]) -> Option<String> {
+    let set: Vec<String> = (suggested.iter())
+        .map(|(key, value)| format!("{key} = \"{value}\""))
+        .collect();
+    (!set.is_empty()).then(|| {
+        format!(
+            "Wrote first-run defaults to {}: {} (edit them there or in /config).",
+            file.display(),
+            set.join(", ")
+        )
+    })
+}
+
+/// [`save`], saying nothing: the suggested efforts it wrote.
+fn save_quietly(
+    file: &Path,
+    chosen: Option<(&str, &str)>,
+) -> Result<Vec<(&'static str, &'static str)>, String> {
     if !file.exists() {
         if let Some(dir) = file.parent() {
             std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
@@ -1101,18 +1128,17 @@ fn save(file: &Path, chosen: Option<(&str, &str)>) -> Result<(), String> {
         ("sonny.lead_effort", "medium", sonny.lead_effort),
         ("sonny.task_effort", "high", sonny.task_effort),
     ];
-    let pairs: Vec<(&str, &str)> = (chosen.into_iter())
-        .chain(
-            suggested
-                .iter()
-                .filter(|(.., set)| set.is_none())
-                .map(|(k, v, _)| (*k, *v)),
-        )
+    let suggested: Vec<(&'static str, &'static str)> = (suggested.iter())
+        .filter(|(.., set)| set.is_none())
+        .map(|(k, v, _)| (*k, *v))
         .collect();
-    match pairs.is_empty() {
-        true => Ok(()),
-        false => agent_client::config::set(file, &pairs),
+    let pairs: Vec<(&str, &str)> = (chosen.into_iter())
+        .chain(suggested.iter().copied())
+        .collect();
+    if !pairs.is_empty() {
+        agent_client::config::set(file, &pairs)?;
     }
+    Ok(suggested)
 }
 
 const ACCENT: &str = "\x1b[38;2;255;190;60m";
@@ -1415,11 +1441,25 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("sonny-setup-save-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let file = dir.join("config.toml");
-        save(&file, Some(("model", "openai/gpt-x"))).unwrap();
+        let suggested = save_quietly(&file, Some(("model", "openai/gpt-x"))).unwrap();
+        // What it wrote unasked, it says.
+        assert_eq!(
+            suggested,
+            [
+                ("sonny.lead_effort", "medium"),
+                ("sonny.task_effort", "high")
+            ]
+        );
+        let said = wrote_defaults(&file, &suggested).unwrap();
+        assert!(said.contains(r#"sonny.lead_effort = "medium", sonny.task_effort = "high""#));
+        // Set already, they are not written or said again.
+        let again = save_quietly(&file, Some(("model", "openai/gpt-y"))).unwrap();
+        assert!(again.is_empty());
+        assert_eq!(wrote_defaults(&file, &again), None);
         let text = std::fs::read_to_string(&file).unwrap();
         assert!(text.starts_with("# Sonny's and the agent daemon's settings."));
         let config = agent_client::config::read(&file).unwrap();
-        assert_eq!(config.model.as_deref(), Some("openai/gpt-x"));
+        assert_eq!(config.model.as_deref(), Some("openai/gpt-y"));
         assert_eq!(config.sonny.lead_effort.as_deref(), Some("medium"));
         assert_eq!(config.sonny.task_effort.as_deref(), Some("high"));
         std::fs::remove_dir_all(&dir).unwrap();

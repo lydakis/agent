@@ -176,17 +176,20 @@ const FAILED: Color = Color::Red;
 const AGENTS: Color = Color::Blue;
 const YOU: Color = Color::Magenta;
 /// The models' colours on `m`, an exception to one meaning per hue as the
-/// usage chart's are: telling models apart needs a fill each. Hues the
-/// sky's messages and tools don't take first, then the bright twins.
+/// usage chart's are: telling models apart needs a fill each. The six
+/// hues first, those the sky's messages and tools don't take leading, and
+/// only then the bright twins, which many themes draw as a duller shade of
+/// the same hue (Flexoki's bright green is an olive beside its green) or
+/// as grays (Solarized), so two models in neighbouring hues stay apart.
 const MODEL_HUES: [Color; 8] = [
     Color::Green,
     Color::Yellow,
-    Color::LightGreen,
-    Color::LightYellow,
+    Color::Blue,
+    Color::Magenta,
+    Color::Cyan,
+    Color::Red,
     Color::LightBlue,
     Color::LightMagenta,
-    Color::LightCyan,
-    Color::LightRed,
 ];
 
 /// What the follow brings the view.
@@ -441,6 +444,12 @@ pub struct View {
     /// The agents in the tree's order, each with its depth, for the list.
     order: Vec<(usize, usize)>,
     live: bool,
+    /// The follow said it is ready: who is here, what they did and what
+    /// they hold are read.
+    ready: bool,
+    /// Whose questions the opening asked for and has not heard back: the
+    /// sky draws once none is left, so nothing pops in after.
+    unread: HashSet<String>,
     paused: bool,
     /// Where the follow reads agents' questions, once it says.
     scans: Option<mpsc::UnboundedSender<(String, Option<i64>)>>,
@@ -869,6 +878,8 @@ impl View {
             laid: false,
             order: Vec::new(),
             live: false,
+            ready: false,
+            unread: HashSet::new(),
             paused: false,
             scans: None,
             legend: false,
@@ -943,6 +954,8 @@ impl View {
         // is read again from the turns kept.
         self.forget();
         self.live = false;
+        self.ready = false;
+        self.unread.clear();
         self.down = None;
         // The new connection's greeting says whether it still hangs.
         self.cord = None;
@@ -1079,8 +1092,9 @@ impl View {
                         agent.waits.held(held, |bot| bot == name);
                         if !agent.gone
                             && let Some(scans) = &self.scans
+                            && scans.send((name.clone(), None)).is_ok()
                         {
-                            let _ = scans.send((name, None));
+                            self.unread.insert(name);
                         }
                     }
                 }
@@ -1088,6 +1102,7 @@ impl View {
                 // Read as of when it was asked: what an event since left
                 // unsure is read again when its turn ends.
                 Feed::Asked(name, Some(seen)) => {
+                    self.unread.remove(&name);
                     if let Some(at) = self.agent(&name)
                         && !self.agents[at].waits.unsure(&name)
                     {
@@ -1096,7 +1111,9 @@ impl View {
                         self.agents[at].waits.asked(&name, ask);
                     }
                 }
-                Feed::Asked(_, None) => {}
+                Feed::Asked(name, None) => {
+                    self.unread.remove(&name);
+                }
                 Feed::Live(event) => {
                     self.live = true;
                     self.event(&event, now, true);
@@ -1120,7 +1137,7 @@ impl View {
                         self.agents[at].set_model(&model);
                     }
                 }
-                Feed::Ready => self.live = true,
+                Feed::Ready => (self.live, self.ready) = (true, true),
                 Feed::Down(why) => self.down = Some(why),
             }
         }
@@ -1440,8 +1457,9 @@ impl View {
     }
 
     /// The haiku's rows: its three lines streaming in a word at a time,
-    /// muted, each word up from faint, then its writer signed in faint;
-    /// the one before all faint as it fades; in a replay, the one up then.
+    /// in the text's own weight, each word up from faint through muted,
+    /// then its writer signed muted; the one before all faint as it fades;
+    /// in a replay, the one up then.
     fn haiku(&self, now: Instant) -> Vec<Line<'static>> {
         let showing = self.verse.as_ref().filter(|verse| now >= verse.from);
         let (verse, faded) = match (showing, &self.fading) {
@@ -1464,9 +1482,10 @@ impl View {
                 if !faded && t < shows {
                     continue;
                 }
-                let ink = match faded || t < shows + WORD {
-                    true => Ink::Faint,
-                    false => Ink::Muted,
+                let ink = match () {
+                    _ if faded || t < shows + WORD / 2.0 => Ink::Faint,
+                    _ if t < shows + WORD => Ink::Muted,
+                    _ => Ink::Plain,
                 };
                 if !spans.is_empty() {
                     spans.push(Span::raw(" "));
@@ -1485,8 +1504,9 @@ impl View {
                 .saturating_duration_since(verse.since);
             let minutes = (held.as_secs() / 60).max(1);
             lines.push(Line::default());
+            let ink = if faded { Ink::Faint } else { Ink::Muted };
             for signed in signature(&name, minutes, haiku::WIDTH) {
-                lines.push(Line::from(Span::styled(signed, Ink::Faint.style())));
+                lines.push(Line::from(Span::styled(signed, ink.style())));
             }
         }
         lines
@@ -2826,13 +2846,29 @@ impl View {
         }
     }
 
+    /// Still reading who is here, what they did, what they hold and what
+    /// they ask: the follow has not said it is ready, or a question asked
+    /// for at the start is unread. A replay and a lost follow show what
+    /// they have.
+    fn opening(&self) -> bool {
+        self.replay.is_none() && self.down.is_none() && (!self.ready || !self.unread.is_empty())
+    }
+
     /// The sky `cols` wide and `rows` high, what happened under it.
     pub fn card(&mut self, cols: usize, rows: usize) -> Vec<Line<'static>> {
+        let mut lines = Vec::new();
+        // The sky opens whole: until who is here, what they did, what they
+        // hold and what they ask are all read, one quiet line, and laid out
+        // once, so no star moves for what was only late. A follow lost on
+        // the way shows what it read, and says so.
+        if self.opening() {
+            lines.push(Line::from("Catching up with who is here…"));
+            return lines;
+        }
         let now = Instant::now();
         self.lay(now);
         self.glide(now);
         let cols = cols.max(20);
-        let mut lines = Vec::new();
         let shown = self.agents.iter().filter(|a| !a.gone).count();
         if shown == 0 {
             lines.push(Line::from(match (&self.down, self.live) {
@@ -3049,8 +3085,8 @@ impl View {
             // What needs the person or failed, still in its colour; a
             // working star breathes. As in 0.7.0, those are blobs, and so
             // is one a message lights; one at rest is a single dot.
-            // On `m`, each in its model's colour instead, bold while it
-            // works.
+            // On `m`, each a blob in its model's colour instead, bold, so a
+            // hue reads on a star at rest too.
             let hue = (self.models)
                 .then(|| hues.get(agent.model_or_unknown()).copied())
                 .flatten();
@@ -3061,10 +3097,7 @@ impl View {
                 // The stop holds the rest still, as it reaches them; what
                 // needs the person or failed keeps its colour.
                 (_, None | Some(State::Working)) if stilled => (Ink::Muted, false),
-                (Some(hue), state) => {
-                    let big = state.is_some() || agent.glow(now) > 0.4;
-                    (Ink::Color(hue, big), big)
-                }
+                (Some(hue), _) => (Ink::Color(hue, true), true),
                 (None, Some(State::Working)) => {
                     (shade.breathe(agent.breath(now, self.opened)), true)
                 }
@@ -3149,7 +3182,12 @@ impl View {
                 // The pick reversed, as a picker's selection is.
                 (true, _) => Style::default().reversed(),
                 (_, true) => Style::default().bold(),
-                _ => name_style(agent.state(), agent.glow(now)),
+                // On `m`, the name in its star's colour too: a star's mark
+                // is a few dots, its name the most of it there is.
+                _ => match hues.get(agent.model_or_unknown()) {
+                    Some(&hue) => name_style(agent.state(), 1.0).fg(hue),
+                    None => name_style(agent.state(), agent.glow(now)),
+                },
             };
             if !sky.label(agent.at, mark, &short(&agent.name), style)
                 && agent.state() == Some(State::NeedsYou)
@@ -3191,7 +3229,10 @@ impl View {
                     // The haiku at the top, in the blank the log leaves.
                     // A blank under its newest line, as over the haiku: two
                     // from the footer, as two from the key hints.
-                    let mut column = self.ticked(now, LOG_COLS, rows.saturating_sub(1), true);
+                    // As wide as the haiku over it, so both keep the same
+                    // margin from the pane's edge.
+                    let room = rows.saturating_sub(1);
+                    let mut column = self.ticked(now, haiku::WIDTH, room, true);
                     column.push(Line::default());
                     for (row, line) in self.haiku(now).into_iter().enumerate() {
                         let row = HAIKU_TOP + row;
@@ -3275,13 +3316,15 @@ impl View {
                 _ => Ink::Muted.style(),
             };
             // A replay says when it happened, as a chat log's time does.
+            // Its time starts where the haiku does, two cells from its words.
             let when = match written {
                 Some(written) => format!("{} ", clock(*written)),
-                None => format!("{:>4}  ", ago(now, *at)),
+                None => format!("{:>3}  ", ago(now, *at)),
             };
+            let room = cols.saturating_sub(when.width());
             lines.push(Line::from(vec![
                 Span::styled(when, age),
-                Span::styled(cut(text, cols.saturating_sub(6)), words),
+                Span::styled(cut(text, room), words),
             ]));
         }
         if let Some(why) = &self.down {
@@ -3620,6 +3663,10 @@ impl View {
         if let Some(replay) = &self.replay {
             return replay_line(replay, width);
         }
+        // The counts come with the sky, whole.
+        if self.opening() {
+            return Line::default();
+        }
         let shown: Vec<&Agent> = self.agents.iter().filter(|a| !a.gone).collect();
         let count = shown.len();
         let mut spans = vec![
@@ -3672,7 +3719,7 @@ impl View {
                 }
                 spans.push(Span::raw(" ·").dim());
                 spans.push(Span::raw(" ⠛").fg(hue));
-                spans.push(Span::raw(format!(" {model}")).dim());
+                spans.push(Span::raw(format!(" {model}")).fg(hue));
             }
         }
         let states = match self.models {
@@ -5298,6 +5345,7 @@ mod tests {
             json!({"name": "shop.lead", "running_turn": 3}),
         ]))
         .unwrap();
+        send.send(Feed::Ready).unwrap();
         view.drain();
         let area = ratatui::layout::Rect::new(0, 0, 60, 30);
         let mut buf = ratatui::buffer::Buffer::empty(area);
@@ -5425,6 +5473,7 @@ mod tests {
         };
         send.send(roll(&[("zoo.lead", 1), ("apps.lead", 2)]))
             .unwrap();
+        send.send(Feed::Ready).unwrap();
         view.drain();
         view.card(120, 40);
         let angle = |view: &View, name: &str| view.agents[view.index[name]].angle;
@@ -5451,6 +5500,7 @@ mod tests {
             json!({"name": "d.lead", "model": "chatgpt/gpt-6.1-sol"}),
         ]))
         .unwrap();
+        send.send(Feed::Ready).unwrap();
         view.drain();
         view.card(160, 40);
         assert!(view.press(KeyCode::Char('m')));
@@ -5477,6 +5527,7 @@ mod tests {
             json!({"name": "notes.lead", "model": "m1"}),
         ]))
         .unwrap();
+        send.send(Feed::Ready).unwrap();
         view.drain();
         view.card(120, 40);
         // Asked for by its project, the lead goes to the middle.
@@ -6148,6 +6199,7 @@ mod tests {
             json!({"name": "shop.cart", "created_by": "shop.login"}),
         ]))
         .unwrap();
+        send.send(Feed::Ready).unwrap();
         view.drain();
         view.centre_on(Some("shop.lead".into()));
         view.card(120, 40);
@@ -6211,6 +6263,7 @@ mod tests {
             );
         }
         send.send(Feed::Roll(bots)).unwrap();
+        send.send(Feed::Ready).unwrap();
         send.send(Feed::Live(
             json!({"cursor": 1, "event": "tool_started", "bot": "shop.t7",
             "turn": 1, "data": {"name": "ask"}}),
@@ -6278,6 +6331,7 @@ mod tests {
             json!({"name": "shop.login", "created_by": "shop.lead"}),
         ]))
         .unwrap();
+        send.send(Feed::Ready).unwrap();
         let from = json!({"bot": "shop.lead", "turn": 3});
         for kind in ["queued", "accepted"] {
             send.send(Feed::Live(
@@ -6813,9 +6867,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_haiku_reads_as_text_the_log_keeps_its_margin_and_models_colour_names() {
+        let (mut view, send) = view();
+        let long = "shop.a-long-task-name-for-the-log";
+        send.send(Feed::Roll(vec![
+            json!({"name": "shop.lead", "model": "openai/m1"}),
+            json!({"name": long, "created_by": "shop.lead", "model": "anthropic/m2"}),
+        ]))
+        .unwrap();
+        send.send(Feed::Ready).unwrap();
+        send.send(Feed::Live(
+            json!({"event": "accepted", "bot": long, "turn": 1,
+            "data": {"from": {"bot": "shop.lead"}}}),
+        ))
+        .unwrap();
+        view.drain();
+        let now = Instant::now();
+        view.verse = Some(Verse {
+            by: "shop.lead".into(),
+            lines: vec!["stars wake one by one".into(), "b".into(), "c".into()],
+            from: now - Duration::from_secs(60),
+            written: now - Duration::from_secs(60),
+            since: now - Duration::from_secs(600),
+            until: None,
+            story: None,
+        });
+        for note in view.ticker.iter_mut() {
+            note.at = now - Duration::from_secs(20);
+        }
+        // Once in, the haiku's words are in the text's own weight.
+        let haiku = view.haiku(now);
+        assert!(
+            (haiku[0].spans.iter())
+                .filter(|span| !span.content.trim().is_empty())
+                .all(|span| span.style == Style::default()),
+            "{:?}",
+            haiku[0]
+        );
+        // The log's time starts where the haiku does, and its words end
+        // within the haiku's width: the same margin from the edge.
+        let card = text(&view.card(140, 40));
+        let rows: Vec<&str> = card.lines().collect();
+        let col = |row: &str, at: usize| row[..at].width();
+        let poem = rows
+            .iter()
+            .find_map(|row| Some(col(row, row.find("stars wake")?)));
+        let start = poem.expect("the haiku beside the sky");
+        let logged = (rows.iter())
+            .find(|row| row.contains("20s  shop lead → "))
+            .expect("the log line");
+        let time = logged.find("20s").unwrap();
+        assert_eq!(col(logged, time), start, "{logged}");
+        assert!(
+            logged.trim_end().width() <= start + haiku::WIDTH,
+            "{logged}"
+        );
+        // On `m`, a name takes its star's colour.
+        assert!(view.press(ratatui::crossterm::event::KeyCode::Char('m')));
+        let hues: HashMap<String, Color> = view.hues().into_iter().collect();
+        let lines = view.card(140, 40);
+        let named = (lines.iter().flat_map(|line| &line.spans))
+            .find(|span| span.content.contains("lead"))
+            .expect("the lead's name");
+        assert_eq!(named.style.fg, hues.get("m1").copied(), "{named:?}");
+    }
+
+    #[tokio::test]
     async fn a_commons_post_ripples_and_an_origin_comes_from_the_rim() {
         let (mut view, send) = view();
         send.send(Feed::Roll(vec![json!({"name": "a"})])).unwrap();
+        send.send(Feed::Ready).unwrap();
         send.send(Feed::Live(
             json!({"event": "tool_started", "bot": "a", "turn": 1, "data": {
             "name": "commons", "arguments": r#"{"post":{"name":"flaky-tests","title":"Flaky tests","text":"Seen twice"}}"#}}),
@@ -7104,6 +7225,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_sky_opens_whole_once_who_is_here_and_what_they_ask_are_read() {
+        let (mut view, send) = view();
+        let (scans, mut asked) = mpsc::unbounded_channel();
+        send.send(Feed::Scans(scans)).unwrap();
+        send.send(Feed::Roll(vec![json!({"name": "a"}), json!({"name": "b"})]))
+            .unwrap();
+        send.send(Feed::Past(
+            json!({"event": "accepted", "bot": "a", "turn": 1, "data": {}}),
+        ))
+        .unwrap();
+        view.drain();
+        let waiting = text(&view.card(80, 30));
+        assert_eq!(waiting.trim(), "Catching up with who is here…");
+        // What they hold is in and their questions are asked for: still one
+        // line, ready or not, until each agent's questions are read.
+        send.send(Feed::Held(Vec::new())).unwrap();
+        send.send(Feed::Ready).unwrap();
+        view.drain();
+        let mut sent = Vec::new();
+        while let Ok((name, _)) = asked.try_recv() {
+            sent.push(name);
+        }
+        sent.sort();
+        assert_eq!(sent, ["a", "b"]);
+        assert_eq!(
+            text(&view.card(80, 30)).trim(),
+            "Catching up with who is here…"
+        );
+        send.send(Feed::Asked("a".into(), None)).unwrap();
+        view.drain();
+        assert_eq!(
+            text(&view.card(80, 30)).trim(),
+            "Catching up with who is here…"
+        );
+        send.send(Feed::Asked("b".into(), None)).unwrap();
+        view.drain();
+        let open = text(&view.card(80, 30));
+        assert!(!open.contains("Catching up"), "{open}");
+        assert!(
+            open.contains("you") && open.contains("Quiet. Messages"),
+            "{open}"
+        );
+        // A fresh follow opens whole again.
+        view.pause();
+        view.resume();
+        assert_eq!(
+            text(&view.card(80, 30)).trim(),
+            "Catching up with who is here…"
+        );
+    }
+
+    #[tokio::test]
     async fn a_lost_follow_is_told_under_the_messages() {
         let (mut view, send) = view();
         send.send(Feed::Roll(vec![json!({"name": "a"})])).unwrap();
@@ -7134,6 +7307,7 @@ mod tests {
             json!({"name": "shop.cart", "created_by": "shop.lead"}),
         ]))
         .unwrap();
+        send.send(Feed::Ready).unwrap();
         let live = |bot: &str, kind: &str, turn: i64, data: Value| {
             Feed::Live(json!({"event": kind, "bot": bot, "turn": turn, "data": data}))
         };
@@ -7344,6 +7518,7 @@ mod tests {
         let (mut view, send) = view();
         send.send(Feed::Roll(vec![json!({"name": "shop.lead"})]))
             .unwrap();
+        send.send(Feed::Ready).unwrap();
         view.drain();
         view.legend = true;
         let shown = text(&view.card(80, 30));
@@ -7361,7 +7536,7 @@ mod tests {
         assert!(wide.contains("   working: it breathes"), "{wide}");
         assert!(wide.contains(" leads         1"), "{wide}");
         view.legend = false;
-        assert!(text(&view.card(80, 30)).contains("Catching up"));
+        assert!(text(&view.card(80, 30)).contains("Quiet. Messages light up here"));
     }
 
     #[tokio::test]
@@ -7369,6 +7544,7 @@ mod tests {
         let (mut view, send) = view();
         send.send(Feed::Roll(vec![json!({"name": "a"}), json!({"name": "b"})]))
             .unwrap();
+        send.send(Feed::Ready).unwrap();
         for turn in 1..=3 {
             send.send(Feed::Live(
                 json!({"event": "accepted", "bot": "b", "turn": turn,
@@ -7423,6 +7599,7 @@ mod tests {
             bots.push(json!({"name": format!("shop.t{n}"), "created_by": "shop.lead"}));
         }
         send.send(Feed::Roll(bots)).unwrap();
+        send.send(Feed::Ready).unwrap();
         send.send(Feed::Live(
             json!({"event": "accepted", "bot": "shop.t29", "turn": 1,
             "data": {"from": {"bot": "shop.lead"}}}),
