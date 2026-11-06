@@ -20,6 +20,22 @@ latest one into `~/.local`:
 
     curl -fsSL https://raw.githubusercontent.com/lydakis/agent/main/install.sh | sh
 
+For main without a version tag, `brew install lydakis/agent/sonny-nightly`
+builds Sonny and its matching daemon together from one pinned commit. If
+stable Sonny is installed, run `brew unlink sonny` first. Update with
+`brew update` and `brew upgrade lydakis/agent/sonny-nightly`. The
+[nightly workflow](../.github/workflows/nightly.yml) checks main at 07:17 UTC,
+tests it and installs the formula before updating the tap; an unchanged
+commit leaves the formula alone. It can also be run manually from main.
+`sonny --version` and `sonny agent --version` name the built commit.
+
+For the newest main commit between nightly runs, use
+`brew install --HEAD lydakis/agent/sonny-nightly` (or
+`brew reinstall --HEAD lydakis/agent/sonny-nightly` to switch an existing
+install), then `brew upgrade --fetch-HEAD lydakis/agent/sonny-nightly`.
+These installs build from source on macOS and Linux; `install.sh` continues
+to install versioned Linux releases.
+
 With `cargo install`, build both (`--path .` for `agent` and
 `--path sonny`) and set `AGENT_BIN` to that `agent`; Sonny never takes an
 `agent` from `PATH`, which may be another program. `sonny agent ARGS` runs
@@ -790,20 +806,19 @@ way `/react` does, and each note in the margin has its own `↩`.
   lookout's follows, with how many checks each asked for in the last
   day. `↑`/`↓` picks one, `r` runs an automation now, and `d` pressed twice
   removes it; the follow Sonny keeps for a lead's tasks stays. The
-  footer says `↻ 2 in background` while the window's agent has any.
+  footer says `↻ 2` while the window's agent has any.
   What failed is listed first, with a red `✗` and the error: an automation
   whose run failed (one that ended on it stays listed until `d` removes
   it), or whose run went out and whose turn then failed (as
   when the machine was offline or a login expired), and a server the
   nightly memory cleanup could not read. Your own agents' failures, such as
   the memory cleanup's, show in every window. The footer then says
-  `✗ 1 failed` with a red `✗`, left of the `↻`, and a click on either opens
+  `✗ 1` with a red `✗`, left of the `↻`, and a click on either opens
   `/background`. An agent sees the same in its `automations` tool, whose rows
   say how the turn their last run sent ended. Automations and follows are
   what the agents' `automations` and `subscriptions` tools make.
 
   ![/background listing a nightly run whose turn failed offline and a server the cleanup could not read](../docs/sonny/background-failed.png)
-  ![The footer: ✗ 1 failed with a red ✗, left of ↻ 3](../docs/sonny/footer-failed.png)
 
   ![/background in the pane](../docs/sonny/pane-background.png)
 - `/usage` shows, in the pane beside the conversation,
@@ -842,9 +857,10 @@ way `/react` does, and each note in the margin has its own `↩`.
   reviewer's verdict is: a red streak onto the agent whose call it
   denied, a yellow one when it hands the call to you, nothing for an
   allow, whose call runs. What comes in from no agent flies in from the
-  edge only when it is from outside: a follow, another person, a
-  schedule (whose tick flashes as it fires), a reply's note from the
-  commons, task updates. A commons invite flies from whoever started the
+  edge only when it is from outside: news from its sources, another
+  person, a schedule (whose tick flashes as it fires), a reply's note
+  from the commons, task updates, a message that came back; the chat log
+  names each so (`its sources → inbox`, `task updates → shop lead`). A commons invite flies from whoever started the
   thread, a margin note you closed from you, and an agent's own goal only
   pulses its star. It is a
   calm window to keep open and watch: dim lines join who made whom, and
@@ -1465,8 +1481,9 @@ failed in the background and `↻` for its automations and follows (a
 click on either opens `/background`), and its context, each
 left out when there is nothing to say; the footer stops saying them while
 it shows. Under the composer, the footer counts the agents that need you
-and the other agents at work, each with its word (`? 1 needs you  ● 2 working`),
-marked as the roster and `/status` mark them, and a click on the count
+and the other agents at work by their marks and numbers alone (`? 1  ● 2`),
+marked as the roster and `/status` mark them, each mark its own shape so
+the counts read without colour, and a click on the count
 opens `/status`. Every surface reads what needs you one way: an agent
 needs you while a call of its waits on your approval (gated for you, or
 handed to you by the approver) or a question it asked you is still open,
@@ -1480,14 +1497,13 @@ right what wants you (needs you, failed, working, `↻`, `✎`, the
 context). The agent's name is left to the composer, which says it. When
 the window is too narrow for all of it, items give way in one order, as
 Powerline drops its lowest segments first: words before marks, marks
-before whole items, and what needs you never. `↻ 3 in background` goes to
-`↻ 3`, `⏵⏵ full access` to `⏵⏵`, the folder to `~/D/agent` as fish
+before whole items, and what needs you never. `⏵⏵ full access` goes to `⏵⏵`, the folder to `~/D/agent` as fish
 shortens it and then to `agent`, until at 44 columns a busy lead reads
 `⏵⏵ GPT 6.1 Sol high   ? 1  ✗ 1  ● 2  37%`. The hues on it are only for
 what asks something of you: the `?`, the `✗`, the `●` and a context half
 used.
 
-![The footer at 100, 80, 60 and 44 columns: words go first, what needs you stays](../docs/sonny/footer-widths.png) Under the glance are the notes the agent keeps there with its `margin`
+![The footer at 100, 80, 60 and 44 columns: counts are marks and numbers, what needs you stays](../docs/sonny/footer-widths.png) Under the glance are the notes the agent keeps there with its `margin`
 tool: a diagram, a table of findings, a file it is discussing (kept fresh
 as the file changes), or a live view it updates while it works. Each
 note is pinned where the agent first put it: a quiet `✎ title · in the

@@ -1924,7 +1924,13 @@ open. The schema version lives in SQLite's `user_version`; a store created
 before versioning is refused with `store_schema_unsupported`, one written by a
 newer binary with `store_schema_newer`, and an older versioned store is
 migrated inside the opening transaction when its data can be converted without
-guessing. Schema 18 requires each bot's tool selection. Older stores with bots
+guessing. Before it migrates, the store is copied with `VACUUM INTO` to
+`<store>.schema-<version>.backup` beside it, with the store's permissions,
+and the copy is checked (it opens, passes `PRAGMA integrity_check`, and is at
+that version); the two newest copies are kept. A store that cannot be copied,
+for a full disk say, is not migrated: opening fails with
+`store_backup_failed`, which says why, and the store stays as it was. To go
+back a release, stop the daemon and put the copy in the store's place. Schema 18 requires each bot's tool selection. Older stores with bots
 but no recorded selection are refused with `store_migration_tools_unknown`;
 their data and schema version remain intact. Keep those stores and use a new
 store path. Empty stores can migrate. Schema 19 rebuilds cache counters from
@@ -2595,7 +2601,8 @@ SIGHUP, does not outlive it. Each bot keeps at most 16; starting another
 first kills the one it used least recently, as Codex prunes its sessions,
 so that one's slot is free for it. Only the
 bot that started a terminal types into it (`terminal_not_running` for any
-other, and for one that ended), and terminals end when the daemon stops. A
+other, and for one that ended; `not_a_terminal` for its own background
+command, which takes no input), and terminals end when the daemon stops. A
 terminal never leaves its bot's sandbox (`tty` with `require_escalated` is
 refused), so input to a sandboxed bot's terminal runs without review, as its
 commands do; an unsandboxed bot's `write_stdin` is gated like `shell`.

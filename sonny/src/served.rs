@@ -1406,13 +1406,12 @@ async fn script(
     let input = call["arguments"]["input"].as_str().unwrap_or_default();
     let bot = str_of(&call["bot"]);
     unreviewed(client, &bot, &Value::Null, EXEC).await?;
-    let (turn, call_id) = (call["turn"].as_i64().unwrap_or(0), str_of(&call["call_id"]));
-    let steps = crate::exec::Steps::new(client.clone(), bot.clone(), turn, call_id.clone())
-        .journaled(crate::sent::Writes::of(crate::sent::Owner {
-            bot: bot.clone(),
-            turn,
-            call_id,
-        }));
+    let steps = crate::exec::Steps::new(
+        client.clone(),
+        bot.clone(),
+        call["turn"].as_i64().unwrap_or(0),
+        str_of(&call["call_id"]),
+    );
     // On the machine its options line names, against that machine's
     // servers, with this agent's gate asked what they ask first.
     if let Ok(crate::exec::Script {
@@ -1424,8 +1423,7 @@ async fn script(
         // the agent reads it.
         let whole = crate::exec::whole_file();
         let lent = json!({"input": input, "bot": bot, "timeout_ms": left(call).as_millis() as u64,
-            "whole": whole, "store": client.store().unwrap_or_default(),
-            "turn": call["turn"], "call_id": call["call_id"]});
+            "whole": whole, "store": client.store().unwrap_or_default()});
         let answer = crate::link::call(&machine, EXEC, lent, Some(&steps)).await?;
         if let (Some(file), Some(text)) = (&whole, answer["whole"].as_str()) {
             let _ = std::fs::write(file, text);
@@ -1646,6 +1644,25 @@ async fn answer(client: &Client, call: &Value, me: &Path, store: &Path, socket: 
     };
     if let Some(bin) = crate::agent_bin() {
         command.env("AGENT_BIN", bin);
+    }
+    // A run of an automation works for the automation: an open memory
+    // cleanup is the automation's, whichever run's agent started it, so a
+    // run that carries on one cut short changes it as its own.
+    if call["name"] == MEMORY
+        && of("request_id")
+            .as_str()
+            .is_some_and(|r| r.starts_with(crate::trigger::SENT_PREFIX))
+        && let (Some(store_id), Ok(places), Some(id)) = (
+            client.store(),
+            crate::trigger::Places::home(),
+            caller["bot_id"].as_i64(),
+        )
+        && let Some(name) =
+            crate::trigger::run_of(&places, Some(store_id), &str_of(&caller["name"]), id)
+    {
+        command.env("AGENT_AUTOMATION", name);
+    } else {
+        command.env_remove("AGENT_AUTOMATION");
     }
     let mut arguments = call["arguments"].clone();
     if call["name"] == MEMORY

@@ -56,6 +56,26 @@ missing; `PREFIX` installs elsewhere, `SONNY_VERSION` picks a release and
 `SONNY_PACKAGES=0` leaves the system's packages alone. [install.sh](install.sh)
 is short enough to read first.
 
+For Sonny from main without a version tag, use the nightly Homebrew channel
+(macOS or Linux):
+
+```sh
+brew unlink sonny                         # if the stable formula is installed
+brew install lydakis/agent/sonny-nightly
+# Later:
+brew update
+brew upgrade lydakis/agent/sonny-nightly
+```
+
+The nightly workflow updates the formula at 07:17 UTC when main has changed,
+after tests and a Homebrew install check pass. It builds Sonny and its daemon
+from the same pinned commit; `sonny --version` shows that commit. For main's
+latest commit between nightly runs, install with `--HEAD` (or use
+`brew reinstall --HEAD lydakis/agent/sonny-nightly` to switch an existing
+install), then `brew upgrade --fetch-HEAD lydakis/agent/sonny-nightly`.
+Nightlies build from source, as the stable formulas do. The Linux installer
+above continues to install versioned releases.
+
 ## Quickstart
 
 Set the key for any provider you use, and pick a default model as

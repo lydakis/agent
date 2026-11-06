@@ -50,8 +50,6 @@ pub fn run(args: &[String]) -> Result<(), String> {
         return Ok(());
     };
     let _ = std::fs::write(beside(&store, &format!(".{NAME}.sonny")), identity());
-    // The journal keeps `sonny.sent_days`, pruned as each host starts.
-    crate::sent::prune();
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
