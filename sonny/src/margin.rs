@@ -108,10 +108,7 @@ const DESCRIPTION: &str = "Keep something beside the conversation, in the margin
          post it again with the same id, rather than a second note about the change, or remove it \
          in that same turn, even while the change waits \
          on a task's branch, saying in the note which it shows, and remove a note once it \
-         no longer holds. The margin holds a few notes of a few lines each, as the person \
-         sets it: a new note past the most, or text longer than a note takes, is refused, \
-         with the limit and the notes there; write a longer text to a file and show the file. \
-         Where whether a note is still current matters, such as a pull \
+         no longer holds. Where whether a note is still current matters, such as a pull \
          request's state or a check you ran, say when it was last checked, in the person's \
          time zone, and change that as you check again; a note whose content does not age, \
          such as a design, needs no date. Give markdown (rendered as your replies are: tables, math, Mermaid, html \
@@ -1972,7 +1969,8 @@ mod tests {
         let tool = tool();
         assert_eq!(tool["answered_by"], crate::served::TAG);
         assert!(tool.get("result").is_none());
-        assert!(DESCRIPTION.contains("refused"));
+        // The limits are told when a call meets them, in its refusal.
+        assert!(!DESCRIPTION.contains("refused"));
     }
 
     #[test]
