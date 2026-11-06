@@ -147,7 +147,8 @@ With flags it asks nothing: `--provider chatgpt|anthropic|openai|openrouter|bedr
 for Bedrock), `--model PROVIDER/MODEL`, `--import-mcp [codex,claude,...]`
 (never a folder's own servers), and `--json`, which prints what the machine
 has, what is set, the MCP servers to bring, missing tools and setup steps. Either step also suggests efforts, `[sonny] lead_effort =
-"medium"` and `task_effort = "high"`, unless the config already sets them.
+"medium"` and `task_effort = "high"`, unless the config already sets them,
+and says on stderr which it wrote.
 Outside a terminal both fail, naming what to set. The first start also writes
 `~/.agent/models`, the list agents read with `agent models`, when there is
 none, as `agent models --discover` does.
