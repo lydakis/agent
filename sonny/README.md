@@ -270,7 +270,7 @@ at its model's own effort (`AGENT_EFFORT` when its model is
 | Each new task's model | (the lead's) | `threads_model` |
 | Each new task's effort | `[sonny] task_effort` | `threads_effort` |
 | The approver's judge | `[judge] model`, `effort` | |
-| What `/side`'s copy may do | `[sonny] side_chat` (`answer` or `fork`) | |
+| What `/side`'s copy may do | `[sonny] side_chat` (`fork`, the default, or `answer`) | |
 | The chime, and every tool call drawn | `[sonny] chime`, `verbose` (true or false) | |
 | The widest the conversation is written | `[sonny] text_width` (100 by default, at least 40, 0 for the window's whole width) | |
 | A guess at your next message | `[sonny] suggest` (true, the default, or false) | |
@@ -464,13 +464,14 @@ between, the arrows move through its rows. Every window keeps its prompts in
 first, newest first, then those any window sent before it opened. Edit a
 prompt brought back and it is yours to send, or Up starts again from it.
 Ctrl+R finds one by typing, as a shell's reverse search and Claude Code's
-do: the prompts sent before are a list over the composer, newest first,
-narrowed by the letters typed (in order, the first starting a word, as the
-slash menu finds commands). Ctrl+R again or the arrows pick, Enter or Tab puts
-the pick in the composer to edit (Up and Down go on from it), and Esc leaves
-the composer as it was.
+do: the prompts sent before are a list over the composer, newest first, as
+the slash menu is, and the draft stays in the composer under it. The letters
+typed show under the composer, after `find`, and narrow the list (in order,
+the first starting a word, as the slash menu finds commands). Ctrl+R again
+or the arrows pick, Enter or Tab puts the pick in the composer to edit (Up
+and Down go on from it), and Esc leaves the composer as it was.
 
-![Ctrl+R lists the prompts sent before, newest first; fix narrows it to two with the letters bold; Enter puts the picked one in the composer](../docs/sonny/prompt-search.png)
+![Ctrl+R lists the prompts sent before over the composer, the draft still in it; fix, typed under the composer, narrows the list to two with the letters bold](../docs/sonny/prompt-search.png)
 A prompt this window sent comes back with its pictures (the newest as many
 as one message may carry; older ones let theirs go), and the draft with its
 own; one from the file comes back as text alone.
@@ -584,10 +585,10 @@ way `/react` does, and each note in the margin has its own `↩`.
 - `/side [QUESTION]` opens a side chat with a copy of the agent in this
   window, taken where it is now, mid-turn included, in the pane beside
   the conversation.
-  The copy answers from the agent's history and may call no tool, unless
-  `~/.agent/config.toml` sets `[sonny] side_chat = "fork"`: then it is a
-  full fork that can do anything the agent can, with its tools, in its
-  folder, under its approvals. Follow-ups stay with it, and Esc goes
+  The copy is a full fork that can do anything the agent can, with its
+  tools, in its folder, under its approvals, unless `~/.agent/config.toml`
+  sets `[sonny] side_chat = "answer"`: then it answers from the agent's
+  history and may call no tool. Follow-ups stay with it, and Esc goes
   back. In the pane, every key goes to the side chat but Ctrl+\, which
   goes back to the main composer while the side chat stays open. The agent
   carries on meanwhile, in view. The daemon deletes the copy once it has been idle 15

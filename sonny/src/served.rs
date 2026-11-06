@@ -1406,12 +1406,13 @@ async fn script(
     let input = call["arguments"]["input"].as_str().unwrap_or_default();
     let bot = str_of(&call["bot"]);
     unreviewed(client, &bot, &Value::Null, EXEC).await?;
-    let steps = crate::exec::Steps::new(
-        client.clone(),
-        bot.clone(),
-        call["turn"].as_i64().unwrap_or(0),
-        str_of(&call["call_id"]),
-    );
+    let (turn, call_id) = (call["turn"].as_i64().unwrap_or(0), str_of(&call["call_id"]));
+    let steps = crate::exec::Steps::new(client.clone(), bot.clone(), turn, call_id.clone())
+        .journaled(crate::sent::Writes::of(crate::sent::Owner {
+            bot: bot.clone(),
+            turn,
+            call_id,
+        }));
     // On the machine its options line names, against that machine's
     // servers, with this agent's gate asked what they ask first.
     if let Ok(crate::exec::Script {
@@ -1423,7 +1424,8 @@ async fn script(
         // the agent reads it.
         let whole = crate::exec::whole_file();
         let lent = json!({"input": input, "bot": bot, "timeout_ms": left(call).as_millis() as u64,
-            "whole": whole, "store": client.store().unwrap_or_default()});
+            "whole": whole, "store": client.store().unwrap_or_default(),
+            "turn": call["turn"], "call_id": call["call_id"]});
         let answer = crate::link::call(&machine, EXEC, lent, Some(&steps)).await?;
         if let (Some(file), Some(text)) = (&whole, answer["whole"].as_str()) {
             let _ = std::fs::write(file, text);

@@ -56,6 +56,10 @@ impl Look {
     }
 
     pub fn cell(self, cell: &mut Cell) {
+        // The band as it is now: rows hold its role, not a color.
+        if cell.bg == BAND {
+            cell.bg = band();
+        }
         // A hue on a muted row (the footer's branch, an agent's name) is a
         // short mark meant to read: dim over it falls under 3:1 in many
         // themes, so the hue is drawn as it is and the words round it
@@ -144,10 +148,20 @@ impl Pulse {
     }
 }
 
+/// The band as a row holds it: a role, not a color, made the theme's band
+/// ([`band`]) as each frame is finished ([`Look::cell`]), as a stylesheet's
+/// variable is read when the page is painted. Rows drawn before the theme
+/// switched between light and dark so take the new band at once, while a
+/// turn is still running and before anything is drawn again. An RGB too
+/// dark for any theme's band to be: one row drawn without a frame's look
+/// would show near black, not a band that passes for right.
+pub const BAND: Color = Color::Rgb(2, 1, 3);
+
 /// The band the person's own messages sit on, as Codex and Claude Code
 /// tint the user's cell: the theme's foreground a little over its
-/// background, so it reads in every theme; a fixed gray when the terminal
-/// did not say its colors.
+/// background, so it reads in every theme; a fixed gray with no hue of
+/// its own when the terminal did not say its colors, as after it switched
+/// to the other of light and dark.
 pub fn band() -> Color {
     let theme = crate::term::theme();
     let light = crate::term::light();
@@ -156,8 +170,8 @@ pub fn band() -> Color {
             let (r, g, b) = blend(foreground, background, if light { 0.06 } else { 0.09 });
             Color::Rgb(r, g, b)
         }
-        _ if light => Color::Rgb(238, 238, 240),
-        _ => Color::Rgb(40, 40, 48),
+        _ if light => Color::Rgb(238, 238, 238),
+        _ => Color::Rgb(40, 40, 40),
     }
 }
 
@@ -294,6 +308,26 @@ mod tests {
         assert_eq!(buffer[(2, 0)].symbol(), "c");
         assert!(buffer[(1, 0)].modifier.contains(Modifier::DIM));
         assert_eq!(buffer[(2, 0)].bg, Color::Reset);
+    }
+
+    #[test]
+    fn the_band_a_row_holds_is_the_theme_band_as_the_frame_is_finished() {
+        let fresh = || {
+            let mut buffer = Buffer::empty(ratatui::layout::Rect::new(0, 0, 2, 1));
+            buffer[(0, 0)].set_symbol("a").set_bg(BAND);
+            buffer[(1, 0)].set_symbol("b").set_bg(Color::Rgb(9, 9, 9));
+            buffer
+        };
+        for look in [Look::Drawn, Look::Muted((1, 2, 3))] {
+            let mut buffer = fresh();
+            look.finish(&mut buffer);
+            assert_eq!(buffer[(0, 0)].bg, band(), "{look:?}");
+            assert_ne!(buffer[(0, 0)].bg, BAND);
+            assert_eq!(buffer[(1, 0)].bg, Color::Rgb(9, 9, 9), "other colors stay");
+        }
+        let mut buffer = fresh();
+        Look::Plain.finish(&mut buffer);
+        assert_eq!(buffer[(0, 0)].bg, Color::Reset);
     }
 
     #[test]
