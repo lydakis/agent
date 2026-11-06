@@ -1057,6 +1057,69 @@ pub fn seed_profile(file: &Path) -> Result<bool, String> {
     Ok(true)
 }
 
+/// agent-browser's settings in `from` without the profile they name,
+/// written in `dir` once they change: what a browser that starts fresh,
+/// whatever they say, runs with.
+fn fresh_settings(from: Option<&Path>, dir: &Path) -> Result<PathBuf, String> {
+    let mut settings = (from)
+        .and_then(|file| std::fs::read_to_string(file).ok())
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .filter(Value::is_object)
+        .unwrap_or_else(|| json!({}));
+    if let Some(settings) = settings.as_object_mut() {
+        settings.remove("profile");
+    }
+    let text = serde_json::to_string(&settings).map_err(|e| e.to_string())?;
+    let file = dir.join("fresh-config.json");
+    if std::fs::read_to_string(&file).ok().as_deref() != Some(text.as_str()) {
+        agent_client::files::replace_mode(&file, text.as_bytes(), 0o600)
+            .map_err(|e| format!("{}: {e}", file.display()))?;
+    }
+    Ok(file)
+}
+
+/// Whether this machine's Chrome has the profile `name`, by its folder, as
+/// agent-browser finds it: in the first of Chrome's (or Chromium's, or
+/// Brave's) user-data folders that holds a `Local State`.
+pub fn chrome_has_profile(name: &str) -> bool {
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return false;
+    };
+    let (base, names): (PathBuf, [&str; 4]) = match cfg!(target_os = "macos") {
+        true => (
+            home.join("Library/Application Support"),
+            [
+                "Google/Chrome",
+                "Google/Chrome Canary",
+                "Chromium",
+                "BraveSoftware/Brave-Browser",
+            ],
+        ),
+        false => (
+            home.join(".config"),
+            [
+                "google-chrome",
+                "google-chrome-unstable",
+                "chromium",
+                "BraveSoftware/Brave-Browser",
+            ],
+        ),
+    };
+    let Some(state) = (names.iter())
+        .map(|dir| base.join(dir).join("Local State"))
+        .find(|state| state.is_file())
+    else {
+        return false;
+    };
+    profile_listed(&std::fs::read_to_string(state).unwrap_or_default(), name)
+}
+
+/// Whether a `Local State` text lists the profile folder `name`.
+fn profile_listed(state: &str, name: &str) -> bool {
+    serde_json::from_str::<Value>(state)
+        .is_ok_and(|state| state["profile"]["info_cache"].get(name).is_some())
+}
+
 /// The tool, while agent-browser is installed here or on a machine linked
 /// here, which `machine` names.
 pub fn tool() -> Option<Value> {
@@ -1159,9 +1222,22 @@ async fn run(session: &str, args: &[String], launch: &Launch) -> Ran {
         true => command.env_remove("AGENT_BROWSER_CONFIRM_ACTIONS"),
         false => command.env("AGENT_BROWSER_CONFIRM_ACTIONS", confirm),
     };
-    if let Some(profile) = launch.profile.as_deref().filter(|p| !p.is_empty()) {
-        command.env("AGENT_BROWSER_PROFILE", profile);
-    }
+    match launch.profile.as_deref() {
+        // agent-browser takes an empty profile for a name, so a link's
+        // fresh browser gets its own settings with no profile in them.
+        Some("") => match fresh_settings(settings_file().as_deref(), &sockets) {
+            Ok(file) => command.env("AGENT_BROWSER_CONFIG", file),
+            Err(e) => {
+                return Ran {
+                    said: format!("{PROGRAM} is not run: its settings for a fresh browser: {e}"),
+                    ok: false,
+                    confirmation: None,
+                };
+            }
+        },
+        Some(profile) => command.env("AGENT_BROWSER_PROFILE", profile),
+        None => &mut command,
+    };
     match command.output().await {
         Ok(out) => {
             let (stdout, stderr) = (
@@ -1497,6 +1573,21 @@ mod tests {
             assert_eq!(seed_profile(&file), Ok(false));
             assert_eq!(std::fs::read_to_string(&file).unwrap(), set);
         }
+        // A fresh browser runs with the settings less their profile.
+        std::fs::write(&file, r#"{"headed": true, "profile": "Default"}"#).unwrap();
+        let fresh = fresh_settings(Some(&file), &dir).unwrap();
+        let fresh_text = std::fs::read_to_string(&fresh).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&fresh_text).unwrap(),
+            json!({"headed": true})
+        );
+        assert_eq!(mode(&fresh), 0o600);
+        // Chrome's profiles, by folder.
+        let state = r#"{"profile": {"info_cache": {"Default": {"name": "Me"}}}}"#;
+        assert!(profile_listed(state, "Default"));
+        assert!(!profile_listed(state, "Me"));
+        assert!(!profile_listed("{}", "Default"));
+        assert!(!profile_listed("", "Default"));
         // A file it cannot read is left alone.
         std::fs::write(&file, "not json").unwrap();
         assert!(matches!(profile_in(&file), Profile::Unreadable(_)));

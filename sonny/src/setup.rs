@@ -58,9 +58,17 @@ pub const STEPS: [Step; 3] = [
                starts from a copy of their Chrome's Default profile (their own Chrome is left \
                alone). Leaving it unset keeps a fresh browser, signed in nowhere",
         how: "sonny setup --browser-signed-in",
-        done: || !on_path("agent-browser") || browser_profile_set(),
+        done: || !browser_profile_offered(),
     },
 ];
+
+/// Whether there is a signed-in browser to offer: agent-browser here, its
+/// settings naming no profile, and Chrome's own profile to copy.
+fn browser_profile_offered() -> bool {
+    on_path("agent-browser")
+        && !browser_profile_set()
+        && crate::browser::chrome_has_profile(crate::browser::SEEDED_PROFILE)
+}
 
 /// Whether agent-browser's own settings name a profile, or are there and
 /// cannot be read, so Sonny leaves them alone.
@@ -89,7 +97,7 @@ fn browser_profile(config: &agent_client::config::Config) -> Value {
 /// Offer to start agents' browsers signed in, where agent-browser is here
 /// and its settings name no profile; an answer other than yes leaves it.
 fn signed_in_browser() -> Result<(), String> {
-    if !on_path("agent-browser") || browser_profile_set() {
+    if !browser_profile_offered() {
         return Ok(());
     }
     let file = crate::browser::settings_file().ok_or("set HOME")?;
@@ -500,7 +508,7 @@ nothing, for scripts and agents: --key-stdin reads the provider's key from
 stdin into ~/.agent/env; --import-mcp brings the MCP servers of those agents
 (all, when it names none) but those from files in this folder;
 --browser-signed-in names the Default Chrome profile in agent-browser's own
-settings when they name none; --json prints what this machine has and what
+settings when they name none and Chrome has it; --json prints what this machine has and what
 is set, after any change.";
 
 /// `sonny setup` with flags: what they name set, nothing asked.
@@ -649,6 +657,12 @@ pub async fn flags(args: &[String], socket: &Path) -> Result<(), String> {
     let seeded = match signed_in {
         true => {
             crate::skills::note_offered("browser-profile");
+            if !crate::browser::chrome_has_profile(crate::browser::SEEDED_PROFILE) {
+                return Err(format!(
+                    "no Chrome profile {} here to start agents' browsers from: sign in to Chrome, then this again",
+                    crate::browser::SEEDED_PROFILE
+                ));
+            }
             let file = crate::browser::settings_file().ok_or("set HOME")?;
             crate::browser::seed_profile(&file)?
         }

@@ -73,7 +73,9 @@ key `profile`:
   profile's name starts from that one; leave the key out for a fresh
   browser, signed in nowhere. Keep the file's other keys as they are.
 - `sonny setup --browser-signed-in` writes `"Default"` when the file names
-  no profile, and changes nothing when it names one.
+  no profile and Chrome here has one, and changes nothing when it names one.
+- A link whose `browser_profile` is `""` starts its sessions fresh whatever
+  this file names.
 - The file is outside an agent's sandbox, and Sonny runs no browser for
   an agent whose sandbox can write that folder: change it through a
   command the agent's approvals allow, or ask the person to.
