@@ -3694,7 +3694,11 @@ impl Service {
                     }
                     None => None,
                 };
-                let given_rules = (rules_only.then_some(given.as_ref()).flatten())
+                // Rules given reach turns running now, its own (which only
+                // a change of rules alone may meet) and its kin's.
+                let given_rules = (named.iter().any(|key| key == "rules"))
+                    .then_some(given.as_ref())
+                    .flatten()
                     .map(|given| given.rules.clone().unwrap_or_default());
                 let answer = store
                     .op("configure", move |db| {
@@ -3714,8 +3718,12 @@ impl Service {
                         {
                             changed.push("gates".into());
                         }
+                        let mut kin = Vec::new();
                         if let Some(given) = &given {
-                            changed.extend(db.set_settings(&bot, Some(id), &named, given)?);
+                            let (set, of_kin) =
+                                db.set_settings_of_kin(&bot, Some(id), &named, given)?;
+                            changed.extend(set);
+                            kin = of_kin;
                         }
                         if let Some((provider, name)) = &model
                             && db.set_model(&bot, Some(id), provider, name, effort.as_deref())?
@@ -3747,15 +3755,28 @@ impl Service {
                             .into_iter()
                             .map(String::from),
                         );
-                        Ok(json!({"bot":bot,"bot_id":id,"changed":changed}))
+                        Ok((json!({"bot":bot,"bot_id":id,"changed":changed}), kin))
                     })
                     .await?;
+                let (answer, kin) = answer;
                 // Followers read the bot again; nothing durable to replay.
                 if answer["changed"].as_array().is_some_and(|c| !c.is_empty()) {
                     let name = answer["bot"].as_str().unwrap_or_default();
-                    if let (Some(policy), Some(active)) = (given_rules, self.active.get(name)) {
+                    // Its running turn and those of the bots it made, and
+                    // theirs, which go by its rules, each at its next round:
+                    // the walk the store made for them names them, so a
+                    // change costs one look per such bot and no round pays.
+                    if let Some(policy) = given_rules {
                         let rules = Arc::new(agent_runtime::rules::Rules::new(policy));
-                        *active.given_rules.lock().unwrap_or_else(|e| e.into_inner()) = Some(rules);
+                        for running in std::iter::once(name)
+                            .chain(kin.iter().map(String::as_str))
+                            .filter_map(|bot| self.active.get(bot))
+                        {
+                            *running
+                                .given_rules
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner()) = Some(rules.clone());
+                        }
                     }
                     let mut event = answer.clone();
                     event["event"] = json!("configured");

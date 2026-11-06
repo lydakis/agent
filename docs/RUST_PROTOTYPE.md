@@ -2846,7 +2846,9 @@ of it, which a parked turn reads back as it resumes: a call runs as its
 round was announced, also after a park or a restart and whatever the
 rules say by then. A `configure` that changes only `rules` is taken while
 a turn runs: its next round, and every one after, rules its calls by the
-new ones; a turn parked then reads them as it resumes.
+new ones; a turn parked then reads them as it resumes. The bots it made,
+and theirs, go by its rules, and so do their running turns, each from its
+next round.
 
 A bot made by another (its `created_by`) goes by its creator's rules: it
 takes them when it is made, whatever its own client gives, and follows

@@ -2880,6 +2880,18 @@ impl Database {
         named: &[String],
         given: &Settings,
     ) -> Result<Vec<String>> {
+        self.set_settings_of_kin(name, bot_id, named, given)
+            .map(|(changed, _)| changed)
+    }
+    /// [`Database::set_settings`], and the names of the bots it made, and
+    /// theirs, whose rules went with its own: none unless its rules changed.
+    pub fn set_settings_of_kin(
+        &mut self,
+        name: &str,
+        bot_id: Option<i64>,
+        named: &[String],
+        given: &Settings,
+    ) -> Result<(Vec<String>, Vec<String>)> {
         let id = self.identity(name, bot_id)?;
         let bot = self.inspect(name)?;
         let before = settings_map(&bot.settings)?;
@@ -2943,9 +2955,10 @@ impl Database {
             }
         }
         if changed.is_empty() {
-            return Ok(changed);
+            return Ok((changed, Vec::new()));
         }
         let stored = settings.stored()?;
+        let mut kin = Vec::new();
         let tx = self.conn.savepoint()?;
         tx.execute("UPDATE bots SET settings=? WHERE id=?", params![stored, id])?;
         // The bots it made, and theirs, go by the same rules.
@@ -2955,20 +2968,22 @@ impl Database {
                 .as_ref()
                 .map(serde_json::to_string)
                 .transpose()?;
-            tx.execute(
+            let mut updating = tx.prepare(
                 "WITH RECURSIVE kin(id) AS (
                      SELECT id FROM bots WHERE created_by_id=?1
                      UNION SELECT b.id FROM bots b JOIN kin ON b.created_by_id=kin.id)
                  UPDATE bots SET settings=NULLIF(CASE WHEN ?2 IS NULL
                      THEN json_remove(COALESCE(settings,'{}'),'$.rules')
                      ELSE json_set(COALESCE(settings,'{}'),'$.rules',json(?2)) END,'{}')
-                 WHERE id IN kin",
-                params![id, rules],
+                 WHERE id IN kin RETURNING name",
             )?;
+            kin = updating
+                .query_map(params![id, rules], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<_>>()?;
         }
         tx.commit()?;
         changed.sort();
-        Ok(changed)
+        Ok((changed, kin))
     }
     /// The model a declined request goes to, as `provider/model`, or none;
     /// whether that changed it. The daemon has checked its family.

@@ -463,6 +463,35 @@ class ApprovalTests(ModelFixture):
         self.assertEqual(self.tool_output(client, 'script-1')[1]['error'], 'command_forbidden')
         self.assertFalse((self.path / 'made').exists())
 
+    def test_rules_given_reach_the_running_turns_of_the_bots_it_made_and_theirs(self):
+        rules = {'prefix_rules': [{'pattern': ['cp'], 'decision': 'prompt', 'source': 'default.rules:1'}]}
+        client = self.gated(settings={'sandbox': 'workspace-write', 'rules': rules})
+        creator = 'Bob'
+        for name in ('Kid', 'Grandkid'):
+            made_by = client.request('inspect', bot=creator)['result']['bot_id']
+            client.request('create', bot=name, workspace=str(self.path), tools=['echo', 'shell'],
+                           created_by=creator, created_by_id=made_by, approve=['shell'], approver='manual')
+            creator = name
+        self.assertEqual(client.request('inspect', bot='Grandkid')['result']['settings']['rules'], rules)
+        self.model.call_script = [('shell', {'command': f'cp /dev/null {self.path}/asked'}),
+                                  ('shell', {'command': f'mkdir {self.path}/made'})]
+        bots = ('Bob', 'Kid', 'Grandkid')
+        turns = {bot: client.request('submit', bot=bot, request_id='script', prompt='script')['result']['turn']
+                 for bot in bots}
+        for bot in bots:
+            self.assertEqual([call['call_id'] for call in self.announced(client, turns[bot])], ['script-0'])
+        # While each waits in its first round, the creator's rules tighten:
+        # every one of them goes by them from its next round.
+        given = {'prefix_rules': rules['prefix_rules'] + [
+            {'pattern': ['mkdir'], 'decision': 'forbidden', 'source': 'default.rules:2'}]}
+        self.assertEqual(client.request('configure', bot='Bob', settings={'rules': given})['result']['changed'],
+                         ['rules'])
+        for bot in bots:
+            self.answer(client, turns[bot], 'script-0', bot=bot)
+            self.assertEqual(client.finished(turns[bot])['data']['status'], 'completed')
+            self.assertEqual(self.tool_output(client, 'script-1', bot=bot)[1]['error'], 'command_forbidden', bot)
+        self.assertFalse((self.path / 'made').exists())
+
     @unittest.skipUnless(shutil.which('bwrap') or sys.platform == 'darwin', 'sandboxes need bubblewrap')
     def test_command_rules_let_a_command_out_ask_about_it_or_forbid_it(self):
         (ROOT / '.local').mkdir(exist_ok=True)
