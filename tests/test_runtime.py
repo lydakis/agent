@@ -1017,7 +1017,7 @@ class AnthropicRuntimeTests(unittest.TestCase):
         # A refresh re-reads the history, so it does no work: under a cap
         # with room, the cache is kept warm as without one.
         end, warms, usage = run('Ann', usage[0]['work_tokens'] + 9)
-        self.assertEqual((end['status'], end['limit']), ('completed', 'turn_budget'))
+        self.assertEqual((end['status'], end.get('limit')), ('completed', None))
         self.assertGreater(warms, 0)
         self.assertEqual({u['work_tokens'] for u in usage if u.get('purpose') == 'keep_warm'}, {0})
 
@@ -1056,30 +1056,26 @@ class AnthropicRuntimeTests(unittest.TestCase):
         usage = [m['data'] for m in client.saved if m.get('event') == 'usage']
         self.assertEqual([u.get('purpose') for u in usage], [None, 'keep_warm', None])
 
-    def test_a_steer_after_the_last_replys_refresh_gets_the_budgets_last_call(self):
+    def test_a_steer_after_a_reply_that_spent_the_budget_runs_on_its_own(self):
         client, model, path = self.start(settings={'keep_warm': 1})
         model.generate_delay = 1.5
         model.warm_delay = 1
-        # The call does 14 tokens of work (7 in, 7 out); its refresh re-reads
-        # the history, billing 9 but doing none.
-        client.request('create', bot='Bob', workspace=str(path), effort='low', budget_tokens=20)
+        # The call does 14 tokens of work (7 in, 7 out), the whole budget;
+        # its refresh re-reads the history, billing 9 but doing none.
+        client.request('create', bot='Bob', workspace=str(path), effort='low', budget_tokens=14)
         turn = client.request('submit', bot='Bob', request_id='s1', prompt='long')['result']['turn']
         model.requests.get(timeout=5)
         steer = client.request('submit', bot='Bob', request_id='s2', prompt='more', delivery='steer')
-        # The 6 left would not cover a call like the first, so the steer joins
-        # the turn for its last call, without tool calls, and the turn ends
-        # on that reply at its budget.
-        joined = client.finished(steer['result']['turn'])['data']
-        self.assertEqual((joined['status'], joined['into']), ('steered', turn))
-        end = client.finished(turn)['data']
-        self.assertEqual((end['status'], end['limit']), ('completed', 'budget'))
+        # The refresh still in flight when the reply ends is answered and
+        # counted before the steer could join. The reply spent the budget,
+        # so the turn completes on it rather than calling for the steer,
+        # and the steer, run on its own, is refused.
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        self.assertEqual(client.finished(steer['result']['turn'])['data']['error'], 'budget_exhausted')
         self.assertEqual(model.requests.get(timeout=1)['max_tokens'], 0)
-        self.assertEqual(model.requests.get(timeout=1)['tool_choice'], {'type': 'none'})
         self.assertTrue(model.requests.empty())
         bob = client.request('inspect', bot='Bob')['result']
-        self.assertEqual((bob['work_tokens'], bob['tokens_used']), (21, 37))
-        self.assertEqual(client.request('submit', bot='Bob', request_id='s3', prompt='again')['error'],
-                         'budget_exhausted')
+        self.assertEqual((bob['work_tokens'], bob['tokens_used']), (14, 23))
 
     def test_a_call_waiting_to_be_sent_is_refreshed_only_from_its_send(self):
         # One request may start at a time and Ann's waits for its headers,

@@ -2147,9 +2147,6 @@ impl Turn {
         // A turn may run at its own effort; everything after reads the record.
         record.effort = context.effort.clone();
         record.turn_budget = context.budget;
-        // The bot's work when this turn's began: the turn's work is what it
-        // has added since.
-        let work_from = record.work.used.saturating_sub(context.work);
         let (provider, model) = split_model(&context.model)?;
         let Some(provider) = self.providers.get(provider) else {
             let error = Error::with("provider_unavailable", provider);
@@ -2646,15 +2643,11 @@ impl Turn {
             }
             // The round limit's last call goes with the tools shown but no
             // call allowed, so the turn ends on a reply rather than failing
-            // with its work done and unreported; so does the call a budget
-            // leaves room for last.
+            // with its work done and unreported; so does the call after one
+            // that spent a budget.
             accounting.limit = match model_rounds + 1 < self.settings().max_rounds() {
                 false => Some(Limit::Rounds),
-                true => last_call(
-                    &record,
-                    record.work.used.saturating_sub(work_from),
-                    model_rounds,
-                ),
+                true => spent(&record),
             };
             if let Some(limit) = accounting.limit {
                 wrapped |= limit != Limit::Rounds;
@@ -5376,17 +5369,14 @@ fn wraps_up(model_rounds: usize, wrapped: bool) -> bool {
     model_rounds > 0 && !wrapped
 }
 
-/// The budget whose room is for this call at most, which then goes without
-/// tool calls: what is left of it would not cover this call and one more
-/// like the turn's average so far, so this one is the turn's last. A turn's
-/// first call has no average, and goes as asked unless the budget is spent.
-fn last_call(record: &agent_runtime::store::Bot, work: u64, model_rounds: usize) -> Option<Limit> {
-    let (left, limit) = record.room()?;
-    let average = match model_rounds {
-        0 => 0,
-        rounds => work / rounds as u64,
-    };
-    (left == 0 || left < average.saturating_mul(2)).then_some(limit)
+/// The budget a call already spent, whose next call goes without tool
+/// calls as the turn's last. No call's work is known before it is made, so
+/// none is predicted: that last call may overshoot the cap.
+fn spent(record: &agent_runtime::store::Bot) -> Option<Limit> {
+    record
+        .room()
+        .filter(|&(left, _)| left == 0)
+        .map(|(_, limit)| limit)
 }
 
 fn calls_left(record: &agent_runtime::store::Bot, model_rounds: usize) -> bool {

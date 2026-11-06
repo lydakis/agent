@@ -352,13 +352,12 @@ held beside a call counts toward both caps.
 
 A budget ends a turn as the round limit does: its last call goes with the
 tools shown and no call allowed, so the turn ends on a reply rather than
-failing with its work done and unreported. A call goes so once what is left
-of either cap would not cover it and one more like the turn's average call
-so far; and once any call of the turn (an answer, a summary, a failed
-attempt) has spent a cap and the turn goes on, for tool results or a steer,
-its next call goes so too, which may overshoot the cap. Either way the
-live `tool_calls_withheld` says why (`reason`: `budget`, `turn_budget` or
-`tool_round_limit`), and a turn that completes on such a call is `completed`
+failing with its work done and unreported. Once any call of the turn (an
+answer, a summary, a failed attempt) has spent a cap and the turn goes on,
+for tool results or a steer, its next call goes so. No call's work is known
+before it is made, so none is predicted, and that last call may overshoot
+the cap by its own work. The live `tool_calls_withheld` says why (`reason`:
+`budget`, `turn_budget` or `tool_round_limit`), and a turn that completes on such a call is `completed`
 with `limit` (`budget`, `turn_budget` or `rounds`) on its `turn_finished`
 and in its turn view. A retry of a failed attempt that spent a cap goes the
 same way. A cap spent before the turn made any call fails it with

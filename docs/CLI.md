@@ -133,8 +133,8 @@ tries its held turns at once.
   sends the wait it resolved; the daemon keeps no default.
 - `run --turn-budget-tokens N` caps this turn's work, beside the bot's
   lifetime `--budget-tokens`: each call's output and the input it adds, not
-  the history it sends again. Near N the turn's last call goes without tool
-  calls, and the turn completes on its reply with `limit: "turn_budget"`;
+  the history it sends again. Once a call reaches N the turn's next call goes
+  without tool calls, and the turn completes on its reply with `limit: "turn_budget"`;
   the cap is the turn's own, so the next turn starts from zero. A steer joins a turn
   that already has its cap, so `steer` with the flag is `invalid_delivery`.
 - `run --image PATH` sends a PNG, JPEG, GIF or WebP with the prompt, after

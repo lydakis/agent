@@ -1766,8 +1766,6 @@ pub struct TurnContext {
     pub effort: Option<String>,
     /// The token cap it was submitted with.
     pub budget: Option<TurnBudget>,
-    /// The work it has done so far.
-    pub work: u64,
     /// The model and effort of the bot's latest earlier turn that started,
     /// when its calls sent the history this turn starts from: a call sent
     /// its view last, and something follows its prompt. `None` otherwise,
@@ -9118,7 +9116,6 @@ impl Database {
                     .saturating_sub(spent.max(0) as u64)
                     .saturating_add(tokens as u64),
             }),
-            work: spent.max(0) as u64,
             previous_call,
             created_by: bot.created_by,
             created_by_id: bot.created_by_id,
@@ -9220,15 +9217,13 @@ impl Database {
         // retention has dropped the turn's events.
         // One that completed on a call a limit sent without tool calls ended
         // at that limit, not failing; one that did not keeps no limit.
-        let limit: Option<String> = tx.query_row(
-            &format!(
+        let limit: Option<String> = tx
+            .prepare_cached(&format!(
                 "UPDATE turns SET status=?1,finished_ms=?2,reply_node={REPLY_NODE},
                     limited=CASE WHEN ?1='completed' THEN limited END
                   WHERE id=?3 RETURNING limited"
-            ),
-            params![status, epoch_ms(), turn],
-            |r| r.get(0),
-        )?;
+            ))?
+            .query_row(params![status, epoch_ms(), turn], |r| r.get(0))?;
         // A request a safety classifier declined, and the bot's fallback
         // too: what it added since the model last answered goes to later
         // requests as notes in its place, since Anthropic says to remove it

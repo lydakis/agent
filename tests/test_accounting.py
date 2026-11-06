@@ -24,10 +24,9 @@ class AccountingTests(ModelFixture):
         # The first attempt fails and reports 100 in, 10 out: the bot's first
         # call, all of it new. Its retry re-reads what it sent and is charged
         # its output. A budget that attempt spent sends the retry without
-        # tool calls, and the turn ends on its reply; a budget the retry
-        # leaves too little of ends the turn on the next call; a roomy one
-        # lets the turn run as asked.
-        for budget, calls, limit in ((100, 2, 'budget'), (220, 3, 'budget'), (330, 3, None)):
+        # tool calls, and the turn ends on its reply; one the retry leaves
+        # room in lets the turn run as asked.
+        for budget, calls, limit in ((100, 2, 'budget'), (220, 3, None)):
             with self.subTest(budget=budget):
                 prior_calls = self.model.requests.qsize()
                 bot = f'Budget{budget}'
@@ -129,10 +128,10 @@ class AccountingTests(ModelFixture):
         self.assertEqual([t['budget_tokens'] for t in listing], [110, None, 220])
         self.assertEqual([t['model_rounds'] for t in listing], [2, 2, 2])
         self.assertEqual([t['work_tokens'] for t in listing], [120, 20, 20])
-        # A turn that resumes after parking counts what it did before: what
-        # its cap leaves would not cover another call like its first, so the
-        # call after its wait is its last.
-        parked = submit('park', 'wait:proc:999999', budget_tokens=15)['result']['turn']
+        # A turn that resumes after parking counts what it did before: its
+        # first call, 10 of work, spent its cap, so the call after its wait
+        # is its last.
+        parked = submit('park', 'wait:proc:999999', budget_tokens=10)['result']['turn']
         end = client.finished(parked)['data']
         self.assertEqual((end['status'], end['limit']), ('completed', 'turn_budget'))
         # Under both caps the bot's own is named: it outlasts the turn.
