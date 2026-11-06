@@ -29,6 +29,7 @@ mod diff;
 mod embed;
 mod exec;
 mod footer;
+mod frames;
 mod fuzzy;
 mod haiku;
 mod herdr;
@@ -113,10 +114,7 @@ use ratatui::{
             PushKeyboardEnhancementFlags,
         },
         execute,
-        terminal::{
-            BeginSynchronizedUpdate, EndSynchronizedUpdate, EnterAlternateScreen,
-            LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-        },
+        terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
     },
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style, Stylize},
@@ -265,7 +263,7 @@ fn keys_apart(on: bool) {
     };
 }
 
-type Tui = Terminal<CrosstermBackend<std::io::Stdout>>;
+type Tui = Terminal<CrosstermBackend<frames::Screen>>;
 
 /// The whole screen cleared, and drawn whole at the next frame, without
 /// asking the terminal where its cursor is as `Terminal::clear` does to put
@@ -275,31 +273,6 @@ type Tui = Terminal<CrosstermBackend<std::io::Stdout>>;
 fn wipe<B: Backend>(terminal: &mut Terminal<B>) -> Result<(), B::Error> {
     let size = terminal.size()?;
     terminal.resize(Rect::new(0, 0, size.width, size.height))
-}
-
-/// One frame written as the terminal is to show it, as Ink and Codex
-/// write theirs: inside a synchronized update (mode 2026), so a terminal
-/// that knows it shows the frame whole, never half written, and with the
-/// cursor hidden while cells land, shown again only where the frame puts
-/// it. Written cell by cell in view, the cursor flickered over the screen,
-/// and what follows the cursor (an emoji picker, an input method) could
-/// open wherever the cursor passed. A terminal that does not know the
-/// mode ignores it.
-fn synchronized<T, W: std::io::Write>(
-    target: &mut T,
-    out: impl Fn(&mut T) -> &mut W,
-    frame: impl FnOnce(&mut T) -> std::io::Result<()>,
-) -> std::io::Result<()> {
-    ratatui::crossterm::queue!(
-        out(target),
-        BeginSynchronizedUpdate,
-        ratatui::crossterm::cursor::Hide
-    )?;
-    let drawn = frame(target);
-    // Ended even after a failed write, so the terminal is never left
-    // holding frames back.
-    execute!(out(target), EndSynchronizedUpdate)?;
-    drawn
 }
 
 #[derive(Clone)]
@@ -1470,7 +1443,7 @@ async fn run() -> Result<(), String> {
     keys_apart(true);
     own_screen(true);
     let mut terminal =
-        Terminal::new(CrosstermBackend::new(std::io::stdout())).map_err(|e| e.to_string())?;
+        Terminal::new(CrosstermBackend::new(frames::Screen)).map_err(|e| e.to_string())?;
     // A side chat opens on its window's alternate screen, still drawn on.
     let _ = wipe(&mut terminal);
     let mut app = App::new(client, &name, &bot, options.clone());
@@ -12281,10 +12254,11 @@ impl App {
     }
 
     /// A frame drawn, the whole screen written again when it is stale
-    /// (cleared first); every frame shown whole ([`synchronized`]).
+    /// (cleared first); every frame shown whole, or not written at all
+    /// when it changes nothing ([`frames`]).
     fn draw(&mut self, terminal: &mut Tui) -> std::io::Result<()> {
         let stale = std::mem::take(&mut self.stale);
-        synchronized(terminal, Terminal::backend_mut, |terminal| {
+        frames::frame(|| {
             if stale {
                 self.links_written.forget();
                 wipe(terminal)?;
@@ -13824,27 +13798,6 @@ fn zen_notice(on: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_frame_is_shown_whole_with_the_cursor_hidden_while_it_lands() {
-        let mut out: Vec<u8> = Vec::new();
-        let drawn = synchronized(
-            &mut out,
-            |out| out,
-            |out| {
-                out.extend_from_slice(b"CELLS");
-                Ok(())
-            },
-        );
-        assert!(drawn.is_ok());
-        assert_eq!(out, b"\x1b[?2026h\x1b[?25lCELLS\x1b[?2026l");
-        // A frame that fails still ends the update, so the terminal never
-        // holds what comes after back.
-        let mut out: Vec<u8> = Vec::new();
-        let failed = synchronized(&mut out, |out| out, |_| Err(std::io::Error::other("gone")));
-        assert!(failed.is_err());
-        assert!(out.ends_with(b"\x1b[?2026l"));
-    }
 
     #[test]
     fn the_screen_is_wiped_without_asking_the_terminal_anything() {
