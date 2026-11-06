@@ -496,6 +496,17 @@ impl Spread {
 /// `bot`'s turn `turn`, as `turns` lists it, read by its number: no
 /// number of messages steered or attached since can hide it. `None` when
 /// it has no such turn or it could not be read.
+/// An answer sent to a task's question from its lead's window: the
+/// question, as [`asks::Ask::key`] names it; the task; and the turn it
+/// went as, while it may still be taken back unread, with when that was
+/// last read.
+struct TaskAnswer {
+    key: String,
+    bot: String,
+    turn: Option<i64>,
+    checked: Instant,
+}
+
 /// Submit the person's answer to ask `ask`, `submitted` saying to which
 /// bot and how: once, whichever window sends it, as the daemon takes the
 /// first answer to an ask and refuses another. One taken back from the
@@ -2765,7 +2776,7 @@ struct App {
     sent_answers: Vec<String>,
     /// The tasks' asks this window answered, by [`asks::Ask::key`], until
     /// their tasks read them: none is pinned again meanwhile.
-    task_answers: Vec<String>,
+    task_answers: Vec<TaskAnswer>,
     /// What the tasks' questions were last pinned from: the fleet's and
     /// the rosters' versions of them, the lineage and the tasks tracked.
     /// Pinned again only once one changes, not every pass of the loop.
@@ -2809,6 +2820,9 @@ struct App {
     /// What `/status` read of each idle agent's history: its last turn
     /// then, and the question left open.
     asks_seen: HashMap<String, (i64, Seen)>,
+    /// Each running task's newest node when its questions were last
+    /// read: read again only once it grew.
+    running_heads: HashMap<String, i64>,
     /// What `/status` last read of each agent's latest items, and the
     /// history head it read them at: a history that has not moved is not
     /// read again.
@@ -4300,6 +4314,7 @@ impl App {
             suggesting: None,
             suggestion: None,
             asks_seen: HashMap::new(),
+            running_heads: HashMap::new(),
             status_read: HashMap::new(),
             sounds: sound::Sounds::new(false),
             said: String::new(),
@@ -4659,6 +4674,7 @@ impl App {
                 fleet.rescan().await;
             }
             self.pin_task_asks();
+            self.recheck_task_answers().await;
             self.read_running_tasks().await;
             self.read_references().await;
             self.read_names().await;
@@ -5703,10 +5719,25 @@ impl App {
         let (mut read, mut ended) = (Vec::new(), Vec::new());
         let mut states = HashMap::new();
         let store = self.store();
+        // The tasks whose questions were read this pass.
+        let mut asked = Vec::new();
         for bot in bots {
-            let state = match self.task_turn(&bot).await {
-                Ok(turn) => {
+            let state = match self.task_turn_at(&bot).await {
+                Ok((turn, head)) => {
                     let state = started::state(&turn);
+                    // A running task may ask and go on working: read again
+                    // now and then, once its history grew since.
+                    if !started::settled(&state)
+                        && all
+                        && head.is_some()
+                        && self.running_heads.get(&bot) != head.as_ref()
+                    {
+                        let seen = self.scan(&bot, None).await;
+                        self.running_heads
+                            .insert(bot.clone(), head.unwrap_or_default());
+                        needs.asked(&bot, seen.open(&store, &bot, true));
+                        asked.push(bot.clone());
+                    }
                     // A turn that ended on a question waits on the person;
                     // read once per turn it ended.
                     if let (true, Some(last)) = (started::settled(&state), turn["turn"].as_i64()) {
@@ -5721,6 +5752,7 @@ impl App {
                         // One the lead resolved set its question aside.
                         needs.asked(&bot, seen.open(&store, &bot, false));
                         ended.push(bot.clone());
+                        asked.push(bot.clone());
                     }
                     read.push(bot.clone());
                     match (needs.waits(&bot), state.as_str(), turn["turn"].as_i64()) {
@@ -5736,6 +5768,7 @@ impl App {
                 Err(error) if error.code == "bot_not_found" => {
                     // A removed task asks nothing.
                     self.task_needs.forget(&bot);
+                    self.running_heads.remove(&bot);
                     "removed".to_owned()
                 }
                 // Not read this time: it stays as it was.
@@ -5746,8 +5779,8 @@ impl App {
         if let Some(fleet) = &mut self.fleet {
             fleet.adopt(&needs, held.is_ok().then_some(&read[..]), &ended);
         }
-        // A task read running asks nothing now.
-        self.task_needs.adopt(&needs, &[], &read);
+        // A running task not read again this pass keeps what it asked.
+        self.task_needs.adopt(&needs, &[], &asked);
         for at in self.tasks.keys().copied().collect::<Vec<_>>() {
             let mut changed = false;
             for task in self.tasks.get_mut(&at).into_iter().flatten() {
@@ -5767,11 +5800,16 @@ impl App {
     /// The turn that says what `bot` does, as `/status` reads it
     /// ([`active_turn`]), a failed one with why it failed.
     async fn task_turn(&self, bot: &str) -> Result<Value, agent_client::Error> {
+        Ok(self.task_turn_at(bot).await?.0)
+    }
+
+    /// [`App::task_turn`], with the newest node of `bot`'s history.
+    async fn task_turn_at(&self, bot: &str) -> Result<(Value, Option<i64>), agent_client::Error> {
         let record = (self.client)
             .request("inspect", json!({"bot": bot}))
             .await?;
         let turn = active_turn(&self.client, bot, record["running_turn"].as_i64(), None).await?;
-        Ok(self.with_error(turn).await)
+        Ok((self.with_error(turn).await, record["head"].as_i64()))
     }
 
     /// A failed `turn` with why it failed, which `turns` leaves out, as
@@ -6021,14 +6059,12 @@ impl App {
             };
             let answer = asks::answer(&ask, &(at + 1).to_string());
             let sent = match &ask.task {
-                Some(task) => self.answer_task(task.clone(), &ask.id, &answer).await,
-                None => self.send(answer, None, false, false, &[]).await,
+                Some(_) => self.answer_task(&ask, &answer, true, &[]).await,
+                None => (self.send(answer, None, false, false, &[]).await)
+                    .map(|()| self.close_ask(&ask)),
             };
             match sent {
-                Ok(()) => {
-                    self.notice = None;
-                    self.close_ask(&ask);
-                }
+                Ok(()) => self.notice = None,
                 Err(error) => self.notice = Some(error),
             }
         }
@@ -11239,16 +11275,25 @@ impl App {
             Some(ask) => asks::answer(ask, &prompt),
             None => prompt,
         };
-        // An answer to a task's question goes to the task, alone.
-        if let Some(ask) = &answering
-            && let Some(task) = &ask.task
+        // A pick on a task's question goes to the task, alone; so do the
+        // words typed while one with no options to pick is in focus, as
+        // its composer says, for the task to read as its own window's.
+        let replying = (self.asking())
+            .filter(|ask| ask.task.is_some() && ask.options.is_empty())
+            .filter(|_| answering.is_none() && !prompt.trim().is_empty())
+            .cloned();
+        if let Some(ask) = answering
+            .clone()
+            .filter(|ask| ask.task.is_some())
+            .or(replying)
         {
-            match self.answer_task(task.clone(), &ask.id, &prompt).await {
+            let picked = answering.is_some();
+            let pictures = self.placed(&prompt);
+            match self.answer_task(&ask, &prompt, picked, &pictures).await {
                 Ok(()) => {
                     self.input.clear();
                     self.notice = None;
                     self.pictures.clear();
-                    self.close_ask(ask);
                 }
                 Err(error) => self.notice = Some(error),
             }
@@ -11398,17 +11443,75 @@ impl App {
     /// The person's answer to `task`'s question `ask`, sent to the task as
     /// its own window sends it: once, as a steer its running turn takes at
     /// its next round, or that starts one.
+    ///
+    /// A pick goes once, as [`answer_once`] sends it; words go as written,
+    /// for the task to read. Either is kept, with the turn it went as,
+    /// until the task takes it, so the question is not pinned again
+    /// meanwhile; taken back unread, it is pinned again to answer anew.
     async fn answer_task(
         &mut self,
-        task: asks::Asker,
-        ask: &str,
+        ask: &asks::Ask,
         prompt: &str,
+        picked: bool,
+        pictures: &[attach::Picture],
     ) -> Result<(), String> {
+        let Some(task) = ask.task.clone() else {
+            return Err("that question is not a task's".into());
+        };
         let submitted = json!({"bot": task.bot, "prompt": stamp::now(prompt),
-            "delivery": "steer"});
-        answer_once(&self.client, ask, submitted).await?;
+            "delivery": "steer", "images": attach::submitted(pictures)});
+        let reply = match picked {
+            true => answer_once(&self.client, &ask.id, submitted).await?,
+            false => {
+                let mut submitted = submitted;
+                submitted["request_id"] = json!(unique("tui"));
+                (self.client.request("submit", submitted).await).map_err(|e| e.to_string())?
+            }
+        };
+        self.task_answers.push(TaskAnswer {
+            key: ask.key(),
+            bot: task.bot.clone(),
+            turn: reply["turn"].as_i64(),
+            checked: Instant::now(),
+        });
+        self.close_ask(ask);
         self.fleet_said(format!("your answer went to {}", task.name));
         Ok(())
+    }
+
+    /// The answers sent to tasks from here that their tasks have not
+    /// taken yet, each read now and then: one taken back unread, from the
+    /// queue or by its turn's end, answered nothing, and its question is
+    /// pinned again. One read per answer in flight, never per task.
+    async fn recheck_task_answers(&mut self) {
+        let mut released = false;
+        for at in (0..self.task_answers.len()).rev() {
+            let answer = &self.task_answers[at];
+            let Some(turn) = answer
+                .turn
+                .filter(|_| answer.checked.elapsed() >= Duration::from_secs(3))
+            else {
+                continue;
+            };
+            let bot = answer.bot.clone();
+            self.task_answers[at].checked = Instant::now();
+            let Some(row) = turn_row(&self.client, &bot, turn).await else {
+                continue;
+            };
+            if asks::undelivered(&row) {
+                self.task_answers.remove(at);
+                released = true;
+            } else if !matches!(
+                row["status"].as_str(),
+                Some("queued" | "ready" | "attached")
+            ) {
+                // Taken, or ended some other way: nothing to read again.
+                self.task_answers[at].turn = None;
+            }
+        }
+        if released {
+            self.task_asks_read = None;
+        }
     }
 
     /// A picture for the message being written, behind a placeholder put
@@ -11553,11 +11656,12 @@ impl App {
         let still = |ask: &asks::Ask| ask.task.is_none() || keys.contains(&ask.key());
         self.asks.retain(still);
         self.aside.retain(still);
-        self.task_answers.retain(|key| keys.contains(key));
+        self.task_answers
+            .retain(|answer| keys.contains(&answer.key));
         for ask in open {
             let key = ask.key();
             let known = (self.asks.iter().chain(&self.aside)).any(|have| have.key() == key)
-                || self.task_answers.contains(&key);
+                || self.task_answers.iter().any(|answer| answer.key == key);
             if !known {
                 self.commit_ask(&ask);
                 // Oldest first, as the turns that asked them count, as the
@@ -11626,10 +11730,10 @@ impl App {
     fn close_ask(&mut self, ask: &asks::Ask) {
         self.asks.retain(|open| open.key() != ask.key());
         self.aside.retain(|open| open.key() != ask.key());
-        // A task's answer lands in the task's conversation, not this one.
-        match ask.task {
-            Some(_) => self.task_answers.push(ask.key()),
-            None => self.sent_answers.push(ask.id.clone()),
+        // A task's answer lands in the task's conversation, not this one,
+        // and [`App::answer_task`] keeps it.
+        if ask.task.is_none() {
+            self.sent_answers.push(ask.id.clone());
         }
         self.settle_asks();
     }
@@ -19445,6 +19549,72 @@ mod tests {
         app.pin_task_asks();
         assert_eq!(whose(app.asking()), "calc.ask");
         assert_eq!(app.asks.len(), 1);
+    }
+
+    /// Without a multiplexer, a running task that asks and works on is read
+    /// once its history grew; words typed on its question with no options
+    /// go to it as written, and an answer taken back unread pins the
+    /// question again.
+    #[tokio::test]
+    async fn a_running_tasks_question_is_read_answered_in_words_and_pinned_again_if_taken_back() {
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = sent.clone();
+        let asked = json!({"question": "Signed in?", "why": "w", "command": "gh auth login"});
+        let (client, _) = daemon_with_events(json!({}), move |asked_for| {
+            match asked_for["op"].as_str().unwrap_or("") {
+                "inspect" => json!({"name": "calc.ask", "head": 7, "running_turn": 2}),
+                "submit" => {
+                    seen.lock().unwrap().push(asked_for.clone());
+                    json!({"turn": 9})
+                }
+                // The answer went as turn 9, and was taken back unread.
+                "turns" if asked_for["after"] == 8 => {
+                    json!({"turns": [{"turn": 9, "status": "interrupted"}]})
+                }
+                "turns" => json!({"turns": [{"turn": 2, "status": "running"}]}),
+                "history_nodes" => json!({"nodes": [{"node": 7, "turn": 2}]}),
+                "history_items" => json!({"items": [{"node": 7, "item": {
+                    "type": "function_call", "name": "ask", "call_id": "q1",
+                    "arguments": asked.to_string()}}]}),
+                _ => json!({}),
+            }
+        })
+        .await;
+        let mut app = app(client);
+        app.bot = "calc.lead".into();
+        app.width = 80;
+        let arguments = json!({"name": "ask", "brief": "Ask"});
+        app.commit_call(
+            "c",
+            Some(1),
+            served::START,
+            &arguments,
+            "turn:calc.ask/1",
+            false,
+        );
+        drawn(&mut app);
+        app.read_tasks().await;
+        app.pin_task_asks();
+        assert_eq!(app.asks.len(), 1, "read while it runs");
+        app.input.set("done");
+        app.submit().await;
+        let to = sent.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(to["bot"], "calc.ask");
+        let prompt = to["prompt"].as_str().unwrap();
+        assert!(
+            prompt.starts_with("done") && asks::answer_of(prompt, None).is_none(),
+            "{prompt}"
+        );
+        assert!(app.asks.is_empty());
+        app.pin_task_asks();
+        assert!(
+            app.asks.is_empty(),
+            "not pinned again while the task may take it"
+        );
+        app.task_answers[0].checked -= Duration::from_secs(5);
+        app.recheck_task_answers().await;
+        app.pin_task_asks();
+        assert_eq!(app.asks.len(), 1, "taken back unread, it is open again");
     }
 
     /// Without a multiplexer, a task's question goes with the task: one
