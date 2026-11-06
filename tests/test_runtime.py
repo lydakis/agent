@@ -1058,18 +1058,16 @@ class AnthropicRuntimeTests(unittest.TestCase):
             self.assertEqual(sent['output_config'],
                              {'effort': 'low', 'format': {'type': 'json_schema', 'schema': schema}})
             self.assertNotIn('tool_choice', sent)
-        # A refresh renders the call's request, the schema with it.
+        # Its calls are never refreshed: `max_tokens: 0` refuses a
+        # structured output, so the refresh could only fail.
         model.generate_delay = 2.5
         turn = submit('s2', 'long', output_schema=schema)['result']['turn']
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
         requests = []
         while not model.requests.empty():
             requests.append(model.requests.get())
-        call, warms = requests[0], requests[1:]
-        self.assertEqual(call['output_config']['format']['schema'], schema)
-        self.assertTrue(warms)
-        for warm in warms:
-            self.assertEqual(warm, {**call, 'max_tokens': 0, 'stream': False})
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(requests[0]['output_config']['format']['schema'], schema)
         # A turn sent without one is free text.
         model.generate_delay = 0
         turn = submit('s3', 'hello')['result']['turn']

@@ -780,13 +780,21 @@ impl Provider {
     /// with [`Provider::keep_warm`], or `None` where that does not apply.
     /// Anthropic's own API only: a request with `max_tokens: 0` generates
     /// nothing, bills a cache read, and restarts the cache's lifetime. It
-    /// rejects budgeted thinking, so older models with thinking on are left
-    /// out, and Bedrock is left out until the same request is verified there.
-    /// The Responses cache outlives a long tool call without help.
-    pub fn keep_warm_after(&self, model: &str, reasoning: Option<&str>) -> Option<Duration> {
+    /// rejects budgeted thinking and structured outputs, so older models
+    /// with thinking on and calls whose reply follows a schema
+    /// (`structured`) are left out, and Bedrock is left out until the same
+    /// request is verified there. The Responses cache outlives a long tool
+    /// call without help.
+    pub fn keep_warm_after(
+        &self,
+        model: &str,
+        reasoning: Option<&str>,
+        structured: bool,
+    ) -> Option<Duration> {
         let applies = self.family == Family::Anthropic
             && !self.cache_hour
             && !self.bedrock
+            && !structured
             && !(reasoning.is_some() && legacy_thinking(model));
         self.keep_warm.filter(|_| applies)
     }
@@ -1014,7 +1022,11 @@ impl Provider {
         expires: tokio::time::Instant,
     ) -> Result<(Usage, tokio::time::Instant)> {
         if self
-            .keep_warm_after(request.model, request.reasoning)
+            .keep_warm_after(
+                request.model,
+                request.reasoning,
+                request.output_schema.is_some(),
+            )
             .is_none()
         {
             return fail("keep_warm_unsupported");
@@ -2714,7 +2726,10 @@ mod tests {
         let hour = json!({"type":"ephemeral","ttl":"1h"});
         assert_eq!(body["cache_control"], hour);
         assert_eq!(body["system"][0]["cache_control"], hour);
-        assert_eq!(provider.keep_warm_after("claude-sonnet-5", None), None);
+        assert_eq!(
+            provider.keep_warm_after("claude-sonnet-5", None, false),
+            None
+        );
         let responses = Provider::new(transport, Family::Responses, "https://h/v1", None)
             .unwrap()
             .with_cache_hour(true);
@@ -2837,15 +2852,21 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            anthropic.keep_warm_after("claude-sonnet-5", Some("high")),
+            anthropic.keep_warm_after("claude-sonnet-5", Some("high"), false),
             Some(KEEP_WARM)
         );
         assert_eq!(
-            anthropic.keep_warm_after("claude-haiku-4-5", None),
+            anthropic.keep_warm_after("claude-haiku-4-5", None, false),
             Some(KEEP_WARM)
         );
         assert_eq!(
-            anthropic.keep_warm_after("claude-haiku-4-5", Some("low")),
+            anthropic.keep_warm_after("claude-haiku-4-5", Some("low"), false),
+            None
+        );
+        // `max_tokens: 0` refuses a structured output: a call whose reply
+        // follows a schema is never refreshed.
+        assert_eq!(
+            anthropic.keep_warm_after("claude-sonnet-5", None, true),
             None
         );
         let off = Provider::new(
@@ -2857,7 +2878,7 @@ mod tests {
         .unwrap()
         .with_keep_warm(None)
         .unwrap();
-        assert_eq!(off.keep_warm_after("claude-sonnet-5", None), None);
+        assert_eq!(off.keep_warm_after("claude-sonnet-5", None, false), None);
         let responses = Provider::new(
             transport.clone(),
             Family::Responses,
@@ -2865,7 +2886,7 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(responses.keep_warm_after("gpt-5", None), None);
+        assert_eq!(responses.keep_warm_after("gpt-5", None, false), None);
         let bedrock = Provider::new(
             transport.clone(),
             Family::Anthropic,
@@ -2874,7 +2895,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            bedrock.keep_warm_after("anthropic.claude-sonnet-5", None),
+            bedrock.keep_warm_after("anthropic.claude-sonnet-5", None, false),
             None
         );
         for after in [0, 300] {

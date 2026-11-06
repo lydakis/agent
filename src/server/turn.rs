@@ -2872,7 +2872,11 @@ impl Turn {
             // No call has sent the view a summary installed here, so there
             // is no cache of it to keep warm.
             let mut warm = provider
-                .keep_warm_after(model, record.effort.as_deref())
+                .keep_warm_after(
+                    model,
+                    record.effort.as_deref(),
+                    record.output_schema.is_some(),
+                )
                 .filter(|_| !installed)
                 .map(|after| Warm {
                     provider,
@@ -3099,9 +3103,11 @@ impl Turn {
         // A refresh renders the turn's request with its calls allowed, so
         // it would not read what a call without them sent.
         let mut warm_after = match body {
-            Body::Window(_) if tool_calls => {
-                provider.keep_warm_after(model, record.effort.as_deref())
-            }
+            Body::Window(_) if tool_calls => provider.keep_warm_after(
+                model,
+                record.effort.as_deref(),
+                record.output_schema.is_some(),
+            ),
             Body::Window(_) => None,
             Body::Copied(_) | Body::Span(..) => None,
         };
