@@ -250,12 +250,6 @@ pub const SETTINGS: &[Setting] = &[
         default: "1024",
     },
     Setting {
-        key: "sonny.sent_days",
-        about: "days kept of what agents sent through Sonny's tools, which `sonny sent` lists; 0 keeps all",
-        values: &[],
-        default: "30",
-    },
-    Setting {
         key: "sonny.sources.commons.digest",
         about: "how often at most an agent hears of new posts in the commons threads it posted in, as 30s, 15m or 1h; 0 for as they come. The commons is a source, so steer sets what cuts in, as for yours",
         values: &[],

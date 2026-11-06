@@ -20,6 +20,22 @@ latest one into `~/.local`:
 
     curl -fsSL https://raw.githubusercontent.com/lydakis/agent/main/install.sh | sh
 
+For main without a version tag, `brew install lydakis/agent/sonny-nightly`
+builds Sonny and its matching daemon together from one pinned commit. If
+stable Sonny is installed, run `brew unlink sonny` first. Update with
+`brew update` and `brew upgrade lydakis/agent/sonny-nightly`. The
+[nightly workflow](../.github/workflows/nightly.yml) checks main at 07:17 UTC,
+tests it and installs the formula before updating the tap; an unchanged
+commit leaves the formula alone. It can also be run manually from main.
+`sonny --version` and `sonny agent --version` name the built commit.
+
+For the newest main commit between nightly runs, use
+`brew install --HEAD lydakis/agent/sonny-nightly` (or
+`brew reinstall --HEAD lydakis/agent/sonny-nightly` to switch an existing
+install), then `brew upgrade --fetch-HEAD lydakis/agent/sonny-nightly`.
+These installs build from source on macOS and Linux; `install.sh` continues
+to install versioned Linux releases.
+
 With `cargo install`, build both (`--path .` for `agent` and
 `--path sonny`) and set `AGENT_BIN` to that `agent`; Sonny never takes an
 `agent` from `PATH`, which may be another program. `sonny agent ARGS` runs
@@ -842,9 +858,10 @@ way `/react` does, and each note in the margin has its own `↩`.
   reviewer's verdict is: a red streak onto the agent whose call it
   denied, a yellow one when it hands the call to you, nothing for an
   allow, whose call runs. What comes in from no agent flies in from the
-  edge only when it is from outside: a follow, another person, a
-  schedule (whose tick flashes as it fires), a reply's note from the
-  commons, task updates. A commons invite flies from whoever started the
+  edge only when it is from outside: news from its sources, another
+  person, a schedule (whose tick flashes as it fires), a reply's note
+  from the commons, task updates, a message that came back; the chat log
+  names each so (`its sources → inbox`, `task updates → shop lead`). A commons invite flies from whoever started the
   thread, a margin note you closed from you, and an agent's own goal only
   pulses its star. It is a
   calm window to keep open and watch: dim lines join who made whom, and

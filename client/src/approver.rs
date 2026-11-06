@@ -327,6 +327,12 @@ pub struct Home {
     pub agent: Vec<std::path::PathBuf>,
     /// The folders the agent may write, its own and the writable ones.
     pub given: Vec<std::path::PathBuf>,
+    /// Folders in the home that hold agents' work folders, such as Sonny's
+    /// task worktrees: what sits in one is agents' work, not the person's
+    /// settings, so it is the judge's to weigh, as a folder elsewhere is.
+    /// An entry whose name starts with a dot is the client's own record
+    /// and stays the person's.
+    pub work: Vec<std::path::PathBuf>,
 }
 
 impl Home {
@@ -340,6 +346,17 @@ impl Home {
     fn given_holds(&self, path: &std::path::Path) -> bool {
         self.given.iter().any(|given| {
             path.starts_with(given) && (!self.under_agent(path) || self.under_agent(given))
+        }) || self.in_work(path)
+    }
+
+    /// Whether `path` is in one of the [`work`](Self::work) folders, under
+    /// an entry not named with a leading dot.
+    fn in_work(&self, path: &std::path::Path) -> bool {
+        self.work.iter().any(|work| {
+            path.strip_prefix(work)
+                .ok()
+                .and_then(|rest| rest.components().next())
+                .is_some_and(|entry| !entry.as_os_str().to_string_lossy().starts_with('.'))
         })
     }
 
@@ -1991,6 +2008,7 @@ mod tests {
                 "/Users/me/.agent/worktrees/shop-fix".into(),
                 "/Users/me/.agent/sonny/zen".into(),
             ],
+            work: vec!["/Users/me/.agent/worktrees".into()],
         }
     }
 
@@ -2025,6 +2043,14 @@ mod tests {
         assert!(!reaches("/Users/me/.agent/sonny/zen/focus"));
         assert!(!reaches("/Users/me/notes.md"));
         assert!(!reaches("/Users/me/.agents/skills/x/SKILL.md"));
+        // Beside its worktree, among the agents' work: the judge's to weigh.
+        assert!(!reaches("/Users/me/.agent/worktrees/shop-fix-notes.md"));
+        assert!(!reaches("/Users/me/.agent/worktrees/shop-pay/README.md"));
+        // But not the folder itself, nor Sonny's record of where each
+        // task came from.
+        assert!(reaches("/Users/me/.agent/worktrees"));
+        assert!(reaches("/Users/me/.agent/worktrees/.folders/shop-fix"));
+        assert!(reaches("/Users/me/.agent/worktrees/../rules/default.rules"));
     }
 
     #[test]
@@ -2046,6 +2072,11 @@ mod tests {
             "echo x > \"$HOME\"/.agent/env",
             // A `.agent` outside every given folder, wherever it is.
             "rm -rf /opt/other/.agent",
+            // The worktrees' folder itself, Sonny's records in it, and a
+            // way back out of it.
+            "rm -rf ~/.agent/worktrees",
+            "rm ~/.agent/worktrees/.folders/shop-fix",
+            "cp x ~/.agent/worktrees/shop-fix/../../rules/default.rules",
         ] {
             assert!(named(text), "{text}");
         }
@@ -2057,6 +2088,9 @@ mod tests {
             "grep -r agent .",
             "echo my.agent.name",
             "rm -rf ~/.agent/sonny/zen/old",
+            // Beside its worktree, among the agents' work.
+            "echo note > ~/.agent/worktrees/shop-fix-notes.md",
+            "rm -rf ~/.agent/worktrees/shop-fix-notes",
         ] {
             assert!(!named(text), "{text}");
         }

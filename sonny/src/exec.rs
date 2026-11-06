@@ -570,8 +570,6 @@ pub struct Steps {
     /// one, which the agent's judge would take as reviewed already.
     run: String,
     next: std::sync::atomic::AtomicU64,
-    /// Where the call's writes are noted as they go, when they are.
-    writes: Option<crate::sent::Writes>,
 }
 
 /// Where a step is put: this machine's daemon, or the gate of the agent of
@@ -614,22 +612,7 @@ impl Steps {
                 ANSWERINGS.fetch_add(1, Ordering::Relaxed)
             ),
             next: Default::default(),
-            writes: None,
         }
-    }
-
-    /// These steps, with the writes they make noted in `writes`, the
-    /// journal of what went out as the person.
-    pub fn journaled(self, writes: crate::sent::Writes) -> Self {
-        Self {
-            writes: Some(writes),
-            ..self
-        }
-    }
-
-    /// Where the call's writes are noted, when they are.
-    pub fn writes(&self) -> Option<&crate::sent::Writes> {
-        self.writes.as_ref()
     }
 
     /// Put the call of `tool`, which the agent knows as `called`, to the
@@ -1637,13 +1620,6 @@ impl Caller {
             .unwrap()
             .entry(nested.server.clone())
             .or_default() += 1;
-        // A call that may change something is noted before it leaves, and
-        // again as it ends: one dropped unended, as an interrupted script's
-        // is, ends unknown.
-        let noted = (self.steps.as_ref())
-            .and_then(|steps| steps.writes())
-            .filter(|_| !nested.reads)
-            .map(|writes| writes.dispatched(&named, &arguments));
         let hub = self.hub.clone();
         let call = Abort(
             self.host
@@ -1653,13 +1629,6 @@ impl Caller {
             .await
             .map_err(|e| e.to_string())
             .and_then(|called| called);
-        if let Some(noted) = noted {
-            noted.end(match &result {
-                Ok(called) if !called.is_error => crate::sent::Ended::Completed,
-                Ok(_) => crate::sent::Ended::Failed,
-                Err(_) => crate::sent::Ended::Unknown,
-            });
-        }
         if let Some((steps, step)) = allowed {
             let failed = !matches!(&result, Ok(called) if !called.is_error);
             self.host
@@ -2118,48 +2087,6 @@ mod tests {
         let first = Steps::new(client.clone(), "shop.lead".into(), 7, "c1".into());
         let again = Steps::new(client, "shop.lead".into(), 7, "c1".into());
         assert_ne!(first.run, again.run);
-    }
-
-    #[tokio::test]
-    async fn each_call_that_may_change_something_is_journaled_as_it_goes_and_reads_are_not() {
-        let dir = scratch("journal");
-        let hub = hub(&dir).await;
-        let (client, _steps) = gate(&dir, Duration::ZERO, None).await;
-        let folder = dir.join("sent");
-        let owner = crate::sent::Owner {
-            bot: "shop.lead".into(),
-            turn: 7,
-            call_id: "c1".into(),
-        };
-        let asker = Steps::new(client, "shop.lead".into(), 7, "c1".into())
-            .journaled(crate::sent::Writes::to(owner, Some(folder.clone())));
-        let script = r#"await tools.mcp__test__echo({text: "hi"});
-await tools.mcp__test__fail({});
-await tools.mcp__test__slow({ms: 10});
-text("done");"#;
-        let said = run(
-            &hub,
-            Some(&dir),
-            "shop.lead",
-            script,
-            Duration::from_secs(30),
-            Some(asker),
-        )
-        .await
-        .unwrap();
-        assert!(said.as_str().unwrap().ends_with("done"), "{said}");
-        let listed: Vec<(String, String, String)> = crate::sent::writes_in(&folder, 0, None)
-            .into_iter()
-            .map(|w| (w.op, w.what, w.state))
-            .collect();
-        let row = |op: &str, what: &str, state: &str| (op.into(), what.into(), state.into());
-        assert_eq!(
-            listed,
-            [
-                row("7:c1/1", "tools.mcp__test__fail", "failed"),
-                row("7:c1/2", "tools.mcp__test__slow", "completed"),
-            ]
-        );
     }
 
     #[tokio::test]
