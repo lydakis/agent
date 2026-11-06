@@ -104,6 +104,8 @@ struct Options {
     budget_tokens: Option<u64>,
     /// `run --turn-budget-tokens`: the submitted turn's own cap.
     turn_budget_tokens: Option<u64>,
+    /// `--budget-counts`: what the budgets given count.
+    budget_counts: Option<&'static str>,
     /// `run --image`: pictures sent with the prompt, by path.
     images: Vec<String>,
     /// `run --quote`: turns whose words the prompt quotes.
@@ -186,6 +188,7 @@ fn parse(args: &[String]) -> Result<Options> {
         bucket_ms: None,
         budget_tokens: None,
         turn_budget_tokens: None,
+        budget_counts: None,
         images: Vec::new(),
         quotes: Vec::new(),
         turn: None,
@@ -489,6 +492,13 @@ fn parse(args: &[String]) -> Result<Options> {
                         options.turn_budget_tokens = Some(value.parse().map_err(|_| {
                             Error::with("usage", "--turn-budget-tokens needs an integer")
                         })?)
+                    }
+                    "--budget-counts" => {
+                        options.budget_counts = Some(match value.as_str() {
+                            "tokens" => "tokens",
+                            "work" => "work",
+                            _ => return fail_with("usage", "--budget-counts needs tokens or work"),
+                        })
                     }
                     "--turn" => {
                         options.turn = Some(
@@ -1651,7 +1661,8 @@ fn run(options: &Options) -> Result<i32> {
         }
         let mut create = json!({"bot":bot,"workspace":workspace,"model":model,
             "instructions":instructions,"effort":effort,
-            "budget_tokens":options.budget_tokens,"tools":tools,
+            "budget_tokens":options.budget_tokens,
+            "budget_counts":options.budget_tokens.and(options.budget_counts),"tools":tools,
             "created_by":created_by,"created_by_id":created_by_id,
             "compaction_instructions":options.compaction_instructions,
             "compaction_model":options.compaction_model,"fallback":fallback,
@@ -1708,7 +1719,9 @@ fn run(options: &Options) -> Result<i32> {
                 "effort":if created { Value::Null } else { json!(options.effort) },
                 "delivery":delivery,"expected_turn":options.turn,"from":from,
                 "quotes":(!options.quotes.is_empty()).then_some(&options.quotes),
-                "budget_tokens":options.turn_budget_tokens,"wait_ms":wait_ms}),
+                "budget_tokens":options.turn_budget_tokens,
+                "budget_counts":options.turn_budget_tokens.and(options.budget_counts),
+                "wait_ms":wait_ms}),
         )
         .map_err(|error| ways_past_busy(&bot, error))?;
     // An attached message has no turn of its own to follow.
@@ -1951,7 +1964,8 @@ fn make_fork(
     let (created_by, created_by_id) = created_by()?;
     let mut request = json!({"source":source,"checkpoint":options.checkpoint,"bot":bot,
         "workspace":options.workspace.as_ref().map(|_| workspace(options)).transpose()?,
-        "budget_tokens":options.budget_tokens,"request_id":request_id,
+        "budget_tokens":options.budget_tokens,
+        "budget_counts":options.budget_tokens.and(options.budget_counts),"request_id":request_id,
         "created_by":created_by,"created_by_id":created_by_id,"expire_ms":options.expire_ms});
     if let Some(allow) = &options.allow {
         let allow: Vec<&str> = allow.split(',').filter(|t| !t.is_empty()).collect();

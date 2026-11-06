@@ -72,7 +72,7 @@ const REPLY_WAIT_MS: u64 = 86_400_000;
 /// How long `fire` waits for launchd's run of the job to say what came of
 /// it: its gate's whole time, and then some for the send.
 const FIRE_WAIT: Duration = Duration::from_secs(90);
-pub const USAGE: &str = "usage: automation add [--name NAME] [WHEN] [--bot NAME | --start NAME --model PROVIDER/MODEL [--effort LEVEL]] [--reply-to BOT] [--if CMD] [--runs N] [--turn-budget-tokens N] [--shadow] [--replace] -- MESSAGE\n         WHEN: --every N{m,h,d} | --in N{m,h} | --at 'YYYY-MM-DD HH:MM' | --cron 'MIN HOUR DAY MONTH WEEKDAY' | --file PATH | --commit REPO; none: only run runs it\n       automation ls [--after NAME]\n       automation show NAME\n       automation run NAME\n       automation rm NAME";
+pub const USAGE: &str = "usage: automation add [--name NAME] [WHEN] [--bot NAME | --start NAME --model PROVIDER/MODEL [--effort LEVEL]] [--reply-to BOT] [--if CMD] [--runs N] [--turn-budget-tokens N [--budget-counts work]] [--shadow] [--replace] -- MESSAGE\n         WHEN: --every N{m,h,d} | --in N{m,h} | --at 'YYYY-MM-DD HH:MM' | --cron 'MIN HOUR DAY MONTH WEEKDAY' | --file PATH | --commit REPO; none: only run runs it\n       automation ls [--after NAME]\n       automation show NAME\n       automation run NAME\n       automation rm NAME";
 
 /// The system's own scheduler, which keeps Sonny's one job.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -399,8 +399,11 @@ pub struct Trigger {
     pub gate: Option<String>,
     /// Ends once this many messages went out.
     pub runs: Option<u64>,
-    /// The most work, in tokens, each fire's turn may do.
+    /// The most tokens each fire's turn may spend.
     pub turn_budget_tokens: Option<u64>,
+    /// What that cap counts, `tokens` or `work`; none is the daemon's
+    /// default, tokens.
+    pub budget_counts: Option<String>,
     /// The path `--file` watches, which each fire checks is still not one
     /// every fire writes.
     pub file: Option<PathBuf>,
@@ -481,6 +484,9 @@ impl Trigger {
         if let Some(tokens) = self.turn_budget_tokens {
             pair("--turn-budget-tokens", tokens.to_string());
         }
+        if let Some(counts) = &self.budget_counts {
+            pair("--budget-counts", counts.clone());
+        }
         if let Some(file) = &self.file {
             pair("--file", path(file));
         }
@@ -513,7 +519,7 @@ impl Trigger {
             let value = iter
                 .next()
                 .ok_or_else(|| bad(&format!("{flag} needs a value")))?;
-            const FLAGS: [&str; 23] = [
+            const FLAGS: [&str; 24] = [
                 "--name",
                 "--generation",
                 "--bot",
@@ -533,6 +539,7 @@ impl Trigger {
                 "--if",
                 "--runs",
                 "--turn-budget-tokens",
+                "--budget-counts",
                 "--file",
                 "--store",
                 "--socket",
@@ -589,6 +596,7 @@ impl Trigger {
             gate: text("--if"),
             runs: number("--runs")?.map(|n| n.max(1) as u64),
             turn_budget_tokens: number("--turn-budget-tokens")?.map(|n| n.max(1) as u64),
+            budget_counts: text("--budget-counts"),
             file: text("--file").map(PathBuf::from),
             daemon,
             store_id: need("--store-id")?,
@@ -610,7 +618,7 @@ impl Trigger {
         json!({"name": self.name, "generation": self.generation, "when": self.when,
             "bot": self.bot(), "bot_id": bot_id, "start": start,
             "reply_to": self.reply_to.as_ref().map(|r| &r.0), "if": self.gate, "runs": self.runs,
-            "turn_budget_tokens": self.turn_budget_tokens,
+            "turn_budget_tokens": self.turn_budget_tokens, "budget_counts": self.budget_counts,
             "sent": state["sent"].as_u64().unwrap_or(0), "message": self.message,
             "once": self.at.is_some(), "shadow": self.shadow, "last": state["last"],
             "checked": state["checked"]})
@@ -636,6 +644,7 @@ impl Trigger {
                 "turn_budget_tokens",
                 self.turn_budget_tokens == other.turn_budget_tokens,
             ),
+            ("budget_counts", self.budget_counts == other.budget_counts),
             ("commit", self.commit == other.commit),
             ("dir", self.dir == other.dir),
             ("daemon", self.daemon == other.daemon),
@@ -1462,7 +1471,7 @@ impl Trigger {
         json!({"name": self.name, "when": self.when, "bot": self.bot(), "start": start,
             "by": by, "reply_to": self.reply_to.as_ref().map(|(to, _)| to), "if": self.gate,
             "runs": self.runs, "turn_budget_tokens": self.turn_budget_tokens,
-            "once": self.at.is_some(), "commit": self.commit, "file": self.file,
+            "budget_counts": self.budget_counts, "once": self.at.is_some(), "commit": self.commit, "file": self.file,
             "dir": self.dir, "shadow": self.shadow, "message": self.message})
     }
 }
@@ -2482,6 +2491,7 @@ struct Add {
     gate: Option<String>,
     runs: Option<u64>,
     turn_budget_tokens: Option<u64>,
+    budget_counts: Option<String>,
     shadow: bool,
     replace: bool,
     message: String,
@@ -2529,7 +2539,8 @@ fn parse_add(args: &[String], now: i64) -> Result<Add, String> {
             | "--reply-to"
             | "--if"
             | "--runs"
-            | "--turn-budget-tokens" => {
+            | "--turn-budget-tokens"
+            | "--budget-counts" => {
                 if v.insert(flag.clone(), value.clone()).is_some() {
                     return Err(bad(format!("{flag} once")));
                 }
@@ -2568,6 +2579,15 @@ fn parse_add(args: &[String], now: i64) -> Result<Add, String> {
     };
     let runs = counted("--runs")?;
     let turn_budget_tokens = counted("--turn-budget-tokens")?;
+    let budget_counts = take("--budget-counts");
+    match (&budget_counts, turn_budget_tokens) {
+        (Some(counts), Some(_)) if counts == "tokens" || counts == "work" => {}
+        (Some(_), Some(_)) => return Err(bad("--budget-counts takes tokens or work".into())),
+        (Some(_), None) => {
+            return Err(bad("--budget-counts goes with --turn-budget-tokens".into()));
+        }
+        (None, _) => {}
+    }
     if message.trim().is_empty() {
         return Err(bad("a message goes after --".into()));
     }
@@ -2601,6 +2621,7 @@ fn parse_add(args: &[String], now: i64) -> Result<Add, String> {
         gate,
         runs,
         turn_budget_tokens,
+        budget_counts,
         shadow,
         replace,
         message,
@@ -2980,6 +3001,7 @@ fn add_args(asked: &Value) -> Vec<String> {
         ("bot", "--bot"),
         ("reply_to", "--reply-to"),
         ("if", "--if"),
+        ("budget_counts", "--budget-counts"),
     ] {
         if let Some(value) = asked[key].as_str() {
             args.extend([flag.to_owned(), value.to_owned()]);
@@ -3222,6 +3244,7 @@ fn add(places: &Places, args: &[String]) -> Result<Value, String> {
         gate: asked.gate,
         runs: asked.runs,
         turn_budget_tokens: asked.turn_budget_tokens,
+        budget_counts: asked.budget_counts,
         daemon,
         store_id,
         message: asked.message,
@@ -3602,7 +3625,7 @@ async fn deliver(
     };
     let asking = json!({"bot": bot, "bot_id": id, "request_id": request_id(trigger, id, ask),
         "prompt": prompt, "delivery": delivery, "origin": ORIGIN,
-        "budget_tokens": trigger.turn_budget_tokens});
+        "budget_tokens": trigger.turn_budget_tokens, "budget_counts": trigger.budget_counts});
     if let Some(ask) = ask {
         let sent = json!({"store_id": trigger.store_id, "generation": trigger.generation,
             "reply_to": trigger.reply_to, "submit": asking});
@@ -3798,7 +3821,7 @@ async fn shadow(
     );
     let asking = json!({"bot": name, "bot_id": shadow, "request_id": request_id(trigger, shadow, ask),
         "prompt": prompt, "delivery": "reject", "origin": ORIGIN,
-        "budget_tokens": trigger.turn_budget_tokens});
+        "budget_tokens": trigger.turn_budget_tokens, "budget_counts": trigger.budget_counts});
     let sent = json!({"store_id": trigger.store_id, "generation": trigger.generation,
         "reply_to": trigger.reply_to, "shadow_of": bot, "submit": asking});
     if let Some(ask) = ask {
@@ -4875,7 +4898,8 @@ pub(crate) mod tests {
             json!({"name": "p.digest", "when": "every 30m", "bot": "p.digest",
                 "start": {"model": "openai/gpt", "effort": "low"}, "by": "p.lead",
                 "reply_to": null, "if": "test -s inbox", "runs": null,
-                "turn_budget_tokens": null, "once": false, "commit": null, "file": null,
+                "turn_budget_tokens": null, "budget_counts": null, "once": false, "commit": null,
+                "file": null,
                 "dir": "/work/p", "shadow": false, "message": digest.message}),
             "what it did and its daemon's ids stay out"
         );
@@ -5253,6 +5277,7 @@ pub(crate) mod tests {
             gate: None,
             runs: None,
             turn_budget_tokens: None,
+            budget_counts: None,
             file: None,
             daemon: Daemon {
                 store: Some("/Users/a/.agent/state.sqlite".into()),
@@ -7107,7 +7132,7 @@ pub(crate) mod tests {
         );
         let started = parse_add(
             &words(
-                "--start p.r --model a/m --effort high --reply-to p.lead --runs 3 --turn-budget-tokens 50000 --if true -- go",
+                "--start p.r --model a/m --effort high --reply-to p.lead --runs 3 --turn-budget-tokens 50000 --budget-counts work --if true -- go",
             ),
             now,
         )
@@ -7125,12 +7150,15 @@ pub(crate) mod tests {
             ),
             (Some("p.lead"), Some(3), Some(50_000), ON_DEMAND)
         );
+        assert_eq!(started.budget_counts.as_deref(), Some("work"));
         let watched = parse_add(&words("--file notes.md -- x"), now).unwrap();
         assert_eq!(
             watched.when.watch,
             Some(std::path::absolute("notes.md").unwrap())
         );
         for bad in [
+            "--budget-counts work -- x",
+            "--turn-budget-tokens 9 --budget-counts all -- x",
             "--count 3 -- x",
             "--turn-end a -- x",
             "--every 30m --in 5m -- x",

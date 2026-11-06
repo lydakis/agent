@@ -131,12 +131,17 @@ tries its held turns at once.
   `0` waits as long as it takes. Without the flag, `attach_wait` in
   `~/.agent/config.toml` applies, then `1d`. Like the mode, the CLI always
   sends the wait it resolved; the daemon keeps no default.
-- `run --turn-budget-tokens N` caps this turn's work, beside the bot's
-  lifetime `--budget-tokens`: each call's output and the input it adds, not
-  the history it sends again. Once a call reaches N the turn's next call goes
-  without tool calls, and the turn completes on its reply with `limit: "turn_budget"`;
-  the cap is the turn's own, so the next turn starts from zero. A steer joins a turn
-  that already has its cap, so `steer` with the flag is `invalid_delivery`.
+- `run --turn-budget-tokens N` caps this turn's input plus output tokens,
+  beside the bot's lifetime `--budget-tokens`. Once a call reaches N the
+  turn's next call goes without tool calls, and the turn completes on its
+  reply with `limit: "turn_budget"`; the cap is the turn's own, so the next
+  turn starts from zero. A steer joins a turn that already has its cap, so
+  `steer` with the flag is `invalid_delivery`.
+- `--budget-counts work` makes the budgets given with it (`--budget-tokens`,
+  `--turn-budget-tokens`) count work instead: each call's output and the
+  input it adds, not the history it sends again, so a bot with a long
+  history can take a small allowance. `tokens`, the default, counts every
+  call's whole input.
 - `run --image PATH` sends a PNG, JPEG, GIF or WebP with the prompt, after
   its words; repeat it for more (up to 20, 5 MiB together). It goes with a
   steer or a turn of its own alike.

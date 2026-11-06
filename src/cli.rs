@@ -20,7 +20,7 @@ const COMMANDS: &[Command] = &[
         name: "run",
         about: "Send a prompt to a bot, or make one with --new; prints the turn as it runs",
         usage: "run [OPTIONS] [--] PROMPT...",
-        flags: "--bot --new --created-by --fork --allow --expires --detach --delivery --attach-wait --turn --model --workspace --effort --turn-budget-tokens --image --quote --agents --profile --request-id --bot-id --pretty --no-spawn",
+        flags: "--bot --new --created-by --fork --allow --expires --detach --delivery --attach-wait --turn --model --workspace --effort --turn-budget-tokens --budget-counts --image --quote --agents --profile --request-id --bot-id --pretty --no-spawn",
         settings: "--tools --instructions --instructions-file --budget-tokens --compaction-instructions --compaction-instructions-file --compaction-model --no-compaction --fallback --approval --approve --context-bytes --context-items --note-turns --compact-at --compact-keep --compact-tokens --max-rounds --keep-turns --approval-hold --max-output-tokens --keep-warm --cache-ttl --speed --sandbox --writable --network --hide-senders --quiet-background --hold --unix-socket --outputs",
         startup: true,
     },
@@ -36,7 +36,7 @@ const COMMANDS: &[Command] = &[
         name: "fork",
         about: "Copy a bot's conversation up to a message into a new bot",
         usage: "fork --source NAME --bot NAME [--checkpoint NODE] [--allow LIST] [--expires DURATION]",
-        flags: "--source --bot --checkpoint --workspace --budget-tokens --allow --expires --request-id --pretty",
+        flags: "--source --bot --checkpoint --workspace --budget-tokens --budget-counts --allow --expires --request-id --pretty",
         settings: "",
         startup: false,
     },
@@ -341,6 +341,10 @@ fn print_flags(flags: &str) {
             "--turn-budget-tokens" => (
                 "N",
                 "This turn's input + output token cap, beside the bot's own budget",
+            ),
+            "--budget-counts" => (
+                "tokens|work",
+                "What the budgets given here count: tokens, the default, or work, what calls add beside the history they send again",
             ),
             "--image" => (
                 "PATH",
@@ -807,6 +811,12 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
         }
     } else if !matches!(c.name, "run" | "wait" | "companion") && positional != 0 {
         return fail_with("usage", format!("{} takes no positional arguments", c.name));
+    }
+    if has("--budget-counts") && !has("--budget-tokens") && !has("--turn-budget-tokens") {
+        return fail_with(
+            "usage",
+            "--budget-counts names what a budget counts; give --budget-tokens or --turn-budget-tokens",
+        );
     }
     if c.name == "run" && has("--fork") {
         if !has("--bot") {

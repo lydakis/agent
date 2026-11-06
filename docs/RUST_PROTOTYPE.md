@@ -316,7 +316,12 @@ is the number the context window's hysteresis exists to keep high, and
 `stats` reports the same totals and ratio for every turn since the daemon
 started, from three atomics and no storage read.
 
-Budgets count work, not usage. A call's work is its output, plus the input it
+A budget counts one of two measures, named by `budget_counts`: `tokens`, the
+default, is the provider's usage, every call's input and output, the history
+it sends again included; `work` counts what the calls add, for an allowance
+that should not pay again for a history the bot already has. The daemon
+keeps both for every bot and turn, the same way wherever they are counted.
+A call's work is its output, plus the input it
 sends past what the bot's previous call sent and got back on the same model:
 a history sent again, warm in the provider's cache or cold, is free, and what
 joins it (a prompt, a steer, a note, a tool's result) is charged once. Output
@@ -336,19 +341,25 @@ call charged), so a park or a restart counts on. Cancellation and failures
 before a usage report is returned can leave usage and work unaccounted for;
 these totals are not a reconciliation of provider billing.
 
-`create` and `fork` accept `budget_tokens`, a lifetime cap on the bot's work.
-The cap is checked before each model call and before each submission: a
-submission on an exhausted bot fails with `budget_exhausted` and the facts
-`budget_tokens` and `work_tokens`. Forks start at zero with their own
-optional cap. `submit` also accepts `budget_tokens`, a cap on the work of the
-turn it starts, checked where the bot's cap is; past it the facts are
-`turn_budget_tokens` and `turn_work_tokens`, and when both caps are reached
-the bot's `budget_exhausted` is named, since it outlasts the turn. The cap is
-stored on the turn (`turns` lists it as `budget_tokens`), so a resumed turn
-counts what it did before parking, and a resend naming another cap is an
-`idempotency_conflict`. A steer joins a turn that already has its cap:
+`create` and `fork` accept `budget_tokens`, a lifetime cap on the bot, and
+`budget_counts` (`tokens` or `work`, only with a cap; alone it is
+`invalid_budget`); `inspect` and `bots` report both. The cap is checked
+before each model call and before each submission: a submission on an
+exhausted bot fails with `budget_exhausted` and the facts `budget_tokens`,
+`budget_counts` and the count it reached (`tokens_used` or `work_tokens`).
+Forks start at zero with their own optional cap. `submit` also accepts
+`budget_tokens` and `budget_counts`, a cap on the turn it starts, checked
+where the bot's cap is; past it the facts are `turn_budget_tokens`,
+`budget_counts` and `turn_tokens_used` or `turn_work_tokens`, and when both
+caps are reached the bot's `budget_exhausted` is named, since it outlasts the
+turn. The two caps may count different measures. The cap is stored on the
+turn (`turns` lists `budget_tokens` and, with one, `budget_counts`), so a
+resumed turn counts what it did before parking, and a resend naming another
+cap or measure is an `idempotency_conflict`. A steer joins a turn that already has its cap:
 `budget_tokens` with `delivery: "steer"` is `invalid_delivery`. A summary
-held beside a call counts toward both caps.
+held beside a call counts toward both caps, in the measure each counts. A
+prompt-cache refresh spends the tokens it re-reads and no work, so it stops
+at a cap on tokens and goes on under one on work.
 
 A budget ends a turn as the round limit does: its last call goes with the
 tools shown and no call allowed, so the turn ends on a reply rather than
@@ -356,7 +367,7 @@ failing with its work done and unreported. Once any call of the turn (an
 answer, a summary, a failed attempt) has spent a cap and the turn goes on,
 for tool results or a steer, its next call goes so. No call's work is known
 before it is made, so none is predicted, and that last call may overshoot
-the cap by its own work. The live `tool_calls_withheld` says why (`reason`:
+the cap by what it spends. The live `tool_calls_withheld` says why (`reason`:
 `budget`, `turn_budget` or `tool_round_limit`), and a turn that completes on such a call is `completed`
 with `limit` (`budget`, `turn_budget` or `rounds`) on its `turn_finished`
 and in its turn view. A retry of a failed attempt that spent a cap goes the

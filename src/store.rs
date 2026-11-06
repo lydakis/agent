@@ -17,11 +17,12 @@ mod db;
 pub use context::{ContextPrefix, ContextUsage, pinned_item, thinking_bytes, without_thinking};
 pub use db::{
     Absorbed, Answered, BACKGROUND_ORIGIN, Binding, Blocked, Bot, CacheTtl, CallAnswer, Carried,
-    CatchUp, Charge, CompactionPlan, CompactionView, CopiedCall, DENIAL_WINDOW, Database, Decision,
-    Delivery, ElisionPlan, FOLDERS_JSON, Fork, Gate, Gated, Halt, Halted, Lapsed, Limit, MAX_GATES,
-    ParkedFallback, Planning, Publication, QuoteRef, RULES_JSON, SANDBOX, SETTINGS, Served,
-    Settings, Started, Step, Stepped, Strip, TURN_VIEW_ACCOUNTING, TurnBudget, TurnContext,
-    TurnOptions, Waiting, Wake, Window, Work, cache_hit, merge_gates, unserved,
+    CatchUp, Charge, CompactionPlan, CompactionView, CopiedCall, Counts, DENIAL_WINDOW, Database,
+    Decision, Delivery, ElisionPlan, FOLDERS_JSON, Fork, Gate, Gated, Halt, Halted, Lapsed, Limit,
+    MAX_GATES, ParkedFallback, Planning, Publication, QuoteRef, RULES_JSON, Room, SANDBOX,
+    SETTINGS, Served, Settings, Spend, Started, Step, Stepped, Strip, TURN_VIEW_ACCOUNTING,
+    TurnBudget, TurnContext, TurnOptions, Waiting, Wake, Window, Work, cache_hit, merge_gates,
+    unserved,
 };
 
 type ReadJob = Box<dyn FnOnce(&Database) + Send>;
@@ -920,6 +921,7 @@ mod tests {
                             instructions: "",
                             effort: None,
                             budget_tokens: None,
+                            budget_counts: Default::default(),
                             tools: &[],
                             created_by: None,
                             created_by_id: None,
@@ -1077,6 +1079,7 @@ mod tests {
                         instructions: "",
                         effort: None,
                         budget_tokens: None,
+                        budget_counts: Default::default(),
                         tools: &[],
                         created_by: None,
                         created_by_id: None,
@@ -1291,6 +1294,7 @@ mod tests {
                         instructions: "test",
                         effort: None,
                         budget_tokens: None,
+                        budget_counts: Default::default(),
                         tools: &[],
                         created_by: None,
                         created_by_id: None,

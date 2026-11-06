@@ -424,7 +424,7 @@ class CompactionTests(ModelFixture):
         # third turn's call after its summary is its last, without tool
         # calls, and the turn ends on it.
         client = self.client(settings={'context_bytes': 4096, 'compact_at': 50})
-        self.create(client, budget_tokens=130)
+        self.create(client, budget_tokens=130, budget_counts='work')
         for n in range(3):
             ended = self.run_turn(client, 'Bob', n, str(n) * 500)
         self.assertEqual((ended['data']['status'], ended['data']['limit']), ('completed', 'budget'))
@@ -459,7 +459,7 @@ class CompactionTests(ModelFixture):
     def test_empty_summary_is_charged_even_though_the_view_is_not_changed(self):
         self.model.empty_compaction = True
         client = self.client(settings={'context_bytes': 4096, 'compact_at': 50})
-        self.create(client, budget_tokens=130)
+        self.create(client, budget_tokens=130, budget_counts='work')
         for n in range(3):
             ended = self.run_turn(client, 'Bob', n, str(n) * 500)
         # The summary's output is charged, so the call after it is the last.

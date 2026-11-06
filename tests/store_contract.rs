@@ -3,7 +3,7 @@ use agent_runtime::{
     codec::Family,
     provider::{ToolCall, Usage},
     store::{
-        Answered, Binding, Blocked, Bot, CacheTtl, CompactionPlan, ContextUsage, Database,
+        Answered, Binding, Blocked, Bot, CacheTtl, CompactionPlan, ContextUsage, Counts, Database,
         Decision, Delivery, Fork, Gate, Gated, Halt, Halted, Limit, Planning, QuoteRef, Settings,
         Strip, TurnBudget, TurnOptions, Wake,
     },
@@ -42,6 +42,7 @@ fn binding() -> Binding<'static> {
         instructions: "test",
         effort: None,
         budget_tokens: None,
+        budget_counts: Default::default(),
         tools: &READ,
         created_by: None,
         created_by_id: None,
@@ -165,6 +166,7 @@ fn historical_fork_and_exact_resume_preserve_independent_lineage() {
         person: None,
         quotes: Vec::new(),
         budget_tokens: None,
+        budget_counts: Default::default(),
         images: Vec::new(),
         wait_ms: None,
     };
@@ -5341,6 +5343,7 @@ fn turn_options_are_recorded_and_part_of_idempotency() {
         person: None,
         quotes: Vec::new(),
         budget_tokens: None,
+        budget_counts: Default::default(),
         images: Vec::new(),
         wait_ms: None,
     };
@@ -5474,6 +5477,7 @@ fn a_bot_without_a_default_workspace_needs_one_per_submission() {
         person: None,
         quotes: Vec::new(),
         budget_tokens: None,
+        budget_counts: Default::default(),
         images: Vec::new(),
         wait_ms: None,
     };
@@ -6075,7 +6079,7 @@ fn begun(db: &mut Database, bot: &str, key: &str) -> i64 {
 fn budgets_count_work_and_turn_listings_carry_accounting() {
     let mut db = db();
     let mut capped = binding();
-    capped.budget_tokens = Some(150);
+    (capped.budget_tokens, capped.budget_counts) = (Some(150), Counts::Work);
     db.create("Bob", Some("/synthetic"), capped).unwrap();
     let turn = begun(&mut db, "Bob", "r1");
     // A bot's first call has no history yet: all it sends is new.
@@ -6115,7 +6119,37 @@ fn budgets_count_work_and_turn_listings_carry_accounting() {
     assert_eq!(refused.code, "budget_exhausted");
     assert_eq!(
         refused.facts.map(|facts| Value::Object(*facts)),
-        Some(json!({"budget_tokens":150,"work_tokens":170}))
+        Some(json!({"budget_tokens":150,"budget_counts":"work","work_tokens":170}))
+    );
+    // By default a cap counts the provider's tokens, the history included:
+    // the same calls spend Ann's after one turn.
+    let mut capped = binding();
+    capped.budget_tokens = Some(150);
+    db.create("Ann", Some("/synthetic"), capped).unwrap();
+    for (key, input) in [("a1", 100), ("a2", 150)] {
+        let turn = begun(&mut db, "Ann", key);
+        db.append(
+            turn,
+            vec![assistant(key)],
+            &[],
+            Some(&usage(input, 20, "m")),
+        )
+        .unwrap();
+        db.finish(turn, None).unwrap();
+    }
+    let refused = db
+        .begin(
+            "Ann",
+            "a3",
+            "again",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap_err();
+    assert_eq!(
+        refused.facts.map(|facts| Value::Object(*facts)),
+        Some(json!({"budget_tokens":150,"budget_counts":"tokens","tokens_used":290}))
     );
     let page = db.turns("Bob", 0, None, 1, false).unwrap();
     let first = &page["turns"][0];
@@ -6306,7 +6340,8 @@ fn schema_78_counts_on_from_usage_and_rebases_a_history() {
         .execute_batch(
             "ALTER TABLE bots DROP COLUMN work; ALTER TABLE bots DROP COLUMN carried;
              ALTER TABLE bots DROP COLUMN carried_model; ALTER TABLE turns DROP COLUMN work;
-             ALTER TABLE turns DROP COLUMN limited; PRAGMA user_version=78;",
+             ALTER TABLE turns DROP COLUMN limited; ALTER TABLE bots DROP COLUMN budget_counts;
+             ALTER TABLE turns DROP COLUMN budget_counts; PRAGMA user_version=78;",
         )
         .unwrap();
     let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
@@ -6878,6 +6913,7 @@ fn forks_start_at_any_answered_message_and_default_to_the_head() {
                 person: None,
                 quotes: Vec::new(),
                 budget_tokens: None,
+                budget_counts: Default::default(),
                 images: Vec::new(),
                 wait_ms: None,
             },
@@ -9848,6 +9884,7 @@ fn schema_47_turns_take_their_own_token_cap() {
     let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
     let capped = TurnOptions {
         budget_tokens: Some(300),
+        budget_counts: Counts::Work,
         ..TurnOptions::default()
     };
     let turn = db
@@ -9867,8 +9904,12 @@ fn schema_47_turns_take_their_own_token_cap() {
     let cap = TurnBudget {
         tokens: 300,
         until: 420,
+        counts: Counts::Work,
     };
-    assert_eq!((bot.turn_budget, bot.ceiling()), (Some(cap), Some(420)));
+    assert_eq!(
+        (bot.turn_budget, bot.room()),
+        (Some(cap), Some((280, Limit::TurnBudget)))
+    );
     assert!(bot.exhausted().is_none());
     // Its work: the 120 the call before sent and got back are re-read, so
     // 280 are new, and 20 come out.
@@ -9878,12 +9919,13 @@ fn schema_47_turns_take_their_own_token_cap() {
     assert_eq!(error.code, "turn_budget_exhausted");
     assert_eq!(
         error.facts.map(|facts| Value::Object(*facts)),
-        Some(json!({"turn_budget_tokens":300,"turn_work_tokens":320}))
+        Some(json!({"turn_budget_tokens":300,"budget_counts":"work","turn_work_tokens":320}))
     );
     db.finish(turn, None).unwrap();
     // A resend names the same cap; the earlier turn reports none.
     let other = TurnOptions {
         budget_tokens: Some(200),
+        budget_counts: Counts::Work,
         ..TurnOptions::default()
     };
     assert_eq!(

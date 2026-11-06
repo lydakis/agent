@@ -100,11 +100,13 @@ const EARNS_FOR: i64 = 7 * 86_400;
 /// How long an invite may take to reach an agent before it counts as
 /// given back, in seconds: one whose sender was stopped never settles.
 const SENDING_FOR: i64 = 5 * 60;
-/// The tokens an invite pays for in its thread, from `[sonny]
+/// The tokens of work an invite pays for in its thread, from `[sonny]
 /// commons_invite_tokens`: the turn it starts, and the turns a reply there
-/// starts for the invited agent while any are left, each capped at what
-/// is. Once they are spent, a reply joins the agent's next model call, as
-/// for any poster.
+/// starts for the invited agent while any are left. A turn started runs to
+/// its own end, under the agent's round limit and none of the invite's, so
+/// a reply is never cut short; what it did counts toward the next. Once
+/// they are spent, a reply joins the agent's next model call, as for any
+/// poster.
 fn invite_tokens() -> u64 {
     settings().1
 }
@@ -609,8 +611,8 @@ fn paid(dir: &Path, thread: &str, bot: &str, turn: i64) {
 }
 
 /// What is left of an invite that paid for `turns` of `bot`; none when a
-/// turn cannot be read. A turn not yet finished holds its whole cap, which
-/// it may still spend, so a reply meanwhile joins it rather than funding
+/// turn cannot be read. A turn not yet finished holds all of it, which it
+/// may still spend, so a reply meanwhile joins it rather than funding
 /// another.
 async fn left(client: &agent_client::Client, bot: &str, turns: &[i64], pays: u64) -> u64 {
     let mut spent = 0;
@@ -624,8 +626,8 @@ async fn left(client: &agent_client::Client, bot: &str, turns: &[i64], pays: u64
         else {
             return 0;
         };
-        // Its work, as the turn's own budget counts it: what it added, not
-        // the history each of its calls sent again.
+        // Its work, as the daemon counts budgets: what it added, not the
+        // history each of its calls sent again.
         let used = row["work_tokens"].as_u64().unwrap_or(0);
         let holds = match row["finished_ms"].is_null() {
             true => row["budget_tokens"].as_u64().unwrap_or(u64::MAX).max(used),
@@ -791,8 +793,7 @@ pub async fn invite(home: &Path, started: &Value, author: &str, invite: &Value) 
             let bot = pool.swap_remove(draw() % pool.len());
             let note = invited_note(thread, title, author, ticket);
             let submit = json!({"bot": bot, "prompt": note, "delivery": "queue",
-                "origin": ORIGIN, "request_id": format!("commons.invite.{thread}"),
-                "budget_tokens": pays(ticket)});
+                "origin": ORIGIN, "request_id": format!("commons.invite.{thread}")});
             if let Ok(started) = client.request("submit", submit).await
                 && let Some(turn) = started["turn"].as_i64()
             {
@@ -1095,7 +1096,7 @@ pub fn told(replied: &Value, author: &str) -> String {
 
 /// Wakes each of `tell` whose invite to the thread has tokens left with
 /// the reply `replied`, while it still listens to the thread: the note
-/// starts its turn, capped at what is left. The rest hear of it through
+/// starts its turn, which runs to its own end. The rest hear of it through
 /// their subscription to the thread, as the lookout tells the commons
 /// source (`news`), and one that removed it hears of it no more. The ones
 /// woken.
@@ -1132,8 +1133,7 @@ pub async fn tell(home: &Path, replied: &Value, author: &str, tell: &Value) -> V
             continue;
         }
         let mut submit = json!({"bot": bot, "prompt": note, "delivery": "queue",
-            "origin": ORIGIN, "request_id": format!("{request}.woken"),
-            "budget_tokens": left});
+            "origin": ORIGIN, "request_id": format!("{request}.woken")});
         if told_one["bot_id"].is_i64() {
             submit["bot_id"] = told_one["bot_id"].clone();
         }
@@ -2001,7 +2001,8 @@ mod tests {
         // An agent with a 1.4M history, woken three times on one invite:
         // each turn sent that history again, and each did 30K of work. A
         // 1M invite has 910K left, where its usage would have spent it on
-        // the first wake. The one still running holds its cap.
+        // the first wake. One still running, with no cap of its own, holds
+        // the rest: a reply meanwhile joins it.
         let client = crate::tests::daemon_answering(|asked| {
             let turn = asked["before"].as_i64().unwrap_or(1) - 1;
             let finished = match turn {
@@ -2009,11 +2010,11 @@ mod tests {
                 _ => json!(1),
             };
             json!({"turns": [{"turn": turn, "input_tokens": 1_400_000, "output_tokens": 5_000,
-                "work_tokens": 30_000, "budget_tokens": 200_000, "finished_ms": finished}]})
+                "work_tokens": 30_000, "budget_tokens": null, "finished_ms": finished}]})
         })
         .await;
         assert_eq!(left(&client, "a", &[1, 2, 3], 1_000_000).await, 910_000);
-        assert_eq!(left(&client, "a", &[1, 2, 3, 4], 1_000_000).await, 710_000);
+        assert_eq!(left(&client, "a", &[1, 2, 3, 4], 1_000_000).await, 0);
     }
 
     #[test]

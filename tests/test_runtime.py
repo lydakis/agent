@@ -999,10 +999,10 @@ class AnthropicRuntimeTests(unittest.TestCase):
 
     def test_refreshes_stop_at_the_turns_cap(self):
         client, model, path = self.start(settings={'keep_warm': 1})
-        def run(bot, cap):
+        def run(bot, cap, counts='tokens'):
             client.request('create', bot=bot, workspace=str(path), effort='low')
             turn = client.request('submit', bot=bot, request_id='w', prompt='shell:sleep 2.5',
-                                  budget_tokens=cap)['result']['turn']
+                                  budget_tokens=cap, budget_counts=counts)['result']['turn']
             end = client.finished(turn)['data']
             requests = []
             while not model.requests.empty():
@@ -1014,9 +1014,15 @@ class AnthropicRuntimeTests(unittest.TestCase):
         # it, and nothing reads a cache refreshed for one with them.
         end, warms, usage = run('Bob', 1)
         self.assertEqual((end['status'], end['limit'], warms), ('completed', 'turn_budget', 0))
-        # A refresh re-reads the history, so it does no work: under a cap
-        # with room, the cache is kept warm as without one.
-        end, warms, usage = run('Ann', usage[0]['work_tokens'] + 9)
+        # A refresh bills the history it re-reads: room for one refresh,
+        # and the second would bill past the cap, so the call after it is
+        # the last.
+        call = usage[0]['input_tokens'] + usage[0]['output_tokens']
+        end, warms, _ = run('Ann', call + 9)
+        self.assertEqual((end['status'], end['limit'], warms), ('completed', 'turn_budget', 1))
+        # But it does no work: under a cap on work with room, the cache is
+        # kept warm as without one.
+        end, warms, usage = run('Cy', usage[0]['work_tokens'] + 9, 'work')
         self.assertEqual((end['status'], end.get('limit')), ('completed', None))
         self.assertGreater(warms, 0)
         self.assertEqual({u['work_tokens'] for u in usage if u.get('purpose') == 'keep_warm'}, {0})
@@ -1062,7 +1068,8 @@ class AnthropicRuntimeTests(unittest.TestCase):
         model.warm_delay = 1
         # The call does 14 tokens of work (7 in, 7 out), the whole budget;
         # its refresh re-reads the history, billing 9 but doing none.
-        client.request('create', bot='Bob', workspace=str(path), effort='low', budget_tokens=14)
+        client.request('create', bot='Bob', workspace=str(path), effort='low', budget_tokens=14,
+                       budget_counts='work')
         turn = client.request('submit', bot='Bob', request_id='s1', prompt='long')['result']['turn']
         model.requests.get(timeout=5)
         steer = client.request('submit', bot='Bob', request_id='s2', prompt='more', delivery='steer')

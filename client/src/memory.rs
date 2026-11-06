@@ -1424,6 +1424,8 @@ fn schedule_args(script: &Path, args: &[String]) -> Result<Vec<String>, String> 
         format!("{quote} changed"),
         "--turn-budget-tokens".into(),
         "1000000".into(),
+        "--budget-counts".into(),
+        "work".into(),
         "--".into(),
         "Clean up memory as the memory-cleanup skill says.".into(),
     ]);
@@ -2592,6 +2594,8 @@ mod tests {
                 "'/Users/g/.agent/memory' changed",
                 "--turn-budget-tokens",
                 "1000000",
+                "--budget-counts",
+                "work",
                 "--",
                 "Clean up memory as the memory-cleanup skill says.",
             ])

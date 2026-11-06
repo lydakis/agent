@@ -36,13 +36,15 @@ pub struct Bot {
     /// recycled; a retry that carries the id cannot land on the new holder.
     pub bot_id: i64,
     pub head: Option<i64>,
-    /// Lifetime cap on the bot's work, in tokens (see [`Work`]); checked
+    /// Lifetime cap, in tokens of what `budget_counts` names; checked
     /// before each model call.
     pub budget_tokens: Option<u64>,
-    /// Input plus output tokens the provider counted: usage, for reporting
-    /// and cost. Budgets count `work` instead.
+    pub budget_counts: Counts,
+    /// Input plus output tokens the provider counted: its usage, for
+    /// reporting and cost, and what a budget counts by default.
     pub tokens_used: u64,
-    /// The work its calls did, which its own and its turns' budgets count.
+    /// The work its calls did (see [`Work`]), which a budget counts when
+    /// it names it.
     #[serde(flatten)]
     pub work: Work,
     /// The cap its running turn was submitted with, while that turn runs.
@@ -660,56 +662,196 @@ impl Limit {
         }
     }
 }
-/// A turn's own token cap: `tokens` as submitted, and `until`, the bot's
-/// lifetime work at which the turn has spent them.
+/// What a budget counts. `Tokens`, the default, is the provider's usage:
+/// every call's input and output, the history it sends again included.
+/// `Work` is what the calls added (see [`Work`]), for an allowance that
+/// should not pay again for a history the bot already has.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Counts {
+    #[default]
+    Tokens,
+    Work,
+}
+impl Counts {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Counts::Tokens => "tokens",
+            Counts::Work => "work",
+        }
+    }
+    pub fn parse(text: &str) -> Option<Counts> {
+        match text {
+            "tokens" => Some(Counts::Tokens),
+            "work" => Some(Counts::Work),
+            _ => None,
+        }
+    }
+    /// How a row keeps it: the default as NULL.
+    fn stored(self) -> Option<&'static str> {
+        (self == Counts::Work).then_some("work")
+    }
+    fn from_stored(stored: Option<&str>) -> Counts {
+        match stored {
+            Some("work") => Counts::Work,
+            _ => Counts::Tokens,
+        }
+    }
+    /// The name of what it counts, in a bot's view and a refusal's facts.
+    pub fn field(self) -> &'static str {
+        match self {
+            Counts::Tokens => "tokens_used",
+            Counts::Work => "work_tokens",
+        }
+    }
+    fn done(self, used: u64, cap: u64) -> String {
+        match self {
+            Counts::Tokens => format!("{used} of {cap} tokens used"),
+            Counts::Work => format!("{used} of {cap} tokens of work done"),
+        }
+    }
+}
+/// An amount in both measures: the tokens the provider counted and the
+/// work they did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Spend {
+    pub tokens: u64,
+    pub work: u64,
+}
+impl Spend {
+    pub fn of(self, counts: Counts) -> u64 {
+        match counts {
+            Counts::Tokens => self.tokens,
+            Counts::Work => self.work,
+        }
+    }
+    pub fn plus(self, other: Spend) -> Spend {
+        Spend {
+            tokens: self.tokens.saturating_add(other.tokens),
+            work: self.work.saturating_add(other.work),
+        }
+    }
+    pub fn minus(self, other: Spend) -> Spend {
+        Spend {
+            tokens: self.tokens.saturating_sub(other.tokens),
+            work: self.work.saturating_sub(other.work),
+        }
+    }
+}
+/// What a bot's caps leave in each measure, the least of each; `None` where
+/// no cap counts it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Room {
+    pub tokens: Option<u64>,
+    pub work: Option<u64>,
+}
+impl Room {
+    /// Whether spending `more` would leave each cap some room.
+    pub fn holds(self, more: Spend) -> bool {
+        self.tokens.is_none_or(|left| more.tokens < left)
+            && self.work.is_none_or(|left| more.work < left)
+    }
+}
+/// A turn's own token cap: `tokens` as submitted, in what it `counts`, and
+/// `until`, the bot's lifetime count of that at which the turn has spent
+/// them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TurnBudget {
     pub tokens: u64,
     pub until: u64,
+    pub counts: Counts,
 }
 impl Bot {
-    /// The lifetime count past which the bot makes no more calls: its
-    /// budget's or its running turn's, whichever comes first.
-    pub fn ceiling(&self) -> Option<u64> {
-        let turn = self.turn_budget.map(|cap| cap.until);
-        match (self.budget_tokens, turn) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
+    /// What its calls spent, in both measures.
+    pub fn spent(&self) -> Spend {
+        Spend {
+            tokens: self.tokens_used,
+            work: self.work.used,
         }
     }
-    /// What its caps leave its work, when either is set, and the one that
-    /// leaves the least: the bot's own when they leave the same.
+    pub fn add(&mut self, spend: Spend) {
+        self.tokens_used = self.tokens_used.saturating_add(spend.tokens);
+        self.work.used = self.work.used.saturating_add(spend.work);
+    }
+    pub fn take_back(&mut self, spend: Spend) {
+        self.tokens_used = self.tokens_used.saturating_sub(spend.tokens);
+        self.work.used = self.work.used.saturating_sub(spend.work);
+    }
+    /// Count `usage` in both measures, as the store does; returns what it
+    /// added.
+    pub fn charge(&mut self, usage: &Usage, charge: Charge) -> Spend {
+        let tokens = usage.input_tokens.saturating_add(usage.output_tokens);
+        self.tokens_used = self.tokens_used.saturating_add(tokens);
+        Spend {
+            tokens,
+            work: self.work.charge(usage, charge),
+        }
+    }
+    /// Its caps, the bot's own first: each one's limit, what it counts, and
+    /// the count at which it is spent.
+    fn caps(&self) -> impl Iterator<Item = (Limit, Counts, u64)> {
+        let own = (self.budget_tokens).map(|cap| (Limit::Budget, self.budget_counts, cap));
+        let turn = (self.turn_budget).map(|cap| (Limit::TurnBudget, cap.counts, cap.until));
+        own.into_iter().chain(turn)
+    }
+    /// Whether a cap is set.
+    pub fn capped(&self) -> bool {
+        self.caps().next().is_some()
+    }
+    /// What its caps leave, when either is set, and the one that leaves the
+    /// least: the bot's own when they leave the same.
     pub fn room(&self) -> Option<(u64, Limit)> {
-        let used = self.work.used;
-        let own = (self.budget_tokens).map(|cap| (cap.saturating_sub(used), Limit::Budget));
-        let turn =
-            (self.turn_budget).map(|cap| (cap.until.saturating_sub(used), Limit::TurnBudget));
-        match (own, turn) {
-            (Some(own), Some(turn)) if turn.0 < own.0 => Some(turn),
-            (own, turn) => own.or(turn),
+        let spent = self.spent();
+        self.caps()
+            .map(|(limit, counts, cap)| (cap.saturating_sub(spent.of(counts)), limit))
+            .reduce(|least, next| if next.0 < least.0 { next } else { least })
+    }
+    /// What its caps leave in each measure.
+    pub fn left(&self) -> Room {
+        let spent = self.spent();
+        let mut room = Room::default();
+        for (_, counts, cap) in self.caps() {
+            let left = cap.saturating_sub(spent.of(counts));
+            let least = match counts {
+                Counts::Tokens => &mut room.tokens,
+                Counts::Work => &mut room.work,
+            };
+            *least = Some(least.map_or(left, |least| least.min(left)));
+        }
+        room
+    }
+    /// Lower its caps to end once it spent `share` more.
+    pub fn cap_at(&mut self, share: Spend) {
+        let at = self.spent().plus(share);
+        let counts = self.budget_counts;
+        if let Some(budget) = &mut self.budget_tokens {
+            *budget = (*budget).min(at.of(counts));
+        }
+        if let Some(cap) = &mut self.turn_budget {
+            cap.until = cap.until.min(at.of(cap.counts));
         }
     }
     /// Why no more calls may be made, once either cap is reached. The
     /// bot's own budget is named first: it outlasts the turn.
     pub fn exhausted(&self) -> Option<Error> {
-        let used = self.work.used;
-        if let Some(cap) = self.budget_tokens.filter(|&cap| used >= cap) {
-            return Some(
-                Error::with(
-                    "budget_exhausted",
-                    format!("{used} of {cap} tokens of work done"),
-                )
-                .facts(json!({"budget_tokens":cap,"work_tokens":used})),
-            );
+        let spent = self.spent();
+        let counts = self.budget_counts;
+        if let Some(cap) = self.budget_tokens.filter(|&cap| spent.of(counts) >= cap) {
+            return Some(budget_exhausted(self, cap));
         }
-        let cap = self.turn_budget.filter(|cap| used >= cap.until)?;
-        let spent = cap.tokens.saturating_add(used - cap.until);
+        let cap = self
+            .turn_budget
+            .filter(|cap| spent.of(cap.counts) >= cap.until)?;
+        let used = cap.tokens.saturating_add(spent.of(cap.counts) - cap.until);
+        let mut facts = json!({"turn_budget_tokens":cap.tokens,
+            "budget_counts":cap.counts.as_str()});
+        facts[format!("turn_{}", cap.counts.field())] = json!(used);
         Some(
             Error::with(
                 "turn_budget_exhausted",
-                format!("this turn did {spent} of its {} tokens of work", cap.tokens),
+                format!("this turn: {}", cap.counts.done(used, cap.tokens)),
             )
-            .facts(json!({"turn_budget_tokens":cap.tokens,"turn_work_tokens":spent})),
+            .facts(facts),
         )
     }
     /// Whether this call, of the daemon's tool or a declared one, waits
@@ -810,6 +952,7 @@ pub struct Fork<'a> {
     pub checkpoint: Option<i64>,
     pub workspace: Option<&'a str>,
     pub budget_tokens: Option<u64>,
+    pub budget_counts: Counts,
     pub created_by: Option<&'a str>,
     pub created_by_id: Option<i64>,
     /// A gate the fork adds to the ones it inherits.
@@ -831,6 +974,7 @@ pub struct Binding<'a> {
     pub instructions: &'a str,
     pub effort: Option<&'a str>,
     pub budget_tokens: Option<u64>,
+    pub budget_counts: Counts,
     pub tools: &'a [String],
     pub created_by: Option<&'a str>,
     pub created_by_id: Option<i64>,
@@ -891,8 +1035,9 @@ pub struct TurnOptions {
     /// Turns whose words the store copies after this prompt's, each with
     /// who wrote them.
     pub quotes: Vec<QuoteRef>,
-    /// The most work, in tokens, this turn may do; none is
-    /// bounded only by the bot's own budget.
+    /// The most tokens, of what `budget_counts` names, this turn may
+    /// spend; none is bounded only by the bot's own budget.
+    pub budget_counts: Counts,
     pub budget_tokens: Option<u64>,
     /// Pictures sent with the prompt, after its words in the user item.
     pub images: Vec<crate::codec::Image>,
@@ -2075,14 +2220,14 @@ fn not_in_tools(gated: &[String], tools: &[String]) -> Result<()> {
 }
 
 fn budget_exhausted(bot: &Bot, budget: u64) -> Error {
+    let (counts, used) = (bot.budget_counts, bot.spent().of(bot.budget_counts));
+    let mut facts = json!({"budget_tokens":budget,"budget_counts":counts.as_str()});
+    facts[counts.field()] = json!(used);
     Error::with(
         "budget_exhausted",
-        format!(
-            "{} has done {} of its {budget} tokens of work",
-            bot.name, bot.work.used
-        ),
+        format!("{}: {}", bot.name, counts.done(used, budget)),
     )
-    .facts(json!({"budget_tokens":budget,"work_tokens":bot.work.used}))
+    .facts(facts)
 }
 /// What a keyed creation keeps of its instructions: a stable FNV-1a
 /// fingerprint, as hex, so a resend compares with what was sent even after
@@ -2280,7 +2425,8 @@ impl Database {
                 closed INTEGER, open_calls INTEGER, allowed TEXT, settings TEXT, creation TEXT,
                 expire_ms INTEGER, expires_at INTEGER,
                 sent_bytes INTEGER, sent_tokens INTEGER, compact_asked INTEGER NOT NULL DEFAULT 0,
-                declared TEXT, work INTEGER NOT NULL DEFAULT 0, carried INTEGER, carried_model TEXT);
+                declared TEXT, work INTEGER NOT NULL DEFAULT 0, carried INTEGER, carried_model TEXT,
+                budget_counts TEXT);
             CREATE UNIQUE INDEX IF NOT EXISTS bots_id ON bots(id);
             CREATE INDEX IF NOT EXISTS bots_note ON bots(note);
             CREATE INDEX IF NOT EXISTS bots_compaction ON bots(compaction);
@@ -2311,7 +2457,7 @@ impl Database {
                 from_bot TEXT, from_turn INTEGER, from_id INTEGER, origin TEXT, reasoning TEXT, inherited_reasoning TEXT,
                 bot_model TEXT, bot_reasoning TEXT, images TEXT, person TEXT, quotes TEXT, reply_node INTEGER,
                 wait_ms INTEGER, due_ms INTEGER, held TEXT,
-                work INTEGER NOT NULL DEFAULT 0, limited TEXT,
+                work INTEGER NOT NULL DEFAULT 0, limited TEXT, budget_counts TEXT,
                 UNIQUE(bot,request_id));
             CREATE INDEX IF NOT EXISTS turns_bot_id ON turns(bot,id);
             CREATE INDEX IF NOT EXISTS turns_started ON turns(bot,id) WHERE started_ms IS NOT NULL;
@@ -2745,6 +2891,7 @@ impl Database {
             name: r.get(0)?,
             head: r.get(1)?,
             budget_tokens: r.get::<_, Option<i64>>(10)?.map(|b| b.max(0) as u64),
+            budget_counts: Counts::from_stored(r.get::<_, Option<String>>(44)?.as_deref()),
             tokens_used: r.get::<_, i64>(11)?.max(0) as u64,
             work: Work {
                 used: r.get::<_, i64>(41)?.max(0) as u64,
@@ -2846,7 +2993,7 @@ impl Database {
             },
         })
     }
-    const COLUMNS: &str = "name,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,tools,input_tokens,cached_input_tokens,id,created_by,created_by_id,note,compaction,compaction_instructions,compaction_model,cache_bot,thinking_prefix,thinking_floor,fallback,elision,thinking_from,thinking_to,thinking_elided,gates,denials,allowed,closed,settings,expire_ms,expires_at,sent_bytes,sent_tokens,compact_asked,declared,work,carried,carried_model";
+    const COLUMNS: &str = "name,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,tools,input_tokens,cached_input_tokens,id,created_by,created_by_id,note,compaction,compaction_instructions,compaction_model,cache_bot,thinking_prefix,thinking_floor,fallback,elision,thinking_from,thinking_to,thinking_elided,gates,denials,allowed,closed,settings,expire_ms,expires_at,sent_bytes,sent_tokens,compact_asked,declared,work,carried,carried_model,budget_counts";
     /// Validate the caller's captured identity in the same transaction that
     /// creates the child. Never resolve a stale shell's name to a new bot.
     fn creator_id(
@@ -3232,7 +3379,8 @@ impl Database {
         };
         let mut statement = self.conn.prepare_cached(&format!(
             "SELECT name,head,workspace,status,running_turn,provider,family,model,reasoning,budget_tokens,tokens_used,tools,
-                    input_tokens,cached_input_tokens,id,created_by,created_by_id,gates,allowed,expire_ms,expires_at
+                    input_tokens,cached_input_tokens,id,created_by,created_by_id,gates,allowed,expire_ms,expires_at,
+                    work,budget_counts
              FROM bots WHERE {from}{maker}{running} ORDER BY name LIMIT ?2"
         ))?;
         let mut rows = statement.query(values.as_slice())?;
@@ -3246,7 +3394,9 @@ impl Database {
                 "running_turn":r.get::<_, Option<i64>>(4)?,"provider":r.get::<_, String>(5)?,
                 "family":r.get::<_, String>(6)?,"model":r.get::<_, String>(7)?,
                 "effort":r.get::<_, Option<String>>(8)?,
-                "budget_tokens":r.get::<_, Option<i64>>(9)?,"tokens_used":r.get::<_, i64>(10)?,
+                "budget_tokens":r.get::<_, Option<i64>>(9)?,
+                "budget_counts":Counts::from_stored(r.get::<_, Option<String>>(22)?.as_deref()),
+                "tokens_used":r.get::<_, i64>(10)?,"work_tokens":r.get::<_, i64>(21)?,
                 "tools":split_tools(&r.get::<_, String>(11)?),
                 "input_tokens":r.get::<_, i64>(12)?,"cached_input_tokens":r.get::<_, i64>(13)?,
                 "cache_hit":cache_hit(r.get::<_, i64>(13)?, r.get::<_, i64>(12)?),
@@ -3354,13 +3504,16 @@ impl Database {
     ) -> Result<(Bot, Option<Value>)> {
         // As sent, so a resend compares equal whatever has happened since;
         // the instructions by a fingerprint, never copied.
-        let request = binding.request_id.map(|_| json!({"op":"create","workspace":workspace,
+        let request = binding.request_id.map(|_| {
+            json!({"op":"create","workspace":workspace,
             "instructions":instructions_key(binding.instructions),
             "provider":binding.provider,"model":binding.model,"effort":binding.effort,
-            "budget_tokens":binding.budget_tokens,"tools":binding.tools,"created_by":binding.created_by,
+            "budget_tokens":binding.budget_tokens,"budget_counts":binding.budget_counts,
+            "tools":binding.tools,"created_by":binding.created_by,
             "created_by_id":binding.created_by_id,"compaction_model":binding.compaction_model,
             "fallback":binding.fallback,"gate":binding.gate,"settings":binding.settings,
-            "declare":binding.declared}));
+            "declare":binding.declared})
+        });
         if let Some(bot) = self.resent(name, binding.request_id, request.as_ref())? {
             if bot.compaction_instructions.as_deref() != binding.compaction_instructions {
                 return Err(conflict(name, "compaction_instructions"));
@@ -3395,7 +3548,7 @@ impl Database {
             None => binding.settings.clone(),
         };
         tx.execute(
-            "INSERT INTO bots(name,id,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,context_start,pruned_cursor,tools,created_by,created_by_id,compaction_instructions,compaction_model,fallback,gates,settings,creation,declared) VALUES (?,?,NULL,?,'idle',NULL,?,?,?,?,?,?,0,NULL,0,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO bots(name,id,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,context_start,pruned_cursor,tools,created_by,created_by_id,compaction_instructions,compaction_model,fallback,gates,settings,creation,declared,budget_counts) VALUES (?,?,NULL,?,'idle',NULL,?,?,?,?,?,?,0,NULL,0,?,?,?,?,?,?,?,?,?,?,?)",
             params![
                 name,
                 id,
@@ -3416,6 +3569,7 @@ impl Database {
                 settings.stored()?,
                 creation(binding.request_id, request),
                 declared,
+                binding.budget_counts.stored(),
             ],
         )?;
         // The event carries the list record's fields, so a follower can
@@ -5924,7 +6078,7 @@ impl Database {
             .conn
             .query_row(
                 "SELECT id,prompt,status,workspace,model,delivery,expected_turn,prompt_node,from_bot,from_turn,origin,reasoning,budget_tokens,images,
-                    person,quotes,wait_ms
+                    person,quotes,wait_ms,budget_counts
                  FROM turns WHERE bot=? AND request_id=?",
                 params![name, request_id],
                 |r| {
@@ -5970,6 +6124,9 @@ impl Database {
                                 None => Vec::new(),
                             },
                             budget_tokens: r.get::<_, Option<i64>>(12)?.map(|n| n as u64),
+                            budget_counts: Counts::from_stored(
+                                r.get::<_, Option<String>>(17)?.as_deref(),
+                            ),
                             // Checked by their digest below.
                             images: Vec::new(),
                             wait_ms: r.get::<_, Option<i64>>(16)?.map(|n| n as u64),
@@ -6008,6 +6165,7 @@ impl Database {
                 person,
                 quotes,
                 budget_tokens,
+                budget_counts,
                 images: _,
                 wait_ms,
             } = &saved_options;
@@ -6024,6 +6182,7 @@ impl Database {
                 ("person", *person != same.person),
                 ("quotes", *quotes != same.quotes),
                 ("budget_tokens", *budget_tokens != same.budget_tokens),
+                ("budget_counts", *budget_counts != same.budget_counts),
                 ("wait_ms", *wait_ms != same.wait_ms),
                 (
                     "images",
@@ -6135,7 +6294,9 @@ impl Database {
             return Err(Error::with("bot_busy", detail)
                 .facts(json!({"running_turn":bot.running_turn,"fork_point":bot.fork_point})));
         }
-        if let Some(budget) = bot.budget_tokens.filter(|b| bot.work.used >= *b) {
+        if let Some(budget) =
+            (bot.budget_tokens).filter(|b| bot.spent().of(bot.budget_counts) >= *b)
+        {
             return Err(budget_exhausted(&bot, budget));
         }
         // A bot keeps its folder; a turn that names one moves it there. An
@@ -6195,8 +6356,8 @@ impl Database {
             .query_row([], |r| r.get(0))?;
         tx.prepare_cached(
             "INSERT INTO turns(id,bot,request_id,prompt,status,workspace,model,delivery,expected_turn,from_bot,from_turn,from_id,origin,reasoning,budget_tokens,images,person,quotes,
-                wait_ms,due_ms)
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                wait_ms,due_ms,budget_counts)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         )?.execute(
             // Queued work keeps the folder it was sent to even if the bot
             // moves before it starts; a steer without one joins any turn.
@@ -6207,7 +6368,8 @@ impl Database {
                 options.effort, options.budget_tokens.map(|n| n as i64),
                 stored_images(&options.images)?, options.person, quotes,
                 options.wait_ms.map(|n| n as i64),
-                options.wait_ms.map(|n| epoch_ms().saturating_add(n as i64))],
+                options.wait_ms.map(|n| epoch_ms().saturating_add(n as i64)),
+                options.budget_counts.stored()],
         )?;
         if moved {
             tx.prepare_cached("UPDATE bots SET workspace=? WHERE name=?")?
@@ -6325,7 +6487,9 @@ impl Database {
                 .execute("UPDATE turns SET status='queued' WHERE id=?", [turn])?;
             return fail("bot_busy");
         }
-        if let Some(budget) = bot.budget_tokens.filter(|b| bot.work.used >= *b) {
+        if let Some(budget) =
+            (bot.budget_tokens).filter(|b| bot.spent().of(bot.budget_counts) >= *b)
+        {
             return Err(budget_exhausted(&bot, budget));
         }
         validate(&bot, model.as_deref())?;
@@ -9048,7 +9212,8 @@ impl Database {
     }
     /// The workspace and model reference a running turn must use.
     pub fn context(&self, turn: i64) -> Result<TurnContext> {
-        // Workspace, model, rounds, view sent, effort, cap, and tokens spent.
+        // Workspace, model, rounds, view sent, effort, cap, what it spent,
+        // and what the cap counts.
         type Row = (
             Option<String>,
             Option<String>,
@@ -9056,11 +9221,13 @@ impl Database {
             Option<bool>,
             Option<String>,
             Option<i64>,
-            i64,
+            Spend,
+            Counts,
         );
-        let (workspace, model, model_rounds, view_sent, reasoning, budget, spent): Row =
+        let (workspace, model, model_rounds, view_sent, reasoning, budget, spent, counts): Row =
             self.conn.query_row(
-                "SELECT workspace,model,model_rounds,view_sent,reasoning,budget_tokens,work
+                "SELECT workspace,model,model_rounds,view_sent,reasoning,budget_tokens,
+                        input_tokens+output_tokens,work,budget_counts
                FROM turns WHERE id=?",
                 [turn],
                 |r| {
@@ -9071,11 +9238,16 @@ impl Database {
                         r.get(3)?,
                         r.get(4)?,
                         r.get(5)?,
-                        r.get(6)?,
+                        Spend {
+                            tokens: r.get::<_, i64>(6)?.max(0) as u64,
+                            work: r.get::<_, i64>(7)?.max(0) as u64,
+                        },
+                        Counts::from_stored(r.get::<_, Option<String>>(8)?.as_deref()),
                     ))
                 },
             )?;
         let bot = self.active(turn)?;
+        let spent_now = bot.spent();
         let default = format!("{}/{}", bot.provider, bot.model);
         // A turn that started stored its prompt node then; steers absorbed
         // elsewhere and refusals never start, and the partial index skips
@@ -9106,15 +9278,15 @@ impl Database {
                 .ok_or(Error::new("workspace_required"))?,
             model: model.unwrap_or(default),
             effort: reasoning.or(bot.effort),
-            // Every token of the turn's work counts toward the bot's too, so
-            // the cap is where the bot's work will stand once the turn did it.
+            // Every token the turn counts counts toward the bot's too, so
+            // the cap is where the bot's count will stand once the turn
+            // spent it.
             budget: budget.map(|tokens| TurnBudget {
                 tokens: tokens as u64,
-                until: bot
-                    .work
-                    .used
-                    .saturating_sub(spent.max(0) as u64)
+                until: (spent_now.of(counts))
+                    .saturating_sub(spent.of(counts))
                     .saturating_add(tokens as u64),
+                counts,
             }),
             previous_call,
             created_by: bot.created_by,
@@ -10258,6 +10430,7 @@ impl Database {
             checkpoint: node,
             workspace,
             budget_tokens,
+            budget_counts,
             created_by,
             created_by_id,
             gate,
@@ -10267,7 +10440,8 @@ impl Database {
         } = fork;
         let request = request_id.map(|_| {
             json!({"op":"fork","source":source,"checkpoint":node,
-            "workspace":workspace,"budget_tokens":budget_tokens,"created_by":created_by,
+            "workspace":workspace,"budget_tokens":budget_tokens,"budget_counts":budget_counts,
+            "created_by":created_by,
             "created_by_id":created_by_id,"gate":gate,"allow":allow,"expire_ms":expire_ms})
         });
         if let Some(bot) = self.resent(name, request_id, request.as_ref())? {
@@ -10359,7 +10533,7 @@ impl Database {
             None => parent.settings.clone(),
         };
         tx.execute(
-            "INSERT INTO bots(name,id,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,context_start,pruned_cursor,tools,created_by,created_by_id,compaction_instructions,compaction_model,cache_bot,thinking_prefix,thinking_floor,fallback,thinking_from,thinking_to,thinking_elided,gates,allowed,settings,creation,expire_ms,expires_at,declared) VALUES (?,?,?,?,'idle',NULL,?,?,?,?,?,?,0,NULL,0,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO bots(name,id,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,context_start,pruned_cursor,tools,created_by,created_by_id,compaction_instructions,compaction_model,cache_bot,thinking_prefix,thinking_floor,fallback,thinking_from,thinking_to,thinking_elided,gates,allowed,settings,creation,expire_ms,expires_at,declared,budget_counts) VALUES (?,?,?,?,'idle',NULL,?,?,?,?,?,?,0,NULL,0,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             params![
                 name,
                 id,
@@ -10395,6 +10569,7 @@ impl Database {
                 expire_ms.map(|ms| ms as i64),
                 expire_ms.map(|ms| epoch_ms().saturating_add(ms as i64)),
                 stored_declared(&parent.declared)?,
+                budget_counts.stored(),
             ],
         )?;
         if let Some(node) = checkpoint {
@@ -11413,7 +11588,7 @@ impl Database {
                     length(CASE WHEN t.prompt_node IS NULL THEN t.prompt ELSE json_extract(CAST(COALESCE(d.item,n.item) AS TEXT),'$.content[0].text') END),
                     t.delivery,COALESCE(t.reasoning,t.inherited_reasoning,
                         CASE WHEN t.bot_model IS NULL THEN b.reasoning ELSE t.bot_reasoning END),t.summary_ms,
-                    t.budget_tokens
+                    t.budget_tokens,t.budget_counts
              FROM turns t JOIN bots b ON b.name=t.bot LEFT JOIN nodes n ON n.id=t.prompt_node
              LEFT JOIN declined d ON d.node=t.prompt_node
              WHERE t.bot=?1 AND t.id>?2 AND t.id<?3 ORDER BY t.id {order} LIMIT ?4"
@@ -11436,7 +11611,13 @@ impl Database {
             turn["delivery"] = json!(r.get::<_, String>(at + 4)?);
             turn["effort"] = json!(r.get::<_, Option<String>>(at + 5)?);
             turn["summary_ms"] = json!(r.get::<_, i64>(at + 6)?);
-            turn["budget_tokens"] = json!(r.get::<_, Option<i64>>(at + 7)?);
+            let budget = r.get::<_, Option<i64>>(at + 7)?;
+            turn["budget_tokens"] = json!(budget);
+            if budget.is_some() {
+                turn["budget_counts"] = json!(Counts::from_stored(
+                    r.get::<_, Option<String>>(at + 8)?.as_deref()
+                ));
+            }
             turn["cache_hit"] = json!(cache_hit(
                 turn["cached_input_tokens"].as_i64().unwrap_or(0),
                 turn["input_tokens"].as_i64().unwrap_or(0)
@@ -13853,6 +14034,8 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
              ALTER TABLE bots ADD COLUMN carried_model TEXT;
              ALTER TABLE turns ADD COLUMN work INTEGER NOT NULL DEFAULT 0;
              ALTER TABLE turns ADD COLUMN limited TEXT;
+             ALTER TABLE bots ADD COLUMN budget_counts TEXT;
+             ALTER TABLE turns ADD COLUMN budget_counts TEXT;
              UPDATE bots SET work=tokens_used,carried=CASE WHEN head IS NOT NULL THEN 0 END;
              UPDATE turns SET work=input_tokens+output_tokens WHERE input_tokens+output_tokens>0;",
         )?;

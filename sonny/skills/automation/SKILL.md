@@ -99,9 +99,9 @@ and returns its `outcome` and the `handle` of the turn it sent, to pass to
 
 An automation's `turn_budget_tokens` caps each run on its own: once a call
 reaches it, the run's next call goes without tool calls, and the run ends on
-its reply. It
-counts what each run adds, its new input and its output, not the history it
-re-reads. Set one only when the person asks for a spending limit.
+its reply. It counts every request's input, the agent's history included, so
+a cap below that history ends every run on its first reply: set one only when
+the person asks for a spending limit.
 
 ## Monitors
 
