@@ -195,6 +195,8 @@ def run(binary, rounds, judge, *, providers, reasoning, note, parallel, out):
             else:
                 counts['false_deny'] += 1
     times = [line['judge_ms'] for line in judged.values()]
+    timed = [line for line in judged.values()
+             if line.get('attempts') and line.get('timed_attempts') == line['attempts']]
     tokens = {k: sum(line.get(k, 0) for line in judged.values())
               for k in ('input_tokens', 'cached_tokens', 'output_tokens')}
     return {
@@ -203,17 +205,20 @@ def run(binary, rounds, judge, *, providers, reasoning, note, parallel, out):
         'judge_failed': len(failures), 'judged_again': extra,
         'judge_ms': {q: percentile(times, f) for q, f in (('p50', .5), ('p90', .9), ('p99', .99))},
         'judge_ms_max': max(times) if times else None,
-        # Where the judge time went, each part's p50 and p90: reading the
-        # turn for evidence, waiting for a slot, the model's rounds before
-        # its answer, the tools it looked with, the answering round, the
-        # attempts before the last; and the rounds and retries counted.
-        'split_ms': {part: {q: percentile([line.get(part, 0) for line in judged.values()], f)
+        # Where the judge time went, each part's p50 and p90 over the checks
+        # every attempt of which was timed: reading the turn for evidence,
+        # waiting for a slot, the model's rounds before its answer, the
+        # tools it looked with, the answering round; and the rounds and
+        # retries counted. A check whose last attempt was still running
+        # when it gave up is counted apart, never as zeros.
+        'split_ms': {part: {q: percentile([line[part] for line in timed], f)
                             for q, f in (('p50', .5), ('p90', .9))}
                      for part in ('evidence_ms', 'queued_ms', 'looking_ms', 'tools_ms',
-                                  'verdict_ms', 'paced_ms', 'retried_ms')},
-        'counts': {part: {q: percentile([line.get(part, 0) for line in judged.values()], f)
+                                  'verdict_ms', 'paced_ms')},
+        'counts': {part: {q: percentile([line[part] for line in timed], f)
                           for q, f in (('p50', .5), ('p90', .9))}
                    for part in ('model_rounds', 'provider_retries', 'attempts')},
+        'untimed': len(judged) - len(timed),
         'tokens': tokens, 'wall_s': round(wall, 1),
     }
 

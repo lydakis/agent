@@ -56,6 +56,17 @@ pub struct Timing {
 }
 
 impl Timing {
+    /// Add `other`'s times and counts to these: one check's attempts.
+    pub fn add(&mut self, other: &Timing) {
+        self.queued_ms += other.queued_ms;
+        self.looking_ms += other.looking_ms;
+        self.tools_ms += other.tools_ms;
+        self.verdict_ms += other.verdict_ms;
+        self.paced_ms += other.paced_ms;
+        self.rounds += other.rounds;
+        self.retries += other.retries;
+    }
+
     /// The time of a judge's turn, from its row in `turns`, the time it
     /// was `submitted`, and each of its history's entries in order, as
     /// when it was written and whether it is a tool's output. A tool's
@@ -107,6 +118,15 @@ fn epoch_ms() -> i64 {
         .map_or(0, |since| since.as_millis() as i64)
 }
 
+/// Whether a history item is a tool's output: a `function_call_output`,
+/// or a message of `tool_result` blocks, as the Anthropic family keeps them.
+fn tool_output(item: &Value) -> bool {
+    item["type"] == "function_call_output"
+        || (item["role"] == "user"
+            && (item["content"].as_array().into_iter().flatten())
+                .any(|block| block["type"] == "tool_result"))
+}
+
 /// Each history entry of `bot`'s turn `turn`, oldest first, as when it
 /// was written and whether it is a tool's output. Empty when it could not
 /// be read: the time then reads as all the verdict's.
@@ -140,8 +160,7 @@ async fn entries(client: &Client, bot: &str, turn: i64) -> Vec<(i64, bool)> {
         .filter_map(|entry| {
             let node = entry["node"].as_i64()?;
             let at = written.get(&node.to_string())?.as_i64()?;
-            let kind = entry["item"]["type"].as_str();
-            Some((node, at, kind == Some("function_call_output")))
+            Some((node, at, tool_output(&entry["item"])))
         })
         .collect();
     entries.sort_unstable();
@@ -159,12 +178,16 @@ pub struct Failed {
     /// answers: whole, so whoever logs it redacts it before [`excerpt`]
     /// cuts it, and no secret is cut where redaction would miss it.
     pub reply: Option<String>,
+    /// Where the judge's turn spent its time, when it ended: none for one
+    /// that never started or was still running when the check gave up.
+    pub timing: Option<Timing>,
 }
 
 fn failed(why: impl Into<String>) -> Failed {
     Failed {
         why: why.into(),
         reply: None,
+        timing: None,
     }
 }
 
@@ -416,13 +439,18 @@ pub async fn turn_with(
     if outcome["pending"] == true {
         return (Err(failed("the check timed out")), Some(turn));
     }
+    let usage = usage(client, name, turn, submitted_ms).await;
     if outcome["status"] != "completed" {
         let why = format!(
             "the judge's turn {}: {}",
             outcome["status"].as_str().unwrap_or("ended"),
             outcome["error"].as_str().unwrap_or("no answer")
         );
-        return (Err(failed(why)), None);
+        let failed = Failed {
+            timing: Some(usage.timing),
+            ..failed(why)
+        };
+        return (Err(failed), None);
     }
     let text = outcome["text"].as_str().unwrap_or_default();
     let parsed = match outcome["text_truncated"] == true {
@@ -435,28 +463,33 @@ pub async fn turn_with(
             let failed = Failed {
                 why,
                 reply: Some(text.to_owned()),
+                timing: Some(usage.timing),
             };
             return (Err(failed), None);
         }
     };
+    (Ok((answers, usage)), None)
+}
+
+/// The tokens and time of `bot`'s ended turn `turn`, sent at `submitted_ms`.
+async fn usage(client: &Client, bot: &str, turn: i64, submitted_ms: i64) -> Usage {
     let read = client
-        .request("turns", json!({"bot": name, "after": turn - 1, "limit": 1}))
+        .request("turns", json!({"bot": bot, "after": turn - 1, "limit": 1}))
         .await
         .unwrap_or_default();
     let row = &read["turns"][0];
     let tokens = |key: &str| row[key].as_u64().unwrap_or(0);
     // A turn of one round looked at nothing: its history says no more.
     let entries = match tokens("model_rounds") > 1 {
-        true => entries(client, name, turn).await,
+        true => entries(client, bot, turn).await,
         false => Vec::new(),
     };
-    let usage = Usage {
+    Usage {
         input: tokens("input_tokens"),
         cached: tokens("cached_input_tokens"),
         output: tokens("output_tokens"),
         timing: Timing::of(row, submitted_ms, &entries),
-    };
-    (Ok((answers, usage)), None)
+    }
 }
 
 /// Delete a judge's fork, ending its turn first if it still runs. One that
@@ -515,6 +548,14 @@ mod tests {
             (once.looking_ms, once.tools_ms, once.verdict_ms),
             (0, 0, 8_000)
         );
+        // Either family's tool results are outputs; words are not.
+        assert!(tool_output(
+            &json!({"type": "function_call_output", "call_id": "c1"})
+        ));
+        assert!(tool_output(&json!({"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "t1", "content": "ok"}]})));
+        assert!(!tool_output(&json!({"role": "user", "content": [
+            {"type": "input_text", "text": "look"}]})));
         // A turn not yet ended has no time to split.
         assert_eq!(
             Timing::of(&json!({"started_ms": 1}), 0, &[]),
