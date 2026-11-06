@@ -173,7 +173,9 @@ submitting client. `--delivery queue` or `steer` hands a busy bot the work
 instead of getting `bot_busy` ([delivery modes](#delivery-modes)). A controller can inspect metadata through `ls` or observe events through
 `follow` from outside a shell tool. Full records remain available via the protocol.
 
-Shell tool processes receive `AGENT_BIN`, an absolute `AGENT_STORE`,
+Shell tool processes receive `AGENT_BIN` (the daemon's own program, or the
+path its starter gave in `AGENT_BIN` when that names the same program, as a
+client that starts the daemon under a name of its own does), an absolute `AGENT_STORE`,
 `AGENT_SOCKET` when a socket is configured, and `AGENT_MODEL`, the running
 turn's effective model, so newly created peers default to its model.
 Continuing an existing peer keeps that peer's stored model unless `--model`
@@ -1465,7 +1467,9 @@ name, the sandbox's four as `sandbox`) that differed; the same request again
 changes nothing, so a resend is harmless. A change is told to the bot's
 followers as a live `configured` event with the same fields, which is not
 kept, so a client that attaches later reads the bot as it is. It is refused with `bot_busy`
-while a turn runs or waits parked, and the next turn sends the
+while a turn runs or waits parked, except a change of `rules` alone, which
+the running turn's next round takes ([command rules](#command-rules));
+otherwise the next turn sends the
 new instructions: the provider's cache of the old ones is not read again,
 replayed thinking written after them is withheld as when any context in
 front of it changes, and a fork keys its own prompt cache from then on.
@@ -2857,8 +2861,11 @@ only as trusted as the folders there. A turn takes its bot's rules when
 its first round begins, and each call a round plans keeps what they made
 of it, which a parked turn reads back as it resumes: a call runs as its
 round was announced, also after a park or a restart and whatever the
-rules say by then. A turn started after a `configure` takes the new
-rules.
+rules say by then. A `configure` that changes only `rules` is taken while
+a turn runs: its next round, and every one after, rules its calls by the
+new ones; a turn parked then reads them as it resumes. The bots it made,
+and theirs, go by its rules, and so do their running turns, each from its
+next round.
 
 A bot made by another (its `created_by`) goes by its creator's rules: it
 takes them when it is made, whatever its own client gives, and follows
@@ -2948,7 +2955,8 @@ stops waiting: `expire_ms` after it started (1 to 3,600,000, default
 60,000). A client finds such calls by following the bot, or every bot with
 `*`, and lists those still waiting with
 `{"op":"tool_calls","tag","after"?,"limit"?}`: oldest first, each with
-`bot`, `turn`, `call_id`, `name`, `arguments` and `expires_ms`, at most
+`bot`, `turn`, `call_id`, `name`, `arguments`, `expires_ms` and
+`taken_ms`, at most
 `limit` (1 to 256, default 64) and 256 KiB a page, continued from
 `next_after`. It answers with
 `{"op":"tool_result","bot","turn","call_id","output"}`, the text the model
@@ -2967,6 +2975,22 @@ picture does. The client scales a picture; the daemon sends it as given. The fir
 `call_already_answered`, one for a call that ended or ran out of time is
 `no_pending_call` or, once its turn ended, `stale_turn`. There is no lease: a tag is the client's
 to serve.
+
+Protocol version 49 lets a client take a call before it runs it, so that
+no call runs twice: `{"op":"take_call","bot","turn","call_id"}` records
+when (`taken_ms`, returned with `bot`, `turn` and `call_id`), and the
+calls `tool_calls` lists say it, `null` for one not taken. A second take,
+by a client that restarted or by another one, is `call_taken` with the
+first take's `taken_ms` beside its detail; the call may have done its work,
+and only the client that took it knows, so a client answers such a call
+rather than running it again (Sonny answers `tool_outcome_unknown`). A take
+is refused as an answer is: an answered call is `call_already_answered`,
+one that ended or ran out of time is `no_pending_call` or `stale_turn`.
+Taking is the client's choice and never expires; a taken call is answered
+with `tool_result` as before. The daemon never runs its own tools twice
+either: one a restart cut off ends `tool_outcome_unknown`. Schema 79 counts
+every call still unanswered when a store upgrades to it as taken, since an
+older client may have run it with nothing to say so.
 
 The call waits as a gated call waits for its verdict. Its turn holds live
 for the bot's `approval_hold_ms`, but at most 250 ms, and an answer in that

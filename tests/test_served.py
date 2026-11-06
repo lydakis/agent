@@ -91,6 +91,51 @@ class ServedToolTests(ModelFixture):
         subprocess.run(['git', '-c', 'user.name=t', '-c', 'user.email=t@example.com', *args], cwd=folder,
                        check=True, capture_output=True)
 
+    @unittest.skipUnless(shutil.which('bwrap') or sys.platform == 'darwin', 'sandboxes need bubblewrap')
+    def test_a_rule_reaches_an_agent_at_work_at_its_next_round(self):
+        self.daemon.close()
+        self.daemon = SocketClient(self.binary, self.store, self.url, 'shell')
+        self.addCleanup(self.daemon.close)
+        rules = self.path / '.agent/rules/default.rules'
+        rules.parent.mkdir(parents=True)
+        rules.write_text('prefix_rule(pattern=["cp"], decision="prompt")\n')
+        self.daemon.request('create', bot='calc.lead', workspace=str(self.path), model='openai/synthetic-model',
+                            instructions='Lead.', settings={'sandbox': 'workspace-write'},
+                            declare=[declared('show_agent')], approve=['shell'], approver='manual')
+        self.host()
+
+        def ruled(word):
+            deadline = time.monotonic() + 20
+            while word not in json.dumps(self.daemon.request('inspect', bot='calc.lead')['result']['settings']):
+                self.assertLess(time.monotonic(), deadline, f'no rule for {word} reached the agent')
+                time.sleep(.1)
+        ruled('cp')
+        self.model.call_script = [('shell', {'command': f'cp /dev/null {self.path}/copied'}),
+                                  ('shell', {'command': f'mkdir {self.path}/made'})]
+        turn = self.daemon.request('submit', bot='calc.lead', request_id='work', prompt='script')['result']['turn']
+        deadline = time.monotonic() + 20
+        while not (asked := self.daemon.request('approvals', bot='calc.lead')['result']['approvals']):
+            self.assertLess(time.monotonic(), deadline, 'no approval was asked')
+            time.sleep(.05)
+        # While it waits, the person forbids what it does next and gives its
+        # model a fallback, which waits for it to be idle.
+        rules.write_text('prefix_rule(pattern=["cp"], decision="prompt")\n'
+                         'prefix_rule(pattern=["mkdir"], decision="forbidden")\n')
+        (self.path / '.agent/config.toml').write_text('[fallbacks]\n"openai/synthetic-model" = "openai/other"\n')
+        ruled('mkdir')
+        self.assertIsNone(self.daemon.request('inspect', bot='calc.lead')['result']['fallback'])
+        [call] = asked
+        self.daemon.request('answer', bot='calc.lead', turn=turn, call_id=call['call_id'], request=call['request'],
+                            decision='allow', by='test')
+        self.assertEqual(self.daemon.finished(turn, 30)['data']['status'], 'completed')
+        self.assertEqual(json.loads(self.output('calc.lead', turn))['error'], 'command_forbidden')
+        self.assertFalse((self.path / 'made').exists())
+        # Idle, it takes the rest.
+        deadline = time.monotonic() + 20
+        while self.daemon.request('inspect', bot='calc.lead')['result']['fallback'] != 'openai/other':
+            self.assertLess(time.monotonic(), deadline, 'the fallback never reached the agent')
+            time.sleep(.1)
+
     def test_a_lead_starts_a_task_in_a_worktree_of_its_own(self):
         repo = self.path / 'calc'
         repo.mkdir()
@@ -175,7 +220,7 @@ class ServedToolTests(ModelFixture):
         self.assertFalse((self.path / 'setup.done').exists())
         self.assertEqual(self.daemon.request('bots', name='calc.fix')['result']['bots'], [])
 
-    def test_a_tool_host_that_gives_way_mid_setup_stops_it_and_the_next_serves_the_call(self):
+    def test_a_tool_host_that_gives_way_mid_setup_stops_it_and_the_next_never_runs_it_again(self):
         repo = self.path / 'calc'
         (repo / '.agents').mkdir(parents=True)
         setup = repo / '.agents/setup'
@@ -205,9 +250,11 @@ class ServedToolTests(ModelFixture):
         while running(first):
             self.assertLess(time.monotonic(), deadline, 'the first setup still runs')
             time.sleep(.05)
+        # The call was taken and stopped part way: the next host answers
+        # that its outcome is unknown, and runs no second setup.
         self.assertEqual(self.daemon.finished(turn)['data']['status'], 'completed')
-        self.assertTrue(self.output('calc.lead', turn).startswith('Started calc.fix: '))
-        self.assertEqual(len(pids.read_text().split()), 2)
+        self.assertEqual(json.loads(self.output('calc.lead', turn))['error'], 'tool_outcome_unknown')
+        self.assertEqual(len(pids.read_text().split()), 1)
 
     def test_a_start_the_person_denies_runs_no_setup(self):
         repo = self.path / 'calc'

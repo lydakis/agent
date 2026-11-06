@@ -2889,6 +2889,116 @@ pub fn at_start() {
     });
 }
 
+/// The nightly memory cleanup is on by default: the first Sonny to open a
+/// lead schedules it, on that lead's model, as `memory schedule --model`
+/// would. Once scheduled it is the person's: one they removed stays
+/// removed, since the memory folder it made a repository says it was
+/// scheduled ([`agent_client::memory::scheduled_once`]). One that could not
+/// be scheduled (no scheduler here) says why in `/background` until it is
+/// ([`cleanup_unscheduled`]), and is tried again at the next start.
+pub fn cleanup_by_default(lead: &Value, store: &Path, socket: &Path) {
+    let (Some(home), Some(sonny)) = (
+        std::env::var_os("HOME").map(PathBuf::from),
+        crate::skills::sonny_path(),
+    ) else {
+        return;
+    };
+    if let Some(mut schedule) = cleanup_schedule(&home, &sonny, lead, store, socket) {
+        std::thread::spawn(move || {
+            let failure = cleanup_failure(schedule.output());
+            settle_cleanup(&home, failure.as_deref(), now());
+        });
+    }
+}
+
+/// Where why Sonny could not schedule the nightly cleanup is kept, until
+/// it can.
+fn cleanup_unscheduled_path(home: &Path) -> PathBuf {
+    home.join(".agent/sonny/cleanup-not-scheduled.json")
+}
+
+/// Why a `sonny memory schedule` did not schedule the cleanup: the error
+/// it printed, else how it ended. None when it did.
+fn cleanup_failure(said: std::io::Result<std::process::Output>) -> Option<String> {
+    let out = match said {
+        Ok(out) if out.status.success() => return None,
+        Ok(out) => out,
+        Err(error) => return Some(format!("could not run sonny memory schedule: {error}")),
+    };
+    let text = |bytes: &[u8]| String::from_utf8_lossy(bytes).trim().to_owned();
+    let printed = [text(&out.stderr), text(&out.stdout)]
+        .into_iter()
+        .find(|t| !t.is_empty());
+    let Some(printed) = printed else {
+        return Some(format!("sonny memory schedule ended: {}", out.status));
+    };
+    let last = printed.lines().last().unwrap_or_default();
+    Some(match serde_json::from_str::<Value>(last) {
+        Ok(error) if error["error"].is_string() => match error["detail"].as_str() {
+            Some(detail) => format!("{}: {detail}", error["error"].as_str().unwrap_or_default()),
+            None => error["error"].as_str().unwrap_or_default().to_owned(),
+        },
+        _ => last.to_owned(),
+    })
+}
+
+/// Keep why the cleanup could not be scheduled, or, once it was, forget it.
+fn settle_cleanup(home: &Path, failure: Option<&str>, at: i64) {
+    let path = cleanup_unscheduled_path(home);
+    match failure {
+        None => {
+            let _ = std::fs::remove_file(&path);
+        }
+        Some(why) => {
+            if let Some(dir) = path.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            let _ = replace(&path, &json!({"why": why, "at": at}).to_string());
+        }
+    }
+}
+
+/// Why the nightly cleanup Sonny turns on by default is not scheduled, and
+/// when it last tried, while it is not: none once it was scheduled, by
+/// Sonny or the person, and so none after the person removed it, which is
+/// their choice, not a failure. Each window's background count asks every
+/// ten seconds: mostly one open of a file that is not there.
+pub fn cleanup_unscheduled(home: &Path) -> Option<(String, i64)> {
+    let kept = read_json(&cleanup_unscheduled_path(home))?;
+    if agent_client::memory::scheduled_once(home) {
+        return None;
+    }
+    Some((kept["why"].as_str()?.to_owned(), kept["at"].as_i64()?))
+}
+
+/// The `sonny memory schedule` that turns the cleanup on, unless it was
+/// scheduled here before or the lead has no model to run it on.
+fn cleanup_schedule(
+    home: &Path,
+    sonny: &Path,
+    lead: &Value,
+    store: &Path,
+    socket: &Path,
+) -> Option<std::process::Command> {
+    let model = format!("{}/{}", lead["provider"].as_str()?, lead["model"].as_str()?);
+    if agent_client::memory::scheduled_once(home) {
+        return None;
+    }
+    let mut schedule = std::process::Command::new(sonny);
+    // Absolute: `schedule` works in the memory folder, and adds the
+    // automation from there.
+    let absolute = |p: &Path| std::path::absolute(p).unwrap_or_else(|_| p.to_owned());
+    // Sonny's own, not an agent's: the automation is no agent's.
+    schedule
+        .args(["memory", "schedule", "--model", &model])
+        .env("AGENT_STORE", absolute(store))
+        .env("AGENT_SOCKET", absolute(socket))
+        .env_remove("AGENT_BOT")
+        .env_remove("AGENT_BOT_ID")
+        .stdin(std::process::Stdio::null());
+    Some(schedule)
+}
+
 /// Each trigger made when it was a job of the system's own (a LaunchAgent
 /// or a user service of its own, under [`LABEL`]) becomes a definition for
 /// the scheduler, and the system lets go of its job. Only one made from
@@ -5145,9 +5255,6 @@ fn fire(places: &Places, trigger: &Trigger, ask: Option<&Asked>) {
         .gate
         .as_deref()
         .map(|c| gate(c, trigger.dir.as_deref(), &trigger.daemon));
-    let checked = |gate: &str, detail: Option<&String>| {
-        named(json!({"checked_ms": now * 1000, "gate": gate, "detail": detail}))
-    };
     // A check that broke is told once, and that it works again once: an
     // `--if` that fails every minute is one note, not one a minute.
     let news = said
@@ -5160,12 +5267,9 @@ fn fire(places: &Places, trigger: &Trigger, ask: Option<&Asked>) {
         Some(news @ GateNews::Works) => !tell_gate(trigger, &kept, news),
         None => kept.checked["told"] == true,
     };
+    let before = kept.checked.clone();
     let checked = |gate: &str, detail: Option<&String>| {
-        let mut checked = checked(gate, detail);
-        if told {
-            checked["told"] = json!(true);
-        }
-        checked
+        named(checked_now(&before, gate, detail, now * 1000, told))
     };
     match said {
         None => {}
@@ -5191,7 +5295,9 @@ fn fire(places: &Places, trigger: &Trigger, ask: Option<&Asked>) {
         }
         Some(Err(broken)) => {
             kept.checked = checked("failed", Some(&broken));
-            let failed = named(json!({"outcome": "failed", "detail": broken}));
+            // Its `--if` could not answer: no run, and a later check that
+            // answers ends this failure (the person's `/background` says so).
+            let failed = named(json!({"outcome": "failed", "detail": broken, "gate": "failed"}));
             settle(places, trigger, &failed, &kept);
             return;
         }
@@ -5201,6 +5307,34 @@ fn fire(places: &Places, trigger: &Trigger, ask: Option<&Asked>) {
     });
     let (Ok(outcome) | Err(outcome)) = outcome;
     settle(places, trigger, &named(outcome), &kept);
+}
+
+/// What a check of an `--if` leaves on the trigger's row (`checked`): when
+/// it ran (`now_ms`), what it said (`go`, `no` or `failed`), why, and
+/// whether a break is told. One that could not answer keeps when the checks
+/// first could not (`since_ms`), so a gate that fails every minute is one
+/// break, not one a minute.
+fn checked_now(
+    before: &Value,
+    gate: &str,
+    detail: Option<&String>,
+    now_ms: i64,
+    told: bool,
+) -> Value {
+    let mut checked = json!({"checked_ms": now_ms, "gate": gate, "detail": detail});
+    if told {
+        checked["told"] = json!(true);
+    }
+    if gate == "failed" {
+        checked["since_ms"] = match before["gate"] == "failed" {
+            true => before["since_ms"].clone(),
+            false => Value::Null,
+        };
+        if checked["since_ms"].is_null() {
+            checked["since_ms"] = json!(now_ms);
+        }
+    }
+    checked
 }
 
 /// A repeating trigger's `--if` that said no: its row says so, its last
@@ -5526,6 +5660,23 @@ pub(crate) mod tests {
                 .prompt(&s)
                 .ends_with(" · its --if works again]")
         );
+    }
+
+    #[test]
+    fn a_check_that_cannot_answer_keeps_when_the_break_began() {
+        let why = "--if: exit status: 2".to_owned();
+        let first = checked_now(&Value::Null, "failed", Some(&why), 1_000, true);
+        assert_eq!(
+            (&first["since_ms"], &first["told"]),
+            (&json!(1_000), &json!(true))
+        );
+        let again = checked_now(&first, "failed", Some(&why), 61_000, true);
+        assert_eq!(again["checked_ms"], 61_000);
+        assert_eq!(again["since_ms"], 1_000, "one break, however many checks");
+        let works = checked_now(&again, "no", None, 121_000, false);
+        assert!(works["since_ms"].is_null());
+        let next = checked_now(&works, "failed", Some(&why), 181_000, false);
+        assert_eq!(next["since_ms"], 181_000, "a new break");
     }
 
     #[test]
@@ -8289,5 +8440,109 @@ pub(crate) mod tests {
             Job::read(&w.plist(&s.name)).unwrap().watch,
             Some(PathBuf::from("/repo/50%"))
         );
+    }
+
+    #[test]
+    fn the_nightly_cleanup_is_scheduled_once_on_the_leads_model_and_stays_removed() {
+        let home = std::env::temp_dir().join(format!("cleanup-default-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let lead = json!({"provider": "openai", "model": "mini"});
+        let (sonny, store, socket) = (
+            Path::new("/bin/sonny"),
+            Path::new("/s.sqlite"),
+            Path::new("/s.sock"),
+        );
+        let schedule = cleanup_schedule(&home, sonny, &lead, store, socket).unwrap();
+        let args: Vec<_> = schedule
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args, ["memory", "schedule", "--model", "openai/mini"]);
+        let env: Vec<_> = schedule
+            .get_envs()
+            .map(|(k, v)| (k.to_owned(), v.map(|v| v.to_owned())))
+            .collect();
+        assert!(
+            env.contains(&("AGENT_STORE".into(), Some("/s.sqlite".into()))),
+            "{env:?}"
+        );
+        assert!(env.contains(&("AGENT_BOT".into(), None)), "{env:?}");
+        // A lead with no model says nothing to run it on.
+        assert!(cleanup_schedule(&home, sonny, &json!({}), store, socket).is_none());
+        // A relative socket is the one Sonny was given, wherever the
+        // schedule then works.
+        let here = std::env::current_dir().unwrap();
+        let relative = cleanup_schedule(&home, sonny, &lead, store, Path::new("s.sock")).unwrap();
+        let socket_given = relative
+            .get_envs()
+            .find(|(k, _)| *k == "AGENT_SOCKET")
+            .unwrap()
+            .1;
+        assert_eq!(socket_given, Some(here.join("s.sock").as_os_str()));
+        // Scheduled once, by Sonny or the person, the memory folder is a
+        // repository: removed since, it is not scheduled again.
+        std::fs::create_dir_all(home.join(".agents/memory/.git")).unwrap();
+        std::fs::write(
+            home.join(".agents/memory/.git/HEAD"),
+            "ref: refs/heads/main\n",
+        )
+        .unwrap();
+        assert!(cleanup_schedule(&home, sonny, &lead, store, socket).is_none());
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn a_cleanup_that_could_not_be_scheduled_says_why_until_it_is() {
+        use std::os::unix::process::ExitStatusExt;
+        let home = std::env::temp_dir().join(format!("cleanup-unscheduled-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let ended = |code: i32, stdout: &str, stderr: &str| {
+            Ok(std::process::Output {
+                status: std::process::ExitStatus::from_raw(code << 8),
+                stdout: stdout.as_bytes().to_vec(),
+                stderr: stderr.as_bytes().to_vec(),
+            })
+        };
+        assert_eq!(cleanup_failure(ended(0, "{}", "")), None);
+        let refused = r#"{"error":"automations_unsupported","detail":"no scheduler here"}"#;
+        let why = cleanup_failure(ended(1, "", refused)).unwrap();
+        assert_eq!(why, "automations_unsupported: no scheduler here");
+        assert_eq!(
+            cleanup_failure(ended(1, "", "boom\nlast words")).as_deref(),
+            Some("last words")
+        );
+        assert!(
+            cleanup_failure(ended(1, "", ""))
+                .unwrap()
+                .starts_with("sonny memory schedule ended")
+        );
+        let missing = Err(std::io::Error::from(std::io::ErrorKind::NotFound));
+        assert!(
+            cleanup_failure(missing)
+                .unwrap()
+                .starts_with("could not run")
+        );
+        // Kept until a try goes, and shown while nothing is scheduled.
+        assert_eq!(cleanup_unscheduled(&home), None);
+        settle_cleanup(&home, Some(&why), 1_790_000_000);
+        assert_eq!(
+            cleanup_unscheduled(&home),
+            Some((why.clone(), 1_790_000_000))
+        );
+        settle_cleanup(&home, None, 1_790_000_100);
+        assert_eq!(cleanup_unscheduled(&home), None);
+        // Scheduled once, then removed by the person: their choice, never
+        // shown as a failure, whatever an older try kept.
+        settle_cleanup(&home, Some(&why), 1_790_000_200);
+        std::fs::create_dir_all(home.join(".agents/memory/.git")).unwrap();
+        std::fs::write(
+            home.join(".agents/memory/.git/HEAD"),
+            "ref: refs/heads/main\n",
+        )
+        .unwrap();
+        assert_eq!(cleanup_unscheduled(&home), None);
+        std::fs::remove_dir_all(home).unwrap();
     }
 }

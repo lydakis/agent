@@ -519,6 +519,13 @@ enum Command {
         output: Option<ToolOutput>,
         error: Option<ToolError>,
     },
+    /// Take a declared call this client answers, to run it: refused with
+    /// `call_taken` once any client took it, so it never runs twice.
+    TakeCall {
+        bot: String,
+        turn: i64,
+        call_id: String,
+    },
     /// Put one step of a declared call this client answers to the bot's
     /// gates that name the tool, and answer once it is decided: a script's
     /// nested call, say. `step` is the client's id for it within the call.
@@ -1336,6 +1343,9 @@ struct Active {
     lift: Arc<turn::Lift>,
     /// Released by the task before it submits its finish ([`Slot::release`]).
     slot: Slot,
+    /// Command rules a `configure` gave while the turn runs, which its next
+    /// round takes.
+    given_rules: Arc<std::sync::Mutex<Option<Arc<agent_runtime::rules::Rules>>>>,
 }
 impl Active {
     /// The running turn, unless it has committed or is committing its end;
@@ -1538,7 +1548,7 @@ pub async fn run(config: Configuration) -> Result<()> {
     let mut environment = vec![
         (
             "AGENT_BIN".into(),
-            std::env::current_exe()?.to_string_lossy().into_owned(),
+            agent_bin()?.to_string_lossy().into_owned(),
         ),
         (
             "AGENT_STORE".into(),
@@ -2205,6 +2215,7 @@ impl Service {
                 return refuse("serve approvals");
             }
             Command::ToolResult { .. } => return refuse("answer a declared tool call"),
+            Command::TakeCall { .. } => return refuse("take a declared tool call"),
             Command::ApproveStep { .. } => return refuse("put a declared call's step to a gate"),
             Command::StepResult { .. } => return refuse("record a declared call's step"),
             Command::Shutdown { .. } => return refuse("stop the daemon"),
@@ -3119,6 +3130,7 @@ impl Service {
         if lifted {
             lift.arm();
         }
+        let given_rules: Arc<std::sync::Mutex<_>> = Arc::default();
         let slot = (self.active)
             .start(bot.clone(), |slot| Active {
                 turn,
@@ -3128,6 +3140,7 @@ impl Service {
                 compact: compact.clone(),
                 lift: lift.clone(),
                 slot,
+                given_rules: given_rules.clone(),
             })
             .slot
             .clone();
@@ -3143,6 +3156,7 @@ impl Service {
             background_failures: self.background_failures.clone(),
             settings: Default::default(),
             rules: Default::default(),
+            given_rules,
             ruled: Default::default(),
             window: Default::default(),
             resumed,
@@ -3563,7 +3577,20 @@ impl Service {
                 if let Some(declare) = &declare {
                     validate_declared(declare)?;
                 }
-                if let Some(turn) = self.active.get(&bot).and_then(Active::running) {
+                // The command rules alone may change while a turn runs: its
+                // next round takes them, and a round already announced keeps
+                // the rules it was announced under.
+                let rules_only = settings
+                    .as_ref()
+                    .is_some_and(|changes| changes.len() == 1 && changes.contains_key("rules"))
+                    && instructions.is_none()
+                    && model.is_none()
+                    && gate.is_none()
+                    && declare.is_none()
+                    && fallback.is_none()
+                    && compaction_instructions.is_none()
+                    && compaction_model.is_none();
+                if !rules_only && let Some(turn) = self.active.get(&bot).and_then(Active::running) {
                     return Err(Error::with(
                         "bot_busy",
                         format!("turn {turn} of {bot} is running"),
@@ -3675,11 +3702,17 @@ impl Service {
                     }
                     None => None,
                 };
+                // Rules given reach turns running now, its own (which only
+                // a change of rules alone may meet) and its kin's.
+                let given_rules = (named.iter().any(|key| key == "rules"))
+                    .then_some(given.as_ref())
+                    .flatten()
+                    .map(|given| given.rules.clone().unwrap_or_default());
                 let answer = store
                     .op("configure", move |db| {
                         let id = db.identity(&bot, bot_id)?;
                         // A parked turn reads the bot again when it resumes.
-                        if let Some(turn) = db.inspect(&bot)?.running_turn {
+                        if !rules_only && let Some(turn) = db.inspect(&bot)?.running_turn {
                             return Err(Error::with(
                                 "bot_busy",
                                 format!("turn {turn} of {bot} is running"),
@@ -3693,8 +3726,12 @@ impl Service {
                         {
                             changed.push("gates".into());
                         }
+                        let mut kin = Vec::new();
                         if let Some(given) = &given {
-                            changed.extend(db.set_settings(&bot, Some(id), &named, given)?);
+                            let (set, of_kin) =
+                                db.set_settings_of_kin(&bot, Some(id), &named, given)?;
+                            changed.extend(set);
+                            kin = of_kin;
                         }
                         if let Some((provider, name)) = &model
                             && db.set_model(&bot, Some(id), provider, name, effort.as_deref())?
@@ -3726,11 +3763,29 @@ impl Service {
                             .into_iter()
                             .map(String::from),
                         );
-                        Ok(json!({"bot":bot,"bot_id":id,"changed":changed}))
+                        Ok((json!({"bot":bot,"bot_id":id,"changed":changed}), kin))
                     })
                     .await?;
+                let (answer, kin) = answer;
                 // Followers read the bot again; nothing durable to replay.
                 if answer["changed"].as_array().is_some_and(|c| !c.is_empty()) {
+                    let name = answer["bot"].as_str().unwrap_or_default();
+                    // Its running turn and those of the bots it made, and
+                    // theirs, which go by its rules, each at its next round:
+                    // the walk the store made for them names them, so a
+                    // change costs one look per such bot and no round pays.
+                    if let Some(policy) = given_rules {
+                        let rules = Arc::new(agent_runtime::rules::Rules::new(policy));
+                        for running in std::iter::once(name)
+                            .chain(kin.iter().map(String::as_str))
+                            .filter_map(|bot| self.active.get(bot))
+                        {
+                            *running
+                                .given_rules
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner()) = Some(rules.clone());
+                        }
+                    }
                     let mut event = answer.clone();
                     event["event"] = json!("configured");
                     event["durable"] = json!(false);
@@ -4241,6 +4296,16 @@ impl Service {
                 store
                     .op("step_result", move |db| {
                         db.step_result(&bot, turn, &call_id, &step, failed)
+                    })
+                    .await
+            }
+            Command::TakeCall { bot, turn, call_id } => {
+                if call_id.is_empty() {
+                    return fail_with("invalid_call_id", "call_id may not be empty");
+                }
+                store
+                    .op("take_call", move |db| {
+                        db.take_call(&bot, turn, &call_id, now_ms())
                     })
                     .await
             }
@@ -5153,6 +5218,32 @@ fn fit_listings(
     Ok(answer)
 }
 
+/// The program this daemon hands its agents as `AGENT_BIN`: the one its
+/// starter named in `AGENT_BIN` when that is this same program (the same
+/// file under another name, or a copy of it of the same length and time of
+/// writing), as a client that starts the daemon by a name of its own
+/// gives it; else this daemon's own.
+fn agent_bin() -> std::io::Result<std::path::PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    let exe = std::env::current_exe()?;
+    let named = std::env::var_os("AGENT_BIN").map(std::path::PathBuf::from);
+    let same = |given: &std::path::Path| {
+        let (Ok(given), Ok(own)) = (std::fs::metadata(given), std::fs::metadata(&exe)) else {
+            return false;
+        };
+        (given.dev(), given.ino()) == (own.dev(), own.ino())
+            || (given.len() == own.len()
+                && given.modified().ok().is_some()
+                && given.modified().ok() == own.modified().ok())
+    };
+    Ok(
+        match named.filter(|given| given.is_absolute() && same(given)) {
+            Some(given) => given,
+            None => exe,
+        },
+    )
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -5190,6 +5281,7 @@ mod tests {
             compact: Arc::default(),
             lift: Arc::default(),
             slot: Slot::alone(),
+            given_rules: Default::default(),
         };
         assert!(active.cancel(turn::INTERRUPTED));
         assert!(active.cancel(turn::SHUTDOWN));
@@ -5496,6 +5588,7 @@ mod tests {
                 compact: Arc::default(),
                 lift: Arc::default(),
                 slot,
+                given_rules: Default::default(),
             }),
             next_task: 1,
             jobs: JoinSet::new(),
@@ -5582,6 +5675,7 @@ mod tests {
             compact: Arc::default(),
             lift: Arc::default(),
             slot: Slot::alone(),
+            given_rules: Default::default(),
         };
         // A pause only parks the turn: an interrupt after it ends it.
         let (cancel, cause) = watch::channel(None);
@@ -5703,6 +5797,7 @@ mod tests {
                 compact: Arc::default(),
                 lift: Arc::default(),
                 slot,
+                given_rules: Default::default(),
             }),
             next_task: 1,
             jobs: JoinSet::new(),
@@ -5923,6 +6018,7 @@ mod tests {
                     compact: Arc::default(),
                     lift: Arc::default(),
                     slot,
+                    given_rules: Default::default(),
                 })
             }),
             next_task: 0,

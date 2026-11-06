@@ -26,6 +26,9 @@ pub enum Kind {
     /// A server the nightly memory cleanup could not read: its
     /// `unreadable-SERVER` fact.
     Server,
+    /// The nightly memory cleanup Sonny turns on by default, which it
+    /// could not schedule ([`trigger::cleanup_unscheduled`]).
+    Setup,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -57,6 +60,9 @@ pub struct Item {
     /// When a trigger last fired, in ms: a fire that sent no turn is still
     /// a fire of its own.
     pub fired_ms: Option<u64>,
+    /// What makes its failure the same one when `failed`'s words change:
+    /// a broken `--if`'s break, whatever each failed check printed.
+    pub episode: Option<String>,
 }
 
 /// Every trigger made on the daemon whose store is `store_id` and every
@@ -105,6 +111,7 @@ pub fn read(
                 failed: None,
                 handle: None,
                 fired_ms: None,
+                episode: None,
             });
         }
     }
@@ -151,11 +158,36 @@ pub fn read_around(
     let mut items = read(store, store_id, turns, |bot| {
         scope.takes(bot) || personal(bot)
     });
-    if let Some(home) = std::env::var_os("HOME") {
-        let root = PathBuf::from(home).join(".agents/memory");
-        items.extend(servers(&root, &scope.project));
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        items.extend(servers(&home.join(".agents/memory"), &scope.project));
+        items.extend(unscheduled(&home));
     }
     items
+}
+
+/// The nightly memory cleanup, when Sonny could not schedule it: the
+/// person's to know in every window, since nothing else runs it.
+fn unscheduled(home: &Path) -> Option<Item> {
+    let (why, at) = trigger::cleanup_unscheduled(home)?;
+    let tried = (now_ms() / 1000).saturating_sub(at.max(0) as u64);
+    Some(Item {
+        kind: Kind::Setup,
+        name: "memory-cleanup".into(),
+        bot: String::new(),
+        bots: Vec::new(),
+        when: String::new(),
+        what: String::new(),
+        facts: vec![
+            format!("tried {}", ago(tried)),
+            "Sonny tries again at its next start".into(),
+        ],
+        reply_to: None,
+        own: false,
+        failed: Some(first_line(&why)),
+        episode: None,
+        handle: None,
+        fired_ms: None,
+    })
 }
 
 /// The `unreadable-SERVER` facts the nightly memory cleanup saves, the
@@ -196,6 +228,7 @@ fn servers(root: &Path, project: &str) -> Vec<Item> {
                 }),
                 handle: None,
                 fired_ms: None,
+                episode: None,
             });
         }
     }
@@ -210,6 +243,7 @@ pub fn failures(items: &[Item]) -> Vec<String> {
     (items.iter())
         .filter_map(|item| {
             let why = item.failed.as_ref()?;
+            let why = item.episode.as_ref().unwrap_or(why);
             let turn = item.handle.as_deref().unwrap_or("");
             let at = item.fired_ms.unwrap_or(0);
             Some(format!("{:?}/{}/{at}/{turn}/{why}", item.kind, item.name))
@@ -230,13 +264,24 @@ fn trigger_item(row: &Value, bots: Vec<String>) -> Item {
     let mut facts = Vec::new();
     let sent = row["sent"].as_u64().unwrap_or(0);
     let last = &row["last"];
+    // What its `--if` said, while it has one: one removed since says
+    // nothing about it now.
+    let checked = match row["if"].is_string() {
+        true => &row["checked"],
+        false => &Value::Null,
+    };
     let mut failed = None;
+    let mut episode = None;
+    // A last fire that failed because its `--if` could not answer is over
+    // once a later check answers: the check, not that fire, is what holds.
+    let gate_broke = last["gate"] == "failed";
+    let mut fired_ms = last["fired_ms"].as_u64();
     facts.push(match row["runs"].as_u64() {
         Some(runs) => format!("sent {sent} of {runs}"),
         None if sent == 0 && last.is_null() => "not run yet".into(),
         None => format!("sent {sent}"),
     });
-    if let Some(outcome) = last["outcome"].as_str() {
+    if let Some(outcome) = last["outcome"].as_str().filter(|_| !gate_broke) {
         let ago = last["fired_ms"]
             .as_u64()
             .map(|at| format!(" {}", ago(now_ms().saturating_sub(at) / 1000)))
@@ -275,6 +320,29 @@ fn trigger_item(row: &Value, bots: Vec<String>) -> Item {
             });
         }
     }
+    // What its `--if` said last: checked and nothing new is a healthy
+    // quiet; could not check is a failure until a check answers again.
+    let checked_ago = |key: &str| {
+        checked[key]
+            .as_u64()
+            .map(|at| format!(" {}", ago(now_ms().saturating_sub(at) / 1000)))
+            .unwrap_or_default()
+    };
+    match checked["gate"].as_str() {
+        Some("no") => facts.push(format!("checked{}, nothing new", checked_ago("checked_ms"))),
+        Some("failed") => {
+            facts.push(format!("could not check since{}", checked_ago("since_ms")));
+            failed = Some(match checked["detail"].as_str() {
+                Some(detail) if !detail.is_empty() => first_line(detail),
+                _ => "could not check".into(),
+            });
+            // One break, however many checks it failed and whatever each
+            // printed.
+            fired_ms = checked["since_ms"].as_u64().or(fired_ms);
+            episode = Some("could not check".into());
+        }
+        _ => {}
+    }
     if row["missed"] == true {
         facts.push("missed its time".into());
     }
@@ -296,7 +364,8 @@ fn trigger_item(row: &Value, bots: Vec<String>) -> Item {
         own: false,
         failed,
         handle: trigger::sent(row),
-        fired_ms: last["fired_ms"].as_u64(),
+        fired_ms,
+        episode,
     }
 }
 
@@ -473,6 +542,11 @@ impl View {
                     self.notice = Some(
                         "the nightly cleanup removes it the night the server reads again".into(),
                     );
+                } else if item.kind == Kind::Setup {
+                    self.notice = Some(
+                        "it goes once the cleanup is scheduled: `~/.agent/memory schedule --model PROVIDER/MODEL`"
+                            .into(),
+                    );
                 } else if confirm == Some(key_of(&item)) {
                     self.remove(&item);
                 } else {
@@ -512,7 +586,7 @@ impl View {
             Kind::Subscription => {
                 lookout::subs::remove(&self.store, &item.bot, &item.name).map(drop)
             }
-            Kind::Server => return,
+            Kind::Server | Kind::Setup => return,
         };
         self.notice = Some(match done {
             Ok(()) => format!("removed {}", item.name),
@@ -585,7 +659,7 @@ impl View {
             _ if item.failed.is_some() => Span::raw("✗ ").fg(Color::Red),
             Kind::Trigger => Span::raw("↻ ").dim(),
             Kind::Subscription => Span::raw("◎ ").dim(),
-            Kind::Server => Span::raw("  "),
+            Kind::Server | Kind::Setup => Span::raw("  "),
         };
         let name = Span::raw(item.name.clone()).bold();
         let mut spans = vec![pick, mark, name];
@@ -599,6 +673,9 @@ impl View {
             }
             Kind::Server => {
                 spans.push(Span::raw(" could not be read by the nightly memory cleanup").dim());
+            }
+            Kind::Setup => {
+                spans.push(Span::raw(" is not scheduled: nothing cleans up memory").dim());
             }
         }
         let mut first =
@@ -665,7 +742,9 @@ impl View {
         }
         match self.items.get(self.selected) {
             Some(item) if item.kind == Kind::Trigger => keys.extend(["r run now", "d remove"]),
-            Some(item) if !item.own && item.kind != Kind::Server => keys.push("d remove"),
+            Some(item) if !item.own && !matches!(item.kind, Kind::Server | Kind::Setup) => {
+                keys.push("d remove")
+            }
             _ => {}
         }
         keys.push("esc close");
@@ -726,6 +805,7 @@ mod tests {
             failed: None,
             handle: None,
             fired_ms: None,
+            episode: None,
         }
     }
 
@@ -773,6 +853,120 @@ mod tests {
         );
         assert_eq!(fresh.facts, ["not run yet"]);
         assert_eq!(fresh.failed, None);
+    }
+
+    #[test]
+    fn a_cleanup_sonny_could_not_schedule_is_a_failure_in_every_window() {
+        let home = std::env::temp_dir().join(format!("bg-unscheduled-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(home.join(".agent/sonny")).unwrap();
+        assert_eq!(unscheduled(&home), None);
+        let at = now_ms() / 1000 - 120;
+        std::fs::write(
+            home.join(".agent/sonny/cleanup-not-scheduled.json"),
+            json!({"why": "automations_unsupported: no scheduler here", "at": at}).to_string(),
+        )
+        .unwrap();
+        let item = unscheduled(&home).unwrap();
+        assert_eq!(item.kind, Kind::Setup);
+        assert_eq!(
+            item.failed.as_deref(),
+            Some("automations_unsupported: no scheduler here")
+        );
+        assert_eq!(
+            item.facts,
+            ["tried 2m ago", "Sonny tries again at its next start"]
+        );
+        // The person's, so every window shows it.
+        let scope = Scope {
+            project: "calc".into(),
+            lead: "calc.lead".into(),
+            glob: "calc.*".into(),
+        };
+        assert!(shown(&scope, &item));
+        assert_eq!(failures(std::slice::from_ref(&item)).len(), 1);
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn a_check_that_found_nothing_is_healthy_and_one_that_could_not_is_a_failure() {
+        let at = now_ms() - 5 * 60 * 1000;
+        let row = |checked: Value, last: Value| {
+            json!({"name": "triage", "when": "every 10m", "bot": "p.triage",
+                "message": "Run the triage", "sent": 3, "if": "cd /w && ! ./quiet",
+                "last": last, "checked": checked})
+        };
+        let sent = json!({"outcome": "sent", "fired_ms": at - 3_600_000});
+        // Checked, nothing new: no failure, and it says when it looked.
+        let quiet = trigger_item(
+            &row(json!({"gate": "no", "checked_ms": at}), sent.clone()),
+            vec!["p.triage".into()],
+        );
+        assert_eq!(quiet.failed, None);
+        assert_eq!(
+            quiet.facts,
+            [
+                "sent 3",
+                "last sent 1h ago",
+                "checked 5m ago, nothing new",
+                "if cd /w && ! ./quiet"
+            ]
+        );
+        // Could not check: a failure, since the first check that could not.
+        let broke = json!({"outcome": "failed", "gate": "failed", "fired_ms": at,
+            "detail": "--if: exit status: 2: quiet: token expired"});
+        // Each failed check settles as the last fire, at its own time.
+        let checking = |checked_ms: u64| {
+            let mut last = broke.clone();
+            last["fired_ms"] = json!(checked_ms);
+            trigger_item(
+                &row(
+                    json!({"gate": "failed", "checked_ms": checked_ms, "since_ms": at - 600_000,
+                        "detail": "--if: exit status: 2: quiet: token expired"}),
+                    last,
+                ),
+                vec!["p.triage".into()],
+            )
+        };
+        let unhealthy = checking(at);
+        assert_eq!(
+            unhealthy.failed.as_deref(),
+            Some("--if: exit status: 2: quiet: token expired")
+        );
+        assert_eq!(
+            unhealthy.facts[..2],
+            ["sent 3", "could not check since 15m ago"]
+        );
+        // Each check that fails again is the same break, not news, though
+        // what it printed changed.
+        let mut again = checking(at + 60_000);
+        assert_eq!(
+            failures(std::slice::from_ref(&unhealthy)),
+            failures(std::slice::from_ref(&again))
+        );
+        again.failed = Some("--if: exit status: 2: quiet: request 7f3a timed out".into());
+        assert_eq!(
+            failures(std::slice::from_ref(&unhealthy)),
+            failures(&[again])
+        );
+        // A check that answers again ends it, though no run went since.
+        let back = trigger_item(
+            &row(json!({"gate": "no", "checked_ms": at + 120_000}), broke),
+            vec!["p.triage".into()],
+        );
+        assert_eq!(back.failed, None);
+        assert_eq!(back.facts[..2], ["sent 3", "checked 3m ago, nothing new"]);
+        // Its `--if` removed since: what the old one said last is not its
+        // health now.
+        let mut ungated = row(
+            json!({"gate": "failed", "checked_ms": at, "since_ms": at,
+                "detail": "--if: exit status: 2"}),
+            sent,
+        );
+        ungated["if"] = Value::Null;
+        let ungated = trigger_item(&ungated, vec!["p.triage".into()]);
+        assert_eq!(ungated.failed, None);
+        assert_eq!(ungated.facts, ["sent 3", "last sent 1h ago"]);
     }
 
     #[test]

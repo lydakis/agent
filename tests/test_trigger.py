@@ -1,4 +1,5 @@
 """A trigger's fire against a real daemon: what launchd or systemd runs, sent to the bot it was made for."""
+import filecmp
 import json
 import os
 import re
@@ -235,6 +236,34 @@ class TriggerFireTests(ModelFixture):
         turns = json.loads(self.agent('turns', '--store', str(self.store), '--socket', str(socket), '--bot', 'p.task').stdout)
         self.assertTrue(turns[-1]['prompt_preview'].endswith(']\nMorning check.'))
 
+    def test_a_daemon_sonny_starts_runs_by_a_name_of_its_own_and_its_agents_by_agents(self):
+        self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
+        target = ['--bot', 'p.task', '--bot-id', str(self.bot_id('p.task'))]
+        self.store_identity()
+        self.agent('shutdown', '--store', str(self.store))
+        short = Path(tempfile.mkdtemp(prefix='ag', dir='/tmp'))
+        self.addCleanup(shutil.rmtree, short, True)
+        socket = short / 'own.sock'
+        self.addCleanup(lambda: subprocess.run([str(self.binary), 'shutdown', '--store', str(self.store),
+                                                '--socket', str(socket)], env=clean_env(), capture_output=True, timeout=35))
+        shell = short / 'login-shell'
+        shell.write_text(f"#!/bin/sh\nexport AGENT_PROVIDER='openai=responses,{self.url}'\nexec /bin/sh -c \"$4\"\n")
+        shell.chmod(0o755)
+        sent = self.fire('p.task', 'Morning check.', target=target, app=self.bundle(), socket=socket,
+                         env={'SHELL': str(shell)})
+        self.assertEqual(sent['last']['outcome'], 'sent', sent)
+        # A process list names it as it names the file it runs from:
+        # Sonny's name for its daemon, the same program as Agent's.
+        name = self.home / '.agent/sonny/programs/names/sonny-daemon'
+        self.assertTrue(filecmp.cmp(name, self.binary, shallow=False))
+        pid = json.loads(self.agent('start', '--store', str(self.store), '--socket', str(socket)).stdout)['pid']
+        shown = subprocess.run(['ps', '-o', 'comm=', '-p', str(pid)], capture_output=True, text=True).stdout.strip()
+        self.assertEqual(Path(shown).name, 'sonny-daemon')
+        # Its agents still run Agent by Agent's own path.
+        self.agent('run', '--store', str(self.store), '--socket', str(socket), '--bot', 'p.task',
+                   'shell:printf %s "$AGENT_BIN" > agent-bin')
+        self.assertEqual((self.path / 'agent-bin').read_text(), str(self.bundle().parent.parent / 'libexec/agent'))
+
     def test_a_fire_never_reaches_another_stores_daemon(self):
         self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
         other = self.fire('p.task', 'x', store_id='0' * 16)
@@ -443,7 +472,8 @@ class TriggerFireTests(ModelFixture):
                                       capture_output=True, text=True, timeout=60)
                 self.assertEqual(done.returncode, 0, done.stderr)
                 if verb == 'start':
-                    by = json.loads((self.home / '.agents/memory/.cleanup').read_text())['by']
+                    # The open cleanup's owners: this one start's caller alone.
+                    [by] = json.loads((self.home / '.agents/memory/.cleanup').read_text())['by']
             return by
         by = cleanup_by('p.review-1', one)
         self.assertTrue(by.endswith('#automation:p.review'), by)
