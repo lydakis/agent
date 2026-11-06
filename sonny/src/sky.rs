@@ -4021,32 +4021,49 @@ fn radial(
 ) -> (Vec<Option<((f32, f32), f32)>>, Vec<(usize, usize)>) {
     let mut places = vec![None; nodes];
     let mut order = Vec::new();
-    // How many generations below the leads the deepest line goes.
-    fn height(at: usize, children: &[Vec<usize>], depth: usize) -> usize {
-        match depth > children.len() {
-            true => depth,
-            false => (children[at].iter())
-                .map(|&kid| height(kid, children, depth + 1))
-                .fold(depth, usize::max),
+    // The leaves under each node, and how many generations below the
+    // leads the deepest line goes, in one pass from the roots: each node
+    // is visited once, children summed before their parent. A node met
+    // again (a tree has none) adds what it had when first met.
+    let mut weights = vec![0usize; nodes];
+    let mut seen = vec![false; nodes];
+    let mut deepest = 0;
+    let mut stack: Vec<(usize, usize, bool)> =
+        (roots.iter().rev()).map(|&root| (root, 0, false)).collect();
+    while let Some((at, depth, summed)) = stack.pop() {
+        if summed {
+            weights[at] = (children[at].iter())
+                .map(|&kid| weights[kid])
+                .sum::<usize>()
+                .max(1);
+            continue;
         }
+        if std::mem::replace(&mut seen[at], true) {
+            continue;
+        }
+        deepest = deepest.max(depth);
+        stack.push((at, depth, true));
+        stack.extend(children[at].iter().map(|&kid| (kid, depth + 1, false)));
     }
-    let deepest = (roots.iter())
-        .map(|&root| height(root, children, 0))
-        .max()
-        .unwrap_or(0);
-    #[allow(clippy::too_many_arguments)]
-    fn place(
-        at: usize,
-        from: f32,
-        span: f32,
-        depth: usize,
-        deepest: usize,
-        children: &[Vec<usize>],
-        places: &mut Vec<Option<((f32, f32), f32)>>,
-        order: &mut Vec<(usize, usize)>,
-    ) {
+    // Each arm as wide as the square root of what is under it, so one
+    // big project can't squeeze the rest to nothing.
+    let root_weights: Vec<f32> = (roots.iter())
+        .map(|&root| (weights[root] as f32).sqrt())
+        .collect();
+    let total: f32 = root_weights.iter().sum::<f32>().max(1.0);
+    // Each node then its children, depth first in the tree's order: a node,
+    // the arc it spans from where, and its generation.
+    let mut arcs: Vec<(usize, f32, f32, usize)> = Vec::with_capacity(roots.len());
+    let mut from = -PI / 2.0;
+    for (&root, weight) in roots.iter().zip(root_weights) {
+        let span = TAU * weight / total;
+        arcs.push((root, from, span, 0));
+        from += span;
+    }
+    arcs.reverse();
+    while let Some((at, from, span, depth)) = arcs.pop() {
         if places[at].is_some() {
-            return;
+            continue;
         }
         // Leads on the inner ring and every agent that made none on the
         // outer, as a cluster dendrogram puts its leaves (d3.cluster), so
@@ -4062,47 +4079,15 @@ fn radial(
         places[at] = Some(((radius * angle.cos(), radius * angle.sin()), angle));
         order.push((at, depth));
         let kids = &children[at];
-        let weights: Vec<f32> = kids
-            .iter()
-            .map(|&kid| weight(kid, children) as f32)
-            .collect();
-        let total: f32 = weights.iter().sum();
+        let total: f32 = kids.iter().map(|&kid| weights[kid] as f32).sum();
         let mut start = from;
-        for (kid, w) in kids.iter().zip(weights) {
-            let part = span * w / total;
-            place(
-                *kid,
-                start,
-                part,
-                depth + 1,
-                deepest,
-                children,
-                places,
-                order,
-            );
+        let first = arcs.len();
+        for &kid in kids {
+            let part = span * weights[kid] as f32 / total;
+            arcs.push((kid, start, part, depth + 1));
             start += part;
         }
-    }
-    // Each arm as wide as the square root of what is under it, so one
-    // big project can't squeeze the rest to nothing.
-    let weights: Vec<f32> = (roots.iter())
-        .map(|&root| (weight(root, children) as f32).sqrt())
-        .collect();
-    let total: f32 = weights.iter().sum::<f32>().max(1.0);
-    let mut from = -PI / 2.0;
-    for (&root, weight) in roots.iter().zip(weights) {
-        let span = TAU * weight / total;
-        place(
-            root,
-            from,
-            span,
-            0,
-            deepest,
-            children,
-            &mut places,
-            &mut order,
-        );
-        from += span;
+        arcs[first..].reverse();
     }
     let far = (places.iter().flatten())
         .map(|((x, y), _)| x.hypot(*y))
@@ -4122,19 +4107,6 @@ fn hashed(name: &str) -> f32 {
         (h ^ u32::from(b)).wrapping_mul(16777619)
     });
     (hash % 10_000) as f32 / 10_000.0
-}
-
-fn weight(at: usize, children: &[Vec<usize>]) -> usize {
-    fn go(at: usize, children: &[Vec<usize>], depth: usize) -> usize {
-        if depth > children.len() {
-            return 1;
-        }
-        let below: usize = (children[at].iter())
-            .map(|&kid| go(kid, children, depth + 1))
-            .sum();
-        below.max(1)
-    }
-    go(at, children, 0)
 }
 
 /// Whether a `commons` call's arguments, a JSON preview that may be cut
@@ -5158,6 +5130,161 @@ async fn roll(client: &Client, send: &mpsc::UnboundedSender<Feed>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The layout as it was drawn before it took one pass: each child's
+    /// weight walked again for every node above it.
+    #[allow(clippy::type_complexity)]
+    fn radial_by_walks(
+        roots: &[usize],
+        children: &[Vec<usize>],
+        nodes: usize,
+    ) -> (Vec<Option<((f32, f32), f32)>>, Vec<(usize, usize)>) {
+        fn weight(at: usize, children: &[Vec<usize>]) -> usize {
+            let below: usize = children[at].iter().map(|&kid| weight(kid, children)).sum();
+            below.max(1)
+        }
+        fn height(at: usize, children: &[Vec<usize>], depth: usize) -> usize {
+            (children[at].iter())
+                .map(|&kid| height(kid, children, depth + 1))
+                .fold(depth, usize::max)
+        }
+        #[allow(clippy::too_many_arguments)]
+        fn place(
+            at: usize,
+            from: f32,
+            span: f32,
+            depth: usize,
+            deepest: usize,
+            children: &[Vec<usize>],
+            places: &mut Vec<Option<((f32, f32), f32)>>,
+            order: &mut Vec<(usize, usize)>,
+        ) {
+            let radius = match (deepest, depth) {
+                (0, _) => 0.62,
+                (_, 0) => 0.45,
+                _ if children[at].is_empty() => 1.0,
+                (deepest, depth) => 0.45 + 0.55 * depth as f32 / deepest as f32,
+            };
+            let angle = from + span / 2.0;
+            places[at] = Some(((radius * angle.cos(), radius * angle.sin()), angle));
+            order.push((at, depth));
+            let weights: Vec<f32> = (children[at].iter())
+                .map(|&kid| weight(kid, children) as f32)
+                .collect();
+            let total: f32 = weights.iter().sum();
+            let mut start = from;
+            for (kid, w) in children[at].iter().zip(weights) {
+                let part = span * w / total;
+                place(
+                    *kid,
+                    start,
+                    part,
+                    depth + 1,
+                    deepest,
+                    children,
+                    places,
+                    order,
+                );
+                start += part;
+            }
+        }
+        let (mut places, mut order) = (vec![None; nodes], Vec::new());
+        let deepest = roots
+            .iter()
+            .map(|&r| height(r, children, 0))
+            .max()
+            .unwrap_or(0);
+        let weights: Vec<f32> = (roots.iter())
+            .map(|&root| (weight(root, children) as f32).sqrt())
+            .collect();
+        let total: f32 = weights.iter().sum::<f32>().max(1.0);
+        let mut from = -PI / 2.0;
+        for (&root, weight) in roots.iter().zip(weights) {
+            let span = TAU * weight / total;
+            place(
+                root,
+                from,
+                span,
+                0,
+                deepest,
+                children,
+                &mut places,
+                &mut order,
+            );
+            from += span;
+        }
+        let far = (places.iter().flatten())
+            .map(|((x, y), _)| x.hypot(*y))
+            .fold(0.0f32, f32::max);
+        if far > 0.0 {
+            let grow = 0.9 / far;
+            for ((x, y), _) in places.iter_mut().flatten() {
+                (*x, *y) = (*x * grow, *y * grow);
+            }
+        }
+        (places, order)
+    }
+
+    /// A forest of `nodes`: roots, then each node made by one before it,
+    /// as `shape` picks its maker.
+    fn forest(
+        nodes: usize,
+        shape: impl Fn(usize) -> Option<usize>,
+    ) -> (Vec<usize>, Vec<Vec<usize>>) {
+        let (mut roots, mut children) = (Vec::new(), vec![Vec::new(); nodes]);
+        for at in 0..nodes {
+            match shape(at) {
+                Some(by) => children[by].push(at),
+                None => roots.push(at),
+            }
+        }
+        (roots, children)
+    }
+
+    #[test]
+    fn the_radial_layout_places_every_shape_as_before_in_one_pass() {
+        let mut seed = 7u64;
+        let mut random = move || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) as usize
+        };
+        let picks: Vec<usize> = (0..400).map(|_| random()).collect();
+        type Maker = Box<dyn Fn(usize) -> Option<usize>>;
+        let shapes: [(&str, Maker); 5] = [
+            ("chain", Box::new(|at| at.checked_sub(1))),
+            ("star", Box::new(|at| (at > 0).then_some(0))),
+            (
+                "projects",
+                Box::new(|at| (at % 50 != 0).then(|| at - at % 50)),
+            ),
+            (
+                "random",
+                Box::new(move |at| (at % 37 != 0).then(|| picks[at] % at)),
+            ),
+            ("lone", Box::new(|_| None)),
+        ];
+        for (name, shape) in shapes {
+            let (roots, children) = forest(400, shape);
+            assert_eq!(
+                radial(&roots, &children, 400),
+                radial_by_walks(&roots, &children, 400),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_long_line_of_agents_is_laid_out_in_one_pass() {
+        // Walking each node's weight again for every node above it was
+        // quadratic here, and its recursion as deep as the line.
+        let (roots, children) = forest(200_000, |at| at.checked_sub(1));
+        let (places, order) = radial(&roots, &children, 200_000);
+        assert_eq!(order.len(), 200_000);
+        assert!(places.iter().all(Option::is_some));
+        assert_eq!(order.last(), Some(&(199_999, 199_999)));
+    }
 
     fn view() -> (View, mpsc::UnboundedSender<Feed>) {
         let (send, feed) = mpsc::unbounded_channel();

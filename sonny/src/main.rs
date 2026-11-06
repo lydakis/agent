@@ -71,7 +71,6 @@ mod said;
 mod scheduler;
 mod screen;
 mod seed;
-mod sent;
 mod served;
 mod settings;
 mod setup;
@@ -1301,7 +1300,6 @@ fn main() -> std::process::ExitCode {
         Some((verb, rest)) if verb == "approver" => approver::run(rest),
         Some((verb, rest)) if verb == "mcp" => mcp::cli(rest),
         Some((verb, rest)) if verb == "link" => link::cli(rest),
-        Some((verb, rest)) if verb == "sent" => sent::cli(rest),
         Some((verb, rest)) if verb == "rules" => {
             return std::process::ExitCode::from(rules::cli(rest) as u8);
         }
@@ -11863,9 +11861,9 @@ impl App {
 
     /// `/side`: a side chat with a copy of this bot, taken where it is now,
     /// mid-turn included, and opened in a Sonny of its own on the alternate
-    /// screen. The copy may call no tool, so it answers from what the bot
-    /// knows, unless the config's `[sonny] side_chat` is `"fork"`: then it
-    /// may do anything the bot may. The daemon deletes it once it has been
+    /// screen. The copy may do anything the bot may, unless the config's
+    /// `[sonny] side_chat` is `"answer"`: then it calls no tool and answers
+    /// from what the bot knows. The daemon deletes it once it has been
     /// idle a quarter hour. This bot carries on, and its lines wait for the
     /// main screen.
     async fn side(&mut self, question: String, pictures: &[attach::Picture]) {
