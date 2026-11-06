@@ -66,9 +66,9 @@ pub fn cells(
             if !ends(&rows[last_row], last_end) {
                 continue;
             }
-            // A web address where one starts; a `file://` address as the
-            // path it names, so only one that is there; else a path once
-            // what opens and closes around it is off.
+            // A web address where one starts; a `file://` address when the
+            // file it names is there; else a path once what opens and
+            // closes around it is off.
             let (lead, target, kept) = match (web(&word), scheme(&word, &["file://"])) {
                 (Some(lead), _) => {
                     let url = trim(&word[lead..]);
@@ -76,17 +76,7 @@ pub fn cells(
                 }
                 (None, Some(lead)) => {
                     let url = trim(&word[lead..]);
-                    let Some((path, line)) = crate::pane::file_url(&url) else {
-                        continue;
-                    };
-                    let Some(path) = path.to_str() else {
-                        continue;
-                    };
-                    let named = match line {
-                        Some(line) => format!("{path}#L{line}"),
-                        None => path.to_owned(),
-                    };
-                    match file(&named) {
+                    match file_address(&url) {
                         Some(target) => (lead, target, url.len()),
                         None => continue,
                     }
@@ -321,6 +311,28 @@ pub fn file(workspace: &Path, word: &str) -> Option<String> {
         return None;
     }
     file_url(&full)
+}
+
+/// Where a `file://` address opens, if the file or folder it names is
+/// there on this machine: `file:///PATH` or `file://localhost/PATH`, its
+/// escapes read back as the path's own characters (an escaped `#` or
+/// `:12` is part of the name, not a line), its `#L…` line kept. An
+/// address on another host opens nothing.
+fn file_address(url: &str) -> Option<String> {
+    let rest = url.strip_prefix("file://")?;
+    let rest = rest.strip_prefix("localhost").unwrap_or(rest);
+    if !rest.starts_with('/') {
+        return None;
+    }
+    let (path, line) = crate::pane::file_url(&format!("file://{rest}"))?;
+    if !path.exists() {
+        return None;
+    }
+    let url = file_url(&path)?;
+    Some(match line {
+        Some(line) => format!("{url}#L{line}"),
+        None => url,
+    })
 }
 
 /// The `file://` address of the absolute path `full`, every byte but
@@ -584,17 +596,31 @@ mod tests {
             Some(format!("{main}#L40"))
         );
         assert_eq!(file_line(&dir, "src/main.rs"), Some(main.clone()));
-        // A `file://` address opens as the path it names: escapes read
-        // back, its line kept, and only when the file is there.
+        // A `file://` address opens when its file is there: escapes read
+        // back as the name's own characters, its line kept.
         let spaced = format!("file://{}/a%20b.md", dir.display());
         assert_eq!(
             opens(&format!("Wrote {spaced}."), 200),
             [(8, spaced.clone())]
         );
-        assert_eq!(opens(&format!("{main}#L4"), 200), [(2, main.clone())]);
+        assert_eq!(
+            opens(&format!("{main}#L4"), 200),
+            [(2, format!("{main}#L4"))]
+        );
+        let local = format!("file://localhost{}/src/main.rs", dir.display());
+        assert_eq!(opens(&local, 200), [(2, main.clone())]);
         let gone = format!("file://{}/src/gone.rs", dir.display());
         assert!(opens(&format!("see {gone}"), 200).is_empty());
         assert!(opens(&format!("x{main}"), 200).is_empty(), "inside a word");
+        // Another host's, or a relative one, is no file here.
+        assert!(opens("file://host/src/main.rs", 200).is_empty());
+        assert!(opens("file://src/main.rs", 200).is_empty());
+        // `%23` and `%3A12` are the name's, not a line or a fragment.
+        std::fs::write(dir.join("report#draft.md"), "").unwrap();
+        let hashed = format!("file://{}/report%23draft.md", dir.display());
+        assert_eq!(opens(&hashed, 200), [(2, hashed.clone())]);
+        let colon = format!("file://{}/src/main.rs%3A12", dir.display());
+        assert!(opens(&colon, 200).is_empty(), "no file is named main.rs:12");
         // A file's `'s` is no part of it, unless its name ends so.
         assert_eq!(opens("src/main.rs's tests", 80), [(2, main.clone())]);
         std::fs::write(dir.join("src/owner's"), "").unwrap();
