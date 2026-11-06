@@ -2178,9 +2178,13 @@ mod tests {
 
     #[test]
     fn shards_share_one_tls_setup() {
-        // Loading the root certificates is most of what a client costs to
-        // build; shared, 64 shards cost little more than one. Built apart,
-        // each loaded them again and 64 took about 64 times as long.
+        // On Linux, loading the root certificates from disk is most of
+        // what a client costs to build; shared, 64 shards cost little more
+        // than one. Built apart, each loaded them again and 64 took about
+        // 64 times as long. macOS's verifier reads its roots from the
+        // system when it first checks a certificate, so building clients
+        // costs no load there either way.
+        #[cfg(target_os = "linux")]
         let build = |shards| {
             (0..3)
                 .map(|_| {
@@ -2191,8 +2195,12 @@ mod tests {
                 .min()
                 .unwrap()
         };
-        let (one, many) = (build(1), build(64));
-        assert!(many < one * 16, "1 shard {one:?}, 64 shards {many:?}");
+        #[cfg(target_os = "linux")]
+        {
+            let (one, many) = (build(1), build(64));
+            assert!(many < one * 16, "1 shard {one:?}, 64 shards {many:?}");
+        }
+        Transport::new(0, 64).unwrap();
         let tls = tls_config(&[b"h2", b"http/1.1"]).unwrap();
         assert_eq!(tls.alpn_protocols, [b"h2".to_vec(), b"http/1.1".to_vec()]);
     }
