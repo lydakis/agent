@@ -50,7 +50,29 @@ impl Step {
 
 /// What this Sonny's upgrade asks agents to do. A new one is a file in
 /// `sonny/upgrades` and a row here, named in its feature's history.
-pub const STEPS: &[Step] = &[];
+pub const STEPS: &[Step] = &[
+    // A reviewer model set as `AGENT_JUDGE` in ~/.agent/env, unread since
+    // 0.8.0, moves to `[judge] model` (0.9.0).
+    Step {
+        id: "judge-env",
+        text: include_str!("../upgrades/judge-env.md"),
+        done: judge_env_done,
+        retire: "0.11.0",
+    },
+];
+
+/// Whether `~/.agent/env` sets no `AGENT_JUDGE`, the reviewer's model
+/// before 0.8.0 read it from `[judge] model`.
+fn judge_env_done() -> bool {
+    agent_client::env_file::path().is_none_or(|file| no_judge_in(&file))
+}
+
+/// Whether the env file at `file` sets no `AGENT_JUDGE`.
+fn no_judge_in(file: &Path) -> bool {
+    agent_client::env_file::read(file).map_or(true, |pairs| {
+        pairs.iter().all(|(key, _)| key != "AGENT_JUDGE")
+    })
+}
 
 /// Something Sonny does once itself, by [`once`], for as long as it is
 /// listed.
@@ -191,6 +213,21 @@ fn overdue(now: &str, steps: &[Step], migrations: &[Migration]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_judge_set_in_the_env_file_is_a_step_until_it_goes() {
+        let dir = std::env::temp_dir().join(format!("judge-env-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("env");
+        assert!(no_judge_in(&file), "no file, nothing to do");
+        std::fs::write(&file, "OPENAI_API_KEY=k\nAGENT_JUDGE=openai/x\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(!no_judge_in(&file));
+        std::fs::write(&file, "OPENAI_API_KEY=k\n").unwrap();
+        assert!(no_judge_in(&file));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn nothing_outlives_its_release() {

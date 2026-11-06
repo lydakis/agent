@@ -160,6 +160,13 @@ mod tests {
             rules.rule("cp a b && rm -rf c"),
             Ok(Ruling::Forbidden("Use the trash.".into()))
         );
+        // A wrapper is seen through, as the command it runs.
+        assert_eq!(rules.rule("timeout 60 touch a"), Ok(Ruling::Allow));
+        assert_eq!(
+            rules.rule("nice -n 5 rm -rf c"),
+            Ok(Ruling::Forbidden("Use the trash.".into()))
+        );
+        assert_eq!(rules.rule("env PATH=/tmp touch a"), Ok(Ruling::None));
         // What the sandbox can't read as plain commands matches none.
         assert_eq!(rules.rule("touch $(echo a)"), Ok(Ruling::None));
         assert_eq!(rules.rule(""), Ok(Ruling::None));

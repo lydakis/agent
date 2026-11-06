@@ -476,8 +476,9 @@ own; one from the file comes back as text alone.
 
 ![Up brings back a two-row prompt with the cursor at its top, Up again the one before, and Down twice returns the draft](../docs/sonny/prompt-history.png)
 
-Alt-T boosts the next message: the turn it starts runs at a higher effort
-(`xhigh`, or `high` where the model has no `xhigh`), Alt-T again at `max`
+Alt-T (or Ctrl-X, where something else takes Alt) boosts the next message:
+the turn it starts runs at a higher effort (`xhigh`, or `high` where the
+model has no `xhigh`), Alt-T again at `max`
 where the model takes it, and again back to the agent's own. The footer
 shows `↑xhigh` beside the effort until a message takes it (in zen, quieter, an
 arrow a step after the focus: `↑`, then `↑↑`); a message that
@@ -691,7 +692,11 @@ way `/react` does, and each note in the margin has its own `↩`.
   run it outside without asking, as Codex's rules do (Codex's own rules
   files work unchanged). A rule names a command's first words
   (`["docker", "compose"]`), and a call runs outside only when everything
-  it runs is allowed, so `mcpx … | jq` still asks. A rule can also always
+  it runs is allowed, so `mcpx … | jq` still asks. A wrapper is seen
+  through: `timeout 60 mcpx …`, `nice`, `nohup` and `time` match as the
+  command they run, and through `env` or `NAME=value`, which change what
+  it runs with, a rule may still ask or refuse but never lets it out.
+  A rule can also always
   ask (`"prompt"`) or never run a command (`"forbidden"`, with a
   `justification` the agent is told); `sonny rules check -- git push`
   shows what the rules say. The files are Starlark, as Codex runs them,
@@ -737,7 +742,9 @@ way `/react` does, and each note in the margin has its own `↩`.
   **Working** (a turn running, queued, rate limited, waiting on other
   tasks, or `waiting on its reviewer` while the approver weighs a call), **Ready for review** (finished, its last reply linking a pull
   request), **Done** (finished or stopped with nothing open), and
-  **Resolved**, only counted until `r` shows them. As threads in a
+  **Resolved**. Done and Resolved fold to their heading (`Done · 3 ▸`)
+  until a click on it, or `d` and `r` with the keys in the pane, opens
+  them, and the same folds them again. As threads in a
   claude.ai project do, a task resolves itself with the `resolve_task`
   tool once nothing is left to do in it, such as when its pull request
   merged or you dropped the work, and the lead can resolve any of its
