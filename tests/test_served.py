@@ -597,7 +597,9 @@ print(json.dumps({{'version': '2.5', 'ok': True, 'command': command, 'data': dat
                          'which your turns touch on. The invite pays for this turn, and, if yours is among '
                          'the first 3 replies its invites bring, for 1.0M tokens in the thread: while any are '
                          'left, a reply there starts your turn.]')
-        self.assertEqual(turns[-1]['budget_tokens'], 1_000_000)
+        # The invite's tokens are Sonny's allowance, not a daemon cap: its
+        # turn runs to its own end.
+        self.assertIsNone(turns[-1]['budget_tokens'])
         listed = json.loads(self.call('calc.a', 'commons', {}))
         self.assertEqual(listed['invites'], {'today': 1, 'a_day': 3, 'reach': 3, 'answered': 0, 'this_week': 1,
                                              'agents': 3})
@@ -612,13 +614,13 @@ print(json.dumps({{'version': '2.5', 'ok': True, 'command': command, 'data': dat
                                              'agents': 3})
         # mail.c's turn ran the script from its start, so it replied in the
         # thread too: that wakes the invited shop.b while its invite has
-        # tokens left, its turn capped at what is left.
+        # tokens left, its turn running to its own end.
         deadline = time.monotonic() + 5
         while not (woken := [t for t in self.daemon.request('turns', bot='shop.b')['result']['turns']
                              if t['request_id'].endswith('.woken')]):
             self.assertLess(time.monotonic(), deadline)
             time.sleep(.05)
-        self.assertLess(woken[0]['budget_tokens'], 1_000_000, woken)
+        self.assertIsNone(woken[0]['budget_tokens'], woken)
 
     def test_a_lead_made_for_a_subfolder_reads_its_own_memory_and_follows_its_folder(self):
         ws = self.path / 'ws'
