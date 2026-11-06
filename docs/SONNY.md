@@ -1004,6 +1004,38 @@ Once a call a gate allowed has run, Sonny tells the daemon how it ended
 (`step_result`), so the judge of the agent's next call counts it among those
 the turn already ran.
 
+### What went out as you
+
+Sonny keeps a journal of the writes agents make through its tools
+([sent.rs](../sonny/src/sent.rs)): every call to an MCP server tool that
+does not say it only reads (`readOnlyHint`), from a script answered here or
+one a host's agent sent over a link. Each is noted before it leaves, with
+the line on disk first, and again as it ends: `completed` when its server
+answered, `failed` when its server refused it, and `unknown` when nothing
+will say whether it took effect (the call broke, or the script was stopped
+while it was out). A write noted only as it left, because the program
+stopped, is still listed. Each has an identity that holds across the
+attempts at its call: `TURN:CALL/N`, the agent's turn, the daemon's call
+and its place among the call's writes, and is listed once for each attempt,
+as when a restarted tool host answers the call again. A call lent over a
+link is noted on the machine that makes it, under the asking agent's turn
+and call. What a line keeps of the arguments, the first 120 characters, has
+credentials redacted first, as the approver redacts what it is shown.
+
+```sh
+sonny sent                  # today's, UTC
+sonny sent --since 2d --agent shop.lead
+sonny sent --json
+```
+
+`sonny sent` lists them as attempted, completed, failed or uncertain, with
+what it cannot see first: writes made by shell commands, as a CLI posting a
+comment, are not in it, and an approval is a decision, not proof that a
+write was sent. The journal is `~/.agent/sonny/sent/YYYY-MM-DD.jsonl`, one
+JSON line per change, readable by the person only. The tool host keeps
+`sonny.sent_days` days of it (30 by default, 0 keeps all) and removes the
+rest as it starts. Reads are not kept.
+
 ## Links
 
 A link lets the agents of a host use another machine's browser, MCP servers
@@ -1069,7 +1101,13 @@ about, an action in `browser_confirm`) comes back over the link to the
 calling agent's gate on the host, so you see it in the host's Sonny, where
 you are working. The linked machine's own settings decide what it
 confirms. A call to a machine that is asleep returns `not_connected` at
-once, or within 3 seconds, with when it was last connected. A machine runs
+once, or within 3 seconds, with when it was last connected. A call that
+was already sent down the link when the machine went quiet, before it took
+the call, or whose link closed while the machine ran it, returns
+`tool_outcome_unknown`: it may have run, so see whether it took effect
+before making it again. A machine that says nothing for 3 seconds after a
+call is sent, neither taking it nor carrying anything else, has gone
+quiet, and the call is let go there should it still arrive. A machine runs
 at most `calls` of the host's calls at once; one past that returns
 `link_busy`, to call again when one ends. On a slow link, each end holds at
 most one longest line (48 MB) of calls and answers queued, and the pings,

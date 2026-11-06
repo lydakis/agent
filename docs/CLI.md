@@ -375,8 +375,16 @@ turn, where `AGENT_BOT_ID` is set, since that turn is one it would wait on):
 it is asked to shut down with a 2-minute grace, so running turns park at their
 next boundary while none starts, or sent SIGTERM when it refuses that request, as daemons
 before 0.6.0 do; once it exits, this `agent`'s daemon starts on the same
-socket and upgrades the store. Sonny starts the daemon this way, so opening it
-after an upgrade replaces the old daemon, and it says so first. `stats` starts it as `start` does, so it answers on a fresh install;
+socket and upgrades the store, and the command goes to it. The commands on
+running bots that never start a daemon where none runs (`ls`, `wait`,
+`follow`, `fork`, `interrupt`) replace an older one the same way, with the
+provider their environment names, when it listens on their store's own socket
+(a socket named apart from its store may serve another store). One that keeps
+the older daemon says why in its `daemon_protocol_mismatch` detail, and that
+nothing was sent: from inside a bot's turn, with `--no-spawn`, with no provider
+to start a new one, or on a socket that is not the store's own. Sonny
+starts the daemon this way, so opening it after an upgrade replaces the old
+daemon, and it says so first. `stats` starts it as `start` does, so it answers on a fresh install;
 `turns`, `rm`, `prune`, `approvals`, and `answer` may restart it only for an
 existing store (`store_not_found` otherwise). These commands accept the startup
 provider/limit flags shown in help and `--no-spawn` to require an
