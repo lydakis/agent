@@ -16137,7 +16137,11 @@ mod tests {
             app.submit().await;
         }
         assert_eq!(staged(&app), [2, 3]);
-        assert_eq!(app.staged_rows(80).len(), 5, "each with a blank row above");
+        assert_eq!(
+            app.staged_rows(80).len(),
+            7,
+            "each with a blank row above and what it waits for"
+        );
         // Turn 1 takes in the first; its own turn ends as steered.
         app.daemon(turn_event("turn_finished", 2, json!({"status": "steered"})))
             .await;
