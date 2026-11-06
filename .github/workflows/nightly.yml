@@ -56,8 +56,10 @@ jobs:
           brew trust --formula lydakis/agent/sonny-nightly
           ruby -c "$RUNNER_TEMP/nightly/Formula/sonny-nightly.rb"
           brew style --formula lydakis/agent/sonny-nightly
-          brew install --formula lydakis/agent/sonny-nightly
-          brew test lydakis/agent/sonny-nightly
+          # Test its own installed paths, as in the smoke check, without
+          # resolving conflicts against formulas absent from this test tap.
+          brew install --formula --skip-link lydakis/agent/sonny-nightly
+          brew test --force lydakis/agent/sonny-nightly
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: sonny-nightly-formula

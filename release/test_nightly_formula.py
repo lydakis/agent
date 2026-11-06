@@ -74,6 +74,9 @@ class NightlyWorkflowTest(unittest.TestCase):
         self.assertIn("workflow_dispatch:", workflow)
         # A failed publish job can be retried without rebuilding its artifact.
         self.assertNotIn("github.run_attempt", workflow)
+        # The test tap contains only nightly; stable's formula is absent.
+        self.assertIn("brew install --formula --skip-link lydakis/agent/sonny-nightly", workflow)
+        self.assertIn("brew test --force lydakis/agent/sonny-nightly", workflow)
         self.assertIn("github.repository == 'lydakis/agent' && github.ref == 'refs/heads/main'", workflow)
         publish = workflow[workflow.index("\n  publish:\n"):]
         self.assertIn("needs: validate", publish)
