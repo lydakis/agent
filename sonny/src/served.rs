@@ -1645,6 +1645,25 @@ async fn answer(client: &Client, call: &Value, me: &Path, store: &Path, socket: 
     if let Some(bin) = crate::agent_bin() {
         command.env("AGENT_BIN", bin);
     }
+    // A run of an automation works for the automation: an open memory
+    // cleanup is the automation's, whichever run's agent started it, so a
+    // run that carries on one cut short changes it as its own.
+    if call["name"] == MEMORY
+        && of("request_id")
+            .as_str()
+            .is_some_and(|r| r.starts_with(crate::trigger::SENT_PREFIX))
+        && let (Some(store_id), Ok(places), Some(id)) = (
+            client.store(),
+            crate::trigger::Places::home(),
+            caller["bot_id"].as_i64(),
+        )
+        && let Some(name) =
+            crate::trigger::run_of(&places, Some(store_id), &str_of(&caller["name"]), id)
+    {
+        command.env("AGENT_AUTOMATION", name);
+    } else {
+        command.env_remove("AGENT_AUTOMATION");
+    }
     let mut arguments = call["arguments"].clone();
     if call["name"] == MEMORY
         && arguments["save"].is_object()
