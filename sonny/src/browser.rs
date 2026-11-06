@@ -1047,7 +1047,12 @@ pub fn seed_profile(file: &Path) -> Result<bool, String> {
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     }
     let text = serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())? + "\n";
-    agent_client::files::replace_mode(file, text.as_bytes(), 0o644)
+    // As readable as the file was, and a new one by its owner only: it may
+    // hold what the person keeps from others.
+    let mode = std::fs::metadata(file).map_or(0o600, |meta| {
+        std::os::unix::fs::PermissionsExt::mode(&meta.permissions()) & 0o7777
+    });
+    agent_client::files::replace_mode(file, text.as_bytes(), mode)
         .map_err(|e| format!("{}: {e}", file.display()))?;
     Ok(true)
 }
@@ -1464,11 +1469,26 @@ mod tests {
         assert_eq!(profile_in(&file), Profile::Unset);
         assert_eq!(seed_profile(&file), Ok(true));
         assert_eq!(profile_in(&file), Profile::Named("Default".into()));
+        let mode = |file: &Path| {
+            std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(file).unwrap().permissions())
+                & 0o777
+        };
+        assert_eq!(mode(&file), 0o600);
         // Seeded once.
         assert_eq!(seed_profile(&file), Ok(false));
         // Other settings are kept.
         std::fs::write(&file, r#"{"headed": true}"#).unwrap();
-        assert_eq!(seed_profile(&file), Ok(true));
+        // So is how readable the file is.
+        for kept_mode in [0o600, 0o640] {
+            std::fs::write(&file, r#"{"headed": true}"#).unwrap();
+            std::fs::set_permissions(
+                &file,
+                std::os::unix::fs::PermissionsExt::from_mode(kept_mode),
+            )
+            .unwrap();
+            assert_eq!(seed_profile(&file), Ok(true));
+            assert_eq!(mode(&file), kept_mode);
+        }
         let kept: Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
         assert_eq!(kept, json!({"headed": true, "profile": "Default"}));
         // A profile set, a fresh one too, is the person's.
