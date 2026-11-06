@@ -3276,6 +3276,120 @@ fn schema_77_holds_a_refused_start_in_line() {
     std::fs::remove_file(path).unwrap();
 }
 
+/// A store at schema 77 on disk, in a folder of its own: its path.
+fn store_at_77(name: &str) -> std::path::PathBuf {
+    let folder = std::env::temp_dir().join(format!("agent-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&folder);
+    std::fs::create_dir_all(&folder).unwrap();
+    let path = folder.join("state.sqlite");
+    {
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    }
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            "DROP INDEX turns_held; ALTER TABLE turns DROP COLUMN held; PRAGMA user_version=77;",
+        )
+        .unwrap();
+    path
+}
+
+#[test]
+fn an_older_store_is_copied_and_checked_before_it_migrates_and_two_copies_are_kept() {
+    let path = store_at_77("backup");
+    let folder = path.parent().unwrap().to_path_buf();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    // Copies from two earlier upgrades are there already.
+    for old in [70, 75] {
+        std::fs::write(
+            folder.join(format!("state.sqlite.schema-{old}.backup")),
+            b"",
+        )
+        .unwrap();
+    }
+    let db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    drop(db);
+    // The copy is the store as it was: schema 77, its bot, no column the
+    // migration added, and it passes SQLite's integrity check.
+    let copy = folder.join("state.sqlite.schema-77.backup");
+    let copied = Connection::open(&copy).unwrap();
+    let at: i32 = copied
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    let check: String = copied
+        .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+        .unwrap();
+    let bots: i64 = copied
+        .query_row("SELECT COUNT(*) FROM bots", [], |r| r.get(0))
+        .unwrap();
+    let held: bool = copied
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('turns') WHERE name='held')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!((at, check.as_str(), bots, held), (77, "ok", 1, false));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&copy).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "the copy is as private as the store");
+    }
+    // The two newest copies are kept.
+    let mut left: Vec<String> = std::fs::read_dir(&folder)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.contains(".backup"))
+        .collect();
+    left.sort();
+    assert_eq!(
+        left,
+        [
+            "state.sqlite.schema-75.backup",
+            "state.sqlite.schema-77.backup"
+        ]
+    );
+    // A store at the current schema is not copied again.
+    let before = std::fs::metadata(&copy).unwrap().modified().unwrap();
+    drop(Database::initialize(Connection::open(&path).unwrap()).unwrap());
+    assert_eq!(
+        std::fs::metadata(&copy).unwrap().modified().unwrap(),
+        before
+    );
+    std::fs::remove_dir_all(folder).unwrap();
+}
+
+#[test]
+fn a_store_that_cannot_be_copied_is_not_migrated() {
+    let path = store_at_77("backup-fails");
+    let folder = path.parent().unwrap().to_path_buf();
+    // Something already stands where the copy is written.
+    std::fs::create_dir(folder.join("state.sqlite.schema-77.backup.partial")).unwrap();
+    let Err(failed) = Database::initialize(Connection::open(&path).unwrap()) else {
+        panic!("a store that could not be copied was opened");
+    };
+    assert_eq!(failed.code, "store_backup_failed");
+    assert!(
+        failed
+            .detail
+            .unwrap()
+            .ends_with("the store was left at schema 77"),
+        "it says the store is as it was"
+    );
+    let at: i32 = Connection::open(&path)
+        .unwrap()
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(at, 77);
+    std::fs::remove_dir_all(folder).unwrap();
+}
+
 #[test]
 fn schema_70_finds_each_attached_message_from_its_event() {
     let path = std::env::temp_dir().join(format!(

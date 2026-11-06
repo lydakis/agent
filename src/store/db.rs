@@ -2279,6 +2279,14 @@ impl Database {
         })
     }
 
+    /// Set this connection's page cache to `kib`, as a reader's share of
+    /// the readers' budget.
+    pub fn cache_kib(&self, kib: usize) -> Result<()> {
+        self.conn
+            .execute_batch(&format!("PRAGMA cache_size=-{}", kib.max(1)))?;
+        Ok(())
+    }
+
     pub fn initialize(conn: Connection) -> Result<Self> {
         // FULL syncs the WAL before a commit is answered. An answer survives
         // a daemon crash, but on macOS plain fsync can leave writes in the
@@ -2308,6 +2316,11 @@ impl Database {
             [],
             |r| r.get(0),
         )?;
+        // An older store is copied and the copy checked before migrating,
+        // so a release can go back to the store as it was.
+        if version != 0 && version < Self::SCHEMA {
+            back_up(&conn, version)?;
+        }
         // Initialize a fresh store atomically; existing stores must match.
         let tx = conn.unchecked_transaction()?;
         match version {
@@ -13023,6 +13036,98 @@ fn turn_status_name(status: &str) -> &'static str {
 fn node(conn: &Connection, parent: Option<i64>, item: &[u8]) -> Result<i64> {
     node_with_turn(conn, parent, item, None)
 }
+
+/// How many copies of the store, one per schema it migrated from, are kept.
+const BACKUPS: usize = 2;
+
+/// Copy the store at `version`, before it migrates, to
+/// `<store>.schema-<version>.backup` beside it, with the store's
+/// permissions, and check the copy: it opens, passes SQLite's integrity
+/// check and is at `version`. Only the newest [`BACKUPS`] are kept. A store
+/// that cannot be copied is not migrated: `store_backup_failed` says why.
+fn back_up(conn: &Connection, version: i32) -> Result<()> {
+    let Some(store) = conn
+        .path()
+        .filter(|path| !path.is_empty())
+        .map(std::path::PathBuf::from)
+    else {
+        return Ok(());
+    };
+    let failed = |why: String| Error::with("store_backup_failed", why);
+    let name = store
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned());
+    let (Some(folder), Some(name)) = (store.parent(), name) else {
+        return Ok(());
+    };
+    let copy = folder.join(format!("{name}.schema-{version}.backup"));
+    let partial = folder.join(format!("{name}.schema-{version}.backup.partial"));
+    let _ = std::fs::remove_file(&partial);
+    // Made empty first with the store's permissions, since the copy holds
+    // everything the store does.
+    let checked = std::fs::File::create_new(&partial)
+        .and_then(|file| file.set_permissions(std::fs::metadata(&store)?.permissions()))
+        .map_err(|error| format!("could not create {}: {error}", partial.display()))
+        .and_then(|_| {
+            conn.execute("VACUUM INTO ?1", [partial.to_string_lossy()])
+                .map_err(|error| {
+                    format!("could not copy the store to {}: {error}", partial.display())
+                })
+        })
+        .and_then(|_| {
+            let copied =
+                Connection::open_with_flags(&partial, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                    .map_err(|error| error.to_string())?;
+            let check: String = copied
+                .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+                .map_err(|error| error.to_string())?;
+            let at: i32 = copied
+                .query_row("PRAGMA user_version", [], |r| r.get(0))
+                .map_err(|error| error.to_string())?;
+            if check != "ok" || at != version {
+                return Err(format!(
+                    "the copy at {} did not check out: integrity {check}, schema {at}",
+                    partial.display()
+                ));
+            }
+            Ok(())
+        })
+        .and_then(|_| {
+            std::fs::rename(&partial, &copy)
+                .map_err(|error| format!("could not name the copy {}: {error}", copy.display()))
+        });
+    if let Err(why) = checked {
+        // Only a file this attempt made: what stood there before is left.
+        if std::fs::metadata(&partial).is_ok_and(|meta| meta.is_file()) {
+            let _ = std::fs::remove_file(&partial);
+        }
+        return Err(failed(format!(
+            "{why}; the store was left at schema {version}"
+        )));
+    }
+    // The newest copies by the schema they were taken at; the rest go.
+    let prefix = format!("{name}.schema-");
+    let mut kept: Vec<(i32, std::path::PathBuf)> = std::fs::read_dir(folder)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let file = entry.file_name().to_string_lossy().into_owned();
+            let at = file
+                .strip_prefix(&prefix)?
+                .strip_suffix(".backup")?
+                .parse()
+                .ok()?;
+            Some((at, entry.path()))
+        })
+        .collect();
+    kept.sort_by_key(|(at, _)| std::cmp::Reverse(*at));
+    for (_, old) in kept.into_iter().skip(BACKUPS) {
+        let _ = std::fs::remove_file(old);
+    }
+    Ok(())
+}
+
 /// Bring an older versioned store forward to the current schema inside the
 /// caller's transaction. Each step converts stored data once; the runtime has
 /// no other knowledge of earlier formats.

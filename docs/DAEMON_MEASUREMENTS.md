@@ -7077,6 +7077,73 @@ the pinned prefix is bounded (summary, kept prompts, note). At 1M the kept
 tail ran past its target by about one turn, since a cut lands on a turn's
 prompt or a round start of the newest turn.
 
+## Readers opened as reads wait for them
+
+The store opened one reader connection per CPU at start, each on its own
+thread with its own 2 MiB SQLite page cache, so a quiet daemon paid for a
+pool sized for a busy one, and every reader's cache filled with whatever
+the deepest reads had paged in. Now one reader opens with the store; one
+more opens when a read is queued with no reader waiting for it, up to
+`--max-readers`; one past the first closes after 30 seconds without a read
+(a pool's idle timeout, as HikariCP and Go's `database/sql` keep a floor
+and close the rest). The open readers share one 2 MiB page cache budget,
+each resizing its share when the pool changes: an idle reader at once, a
+busy one as its read ends, since only its own thread may touch its
+connection. A read in flight keeps the share it began with, so staggered
+overlapping reads can briefly hold more than the budget, never more than
+each reader's share when its read began. Since any write clears a WAL
+reader's cache, under load a share outlives little more than one read.
+
+`bench.store_load` (added in the prompt-openings change), alternating
+`main` (be1a3bb) and this branch on one 4-CPU Linux box, 40 s idle between
+the bursts so extra readers close. 32 KiB prompts in a 128 KiB window, 12
+turns per live bot per burst; two runs each at `today` and `heavy`, one at
+`team`; threads are the daemon's:
+
+| Point | Measure | `main` | On demand |
+| --- | --- | ---: | ---: |
+| today (100 bots, 10 live) | RSS at start, MiB / threads | 21.4 / 6 | 20.8 / 3 |
+| today | Peak RSS, MiB | 31.3, 30.8 | 31.6, 30.9 |
+| today | Threads after 40 s idle | 6 | 3 |
+| today | Daemon CPU, s | 2.73, 2.85 | 2.66, 2.94 |
+| today | Short read p95 during the burst, ms | 4.2, 4.2 | 2.9, 3.8 |
+| heavy (100 bots, 50 live) | Peak RSS, MiB | 37.1, 36.8 | 33.8, 33.7 |
+| heavy | Daemon CPU, s | 11.8, 13.1 | 12.0, 13.7 |
+| heavy | Turn p95, ms | 236, 236 | 233, 279 |
+| heavy | Short read p95 during the burst, ms | 7.7, 8.3 | 8.1, 9.1 |
+| team (2,000 bots, 200 live) | Peak RSS, MiB | 41.4 | 34.6 |
+| team | Daemon CPU, s | 63.8 | 62.3 |
+| team | Turn p95, ms | 1,155 | 1,033 |
+| team | Short read p95 during the burst, ms | 19.3 | 17.6 |
+| team | Second Sky open under load, ms | 431 | 192 |
+
+With `--max-readers 12` (one per CPU on a 12-CPU machine), 32 live bots of
+32, 30 turns per burst, 64 KiB prompts in a 256 KiB window: peak RSS 62.9
+→ 38.2 MiB, RSS after 40 s idle 48.6 → 33.0 MiB with 14 → 3 threads,
+daemon CPU 22.8 → 18.8 s, turn p95 171 → 157 ms, short read p95 13.2 →
+11.5 ms. Latency elsewhere stays within the runs' spread; the pool widened
+to what the reads asked for (7 threads at the 4-CPU points, 10 of 14 at
+`--max-readers 12`).
+
+The AGENTS.md hot-path screen (`bench.admission_burst`, `bench.completion_burst`
+and `bench.lifecycle` at `--repeat 5`, `bench.footprint` at `--repeat 2`,
+two rounds alternating with `main` on the same box, compared by
+`bench.perf_gate`): store work per turn is the same, and nothing passes
+the gate's 15% warning.
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 43.447 | 45.0 | +3.6% |
+| admission | burst submit p99, ms | 6.366 | 6.291 | -1.2% |
+| completion | release to terminal p99, ms | 13.144 | 12.338 | -6.1% |
+| footprint | idle RSS, MiB | 21.1 | 20.412 | -3.3% |
+| footprint | per idle bot, KiB | 1.488 | 1.51 | +1.5% |
+| footprint | RSS after a turn each, MiB | 30.205 | 30.449 | +0.8% |
+| footprint | CPU per turn, ms | 1.353 | 1.219 | -9.9% |
+| lifecycle | CPU, s | 1.185 | 1.135 | -4.2% |
+| lifecycle | p95 turn, ms | 587.629 | 589.372 | +0.3% |
+| lifecycle | peak RSS, MiB | 27.756 | 27.377 | -1.4% |
+
 ## Budgets count work (#729)
 
 Each model call's usage commit now also adds the call's work to the turn

@@ -1,4 +1,4 @@
-name: Sonny nightly
+name: Nightly
 
 # A source formula, as for stable releases, but with both binaries pinned to
 # one main commit. No release tag, version bump or Apple signing is needed.

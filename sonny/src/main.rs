@@ -2857,6 +2857,9 @@ struct App {
     /// What the terminal shows may not be the frame last drawn, so the
     /// next draw writes every cell again.
     stale: bool,
+    /// The links last written over the screen, written again only when
+    /// they or what is under them change.
+    links_written: screen::Written,
     /// The oldest node this window drew, which a repaint draws back to.
     first_node: Option<i64>,
     /// The node before it, while the bot has older ones.
@@ -4294,6 +4297,7 @@ impl App {
             down: false,
             repaint: false,
             stale: false,
+            links_written: screen::Written::default(),
             first_node: None,
             older: None,
             unpaired: Vec::new(),
@@ -5083,6 +5087,7 @@ impl App {
         if newest.is_none() {
             self.pages.clear();
         }
+        self.links_written.forget();
         wipe(terminal).map_err(|e| e.to_string())?;
         self.pending.clear();
         self.marks.clear();
@@ -12291,6 +12296,7 @@ impl App {
         let stale = std::mem::take(&mut self.stale);
         synchronized(terminal, Terminal::backend_mut, |terminal| {
             if stale {
+                self.links_written.forget();
                 wipe(terminal)?;
             }
             self.frame(terminal)
@@ -12882,7 +12888,7 @@ impl App {
                 .collect();
         };
         let look = look::Look::now();
-        terminal.draw(|frame| {
+        let drawn = terminal.draw(|frame| {
             paint(frame, &mut linked);
             // A link something was drawn over since, as a list over the
             // conversation, is left as the frame drew it.
@@ -12891,11 +12897,13 @@ impl App {
             // The pictures it shows, sent before it is written.
             image::send_shown(frame.buffer_mut());
         })?;
+        linked.iter_mut().for_each(|(_, _, cell)| look.cell(cell));
+        // Only the links that changed, or that the frame drew over.
+        let linked = self.links_written.changed(linked, drawn.buffer);
         self.composer_at = composer_at;
         self.counter_at = counter_at;
         // Over themselves, the cursor kept where the frame left it.
         if !linked.is_empty() {
-            linked.iter_mut().for_each(|(_, _, cell)| look.cell(cell));
             execute!(
                 terminal.backend_mut(),
                 ratatui::crossterm::cursor::SavePosition
@@ -13372,7 +13380,13 @@ impl App {
             });
             let marked = boost.as_ref().map_or(0, |boost| boost.width());
             let room = width.saturating_sub(4 + needs + marked + "zen · ".len());
-            let focus = format!("zen · {}", transcript::cut(&first_line(focus), room));
+            // As much of its first line as the row holds: the footer's own
+            // width, not a glance's.
+            let mut line = focus.lines().next().unwrap_or("").to_owned();
+            if focus.lines().nth(1).is_some() {
+                line.push('…');
+            }
+            let focus = format!("zen · {}", transcript::cut(&line, room));
             items.retain(|item| item.slot == Slot::Needs);
             let mut place = vec![Span::raw(focus).dim()];
             place.extend(boost.map(Span::raw));
@@ -16127,6 +16141,14 @@ mod tests {
             footer.starts_with("  zen · the receipts' currency ↑") && !footer.contains("xhigh"),
             "{footer}"
         );
+        // A long focus runs to the row's end, not to a glance's length.
+        app.boost = None;
+        let long = "the receipts' currency, rounding each line in the store's own currency before it is converted and summed";
+        app.zen = Some(long.into());
+        let footer = app.footer_line(100).to_string();
+        assert!(footer.trim_end().width() >= 100 - 3, "{footer}");
+        assert!(footer.trim_end().ends_with('…'), "{footer}");
+        app.zen = Some("the receipts' currency".into());
         app.boost = Some("max".into());
         let line = app.footer_line(30);
         assert!(line.to_string().trim_end().ends_with(" ↑↑"), "{line}");

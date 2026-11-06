@@ -390,7 +390,10 @@ fn print_flags(flags: &str) {
                 "N",
                 "Request bytes read ahead of the service; default memory/16; 0 is unbounded",
             ),
-            "--max-readers" => ("N", "Store reader connections; default one per CPU"),
+            "--max-readers" => (
+                "N",
+                "Most store reader connections, opened as reads wait; default one per CPU",
+            ),
             "--max-load" => (
                 "LOAD",
                 "New commands wait while the 1-minute load average is this or more and one is running; 0 is no gate",
