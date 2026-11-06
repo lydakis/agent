@@ -827,13 +827,16 @@ impl Kept {
     fn save(&self, store: &Store) -> std::io::Result<()> {
         // Each daemon's apart, by its socket; the others' as they are.
         let mut all = store.all();
-        all.insert(
-            self.socket.clone(),
-            json!({"day": self.day, "written": self.written, "by": self.by,
-                "lines": self.lines, "at_ms": self.at_ms, "since_ms": self.since_ms,
-                "claim": {"by": self.claim.0, "since_ms": self.claim.1},
-                "unwritten": self.unwritten.as_ref().map(Unwritten::json)}),
-        );
+        let mut kept = json!({"day": self.day, "written": self.written, "by": self.by,
+            "lines": self.lines, "at_ms": self.at_ms, "since_ms": self.since_ms,
+            "claim": {"by": self.claim.0, "since_ms": self.claim.1},
+            "unwritten": self.unwritten.as_ref().map(Unwritten::json)});
+        // A day of past haikus [`PAST`] has not moved yet stays where it
+        // is, for that migration to move when it runs again.
+        if let Some(past) = all.get(&self.socket).and_then(|old| old.get("past")) {
+            kept["past"] = past.clone();
+        }
+        all.insert(self.socket.clone(), kept);
         store.write(&Value::Object(all))
     }
 
@@ -1223,6 +1226,33 @@ mod tests {
         let off = Rule { on: false, ..free };
         assert!(!kept.claim(&off, "one more", ms, ms));
         assert_eq!(kept.written, 50);
+    }
+
+    #[test]
+    fn a_past_not_yet_moved_outlives_a_write_and_moves_once_it_can() {
+        let store = Store::new();
+        let file = store.file.clone().unwrap();
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        let ms = 1_793_400_000_000_i64;
+        let socket = Path::new("/tmp/a.sock");
+        let old = json!({"/tmp/a.sock": {"day": "2026-11-05", "written": 1, "by": "a",
+            "lines": ["x", "y", "z"], "at_ms": ms, "since_ms": ms,
+            "claim": {"by": "a", "since_ms": ms},
+            "past": [{"by": "a", "lines": ["x", "y", "z"], "at_ms": ms, "since_ms": ms}]}});
+        std::fs::write(&file, old.to_string()).unwrap();
+        // The past file can't be read, so the move fails and waits.
+        let past_file = store.past().unwrap();
+        std::fs::create_dir_all(&past_file).unwrap();
+        upgrade(&store);
+        Kept::update(&store, socket, |kept| kept.written += 1).unwrap();
+        let live = std::fs::read_to_string(&file).unwrap();
+        assert!(live.contains("\"past\""), "{live}");
+        std::fs::remove_dir(&past_file).unwrap();
+        upgrade(&store);
+        assert_eq!(past(&store, socket).len(), 1);
+        assert!(!std::fs::read_to_string(&file).unwrap().contains("past"));
+        assert_eq!(Kept::load(&store, socket).written, 2);
+        let _ = std::fs::remove_dir_all(file.parent().unwrap());
     }
 
     #[test]
