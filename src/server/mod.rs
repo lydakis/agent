@@ -519,6 +519,13 @@ enum Command {
         output: Option<ToolOutput>,
         error: Option<ToolError>,
     },
+    /// Take a declared call this client answers, to run it: refused with
+    /// `call_taken` once any client took it, so it never runs twice.
+    TakeCall {
+        bot: String,
+        turn: i64,
+        call_id: String,
+    },
     /// Put one step of a declared call this client answers to the bot's
     /// gates that name the tool, and answer once it is decided: a script's
     /// nested call, say. `step` is the client's id for it within the call.
@@ -2205,6 +2212,7 @@ impl Service {
                 return refuse("serve approvals");
             }
             Command::ToolResult { .. } => return refuse("answer a declared tool call"),
+            Command::TakeCall { .. } => return refuse("take a declared tool call"),
             Command::ApproveStep { .. } => return refuse("put a declared call's step to a gate"),
             Command::StepResult { .. } => return refuse("record a declared call's step"),
             Command::Shutdown { .. } => return refuse("stop the daemon"),
@@ -4241,6 +4249,16 @@ impl Service {
                 store
                     .op("step_result", move |db| {
                         db.step_result(&bot, turn, &call_id, &step, failed)
+                    })
+                    .await
+            }
+            Command::TakeCall { bot, turn, call_id } => {
+                if call_id.is_empty() {
+                    return fail_with("invalid_call_id", "call_id may not be empty");
+                }
+                store
+                    .op("take_call", move |db| {
+                        db.take_call(&bot, turn, &call_id, now_ms())
                     })
                     .await
             }

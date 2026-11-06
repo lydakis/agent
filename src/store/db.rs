@@ -1984,7 +1984,7 @@ impl Database {
     /// Stored schema version, kept in `PRAGMA user_version`. Stores created
     /// before versioning and stores from newer binaries are rejected; an older
     /// versioned store is migrated forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 78;
+    pub const SCHEMA: i32 = 79;
     /// Verbatim user prompts a compaction keeps: per-prompt text, and the
     /// total text plus `(ordinal, String)` entry metadata. Empty entries cost
     /// space too, so the retained list cannot grow with conversation length.
@@ -2212,7 +2212,7 @@ impl Database {
             CREATE TABLE IF NOT EXISTS answers(id INTEGER PRIMARY KEY AUTOINCREMENT, turn INTEGER NOT NULL REFERENCES turns(id),
                 call_id TEXT NOT NULL, tag TEXT NOT NULL, name TEXT NOT NULL, arguments TEXT NOT NULL,
                 expires_ms INTEGER NOT NULL, output TEXT, failed INTEGER NOT NULL DEFAULT 0, paused_ms INTEGER,
-                parts TEXT);
+                parts TEXT, taken_ms INTEGER);
             CREATE UNIQUE INDEX IF NOT EXISTS answers_call ON answers(turn,call_id);
             CREATE INDEX IF NOT EXISTS answers_waiting ON answers(tag,id) WHERE output IS NULL;
             CREATE INDEX IF NOT EXISTS answers_paused ON answers(turn) WHERE paused_ms IS NOT NULL;
@@ -7989,6 +7989,67 @@ impl Database {
         }
         Ok(())
     }
+    /// Take an answered call to run it: recorded, so that a second take,
+    /// from a client that restarted or another one, is refused with
+    /// `call_taken` and the call never runs twice. What a taken call did
+    /// is known only to the client that took it.
+    pub fn take_call(&mut self, bot: &str, turn: i64, call_id: &str, now_ms: u64) -> Result<Value> {
+        let owner: Option<(String, String)> = self
+            .conn
+            .query_row("SELECT bot,status FROM turns WHERE id=?", [turn], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .optional()?;
+        let Some((_, status)) = owner.filter(|(owner, _)| owner == bot) else {
+            return fail("turn_not_found");
+        };
+        // Answered, its tool's status, when it expires, paused, when taken.
+        type Waiting = (bool, Option<String>, i64, bool, Option<i64>);
+        let call: Option<Waiting> = self
+            .conn
+            .prepare_cached(
+                "SELECT a.output IS NOT NULL,t.status,a.expires_ms,a.paused_ms IS NOT NULL,a.taken_ms
+                 FROM answers a LEFT JOIN tools t ON t.turn=a.turn AND t.call_id=a.call_id
+                 WHERE a.turn=? AND a.call_id=?",
+            )?
+            .query_row(params![turn, call_id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })
+            .optional()?;
+        let Some((stored, tool, expires_ms, paused, taken_ms)) = call else {
+            if !matches!(status.as_str(), "running" | "waiting") {
+                return Err(Error::with(
+                    "stale_turn",
+                    format!("turn {turn} is {status}"),
+                ));
+            }
+            return fail("no_pending_call");
+        };
+        let held = self
+            .live
+            .get(&turn)
+            .is_some_and(|live| live.answers.contains_key(call_id));
+        if stored || held {
+            return fail("call_already_answered");
+        }
+        if tool.as_deref() != Some("executing") {
+            return fail_with("no_pending_call", "the call ended unanswered");
+        }
+        if !paused && now_ms >= expires_ms.max(0) as u64 {
+            return fail_with("no_pending_call", "the call ran out of time");
+        }
+        if let Some(taken_ms) = taken_ms {
+            return Err(Error::with(
+                "call_taken",
+                "a client took this call to run it and has not answered it",
+            )
+            .facts(json!({"taken_ms": taken_ms})));
+        }
+        self.conn
+            .prepare_cached("UPDATE answers SET taken_ms=? WHERE turn=? AND call_id=?")?
+            .execute(params![now_ms as i64, turn, call_id])?;
+        Ok(json!({"bot":bot,"turn":turn,"call_id":call_id,"taken_ms":now_ms}))
+    }
     /// Answered calls still waiting for the client `tag` names, oldest
     /// first: at most `limit` and 256 KiB of them (or the one call, when it
     /// alone is larger). `next_after` continues the listing.
@@ -7997,7 +8058,7 @@ impl Database {
             return fail_with("invalid_page", "limit must be 1 to 256 and after 0 or more");
         }
         let mut statement = self.conn.prepare_cached(
-            "SELECT a.id,t.bot,a.turn,a.call_id,a.name,a.arguments,a.expires_ms FROM answers a
+            "SELECT a.id,t.bot,a.turn,a.call_id,a.name,a.arguments,a.expires_ms,a.taken_ms FROM answers a
              JOIN turns t ON t.id=a.turn JOIN tools l ON l.turn=a.turn AND l.call_id=a.call_id
              WHERE a.tag=? AND a.id>? AND a.output IS NULL AND l.status='executing'
                AND t.status IN ('running','waiting') ORDER BY a.id LIMIT ?",
@@ -8021,7 +8082,7 @@ impl Database {
             let entry = json!({"bot":r.get::<_, String>(1)?,"turn":turn,"call_id":call_id,
                 "name":r.get::<_, String>(4)?,
                 "arguments":serde_json::from_str::<Value>(&arguments).unwrap_or(Value::Null),
-                "expires_ms":r.get::<_, i64>(6)?});
+                "expires_ms":r.get::<_, i64>(6)?,"taken_ms":r.get::<_, Option<i64>>(7)?});
             let size = crate::output::encoded_len(&entry)? + 1;
             if listed.len() == limit || (!listed.is_empty() && bytes + size > 256 * 1024) {
                 more = true;
@@ -13782,6 +13843,18 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
         )?
     {
         conn.execute("ALTER TABLE turns ADD COLUMN held TEXT", [])?;
+    }
+    // 78 -> 79: when a client took an answered call to run it, so no
+    // client runs it again.
+    if from < 79
+        && conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='answers')
+             AND NOT EXISTS(SELECT 1 FROM pragma_table_info('answers') WHERE name='taken_ms')",
+            [],
+            |r| r.get::<_, bool>(0),
+        )?
+    {
+        conn.execute("ALTER TABLE answers ADD COLUMN taken_ms INTEGER", [])?;
     }
     Ok(())
 }
