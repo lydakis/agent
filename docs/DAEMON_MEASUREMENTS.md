@@ -7032,3 +7032,47 @@ d85dfd9 (the count, merged with `main`), on a GitHub runner:
 
 Nothing moved past noise, and the gate counted no more store work per
 turn. Sonny's rows moved within their noise.
+
+## Context windows by model, and what each compaction left (#718)
+
+A turn now reads the window the person set for its model before the
+provider's listing: one walk over the `--context-window` patterns, most
+specific first, and one `PROVIDER/MODEL` string, once per turn (the window
+is kept in a `OnceLock`, as before). Each compaction adds a small `trigger`
+object to its `compacted` event and the store a `room_bytes` beside it; a
+summary longer than its limit makes another model call only where it used
+to end the compaction. No store job is added on a turn's path.
+
+The Perf workflow's matched screen, base `main` (be1a3bb) against this
+branch at 64d82cd, on a GitHub runner:
+
+| Measure | Base | Head | Change |
+| --- | ---: | ---: | ---: |
+| Lone submit CPU, ms | 42.273 | 41.595 | -1.6% |
+| Burst submit p99, ms | 6.713 | 6.441 | -4.1% |
+| Release to terminal p99, ms | 14.704 | 14.241 | -3.2% |
+| Idle RSS, MiB | 20.941 | 20.912 | -0.1% |
+| Per idle bot, KiB | 1.5 | 1.372 | -8.5% |
+| RSS after a turn each, MiB | 30.283 | 28.785 | -4.9% |
+| Daemon CPU per turn, ms | 1.309 | 1.308 | -0.1% |
+| Lifecycle CPU, s | 1.235 | 1.215 | -1.6% |
+| Lifecycle p95 turn, ms | 583.926 | 583.07 | -0.1% |
+| Lifecycle peak RSS, MiB | 27.189 | 27.375 | +0.7% |
+
+Nothing moved past noise, and the gate counted no more store work per
+turn. Sonny's rows moved within their noise (this change does not touch
+Sonny's code).
+
+What a compaction leaves, from `tests/test_turn_compaction.py`'s drive (a
+lead's turns of four shell rounds, every summary the full 64 KiB it may
+take, the scripted model counting the bytes per token given):
+
+| Window | Bytes a token | Instructions | Round | Threshold | Kept target | View after | Room, 2nd to 20th |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 200K | 4 | 42 KB | 36 KB | 625 KB | 208 KB | 341 KB | 283 KB (~70K tokens) |
+| 1M | 1 | 17 KB | 63 KB | 882 KB | 294 KB | 620 KB | 262 KB |
+
+The room is the same after the twentieth compaction as after the second:
+the pinned prefix is bounded (summary, kept prompts, note). At 1M the kept
+tail ran past its target by about one turn, since a cut lands on a turn's
+prompt or a round start of the newest turn.
