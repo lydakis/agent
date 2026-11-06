@@ -1453,6 +1453,7 @@ async fn run() -> Result<(), String> {
     app.sounds.chime = settings.chime;
     app.verbose = settings.verbose;
     set_measure(settings.text_width);
+    margin::set_most_notes(settings.margin_notes);
     app.zen = zen::focus(app.reactions_key.as_deref());
     app.margin_opens = settings.margin_opens;
     app.agent_opens = settings.agent_opens;
@@ -2784,8 +2785,9 @@ struct App {
     /// The reasoning streamed since the bot last spoke or called a tool,
     /// whose latest heading the status row shows, as Codex does.
     thought: String,
-    /// What a retried call will stream again, not to be shown twice.
-    replay: Option<String>,
+    /// What a retried call will stream again, not to be shown twice, and
+    /// how much of it the retry has streamed so far.
+    replay: Option<(String, usize)>,
     /// How to reach the daemon again when the connection drops.
     options: Options,
     /// The lead's connection dropped.
@@ -3281,6 +3283,13 @@ fn kin(
 /// it or by one of its, or, for the folder's first lead, made by no agent
 /// at all; never another lead.
 fn lineage_of(bots: &[Value], lead: &str, first: bool) -> std::collections::HashSet<String> {
+    lineage(bots, lead, first).0
+}
+
+/// [`lineage_of`], and how many makers it looked up: each bot's answer is
+/// worked out once, so a line of makers is walked by the first bot on it
+/// and every later one stops where it meets a bot already answered.
+fn lineage(bots: &[Value], lead: &str, first: bool) -> (std::collections::HashSet<String>, usize) {
     let made_by: HashMap<&str, &str> = (bots.iter())
         .filter_map(|bot| {
             Some((
@@ -3289,37 +3298,43 @@ fn lineage_of(bots: &[Value], lead: &str, first: bool) -> std::collections::Hash
             ))
         })
         .collect();
-    let mut mine = std::collections::HashSet::new();
+    let mut answered: HashMap<&str, bool> = HashMap::with_capacity(made_by.len());
+    let mut line: Vec<&str> = Vec::new();
+    let mut on_line = std::collections::HashSet::new();
+    let mut looked = 0;
     for &name in made_by.keys() {
-        if name == lead || project::is_lead(name) {
+        if name == lead || project::is_lead(name) || answered.contains_key(name) {
             continue;
         }
         let mut at = name;
-        // A chain of makers no longer than the daemon lists bots.
-        for _ in 0..=made_by.len() {
-            match made_by.get(at).copied() {
-                Some(by) if by == lead => {
-                    mine.insert(name.to_owned());
-                    break;
-                }
-                Some(by) if by.is_empty() || project::is_lead(by) => {
-                    if by.is_empty() && first {
-                        mine.insert(name.to_owned());
-                    }
-                    break;
-                }
-                Some(by) => at = by,
-                None => {
-                    // Made by a bot no longer listed: the first lead's.
-                    if first && at != name {
-                        mine.insert(name.to_owned());
-                    }
-                    break;
-                }
+        let theirs = loop {
+            if let Some(&known) = answered.get(at) {
+                break known;
             }
+            // A ring of makers leads to no lead.
+            if !on_line.insert(at) {
+                break false;
+            }
+            line.push(at);
+            looked += 1;
+            match made_by[at] {
+                by if by == lead => break true,
+                by if by.is_empty() || project::is_lead(by) => break by.is_empty() && first,
+                by if made_by.contains_key(by) => at = by,
+                // Made by a bot no longer listed: the first lead's.
+                _ => break first,
+            }
+        };
+        for bot in line.drain(..) {
+            answered.insert(bot, theirs);
         }
+        on_line.clear();
     }
-    mine
+    let mine = (answered.into_iter())
+        .filter(|&(_, theirs)| theirs)
+        .map(|(name, _)| name.to_owned())
+        .collect();
+    (mine, looked)
 }
 
 /// What a lead's windows are named from: its project, the lead, what
@@ -7640,17 +7655,25 @@ impl App {
                 let mut delta = event["text"].as_str().unwrap_or("");
                 // A retried call streams its reply again from the start:
                 // what was already shown is not shown twice.
-                if let Some(replay) = &mut self.replay {
-                    if let Some(left) = replay.strip_prefix(delta) {
+                if let Some((replay, at)) = &mut self.replay {
+                    // A cursor through what was shown, not a copy of the rest
+                    // per piece: a long reply streamed again costs its length.
+                    let left = &replay[*at..];
+                    if left.starts_with(delta) {
                         self.said.push_str(delta);
-                        *replay = left.to_owned();
-                        if replay.is_empty() {
+                        *at += delta.len();
+                        if *at == replay.len() {
                             self.replay = None;
                         }
                         return;
                     }
-                    match delta.strip_prefix(replay.as_str()) {
-                        Some(rest) => delta = rest,
+                    match delta.strip_prefix(left) {
+                        // What the retry said past what was shown: the
+                        // shown part still counts as said.
+                        Some(rest) => {
+                            self.said.push_str(left);
+                            delta = rest;
+                        }
                         None => {
                             self.notice = Some("the model retried; its reply may repeat".into())
                         }
@@ -7672,10 +7695,15 @@ impl App {
                         Live::new(self.any_history, &self.workspace)
                     }
                 };
-                live.partial.push_str(delta);
-                while let Some(at) = live.partial.find('\n') {
-                    let line: String = live.partial.drain(..=at).collect();
-                    self.live_line(&mut live, line.trim_end_matches('\n'));
+                // Only the new words are searched for a line's end, and an
+                // ended line leaves whole: a long line streamed in small
+                // pieces costs its length once.
+                for piece in delta.split_inclusive('\n') {
+                    live.partial.push_str(piece);
+                    if piece.ends_with('\n') {
+                        let line = std::mem::take(&mut live.partial);
+                        self.live_line(&mut live, line.trim_end_matches('\n'));
+                    }
                 }
                 self.live = Some(live);
             }
@@ -7788,7 +7816,7 @@ impl App {
                     self.notice = Some("the model retried; its reply may repeat".into());
                 }
                 if !self.said.is_empty() {
-                    self.replay = Some(std::mem::take(&mut self.said));
+                    self.replay = Some((std::mem::take(&mut self.said), 0));
                 }
                 if let Some(running) = &mut self.running {
                     running.phase = "Retrying".into();
@@ -10358,6 +10386,7 @@ impl App {
             self.sounds.chime = settings.chime;
             self.margin_opens = settings.margin_opens;
             self.agent_opens = settings.agent_opens;
+            margin::set_most_notes(settings.margin_notes);
             if self.verbose != settings.verbose {
                 self.verbose = settings.verbose;
                 self.repaint = true;
@@ -12280,7 +12309,7 @@ impl App {
             && self.pane.as_ref().is_some_and(pane::Pane::is_margin)
         {
             let live = self.running.as_ref().map(|running| running.turn);
-            let width = (at.width.saturating_sub(1) as usize).min(measure());
+            let width = (pane::margin_room(at.width).saturating_sub(1) as usize).min(measure());
             let (lines, marks) = self.margin.lines(width, &workspace, live);
             let glance = self.glance().line();
             if let Some(pane) = &mut self.pane {
@@ -13772,6 +13801,93 @@ mod tests {
         // A closed window says nothing more.
         reported = Some(("shop.a".into(), "clear".into(), false));
         assert_eq!(asked_now(&mut reported, "shop.a", true), None);
+    }
+
+    /// [`lineage_of`] as it was: each bot's line of makers walked afresh.
+    fn lineage_by_walks(
+        bots: &[Value],
+        lead: &str,
+        first: bool,
+    ) -> std::collections::HashSet<String> {
+        let made_by: HashMap<&str, &str> = (bots.iter())
+            .filter_map(|bot| {
+                Some((
+                    bot["name"].as_str()?,
+                    bot["created_by"].as_str().unwrap_or(""),
+                ))
+            })
+            .collect();
+        let mut mine = std::collections::HashSet::new();
+        for &name in made_by.keys() {
+            if name == lead || project::is_lead(name) {
+                continue;
+            }
+            let mut at = name;
+            for _ in 0..=made_by.len() {
+                match made_by.get(at).copied() {
+                    Some(by) if by == lead => {
+                        mine.insert(name.to_owned());
+                        break;
+                    }
+                    Some(by) if by.is_empty() || project::is_lead(by) => {
+                        if by.is_empty() && first {
+                            mine.insert(name.to_owned());
+                        }
+                        break;
+                    }
+                    Some(by) => at = by,
+                    None => {
+                        if first && at != name {
+                            mine.insert(name.to_owned());
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+        mine
+    }
+
+    #[test]
+    fn a_leads_lineage_reads_each_maker_once() {
+        let bot = |name: &str, by: &str| json!({"name": name, "created_by": by});
+        // Every case the walk had: made by the lead, through others, by
+        // another lead, by nobody, by a bot gone, in a ring, by itself.
+        let mut bots = vec![
+            bot("shop.lead", ""),
+            bot("shop.lead.b", ""),
+            bot("shop.a", "shop.lead"),
+            bot("shop.a1", "shop.a"),
+            bot("shop.a2", "shop.a1"),
+            bot("shop.x", "shop.lead.b"),
+            bot("shop.x1", "shop.x"),
+            bot("loose", ""),
+            bot("orphan", "gone"),
+            bot("orphan1", "orphan"),
+            bot("ring1", "ring2"),
+            bot("ring2", "ring1"),
+            bot("into-ring", "ring1"),
+            bot("self", "self"),
+        ];
+        for first in [true, false] {
+            for lead in ["shop.lead", "shop.lead.b"] {
+                assert_eq!(
+                    lineage_of(&bots, lead, first),
+                    lineage_by_walks(&bots, lead, first),
+                    "{lead} first={first}"
+                );
+            }
+        }
+        // A line of makers 20,000 long: walked once, not once per bot on it.
+        bots = (0..20_000)
+            .map(|n| match n {
+                0 => bot("shop.t0", "shop.lead"),
+                n => bot(&format!("shop.t{n}"), &format!("shop.t{}", n - 1)),
+            })
+            .collect();
+        let (mine, looked) = lineage(&bots, "shop.lead", true);
+        assert_eq!(mine.len(), 20_000);
+        assert_eq!(looked, 20_000);
     }
 
     #[test]
@@ -16595,6 +16711,53 @@ mod tests {
         );
         assert!(app.ahead.is_empty());
         assert!(!app.kept(screen::Tag::Streamed(1)));
+    }
+
+    #[tokio::test]
+    async fn a_retry_streamed_again_in_other_pieces_is_drawn_once() {
+        let text = "First line.\nSecond line,\nthird.";
+        let client = daemon_with(json!({
+            "2": {"type": "message", "role": "assistant",
+                  "content": [{"type": "output_text", "text": text}]}
+        }))
+        .await;
+        let mut app = app(client);
+        let event =
+            |event: &str, data: Value| json!({"event": event, "bot": "b", "turn": 1, "data": data});
+        app.daemon(event("accepted", json!({}))).await;
+        let said = |text: &str| {
+            let mut delta = event("text_delta", json!({}));
+            (delta["item"], delta["text"]) = (json!(1), json!(text));
+            delta
+        };
+        // Lines ending inside a piece, and pieces of one character.
+        for piece in ["Fir", "st line.\nSec", "ond line,\n", "t", "h"] {
+            app.daemon(said(piece)).await;
+        }
+        app.daemon(event("retry", json!({"error": "provider_http_529"})))
+            .await;
+        // The retry streams it all again, cut elsewhere: shown once, with
+        // nothing said of a repeat.
+        let mut at = 0;
+        for size in [1, 4, 9, 2, 30] {
+            let end = (at + size).min(text.len());
+            app.daemon(said(&text[at..end])).await;
+            at = end;
+        }
+        app.daemon(event("message", json!({"node": 2}))).await;
+        let open = app.open_rows(80);
+        let drawn: Vec<String> = (app.pending.iter().chain(&open))
+            .map(|line| line.to_string())
+            .collect();
+        for line in ["First line.", "Second line,", "third."] {
+            assert_eq!(
+                drawn.iter().filter(|l| l.contains(line)).count(),
+                1,
+                "{line}: {drawn:?}"
+            );
+        }
+        assert!(app.notice.is_none(), "{:?}", app.notice);
+        assert!(app.replay.is_none());
     }
 
     #[test]

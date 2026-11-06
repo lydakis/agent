@@ -276,6 +276,7 @@ at its model's own effort (`AGENT_EFFORT` when its model is
 | A guess at your next message | `[sonny] suggest` (true, the default, or false) | |
 | Whether agents have the commons | `[sonny] commons` (true, the default, or false) | |
 | When a note opens the margin | `[sonny] margin_opens` (`always`, the default, `unless-closed` or `never`) | |
+| The most notes a margin holds | `[sonny] margin_notes` (20 by default, at least 1; past it the oldest goes) | |
 | Where a click on an agent's name goes | `[sonny] agent_opens` (`tab`, the default, or `beside`) | |
 | Task windows a lead keeps open | `[sonny] task_windows` (32 by default, 0 for no limit) | |
 | The daemon started with the machine | `[sonny] start_at_boot` (true or false, the default) | |
@@ -828,7 +829,10 @@ way `/react` does, and each note in the margin has its own `↩`.
 - `/sky` draws every agent the daemon keeps, in the pane: leads on the inner
   ring, the agents each one made fanned out behind it, you in the middle,
   on a circle as 0.7.0 drew it, stretched to fill a wide pane (up to twice
-  as wide as high). Projects keep their places in the order they started,
+  as wide as high). It opens whole: "Catching up with who is here…" until
+  every agent, what each did and holds, and what each asks are read, then
+  the sky, its counts and its log at once. Projects keep their places in
+  the order they started,
   each arm as wide as the square root of its size, and the agents that made
   none sit on the outer edge, as a tree's leaves do, so the sky fills to
   its rim. Throwaway copies, such as the approver's judges or a
