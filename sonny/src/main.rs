@@ -71,7 +71,6 @@ mod said;
 mod scheduler;
 mod screen;
 mod seed;
-mod sent;
 mod served;
 mod settings;
 mod setup;
@@ -1264,7 +1263,6 @@ fn main() -> std::process::ExitCode {
         Some((verb, rest)) if verb == "approver" => approver::run(rest),
         Some((verb, rest)) if verb == "mcp" => mcp::cli(rest),
         Some((verb, rest)) if verb == "link" => link::cli(rest),
-        Some((verb, rest)) if verb == "sent" => sent::cli(rest),
         Some((verb, rest)) if verb == "rules" => {
             return std::process::ExitCode::from(rules::cli(rest) as u8);
         }
@@ -1859,7 +1857,7 @@ fn edge(frame: &mut ratatui::Frame, gap: Rect, composer: Rect, pad: Rect) {
     };
     frame
         .buffer_mut()
-        .set_style(band, Style::default().bg(look::band()));
+        .set_style(band, Style::default().bg(look::BAND));
 }
 
 /// The viewport's rows, top to bottom: the reply's open line (`live`
@@ -2603,6 +2601,10 @@ impl Watch {
     }
 }
 
+/// What leads the words typed to find an earlier prompt, under the
+/// composer.
+const SEARCH_LABEL: &str = "  find ";
+
 /// Ctrl+R's search of the prompts sent before.
 struct Search {
     /// Each prompt once, newest first: how far back, and its words on one
@@ -2625,6 +2627,15 @@ impl Search {
         };
         search.narrow();
         search
+    }
+
+    /// The row under the composer while it is open: what is typed to
+    /// find, then the keys; and the column the cursor goes in.
+    fn keys(&self) -> (Line<'static>, u16) {
+        let mut keys = vec![Span::raw(SEARCH_LABEL).dim(), Span::raw(self.typed.clone())];
+        keys.extend(hint::spans("  ↑↓ pick · enter edit · esc cancel"));
+        let cursor = SEARCH_LABEL.width() + self.typed.width();
+        (Line::from(keys), cursor as u16)
     }
 
     /// The matches for what is typed now, the best picked.
@@ -10728,7 +10739,7 @@ impl App {
         }
     }
 
-    /// Ctrl+R: the list of prompts sent before over the composer.
+    /// Ctrl+R: the list of prompts sent before, over the composer.
     fn search(&mut self) {
         let prompts = (self.recall.all().into_iter())
             .map(|(back, text)| (back, text.replace('\n', " ")))
@@ -11714,9 +11725,9 @@ impl App {
 
     /// `/side`: a side chat with a copy of this bot, taken where it is now,
     /// mid-turn included, and opened in a Sonny of its own on the alternate
-    /// screen. The copy may call no tool, so it answers from what the bot
-    /// knows, unless the config's `[sonny] side_chat` is `"fork"`: then it
-    /// may do anything the bot may. The daemon deletes it once it has been
+    /// screen. The copy may do anything the bot may, unless the config's
+    /// `[sonny] side_chat` is `"answer"`: then it calls no tool and answers
+    /// from what the bot knows. The daemon deletes it once it has been
     /// idle a quarter hour. This bot carries on, and its lines wait for the
     /// main screen.
     async fn side(&mut self, question: String, pictures: &[attach::Picture]) {
@@ -12699,8 +12710,11 @@ impl App {
                 return;
             }
             if let Some(search) = &self.searching {
+                // Over the composer's band, as the slash menu is, the
+                // draft left in it as it was: what is typed to find goes
+                // under it, where the keys are, as a shell's
+                // reverse-i-search and Codex's are.
                 let found = &search.found;
-                let room = composer.y as usize;
                 let items: Vec<list::Item> = (found.iter())
                     .map(|(at, found)| {
                         let text = &search.prompts[*at].1;
@@ -12708,6 +12722,7 @@ impl App {
                             .found(found)
                     })
                     .collect();
+                let room = gap.y as usize;
                 let mut rows = list::lines(&items, search.pick, width, room);
                 if items.is_empty() && room > 1 {
                     rows.push(
@@ -12718,24 +12733,12 @@ impl App {
                         .dim(),
                     );
                 }
-                over(frame, rows, composer);
-                let line = match search.typed.is_empty() {
-                    true => Line::from(vec![
-                        Span::raw("› ").bold(),
-                        Span::raw("type to find a prompt").dim(),
-                    ]),
-                    false => Line::from(vec![
-                        Span::raw("› ").bold(),
-                        Span::raw(search.typed.clone()),
-                    ]),
-                };
-                frame.render_widget(Paragraph::new(line), composer);
-                frame.set_cursor_position((
-                    composer.x + 2 + search.typed.width() as u16,
-                    composer.y,
-                ));
-                let keys = Line::from(hint::spans("  ↑↓ pick · enter edit · esc cancel"));
+                over(frame, rows, gap);
+                edge(frame, gap, composer, pad);
+                frame.render_widget(Paragraph::new(composer_rows), composer);
+                let (keys, cursor) = search.keys();
                 frame.render_widget(Paragraph::new(keys), footer);
+                frame.set_cursor_position((footer.x + cursor, footer.y));
                 return;
             }
             if let Some((items, list)) = (self.making.as_ref()).and_then(new::Making::listed)
@@ -19979,6 +19982,14 @@ mod tests {
         }
         assert_eq!(shown(&app), ["fix the readme", "fix the rounding"]);
         assert_eq!(&*app.input, "draft", "typing goes to the search");
+        // The draft keeps the composer: what is typed to find shows
+        // under it, with the keys, the cursor after it.
+        let (keys, cursor) = app.searching.as_ref().unwrap().keys();
+        assert_eq!(
+            keys.to_string(),
+            "  find fix  ↑↓ pick · enter edit · esc cancel"
+        );
+        assert_eq!(cursor, 10);
         // Ctrl+R again goes further back, as a shell's does.
         app.key(ctrl('r')).await;
         app.key(key(KeyCode::Enter)).await;

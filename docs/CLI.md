@@ -33,6 +33,18 @@ terminal it was started in (`TMUX`, `TMUX_PANE`, Rex's, Herdr's and cmux's
 places, `agent_client::TERMINAL_PLACES`), so a bot's command never lands in
 that terminal. A running daemon keeps the excludes it started with, and
 a variable a bot or caller sets with `--env` is still set.
+
+A model's context window, which sets where its bots compact unless they set
+`--compact-tokens`, is what its provider lists, else the window Anthropic
+publishes for a Claude model, else 200K. `serve --context-window
+PROVIDER/MODEL=TOKENS`, repeatable, sets it instead for every model whose path
+matches, with `*` and `?` wildcards: `bedrock/*` for every Bedrock model,
+`bedrock/*openai.*` for OpenAI's there, or one exact model. The most specific
+pattern wins (the most characters that are not wildcards, then the first by
+name), and it wins over the provider's listing, so a window can be set lower
+on purpose. A client that starts a daemon passes `[context_windows]` from
+`~/.agent/config.toml`; the daemon announces them in `ready` as
+`context_windows`, and a running daemon keeps the ones it started with.
 `serve --redact-field NAME` has the value printed after a field named like
 NAME (its end, any case, `_` and `-` ignored) redacted from tool output, and
 `serve --redact-block LABEL` the body of each PEM block whose header names

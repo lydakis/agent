@@ -1226,7 +1226,7 @@ pub fn prompt(text: &str, from: Option<&str>, width: usize) -> Vec<Line<'static>
     let shown = shown_lines(lines.len());
     // On its band with a row of it above and below, as the composer it
     // was written in: the words sit in the middle, not on an edge.
-    let band = crate::look::band();
+    let band = crate::look::BAND;
     out.push(Line::default().bg(band));
     out.extend(answering.map(|row| row.bg(band)));
     out.extend(prompt_rows(&lines[..shown], 0, width));
@@ -1248,7 +1248,7 @@ fn shown_lines(count: usize) -> usize {
 
 /// A prompt's `lines` on its band, the first of them its `at`th.
 fn prompt_rows(lines: &[&str], at: usize, width: usize) -> Vec<Line<'static>> {
-    let band = crate::look::band();
+    let band = crate::look::BAND;
     let mut out = Vec::new();
     for (i, line) in lines.iter().enumerate() {
         let lead = if at + i == 0 { "› " } else { "  " };
@@ -1267,7 +1267,7 @@ fn prompt_rows(lines: &[&str], at: usize, width: usize) -> Vec<Line<'static>> {
 /// (`open`, from its first hidden one) and the row under them, which a
 /// click shuts again.
 fn prompt_rest(more: usize, open: Option<&[&str]>, width: usize) -> Vec<Line<'static>> {
-    let band = crate::look::band();
+    let band = crate::look::BAND;
     let mut out = match open {
         Some(lines) => prompt_rows(lines, PROMPT_LINES, width),
         None => Vec::new(),
@@ -1399,7 +1399,7 @@ pub fn with_quotes(
     quotes: &str,
     width: usize,
 ) -> Vec<Line<'static>> {
-    let band = crate::look::band();
+    let band = crate::look::BAND;
     let Some(end) = prompt.pop() else {
         return prompt;
     };
@@ -3186,7 +3186,13 @@ mod tests {
         assert_eq!(shown, ["", "  answering “Ship it?”", "› Not yet", ""]);
         let rows = prompt("You asked (c1): Ship **it**?\n\nNot yet", None, 80);
         assert_eq!(rows[1].to_string(), "  answering “Ship it?”");
-        assert!(rows.iter().all(|row| row.style.bg.is_some()));
+        // The band's role, made the theme's band as each frame is drawn,
+        // so a light/dark switch reaches these rows without drawing them
+        // again.
+        assert!(
+            rows.iter()
+                .all(|row| row.style.bg == Some(crate::look::BAND))
+        );
     }
 
     #[test]
@@ -3376,21 +3382,75 @@ mod tests {
         assert!(shown.iter().any(|l| l.contains("+new")), "{shown:?}");
     }
 
-    /// How long `draw` takes on `unit` repeated to `n` bytes, and on twice
-    /// that: work in proportion to the text takes about twice as long, where
-    /// work as its square takes four times.
-    fn scales(
-        unit: &str,
-        n: usize,
-        draw: impl Fn(&str),
-    ) -> (std::time::Duration, std::time::Duration) {
-        let timed = |len: usize| {
-            let text = unit.repeat(len / unit.len());
+    /// Whether `draw` on `unit` repeated to twice `n` bytes takes about twice
+    /// as long as on `n`, not four times, as work as the text's square would.
+    #[track_caller]
+    fn assert_linear(unit: &str, n: usize, draw: impl Fn(&str)) {
+        let (small, large) = (unit.repeat(n / unit.len()), unit.repeat(2 * n / unit.len()));
+        let timed = |longer: bool| {
             let started = std::time::Instant::now();
-            draw(&text);
+            draw(if longer { &large } else { &small });
             started.elapsed()
         };
-        (timed(n), timed(2 * n))
+        if let Some((once, twice)) = outgrows(timed) {
+            panic!("{unit}: {once:?} then {twice:?}");
+        }
+    }
+
+    /// The fastest of each timing when the longer text took three times the
+    /// shorter and 50 ms more; none when it did not. Each size is timed again,
+    /// the two in turn, up to five times while the fastest of each says
+    /// otherwise, so a busy machine pausing the test once is not read as the
+    /// work growing. `timed(true)` times the longer text.
+    fn outgrows(
+        mut timed: impl FnMut(bool) -> std::time::Duration,
+    ) -> Option<(std::time::Duration, std::time::Duration)> {
+        let (mut once, mut twice) = (std::time::Duration::MAX, std::time::Duration::MAX);
+        for _ in 0..5 {
+            once = once.min(timed(false));
+            twice = twice.min(timed(true));
+            if twice < once * 3 + std::time::Duration::from_millis(50) {
+                return None;
+            }
+        }
+        Some((once, twice))
+    }
+
+    #[test]
+    fn work_as_the_square_of_the_text_is_caught_however_often_it_is_timed() {
+        // 80 ms, then 320 ms: four times, against under three and 50 ms more.
+        let mut rounds = 0;
+        let caught = outgrows(|longer| {
+            rounds += usize::from(longer);
+            std::time::Duration::from_millis(if longer { 320 } else { 80 })
+        });
+        assert_eq!(
+            caught,
+            Some((
+                std::time::Duration::from_millis(80),
+                std::time::Duration::from_millis(320)
+            ))
+        );
+        assert_eq!(rounds, 5);
+    }
+
+    #[test]
+    fn a_pause_while_timed_once_is_not_read_as_the_work_growing() {
+        // Work in proportion to the text, the machine busy for 300 ms the
+        // first time the longer text is drawn.
+        let mut paused = false;
+        let mut rounds = 0;
+        let caught = outgrows(|longer| {
+            rounds += usize::from(longer);
+            let pause = if longer && !std::mem::replace(&mut paused, true) {
+                300
+            } else {
+                0
+            };
+            std::time::Duration::from_millis(if longer { 20 } else { 10 } + pause)
+        });
+        assert_eq!(caught, None);
+        assert_eq!(rounds, 2);
     }
 
     #[test]
@@ -3401,13 +3461,9 @@ mod tests {
             "[a", "\\(", "`", "**a", "~~", "*a ", "_a ", "$a", "<b>", "<kbd>", "<!--", "<a x",
             "<del>", "<b x", "![a](",
         ] {
-            let (once, twice) = scales(unit, 1 << 17, |text| {
+            assert_linear(unit, 1 << 17, |text| {
                 inline(text, Style::new());
             });
-            assert!(
-                twice < once * 3 + std::time::Duration::from_millis(50),
-                "{unit}: {once:?} then {twice:?}"
-            );
         }
         // What does close still reads as it did.
         let spans = inline(
@@ -3420,7 +3476,7 @@ mod tests {
 
     #[test]
     fn a_long_word_is_wrapped_in_time_as_its_length() {
-        let (once, twice) = scales("abcdefgh", 1 << 18, |text| {
+        assert_linear("abcdefgh", 1 << 18, |text| {
             let rows = wrap(
                 Line::from(text.to_owned()),
                 80,
@@ -3432,10 +3488,6 @@ mod tests {
                 .collect();
             assert_eq!(kept, text);
         });
-        assert!(
-            twice < once * 3 + std::time::Duration::from_millis(50),
-            "{once:?} then {twice:?}"
-        );
         // Joined emoji are measured alike when cut and after, so no row is
         // wider than the room.
         let family = "👨\u{200d}👩\u{200d}👧\u{200d}👦".repeat(12);
