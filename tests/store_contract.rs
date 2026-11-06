@@ -3557,6 +3557,63 @@ fn an_event_is_never_written_before_the_one_before_it() {
 }
 
 #[test]
+fn a_follow_of_some_kinds_pages_the_streams_own_events_of_them() {
+    let path = std::env::temp_dir().join(format!("agent-kinds-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    db.create("Ann", Some("/synthetic"), binding()).unwrap();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    drop(db);
+    Connection::open(&path)
+        .unwrap()
+        .execute(
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<3000)
+             INSERT INTO events(bot,turn,kind,data)
+             SELECT CASE i%3 WHEN 0 THEN 'Ann' ELSE 'Bob' END,1,
+              CASE WHEN i%97=0 THEN 'turn_finished' WHEN i%101=0 THEN 'accepted'
+                   ELSE 'tool_started' END,'{}' FROM n",
+            [],
+        )
+        .unwrap();
+    let db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    let kinds = ["turn_finished", "accepted", "created", "turn_finished"];
+    let wanted = |e: &Value| kinds.contains(&e["event"].as_str().unwrap());
+    for bot in [None, Some("Bob")] {
+        let (mut all, mut after) = (Vec::new(), 0);
+        loop {
+            let page = match bot {
+                Some(bot) => db.events(bot, after, 256),
+                None => db.events_after(after, 256),
+            };
+            let page = page.unwrap();
+            let events = page["events"].as_array().unwrap();
+            if events.is_empty() {
+                break;
+            }
+            all.extend(events.iter().filter(|e| wanted(e)).cloned());
+            after = page["next_cursor"].as_i64().unwrap();
+        }
+        assert!(all.len() > 40, "{bot:?}: {}", all.len());
+        for limit in [1, 7, 256] {
+            let (mut paged, mut after) = (Vec::new(), 0);
+            loop {
+                let page = db.events_of_kinds(bot, &kinds, after, limit).unwrap();
+                let events = page["events"].as_array().unwrap();
+                if events.is_empty() {
+                    break;
+                }
+                assert!(events.len() <= limit);
+                paged.extend(events.iter().cloned());
+                after = page["next_cursor"].as_i64().unwrap();
+            }
+            assert_eq!(paged, all, "{bot:?} by {limit}");
+        }
+    }
+    drop(db);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn schema_68_events_had_no_times() {
     let path = std::env::temp_dir().join(format!("agent-schema69-{}.sqlite", std::process::id()));
     let _ = std::fs::remove_file(&path);

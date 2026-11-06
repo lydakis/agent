@@ -664,11 +664,26 @@ impl Hub {
 }
 
 /// `limit` of `bot`'s durable events after `after`, or every bot's for `*`.
-fn event_page(db: &Database, bot: &str, after: i64, limit: usize) -> Result<Value> {
-    if bot == ALL {
-        db.events_after(after, limit)
-    } else {
-        db.events(bot, after, limit)
+/// A page of `bot`'s events, or every bot's, of `kinds` when it names
+/// some: the store passes the rest over, so a follow of a few rare kinds
+/// costs the events it gets, not every event written since.
+fn event_page(
+    db: &Database,
+    bot: &str,
+    kinds: Option<&Arc<HashSet<String>>>,
+    after: i64,
+    limit: usize,
+) -> Result<Value> {
+    let name = (bot != ALL).then_some(bot);
+    match kinds {
+        Some(kinds) => {
+            let kinds: Vec<&str> = kinds.iter().map(String::as_str).collect();
+            db.events_of_kinds(name, &kinds, after, limit)
+        }
+        None => match name {
+            Some(bot) => db.events(bot, after, limit),
+            None => db.events_after(after, limit),
+        },
     }
 }
 
@@ -690,7 +705,7 @@ pub async fn replay(store: Store, hub: Hub, bot: String, sub: Sub) -> Result<()>
             }
             (s.session, s.output.clone(), s.last_cursor, s.kinds.clone())
         };
-        let page_bot = bot.clone();
+        let (page_bot, page_kinds) = (bot.clone(), kinds.clone());
         // The seat goes with the read itself: a replay cancelled while its
         // page waits or runs on a reader keeps it until the read is done.
         let seat = hub
@@ -702,7 +717,7 @@ pub async fn replay(store: Store, hub: Hub, bot: String, sub: Sub) -> Result<()>
         let mut page = reader
             .read("events_after", move |db| {
                 let _seat = seat;
-                event_page(db, &page_bot, after, 256)
+                event_page(db, &page_bot, page_kinds.as_ref(), after, 256)
             })
             .await?;
         let Value::Array(events) = page["events"].take() else {
@@ -714,7 +729,8 @@ pub async fn replay(store: Store, hub: Hub, bot: String, sub: Sub) -> Result<()>
             let (live, pruned) = store
                 .op("follow_live", move |db| {
                     let mut s = switch_sub.lock().unwrap();
-                    let behind = event_page(db, &switch_bot, s.last_cursor, 1)?;
+                    // Only a wanted event behind it keeps the follow paging.
+                    let behind = event_page(db, &switch_bot, s.kinds.as_ref(), s.last_cursor, 1)?;
                     if s.cancelled || behind["events"].as_array().is_some_and(|e| !e.is_empty()) {
                         return Ok((false, None));
                     }
