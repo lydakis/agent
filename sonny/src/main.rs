@@ -29,6 +29,7 @@ mod diff;
 mod embed;
 mod exec;
 mod footer;
+mod frames;
 mod fuzzy;
 mod haiku;
 mod herdr;
@@ -113,10 +114,7 @@ use ratatui::{
             PushKeyboardEnhancementFlags,
         },
         execute,
-        terminal::{
-            BeginSynchronizedUpdate, EndSynchronizedUpdate, EnterAlternateScreen,
-            LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-        },
+        terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
     },
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style, Stylize},
@@ -265,7 +263,7 @@ fn keys_apart(on: bool) {
     };
 }
 
-type Tui = Terminal<CrosstermBackend<std::io::Stdout>>;
+type Tui = Terminal<CrosstermBackend<frames::Screen>>;
 
 /// The whole screen cleared, and drawn whole at the next frame, without
 /// asking the terminal where its cursor is as `Terminal::clear` does to put
@@ -275,31 +273,6 @@ type Tui = Terminal<CrosstermBackend<std::io::Stdout>>;
 fn wipe<B: Backend>(terminal: &mut Terminal<B>) -> Result<(), B::Error> {
     let size = terminal.size()?;
     terminal.resize(Rect::new(0, 0, size.width, size.height))
-}
-
-/// One frame written as the terminal is to show it, as Ink and Codex
-/// write theirs: inside a synchronized update (mode 2026), so a terminal
-/// that knows it shows the frame whole, never half written, and with the
-/// cursor hidden while cells land, shown again only where the frame puts
-/// it. Written cell by cell in view, the cursor flickered over the screen,
-/// and what follows the cursor (an emoji picker, an input method) could
-/// open wherever the cursor passed. A terminal that does not know the
-/// mode ignores it.
-fn synchronized<T, W: std::io::Write>(
-    target: &mut T,
-    out: impl Fn(&mut T) -> &mut W,
-    frame: impl FnOnce(&mut T) -> std::io::Result<()>,
-) -> std::io::Result<()> {
-    ratatui::crossterm::queue!(
-        out(target),
-        BeginSynchronizedUpdate,
-        ratatui::crossterm::cursor::Hide
-    )?;
-    let drawn = frame(target);
-    // Ended even after a failed write, so the terminal is never left
-    // holding frames back.
-    execute!(out(target), EndSynchronizedUpdate)?;
-    drawn
 }
 
 #[derive(Clone)]
@@ -1222,6 +1195,7 @@ fn main() -> std::process::ExitCode {
     // Before anything reads the config, which refuses a key it no longer
     // knows.
     lookout::subs::at_start();
+    haiku::at_start();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.split_first() {
         // The tool host runs this for each call of a tool Sonny answers.
@@ -1462,6 +1436,9 @@ async fn run() -> Result<(), String> {
         .request("inspect", json!({"bot": name}))
         .await
         .map_err(|e| e.to_string())?;
+    if options.side.is_none() && !options.embedded {
+        trigger::cleanup_by_default(&bot, &options.store, &options.socket);
+    }
 
     enable_raw_mode().map_err(|e| e.to_string())?;
     term::detect();
@@ -1469,7 +1446,7 @@ async fn run() -> Result<(), String> {
     keys_apart(true);
     own_screen(true);
     let mut terminal =
-        Terminal::new(CrosstermBackend::new(std::io::stdout())).map_err(|e| e.to_string())?;
+        Terminal::new(CrosstermBackend::new(frames::Screen)).map_err(|e| e.to_string())?;
     // A side chat opens on its window's alternate screen, still drawn on.
     let _ = wipe(&mut terminal);
     let mut app = App::new(client, &name, &bot, options.clone());
@@ -2857,6 +2834,9 @@ struct App {
     /// What the terminal shows may not be the frame last drawn, so the
     /// next draw writes every cell again.
     stale: bool,
+    /// The links last written over the screen, written again only when
+    /// they or what is under them change.
+    links_written: screen::Written,
     /// The oldest node this window drew, which a repaint draws back to.
     first_node: Option<i64>,
     /// The node before it, while the bot has older ones.
@@ -4294,6 +4274,7 @@ impl App {
             down: false,
             repaint: false,
             stale: false,
+            links_written: screen::Written::default(),
             first_node: None,
             older: None,
             unpaired: Vec::new(),
@@ -5083,6 +5064,7 @@ impl App {
         if newest.is_none() {
             self.pages.clear();
         }
+        self.links_written.forget();
         wipe(terminal).map_err(|e| e.to_string())?;
         self.pending.clear();
         self.marks.clear();
@@ -12275,11 +12257,13 @@ impl App {
     }
 
     /// A frame drawn, the whole screen written again when it is stale
-    /// (cleared first); every frame shown whole ([`synchronized`]).
+    /// (cleared first); every frame shown whole, or not written at all
+    /// when it changes nothing ([`frames`]).
     fn draw(&mut self, terminal: &mut Tui) -> std::io::Result<()> {
         let stale = std::mem::take(&mut self.stale);
-        synchronized(terminal, Terminal::backend_mut, |terminal| {
+        frames::frame(|| {
             if stale {
+                self.links_written.forget();
                 wipe(terminal)?;
             }
             self.frame(terminal)
@@ -12871,7 +12855,7 @@ impl App {
                 .collect();
         };
         let look = look::Look::now();
-        terminal.draw(|frame| {
+        let drawn = terminal.draw(|frame| {
             paint(frame, &mut linked);
             // A link something was drawn over since, as a list over the
             // conversation, is left as the frame drew it.
@@ -12880,11 +12864,13 @@ impl App {
             // The pictures it shows, sent before it is written.
             image::send_shown(frame.buffer_mut());
         })?;
+        linked.iter_mut().for_each(|(_, _, cell)| look.cell(cell));
+        // Only the links that changed, or that the frame drew over.
+        let linked = self.links_written.changed(linked, drawn.buffer);
         self.composer_at = composer_at;
         self.counter_at = counter_at;
         // Over themselves, the cursor kept where the frame left it.
         if !linked.is_empty() {
-            linked.iter_mut().for_each(|(_, _, cell)| look.cell(cell));
             execute!(
                 terminal.backend_mut(),
                 ratatui::crossterm::cursor::SavePosition
@@ -13361,7 +13347,13 @@ impl App {
             });
             let marked = boost.as_ref().map_or(0, |boost| boost.width());
             let room = width.saturating_sub(4 + needs + marked + "zen · ".len());
-            let focus = format!("zen · {}", transcript::cut(&first_line(focus), room));
+            // As much of its first line as the row holds: the footer's own
+            // width, not a glance's.
+            let mut line = focus.lines().next().unwrap_or("").to_owned();
+            if focus.lines().nth(1).is_some() {
+                line.push('…');
+            }
+            let focus = format!("zen · {}", transcript::cut(&line, room));
             items.retain(|item| item.slot == Slot::Needs);
             let mut place = vec![Span::raw(focus).dim()];
             place.extend(boost.map(Span::raw));
@@ -13809,27 +13801,6 @@ fn zen_notice(on: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_frame_is_shown_whole_with_the_cursor_hidden_while_it_lands() {
-        let mut out: Vec<u8> = Vec::new();
-        let drawn = synchronized(
-            &mut out,
-            |out| out,
-            |out| {
-                out.extend_from_slice(b"CELLS");
-                Ok(())
-            },
-        );
-        assert!(drawn.is_ok());
-        assert_eq!(out, b"\x1b[?2026h\x1b[?25lCELLS\x1b[?2026l");
-        // A frame that fails still ends the update, so the terminal never
-        // holds what comes after back.
-        let mut out: Vec<u8> = Vec::new();
-        let failed = synchronized(&mut out, |out| out, |_| Err(std::io::Error::other("gone")));
-        assert!(failed.is_err());
-        assert!(out.ends_with(b"\x1b[?2026l"));
-    }
 
     #[test]
     fn the_screen_is_wiped_without_asking_the_terminal_anything() {
@@ -16116,6 +16087,14 @@ mod tests {
             footer.starts_with("  zen · the receipts' currency ↑") && !footer.contains("xhigh"),
             "{footer}"
         );
+        // A long focus runs to the row's end, not to a glance's length.
+        app.boost = None;
+        let long = "the receipts' currency, rounding each line in the store's own currency before it is converted and summed";
+        app.zen = Some(long.into());
+        let footer = app.footer_line(100).to_string();
+        assert!(footer.trim_end().width() >= 100 - 3, "{footer}");
+        assert!(footer.trim_end().ends_with('…'), "{footer}");
+        app.zen = Some("the receipts' currency".into());
         app.boost = Some("max".into());
         let line = app.footer_line(30);
         assert!(line.to_string().trim_end().ends_with(" ↑↑"), "{line}");

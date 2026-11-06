@@ -26,6 +26,9 @@ pub enum Kind {
     /// A server the nightly memory cleanup could not read: its
     /// `unreadable-SERVER` fact.
     Server,
+    /// The nightly memory cleanup Sonny turns on by default, which it
+    /// could not schedule ([`trigger::cleanup_unscheduled`]).
+    Setup,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -155,11 +158,36 @@ pub fn read_around(
     let mut items = read(store, store_id, turns, |bot| {
         scope.takes(bot) || personal(bot)
     });
-    if let Some(home) = std::env::var_os("HOME") {
-        let root = PathBuf::from(home).join(".agents/memory");
-        items.extend(servers(&root, &scope.project));
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        items.extend(servers(&home.join(".agents/memory"), &scope.project));
+        items.extend(unscheduled(&home));
     }
     items
+}
+
+/// The nightly memory cleanup, when Sonny could not schedule it: the
+/// person's to know in every window, since nothing else runs it.
+fn unscheduled(home: &Path) -> Option<Item> {
+    let (why, at) = trigger::cleanup_unscheduled(home)?;
+    let tried = (now_ms() / 1000).saturating_sub(at.max(0) as u64);
+    Some(Item {
+        kind: Kind::Setup,
+        name: "memory-cleanup".into(),
+        bot: String::new(),
+        bots: Vec::new(),
+        when: String::new(),
+        what: String::new(),
+        facts: vec![
+            format!("tried {}", ago(tried)),
+            "Sonny tries again at its next start".into(),
+        ],
+        reply_to: None,
+        own: false,
+        failed: Some(first_line(&why)),
+        episode: None,
+        handle: None,
+        fired_ms: None,
+    })
 }
 
 /// The `unreadable-SERVER` facts the nightly memory cleanup saves, the
@@ -514,6 +542,11 @@ impl View {
                     self.notice = Some(
                         "the nightly cleanup removes it the night the server reads again".into(),
                     );
+                } else if item.kind == Kind::Setup {
+                    self.notice = Some(
+                        "it goes once the cleanup is scheduled: `~/.agent/memory schedule --model PROVIDER/MODEL`"
+                            .into(),
+                    );
                 } else if confirm == Some(key_of(&item)) {
                     self.remove(&item);
                 } else {
@@ -553,7 +586,7 @@ impl View {
             Kind::Subscription => {
                 lookout::subs::remove(&self.store, &item.bot, &item.name).map(drop)
             }
-            Kind::Server => return,
+            Kind::Server | Kind::Setup => return,
         };
         self.notice = Some(match done {
             Ok(()) => format!("removed {}", item.name),
@@ -626,7 +659,7 @@ impl View {
             _ if item.failed.is_some() => Span::raw("✗ ").fg(Color::Red),
             Kind::Trigger => Span::raw("↻ ").dim(),
             Kind::Subscription => Span::raw("◎ ").dim(),
-            Kind::Server => Span::raw("  "),
+            Kind::Server | Kind::Setup => Span::raw("  "),
         };
         let name = Span::raw(item.name.clone()).bold();
         let mut spans = vec![pick, mark, name];
@@ -640,6 +673,9 @@ impl View {
             }
             Kind::Server => {
                 spans.push(Span::raw(" could not be read by the nightly memory cleanup").dim());
+            }
+            Kind::Setup => {
+                spans.push(Span::raw(" is not scheduled: nothing cleans up memory").dim());
             }
         }
         let mut first =
@@ -706,7 +742,9 @@ impl View {
         }
         match self.items.get(self.selected) {
             Some(item) if item.kind == Kind::Trigger => keys.extend(["r run now", "d remove"]),
-            Some(item) if !item.own && item.kind != Kind::Server => keys.push("d remove"),
+            Some(item) if !item.own && !matches!(item.kind, Kind::Server | Kind::Setup) => {
+                keys.push("d remove")
+            }
             _ => {}
         }
         keys.push("esc close");
@@ -815,6 +853,39 @@ mod tests {
         );
         assert_eq!(fresh.facts, ["not run yet"]);
         assert_eq!(fresh.failed, None);
+    }
+
+    #[test]
+    fn a_cleanup_sonny_could_not_schedule_is_a_failure_in_every_window() {
+        let home = std::env::temp_dir().join(format!("bg-unscheduled-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(home.join(".agent/sonny")).unwrap();
+        assert_eq!(unscheduled(&home), None);
+        let at = now_ms() / 1000 - 120;
+        std::fs::write(
+            home.join(".agent/sonny/cleanup-not-scheduled.json"),
+            json!({"why": "automations_unsupported: no scheduler here", "at": at}).to_string(),
+        )
+        .unwrap();
+        let item = unscheduled(&home).unwrap();
+        assert_eq!(item.kind, Kind::Setup);
+        assert_eq!(
+            item.failed.as_deref(),
+            Some("automations_unsupported: no scheduler here")
+        );
+        assert_eq!(
+            item.facts,
+            ["tried 2m ago", "Sonny tries again at its next start"]
+        );
+        // The person's, so every window shows it.
+        let scope = Scope {
+            project: "calc".into(),
+            lead: "calc.lead".into(),
+            glob: "calc.*".into(),
+        };
+        assert!(shown(&scope, &item));
+        assert_eq!(failures(std::slice::from_ref(&item)).len(), 1);
+        std::fs::remove_dir_all(home).unwrap();
     }
 
     #[test]

@@ -124,10 +124,10 @@ refused for room: save what is worth keeping, and leave merging and
 pruning to the nightly cleanup. `check` reports any file that is not a valid fact and an index
 that is out of date; `index` rewrites the index from the facts.
 
-When the person has run `"$HOME/.agent/memory" schedule`, a nightly agent
-merges duplicates, drops superseded facts and retires finished work,
-following the
-`memory-cleanup` skill. `~/.agents/memory` is then a local git repository
+Each night an agent merges duplicates, drops superseded facts and retires
+finished work, following the `memory-cleanup` skill: Sonny schedules it
+when it first opens a lead, and it stays off once the person removes it.
+`~/.agents/memory` is then a local git repository
 whose history keeps memory as it was before and after each cleanup. Leave the `cleanup` and `changed`
 commands to that agent.
 

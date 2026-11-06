@@ -1155,13 +1155,14 @@ there.wait()
             challenge = json.loads(reader.readline())['challenge']
             # As a sandboxed command would: it names the file but cannot write it.
             conn.sendall((json.dumps({'proof': challenge}) + '\n').encode())
-            conn.sendall((json.dumps({'call': {'tool': 'exec', 'payload': {'input': 'text(1)'}}}) + '\n').encode())
             conn.settimeout(10)
-            # Closed, unanswered: a close with the call still unread comes
-            # as a reset.
+            # Closed, unanswered. The host may close as soon as it reads the
+            # proof, before the call is even written (a broken pipe), or with
+            # the call still unread (a reset): either way no call is sent.
             try:
+                conn.sendall((json.dumps({'call': {'tool': 'exec', 'payload': {'input': 'text(1)'}}}) + '\n').encode())
                 said = reader.readline()
-            except ConnectionResetError:
+            except (BrokenPipeError, ConnectionResetError):
                 said = ''
             self.assertEqual(said, '')
 
