@@ -389,6 +389,77 @@ pub fn open(items: &[Value]) -> Option<String> {
     open
 }
 
+/// The asks among a bot's history `items`, newest first, each with the
+/// `turn` it holds, as the approver's judge is shown them: each ask's ID,
+/// question and what a yes covers, and the person's pick with the turn it
+/// came in, or none while it is open. An answer names its ask whole
+/// ([`answer_of`]): another's words, or an old-form answer, answer none. A
+/// refused or failed ask was never put to the person.
+/// Whether a history item bears on the asks [`decisions`] reads: an ask
+/// call, a call's failed or refused result, or the person's answer.
+pub fn bears_on_asks(item: &Value) -> bool {
+    match item["type"].as_str() {
+        Some("function_call") => item["name"] == TOOL,
+        Some("function_call_output") => item["failed"] == true || crate::reactions::refused(item),
+        _ => {
+            item["role"] == "user" && answer_of(&crate::text(item), item["from"].as_str()).is_some()
+        }
+    }
+}
+
+pub fn decisions(items: &[(i64, Value)]) -> Vec<agent_client::approver::Decision> {
+    let mut answers: Vec<(String, i64, String)> = Vec::new();
+    // By turn and call: a provider's call IDs repeat across turns.
+    let mut refused: Vec<(i64, Value)> = Vec::new();
+    let mut decisions = Vec::new();
+    for (turn, item) in items {
+        if item["role"] == "user" {
+            let text = crate::text(item);
+            if let Some(ask) = answer_of(&text, item["from"].as_str())
+                && let Some((_, pick)) = split(&text)
+            {
+                answers.push((ask.to_owned(), *turn, pick.trim().to_owned()));
+            }
+        }
+        if item["type"] == "function_call_output"
+            && (item["failed"] == true || crate::reactions::refused(item))
+        {
+            refused.push((*turn, item["call_id"].clone()));
+        }
+        if item["type"] != "function_call"
+            || item["name"] != TOOL
+            || refused.contains(&(*turn, item["call_id"].clone()))
+        {
+            continue;
+        }
+        let Some(call) = item["call_id"].as_str() else {
+            continue;
+        };
+        let asked = id(*turn, call);
+        let Some(ask) = (item["arguments"].as_str())
+            .and_then(|a| serde_json::from_str::<Value>(a).ok())
+            .and_then(|arguments| self::call(&asked, &arguments))
+        else {
+            continue;
+        };
+        // The first answer counts, as the daemon takes only the first.
+        let answered = (answers.iter().rev())
+            .find(|(answering, ..)| *answering == asked)
+            .map(|(_, turn, pick)| (*turn, pick.clone()));
+        decisions.push(agent_client::approver::Decision {
+            id: asked,
+            question: ask.question,
+            covers: ask.covers.map(|covers| agent_client::approver::Covers {
+                action: covers.action,
+                target: covers.target,
+                revision: covers.revision,
+            }),
+            answered,
+        });
+    }
+    decisions
+}
+
 /// Whether a message is the person's own words, answering no question:
 /// not another agent's, nor a reaction, a note taken away or what they
 /// ran. After it the questions asked before are set aside, the
@@ -1845,6 +1916,86 @@ mod tests {
             read(&[person("You asked (ask:2/a2): Tag it?\n\nYes")]),
             None
         );
+    }
+
+    #[test]
+    fn the_reviewer_reads_each_ask_with_what_it_covers_and_the_persons_first_pick() {
+        let asking = |call: &str, question: &str, covers: Value| {
+            let arguments = json!({"question": question, "why": "w", "if_unanswered": "wait",
+                "options": [{"label": "Yes", "explanation": "e"}, {"label": "No", "explanation": "e"}],
+                "covers": covers});
+            json!({"type": "function_call", "name": TOOL, "call_id": call,
+                "arguments": arguments.to_string()})
+        };
+        let words = |text: String| json!({"role": "user", "content": [{"type": "input_text", "text": text}]});
+        let publish_a = json!({"action": "publish", "target": "notes", "revision": "A"});
+        let shown = call(
+            &id(3, "a1"),
+            &asking("a1", "Publish it?", publish_a.clone())["arguments"]
+                .as_str()
+                .and_then(|a| serde_json::from_str(a).ok())
+                .unwrap(),
+        )
+        .unwrap();
+        let mut from_lead = words(answer(&shown, "1"));
+        from_lead["from"] = json!("shop.lead");
+        // Newest first, as the approver reads history.
+        let items = [
+            // A later turn's refused call with the same ID refuses only its own.
+            (
+                7,
+                json!({"type": "function_call_output", "call_id": "a1", "output": "", "failed": true}),
+            ),
+            (6, words(answer(&shown, "2"))),
+            (5, words(answer(&shown, "1"))),
+            (4, from_lead),
+            // Refused before it reached the person: never asked.
+            (
+                4,
+                json!({"type": "function_call_output", "call_id": "r1", "output": "", "failed": true}),
+            ),
+            (4, asking("r1", "Delete it?", json!(null))),
+            // Asked in turn 3 again by call ID, and still open.
+            (3, asking("a1", "Publish it?", publish_a)),
+            (
+                2,
+                asking(
+                    "a1",
+                    "Send it?",
+                    json!({"action": "send", "target": "the list"}),
+                ),
+            ),
+        ];
+        // Each of them bears on an ask but the lead's words; a reply or a
+        // plain output does not either.
+        let bearing: Vec<bool> = items.iter().map(|(_, item)| bears_on_asks(item)).collect();
+        assert_eq!(bearing, [true, true, true, false, true, true, true, true]);
+        let reply = json!({"role": "assistant", "content": [{"type": "output_text", "text": "x"}]});
+        let output = json!({"type": "function_call_output", "call_id": "c", "output": "big"});
+        assert!(
+            !bears_on_asks(&reply)
+                && !bears_on_asks(&output)
+                && !bears_on_asks(&words("hi".into()))
+        );
+        let decisions = decisions(&items);
+        let ids: Vec<&str> = decisions.iter().map(|d| d.id.as_str()).collect();
+        assert_eq!(ids, ["ask:3/a1", "ask:2/a1"]);
+        // The person's first pick counts; a lead's words and a later pick
+        // don't.
+        assert_eq!(decisions[0].answered, Some((5, "Yes".into())));
+        assert_eq!(
+            decisions[0].covers,
+            Some(agent_client::approver::Covers {
+                action: "publish".into(),
+                target: "notes".into(),
+                revision: Some("A".into()),
+            })
+        );
+        // Another turn's ask with the same call ID is a decision of its own,
+        // and open.
+        assert_eq!(decisions[1].question, "Send it?");
+        assert_eq!(decisions[1].answered, None);
+        assert_eq!(decisions[1].covers.as_ref().unwrap().revision, None);
     }
 
     #[test]
