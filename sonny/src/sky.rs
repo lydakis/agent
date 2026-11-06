@@ -351,6 +351,13 @@ struct Agent {
 }
 
 impl Agent {
+    /// Whether its `?` is on a beat `now`: it needs the person and came
+    /// to a moment ago, so the mark beats a few times and then holds.
+    fn beats(&self, now: Instant) -> bool {
+        self.state() == Some(State::NeedsYou)
+            && (self.asked).is_some_and(|at| crate::look::beat(now.saturating_duration_since(at)))
+    }
+
     /// Its model, as `m` colours it: by name and provider, so one
     /// model's ids from one provider, as two Bedrock regions', share a
     /// colour.
@@ -3189,13 +3196,11 @@ impl View {
             // The mark says what the colour does: `? ` for an agent that
             // needs you, `✗ ` for one that failed. Bold while it works.
             // A `?` new since a moment ago beats, reversed, then holds.
-            let beat = (agent.asked)
-                .is_some_and(|at| crate::look::beat(now.saturating_duration_since(at)));
             let mark = match agent.state() {
                 Some(state @ (State::NeedsYou | State::Failed)) => {
                     let (mark, color, _) = state.mark();
                     let style = Style::default().fg(color).bold();
-                    let style = match beat && state == State::NeedsYou {
+                    let style = match agent.beats(now) {
                         true => style.reversed(),
                         false => style,
                     };
@@ -3645,10 +3650,14 @@ impl View {
                 g if g > 0.08 => Span::raw("•"),
                 _ => Span::raw("·").dim(),
             };
+            // The same beat as in the sky for a `?` just raised.
             let mark = match agent.state() {
                 Some(state) => {
                     let (mark, color, _) = state.mark();
-                    Span::raw(mark).fg(color)
+                    match agent.beats(now) {
+                        true => Span::raw(mark).fg(color).reversed(),
+                        false => Span::raw(mark).fg(color),
+                    }
                 }
                 None => Span::raw(" "),
             };
@@ -7517,17 +7526,23 @@ mod tests {
         assert!(shown.contains("? shop lead"), "{shown}");
         assert!(shown.contains("✗ cart"), "{shown}");
         // A `?` just raised beats reversed, then holds still.
-        let beating = |view: &mut View| {
-            (view.card(100, 40).iter().flat_map(|line| line.spans.iter()))
-                .filter(|span| span.content.contains('?'))
-                .filter(|span| span.style.add_modifier.contains(Modifier::REVERSED))
-                .count()
+        // The compact list a small pane draws beats the same.
+        let beating = |view: &mut View, cols: usize, rows: usize| {
+            (view
+                .card(cols, rows)
+                .iter()
+                .flat_map(|line| line.spans.iter()))
+            .filter(|span| span.content.contains('?'))
+            .filter(|span| span.style.add_modifier.contains(Modifier::REVERSED))
+            .count()
         };
-        assert_eq!(beating(&mut view), 2);
+        assert_eq!(beating(&mut view, 100, 40), 2);
+        assert_eq!(beating(&mut view, 50, 20), 2);
         for agent in &mut view.agents {
             agent.asked = agent.asked.map(|at| at - Duration::from_secs(2));
         }
-        assert_eq!(beating(&mut view), 0);
+        assert_eq!(beating(&mut view, 100, 40), 0);
+        assert_eq!(beating(&mut view, 50, 20), 0);
         assert_eq!(
             text(&[view.footer(100)]),
             "  3 agents · ? 2 need you · ● 0 working · ✗ 1 failed · 3 messages in the last minute"
