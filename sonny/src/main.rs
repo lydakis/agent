@@ -268,6 +268,41 @@ fn keys_apart(on: bool) {
 
 type Tui = Terminal<CrosstermBackend<std::io::Stdout>>;
 
+/// The whole screen cleared, and drawn whole at the next frame, without
+/// asking the terminal where its cursor is as `Terminal::clear` does to put
+/// it back: an answer late through a multiplexer or a slow link ends Sonny
+/// with "the cursor position could not be read", and nothing here needs
+/// the cursor kept.
+fn wipe<B: Backend>(terminal: &mut Terminal<B>) -> Result<(), B::Error> {
+    let size = terminal.size()?;
+    terminal.resize(Rect::new(0, 0, size.width, size.height))
+}
+
+/// One frame written as the terminal is to show it, as Ink and Codex
+/// write theirs: inside a synchronized update (mode 2026), so a terminal
+/// that knows it shows the frame whole, never half written, and with the
+/// cursor hidden while cells land, shown again only where the frame puts
+/// it. Written cell by cell in view, the cursor flickered over the screen,
+/// and what follows the cursor (an emoji picker, an input method) could
+/// open wherever the cursor passed. A terminal that does not know the
+/// mode ignores it.
+fn synchronized<T, W: std::io::Write>(
+    target: &mut T,
+    out: impl Fn(&mut T) -> &mut W,
+    frame: impl FnOnce(&mut T) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    ratatui::crossterm::queue!(
+        out(target),
+        BeginSynchronizedUpdate,
+        ratatui::crossterm::cursor::Hide
+    )?;
+    let drawn = frame(target);
+    // Ended even after a failed write, so the terminal is never left
+    // holding frames back.
+    execute!(out(target), EndSynchronizedUpdate)?;
+    drawn
+}
+
 #[derive(Clone)]
 struct Options {
     store: PathBuf,
@@ -1424,7 +1459,7 @@ async fn run() -> Result<(), String> {
     let mut terminal =
         Terminal::new(CrosstermBackend::new(std::io::stdout())).map_err(|e| e.to_string())?;
     // A side chat opens on its window's alternate screen, still drawn on.
-    let _ = terminal.clear();
+    let _ = wipe(&mut terminal);
     let mut app = App::new(client, &name, &bot, options.clone());
     app.context = caught.context;
     app.window = caught.window;
@@ -1585,7 +1620,7 @@ async fn run() -> Result<(), String> {
         app.notice = Some(error);
     }
     let result = app.main(&mut terminal, &mut events).await;
-    let _ = terminal.clear();
+    let _ = wipe(&mut terminal);
     own_screen(false);
     keys_apart(false);
     let _ = execute!(std::io::stdout(), DisableBracketedPaste);
@@ -5023,7 +5058,7 @@ impl App {
         if newest.is_none() {
             self.pages.clear();
         }
-        terminal.clear().map_err(|e| e.to_string())?;
+        wipe(terminal).map_err(|e| e.to_string())?;
         self.pending.clear();
         self.marks.clear();
         self.folds.clear();
@@ -12214,17 +12249,16 @@ impl App {
         self.commit(lines);
     }
 
-    /// A frame drawn, the whole screen written again when it is stale:
-    /// cleared first, and shown at once with what replaces it where the
-    /// terminal holds a frame back until it is done.
+    /// A frame drawn, the whole screen written again when it is stale
+    /// (cleared first); every frame shown whole ([`synchronized`]).
     fn draw(&mut self, terminal: &mut Tui) -> std::io::Result<()> {
-        if !std::mem::take(&mut self.stale) {
-            return self.frame(terminal);
-        }
-        execute!(terminal.backend_mut(), BeginSynchronizedUpdate)?;
-        let drawn = terminal.clear().and_then(|()| self.frame(terminal));
-        execute!(terminal.backend_mut(), EndSynchronizedUpdate)?;
-        drawn
+        let stale = std::mem::take(&mut self.stale);
+        synchronized(terminal, Terminal::backend_mut, |terminal| {
+            if stale {
+                wipe(terminal)?;
+            }
+            self.frame(terminal)
+        })
     }
 
     fn frame(&mut self, terminal: &mut Tui) -> std::io::Result<()> {
@@ -13760,6 +13794,112 @@ fn zen_notice(on: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_frame_is_shown_whole_with_the_cursor_hidden_while_it_lands() {
+        let mut out: Vec<u8> = Vec::new();
+        let drawn = synchronized(
+            &mut out,
+            |out| out,
+            |out| {
+                out.extend_from_slice(b"CELLS");
+                Ok(())
+            },
+        );
+        assert!(drawn.is_ok());
+        assert_eq!(out, b"\x1b[?2026h\x1b[?25lCELLS\x1b[?2026l");
+        // A frame that fails still ends the update, so the terminal never
+        // holds what comes after back.
+        let mut out: Vec<u8> = Vec::new();
+        let failed = synchronized(&mut out, |out| out, |_| Err(std::io::Error::other("gone")));
+        assert!(failed.is_err());
+        assert!(out.ends_with(b"\x1b[?2026l"));
+    }
+
+    #[test]
+    fn the_screen_is_wiped_without_asking_the_terminal_anything() {
+        /// A terminal that never answers where its cursor is.
+        struct Mute(ratatui::backend::TestBackend);
+        impl Backend for Mute {
+            type Error = std::convert::Infallible;
+            fn draw<'a, I>(&mut self, content: I) -> Result<(), Self::Error>
+            where
+                I: Iterator<Item = (u16, u16, &'a ratatui::buffer::Cell)>,
+            {
+                self.0.draw(content)
+            }
+            fn hide_cursor(&mut self) -> Result<(), Self::Error> {
+                self.0.hide_cursor()
+            }
+            fn show_cursor(&mut self) -> Result<(), Self::Error> {
+                self.0.show_cursor()
+            }
+            fn get_cursor_position(&mut self) -> Result<ratatui::layout::Position, Self::Error> {
+                panic!("asked the terminal where its cursor is")
+            }
+            fn set_cursor_position<P: Into<ratatui::layout::Position>>(
+                &mut self,
+                position: P,
+            ) -> Result<(), Self::Error> {
+                self.0.set_cursor_position(position)
+            }
+            fn clear(&mut self) -> Result<(), Self::Error> {
+                self.0.clear()
+            }
+            fn clear_region(
+                &mut self,
+                clear_type: ratatui::backend::ClearType,
+            ) -> Result<(), Self::Error> {
+                self.0.clear_region(clear_type)
+            }
+            fn size(&self) -> Result<ratatui::layout::Size, Self::Error> {
+                self.0.size()
+            }
+            fn window_size(&mut self) -> Result<ratatui::backend::WindowSize, Self::Error> {
+                self.0.window_size()
+            }
+            fn flush(&mut self) -> Result<(), Self::Error> {
+                self.0.flush()
+            }
+            fn scroll_region_up(
+                &mut self,
+                region: std::ops::Range<u16>,
+                lines: u16,
+            ) -> Result<(), Self::Error> {
+                self.0.scroll_region_up(region, lines)
+            }
+            fn scroll_region_down(
+                &mut self,
+                region: std::ops::Range<u16>,
+                lines: u16,
+            ) -> Result<(), Self::Error> {
+                self.0.scroll_region_down(region, lines)
+            }
+        }
+        let mut terminal = Terminal::new(Mute(ratatui::backend::TestBackend::new(8, 2))).unwrap();
+        let draw = |terminal: &mut Terminal<Mute>| {
+            terminal
+                .draw(|frame| frame.render_widget(Paragraph::new("drawn"), frame.area()))
+                .unwrap();
+        };
+        draw(&mut terminal);
+        wipe(&mut terminal).unwrap();
+        assert!(
+            terminal
+                .backend()
+                .0
+                .buffer()
+                .content()
+                .iter()
+                .all(|cell| cell.symbol() == " ")
+        );
+        // What was drawn before is forgotten: the next frame writes it all.
+        draw(&mut terminal);
+        terminal
+            .backend()
+            .0
+            .assert_buffer_lines(["drawn   ", "        "]);
+    }
 
     #[test]
     fn a_question_open_says_the_agent_needs_you_to_its_multiplexer() {
