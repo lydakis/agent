@@ -255,6 +255,9 @@ pub struct Needs {
     unsure: HashSet<String>,
     /// Those whose turn ended since, with the turn.
     due: Vec<(String, Option<i64>)>,
+    /// Counts every change to the questions open, so a window showing
+    /// them reads them again only when they changed.
+    version: u64,
 }
 
 /// A question open: the call that asked it, when an event said, and the
@@ -291,8 +294,14 @@ impl Needs {
         (self.asks.iter()).filter_map(|(bot, open)| Some((bot.as_str(), open.ask.as_ref()?)))
     }
 
+    /// What [`Needs::asks`] says changes whenever this does.
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+
     /// `bot`'s open question, as its history reads now.
     pub fn asked(&mut self, bot: &str, question: Option<crate::asks::Ask>) {
+        self.version += 1;
         match question {
             Some(ask) => {
                 self.asks.entry(bot.to_owned()).or_default().ask = Some(ask);
@@ -314,6 +323,7 @@ impl Needs {
             };
         }
         for bot in asks {
+            self.version += 1;
             match other.asks.get(bot) {
                 Some(asked) => self.asks.insert(bot.clone(), asked.clone()),
                 None => self.asks.remove(bot),
@@ -324,7 +334,9 @@ impl Needs {
     /// `bot` is gone, or resolved: nothing of its waits now.
     pub fn forget(&mut self, bot: &str) {
         self.calls.remove(bot);
-        self.asks.remove(bot);
+        if self.asks.remove(bot).is_some() {
+            self.version += 1;
+        }
         self.unsure.remove(bot);
     }
 
@@ -383,6 +395,7 @@ impl Needs {
             "tool_started" => {
                 let call = data["call_id"].as_str().map(str::to_owned);
                 self.asks.insert(bot.to_owned(), Open { call, ask: None });
+                self.version += 1;
                 self.unsure.insert(bot.to_owned());
             }
             // Each answer lets go of its call alone; a question refused
@@ -397,6 +410,7 @@ impl Needs {
                         (self.asks.get(bot)).is_some_and(|a| a.call.as_deref() == Some(id));
                     if refused && asking {
                         self.asks.remove(bot);
+                        self.version += 1;
                     }
                     // Taken, the question is in its history whole, with what
                     // Sonny took it as: read now, not when the turn ends,
@@ -412,6 +426,7 @@ impl Needs {
             "accepted" | "steered" if from_person(data) => {
                 if self.asks.remove(bot).is_some() {
                     self.unsure.insert(bot.to_owned());
+                    self.version += 1;
                 }
             }
             // A steer the running turn took ends as a turn of its own: only

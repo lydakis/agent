@@ -2766,6 +2766,10 @@ struct App {
     /// The tasks' asks this window answered, by [`asks::Ask::key`], until
     /// their tasks read them: none is pinned again meanwhile.
     task_answers: Vec<String>,
+    /// What the tasks' questions were last pinned from: the fleet's and
+    /// the rosters' versions of them, the lineage and the tasks tracked.
+    /// Pinned again only once one changes, not every pass of the loop.
+    task_asks_read: Option<(u64, u64, usize, usize)>,
     /// What the tasks this window started wait on, as their rows last
     /// read it: with no multiplexer, and so no fleet, their questions are
     /// pinned from it.
@@ -4265,6 +4269,7 @@ impl App {
             commands: HashMap::new(),
             sent_answers: Vec::new(),
             task_answers: Vec::new(),
+            task_asks_read: None,
             task_needs: Default::default(),
             bot_id: record["bot_id"].as_i64(),
             reactions_key: record["bot_id"].as_i64().map(|id| {
@@ -11503,6 +11508,15 @@ impl App {
     /// elsewhere, answered in the task's window or by words past it, is
     /// let go.
     fn pin_task_asks(&mut self) {
+        let read = (
+            self.fleet.as_ref().map_or(0, |fleet| fleet.needs.version()),
+            self.task_needs.version(),
+            self.fleet.as_ref().map_or(0, |fleet| fleet.lineage.len()),
+            self.tasks.values().map(Vec::len).sum(),
+        );
+        if self.task_asks_read.replace(read) == Some(read) {
+            return;
+        }
         let pinned = |bot: &str, ask: &asks::Ask, name: String| {
             let mut ask = ask.clone();
             ask.task = Some(asks::Asker {
