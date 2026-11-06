@@ -12623,7 +12623,7 @@ impl App {
                     rows.push(Line::from(format!("    {refused}")).dim());
                 }
                 over(frame, rows, composer);
-                let effort = picker.effort().unwrap_or("default");
+                let effort = picker.effort_label();
                 let line = if picker.filter.is_empty() {
                     Line::from(vec![
                         Span::raw("› ").bold(),

@@ -9,7 +9,7 @@ pub struct Picker {
     /// Typed to narrow the list.
     pub filter: String,
     pick: usize,
-    /// No effort first: the provider's default.
+    /// No effort first: the model's own, as its provider sets it.
     efforts: Vec<Option<String>>,
     effort: usize,
     /// Why a provider of the family listed nothing.
@@ -136,6 +136,13 @@ impl Picker {
 
     pub fn effort(&self) -> Option<&str> {
         self.efforts[self.effort].as_deref()
+    }
+
+    /// The effort as the picker names it: no effort sent is the model's
+    /// own, which its provider sets per model and does not say, so no
+    /// level is guessed for it (C8).
+    pub fn effort_label(&self) -> &str {
+        self.effort().unwrap_or("model's own")
     }
 
     /// The model and effort picked, when the filter leaves any model.
@@ -360,7 +367,10 @@ mod tests {
         assert_eq!(picker.shown(), ["anthropic/claude-opus-5-5"]);
         assert_eq!(picker.refused, ["anthropic: unauthorized"]);
         assert_eq!(picker.effort(), None);
+        assert_eq!(picker.effort_label(), "model's own");
         picker.less();
         assert_eq!(picker.effort(), None);
+        picker.more();
+        assert_eq!(picker.effort_label(), "low");
     }
 }

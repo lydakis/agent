@@ -610,7 +610,9 @@ way `/react` does, and each note in the margin has its own `↩`.
   ![/config over the composer, side_chat set to fork](../docs/sonny/config.png)
 - `/model` picks the lead's model, from every model its provider family
   lists, each by its name and provider (`Opus 5.5 · bedrock`) with its id
-  muted after them, found by either, and its effort (←/→), and writes them to the project's
+  muted after them, found by either, and its effort (←/→: first `model's own`,
+  which sends none and leaves the level to the provider, as it sets one per
+  model and does not say which), and writes them to the project's
   `.agents/project.toml` when the folder has one. A pick made while a turn
   runs shows in the footer and applies when the lead is idle; one that
   another client overtakes is dropped.
