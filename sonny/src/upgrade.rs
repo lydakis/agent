@@ -1,10 +1,12 @@
 //! One-off work an upgrade brings, each retired two releases after it
-//! ships. What needs judgment, or reaches what is the person's own (config
-//! they wrote, skills they changed, hosts this machine knows), is a step:
-//! words in `sonny/upgrades/ID.md` that the upgrade note hands the folder's
-//! lead, as release notes hand an operator, with a check in code that says
-//! when it is done. What a script does the same everywhere (a rewrite of
-//! Sonny's own files) is a migration: code that runs once, through
+//! ships. What needs judgment, or reaches what is the person's own (what
+//! they wrote in a setting's value or a command, skills they changed,
+//! hosts this machine knows), is a step: words in `sonny/upgrades/ID.md`
+//! that the upgrade note hands the folder's lead, as release notes hand an
+//! operator, with a check in code that says when it is done. What a script
+//! does the same everywhere (a rewrite of Sonny's own files, or a key
+//! renamed in the person's config, kept only when the file reads as the
+//! same settings after) is a migration: code that runs once, through
 //! [`once`]. The store's schema is neither; its migrations stay in the
 //! daemon for good, since each new store replays them.
 //!
