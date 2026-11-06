@@ -3318,7 +3318,6 @@ fn add_args(asked: &Value) -> Vec<String> {
         ("bot", "--bot"),
         ("reply_to", "--reply-to"),
         ("if", "--if"),
-        ("budget_counts", "--budget-counts"),
     ] {
         if let Some(value) = asked[key].as_str() {
             args.extend([flag.to_owned(), value.to_owned()]);
@@ -7914,6 +7913,14 @@ pub(crate) mod tests {
         assert!(!mine.shadow);
         let shadowed = json!({"every": "30m", "shadow": true, "message": "go"});
         assert!(parse_add(&add_args(&shadowed), now).unwrap().shadow);
+        // A cap the tool sets counts tokens: what a cap counts is the
+        // person's choice, made on the command line.
+        let work = json!({"every": "30m", "turn_budget_tokens": 9000, "budget_counts": "work",
+            "message": "go"});
+        assert_eq!(
+            parse_add(&add_args(&work), now).unwrap().budget_counts,
+            None
+        );
     }
 
     #[test]
