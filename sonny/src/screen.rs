@@ -9,6 +9,7 @@
 //! as written: a line wrapped over rows comes back as one line, without
 //! the rows' leads or the indent every copied line shares.
 use std::{
+    collections::HashMap,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -2164,9 +2165,100 @@ pub fn keep_shown(cells: &mut Vec<(u16, u16, Cell)>, buf: &Buffer) {
     *cells = kept;
 }
 
+/// The links written over the screen last frame: each link's cells, and
+/// the cell the frame drew under each, by where the link starts; and the
+/// screen's size then.
+#[derive(Default)]
+pub struct Written {
+    area: Rect,
+    links: HashMap<(u16, u16), WrittenLink>,
+}
+
+/// A link's cells as written, each with the frame's cell under it.
+type WrittenLink = Vec<((u16, u16, Cell), Cell)>;
+
+impl Written {
+    /// The screen was cleared: every link is to be written again.
+    pub fn forget(&mut self) {
+        self.links.clear();
+    }
+
+    /// Of the links in `cells`, as [`keep_shown`] leaves them, those to
+    /// write over the frame just drawn, `under`: each that is new, or
+    /// whose cells, or the frame's cells under them, changed since it was
+    /// last written. One the frame left alone is still on the terminal as
+    /// it was written, so it is not written again: an idle window writes
+    /// nothing at all, where it wrote every link on screen ten times a
+    /// second. A link is written whole or not at all, so its opening and
+    /// closing go with it.
+    pub fn changed(
+        &mut self,
+        cells: Vec<(u16, u16, Cell)>,
+        under: &Buffer,
+    ) -> Vec<(u16, u16, Cell)> {
+        const CLOSE: &str = "\x1b]8;;\x1b\\";
+        if under.area != self.area {
+            (self.area, self.links) = (under.area, HashMap::new());
+        }
+        let mut last = std::mem::take(&mut self.links);
+        let mut out = Vec::new();
+        let mut link: WrittenLink = Vec::new();
+        for cell in cells {
+            let ends = cell.2.symbol().ends_with(CLOSE);
+            let drawn = match under.area.contains((cell.0, cell.1).into()) {
+                true => under[(cell.0, cell.1)].clone(),
+                false => Cell::default(),
+            };
+            link.push((cell, drawn));
+            if ends {
+                let at = (link[0].0.0, link[0].0.1);
+                if last.remove(&at).as_ref() != Some(&link) {
+                    out.extend(link.iter().map(|(cell, _)| cell.clone()));
+                }
+                self.links.insert(at, std::mem::take(&mut link));
+            }
+        }
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_link_is_written_again_only_when_it_or_what_is_under_it_changed() {
+        let cell = |symbol: &str| {
+            let mut cell = Cell::default();
+            cell.set_symbol(symbol);
+            cell
+        };
+        let link = || {
+            vec![
+                (0, 0, cell("\x1b]8;;https://a.b\x1b\\a")),
+                (1, 0, cell("b\x1b]8;;\x1b\\")),
+                (3, 0, cell("\x1b]8;;https://c.d\x1b\\c\x1b]8;;\x1b\\")),
+            ]
+        };
+        let mut under = Buffer::empty(Rect::new(0, 0, 6, 1));
+        under.set_string(0, 0, "ab c", Style::new());
+        let mut written = Written::default();
+        assert_eq!(written.changed(link(), &under).len(), 3, "all new");
+        assert!(written.changed(link(), &under).is_empty(), "idle: nothing");
+        // The frame drew over `c`: that link, whole, and only it.
+        under.set_string(3, 0, "c", Style::new().bold());
+        let again = written.changed(link(), &under);
+        assert_eq!(again.iter().map(|c| c.0).collect::<Vec<_>>(), [3]);
+        // Its address changed: written again, both its cells.
+        let mut moved = link();
+        moved[0].2 = cell("\x1b]8;;https://e.f\x1b\\a");
+        assert_eq!(written.changed(moved.clone(), &under).len(), 2);
+        // A cleared screen, or a resized one, has none of them.
+        written.forget();
+        assert_eq!(written.changed(moved.clone(), &under).len(), 3);
+        let wider = Buffer::empty(Rect::new(0, 0, 7, 1));
+        assert_eq!(written.changed(moved, &wider).len(), 3);
+    }
 
     #[test]
     fn a_link_drawn_over_is_dropped_whole_and_one_still_shown_kept() {
