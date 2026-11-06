@@ -25,9 +25,10 @@ static PROBE: OnceLock<Probe> = OnceLock::new();
 static LIGHT: AtomicBool = AtomicBool::new(true);
 /// The background changed since [`switched`] was last asked.
 static SWITCHED: AtomicBool = AtomicBool::new(false);
-static THEME: OnceLock<Theme> = OnceLock::new();
-/// The theme changed since it was asked, so its colors are not known.
-static STALE: AtomicBool = AtomicBool::new(false);
+/// The theme's colors as the terminal answered them at start, and
+/// whether the background was light then: they are that background's
+/// colors, known again whenever the terminal is back on it.
+static THEME: OnceLock<(Theme, bool)> = OnceLock::new();
 /// Sonny turned the terminal's grapheme clustering on, to be turned off
 /// again as it leaves.
 static CLUSTERED: AtomicBool = AtomicBool::new(false);
@@ -35,7 +36,8 @@ static CLUSTERED: AtomicBool = AtomicBool::new(false);
 pub type Rgb = (u8, u8, u8);
 
 /// The theme's own colors, each as the terminal answered at start; none
-/// it did not answer, and none at all once the theme has switched.
+/// it did not answer, and none at all while the background is the other
+/// one of light and dark, whose colors were never asked.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Theme {
     pub foreground: Option<Rgb>,
@@ -45,9 +47,14 @@ pub struct Theme {
 }
 
 pub fn theme() -> Theme {
-    match STALE.load(Ordering::Relaxed) {
-        true => Theme::default(),
-        false => THEME.get().copied().unwrap_or_default(),
+    theme_on(THEME.get().copied(), light())
+}
+
+/// The colors `answered` gives for a background that is `light` now.
+fn theme_on(answered: Option<(Theme, bool)>, light: bool) -> Theme {
+    match answered {
+        Some((theme, answered_light)) if answered_light == light => theme,
+        _ => Theme::default(),
     }
 }
 
@@ -105,7 +112,6 @@ pub async fn laid_out() {
 pub fn detect() {
     let reply = query().unwrap_or_default();
     let mac = appearance();
-    let _ = THEME.set(answered(&reply));
     let light = parse(&reply)
         .map(|rgb| luminance(rgb) > 0.5)
         .or_else(|| scheme(&reply))
@@ -113,6 +119,7 @@ pub fn detect() {
         .or(mac)
         .unwrap_or(true);
     LIGHT.store(light, Ordering::Relaxed);
+    let _ = THEME.set((answered(&reply), light));
     let _ = PROBE.set(Probe {
         graphics: reply.contains("_Gi=31;OK"),
         cell: cell_size(&reply).unwrap_or((8, 16)),
@@ -139,7 +146,6 @@ pub fn detect() {
                 if let Some(now) = appearance()
                     && LIGHT.swap(now, Ordering::Relaxed) != now
                 {
-                    STALE.store(true, Ordering::Relaxed);
                     SWITCHED.store(true, Ordering::Relaxed);
                 }
             }
@@ -319,6 +325,21 @@ pub fn copy(text: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_theme_answered_holds_again_once_back_on_its_background() {
+        let dark = Theme {
+            foreground: Some((0xce, 0xcd, 0xc3)),
+            background: Some((0x10, 0x0f, 0x0f)),
+            ..Theme::default()
+        };
+        // Answered on a dark background: known there, not on a light one,
+        // and known again once the terminal switches back.
+        assert_eq!(theme_on(Some((dark, false)), false), dark);
+        assert_eq!(theme_on(Some((dark, false)), true), Theme::default());
+        assert_eq!(theme_on(Some((dark, false)), false), dark);
+        assert_eq!(theme_on(None, false), Theme::default());
+    }
 
     #[test]
     fn grapheme_clustering_reads_as_on_off_or_unknown() {
