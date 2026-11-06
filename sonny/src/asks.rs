@@ -184,9 +184,8 @@ pub fn tool() -> Value {
             with what happens if they pick it, the one you recommend and why, and what you do until \
             they answer. Options without what they mean are useless to the person, so say what each \
             one does to their goal. Ask once, one decision per call, and do not repeat it in your \
-            reply. When their pick approves an action, say in covers what it approves. Their yes \
-            covers that action on that target at that revision and nothing else, so a new target \
-            or revision needs a new ask. A pick comes as their next message, starting \"You \
+            reply. When their pick approves an action, say in covers what: their yes covers that \
+            action, target and revision alone, so a new target or revision needs a new ask. A pick comes as their next message, starting \"You \
             asked\", the ask's ID, your question and what it covers; words they write instead come as they wrote them, so read whether they \
             answer it. Say in if_unanswered what you do until then. go_now goes on with the option \
             you recommend at once, for a step you can undo once they have seen it. go_later goes \
@@ -232,16 +231,15 @@ pub fn tool() -> Value {
                 "if_unanswered": {"type": "string", "enum": ["go_now", "go_later", "wait"],
                     "description": "What you do until they answer, as above."},
                 "covers": {"type": "object",
-                    "description": "For an ask that approves an action: what a yes covers. The card \
-                        shows it and the answer names it.",
+                    "description": "What a yes approves.",
                     "properties": {
                         "action": {"type": "string",
-                            "description": "The action, in a word or two: publish, merge, send, delete."},
+                            "description": "A word or two: publish, merge, send, delete."},
                         "target": {"type": "string",
-                            "description": "What it acts on: a pull request, a path, a recipient."},
+                            "description": "What it acts on: a pull request, a path."},
                         "revision": {"type": "string",
-                            "description": "The exact version they approve, where one exists: a \
-                                commit, a draft number, a content hash."}
+                            "description": "The exact version, where one exists: a commit, a draft, \
+                                a hash."}
                     },
                     "required": ["action", "target"],
                     "additionalProperties": false},
