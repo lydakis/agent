@@ -676,8 +676,15 @@ when the person wrote to any agent since the last finished cleanup
 started (starting a stopped daemon to read it, as a fire would), so a night after nothing was saved or removed and nothing said
 costs no turn. Each turn is capped at 1,000,000 tokens, and each night
 starts a conversation of its own, so a call carries only that night's work.
-Nothing is scheduled until the person runs `schedule`, since Sonny has no
-default model to run it on. `schedule` again replaces the automation:
+It is on by default: the first Sonny to open a lead schedules it on that
+lead's model (`schedule --model`), in the background, and tries again at
+its next start if it could not (no scheduler). Until it is, `/background`
+shows `memory-cleanup` as not scheduled, in every window, with the error
+the scheduling gave (kept in `~/.agent/sonny/cleanup-not-scheduled.json`).
+Once scheduled it is the
+person's: removed with `~/.agent/automation rm memory-cleanup`, it stays
+removed, since `~/.agents/memory` being a repository says it was scheduled
+once, and `schedule` turns it on again. `schedule` again replaces the automation:
 without `--model` it keeps the model (and effort) it runs on, so moving the
 time is one call. A cleanup scheduled before 0.9.0 keeps its one agent
 until `schedule` runs again. The `memory-cleanup` skill

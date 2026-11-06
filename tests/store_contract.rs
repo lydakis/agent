@@ -3391,6 +3391,91 @@ fn a_store_that_cannot_be_copied_is_not_migrated() {
 }
 
 #[test]
+fn schema_78_counts_a_call_left_unanswered_before_the_upgrade_as_taken() {
+    let path = std::env::temp_dir().join(format!(
+        "agent-schema78-taken-{}.sqlite",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    // An older host was serving calls when the upgrade came: what it did
+    // with them is not known.
+    let turn = {
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        let start = Declared {
+            name: "start".into(),
+            description: "Start.".into(),
+            parameters: json!({"type":"object"}),
+            result: "ok".into(),
+            answered_by: Some("sonny".into()),
+            expire_ms: None,
+            grammar: None,
+            steps: false,
+            inherit: Inherit::All,
+        };
+        db.create(
+            "Lead",
+            Some("/synthetic"),
+            Binding {
+                declared: Some(std::slice::from_ref(&start)),
+                ..binding()
+            },
+        )
+        .unwrap();
+        let turn = db
+            .begin(
+                "Lead",
+                "request",
+                "work",
+                true,
+                &TurnOptions::default(),
+                allow_provider,
+            )
+            .unwrap()
+            .turn;
+        let calls: Vec<ToolCall> = (1..=3)
+            .map(|n| ToolCall {
+                name: "start".into(),
+                call_id: format!("c{n}"),
+                arguments: "{}".into(),
+                custom: false,
+            })
+            .collect();
+        db.append(turn, vec![], &calls, None).unwrap();
+        for call in &calls {
+            db.tool_start(turn, call).unwrap();
+        }
+        // The turn waits on c1's answer, as a turn waits across a restart.
+        assert!(
+            db.suspend_answer(turn, "c1", &calls[1..], 0, None, None)
+                .unwrap()
+                .is_some()
+        );
+        turn
+    };
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch("ALTER TABLE answers DROP COLUMN taken_ms; PRAGMA user_version=78;")
+        .unwrap();
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    // Each counts as taken, so no client runs it again.
+    let untaken: i64 = Connection::open(&path)
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM answers WHERE taken_ms IS NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(untaken, 0);
+    let Err(taken) = db.take_call("Lead", turn, "c1", 0) else {
+        panic!("a call left unanswered was taken again after the upgrade");
+    };
+    assert_eq!(taken.code, "call_taken");
+    drop(db);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn schema_70_finds_each_attached_message_from_its_event() {
     let path = std::env::temp_dir().join(format!(
         "agent-schema70-attached-{}.sqlite",
@@ -4829,6 +4914,99 @@ fn a_tool_declared_for_some_generations_goes_that_far_down_and_no_further() {
     assert_eq!(read(json!(0)).unwrap(), Inherit::Generations(0));
     assert_eq!(read(json!(3)).unwrap(), Inherit::Generations(3));
     assert!(read(json!(-1)).is_err() && read(json!("all")).is_err());
+}
+
+#[test]
+fn a_call_is_taken_once_and_a_second_take_is_refused_so_it_never_runs_twice() {
+    let mut db = db();
+    let start = Declared {
+        name: "start".into(),
+        description: "Start.".into(),
+        parameters: json!({"type":"object"}),
+        result: "ok".into(),
+        answered_by: Some("sonny".into()),
+        expire_ms: None,
+        grammar: None,
+        steps: false,
+        inherit: Inherit::All,
+    };
+    db.create(
+        "Lead",
+        Some("/synthetic"),
+        Binding {
+            declared: Some(std::slice::from_ref(&start)),
+            ..binding()
+        },
+    )
+    .unwrap();
+    let turn = db
+        .begin(
+            "Lead",
+            "request",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let calls: Vec<ToolCall> = (1..=3)
+        .map(|n| ToolCall {
+            name: "start".into(),
+            call_id: format!("c{n}"),
+            arguments: "{}".into(),
+            custom: false,
+        })
+        .collect();
+    db.append(turn, vec![], &calls, None).unwrap();
+    let mut expires = 0;
+    for call in &calls {
+        expires = db.tool_start(turn, call).unwrap()["data"]["expires_ms"]
+            .as_u64()
+            .unwrap();
+    }
+    // An answered call is held, so it is not there to take.
+    db.answer_call("Lead", turn, "c1", result("started"), 0)
+        .unwrap();
+    let Err(held) = db.take_call("Lead", turn, "c1", 0) else {
+        panic!("an answered call was taken");
+    };
+    assert_eq!(held.code, "call_already_answered");
+    // Taken once, the call says when; a second take, by a client that
+    // restarted or another one, is refused with that time.
+    let took = db.take_call("Lead", turn, "c2", 7).unwrap();
+    assert_eq!(took["taken_ms"], 7);
+    let Err(again) = db.take_call("Lead", turn, "c2", 9) else {
+        panic!("a call was taken twice");
+    };
+    assert_eq!(again.code, "call_taken");
+    assert_eq!(again.facts.unwrap()["taken_ms"], 7);
+    // The waiting calls say which one was taken.
+    let page = db.tool_calls("sonny", 0, 10).unwrap();
+    let taken: Vec<(String, Value)> = page["calls"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|call| {
+            (
+                call["call_id"].as_str().unwrap().into(),
+                call["taken_ms"].clone(),
+            )
+        })
+        .collect();
+    assert_eq!(taken, [("c2".into(), json!(7)), ("c3".into(), Value::Null)]);
+    // Taken or not, it is answered as before; out of time, it can't be taken.
+    db.answer_call("Lead", turn, "c2", result("done"), 9)
+        .unwrap();
+    let Err(late) = db.take_call("Lead", turn, "c3", expires) else {
+        panic!("a call out of time was taken");
+    };
+    assert_eq!(late.code, "no_pending_call");
+    // Another bot's turn is not this one's to take.
+    let Err(other) = db.take_call("Other", turn, "c3", 0) else {
+        panic!("another bot took the call");
+    };
+    assert_eq!(other.code, "turn_not_found");
 }
 
 #[test]

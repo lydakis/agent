@@ -399,7 +399,7 @@ fn hand_off(index: usize) -> Result<bool, String> {
             Some(PathBuf::from(home).join(".agents/skills/sonny-setup/SKILL.md"))
         })
         .ok_or("set HOME")?;
-    let sonny = std::env::current_exe().map_err(|e| e.to_string())?;
+    let sonny = crate::named::me().map_err(|e| e.to_string())?;
     let prompt = format!(
         "Set up Sonny, the coding-agent client on this machine, so its agents reach a model. \
          Follow the skill at {}. Sonny is {}; start with `{} setup --json` to see what this \

@@ -524,6 +524,13 @@ enum Command {
         output: Option<ToolOutput>,
         error: Option<ToolError>,
     },
+    /// Take a declared call this client answers, to run it: refused with
+    /// `call_taken` once any client took it, so it never runs twice.
+    TakeCall {
+        bot: String,
+        turn: i64,
+        call_id: String,
+    },
     /// Put one step of a declared call this client answers to the bot's
     /// gates that name the tool, and answer once it is decided: a script's
     /// nested call, say. `step` is the client's id for it within the call.
@@ -1557,7 +1564,7 @@ pub async fn run(config: Configuration) -> Result<()> {
     let mut environment = vec![
         (
             "AGENT_BIN".into(),
-            std::env::current_exe()?.to_string_lossy().into_owned(),
+            agent_bin()?.to_string_lossy().into_owned(),
         ),
         (
             "AGENT_STORE".into(),
@@ -2224,6 +2231,7 @@ impl Service {
                 return refuse("serve approvals");
             }
             Command::ToolResult { .. } => return refuse("answer a declared tool call"),
+            Command::TakeCall { .. } => return refuse("take a declared tool call"),
             Command::ApproveStep { .. } => return refuse("put a declared call's step to a gate"),
             Command::StepResult { .. } => return refuse("record a declared call's step"),
             Command::Shutdown { .. } => return refuse("stop the daemon"),
@@ -4266,6 +4274,16 @@ impl Service {
                     })
                     .await
             }
+            Command::TakeCall { bot, turn, call_id } => {
+                if call_id.is_empty() {
+                    return fail_with("invalid_call_id", "call_id may not be empty");
+                }
+                store
+                    .op("take_call", move |db| {
+                        db.take_call(&bot, turn, &call_id, now_ms())
+                    })
+                    .await
+            }
             Command::ToolCalls { tag, after, limit } => {
                 store
                     .op("tool_calls", move |db| {
@@ -5179,6 +5197,32 @@ fn fit_listings(
         answer.insert(name, entry);
     }
     Ok(answer)
+}
+
+/// The program this daemon hands its agents as `AGENT_BIN`: the one its
+/// starter named in `AGENT_BIN` when that is this same program (the same
+/// file under another name, or a copy of it of the same length and time of
+/// writing), as a client that starts the daemon by a name of its own
+/// gives it; else this daemon's own.
+fn agent_bin() -> std::io::Result<std::path::PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    let exe = std::env::current_exe()?;
+    let named = std::env::var_os("AGENT_BIN").map(std::path::PathBuf::from);
+    let same = |given: &std::path::Path| {
+        let (Ok(given), Ok(own)) = (std::fs::metadata(given), std::fs::metadata(&exe)) else {
+            return false;
+        };
+        (given.dev(), given.ino()) == (own.dev(), own.ino())
+            || (given.len() == own.len()
+                && given.modified().ok().is_some()
+                && given.modified().ok() == own.modified().ok())
+    };
+    Ok(
+        match named.filter(|given| given.is_absolute() && same(given)) {
+            Some(given) => given,
+            None => exe,
+        },
+    )
 }
 
 #[cfg(test)]

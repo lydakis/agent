@@ -29,6 +29,7 @@ mod diff;
 mod embed;
 mod exec;
 mod footer;
+mod frames;
 mod fuzzy;
 mod haiku;
 mod herdr;
@@ -53,6 +54,7 @@ mod mcp_import;
 mod mermaid;
 mod models;
 mod mux;
+mod named;
 mod needs;
 mod new;
 mod pane;
@@ -113,10 +115,7 @@ use ratatui::{
             PushKeyboardEnhancementFlags,
         },
         execute,
-        terminal::{
-            BeginSynchronizedUpdate, EndSynchronizedUpdate, EnterAlternateScreen,
-            LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-        },
+        terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
     },
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style, Stylize},
@@ -265,7 +264,7 @@ fn keys_apart(on: bool) {
     };
 }
 
-type Tui = Terminal<CrosstermBackend<std::io::Stdout>>;
+type Tui = Terminal<CrosstermBackend<frames::Screen>>;
 
 /// The whole screen cleared, and drawn whole at the next frame, without
 /// asking the terminal where its cursor is as `Terminal::clear` does to put
@@ -275,31 +274,6 @@ type Tui = Terminal<CrosstermBackend<std::io::Stdout>>;
 fn wipe<B: Backend>(terminal: &mut Terminal<B>) -> Result<(), B::Error> {
     let size = terminal.size()?;
     terminal.resize(Rect::new(0, 0, size.width, size.height))
-}
-
-/// One frame written as the terminal is to show it, as Ink and Codex
-/// write theirs: inside a synchronized update (mode 2026), so a terminal
-/// that knows it shows the frame whole, never half written, and with the
-/// cursor hidden while cells land, shown again only where the frame puts
-/// it. Written cell by cell in view, the cursor flickered over the screen,
-/// and what follows the cursor (an emoji picker, an input method) could
-/// open wherever the cursor passed. A terminal that does not know the
-/// mode ignores it.
-fn synchronized<T, W: std::io::Write>(
-    target: &mut T,
-    out: impl Fn(&mut T) -> &mut W,
-    frame: impl FnOnce(&mut T) -> std::io::Result<()>,
-) -> std::io::Result<()> {
-    ratatui::crossterm::queue!(
-        out(target),
-        BeginSynchronizedUpdate,
-        ratatui::crossterm::cursor::Hide
-    )?;
-    let drawn = frame(target);
-    // Ended even after a failed write, so the terminal is never left
-    // holding frames back.
-    execute!(out(target), EndSynchronizedUpdate)?;
-    drawn
 }
 
 #[derive(Clone)]
@@ -372,7 +346,7 @@ async fn show(
         ));
     }
     let (socket, project, chain) = agents_project(caller).await?;
-    let me = std::env::current_exe().map_err(|e| e.to_string())?;
+    let me = named::me().map_err(|e| e.to_string())?;
     if split.is_none()
         && let Some(other) = project::lead_project(bot).filter(|p| *p != project)
     {
@@ -779,7 +753,7 @@ async fn project_of(client: &Client, bot: &str) -> String {
 /// out), else Homebrew's `agent` formula when Sonny is its `sonny`. Not
 /// `agent` on PATH, which may be another program.
 fn agent_bin() -> Option<PathBuf> {
-    let me = std::env::current_exe().and_then(std::fs::canonicalize).ok();
+    let me = named::me().and_then(std::fs::canonicalize).ok();
     std::env::var_os("AGENT_BIN")
         .map(PathBuf::from)
         .into_iter()
@@ -855,10 +829,26 @@ async fn serve_auto(client: &Client, model: &str) -> Result<(), String> {
 /// the daemon keeps, so a Sonny upgraded in place has the daemon start the
 /// new ones, the approver too, with no window in `auto` needed.
 async fn start_companions(client: &Client) -> Result<(), String> {
-    let me = std::env::current_exe().map_err(|e| e.to_string())?;
-    let build = json!({"SONNY_BUILD": lookout::identity()});
-    keep(client, LOOKOUT, &me, daemon_args("lookout"), build.clone()).await?;
-    keep(client, TOOL_HOST, &me, daemon_args(tool_host::NAME), build).await?;
+    let me = named::me().map_err(|e| e.to_string())?;
+    let build = json!({"SONNY_BUILD": lookout::identity(), named::PROGRAM: me});
+    let lookout = named::named(&me, named::LOOKOUT);
+    keep(
+        client,
+        LOOKOUT,
+        &lookout,
+        daemon_args("lookout"),
+        build.clone(),
+    )
+    .await?;
+    let host = named::named(&me, named::TOOL_HOST);
+    keep(
+        client,
+        TOOL_HOST,
+        &host,
+        daemon_args(tool_host::NAME),
+        build,
+    )
+    .await?;
     keep_approver(client, None).await
 }
 
@@ -866,17 +856,19 @@ async fn start_companions(client: &Client) -> Result<(), String> {
 /// already with the judge it has, else, given a `model`, a new one judged
 /// by it. Without one kept or a model, nothing.
 async fn keep_approver(client: &Client, model: Option<&str>) -> Result<(), String> {
-    let me = std::env::current_exe().map_err(|e| e.to_string())?;
+    let me = named::me().map_err(|e| e.to_string())?;
     let listed = client
         .request("companions", json!({}))
         .await
         .map_err(|e| e.to_string())?;
     let kept =
         (listed["companions"].as_array().into_iter().flatten()).find(|c| c["name"] == APPROVER);
-    let Some(env) = approver_env(kept, model, &lookout::identity()) else {
+    let Some(mut env) = approver_env(kept, model, &lookout::identity()) else {
         return Ok(());
     };
-    keep(client, APPROVER, &me, daemon_args("approver"), env).await
+    env[named::PROGRAM] = json!(me);
+    let approver = named::named(&me, named::APPROVER);
+    keep(client, APPROVER, &approver, daemon_args("approver"), env).await
 }
 
 /// What the approver runs with: the judge the one `kept` has, else
@@ -1042,15 +1034,18 @@ fn start_daemon(
     // left in it when it ends: the daemon is started in a scope of its own,
     // as a desktop starts an app, so it outlives the fire.
     let scoped = login && cfg!(target_os = "linux") && std::env::var_os("INVOCATION_ID").is_some();
+    // Started by its own name, so a process list tells it from another
+    // program called `agent`; its agents still run Agent by its own.
+    let daemon = named::named(&bin, named::DAEMON);
     let mut command = match scoped {
         true => {
             let mut command = std::process::Command::new("systemd-run");
             command
                 .args(["--user", "--scope", "--quiet", "--collect", "--"])
-                .arg(&bin);
+                .arg(&daemon);
             command
         }
-        false => std::process::Command::new(&bin),
+        false => std::process::Command::new(&daemon),
     };
     if let Some(environment) = login.then(login::environment).flatten() {
         command.env_clear().envs(environment);
@@ -1060,6 +1055,7 @@ fn start_daemon(
         command.env("XDG_RUNTIME_DIR", runtime);
     }
     apply_env_file(&mut command)?;
+    command.env("AGENT_BIN", &bin).env_remove(named::PROGRAM);
     let out = command
         .arg("start")
         .arg("--store")
@@ -1222,6 +1218,7 @@ fn main() -> std::process::ExitCode {
     // Before anything reads the config, which refuses a key it no longer
     // knows.
     lookout::subs::at_start();
+    haiku::at_start();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.split_first() {
         // The tool host runs this for each call of a tool Sonny answers.
@@ -1462,6 +1459,9 @@ async fn run() -> Result<(), String> {
         .request("inspect", json!({"bot": name}))
         .await
         .map_err(|e| e.to_string())?;
+    if options.side.is_none() && !options.embedded {
+        trigger::cleanup_by_default(&bot, &options.store, &options.socket);
+    }
 
     enable_raw_mode().map_err(|e| e.to_string())?;
     term::detect();
@@ -1469,7 +1469,7 @@ async fn run() -> Result<(), String> {
     keys_apart(true);
     own_screen(true);
     let mut terminal =
-        Terminal::new(CrosstermBackend::new(std::io::stdout())).map_err(|e| e.to_string())?;
+        Terminal::new(CrosstermBackend::new(frames::Screen)).map_err(|e| e.to_string())?;
     // A side chat opens on its window's alternate screen, still drawn on.
     let _ = wipe(&mut terminal);
     let mut app = App::new(client, &name, &bot, options.clone());
@@ -1651,7 +1651,7 @@ async fn run() -> Result<(), String> {
             marker.retire();
             place = marker.known();
         }
-        let me = std::env::current_exe().map_err(|e| e.to_string())?;
+        let me = named::me().map_err(|e| e.to_string())?;
         // Named by --agent, whatever folder this window is in.
         let mut args = reopen(&other).split_off(1);
         if let Some(at) = args.iter().position(|arg| arg == "--lead") {
@@ -3509,7 +3509,7 @@ impl Fleet {
         let (client, mut events) = Client::connect(&options.socket).await.ok()?;
         client.request("follow", fleet_follow()).await.ok()?;
         caught_up(&mut events).await;
-        let me = std::env::current_exe().ok()?;
+        let me = named::me().ok()?;
         // Rex starts a block without this process's environment.
         // The lead's Sonny rings for the whole project; a task's is quiet.
         let command = vec![
@@ -5846,7 +5846,7 @@ impl App {
     /// Sonny run with `args` in the pane, on a terminal of its own: a side
     /// chat, or a task opened to watch.
     fn embed(&mut self, title: &str, args: &[String]) -> Result<(), String> {
-        let me = std::env::current_exe().map_err(|e| e.to_string())?;
+        let me = named::me().map_err(|e| e.to_string())?;
         let mut command = std::process::Command::new(me);
         command
             .arg("--store")
@@ -12291,10 +12291,11 @@ impl App {
     }
 
     /// A frame drawn, the whole screen written again when it is stale
-    /// (cleared first); every frame shown whole ([`synchronized`]).
+    /// (cleared first); every frame shown whole, or not written at all
+    /// when it changes nothing ([`frames`]).
     fn draw(&mut self, terminal: &mut Tui) -> std::io::Result<()> {
         let stale = std::mem::take(&mut self.stale);
-        synchronized(terminal, Terminal::backend_mut, |terminal| {
+        frames::frame(|| {
             if stale {
                 self.links_written.forget();
                 wipe(terminal)?;
@@ -13834,27 +13835,6 @@ fn zen_notice(on: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_frame_is_shown_whole_with_the_cursor_hidden_while_it_lands() {
-        let mut out: Vec<u8> = Vec::new();
-        let drawn = synchronized(
-            &mut out,
-            |out| out,
-            |out| {
-                out.extend_from_slice(b"CELLS");
-                Ok(())
-            },
-        );
-        assert!(drawn.is_ok());
-        assert_eq!(out, b"\x1b[?2026h\x1b[?25lCELLS\x1b[?2026l");
-        // A frame that fails still ends the update, so the terminal never
-        // holds what comes after back.
-        let mut out: Vec<u8> = Vec::new();
-        let failed = synchronized(&mut out, |out| out, |_| Err(std::io::Error::other("gone")));
-        assert!(failed.is_err());
-        assert!(out.ends_with(b"\x1b[?2026l"));
-    }
 
     #[test]
     fn the_screen_is_wiped_without_asking_the_terminal_anything() {
@@ -18944,12 +18924,20 @@ mod tests {
         let added = added.lock().unwrap().clone();
         let names: Vec<&str> = added.iter().filter_map(|a| a["name"].as_str()).collect();
         assert_eq!(names, [LOOKOUT, TOOL_HOST, APPROVER]);
+        // Each by its own name, which is this binary.
         let me = std::env::current_exe().unwrap();
-        assert_eq!(added[2]["command"], json!(me));
+        for (add, name) in added
+            .iter()
+            .zip([named::LOOKOUT, named::TOOL_HOST, named::APPROVER])
+        {
+            assert_eq!(add["command"], json!(named::named(&me, name)));
+            assert_eq!(add["env"][named::PROGRAM], json!(me));
+        }
         assert_eq!(added[2]["args"], json!(["approver"]));
         assert_eq!(
             added[2]["env"],
-            json!({"AGENT_MODEL": "openai/gpt-6", "SONNY_BUILD": lookout::identity()})
+            json!({"AGENT_MODEL": "openai/gpt-6", "SONNY_BUILD": lookout::identity(),
+                named::PROGRAM: me})
         );
     }
 

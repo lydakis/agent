@@ -1013,7 +1013,7 @@ async fn open_new_lead(client: &Client, socket: &Path, caller: &str, made: &mut 
     }
     let like = crate::project_of(client, caller).await;
     let store = std::env::var_os("AGENT_STORE").map(PathBuf::from);
-    let opened = std::env::current_exe()
+    let opened = crate::named::me()
         .map_err(|e| e.to_string())
         .and_then(|me| {
             let bot = format!("{project}.lead");

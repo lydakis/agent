@@ -215,9 +215,21 @@ pub const SETTINGS: &[Setting] = &[
     },
     Setting {
         key: "sonny.sky_haikus",
-        about: "haikus a day from the agent the sky finds busiest, each written by a copy of it that calls no tool when the title passes; 0 for none",
+        about: "a haiku from the agent the sky finds busiest, written by a copy of it that calls no tool each time the title passes",
+        values: SWITCH,
+        default: "true",
+    },
+    Setting {
+        key: "sonny.sky_haiku_daily",
+        about: "the most haikus a day; 0 for no limit, the title's hold keeping them a hold apart",
         values: &[],
-        default: "8",
+        default: "0",
+    },
+    Setting {
+        key: "sonny.sky_haiku_keep",
+        about: "the hours haikus are kept, for a replay to show the one up at its time; 0 keeps them all",
+        values: &[],
+        default: "24",
     },
     Setting {
         key: "sonny.sky_haiku_window",
