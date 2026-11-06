@@ -23,8 +23,36 @@ use crate::transcript::Markdown;
 
 /// The name of the tool a bot keeps notes in the margin with.
 pub const TOOL: &str = "margin";
-/// The most notes a margin holds: a new one past it lets the oldest go.
-pub const MOST_NOTES: usize = 20;
+/// The most notes a margin holds, as `[sonny] margin_notes` sets it: a
+/// new one past it lets the oldest go.
+#[cfg(not(test))]
+static MOST_NOTES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(agent_client::config::MARGIN_NOTES as usize);
+
+// Each test's own, so one that sets it changes no other running beside it.
+#[cfg(test)]
+thread_local! {
+    static MOST_NOTES: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(agent_client::config::MARGIN_NOTES as usize) };
+}
+
+/// The most notes a margin holds; [`set_most_notes`] sets it.
+pub fn most_notes() -> usize {
+    #[cfg(not(test))]
+    return MOST_NOTES.load(std::sync::atomic::Ordering::Relaxed);
+    #[cfg(test)]
+    return MOST_NOTES.with(std::cell::Cell::get);
+}
+
+/// The most notes a margin holds, as `[sonny] margin_notes` says: at
+/// least one.
+pub fn set_most_notes(notes: u64) {
+    let notes = usize::try_from(notes).unwrap_or(usize::MAX).max(1);
+    #[cfg(not(test))]
+    MOST_NOTES.store(notes, std::sync::atomic::Ordering::Relaxed);
+    #[cfg(test)]
+    MOST_NOTES.with(|most| most.set(notes));
+}
 /// The most of a note's Markdown kept, and of a file read for one.
 const NOTE_BYTES: usize = 64 * 1024;
 /// The most lines of a file a note shows.
@@ -322,7 +350,7 @@ pub struct Reference {
     /// Taken away there since it was last posted.
     removed: bool,
     /// The notes its margin holds, oldest first, as far as read: one
-    /// put there past [`MOST_NOTES`] takes the oldest away.
+    /// put there past [`most_notes`] takes the oldest away.
     held: Vec<String>,
     /// Notes read as taken away, the latest few: put there again, they
     /// are new ones.
@@ -358,12 +386,12 @@ impl Reference {
                 if self.whole || self.left.contains(&at) {
                     self.left.retain(|left| *left != at);
                     self.held.push(at.clone());
-                    if self.held.len() > MOST_NOTES {
-                        let gone = self.held.remove(0);
+                    let over = self.held.len().saturating_sub(most_notes());
+                    for gone in self.held.drain(..over).collect::<Vec<_>>() {
                         self.removed |= gone == id;
                         self.left(gone);
                     }
-                } else if self.held.len() < MOST_NOTES {
+                } else if self.held.len() < most_notes() {
                     // Maybe one from before what was read, so older than
                     // the rest: never taken for a new one that puts the
                     // oldest out.
@@ -416,7 +444,7 @@ impl Reference {
     fn left(&mut self, id: String) {
         self.left.retain(|left| *left != id);
         self.left.push_back(id);
-        if self.left.len() > 4 * MOST_NOTES {
+        if self.left.len() > 4 * most_notes() {
             self.left.pop_front();
         }
     }
@@ -793,9 +821,8 @@ impl Margin {
                     turn: None,
                     opens: opens.flatten(),
                 });
-                if self.kept.notes.len() > MOST_NOTES {
-                    self.kept.notes.remove(0);
-                }
+                let over = self.kept.notes.len().saturating_sub(most_notes());
+                self.kept.notes.drain(..over);
                 Some(Change::Posted(id.to_owned()))
             }
         }
@@ -1057,8 +1084,8 @@ fn cut(text: &str, most: usize) -> &str {
 /// it, and its buttons on the right; and where those buttons are.
 fn head(note: &Note, width: usize, live: bool) -> (Line<'static>, crate::screen::Buttons) {
     let right = match note.opens {
-        Some(_) => "↗  ↩  ↑  × ",
-        None => "↩  ↑  × ",
+        Some(_) => "↗  ↩  ↑  ×",
+        None => "↩  ↑  ×",
     };
     let tail = match live {
         true => " live",
@@ -1385,7 +1412,7 @@ mod tests {
         )];
         items.push(call(json!({"id": "n0", "markdown": "-"})));
         items.push(call(json!({"id": "n0", "remove": true})));
-        for n in 1..MOST_NOTES {
+        for n in 1..most_notes() {
             items.push(call(json!({"id": format!("n{n}"), "markdown": "-"})));
             items.push(call(json!({"id": format!("n{n}"), "markdown": "again"})));
         }
@@ -1402,7 +1429,7 @@ mod tests {
         let mut items = vec![call(
             json!({"id": "flow", "title": "Flow", "markdown": "one"}),
         )];
-        for n in 1..MOST_NOTES {
+        for n in 1..most_notes() {
             items.push(call(json!({"id": format!("old{n}"), "markdown": "again"})));
         }
         items.push(call(
@@ -1580,13 +1607,35 @@ mod tests {
     }
 
     #[test]
-    fn the_oldest_note_goes_past_the_most() {
+    fn margin_notes_sets_the_most_a_margin_holds_and_a_lower_one_trims() {
+        set_most_notes(3);
         let mut margin = margin();
-        for n in 0..=MOST_NOTES {
+        for n in 0..5 {
             let post = json!({"id": format!("n{n}"), "markdown": "x"});
             margin.apply(&format!("c{n}"), &post, None, None);
         }
-        assert_eq!(margin.notes().len(), MOST_NOTES);
+        let ids = |margin: &Margin| -> Vec<String> {
+            margin.notes().iter().map(|note| note.id.clone()).collect()
+        };
+        assert_eq!(ids(&margin), ["n2", "n3", "n4"]);
+        // Set lower, the next note leaves only as many as it says.
+        set_most_notes(2);
+        let post = json!({"id": "n5", "markdown": "x"});
+        margin.apply("c5", &post, None, None);
+        assert_eq!(ids(&margin), ["n4", "n5"]);
+        // Never fewer than one.
+        set_most_notes(0);
+        assert_eq!(most_notes(), 1);
+    }
+
+    #[test]
+    fn the_oldest_note_goes_past_the_most() {
+        let mut margin = margin();
+        for n in 0..=most_notes() {
+            let post = json!({"id": format!("n{n}"), "markdown": "x"});
+            margin.apply(&format!("c{n}"), &post, None, None);
+        }
+        assert_eq!(margin.notes().len(), most_notes());
         assert_eq!(margin.notes()[0].id, "n1");
         // A note posted without a title goes by its id.
         assert_eq!(margin.notes()[0].title, "n1");
@@ -1596,7 +1645,7 @@ mod tests {
     fn every_note_stays_drawn_however_long_they_all_are() {
         let mut margin = margin();
         let long = "a line\n\n".repeat(700);
-        for n in 0..MOST_NOTES {
+        for n in 0..most_notes() {
             let post = json!({"id": format!("n{n}"), "markdown": long});
             margin.apply(&format!("c{n}"), &post, None, None);
         }
@@ -1604,7 +1653,7 @@ mod tests {
         // Under what a screen keeps, each note cut short and saying so.
         assert!(lines.len() < 12_500, "{}", lines.len());
         let heads = marks.iter().filter(|(_, m)| matches!(m, Mark::Tag(_)));
-        assert_eq!(heads.count(), MOST_NOTES);
+        assert_eq!(heads.count(), most_notes());
         assert!(lines.iter().any(|l| l.to_string().contains("more rows")));
     }
 
@@ -1685,7 +1734,7 @@ mod tests {
         let head = lines[1].to_string();
         assert!(head.starts_with(" ✎ Repro live"), "{head}");
         assert!(head.ends_with("↑  ×"), "{head}");
-        assert_eq!(head.width(), 40 - 1);
+        assert_eq!(head.width(), 40);
         assert!(marks.contains(&(1, Mark::Tag(Tag::Note(anchor("c1"))))));
         let Some((_, Mark::Buttons(buttons))) =
             marks.iter().find(|(_, m)| matches!(m, Mark::Buttons(_)))
@@ -1837,7 +1886,7 @@ mod tests {
         let (lines, _) = margin.lines(40, workspace, None);
         assert!(lines.iter().any(|line| line.to_string().contains('y')));
         let (wider, _) = margin.lines(60, workspace, None);
-        assert_eq!(wider[1].width(), 60 - 1);
+        assert_eq!(wider[1].width(), 60);
     }
 
     #[test]
