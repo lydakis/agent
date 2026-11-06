@@ -788,7 +788,9 @@ mod tests {
         // wrap its share away from its bar.
         for width in 30..=100 {
             let card = view.card(width);
-            let bars = card.into_iter().filter(|line| text(&[line.clone()]).ends_with('%'));
+            let bars = card
+                .into_iter()
+                .filter(|line| text(&[line.clone()]).ends_with('%'));
             for line in bars {
                 assert!(
                     line.width() <= width,
