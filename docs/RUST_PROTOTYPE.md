@@ -173,7 +173,9 @@ submitting client. `--delivery queue` or `steer` hands a busy bot the work
 instead of getting `bot_busy` ([delivery modes](#delivery-modes)). A controller can inspect metadata through `ls` or observe events through
 `follow` from outside a shell tool. Full records remain available via the protocol.
 
-Shell tool processes receive `AGENT_BIN`, an absolute `AGENT_STORE`,
+Shell tool processes receive `AGENT_BIN` (the daemon's own program, or the
+path its starter gave in `AGENT_BIN` when that names the same program, as a
+client that starts the daemon under a name of its own does), an absolute `AGENT_STORE`,
 `AGENT_SOCKET` when a socket is configured, and `AGENT_MODEL`, the running
 turn's effective model, so newly created peers default to its model.
 Continuing an existing peer keeps that peer's stored model unless `--model`
