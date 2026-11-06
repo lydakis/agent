@@ -59,11 +59,12 @@ pub async fn listing(client: &Client, bot: Option<&str>) -> agent_client::Result
     }
 }
 
-/// What an agent's history says: the question it has open, whether its
-/// last turn resolved it, and that turn, the newest its history holds.
+/// What an agent's history says: the question it has open, whole,
+/// whether its last turn resolved it, and that turn, the newest its
+/// history holds.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Seen {
-    pub ask: Option<String>,
+    pub ask: Option<crate::asks::Ask>,
     pub itself: bool,
     pub turn: Option<i64>,
 }
@@ -73,7 +74,12 @@ impl Seen {
     /// resolved, by its own call in the turn read or by its lead's mark kept
     /// beside `store` that no later turn reopened while nothing `running`.
     /// A lead is never resolved.
-    pub fn open(self, store: &std::path::Path, bot: &str, running: bool) -> Option<String> {
+    pub fn open(
+        self,
+        store: &std::path::Path,
+        bot: &str,
+        running: bool,
+    ) -> Option<crate::asks::Ask> {
         let resolved = !crate::project::is_lead(bot)
             && (self.itself
                 || crate::resolved::holds(crate::resolved::read(store, bot), self.turn, running));
@@ -242,14 +248,21 @@ pub fn resolved_itself(items: &[Value], bot: &str) -> bool {
 #[derive(Clone, Debug, Default)]
 pub struct Needs {
     calls: HashMap<String, BTreeSet<(i64, String)>>,
-    /// Each agent with a question open, and the call that asked it when
-    /// an event said.
-    asks: HashMap<String, Option<String>>,
+    /// Each agent with a question open.
+    asks: HashMap<String, Open>,
     /// Agents whose questions an event left unsure, to read again once
     /// their turn ends.
     unsure: HashSet<String>,
     /// Those whose turn ended since, with the turn.
     due: Vec<(String, Option<i64>)>,
+}
+
+/// A question open: the call that asked it, when an event said, and the
+/// question whole, once read, as a window that answers it shows it.
+#[derive(Clone, Debug, Default)]
+struct Open {
+    call: Option<String>,
+    ask: Option<crate::asks::Ask>,
 }
 
 impl Needs {
@@ -273,11 +286,16 @@ impl Needs {
         self.calls.retain(|_, calls| !calls.is_empty());
     }
 
+    /// The question each agent has open, whole, where it was read.
+    pub fn asks(&self) -> impl Iterator<Item = (&str, &crate::asks::Ask)> {
+        (self.asks.iter()).filter_map(|(bot, open)| Some((bot.as_str(), open.ask.as_ref()?)))
+    }
+
     /// `bot`'s open question, as its history reads now.
-    pub fn asked(&mut self, bot: &str, question: Option<String>) {
+    pub fn asked(&mut self, bot: &str, question: Option<crate::asks::Ask>) {
         match question {
-            Some(_) => {
-                self.asks.entry(bot.to_owned()).or_default();
+            Some(ask) => {
+                self.asks.entry(bot.to_owned()).or_default().ask = Some(ask);
             }
             None => {
                 self.asks.remove(bot);
@@ -363,7 +381,16 @@ impl Needs {
             }
             "tool_started" => {
                 let call = data["call_id"].as_str().map(str::to_owned);
-                self.asks.insert(bot.to_owned(), call);
+                // Whole, unless the event cut its arguments short: then
+                // its history, read once the turn ends, says it whole.
+                let ask = (call.as_deref())
+                    .zip(event["turn"].as_i64())
+                    .filter(|_| data["arguments_truncated"] != true)
+                    .and_then(|(call, turn)| {
+                        let arguments = serde_json::from_str(data["arguments"].as_str()?).ok()?;
+                        crate::asks::call(&crate::asks::id(turn, call), &arguments)
+                    });
+                self.asks.insert(bot.to_owned(), Open { call, ask });
                 self.unsure.insert(bot.to_owned());
             }
             // Each answer lets go of its call alone; a question refused
@@ -374,7 +401,9 @@ impl Needs {
                         calls.retain(|(_, call)| call != id);
                     }
                     let refused = data["failed"] == true || data["denied"] == true;
-                    if refused && (self.asks.get(bot)).is_some_and(|a| a.as_deref() == Some(id)) {
+                    if refused
+                        && (self.asks.get(bot)).is_some_and(|a| a.call.as_deref() == Some(id))
+                    {
                         self.asks.remove(bot);
                     }
                 }
@@ -419,6 +448,11 @@ mod tests {
 
     fn event(bot: &str, turn: i64, kind: &str, data: Value) -> Value {
         json!({"bot": bot, "turn": turn, "event": kind, "data": data})
+    }
+
+    fn whole(question: &str) -> crate::asks::Ask {
+        let arguments = json!({"question": question, "options": [{"label": "a"}]});
+        crate::asks::call(&crate::asks::id(1, "c"), &arguments).unwrap()
     }
 
     fn ask(call: &str, question: &str) -> Value {
@@ -505,7 +539,16 @@ mod tests {
         let mut needs = Needs::default();
         needs.event(&event("p.fix", 2, "tool_started", ask("q1", "Ship it?")));
         assert!(needs.waits("p.fix"));
-        assert_eq!(needs.asks["p.fix"].as_deref(), Some("q1"));
+        assert_eq!(needs.asks["p.fix"].call.as_deref(), Some("q1"));
+        // Whole from its event, as a lead's window pins it.
+        let read: Vec<_> = needs.asks().map(|(bot, a)| (bot, a.id.as_str())).collect();
+        assert_eq!(read, [("p.fix", "ask:2/q1")]);
+        // Cut short there, it waits for its history to say it whole.
+        let mut cut = ask("q2", "Tag it?");
+        cut["arguments_truncated"] = json!(true);
+        let mut other = Needs::default();
+        other.event(&event("p.cut", 2, "tool_started", cut));
+        assert!(other.waits("p.cut") && other.asks().next().is_none());
         needs.event(&event(
             "p.fix",
             2,
@@ -524,7 +567,7 @@ mod tests {
             "a task that ended on a question needs you"
         );
         assert_eq!(needs.due(), vec![("p.fix".to_owned(), Some(2))]);
-        needs.asked("p.fix", Some("Ship it?".into()));
+        needs.asked("p.fix", Some(whole("Ship it?")));
         assert!(needs.waits("p.fix"));
     }
 
@@ -544,7 +587,7 @@ mod tests {
     #[test]
     fn the_persons_words_answer_and_agents_words_do_not() {
         let mut needs = Needs::default();
-        needs.asked("p.fix", Some("Ship it?".into()));
+        needs.asked("p.fix", Some(whole("Ship it?")));
         needs.event(&event(
             "p.fix",
             3,
@@ -563,15 +606,15 @@ mod tests {
         ));
         assert_eq!(needs.due(), vec![("p.fix".to_owned(), Some(4))]);
         // A reaction is not words of their own: the read puts it back.
-        needs.asked("p.fix", Some("Ship it?".into()));
+        needs.asked("p.fix", Some(whole("Ship it?")));
         assert!(needs.waits("p.fix"));
     }
 
     #[test]
     fn what_another_read_replaces_only_the_agents_it_read() {
         let mut kept = Needs::default();
-        kept.asked("p.a", Some("A?".into()));
-        kept.asked("p.b", Some("B?".into()));
+        kept.asked("p.a", Some(whole("A?")));
+        kept.asked("p.b", Some(whole("B?")));
         let mut read = Needs::default();
         read.held(vec![("p.c".into(), 1, "c".into())], |_| true);
         let bots = ["p.a".to_owned(), "p.c".to_owned()];

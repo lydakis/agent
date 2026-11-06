@@ -60,6 +60,19 @@ pub struct Ask {
     /// When it goes ahead or is raised again, in seconds since the epoch,
     /// as the call's result says.
     pub deadline: Option<i64>,
+    /// The task that asked, when not the window's own agent: a lead's
+    /// window shows its tasks' open questions too, and an answer to one
+    /// goes to the task, the same answer to the same ask its own window
+    /// sends.
+    pub task: Option<Asker>,
+}
+
+/// A task whose question a lead's window shows: the agent its answer goes
+/// to, and its name as the window says it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Asker {
+    pub bot: String,
+    pub name: String,
 }
 
 /// What an agent does while the person has not answered.
@@ -106,6 +119,12 @@ pub struct Choice {
 /// asked too, read from the source or any fork of it alike.
 pub fn id(turn: i64, call: &str) -> String {
     format!("ask:{turn}/{call}")
+}
+
+/// The turn that asked ask `id`, as [`id`] names it: turns count up
+/// across every agent, so the older ask has the smaller.
+pub fn turn_of(id: &str) -> Option<i64> {
+    id.strip_prefix("ask:")?.split_once('/')?.0.parse().ok()
 }
 
 /// The `request_id` the person's answer to ask `id` goes with on its
@@ -275,6 +294,7 @@ pub fn call(id: &str, arguments: &Value) -> Option<Ask> {
         reason: prose(arguments["reason"].as_str()),
         unanswered,
         deadline: None,
+        task: None,
     })
 }
 
@@ -292,13 +312,14 @@ pub fn settled(mut ask: Ask, output: &str) -> Ask {
 }
 
 /// The oldest question still open among `bot`'s `items`, newest first,
-/// each call marked with the `turn` it was made in: an `ask` call that was
+/// whole, as its card shows it, under the ID [`id`] gives it from the
+/// `turn` each call is marked with: an `ask` call that was
 /// taken, with no answer to it after, as the pinned questions are closed:
 /// by the person's `You asked` message naming that ask, one answer to one
 /// ask, or by words of their own after it, the conversation going on past
 /// it. Asks are told apart by turn and call, never by wording: two
 /// asking the same question are two decisions.
-pub fn open(items: &[Value]) -> Option<String> {
+pub fn open(items: &[Value]) -> Option<Ask> {
     let (mut answers, mut refused, mut open) = (Vec::new(), Vec::new(), None);
     let mut moved_on = false;
     for item in items {
@@ -317,7 +338,7 @@ pub fn open(items: &[Value]) -> Option<String> {
         if item["type"] == "function_call"
             && item["name"] == TOOL
             && !refused.contains(&item["call_id"])
-            && let Some(ask) = item["arguments"]
+            && let Some(mut ask) = item["arguments"]
                 .as_str()
                 .and_then(|a| serde_json::from_str::<Value>(a).ok())
                 .and_then(|arguments| call("", &arguments))
@@ -329,7 +350,12 @@ pub fn open(items: &[Value]) -> Option<String> {
                 Some(at) => {
                     answers.remove(at);
                 }
-                None if !moved_on => open = Some(ask.question),
+                None if !moved_on => {
+                    // One whose turn is not known no answer names.
+                    ask.id = (asked.or_else(|| item["call_id"].as_str().map(str::to_owned)))
+                        .unwrap_or_default();
+                    open = Some(ask);
+                }
                 None => {}
             }
         }
@@ -939,14 +965,17 @@ pub fn hint(ask: &Ask, at: usize, of: usize, width: usize) -> Vec<Span<'static>>
         _ => "",
     };
     let place = place(at, of);
+    // A task's question, pinned in its lead's window, by whose it is.
+    let whose = (ask.task.as_ref()).map_or(String::new(), |task| format!(" from {}", task.name));
     let room = width.saturating_sub(
         "Answer “”: ".chars().count()
+            + whose.chars().count()
             + place.chars().count()
             + words.chars().count()
             + keys.chars().count(),
     );
     let question = crate::transcript::cut(&plain(&ask.question), room.max(8));
-    let mut spans = vec![Span::raw(format!("Answer “{question}”{place}:{words} ")).dim()];
+    let mut spans = vec![Span::raw(format!("Answer “{question}”{whose}{place}:{words} ")).dim()];
     spans.extend(crate::hint::spans(&keys));
     spans
 }
@@ -1206,6 +1235,10 @@ mod tests {
             let ask = call_of(call, turn, question);
             person(&answer(&ask, "1"))
         };
+        // Whole, under the ID its answer names.
+        let whole = super::open(&[reply.clone(), asked.clone()]).unwrap();
+        assert_eq!((whole.id.as_str(), whole.options.len()), ("ask:3/a1", 1));
+        let open = |items: &[Value]| super::open(items).map(|ask| ask.question);
         // Newest first.
         assert_eq!(
             open(&[reply.clone(), output.clone(), asked.clone()]),
@@ -1260,6 +1293,7 @@ mod tests {
         // were, so an answer its source got before the fork closes the
         // same ask in the fork's history.
         assert_eq!(id(3, "a1"), "ask:3/a1");
+        assert_eq!((turn_of("ask:3/a1"), turn_of("a1")), (Some(3), None));
         let unknown = json!({"type": "function_call_output", "call_id": "a1",
             "output": json!({"error": "unknown_tool"}).to_string()});
         assert_eq!(open(&[unknown, asked]), None);
@@ -1501,7 +1535,7 @@ mod tests {
             "arguments": sign_in().to_string()}),
         ];
         assert_eq!(
-            open(&items).as_deref(),
+            open(&items).map(|ask| ask.question).as_deref(),
             Some("Sign in to the package registry")
         );
         assert_eq!(

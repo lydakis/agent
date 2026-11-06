@@ -7395,7 +7395,10 @@ mod tests {
         ]))
         .unwrap();
         let seen = |turn: i64| crate::needs::Seen {
-            ask: Some("q1".into()),
+            ask: crate::asks::call(
+                &crate::asks::id(2, "q1"),
+                &json!({"question": "q1", "options": [{"label": "a"}]}),
+            ),
             itself: false,
             turn: Some(turn),
         };
