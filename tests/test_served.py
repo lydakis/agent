@@ -175,7 +175,7 @@ class ServedToolTests(ModelFixture):
         self.assertFalse((self.path / 'setup.done').exists())
         self.assertEqual(self.daemon.request('bots', name='calc.fix')['result']['bots'], [])
 
-    def test_a_tool_host_that_gives_way_mid_setup_stops_it_and_the_next_serves_the_call(self):
+    def test_a_tool_host_that_gives_way_mid_setup_stops_it_and_the_next_never_runs_it_again(self):
         repo = self.path / 'calc'
         (repo / '.agents').mkdir(parents=True)
         setup = repo / '.agents/setup'
@@ -205,9 +205,11 @@ class ServedToolTests(ModelFixture):
         while running(first):
             self.assertLess(time.monotonic(), deadline, 'the first setup still runs')
             time.sleep(.05)
+        # The call was taken and stopped part way: the next host answers
+        # that its outcome is unknown, and runs no second setup.
         self.assertEqual(self.daemon.finished(turn)['data']['status'], 'completed')
-        self.assertTrue(self.output('calc.lead', turn).startswith('Started calc.fix: '))
-        self.assertEqual(len(pids.read_text().split()), 2)
+        self.assertEqual(json.loads(self.output('calc.lead', turn))['error'], 'tool_outcome_unknown')
+        self.assertEqual(len(pids.read_text().split()), 1)
 
     def test_a_start_the_person_denies_runs_no_setup(self):
         repo = self.path / 'calc'

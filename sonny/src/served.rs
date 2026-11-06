@@ -1793,8 +1793,8 @@ fn kill(group: u32) {
 }
 
 /// Stop every call still being answered, as a tool host that gives way to
-/// another build's does: that one answers them again, and two of a call
-/// would run at once, as two setups in one task's folder.
+/// another build's does, so none goes on behind it. Each was taken, so
+/// that host answers that its outcome is unknown and never runs it again.
 pub fn stop() {
     for group in GROUPS.lock().unwrap().take().unwrap_or_default() {
         kill(group);
