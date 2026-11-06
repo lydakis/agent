@@ -2855,7 +2855,7 @@ fn shown(path: &str, workspace: &str) -> String {
     }
 }
 
-pub fn finished(status: &str, detail: &str, seconds: Option<u64>, width: usize) -> Line<'static> {
+pub fn finished(status: &str, detail: &str, seconds: Option<u64>) -> Line<'static> {
     let mut label = match status {
         "completed" => "Worked".to_owned(),
         "steered" => "Steered".to_owned(),
@@ -2867,23 +2867,13 @@ pub fn finished(status: &str, detail: &str, seconds: Option<u64>, width: usize) 
     if !detail.is_empty() {
         label.push_str(&format!(" · {detail}"));
     }
-    let text = format!("{label} ");
-    // No wider than 80 columns, so a pane that narrows later rarely re-wraps it.
-    let fill = width.min(80).saturating_sub(text.width() + 2);
-    // The words muted, the rule round them faint: structure, not text, so
-    // it parts turns without weighing more than the words above it.
-    let (words, rule) = if matches!(status, "completed" | "steered") {
-        (Style::new().dim(), Style::new().fg(crate::look::STRUCTURE))
-    } else {
-        (Style::new().fg(Color::Red), Style::new().fg(Color::Red))
+    // Words only, muted: the person's band already parts one turn from the
+    // next, and a rule as wide as the column outweighed the reply above it.
+    let style = match status {
+        "completed" | "steered" => Style::new().dim(),
+        _ => Style::new().fg(Color::Red),
     };
-    // The fill is a span of its own: a row that ends in one is a rule, cut
-    // at the edge rather than wrapped (`screen`).
-    Line::from(vec![
-        Span::styled("─ ", rule),
-        Span::styled(text, words),
-        Span::styled("─".repeat(fill), rule),
-    ])
+    Line::from(Span::styled(label, style))
 }
 
 /// How full a conversation of `size` tokens is, as the footer says it:
@@ -3203,18 +3193,13 @@ mod tests {
     }
 
     #[test]
-    fn a_turn_rule_draws_its_words_muted_and_its_line_faint() {
-        let rule = finished("completed", "", Some(11), 40);
-        assert_eq!(rule.to_string().chars().count(), 40);
-        assert!(rule.to_string().starts_with("─ Worked for 11s ─"));
-        let (lead, words, fill) = (&rule.spans[0], &rule.spans[1], &rule.spans[2]);
-        assert_eq!(lead.style.fg, Some(crate::look::STRUCTURE));
-        assert_eq!(fill.style.fg, Some(crate::look::STRUCTURE));
-        assert!(fill.content.chars().all(|c| c == '─'), "still a rule");
-        assert!(words.style.add_modifier.contains(Modifier::DIM));
-        assert_eq!(words.style.fg, None);
-        // A failure is still read in red, rule and all.
-        let failed = finished("failed", "", None, 40);
+    fn a_finished_turn_ends_on_its_words_alone_muted() {
+        let done = finished("completed", "", Some(11));
+        assert_eq!(done.to_string(), "Worked for 11s");
+        assert!(!done.to_string().contains('─'), "no rule");
+        assert!(done.spans[0].style.add_modifier.contains(Modifier::DIM));
+        // A failure is still read in red.
+        let failed = finished("failed", "", None);
         assert!(failed.spans.iter().all(|s| s.style.fg == Some(Color::Red)));
     }
 

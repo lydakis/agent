@@ -8090,7 +8090,7 @@ impl App {
                 let note = running.as_ref().is_some_and(|r| r.note);
                 let seconds = running.map(|r| r.started.elapsed().as_secs());
                 let shown = if empty { "" } else { detail };
-                let line = transcript::finished(status, shown, seconds, self.prose());
+                let line = transcript::finished(status, shown, seconds);
                 self.close_live();
                 // A turn that only reacted ends as a reaction under the
                 // message, with no line under it.
@@ -16992,7 +16992,7 @@ mod tests {
         assert_eq!(rows[2], ("• Ran ls".into(), true));
         let line = rows
             .iter()
-            .position(|(row, _)| row.starts_with("─ Worked"))
+            .position(|(row, _)| row.starts_with("Worked for"))
             .unwrap();
         assert_eq!(
             rows[line + 1..],
@@ -17021,7 +17021,7 @@ mod tests {
             json!({"status": "completed"}),
         ))
         .await;
-        assert!(!lines(&app).iter().any(|row| row.starts_with("─ Worked")));
+        assert!(!lines(&app).iter().any(|row| row.starts_with("Worked for")));
         // One that says something ends as any other turn.
         app.daemon(turn_event("accepted", 2, note)).await;
         app.daemon(
@@ -17037,7 +17037,7 @@ mod tests {
         ))
         .await;
         let rows = lines(&app);
-        assert!(rows.iter().any(|row| row.starts_with("─ Worked")));
+        assert!(rows.iter().any(|row| row.starts_with("Worked for")));
         assert_eq!(rows.last().map(String::as_str), Some("• Docs are blocked."));
         // A reply long enough to spill above as it streams still speaks.
         app.pending.clear();
@@ -17058,7 +17058,7 @@ mod tests {
             json!({"status": "completed"}),
         ))
         .await;
-        assert!(lines(&app).iter().any(|row| row.starts_with("─ Worked")));
+        assert!(lines(&app).iter().any(|row| row.starts_with("Worked for")));
         // The person's own turn, with nothing said, still ends with its line.
         app.pending.clear();
         app.daemon(turn_event("accepted", 3, json!({"request_id": "r3"})))
@@ -17069,7 +17069,7 @@ mod tests {
             json!({"status": "completed"}),
         ))
         .await;
-        assert!(lines(&app).iter().any(|row| row.starts_with("─ Worked")));
+        assert!(lines(&app).iter().any(|row| row.starts_with("Worked for")));
     }
 
     #[tokio::test]
@@ -17101,8 +17101,7 @@ mod tests {
             .await;
         app.daemon(turn_event("turn_finished", 2, empty)).await;
         let rows = lines(&app);
-        let line = rows.iter().find(|row| row.starts_with("─ ")).unwrap();
-        assert!(line.starts_with("─ Worked"), "{line}");
+        let line = rows.iter().find(|row| row.starts_with("Worked")).unwrap();
         assert!(!line.contains("empty_completion"));
         // Another failure still says what it was.
         app.pending.clear();
@@ -17564,7 +17563,7 @@ mod tests {
             ["", "", "› and the notes?", "", "   🎉 "],
             "{rows:?}"
         );
-        assert!(rows[10].starts_with("─ Worked"), "{rows:?}");
+        assert!(rows[10].starts_with("Worked for"), "{rows:?}");
         assert_eq!(rows[11..], ["", "• Updated."]);
         // Once that message is no longer in the conversation, a reaction
         // to it draws no row of its own.

@@ -1065,7 +1065,7 @@ impl Screen {
             let line = row.line.clone();
             // A picture's row is cut at the edge, not wrapped into pieces:
             // Kitty's placeholders, or one drawn in half blocks. So is a
-            // rule, a last span of nothing but "─" as "Worked for" draws: its
+            // rule, a last span of nothing but "─" after its words: its
             // line just ends sooner. Text that only ends in "──" still wraps.
             let picture = (line.spans.iter()).any(|span| {
                 span.content.starts_with(crate::image::PLACEHOLDER)
@@ -3309,7 +3309,7 @@ mod tests {
         let (mut banner, _) = screen(vec![blocks], 20, 5);
         assert_eq!(banner.height(20), 1);
         // A rule drawn wider than the screen ends at its edge.
-        let rule = crate::transcript::finished("completed", "", Some(48), 80);
+        let rule = Line::from(vec![Span::raw("─ Notes "), Span::raw("─".repeat(72))]);
         let (mut worked, _) = screen(vec![rule], 20, 5);
         assert_eq!(worked.height(20), 1);
         // Text that only ends in a rule's characters still wraps.

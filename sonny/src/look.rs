@@ -55,22 +55,9 @@ impl Look {
     }
 
     pub fn cell(self, cell: &mut Cell) {
-        // The band and faint structure as they are now: rows hold their
-        // roles, not colors. A picture's cells name it by their color.
+        // The band as it is now: rows hold its role, not a color.
         if cell.bg == BAND {
             cell.bg = band();
-        }
-        if cell.fg == STRUCTURE && !cell.symbol().contains(crate::image::PLACEHOLDER) {
-            match faint() {
-                Some(color) => {
-                    cell.fg = color;
-                    cell.modifier.remove(Modifier::DIM);
-                }
-                None => {
-                    cell.fg = Color::Reset;
-                    cell.modifier.insert(Modifier::DIM);
-                }
-            }
         }
         // A hue on a muted row (the footer's branch, an agent's name) is a
         // short mark meant to read: dim over it falls under 3:1 in many
@@ -129,10 +116,6 @@ fn muted(foreground: Rgb, background: Rgb) -> Rgb {
 /// dark for any theme's band to be: one row drawn without a frame's look
 /// would show near black, not a band that passes for right.
 pub const BAND: Color = Color::Rgb(2, 1, 3);
-
-/// Faint structure as a row holds it, made [`faint`] (or plain dim where
-/// that is not known) as each frame is finished, as [`BAND`] is.
-pub const STRUCTURE: Color = Color::Rgb(3, 1, 2);
 
 /// The band the person's own messages sit on, as Codex and Claude Code
 /// tint the user's cell: the theme's foreground a little over its
@@ -286,24 +269,6 @@ mod tests {
         let mut buffer = fresh();
         Look::Plain.finish(&mut buffer);
         assert_eq!(buffer[(0, 0)].bg, Color::Reset);
-    }
-
-    #[test]
-    fn faint_structure_a_row_holds_is_drawn_faint_or_dim() {
-        let mut buffer = Buffer::empty(ratatui::layout::Rect::new(0, 0, 1, 1));
-        buffer[(0, 0)].set_symbol("─").set_fg(STRUCTURE).modifier = Modifier::DIM;
-        Look::Drawn.finish(&mut buffer);
-        let cell = &buffer[(0, 0)];
-        match faint() {
-            Some(color) => {
-                assert_eq!(cell.fg, color);
-                assert!(!cell.modifier.contains(Modifier::DIM), "never dimmed twice");
-            }
-            None => {
-                assert_eq!(cell.fg, Color::Reset);
-                assert!(cell.modifier.contains(Modifier::DIM));
-            }
-        }
     }
 
     #[test]
