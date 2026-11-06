@@ -1307,10 +1307,20 @@ pub fn relays(text: &str, from: Option<&str>) -> bool {
     from.is_some() || news(text).is_some()
 }
 
-/// What sent a prompt from outside, in the words the person reads.
+/// What sent a prompt from outside, in the words the person reads. The
+/// lookout's notes say what they bring, not the lookout's own word for
+/// how an agent asked for them (a follow): its tasks' news, its sources'
+/// news, a message that came back.
 pub fn from_outside(origin: Option<&str>) -> &'static str {
-    match origin.unwrap_or("").split('.').next() {
-        Some("lookout") => "a follow",
+    let origin = origin.unwrap_or("");
+    match origin {
+        crate::lookout::TASKS_ORIGIN => return "task updates",
+        crate::lookout::sources::ORIGIN => return "its sources",
+        crate::lookout::BOUNCE_ORIGIN => return "a returned message",
+        _ => {}
+    }
+    match origin.split('.').next() {
+        Some("lookout") => "the lookout",
         Some("automation" | "trigger") => "an automation",
         Some("commons") => "the commons",
         Some("goal") => "a goal",
@@ -1501,7 +1511,7 @@ pub fn relayed_kind(text: &str, from: Option<&str>) -> &'static str {
 /// Whom a message between agents is from or about: its sender, the tasks
 /// task updates name, the sources that reported.
 pub fn relayed_names(text: &str, from: Option<&str>) -> Vec<String> {
-    // News names whom it is about, not what sent it ("a follow").
+    // News names whom it is about, not what sent it ("task updates").
     if let Some(rest) = text.strip_prefix(FROM_SOURCES) {
         return (sourced(rest).into_iter().skip(1))
             .filter(|source| !source.starts_with('+'))
@@ -2928,6 +2938,19 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn the_lookout_s_notes_are_named_for_what_they_bring() {
+        assert_eq!(from_outside(Some("lookout.tasks")), "task updates");
+        assert_eq!(from_outside(Some("lookout.sources")), "its sources");
+        assert_eq!(from_outside(Some("lookout.bounce")), "a returned message");
+        assert_eq!(from_outside(Some("lookout.other")), "the lookout");
+        assert_eq!(from_outside(Some("automation.weekly")), "an automation");
+        assert_eq!(
+            sender(None, Some("lookout.sources"), None).as_deref(),
+            Some("its sources")
+        );
+    }
+
     fn text(lines: &[Line]) -> Vec<String> {
         lines.iter().map(|l| l.to_string()).collect()
     }
@@ -3256,7 +3279,7 @@ mod tests {
             "task update",
         ];
         assert_eq!(relayed_names(updates, None), ["a.b"]);
-        assert_eq!(relayed_names(updates, Some("a follow")), ["a.b"]);
+        assert_eq!(relayed_names(updates, Some("task updates")), ["a.b"]);
         assert_eq!(relayed_names("Look at this", Some("a.c")), ["a.c"]);
         let names = ["a.b", "a.c", "a.b", "a.d"].map(String::from);
         assert_eq!(
@@ -3382,21 +3405,75 @@ mod tests {
         assert!(shown.iter().any(|l| l.contains("+new")), "{shown:?}");
     }
 
-    /// How long `draw` takes on `unit` repeated to `n` bytes, and on twice
-    /// that: work in proportion to the text takes about twice as long, where
-    /// work as its square takes four times.
-    fn scales(
-        unit: &str,
-        n: usize,
-        draw: impl Fn(&str),
-    ) -> (std::time::Duration, std::time::Duration) {
-        let timed = |len: usize| {
-            let text = unit.repeat(len / unit.len());
+    /// Whether `draw` on `unit` repeated to twice `n` bytes takes about twice
+    /// as long as on `n`, not four times, as work as the text's square would.
+    #[track_caller]
+    fn assert_linear(unit: &str, n: usize, draw: impl Fn(&str)) {
+        let (small, large) = (unit.repeat(n / unit.len()), unit.repeat(2 * n / unit.len()));
+        let timed = |longer: bool| {
             let started = std::time::Instant::now();
-            draw(&text);
+            draw(if longer { &large } else { &small });
             started.elapsed()
         };
-        (timed(n), timed(2 * n))
+        if let Some((once, twice)) = outgrows(timed) {
+            panic!("{unit}: {once:?} then {twice:?}");
+        }
+    }
+
+    /// The fastest of each timing when the longer text took three times the
+    /// shorter and 50 ms more; none when it did not. Each size is timed again,
+    /// the two in turn, up to five times while the fastest of each says
+    /// otherwise, so a busy machine pausing the test once is not read as the
+    /// work growing. `timed(true)` times the longer text.
+    fn outgrows(
+        mut timed: impl FnMut(bool) -> std::time::Duration,
+    ) -> Option<(std::time::Duration, std::time::Duration)> {
+        let (mut once, mut twice) = (std::time::Duration::MAX, std::time::Duration::MAX);
+        for _ in 0..5 {
+            once = once.min(timed(false));
+            twice = twice.min(timed(true));
+            if twice < once * 3 + std::time::Duration::from_millis(50) {
+                return None;
+            }
+        }
+        Some((once, twice))
+    }
+
+    #[test]
+    fn work_as_the_square_of_the_text_is_caught_however_often_it_is_timed() {
+        // 80 ms, then 320 ms: four times, against under three and 50 ms more.
+        let mut rounds = 0;
+        let caught = outgrows(|longer| {
+            rounds += usize::from(longer);
+            std::time::Duration::from_millis(if longer { 320 } else { 80 })
+        });
+        assert_eq!(
+            caught,
+            Some((
+                std::time::Duration::from_millis(80),
+                std::time::Duration::from_millis(320)
+            ))
+        );
+        assert_eq!(rounds, 5);
+    }
+
+    #[test]
+    fn a_pause_while_timed_once_is_not_read_as_the_work_growing() {
+        // Work in proportion to the text, the machine busy for 300 ms the
+        // first time the longer text is drawn.
+        let mut paused = false;
+        let mut rounds = 0;
+        let caught = outgrows(|longer| {
+            rounds += usize::from(longer);
+            let pause = if longer && !std::mem::replace(&mut paused, true) {
+                300
+            } else {
+                0
+            };
+            std::time::Duration::from_millis(if longer { 20 } else { 10 } + pause)
+        });
+        assert_eq!(caught, None);
+        assert_eq!(rounds, 2);
     }
 
     #[test]
@@ -3407,13 +3484,9 @@ mod tests {
             "[a", "\\(", "`", "**a", "~~", "*a ", "_a ", "$a", "<b>", "<kbd>", "<!--", "<a x",
             "<del>", "<b x", "![a](",
         ] {
-            let (once, twice) = scales(unit, 1 << 17, |text| {
+            assert_linear(unit, 1 << 17, |text| {
                 inline(text, Style::new());
             });
-            assert!(
-                twice < once * 3 + std::time::Duration::from_millis(50),
-                "{unit}: {once:?} then {twice:?}"
-            );
         }
         // What does close still reads as it did.
         let spans = inline(
@@ -3426,7 +3499,7 @@ mod tests {
 
     #[test]
     fn a_long_word_is_wrapped_in_time_as_its_length() {
-        let (once, twice) = scales("abcdefgh", 1 << 18, |text| {
+        assert_linear("abcdefgh", 1 << 18, |text| {
             let rows = wrap(
                 Line::from(text.to_owned()),
                 80,
@@ -3438,10 +3511,6 @@ mod tests {
                 .collect();
             assert_eq!(kept, text);
         });
-        assert!(
-            twice < once * 3 + std::time::Duration::from_millis(50),
-            "{once:?} then {twice:?}"
-        );
         // Joined emoji are measured alike when cut and after, so no row is
         // wider than the room.
         let family = "👨\u{200d}👩\u{200d}👧\u{200d}👦".repeat(12);
