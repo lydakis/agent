@@ -56,7 +56,7 @@ fn short(key: &str) -> &str {
 }
 
 /// Every key `agent_client::config` reads.
-pub const SETTINGS: [Setting; 32] = [
+pub const SETTINGS: [Setting; 33] = [
     Setting {
         key: "model",
         about: "a new agent's model, when none is named (provider/model)",
@@ -146,6 +146,12 @@ pub const SETTINGS: [Setting; 32] = [
         about: "when a note the agent puts up or changes opens the margin: always, unless you closed it with Esc, or never",
         values: &["always", "unless-closed", "never"],
         default: "always",
+    },
+    Setting {
+        key: "sonny.margin_notes",
+        about: "the most notes a margin holds; past it the oldest goes",
+        values: &[],
+        default: "20",
     },
     Setting {
         key: "sonny.agent_opens",
@@ -242,6 +248,12 @@ pub const SETTINGS: [Setting; 32] = [
         about: "events from your sources that wait for one agent while it is busy: past it, newer ones are not kept, and the agent's next note says how many, from where and when; 0 for no limit",
         values: &[],
         default: "1024",
+    },
+    Setting {
+        key: "sonny.sent_days",
+        about: "days kept of what agents sent through Sonny's tools, which `sonny sent` lists; 0 keeps all",
+        values: &[],
+        default: "30",
     },
     Setting {
         key: "sonny.sources.commons.digest",
