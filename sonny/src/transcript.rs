@@ -3181,9 +3181,9 @@ mod tests {
 
     #[test]
     fn a_turn_rule_draws_its_words_muted_and_its_line_faint() {
-        let rule = finished("completed", "$0.02", Some(11), 40);
+        let rule = finished("completed", "", Some(11), 40);
         assert_eq!(rule.to_string().chars().count(), 40);
-        assert!(rule.to_string().starts_with("─ Worked for 11s · $0.02 ─"));
+        assert!(rule.to_string().starts_with("─ Worked for 11s ─"));
         let (lead, words, fill) = (&rule.spans[0], &rule.spans[1], &rule.spans[2]);
         assert_eq!(lead.style.fg, Some(crate::look::STRUCTURE));
         assert_eq!(fill.style.fg, Some(crate::look::STRUCTURE));
