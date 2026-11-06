@@ -1453,6 +1453,7 @@ async fn run() -> Result<(), String> {
     app.sounds.chime = settings.chime;
     app.verbose = settings.verbose;
     set_measure(settings.text_width);
+    margin::set_most_notes(settings.margin_notes);
     app.zen = zen::focus(app.reactions_key.as_deref());
     app.margin_opens = settings.margin_opens;
     app.agent_opens = settings.agent_opens;
@@ -10254,6 +10255,7 @@ impl App {
             self.sounds.chime = settings.chime;
             self.margin_opens = settings.margin_opens;
             self.agent_opens = settings.agent_opens;
+            margin::set_most_notes(settings.margin_notes);
             if self.verbose != settings.verbose {
                 self.verbose = settings.verbose;
                 self.repaint = true;
@@ -12125,7 +12127,7 @@ impl App {
             && self.pane.as_ref().is_some_and(pane::Pane::is_margin)
         {
             let live = self.running.as_ref().map(|running| running.turn);
-            let width = (at.width.saturating_sub(1) as usize).min(measure());
+            let width = (pane::margin_room(at.width).saturating_sub(1) as usize).min(measure());
             let (lines, marks) = self.margin.lines(width, &workspace, live);
             let glance = self.glance().line();
             if let Some(pane) = &mut self.pane {

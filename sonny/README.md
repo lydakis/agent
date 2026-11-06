@@ -275,6 +275,7 @@ at its model's own effort (`AGENT_EFFORT` when its model is
 | A guess at your next message | `[sonny] suggest` (true, the default, or false) | |
 | Whether agents have the commons | `[sonny] commons` (true, the default, or false) | |
 | When a note opens the margin | `[sonny] margin_opens` (`always`, the default, `unless-closed` or `never`) | |
+| The most notes a margin holds | `[sonny] margin_notes` (20 by default, at least 1; past it the oldest goes) | |
 | Where a click on an agent's name goes | `[sonny] agent_opens` (`tab`, the default, or `beside`) | |
 | Task windows a lead keeps open | `[sonny] task_windows` (32 by default, 0 for no limit) | |
 | The daemon started with the machine | `[sonny] start_at_boot` (true or false, the default) | |
