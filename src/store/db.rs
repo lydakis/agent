@@ -1968,29 +1968,39 @@ fn entry(cursor: i64, bot: &str, turn: Option<i64>, kind: &str, data: Value) -> 
 /// The most kinds a page reads each from its place in the index; past
 /// it, one pass over the events (SQLite allows 500 arms in a compound).
 const KINDS_BY_INDEX: usize = 64;
+/// Every bot's next events of one kind (`?3`) after `?1`, at most `?2`,
+/// from the kind's place in the index.
+const KINDS_PAGE: &str = "SELECT id,turn,kind,data,bot,written_ms FROM events WHERE id IN
+    (SELECT id FROM events INDEXED BY events_kind_cursor WHERE kind=?3 AND id>?1 ORDER BY id LIMIT ?2)
+    ORDER BY id LIMIT ?2";
+const KIND_CURSORS: &str = "SELECT id FROM events INDEXED BY events_kind_cursor WHERE kind=?3 AND id>?1 ORDER BY id LIMIT ?2";
+/// One kind's cursors as an arm of a compound, which takes no `LIMIT` of
+/// its own unless wrapped (SQLite flattens the wrapper).
+const KIND_ARM: &str = "SELECT * FROM (SELECT id FROM events INDEXED BY events_kind_cursor
+    WHERE kind=?3 AND id>?1 ORDER BY id LIMIT ?2)";
+/// Past [`KINDS_BY_INDEX`] kinds, in cursor order, stopping at the limit.
+const KINDS_SCAN: &str = "SELECT id FROM events NOT INDEXED
+    WHERE id>?1 AND kind IN (SELECT value FROM json_each(?3)) ORDER BY id LIMIT ?2";
 
-/// Every bot's next events of `kinds` distinct kinds after `?1`, at most
-/// `?2`, as one statement: each kind's first `?2` from the index (the
-/// page's first `?2` are among them), the events read in cursor order.
+/// [`KINDS_PAGE`] for `kinds` distinct kinds bound from `?3` on, as one
+/// statement: the page's first `?2` are among each kind's first `?2`.
 fn kinds_page(kinds: usize) -> String {
-    let wanted = match kinds <= KINDS_BY_INDEX {
-        true => (0..kinds)
-            .map(|at| {
-                format!(
-                    "SELECT * FROM (SELECT id FROM events INDEXED BY events_kind_cursor
-                     WHERE kind=?{} AND id>?1 ORDER BY id LIMIT ?2)",
-                    at + 3
-                )
-            })
+    let page = re_spaced(KINDS_PAGE);
+    let cursors = re_spaced(KIND_CURSORS);
+    let wanted = match kinds {
+        1 => return page,
+        2..=KINDS_BY_INDEX => (0..kinds)
+            .map(|at| re_spaced(KIND_ARM).replace("kind=?3", &format!("kind=?{}", at + 3)))
             .collect::<Vec<_>>()
             .join(" UNION ALL "),
-        false => "SELECT * FROM (SELECT id FROM events WHERE id>?1
-             AND kind IN (SELECT value FROM json_each(?3)) ORDER BY id LIMIT ?2)"
-            .to_owned(),
+        _ => re_spaced(KINDS_SCAN),
     };
-    format!(
-        "SELECT id,turn,kind,data,bot,written_ms FROM events WHERE id IN ({wanted}) ORDER BY id LIMIT ?2"
-    )
+    page.replace(&cursors, &wanted)
+}
+
+/// A statement on one line, as written across several.
+fn re_spaced(sql: &str) -> String {
+    sql.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn stored_entry(
