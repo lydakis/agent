@@ -143,6 +143,32 @@ automation ends, keeping its row, as when its `--reply-to` agent is gone. The `c
 request id, so a fire cut short after the daemon made the agent asks again
 and gets that same agent, and no other.
 
+`--fresh` (with `--start`) makes a new agent for each run instead, `NAME-N`
+for run N, so no run reads another's conversation: what lasts between runs
+lives in files and memory, as a cron job's does. Sonny's own nightly memory
+cleanup runs so; an automation an agent sets up keeps one agent unless asked.
+Each is made as the one agent above is. A run is numbered when its time
+passes its `--if`, and the number is on the automation's row (`run`) before
+its agent is made: a fire cut short and taken again is another attempt at
+the same run, whose `create` (request id `trigger-GENERATION-N`) and
+message (`…ID.run`) the daemon takes once. Runs go one at a time: a run's
+fire waits for the run before to end (the daemon's `wait`, up to a day; a
+run still working then is skipped), reads how it ended, and says so on its
+first line when it did not finish (`[automation NAME · run N · TIME · WHY]`,
+then `Run N-1 did not finish: failed: provider_failed. Its conversation is
+NAME-(N-1).`). The row keeps three agents at most: the run under way, the
+latest that finished and the latest that did not; an agent a later run
+replaces there is deleted. An agent of a run deleted by hand ends that run,
+not the automation. A run passes over a `NAME-N` an agent already has, so
+NAME may be an agent's, and it is at most 117 bytes, so `NAME-N` fits the
+daemon's 128. A run's message is kept on the row before it goes, so an
+attempt cut short sends it again as it was. A memory tool call in a run's
+turn, and a change from a run's shell through `~/.agent/memory`, is the
+automation's, so an open memory cleanup belongs to the automation, and a run
+that carries on one cut short changes it as its own. `--fresh` and
+`--shadow` do not go together, and an automation replaced with or without
+`--fresh` starts its agents over.
+
 **What else.** `--reply-to BOT` keeps the fire's process until the turn it
 sent ends (the daemon's `wait`, up to a day), then queues that turn's
 answer to BOT, pinned by id; the scheduler starts no second fire of the automation
@@ -640,21 +666,19 @@ follow.
 
 Memory grows by saves, so a nightly cleanup keeps it small and true. It is
 a skill and an automation, not part of the daemon. `schedule` adds
-the automation `memory-cleanup`: at 03:30 by default (`--cron` moves it) it
-starts, on its first fire, an agent of that name in `~/.agents/memory` on
-the model given, and sends it "Clean up memory as the memory-cleanup skill
-says." The automation's `--if` runs `changed`, which Sonny answers true also
+the automation `memory-cleanup`: at 03:30 by default (`--cron` moves it)
+each run starts an agent of its own (`--fresh`), `memory-cleanup-N`, in
+`~/.agents/memory` on the model given, and sends it "Clean up memory as the
+memory-cleanup skill says." The automation's `--if` runs `changed`, which Sonny answers true also
 when the person wrote to any agent since the last finished cleanup
 started (starting a stopped daemon to read it, as a fire would), so a night after nothing was saved or removed and nothing said
-costs no turn. Each turn is capped at 1,000,000 tokens:
-the agent keeps one conversation, as every `--start` agent does, so each
-call carries earlier nights up to where compaction summarizes them.
+costs no turn. Each turn is capped at 1,000,000 tokens, and each night
+starts a conversation of its own, so a call carries only that night's work.
 Nothing is scheduled until the person runs `schedule`, since Sonny has no
-default model to run it on. To move the time, `~/.agent/automation rm
-memory-cleanup` and `schedule` again without `--model`: that keeps the
-agent it started, with its model and history. With `--model`, while that
-agent exists, `schedule` is `bot_exists`: it only starts that agent, and
-never changes the model of one it already started. The `memory-cleanup` skill
+default model to run it on. `schedule` again replaces the automation:
+without `--model` it keeps the model (and effort) it runs on, so moving the
+time is one call. A cleanup scheduled before 0.9.0 keeps its one agent
+until `schedule` runs again. The `memory-cleanup` skill
 ([SKILL.md](../sonny/skills/memory-cleanup/SKILL.md)) merges duplicates,
 drops superseded facts and dates relative ones, with `save` and `rm` only,
 and never removes a lasting fact for its age alone.
