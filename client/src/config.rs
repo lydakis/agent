@@ -52,7 +52,9 @@
 //! ask_wait_minutes = 60         # how long an unanswered ask waits to go ahead or remind; 0 never
 //! task_windows = 64            # task windows a lead keeps open, 32 by default; past it the least recently used closes, never one not looked at yet; 0 no limit
 //! task_depth = 3                # generations of tasks below a lead, 2 by default (tasks' own start none); 0 no end
-//! sky_haikus = 0                # haikus a day from the sky's busiest agent, 8 by default; 0 none
+//! sky_haikus = false            # no haikus from the sky's busiest agent, on by default
+//! sky_haiku_daily = 8           # haikus a day at most; 0, the default, no limit but the title's hold
+//! sky_haiku_keep = 168          # hours haikus are kept for replays, 24 by default; 0 keeps all
 //! sky_haiku_window = 10         # minutes of messages and tool calls that make an agent busiest
 //! sky_haiku_margin = 50         # how much busier, in percent, a challenger must be to take the title
 //! sky_haiku_hold = 10           # minutes the title is held before it can pass
@@ -484,9 +486,14 @@ pub struct Sonny {
     /// How many generations below a lead its line goes: a lead's tasks
     /// are the first, and an agent of the last starts none; 0 for no end.
     pub task_depth: u64,
-    /// The haikus a day the sky's busiest agent writes, each time the
-    /// title passes; 0 for none.
-    pub sky_haikus: u64,
+    /// Whether the sky's busiest agent writes a haiku each time the title
+    /// passes.
+    pub sky_haikus: bool,
+    /// The most haikus a day; 0 for no limit, the title's hold being
+    /// bound enough.
+    pub sky_haiku_daily: u64,
+    /// The hours haikus are kept for replays; 0 keeps them all.
+    pub sky_haiku_keep: u64,
     /// The minutes of messages and tool calls that make an agent busiest.
     pub sky_haiku_window: u64,
     /// How much busier, in percent, a challenger must be to take the
@@ -599,7 +606,9 @@ impl Default for Sonny {
             ask_wait_minutes: 60,
             task_windows: 32,
             task_depth: 2,
-            sky_haikus: 8,
+            sky_haikus: true,
+            sky_haiku_daily: 0,
+            sky_haiku_keep: 24,
             sky_haiku_window: 10,
             sky_haiku_margin: 50,
             sky_haiku_hold: 10,
@@ -1214,6 +1223,8 @@ fn parse(text: &str) -> Result<Config, String> {
                 "task_windows",
                 "task_depth",
                 "sky_haikus",
+                "sky_haiku_daily",
+                "sky_haiku_keep",
                 "sky_haiku_window",
                 "sky_haiku_margin",
                 "sky_haiku_hold",
@@ -1282,8 +1293,17 @@ fn parse(text: &str) -> Result<Config, String> {
                 "commons" => Some(&mut config.sonny.commons),
                 "verbose" => Some(&mut config.sonny.verbose),
                 "start_at_boot" => Some(&mut config.sonny.start_at_boot),
+                "sky_haikus" => Some(&mut config.sonny.sky_haikus),
                 _ => None,
             } {
+                // A count was 0.8's: the switch and the day's most are two
+                // keys now, and 0 says "no limit" where it said "none".
+                if key == "sky_haikus" && value.is_integer() {
+                    return Err(format!(
+                        "{name}.{key} is true or false; the most haikus a day is \
+                         {name}.sky_haiku_daily, 0 for no limit"
+                    ));
+                }
                 *switch = value
                     .as_bool()
                     .ok_or_else(|| format!("{name}.{key} must be true or false"))?;
@@ -1295,7 +1315,8 @@ fn parse(text: &str) -> Result<Config, String> {
                 "ask_wait_minutes" => Some(&mut config.sonny.ask_wait_minutes),
                 "task_windows" => Some(&mut config.sonny.task_windows),
                 "task_depth" => Some(&mut config.sonny.task_depth),
-                "sky_haikus" => Some(&mut config.sonny.sky_haikus),
+                "sky_haiku_daily" => Some(&mut config.sonny.sky_haiku_daily),
+                "sky_haiku_keep" => Some(&mut config.sonny.sky_haiku_keep),
                 "sky_haiku_window" => Some(&mut config.sonny.sky_haiku_window),
                 "sky_haiku_margin" => Some(&mut config.sonny.sky_haiku_margin),
                 "sky_haiku_hold" => Some(&mut config.sonny.sky_haiku_hold),
@@ -1962,14 +1983,26 @@ mod tests {
         assert!(parse("[sonny]\nbrowser_confirm = \"eval\"").is_err());
         assert!(parse("[sonny]\ncommons_invites = -1").is_err());
         assert!(parse("[sonny]\ncommons_invites = \"3\"").is_err());
-        let sky = (config.sonny.sky_haikus, config.sonny.sky_haiku_window);
-        assert_eq!(sky, (8, 10));
+        let sky = (config.sonny.sky_haikus, config.sonny.sky_haiku_daily);
+        assert_eq!(sky, (true, 0));
+        assert_eq!(config.sonny.sky_haiku_keep, 24);
+        assert_eq!(config.sonny.sky_haiku_window, 10);
         let sky = (config.sonny.sky_haiku_margin, config.sonny.sky_haiku_hold);
         assert_eq!(sky, (50, 10));
-        assert_eq!(
-            parse("[sonny]\nsky_haikus = 0").unwrap().sonny.sky_haikus,
-            0
+        assert!(
+            !(parse("[sonny]\nsky_haikus = false")
+                .unwrap()
+                .sonny
+                .sky_haikus)
         );
+        let daily = parse("[sonny]\nsky_haiku_daily = 8\nsky_haiku_keep = 0").unwrap();
+        assert_eq!(
+            (daily.sonny.sky_haiku_daily, daily.sonny.sky_haiku_keep),
+            (8, 0)
+        );
+        // 0.8's count is refused by name, never read as "no limit".
+        let old = parse("[sonny]\nsky_haikus = 0").unwrap_err();
+        assert!(old.contains("sky_haiku_daily"), "{old}");
         assert!(parse("[sonny]\nsky_haiku_margin = 1.5").is_err());
         assert_eq!(config.sonny.text_width, 100);
         let text_width = |text: &str| parse(text).map(|config| config.sonny.text_width);

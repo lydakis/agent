@@ -1222,6 +1222,7 @@ fn main() -> std::process::ExitCode {
     // Before anything reads the config, which refuses a key it no longer
     // knows.
     lookout::subs::at_start();
+    haiku::at_start();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.split_first() {
         // The tool host runs this for each call of a tool Sonny answers.
