@@ -269,7 +269,7 @@ at its model's own effort (`AGENT_EFFORT` when its model is
 | Each new task's model | (the lead's) | `threads_model` |
 | Each new task's effort | `[sonny] task_effort` | `threads_effort` |
 | The approver's judge | `[judge] model`, `effort` | |
-| What `/side`'s copy may do | `[sonny] side_chat` (`answer` or `fork`) | |
+| What `/side`'s copy may do | `[sonny] side_chat` (`fork`, the default, or `answer`) | |
 | The chime, and every tool call drawn | `[sonny] chime`, `verbose` (true or false) | |
 | The widest the conversation is written | `[sonny] text_width` (100 by default, at least 40, 0 for the window's whole width) | |
 | A guess at your next message | `[sonny] suggest` (true, the default, or false) | |
@@ -581,10 +581,10 @@ way `/react` does, and each note in the margin has its own `↩`.
 - `/side [QUESTION]` opens a side chat with a copy of the agent in this
   window, taken where it is now, mid-turn included, in the pane beside
   the conversation.
-  The copy answers from the agent's history and may call no tool, unless
-  `~/.agent/config.toml` sets `[sonny] side_chat = "fork"`: then it is a
-  full fork that can do anything the agent can, with its tools, in its
-  folder, under its approvals. Follow-ups stay with it, and Esc goes
+  The copy is a full fork that can do anything the agent can, with its
+  tools, in its folder, under its approvals, unless `~/.agent/config.toml`
+  sets `[sonny] side_chat = "answer"`: then it answers from the agent's
+  history and may call no tool. Follow-ups stay with it, and Esc goes
   back. In the pane, every key goes to the side chat but Ctrl+\, which
   goes back to the main composer while the side chat stays open. The agent
   carries on meanwhile, in view. The daemon deletes the copy once it has been idle 15
