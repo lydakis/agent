@@ -482,6 +482,9 @@ pub struct Registry {
     /// Background commands accepted and waiting for a slot. The operating
     /// system never sees these, so only this count can bound them.
     pending: Arc<std::sync::atomic::AtomicUsize>,
+    /// Foreground commands holding a slot now; background ones are the
+    /// store's to count, as their results are recorded there.
+    foreground: Arc<std::sync::atomic::AtomicUsize>,
     /// Processes that outlive their call, as a systemd slice holds a
     /// service's: a permit stays with each terminal until its session is
     /// gone and with each detached child until its wait completes.
@@ -545,6 +548,50 @@ fn binary(bytes: &[u8]) -> Option<&'static str> {
 pub struct Queued {
     permit: Option<tokio::sync::OwnedSemaphorePermit>,
     pending: Option<Arc<std::sync::atomic::AtomicUsize>>,
+}
+/// A foreground command's place in the running count: taken when it
+/// starts and given up once, when it ends or when [`lift`](Self::lift)
+/// moves it to the background, whichever comes first. A place lifted
+/// before its command starts is never taken.
+#[derive(Clone)]
+pub struct Place {
+    /// `WAITING`, then `COUNTED` while it holds its place, then `LEFT`.
+    state: Arc<std::sync::atomic::AtomicU8>,
+    count: Arc<std::sync::atomic::AtomicUsize>,
+}
+const WAITING: u8 = 0;
+const COUNTED: u8 = 1;
+const LEFT: u8 = 2;
+impl Place {
+    /// The command now runs as a background process, which the store counts.
+    pub fn lift(&self) {
+        if self.state.swap(LEFT, std::sync::atomic::Ordering::AcqRel) == COUNTED {
+            self.count
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    fn take(&self) -> Taken {
+        use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed};
+        if (self
+            .state
+            .compare_exchange(WAITING, COUNTED, AcqRel, Acquire))
+        .is_ok()
+        {
+            self.count.fetch_add(1, Relaxed);
+        }
+        Taken(self.clone())
+    }
+}
+/// A taken [`Place`], given up when dropped unless lifted first.
+struct Taken(Place);
+impl Drop for Taken {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed};
+        let place = &self.0;
+        if (place.state.compare_exchange(COUNTED, LEFT, AcqRel, Acquire)).is_ok() {
+            place.count.fetch_sub(1, Relaxed);
+        }
+    }
 }
 impl Drop for Queued {
     fn drop(&mut self) {
@@ -1229,6 +1276,7 @@ impl Registry {
             load_parked: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             load_line: Arc::default(),
             pending: Arc::default(),
+            foreground: Arc::default(),
             lasting_slots: Arc::new(Semaphore::new(default_lasting())),
             lasting_budget: default_lasting(),
             #[cfg(unix)]
@@ -1501,6 +1549,20 @@ impl Registry {
     /// Background commands accepted but not yet running, for `stats`.
     pub fn pending(&self) -> usize {
         self.pending.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    /// Foreground commands running now, each holding a process slot; one
+    /// moved to the background has left this count for the store's.
+    pub fn foreground_running(&self) -> usize {
+        self.foreground.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    /// A foreground command's place in
+    /// [`foreground_running`](Self::foreground_running), handed to
+    /// [`foreground`](Self::foreground).
+    pub fn place(&self) -> Place {
+        Place {
+            state: Arc::default(),
+            count: self.foreground.clone(),
+        }
     }
     /// Variables added to every shell child, such as the store and binary
     /// paths a bot needs to delegate through the same daemon.
@@ -1948,6 +2010,7 @@ impl Registry {
                     timeout_ms,
                     environment.to_vec(),
                     sandbox,
+                    self.place(),
                     tokio::sync::oneshot::channel().0,
                 )
                 .await
@@ -2169,6 +2232,7 @@ impl Registry {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn foreground(
         &self,
         command: String,
@@ -2176,6 +2240,7 @@ impl Registry {
         timeout_ms: u64,
         environment: Vec<(String, String)>,
         sandbox: Option<Arc<Policy>>,
+        place: Place,
         started: tokio::sync::oneshot::Sender<()>,
     ) -> impl Future<Output = Result<Outcome>> + Send + 'static {
         let registry = self.clone();
@@ -2191,6 +2256,7 @@ impl Registry {
                     .acquire()
                     .await
                     .map_err(|_| Error::new("tool_scheduler_closed"))?;
+                let _place = place.take();
                 let _ = started.send(());
                 shell(
                     &command,
@@ -3066,6 +3132,56 @@ mod tests {
             .unwrap();
         assert_eq!(registry.running(), 2);
         drop(second);
+    }
+    #[tokio::test]
+    async fn a_foreground_command_leaves_the_running_count_once() {
+        let dir = std::env::temp_dir().join(format!("agent-place-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let registry = Registry::new("shell").unwrap().with_process_budget(1);
+        let start = |command: &str, place: Place| {
+            let (started, running) = tokio::sync::oneshot::channel();
+            let run = tokio::spawn(registry.foreground(
+                command.into(),
+                dir.clone(),
+                60_000,
+                Vec::new(),
+                None,
+                place,
+                started,
+            ));
+            (run, running)
+        };
+        // Output past what is redacted inline keeps the result in hand
+        // after the process ends.
+        let lifted = registry.place();
+        let (first, running) = start(
+            "sleep 0.5; head -c 200000 /dev/zero | tr '\\0' a",
+            lifted.clone(),
+        );
+        running.await.unwrap();
+        assert_eq!(registry.foreground_running(), 1);
+        lifted.lift();
+        assert_eq!(registry.foreground_running(), 0);
+        // One waiting for the only slot, lifted before it starts, is never
+        // counted, even once it runs.
+        let early = registry.place();
+        let (second, waiting) = start("sleep 0.5", early.clone());
+        early.lift();
+        assert!(first.await.unwrap().is_ok());
+        waiting.await.unwrap();
+        assert_eq!(registry.foreground_running(), 0);
+        assert!(second.await.unwrap().is_ok());
+        // One that ends where it began gives its place back once, and
+        // a lift after its end changes nothing.
+        let plain = registry.place();
+        let (third, running) = start("sleep 0.2", plain.clone());
+        running.await.unwrap();
+        assert_eq!(registry.foreground_running(), 1);
+        assert!(third.await.unwrap().is_ok());
+        assert_eq!(registry.foreground_running(), 0);
+        plain.lift();
+        assert_eq!(registry.foreground_running(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
     #[test]
     fn a_load_gate_of_zero_is_none() {

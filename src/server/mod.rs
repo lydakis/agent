@@ -3968,7 +3968,10 @@ impl Service {
                     "pending_bytes": pending_bytes,
                     "pending_limit": self.limits.pending,
                     "pending_bytes_limit": self.limits.pending_bytes,
-                    "running_processes": running,
+                    // What process_limit bounds: the background commands
+                    // whose results the store has yet to record, waiting
+                    // for a slot or not, and the foreground ones running.
+                    "running_processes": running + self.registry.foreground_running() as i64,
                     "queued_processes": self.registry.pending(),
                     "process_limit": self.limits.processes,
                     // Terminals and detached commands, which --max-lasting

@@ -22,7 +22,7 @@ use agent_runtime::{
         Bot, CallAnswer, ContextPrefix, ContextUsage, Database, ElisionPlan, Gated, Halt, Halted,
         Settings, Slot, Store, Strip, TURN_VIEW_ACCOUNTING, Waiting, Window, unserved,
     },
-    tools::{Files, Outcome, POLL_YIELD_MS, Prepared, ReadSource, Registry},
+    tools::{Files, Outcome, POLL_YIELD_MS, Place, Prepared, ReadSource, Registry},
 };
 use bytes::Bytes;
 use futures_util::{StreamExt, stream};
@@ -4291,12 +4291,14 @@ impl Turn {
                     background: false,
                 }) => {
                     let (started, running) = oneshot::channel();
+                    let place = self.registry.place();
                     let run = self.registry.foreground(
                         command,
                         workspace.to_path_buf(),
                         timeout_ms,
                         environment.to_vec(),
                         sandbox,
+                        place.clone(),
                         started,
                     );
                     match self
@@ -4312,7 +4314,7 @@ impl Turn {
                         Ran::Done(Err(error)) => failure(error),
                         Ran::Lifted(run) => {
                             let outputs = self.outputs(record, workspace);
-                            self.lift_shell(&call.call_id, run, outputs).await?
+                            self.lift_shell(&call.call_id, run, &place, outputs).await?
                         }
                     }
                 }
@@ -4516,12 +4518,14 @@ impl Turn {
                 background: false,
             } => {
                 let (started, running) = oneshot::channel();
+                let place = self.registry.place();
                 let mut run = Box::pin(self.registry.foreground(
                     command,
                     workspace.to_path_buf(),
                     timeout_ms,
                     environment.to_vec(),
                     sandbox,
+                    place.clone(),
                     started,
                 ));
                 let lifted = async {
@@ -4542,7 +4546,7 @@ impl Turn {
                         let outputs = self.outputs(record, workspace);
                         return (
                             call_id.clone(),
-                            self.lift_shell(&call_id, run, outputs).await,
+                            self.lift_shell(&call_id, run, &place, outputs).await,
                         );
                     }
                 }
@@ -5268,6 +5272,7 @@ impl Turn {
         &self,
         call_id: &str,
         run: std::pin::Pin<Box<F>>,
+        place: &Place,
         outputs: Option<Outputs>,
     ) -> Result<Outcome>
     where
@@ -5280,6 +5285,8 @@ impl Turn {
             .await?;
         let (sender, receiver) = oneshot::channel();
         let run = self.registry.until_pulled(run);
+        // Counted as the process it is now, not as a foreground command too.
+        place.lift();
         tokio::spawn(async move {
             let _ = sender.send(run.await);
         });
@@ -6779,6 +6786,7 @@ mod tests {
             60_000,
             Vec::new(),
             None,
+            registry.place(),
             started,
         ));
         running.await.unwrap();
