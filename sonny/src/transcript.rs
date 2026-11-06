@@ -1211,20 +1211,37 @@ pub fn prompt(text: &str, from: Option<&str>, width: usize) -> Vec<Line<'static>
         Some((question, answer)) => (Some(crate::asks::answering(question, width)), answer),
         None => (None, text),
     };
-    // A long paste shows its start; the rest is in the conversation.
+    // A long paste shows its start, and a row a click opens to the rest.
     let lines: Vec<&str> = text.lines().collect();
-    let shown = if lines.len() > PROMPT_LINES + 2 {
-        PROMPT_LINES
-    } else {
-        lines.len()
-    };
+    let shown = shown_lines(lines.len());
     // On its band with a row of it above and below, as the composer it
     // was written in: the words sit in the middle, not on an edge.
     let band = crate::look::BAND;
     out.push(Line::default().bg(band));
     out.extend(answering.map(|row| row.bg(band)));
-    for (i, line) in lines[..shown].iter().enumerate() {
-        let lead = if i == 0 { "› " } else { "  " };
+    out.extend(prompt_rows(&lines[..shown], 0, width));
+    if lines.len() > shown {
+        out.extend(prompt_rest(lines.len() - shown, None, width));
+    }
+    out.push(Line::default().bg(band));
+    out
+}
+
+/// How many of a prompt's `count` lines show while it is folded: all of
+/// a short one, the first [`PROMPT_LINES`] of a long one.
+fn shown_lines(count: usize) -> usize {
+    match count > PROMPT_LINES + 2 {
+        true => PROMPT_LINES,
+        false => count,
+    }
+}
+
+/// A prompt's `lines` on its band, the first of them its `at`th.
+fn prompt_rows(lines: &[&str], at: usize, width: usize) -> Vec<Line<'static>> {
+    let band = crate::look::band();
+    let mut out = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        let lead = if at + i == 0 { "› " } else { "  " };
         out.extend(wrap(
             Line::from(line.to_string()).bg(band),
             width,
@@ -1232,15 +1249,46 @@ pub fn prompt(text: &str, from: Option<&str>, width: usize) -> Vec<Line<'static>
             Span::raw("  "),
         ));
     }
-    if lines.len() > shown {
-        out.push(
-            Line::from(format!("  … +{} lines", lines.len() - shown))
-                .dim()
-                .bg(band),
-        );
-    }
-    out.push(Line::default().bg(band));
     out
+}
+
+/// The rows of a long prompt past its first lines, `more` of them: its
+/// fold row alone while shut (`open` none), and open, those lines
+/// (`open`, from its first hidden one) and the row under them, which a
+/// click shuts again.
+fn prompt_rest(more: usize, open: Option<&[&str]>, width: usize) -> Vec<Line<'static>> {
+    let band = crate::look::band();
+    let mut out = match open {
+        Some(lines) => prompt_rows(lines, PROMPT_LINES, width),
+        None => Vec::new(),
+    };
+    let row = match open {
+        Some(_) => format!("  +{more} lines ▾"),
+        None => format!("  … +{more} lines ▸"),
+    };
+    out.push(Line::from(row).dim().bg(band));
+    out
+}
+
+/// Where a prompt drawn by [`prompt`] folds: its fold row's place among
+/// its rows, at `width`; none for one that shows whole.
+pub fn prompt_fold(text: &str, width: usize) -> Option<usize> {
+    let (_, body) = crate::asks::split(text).unwrap_or(("", text));
+    let count = body.lines().count();
+    if shown_lines(count) == count || news(text).is_some() {
+        return None;
+    }
+    // Its last row is the band's; the fold row is right over it.
+    Some(prompt(text, None, width).len() - 2)
+}
+
+/// A long prompt's rows past its first lines, open or shut: what
+/// replaces its fold row (or those rows) when the row is clicked.
+pub fn prompt_more(text: &str, width: usize, open: bool) -> Vec<Line<'static>> {
+    let (_, body) = crate::asks::split(text).unwrap_or(("", text));
+    let lines: Vec<&str> = body.lines().collect();
+    let shown = shown_lines(lines.len());
+    prompt_rest(lines.len() - shown, open.then_some(&lines[shown..]), width)
 }
 
 /// Whether a message is from another bot or tells the lead of its tasks:
