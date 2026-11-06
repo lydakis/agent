@@ -1307,10 +1307,20 @@ pub fn relays(text: &str, from: Option<&str>) -> bool {
     from.is_some() || news(text).is_some()
 }
 
-/// What sent a prompt from outside, in the words the person reads.
+/// What sent a prompt from outside, in the words the person reads. The
+/// lookout's notes say what they bring, not the lookout's own word for
+/// how an agent asked for them (a follow): its tasks' news, its sources'
+/// news, a message that came back.
 pub fn from_outside(origin: Option<&str>) -> &'static str {
-    match origin.unwrap_or("").split('.').next() {
-        Some("lookout") => "a follow",
+    let origin = origin.unwrap_or("");
+    match origin {
+        crate::lookout::TASKS_ORIGIN => return "task updates",
+        crate::lookout::sources::ORIGIN => return "its sources",
+        crate::lookout::BOUNCE_ORIGIN => return "a returned message",
+        _ => {}
+    }
+    match origin.split('.').next() {
+        Some("lookout") => "the lookout",
         Some("automation" | "trigger") => "an automation",
         Some("commons") => "the commons",
         Some("goal") => "a goal",
@@ -1501,7 +1511,7 @@ pub fn relayed_kind(text: &str, from: Option<&str>) -> &'static str {
 /// Whom a message between agents is from or about: its sender, the tasks
 /// task updates name, the sources that reported.
 pub fn relayed_names(text: &str, from: Option<&str>) -> Vec<String> {
-    // News names whom it is about, not what sent it ("a follow").
+    // News names whom it is about, not what sent it ("task updates").
     if let Some(rest) = text.strip_prefix(FROM_SOURCES) {
         return (sourced(rest).into_iter().skip(1))
             .filter(|source| !source.starts_with('+'))
@@ -2928,6 +2938,19 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn the_lookout_s_notes_are_named_for_what_they_bring() {
+        assert_eq!(from_outside(Some("lookout.tasks")), "task updates");
+        assert_eq!(from_outside(Some("lookout.sources")), "its sources");
+        assert_eq!(from_outside(Some("lookout.bounce")), "a returned message");
+        assert_eq!(from_outside(Some("lookout.other")), "the lookout");
+        assert_eq!(from_outside(Some("automation.weekly")), "an automation");
+        assert_eq!(
+            sender(None, Some("lookout.sources"), None).as_deref(),
+            Some("its sources")
+        );
+    }
+
     fn text(lines: &[Line]) -> Vec<String> {
         lines.iter().map(|l| l.to_string()).collect()
     }
@@ -3256,7 +3279,7 @@ mod tests {
             "task update",
         ];
         assert_eq!(relayed_names(updates, None), ["a.b"]);
-        assert_eq!(relayed_names(updates, Some("a follow")), ["a.b"]);
+        assert_eq!(relayed_names(updates, Some("task updates")), ["a.b"]);
         assert_eq!(relayed_names("Look at this", Some("a.c")), ["a.c"]);
         let names = ["a.b", "a.c", "a.b", "a.d"].map(String::from);
         assert_eq!(

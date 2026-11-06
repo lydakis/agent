@@ -7078,7 +7078,8 @@ mod tests {
         assert_eq!(view.sparks[0].from, End::Rim(0));
         let shown = text(&view.card(60, 30));
         assert!(shown.contains("a posted to the commons"), "{shown}");
-        assert!(shown.contains("a follow → a"), "{shown}");
+        // Named for what it brings, not the lookout's word for asking.
+        assert!(shown.contains("its sources → a"), "{shown}");
     }
 
     #[tokio::test]

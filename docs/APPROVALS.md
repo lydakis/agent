@@ -1079,7 +1079,12 @@ as one.
   edit or patch by the path it resolves to, a command that would run
   outside the sandbox by any path word holding `.agent` (`~`, `$HOME` and
   `${HOME}` read as the home). What the judge would allow waits for the
-  person, as a call too long to show does; a denial stays one. Codex's
+  person, as a call too long to show does; a denial stays one. What sits
+  in `~/.agent/worktrees` beside the agent's own worktree (a note, another
+  task's worktree) is agents' work, not the person's settings: the judge
+  weighs it as it weighs a folder elsewhere, so a note beside the
+  worktree no longer waits for the person. The folder itself and Sonny's
+  records in it (`.folders`) still do. Codex's
   guardian may approve writes to `~/.codex`; Claude Code routes writes to
   its own paths to its classifier, except under `--restricted`, where only
   the person may allow them, which is what this follows. The command check
