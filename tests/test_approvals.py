@@ -463,6 +463,7 @@ class ApprovalTests(ModelFixture):
         self.assertEqual(self.tool_output(client, 'script-1')[1]['error'], 'command_forbidden')
         self.assertFalse((self.path / 'made').exists())
 
+    @unittest.skipUnless(shutil.which('bwrap') or sys.platform == 'darwin', 'sandboxes need bubblewrap')
     def test_rules_given_reach_the_running_turns_of_the_bots_it_made_and_theirs(self):
         rules = {'prefix_rules': [{'pattern': ['cp'], 'decision': 'prompt', 'source': 'default.rules:1'}]}
         client = self.gated(settings={'sandbox': 'workspace-write', 'rules': rules})

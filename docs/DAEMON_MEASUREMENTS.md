@@ -5827,6 +5827,36 @@ Store jobs per turn did not change (7.5 on both), and nothing passed the
 gate's 15%. The steps path itself is not measured: it runs once per step a
 client asks about, one store job to decide it and one to record its end.
 
+## Command rules a running turn takes at its next round (#759)
+
+Each model round now takes rules given since the last one: one uncontended
+`std::sync::Mutex` lock on the turn's slot for them, and one more with an
+`Arc` clone where a call is ruled. A rules change looks up each running
+turn it reaches in the active map, by the names the store's recursive
+update of the bot's kin returns, so nothing is walked twice and no round
+pays for a change it does not see.
+
+The Perf workflow's matched screen, base `main` against this branch at
+cc23489, on a GitHub runner:
+
+| Measure | Base | Head | Change |
+| --- | ---: | ---: | ---: |
+| Lone submit CPU, ms | 25.821 | 25.868 | +0.2% |
+| Burst submit p99, ms | 3.211 | 3.147 | -2.0% |
+| Release to terminal p99, ms | 7.335 | 7.423 | +1.2% |
+| Idle RSS, MiB | 20.791 | 20.383 | -2.0% |
+| Per idle bot, KiB | 1.534 | 1.562 | +1.8% |
+| RSS after a turn each, MiB | 29.916 | 29.758 | -0.5% |
+| Daemon CPU per turn, ms | 0.695 | 0.682 | -1.8% |
+| Lifecycle CPU, s | 0.75 | 0.67 | -10.7% |
+| Lifecycle p95 turn, ms | 661.748 | 573.666 | -13.3% |
+| Lifecycle peak RSS, MiB | 27.533 | 26.877 | -2.4% |
+
+Nothing moved past noise, and the gate counted no more store work per
+turn. Sonny's code is not touched; its lookout CPU at 10x1 read 6.25 then
+12.5 ms, the smallest of its screens, while the larger ones moved within
+their noise.
+
 ## A session's queue is bounded by bytes, not 64 messages (#425)
 
 A session's output channel is now unbounded, and its 2 MiB budget, at 64
