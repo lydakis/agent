@@ -38,7 +38,7 @@
 //! task_effort = "high"          # each new task's
 //! lead_profile = "my-lead"      # the role a new lead starts in, not lead
 //! task_profile = "worker"       # what every other agent is told, not task
-//! side_chat = "fork"            # "answer", the default, calls no tool
+//! side_chat = "answer"          # calls no tool; "fork", the default, may do anything its agent may
 //! chime = false                 # rings when work ends or waits, the default
 //! verbose = true                # every tool call drawn, not the clean view
 //! text_width = 0                # the widest the conversation is written, 100 by default; 0 the window's whole width
@@ -624,13 +624,13 @@ impl Default for Sonny {
     }
 }
 
-/// What the copy `/side` talks to may do: `"answer"`, the default, from
-/// what its agent knows, calling no tool; or `"fork"`, anything its agent
-/// may, with its tools, in its folder, under its approvals.
+/// What the copy `/side` talks to may do: `"fork"`, the default, anything
+/// its agent may, with its tools, in its folder, under its approvals; or
+/// `"answer"`, from what its agent knows, calling no tool.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SideChat {
-    #[default]
     Answer,
+    #[default]
     Fork,
 }
 
@@ -2011,9 +2011,9 @@ mod tests {
         let off = parse("web_search = \"disabled\"").unwrap();
         assert_eq!(off.web_search, WebSearch::Disabled);
         assert!(!config.hide_senders);
-        assert_eq!(config.sonny.side_chat, SideChat::Answer);
-        let fork = parse("[sonny]\nside_chat = \"fork\"").unwrap();
-        assert_eq!(fork.sonny.side_chat, SideChat::Fork);
+        assert_eq!(config.sonny.side_chat, SideChat::Fork);
+        let answer = parse("[sonny]\nside_chat = \"answer\"").unwrap();
+        assert_eq!(answer.sonny.side_chat, SideChat::Answer);
         assert_eq!(config.sonny.margin_opens, MarginOpens::Always);
         let never = parse("[sonny]\nmargin_opens = \"never\"").unwrap();
         assert_eq!(never.sonny.margin_opens, MarginOpens::Never);
