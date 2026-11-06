@@ -147,7 +147,8 @@ With flags it asks nothing: `--provider chatgpt|anthropic|openai|openrouter|bedr
 for Bedrock), `--model PROVIDER/MODEL`, `--import-mcp [codex,claude,...]`
 (never a folder's own servers), and `--json`, which prints what the machine
 has, what is set, the MCP servers to bring, missing tools and setup steps. Either step also suggests efforts, `[sonny] lead_effort =
-"medium"` and `task_effort = "high"`, unless the config already sets them.
+"medium"` and `task_effort = "high"`, unless the config already sets them,
+and says on stderr which it wrote.
 Outside a terminal both fail, naming what to set. The first start also writes
 `~/.agent/models`, the list agents read with `agent models`, when there is
 none, as `agent models --discover` does.
@@ -690,7 +691,11 @@ way `/react` does, and each note in the margin has its own `↩`.
   run it outside without asking, as Codex's rules do (Codex's own rules
   files work unchanged). A rule names a command's first words
   (`["docker", "compose"]`), and a call runs outside only when everything
-  it runs is allowed, so `mcpx … | jq` still asks. A rule can also always
+  it runs is allowed, so `mcpx … | jq` still asks. A wrapper is seen
+  through: `timeout 60 mcpx …`, `nice`, `nohup` and `time` match as the
+  command they run, and through `env` or `NAME=value`, which change what
+  it runs with, a rule may still ask or refuse but never lets it out.
+  A rule can also always
   ask (`"prompt"`) or never run a command (`"forbidden"`, with a
   `justification` the agent is told); `sonny rules check -- git push`
   shows what the rules say. The files are Starlark, as Codex runs them,
@@ -851,8 +856,8 @@ way `/react` does, and each note in the margin has its own `↩`.
   the bottom, fading as it rises; in a narrower pane the last few lines sit
   under it. `?` swaps the log for a legend of every mark and shape and a few
   numbers: projects, leads, agents, messages and tool calls a minute and
-  this hour, the busiest pair. `m` colours each agent by its model where it
-  stands, the footer naming each colour. `z` is zen: the sky alone, no log,
+  this hour, the busiest pair. `m` colours each agent, its star and its name,
+  by its model where it stands, the footer naming each colour. `z` is zen: the sky alone, no log,
   no footer, no names but what needs you or failed. The arrows pick a star
   and Enter puts it in the middle: its maker, what it made and whoever it
   talked to in the last hour on the first ring, two hops on the next, the
