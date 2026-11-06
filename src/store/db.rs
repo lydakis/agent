@@ -1965,10 +1965,32 @@ fn entry(cursor: i64, bot: &str, turn: Option<i64>, kind: &str, data: Value) -> 
 /// A stored event as read back: its entry with `written_ms`, the Unix ms
 /// it joined the store, when it has one (events from before the column
 /// existed have none).
-/// One kind's next cursors, every bot's, from its place in the index.
-const KIND_CURSORS: &str = "SELECT id FROM events INDEXED BY events_kind_cursor
-    WHERE kind=?1 AND id>?2 ORDER BY id LIMIT ?3";
-const EVENT_AT: &str = "SELECT id,turn,kind,data,bot,written_ms FROM events WHERE id=?1";
+/// The most kinds a page reads each from its place in the index; past
+/// it, one pass over the events (SQLite allows 500 arms in a compound).
+const KINDS_BY_INDEX: usize = 64;
+
+/// Every bot's next events of `kinds` distinct kinds after `?1`, at most
+/// `?2`, as one statement: each kind's first `?2` from the index (the
+/// page's first `?2` are among them), the events read in cursor order.
+fn kinds_page(kinds: usize) -> String {
+    let wanted = match kinds <= KINDS_BY_INDEX {
+        true => (0..kinds)
+            .map(|at| {
+                format!(
+                    "SELECT * FROM (SELECT id FROM events INDEXED BY events_kind_cursor
+                     WHERE kind=?{} AND id>?1 ORDER BY id LIMIT ?2)",
+                    at + 3
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" UNION ALL "),
+        false => "SELECT id FROM events WHERE id>?1 AND kind IN (SELECT value FROM json_each(?3))"
+            .to_owned(),
+    };
+    format!(
+        "SELECT id,turn,kind,data,bot,written_ms FROM events WHERE id IN ({wanted}) ORDER BY id LIMIT ?2"
+    )
+}
 
 fn stored_entry(
     cursor: i64,
@@ -10376,21 +10398,12 @@ impl Database {
     pub fn events_after(&self, after: i64, limit: usize) -> Result<Value> {
         self.event_page(None, None, after, limit)
     }
-    /// [`Self::events`] (a bot named) or [`Self::events_after`] (none),
-    /// only of `kinds`. Each kind is read from its own place in the
-    /// `events_kind_cursor` index, so a page costs the events it returns,
-    /// not every event between them.
-    pub fn events_of_kinds(
-        &self,
-        name: Option<&str>,
-        kinds: &[&str],
-        after: i64,
-        limit: usize,
-    ) -> Result<Value> {
-        if let Some(name) = name {
-            self.inspect(name)?;
-        }
-        self.event_page(name, Some(kinds), after, limit)
+    /// [`Self::events_after`], only of `kinds`. Each kind's next events
+    /// come from its own place in the `events_kind_cursor` index, in one
+    /// statement and so one snapshot, so a page costs the events it
+    /// returns, not every event written between them.
+    pub fn events_of_kinds(&self, kinds: &[&str], after: i64, limit: usize) -> Result<Value> {
+        self.event_page(None, Some(kinds), after, limit)
     }
     fn event_page(
         &self,
@@ -10435,61 +10448,33 @@ impl Database {
             events.push(item);
             Ok(true)
         };
-        match (name, kinds) {
-            (_, None) => {
-                let mut stmt = self.conn.prepare_cached(match name {
+        let kinds_json = serde_json::to_string(&kinds)?;
+        let mut stmt;
+        let mut rows = match kinds {
+            None => {
+                stmt = self.conn.prepare_cached(match name {
                     Some(_) => "SELECT id,turn,kind,data,bot,written_ms FROM events WHERE bot=?1 AND id>?2 ORDER BY id LIMIT ?3",
                     None => "SELECT id,turn,kind,data,bot,written_ms FROM events WHERE ?1 IS NULL AND id>?2 ORDER BY id LIMIT ?3",
                 })?;
-                let mut rows = stmt.query(params![name, after, limit as i64])?;
-                while let Some(row) = rows.next()? {
-                    if !take(row)? {
-                        break;
-                    }
-                }
+                stmt.query(params![name, after, limit as i64])?
             }
-            // One bot's events are read in order, as without kinds; the
-            // others are passed over unread.
-            (Some(name), Some(kinds)) => {
-                let mut stmt = self.conn.prepare_cached(
-                    "SELECT id,turn,kind,data,bot,written_ms FROM events INDEXED BY events_bot_cursor
-                     WHERE bot=?1 AND id>?2 AND kind IN (SELECT value FROM json_each(?4))
-                     ORDER BY id LIMIT ?3",
-                )?;
-                let kinds = serde_json::to_string(kinds)?;
-                let mut rows = stmt.query(params![name, after, limit as i64, kinds])?;
-                while let Some(row) = rows.next()? {
-                    if !take(row)? {
-                        break;
-                    }
-                }
-            }
-            // Every bot's: each kind's next cursors from its own place in
-            // the index, the page's first `limit` being among the first
-            // `limit` of each, then those events read in order.
-            (None, Some(kinds)) => {
-                let mut next = self.conn.prepare_cached(KIND_CURSORS)?;
+            Some(kinds) => {
                 let mut kinds = kinds.to_vec();
                 kinds.sort_unstable();
                 kinds.dedup();
-                let mut ids: Vec<i64> = Vec::new();
-                for kind in kinds {
-                    let rows = next.query_map(params![kind, after, limit as i64], |r| r.get(0))?;
-                    for id in rows {
-                        ids.push(id?);
-                    }
+                stmt = self.conn.prepare_cached(&kinds_page(kinds.len()))?;
+                let most = limit as i64;
+                let mut values: Vec<&dyn rusqlite::ToSql> = vec![&after, &most];
+                match kinds.len() <= KINDS_BY_INDEX {
+                    true => values.extend(kinds.iter().map(|kind| kind as &dyn rusqlite::ToSql)),
+                    false => values.push(&kinds_json),
                 }
-                ids.sort_unstable();
-                ids.truncate(limit);
-                let mut one = self.conn.prepare_cached(EVENT_AT)?;
-                for id in ids {
-                    let mut rows = one.query([id])?;
-                    if let Some(row) = rows.next()?
-                        && !take(row)?
-                    {
-                        break;
-                    }
-                }
+                stmt.query(&values[..])?
+            }
+        };
+        while let Some(row) = rows.next()? {
+            if !take(row)? {
+                break;
             }
         }
         let pruned: i64 = match name {
@@ -14504,7 +14489,7 @@ mod tests {
         let kinds = ["turn_finished", "accepted", "turn_finished"];
         let steps = |common: i64| {
             let db = store(common);
-            let page = db.events_of_kinds(None, &kinds, 0, 256).unwrap();
+            let page = db.events_of_kinds(&kinds, 0, 256).unwrap();
             let got: Vec<&str> = (page["events"].as_array().unwrap().iter())
                 .map(|e| e["event"].as_str().unwrap())
                 .collect();
@@ -14517,10 +14502,10 @@ mod tests {
                     "turn_finished"
                 ]
             );
-            let step = |sql| {
+            let step = |sql: &str| {
                 (db.conn.prepare_cached(sql).unwrap()).get_status(rusqlite::StatementStatus::VmStep)
             };
-            step(KIND_CURSORS) + step(EVENT_AT)
+            step(&kinds_page(2))
         };
         let (few, many) = (steps(30), steps(30_000));
         assert!(

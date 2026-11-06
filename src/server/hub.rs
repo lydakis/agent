@@ -664,9 +664,11 @@ impl Hub {
 }
 
 /// `limit` of `bot`'s durable events after `after`, or every bot's for `*`.
-/// A page of `bot`'s events, or every bot's, of `kinds` when it names
-/// some: the store passes the rest over, so a follow of a few rare kinds
-/// costs the events it gets, not every event written since.
+/// A page of `bot`'s events, or every bot's. A follow of every bot that
+/// names `kinds` gets only those from the store, so a few rare kinds cost
+/// the events they are, not every event written since; one bot's events
+/// are paged whole and filtered as they are sent, so its cursor passes
+/// what it skipped and going live looks at no more than one event.
 fn event_page(
     db: &Database,
     bot: &str,
@@ -674,16 +676,13 @@ fn event_page(
     after: i64,
     limit: usize,
 ) -> Result<Value> {
-    let name = (bot != ALL).then_some(bot);
-    match kinds {
-        Some(kinds) => {
+    match (bot == ALL, kinds) {
+        (true, Some(kinds)) => {
             let kinds: Vec<&str> = kinds.iter().map(String::as_str).collect();
-            db.events_of_kinds(name, &kinds, after, limit)
+            db.events_of_kinds(&kinds, after, limit)
         }
-        None => match name {
-            Some(bot) => db.events(bot, after, limit),
-            None => db.events_after(after, limit),
-        },
+        (true, None) => db.events_after(after, limit),
+        (false, _) => db.events(bot, after, limit),
     }
 }
 
@@ -729,7 +728,8 @@ pub async fn replay(store: Store, hub: Hub, bot: String, sub: Sub) -> Result<()>
             let (live, pruned) = store
                 .op("follow_live", move |db| {
                     let mut s = switch_sub.lock().unwrap();
-                    // Only a wanted event behind it keeps the follow paging.
+                    // Only a wanted event behind it keeps the follow paging:
+                    // for every bot's, one index probe a kind.
                     let behind = event_page(db, &switch_bot, s.kinds.as_ref(), s.last_cursor, 1)?;
                     if s.cancelled || behind["events"].as_array().is_some_and(|e| !e.is_empty()) {
                         return Ok((false, None));

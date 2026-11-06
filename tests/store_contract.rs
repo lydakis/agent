@@ -3557,7 +3557,7 @@ fn an_event_is_never_written_before_the_one_before_it() {
 }
 
 #[test]
-fn a_follow_of_some_kinds_pages_the_streams_own_events_of_them() {
+fn a_follow_of_every_bot_of_some_kinds_pages_the_streams_own_events_of_them() {
     let path = std::env::temp_dir().join(format!("agent-kinds-{}.sqlite", std::process::id()));
     let _ = std::fs::remove_file(&path);
     let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
@@ -3578,14 +3578,10 @@ fn a_follow_of_some_kinds_pages_the_streams_own_events_of_them() {
     let db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
     let kinds = ["turn_finished", "accepted", "created", "turn_finished"];
     let wanted = |e: &Value| kinds.contains(&e["event"].as_str().unwrap());
-    for bot in [None, Some("Bob")] {
+    {
         let (mut all, mut after) = (Vec::new(), 0);
         loop {
-            let page = match bot {
-                Some(bot) => db.events(bot, after, 256),
-                None => db.events_after(after, 256),
-            };
-            let page = page.unwrap();
+            let page = db.events_after(after, 256).unwrap();
             let events = page["events"].as_array().unwrap();
             if events.is_empty() {
                 break;
@@ -3593,11 +3589,11 @@ fn a_follow_of_some_kinds_pages_the_streams_own_events_of_them() {
             all.extend(events.iter().filter(|e| wanted(e)).cloned());
             after = page["next_cursor"].as_i64().unwrap();
         }
-        assert!(all.len() > 40, "{bot:?}: {}", all.len());
+        assert!(all.len() > 40, "{}", all.len());
         for limit in [1, 7, 256] {
             let (mut paged, mut after) = (Vec::new(), 0);
             loop {
-                let page = db.events_of_kinds(bot, &kinds, after, limit).unwrap();
+                let page = db.events_of_kinds(&kinds, after, limit).unwrap();
                 let events = page["events"].as_array().unwrap();
                 if events.is_empty() {
                     break;
@@ -3606,8 +3602,15 @@ fn a_follow_of_some_kinds_pages_the_streams_own_events_of_them() {
                 paged.extend(events.iter().cloned());
                 after = page["next_cursor"].as_i64().unwrap();
             }
-            assert_eq!(paged, all, "{bot:?} by {limit}");
+            assert_eq!(paged, all, "by {limit}");
         }
+        // Past the kinds read each from the index, one pass gives the same.
+        let names: Vec<String> = (0..70).map(|at| format!("kind_{at}")).collect();
+        let many: Vec<&str> = (kinds.iter().copied())
+            .chain(names.iter().map(String::as_str))
+            .collect();
+        let page = db.events_of_kinds(&many, 0, 256).unwrap();
+        assert_eq!(page["events"].as_array().unwrap(), &all);
     }
     drop(db);
     std::fs::remove_file(path).unwrap();
