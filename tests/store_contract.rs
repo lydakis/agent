@@ -3557,6 +3557,70 @@ fn an_event_is_never_written_before_the_one_before_it() {
 }
 
 #[test]
+fn a_follow_of_every_bot_of_some_kinds_pages_the_streams_own_events_of_them() {
+    let path = std::env::temp_dir().join(format!("agent-kinds-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    db.create("Ann", Some("/synthetic"), binding()).unwrap();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    drop(db);
+    Connection::open(&path)
+        .unwrap()
+        .execute(
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<3000)
+             INSERT INTO events(bot,turn,kind,data)
+             SELECT CASE i%3 WHEN 0 THEN 'Ann' ELSE 'Bob' END,1,
+              CASE WHEN i%97=0 THEN 'turn_finished' WHEN i%101=0 THEN 'accepted'
+                   ELSE 'tool_started' END,'{}' FROM n",
+            [],
+        )
+        .unwrap();
+    let db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    let kinds = ["turn_finished", "accepted", "created", "turn_finished"];
+    let wanted = |e: &Value| kinds.contains(&e["event"].as_str().unwrap());
+    {
+        let (mut all, mut after) = (Vec::new(), 0);
+        loop {
+            let page = db.events_after(after, 256).unwrap();
+            let events = page["events"].as_array().unwrap();
+            if events.is_empty() {
+                break;
+            }
+            all.extend(events.iter().filter(|e| wanted(e)).cloned());
+            after = page["next_cursor"].as_i64().unwrap();
+        }
+        assert!(all.len() > 40, "{}", all.len());
+        for limit in [1, 7, 256] {
+            let (mut paged, mut after) = (Vec::new(), 0);
+            loop {
+                let page = db.events_of_kinds(&kinds, after, limit).unwrap();
+                let events = page["events"].as_array().unwrap();
+                if events.is_empty() {
+                    break;
+                }
+                assert!(events.len() <= limit);
+                paged.extend(events.iter().cloned());
+                after = page["next_cursor"].as_i64().unwrap();
+            }
+            assert_eq!(paged, all, "by {limit}");
+        }
+        // As many kinds as a page takes give the same; one more is refused.
+        let names: Vec<String> = (3..agent_runtime::store::EVENT_PAGE_KINDS)
+            .map(|at| format!("kind_{at}"))
+            .collect();
+        let mut many: Vec<&str> = (kinds.iter().copied())
+            .chain(names.iter().map(String::as_str))
+            .collect();
+        let page = db.events_of_kinds(&many, 0, 256).unwrap();
+        assert_eq!(page["events"].as_array().unwrap(), &all);
+        many.push("one_too_many");
+        assert!(db.events_of_kinds(&many, 0, 256).is_err());
+    }
+    drop(db);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn schema_68_events_had_no_times() {
     let path = std::env::temp_dir().join(format!("agent-schema69-{}.sqlite", std::process::id()));
     let _ = std::fs::remove_file(&path);

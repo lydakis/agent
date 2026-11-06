@@ -5800,6 +5800,76 @@ they measure the unfiltered path. Filtering pays off in
 of `*` no longer carries the deltas, and it hears all 6,000 task endings,
 where before the daemon dropped it.
 
+## A follow of some kinds reads only those
+
+A `follow` that names `kinds` (Sky reads the past this way, asking for how
+turns started and ended) paged through every event in the store and
+dropped the other kinds after reading and decoding each one. Now a follow
+of every bot reads only the kinds asked for: one statement, so one
+snapshot, takes each kind's next events from a new `events_kind_cursor`
+index on `(kind, id)` and reads them in cursor order. Going live checks
+for a wanted event behind the cursor with one index probe per kind, up to
+64 kinds (`EVENT_PAGE_KINDS`). A follow of one bot, or of every bot with
+more kinds than that, pages the events whole, as before, so each page
+costs its limit, its cursor passes what it skipped and going live looks at
+one event: going live runs on the writer, so it never scans the tail. The index is
+created when a store opens, so it needs no schema number.
+
+A page of some kinds ends at the last event of those kinds, which can sit
+far behind what the store has committed. Going live therefore moves the
+follow's cursor to the newest event already published, when that is
+newer, and `follow_live` reports that: nothing wanted lies between the
+two, and a follow resumed from it with wider kinds (Sky reads the past
+narrowly, then follows what animates it from where the past ended)
+replays nothing written before the switch. The published cursor is held
+in memory, so this adds no read, with a few bots or thousands.
+
+A store of 300,000 events of about 800 bytes each (307 MiB), six of them
+`turn_finished`, followed with `bot='*', kinds=[accepted, steered,
+turn_finished]` from cursor 0 until `follow_live`, three follows per open,
+two opens each, `main` (272fed4) against this branch, on one 4-CPU Linux
+box:
+
+| Measure | `main` | Kinds in the store |
+| --- | ---: | ---: |
+| Follow to live, ms | 1,986 to 2,158 | 1 to 2 |
+| First open of the existing store, ms | 186, 207 | 754, 775 (builds the index once) |
+| Store size after, MiB | 307 | 314 |
+
+The index adds about 24 bytes per event. In isolation (SQLite through
+Python, 200,000 inserts in groups of 32), it adds about 6 µs to each event
+written, on a cost of about 27 µs. In the daemon, where an event's write is
+part of a turn's group commit, it falls within the runs' spread.
+`bench.store_load --point heavy --idle-s 5`, twice each:
+
+| Measure | `main` | Kinds in the store |
+| --- | ---: | ---: |
+| Daemon CPU, s | 12.81, 11.44 | 12.48, 11.58 |
+| Turn p95, first burst, ms | 232, 209 | 241, 208 |
+| Short read p95, first burst, ms | 7.7, 7.7 | 8.5, 7.3 |
+| Store, MiB | 45 | 45 |
+
+The AGENTS.md hot-path screen (`bench.admission_burst`, `bench.completion_burst`
+and `bench.lifecycle` at `--repeat 5`, `bench.footprint` at `--repeat 2`,
+two rounds alternating with `main` on the same box, compared by
+`bench.perf_gate`): store work per turn is the same, and nothing passes
+the gate's 15% warning. The completion p99 and lone-submit CPU medians
+moved within overlapping runs (completion p99 10.4 to 20.8 ms here, 11.5
+to 16.4 ms on `main`).
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 43.447 | 48.831 | +12.4% |
+| admission | burst submit p99, ms | 6.366 | 6.785 | +6.6% |
+| completion | release to terminal p99, ms | 13.144 | 15.803 | +20.2% |
+| footprint | idle RSS, MiB | 21.1 | 20.975 | -0.6% |
+| footprint | per idle bot, KiB | 1.488 | 1.514 | +1.7% |
+| footprint | RSS after a turn each, MiB | 30.205 | 30.582 | +1.2% |
+| footprint | CPU per turn, ms | 1.353 | 1.173 | -13.3% |
+| lifecycle | CPU, s | 1.185 | 1.11 | -6.3% |
+| lifecycle | p95 turn, ms | 587.629 | 585.464 | -0.4% |
+| lifecycle | peak RSS, MiB | 27.756 | 27.617 | -0.5% |
+
 ## Approving each step of an exec script (#393)
 
 A client answering a declared call can ask the bot's gate about each step
