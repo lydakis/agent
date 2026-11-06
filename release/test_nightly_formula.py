@@ -72,6 +72,8 @@ class NightlyWorkflowTest(unittest.TestCase):
         workflow = (WORKFLOWS / "nightly.yml").read_text()
         self.assertIn('cron: "17 7 * * *"', workflow)
         self.assertIn("workflow_dispatch:", workflow)
+        # A failed publish job can be retried without rebuilding its artifact.
+        self.assertNotIn("github.run_attempt", workflow)
         self.assertIn("github.repository == 'lydakis/agent' && github.ref == 'refs/heads/main'", workflow)
         publish = workflow[workflow.index("\n  publish:\n"):]
         self.assertIn("needs: validate", publish)

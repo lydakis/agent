@@ -20,9 +20,10 @@ defaults:
 
 env:
   NIGHTLY_COMMIT: ${{ github.sha }}
-  # Increasing across runs, including a retry of the same run. Unchanged
-  # commits and older runs do not update the tap.
-  NIGHTLY_VERSION: ${{ github.run_number }}.${{ github.run_attempt }}
+  # Increasing across runs, stable across retries: rerunning only publish
+  # must still match the formula the validation job already produced.
+  # Unchanged commits and older runs do not update the tap.
+  NIGHTLY_VERSION: ${{ github.run_number }}.1
 
 jobs:
   validate:

@@ -15,7 +15,7 @@ def render_formula(commit: str, version: str) -> str:
     if not re.fullmatch(r"[0-9a-f]{40}", commit):
         raise ValueError("expected a full commit SHA")
     if not re.fullmatch(VERSION, version):
-        raise ValueError("expected a nightly workflow run number and attempt, such as 12.1")
+        raise ValueError("expected a nightly workflow version such as 12.1")
     return f'''class SonnyNightly < Formula
   desc "Nightly terminal coordinator with its matching agent daemon"
   homepage "https://github.com/lydakis/agent"
