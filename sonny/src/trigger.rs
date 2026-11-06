@@ -2889,6 +2889,53 @@ pub fn at_start() {
     });
 }
 
+/// The nightly memory cleanup is on by default: the first Sonny to open a
+/// lead schedules it, on that lead's model, as `memory schedule --model`
+/// would. Once scheduled it is the person's: one they removed stays
+/// removed, since the memory folder it made a repository says it was
+/// scheduled ([`agent_client::memory::scheduled_once`]). One that could not
+/// be scheduled (no scheduler here) is tried again at the next start.
+pub fn cleanup_by_default(lead: &Value, store: &Path, socket: &Path) {
+    let (Some(home), Some(sonny)) = (
+        std::env::var_os("HOME").map(PathBuf::from),
+        crate::skills::sonny_path(),
+    ) else {
+        return;
+    };
+    if let Some(mut schedule) = cleanup_schedule(&home, &sonny, lead, store, socket) {
+        std::thread::spawn(move || {
+            let _ = schedule.status();
+        });
+    }
+}
+
+/// The `sonny memory schedule` that turns the cleanup on, unless it was
+/// scheduled here before or the lead has no model to run it on.
+fn cleanup_schedule(
+    home: &Path,
+    sonny: &Path,
+    lead: &Value,
+    store: &Path,
+    socket: &Path,
+) -> Option<std::process::Command> {
+    let model = format!("{}/{}", lead["provider"].as_str()?, lead["model"].as_str()?);
+    if agent_client::memory::scheduled_once(home) {
+        return None;
+    }
+    let mut schedule = std::process::Command::new(sonny);
+    // Sonny's own, not an agent's: the automation is no agent's.
+    schedule
+        .args(["memory", "schedule", "--model", &model])
+        .env("AGENT_STORE", store)
+        .env("AGENT_SOCKET", socket)
+        .env_remove("AGENT_BOT")
+        .env_remove("AGENT_BOT_ID")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    Some(schedule)
+}
+
 /// Each trigger made when it was a job of the system's own (a LaunchAgent
 /// or a user service of its own, under [`LABEL`]) becomes a definition for
 /// the scheduler, and the system lets go of its job. Only one made from
@@ -8289,5 +8336,45 @@ pub(crate) mod tests {
             Job::read(&w.plist(&s.name)).unwrap().watch,
             Some(PathBuf::from("/repo/50%"))
         );
+    }
+
+    #[test]
+    fn the_nightly_cleanup_is_scheduled_once_on_the_leads_model_and_stays_removed() {
+        let home = std::env::temp_dir().join(format!("cleanup-default-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let lead = json!({"provider": "openai", "model": "mini"});
+        let (sonny, store, socket) = (
+            Path::new("/bin/sonny"),
+            Path::new("/s.sqlite"),
+            Path::new("/s.sock"),
+        );
+        let schedule = cleanup_schedule(&home, sonny, &lead, store, socket).unwrap();
+        let args: Vec<_> = schedule
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args, ["memory", "schedule", "--model", "openai/mini"]);
+        let env: Vec<_> = schedule
+            .get_envs()
+            .map(|(k, v)| (k.to_owned(), v.map(|v| v.to_owned())))
+            .collect();
+        assert!(
+            env.contains(&("AGENT_STORE".into(), Some("/s.sqlite".into()))),
+            "{env:?}"
+        );
+        assert!(env.contains(&("AGENT_BOT".into(), None)), "{env:?}");
+        // A lead with no model says nothing to run it on.
+        assert!(cleanup_schedule(&home, sonny, &json!({}), store, socket).is_none());
+        // Scheduled once, by Sonny or the person, the memory folder is a
+        // repository: removed since, it is not scheduled again.
+        std::fs::create_dir_all(home.join(".agents/memory/.git")).unwrap();
+        std::fs::write(
+            home.join(".agents/memory/.git/HEAD"),
+            "ref: refs/heads/main\n",
+        )
+        .unwrap();
+        assert!(cleanup_schedule(&home, sonny, &lead, store, socket).is_none());
+        std::fs::remove_dir_all(home).unwrap();
     }
 }
