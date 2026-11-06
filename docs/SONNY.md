@@ -1069,7 +1069,13 @@ about, an action in `browser_confirm`) comes back over the link to the
 calling agent's gate on the host, so you see it in the host's Sonny, where
 you are working. The linked machine's own settings decide what it
 confirms. A call to a machine that is asleep returns `not_connected` at
-once, or within 3 seconds, with when it was last connected. A machine runs
+once, or within 3 seconds, with when it was last connected. A call that
+was already sent down the link when the machine went quiet, before it took
+the call, or whose link closed while the machine ran it, returns
+`tool_outcome_unknown`: it may have run, so see whether it took effect
+before making it again. A machine that says nothing for 3 seconds after a
+call is sent, neither taking it nor carrying anything else, has gone
+quiet, and the call is let go there should it still arrive. A machine runs
 at most `calls` of the host's calls at once; one past that returns
 `link_busy`, to call again when one ends. On a slow link, each end holds at
 most one longest line (48 MB) of calls and answers queued, and the pings,
