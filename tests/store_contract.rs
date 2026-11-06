@@ -3604,13 +3604,17 @@ fn a_follow_of_every_bot_of_some_kinds_pages_the_streams_own_events_of_them() {
             }
             assert_eq!(paged, all, "by {limit}");
         }
-        // Past the kinds read each from the index, one pass gives the same.
-        let names: Vec<String> = (0..70).map(|at| format!("kind_{at}")).collect();
-        let many: Vec<&str> = (kinds.iter().copied())
+        // As many kinds as a page takes give the same; one more is refused.
+        let names: Vec<String> = (3..agent_runtime::store::EVENT_PAGE_KINDS)
+            .map(|at| format!("kind_{at}"))
+            .collect();
+        let mut many: Vec<&str> = (kinds.iter().copied())
             .chain(names.iter().map(String::as_str))
             .collect();
         let page = db.events_of_kinds(&many, 0, 256).unwrap();
         assert_eq!(page["events"].as_array().unwrap(), &all);
+        many.push("one_too_many");
+        assert!(db.events_of_kinds(&many, 0, 256).is_err());
     }
     drop(db);
     std::fs::remove_file(path).unwrap();

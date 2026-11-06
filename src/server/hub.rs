@@ -6,7 +6,7 @@
 use agent_runtime::{
     Error, Result, fail,
     output::Output,
-    store::{Database, Served, Store},
+    store::{Database, EVENT_PAGE_KINDS, Served, Store},
 };
 use serde_json::{Value, json};
 use std::{
@@ -665,10 +665,12 @@ impl Hub {
 
 /// `limit` of `bot`'s durable events after `after`, or every bot's for `*`.
 /// A page of `bot`'s events, or every bot's. A follow of every bot that
-/// names `kinds` gets only those from the store, so a few rare kinds cost
-/// the events they are, not every event written since; one bot's events
-/// are paged whole and filtered as they are sent, so its cursor passes
-/// what it skipped and going live looks at no more than one event.
+/// names `kinds`, up to as many as a page takes, gets only those from the
+/// store, so a few rare kinds cost the events they are, not every event
+/// written since. One bot's events, or every bot's of more kinds, are paged
+/// whole and filtered as they are sent: each page costs its limit, so its
+/// cursor passes what it skipped and going live looks at no more than one
+/// event.
 fn event_page(
     db: &Database,
     bot: &str,
@@ -677,11 +679,11 @@ fn event_page(
     limit: usize,
 ) -> Result<Value> {
     match (bot == ALL, kinds) {
-        (true, Some(kinds)) => {
+        (true, Some(kinds)) if (1..=EVENT_PAGE_KINDS).contains(&kinds.len()) => {
             let kinds: Vec<&str> = kinds.iter().map(String::as_str).collect();
             db.events_of_kinds(&kinds, after, limit)
         }
-        (true, None) => db.events_after(after, limit),
+        (true, _) => db.events_after(after, limit),
         (false, _) => db.events(bot, after, limit),
     }
 }
@@ -834,6 +836,39 @@ mod tests {
         assert_eq!(got, event(2, "turn_finished"));
         // What it passed by still counts as seen: no replay sends it later.
         assert_eq!(sub.lock().unwrap().last_cursor, 2);
+    }
+
+    #[test]
+    fn a_page_of_more_kinds_than_the_index_reads_costs_its_limit() {
+        let path =
+            std::env::temp_dir().join(format!("agent-hub-kinds-{}.sqlite", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        drop(Database::initialize(rusqlite::Connection::open(&path).unwrap()).unwrap());
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "PRAGMA foreign_keys=OFF;
+                 WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<3000)
+                 INSERT INTO events(bot,turn,kind,data) SELECT 'B',1,'tool_started','{}' FROM n",
+            )
+            .unwrap();
+        let db = Database::initialize(rusqlite::Connection::open(&path).unwrap()).unwrap();
+        let few: Arc<HashSet<String>> = Arc::new(["turn_finished".to_owned()].into());
+        let many: Arc<HashSet<String>> = Arc::new(
+            (0..=EVENT_PAGE_KINDS)
+                .map(|at| format!("kind_{at}"))
+                .collect(),
+        );
+        // A few kinds, none written: the store says so from the index.
+        let page = event_page(&db, ALL, Some(&few), 0, 1).unwrap();
+        assert_eq!(page["events"], json!([]));
+        // More: the next event, wanted or not, so the follow keeps paging
+        // and going live reads one event, not the whole tail.
+        let page = event_page(&db, ALL, Some(&many), 0, 1).unwrap();
+        assert_eq!(page["events"].as_array().unwrap().len(), 1);
+        assert_eq!(page["next_cursor"], page["events"][0]["cursor"]);
+        drop(db);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[tokio::test]

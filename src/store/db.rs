@@ -1965,9 +1965,11 @@ fn entry(cursor: i64, bot: &str, turn: Option<i64>, kind: &str, data: Value) -> 
 /// A stored event as read back: its entry with `written_ms`, the Unix ms
 /// it joined the store, when it has one (events from before the column
 /// existed have none).
-/// The most kinds a page reads each from its place in the index; past
-/// it, one pass over the events (SQLite allows 500 arms in a compound).
-const KINDS_BY_INDEX: usize = 64;
+/// The most kinds `events_of_kinds` takes, each read from its place in the
+/// index (SQLite allows 500 arms in a compound). A follow of more pages
+/// every event and filters them as they are sent, which costs each page its
+/// limit however rare the kinds are.
+pub const EVENT_PAGE_KINDS: usize = 64;
 /// Every bot's next events of one kind (`?3`) after `?1`, at most `?2`,
 /// from the kind's place in the index.
 const KINDS_PAGE: &str = "SELECT id,turn,kind,data,bot,written_ms FROM events WHERE id IN
@@ -1978,9 +1980,6 @@ const KIND_CURSORS: &str = "SELECT id FROM events INDEXED BY events_kind_cursor 
 /// its own unless wrapped (SQLite flattens the wrapper).
 const KIND_ARM: &str = "SELECT * FROM (SELECT id FROM events INDEXED BY events_kind_cursor
     WHERE kind=?3 AND id>?1 ORDER BY id LIMIT ?2)";
-/// Past [`KINDS_BY_INDEX`] kinds, in cursor order, stopping at the limit.
-const KINDS_SCAN: &str = "SELECT id FROM events NOT INDEXED
-    WHERE id>?1 AND kind IN (SELECT value FROM json_each(?3)) ORDER BY id LIMIT ?2";
 
 /// [`KINDS_PAGE`] for `kinds` distinct kinds bound from `?3` on, as one
 /// statement: the page's first `?2` are among each kind's first `?2`.
@@ -1989,11 +1988,10 @@ fn kinds_page(kinds: usize) -> String {
     let cursors = re_spaced(KIND_CURSORS);
     let wanted = match kinds {
         1 => return page,
-        2..=KINDS_BY_INDEX => (0..kinds)
+        _ => (0..kinds)
             .map(|at| re_spaced(KIND_ARM).replace("kind=?3", &format!("kind=?{}", at + 3)))
             .collect::<Vec<_>>()
             .join(" UNION ALL "),
-        _ => re_spaced(KINDS_SCAN),
     };
     page.replace(&cursors, &wanted)
 }
@@ -10459,7 +10457,6 @@ impl Database {
             events.push(item);
             Ok(true)
         };
-        let kinds_json = serde_json::to_string(&kinds)?;
         let mut stmt;
         let mut rows = match kinds {
             None => {
@@ -10473,13 +10470,13 @@ impl Database {
                 let mut kinds = kinds.to_vec();
                 kinds.sort_unstable();
                 kinds.dedup();
+                if !(1..=EVENT_PAGE_KINDS).contains(&kinds.len()) {
+                    return fail_with("invalid_event_page", "kinds must name 1 to 64 kinds");
+                }
                 stmt = self.conn.prepare_cached(&kinds_page(kinds.len()))?;
                 let most = limit as i64;
                 let mut values: Vec<&dyn rusqlite::ToSql> = vec![&after, &most];
-                match kinds.len() <= KINDS_BY_INDEX {
-                    true => values.extend(kinds.iter().map(|kind| kind as &dyn rusqlite::ToSql)),
-                    false => values.push(&kinds_json),
-                }
+                values.extend(kinds.iter().map(|kind| kind as &dyn rusqlite::ToSql));
                 stmt.query(&values[..])?
             }
         };
@@ -14523,10 +14520,12 @@ mod tests {
             many <= few + 8,
             "{few} steps among 30 events, {many} among 30,000"
         );
-        // Past the kinds read from the index, a page of a common kind
-        // still stops at its limit.
-        let names: Vec<String> = (0..70).map(|at| format!("kind_{at}")).collect();
-        let common: Vec<&str> = std::iter::once("tool_started")
+        // As many kinds as a page takes, a page of a common one still
+        // stops at its limit; past them, none is read.
+        let names: Vec<String> = (1..EVENT_PAGE_KINDS)
+            .map(|at| format!("kind_{at}"))
+            .collect();
+        let mut common: Vec<&str> = std::iter::once("tool_started")
             .chain(names.iter().map(String::as_str))
             .collect();
         let steps = |events: i64| {
@@ -14541,6 +14540,11 @@ mod tests {
             many <= few + 8,
             "{few} steps among 30 events, {many} among 30,000"
         );
+        common.push("one_too_many");
+        let db = store(30);
+        let refused = db.events_of_kinds(&common, 0, 1).unwrap_err();
+        assert_eq!(refused.code, "invalid_event_page");
+        assert!(db.events_of_kinds(&[], 0, 1).is_err());
     }
 
     #[test]
