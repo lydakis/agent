@@ -1436,6 +1436,9 @@ async fn run() -> Result<(), String> {
         .request("inspect", json!({"bot": name}))
         .await
         .map_err(|e| e.to_string())?;
+    if options.side.is_none() && !options.embedded {
+        trigger::cleanup_by_default(&bot, &options.store, &options.socket);
+    }
 
     enable_raw_mode().map_err(|e| e.to_string())?;
     term::detect();

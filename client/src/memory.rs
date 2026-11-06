@@ -11,7 +11,8 @@
 //! `~/.agent/memory`, a script Sonny writes, shows the indexes, reads,
 //! saves, removes, indexes and checks facts; the `memory` skill Sonny
 //! installs says what to save. A read is recorded beside the facts, so the
-//! cleanup can find facts no agent has opened in a while. `schedule` adds a nightly automation, through
+//! cleanup can find facts no agent has opened in a while. `schedule`, which Sonny
+//! runs when it first opens a lead, adds a nightly automation, through
 //! `~/.agent/automation`, whose agent follows the `memory-cleanup` skill
 //! between `cleanup start` and `cleanup finish`, which commit to a local
 //! git repository in `~/.agents/memory` and revert a cleanup that removed too
@@ -1489,6 +1490,13 @@ fn schedule(home: &Path, args: &[String]) -> Result<Value, String> {
     let added = automation(&script, &[&["add".to_owned()][..], &add].concat())?;
     repo(&root)?;
     Ok(added)
+}
+
+/// Whether the nightly cleanup was ever scheduled here, by the person or
+/// by Sonny: the memory folder is a repository from then on, also after
+/// the person removes the automation, which then stays removed.
+pub fn scheduled_once(home: &Path) -> bool {
+    crate::policy::git_entry(&home.join(".agents/memory"))
 }
 
 /// `~/.agent/automation ARGS`, run in this folder with this shell's daemon
