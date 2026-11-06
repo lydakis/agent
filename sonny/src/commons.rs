@@ -221,7 +221,7 @@ pub fn call(
         let text = reply["text"].as_str().unwrap_or_default();
         return add(&dir, thread, &entry(author, author_id, model, text, reply)?);
     }
-    list(&dir, from, LIST_BYTES, &mut Summaries::new())
+    list(&dir, from, LIST_BYTES, &mut Summaries::new(), &sent(&dir))
 }
 
 fn valid_name(name: &str) -> Result<(), String> {
@@ -1023,11 +1023,18 @@ fn summary(name: &str, path: &Path) -> Option<Value> {
 }
 
 /// The threads from the `from`th newest, as many as `bytes` holds, with
-/// `next` where the rest start; `known` keeps what each read found.
-fn list(dir: &Path, from: usize, bytes: usize, known: &mut Summaries) -> Result<Value, String> {
+/// `next` where the rest start; `known` keeps what each read found, and
+/// `sent` is the week's invites, read once by the caller.
+fn list(
+    dir: &Path,
+    from: usize,
+    bytes: usize,
+    known: &mut Summaries,
+    sent: &[Value],
+) -> Result<Value, String> {
     let entries = match std::fs::read_dir(dir) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(json!({"dir": dir, "threads": [], "invites": budget(&[], agents(dir))}));
+            return Ok(json!({"dir": dir, "threads": [], "invites": budget(sent, agents(dir))}));
         }
         entries => entries.map_err(|e| format!("commons_failed: {}: {e}", dir.display()))?,
     };
@@ -1072,7 +1079,7 @@ fn list(dir: &Path, from: usize, bytes: usize, known: &mut Summaries) -> Result<
     }
     let next = from + shown.len();
     let mut listed = json!({"dir": dir, "threads": shown,
-        "invites": budget(&sent(dir), agents(dir))});
+        "invites": budget(sent, agents(dir))});
     if next < of {
         listed["next"] = json!(next);
         listed["of"] = json!(of);
@@ -1413,11 +1420,14 @@ impl View {
     /// Read it all again, the pick kept on the same thread where it still is.
     pub fn reload(&mut self) {
         let picked = self.picked().map(str::to_owned);
-        match list(&self.dir, 0, usize::MAX, &mut self.known) {
+        // The invites file is read once for the budget and the golden
+        // tickets both.
+        let sent = sent(&self.dir);
+        match list(&self.dir, 0, usize::MAX, &mut self.known, &sent) {
             Ok(listed) => {
                 self.threads = listed["threads"].as_array().cloned().unwrap_or_default();
                 self.invites = listed["invites"].clone();
-                self.golden = (sent(&self.dir).iter())
+                self.golden = (sent.iter())
                     .filter(|invite| !invite["bot"].is_null() && invite["golden"] == true)
                     .count();
             }
