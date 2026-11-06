@@ -20503,10 +20503,13 @@ mod tests {
     #[tokio::test]
     async fn margin_calls_made_together_take_no_more_than_the_margin_holds() {
         // Five notes taken, then one response's two new ones, neither
-        // answered yet.
+        // answered yet; then one taking the first five's away, and another
+        // new one, before that one is answered.
         let item = |node: i64| match node {
             1..=10 if node % 2 == 0 => json!({"type": "function_call_output",
                 "call_id": format!("c{}", node - 1), "output": "In the margin."}),
+            13 => json!({"type": "function_call", "call_id": "c13", "name": margin::TOOL,
+                "arguments": json!({"id": "n1", "remove": true}).to_string()}),
             _ => json!({"type": "function_call", "call_id": format!("c{node}"),
                 "name": margin::TOOL,
                 "arguments": json!({"id": format!("n{node}"), "markdown": "-"}).to_string()}),
@@ -20515,7 +20518,7 @@ mod tests {
             Some("bots") => json!({"bots": [{"name": "calc.add", "bot_id": 10}]}),
             Some("history_nodes") => {
                 let from = asked["min_node"].as_i64().unwrap();
-                json!({"nodes": (from..=12).map(|node| json!({"node": node}))
+                json!({"nodes": (from..=14).map(|node| json!({"node": node}))
                     .collect::<Vec<_>>()})
             }
             Some("history_items") => json!({"items": (asked["nodes"].as_array().unwrap().iter())
@@ -20541,6 +20544,12 @@ mod tests {
         assert_eq!(answer("c11", "n11").await, Ok("In the margin.".into()));
         assert!(
             answer("c12", "n12")
+                .await
+                .is_err_and(|(code, _)| code == "margin_full")
+        );
+        // A removal not answered yet makes no room: it may yet fail.
+        assert!(
+            answer("c14", "n14")
                 .await
                 .is_err_and(|(code, _)| code == "margin_full")
         );

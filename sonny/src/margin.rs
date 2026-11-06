@@ -245,7 +245,8 @@ pub async fn answer(
     // Calls made before this one and not answered yet, as when one
     // response makes several, are answered as this one is, in the order
     // they were made: each taken if it fits, so calls made together never
-    // hold more than the margin takes. Kept nowhere: their answers do.
+    // hold more than the margin takes. A removal makes room only once its
+    // answer is in, since it may yet fail. Kept nowhere: their answers do.
     let mine = calls.get(call_id).map(|(_, made, _)| *made);
     let mut before: Vec<(&String, &(i64, usize, Value))> = (calls.iter())
         .filter(|(id, (_, made, _))| *id != call_id && mine.is_none_or(|mine| *made < mine))
@@ -256,7 +257,7 @@ pub async fn answer(
         ..Margin::default()
     };
     for (id, (.., arguments)) in before {
-        if held.refusal(arguments).is_none() {
+        if arguments["remove"] != true && held.refusal(arguments).is_none() {
             held.apply(id, arguments, None, None);
         }
     }
