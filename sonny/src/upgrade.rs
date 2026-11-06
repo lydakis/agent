@@ -103,6 +103,11 @@ pub const MIGRATIONS: &[Migration] = &[
         id: crate::lookout::subs::STEER,
         retire: "0.10.0",
     },
+    // Sonny's scheduler job moves to a label that names no one (0.9.0).
+    Migration {
+        id: crate::scheduler::RELABELED,
+        retire: "0.11.0",
+    },
     // Each daemon's haiku claim is kept apart from the haiku shown, in
     // `haiku.json` (0.8.1).
     Migration {

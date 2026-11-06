@@ -2212,6 +2212,12 @@ struct Fold {
 }
 
 /// The button that opens or shuts the message between agents at `node`.
+/// What a click on the fold row of the person's long message at `node`
+/// does: opens the rest of it, or shuts it again.
+fn more_button(node: i64) -> screen::Mark {
+    screen::Mark::Link(format!("{}more/{node}", screen::BUTTON))
+}
+
 fn said_button(node: i64) -> screen::Mark {
     screen::Mark::Link(format!("{}said/{node}", screen::BUTTON))
 }
@@ -5866,6 +5872,12 @@ impl App {
                 self.draw_cluster(at);
             }
         }
+        if let Some(node) = button
+            .strip_prefix("more/")
+            .and_then(|node| node.parse::<i64>().ok())
+        {
+            self.toggle_more(node).await;
+        }
         if let Some(command) = (button.strip_prefix("copy/")).and_then(|id| self.commands.get(id)) {
             term::copy(command);
             self.notice = Some("copied".into());
@@ -5892,6 +5904,26 @@ impl App {
                 Err(error) => self.notice = Some(error),
             }
         }
+    }
+
+    /// The person's long message at `node` opened past its first lines,
+    /// or shut again: its fold row and what it hid drawn anew from the
+    /// message as stored, so nothing of it is kept but its rows drawn.
+    async fn toggle_more(&mut self, node: i64) {
+        let Some(item) = self.items(&[node]).await.first().cloned() else {
+            self.notice = Some("could not read that message".into());
+            return;
+        };
+        // Shut, it is its fold row alone.
+        let open = self.screen.count_tagged(screen::Tag::More(node)) == 1;
+        let rows = transcript::prompt_more(&text(&item), self.prose(), open);
+        let last = rows.len().saturating_sub(1);
+        self.flush();
+        self.screen.replace_tagged(
+            screen::Tag::More(node),
+            rows,
+            vec![(last, more_button(node))],
+        );
     }
 
     /// A `margin` call where it was made: the note's first post as a
@@ -6112,11 +6144,22 @@ impl App {
                 false => landed(said, &mut self.ran_here, prose),
             };
             if !lines.is_empty() {
+                // A long message's fold row opens the rest of it.
+                let fold = (user_shell::read(said).is_none())
+                    .then(|| transcript::prompt_fold(said, prose))
+                    .flatten();
                 let lines = match quotes.is_empty() {
                     true => lines,
                     false => transcript::with_quotes(lines, quotes, prose),
                 };
+                let count = lines.len();
                 self.commit(lines);
+                if let Some(fold) = fold {
+                    let at = self.pending.len() - count + fold;
+                    self.marks
+                        .push((at, screen::Mark::Tag(screen::Tag::More(node))));
+                    self.marks.push((at, more_button(node)));
+                }
                 self.mark_last(screen::Mark::Tag(screen::Tag::End(node)));
                 // What another agent reacted with before it was drawn.
                 if !self.picked.on(node).is_empty() {
@@ -9481,7 +9524,7 @@ impl App {
             ("ctrl+[ ctrl+]", "hide the pane, show it again"),
             ("ctrl+g", "open the pane's agent in the main view"),
             ("ctrl+t", "go to the pane's agent's own tab"),
-            ("alt+t", "boost the next message; again for more"),
+            ("alt+t ctrl+x", "boost the next message; again for more"),
             ("ctrl+v", "paste a picture"),
             ("ctrl+c", "copy the selection, clear, or quit"),
             ("ctrl+l", "draw the screen again"),
@@ -10456,7 +10499,10 @@ impl App {
                     KeyCode::Char('d') if alt => self.input.delete_word_forward(),
                     // Think harder for one message, as Claude Code's Alt+T
                     // toggles thinking: again for the most, again for none.
+                    // Ctrl+X too, for a terminal or window manager that
+                    // keeps Alt for itself: x as in xhigh.
                     KeyCode::Char('t') if alt => self.boost_step(),
+                    KeyCode::Char('x') if ctrl => self.boost_step(),
                     // With nothing typed, ? shows the keys, as it does in
                     // Codex and Claude Code.
                     KeyCode::Char('?')
@@ -10623,7 +10669,7 @@ impl App {
         }
     }
 
-    /// Alt+T: the next message's effort up a step from the agent's own,
+    /// Alt+T or Ctrl+X: the next message's effort up a step from the agent's own,
     /// to the most the model takes, then back to its own. The steps are
     /// the model's family's: `xhigh` (else `high`), then `max` where it
     /// has one, each only when above the effort set.
@@ -13954,6 +14000,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ctrl_x_boosts_as_alt_t_does() {
+        let providers = json!({"anthropic": {"family": "anthropic",
+            "efforts": ["low", "medium", "high", "xhigh", "max"]}});
+        let client = daemon_serving(providers, |_| json!({})).await;
+        let mut app = app(client);
+        app.model = "anthropic/opus".into();
+        let key = |c, modifiers| Event::Key(event::KeyEvent::new(KeyCode::Char(c), modifiers));
+        app.key(key('x', KeyModifiers::CONTROL)).await;
+        assert_eq!(app.boost.as_deref(), Some("xhigh"));
+        app.key(key('t', KeyModifiers::ALT)).await;
+        assert_eq!(app.boost.as_deref(), Some("max"));
+        app.key(key('x', KeyModifiers::CONTROL)).await;
+        assert!(app.boost.is_none(), "again goes back to the agent's own");
+        assert!(app.input.is_empty());
+    }
+
+    #[tokio::test]
     async fn a_boost_goes_with_the_next_turn_alone() {
         let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen = asked.clone();
@@ -16760,6 +16823,50 @@ mod tests {
         app.submit().await;
         assert_eq!(words_sent(&sent.lock().unwrap()[3]), "👍 ship it");
         assert_eq!(sent.lock().unwrap()[3]["delivery"], "reject");
+    }
+
+    #[tokio::test]
+    async fn a_long_message_s_fold_row_opens_the_rest_and_shuts_it_again() {
+        let long: String = (1..=12).map(|n| format!("line {n}\n")).collect();
+        let stored = long.clone();
+        let client = daemon_answering(move |asked| match asked["op"].as_str() {
+            Some("history_items") => json!({"items": [{"node": 5, "item": {
+                "type": "message", "role": "user",
+                "content": [{"type": "input_text", "text": stored}]}}]}),
+            _ => json!({}),
+        })
+        .await;
+        let mut app = app(client);
+        app.land(5, (&long, ""), (None, false, false), false);
+        let texts = |app: &mut App| -> Vec<String> {
+            (drawn(app).into_iter())
+                .map(|row| row.trim_end().to_owned())
+                .filter(|row| !row.is_empty())
+                .collect()
+        };
+        let shut: Vec<String> = (1..=6)
+            .map(|n| format!("{} line {n}", if n == 1 { "›" } else { " " }))
+            .chain(["  … +6 lines ▸".to_owned()])
+            .collect();
+        assert_eq!(texts(&mut app), shut);
+        let links = app.screen.links();
+        let fold = (links.iter()).position(|link| link.is_some()).unwrap();
+        assert_eq!(links[fold], Some(format!("{}more/5", screen::BUTTON)));
+        // A click opens the rest of it, and the row stays to shut it.
+        app.press_row("more/5").await;
+        let open: Vec<String> = (1..=12)
+            .map(|n| format!("{} line {n}", if n == 1 { "›" } else { " " }))
+            .chain(["  +6 lines ▾".to_owned()])
+            .collect();
+        assert_eq!(texts(&mut app), open);
+        let links = app.screen.links();
+        assert_eq!(
+            links.iter().flatten().collect::<Vec<_>>(),
+            [&format!("{}more/5", screen::BUTTON)],
+            "only the row under them opens and shuts it"
+        );
+        app.press_row("more/5").await;
+        assert_eq!(texts(&mut app), shut);
     }
 
     #[tokio::test]
