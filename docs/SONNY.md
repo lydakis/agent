@@ -1012,7 +1012,11 @@ will say whether it took effect (the call broke, or the script was stopped
 while it was out). A write noted only as it left, because the program
 stopped, is still listed. Each has an identity that holds across the
 attempts at its call: `TURN:CALL/N`, the agent's turn, the daemon's call
-and its place among the call's writes.
+and its place among the call's writes, and is listed once for each attempt,
+as when a restarted tool host answers the call again. A call lent over a
+link is noted on the machine that makes it, under the asking agent's turn
+and call. What a line keeps of the arguments, the first 120 characters, has
+credentials redacted first, as the approver redacts what it is shown.
 
 ```sh
 sonny sent                  # today's, UTC

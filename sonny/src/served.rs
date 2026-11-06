@@ -1424,7 +1424,8 @@ async fn script(
         // the agent reads it.
         let whole = crate::exec::whole_file();
         let lent = json!({"input": input, "bot": bot, "timeout_ms": left(call).as_millis() as u64,
-            "whole": whole, "store": client.store().unwrap_or_default()});
+            "whole": whole, "store": client.store().unwrap_or_default(),
+            "turn": call["turn"], "call_id": call["call_id"]});
         let answer = crate::link::call(&machine, EXEC, lent, Some(&steps)).await?;
         if let (Some(file), Some(text)) = (&whole, answer["whole"].as_str()) {
             let _ = std::fs::write(file, text);

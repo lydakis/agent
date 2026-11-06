@@ -1278,12 +1278,13 @@ async fn lend(
     asker: Asker,
 ) -> Result<Value, Failed> {
     let payload = &called["payload"];
-    // Its writes go out from here, so they are noted here: for the agent
-    // on the host that asked, under this link's call, with no turn here.
+    // Its writes go out from here, so they are noted here, under the turn
+    // and call of the agent on the host that asked.
     let steps = Steps::over(asker).journaled(crate::sent::Writes::of(crate::sent::Owner {
         bot: payload["bot"].as_str().unwrap_or_default().to_owned(),
-        turn: 0,
-        call_id: format!("{}.{id}", name_of(&link.host)),
+        turn: payload["turn"].as_i64().unwrap_or_default(),
+        call_id: (payload["call_id"].as_str())
+            .map_or_else(|| format!("{}.{id}", name_of(&link.host)), str::to_owned),
     }));
     let left = Duration::from_millis(payload["timeout_ms"].as_u64().unwrap_or(600_000));
     match called["tool"].as_str() {

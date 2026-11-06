@@ -6,9 +6,11 @@
 //! One JSON line per change, in `~/.agent/sonny/sent/YYYY-MM-DD.jsonl`
 //! (UTC), which only the person reads. A write has an identity that stays
 //! across attempts at its call (`TURN:CALL/N`, its place among the call's
-//! writes) and a state: `dispatched` once it may have left, then
+//! writes), the attempt it was made in (each answering of the call is
+//! one), and a state: `dispatched` once it may have left, then
 //! `completed`, `failed`, or `unknown` when nothing will say whether it
-//! took effect. Reads are not kept: they may always be made again.
+//! took effect. Reads are not kept: they may always be made again. What
+//! a line keeps of a write's arguments has its credentials redacted.
 //!
 //! `sonny sent` lists them. It sees only what goes through Sonny's tools:
 //! a write a shell command makes is not here, and an approval is a
@@ -64,10 +66,16 @@ pub struct Owner {
     pub call_id: String,
 }
 
+/// Answerings begun in this process, so two attempts differ.
+static ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+
 /// The writes of one answering of a call, numbered in the order they go.
 #[derive(Debug, Default)]
 pub struct Writes {
     owner: Owner,
+    /// This answering of the call: its writes' identities may repeat in
+    /// another, which is a separate attempt at them.
+    attempt: String,
     next: AtomicU64,
     /// The journal's folder; none when HOME is not set.
     folder: Option<PathBuf>,
@@ -81,8 +89,17 @@ impl Writes {
 
     /// `owner`'s writes, noted in the journal in `folder`.
     pub fn to(owner: Owner, folder: Option<PathBuf>) -> Self {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let attempt = format!(
+            "{nanos:x}.{:x}.{:x}",
+            std::process::id(),
+            ATTEMPTS.fetch_add(1, Ordering::Relaxed)
+        );
         Self {
             owner,
+            attempt,
             next: AtomicU64::new(0),
             folder,
         }
@@ -94,8 +111,9 @@ impl Writes {
     pub fn dispatched(&self, what: &str, arguments: &Value) -> Open {
         let n = self.next.fetch_add(1, Ordering::SeqCst) + 1;
         let Owner { bot, turn, call_id } = &self.owner;
-        let line = json!({"op": format!("{turn}:{call_id}/{n}"), "bot": bot, "turn": turn,
-            "call_id": call_id, "n": n, "what": what, "target": target(arguments)});
+        let line = json!({"op": format!("{turn}:{call_id}/{n}"), "attempt": self.attempt,
+            "bot": bot, "turn": turn, "call_id": call_id, "n": n, "what": what,
+            "target": target(arguments)});
         if let Some(folder) = &self.folder {
             note(folder, &line, "dispatched", true);
         }
@@ -149,11 +167,14 @@ impl Drop for Open {
     }
 }
 
-/// `arguments` cut to what a line keeps.
+/// `arguments` cut to what a line keeps, its credentials redacted first,
+/// as the approver redacts what it is shown: the values of the
+/// environment's secret variables, keys, tokens, and passwords in URLs.
 fn target(arguments: &Value) -> String {
+    let redactor = agent_client::approver::Redactor::from_env(std::env::vars());
     let text = match arguments {
         Value::Null => String::new(),
-        other => other.to_string(),
+        other => redactor.redact_value(other).to_string(),
     };
     match text.char_indices().nth(TARGET_CHARS) {
         Some((cut, _)) => format!("{}…", &text[..cut]),
@@ -193,6 +214,7 @@ fn note(folder: &Path, line: &Value, state: &str, kept: bool) {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Noted {
     pub op: String,
+    pub attempt: String,
     pub bot: String,
     pub turn: i64,
     pub call_id: String,
@@ -222,17 +244,20 @@ pub fn writes_in(folder: &Path, since: u64, bot: Option<&str>) -> Vec<Noted> {
     let mut order = Vec::new();
     let mut latest: std::collections::HashMap<String, Noted> = Default::default();
     for path in days {
-        let Ok(text) = std::fs::read_to_string(&path) else {
+        let Ok(bytes) = std::fs::read(&path) else {
             continue;
         };
-        for line in text.lines() {
-            let Ok(said) = serde_json::from_str::<Value>(line) else {
+        // Line by line, so a line left torn, as by a full disk, costs
+        // only itself.
+        for line in bytes.split(|&b| b == b'\n') {
+            let Ok(said) = serde_json::from_slice::<Value>(line) else {
                 continue;
             };
             let at = said["at"].as_u64().unwrap_or_default();
             let named = |key: &str| said[key].as_str().unwrap_or_default().to_owned();
             let write = Noted {
                 op: named("op"),
+                attempt: named("attempt"),
                 bot: named("bot"),
                 turn: said["turn"].as_i64().unwrap_or_default(),
                 call_id: named("call_id"),
@@ -245,18 +270,19 @@ pub fn writes_in(folder: &Path, since: u64, bot: Option<&str>) -> Vec<Noted> {
                 continue;
             }
             // Its first line's time is when it went; a later one, its end.
-            match latest.get_mut(&write.op) {
+            let key = format!("{} {}", write.attempt, write.op);
+            match latest.get_mut(&key) {
                 Some(kept) => kept.state = write.state,
                 None => {
-                    order.push(write.op.clone());
-                    latest.insert(write.op.clone(), write);
+                    order.push(key.clone());
+                    latest.insert(key, write);
                 }
             }
         }
     }
     order
         .into_iter()
-        .filter_map(|op| latest.remove(&op))
+        .filter_map(|key| latest.remove(&key))
         .collect()
 }
 
@@ -319,7 +345,7 @@ pub fn cli(args: &[String]) -> Result<(), String> {
     if as_json {
         let listed: Vec<Value> = (writes.iter())
             .map(|w| {
-                json!({"op": w.op, "agent": w.bot, "turn": w.turn, "call_id": w.call_id,
+                json!({"op": w.op, "attempt": w.attempt, "agent": w.bot, "turn": w.turn, "call_id": w.call_id,
                     "what": w.what, "target": w.target, "state": said(&w.state), "at": w.at})
             })
             .collect();
@@ -412,6 +438,48 @@ mod tests {
         assert_eq!(listed[0].target, r#"{"text":"hi"}"#);
         assert!(writes_in(&folder, 0, Some("q.lead")).is_empty());
         let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn another_attempt_at_a_call_lists_apart_and_a_torn_line_costs_only_itself() {
+        let folder = scratch();
+        let owner = Owner {
+            bot: "p.lead".into(),
+            turn: 7,
+            call_id: "c1".into(),
+        };
+        let (first, again) = (
+            Writes::to(owner.clone(), Some(folder.clone())),
+            Writes::to(owner, Some(folder.clone())),
+        );
+        first
+            .dispatched("tools.a", &Value::Null)
+            .end(Ended::Unknown);
+        // A line torn inside a character, as a full disk leaves one.
+        let file = folder.join(format!("{}.jsonl", day(now_ms())));
+        let mut torn = std::fs::read(&file).unwrap();
+        torn.extend_from_slice(b"{\"op\":\"7:c1/9\",\"target\":\"\xc3");
+        std::fs::write(&file, torn).unwrap();
+        again
+            .dispatched("tools.a", &Value::Null)
+            .end(Ended::Completed);
+        let listed = writes_in(&folder, 0, None);
+        let states: Vec<(&str, &str)> = (listed.iter())
+            .map(|w| (w.op.as_str(), said(&w.state)))
+            .collect();
+        assert_eq!(states, [("7:c1/1", "uncertain"), ("7:c1/1", "completed")]);
+        assert_ne!(listed[0].attempt, listed[1].attempt);
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn a_target_keeps_no_credentials() {
+        let kept = target(&json!({"url": "https://me:hunter2-long-pass@example.com/x",
+            "api_key": "sk-abcdefghijklmnopqrstuvwxyz0123456789"}));
+        assert!(
+            !kept.contains("hunter2") && !kept.contains("sk-abcdef"),
+            "{kept}"
+        );
     }
 
     #[test]
