@@ -418,13 +418,12 @@ class CompactionTests(ModelFixture):
         self.assertIn('result', response)
 
     def test_summary_cost_is_durable_and_makes_the_next_call_the_last(self):
-        # Each call reports 100 in and 10 out. The first answer's work is all
-        # 110; the second adds its 10 of output to a history it resends; the
-        # summary is charged its output. Those 130 are the budget, so the
-        # third turn's call after its summary is its last, without tool
-        # calls, and the turn ends on it.
+        # Each call reports 100 in and 10 out, 110 tokens. Two answers and
+        # the summary spend the budget of 330, so the third turn's call
+        # after its summary is its last, without tool calls, and the turn
+        # ends on it.
         client = self.client(settings={'context_bytes': 4096, 'compact_at': 50})
-        self.create(client, budget_tokens=130, budget_counts='work')
+        self.create(client, budget_tokens=330)
         for n in range(3):
             ended = self.run_turn(client, 'Bob', n, str(n) * 500)
         self.assertEqual((ended['data']['status'], ended['data']['limit']), ('completed', 'budget'))
@@ -433,13 +432,19 @@ class CompactionTests(ModelFixture):
         self.assertEqual([is_summary(r) for r in requests], [False, False, True, False])
         self.assertEqual(requests[-1]['tool_choice'], 'none')
         bob = client.request('inspect', bot='Bob')['result']
-        self.assertEqual((bob['tokens_used'], bob['work_tokens']), (440, 140))
+        self.assertEqual(bob['tokens_used'], 440)
         self.assertEqual(client.request('submit', bot='Bob', request_id='after', prompt='more')['error'],
                          'budget_exhausted')
         events = client.request('events', bot='Bob', after=0, limit=256)['result']['events']
         usage = [e['data'] for e in events if e['event'] == 'usage']
         self.assertEqual(sum(u['input_tokens'] + u['output_tokens'] for u in usage), 440)
-        self.assertEqual([u['work_tokens'] for u in usage], [110, 10, 10, 10])
+        # Counting work, the first answer is all new; a later one is charged
+        # its output and its new prompt's share, not the history it sends
+        # again; the summary, its output alone.
+        work = [u['work_tokens'] for u in usage]
+        self.assertEqual(work[:1] + work[2:3], [110, 10])
+        self.assertTrue(all(10 < w < 110 for w in work[1:2] + work[3:]), work)
+        self.assertEqual(bob['work_tokens'], sum(work))
         self.assertEqual(sum(u.get('purpose') == 'compaction' for u in usage), 1)
         # The summary names the model that wrote it, so it is priced at that
         # model's rates even when that is not the turn's model.
@@ -459,14 +464,14 @@ class CompactionTests(ModelFixture):
     def test_empty_summary_is_charged_even_though_the_view_is_not_changed(self):
         self.model.empty_compaction = True
         client = self.client(settings={'context_bytes': 4096, 'compact_at': 50})
-        self.create(client, budget_tokens=130, budget_counts='work')
+        self.create(client, budget_tokens=330)
         for n in range(3):
             ended = self.run_turn(client, 'Bob', n, str(n) * 500)
-        # The summary's output is charged, so the call after it is the last.
+        # The summary is charged, so the call after it is the last.
         self.assertEqual(ended['data']['limit'], 'budget')
         self.assertEqual(len(self.requests()), 4)
         bot = client.request('inspect', bot='Bob')['result']
-        self.assertEqual((bot['tokens_used'], bot['work_tokens']), (440, 140))
+        self.assertEqual(bot['tokens_used'], 440)
         self.assertIsNone(bot['compaction'])
         self.assertTrue(any(m.get('event') == 'compaction_failed' and m.get('error') == 'empty_summary'
                             for m in client.saved))

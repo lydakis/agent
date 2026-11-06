@@ -2802,9 +2802,11 @@ impl Turn {
             sent_here = true;
             accounting.answered = true;
             model_rounds += 1;
-            if let Some(usage) = &response.usage {
-                record.charge(usage, Charge::Round);
-            }
+            let added = response.usage.as_ref().map_or(0, |usage| {
+                let (added, _) = added_input(&record, &context, &tools, usage);
+                record.charge(usage, Charge::Round { added });
+                added
+            });
             let items = response.items;
             let calls: Vec<ToolCall> = response.calls.clone();
             let usage = response.usage.clone();
@@ -2835,7 +2837,7 @@ impl Turn {
             wrapped |= limit.is_some_and(|limit| limit != Limit::Rounds);
             let append = self.store.op("append", move |db| {
                 let entries =
-                    db.append_under(turn, items, &calls, usage.as_ref(), &rules, limit)?;
+                    db.append_under(turn, items, &calls, usage.as_ref(), &rules, limit, added)?;
                 if let Some((bytes, tokens)) = sent {
                     db.record_sent(&name, bytes, tokens)?;
                 }
@@ -2864,11 +2866,25 @@ impl Turn {
                         .filter(|entry| entry["event"] == "message")
                         .filter_map(|entry| entry["data"]["node"].as_i64())
                         .collect();
+                    // Its history is read through its own items, as the
+                    // store recorded with its usage.
+                    if response.usage.is_some() {
+                        record.work.read = nodes
+                            .iter()
+                            .copied()
+                            .max()
+                            .or(record.head)
+                            .or(record.work.read);
+                    }
                     provider.recorded(&self.bot, &nodes);
                     verdicts
                 }
                 Err(error) => {
-                    self.failed_usage(response.usage.clone()).await?;
+                    let charge = response.usage.as_ref().map_or(Charge::Aside, |usage| {
+                        let (added, read) = added_input(&record, &context, &tools, usage);
+                        Charge::Failed { added, read }
+                    });
+                    self.failed_usage(response.usage.clone(), charge).await?;
                     return Err(error);
                 }
             };
@@ -3399,17 +3415,20 @@ impl Turn {
                 return Ok(None);
             }
             // Whatever the provider billed for a failed attempt is still spent.
+            let mut failed = Charge::Aside;
             if let Some(usage) = &mut accounting.report.usage {
                 usage.sent_ms = sent_ms;
                 self.tokens.add(usage);
                 *model_rounds += 1;
-                record.charge(
-                    usage,
-                    match summary {
-                        true => Charge::Aside,
-                        false => Charge::Failed,
-                    },
-                );
+                let charge = match body {
+                    Body::Window(context) => {
+                        let (added, read) = added_input(record, context, tools, usage);
+                        Charge::Failed { added, read }
+                    }
+                    _ => Charge::Aside,
+                };
+                record.charge(usage, charge);
+                failed = charge;
             }
             let usage = accounting.report.usage.take();
             if summary {
@@ -3423,7 +3442,7 @@ impl Turn {
                         .await?;
                 }
             } else {
-                self.failed_usage(usage).await?;
+                self.failed_usage(usage, failed).await?;
             }
             let mut resend = false;
             let mut retry = json!({"thinking_withheld":true});
@@ -3621,11 +3640,21 @@ impl Turn {
             .await
     }
 
-    async fn failed_usage(&self, usage: Option<agent_runtime::provider::Usage>) -> Result<()> {
+    async fn failed_usage(
+        &self,
+        usage: Option<agent_runtime::provider::Usage>,
+        charge: Charge,
+    ) -> Result<()> {
+        let (added, read) = match charge {
+            Charge::Failed { added, read } => (added, read),
+            _ => (0, None),
+        };
         if let Some(usage) = usage {
             let turn = self.turn;
             self.store
-                .op("failed_usage", move |db| db.failed_usage(turn, &usage))
+                .op("failed_usage", move |db| {
+                    db.failed_usage(turn, &usage, added, read)
+                })
                 .await?;
         }
         Ok(())
@@ -4207,6 +4236,9 @@ impl Turn {
                             ControlFlow::Continue(outcome) => outcome,
                             ControlFlow::Break(stop) => return Ok(Some(stop)),
                         },
+                        Ran::Done(Err(error)) if error.code == "terminal_not_running" => {
+                            failure(self.no_terminal(handle, error).await?)
+                        }
                         Ran::Done(Err(error)) => failure(error),
                         Ran::Lifted(_) => unreachable!("only a command moves to the background"),
                     }
@@ -4229,6 +4261,9 @@ impl Turn {
                         Ran::Done(Ok(outcome)) => {
                             seen = Self::seen(handle, &outcome);
                             outcome
+                        }
+                        Ran::Done(Err(error)) if error.code == "terminal_not_running" => {
+                            failure(self.no_terminal(handle, error).await?)
                         }
                         Ran::Done(Err(error)) => failure(error),
                         Ran::Lifted(_) => unreachable!("only a command moves to the background"),
@@ -5463,6 +5498,38 @@ fn budget_reached(record: &agent_runtime::store::Bot) -> Option<Limit> {
         .map(|(_, limit)| limit)
 }
 
+/// The input tokens a call's request sent new, as the work measure counts
+/// them, and the newest node it sent: of what the answering model read, the
+/// share of the request its history items after the newest node the bot's
+/// calls have read or written take. One pass over those items alone, from
+/// the window the turn holds: no read, whatever the history's length. A bot
+/// whose calls have read nothing sends all of it new.
+fn added_input(
+    record: &agent_runtime::store::Bot,
+    context: &Context,
+    tools: &serde_json::value::RawValue,
+    usage: &agent_runtime::provider::Usage,
+) -> (u64, Option<i64>) {
+    let input = usage
+        .models
+        .last()
+        .map_or(usage.input_tokens, |m| m.input_tokens);
+    let Some(window) = &context.window else {
+        return (input, record.work.read);
+    };
+    let sent = window.ids.last().copied();
+    let Some(read) = record.work.read else {
+        return (input, sent);
+    };
+    let new: u64 = (window.ids.iter().rev())
+        .zip(window.sizes.iter().rev())
+        .take_while(|(id, _)| **id > read)
+        .map(|(_, size)| u64::from(*size))
+        .sum();
+    let whole = context.usage().bytes + record.instructions.len() + tools.get().len();
+    (agent_runtime::store::share(input, new, whole as u64), sent)
+}
+
 fn calls_left(record: &agent_runtime::store::Bot, model_rounds: usize) -> bool {
     model_rounds < record.settings.max_rounds() && record.exhausted().is_none()
 }
@@ -6180,6 +6247,26 @@ fn completion_text(items: &[Bytes]) -> String {
         }
     }
     text
+}
+
+impl Turn {
+    /// Why `write_stdin` found no terminal `handle`: `error`, unless the
+    /// handle is a command of this bot's that runs without a terminal.
+    async fn no_terminal(&self, handle: i64, error: Error) -> Result<Error> {
+        let bot = self.bot.clone();
+        let runs = (self.store)
+            .op("runs_for", move |db| db.runs_for(&bot, handle))
+            .await?;
+        Ok(match runs {
+            true => Error::with(
+                "not_a_terminal",
+                format!(
+                    "proc:{handle} is a background command, not a terminal: write_stdin types into and kills only commands started with tty=true; a background command runs until it exits or reaches its timeout_ms, and wait on it reports how it ended"
+                ),
+            ),
+            false => error,
+        })
+    }
 }
 
 fn failure(error: Error) -> Outcome {

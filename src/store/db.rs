@@ -547,99 +547,65 @@ fn resolved_settings<S: serde::Serializer>(
 ) -> std::result::Result<S::Ok, S::Error> {
     settings.resolved().serialize(serializer)
 }
-/// The work measure: what a bot's calls added, in tokens, as its budgets
-/// count it. A call is charged its output, and the input it sends past what
-/// the bot's previous call sent and got back on the same model: a history it
-/// sends again, warm in the provider's cache or cold, is free, and what joins
-/// it (a prompt, a steer, a note, a tool's result) is charged once. A summary
-/// or a cache refresh re-reads the history and is charged its output alone.
-/// A failed attempt is charged as a call, its output not joining the history,
-/// so the retry re-reads what it sent for free. A compaction or an elision
-/// sends less and charges nothing for it, and refunds nothing either: the
-/// next call is measured from what it sends. Kept on the bot and its turns,
-/// so a park or a restart counts on.
+/// The work measure: what a bot's calls added, in tokens, as a budget on
+/// work counts it. A call is charged its output, and of its input the share
+/// its request's history items sent for the first time take of the request:
+/// those after the newest node the bot's calls have read or written. A
+/// history sent again, warm in the provider's cache or cold, is free, and
+/// what joins it (a prompt, a steer, a tool's result) is charged once, on the
+/// call that first sends it, whatever else the request lost meanwhile to an
+/// elision, a compaction or the window moving on. A summary or a cache
+/// refresh re-reads the history and is charged its output alone. A failed
+/// attempt is charged as a call, its output not joining the history, so the
+/// retry re-reads what it sent for free. Kept on the bot and its turns, so a
+/// park or a restart counts on.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct Work {
     /// The bot's work in all its turns.
     #[serde(rename = "work_tokens")]
     pub used: u64,
-    /// What its previous call sent and got back, which the next call
-    /// re-reads; `None` before it has a history.
+    /// The newest node its calls have read or written; `None` before any
+    /// call, when all a call sends is new.
     #[serde(skip)]
-    pub carried: Option<Carried>,
-}
-/// The history a bot's calls carry from one to the next, in input tokens.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Carried {
-    pub tokens: u64,
-    /// The model that counted them. Another model counts the same history
-    /// in other tokens, so a call on it measures from what it sends; so
-    /// does one after a history the measure has not seen, `None`, as a
-    /// fork's or an upgraded store's.
-    pub model: Option<String>,
+    pub read: Option<i64>,
 }
 /// How a call joins the history, for the work measure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Charge {
-    /// A model round: its output joins the history.
-    Round,
-    /// A call that failed: it sent the history, and its output is not kept.
-    Failed,
+    /// A model round, whose request sent `added` input tokens new; its
+    /// output joins the history, read through the node its items end at.
+    Round { added: u64 },
+    /// A call that failed, whose request sent `added` input tokens new and
+    /// read through node `read`; its output is not kept.
+    Failed { added: u64, read: Option<i64> },
     /// A summary or a cache refresh: it re-reads the history.
     Aside,
 }
 impl Work {
-    /// What `usage` adds to the measure, and what the history carries after
-    /// it. A fallback that ran several models sent the history to each; the
-    /// last one answered.
-    pub fn charged(&self, usage: &Usage, charge: Charge) -> (u64, Option<Carried>) {
-        let (input, output, model) = match usage.models.last() {
-            Some(last) => (last.input_tokens, last.output_tokens, last.model.as_str()),
-            None => (
-                usage.input_tokens,
-                usage.output_tokens,
-                usage.served_model.as_str(),
-            ),
+    /// What `usage` adds to the measure, and the node the history is read
+    /// through after it; `head` is where a round's items end.
+    pub fn charged(&self, usage: &Usage, charge: Charge, head: Option<i64>) -> (u64, Option<i64>) {
+        let (added, read) = match charge {
+            Charge::Aside => (0, self.read),
+            Charge::Round { added } => (added, head.or(self.read)),
+            Charge::Failed { added, read } => (added, read.or(self.read)),
         };
-        // A provider that named no model, as on an error before its first
-        // event, answered the one the history was sent to before.
-        let model = match (&self.carried, model) {
-            (
-                Some(Carried {
-                    model: Some(before),
-                    ..
-                }),
-                "",
-            ) => before.as_str(),
-            _ => model,
-        };
-        let fresh = match (&self.carried, charge) {
-            (_, Charge::Aside) => 0,
-            (None, _) => input,
-            (Some(carried), _) if carried.model.as_deref() == Some(model) => {
-                input.saturating_sub(carried.tokens)
-            }
-            (Some(_), _) => 0,
-        };
-        let carried = match charge {
-            Charge::Aside => self.carried.clone(),
-            Charge::Round => Some(Carried {
-                tokens: input.saturating_add(output),
-                model: Some(model.to_owned()),
-            }),
-            Charge::Failed => Some(Carried {
-                tokens: input,
-                model: Some(model.to_owned()),
-            }),
-        };
-        (usage.output_tokens.saturating_add(fresh), carried)
+        (usage.output_tokens.saturating_add(added), read)
     }
     /// Charge `usage`; returns what it added.
-    pub fn charge(&mut self, usage: &Usage, charge: Charge) -> u64 {
-        let (tokens, carried) = self.charged(usage, charge);
+    pub fn charge(&mut self, usage: &Usage, charge: Charge, head: Option<i64>) -> u64 {
+        let (tokens, read) = self.charged(usage, charge, head);
         self.used = self.used.saturating_add(tokens);
-        self.carried = carried;
+        self.read = read;
         tokens
+    }
+}
+/// Of `input`, the share the new bytes take of the request: `new` of its
+/// `whole` bytes.
+pub fn share(input: u64, new: u64, whole: u64) -> u64 {
+    match whole {
+        0 => input,
+        whole => (input as u128 * new.min(whole) as u128 / whole as u128) as u64,
     }
 }
 /// The limit a turn's last call met, which it went to without tool calls,
@@ -784,7 +750,7 @@ impl Bot {
         self.tokens_used = self.tokens_used.saturating_add(tokens);
         Spend {
             tokens,
-            work: self.work.charge(usage, charge),
+            work: self.work.charge(usage, charge, None),
         }
     }
     /// Its caps, the bot's own first: each one's limit, what it counts, and
@@ -2273,7 +2239,7 @@ impl Database {
     /// Stored schema version, kept in `PRAGMA user_version`. Stores created
     /// before versioning and stores from newer binaries are rejected; an older
     /// versioned store is migrated forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 79;
+    pub const SCHEMA: i32 = 80;
     /// Verbatim user prompts a compaction keeps: per-prompt text, and the
     /// total text plus `(ordinal, String)` entry metadata. Empty entries cost
     /// space too, so the retained list cannot grow with conversation length.
@@ -2425,7 +2391,7 @@ impl Database {
                 closed INTEGER, open_calls INTEGER, allowed TEXT, settings TEXT, creation TEXT,
                 expire_ms INTEGER, expires_at INTEGER,
                 sent_bytes INTEGER, sent_tokens INTEGER, compact_asked INTEGER NOT NULL DEFAULT 0,
-                declared TEXT, work INTEGER NOT NULL DEFAULT 0, carried INTEGER, carried_model TEXT,
+                declared TEXT, work INTEGER NOT NULL DEFAULT 0, work_read INTEGER,
                 budget_counts TEXT);
             CREATE UNIQUE INDEX IF NOT EXISTS bots_id ON bots(id);
             CREATE INDEX IF NOT EXISTS bots_note ON bots(note);
@@ -2891,17 +2857,11 @@ impl Database {
             name: r.get(0)?,
             head: r.get(1)?,
             budget_tokens: r.get::<_, Option<i64>>(10)?.map(|b| b.max(0) as u64),
-            budget_counts: Counts::from_stored(r.get::<_, Option<String>>(44)?.as_deref()),
+            budget_counts: Counts::from_stored(r.get::<_, Option<String>>(43)?.as_deref()),
             tokens_used: r.get::<_, i64>(11)?.max(0) as u64,
             work: Work {
                 used: r.get::<_, i64>(41)?.max(0) as u64,
-                carried: match r.get::<_, Option<i64>>(42)? {
-                    None => None,
-                    Some(tokens) => Some(Carried {
-                        tokens: tokens.max(0) as u64,
-                        model: r.get(43)?,
-                    }),
-                },
+                read: r.get(42)?,
             },
             turn_budget: None,
             workspace: r.get(2)?,
@@ -2993,7 +2953,7 @@ impl Database {
             },
         })
     }
-    const COLUMNS: &str = "name,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,tools,input_tokens,cached_input_tokens,id,created_by,created_by_id,note,compaction,compaction_instructions,compaction_model,cache_bot,thinking_prefix,thinking_floor,fallback,elision,thinking_from,thinking_to,thinking_elided,gates,denials,allowed,closed,settings,expire_ms,expires_at,sent_bytes,sent_tokens,compact_asked,declared,work,carried,carried_model,budget_counts";
+    const COLUMNS: &str = "name,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,tools,input_tokens,cached_input_tokens,id,created_by,created_by_id,note,compaction,compaction_instructions,compaction_model,cache_bot,thinking_prefix,thinking_floor,fallback,elision,thinking_from,thinking_to,thinking_elided,gates,denials,allowed,closed,settings,expire_ms,expires_at,sent_bytes,sent_tokens,compact_asked,declared,work,work_read,budget_counts";
     /// Validate the caller's captured identity in the same transaction that
     /// creates the child. Never resolve a stale shell's name to a new bot.
     fn creator_id(
@@ -4963,7 +4923,15 @@ impl Database {
         // Successful summaries and their accounting share one fsync/commit.
         if let Some(turn) = bot.running_turn {
             if let Some(usage) = usage {
-                record_usage_for(&tx, &bot, turn, usage, Some("compaction"), Charge::Aside)?;
+                record_usage_for(
+                    &tx,
+                    &bot,
+                    turn,
+                    usage,
+                    Some("compaction"),
+                    Charge::Aside,
+                    None,
+                )?;
             }
             tx.execute(
                 "UPDATE turns SET model_rounds=model_rounds+1,view_sent=0 WHERE id=?",
@@ -6980,10 +6948,14 @@ impl Database {
         calls: &[ToolCall],
         usage: Option<&Usage>,
     ) -> Result<Vec<Value>> {
-        self.append_under(turn, items, calls, usage, &Rules::default(), None)
+        // All its input new, as a bot's first call's is.
+        let added = usage.map_or(0, |usage| usage.input_tokens);
+        self.append_under(turn, items, calls, usage, &Rules::default(), None, added)
     }
-    /// A round's items and calls, under the `rules` its turn runs with, and
-    /// the `limit` that sent its call without tool calls, if one did.
+    /// A round's items and calls, under the `rules` its turn runs with, the
+    /// `limit` that sent its call without tool calls, if one did, and the
+    /// input tokens its request `added` (see [`Work`]).
+    #[allow(clippy::too_many_arguments)]
     pub fn append_under(
         &mut self,
         turn: i64,
@@ -6992,6 +6964,7 @@ impl Database {
         usage: Option<&Usage>,
         rules: &Rules,
         limit: Option<Limit>,
+        added: u64,
     ) -> Result<Vec<Value>> {
         let bot = self.active(turn)?;
         // A gated round notes which item plans each call. Whether a
@@ -7028,7 +7001,7 @@ impl Database {
             entries.push(entry(cursor, &bot.name, Some(turn), "message", data));
         }
         if let Some(usage) = usage {
-            entries.push(record_usage(&tx, &bot, turn, usage)?);
+            entries.push(record_usage(&tx, &bot, turn, usage, added, head)?);
         }
         // A turn keys its calls by id. The provider checks one response's ids;
         // one that reuses an id from an earlier round of the turn is refused
@@ -7192,10 +7165,19 @@ impl Database {
         Ok(())
     }
     /// Charge an unsuccessful provider call without accepting its output.
-    pub fn failed_usage(&mut self, turn: i64, usage: &Usage) -> Result<Value> {
+    /// A failed call's usage: its request sent `added` input tokens new,
+    /// and its history read through node `read`.
+    pub fn failed_usage(
+        &mut self,
+        turn: i64,
+        usage: &Usage,
+        added: u64,
+        read: Option<i64>,
+    ) -> Result<Value> {
         let bot = self.active(turn)?;
         let tx = self.conn.savepoint()?;
-        let entry = record_usage_for(&tx, &bot, turn, usage, None, Charge::Failed)?;
+        let charge = Charge::Failed { added, read };
+        let entry = record_usage_for(&tx, &bot, turn, usage, None, charge, None)?;
         tx.execute(
             "UPDATE turns SET model_rounds=model_rounds+1 WHERE id=?",
             [turn],
@@ -7208,7 +7190,15 @@ impl Database {
     pub fn keep_warm_usage(&mut self, turn: i64, usage: &Usage) -> Result<()> {
         let bot = self.active(turn)?;
         let tx = self.conn.savepoint()?;
-        record_usage_for(&tx, &bot, turn, usage, Some("keep_warm"), Charge::Aside)?;
+        record_usage_for(
+            &tx,
+            &bot,
+            turn,
+            usage,
+            Some("keep_warm"),
+            Charge::Aside,
+            None,
+        )?;
         tx.commit()?;
         Ok(())
     }
@@ -7217,7 +7207,15 @@ impl Database {
         let bot = self.active(turn)?;
         let tx = self.conn.savepoint()?;
         if let Some(usage) = usage {
-            record_usage_for(&tx, &bot, turn, usage, Some("compaction"), Charge::Aside)?;
+            record_usage_for(
+                &tx,
+                &bot,
+                turn,
+                usage,
+                Some("compaction"),
+                Charge::Aside,
+                None,
+            )?;
         }
         tx.execute(
             "UPDATE turns SET model_rounds=model_rounds+1 WHERE id=?",
@@ -10348,6 +10346,18 @@ impl Database {
             |r| r.get(0),
         )?)
     }
+    /// Whether `id` is a command of `bot`'s that runs now.
+    pub fn runs_for(&self, bot: &str, id: i64) -> Result<bool> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT 1 FROM processes WHERE id=? AND bot=? AND status='running'",
+                params![id, bot],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
     /// `None` for an unknown id; otherwise the status and any recorded result.
     pub fn process_result(&self, id: i64) -> Result<Option<(String, Option<Value>)>> {
         let row: Option<(String, Option<String>)> = self
@@ -10584,9 +10594,13 @@ impl Database {
             ],
         )?;
         if let Some(node) = checkpoint {
-            // Its history is its source's, in a measure it has not taken:
-            // its first call re-bases.
-            tx.execute("UPDATE bots SET carried=0 WHERE name=?", [name])?;
+            // Its history is its source's: what the source's calls read of
+            // it is read, and what follows is what the fork's calls send new.
+            // Ids grow along a lineage, so the lesser node is the earlier.
+            tx.execute(
+                "UPDATE bots SET work_read=? WHERE name=?",
+                params![parent.work.read.map(|read| read.min(node)), name],
+            )?;
             tx.execute("INSERT INTO checkpoints VALUES (?,?)", params![name, node])?;
             // The newest note version at or before the checkpoint, along
             // the source's version chain; ids grow along a lineage.
@@ -12000,8 +12014,16 @@ fn assistant_text(item: &Value) -> String {
     text
 }
 
-fn record_usage(conn: &Connection, bot: &Bot, turn: i64, usage: &Usage) -> Result<Value> {
-    record_usage_for(conn, bot, turn, usage, None, Charge::Round)
+/// A round's usage, its items ending at `head`.
+fn record_usage(
+    conn: &Connection,
+    bot: &Bot,
+    turn: i64,
+    usage: &Usage,
+    added: u64,
+    head: Option<i64>,
+) -> Result<Value> {
+    record_usage_for(conn, bot, turn, usage, None, Charge::Round { added }, head)
 }
 /// Record a call's usage, and its work, from the measure as `bot` holds it.
 fn record_usage_for(
@@ -12011,8 +12033,9 @@ fn record_usage_for(
     usage: &Usage,
     purpose: Option<&str>,
     charge: Charge,
+    head: Option<i64>,
 ) -> Result<Value> {
-    let (work, carried) = bot.work.charged(usage, charge);
+    let (work, read) = bot.work.charged(usage, charge, head);
     let mut data = serde_json::to_value(usage)?;
     data["work_tokens"] = json!(work);
     if let Some(purpose) = purpose {
@@ -12032,16 +12055,14 @@ fn record_usage_for(
     ])?;
     conn.prepare_cached(
         "UPDATE bots SET tokens_used=tokens_used+?,input_tokens=input_tokens+?,
-             cached_input_tokens=cached_input_tokens+?,work=work+?,carried=?,carried_model=?
-             WHERE name=?",
+             cached_input_tokens=cached_input_tokens+?,work=work+?,work_read=? WHERE name=?",
     )?
     .execute(params![
         usage.input_tokens.saturating_add(usage.output_tokens) as i64,
         usage.input_tokens as i64,
         usage.cached_input_tokens as i64,
         work as i64,
-        carried.as_ref().map(|c| c.tokens as i64),
-        carried.as_ref().and_then(|c| c.model.as_deref()),
+        read,
         bot.name
     ])?;
     Ok(entry(cursor, &bot.name, Some(turn), "usage", data))
@@ -14026,12 +14047,11 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
     {
         conn.execute("ALTER TABLE turns ADD COLUMN held TEXT", [])?;
     }
-    // Schema 79: budgets count work, not every token a call sends. What was
-    // counted before stays counted: a bot's work and its turns' start from
-    // their usage, so no budget is refilled and a parked turn counts on. A
-    // bot with a history re-bases on its next call, which the measure has
-    // not seen the history of.
-    if from < 79
+    // Schema 80: budgets may count work, not every token a call sends. What
+    // was counted before stays counted: a bot's work and its turns' start
+    // from their usage, so no budget is refilled and a parked turn counts
+    // on. A bot's history is read through its head: what joins it is new.
+    if from < 80
         && conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='turns')
              AND NOT EXISTS(SELECT 1 FROM pragma_table_info('turns') WHERE name='work')",
@@ -14041,13 +14061,12 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
     {
         conn.execute_batch(
             "ALTER TABLE bots ADD COLUMN work INTEGER NOT NULL DEFAULT 0;
-             ALTER TABLE bots ADD COLUMN carried INTEGER;
-             ALTER TABLE bots ADD COLUMN carried_model TEXT;
+             ALTER TABLE bots ADD COLUMN work_read INTEGER;
              ALTER TABLE turns ADD COLUMN work INTEGER NOT NULL DEFAULT 0;
              ALTER TABLE turns ADD COLUMN limited TEXT;
              ALTER TABLE bots ADD COLUMN budget_counts TEXT;
              ALTER TABLE turns ADD COLUMN budget_counts TEXT;
-             UPDATE bots SET work=tokens_used,carried=CASE WHEN head IS NOT NULL THEN 0 END;
+             UPDATE bots SET work=tokens_used,work_read=head;
              UPDATE turns SET work=input_tokens+output_tokens WHERE input_tokens+output_tokens>0;",
         )?;
     }

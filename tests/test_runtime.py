@@ -2882,6 +2882,19 @@ class RuntimeTests(ModelFixture):
         self.assertEqual(typed['exit_code'], 0)
         ended = call('Bob', 't3', 'wait', {'handles': [handle]})
         self.assertEqual(ended['results'][handle]['exit_code'], 0)
+        # A background command has no terminal: write_stdin says so to the
+        # bot that started it, and nothing more to another.
+        background = call('Bob', 'b1', 'shell', {'command': 'sleep 600', 'background': True})['handle']
+        # Whether it types, polls past the hold, or kills.
+        for bot, request_id, said, arguments in (
+                ('Bob', 'b2', 'not_a_terminal', {'handle': background, 'kill': True}),
+                ('Bob', 'b3', 'not_a_terminal', {'handle': background}),
+                ('Bob', 'b4', 'not_a_terminal', {'handle': background, 'chars': 'x'}),
+                ('Eve', 'e2', 'terminal_not_running', {'handle': background, 'kill': True})):
+            prompt = 'calls:' + json.dumps([['write_stdin', arguments]])
+            turn = client.request('submit', bot=bot, request_id=request_id, prompt=prompt)['result']['turn']
+            client.finished(turn)
+            self.assertIn(said, poll(client, bot, turn)['result']['text'])
         # One still running ends with the daemon, which stops at once.
         self.assertTrue(call('Bob', 't4', 'shell', {'command': 'sleep 600', 'tty': True,
                                                     'yield_time_ms': 0})['running'])

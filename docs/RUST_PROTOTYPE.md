@@ -323,23 +323,24 @@ default, is the provider's usage, every call's input and output, the history
 it sends again included; `work` counts what the calls add, for an allowance
 that should not pay again for a history the bot already has. The daemon
 keeps both for every bot and turn, the same way wherever they are counted.
-A call's work is its output, plus the input it
-sends past what the bot's previous call sent and got back on the same model:
-a history sent again, warm in the provider's cache or cold, is free, and what
-joins it (a prompt, a steer, a note, a tool's result) is charged once. Output
-is charged when it is made; sending it back is free. A summary or a
+A call's work is its output, plus the share of its input that the request's
+history items sent for the first time take of the request, by size: the items
+after the newest node the bot's calls have read or written. A history sent
+again, warm in the provider's cache or cold, is free, and what joins it (a
+prompt, a steer, a tool's result) is charged once, on the call that first
+sends it, however much the request lost meanwhile to an elision, a compaction
+or a window moving on: what leaves a request never hides what joins it.
+Output is charged when it is made; sending it back is free. A summary or a
 prompt-cache refresh re-reads the history and is charged its output alone. A
-failed or incomplete call is charged as a call, its output not accepted into
-history, so its retry re-reads what it sent. A compaction or an elision makes
-the next call send less, which charges nothing and refunds nothing: the call
-after is measured from what that one sent. A call on another model than the
-one before counts the history in other tokens, so it is charged its output and
-the next is measured from it; so is a bot's first call on a history the
-measure has not seen, a fork's. A failed call whose provider named no model
-is taken to be on the one before. The store keeps the bot's work (`work_tokens`
-in `inspect`, beside `tokens_used`), what its last call carried, and each
-turn's (`work_tokens` in the turn view, and on each `usage` event what that
-call charged), so a park or a restart counts on. Cancellation and failures
+failed or incomplete call is charged as a call, the history it sent read
+through, its output not accepted, so its retry sends nothing new. A fork's
+history is its source's: what the source's calls read of it is read, through
+the checkpoint at most. Each call counts its new items from the end of the
+window the turn already holds, so the cost is the new items alone, with no
+store read, whatever the history's length. The store keeps the bot's work
+(`work_tokens` in `inspect`, beside `tokens_used`), the node its calls have
+read through, and each turn's (`work_tokens` in the turn view, and on each
+`usage` event what that call charged), so a park or a restart counts on. Cancellation and failures
 before a usage report is returned can leave usage and work unaccounted for;
 these totals are not a reconciliation of provider billing.
 
@@ -2632,7 +2633,8 @@ SIGHUP, does not outlive it. Each bot keeps at most 16; starting another
 first kills the one it used least recently, as Codex prunes its sessions,
 so that one's slot is free for it. Only the
 bot that started a terminal types into it (`terminal_not_running` for any
-other, and for one that ended), and terminals end when the daemon stops. A
+other, and for one that ended; `not_a_terminal` for its own background
+command, which takes no input), and terminals end when the daemon stops. A
 terminal never leaves its bot's sandbox (`tty` with `require_escalated` is
 refused), so input to a sandboxed bot's terminal runs without review, as its
 commands do; an unsandboxed bot's `write_stdin` is gated like `shell`.

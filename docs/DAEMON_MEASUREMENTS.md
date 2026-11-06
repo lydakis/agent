@@ -7080,8 +7080,8 @@ prompt or a round start of the newest turn.
 ## Budgets count work (#729)
 
 Each model call's usage commit now also adds the call's work to the turn
-and the bot and stores what the call carried (`bots.work`, `carried`,
-`carried_model`; `turns.work`), as more columns in the two cached UPDATEs
+and the bot and stores the node its calls have read through (`bots.work`,
+`work_read`; `turns.work`), as more columns in the two cached UPDATEs
 that already recorded its usage, with no new statement and no new store
 job. A turn's finish returns its `limited` column from the UPDATE that
 already ends it. The check for a spent budget is arithmetic on the bot the
@@ -7117,3 +7117,17 @@ nothing. The box is noisy at these sizes: the admission rows moved the
 other way in the first screen (lone submit CPU -2.8%, burst p99 +3.0%),
 and lone submit CPU ran 41–58 ms on `main` and 40–73 on the head across
 both, a submit path this change does not touch.
+
+A review found that measuring a call's new input as the request's growth over
+the previous call (input less what that one sent and got back) hides new
+material when the request also shrinks: an elision that drops 50K of old
+results in the call that adds a 10K result reads as no growth. The measure
+now counts the items each request sends past the node the bot's calls have
+read through, from the end of the window the turn already holds: a walk over
+the new items only (typically the prompt or a round's tool results), integer
+adds on sizes the window already carries, no store read and no history
+scan, then one multiply and divide for their share of the reported input.
+The usage UPDATE writes one column (`work_read`) where it wrote two
+(`carried`, `carried_model`), and the bot row reads one fewer. Per call that
+is O(new items) at one bot or at thousands, the same order as appending
+those items; the Perf workflow's screen of the head is checked before merge.

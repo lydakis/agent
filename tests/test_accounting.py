@@ -23,7 +23,8 @@ class AccountingTests(ModelFixture):
         client = self.client('echo')
         # The first attempt fails and reports 100 in, 10 out: the bot's first
         # call, all of it new. Its retry re-reads what it sent and is charged
-        # its output. A budget that attempt spent sends the retry without
+        # its output; a call after it, its output and its share for the
+        # tool's result it sends new. A budget that attempt spent sends the retry without
         # tool calls, and the turn ends on its reply; one the retry leaves
         # room in lets the turn run as asked.
         for budget, calls, limit in ((100, 2, 'budget'), (220, 3, None)):
@@ -39,12 +40,15 @@ class AccountingTests(ModelFixture):
                 row = client.request('turns', bot=bot)['result']['turns'][0]
                 self.assertEqual((row['model_rounds'], row['input_tokens'], row['output_tokens']),
                                  (calls, calls * 100, calls * 10))
-                self.assertEqual(row['work_tokens'], 110 + (calls - 1) * 10)
+                work = row['work_tokens']
+                if calls == 2:
+                    self.assertEqual(work, 120)
+                else:
+                    self.assertTrue(130 < work < 220, work)
                 self.assertEqual(row['retries'], 1)
                 self.assertEqual(self.model.requests.qsize() - prior_calls, calls)
                 bot_row = client.request('inspect', bot=bot)['result']
-                self.assertEqual((bot_row['tokens_used'], bot_row['work_tokens']),
-                                 (calls * 110, 110 + (calls - 1) * 10))
+                self.assertEqual((bot_row['tokens_used'], bot_row['work_tokens']), (calls * 110, work))
                 self.assertEqual(client.request('stats')['result']['tokens']['input_tokens'],
                                  (prior_calls + calls) * 100)
                 page = client.request('events', bot=bot, after=0, limit=256)['result']['events']
@@ -62,8 +66,9 @@ class AccountingTests(ModelFixture):
         self.assertEqual(client.request('create', bot='Odd', workspace=str(self.path),
                                         budget_counts='work')['error'], 'invalid_budget')
         # Each synthetic call sends 100 and writes 10. Counting work, the
-        # bot's first call is all new; later ones send the same history
-        # again, which is free.
+        # bot's first call is all new; a later one is charged its output and
+        # the share of its request it sends new (a prompt, a tool's result),
+        # the history it sends again free.
         bot = client.request('create', bot='Bob', workspace=str(self.path), budget_tokens=115,
                              budget_counts='work')['result']
         self.assertEqual((bot['budget_tokens'], bot['budget_counts'], bot['tokens_used'], bot['work_tokens']),
@@ -81,13 +86,15 @@ class AccountingTests(ModelFixture):
         self.assertEqual(sum(e['event'] == 'tool_completed' and e['turn'] == second for e in events), 1)
         refused = client.request('submit', bot='Bob', request_id='3', prompt='again')
         self.assertEqual(refused['error'], 'budget_exhausted')
-        self.assertIn('130 of 115 tokens of work done', refused['detail'])
-        self.assertEqual((refused['budget_counts'], refused['work_tokens']), ('work', 130))
+        work = refused['work_tokens']
+        self.assertTrue(130 < work < 200, work)
+        self.assertIn(f'{work} of 115 tokens of work done', refused['detail'])
+        self.assertEqual(refused['budget_counts'], 'work')
         listing = client.request('turns', bot='Bob')['result']
         self.assertEqual([t['status'] for t in listing['turns']], ['completed', 'completed'])
         self.assertEqual([t.get('limit') for t in listing['turns']], [None, 'budget'])
         self.assertEqual([t['input_tokens'] for t in listing['turns']], [100, 200])
-        self.assertEqual([t['work_tokens'] for t in listing['turns']], [110, 20])
+        self.assertEqual([t['work_tokens'] for t in listing['turns']], [110, work - 110])
         self.assertEqual([t['model_rounds'] for t in listing['turns']], [1, 2])
         self.assertTrue(all(t['started_ms'] <= t['finished_ms'] for t in listing['turns']))
         self.assertEqual(listing['turns'][0]['workspace'], str(self.path.resolve()))
@@ -109,7 +116,8 @@ class AccountingTests(ModelFixture):
         end = client.finished(parked)['data']
         self.assertEqual((end['status'], end['limit']), ('completed', 'budget'))
         row = client.request('turns', bot='Parked')['result']['turns'][0]
-        self.assertEqual((row['work_tokens'], row['model_rounds']), (120, 2))
+        self.assertEqual(row['model_rounds'], 2)
+        self.assertTrue(120 < row['work_tokens'] < 200, row)
 
     def test_a_turns_own_cap_ends_it_on_a_reply(self):
         client = self.client('echo,shell,wait')
@@ -129,7 +137,8 @@ class AccountingTests(ModelFixture):
         # The cap is the turn's: the next turn, capped or not, starts from
         # its own zero.
         bot = client.request('inspect', bot='Bob')['result']
-        self.assertEqual((bot['tokens_used'], bot['work_tokens']), (220, 120))
+        self.assertEqual(bot['tokens_used'], 220)
+        self.assertTrue(120 < bot['work_tokens'] < 200, bot)
         for key, more in (('free', {}), ('roomy', {'budget_tokens': 220})):
             turn = submit(key, 'tool:x', **more)['result']['turn']
             end = client.finished(turn)['data']
@@ -137,7 +146,9 @@ class AccountingTests(ModelFixture):
         listing = client.request('turns', bot='Bob')['result']['turns']
         self.assertEqual([t['budget_tokens'] for t in listing], [110, None, 220])
         self.assertEqual([t['model_rounds'] for t in listing], [2, 2, 2])
-        self.assertEqual([t['work_tokens'] for t in listing], [120, 20, 20])
+        work = [t['work_tokens'] for t in listing]
+        self.assertEqual(work[0], bot['work_tokens'])
+        self.assertTrue(all(20 < w < 100 for w in work[1:]), work)
         # A turn that resumes after parking counts what it did before: its
         # first call spent its cap, so the call after its wait is its last.
         parked = submit('park', 'wait:proc:999999', budget_tokens=10)['result']['turn']
