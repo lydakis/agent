@@ -139,7 +139,7 @@ async fn entries(client: &Client, bot: &str, turn: i64) -> Vec<(i64, bool)> {
         let Ok(page) = client
             .request(
                 "history_nodes",
-                json!({"bot": bot, "limit": 400, "from": from}),
+                json!({"bot": bot, "limit": HISTORY_PAGE, "from": from}),
             )
             .await
         else {
@@ -154,21 +154,26 @@ async fn entries(client: &Client, bot: &str, turn: i64) -> Vec<(i64, bool)> {
         .keys()
         .filter_map(|node| node.parse().ok())
         .collect();
-    // A read stops at a size, its items a prefix of those asked: the
-    // rest are asked for again until every one is read, or the split is
-    // left unsaid rather than given wrong.
+    // A read takes at most a page of nodes and stops at a size, its items
+    // a prefix of those asked: the rest are asked for again until every
+    // one is read, or the split is left unsaid rather than given wrong.
     let mut items = Vec::new();
     while !left.is_empty() {
+        let asked = left.len().min(HISTORY_PAGE);
         let Ok(page) = client
-            .request("history_items", json!({"bot": bot, "nodes": left}))
+            .request(
+                "history_items",
+                json!({"bot": bot, "nodes": &left[..asked]}),
+            )
             .await
         else {
             return Vec::new();
         };
         let page = page["items"].as_array().cloned().unwrap_or_default();
-        let Some(rest) = rest(&left, &page) else {
+        let Some(mut rest) = rest(&left[..asked], &page) else {
             return Vec::new();
         };
+        rest.extend_from_slice(&left[asked..]);
         left = rest;
         items.extend(page);
     }
@@ -185,6 +190,9 @@ async fn entries(client: &Client, bot: &str, turn: i64) -> Vec<(i64, bool)> {
         .map(|(_, at, output)| (at, output))
         .collect()
 }
+
+/// The most nodes one history read takes, as the daemon allows.
+const HISTORY_PAGE: usize = 400;
 
 /// Add the nodes of turn `turn` on a newest-first `page` to `written`, by
 /// node, as when each was written. Gives where the next page starts while
