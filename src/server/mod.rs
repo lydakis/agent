@@ -859,6 +859,8 @@ pub struct Configuration {
     /// Folders whose Unix sockets no sandboxed command reaches, made if
     /// missing, private to the daemon's user.
     pub walled: Vec<PathBuf>,
+    /// The context windows the person set, by model path.
+    pub context_windows: Arc<agent_runtime::provider::Windows>,
 }
 
 /// `path` by its real path, or, while it doesn't exist, by the real path
@@ -1504,7 +1506,9 @@ pub async fn run(config: Configuration) -> Result<()> {
         if spec.socket {
             provider = provider.with_socket()?;
         }
-        let provider = provider.with_stall_timeout(stall_timeout)?;
+        let provider = provider
+            .with_stall_timeout(stall_timeout)?
+            .with_windows(&spec.name, config.context_windows.clone());
         let (searches, speeds) = (provider.searches(), provider.speeds());
         if providers.insert(spec.name.clone(), provider).is_some() {
             return fail_with("duplicate_provider", spec.name.as_str());
@@ -1634,6 +1638,7 @@ pub async fn run(config: Configuration) -> Result<()> {
             "stall_timeout_seconds":stall_timeout.as_secs()},
         "schema":agent_runtime::store::Database::SCHEMA,
         "tools":registry.names(),"providers":bindings,
+        "context_windows":config.context_windows.json(),
         "durability":"sqlite_full","partial_text_durable":false});
     let mut sessions: HashMap<u64, Output> = HashMap::new();
     // The sandboxed bot each session on a bot's own socket answers as.

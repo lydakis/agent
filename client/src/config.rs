@@ -20,6 +20,11 @@
 //! [fallbacks]                   # the model a declined request goes to, by model
 //! "anthropic/claude-opus-5-5" = "anthropic/claude-opus-4-8"
 //!
+//! [context_windows]             # tokens a model's context holds, over its provider's listing; restart the daemon to apply
+//! "bedrock/*" = 400000          # by PROVIDER/MODEL, * and ? wildcards; the most specific pattern wins
+//! "bedrock/*openai.*" = 1000000 # every OpenAI model on Bedrock
+//! "anthropic/claude-opus-5-5" = 500000  # lower than the model's own on purpose
+//!
 //! [judge]
 //! model = "openai/gpt-6-luna"   # who judges for the approver and the lookout
 //! effort = "low"                # a model judge's effort
@@ -91,6 +96,9 @@ use std::path::{Path, PathBuf};
 /// The largest file the reader takes.
 pub const LIMIT: u64 = 64 * 1024;
 
+/// The least context window `[context_windows]` sets, as the daemon takes it.
+pub const MIN_WINDOW: u64 = 1024;
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Config {
     /// `provider/model` for a new agent that names none.
@@ -119,6 +127,12 @@ pub struct Config {
     /// agent on that model that names none sends a request a safety
     /// classifier declined to it, that request alone.
     pub fallbacks: BTreeMap<String, String>,
+    /// `[context_windows]`: the context window, in tokens, of each model
+    /// whose `PROVIDER/MODEL` path a pattern matches, `*` and `?` wildcards,
+    /// the most specific pattern winning, over what its provider lists.
+    /// Unset, the provider's listing, else the daemon's own default. The
+    /// agent CLI starts the daemon with them.
+    pub context_windows: BTreeMap<String, u64>,
     pub judge: Judge,
     pub shell_environment_policy: ShellEnvironmentPolicy,
     pub sonny: Sonny,
@@ -1099,6 +1113,28 @@ fn parse(text: &str) -> Result<Config, String> {
             config.attach_wait_ms = Some(ms);
             continue;
         }
+        if name == "context_windows" {
+            let models = value.as_table().ok_or("context_windows must be a table")?;
+            for (pattern, tokens) in models {
+                let tokens = tokens
+                    .as_integer()
+                    .filter(|tokens| *tokens >= MIN_WINDOW as i64)
+                    .ok_or_else(|| {
+                        format!(
+                            "context_windows.{pattern} is a number of tokens, at least {MIN_WINDOW}"
+                        )
+                    })?;
+                if !pattern.contains('/') || pattern.contains(char::is_whitespace) {
+                    return Err(format!(
+                        "context_windows keys are PROVIDER/MODEL, * and ? wildcards, as \"bedrock/*\", not {pattern:?}"
+                    ));
+                }
+                config
+                    .context_windows
+                    .insert(pattern.clone(), tokens as u64);
+            }
+            continue;
+        }
         if name == "fallbacks" {
             let models = value.as_table().ok_or("fallbacks must be a table")?;
             for (model, fallback) in models {
@@ -1998,6 +2034,19 @@ mod tests {
         assert_eq!(fallbacks.get("a/big").map(String::as_str), Some("a/other"));
         assert!(parse("[fallbacks]\n\"a/big\" = 1\n").is_err());
         assert!(parse("fallbacks = \"a/other\"").is_err());
+        let windows = parse("[context_windows]\n\"bedrock/*\" = 400000\n\"a/b\" = 1024\n")
+            .unwrap()
+            .context_windows;
+        assert_eq!(windows.get("bedrock/*"), Some(&400_000));
+        assert_eq!(windows.get("a/b"), Some(&1024));
+        for wrong in [
+            "[context_windows]\n\"bedrock\" = 400000\n",
+            "[context_windows]\n\"a/b\" = 1000\n",
+            "[context_windows]\n\"a/b\" = \"1M\"\n",
+            "context_windows = 400000\n",
+        ] {
+            assert!(parse(wrong).is_err(), "{wrong}");
+        }
         for (text, error) in [
             (
                 "web_search = \"cached\"",
