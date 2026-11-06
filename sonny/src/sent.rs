@@ -191,8 +191,9 @@ fn note(folder: &Path, line: &Value, state: &str, kept: bool) {
     let mut line = line.clone();
     line["at"] = json!(at);
     line["state"] = json!(state);
-    let mut text = line.to_string();
-    text.push('\n');
+    // Begun on a line of its own, so a line an earlier append left torn,
+    // with no newline after it, never takes this one with it.
+    let text = format!("\n{line}");
     let _ = std::fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
@@ -455,19 +456,31 @@ mod tests {
         first
             .dispatched("tools.a", &Value::Null)
             .end(Ended::Unknown);
-        // A line torn inside a character, as a full disk leaves one.
+        // An append torn inside a character, as a full disk leaves one,
+        // with no newline after it.
         let file = folder.join(format!("{}.jsonl", day(now_ms())));
         let mut torn = std::fs::read(&file).unwrap();
-        torn.extend_from_slice(b"{\"op\":\"7:c1/9\",\"target\":\"\xc3");
+        torn.extend_from_slice(b"\n{\"op\":\"7:c1/9\",\"target\":\"\xc3");
         std::fs::write(&file, torn).unwrap();
-        again
-            .dispatched("tools.a", &Value::Null)
-            .end(Ended::Completed);
+        // Kept apart from the torn line before it ends, so a stop now
+        // still leaves it listed.
+        let open = again.dispatched("tools.a", &Value::Null);
+        let states = || -> Vec<(String, String)> {
+            (writes_in(&folder, 0, None).into_iter())
+                .map(|w| (w.op, said(&w.state).to_owned()))
+                .collect()
+        };
+        let row = |op: &str, state: &str| (op.to_owned(), state.to_owned());
+        assert_eq!(
+            states(),
+            [row("7:c1/1", "uncertain"), row("7:c1/1", "attempted")]
+        );
+        open.end(Ended::Completed);
+        assert_eq!(
+            states(),
+            [row("7:c1/1", "uncertain"), row("7:c1/1", "completed")]
+        );
         let listed = writes_in(&folder, 0, None);
-        let states: Vec<(&str, &str)> = (listed.iter())
-            .map(|w| (w.op.as_str(), said(&w.state)))
-            .collect();
-        assert_eq!(states, [("7:c1/1", "uncertain"), ("7:c1/1", "completed")]);
         assert_ne!(listed[0].attempt, listed[1].attempt);
         let _ = std::fs::remove_dir_all(&folder);
     }
