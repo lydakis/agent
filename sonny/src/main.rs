@@ -71,7 +71,6 @@ mod said;
 mod scheduler;
 mod screen;
 mod seed;
-mod sent;
 mod served;
 mod settings;
 mod setup;
@@ -1264,7 +1263,6 @@ fn main() -> std::process::ExitCode {
         Some((verb, rest)) if verb == "approver" => approver::run(rest),
         Some((verb, rest)) if verb == "mcp" => mcp::cli(rest),
         Some((verb, rest)) if verb == "link" => link::cli(rest),
-        Some((verb, rest)) if verb == "sent" => sent::cli(rest),
         Some((verb, rest)) if verb == "rules" => {
             return std::process::ExitCode::from(rules::cli(rest) as u8);
         }

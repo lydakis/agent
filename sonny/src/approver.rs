@@ -752,10 +752,15 @@ fn own_home_in(home: PathBuf, given: &[String]) -> policy::Home {
     }
     folders.sort();
     folders.dedup();
+    // Where tasks' worktrees are made, as each of its spellings names it.
+    let work = (std::iter::once(&agent).chain(&real))
+        .map(|agent| agent.join("worktrees"))
+        .collect();
     policy::Home {
         home,
         agent: std::iter::once(agent).chain(real).collect(),
         given: folders,
+        work,
     }
 }
 
@@ -1579,6 +1584,7 @@ mod tests {
             home: root.clone(),
             agent: vec![agent.clone()],
             given: vec![root.join("code"), worktree.clone()],
+            work: vec![agent.join("worktrees")],
         };
         let folder = root.join("code");
         let reaches = |tool: &str, arguments: Value, confined: bool| {

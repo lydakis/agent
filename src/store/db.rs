@@ -10009,6 +10009,18 @@ impl Database {
             |r| r.get(0),
         )?)
     }
+    /// Whether `id` is a command of `bot`'s that runs now.
+    pub fn runs_for(&self, bot: &str, id: i64) -> Result<bool> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT 1 FROM processes WHERE id=? AND bot=? AND status='running'",
+                params![id, bot],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
     /// `None` for an unknown id; otherwise the status and any recorded result.
     pub fn process_result(&self, id: i64) -> Result<Option<(String, Option<Value>)>> {
         let row: Option<(String, Option<String>)> = self
