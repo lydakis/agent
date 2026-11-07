@@ -2997,8 +2997,6 @@ struct Relayed {
     /// What its shut row says, as [`transcript::relayed_head`] has it.
     head: String,
     from: Option<String>,
-    /// Whether `from` names a person, whom no agents' colour marks.
-    person: bool,
     /// Whether it rode along on a call rather than coming as a message:
     /// drawn as an attachment of what the call carried.
     attached: bool,
@@ -3784,8 +3782,9 @@ struct App {
     /// area, the first of its rows shown there, and the width it was laid
     /// out at; none while something else is drawn over it.
     composer_at: Option<(Rect, usize, usize)>,
-    /// Where the footer counts the agents at work: its row and columns.
-    counter_at: Vec<(u16, std::ops::Range<u16>, &'static str)>,
+    /// What a click opens around the composer, by row and columns: the
+    /// footer's counts, and the agent the composer's guess came from.
+    opens_at: Vec<(u16, std::ops::Range<u16>, String)>,
     /// The mouse button went down on the composer's text, on what: a
     /// spot, word or line a drag selects from, and where the text was
     /// drawn then, kept while the button is down so a redraw that scrolls
@@ -5305,7 +5304,7 @@ impl App {
             pane_mouse: false,
             closed: None,
             composer_at: None,
-            counter_at: Vec::new(),
+            opens_at: Vec::new(),
             composing: None,
             composer_click: None,
             margin: margin::Margin::default(),
@@ -7405,13 +7404,13 @@ impl App {
         &mut self,
         node: i64,
         (said, quotes): (&str, &str),
-        (from, person, attached): (Option<&str>, bool, bool),
+        (from, attached): (Option<&str>, bool),
         older: bool,
     ) {
         let attached = attached && transcript::relays(said, from);
         if attached {
             if self.zen.is_none() {
-                self.land_relayed(node, said, from, (person, true));
+                self.land_relayed(node, said, from, true);
             }
             return;
         }
@@ -7420,7 +7419,7 @@ impl App {
         // Words between agents are one quiet row a click opens; none in zen.
         if transcript::relays(said, from) {
             if self.zen.is_none() {
-                self.land_relayed(node, said, from, (person, false));
+                self.land_relayed(node, said, from, false);
             }
         } else {
             let prose = self.prose();
@@ -7458,17 +7457,10 @@ impl App {
     /// The message between agents at `node`: one quiet row a click opens,
     /// gathered with those right before it into one that lists them; one
     /// `attached` to a call only with others attached.
-    fn land_relayed(
-        &mut self,
-        node: i64,
-        said: &str,
-        from: Option<&str>,
-        (person, attached): (bool, bool),
-    ) {
+    fn land_relayed(&mut self, node: i64, said: &str, from: Option<&str>, attached: bool) {
         let relayed = Relayed {
             head: transcript::relayed_head(said, from),
             from: from.map(str::to_owned),
-            person,
             attached,
             text: None,
         };
@@ -7597,11 +7589,7 @@ impl App {
         };
         let lines = match &relayed.text {
             Some(text) => transcript::relayed(text, relayed.from.as_deref(), true, width),
-            None => {
-                // Only an agent's name takes the agents' colour.
-                let agent = relayed.from.as_deref().filter(|_| !relayed.person);
-                transcript::relayed_shut(&relayed.head, agent, width)
-            }
+            None => transcript::relayed_shut(&relayed.head, width),
         };
         match relayed.attached {
             true => transcript::attached(lines),
@@ -8489,11 +8477,7 @@ impl App {
                         self.land(
                             node,
                             (&text(&item), &quotes_of(&item)),
-                            (
-                                item["from"].as_str(),
-                                item["person"] == true,
-                                item["attached"] == true,
-                            ),
+                            (item["from"].as_str(), item["attached"] == true),
                             older,
                         );
                     }
@@ -9030,11 +9014,7 @@ impl App {
                     self.land(
                         node,
                         (&text(item), &quotes_of(item)),
-                        (
-                            item["from"].as_str(),
-                            item["person"] == true,
-                            item["attached"] == true,
-                        ),
+                        (item["from"].as_str(), item["attached"] == true),
                         false,
                     );
                     self.answered(&text(item), item["from"].as_str());
@@ -9060,11 +9040,7 @@ impl App {
                     self.land(
                         node,
                         (&text(item), &quotes_of(item)),
-                        (
-                            item["from"].as_str(),
-                            item["person"] == true,
-                            item["attached"] == true,
-                        ),
+                        (item["from"].as_str(), item["attached"] == true),
                         false,
                     );
                     self.answered(&text(item), item["from"].as_str());
@@ -10306,14 +10282,17 @@ impl App {
                     MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left)
                 );
                 let in_pane = if held { self.pane_mouse } else { over_pane };
-                // A count under the composer: what it counts.
-                if down
-                    && let Some((_, _, opens)) =
-                        (self.counter_at.iter()).find(|(row, columns, _)| {
-                            mouse.row == *row && columns.contains(&mouse.column)
-                        })
+                // A count under the composer, or the agent a guess came
+                // from: what it opens; a right click on the agent, the
+                // other way to it, as on its name anywhere.
+                let right = matches!(mouse.kind, MouseEventKind::Down(MouseButton::Right));
+                if (down || right)
+                    && let Some((_, _, opens)) = (self.opens_at.iter()).find(|(row, columns, _)| {
+                        mouse.row == *row && columns.contains(&mouse.column)
+                    })
+                    && let Some(opens) = clicked(opens, right)
                 {
-                    self.follow(&format!("{}{opens}", screen::BUTTON));
+                    self.follow(&opens);
                     return true;
                 }
                 if !in_pane && self.composer_mouse(mouse) {
@@ -12775,14 +12754,10 @@ impl App {
         open: bool,
     ) -> (Vec<Line<'static>>, Vec<(usize, screen::Mark)>) {
         let mut rows = Vec::new();
+        // By the task's whole name, as words from another agent are, which
+        // opens it as any agent's name drawn does.
         if let Some(task) = &ask.task {
-            rows.push(
-                Line::from(vec![
-                    Span::raw("↳ From "),
-                    Span::raw(task.name.clone()).fg(Color::Blue),
-                ])
-                .dim(),
-            );
+            rows.push(Line::from(format!("↳ From {}", task.bot)).dim());
         }
         let card = asks::card(ask, state, !open, self.width);
         let from = rows.len();
@@ -13007,6 +12982,10 @@ impl App {
             if !known {
                 // Pinned again, as an answer taken back unread: open anew.
                 self.settled.remove(&key);
+                // The task asking is there: its name opens it at once.
+                if let Some(task) = &ask.task {
+                    self.names.get_mut().learn(task.bot.clone(), true);
+                }
                 self.commit_ask(&ask);
                 // Oldest first, as the turns that asked them count, as the
                 // lead's own are: one read late goes where it was asked.
@@ -13357,6 +13336,14 @@ impl App {
         {
             let job = self.suggesting.take().unwrap();
             self.suggestion = job.await.ok().flatten();
+            // The agent it came from, found kept there: its name opens it.
+            if let Some(suggest::Origin::Agent(name)) = self
+                .suggestion
+                .as_ref()
+                .and_then(|guess| guess.from.as_ref())
+            {
+                self.names.get_mut().learn(name.clone(), true);
+            }
         }
     }
 
@@ -13995,7 +13982,7 @@ impl App {
             cursor_row += 1;
         }
         let mut composer_at = None;
-        let mut counter_at = Vec::new();
+        let mut opens_at = Vec::new();
         // The reply's open line, wrapped as it will be written: it grows
         // here row by row until its newline writes it into the history.
         let mut open_rows = self.open_rows(width.min(measure()));
@@ -14503,7 +14490,33 @@ impl App {
                 return;
             }
             edge(frame, gap, composer, pad);
+            // The agent the guess came from opens it, as its name does
+            // wherever it is drawn: its last word, once it is an agent's.
+            let cue = (self.suggested())
+                .and_then(|guess| match &guess.from {
+                    Some(suggest::Origin::Agent(name)) => Some(name),
+                    _ => None,
+                })
+                .and_then(|name| {
+                    let row = composer_rows.first()?;
+                    let last = row.spans.last()?;
+                    (last.content == name.as_str()).then_some((row.width(), name))
+                })
+                .and_then(|(width, name)| {
+                    let link = self.names.borrow_mut().link(name)?;
+                    let x = composer.x + (width - name.width()) as u16;
+                    let y = composer.y + heading.is_some() as u16;
+                    Some((y, x..(x + name.width() as u16).min(composer.right()), link))
+                });
             frame.render_widget(Paragraph::new(composer_rows), composer);
+            if let Some((y, columns, link)) = cue
+                && y < composer.bottom()
+            {
+                for x in columns.clone() {
+                    frame.buffer_mut()[(x, y)].set_fg(Color::Blue);
+                }
+                opens_at.push((y, columns, link));
+            }
             // The mouse finds the text under the row over it.
             let text = match heading {
                 Some(_) => Rect {
@@ -14530,9 +14543,10 @@ impl App {
                 None => self.footer(width.min(measure())),
             };
             frame.render_widget(Paragraph::new(line), footer);
-            counter_at = (opens.into_iter())
-                .map(|(at, link)| (footer.y, footer.x + at.start..footer.x + at.end, link))
-                .collect();
+            opens_at.extend((opens.into_iter()).map(|(at, link)| {
+                let link = format!("{}{link}", screen::BUTTON);
+                (footer.y, footer.x + at.start..footer.x + at.end, link)
+            }));
         };
         let look = look::Look::now();
         let drawn = terminal.draw(|frame| {
@@ -14548,7 +14562,7 @@ impl App {
         // Only the links that changed, or that the frame drew over.
         let linked = self.links_written.changed(linked, drawn.buffer);
         self.composer_at = composer_at;
-        self.counter_at = counter_at;
+        self.opens_at = opens_at;
         // Over themselves, the cursor kept where the frame left it.
         if !linked.is_empty() {
             execute!(
@@ -14622,12 +14636,10 @@ impl App {
             ];
             if let Some((from, _)) = cue {
                 spans.push(Span::raw("  ↳ ").dim());
-                // An agent in the agents' colour, as "↳ From …" rows name
-                // one; the margin, the commons and "earlier" in words.
-                spans.push(match from {
-                    suggest::Origin::Agent(name) => Span::raw(name.clone()).fg(Color::Blue).dim(),
-                    other => Span::raw(other.name().to_owned()).dim(),
-                });
+                // An agent by its name, which opens it as anywhere (the
+                // draw links it); the margin, the commons and "earlier" in
+                // words.
+                spans.push(Span::raw(from.name().to_owned()).dim());
             }
             return (vec![Line::from(spans)], (0, prompt::LEAD));
         }
@@ -15310,6 +15322,17 @@ fn shimmer(text: &str, since: Duration) -> Vec<Span<'static>> {
 /// else `manual`.
 fn person_gate(call: &Value) -> &str {
     call["asked"][0]["tag"].as_str().unwrap_or("manual")
+}
+
+/// Where a click on `link` goes: the link itself, or with the `right`
+/// button the other way to an agent (its tab or a look beside), as a right
+/// click on its name in the conversation goes; anything else takes none.
+fn clicked(link: &str, right: bool) -> Option<String> {
+    match (right, link.strip_prefix(links::AGENT)) {
+        (false, _) => Some(link.to_owned()),
+        (true, Some(bot)) => Some(format!("{}other/{bot}", screen::BUTTON)),
+        (true, None) => None,
+    }
 }
 
 fn short(bot: &str, project: &str, lead: &str) -> String {
@@ -17086,6 +17109,11 @@ mod tests {
         assert_eq!(
             row(&app, 80),
             "› check pricing's failing test  tab  ↳ shop.pricing"
+        );
+        // Kept there, its name opens it, as wherever an agent is named.
+        assert_eq!(
+            app.names.borrow_mut().link("shop.pricing").as_deref(),
+            Some("sonny:agent/shop.pricing")
         );
         // Too narrow for both: the guess keeps the room.
         assert_eq!(row(&app, 40), "› check pricing's failing test  tab");
@@ -19163,7 +19191,7 @@ mod tests {
         })
         .await;
         let mut app = app(client);
-        app.land(5, (&long, ""), (None, false, false), false);
+        app.land(5, (&long, ""), (None, false), false);
         let texts = |app: &mut App| -> Vec<String> {
             (drawn(app).into_iter())
                 .map(|row| row.trim_end().to_owned())
@@ -19246,7 +19274,7 @@ mod tests {
         let mut app = app(client);
         app.width = 80;
         let quotes = "\n\ncalc.fix replied:\n> Fixed **it**.\n> 1\n> 2\n> 3\n> 4\n> 5\n> 6\n> 7";
-        app.land(6, ("ship that", quotes), (None, false, false), false);
+        app.land(6, ("ship that", quotes), (None, false), false);
         let rows = drawn(&mut app);
         let rows: Vec<&str> = rows.iter().map(|row| row.trim_end()).collect();
         assert_eq!(
@@ -19277,7 +19305,7 @@ mod tests {
             transcript::reply("Merged it.", 80, std::path::Path::new("/")),
         );
         app.saw_reply(4, "Merged it.");
-        app.land(6, ("and tag it", ""), (None, false, false), false);
+        app.land(6, ("and tag it", ""), (None, false), false);
         app.commit_said(
             8,
             transcript::reply("Tagged 0.4.0.", 80, std::path::Path::new("/")),
@@ -19419,7 +19447,7 @@ mod tests {
         };
         // Attached mid-turn: the history drew the message and what the bot
         // reacted with so far, and the turn's start comes again after it.
-        app.land(5, ("ship it", ""), (None, false, false), false);
+        app.land(5, ("ship it", ""), (None, false), false);
         app.daemon(react("c1", "👀")).await;
         app.daemon(turn_event("tool_completed", 4, json!({"call_id": "c1"})))
             .await;
@@ -19445,7 +19473,7 @@ mod tests {
     async fn the_leads_reaction_goes_under_the_persons_message_wherever_it_is() {
         let client = daemon_answering(|_| json!({})).await;
         let mut app = app(client);
-        app.land(5, ("ship it", ""), (None, false, false), false);
+        app.land(5, ("ship it", ""), (None, false), false);
         app.commit(vec![Line::from("• Shipped.")]);
         app.picked.set(5, "calc.lead", "👀", false);
         app.place_picked(5);
@@ -19471,7 +19499,7 @@ mod tests {
         );
         // Reacted to before it landed: under it once it does.
         app.picked.set(7, "calc.lead", "👀", false);
-        app.land(7, ("and the notes", ""), (None, false, false), false);
+        app.land(7, ("and the notes", ""), (None, false), false);
         assert_eq!(drawn(&mut app).last().unwrap(), "   👀 calc.lead ");
     }
 
@@ -19944,29 +19972,17 @@ mod tests {
         app.land(
             4,
             ("The build is green.\nI pushed the fix to calc.add.", ""),
-            (Some("calc.add"), false, false),
+            (Some("calc.add"), false),
             false,
         );
         assert_eq!(drawn(&mut app), ["↳ From calc.add ▸"]);
-        // An agent's name takes the agents' colour; a person's never does.
-        let blue = |app: &App, node| {
-            (app.relayed_lines(node, 80).iter())
+        // Its sender is a word like any other: the screen colors it, and
+        // opens the agent from it, once it is an agent's name.
+        assert!(
+            (app.relayed_lines(4, 80).iter())
                 .flat_map(|line| &line.spans)
-                .any(|span| span.style.fg == Some(Color::Blue))
-        };
-        assert!(blue(&app, 4));
-        app.relayed.insert(
-            40,
-            Relayed {
-                head: "From ana".into(),
-                from: Some("ana".into()),
-                person: true,
-                attached: false,
-                text: None,
-            },
+                .all(|span| span.style.fg.is_none())
         );
-        assert!(!blue(&app, 40));
-        app.relayed.remove(&40);
         // A click on one opens it whole, and again shuts it.
         app.follow("sonny:said/4");
         let button = app.pressed.pop().unwrap();
@@ -19991,7 +20007,7 @@ mod tests {
         // and says what the agent did while it said nothing.
         let updates = "Task updates: what happened in your tasks since you last heard.\n\
             - calc.neg: turn:calc.neg/3 completed";
-        app.land(5, (updates, ""), (None, false, false), false);
+        app.land(5, (updates, ""), (None, false), false);
         let steer =
             r#""$AGENT_BIN" run --detach --delivery steer --bot calc.neg -- 'Check div too.'"#;
         app.commit_call(
@@ -20026,7 +20042,7 @@ mod tests {
         assert_eq!(drawn(&mut app), [shut]);
         // The agent's words end it: what comes after starts anew.
         app.commit(vec![Line::from("• calc.neg is done.")]);
-        app.land(6, (updates, ""), (None, false, false), false);
+        app.land(6, (updates, ""), (None, false), false);
         assert_eq!(
             drawn(&mut app)[2..],
             [
@@ -20036,12 +20052,12 @@ mod tests {
             ]
         );
         // The person's own words are drawn as ever.
-        app.land(7, ("thanks", ""), (None, false, false), false);
+        app.land(7, ("thanks", ""), (None, false), false);
         assert_eq!(drawn(&mut app).iter().rev().nth(1).unwrap(), "› thanks");
         // A message a page drawn again put in a newer cluster opens there,
         // not in the cluster its rows were let go from.
         app.next_group = 9;
-        app.land(8, (updates, ""), (None, false, false), false);
+        app.land(8, (updates, ""), (None, false), false);
         let stale = Cluster {
             entries: vec![Gathered::Message(Clustered {
                 node: 8,
@@ -20082,26 +20098,21 @@ mod tests {
         .await;
         let mut app = app(client);
         app.width = 80;
-        app.land(3, ("What changed?", ""), (None, false, false), false);
+        app.land(3, ("What changed?", ""), (None, false), false);
         let mine = drawn(&mut app).len();
         // Read with the person's message: right under it, a clip for an
         // arrow, and no message the bot answers.
-        app.land(4, (note, ""), (Some("an automation"), false, true), false);
+        app.land(4, (note, ""), (Some("an automation"), true), false);
         let rows = drawn(&mut app);
         assert_eq!(rows[mine..], ["  📎 From an automation ▸"], "{rows:?}");
         assert_eq!(app.answering.as_ref().map(|(_, _, node)| *node), Some(3));
         // Another joins it; a message between agents does not.
-        app.land(5, (note, ""), (Some("calc.add"), false, true), false);
+        app.land(5, (note, ""), (Some("calc.add"), true), false);
         assert_eq!(
             drawn(&mut app)[mine..],
             ["  📎 2 attached notes · an automation, calc.add ▸"]
         );
-        app.land(
-            6,
-            ("Check div too.", ""),
-            (Some("calc.add"), false, false),
-            false,
-        );
+        app.land(6, ("Check div too.", ""), (Some("calc.add"), false), false);
         assert_eq!(
             drawn(&mut app)[mine..],
             [
@@ -20125,7 +20136,7 @@ mod tests {
             ]
         );
         // The person's own words attached are theirs, as ever.
-        app.land(7, ("thanks", ""), (None, false, true), false);
+        app.land(7, ("thanks", ""), (None, true), false);
         assert_eq!(drawn(&mut app).iter().rev().nth(1).unwrap(), "› thanks");
     }
 
@@ -21096,7 +21107,9 @@ mod tests {
         let ask = app.asks[0].clone();
         assert_eq!(ask.id, "ask:2/q1");
         let rows: Vec<String> = app.pending.iter().map(|l| l.to_string()).collect();
-        assert_eq!(rows[..2], ["↳ From ask", "? Ship it?"]);
+        // By the task's whole name, which opens it as any agent's does:
+        // in the agents' color, a click on it opening the task.
+        assert_eq!(rows[..2], ["↳ From calc.ask", "? Ship it?"]);
         let hint: String = (asks::hint(&ask, 0, 1, 80).iter())
             .map(|span| span.content.as_ref())
             .collect();
@@ -21104,6 +21117,34 @@ mod tests {
         // Pinned once, however often the fleet is read.
         app.pin_task_asks();
         assert_eq!((app.asks.len(), app.pending.len()), (1, rows.len()));
+        {
+            use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+            app.flush();
+            let area = Rect::new(0, 0, 40, 20);
+            let mut buf = ratatui::buffer::Buffer::empty(area);
+            let names = &app.names;
+            app.screen
+                .render(area, &mut buf, |word| names.borrow_mut().link(word));
+            let row = |y| (0..40).map(|x| buf[(x, y)].symbol()).collect::<String>();
+            let at = (0..20).find(|&y| row(y).starts_with("↳ From")).unwrap();
+            assert_eq!(buf[(7, at)].fg, Color::Blue);
+            assert_eq!(buf[(6, at)].fg, Color::Reset);
+            let click = |kind| MouseEvent {
+                kind,
+                column: 9,
+                row: at,
+                modifiers: KeyModifiers::NONE,
+            };
+            app.screen
+                .mouse(click(MouseEventKind::Down(MouseButton::Left)));
+            let action = app
+                .screen
+                .mouse(click(MouseEventKind::Up(MouseButton::Left)));
+            assert_eq!(
+                action,
+                Some(screen::Action::Open("sonny:agent/calc.ask".into()))
+            );
+        }
         // Drawn again from the start, as a repaint does, it is pinned again.
         app.forget_asks();
         app.pin_task_asks();
@@ -21863,7 +21904,11 @@ mod tests {
             .map(|span| span.style.fg)
             .collect();
         assert_eq!(marks, [Some(Color::Yellow), Some(Color::Cyan)]);
-        app.counter_at = vec![(20, 10 + counter.start..10 + counter.end, "status")];
+        app.opens_at = vec![(
+            20,
+            10 + counter.start..10 + counter.end,
+            "sonny:status".into(),
+        )];
         let click = |column| {
             Event::Mouse(MouseEvent {
                 kind: MouseEventKind::Down(MouseButton::Left),
@@ -21876,6 +21921,22 @@ mod tests {
         assert!(app.pane.is_none());
         app.key(click(10 + counter.start)).await;
         assert!(app.pane.as_ref().is_some_and(pane::Pane::is_card));
+    }
+
+    #[test]
+    fn a_right_click_on_an_agent_goes_the_other_way_and_on_a_count_nowhere() {
+        // The agent a guess came from, as its name anywhere.
+        let agent = "sonny:agent/shop.fix";
+        assert_eq!(clicked(agent, false).as_deref(), Some(agent));
+        assert_eq!(
+            clicked(agent, true).as_deref(),
+            Some("sonny:other/shop.fix")
+        );
+        assert_eq!(
+            clicked("sonny:status", false).as_deref(),
+            Some("sonny:status")
+        );
+        assert_eq!(clicked("sonny:status", true), None);
     }
 
     #[test]
@@ -23315,7 +23376,7 @@ mod tests {
         app.commit_call("p1", Some(1), "plan", &plan, "Plan set.", false);
         let updates = "Task updates: what happened in your tasks since you last heard.\n\
             - calc.neg: turn:calc.neg/3 completed";
-        app.land(5, (updates, ""), (None, false, false), false);
+        app.land(5, (updates, ""), (None, false), false);
         let steer = |bot: &str| {
             json!({"command": format!(
                 r#""$AGENT_BIN" run --detach --delivery steer --bot {bot} -- 'Check div too.'"#
@@ -23453,7 +23514,7 @@ mod tests {
             )
         };
         let land = |app: &mut App, node: i64, task: &str| {
-            app.land(node, (&news(task), ""), (None, false, false), false);
+            app.land(node, (&news(task), ""), (None, false), false);
         };
         let texts = |app: &App| -> Vec<String> {
             (app.screen.texts().iter())

@@ -8,7 +8,7 @@
 //! agents make of it is theirs.
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
-    style::{Color, Stylize},
+    style::Stylize,
     text::{Line, Span},
 };
 use serde_json::{Value, json};
@@ -1609,10 +1609,9 @@ impl View {
         for post in read["posts"].as_array().into_iter().flatten() {
             out.push(Line::default());
             let mut head = vec![
-                // An agent's name in the agents' hue, as everywhere.
-                Span::raw(post["by"].as_str().unwrap_or_default().to_owned())
-                    .fg(Color::Blue)
-                    .bold(),
+                // Its writer by name: one of this daemon's agents takes the
+                // agents' hue and opens, as wherever an agent is named.
+                Span::raw(post["by"].as_str().unwrap_or_default().to_owned()).bold(),
             ];
             // The model it was written with, as people say it.
             if let Some(model) = post["model"].as_str() {
