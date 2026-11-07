@@ -3558,6 +3558,9 @@ struct App {
     /// What `/status` read of each idle agent's history: its last turn
     /// then, and the question left open.
     asks_seen: HashMap<String, (i64, Seen)>,
+    /// The turn of each task whose reply this window, with no fleet to
+    /// hear it end, last set checking ([`waiting::spawn`]).
+    checks_set: HashMap<String, i64>,
     /// Each running task's newest node when its questions were last
     /// read: read again only once it grew.
     running_heads: HashMap<String, i64>,
@@ -5139,6 +5142,7 @@ impl App {
             suggesting: None,
             suggestion: None,
             asks_seen: HashMap::new(),
+            checks_set: HashMap::new(),
             running_heads: HashMap::new(),
             status_read: HashMap::new(),
             sounds: sound::Sounds::new(false),
@@ -6658,24 +6662,22 @@ impl App {
                             _ => {
                                 let seen = self.scan(&bot, Some(last)).await;
                                 self.asks_seen.insert(bot.clone(), (last, seen.clone()));
-                                // With no layout, no fleet hears it end: a
-                                // turn just ended is checked from here.
-                                if self.fleet.is_none()
-                                    && turn["status"] == "completed"
-                                    && turn["finished_ms"]
-                                        .as_u64()
-                                        .is_some_and(waiting::just_ended)
-                                {
-                                    waiting::spawn(
-                                        self.client.clone(),
-                                        store.clone(),
-                                        bot.clone(),
-                                        last,
-                                    );
-                                }
                                 seen
                             }
                         };
+                        // With no layout, no fleet hears it end: a turn
+                        // just ended is checked from here, once, whoever
+                        // read its history first.
+                        if self.fleet.is_none()
+                            && turn["status"] == "completed"
+                            && turn["finished_ms"]
+                                .as_u64()
+                                .is_some_and(waiting::just_ended)
+                            && self.checks_set.get(&bot) != Some(&last)
+                        {
+                            self.checks_set.insert(bot.clone(), last);
+                            waiting::spawn(self.client.clone(), store.clone(), bot.clone(), last);
+                        }
                         done = seen.itself
                             || resolved::holds(resolved::read(&store, &bot), seen.turn, false);
                         // One the lead resolved set its question aside.

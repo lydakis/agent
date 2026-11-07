@@ -46,28 +46,22 @@ pub fn note(store: &Path, bot: &str, named: &[String]) -> Result<(), String> {
     if named.is_empty() {
         return Ok(());
     }
-    let mut kept = read(store, bot);
-    let before = kept.clone();
-    for review in named {
-        kept.retain(|k| *k != review);
-        kept.push(review);
-    }
-    if kept.len() > MOST {
-        kept.drain(..kept.len() - MOST);
-    }
-    if kept == before {
-        return Ok(());
-    }
-    let path = file(store, bot);
-    let failed = |e: std::io::Error| format!("{}: {e}", path.display());
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(failed)?;
-    }
-    // Its own, so two writers never write one file together.
-    let next = path.with_extension(format!("json.{}.next", std::process::id()));
-    let json = serde_json::to_vec(&kept).map_err(|e| e.to_string())?;
-    std::fs::write(&next, json).map_err(failed)?;
-    std::fs::rename(&next, &path).map_err(failed)
+    crate::waiting::locked(&dir(store), || {
+        let mut kept = read(store, bot);
+        let before = kept.clone();
+        for review in named {
+            kept.retain(|k| *k != review);
+            kept.push(review);
+        }
+        if kept.len() > MOST {
+            kept.drain(..kept.len() - MOST);
+        }
+        if kept == before {
+            return Ok(());
+        }
+        let json = serde_json::to_vec(&kept).map_err(|e| e.to_string())?;
+        crate::waiting::replace(&file(store, bot), &json)
+    })
 }
 
 /// How `/status` says them: the latest, with how many in all when more.

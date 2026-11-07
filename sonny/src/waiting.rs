@@ -115,22 +115,41 @@ pub fn read_file(file: &Path) -> Option<Mark> {
 /// with none the turn alone, which no surface reads as waiting, unless a
 /// later turn's is there already.
 pub fn keep(store: &Path, bot: &str, turn: i64, mark: Option<&Mark>) -> Result<(), String> {
-    if answered(store, bot, turn + 1) {
-        return Ok(());
-    }
-    let path = file(store, bot);
+    locked(&dir(store), || {
+        if answered(store, bot, turn + 1) {
+            return Ok(());
+        }
+        let kept = match mark {
+            Some(mark) => json!({"turn": mark.turn, "for": mark.waiting_for}),
+            None => json!({"turn": turn}),
+        };
+        replace(&file(store, bot), kept.to_string().as_bytes())
+    })
+}
+
+/// Run `write`, a read of a file in `dir` and its replacement, while no
+/// other window runs one there: a check's write never undoes a newer one
+/// another window made between its read and its rename.
+pub fn locked<T>(dir: &Path, write: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    let failed = |e: std::io::Error| format!("{}: {e}", dir.display());
+    std::fs::create_dir_all(dir).map_err(failed)?;
+    let lock = (std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true))
+    .open(dir.join(".lock"))
+    .map_err(failed)?;
+    lock.lock().map_err(failed)?;
+    write()
+}
+
+/// Put `bytes` in place of `path` at once, written first beside it under
+/// this process's own name.
+pub fn replace(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let failed = |e: std::io::Error| format!("{}: {e}", path.display());
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(failed)?;
-    }
-    // Its own, so two writers never write one file together.
     let next = path.with_extension(format!("json.{}.next", std::process::id()));
-    let kept = match mark {
-        Some(mark) => json!({"turn": mark.turn, "for": mark.waiting_for}),
-        None => json!({"turn": turn}),
-    };
-    std::fs::write(&next, kept.to_string()).map_err(failed)?;
-    std::fs::rename(&next, &path).map_err(failed)
+    std::fs::write(&next, bytes).map_err(failed)?;
+    std::fs::rename(&next, path).map_err(failed)
 }
 
 /// Whether what `bot`'s turn `turn`, or a later one, left waiting is kept.
