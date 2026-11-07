@@ -115,7 +115,7 @@ fn start() -> Value {
             folder where it is. With setup, the folder's .agents/setup runs in the task's folder first. The task starts there with this folder's rules, skills and \
             memory, in the role named, and the brief as its first message. Paths in this folder that the brief \
             names are turned into the task's own. The result is the task's turn handle; its work comes back on \
-            its branch, here already as it commits. A start that fails leaves no folder behind.",
+            its branch, here already as it commits.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -135,6 +135,9 @@ fn start() -> Value {
                     "description": "An empty folder of the task's own instead of a worktree or this folder: \
                         for work that makes its own copy of what it changes, such as a workspace on another \
                         branch made with this folder's tooling, or that must not touch this folder."},
+                "tab": {"type": "boolean",
+                    "description": "A tab of its own, for a task the person will want to watch or talk to, \
+                        asked or not."},
                 "setup": {"type": "boolean",
                     "description": "Run the folder's .agents/setup in the copy first: true for a task \
                         that will change files, false for one that only reads."},
@@ -165,6 +168,25 @@ fn start() -> Value {
         // A setup script may build for minutes.
         "expire_ms": 20 * 60 * 1000
     })
+}
+
+/// Open the task `name` just started in a tab of its own, as its starter
+/// asked: said after the start's result only when it could not. With
+/// `task_tabs = "every"`, the lead's Sonny opens it as its turn starts.
+async fn tab(caller: &str, project: &str, name: &str) -> String {
+    let every = agent_client::config::load()
+        .is_ok_and(|c| c.sonny.task_tabs == agent_client::config::TaskTabs::Every);
+    if every {
+        return String::new();
+    }
+    let name = name.trim();
+    let bot = match name.strip_prefix(&format!("{project}.")) {
+        Some(_) => name.to_owned(),
+        None => format!("{project}.{name}"),
+    };
+    crate::task_tab(caller, &bot)
+        .await
+        .unwrap_or_else(|error| format!("\n\nNo tab opened for it: {error}"))
 }
 
 fn remove() -> Value {
@@ -239,8 +261,7 @@ fn subscriptions() -> Value {
             Add steer yourself for what you own; a filter or a digest only when the person asks for one: \
             what a filter leaves out you never hear, and a digest makes you late. Add one, or remove one by \
             name; with neither, or after either, the result lists them all, with \
-            the sources there are and the fields their events lately had, to filter on. Adding one again \
-            changes nothing; one by a name in use that differs is refused with the field, so remove it first.",
+            the sources there are and the fields their events lately had, to filter on.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -294,13 +315,17 @@ fn subscriptions() -> Value {
 fn automations() -> Value {
     json!({
         "name": AUTOMATIONS,
-        "description": "Your automations, which wake an agent later, again and again, or when something \
-            happens, even with Sonny closed (a Mac keeps watch). Each run gives the agent the message in its \
-            own conversation after a line with the run's time and what started it; a run while the agent is working \
-            waits for its work, one run of a repeating automation at a time. Add one, or remove, run or show one by name; with none, the result lists \
-            them all with any problems. Adding the same one again changes nothing; a different one under a name \
-            in use is refused with the field that differs unless replace is set. Write the message as what to \
-            check and when to stop, including removing its own automation once the work is done.",
+        // Its gate judges what `automate` puts to it: an add, a removal
+        // or a run, not a look.
+        "steps": true,
+        "description": "Your automations, which wake an agent later, repeatedly, or when something \
+            happens, even with Sonny closed. Each run gives the agent the message in its own conversation, \
+            after a line saying when and why it ran; a run waits for the agent's work, one run of an automation \
+            at a time. Add one, or remove, run or show one by name; with none, the result lists yours (those \
+            that wake you, answer to you or start an agent you added) with any problems. Adding the same one \
+            again changes nothing; a different one under a name in use is refused with the field that differs \
+            unless replace is set. Write the message as what to check and when to stop, and to remove its \
+            automation once the work is done.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -482,10 +507,9 @@ fn show() -> Value {
     json!({
         "name": SHOW,
         "description": "Put an agent's window where the person asks, or where they should watch it now: a tab \
-            of its own, the default, or a split on one side of yours, or of the agent beside names, or \
-            floating over that window for a moment where the terminal can float it. Another project's \
-            lead (PROJECT.lead) opens in its project's own home instead, unless it is open there already. \
-            Every agent you start gets a tab of its own when its turn starts, without this.",
+            of its own, the default, a split beside yours or the agent beside names, or floating over that \
+            window where the terminal can float it. Another project's lead (PROJECT.lead) opens in its \
+            project's own home, unless open there already.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -511,9 +535,8 @@ fn run() -> Value {
             the command exits so its output can be read. Running the same name again replaces its pane. A tab \
             is the default; a split puts it beside you, for something the person should see now, and float \
             over your window, where the terminal can float it, for a quick look. A command that needs the \
-            person's own keyboard (a sign-in, a password or passphrase prompt, ssh -t) sits unnoticed in a \
-            pane: ask them with ask and its command instead, so the step shows as theirs to take. The \
-            result holds the pane's ID as block.",
+            person's own keyboard (a sign-in, a password prompt, ssh -t) goes to them through ask and its \
+            command instead. The result holds the pane's ID as block.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -652,6 +675,13 @@ async fn called(name: &str, arguments: &Value) -> Answer {
             };
             let started = crate::task::start(&line.folder, &line.project, &caller, &start)
                 .map_err(|e| ("task_not_started", e))?;
+            let started = match arguments["tab"] == true {
+                true => format!(
+                    "{started}{}",
+                    tab(&caller, &line.project, &start.name).await
+                ),
+                false => started,
+            };
             // What the lead's gone tasks left, which only it can clear.
             let left = match line.lead {
                 true => crate::task::left_behind(&line.folder, &line.project),
@@ -808,6 +838,20 @@ async fn called(name: &str, arguments: &Value) -> Answer {
             }
             Ok(said.to_string())
         }
+        crate::asks::CLOSE => {
+            // The bot whose history holds the ask: a side chat's own.
+            let asker = std::env::var("AGENT_CALL_BOT").unwrap_or(caller);
+            // This call is in the history it reads: it closes nothing yet.
+            let (call, turn) = (
+                std::env::var("AGENT_CALL").ok(),
+                std::env::var("AGENT_TURN"),
+            );
+            let turn = turn.ok().and_then(|t| t.parse::<i64>().ok());
+            let this = turn.zip(call.as_deref());
+            crate::asks::served_close(arguments, &asker, this)
+                .await
+                .map_err(|e| ("ask_close_refused", e))
+        }
         crate::asks::TOOL => {
             // A deadline is a trigger, whose add runs on a runtime of its own.
             // Its card is in the history of the bot that asked, a side chat
@@ -828,19 +872,30 @@ async fn called(name: &str, arguments: &Value) -> Answer {
             .map_err(|e| ("ask_refused", e))
         }
         AUTOMATIONS => {
+            // The daemon's store says whose automations are the caller's:
+            // its id there, as fires deliver to it.
+            let client = match crate::daemon_paths(None, None) {
+                Ok((_, socket)) => Client::connect(&socket).await.ok().map(|(c, _)| c),
+                Err(_) => None,
+            };
+            let caller = crate::trigger::Caller {
+                id: std::env::var("AGENT_BOT_ID")
+                    .ok()
+                    .and_then(|id| id.parse().ok()),
+                store: client.as_ref().and_then(|c| c.store()).map(str::to_owned),
+            };
             // A trigger's add runs on a runtime of its own.
             let arguments = arguments.clone();
-            let mut said = tokio::task::spawn_blocking(move || crate::trigger::tool(&arguments))
-                .await
-                .map_err(|e| ("tool_failed", e.to_string()))?
-                .map_err(|e| ("automation_refused", e))?;
+            let mut said =
+                tokio::task::spawn_blocking(move || crate::trigger::tool(&arguments, &caller))
+                    .await
+                    .map_err(|e| ("tool_failed", e.to_string()))?
+                    .map_err(|e| ("automation_refused", e))?;
             // How the turns their last fires sent ended, as the person's
             // `/background` shows them; without the daemon, as the files say.
             // Only a trigger made on this daemon's store: a turn handle names
             // a bot and a turn, which another store's daemon has its own of.
-            if let Ok((_, socket)) = crate::daemon_paths(None, None)
-                && let Ok((client, _events)) = Client::connect(&socket).await
-            {
+            if let Some(client) = client {
                 let ours: Vec<Value> = match (client.store(), crate::trigger::Places::home()) {
                     (Some(store), Ok(places)) => crate::trigger::on_store(&places, store)
                         .into_iter()
@@ -1204,6 +1259,9 @@ async fn serve(store: PathBuf, socket: PathBuf, nudge: Arc<Notify>, serving: Ser
                                 Some(EXEC) => script(&hub, &client, &call).await,
                                 Some(BROWSER) => browse(&client, &call).await,
                                 Some(DESKTOP) => desktop(&client, &call).await,
+                                Some(AUTOMATIONS) => automate(&client, &call, &me, &store, &socket)
+                                    .await
+                                    .map(Value::String),
                                 _ => answer(&client, &call, &me, &store, &socket)
                                     .await
                                     .map(Value::String),
@@ -1489,6 +1547,50 @@ async fn browse(client: &Arc<Client>, call: &Value) -> Result<Value, (&'static s
     }
 }
 
+/// Whether an `automations` call only looks: it lists them or shows one,
+/// and adds, removes and runs none.
+fn looks(arguments: &Value) -> bool {
+    ["add", "remove", "run"]
+        .iter()
+        .all(|key| arguments.get(key).is_none_or(Value::is_null))
+}
+
+/// Answer an `automations` call: one that adds, removes or runs one is a
+/// step the agent's gate judges first, as a script's calls are; a look
+/// runs unjudged, as reads do.
+async fn automate(
+    client: &Arc<Client>,
+    call: &Value,
+    me: &Path,
+    store: &Path,
+    socket: &Path,
+) -> Answer {
+    if looks(&call["arguments"]) {
+        return answer(client, call, me, store, socket).await;
+    }
+    let bot = str_of(&call["bot"]);
+    unreviewed(client, &bot, &Value::Null, AUTOMATIONS).await?;
+    let steps = crate::exec::Steps::new(
+        client.clone(),
+        bot,
+        call["turn"].as_i64().unwrap_or(0),
+        str_of(&call["call_id"]),
+    );
+    let asked = std::time::Instant::now();
+    let step = (steps
+        .ask(AUTOMATIONS, AUTOMATIONS, call["arguments"].clone())
+        .await)
+        .map_err(|e| ("automation_refused", e))?;
+    // The daemon's clock for the call stood still while the gate weighed
+    // it, so this one does too.
+    let call = later(call, asked.elapsed());
+    let answered = answer(client, &call, me, store, socket).await;
+    if let Some(step) = step {
+        steps.ran(step, answered.is_err()).await;
+    }
+    answered
+}
+
 /// Answer a `desktop` call in the host, with the agent's gate judging what
 /// acts on the desktop.
 async fn desktop(client: &Arc<Client>, call: &Value) -> Result<Value, (&'static str, String)> {
@@ -1536,6 +1638,15 @@ async fn unreviewed(
 }
 
 /// The time a call has left before the daemon gives up on it.
+/// `call` with its time to answer moved `by` later.
+fn later(call: &Value, by: Duration) -> Value {
+    let mut call = call.clone();
+    if let Some(expires) = call["expires_ms"].as_u64() {
+        call["expires_ms"] = json!(expires.saturating_add(by.as_millis() as u64));
+    }
+    call
+}
+
 fn left(call: &Value) -> Duration {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1622,8 +1733,11 @@ async fn answer(client: &Client, call: &Value, me: &Path, store: &Path, socket: 
         None => record.clone(),
     };
     let name = call["name"].as_str().unwrap_or_default();
-    // That bot, by its id, not one given its name since.
-    unreviewed(client, bot, &record["bot_id"], name).await?;
+    // That bot, by its id, not one given its name since. `automate` has
+    // seen to an automations call: a look needs no one to review it.
+    if name != AUTOMATIONS {
+        unreviewed(client, bot, &record["bot_id"], name).await?;
+    }
     // As the calling turn runs, which keeps its folder and model when the
     // bot's own change for a turn after it.
     let turn = call["turn"].as_i64().unwrap_or(0);

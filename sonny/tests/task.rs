@@ -84,6 +84,7 @@ impl Lab {
             .env("AGENT_BOT", self.bot.borrow().as_str())
             .env("AGENT_BOT_ID", "1")
             .env("HOME", &self.home)
+            .env_remove("XDG_STATE_HOME")
             .env("AGENT_BIN", &self.agent)
             .env("AGENT_LOG", self.scratch.join("run.log"))
             .env("AGENT_STORE", self.store())
@@ -435,6 +436,7 @@ fn a_task_starts_with_the_agent_installed_beside_sonny() {
         .current_dir(&lab.repo)
         .env("GIT_CEILING_DIRECTORIES", env!("CARGO_TARGET_TMPDIR"))
         .env("HOME", &lab.home)
+        .env_remove("XDG_STATE_HOME")
         .env("AGENT_BOT", "demo.lead")
         .env_remove("AGENT_BIN")
         .env("AGENT_LOG", lab.scratch.join("run.log"))
@@ -800,16 +802,19 @@ fn a_task_outside_git_works_in_an_empty_folder_of_its_own() {
     assert_eq!(after("--workspace"), folder.to_string_lossy());
     // Told the rules of the lead's folder, not of its empty one.
     assert!(ran.join("\n").contains("Build with the workspace tool."));
-    // It writes no folder but its own, and Sonny's zen folder every
-    // sandboxed row writes.
+    // It writes no folder but its own, Sonny's zen folder every sandboxed
+    // row writes, and its lead's state folder, made for the lead alone.
     let writable: Vec<&String> = (ran.iter().zip(ran.iter().skip(1)))
         .filter(|(flag, _)| *flag == "--writable")
         .map(|(_, folder)| folder)
         .collect();
+    let state = std::fs::canonicalize(lab.home.join(".local/state/sonny/agents/demo.lead"))
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    assert!(writable.contains(&&state), "{ran:?}");
     assert!(
-        writable
-            .iter()
-            .all(|folder| folder.ends_with(".agent/sonny/zen")),
+        (writable.iter()).all(|folder| folder.ends_with(".agent/sonny/zen") || **folder == state),
         "{ran:?}"
     );
     // The lead's folder is as it was.

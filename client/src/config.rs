@@ -52,6 +52,7 @@
 //! commons_invites = 3           # least threads a day that send invites (more with the square root of the week's agents), 0 none; answers add up to as many again
 //! commons_invite_tokens = 1000000  # what an invite pays for in its thread
 //! ask_wait_minutes = 60         # how long an unanswered ask waits to go ahead or remind; 0 never
+//! task_tabs = "every"         # which tasks open in a tab: "asked", the default, those an agent or you asked for; "every", each as its turn starts
 //! task_windows = 64            # task windows a lead keeps open, 32 by default; past it the least recently used closes, never one not looked at yet; 0 no limit
 //! sky_haikus = false            # no haikus from the sky's busiest agent, on by default
 //! sky_haiku_daily = 8           # haikus a day at most; 0, the default, no limit but the title's hold
@@ -86,6 +87,7 @@
 //! every = "1m"                  # how long after it exits it runs again
 //! digest = "15m"                # a subscriber hears it at most this often; unset, as it comes
 //! steer = { from = ["boss"] }   # what cuts into a busy subscriber's turn, as a filter is written
+//! watch = ["~/bin/slack-poll"]  # files whose edit starts it again on them; unset, none
 //! [sonny.sources.commons]       # Sonny's own source: the commons threads an agent posted in
 //! digest = "15m"                # the default; 0 at once. Takes digest and steer alone
 //! ```
@@ -485,6 +487,8 @@ pub struct Sonny {
     /// before its agent goes on with what it recommended, where it said
     /// it could, or is reminded of it; 0 lets every ask wait for them.
     pub ask_wait_minutes: u64,
+    /// Which tasks open in a tab of their own in the lead's multiplexer.
+    pub task_tabs: TaskTabs,
     /// How many of its tasks' windows a lead keeps open in its
     /// multiplexer: past it, a new one closes the window the person used
     /// least recently, never one they have not looked at yet; 0 for no
@@ -613,6 +617,7 @@ impl Default for Sonny {
             commons_invite_tokens: 1_000_000,
             commons_source: commons_source(),
             ask_wait_minutes: 60,
+            task_tabs: TaskTabs::default(),
             task_windows: 32,
             sky_haikus: true,
             sky_haiku_daily: 0,
@@ -705,6 +710,17 @@ pub enum AgentOpens {
     Beside,
 }
 
+/// Which tasks open in a tab of their own in the lead's multiplexer:
+/// `"asked"`, the default, those their starter asked a tab for, those an
+/// agent shows, those the person opens and those that come to need them;
+/// or `"every"`, each task as a turn of its starts.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TaskTabs {
+    #[default]
+    Asked,
+    Every,
+}
+
 /// A command Sonny's lookout runs, whose every printed line is news for
 /// the agents subscribed to it by name.
 #[derive(Clone, Debug, PartialEq)]
@@ -721,6 +737,9 @@ pub struct Source {
     /// An event pattern, as a subscription's filter is written: an event
     /// it matches steers, as one the command marks so does.
     pub steer: Option<serde_json::Value>,
+    /// Files whose change starts it again on them, as a service manager
+    /// restarts a unit on its new binary: each from `/` or `~/`.
+    pub watch: Vec<String>,
 }
 
 /// An MCP server, under Codex's key names for `[mcp_servers.NAME]`: a
@@ -1230,6 +1249,7 @@ fn parse(text: &str) -> Result<Config, String> {
                 "commons_invites",
                 "commons_invite_tokens",
                 "ask_wait_minutes",
+                "task_tabs",
                 "task_windows",
                 "sky_haikus",
                 "sky_haiku_daily",
@@ -1416,6 +1436,16 @@ fn parse(text: &str) -> Result<Config, String> {
                 };
                 continue;
             }
+            if key == "task_tabs" {
+                config.sonny.task_tabs = match value.as_str() {
+                    "asked" => TaskTabs::Asked,
+                    "every" => TaskTabs::Every,
+                    other => {
+                        return Err(format!("sonny.task_tabs is asked or every, not {other}"));
+                    }
+                };
+                continue;
+            }
             if key == "agent_opens" {
                 config.sonny.agent_opens = match value.as_str() {
                     "tab" => AgentOpens::Tab,
@@ -1565,6 +1595,7 @@ fn commons_source() -> Source {
         every: None,
         digest: Some(COMMONS_DIGEST.into()),
         steer: None,
+        watch: Vec::new(),
     }
 }
 
@@ -1590,10 +1621,11 @@ fn sources(value: &toml::Value) -> Result<(Vec<Source>, Source), String> {
         let mut every = None;
         let mut digest = None;
         let mut steer = None;
+        let mut watch = Vec::new();
         let own = name == COMMONS_SOURCE;
         for (field, value) in fields {
             match field.as_str() {
-                "command" | "every" if own => {
+                "command" | "every" | "watch" if own => {
                     return Err(format!(
                         "{}: the commons is a source of Sonny's own, which takes digest and steer alone; \
                          name yours another way",
@@ -1616,6 +1648,18 @@ fn sources(value: &toml::Value) -> Result<(Vec<Source>, Source), String> {
                     }
                     steer = Some(serde_json::to_value(value).map_err(|e| e.to_string())?);
                 }
+                "watch" => {
+                    let paths = (value.as_array()).ok_or_else(|| {
+                        format!("{} is a list of files, as [\"~/bin/poll\"]", key(field))
+                    })?;
+                    for path in paths {
+                        let path = string(&key(field), path)?;
+                        if !(path.starts_with('/') || path.starts_with("~/")) {
+                            return Err(format!("{}: {path:?} is a file from / or ~/", key(field)));
+                        }
+                        watch.push(path);
+                    }
+                }
                 _ => return Err(format!("unknown key {}", key(field))),
             }
         }
@@ -1630,6 +1674,7 @@ fn sources(value: &toml::Value) -> Result<(Vec<Source>, Source), String> {
             every,
             digest,
             steer,
+            watch,
         });
     }
     Ok((sources, commons))
@@ -2082,6 +2127,10 @@ mod tests {
         let beside = parse("[sonny]\nagent_opens = \"beside\"").unwrap();
         assert_eq!(beside.sonny.agent_opens, AgentOpens::Beside);
         assert!(parse("[sonny]\nagent_opens = \"window\"").is_err());
+        assert_eq!(config.sonny.task_tabs, TaskTabs::Asked);
+        let every = parse("[sonny]\ntask_tabs = \"every\"").unwrap();
+        assert_eq!(every.sonny.task_tabs, TaskTabs::Every);
+        assert!(parse("[sonny]\ntask_tabs = \"all\"").is_err());
         let closed = parse("[sonny]\nmargin_opens = \"unless-closed\"").unwrap();
         assert_eq!(closed.sonny.margin_opens, MarginOpens::UnlessClosed);
         assert!(config.sonny.chime && !config.sonny.verbose);
@@ -2376,6 +2425,16 @@ mod tests {
             Some(serde_json::json!({"from": ["boss"], "text": [{"prefix": "[prod]"}]}))
         );
         assert_eq!(config.sonny.sources[0].steer, None);
+        // Only the files it names are watched; unset, none.
+        let watched = parse(
+            "[sonny.sources.slack]\ncommand = \"python3 ~/bin/poll.py --cursor state.json\"\nwatch = [\"~/bin/poll.py\", \"/opt/poll/lib.py\"]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            watched.sonny.sources[0].watch,
+            ["~/bin/poll.py", "/opt/poll/lib.py"]
+        );
+        assert!(config.sonny.sources[0].watch.is_empty());
         // The commons is a source of Sonny's own, set as any other.
         assert_eq!(config.sonny.commons_source.digest.as_deref(), Some("15m"));
         let commons =
@@ -2413,6 +2472,18 @@ mod tests {
             (
                 "[sonny.sources.commons]\ncommand = \"x\"",
                 "sonny.sources.commons.command: the commons is a source of Sonny's own, which takes digest and steer alone; name yours another way",
+            ),
+            (
+                "[sonny.sources.slack]\ncommand = \"x\"\nwatch = \"poll.py\"",
+                "sonny.sources.slack.watch is a list of files, as [\"~/bin/poll\"]",
+            ),
+            (
+                "[sonny.sources.slack]\ncommand = \"x\"\nwatch = [\"poll.py\"]",
+                "sonny.sources.slack.watch: \"poll.py\" is a file from / or ~/",
+            ),
+            (
+                "[sonny.sources.commons]\nwatch = [\"~/x\"]",
+                "sonny.sources.commons.watch: the commons is a source of Sonny's own, which takes digest and steer alone; name yours another way",
             ),
             (
                 "[sonny.sources.commons]\ndigest = \"an hour\"",

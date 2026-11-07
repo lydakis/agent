@@ -19,8 +19,9 @@ use agent_runtime::{
     output::{self, Output},
     provider::{Listed, Provider, STREAMS_PER_CONNECTION, Transport},
     store::{
-        Answer, Binding, Bot, Decision, Delivery, FOLDERS_JSON, Fork, Gate, MAX_GATES, Publication,
-        RULES_JSON, Settings, Started, Step, Stepped, Store, TurnOptions, Waiting, Wake,
+        Answer, Binding, Bot, Decision, Delivery, ENV_JSON, FOLDERS_JSON, Fork, Gate, MAX_GATES,
+        Publication, RULES_JSON, Settings, Started, Step, Stepped, Store, TurnOptions, Waiting,
+        Wake,
     },
     tools::{
         ANSWER_BYTES, DECLARED_BYTES, Declared, MAX_DECLARED, Outcome, Registry, validate_declared,
@@ -158,18 +159,21 @@ fn admission_bound(command: &Command, id: &Value, deliveries: usize) -> Bound {
             }),
             output::encoded_len(&(bot, created_by)),
             // The workspace, the writable folders, the Unix sockets,
-            // canonical, and the command rules, which the reply's settings
-            // repeat; a bot another makes takes its creator's rules, and a
-            // sandboxed one's folders.
+            // canonical, the command rules and the variables, which the
+            // reply's settings repeat; a bot another makes takes its
+            // creator's rules and variables, and a sandboxed one's folders.
             usize::from(workspace.is_some()) * PATH_JSON
                 + match created_by {
-                    Some(_) => 2 * FOLDERS_JSON + RULES_JSON,
+                    Some(_) => 2 * FOLDERS_JSON + RULES_JSON + ENV_JSON,
                     None => {
                         (settings.writable.len() * PATH_JSON).min(FOLDERS_JSON)
                             + (settings.unix_sockets.len() * PATH_JSON).min(FOLDERS_JSON)
                             + (settings.rules.as_ref())
                                 .map_or(0, |rules| output::encoded_len(rules).unwrap_or(RULES_JSON))
                                 .min(RULES_JSON)
+                            + output::encoded_len(&settings.env)
+                                .unwrap_or(ENV_JSON)
+                                .min(ENV_JSON)
                     }
                 },
             // Both the bot and its event carry its gates, most of them
@@ -6665,6 +6669,50 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
+    }
+
+    #[tokio::test]
+    async fn a_parked_task_reaped_after_its_turn_resumed_leaves_the_new_task_in_place() {
+        let dir = std::env::temp_dir().join(format!("agent-late-reap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (store, _publications) = Store::open(&dir.join("state.sqlite")).await.unwrap();
+        let turns = running(&store, &["Bob".into()]).await;
+        let bob = turns[0].1;
+        let mut service = bare_service(&store);
+        // Task 1 parked Bob's turn; a wake-up resumed it as task 2 before
+        // task 1 was reaped.
+        service.active.start("Bob".into(), |slot| Active {
+            turn: bob,
+            task: 2,
+            cancel: watch::channel(None).0,
+            steers: Arc::default(),
+            compact: Arc::default(),
+            lift: Arc::default(),
+            slot,
+            given_rules: Default::default(),
+        });
+        let later = now_ms() + 60_000;
+        for exit in [turn::Exit::Paced(later), turn::Exit::Parked] {
+            service
+                .complete("Bob".into(), bob, 1, Ok(exit))
+                .await
+                .unwrap();
+            // Task 2 still owns the bot and its slot, and the old park sets
+            // no wake-up for a turn that already runs.
+            assert_eq!(service.active.get("Bob").map(|a| a.task), Some(2));
+            assert_eq!(service.active.holding(), 1);
+            assert_eq!(service.wakes.next(), None);
+        }
+        // Task 2's own completion is the one that lets the bot go.
+        service
+            .complete("Bob".into(), bob, 2, Ok(turn::Exit::Paced(later)))
+            .await
+            .unwrap();
+        assert!(service.active.is_empty());
+        assert_eq!(service.wakes.next(), Some(later));
+        drop(service);
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

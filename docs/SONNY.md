@@ -27,6 +27,12 @@ Sonny's tool host answers outside the agent's sandbox, since an automation runs
 as the person outside it: `add` (the fields below, as `every`, `cron`, `start {name,
 model, effort}`, `reply_to`, `if`, `runs`, `turn_budget_tokens`, `replace`
 and `message`), `remove`, `run` or `show` NAME, or nothing to list them.
+An agent lists and shows only its own: those that wake it, send their answers
+to it, or start an agent it added; `sonny automation list` lists every one.
+A look acts on nothing and runs as any read does, also for an agent whose
+sandbox no one reviews. An add, a removal or a run is a step its gate judges
+first (`approve_step`), as a script's calls are, and is refused, as the
+other ways out of its sandbox are, for a confined agent with no gate.
 A row whose last fire sent a turn says how that turn ended, as the daemon
 has it: `last.turn_status`, and `last.turn_error` when it did not complete,
 so an agent sees the failure the person sees in `/background`. It does not
@@ -704,9 +710,16 @@ agent reads first rather than every fact; a second `start` before `finish` says 
 keeps the first. `cleanup finish` commits the cleanup and returns what it
 removed, added and changed. A cleanup that removed more than a quarter of
 the lasting facts, and more than two, is `loss_guard` (the `work` facts it
-started with are left out of both counts, since work under way ends): `finish` reverts it with a
-new commit, so memory is as it was at the start and the refused cleanup
-stays in history for the person to read. `changed` fails with `unchanged`
+started with are left out of both counts, since work under way ends): `finish` takes memory back
+to the start with a new commit, puts back what other agents saved or removed
+meanwhile, and the refused cleanup stays in history for the person to read.
+The refusal is written to `.cleanup` first, so a `finish` cut short is
+carried on by the next one rather than closed as a clean cleanup; once
+memory is back at the start, `.cleanup` says so too, and a later `finish`
+only puts back what others saved since, never going back again. A
+`cleanup start` that finds such a refusal closes it the same way and
+answers `loss_guard`, so no run carries on a refused cleanup, and once a
+cleanup is refused its own agents' saves are put back like the others'. `changed` fails with `unchanged`
 when the folder matches the last commit, which is what keeps the automation
 quiet.
 

@@ -1014,6 +1014,30 @@ class SocketAndCliTests(ModelFixture):
         self.assertIn('bot_not_found', (self.path / 'route.err').read_text())
         self.assertEqual(control.request('inspect', bot='Bob')['result']['head'], replacement['head'])
 
+    def test_a_bot_s_variables_reach_its_shell_and_the_bots_it_makes(self):
+        self.agent('run', *self.common, '--new', '--bot', 'Bob', 'hello')
+        control = Connection(self.socket)
+        self.addCleanup(control.close)
+        configured = control.request('configure', bot='Bob', settings={'env': {'SONNY_STATE': '/state/Bob'}})
+        self.assertEqual(configured['result']['changed'], ['env'])
+        # Its own shell sees it, and so does a bot its shell makes, which
+        # takes its creator's whatever it asks for.
+        nested = ('"$AGENT_BIN" run --detach --no-spawn --new --bot Alice -- '
+                  '\'shell:printf "%s" "$SONNY_STATE" > alice-state\'')
+        ran = self.agent('run', *self.again, '--bot', 'Bob', '--pretty',
+                         f'shell:printf "%s" "$SONNY_STATE" > bob-state; {nested}')
+        deadline = time.monotonic() + 5
+        while not (self.path / 'alice-state').exists() and time.monotonic() < deadline:
+            time.sleep(.02)
+        self.assertEqual((self.path / 'bob-state').read_text(), '/state/Bob')
+        self.assertTrue((self.path / 'alice-state').exists(), ran.stdout)
+        self.assertEqual((self.path / 'alice-state').read_text(), '/state/Bob')
+        alice = control.request('inspect', bot='Alice')['result']
+        self.assertEqual(alice['settings']['env'], {'SONNY_STATE': '/state/Bob'})
+        # The daemon's own names stay its own.
+        refused = control.request('configure', bot='Bob', settings={'env': {'AGENT_BOT': 'x'}})
+        self.assertEqual(refused['error'], 'invalid_setting')
+
     def test_creator_identity_is_required_and_survives_daemon_restart(self):
         self.agent('run', *self.common, '--new', '--bot', 'Creator',
                    'shell:printf "%s" "$AGENT_BOT_ID" > own-id')
