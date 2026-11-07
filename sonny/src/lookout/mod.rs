@@ -1248,9 +1248,6 @@ impl Service {
         // files less often.
         let mut tick = tokio::time::interval(SETTLE / 2);
         let mut reread: Option<Instant> = None;
-        // When quiet's schedule was last checked: once a minute, the
-        // lookout being the one process that always runs to start it.
-        let mut quiet_checked: Option<Instant> = None;
         // Past the replay: a turn that ends now left its folder as it is.
         let mut streaming = false;
         loop {
@@ -1493,12 +1490,6 @@ impl Service {
                             lookout.waiting = self.waiting;
                         }
                         self.reread(&client).await;
-                    }
-                    if quiet_checked.is_none_or(|at| now >= at + crate::quiet::READ_EVERY) {
-                        quiet_checked = Some(now);
-                        if let Some(away) = crate::quiet::arm(&crate::quiet::schedule()) {
-                            println!("{}", json!({"event": "quiet", "since": away.since}));
-                        }
                     }
                     for lookout in self.lookouts.values_mut() {
                         lookout.updates.expire(now);

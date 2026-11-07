@@ -9,10 +9,12 @@
 //!   window, a key, click, paste or focus, marked with the per-agent mark
 //!   in [`crate::used`] and as often (at most once every 10 seconds a
 //!   window).
-//! - `away`: there while quiet is on. It says since when and why. The
-//!   lookout, which always runs, starts it on its own; a window starts it
-//!   for `/quiet`; the window the person writes words from ends it, so
-//!   quiet ends for every agent at once.
+//! - `away`: there while quiet is on. It says since when and why. Nothing
+//!   runs to start it: whoever asks whether the person is away (a window's
+//!   minute check, a sound, a message to a lead) and finds them past their
+//!   hours and gone `quiet_after` writes it, with the start the hours and
+//!   `present` give. A window writes it for `/quiet`; the window the person
+//!   writes words from ends it, so quiet ends for every agent at once.
 //!
 //! A glance, a scroll or a focus keeps quiet from starting but does not end
 //! it: opening the laptop at night should not wake every lead. The clock
@@ -197,13 +199,16 @@ fn modified(file: &Path) -> Option<i64> {
     Some(modified.duration_since(UNIX_EPOCH).ok()?.as_secs() as i64)
 }
 
-/// Quiet as its file says now; none while it is off.
+/// Quiet now; none while it is off. The first to ask once the person is
+/// past their hours and gone `quiet_after` starts it, so nothing has to run
+/// to start it on time: until someone asks, nobody needs to know.
 pub fn away() -> Option<Away> {
     // Kept until the file changes: a window asks once a minute and the
     // sound asks on each alert, and an idle window opens no files (A17).
     static KEPT: crate::kept::Slot<Option<Away>> = std::sync::Mutex::new(None);
     let file = away_file()?;
-    crate::kept::read(&KEPT, "away", vec![file.clone()], || (away_at(&file), None))
+    let kept = crate::kept::read(&KEPT, "away", vec![file.clone()], || (away_at(&file), None));
+    kept.or_else(|| arm_at(&schedule(), &present_file()?, &file, now()))
 }
 
 fn away_at(file: &Path) -> Option<Away> {
@@ -229,8 +234,7 @@ fn write(away: Away) -> String {
 }
 
 /// Start quiet, unless it is on: the file appears whole, and only where
-/// none is, so the lookout and a window starting it at once agree on one
-/// start and no reader sees it half written.
+/// none is, so two askers starting it at once agree on one start and no reader sees it half written.
 pub fn start(away: Away) -> Result<(), String> {
     start_at(&away_file().ok_or("HOME is not set")?, away)
 }
@@ -261,13 +265,12 @@ fn end_at(file: &Path) -> Option<Away> {
     away
 }
 
-/// Start quiet if the schedule says it is time: the lookout asks this once
-/// a minute. What it started, if it did.
-pub fn arm(schedule: &Schedule) -> Option<Away> {
-    arm_at(schedule, &present_file()?, &away_file()?, now())
-}
-
+/// Start quiet if the schedule says it is time: what it started, if it
+/// did. With no hours, not even `present` is looked at.
 fn arm_at(schedule: &Schedule, present: &Path, file: &Path, now: i64) -> Option<Away> {
+    if schedule.hours.is_empty() {
+        return None;
+    }
     let since = schedule.starts(modified(present), now)?;
     if since > now || file.exists() {
         return None;
@@ -339,8 +342,8 @@ pub fn footer(away: Option<Away>, schedule: &Schedule, epoch: i64) -> Option<(St
     }
 }
 
-/// How often a window reads the file again: quiet starts on a minute's
-/// check, and the window it ends in knows at once.
+/// How often a window asks again: quiet starts on a minute's check at
+/// most, and the window it ends in knows at once.
 pub const READ_EVERY: Duration = Duration::from_secs(60);
 
 #[cfg(test)]
@@ -438,7 +441,7 @@ mod tests {
     }
 
     #[test]
-    fn the_lookout_starts_quiet_once_and_the_person_s_words_end_it() {
+    fn the_first_to_ask_starts_quiet_once_and_the_person_s_words_end_it() {
         let dir = std::env::temp_dir().join(format!("sonny-quiet-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let (present, file) = (dir.join("present"), dir.join("away"));

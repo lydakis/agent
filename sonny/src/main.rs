@@ -4711,8 +4711,9 @@ impl App {
                 }
                 _ = self.woken.notified() => changed = true,
             }
-            // Quiet starts in the lookout and ends in whichever window the
-            // person writes in: read once a minute, never per frame.
+            // Quiet starts when someone first asks past the hours (this
+            // check, at most a minute late) and ends in whichever window
+            // the person writes in: asked once a minute, never per frame.
             if self.quiet_read.elapsed() >= quiet::READ_EVERY {
                 self.quiet_read = Instant::now();
                 self.quiet = quiet::away();
