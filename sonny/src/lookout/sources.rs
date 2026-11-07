@@ -377,8 +377,17 @@ pub struct Runner {
     unreadable: Option<String>,
     /// Tells Sonny's own sources to look now.
     poked: std::sync::Arc<tokio::sync::Notify>,
-    /// Each command source's runs as they went, kept across its restarts.
-    health: HashMap<String, Arc<Mutex<Health>>>,
+    /// What each command source keeps across its restarts.
+    lasting: HashMap<String, Lasting>,
+}
+
+/// What a command source keeps across a restart on an edited command:
+/// its runs as they went, so a source fixed by an edit is heard to work
+/// again, and the IDs it printed lately, so an edit sends nothing twice.
+#[derive(Clone, Default)]
+struct Lasting {
+    health: Arc<Mutex<Health>>,
+    seen: Arc<tokio::sync::Mutex<Seen>>,
 }
 
 impl Runner {
@@ -389,7 +398,7 @@ impl Runner {
             running: HashMap::new(),
             unreadable: None,
             poked: std::sync::Arc::new(tokio::sync::Notify::new()),
-            health: HashMap::new(),
+            lasting: HashMap::new(),
         }
     }
 
@@ -422,7 +431,8 @@ impl Runner {
     /// them, as a service manager restarts a unit on its new binary.
     pub fn set(&mut self, sources: Vec<Source>) {
         let wanted: HashSet<&str> = sources.iter().map(|s| s.name.as_str()).collect();
-        self.health.retain(|name, _| wanted.contains(name.as_str()));
+        self.lasting
+            .retain(|name, _| wanted.contains(name.as_str()));
         self.running.retain(|name, (had, stamp, task)| {
             let keep = sources.contains(had) && wanted.contains(name.as_str());
             let changed = keep && stamp.changed();
@@ -473,10 +483,8 @@ impl Runner {
                     self.poked.clone(),
                 )),
                 false => {
-                    // Its health outlasts a restart, so a source fixed by an
-                    // edit is heard to work again.
-                    let health = self.health.entry(source.name.clone()).or_default().clone();
-                    tokio::spawn(run(source.clone(), every, dir, (shape, health), sent))
+                    let lasting = self.lasting.entry(source.name.clone()).or_default().clone();
+                    tokio::spawn(run(source.clone(), every, dir, (shape, lasting), sent))
                 }
             };
             println!(
@@ -508,8 +516,15 @@ impl Stamp {
     fn of(command: &str) -> Stamp {
         let home = std::env::var_os("HOME").map(PathBuf::from);
         let mut files: Vec<PathBuf> = Vec::new();
-        for (n, word) in command.split_whitespace().enumerate() {
-            let word = word.trim_matches(|c| c == '"' || c == '\'');
+        // Words as the shell splits them, so a quoted path with spaces is
+        // one word.
+        let words = shlex::split(command).unwrap_or_else(|| {
+            (command.split_whitespace())
+                .map(|word| word.trim_matches(|c| c == '"' || c == '\'').to_owned())
+                .collect()
+        });
+        for (n, word) in words.iter().enumerate() {
+            let word = word.as_str();
             let path = match (
                 word.strip_prefix("~/").or(word.strip_prefix("$HOME/")),
                 &home,
@@ -620,10 +635,11 @@ async fn run(
     source: Source,
     every: Duration,
     dir: PathBuf,
-    (shape, health): (PathBuf, Arc<Mutex<Health>>),
+    (shape, Lasting { health, seen }): (PathBuf, Lasting),
     sent: Sender<Said>,
 ) {
-    let mut seen = Seen::default();
+    // Held while it runs: a restart's run takes it once this one is gone.
+    let mut seen = seen.lock_owned().await;
     let mut shape = Shape::read(shape);
     loop {
         let _ = super::make_dir(&dir);
@@ -1785,7 +1801,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let script = dir.join("poll.sh");
-        std::fs::write(&script, "echo v1\n").unwrap();
+        std::fs::write(&script, "echo '{\"text\": \"v1\", \"id\": \"1\"}'\n").unwrap();
         let (sent, mut got) = tokio::sync::mpsc::channel(16);
         let mut runner = Runner::new(dir.join("state"), sent);
         // It runs once an hour: only a restart runs it again soon.
@@ -1805,8 +1821,13 @@ mod tests {
                 .await
                 .is_err()
         );
-        // An edit, even one that keeps its length, starts it on the new one.
-        std::fs::write(&script, "echo v2\n").unwrap();
+        // An edit starts it on the new one.
+        // What it printed before the edit is not news again after it.
+        std::fs::write(
+            &script,
+            "echo '{\"text\": \"v1\", \"id\": \"1\"}'; echo v2\n",
+        )
+        .unwrap();
         let later = std::time::SystemTime::now() + Duration::from_secs(5);
         std::fs::File::options()
             .write(true)
@@ -1846,7 +1867,7 @@ mod tests {
         runner.set(vec![source.clone()]);
         for n in 1..3 {
             // Each run is over before the next edit stops it.
-            let failed = || runner.health["poll"].lock().unwrap().failed;
+            let failed = || runner.lasting["poll"].health.lock().unwrap().failed;
             for _ in 0..500 {
                 if failed() == n {
                     break;
@@ -1892,6 +1913,15 @@ mod tests {
         std::fs::remove_file(&script).unwrap();
         assert!(stamp.changed(), "a file gone is a change");
         assert_eq!(Stamp::of(""), Stamp::default());
+        // A quoted path with spaces is one word.
+        let spaced = dir.join("my polls").join("poll.sh");
+        std::fs::create_dir_all(spaced.parent().unwrap()).unwrap();
+        std::fs::write(&spaced, "echo hi\n").unwrap();
+        let quoted = Stamp::of(&format!("sh \"{}\"", spaced.display()));
+        assert!(
+            quoted.0.iter().any(|(path, _)| *path == spaced),
+            "{quoted:?}"
+        );
         // A file named from where the lookout runs, as `sh poll.sh`.
         let here = Stamp::of("sh Cargo.toml");
         assert!(
