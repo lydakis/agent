@@ -122,6 +122,22 @@ impl State {
     pub fn takes_a_pick(&self) -> bool {
         !matches!(self, Self::Answered(_))
     }
+
+    /// The same state with its words cut to a line, as kept for a card
+    /// no longer drawn: what it shows once drawn again, at a size that
+    /// does not grow with what was said.
+    pub fn kept(self) -> Self {
+        let cut = |text: String| crate::transcript::cut(text.lines().next().unwrap_or(""), QUOTED);
+        match self {
+            Self::Answered(text) => Self::Answered(cut(text)),
+            Self::Recorded { option, note } => Self::Recorded {
+                option,
+                note: cut(note),
+            },
+            Self::Withdrawn(text) => Self::Withdrawn(cut(text)),
+            other => other,
+        }
+    }
 }
 
 /// What a `close_ask` call with `arguments` closes: the ask it names, as
@@ -497,9 +513,10 @@ pub fn open(items: &[Value]) -> Option<Ask> {
                 false => results.push((at.clone(), crate::output(item).0)),
             }
         }
-        // The agent closed it, as an answer would.
+        // The agent closed it, as an answer would, once its close was
+        // taken: one still running may yet fail.
         if let Some((closed, _)) = closed_by(item)
-            && !refused.contains(&at)
+            && results.iter().any(|(of, _)| *of == at)
         {
             answers.push(closed);
         }
@@ -1206,13 +1223,13 @@ fn fire(question: &str, plan: Unanswered, label: &str) -> String {
 struct Standing {
     /// The person's answers after the call, by ask, newest first.
     answers: Vec<(String, String)>,
-    /// The agent's closes after it that were not refused, by ask, newest
-    /// first.
+    /// The agent's closes after it that were taken, by ask, newest first.
     closes: Vec<(String, State)>,
-    /// The calls refused or failed whose call is not read yet, by turn
-    /// and call: a close refused closed nothing. A result comes after its
-    /// call, so each is let go once its call is read.
-    refused: Vec<(i64, Value)>,
+    /// The calls taken whose call is not read yet, by turn and call: a
+    /// close counts once its result says it was taken, as one still
+    /// running may yet fail. A result comes after its call, so each is
+    /// let go once its call is read.
+    taken: Vec<(i64, Value)>,
     /// The one ask read for, when only its answers and closes are kept,
     /// so a long history costs no more than that ask's.
     wanted: Option<String>,
@@ -1237,29 +1254,30 @@ impl Standing {
     ) -> Option<Option<(Ask, State)>> {
         let items = crate::responses(&entry["item"]);
         let wanted = |of: &str| self.wanted.as_deref().is_none_or(|wanted| wanted == of);
-        let (mut refusals, mut closes) = (Vec::new(), Vec::new());
-        for item in &items {
+        // An entry's results first, as they come after its calls.
+        self.taken.extend(
+            (items.iter())
+                .filter(|item| {
+                    item["type"] == "function_call_output"
+                        && item["failed"] != true
+                        && !crate::reactions::refused(item)
+                })
+                .map(|item| (at, item["call_id"].clone())),
+        );
+        let mut closes = Vec::new();
+        for item in items.iter().filter(|item| item["type"] == "function_call") {
             let made = (at, item["call_id"].clone());
-            if item["type"] == "function_call_output"
-                && (item["failed"] == true || crate::reactions::refused(item))
-            {
-                refusals.push(made.clone());
-            }
-            if item["type"] != "function_call" {
-                continue;
-            }
-            let was_refused = (self.refused.iter().position(|r| *r == made))
-                .map(|at| self.refused.swap_remove(at))
+            let was_taken = (self.taken.iter().position(|taken| *taken == made))
+                .map(|at| self.taken.swap_remove(at))
                 .is_some();
             if let Some((closed, state)) = closed_by(item)
                 && self.skip.as_ref() != Some(&made)
-                && !was_refused
+                && was_taken
                 && wanted(&closed)
             {
                 closes.push((closed, state));
             }
         }
-        self.refused.extend(refusals);
         self.closes.extend(closes);
         if crate::lookout::said_by_person(entry).is_some() {
             let text = crate::text(&entry["item"]);
@@ -1295,7 +1313,7 @@ impl Standing {
 
     /// Where ask `asked` stands by what was read after it. The person's
     /// first answer counts, as the daemon takes only the first, over any
-    /// close; then the agent's first close that was not refused.
+    /// close; then the agent's first close that was taken.
     fn state(&self, asked: &str) -> State {
         if let Some((_, answer)) = (self.answers.iter().rev()).find(|(of, _)| of == asked) {
             return State::Answered(answer.clone());
@@ -2056,9 +2074,13 @@ mod tests {
             "arguments": asked("wait").to_string()});
         let mut closed = closing_call("ask:2/a1", "withdrawn", None, "no longer needed");
         closed["turn"] = json!(3);
-        // The window's open questions and needs.
+        let taken = json!({"type": "function_call_output", "call_id": "k1", "turn": 3,
+            "output": "{\"closed\":\"ask:2/a1\"}"});
+        // The window's open questions and needs, once the close was taken:
+        // one still running may yet fail.
         assert!(open(std::slice::from_ref(&asking)).is_some());
-        assert!(open(&[closed.clone(), asking.clone()]).is_none());
+        assert!(open(&[closed.clone(), asking.clone()]).is_some());
+        assert!(open(&[taken.clone(), closed.clone(), asking.clone()]).is_none());
         // Refused, it closed nothing.
         let refused = json!({"type": "function_call_output", "call_id": "k1", "turn": 3,
             "failed": true, "output": "closed already"});
@@ -2080,9 +2102,15 @@ mod tests {
         let open_one = (2, entry(1, &asking));
         assert_eq!(stands(std::slice::from_ref(&open_one)), Some(State::Open));
         let closing = (3, entry(5, &closed));
+        let took = (3, entry(6, &taken));
+        assert_eq!(
+            stands(&[took.clone(), closing.clone(), open_one.clone()]),
+            Some(State::Withdrawn("no longer needed".into()))
+        );
+        // Still running, it closed nothing yet.
         assert_eq!(
             stands(&[closing.clone(), open_one.clone()]),
-            Some(State::Withdrawn("no longer needed".into()))
+            Some(State::Open)
         );
         // The close being answered reads its own call in the history,
         // and does not count it.
@@ -2091,7 +2119,7 @@ mod tests {
             ..Standing::default()
         };
         assert_eq!(
-            [closing.clone(), open_one.clone()]
+            [took.clone(), closing.clone(), open_one.clone()]
                 .iter()
                 .find_map(|(at, entry)| reading.entry(*at, entry, 2, "a1"))
                 .flatten()
@@ -2100,7 +2128,7 @@ mod tests {
         );
         let mut reading = Reading::default();
         assert_eq!(
-            [closing.clone(), open_one.clone()]
+            [took.clone(), closing.clone(), open_one.clone()]
                 .iter()
                 .find_map(|(at, entry)| reading.entry(*at, entry, 2, "a1")),
             Some(false)
@@ -2119,13 +2147,14 @@ mod tests {
         assert_eq!(
             stands(&[
                 (4, person(&answer(&ask, "talk later"))),
+                took.clone(),
                 closing.clone(),
                 open_one
             ]),
             Some(State::Answered("talk later".into()))
         );
         // Read for one ask, another's answers and closes are not kept,
-        // and a refusal goes once its call is read.
+        // and a result goes once its call is read.
         let other = call(&id(1, "z9"), &asked("wait")).unwrap();
         let mut reading = Standing {
             wanted: Some(id(2, "a1")),
@@ -2136,13 +2165,21 @@ mod tests {
         for (at, entry) in [
             (4, person(&answer(&other, "no"))),
             (3, entry(7, &withdrawn_other)),
+            (
+                3,
+                entry(
+                    8,
+                    &json!({"type": "function_call_output", "call_id": "k2",
+                "turn": 3, "output": "ok"}),
+                ),
+            ),
             (3, entry(6, &refused)),
             closing,
         ] {
             reading.entry(at, &entry, 2, "a1");
         }
         assert!(reading.answers.is_empty() && reading.closes.is_empty());
-        assert!(reading.refused.is_empty());
+        assert_eq!(reading.taken, [(3, json!("k2"))]);
     }
 
     #[test]

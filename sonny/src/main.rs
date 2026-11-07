@@ -11796,9 +11796,9 @@ impl App {
             .extend((from..from + count).map(|row| (row, tag.clone())));
     }
 
-    /// Lets go of the cards the screen trimmed away, and where their
-    /// questions stood unless they are pinned still: a page read again
-    /// draws them anew from the history. Looked at each time the cards
+    /// Lets go of the cards the screen trimmed away, keeping where their
+    /// questions stood, cut to a line: a page read again draws them anew
+    /// from the history, and their outcomes from what is kept. Looked at each time the cards
     /// double, so the look costs a row per card drawn.
     fn forget_trimmed_cards(&mut self) {
         if self.cards.len() < 64.max(2 * self.cards_kept) {
@@ -11821,9 +11821,12 @@ impl App {
         for key in gone {
             self.cards.remove(&key);
             self.watched.remove(&key);
-            let pinned = (self.asks.iter().chain(&self.aside)).any(|ask| ask.key() == key);
-            if !pinned {
-                self.settled.remove(&key);
+            // Set aside, it is set aside again when its page is read again.
+            self.aside.retain(|ask| ask.key() != key);
+            // Where it stands is kept, cut to a line: its answer or close
+            // may be on a newer page, not read again when its own is.
+            if let Some(state) = self.settled.remove(&key) {
+                self.settled.insert(key, state.kept());
             }
         }
         self.cards_kept = self.cards.len();
@@ -20202,20 +20205,32 @@ mod tests {
         // A close read after, from an older page, leaves their answer.
         app.ask_closed(&json!({"id": "ask:1/c1", "outcome": "withdrawn", "note": "late"}));
         assert!(drawn(&mut app).contains(&"┃ Answered · Drop it".to_owned()));
-        // A card the screen let go of is let go here too, and where its
-        // question stood with it.
+        // A card the screen let go of is let go here too. Where its
+        // question stood is kept, cut to a line, as its answer or close
+        // may be on a newer page; one set aside is let go, set aside again
+        // when its page is read again.
+        let long = "w".repeat(1000);
         for n in 0..64 {
             let key = format!("ask:{}/gone", n + 100);
             let ask = asks::call(&key, &arguments).unwrap();
             app.cards.insert(key.clone(), (10_000 + n, ask, false));
-            app.settled.insert(key, asks::State::Withdrawn("w".into()));
+            app.settled
+                .insert(key, asks::State::Withdrawn(long.clone()));
         }
+        let aside = asks::call("ask:99/aside", &arguments).unwrap();
+        (app.cards).insert(aside.key(), (20_000, aside.clone(), false));
+        app.aside.push(aside);
         // Kept while an older page is drawn, the newer rows held aside.
         app.newer = Some(std::mem::take(&mut app.screen));
         app.forget_trimmed_cards();
         app.screen = app.newer.take().unwrap();
         assert_eq!(app.cards.keys().collect::<Vec<_>>(), ["ask:1/c1"]);
-        assert_eq!(app.settled.len(), 1);
+        assert!(app.aside.is_empty());
+        assert_eq!(app.settled.len(), 65);
+        let Some(asks::State::Withdrawn(why)) = app.settled.get("ask:100/gone") else {
+            panic!("kept");
+        };
+        assert!(why.len() < 400 && why.ends_with('…'), "{why}");
     }
 
     /// A task's question set aside in its own window comes back to the
@@ -20255,16 +20270,19 @@ mod tests {
         let arguments = json!({"question": "Signed in?", "why": "w", "command": "gh auth login"});
         let asked = arguments.clone();
         let client = daemon_answering(move |request| match request["op"].as_str() {
-            Some("inspect") => json!({"head": 2}),
-            Some("history_nodes") => json!({"nodes": [{"node": 2, "turn": 5},
-                {"node": 1, "turn": 4}], "next_from": null}),
+            Some("inspect") => json!({"head": 3}),
+            Some("history_nodes") => json!({"nodes": [{"node": 3, "turn": 5},
+                {"node": 2, "turn": 5}, {"node": 1, "turn": 4}], "next_from": null}),
             Some("history_items") => {
                 let close = json!({"type": "function_call", "name": asks::CLOSE,
                     "call_id": "k1", "arguments": json!({"id": "ask:4/c9",
                     "outcome": "withdrawn", "note": "signed in already"}).to_string()});
                 let ask = json!({"type": "function_call", "name": asks::TOOL,
                     "call_id": "c9", "arguments": asked.to_string()});
-                json!({"items": [{"node": 2, "item": close}, {"node": 1, "item": ask}]})
+                let taken = json!({"type": "function_call_output", "call_id": "k1",
+                    "output": json!({"closed": "ask:4/c9"}).to_string()});
+                json!({"items": [{"node": 3, "item": taken}, {"node": 2, "item": close},
+                    {"node": 1, "item": ask}]})
             }
             _ => json!({}),
         })
@@ -20288,10 +20306,10 @@ mod tests {
         );
         // Withdrawn, a pick still answers it: watched still, its task's
         // newest node noted, and not read again until the task writes on.
-        assert_eq!(app.watched.get(&key).map(|(_, seen)| *seen), Some(Some(2)));
+        assert_eq!(app.watched.get(&key).map(|(_, seen)| *seen), Some(Some(3)));
         app.watched_at = None;
         app.reread_watched().await;
-        assert_eq!(app.watched.get(&key).map(|(_, seen)| *seen), Some(Some(2)));
+        assert_eq!(app.watched.get(&key).map(|(_, seen)| *seen), Some(Some(3)));
         // The person's answer makes it final, and the watch ends.
         app.settle(&key, asks::State::Answered("done".into()));
         assert!(!app.watched.contains_key(&key));
