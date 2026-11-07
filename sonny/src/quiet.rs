@@ -198,7 +198,11 @@ fn modified(file: &Path) -> Option<i64> {
 
 /// Quiet as its file says now; none while it is off.
 pub fn away() -> Option<Away> {
-    away_at(&away_file()?)
+    // Kept until the file changes: a window asks once a minute and the
+    // sound asks on each alert, and an idle window opens no files (A17).
+    static KEPT: crate::kept::Slot<Option<Away>> = std::sync::Mutex::new(None);
+    let file = away_file()?;
+    crate::kept::read(&KEPT, "away", vec![file.clone()], || (away_at(&file), None))
 }
 
 fn away_at(file: &Path) -> Option<Away> {
