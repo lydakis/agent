@@ -1,9 +1,9 @@
-//! The code reviews each agent's replies named, kept by the window that
+//! The code reviews each agent's turns named, kept by the window that
 //! sees each turn of a project's agent end ([`crate::waiting`]), so
 //! `/status` counts them all and shows the latest, with no history read
 //! again: `STORE.reviews/BOT.json`, a list, oldest first. A review is
-//! whatever the reply called it, as the copy that read the reply names
-//! it: a pull or merge request, a change in Gerrit, a Phabricator
+//! whatever the turn called it, as the copy that read the turn names it,
+//! from a command's output or the reply: a pull or merge request, a change in Gerrit, a Phabricator
 //! revision, an internal CR, in git or not: `o/r#7`, `D1234`, `CR-881`,
 //! or a link. Whether one is open or merged is no reply's to say, and
 //! Sonny reads no host.

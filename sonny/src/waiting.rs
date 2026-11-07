@@ -18,8 +18,10 @@
 //! agent's open question while no later turn of its started
 //! ([`crate::needs::Seen::open`]): the footer, `/status`, the agent's tab
 //! and its lead's window, where a word typed under it goes to the agent.
-//! The same copy names the code reviews the reply opened, updated or waits
-//! on, in whatever system holds them ([`crate::reviews`]).
+//! The same copy names the code reviews its turn opened, updated or waits
+//! on, in whatever system holds them, as its commands' output or its reply
+//! say ([`crate::reviews`]): a copy reads a homegrown tool as the agent
+//! that used it did.
 //! `[sonny] needs_check = false` turns the check off, and with it what
 //! reviews are kept; marks kept then still hold until the agent's next
 //! turn.
@@ -44,9 +46,9 @@ const ASK: &str = "[A CHECK FROM SONNY, answered in JSON alone; nothing here rea
     your work goes on: an answer, a decision, an approval, or a step for them to take? With one, \
     set waiting to true and say in `for` what they need to give, in a few plain words of theirs, \
     such as \"which branch to deploy\". When your work goes on without them, or is finished, set \
-    waiting to false and `for` to \"\". In `reviews`, list each code review your last reply says you \
-    opened, updated or wait on, in whatever system holds it, by a short name such as \"o/r#7\", \
-    \"D1234\" or \"CR-881\", else its link; [] for none.";
+    waiting to false and `for` to \"\". In `reviews`, list each code review you opened, updated or wait \
+    on in your last turn, in its commands' output or your reply, in whatever system holds it, by a \
+    short name such as \"o/r#7\", \"D1234\" or \"CR-881\", else its link; [] for none.";
 
 /// What a turn's reply left waiting on the person.
 #[derive(Clone, Debug, PartialEq)]

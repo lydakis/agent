@@ -786,8 +786,8 @@ way `/react` does, and each note in the margin has its own `↩`.
   done). Each agent is one line: its mark, name, state and time, and at
   its right edge, dim, what it tracks: what it follows (a source with an
   `icon` in `[sonny.sources.NAME]` shows as that icon), the code reviews
-  its replies named, in any system, as the copy that checks each reply
-  names them (`3 reviews · CR-881`; a pull or merge request link its last
+  its turns opened or wait on, in any system, as the copy that checks
+  each turn names them from its commands' output and reply (`3 reviews · CR-881`; a pull or merge request link its last
   reply holds shows before any is kept), its background work
   and its window. The picked agent, and every one that needs you, says
   more under it: its model and profile, and its latest step. Idle shows
