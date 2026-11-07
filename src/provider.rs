@@ -257,6 +257,8 @@ pub struct Provider {
     /// A Bedrock endpoint, however it authenticates: it takes no fallback
     /// credit and serves no WebSocket.
     bedrock: bool,
+    /// Bedrock Mantle, the one Bedrock endpoint that hosts server-side tools.
+    mantle: bool,
     /// The models this provider last listed, shared by every clone.
     listing: Arc<models::Listing>,
     /// The windows the person set, with the name this provider is bound
@@ -512,7 +514,9 @@ impl Provider {
             Family::Anthropic => "messages",
         };
         url.set_path(&format!("{}/{route}", url.path().trim_end_matches('/')));
-        let bedrock = aws::endpoint(&url).is_some();
+        let endpoint = aws::endpoint(&url);
+        let bedrock = endpoint.is_some();
+        let mantle = endpoint.is_some_and(|(_, service)| service == "bedrock-mantle");
         Ok(Self {
             transport,
             pools: Arc::new(pace::Pools::default()),
@@ -527,6 +531,7 @@ impl Provider {
             sockets: None,
             aws: None,
             bedrock,
+            mantle,
             listing: Arc::default(),
             windows: None,
         })

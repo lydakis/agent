@@ -3711,12 +3711,12 @@ namespace, which the daemon answers by posting the call's commands to the
 provider's `alpha/search` (bounded at 1 MiB and two minutes) and returning its
 `output`. Searches are paced in a pool of their own and their failures classed
 as a model call's: a rate limit closes the pool, a server or connection failure
-backs off, and both retry within the two minutes before the model hears of them. Bedrock's GPT models get the hosted `web_search` tool over indexed
+backs off, and both retry within the two minutes before the model hears of them. Bedrock Mantle's GPT models get the hosted `web_search` tool over indexed
 results, and Anthropic's API gets its hosted server tool, `web_search_20260209`
 for Claude 4.6 and later but Haiku, `web_search_20250305` otherwise; the
 provider runs both, its blocks and citations are kept in the history as sent,
 and a `pause_turn` stop asks again without a new message. A ChatGPT plan login,
-Claude on Bedrock and any other gateway offer none: `create` refuses the tool
+Claude on Bedrock, Bedrock runtime's OpenAI route and any other gateway offer none: `create` refuses the tool
 there with `web_search_unavailable`, and `ready` says per provider whether it
 searches (`web_search`). It runs without approval, as Codex's does.
 
