@@ -228,7 +228,7 @@ pub async fn call(
             set_by: caller.to_owned(),
             set_ms: now_ms(),
             budget_tokens,
-            tokens_at_set: record["tokens_used"].as_u64().unwrap_or(0),
+            tokens_at_set: record["work_tokens"].as_u64().unwrap_or(0),
             timeout_s,
             blocked: None,
         };
@@ -733,7 +733,7 @@ async fn pursue(
     if let Some(budget) = goal.budget_tokens {
         let record = client.request("inspect", json!({"bot": goal.bot})).await;
         let used = (record.ok())
-            .and_then(|r| r["tokens_used"].as_u64())
+            .and_then(|r| r["work_tokens"].as_u64())
             .unwrap_or(0);
         if used.saturating_sub(goal.tokens_at_set) >= budget {
             return over(

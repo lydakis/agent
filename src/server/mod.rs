@@ -241,6 +241,8 @@ enum Command {
         instructions: Option<String>,
         effort: Option<String>,
         budget_tokens: Option<u64>,
+        /// What `budget_tokens` counts: `tokens`, the default, or `work`.
+        budget_counts: Option<agent_runtime::store::Counts>,
         /// The tools this bot may call, from the daemon's registered set.
         tools: Option<Vec<String>>,
         /// The bot on whose behalf the client creates this one, if any.
@@ -329,6 +331,7 @@ enum Command {
         bot: String,
         workspace: Option<String>,
         budget_tokens: Option<u64>,
+        budget_counts: Option<agent_runtime::store::Counts>,
         created_by: Option<String>,
         created_by_id: Option<i64>,
         /// A gate the fork adds to those it inherits.
@@ -413,9 +416,11 @@ enum Command {
         /// with who wrote them: a turn's prompt, or with `reply` the reply
         /// it ended with.
         quotes: Option<Vec<agent_runtime::store::QuoteRef>>,
-        /// The most input plus output tokens this turn may spend, beside
-        /// the bot's own budget; absent leaves only that.
+        /// The most tokens this turn may spend, beside the bot's own
+        /// budget; absent leaves only that.
         budget_tokens: Option<u64>,
+        /// What `budget_tokens` counts: `tokens`, the default, or `work`.
+        budget_counts: Option<agent_runtime::store::Counts>,
         /// Pictures sent with the prompt, each a media type and base64;
         /// absent or null is none.
         images: Option<Vec<agent_runtime::codec::Image>>,
@@ -991,6 +996,20 @@ const IMAGES_BYTES: usize = 5 << 20;
 const MAX_QUOTES: usize = agent_runtime::store::Database::QUOTES;
 /// The most pictures one prompt, or one tool result, may carry.
 const IMAGES: usize = 20;
+
+/// What a budget counts, which only a budget can name.
+fn counts(
+    budget_tokens: Option<u64>,
+    counts: Option<agent_runtime::store::Counts>,
+) -> Result<agent_runtime::store::Counts> {
+    match (budget_tokens, counts) {
+        (None, Some(_)) => fail_with(
+            "invalid_budget",
+            "budget_counts names what budget_tokens counts, so it goes with one",
+        ),
+        (_, counts) => Ok(counts.unwrap_or_default()),
+    }
+}
 
 /// Pictures a provider takes: a media type both families know, base64 of
 /// an image of that type, and within [`IMAGES`] and [`IMAGES_BYTES`].
@@ -3281,6 +3300,7 @@ impl Service {
                 instructions,
                 effort,
                 budget_tokens,
+                budget_counts,
                 tools,
                 created_by,
                 created_by_id,
@@ -3297,6 +3317,7 @@ impl Service {
                 if budget_tokens == Some(0) {
                     return fail_with("invalid_budget", "budget_tokens must be at least 1");
                 }
+                let budget_counts = counts(budget_tokens, budget_counts)?;
                 if let Some(key) = &request_id {
                     name("request_id", key)?;
                 }
@@ -3391,6 +3412,7 @@ impl Service {
                                 instructions: &instructions,
                                 effort: effort.as_deref(),
                                 budget_tokens,
+                                budget_counts,
                                 tools: &tools,
                                 created_by: created_by.as_deref(),
                                 created_by_id,
@@ -4444,6 +4466,7 @@ impl Service {
                 bot,
                 workspace: path,
                 budget_tokens,
+                budget_counts,
                 created_by,
                 created_by_id,
                 approve,
@@ -4456,6 +4479,7 @@ impl Service {
                 if budget_tokens == Some(0) {
                     return fail_with("invalid_budget", "budget_tokens must be at least 1");
                 }
+                let budget_counts = counts(budget_tokens, budget_counts)?;
                 if expire_ms.is_some_and(|ms| !(1000..=MAX_EXPIRE_MS).contains(&ms)) {
                     return fail_with("invalid_expire", "expire_ms is from 1 s to 7 days");
                 }
@@ -4508,6 +4532,7 @@ impl Service {
                                 checkpoint,
                                 workspace: path.as_deref(),
                                 budget_tokens,
+                                budget_counts,
                                 created_by: created_by.as_deref(),
                                 created_by_id,
                                 gate: gate.as_ref(),
@@ -4656,6 +4681,7 @@ impl Service {
                 person,
                 quotes,
                 budget_tokens,
+                budget_counts,
                 images,
                 wait_ms,
             } => {
@@ -4755,6 +4781,7 @@ impl Service {
                         format!("budget_tokens must be from 1 to {}", i64::MAX),
                     );
                 }
+                let budget_counts = counts(budget_tokens, budget_counts)?;
                 // A turn may run in another checkout or on another model of
                 // the same family; the conversation encoding never changes.
                 let options = TurnOptions {
@@ -4768,6 +4795,7 @@ impl Service {
                     person,
                     quotes,
                     budget_tokens,
+                    budget_counts,
                     images,
                     wait_ms,
                 };
@@ -5527,6 +5555,7 @@ mod tests {
                         instructions: "test",
                         effort: None,
                         budget_tokens: None,
+                        budget_counts: Default::default(),
                         tools: &[],
                         created_by: None,
                         created_by_id: None,
@@ -5714,6 +5743,7 @@ mod tests {
                         instructions: "test",
                         effort: None,
                         budget_tokens: None,
+                        budget_counts: Default::default(),
                         tools: &[],
                         created_by: None,
                         created_by_id: None,
@@ -5944,6 +5974,7 @@ mod tests {
             instructions: "test",
             effort: None,
             budget_tokens: None,
+            budget_counts: Default::default(),
             tools: &[],
             created_by: None,
             created_by_id: None,
@@ -6127,6 +6158,7 @@ mod tests {
             person: None,
             quotes: None,
             budget_tokens: None,
+            budget_counts: Default::default(),
             images: None,
             wait_ms: None,
         }
@@ -6198,6 +6230,7 @@ mod tests {
                                 instructions: "",
                                 effort: None,
                                 budget_tokens: None,
+                                budget_counts: Default::default(),
                                 tools: &[],
                                 created_by: None,
                                 created_by_id: None,
@@ -6509,6 +6542,7 @@ mod tests {
                         instructions: "",
                         effort: None,
                         budget_tokens: None,
+                        budget_counts: Default::default(),
                         tools: &[],
                         created_by: None,
                         created_by_id: None,
@@ -6596,6 +6630,7 @@ mod tests {
                         instructions: "",
                         effort: None,
                         budget_tokens: None,
+                        budget_counts: Default::default(),
                         tools: &[],
                         created_by: None,
                         created_by_id: None,
@@ -6844,6 +6879,7 @@ mod tests {
             instructions: Some(String::new()),
             effort: None,
             budget_tokens: None,
+            budget_counts: Default::default(),
             tools: Some(Vec::new()),
             created_by: None,
             created_by_id: None,
@@ -7566,6 +7602,7 @@ mod tests {
                             instructions: "",
                             effort: None,
                             budget_tokens: None,
+                            budget_counts: Default::default(),
                             tools: &tools,
                             created_by: creator.as_ref().map(|c| c.name.as_str()),
                             created_by_id: creator.as_ref().map(|c| c.bot_id),
@@ -7851,6 +7888,7 @@ mod tests {
                         instructions: "",
                         effort: None,
                         budget_tokens: None,
+                        budget_counts: Default::default(),
                         tools: &tools,
                         created_by: None,
                         created_by_id: None,

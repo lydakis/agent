@@ -88,6 +88,41 @@ class ElisionTests(ModelFixture):
         branch = drain(self.model)
         self.assertTrue(all(encoded(r['input']) <= 65536 for r in branch))
 
+    def test_a_request_that_elides_old_results_is_still_charged_its_new_one(self):
+        # Elision makes a request smaller than the one before while a new
+        # result joins it. The request's net growth hides that result; the
+        # work measure charges it, on the call that first sends it.
+        self.model.bytes_per_token = 4
+        client = self.client(tools='shell,read', settings={'context_bytes': 65536})
+        self.assertIn('result', client.request('create', bot='Bob', workspace=str(self.path),
+                                               tools=['shell', 'read']))
+        turn = client.request('submit', bot='Bob', request_id='1', prompt='long:24')['result']['turn']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        requests = drain(self.model)
+        events, after = [], 0
+        while True:
+            page = client.request('events', bot='Bob', after=after, limit=256)['result']
+            events += page['events']
+            if not page['events']:
+                break
+            after = page['events'][-1]['cursor']
+        usage = [e['data'] for e in events if e['event'] == 'usage']
+        self.assertEqual(len(usage), len(requests))
+        shrunk = 0
+        for before, now, request in zip(usage, usage[1:], requests[1:]):
+            newest = len(json.dumps(request['input'][-1])) // 4
+            self.assertGreater(now['work_tokens'] - now['output_tokens'], newest * 0.8)
+            if now['input_tokens'] < before['input_tokens']:
+                shrunk += 1
+        self.assertGreaterEqual(shrunk, 3)
+        # And no more than the results, the prompt and the replies: the
+        # history each call sends again is free.
+        bot = client.request('inspect', bot='Bob')['result']
+        added = sum(len(json.dumps(r['input'][-1])) // 4 for r in requests)
+        outputs = sum(u['output_tokens'] for u in usage)
+        self.assertLess(bot['work_tokens'], (added + outputs) * 1.25)
+        self.assertLess(bot['work_tokens'] * 2, bot['tokens_used'])
+
     def test_a_turn_over_budget_elides_answered_results_inside_the_keep_target(self):
         # Half the budget kept verbatim. Thirty-six small results, too small
         # to elide, then two large ones: the turn overflows while both large

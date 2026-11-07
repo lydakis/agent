@@ -19,8 +19,9 @@ use agent_runtime::{
     rules::Ruling,
     sandbox::Policy,
     store::{
-        Bot, CallAnswer, ContextPrefix, ContextUsage, Database, ElisionPlan, Gated, Halt, Halted,
-        Settings, Slot, Store, Strip, TURN_VIEW_ACCOUNTING, Waiting, Window, unserved,
+        Bot, CallAnswer, Charge, ContextPrefix, ContextUsage, Database, ElisionPlan, Gated, Halt,
+        Halted, Limit, Settings, Slot, Spend, Store, Strip, TURN_VIEW_ACCOUNTING, Waiting, Window,
+        unserved,
     },
     tools::{Files, Outcome, POLL_YIELD_MS, Place, Prepared, ReadSource, Registry},
 };
@@ -347,11 +348,11 @@ struct Warm<'a> {
     /// When the cache was last read, by the call or a refresh.
     read_at: tokio::time::Instant,
     stopped: bool,
-    /// Tokens the refreshes billed, for the bot's budget.
-    tokens: u64,
-    /// What the bot's and turn's caps leave the refreshes, when either is
-    /// set: they stop once they have billed it.
-    room: Option<u64>,
+    /// What the refreshes spent, for the bot's and turn's budgets.
+    tokens: Spend,
+    /// What those caps leave the refreshes: they stop once they have spent
+    /// it.
+    room: agent_runtime::store::Room,
     /// The refresh in flight, held by [`Accounting`] so an interrupt that
     /// drops the turn's rounds still settles one already sent.
     pending: &'a mut Option<Pending>,
@@ -396,7 +397,7 @@ struct Accounting {
     /// A summary's own, running beside the turn's call.
     beside: bool,
     /// The tokens a summary beside the turn's call holds of its budget.
-    summary_held: u64,
+    summary_held: Spend,
     /// Until when a summary that parked on its pool is not tried again
     /// while the view fits, kept in the park record.
     summary_retry_at: u64,
@@ -409,6 +410,8 @@ struct Accounting {
     /// when the run of holds it belongs to began, kept across tries.
     blocked: Option<agent_runtime::store::Blocked>,
     held_since: Option<u64>,
+    /// The limit the call goes to without tool calls, if one does.
+    limit: Option<Limit>,
 }
 impl Accounting {
     /// Park on a cause a person can fix: the call is tried again after the
@@ -604,7 +607,7 @@ impl Turn {
         // it is installed as a summary before that call would have been; one
         // still running was cancelled with them, as a call is.
         if let Err(error) = self
-            .join_summary(None, &mut landed, &mut 0, &mut 0, &mut accounting)
+            .join_summary(None, &mut landed, None, &mut 0, &mut accounting)
             .await
         {
             result = Err(error);
@@ -1324,38 +1327,28 @@ impl Turn {
             None => Compaction::Skipped,
             Some(mut planned) => {
                 planned.choice.trigger = trigger;
-                // Under a budget it holds the most its calls may bill, read
-                // from the larger of the view and the view it copies.
+                // Under a budget it holds the most its calls may spend,
+                // read from the larger of the view and the view it copies.
                 let copied = planned
                     .copy
                     .as_ref()
                     .map_or(0, |(view, ..)| view.usage().bytes);
                 let held = beside.as_ref().and_then(|_| {
                     self.summary_bound(record, context.usage().bytes.max(copied), tools)
-                        .filter(|tokens| {
-                            record.ceiling().is_none_or(|ceiling| {
-                                record.tokens_used.saturating_add(*tokens) < ceiling
-                            })
-                        })
+                        .filter(|share| record.left().holds(*share))
                 });
                 match (beside, held) {
-                    (Some(slot), Some(tokens)) => {
+                    (Some(slot), Some(share)) => {
                         // It spends only what it holds: its calls and their
                         // retries count from the rounds left after its
                         // share, and the bot's and turn's caps end at its share.
                         let (mut record, tools) = (record.clone(), tools.clone());
-                        let share = record.tokens_used.saturating_add(tokens);
-                        if let Some(budget) = &mut record.budget_tokens {
-                            *budget = (*budget).min(share);
-                        }
-                        if let Some(cap) = &mut record.turn_budget {
-                            cap.until = cap.until.min(share);
-                        }
+                        record.cap_at(share);
                         spent.beside = true;
-                        accounting.summary_held = tokens;
+                        accounting.summary_held = share;
                         *slot = Some(Box::pin(async move {
                             let (before, start) =
-                                (record.tokens_used, self.settings().max_rounds() - 2);
+                                (record.spent(), self.settings().max_rounds() - 2);
                             let mut rounds = start;
                             let mut spent = Counted {
                                 spent,
@@ -1374,7 +1367,7 @@ impl Turn {
                             Landed {
                                 result,
                                 spent: Spent {
-                                    tokens: record.tokens_used.saturating_sub(before),
+                                    spend: record.spent().minus(before),
                                     rounds: rounds - start,
                                 },
                             }
@@ -1403,19 +1396,18 @@ impl Turn {
         Ok(compaction)
     }
 
-    /// The most a summary's two calls may bill toward a bot's or turn's cap:
-    /// each sends at most `view` bytes, the tools and both instructions, a
-    /// token to a byte at most, and generates at most the summarizer's
-    /// output bound. Nothing without a budget; `None` when that bound is
-    /// unknown, and then the summary goes before the call.
+    /// The most a summary's two calls may add to a bot's or turn's work:
+    /// each re-reads the history and is charged its output, at most the
+    /// summarizer's output bound. Nothing without a budget; `None` when that
+    /// bound is unknown, and then the summary goes before the call.
     fn summary_bound(
         &self,
         record: &agent_runtime::store::Bot,
         view: usize,
         tools: &serde_json::value::RawValue,
-    ) -> Option<u64> {
-        if record.ceiling().is_none() {
-            return Some(0);
+    ) -> Option<Spend> {
+        if !record.capped() {
+            return Some(Spend::default());
         }
         let reference = summarizer(record);
         let (name, model) = split_model(&reference).ok()?;
@@ -1432,7 +1424,11 @@ impl Turn {
                 .as_deref()
                 .map_or(0, str::len)
             + SUMMARY_REQUEST_BYTES;
-        Some(2 * (input + output) as u64)
+        // It re-reads the history: its work is its output.
+        Some(Spend {
+            tokens: 2 * (input + output) as u64,
+            work: 2 * output as u64,
+        })
     }
 
     /// The current turn cannot fit the budget, alone or beside what goes
@@ -1813,10 +1809,7 @@ impl Turn {
             // Success is billable even if its text is empty or too large to use.
             *model_rounds += 1;
             if let Some(usage) = &completion.usage {
-                record.tokens_used = record
-                    .tokens_used
-                    .saturating_add(usage.input_tokens)
-                    .saturating_add(usage.output_tokens);
+                record.charge(usage, Charge::Aside);
             }
             let usage = completion.usage.map(|usage| priced_at(usage, name, model));
             let summary = completion_text(&completion.items);
@@ -1887,7 +1880,7 @@ impl Turn {
         &self,
         running: Option<Beside<'_>>,
         landed: &mut Option<Landed>,
-        tokens_used: &mut u64,
+        record: Option<&mut agent_runtime::store::Bot>,
         model_rounds: &mut usize,
         accounting: &mut Accounting,
     ) -> Result<bool> {
@@ -1909,7 +1902,7 @@ impl Turn {
         let Some(Landed { result, spent }) = landed.take() else {
             return Ok(false);
         };
-        spent.count(tokens_used, model_rounds);
+        spent.count(record, model_rounds);
         let installed = match (result, slot) {
             (Ok(Summary::Written(written)), Some(slot)) => self.install(slot, *written).await,
             (Ok(Summary::Written(_)), None) => unreachable!("a written summary reserves a slot"),
@@ -2466,6 +2459,9 @@ impl Turn {
         let elides = record.tools.iter().any(|tool| tool == "read");
         // How a steer stayed queued for lack of room, while one still is.
         let mut capped = None;
+        // Whether a call went without tool calls for a budget: the next
+        // that finds it spent ends the turn.
+        let mut wrapped = false;
         // A steer let in against the whole budget goes to the model before
         // any summary, so no summary spends the round or the budget it went
         // in for; the boundary after that call summarizes as usual.
@@ -2507,8 +2503,13 @@ impl Turn {
             self.settle_refresh(&mut record, accounting).await?;
             // One planned at a boundary that started over has not run.
             beside = None;
-            // The budget is checked before each call, so one call may overshoot.
-            if let Some(error) = record.exhausted() {
+            // The budget is checked before each call. One the turn has
+            // called under ends on a call without tool calls, so it reports
+            // what it did: that call may overshoot.
+            if let Some(error) = record
+                .exhausted()
+                .filter(|_| !wraps_up(model_rounds, wrapped))
+            {
                 return Err(error);
             }
             // Past the threshold, the older turns are summarized before this
@@ -2676,7 +2677,10 @@ impl Turn {
                 (resume_window, steer_first) = (resuming, whole);
                 continue;
             }
-            if let Some(error) = record.exhausted() {
+            if let Some(error) = record
+                .exhausted()
+                .filter(|_| !wraps_up(model_rounds, wrapped))
+            {
                 return Err(error);
             }
             if model_rounds >= self.settings().max_rounds() {
@@ -2729,23 +2733,23 @@ impl Turn {
             let held = running
                 .as_ref()
                 .map(|_| (2, std::mem::take(&mut accounting.summary_held)));
-            if let Some((rounds, tokens)) = held {
+            if let Some((rounds, share)) = held {
                 model_rounds += rounds;
-                record.tokens_used = record.tokens_used.saturating_add(tokens);
+                record.add(share);
             }
             // The round limit's last call goes with the tools shown but no
             // call allowed, so the turn ends on a reply rather than failing
-            // with its work done and unreported.
-            let tool_calls = model_rounds + 1 < self.settings().max_rounds();
-            if !tool_calls {
-                self.hub
-                    .live(
-                        &self.bot,
-                        json!({"event":"tool_calls_withheld","bot":self.bot,"turn":turn,
-                            "durable":false,"reason":"tool_round_limit"}),
-                    )
-                    .await?;
+            // with its work done and unreported; so does the call after one
+            // that spent a budget.
+            accounting.limit = match model_rounds + 1 < self.settings().max_rounds() {
+                false => Some(Limit::Rounds),
+                true => budget_reached(&record),
+            };
+            if let Some(limit) = accounting.limit {
+                wrapped |= limit != Limit::Rounds;
+                self.withheld(turn, limit).await?;
             }
+            let tool_calls = accounting.limit.is_none();
             let called = {
                 let call = self.call(
                     provider,
@@ -2780,9 +2784,9 @@ impl Turn {
             };
             let (called, running) = called;
             self.side.replaced.store(false, Relaxed);
-            if let Some((rounds, tokens)) = held {
+            if let Some((rounds, share)) = held {
                 model_rounds -= rounds;
-                record.tokens_used = record.tokens_used.saturating_sub(tokens);
+                record.take_back(share);
             }
             // A call that withheld its replayed thinking recorded that on
             // the bot; refreshes send what it sent.
@@ -2799,7 +2803,7 @@ impl Turn {
                         .join_summary(
                             running,
                             landed,
-                            &mut record.tokens_used,
+                            Some(&mut record),
                             &mut model_rounds,
                             accounting,
                         )
@@ -2812,12 +2816,11 @@ impl Turn {
             sent_here = true;
             accounting.answered = true;
             model_rounds += 1;
-            if let Some(usage) = &response.usage {
-                record.tokens_used = record
-                    .tokens_used
-                    .saturating_add(usage.input_tokens)
-                    .saturating_add(usage.output_tokens);
-            }
+            let (added, read_through) = response.usage.as_ref().map_or((0, None), |usage| {
+                let (added, through) = added_input(&record, &context, &tools, usage);
+                record.charge(usage, Charge::Round { added });
+                (added, through)
+            });
             let items = response.items;
             let calls: Vec<ToolCall> = response.calls.clone();
             let usage = response.usage.clone();
@@ -2840,8 +2843,11 @@ impl Turn {
             // Taken before the commit that stamps the gates' announcement,
             // so a gate's first lapse is never counted late.
             let planned = tokio::time::Instant::now();
+            let limit = accounting.limit.take();
+            wrapped |= limit.is_some_and(|limit| limit != Limit::Rounds);
             let append = self.store.op("append", move |db| {
-                let entries = db.append_under(turn, items, &calls, usage.as_ref(), &rules)?;
+                let entries =
+                    db.append_under(turn, items, &calls, usage.as_ref(), &rules, limit, added)?;
                 if let Some((bytes, tokens)) = sent {
                     db.record_sent(&name, bytes, tokens)?;
                 }
@@ -2870,11 +2876,26 @@ impl Turn {
                         .filter(|entry| entry["event"] == "message")
                         .filter_map(|entry| entry["data"]["node"].as_i64())
                         .collect();
+                    // Its history is read through its own items, or with
+                    // none through what it sent, the head then: as the store
+                    // recorded with its usage.
+                    if response.usage.is_some() {
+                        record.work.read = nodes
+                            .iter()
+                            .copied()
+                            .max()
+                            .or(read_through)
+                            .or(record.work.read);
+                    }
                     provider.recorded(&self.bot, &nodes);
                     verdicts
                 }
                 Err(error) => {
-                    self.failed_usage(response.usage.clone()).await?;
+                    let charge = response.usage.as_ref().map_or(Charge::Aside, |usage| {
+                        let (added, read) = added_input(&record, &context, &tools, usage);
+                        Charge::Failed { added, read }
+                    });
+                    self.failed_usage(response.usage.clone(), charge).await?;
                     return Err(error);
                 }
             };
@@ -2886,7 +2907,7 @@ impl Turn {
                 .join_summary(
                     running,
                     landed,
-                    &mut record.tokens_used,
+                    Some(&mut record),
                     &mut model_rounds,
                     accounting,
                 )
@@ -2960,10 +2981,8 @@ impl Turn {
                     after,
                     read_at,
                     stopped: stopped || record.exhausted().is_some(),
-                    tokens: 0,
-                    room: record
-                        .ceiling()
-                        .map(|c| c.saturating_sub(record.tokens_used)),
+                    tokens: Spend::default(),
+                    room: record.left(),
                     pending,
                 });
             let stop = self
@@ -2979,8 +2998,8 @@ impl Turn {
                     summary_retry,
                 )
                 .await?;
-            let refreshed = warm.map_or(0, |warm| warm.tokens);
-            record.tokens_used = record.tokens_used.saturating_add(refreshed);
+            let refreshed = warm.map_or_else(Spend::default, |warm| warm.tokens);
+            record.add(refreshed);
             if let Some(stop) = stop {
                 return Ok(stop.round());
             }
@@ -3025,7 +3044,7 @@ impl Turn {
         if let Some(refreshed) = settle(&mut accounting.refresh).await
             && let Some((tokens, _)) = self.account_refresh(refreshed).await?
         {
-            record.tokens_used = record.tokens_used.saturating_add(tokens);
+            record.add(tokens);
         }
         Ok(())
     }
@@ -3192,11 +3211,16 @@ impl Turn {
             None => None,
         };
         let mut tool_calls = tool_calls;
+        // A budget a failed attempt spent, said once its retry goes.
+        let mut announce = None;
         loop {
             // A stopping daemon sends no request, first or retry, and the
             // turn parks as at a boundary.
             if self.stopping.load(Relaxed) {
                 return Err(Error::new(SHUTDOWN));
+            }
+            if let Some(limit) = announce.take() {
+                self.withheld(turn, limit).await?;
             }
             // A billed attempt that failed counts as a round: the retry that
             // is the turn's last allowed call goes without calls, as that
@@ -3206,13 +3230,8 @@ impl Turn {
                 && *model_rounds + 1 >= self.settings().max_rounds()
             {
                 (tool_calls, warm_after) = (false, None);
-                self.hub
-                    .live(
-                        &self.bot,
-                        json!({"event":"tool_calls_withheld","bot":self.bot,"turn":turn,
-                            "durable":false,"reason":"tool_round_limit"}),
-                    )
-                    .await?;
+                accounting.limit = Some(Limit::Rounds);
+                self.withheld(turn, Limit::Rounds).await?;
             }
             let items = match body {
                 Body::Window(context) => self.items(context, withheld.unwrap_or(context.thinking)),
@@ -3287,10 +3306,8 @@ impl Turn {
                         after,
                         read_at: tokio::time::Instant::now(),
                         stopped: false,
-                        tokens: 0,
-                        room: record
-                            .ceiling()
-                            .map(|c| c.saturating_sub(record.tokens_used)),
+                        tokens: Spend::default(),
+                        room: record.left(),
                         pending: &mut accounting.refresh,
                     };
                     let result = self.stream_warm(call, &sent, &mut warm).await;
@@ -3298,8 +3315,7 @@ impl Turn {
                     accounting.warm_read_at =
                         Some(sent.get().map_or(warm.read_at, |at| warm.read_at.max(at)));
                     accounting.warm_stopped = warm.stopped;
-                    let refreshed = warm.tokens;
-                    record.tokens_used = record.tokens_used.saturating_add(refreshed);
+                    record.add(warm.tokens);
                     result?
                 }
                 _ => call.await,
@@ -3410,14 +3426,20 @@ impl Turn {
                 return Ok(None);
             }
             // Whatever the provider billed for a failed attempt is still spent.
+            let mut failed = Charge::Aside;
             if let Some(usage) = &mut accounting.report.usage {
                 usage.sent_ms = sent_ms;
                 self.tokens.add(usage);
                 *model_rounds += 1;
-                record.tokens_used = record
-                    .tokens_used
-                    .saturating_add(usage.input_tokens)
-                    .saturating_add(usage.output_tokens);
+                let charge = match body {
+                    Body::Window(context) => {
+                        let (added, read) = added_input(record, context, tools, usage);
+                        Charge::Failed { added, read }
+                    }
+                    _ => Charge::Aside,
+                };
+                record.charge(usage, charge);
+                failed = charge;
             }
             let usage = accounting.report.usage.take();
             if summary {
@@ -3431,7 +3453,7 @@ impl Turn {
                         .await?;
                 }
             } else {
-                self.failed_usage(usage).await?;
+                self.failed_usage(usage, failed).await?;
             }
             let mut resend = false;
             let mut retry = json!({"thinking_withheld":true});
@@ -3458,7 +3480,22 @@ impl Turn {
             }
             // A retry is another billable call: none once failed usage has
             // spent the bot's or turn's budget, or the rounds are used up.
-            let capped = record.exhausted().or_else(|| {
+            // The turn's own call goes once more without tool calls, as at a
+            // boundary, so the turn reports what it did; one that went so
+            // already is retried as it went.
+            let window = matches!(body, Body::Window(_));
+            let capped = match record.exhausted() {
+                Some(_) if window && tool_calls => {
+                    let limit = record.room().map_or(Limit::Budget, |(_, limit)| limit);
+                    (tool_calls, warm_after) = (false, None);
+                    accounting.limit = Some(limit);
+                    announce = Some(limit);
+                    None
+                }
+                Some(_) if window => None,
+                exhausted => exhausted,
+            };
+            let capped = capped.or_else(|| {
                 (*model_rounds >= self.settings().max_rounds())
                     .then(|| Error::new("tool_round_limit"))
             });
@@ -3591,6 +3628,21 @@ impl Turn {
         }
     }
 
+    /// Say live that the call goes without tool calls, and the limit why.
+    async fn withheld(&self, turn: i64, limit: Limit) -> Result<()> {
+        let reason = match limit {
+            Limit::Rounds => "tool_round_limit",
+            limit => limit.as_str(),
+        };
+        self.hub
+            .live(
+                &self.bot,
+                json!({"event":"tool_calls_withheld","bot":self.bot,"turn":turn,
+                    "durable":false,"reason":reason}),
+            )
+            .await
+    }
+
     /// Record a retry as the turn's event, so it outlives the live stream.
     async fn retried(&self, data: Value) -> Result<()> {
         let turn = self.turn;
@@ -3599,11 +3651,21 @@ impl Turn {
             .await
     }
 
-    async fn failed_usage(&self, usage: Option<agent_runtime::provider::Usage>) -> Result<()> {
+    async fn failed_usage(
+        &self,
+        usage: Option<agent_runtime::provider::Usage>,
+        charge: Charge,
+    ) -> Result<()> {
+        let (added, read) = match charge {
+            Charge::Failed { added, read } => (added, read),
+            _ => (0, None),
+        };
         if let Some(usage) = usage {
             let turn = self.turn;
             self.store
-                .op("failed_usage", move |db| db.failed_usage(turn, &usage))
+                .op("failed_usage", move |db| {
+                    db.failed_usage(turn, &usage, added, read)
+                })
                 .await?;
         }
         Ok(())
@@ -3827,12 +3889,12 @@ impl Turn {
     ) -> Result<()> {
         match self.account_refresh(refreshed).await? {
             Some((tokens, sent_at)) => {
-                warm.tokens = warm.tokens.saturating_add(tokens);
+                warm.tokens = warm.tokens.plus(tokens);
                 // The refresh's own read, from when it was sent. One carried
                 // over from an earlier attempt can be older than this one's.
                 warm.read_at = warm.read_at.max(sent_at);
                 // A cap reached ends them: no call after it would read the cache.
-                warm.stopped |= warm.room.is_some_and(|room| warm.tokens >= room);
+                warm.stopped |= !warm.room.holds(warm.tokens);
             }
             None => warm.stopped = true,
         }
@@ -3845,7 +3907,7 @@ impl Turn {
     async fn account_refresh(
         &self,
         refreshed: Result<(agent_runtime::provider::Usage, tokio::time::Instant)>,
-    ) -> Result<Option<(u64, tokio::time::Instant)>> {
+    ) -> Result<Option<(Spend, tokio::time::Instant)>> {
         let (usage, sent_at) = match refreshed {
             Ok(refreshed) => refreshed,
             Err(error) => {
@@ -3859,7 +3921,11 @@ impl Turn {
                 return Ok(None);
             }
         };
-        let tokens = usage.input_tokens.saturating_add(usage.output_tokens);
+        // It re-reads the history: its work is its output.
+        let tokens = Spend {
+            tokens: usage.input_tokens.saturating_add(usage.output_tokens),
+            work: usage.output_tokens,
+        };
         self.record_refresh(usage, sent_at).await?;
         Ok(Some((tokens, sent_at)))
     }
@@ -5433,6 +5499,55 @@ fn searches(record: &agent_runtime::store::Bot) -> bool {
     record.callable().iter().any(|tool| tool == "web_search")
 }
 
+/// Whether a turn whose budget is spent makes one more call, without tool
+/// calls: one that has called under it, for an answer, a summary or a failed
+/// attempt, answers on it, unless a call for a budget already went.
+fn wraps_up(model_rounds: usize, wrapped: bool) -> bool {
+    model_rounds > 0 && !wrapped
+}
+
+/// The budget a call already spent, whose next call goes without tool
+/// calls as the turn's last. No call's work is known before it is made, so
+/// none is predicted: that last call may overshoot the cap.
+fn budget_reached(record: &agent_runtime::store::Bot) -> Option<Limit> {
+    record
+        .room()
+        .filter(|&(left, _)| left == 0)
+        .map(|(_, limit)| limit)
+}
+
+/// The input tokens a call's request sent new, as the work measure counts
+/// them, and the newest node it sent: of what the answering model read, the
+/// share of the request its history items after the newest node the bot's
+/// calls have read or written take. One pass over those items alone, from
+/// the window the turn holds: no read, whatever the history's length. A bot
+/// whose calls have read nothing sends all of it new.
+fn added_input(
+    record: &agent_runtime::store::Bot,
+    context: &Context,
+    tools: &serde_json::value::RawValue,
+    usage: &agent_runtime::provider::Usage,
+) -> (u64, Option<i64>) {
+    let input = usage
+        .models
+        .last()
+        .map_or(usage.input_tokens, |m| m.input_tokens);
+    let Some(window) = &context.window else {
+        return (input, record.work.read);
+    };
+    let sent = window.ids.last().copied();
+    let Some(read) = record.work.read else {
+        return (input, sent);
+    };
+    let new: u64 = (window.ids.iter().rev())
+        .zip(window.sizes.iter().rev())
+        .take_while(|(id, _)| **id > read)
+        .map(|(_, size)| u64::from(*size))
+        .sum();
+    let whole = context.usage().bytes + record.instructions.len() + tools.get().len();
+    (agent_runtime::store::share(input, new, whole as u64), sent)
+}
+
 fn calls_left(record: &agent_runtime::store::Bot, model_rounds: usize) -> bool {
     model_rounds < record.settings.max_rounds() && record.exhausted().is_none()
 }
@@ -5778,12 +5893,14 @@ type Beside<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = Landed> + S
 /// What a summary beside the call spent, counted toward the turn.
 #[derive(Default)]
 struct Spent {
-    tokens: u64,
+    spend: Spend,
     rounds: usize,
 }
 impl Spent {
-    fn count(self, tokens_used: &mut u64, model_rounds: &mut usize) {
-        *tokens_used = tokens_used.saturating_add(self.tokens);
+    fn count(self, record: Option<&mut agent_runtime::store::Bot>, model_rounds: &mut usize) {
+        if let Some(record) = record {
+            record.add(self.spend);
+        }
         *model_rounds += self.rounds;
     }
 }
@@ -6344,12 +6461,12 @@ mod tests {
     fn a_models_wait_keeps_a_turns_outcome_and_drops_its_accounting() {
         let view = json!({"bot":"Bob","bot_id":2,"turn":3,"handle":"turn:Bob/3",
             "request_id":"r","waiting_on":null,"input_tokens":10,"cached_input_tokens":0,
-            "output_tokens":4,"model_rounds":1,"retries":0,"paced_ms":0,"started_ms":1,
-            "finished_ms":2});
+            "output_tokens":4,"work_tokens":6,"model_rounds":1,"retries":0,"paced_ms":0,
+            "started_ms":1,"finished_ms":2});
         let mut failed = view.clone();
         failed.as_object_mut().unwrap().extend(
-            json!({"status":"failed","error":"turn_budget_exceeded","detail":"over",
-                "budget_tokens":100,"tokens_used":120})
+            json!({"status":"failed","error":"turn_budget_exhausted","detail":"over",
+                "turn_budget_tokens":100,"turn_work_tokens":120})
             .as_object()
             .unwrap()
             .clone(),
@@ -6364,8 +6481,8 @@ mod tests {
         let model = for_model(results);
         assert_eq!(
             *model["turn:Bob/3"],
-            json!({"turn":3,"status":"failed","error":"turn_budget_exceeded","detail":"over",
-                "budget_tokens":100,"tokens_used":120})
+            json!({"turn":3,"status":"failed","error":"turn_budget_exhausted","detail":"over",
+                "turn_budget_tokens":100,"turn_work_tokens":120})
         );
         assert_eq!(
             *model["turn:Bob/4"],
@@ -6398,6 +6515,7 @@ mod tests {
                             instructions: "",
                             effort: None,
                             budget_tokens: None,
+                            budget_counts: Default::default(),
                             tools: &[],
                             created_by: None,
                             created_by_id: None,
@@ -6616,6 +6734,7 @@ mod tests {
                         instructions: "",
                         effort: None,
                         budget_tokens: None,
+                        budget_counts: Default::default(),
                         tools: &[],
                         created_by: None,
                         created_by_id: None,
@@ -6752,6 +6871,7 @@ mod tests {
                         instructions: "",
                         effort: None,
                         budget_tokens: None,
+                        budget_counts: Default::default(),
                         tools: &tools,
                         created_by: None,
                         created_by_id: None,
