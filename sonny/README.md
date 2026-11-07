@@ -1061,18 +1061,27 @@ way `/react` does, and each note in the margin has its own `↩`.
   Markdown with the same renderer a reply uses, and the composer's hint
   names it: a pick answers it (an option's number, or a click on the
   option), and goes to the lead as `You asked (CALL_ID): QUESTION` and the option, by the ask's call so another asking the same words stays open.
-  While you type a number, the composer's band names the question over
-  it, as the sent answer shows it. Words you type are your own message,
-  sent as you wrote them and never framed as an answer, so something
-  typed while a question is open, meant for anything, answers nothing by
-  accident; the lead reads whether your words answer it, as a reply under
-  a card in a chat is read. With several open, the composer picks for one
-  at a time, the oldest first, and says which (`1 of 2`); ↑↓ with nothing
-  typed switches to another, and a click on any card's option answers
-  that one. Esc sets them aside, and Esc again brings them back.
-  Once you send words of your own, the conversation has moved on: the open
-  questions leave the composer and the `needs you` count, and their cards'
-  options still answer them. The lead does not wait on you blindly: each
+  While a question is in focus, whatever you send answers it: a number
+  picks that option, and words you type are your answer, sent once as
+  `You asked (CALL_ID): QUESTION` and your words and drawn as question
+  and answer, as a pick is. The composer's band names the question over
+  what you type, as the sent answer shows it. With several open, the
+  composer answers one at a time, the oldest first, and says which
+  (`1 of 2`); ↑↓ with nothing typed switches to another, and a click on
+  any card's option answers that one. Esc lets you write freely: what you
+  send then is your own message, and the conversation has moved on, so
+  the open questions are set aside. They leave the composer and the
+  `needs you` count, each card's `?` turns muted with `Set aside: you
+  wrote past it. A pick still answers it.`, and a click on a card's
+  question brings it back into the composer to answer. When your own
+  words did answer one, or it no longer matters, the agent closes it
+  with `close_ask`: answered in your words with the option it goes with,
+  or withdrawn with why; there is no matching of your text. Each card
+  says where its question stands: open (a yellow `?`), set aside,
+  answered (`✓` and the answer) or withdrawn (a muted `–` and why), and a
+  settled card folds to its question and that row until a click on the
+  question opens it. A pick of yours on a withdrawn card, or on one the
+  agent closed for you, still answers it. The lead does not wait on you blindly: each
   ask says what it does until you answer, and the card's last row says
   so. It goes on with the option it recommends at once when that can be
   undone (`Going with 2 meanwhile; another pick undoes it.`), goes on with
@@ -1114,6 +1123,8 @@ way `/react` does, and each note in the margin has its own `↩`.
   ![Three decisions: one the lead goes ahead with meanwhile, one that goes ahead at 21:17 unless you pick, and one that waits for you with a reminder](../docs/sonny/ask-meanwhile.png)
 
   ![Typing an answer: the composer's band names the question over the words, as the sent answer will show it](../docs/sonny/ask-answering.png)
+
+  ![Where each question stands: one answered, one withdrawn with why, one set aside, and the composer answering an open one in words](../docs/sonny/question-states-dark.png)
 
   ![A task's question: the lead's task updates say shop.wire asks you, and wire, opened from the margin's ↗, shows the decision in the pane](../docs/sonny/ask-from-task.png)
 - `/copy` puts the last reply on the clipboard; `/open` opens the last
