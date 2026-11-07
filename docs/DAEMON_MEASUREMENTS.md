@@ -2339,6 +2339,27 @@ with the cap and now admits 128 requests without waiting for any headers.
 The caller-selected startup-bound test again starts cold, without a warmup;
 pacing, retry, interruption, and restart tests continue to pass.
 
+## One TLS setup for every connection shard (A2)
+
+`agent serve` to its bound socket, release build, a fresh HOME, no SSL
+environment variables, default limits (64 HTTP/2 shards), median of 7 on
+a Linux cloud box:
+
+| Build | Median | Fastest |
+| --- | ---: | ---: |
+| `main` | 215 ms | 164 ms |
+| One shared TLS setup | 17 ms | 16 ms |
+
+Each shard's client used to build its own TLS setup, and each build read
+the system's root certificates again (248 files under `/etc/ssl/certs`).
+The shards and the websocket path now share one `rustls` setup with the
+platform verifier, so the certificates load once. Nothing on a turn's
+path changes; requests verify as before. With one shard
+(`--max-active 64`) start was already about 24 ms, which the shared setup
+now matches at any shard count. On macOS the platform verifier asks the
+Security framework instead of reading files; that cost per client was
+not measured here.
+
 ## Storage counters by operation
 
 Observed 2026-09-19 on Darwin arm64, external power, Rust 1.98.0. Every
