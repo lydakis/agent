@@ -785,8 +785,10 @@ way `/react` does, and each note in the margin has its own `↩`.
   request its last reply linked shows on its row), and **Done** (marked
   done). Each agent is one line: its mark, name, state and time, and at
   its right edge, dim, what it tracks: what it follows (a source with an
-  `icon` in `[sonny.sources.NAME]` shows as that icon), its pull request
-  (`3 PRs · …#802` when its replies linked more), its background work
+  `icon` in `[sonny.sources.NAME]` shows as that icon), the code reviews
+  its replies named, in any system, as the copy that checks each reply
+  names them (`3 reviews · CR-881`; a pull or merge request link its last
+  reply holds shows before any is kept), its background work
   and its window. The picked agent, and every one that needs you, says
   more under it: its model and profile, and its latest step. Idle shows
   its newest eight and a `+5 more · i shows them` line for the rest; Done
@@ -1176,7 +1178,7 @@ turn of the task numbered after that one reopens it.
 
 ![A decision the lead asked with the ask tool, drawn where it asked it, its code, bold, math and links read as Markdown](../docs/sonny/ask-markdown.png)
 
-![/status with the lead first, then its tasks under Needs you, Working, Idle and Done, one line each, a picked task's two helpers open under it and pull requests at the right edge](../docs/sonny/status-groups.png)
+![/status with the lead first, then its tasks under Needs you, Working, Idle and Done, one line each, a picked task's two helpers open under it and code reviews at the right edge](../docs/sonny/status-groups.png)
 
 Settings Sonny keeps for every folder are in `~/.agent/config.toml`'s
 `[sonny]`, which `/config` shows: the chime (`chime`, on by default) and

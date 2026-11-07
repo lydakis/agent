@@ -64,11 +64,12 @@ mod place;
 mod plan;
 mod project;
 mod prompt;
-mod prs;
+
 mod reactions;
 mod recall;
 mod resolved;
 mod responsible;
+mod reviews;
 mod rex;
 mod rules;
 mod said;
@@ -790,8 +791,8 @@ async fn read_status(
             profile,
             latest: step,
             place,
-            pr: match prs::read(&store, name) {
-                kept if !kept.is_empty() => prs::said(&kept),
+            pr: match reviews::read(&store, name) {
+                kept if !kept.is_empty() => reviews::said(&kept),
                 _ => pr.unwrap_or_default(),
             },
             background: background::fact(&behind, name, &icons),

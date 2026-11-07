@@ -3,7 +3,7 @@
 //! by where they stand, as a thread list is: what needs the person, what
 //! works, what sits idle, and, folded away, what is marked done. Each row
 //! is one line: what the agent is doing and for how long, and at the right
-//! what it follows, its pull requests, what runs for it in the background
+//! what it follows, its code reviews, what runs for it in the background
 //! and where its window is. The picked one says its model, profile and
 //! latest step, and one that needs the person what for. A task's own
 //! helpers fold under it.
@@ -527,7 +527,7 @@ pub fn alert_lines(alert: &Alert, width: usize) -> Vec<Line<'static>> {
 }
 
 /// One agent's lines, after `indent`: its mark, name, state and time,
-/// and at the right what it is followed by, its pull requests, what runs
+/// and at the right what it is followed by, its code reviews, what runs
 /// for it and where its window is; under it, with `details` or while it
 /// waits on the person, its latest step, and with `details` its model and
 /// profile too.
@@ -567,7 +567,7 @@ fn row_lines(row: &Row, width: usize, indent: &str, details: bool) -> Vec<Line<'
     let room = width.saturating_sub(left + 2);
     if !right.is_empty() && room > 0 {
         // At the right edge, as far as it fits: what is followed and the
-        // pull requests first.
+        // code reviews first.
         let right = crate::transcript::cut(&right, room);
         let gap = width.saturating_sub(left + right.width()).max(2);
         spans.push(Span::raw(" ".repeat(gap)));
@@ -814,7 +814,7 @@ mod tests {
             },
             Row {
                 profile: "task".into(),
-                pr: "2 PRs · o/r#9".into(),
+                pr: "2 reviews · o/r#9".into(),
                 follows: "▲".into(),
                 background: "↻ 1 automation".into(),
                 place: "tab 2".into(),
@@ -838,7 +838,7 @@ mod tests {
         assert_eq!(lines[7], "Idle · 1");
         assert_eq!(
             lines[8],
-            " ✓ equal idle · took 42s              ▲ · 2 PRs · o/r#9 · ↻ 1 automation · tab 2"
+            " ✓ equal idle · took 42s          ▲ · 2 reviews · o/r#9 · ↻ 1 automation · tab 2"
         );
         assert_eq!(lines[10], "Done · 1 ▸");
         assert_eq!(lines.len(), 11);

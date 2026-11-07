@@ -18,8 +18,11 @@
 //! agent's open question while no later turn of its started
 //! ([`crate::needs::Seen::open`]): the footer, `/status`, the agent's tab
 //! and its lead's window, where a word typed under it goes to the agent.
-//! `[sonny] needs_check = false` turns the check off; marks kept then
-//! still hold until the agent's next turn.
+//! The same copy names the code reviews the reply opened, updated or waits
+//! on, in whatever system holds them ([`crate::reviews`]).
+//! `[sonny] needs_check = false` turns the check off, and with it what
+//! reviews are kept; marks kept then still hold until the agent's next
+//! turn.
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -41,7 +44,9 @@ const ASK: &str = "[A CHECK FROM SONNY, answered in JSON alone; nothing here rea
     your work goes on: an answer, a decision, an approval, or a step for them to take? With one, \
     set waiting to true and say in `for` what they need to give, in a few plain words of theirs, \
     such as \"which branch to deploy\". When your work goes on without them, or is finished, set \
-    waiting to false and `for` to \"\".";
+    waiting to false and `for` to \"\". In `reviews`, list each code review your last reply says you \
+    opened, updated or wait on, in whatever system holds it, by a short name such as \"o/r#7\", \
+    \"D1234\" or \"CR-881\", else its link; [] for none.";
 
 /// What a turn's reply left waiting on the person.
 #[derive(Clone, Debug, PartialEq)]
@@ -146,9 +151,10 @@ fn schema() -> Value {
         "type": "object",
         "properties": {
             "waiting": {"type": "boolean"},
-            "for": {"type": "string"}
+            "for": {"type": "string"},
+            "reviews": {"type": "array", "items": {"type": "string"}}
         },
-        "required": ["waiting", "for"],
+        "required": ["waiting", "for", "reviews"],
         "additionalProperties": false
     })
 }
@@ -173,6 +179,14 @@ pub fn answer(reply: &str) -> Option<Option<String>> {
     }))
 }
 
+/// The code reviews the copy's reply says the reply named.
+pub fn reviews(reply: &str) -> Vec<String> {
+    let said: Value = serde_json::from_str(reply.trim()).unwrap_or_default();
+    (said["reviews"].as_array().into_iter().flatten())
+        .filter_map(|name| Some(name.as_str()?.to_owned()))
+        .collect()
+}
+
 /// How many copies one window has asking at once.
 const CHECKS: usize = 4;
 static ASKING: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(CHECKS);
@@ -190,12 +204,16 @@ pub fn just_ended(finished_ms: u64) -> bool {
 }
 
 /// Check what `bot`'s turn `turn`, just ended, left waiting on the person,
-/// on its own task so the window never waits on it: the pull requests its
-/// reply names are kept ([`crate::prs`]), and, unless `[sonny]
-/// needs_check` is off, what a copy says is kept as its mark. Not a side
-/// chat's, nor a copy's, nor a turn answered already.
+/// on its own task so the window never waits on it: what a copy says is
+/// kept as its mark, and the code reviews it says the reply named
+/// ([`crate::reviews`]). Not with `[sonny] needs_check` off, nor a side
+/// chat's, a copy's or a turn answered already.
 pub fn spawn(client: Arc<Client>, store: PathBuf, bot: String, turn: i64) {
-    if is_copy(&bot) || crate::side_source(&bot).is_some() || answered(&store, &bot, turn) {
+    if is_copy(&bot)
+        || crate::side_source(&bot).is_some()
+        || answered(&store, &bot, turn)
+        || !agent_client::config::load().map_or(true, |c| c.sonny.needs_check)
+    {
         return;
     }
     let key = (bot.clone(), turn);
@@ -203,15 +221,13 @@ pub fn spawn(client: Arc<Client>, store: PathBuf, bot: String, turn: i64) {
         Ok(mut checking) if !checking.contains(&key) => checking.push(key.clone()),
         _ => return,
     }
-    let check = agent_client::config::load().map_or(true, |c| c.sonny.needs_check);
     tokio::spawn(async move {
         if let Ok(_asking) = ASKING.acquire().await
             // Another window answered it while this one waited its turn.
             && !answered(&store, &bot, turn)
             // What could not be checked, a second window's copy the
             // daemon refused among it, is left unmarked.
-            && let Ok(found) = waiting_for(&client, &store, &bot, turn, check).await
-            && check
+            && let Ok(found) = waiting_for(&client, &store, &bot, turn).await
         {
             let mark = found.map(|waiting_for| Mark { turn, waiting_for });
             let _ = keep(&store, &bot, turn, mark.as_ref());
@@ -222,42 +238,43 @@ pub fn spawn(client: Arc<Client>, store: PathBuf, bot: String, turn: i64) {
     });
 }
 
-/// What `bot`'s turn `turn` left waiting on the person, once the pull
-/// requests its reply names are kept beside `store` ([`crate::prs`]):
-/// nothing unless `check`, nor for a turn that ended without words, or
-/// with a question the ask tool put, which every surface reads itself;
-/// else what a copy of `bot` says.
+/// What `bot`'s turn `turn` left waiting on the person, once the code
+/// reviews its reply names are kept beside `store` ([`crate::reviews`]):
+/// nothing for a turn that ended without words; else what a copy of `bot`
+/// says, unless a question the ask tool put is open, which every surface
+/// reads itself.
 async fn waiting_for(
     client: &Client,
     store: &Path,
     bot: &str,
     turn: i64,
-    check: bool,
 ) -> Result<Option<String>, String> {
     let handle = format!("turn:{bot}/{turn}");
     let ended = client
         .request("wait", json!({"handles": [&handle], "timeout_ms": 0}))
         .await
         .map_err(|e| e.to_string())?;
-    let said = ended["results"][&handle]["text"].as_str().unwrap_or("");
-    crate::prs::note(store, bot, said)?;
-    if !check || said.trim().is_empty() {
-        return Ok(None);
-    }
-    if crate::needs::scan(client, bot, Some(turn))
-        .await
-        .is_some_and(|seen| seen.ask.is_some())
+    if ended["results"][&handle]["text"]
+        .as_str()
+        .is_none_or(|said| said.trim().is_empty())
     {
         return Ok(None);
     }
-    self::check(client, bot, turn).await
+    let reply = self::check(client, bot, turn).await?;
+    crate::reviews::note(store, bot, &reviews(&reply))?;
+    let waiting = answer(&reply)
+        .ok_or_else(|| format!("the check's reply was not the JSON asked for: {reply}"))?;
+    let asked = crate::needs::scan(client, bot, Some(turn))
+        .await
+        .is_some_and(|seen| seen.ask.is_some());
+    Ok(waiting.filter(|_| !asked))
 }
 
 /// Ask a copy of `bot`, with no tools, whether its turn `turn`'s reply
-/// waits on the person: what for, or none; an error when the copy could
-/// not be made, another window's copy of that turn is asked already, or
-/// it did not answer as asked.
-pub async fn check(client: &Client, bot: &str, turn: i64) -> Result<Option<String>, String> {
+/// waits on the person, and what reviews it named: its reply, in JSON
+/// that follows [`schema`]; an error when the copy could not be made, or
+/// another window's copy of that turn is asked already.
+pub async fn check(client: &Client, bot: &str, turn: i64) -> Result<String, String> {
     let name = copy_name(bot, turn as u128 % 0x80_0000);
     // This window's own request: another's, of the same name, is refused
     // while this copy is there.
@@ -274,8 +291,7 @@ pub async fn check(client: &Client, bot: &str, turn: i64) -> Result<Option<Strin
     let _ = client
         .request("delete", json!({"bot": name, "bot_id": forked["bot_id"]}))
         .await;
-    let reply = reply?;
-    answer(&reply).ok_or_else(|| format!("the check's reply was not the JSON asked for: {reply}"))
+    reply
 }
 
 /// The copy's name: `bot` cut short enough that the name, and the submit's
@@ -406,11 +422,11 @@ mod tests {
             match request["op"].as_str() {
                 Some("wait") if handle == "turn:calc.plan/3" => json!({"results": {handle:
                     {"status": "completed", "text":
-                        "Opened https://github.com/o/r/pull/7. Deploy to staging or prod?"}}}),
+                        "Sent CR-881 for review. Deploy to staging or prod?"}}}),
                 Some("wait") if handle == "turn:calc.quiet/3" => json!({"results": {handle:
                     {"status": "completed", "text": " "}}}),
                 Some("wait") => json!({"results": {handle: {"status": "completed",
-                    "text": r#"{"waiting": true, "for": "staging or prod"}"#}}}),
+                    "text": r#"{"waiting": true, "for": "staging or prod", "reviews": ["CR-881"]}"#}}}),
                 Some("history_nodes") => json!({"nodes": []}),
                 Some("fork") => json!({"bot_id": 9}),
                 Some("submit") => json!({"handle": "turn:copy/1", "turn": 1}),
@@ -422,11 +438,12 @@ mod tests {
             .join(format!("sonny-waiting-for-{}", std::process::id()))
             .join("store");
         assert_eq!(
-            waiting_for(&client, &store, "calc.plan", 3, true).await,
+            waiting_for(&client, &store, "calc.plan", 3).await,
             Ok(Some("staging or prod".into()))
         );
-        // The pull request its reply named is kept for `/status`.
-        assert_eq!(crate::prs::read(&store, "calc.plan"), ["o/r#7"]);
+        // The review the copy says its reply named, in any system, is
+        // kept for `/status`.
+        assert_eq!(crate::reviews::read(&store, "calc.plan"), ["CR-881"]);
         let requests = asked.lock().unwrap().clone();
         let fork = requests.iter().find(|r| r["op"] == "fork").unwrap();
         assert_eq!(fork["source"], "calc.plan");
@@ -434,19 +451,13 @@ mod tests {
         let submit = requests.iter().find(|r| r["op"] == "submit").unwrap();
         assert_eq!(
             submit["output_schema"]["required"],
-            json!(["waiting", "for"])
+            json!(["waiting", "for", "reviews"])
         );
         assert!(requests.iter().any(|r| r["op"] == "delete"));
         // No words, no copy.
         asked.lock().unwrap().clear();
         assert_eq!(
-            waiting_for(&client, &store, "calc.quiet", 3, true).await,
-            Ok(None)
-        );
-        assert!(!asked.lock().unwrap().iter().any(|r| r["op"] == "fork"));
-        // With the check off, the pull requests are still kept.
-        assert_eq!(
-            waiting_for(&client, &store, "calc.plan", 3, false).await,
+            waiting_for(&client, &store, "calc.quiet", 3).await,
             Ok(None)
         );
         assert!(!asked.lock().unwrap().iter().any(|r| r["op"] == "fork"));
