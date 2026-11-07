@@ -643,7 +643,7 @@ async fn read_status(
             // One with a goal says whether that turn met it.
             (false, Some("completed" | "steered")) => {
                 lookout::goals::standing(options_store, name, ran["turn"].as_i64())
-                    .unwrap_or("done")
+                    .unwrap_or(started::IDLE)
                     .into()
             }
             (false, Some("failed")) if ran["error"] == EMPTY => started::QUIET.into(),
@@ -729,7 +729,11 @@ async fn read_status(
             true => "needs you".to_owned(),
             false => state,
         };
-        let group = status::group(&state, running, ask.is_some(), pr.is_some(), resolved);
+        let state = match resolved && !running {
+            true => started::DONE.to_owned(),
+            false => state,
+        };
+        let group = status::group(&state, running, ask.is_some(), resolved);
         let place = match view.places.get(name) {
             Some((tab, Some((side, other)))) => {
                 format!("tab {tab}, {side} {}", short(other, &project, &lead))
@@ -2713,6 +2717,8 @@ fn report_status(state: &str, bot: &str) {
     let doing = match state {
         "blocked" | "asking" => "needs you",
         "error" => "failed",
+        // A turn that ended, seen or not yet: it rests.
+        "done" => started::IDLE,
         "clear" => "",
         other => other,
     };
@@ -4855,11 +4861,11 @@ impl Fleet {
                 _ if self.zen && !(bot == self.lead && doing == "needs you") => None,
                 // The lead's view rings for its own ends: only it knows
                 // whether a turn the lookout started said anything.
-                "done" if bot == self.lead => None,
-                "done" => Some((sound::Alert::TaskDone, format!("{short} is done"))),
+                started::IDLE if bot == self.lead => None,
+                started::IDLE => Some((sound::Alert::TaskDone, format!("{short} finished"))),
                 started::QUIET => Some((
                     sound::Alert::TaskDone,
-                    format!("{short} is done, saying nothing"),
+                    format!("{short} finished, saying nothing"),
                 )),
                 "failed" => Some((sound::Alert::Failed, format!("{short} failed"))),
                 "needs you" => Some((sound::Alert::NeedsYou, format!("{short} needs you"))),
@@ -4932,9 +4938,11 @@ impl Fleet {
                     self.doing(
                         bot,
                         match data["status"].as_str() {
-                            Some("completed" | "steered") => "done",
+                            Some("completed" | "steered") => started::IDLE,
                             // A lead says nothing to news by design.
-                            Some("failed") if data["error"] == EMPTY && bot == self.lead => "done",
+                            Some("failed") if data["error"] == EMPTY && bot == self.lead => {
+                                started::IDLE
+                            }
                             Some("failed") if data["error"] == EMPTY => started::QUIET,
                             Some("interrupted") => "stopped",
                             _ => "failed",
@@ -6543,6 +6551,8 @@ impl App {
         // The tasks whose questions were read this pass.
         let mut asked = Vec::new();
         for bot in bots {
+            // Marked done, by itself or its lead, since its newest turn.
+            let mut done = false;
             let state = match self.task_turn_at(&bot).await {
                 Ok((turn, head)) => {
                     let state = started::state(&turn);
@@ -6573,6 +6583,8 @@ impl App {
                                 seen
                             }
                         };
+                        done = seen.itself
+                            || resolved::holds(resolved::read(&store, &bot), seen.turn, false);
                         // One the lead resolved set its question aside.
                         needs.asked(&bot, seen.open(&store, &bot, false));
                         ended.push(bot.clone());
@@ -6584,8 +6596,9 @@ impl App {
                         needs.waits(&bot) || (!asked.contains(&bot) && self.task_needs.waits(&bot));
                     match (waits, state.as_str(), turn["turn"].as_i64()) {
                         (true, ..) => "needs you".to_owned(),
+                        (false, ..) if done => started::DONE.to_owned(),
                         // One with a goal says whether that turn met it.
-                        (false, "done", Some(last)) => {
+                        (false, started::IDLE, Some(last)) => {
                             lookout::goals::standing(&self.options.store, &bot, Some(last))
                                 .map_or(state, str::to_owned)
                         }
@@ -9057,7 +9070,7 @@ impl App {
             .unwrap_or_else(|_| self.options.store.clone())
     }
 
-    /// Note the task a lead's `resolve_task` call `call` in `turn` names
+    /// Note the task a lead's `mark_done` call `call` in `turn` names
     /// as resolved, up to its newest turn finished by then: `now`, as it
     /// happens, when its window closes too; replayed, by the time the
     /// lead's turn ended, unless the mark it made then is kept.
@@ -10056,14 +10069,14 @@ impl App {
                         && !switches(key)
                         && let Some(view) = self.watch.as_mut().and_then(|w| w.sky.as_mut())
                         && view.press(key.code) => {}
-                    // `/status` opens or folds its done and resolved tasks.
-                    KeyCode::Char(key @ ('d' | 'r'))
+                    // `/status` opens or folds its idle and done tasks.
+                    KeyCode::Char(key @ ('i' | 'd'))
                         if pane.is_card()
                             && let Some(watch) = &mut self.watch =>
                     {
                         watch.toggle(match key {
-                            'd' => status::Group::Done,
-                            _ => status::Group::Resolved,
+                            'i' => status::Group::Idle,
+                            _ => status::Group::Done,
                         })
                     }
                     _ if switches(key) || key.code == KeyCode::Tab => self.pane_keys = false,
@@ -10441,7 +10454,7 @@ impl App {
             "group" => {
                 if let Some(watch) = &mut self.watch {
                     watch.toggle(match id {
-                        "r" => status::Group::Resolved,
+                        "i" => status::Group::Idle,
                         _ => status::Group::Done,
                     });
                 }
@@ -14352,10 +14365,10 @@ fn watch_card(
 }
 
 /// The key that opens or folds `group` in `/status`, and its name in a
-/// button: `d` done, `r` resolved.
+/// button: `i` idle, `d` done.
 fn group_key(group: status::Group) -> &'static str {
     match group {
-        status::Group::Resolved => "r",
+        status::Group::Idle => "i",
         _ => "d",
     }
 }
@@ -14366,7 +14379,7 @@ fn status_keys(watch: &Watch, keys: &[&str]) -> String {
     let mut said = String::from("↑↓ pick · enter open");
     for key in keys {
         let group = match *key {
-            "r" => status::Group::Resolved,
+            "i" => status::Group::Idle,
             _ => status::Group::Done,
         };
         let verb = match watch.open.contains(&group) {
@@ -14374,7 +14387,7 @@ fn status_keys(watch: &Watch, keys: &[&str]) -> String {
             false => "show",
         };
         let name = match group {
-            status::Group::Resolved => "resolved",
+            status::Group::Idle => "idle",
             _ => "done",
         };
         said.push_str(&format!(" · {key} {verb} {name}"));
@@ -19483,7 +19496,7 @@ mod tests {
         running.store(false, std::sync::atomic::Ordering::SeqCst);
         app.tasks_read = None;
         app.read_tasks().await;
-        assert_eq!(drawn(&mut app)[1], "  ✓ add  done  Fix add");
+        assert_eq!(drawn(&mut app)[1], "  ✓ add  idle  Fix add");
     }
 
     #[tokio::test]
@@ -19536,7 +19549,7 @@ mod tests {
         // What each does is read, and drawn where they are.
         app.read_tasks().await;
         let rows = drawn(&mut app);
-        assert_eq!(rows[1], "  ✓ add  done     Fix add");
+        assert_eq!(rows[1], "  ✓ add  idle     Fix add");
         assert_eq!(rows[2], "  ● neg  working  Fix neg");
         // A task the daemon could not read stays as it was; one it does not
         // have is removed.
@@ -20671,7 +20684,7 @@ mod tests {
         // as the fleet follows steers too.
         assert!(FLEET_KINDS.contains(&"steered"));
         fleet.event(&event("steered", 4, json!({"steer": 5})));
-        assert_eq!(fleet.doing["calc.new"], "done");
+        assert_eq!(fleet.doing["calc.new"], "idle");
     }
 
     #[tokio::test]

@@ -45,25 +45,24 @@ pub enum Group {
     NeedsYou,
     /// A turn running, queued, rate limited, or waiting on other tasks.
     Working,
-    /// Finished with a pull request for someone to review.
-    Review,
-    /// Finished, stopped, or never started, with nothing open.
+    /// Its turn ended, stopped, or never started, with nothing open; a
+    /// pull request it opened shows on its row.
     #[default]
+    Idle,
+    /// Marked done, by itself, its lead or the person: nothing left to do,
+    /// until new work reopens it.
     Done,
-    /// Marked resolved: nothing left to do, until new work reopens it.
-    Resolved,
 }
 
 impl Group {
-    /// The group as a word for scripts: `needs_you`, `working`,
-    /// `review`, `done`, `resolved`.
+    /// The group as a word for scripts: `needs_you`, `working`, `idle`,
+    /// `done`.
     pub fn key(self) -> &'static str {
         match self {
             Group::NeedsYou => "needs_you",
             Group::Working => "working",
-            Group::Review => "review",
+            Group::Idle => "idle",
             Group::Done => "done",
-            Group::Resolved => "resolved",
         }
     }
 
@@ -71,27 +70,24 @@ impl Group {
         match self {
             Group::NeedsYou => "Needs you",
             Group::Working => "Working",
-            Group::Review => "Ready for review",
+            Group::Idle => "Idle",
             Group::Done => "Done",
-            Group::Resolved => "Resolved",
         }
     }
 }
 
 /// Where a task stands: `state` as `/status` names it, whether a turn
-/// runs, whether it has a question open for the person or a pull request
-/// in its last reply, and whether it is marked resolved, which only a
-/// task with no turn running can be.
-pub fn group(state: &str, running: bool, asking: bool, pr: bool, resolved: bool) -> Group {
+/// runs, whether it has a question open for the person, and whether it is
+/// marked done, which only a task with no turn running can be.
+pub fn group(state: &str, running: bool, asking: bool, done: bool) -> Group {
     match state {
-        _ if resolved && !running => Group::Resolved,
+        _ if done && !running => Group::Done,
         "needs you" | "failed" => Group::NeedsYou,
         // Held on a cause the person can fix: theirs to set right.
         _ if state.starts_with(HELD) => Group::NeedsYou,
         _ if asking => Group::NeedsYou,
         _ if running => Group::Working,
-        "done" | crate::started::CHECKED if pr => Group::Review,
-        _ => Group::Done,
+        _ => Group::Idle,
     }
 }
 
@@ -121,7 +117,8 @@ pub fn mark(state: &str) -> Span<'static> {
     match state {
         "working" | crate::started::CHECKING => Span::raw("● ").fg(Color::Cyan),
         "needs you" => Span::raw("? ").fg(Color::Yellow).bold(),
-        "done" | "completed" => Span::raw("✓ ").fg(Color::Green),
+        crate::started::IDLE | "completed" => Span::raw("✓ ").fg(Color::Green),
+        crate::started::DONE => Span::raw("✓ ").dim(),
         crate::started::CHECKED => Span::raw("✓ ").fg(Color::Green),
         crate::started::QUIET => Span::raw("✓ ").dim(),
         "failed" => Span::raw("✗ ").fg(Color::Red),
@@ -156,7 +153,7 @@ pub fn plain_line(text: &str) -> String {
 
 /// The groups `/status` folds to their heading until opened: those the
 /// person has nothing to do for, and a click or a key opens.
-pub const FOLDS: [Group; 2] = [Group::Done, Group::Resolved];
+pub const FOLDS: [Group; 2] = [Group::Idle, Group::Done];
 
 /// What `/status` shows of a project: the lead, then its tasks by group,
 /// done and resolved ones folded to their heading unless `open` holds
@@ -180,11 +177,7 @@ pub fn card(project: &str, rows: &[Row], width: usize, open: &[Group]) -> Card {
         tasks.len(),
         if tasks.len() == 1 { "" } else { "s" }
     );
-    for (group, said) in [
-        (Group::NeedsYou, "need you"),
-        (Group::Working, "working"),
-        (Group::Review, "to review"),
-    ] {
+    for (group, said) in [(Group::NeedsYou, "need you"), (Group::Working, "working")] {
         if count(group) > 0 {
             head.push_str(&format!(" · {} {said}", count(group)));
         }
@@ -194,13 +187,7 @@ pub fn card(project: &str, rows: &[Row], width: usize, open: &[Group]) -> Card {
         named.push((out.len(), row.bot.clone()));
         out.extend(row_lines(row, width));
     }
-    for group in [
-        Group::NeedsYou,
-        Group::Working,
-        Group::Review,
-        Group::Done,
-        Group::Resolved,
-    ] {
+    for group in [Group::NeedsYou, Group::Working, Group::Idle, Group::Done] {
         let n = count(group);
         if n == 0 {
             continue;
@@ -435,8 +422,7 @@ fn row_lines(row: &Row, width: usize) -> Vec<Line<'static>> {
         None => String::new(),
     };
     let mark = match row.group {
-        Group::Resolved => Span::raw("✓ ").dim(),
-        Group::Review => Span::raw("◆ ").fg(Color::Blue),
+        Group::Done => Span::raw("✓ ").dim(),
         _ => mark(&row.state),
     };
     let mut spans = vec![
@@ -587,7 +573,7 @@ mod tests {
             "usage limit reached · 6000 agents waiting: api and 5999 more"
         );
         assert_eq!(
-            group("held: ChatGPT sign-in", true, false, false, false),
+            group("held: ChatGPT sign-in", true, false, false),
             Group::NeedsYou
         );
     }
@@ -633,24 +619,17 @@ mod tests {
 
     #[test]
     fn tasks_are_grouped_by_where_they_stand() {
-        assert_eq!(group("working", true, false, false, false), Group::Working);
-        assert_eq!(
-            group("waiting on fix", true, false, false, true),
-            Group::Working
-        );
-        assert_eq!(
-            group("needs you", true, false, false, false),
-            Group::NeedsYou
-        );
+        assert_eq!(group("working", true, false, false), Group::Working);
+        assert_eq!(group("waiting on fix", true, false, true), Group::Working);
+        assert_eq!(group("needs you", true, false, false), Group::NeedsYou);
         // A question asked ends the turn; it still needs the person.
-        assert_eq!(group("done", false, true, true, false), Group::NeedsYou);
-        assert_eq!(group("failed", false, false, false, false), Group::NeedsYou);
-        assert_eq!(group("done", false, false, true, false), Group::Review);
-        // A goal's check passed: the pull request still waits on review.
-        assert_eq!(group("checked", false, false, true, false), Group::Review);
-        assert_eq!(group("stopped", false, false, true, false), Group::Done);
-        assert_eq!(group("done", false, false, false, false), Group::Done);
-        assert_eq!(group("failed", false, true, true, true), Group::Resolved);
+        assert_eq!(group("idle", false, true, false), Group::NeedsYou);
+        assert_eq!(group("failed", false, false, false), Group::NeedsYou);
+        // A pull request shows on the row, not as a group of its own.
+        assert_eq!(group("idle", false, false, false), Group::Idle);
+        assert_eq!(group("checked", false, false, false), Group::Idle);
+        assert_eq!(group("stopped", false, false, false), Group::Idle);
+        assert_eq!(group("failed", false, true, true), Group::Done);
     }
 
     #[test]
@@ -694,9 +673,9 @@ mod tests {
                 profile: "task".into(),
                 pr: "o/r#9".into(),
                 background: "↻ 1 automation".into(),
-                ..row("equal", "done", Group::Review)
+                ..row("equal", "idle", Group::Idle)
             },
-            row("old", "done", Group::Resolved),
+            row("old", "done", Group::Done),
         ];
         let text = |open: &[Group]| -> Vec<String> {
             card("calc", &rows, 100, open)
@@ -706,7 +685,7 @@ mod tests {
                 .collect()
         };
         let folded = text(&[]);
-        assert_eq!(folded[0], "calc · 3 tasks · 1 need you · 1 to review");
+        assert_eq!(folded[0], "calc · 3 tasks · 1 need you");
         assert_eq!(folded[1], " ● lead working · 42s");
         // The profile is said even when it is the seat's own.
         assert_eq!(
@@ -715,24 +694,25 @@ mod tests {
         );
         assert_eq!(folded[4], "Needs you · 1");
         assert_eq!(folded[5], " ? zero needs you · 42s");
-        assert_eq!(folded[8], "Ready for review · 1");
-        assert_eq!(folded[9], " ◆ equal done · took 42s");
-        assert_eq!(
-            folded[10],
-            "   GPT 6.1 Sol · chatgpt · task profile · tab 1 · o/r#9 · ↻ 1 automation"
-        );
-        assert_eq!(folded.last().unwrap(), "Resolved · 1 ▸");
+        assert_eq!(folded[8], "Idle · 1 ▸");
+        assert_eq!(folded.last().unwrap(), "Done · 1 ▸");
         let card_of = card("calc", &rows, 100, &[]);
         let named: Vec<(usize, &str)> = (card_of.named.iter())
             .map(|(at, n)| (*at, n.as_str()))
             .collect();
+        assert_eq!(named, [(1, "calc.lead"), (5, "calc.zero")]);
         assert_eq!(
-            named,
-            [(1, "calc.lead"), (5, "calc.zero"), (9, "calc.equal")]
+            card_of.folds,
+            [(8, Group::Idle), (folded.len() - 1, Group::Done)]
         );
-        assert_eq!(card_of.folds, [(folded.len() - 1, Group::Resolved)]);
-        let shown = text(&[Group::Resolved]);
-        assert_eq!(shown[shown.len() - 3], "Resolved · 1 ▾");
+        let shown = text(&[Group::Idle, Group::Done]);
+        assert_eq!(shown[8], "Idle · 1 ▾");
+        assert_eq!(shown[9], " ✓ equal idle · took 42s");
+        assert_eq!(
+            shown[10],
+            "   GPT 6.1 Sol · chatgpt · task profile · tab 1 · o/r#9 · ↻ 1 automation"
+        );
+        assert_eq!(shown[shown.len() - 3], "Done · 1 ▾");
         assert_eq!(shown[shown.len() - 2], " ✓ old done · took 42s");
     }
 

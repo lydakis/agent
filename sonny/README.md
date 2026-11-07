@@ -367,7 +367,7 @@ first's calls open nothing anywhere and say nothing opened would be seen,
 while the Rex lead opens its tasks' tabs as before. With every window closed, the last one used still names the place. A
 project whose lead is in no multiplexer gets none, and its agents get no
 layout skill. A tab asked for stays until you or an agent close it, or the
-task is resolved. With `task_tabs = "every"`, a task's window
+task is marked done. With `task_tabs = "every"`, a task's window
 closes once its work is taken: its turn completed and the lead (or the task
 that started it) waited on it. One that failed, stopped or waits on you stays
 open, and a task given more work opens again; ask the lead to show one, or
@@ -780,17 +780,17 @@ way `/react` does, and each note in the margin has its own `↩`.
   approval, asking you a question, held on something only you can fix,
   such as a ChatGPT sign-in, or failed),
   **Working** (a turn running, queued, rate limited, waiting on other
-  tasks, or `waiting on its reviewer` while the approver weighs a call), **Ready for review** (finished, its last reply linking a pull
-  request), **Done** (finished or stopped with nothing open), and
-  **Resolved**. Done and Resolved fold to their heading (`Done · 3 ▸`)
-  until a click on it, or `d` and `r` with the keys in the pane, opens
-  them, and the same folds them again. As threads in a
-  claude.ai project do, a task resolves itself with the `resolve_task`
-  tool once nothing is left to do in it, such as when its pull request
-  merged or you dropped the work, and the lead can resolve any of its
-  tasks the same way; the lead hears when a task resolved itself, and the
-  task's window closes once its turn ends. New work sent to the task
-  reopens it. Each agent's
+  tasks, or `waiting on its reviewer` while the approver weighs a call), **Idle**
+  (its turn ended, stopped, or never started, with nothing open; a pull
+  request its last reply linked shows on its row), and **Done** (marked
+  done). Idle and Done fold to their heading (`Idle · 3 ▸`) until a
+  click on it, or `i` and `d` with the keys in the pane, opens them, and
+  the same folds them again. As threads in a claude.ai project are
+  resolved, a task marks itself done with the `mark_done` tool once
+  nothing is left to do in it, such as when its pull request merged or
+  you dropped the work, and the lead can mark any of its tasks done the
+  same way; the lead hears when a task marked itself done, and the task's
+  window closes once its turn ends. New work sent to the task reopens it. Each agent's
   time is how long its running turn has been at it, or how long its last
   turn took. Beside its model each agent names the profile it runs
   as, `lead` and `task` too, which the footer leaves out (it names a
@@ -1141,11 +1141,11 @@ way `/react` does, and each note in the margin has its own `↩`.
 Sonny declares its tools on the agents it opens and the leads it makes,
 which agents they make inherit: `react`, `ask`, `plan` (the plan the
 person sees, as a checklist), `margin` (notes beside the conversation),
-`resolve_task`, `subscriptions`, `show_agent` and
+`mark_done`, `subscriptions`, `show_agent` and
 `run_in_pane`, `start_task` and `remove_task`; a lead's own, which its
 tasks never take, is `new_project`. The daemon shows them to
 the model and records each call: `react`, `plan`, `margin` and
-`resolve_task` run nothing, and the rest wait for Sonny's answer. Sonny's tool host answers
+`mark_done` run nothing, and the rest wait for Sonny's answer. Sonny's tool host answers
 those, running each call in the calling agent's folder, so they work with
 every Sonny window closed; a call nobody answers in time ends as
 `tool_unserved`, and the agent goes on. All but `show_agent` wait for a
@@ -1158,8 +1158,8 @@ gate Sonny did not set, as another client's, goes without these until the
 person picks a row in `/permissions`. An agent of Sonny's reaches Sonny only through these tools: none
 of them has a command form. Sonny draws the calls, live and from history,
 and a call answered with an error reads as what it tried, `✗ Couldn't start fix`, with why under it. A task's own
-`resolve_task` is read from its history: its last turn resolved it. The
-lead's Sonny keeps each task the lead resolved beside the store
+`mark_done` is read from its history: its last turn marked it done. The
+lead's Sonny keeps each task the lead marked done beside the store
 (`state.sqlite.resolved/`), with the task's newest turn finished by then: a
 turn of the task numbered after that one reopens it.
 

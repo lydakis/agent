@@ -4791,7 +4791,7 @@ mod tests {
             (json!({"type": ["turn.ended"], "status": ["failed"]}), false),
             (json!({"type": ["turn.ended"], "by": ["you"]}), false),
             (json!({"type": ["turn.ended"], "by": ["person"]}), true),
-            (json!({"type": ["turn.ended"], "resolved": [false]}), false),
+            (json!({"type": ["turn.ended"], "done": [false]}), false),
         ] {
             let mut lookout = seated("idle");
             lookout.subs[0].filter = Some(filter);

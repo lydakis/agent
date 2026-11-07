@@ -230,7 +230,7 @@ pub async fn items(client: &Client, bot: &str, nodes: &[i64]) -> (Vec<(i64, Valu
     (items, false)
 }
 
-/// Whether `items`, one turn of `bot`'s, hold a `resolve_task` call of its
+/// Whether `items`, one turn of `bot`'s, hold a `mark_done` call of its
 /// own that resolved itself and was not refused.
 pub fn resolved_itself(items: &[Value], bot: &str) -> bool {
     items.iter().any(|call| {

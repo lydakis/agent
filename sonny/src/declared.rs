@@ -71,7 +71,7 @@ pub fn role(record: &Value) -> Role {
 }
 
 /// Whether the bot `record` describes resolves itself: a lead made it, or
-/// another bot made it with `resolve_task`, as a task's own helper takes it.
+/// another bot made it with `mark_done`, as a task's own helper takes it.
 fn resolves(record: &Value) -> bool {
     let inherited = || {
         (record["declared"].as_array().into_iter().flatten())
@@ -372,14 +372,14 @@ mod tests {
     }
 
     #[test]
-    fn a_lead_and_its_tasks_resolve_tasks() {
+    fn a_lead_and_its_tasks_mark_tasks_done() {
         let lead = declare(&json!({}), a_lead()).unwrap();
         assert_eq!(lead, Value::Array(tools(a_lead())));
         assert!(
             lead.as_array()
                 .unwrap()
                 .iter()
-                .any(|t| t["name"] == "resolve_task")
+                .any(|t| t["name"] == "mark_done")
         );
         assert_eq!(declare(&json!({"declared": lead}), a_lead()), None);
         // A bot no longer a lead gives it up, unless a lead made it: a
@@ -394,7 +394,7 @@ mod tests {
             own.as_array()
                 .unwrap()
                 .iter()
-                .any(|t| t["name"] == "resolve_task")
+                .any(|t| t["name"] == "mark_done")
         );
         let mut kept = task.clone();
         kept["declared"] = own;
@@ -406,7 +406,7 @@ mod tests {
             kept.as_array()
                 .unwrap()
                 .iter()
-                .any(|t| t["name"] == "resolve_task")
+                .any(|t| t["name"] == "mark_done")
         );
         // What a lead declares, a task it starts takes from its first turn.
         assert!(crate::resolved::tool().get("inherit").is_none());
