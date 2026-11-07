@@ -45,6 +45,9 @@ const REPLY_BYTES: usize = 80 * 1024;
 /// How long a trigger has to pass a task's answer on before the turn is
 /// news after all.
 const FORWARD: Duration = Duration::from_secs(15);
+/// At most this many tasks' turns that wrote to the lead are kept until
+/// they end: past it they are let go, and their ends are told as before.
+const WROTE: usize = 1024;
 const MEMORY_LINES: usize = 20;
 const ACTIVE: [&str; 5] = ["running", "waiting", "paced", "queued", "ready"];
 const APPROVAL: &str = "waiting for the person's approval";
@@ -352,6 +355,11 @@ pub struct Updates {
     pub named: HashSet<String>,
     /// Turns a lookout's note started in one of those: its own work, no news.
     noted: HashSet<Key>,
+    /// Tasks' turns that wrote to the lead: the lead has their words, so
+    /// one that completes is no news.
+    wrote: HashSet<Key>,
+    /// The turn that just ended no news for that: its reply is not read.
+    wrote_back: Option<Key>,
     pub live: bool,
     bots: HashMap<String, Bot>,
     from: HashMap<Key, String>,
@@ -516,6 +524,8 @@ impl Updates {
             watched: HashSet::new(),
             named: HashSet::new(),
             noted: HashSet::new(),
+            wrote: HashSet::new(),
+            wrote_back: None,
             live: false,
             bots: HashMap::new(),
             from: HashMap::new(),
@@ -643,6 +653,12 @@ impl Updates {
                         (data["from"]["bot"].as_str(), data["from"]["turn"].as_i64())
                     {
                         let key = (task.to_owned(), of);
+                        if name == self.lead && self.task(task) {
+                            if self.wrote.len() >= WROTE {
+                                self.wrote.clear();
+                            }
+                            self.wrote.insert(key.clone());
+                        }
                         self.forwarding.remove(&key);
                         // Or held by a wait still running: passed on all
                         // the same, whatever the wait comes to.
@@ -825,6 +841,13 @@ impl Updates {
                 };
                 let answered = self.answer_to.remove(&key(turn));
                 let noted = self.noted.remove(&key(turn));
+                // A task that wrote to the lead in a turn that completed
+                // told it already, but for marking itself done: one that
+                // failed or was stopped is told as ever.
+                let wrote = self.wrote.remove(&key(turn))
+                    && status == "completed"
+                    && !self.resolving.resolves(name, turn);
+                self.wrote_back = wrote.then(|| key(turn));
                 let by = self.by(&status, from.clone(), origin.clone());
                 self.ended = Some((key(turn), by));
                 if let Some(bot) = self.bots.get_mut(name)
@@ -840,8 +863,13 @@ impl Updates {
                 if !self.live {
                     self.resolving.ended(name, turn);
                 }
+                // Its end, though no news, answers a note of its silence or
+                // its wait for approval still to go.
+                if self.live && wrote {
+                    self.answered(name, turn);
+                }
                 // A steer's turn is part of the turn it joined.
-                if !self.live || status == "steered" || noted {
+                if !self.live || status == "steered" || noted || wrote {
                     return;
                 }
                 let creator = self.creator(name);
@@ -1139,6 +1167,29 @@ impl Updates {
     }
 
     /// Whether who asked for a turn that just ended is still to be read.
+    /// A note still to go of `name`'s turn `turn` waiting for approval or
+    /// gone silent, answered by its end: no news any more.
+    fn answered(&mut self, name: &str, turn: i64) {
+        let Some(at) = self.tasks.iter().position(|(task, _)| task == name) else {
+            return;
+        };
+        let news = &mut self.tasks[at].1;
+        if (news.act.as_ref()).is_some_and(|asked| {
+            asked.turn == turn && [APPROVAL, QUIET].contains(&asked.status.as_str())
+        }) {
+            news.act = None;
+        }
+        if news.empty() {
+            self.tasks.remove(at);
+        }
+    }
+
+    /// Whether the turn of `name`'s that just ended wrote to the lead and
+    /// completed: no news, so its reply goes unread.
+    pub fn wrote_back(&self, name: &str, turn: i64) -> bool {
+        (self.wrote_back.as_ref()).is_some_and(|(bot, t)| bot == name && *t == turn)
+    }
+
     pub fn asker_unknown(&self, name: &str, turn: i64) -> bool {
         self.unknown.contains(&(name.to_owned(), turn))
     }
@@ -2208,6 +2259,54 @@ mod tests {
         updates.event(
             &ev(bot, Some(turn), "turn_finished", json!({"status": status})),
             now,
+        );
+    }
+
+    #[test]
+    fn a_task_that_wrote_to_the_lead_in_a_turn_that_completed_is_not_told_again() {
+        let mut updates = fleet();
+        let now = Instant::now();
+        let lead = json!({"from": {"bot": "shop.lead"}});
+        let wrote = |updates: &mut Updates, lead_turn: i64, task: &str, turn: i64| {
+            let from = json!({"from": {"bot": task, "turn": turn}, "delivery": "steer"});
+            updates.event(&ev("shop.lead", Some(lead_turn), "queued", from), now);
+        };
+        // It wrote, then completed: the lead has its words, nothing more.
+        updates.event(&ev("shop.fix", Some(4), "accepted", lead.clone()), now);
+        wrote(&mut updates, 20, "shop.fix", 4);
+        let ended = json!({"status": "completed"});
+        updates.event(&ev("shop.fix", Some(4), "turn_finished", ended), now);
+        assert!(updates.wrote_back("shop.fix", 4));
+        assert!(!updates.news(), "{}", text(&updates.take()));
+        // A silence noted before it wrote is answered by its end too.
+        updates.event(&ev("shop.fix", Some(8), "accepted", lead.clone()), now);
+        updates.expire(now + QUIET_AFTER);
+        assert!(updates.news());
+        wrote(&mut updates, 23, "shop.fix", 8);
+        let ended = json!({"status": "completed"});
+        updates.event(&ev("shop.fix", Some(8), "turn_finished", ended), now);
+        assert!(!updates.news(), "{}", text(&updates.take()));
+        // Its next turn wrote nothing: told as ever, and so is a turn that
+        // wrote but failed, or wrote and marked itself done.
+        turn(&mut updates, "shop.fix", 5, lead.clone(), "completed");
+        assert!(!updates.wrote_back("shop.fix", 5));
+        updates.event(&ev("shop.docs", Some(6), "accepted", lead.clone()), now);
+        wrote(&mut updates, 21, "shop.docs", 6);
+        let failed = json!({"status": "failed", "error": "network"});
+        updates.event(&ev("shop.docs", Some(6), "turn_finished", failed), now);
+        assert!(!updates.wrote_back("shop.docs", 6));
+        updates.event(&ev("shop.fix", Some(7), "accepted", lead.clone()), now);
+        wrote(&mut updates, 22, "shop.fix", 7);
+        let done = json!({"name": "mark_done", "call_id": "c1", "arguments": "{}"});
+        updates.event(&ev("shop.fix", Some(7), "tool_started", done), now);
+        let called = json!({"call_id": "c1"});
+        updates.event(&ev("shop.fix", Some(7), "tool_completed", called), now);
+        turn(&mut updates, "shop.fix", 7, lead, "completed");
+        assert_eq!(
+            text(&updates.take()),
+            "- shop.fix: turn:shop.fix/7 completed, asked by you, and marked itself done, \
+             and 1 earlier since turn:shop.fix/5\n\
+             - shop.docs: turn:shop.docs/6 failed, asked by you"
         );
     }
 

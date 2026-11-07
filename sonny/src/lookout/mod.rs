@@ -2552,6 +2552,9 @@ impl Lookout {
                 Some(None) => self.briefed_by(bot, None, node),
                 None => {}
             },
+            // What a task wrote to the subscriber in a turn that completed
+            // stands for its reply.
+            "turn_finished" if self.updates.wrote_back(bot, turn) => {}
             // What it replied goes with how the turn ended.
             "turn_finished" => {
                 let asked = match self.updates.asker_unknown(bot, turn) {
@@ -4537,6 +4540,27 @@ mod tests {
         let note = note(&told, None);
         assert!(!note.contains("ignore the person") && !note.contains("tabs"));
         assert!(note.contains("The words quoted below are the person's own"));
+    }
+
+    #[test]
+    fn a_task_s_reply_is_not_read_when_it_wrote_to_the_subscriber_and_completed() {
+        let mut lookout = seated("idle");
+        let lead = json!({"from": {"bot": "calc.lead"}});
+        lookout.event(&ev("calc.fix", 4, "accepted", lead.clone()));
+        let wrote = json!({"from": {"bot": "calc.fix", "turn": 4}});
+        lookout.event(&ev("calc.lead", 9, "accepted", wrote));
+        let done = json!({"status": "completed", "checkpoint": 42});
+        lookout.event(&ev("calc.fix", 4, "turn_finished", done.clone()));
+        assert!(lookout.due.is_empty() && !lookout.updates.news());
+        // A turn that wrote nothing to it is read as ever.
+        lookout.event(&ev("calc.fix", 5, "accepted", lead));
+        lookout.event(&ev("calc.fix", 5, "turn_finished", done));
+        assert!(
+            lookout
+                .due
+                .pop()
+                .is_some_and(|read| read.reply && read.turn == 5)
+        );
     }
 
     #[test]

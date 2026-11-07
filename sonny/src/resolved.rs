@@ -87,6 +87,11 @@ impl Own {
         }
     }
 
+    /// Whether `bot`'s turn `turn` resolved it, still to ask once it ends.
+    pub fn resolves(&self, bot: &str, turn: i64) -> bool {
+        self.turns.contains(&(bot.to_owned(), turn))
+    }
+
     /// Whether `bot`'s turn `turn` resolved it, asked once it ended.
     pub fn ended(&mut self, bot: &str, turn: i64) -> bool {
         self.turns.remove(&(bot.to_owned(), turn))

@@ -93,7 +93,7 @@ turns its own lookout's notes start. Two kinds of event count:
 | Event | When |
 | --- | --- |
 | A message | someone other than the lead writes in a task: the person, a program, another task |
-| A turn's end | a task's turn ends, unless the lead is waiting on it or read it with a wait that returned; a wait that failed or was stopped leaves it news |
+| A turn's end | a task's turn ends, unless the lead is waiting on it or read it with a wait that returned; a wait that failed or was stopped leaves it news. A turn that completed after the task wrote to the lead is no news either: the lead has its words. One that failed or was stopped, or marked the task done, still is |
 
 Both are task updates (below). A note goes with `--delivery steer` once
 its news settles, joining the lead's running turn or starting one; when
@@ -406,6 +406,13 @@ subscribe to, not a post:
 
 A filter naming a field no recent event of its sources had is added, and
 the answer says so under `unseen`: it hears nothing until one does.
+
+A call that adds or removes one answers with that change alone: one
+added comes back under `subscriptions` with, when it hears sources, the
+same `test` a try gives (below); one removed, with `removed`. Every
+subscription, the sources there are and their events' recent fields come
+with a call that sends neither, so twenty changes no longer repeat the
+whole listing twenty times.
 
 To try a subscription before adding it, a call sends it as `add` with
 `"test": true`. Nothing is added; the answer's `test` says what it would
