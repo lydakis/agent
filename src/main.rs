@@ -195,6 +195,27 @@ fn sandboxed(args: &[String]) -> Result<i32> {
             "--writable conflicts with --bot, whose sandbox says what it writes",
         );
     }
+    let rest: Vec<&str> = rest.iter().map(String::as_str).collect();
+    if let Some(bot) = bot {
+        // The lend lasts while this holds its connection: until the command
+        // is done. The daemon says what the bot's commands get, as it built it
+        // for them: its sandbox and its whole environment.
+        let lent = client::lend(&connection, &bot, bot_id)?;
+        let policy: Option<Policy> = serde_json::from_value(lent.answer["policy"].clone())
+            .map_err(|_| {
+                Error::with(
+                    "sandbox_unavailable",
+                    "the daemon's sandbox is not one known here",
+                )
+            })?;
+        let environment: std::collections::BTreeMap<String, String> =
+            serde_json::from_value(lent.answer["env"].clone()).map_err(|_| {
+                Error::with("sandbox_unavailable", "the daemon sent no environment")
+            })?;
+        let status = run_in(policy.as_ref(), program, &rest, Some(&environment));
+        drop(lent);
+        return status;
+    }
     // What a daemon this CLI starts keeps read-only in every root: a
     // checkout's git folder, agents' settings, cloud keys.
     let names = |names: &[&str]| names.iter().map(|name| name.to_string()).collect();
@@ -222,95 +243,40 @@ fn sandboxed(args: &[String]) -> Result<i32> {
             .collect(),
         ..Daemon::default()
     };
-    let rest: Vec<&str> = rest.iter().map(String::as_str).collect();
-    let Some(bot) = bot else {
-        agent_runtime::sandbox::available()?;
-        let mode = match writable.is_empty() {
-            true => Mode::ReadOnly,
-            false => Mode::WorkspaceWrite,
-        };
-        let policy = Policy::new(Some(mode), None, &writable, false, &daemon)?
-            .ok_or(Error::new("sandbox_unavailable"))?;
-        return run_in(Some(&policy), program, &rest, &[]);
+    agent_runtime::sandbox::available()?;
+    let mode = match writable.is_empty() {
+        true => Mode::ReadOnly,
+        false => Mode::WorkspaceWrite,
     };
-    // The lend lasts while this holds its connection: until the command
-    // is done.
-    let lent = client::lend(&connection, &bot, bot_id)?;
-    let (record, settings) = (&lent.record, &lent.record["settings"]);
-    let mode: Option<Mode> = serde_json::from_value(settings["sandbox"].clone()).map_err(|_| {
-        Error::with(
-            "sandbox_unavailable",
-            "the bot's sandbox is not one known here",
-        )
-    })?;
-    let strings = |key: &str| -> Vec<String> {
-        (settings[key].as_array().into_iter().flatten())
-            .filter_map(|value| value.as_str().map(str::to_owned))
-            .collect()
-    };
-    let mut environment: Vec<(String, String)> = (settings["env"].as_object().into_iter())
-        .flatten()
-        .filter_map(|(name, value)| Some((name.clone(), value.as_str()?.to_owned())))
-        .collect();
-    // What the daemon gives each of the bot's commands, past its turn.
-    environment.extend([
-        ("AGENT_BOT".into(), bot.clone()),
-        ("AGENT_BOT_ID".into(), record["bot_id"].to_string()),
-        ("AGENT_STORE".into(), lent.store.display().to_string()),
-    ]);
-    if let Ok(own) = std::env::current_exe() {
-        environment.push(("AGENT_BIN".into(), own.display().to_string()));
-    }
-    let policy = match mode {
-        None | Some(Mode::DangerFullAccess) => None,
-        Some(mode) => {
-            agent_runtime::sandbox::available()?;
-            let daemon = Daemon {
-                store: Some(lent.store.clone()),
-                socket: Some(lent.socket.clone()),
-                ..daemon
-            };
-            let workspace = record["workspace"].as_str().map(std::path::Path::new);
-            let network = settings["network"].as_bool().unwrap_or(false);
-            let policy = Policy::new(
-                Some(mode),
-                workspace,
-                &strings("writable"),
-                network,
-                &daemon,
-            )?
-            .ok_or(Error::new("sandbox_unavailable"))?;
-            Some(Policy {
-                capability: record["socket"].as_str().map(std::path::PathBuf::from),
-                ..policy.with_sockets(&strings("unix_sockets"))
-            })
-        }
-    };
-    // The daemon as the bot's own commands reach it: through its own
-    // socket when it is confined.
-    let reach = policy
-        .as_ref()
-        .and_then(Policy::reach)
-        .unwrap_or(&lent.socket);
-    environment.push(("AGENT_SOCKET".into(), reach.display().to_string()));
-    let status = run_in(policy.as_ref(), program, &rest, &environment);
-    drop(lent);
-    status
+    let policy = Policy::new(Some(mode), None, &writable, false, &daemon)?
+        .ok_or(Error::new("sandbox_unavailable"))?;
+    run_in(Some(&policy), program, &rest, None)
 }
 
 /// `program` with `rest`, in `policy` when one is given, with `environment`
-/// beside this one's: its exit status, as a shell reports one a signal
-/// ended.
+/// in place of this one's when one is given: its exit status, as a shell
+/// reports one a signal ended.
 fn run_in(
     policy: Option<&agent_runtime::sandbox::Policy>,
     program: &str,
     rest: &[&str],
-    environment: &[(String, String)],
+    environment: Option<&std::collections::BTreeMap<String, String>>,
 ) -> Result<i32> {
+    // In place of this one's, keeping what the sandbox set itself (the
+    // descriptor its bot's socket is handed by).
+    let given = |command: &mut tokio::process::Command| {
+        if let Some(environment) = environment {
+            let own: Vec<(std::ffi::OsString, std::ffi::OsString)> = (command.as_std().get_envs())
+                .filter_map(|(name, value)| Some((name.to_owned(), value?.to_owned())))
+                .collect();
+            command.env_clear().envs(environment).envs(own);
+        }
+    };
     let status = runtime()?.block_on(async {
         let Some(policy) = policy else {
             let mut command = tokio::process::Command::new(program);
-            command.args(rest).envs(environment.iter().cloned());
+            command.args(rest);
+            given(&mut command);
             return command.status().await.map_err(Error::from);
         };
         // What the sandbox holds in place stays held while the command
@@ -319,7 +285,7 @@ fn run_in(
         let held = agent_runtime::sandbox::hold(policy).await;
         let status = match agent_runtime::sandbox::command(policy, program, rest, false) {
             Ok(mut child) => {
-                child.envs(environment.iter().cloned());
+                given(&mut child);
                 child.status().await.map_err(Error::from)
             }
             Err(e) => Err(e),

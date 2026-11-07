@@ -1071,6 +1071,29 @@ class SocketAndCliTests(ModelFixture):
                              (125, 'bot_not_found'))
         self.assertFalse((self.path / 'refused').exists())
 
+    @unittest.skipUnless(shutil.which('bwrap') or sys.platform == 'darwin', 'sandboxes need bubblewrap')
+    def test_a_command_run_as_a_bot_keeps_what_the_daemon_keeps_from_its_commands(self):
+        kept = self.path / 'kept'
+        kept.mkdir()
+        daemon = SocketClient(self.binary, self.store, self.url, 'shell',
+                              extra=['--protect-path', str(kept), '--shell-exclude', 'SECRET_*'],
+                              env={**clean_env(), 'SECRET_TOKEN': 'daemon'})
+        self.addCleanup(daemon.close)
+        daemon.request('create', bot='Writer', workspace=str(self.path), settings={'sandbox': 'workspace-write'})
+        check = ('touch wrote; touch kept/x 2> /dev/null || echo kept; '
+                 'printf "[%s][%s]\n" "$SECRET_TOKEN" "$CALLER_ONLY"')
+        ran = subprocess.run([str(self.binary), 'sandbox', '--store', str(self.store), '--socket', str(daemon.socket_path),
+                              '--bot', 'Writer', '--', '/bin/sh', '-c', check],
+                             env={**clean_env(), 'SECRET_TOKEN': 'caller', 'CALLER_ONLY': 'caller'},
+                             capture_output=True, text=True, timeout=30, cwd=self.path)
+        self.assertEqual(ran.returncode, 0, ran.stderr)
+        # It writes its folder but not what the daemon protects, and has the
+        # environment the bot's commands have: none of the daemon's withheld
+        # variables, nor the caller's.
+        self.assertEqual(ran.stdout.split('\n')[:2], ['kept', '[][]'])
+        self.assertTrue((self.path / 'wrote').exists())
+        self.assertFalse((kept / 'x').exists())
+
     def test_creator_identity_is_required_and_survives_daemon_restart(self):
         self.agent('run', *self.common, '--new', '--bot', 'Creator',
                    'shell:printf "%s" "$AGENT_BOT_ID" > own-id')

@@ -340,6 +340,20 @@ pub struct Daemon {
     pub socket: Option<PathBuf>,
 }
 
+/// The daemon's own socket for `socket`, which in a confined bot's shell
+/// on macOS is that bot's (`SOCKET.d/ID`, as the daemon opens them): what
+/// an automation keeps is reached outside every sandbox, after that socket
+/// stops listening, and only the daemon's own lends a gate its sandbox.
+fn public(socket: PathBuf) -> PathBuf {
+    let own = || {
+        socket.file_name()?.to_str()?.parse::<i64>().ok()?;
+        let folder = socket.parent()?;
+        let name = folder.file_name()?.to_str()?.strip_suffix(".d")?;
+        Some(folder.with_file_name(name))
+    };
+    own().unwrap_or(socket)
+}
+
 impl Daemon {
     /// The daemon of the shell the trigger is made from, found as the CLI
     /// finds it. An agent's shell has both its daemon's store and socket.
@@ -348,7 +362,8 @@ impl Daemon {
         let absolute = |p: PathBuf| std::path::absolute(&p).unwrap_or(p);
         let socket = std::env::var_os("AGENT_SOCKET")
             .map(PathBuf::from)
-            .map(absolute);
+            .map(absolute)
+            .map(public);
         let store = std::env::var_os("AGENT_STORE")
             .map(PathBuf::from)
             .map(absolute)
@@ -3645,11 +3660,23 @@ async fn bot_id(client: &Client, name: &str) -> Result<i64, String> {
         .ok_or_else(|| "the daemon named no bot id".into())
 }
 
-/// An automation Sonny adds for an agent with a gate Sonny wrote, as an
-/// ask's deadline is: its gate runs as Sonny's own, not in the agent's
-/// sandbox, since the agent wrote none of it.
-pub fn add_sonnys(asked: &Value) -> Result<Value, String> {
-    add_as(&Places::home()?, &add_args(asked), false)
+/// A one-off `name` at `at` (`YYYY-MM-DD HH:MM`) that Sonny adds for the
+/// shell's agent with a gate Sonny wrote, as an ask's deadline is: its gate
+/// runs as the person, not in the agent's sandbox, since the agent wrote
+/// none of it.
+pub fn add_sonnys(name: &str, at: &str, gate: &str, message: &str) -> Result<Value, String> {
+    add_as(
+        &Places::home()?,
+        &sonnys_args(name, at, gate, message),
+        false,
+    )
+}
+
+/// [`add_sonnys`]'s `add` arguments.
+fn sonnys_args(name: &str, at: &str, gate: &str, message: &str) -> Vec<String> {
+    ["--name", name, "--at", at, "--if", gate, "--", message]
+        .map(String::from)
+        .to_vec()
 }
 
 fn add(places: &Places, args: &[String]) -> Result<Value, String> {
@@ -6283,6 +6310,31 @@ pub(crate) mod tests {
             message: "Check the PR's CI & reviews; <fix> what's \"red\".\nThen say so.".into(),
             shadow: false,
         }
+    }
+
+    #[test]
+    fn an_automation_keeps_the_daemon_s_own_socket() {
+        let own = |path: &str| public(PathBuf::from(path));
+        assert_eq!(own("/r/agent.sock.d/42"), PathBuf::from("/r/agent.sock"));
+        for kept in ["/r/agent.sock", "/r/agent.sock.d/x", "/r/other/42", "42"] {
+            assert_eq!(own(kept), PathBuf::from(kept));
+        }
+    }
+
+    #[test]
+    fn sonny_adds_a_one_off_with_its_own_gate() {
+        let now = clock(2026, 9, 28, 9, 7);
+        let asked = sonnys_args(
+            "p.lead.ask-1",
+            "2026-09-28 10:00",
+            "'s' ask open 'b' 3 'c'",
+            "Ask again",
+        );
+        let add = parse_add(&asked, now).unwrap();
+        assert_eq!(add.name.as_deref(), Some("p.lead.ask-1"));
+        assert_eq!(add.gate.as_deref(), Some("'s' ask open 'b' 3 'c'"));
+        assert_eq!(add.message, "Ask again");
+        assert!(add.when.at.is_some());
     }
 
     #[test]

@@ -2853,18 +2853,21 @@ command as one of that bot's own commands runs, for a client running a
 command a bot wrote outside its turns, as Codex runs whatever an agent wrote
 in its sandbox: Sonny's automation gates (`--if`) that an agent added.
 One `lend` request (protocol 54), `{"op":"lend","bot":NAME,"bot_id":ID?}`,
-answers the bot's record, as `inspect` does, with `socket`: the path of the
-bot's own capped socket, which listens while the session that asked lasts,
-or null for a bot with no sandbox. The command then runs in the bot's
-sandbox (its mode, workspace, `writable`, `network`, `unix_sockets`), with
-its `env` setting, `AGENT_BOT`, `AGENT_BOT_ID`, `AGENT_BIN`, `AGENT_STORE`,
-and `AGENT_SOCKET` reaching the daemon through that socket, as its turns'
-commands do; a bot whose commands run unconfined runs this one unconfined.
-Only a session outside every sandbox may lend (`not_permitted`), so a
-confined command cannot reach another bot's socket; `bot_id` that is not
-the bot's is `bot_not_found`. The lend costs one round trip and, for a bot
-whose socket was not listening, one bind, kept once per session however
-often it asks. `agent sandbox` exits as its command does, or 125 when it
+answers `{bot, bot_id, policy, env}`: the sandbox the daemon builds for the
+bot's commands (null for a bot whose commands run unconfined), with the
+bot's own capped socket open for as long as the session that asked lasts,
+and the whole environment its commands get: the daemon's own, without the
+credentials it holds or the variables `--shell-exclude` withholds, with its
+`AGENT_*` variables, the bot's `env` setting, `AGENT_BOT`, `AGENT_BOT_ID` and
+`AGENT_SOCKET` reaching the daemon through that socket. The command runs in
+that policy with that environment in place of the caller's, so it keeps
+everything the daemon keeps from the bot (`--protect-path`, `--wall`, its
+store) and nothing of the caller's environment reaches it. Only a session
+outside every sandbox may lend (`not_permitted`), so a confined command
+cannot reach another bot's socket; `bot_id` that is not the bot's is
+`bot_not_found`. The lend costs one round trip and, for a bot whose socket
+was not listening, one bind, kept once per session however often it asks.
+`agent sandbox` exits as its command does, or 125 when it
 could not run it (a usage error, no sandbox here, the bot not found), as
 `env` and `timeout` do, with the error on stderr.
 

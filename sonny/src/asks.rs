@@ -951,14 +951,18 @@ fn set_deadline(
         quote(call)
     );
     let at = crate::trigger::local(deadline);
-    let add = json!({"add": {
-        "name": trigger_name(bot, call),
-        "at": format!("{}-{:02}-{:02} {:02}:{:02}", at.year, at.month, at.day, at.hour, at.minute),
-        "if": gate,
-        "message": fire(&ask.question, plan, label),
-    }});
+    let at = format!(
+        "{}-{:02}-{:02} {:02}:{:02}",
+        at.year, at.month, at.day, at.hour, at.minute
+    );
     // Sonny wrote its gate: it runs as Sonny's own.
-    crate::trigger::add_sonnys(&add).map(|_| ())
+    crate::trigger::add_sonnys(
+        &trigger_name(bot, call),
+        &at,
+        &gate,
+        &fire(&ask.question, plan, label),
+    )
+    .map(|_| ())
 }
 
 /// The whole minute `minutes` from `now`, never before it, as a one-off

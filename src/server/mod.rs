@@ -3907,19 +3907,42 @@ impl Service {
                         db.inspect(&bot)
                     })
                     .await?;
-                let mut answer = serde_json::to_value(&record)?;
-                // Opening it may bind a socket: off the runtime thread, as
-                // a bot's own command opens it. The session holds one share
-                // per bot, however often it asks.
-                let (daemon, id) = (self.registry.daemon().clone(), record.bot_id);
-                let opened = tokio::task::spawn_blocking(move || daemon.capability(id))
+                let id = record.bot_id;
+                // As its turns' commands get them, past what only a turn has.
+                let mut environment: Vec<(String, String)> = (record.settings.env.iter())
+                    .map(|(name, value)| (name.clone(), value.clone()))
+                    .collect();
+                environment.push(("AGENT_BOT".into(), record.name.clone()));
+                environment.push(("AGENT_BOT_ID".into(), id.to_string()));
+                let mut policy = None;
+                if record.sandboxed() {
+                    let root = (record.workspace.clone().map(std::path::PathBuf::from))
+                        .ok_or_else(|| {
+                            Error::with("sandbox_unavailable", "the bot has no folder")
+                        })?;
+                    // Opening its socket may bind: off the runtime thread,
+                    // as for its turns.
+                    let (daemon, settings) =
+                        (self.registry.daemon().clone(), record.settings.clone());
+                    policy = tokio::task::spawn_blocking(move || {
+                        turn::bot_sandbox(&settings, &root, id, &daemon)
+                    })
                     .await
-                    .map_err(|_| Error::new("socket_bind_failed"))??;
-                answer["socket"] = json!(opened.as_ref().map(|(path, _)| path));
-                if let Some((_, listening)) = opened {
-                    self.lent.entry(session).or_default().insert(id, listening);
+                    .map_err(|_| Error::new("sandbox_unavailable"))??;
                 }
-                Ok(answer)
+                if let Some(policy) = policy.as_mut() {
+                    // The session holds one share per bot, however often it
+                    // asks; the command reaches the daemon through it.
+                    if let Some(listening) = policy.listening.take() {
+                        self.lent.entry(session).or_default().insert(id, listening);
+                    }
+                    if let Some(own) = policy.reach() {
+                        environment.push(("AGENT_SOCKET".into(), own.display().to_string()));
+                    }
+                }
+                let env =
+                    agent_runtime::tools::shell_environment_whole(&self.registry, &environment);
+                Ok(json!({"bot": record.name, "bot_id": id, "policy": policy, "env": env}))
             }
             Command::Inspect { bot, bot_id } => {
                 store
