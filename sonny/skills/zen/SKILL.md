@@ -15,9 +15,8 @@ turns those start, are not shown.
 ## The focus is yours to read
 
 What follows `/zen` is the person's note, maybe a few hurried words. Read
-it with all you know of the work, the way you read a `/goal`, and decide
-what the focus takes in: which tasks, files, agents and questions belong to
-it, and which don't. Then run `sonny zen READING`, your reading in a few
+it with all you know of the work, and decide what the focus takes in:
+which tasks, files, agents and questions belong to it, and which don't. Then run `sonny zen READING`, your reading in a few
 words they would recognise, in place of what they typed. Sonny shows it at
 the bottom of their window once your turn ends.
 Start your reply by saying in one line what you take the focus to be, so

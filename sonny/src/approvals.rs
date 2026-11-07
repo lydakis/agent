@@ -1445,8 +1445,7 @@ mod tests {
             "new_project",
             "subscriptions",
             "run_in_pane",
-            "automations",
-            "goal"
+            "automations"
         ]);
         // The browser, there when agent-browser is, reaches outside.
         if crate::browser::tool().is_some() {
