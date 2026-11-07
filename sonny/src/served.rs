@@ -154,7 +154,7 @@ fn start() -> Value {
             folder where it is. With setup, the folder's .agents/setup runs in the task's folder first. The task starts there with this folder's rules, skills and \
             memory, in the role named, and the brief as its first message. Paths in this folder that the brief \
             names are turned into the task's own. The result is the task's turn handle; its work comes back on \
-            its branch, here already as it commits. A start that fails leaves no folder behind.",
+            its branch, here already as it commits.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -278,8 +278,7 @@ fn subscriptions() -> Value {
             Add steer yourself for what you own; a filter or a digest only when the person asks for one: \
             what a filter leaves out you never hear, and a digest makes you late. Add one, or remove one by \
             name; with neither, or after either, the result lists them all, with \
-            the sources there are and the fields their events lately had, to filter on. Adding one again \
-            changes nothing; one by a name in use that differs is refused with the field, so remove it first.",
+            the sources there are and the fields their events lately had, to filter on.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -550,9 +549,8 @@ fn run() -> Value {
             the command exits so its output can be read. Running the same name again replaces its pane. A tab \
             is the default; a split puts it beside you, for something the person should see now, and float \
             over your window, where the terminal can float it, for a quick look. A command that needs the \
-            person's own keyboard (a sign-in, a password or passphrase prompt, ssh -t) sits unnoticed in a \
-            pane: ask them with ask and its command instead, so the step shows as theirs to take. The \
-            result holds the pane's ID as block.",
+            person's own keyboard (a sign-in, a password prompt, ssh -t) goes to them through ask and its \
+            command instead. The result holds the pane's ID as block.",
         "parameters": {
             "type": "object",
             "properties": {

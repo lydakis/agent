@@ -282,36 +282,34 @@ pub fn tool() -> Value {
         "name": TOOL,
         "description": "Put a decision in front of the person: a fork in the road, an architectural \
             choice, or a step that cannot be undone, where their pick changes what you build. Sonny \
-            shows it in the conversation where you ask it: the question, why you ask it, each option \
-            with what happens if they pick it, the one you recommend and why, and what you do until \
-            they answer. Options without what they mean are useless to the person, so say what each \
-            one does to their goal. Ask once, one decision per call, and do not repeat it in your \
-            reply. When their pick approves an action, say in covers what: their yes covers that \
-            action, target and revision alone, so a new target or revision needs a new ask. Their answer, a \
-            pick or words typed for it, comes as their next message, starting \"You asked\", the ask's \
-            ID, your question and what it covers; other words come as written: once they answer it, \
-            or it no longer matters, close it with close_ask. Say in if_unanswered what you do until \
-            then. go_now goes on with the option \
-            you recommend at once, for a step you can undo once they have seen it. go_later goes \
-            on with it once the wait passes with no word from them, for a step you can undo but \
-            would rather they saw first. wait does nothing they have not picked: anything that goes \
-            out in their name or to other people, approves, merges, publishes, deletes, spends or \
-            cannot be undone waits, and so does an ask you are unsure of or one they said to wait \
-            on. Sonny wakes you at the deadline unless they answered or wrote to you since; that \
-            wake is Sonny's, never their answer, so it allows nothing that needs their own words. \
-            If they pick another option after you went ahead, undo what you did and follow their \
-            pick. Meanwhile do work that does not depend on the answer, or end your turn. A step \
-            only the person can take, such as a sign-in or a command that needs their own \
-            terminal and keyboard, is an ask too: give no options, put the exact line to run in \
-            command, say in why what it unblocks, and wait; their next message says how it went. \
-            Any other question with nothing to choose between goes in your reply instead.",
+            shows it where you ask it; say what each option does to their goal. Ask once, one \
+            decision per call, and do not repeat it in your reply. When their pick approves an \
+            action, say what in covers: their yes covers that action, target and revision alone, so \
+            a new target or revision needs a new ask. \
+            Their answer, a pick or words typed for it, comes as their next message, starting \
+            \"You asked\", the ask's ID, your question and what it covers; other words come as \
+            written: once they answer it, or it no longer matters, close it with close_ask. Say in \
+            if_unanswered what you do until then. go_now goes on with the option you recommend at \
+            once, for a step you can undo once they have seen it. go_later goes on with it once \
+            the wait passes with no word from them, for a step you can undo but would rather they \
+            saw first. wait does nothing they have not picked: anything that goes out in their \
+            name or to other people, approves, merges, publishes, deletes, spends or cannot be \
+            undone waits, and so does an ask you are unsure of or one they said to wait on. Sonny \
+            wakes you at the deadline unless they answered or wrote to you since; that wake is \
+            Sonny's, never their answer, so it allows nothing that needs their own words. If they \
+            pick another option after you went ahead, undo what you did and follow their pick. \
+            Meanwhile do work that does not depend on the answer, or end your turn. A step only \
+            the person can take, such as a sign-in or a command needing their own terminal, is an \
+            ask too: no options, put the exact line to run in command, what it unblocks in why, and \
+            wait; their next message says how it went. Any other question with nothing to choose \
+            between goes in your reply.",
         "parameters": {
             "type": "object",
             "properties": {
                 "question": {"type": "string",
                     "description": "The question, verb first, in the person's own words, in about twelve words."},
                 "why": {"type": "string",
-                    "description": "Why you ask now: what the answer decides and the background the person needs to choose, in a sentence or three."},
+                    "description": "What the answer decides and what the person needs to know to choose, in a sentence or three."},
                 "options": {"type": "array",
                     "description": "2 to 4 options, each a different way forward; none with command.",
                     "items": {
@@ -325,9 +323,8 @@ pub fn tool() -> Value {
                         "additionalProperties": false
                     }},
                 "command": {"type": "string",
-                    "description": "For a step only the person can take, in place of options: the \
-                        exact line for them to paste into their own terminal, whole, with nothing \
-                        to fill in."},
+                    "description": "In place of options: the exact line to paste into their \
+                        terminal, whole, nothing to fill in."},
                 "recommended": {"type": "integer",
                     "description": "The number of the option you recommend, from 1; with options."},
                 "reason": {"type": "string",
@@ -348,9 +345,8 @@ pub fn tool() -> Value {
                     "required": ["action", "target"],
                     "additionalProperties": false},
                 "wait_minutes": {"type": "integer", "minimum": 1, "maximum": MAX_MINUTES,
-                    "description": "How long go_later waits before you go ahead, or wait before you \
-                        are reminded, when the work runs on a clock, such as a meeting or a release; \
-                        left out, the person's setting."}
+                    "description": "How long go_later waits, or wait before a reminder, for work \
+                        on a clock such as a release; left out, the person's setting."}
             },
             "required": ["question", "why", "if_unanswered"],
             "additionalProperties": false
@@ -365,10 +361,9 @@ pub fn tool() -> Value {
 pub fn close_tool() -> Value {
     json!({
         "name": CLOSE,
-        "description": "Close a question you asked once it no longer waits on the person; its card \
-            shows the outcome and your note. answered: their words answered it, here or passed on \
-            to you, with the option you go with. withdrawn: it no longer matters. A pick of theirs \
-            later still answers it.",
+        "description": "Close a question you asked that no longer waits on the person; its card \
+            shows the outcome and your note. answered: their words answered it, with the option \
+            you go with. withdrawn: it no longer matters. A later pick of theirs still answers it.",
         "parameters": {
             "type": "object",
             "properties": {

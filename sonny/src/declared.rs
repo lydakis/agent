@@ -260,9 +260,14 @@ mod tests {
             a_lead(),
         )
         .unwrap();
-        // Sonny's own take at most three fifths of the daemon's budget,
-        // the rest left to the agent's.
-        assert!(serde_json::to_vec(&lead).unwrap().len() <= DECLARED_BYTES * 3 / 5);
+        // Sonny's own take at most half of the daemon's budget, the rest
+        // left to the agent's.
+        let size = serde_json::to_vec(&lead).unwrap().len();
+        assert!(
+            size <= DECLARED_BYTES / 2,
+            "{size} over {}",
+            DECLARED_BYTES / 2
+        );
         let wanted = declare(&json!({"declared": [other]}), a_helper()).unwrap();
         let mut all = vec![other];
         all.extend(tools(a_helper()));

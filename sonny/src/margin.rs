@@ -101,8 +101,7 @@ const DESCRIPTION: &str = "Keep something beside the conversation, in the margin
          the note and walk through it in the reply; for a walkthrough of anything else, the note \
          holds only what the walkthrough does not, such as a summary table. Skip the margin for a \
          short answer the person reads once, and for \
-         the steps of your work, which belong in your plan. A note stays pinned to this point in \
-         the conversation, and the person can jump between it and here. Posting the same id again \
+         the steps of your work, which belong in your plan. Posting the same id again \
          replaces that note in place: update one note as results come in, rather than posting \
          another. When you or a task change what a note shows, such as code a diagram describes, \
          post it again with the same id, rather than a second note about the change, or remove it \
@@ -111,8 +110,7 @@ const DESCRIPTION: &str = "Keep something beside the conversation, in the margin
          no longer holds. Where whether a note is still current matters, such as a pull \
          request's state or a check you ran, say when it was last checked, in the person's \
          time zone, and change that as you check again; a note whose content does not age, \
-         such as a design, needs no date. Give markdown (rendered as your replies are: tables, math, Mermaid, html \
-         fences and pictures included) or file (a path in your own folder, shown as the file \
+         such as a design, needs no date. Give markdown (rendered as your replies are) or file (a path in your own folder, shown as the file \
          stands and kept fresh as it changes; for a file in a task's copy, put its content in \
          markdown instead, since that copy goes away with the task), or from (a task's note as \
          \"task/id\", as your task updates name it, shown here as the task keeps it and kept once \
