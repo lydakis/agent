@@ -4,7 +4,7 @@
 //! step of [`LADDER`] takes an item to its next form, as Powerline drops
 //! its lowest-priority segments first: words before marks, marks before
 //! whole items, and what needs the person never.
-use ratatui::style::{Color, Stylize};
+use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use std::ops::Range;
 use unicode_width::UnicodeWidthStr;
@@ -97,6 +97,15 @@ pub fn count(mark: &'static str, color: Color, n: usize, goes: bool) -> Vec<Vec<
         forms.push(Vec::new());
     }
     forms
+}
+
+/// A span of a count on a beat of its pulse: reversed in its hue, as
+/// wide as at rest so nothing beside it moves.
+pub fn beat(span: &mut Span<'static>) {
+    let color = span.style.fg.unwrap_or(Color::Yellow);
+    span.style = Style::new()
+        .fg(color)
+        .add_modifier(Modifier::REVERSED | Modifier::BOLD);
 }
 
 /// A folder as fish's prompt shortens it: each part but the last to its

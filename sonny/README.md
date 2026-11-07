@@ -869,9 +869,10 @@ way `/react` does, and each note in the margin has its own `↩`.
   empty board stays small), and a tool call twinkles in cyan in a shape for
   its kind (a shell's streak across, a file's up and down, the web's
   corners, any other tool's star). An agent at rest is a single dot; a
-  working one is a block that breathes, slowly, between the text's colour
-  and a brighter shade. A name that needs you carries a yellow `?`, one that
-  failed a red `✗`; the footer counts them the same way. Beside the sky,
+  working one is a block that breathes, slowly, from muted to bright. A name
+  that needs you carries a yellow `?`, one that failed a red `✗`; the footer
+  counts them the same way. A `?` just raised, here and in the footer, beats
+  reversed three times and then holds still. Beside the sky,
   when the pane is wide, a chat log lists who said what to whom, newest at
   the bottom, fading as it rises; in a narrower pane the last few lines sit
   under it. `?` swaps the log for a legend of every mark and shape and a few
