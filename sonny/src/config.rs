@@ -208,16 +208,16 @@ pub const SETTINGS: &[Setting] = &[
         default: "auto",
     },
     Setting {
+        key: "sonny.task_tabs",
+        about: "which tasks open in a tab of their own in Rex, Herdr or cmux: those an agent asks a tab for, shows you, or you open, and any that comes to need you; or every task as its turn starts",
+        values: &["asked", "every"],
+        default: "asked",
+    },
+    Setting {
         key: "sonny.task_windows",
         about: "task windows a lead keeps open in its multiplexer: past it, a new one closes the one you used least recently, never one you have not looked at yet, that needs you, failed or runs something it asked for (with only unseen ones to close, the new one waits for /status); 0 for no limit",
         values: &[],
         default: "32",
-    },
-    Setting {
-        key: "sonny.task_depth",
-        about: "how many generations of tasks a lead's line has: 2 lets its tasks start their own, which start none; 0 for no end",
-        values: &[],
-        default: "2",
     },
     Setting {
         key: "sonny.sky_haikus",
@@ -273,7 +273,115 @@ pub const SETTINGS: &[Setting] = &[
         values: &[],
         default: "15m",
     },
+    Setting {
+        key: "daemon.depth",
+        about: "how many generations below the agent that starts a line (a lead, or an agent you made) a new agent may be: 2 lets a lead's tasks start their own, which start none; 0 for no end; read when the daemon starts",
+        values: &[],
+        default: "2",
+    },
 ];
+
+/// The migration that moves `[sonny] task_depth` to `[daemon] depth`.
+pub const DEPTH: &str = "task-depth-daemon";
+
+/// At start, once, before the config is read: a line depth the person set
+/// for Sonny moved to the daemon, which bounds it now.
+pub fn at_start() {
+    let (Some(home), Some(path)) = (
+        std::env::var_os("HOME").map(PathBuf::from),
+        agent_client::config::path(),
+    ) else {
+        return;
+    };
+    // No config, nothing to move: and nothing made, not even a HOME gone.
+    if !path.exists() {
+        return;
+    }
+    crate::upgrade::once(&home.join(".agent/sonny/migrated"), DEPTH, || {
+        config_depth(&path)
+    });
+}
+
+/// The config at `path` with `[sonny] task_depth` moved, each other line
+/// as the person wrote it. Whether it is done: one it can't move cleanly
+/// is left as it is, for the config's own error to say where the key went,
+/// and tried again next time.
+fn config_depth(path: &std::path::Path) -> bool {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) => return e.kind() == std::io::ErrorKind::NotFound,
+    };
+    match depth_moved(&text) {
+        Err(()) => false,
+        Ok(None) => true,
+        Ok(Some(moved)) => {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(path).map_or(0o600, |m| m.permissions().mode() & 0o777);
+            agent_client::files::replace_mode(path, moved.as_bytes(), mode).is_ok()
+        }
+    }
+}
+
+/// `text` as [`config_depth`] writes it: none when `[sonny]` sets no
+/// `task_depth`. Its line goes, and `depth` joins `[daemon]`, made at the
+/// end when there is none, unless the file sets it there already. What is
+/// written must parse to the config with only that key moved, so a key
+/// lines can't move (a dotted key, an inline table) is an error.
+fn depth_moved(text: &str) -> Result<Option<String>, ()> {
+    use toml::Value;
+    let old: toml::Table = text.parse().map_err(drop)?;
+    let depth = (old.get("sonny").and_then(Value::as_table))
+        .and_then(|sonny| sonny.get("task_depth"))
+        .and_then(Value::as_integer);
+    let Some(depth) = depth else {
+        return Ok(None);
+    };
+    let mut expected = old.clone();
+    let Some(Value::Table(sonny)) = expected.get_mut("sonny") else {
+        return Err(());
+    };
+    sonny.remove("task_depth");
+    let daemon = expected
+        .entry("daemon")
+        .or_insert_with(|| Value::Table(toml::Table::new()));
+    let Value::Table(daemon) = daemon else {
+        return Err(());
+    };
+    let add = !daemon.contains_key("depth");
+    if add {
+        daemon.insert("depth".into(), Value::Integer(depth));
+    }
+    let line = format!("depth = {depth}");
+    let (mut table, mut removed, mut added) = (String::new(), false, !add);
+    let mut lines = Vec::new();
+    for raw in text.lines() {
+        let trimmed = raw.trim();
+        if trimmed.starts_with('[') && !trimmed.starts_with("[[") {
+            table = trimmed.trim_matches(['[', ']']).trim().to_owned();
+        }
+        let key = trimmed.split_once('=').map(|(key, _)| key.trim());
+        if table == "sonny" && key == Some("task_depth") && !removed {
+            removed = true;
+            continue;
+        }
+        lines.push(raw.to_owned());
+        if table == "daemon" && trimmed.starts_with('[') && !added {
+            lines.push(line.clone());
+            added = true;
+        }
+    }
+    let mut new = lines.join("\n");
+    if text.ends_with('\n') || !added {
+        new.push('\n');
+    }
+    if !added {
+        new.push_str(&format!("\n[daemon]\n{line}\n"));
+    }
+    match new.parse::<toml::Table>() {
+        Ok(parsed) if removed && parsed == expected => Ok(Some(new)),
+        _ => Err(()),
+    }
+}
 
 /// The `sonny-config` skill: where the settings live and every key of the
 /// file, from [`SETTINGS`], so it says what this Sonny reads.
@@ -586,6 +694,32 @@ mod tests {
 
     fn press(view: &mut View, code: KeyCode) {
         view.event(&Event::Key(KeyEvent::new(code, KeyModifiers::NONE)));
+    }
+
+    #[test]
+    fn a_line_depth_set_for_sonny_moves_to_the_daemon() {
+        // Into the daemon's table where there is one, the rest as written.
+        let text = "# mine\n[sonny]\nchime = true\ntask_depth = 3\n\n[daemon]\nload = 0\n";
+        assert_eq!(
+            depth_moved(text),
+            Ok(Some(
+                "# mine\n[sonny]\nchime = true\n\n[daemon]\ndepth = 3\nload = 0\n".into()
+            ))
+        );
+        // Into one of its own where there is none.
+        assert_eq!(
+            depth_moved("[sonny]\ntask_depth = 0\n"),
+            Ok(Some("[sonny]\n\n[daemon]\ndepth = 0\n".into()))
+        );
+        // One the daemon's table sets already stays as set.
+        assert_eq!(
+            depth_moved("[daemon]\ndepth = 4\n[sonny]\ntask_depth = 3\n"),
+            Ok(Some("[daemon]\ndepth = 4\n[sonny]\n".into()))
+        );
+        // Nothing to move.
+        assert_eq!(depth_moved("[sonny]\nchime = true\n"), Ok(None));
+        // A key lines can't move is left for the reader's error.
+        assert_eq!(depth_moved("sonny.task_depth = 3\n"), Err(()));
     }
 
     #[test]

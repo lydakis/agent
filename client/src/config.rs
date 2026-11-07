@@ -16,6 +16,7 @@
 //! load = "cpus * 2"             # new commands wait while the load average is this, the default; 0 no gate
 //! input_bytes = "memory / 16"   # also lasting, active, connecting, pending, pending_bytes, readers
 //! stall_timeout = "10m"         # a provider stream with no content this long is retried, the default
+//! depth = 3                     # generations a new agent may be below the one that starts its line, 2 by default; 0 no end
 //!
 //! [fallbacks]                   # the model a declined request goes to, by model
 //! "anthropic/claude-opus-5-5" = "anthropic/claude-opus-4-8"
@@ -51,8 +52,8 @@
 //! commons_invites = 3           # least threads a day that send invites (more with the square root of the week's agents), 0 none; answers add up to as many again
 //! commons_invite_tokens = 1000000  # what an invite pays for in its thread
 //! ask_wait_minutes = 60         # how long an unanswered ask waits to go ahead or remind; 0 never
+//! task_tabs = "every"         # which tasks open in a tab: "asked", the default, those an agent or you asked for; "every", each as its turn starts
 //! task_windows = 64            # task windows a lead keeps open, 32 by default; past it the least recently used closes, never one not looked at yet; 0 no limit
-//! task_depth = 3                # generations of tasks below a lead, 2 by default (tasks' own start none); 0 no end
 //! sky_haikus = false            # no haikus from the sky's busiest agent, on by default
 //! sky_haiku_daily = 8           # haikus a day at most; 0, the default, no limit but the title's hold
 //! sky_haiku_keep = 168          # hours haikus are kept for replays, 24 by default; 0 keeps all
@@ -182,7 +183,7 @@ pub fn duration_ms(value: &str) -> Option<u64> {
 /// the agent CLI starts a daemon with when the file gives none: none is
 /// the daemon's own default. A count rounds down; `load` keeps its
 /// fraction.
-pub const DAEMON_LIMITS: [(&str, &str, Option<&str>); 9] = [
+pub const DAEMON_LIMITS: [(&str, &str, Option<&str>); 10] = [
     ("processes", "--max-processes", None),
     ("lasting", "--max-lasting", None),
     ("active", "--max-active", None),
@@ -193,6 +194,9 @@ pub const DAEMON_LIMITS: [(&str, &str, Option<&str>); 9] = [
     ("readers", "--max-readers", None),
     // As make -l: a busy machine's new commands wait while one runs.
     ("load", "--max-load", Some("cpus * 2")),
+    // As Codex's agents.max_depth: an agent's helpers may start their own,
+    // which start none.
+    ("depth", "--max-depth", Some("2")),
 ];
 
 /// The machine a formula is worked out for: its logical CPUs and its
@@ -483,14 +487,13 @@ pub struct Sonny {
     /// before its agent goes on with what it recommended, where it said
     /// it could, or is reminded of it; 0 lets every ask wait for them.
     pub ask_wait_minutes: u64,
+    /// Which tasks open in a tab of their own in the lead's multiplexer.
+    pub task_tabs: TaskTabs,
     /// How many of its tasks' windows a lead keeps open in its
     /// multiplexer: past it, a new one closes the window the person used
     /// least recently, never one they have not looked at yet; 0 for no
     /// limit.
     pub task_windows: u64,
-    /// How many generations below a lead its line goes: a lead's tasks
-    /// are the first, and an agent of the last starts none; 0 for no end.
-    pub task_depth: u64,
     /// Whether the sky's busiest agent writes a haiku each time the title
     /// passes.
     pub sky_haikus: bool,
@@ -614,8 +617,8 @@ impl Default for Sonny {
             commons_invite_tokens: 1_000_000,
             commons_source: commons_source(),
             ask_wait_minutes: 60,
+            task_tabs: TaskTabs::default(),
             task_windows: 32,
-            task_depth: 2,
             sky_haikus: true,
             sky_haiku_daily: 0,
             sky_haiku_keep: 24,
@@ -705,6 +708,17 @@ pub enum AgentOpens {
     #[default]
     Tab,
     Beside,
+}
+
+/// Which tasks open in a tab of their own in the lead's multiplexer:
+/// `"asked"`, the default, those their starter asked a tab for, those an
+/// agent shows, those the person opens and those that come to need them;
+/// or `"every"`, each task as a turn of its starts.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TaskTabs {
+    #[default]
+    Asked,
+    Every,
 }
 
 /// A command Sonny's lookout runs, whose every printed line is news for
@@ -1235,8 +1249,8 @@ fn parse(text: &str) -> Result<Config, String> {
                 "commons_invites",
                 "commons_invite_tokens",
                 "ask_wait_minutes",
+                "task_tabs",
                 "task_windows",
-                "task_depth",
                 "sky_haikus",
                 "sky_haiku_daily",
                 "sky_haiku_keep",
@@ -1279,6 +1293,12 @@ fn parse(text: &str) -> Result<Config, String> {
             if (name.as_str(), key.as_str()) == ("sonny", "permissions") {
                 config.sonny.permissions = permissions(value)?;
                 continue;
+            }
+            if (name.as_str(), key.as_str()) == ("sonny", "task_depth") {
+                return Err(
+                    "sonny.task_depth is now daemon.depth, which the agent CLI starts the daemon with"
+                        .into(),
+                );
             }
             if !keys.contains(&key.as_str()) {
                 return Err(format!("unknown key {name}.{key}"));
@@ -1329,7 +1349,6 @@ fn parse(text: &str) -> Result<Config, String> {
                 "commons_invite_tokens" => Some(&mut config.sonny.commons_invite_tokens),
                 "ask_wait_minutes" => Some(&mut config.sonny.ask_wait_minutes),
                 "task_windows" => Some(&mut config.sonny.task_windows),
-                "task_depth" => Some(&mut config.sonny.task_depth),
                 "sky_haiku_daily" => Some(&mut config.sonny.sky_haiku_daily),
                 "sky_haiku_keep" => Some(&mut config.sonny.sky_haiku_keep),
                 "sky_haiku_window" => Some(&mut config.sonny.sky_haiku_window),
@@ -1413,6 +1432,16 @@ fn parse(text: &str) -> Result<Config, String> {
                         return Err(format!(
                             "sonny.margin_opens is always, unless-closed or never, not {other}"
                         ));
+                    }
+                };
+                continue;
+            }
+            if key == "task_tabs" {
+                config.sonny.task_tabs = match value.as_str() {
+                    "asked" => TaskTabs::Asked,
+                    "every" => TaskTabs::Every,
+                    other => {
+                        return Err(format!("sonny.task_tabs is asked or every, not {other}"));
                     }
                 };
                 continue;
@@ -1896,9 +1925,19 @@ mod tests {
         let small = parse("[daemon]\nload = 0.001\n").unwrap();
         let flags = daemon_flags(&small.daemon).unwrap();
         assert!(flags.contains(&("--max-load".into(), "0.001".into())));
-        // With none given, only the gate's default is passed.
+        // With none given, only the defaults are passed: the gate's, and
+        // the depth's.
         let flags = daemon_flags(&BTreeMap::new()).unwrap();
-        assert_eq!(flags, [("--max-load".to_owned(), (cpus * 2).to_string())]);
+        assert_eq!(
+            flags,
+            [
+                ("--max-load".to_owned(), (cpus * 2).to_string()),
+                ("--max-depth".to_owned(), "2".to_owned())
+            ]
+        );
+        let deep = parse("[daemon]\ndepth = 0\n").unwrap();
+        let flags = daemon_flags(&deep.daemon).unwrap();
+        assert!(flags.contains(&("--max-depth".into(), "0".into())));
         assert_eq!(
             parse("[daemon]\nprocess = 4\n").unwrap_err(),
             "unknown key daemon.process"
@@ -2067,12 +2106,10 @@ mod tests {
             lines("[sonny]\nmargin_note_lines = 0"),
             Err("sonny.margin_note_lines is the most lines a margin note runs to, at least 1, not 0".into())
         );
-        assert_eq!(config.sonny.task_depth, 2);
         assert_eq!(
-            parse("[sonny]\ntask_depth = 0").unwrap().sonny.task_depth,
-            0
+            parse("[sonny]\ntask_depth = 3").unwrap_err(),
+            "sonny.task_depth is now daemon.depth, which the agent CLI starts the daemon with"
         );
-        assert!(parse("[sonny]\ntask_depth = -1").is_err());
         assert_eq!(
             parse("[sonny]\nsuggest = \"no\"").unwrap_err(),
             "sonny.suggest must be true or false"
@@ -2090,6 +2127,10 @@ mod tests {
         let beside = parse("[sonny]\nagent_opens = \"beside\"").unwrap();
         assert_eq!(beside.sonny.agent_opens, AgentOpens::Beside);
         assert!(parse("[sonny]\nagent_opens = \"window\"").is_err());
+        assert_eq!(config.sonny.task_tabs, TaskTabs::Asked);
+        let every = parse("[sonny]\ntask_tabs = \"every\"").unwrap();
+        assert_eq!(every.sonny.task_tabs, TaskTabs::Every);
+        assert!(parse("[sonny]\ntask_tabs = \"all\"").is_err());
         let closed = parse("[sonny]\nmargin_opens = \"unless-closed\"").unwrap();
         assert_eq!(closed.sonny.margin_opens, MarginOpens::UnlessClosed);
         assert!(config.sonny.chime && !config.sonny.verbose);

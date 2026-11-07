@@ -42,6 +42,7 @@ fn binding(family: Family) -> Binding<'static> {
         settings: Default::default(),
         declared: None,
         request_id: None,
+        starts_line: false,
     }
 }
 

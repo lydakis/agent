@@ -150,6 +150,11 @@ pub const MIGRATIONS: &[Migration] = &[
         id: crate::haiku::DAILY,
         retire: "0.11.0",
     },
+    // `[sonny] task_depth` becomes the daemon's `[daemon] depth` (0.9.0).
+    Migration {
+        id: crate::config::DEPTH,
+        retire: "0.11.0",
+    },
 ];
 
 /// `run` once for each `record`: a file of the ids done, a line each,

@@ -630,13 +630,14 @@ impl Trigger {
     /// Its row, with what its fires left in `state`: the last outcome,
     /// messages sent, and the id of the agent it started.
     fn json(&self, state: &Value) -> Value {
-        let (bot_id, start) = match &self.target {
-            Target::Bot { id, .. } => (json!(id), Value::Null),
+        let (bot_id, start, by) = match &self.target {
+            Target::Bot { id, .. } => (json!(id), Value::Null, None),
             // Its run's agent: the one under way, else the latest.
             Target::Start {
                 model,
                 effort,
                 fresh,
+                by,
                 ..
             } => (
                 ["running", "finished", "failed"]
@@ -646,10 +647,11 @@ impl Trigger {
                     .unwrap_or(&state["started_id"])
                     .clone(),
                 start_json(model, effort, *fresh),
+                by.as_ref().map(|(by, _)| by),
             ),
         };
         json!({"name": self.name, "generation": self.generation, "when": self.when,
-            "bot": self.bot(), "bot_id": bot_id, "start": start,
+            "bot": self.bot(), "bot_id": bot_id, "start": start, "by": by,
             "reply_to": self.reply_to.as_ref().map(|r| &r.0), "if": self.gate, "runs": self.runs,
             "turn_budget_tokens": self.turn_budget_tokens, "budget_counts": self.budget_counts,
             "sent": state["sent"].as_u64().unwrap_or(0), "message": self.message,
@@ -1865,16 +1867,19 @@ fn row(places: &Places, name: &str) -> Value {
         return row;
     }
     match read_trigger(&path) {
-        Ok((t, _)) => {
-            let mut row = t.json(&state(places, &t));
-            row["ended"] = json!(false);
-            if t.at.is_some_and(|at| now() > at + SLACK) {
-                row["missed"] = json!(true);
-            }
-            row
-        }
+        Ok((t, _)) => live_row(&t, &state(places, &t)),
         Err(problem) => json!({"name": name, "ended": false, "problem": problem}),
     }
+}
+
+/// The row of `t`, under way, with what its fires left in `state`.
+fn live_row(t: &Trigger, state: &Value) -> Value {
+    let mut row = t.json(state);
+    row["ended"] = json!(false);
+    if t.at.is_some_and(|at| now() > at + SLACK) {
+        row["missed"] = json!(true);
+    }
+    row
 }
 
 /// Write a file whole beside its place, then rename it there.
@@ -3311,7 +3316,7 @@ pub fn cli(args: &[String]) -> i32 {
 /// A `triggers` call: `add` one, or `remove`, `fire` or `show` one by
 /// name; with none, every trigger. Run as `add` and the rest run from an
 /// agent's shell, for the calling agent.
-pub fn tool(arguments: &Value) -> Result<Value, String> {
+pub fn tool(arguments: &Value, caller: &Caller) -> Result<Value, String> {
     let places = Places::home()?;
     let named = |key: &str| arguments[key].as_str().filter(|name| !name.is_empty());
     if let Some(asked) = arguments.get("add") {
@@ -3324,9 +3329,91 @@ pub fn tool(arguments: &Value) -> Result<Value, String> {
         return fire_now(&places, name, &ring).map(|file| fired(&places, name, &file, FIRE_WAIT));
     }
     if let Some(name) = named("show") {
-        return one(&places, name).ok_or_else(|| format!("automation_not_found: {name}"));
+        return own(&places, name, caller).ok_or_else(|| format!("automation_not_found: {name}"));
     }
-    Ok(list(&places, None))
+    Ok(list_of(&places, caller))
+}
+
+/// The agent asking for its own automations, as durably as the daemon
+/// knows it: its id in the store its daemon announced. A name alone could
+/// be an agent deleted since, or one of another store sharing this HOME.
+#[derive(Debug, Clone, Default)]
+pub struct Caller {
+    pub id: Option<i64>,
+    pub store: Option<String>,
+}
+
+/// The row of the automation `name` when `caller` has a part in it: it
+/// messages that agent, sends its answers to it, or starts an agent it
+/// added, each pinned by id in the caller's store, as fires deliver them.
+/// None for any other, and for one whose file cannot be read to tell.
+fn own(places: &Places, name: &str, caller: &Caller) -> Option<Value> {
+    let (Some(id), Some(store)) = (caller.id, caller.store.as_deref()) else {
+        return None;
+    };
+    valid_name(name).ok()?;
+    let path = places.job(name);
+    if path.exists() {
+        let (t, _) = read_trigger(&path).ok()?;
+        let state = state(places, &t);
+        let messages = match &t.target {
+            Target::Bot { id: to, .. } => *to == id,
+            // The agent it started, or one of its runs' when each run
+            // starts its own.
+            Target::Start { by, .. } => {
+                by.as_ref().is_some_and(|(_, by)| *by == id)
+                    || std::iter::once(&state["started_id"])
+                        .chain(
+                            ["running", "finished", "failed"].map(|key| &state["run"][key]["id"]),
+                        )
+                        .any(|started| started.as_i64() == Some(id))
+            }
+        };
+        let answers = t.reply_to.as_ref().is_some_and(|(_, to)| *to == id);
+        // The row of what was checked, not of a file read again, which
+        // a replacement since could have made another's.
+        return (t.store_id == store && (messages || answers)).then(|| live_row(&t, &state));
+    }
+    // One that ended: what its last row recorded of whose it was.
+    let row = one(places, name)?;
+    let theirs = row["store_id"] == store
+        && ["bot_id", "by_id", "reply_to_id"]
+            .iter()
+            .any(|key| row[key].as_i64() == Some(id));
+    theirs.then_some(row)
+}
+
+/// The first page, in name order, of the automations `caller` has a part
+/// in, as the agent's own tool lists them; the person's `sonny automation
+/// list` lists every one ([`list`]). Each one's row is read to tell.
+fn list_of(places: &Places, caller: &Caller) -> Value {
+    let mut names = std::collections::BTreeSet::new();
+    for dir in [&places.jobs, &places.state] {
+        for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let file = e.file_name();
+            let Some(name) = file.to_str().and_then(|f| f.strip_suffix(".json")) else {
+                continue;
+            };
+            if valid_name(name).is_ok() {
+                names.insert(name.to_owned());
+            }
+        }
+    }
+    let mut rows = Vec::new();
+    let mut next = None;
+    for name in names {
+        let Some(row) = own(places, &name, caller) else {
+            continue;
+        };
+        if rows.len() == PAGE_SIZE {
+            next = rows
+                .last()
+                .and_then(|r: &Value| r["name"].as_str().map(str::to_owned));
+            break;
+        }
+        rows.push(row);
+    }
+    json!({"automations": rows, "next_after": next})
 }
 
 /// The `add` arguments a `triggers` call's `add` names.
@@ -3691,6 +3778,7 @@ fn write_row(places: &Places, trigger: &Trigger, last: &Value, kept: &Kept) -> R
     {
         (row["by"], row["by_id"]) = (json!(by), json!(by_id));
     }
+    row["reply_to_id"] = json!(trigger.reply_to.as_ref().map(|(_, id)| id));
     row["head"] = json!(kept.seen.head);
     row["seen_at"] = json!(kept.seen.at);
     row["checked"] = kept.checked.clone();
@@ -6862,6 +6950,103 @@ pub(crate) mod tests {
             read_job(&w.plist(&s.name)).unwrap().1,
             Path::new("/B/agent-app")
         );
+    }
+
+    #[test]
+    fn an_agent_s_list_holds_only_the_automations_it_has_a_part_in() {
+        let w = World::new("scoped");
+        std::fs::create_dir_all(&w.places.jobs).unwrap();
+        // p.lead is id 1 and q.lead id 2, in store 00ab.
+        let mine = |name: &str, target: Target, reply_to: Option<(&str, i64)>| Trigger {
+            name: name.into(),
+            target,
+            reply_to: reply_to.map(|(to, id)| (to.to_owned(), id)),
+            ..trigger()
+        };
+        let bot = |name: &str, id: i64| Target::Bot {
+            name: name.into(),
+            id,
+        };
+        let start = |by: &str, id: i64| Target::Start {
+            name: "p.watch".into(),
+            model: "m".into(),
+            effort: None,
+            by: Some((by.into(), id)),
+            fresh: false,
+        };
+        let write = |t: &Trigger| {
+            std::fs::write(
+                w.places.job(&t.name),
+                definition(Path::new("/A/app"), t, &fired(), &[]),
+            )
+            .unwrap()
+        };
+        for t in [
+            mine("a-messages-it", bot("p.lead", 1), None),
+            mine("b-answers-it", bot("p.fix", 7), Some(("p.lead", 1))),
+            mine("c-it-started", start("p.lead", 1), None),
+            mine("d-another-s", bot("q.lead", 2), None),
+            mine("e-another-s-start", start("q.lead", 2), Some(("q.lead", 2))),
+            // An earlier p.lead, deleted since: its name, another id.
+            mine("f-a-predecessor-s", bot("p.lead", 5), Some(("p.lead", 5))),
+            // Another store's p.lead, id 1 there, sharing this HOME.
+            Trigger {
+                store_id: "77cd".into(),
+                ..mine("g-another-store-s", bot("p.lead", 1), None)
+            },
+        ] {
+            write(&t);
+        }
+        let caller = |id: i64| Caller {
+            id: Some(id),
+            store: Some("00ab".into()),
+        };
+        let names = |listed: Value| -> Vec<String> {
+            (listed["automations"].as_array().unwrap().iter())
+                .map(|row| row["name"].as_str().unwrap().to_owned())
+                .collect()
+        };
+        assert_eq!(
+            names(list_of(&w.places, &caller(1))),
+            ["a-messages-it", "b-answers-it", "c-it-started"]
+        );
+        assert_eq!(
+            names(list_of(&w.places, &caller(2))),
+            ["d-another-s", "e-another-s-start"]
+        );
+        assert!(names(list_of(&w.places, &caller(3))).is_empty());
+        // No id or no store to match is no one's.
+        assert!(names(list_of(&w.places, &Caller::default())).is_empty());
+        let unknown = Caller {
+            store: None,
+            ..caller(1)
+        };
+        assert!(names(list_of(&w.places, &unknown)).is_empty());
+        assert!(own(&w.places, "f-a-predecessor-s", &caller(1)).is_none());
+        assert!(own(&w.places, "g-another-store-s", &caller(1)).is_none());
+        // The person's list holds every one.
+        assert_eq!(names(list(&w.places, None)).len(), 7);
+        // One that ended is told by the ids its last row kept.
+        let ended = mine("h-ended", bot("p.fix", 7), Some(("p.lead", 1)));
+        write_row(
+            &w.places,
+            &ended,
+            &json!({"outcome": "ok"}),
+            &Kept::default(),
+        )
+        .unwrap();
+        assert!(own(&w.places, "h-ended", &caller(1)).is_some());
+        assert!(own(&w.places, "h-ended", &caller(5)).is_none());
+        // A page fills with the asker's own past others' names.
+        for i in 0..PAGE_SIZE + 1 {
+            write(&mine(&format!("z-{i:03}"), bot("p.lead", 1), None));
+        }
+        let page = list_of(&w.places, &caller(2));
+        assert_eq!(names(page.clone()), ["d-another-s", "e-another-s-start"]);
+        assert!(page["next_after"].is_null());
+        let page = list_of(&w.places, &caller(1));
+        assert_eq!(names(page.clone()).len(), PAGE_SIZE);
+        assert_eq!(page["next_after"], json!(format!("z-{:03}", PAGE_SIZE - 5)));
     }
 
     #[test]

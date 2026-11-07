@@ -389,6 +389,67 @@ async fn show(
     Ok(json!({"bot": bot, "in": layout.home()}))
 }
 
+/// A tab for `bot`, a task `caller` just started asking for one: placed
+/// as a task's window is, within `[sonny] task_windows`, closing the
+/// lead's least recently used task tabs for room, never one the person has
+/// not looked at yet nor one that holds its place. What to tell `caller`
+/// beside the start, if anything.
+async fn task_tab(caller: &str, bot: &str) -> Result<String, String> {
+    let (socket, project, chain) = agents_project(caller).await?;
+    let me = named::me().map_err(|e| e.to_string())?;
+    let mut layout = mux::for_agent(&socket, &project, &chain, None)?;
+    // What it closes or holds back for room, the lead's own layout reads.
+    layout.keep_aside(used::aside());
+    let client = Client::connect(&socket).await.map_err(|e| e.to_string())?.0;
+    let mut bots = Vec::new();
+    let mut after = Value::Null;
+    loop {
+        let asked = json!({"name": format!("{project}.*"), "limit": 256, "after": after});
+        let page = client
+            .request("bots", asked)
+            .await
+            .map_err(|e| e.to_string())?;
+        bots.extend(page["bots"].as_array().cloned().unwrap_or_default());
+        after = page["next_after"].clone();
+        if after.is_null() {
+            break;
+        }
+    }
+    let lead = (chain.last())
+        .filter(|lead| project::is_lead(lead))
+        .cloned()
+        .unwrap_or_else(|| format!("{project}.lead"));
+    let lineage = lineage_of(&bots, &lead, lead == format!("{project}.lead"));
+    let mut room = room_for(&project, &lineage, &HashMap::new(), Arc::new(used::held));
+    room.most = agent_client::config::load().map_or(0, |c| c.sonny.task_windows as usize);
+    let command = [
+        me.to_string_lossy().into_owned(),
+        "--socket".into(),
+        socket.to_string_lossy().into_owned(),
+        "--no-sound".into(),
+        "--window-place".into(),
+        mux::Place::encode(&Some(layout.kept())),
+        "--agent".into(),
+        bot.to_owned(),
+    ];
+    let short = bot.strip_prefix(&format!("{project}.")).unwrap_or(bot);
+    Ok(
+        match layout.show_task(bot, short, &command, &room, false)? {
+            mux::Shown::Had => String::new(),
+            mux::Shown::Opened(closed) if closed.is_empty() => String::new(),
+            mux::Shown::Opened(closed) => format!(
+                "\n\nIts tab opened; {}.",
+                made_room(&closed, &project, room.most)
+            ),
+            mux::Shown::Aside | mux::Shown::NoRoom => format!(
+                "\n\nNo tab opened for it yet: the project's {} task tabs are all ones the person \
+             has not looked at. It opens once they go to it, or once it needs them.",
+                room.most
+            ),
+        },
+    )
+}
+
 /// Open `bot`, a lead of `project`, in that project's own home, made when needed in
 /// the multiplexer `like`'s home is in, running Sonny on it: a session for
 /// each lead, and in it a window for each of its tasks. A lead whose Sonny
@@ -1280,6 +1341,7 @@ fn main() -> std::process::ExitCode {
     // knows.
     lookout::subs::at_start();
     haiku::at_start();
+    config::at_start();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.split_first() {
         // The tool host runs this for each call of a tool Sonny answers.
@@ -1552,8 +1614,8 @@ async fn run() -> Result<(), String> {
     // tools, or none.
     if options.side.is_none() {
         app.role = match project {
-            Some(_) => served::Role::of(0),
-            None => declared::role(&app.client, &bot).await,
+            Some(_) => served::Role::LEAD,
+            None => declared::role(&bot),
         };
         app.declare = declared::declare(&bot, app.role);
     }
@@ -1817,7 +1879,7 @@ pub(crate) fn made(
     workspace: &Path,
 ) -> Result<(), String> {
     let config = agent_client::config::load()?;
-    let declare = json!(declared::tools(served::Role::of(1)));
+    let declare = json!(declared::tools(served::Role::TASK));
     let tools = agent_client::default_tools(client.providers(), model, config.web_search);
     asked["tools"] = json!(tools);
     asked["declare"] = declare.clone();
@@ -3257,33 +3319,46 @@ struct Fleet {
     /// Tasks' turns that resolved them: their window closes once the turn
     /// completes.
     resolving: resolved::Own,
-    /// `[sonny] task_windows`, read on the worker as the file changes.
+    /// `[sonny] task_windows` and `task_tabs`, read as the file changes.
     windows: Arc<std::sync::Mutex<TaskWindows>>,
 }
 
-/// `[sonny] task_windows` as the config file last said it, read again
-/// only once the file changed, so that a change in `/config` from any
-/// window holds from the next task window on.
+/// `[sonny] task_windows` and `task_tabs` as the config file last said
+/// them, read again only once the file changed, so that a change in
+/// `/config` from any window holds from the next task window on.
 #[derive(Default)]
 struct TaskWindows {
     read: Option<Option<std::time::SystemTime>>,
     most: usize,
+    tabs: agent_client::config::TaskTabs,
 }
 
 impl TaskWindows {
     fn most(&mut self) -> usize {
+        self.fresh();
+        self.most
+    }
+
+    /// Whether every task opens in a tab as its turn starts, rather than
+    /// only those asked for.
+    fn every(&mut self) -> bool {
+        self.fresh();
+        self.tabs == agent_client::config::TaskTabs::Every
+    }
+
+    fn fresh(&mut self) {
         let path = agent_client::config::path();
         let changed = (path.as_ref())
             .and_then(|path| std::fs::metadata(path).ok())
             .and_then(|file| file.modified().ok());
         if self.read != Some(changed) {
             self.read = Some(changed);
-            self.most = agent_client::config::load()
-                .map_or(agent_client::config::Sonny::default().task_windows, |c| {
-                    c.sonny.task_windows
-                }) as usize;
+            let sonny = agent_client::config::load()
+                .map(|c| c.sonny)
+                .unwrap_or_default();
+            self.most = sonny.task_windows as usize;
+            self.tabs = sonny.task_tabs;
         }
-        self.most
     }
 }
 
@@ -3863,11 +3938,18 @@ impl Fleet {
     }
 
     /// Open the task's window, unless it has one, it was closed for room,
-    /// or the person uses another of the project's windows now. With `tell`, the lead's view hears where it opened, when not
+    /// or the person uses another of the project's windows now; with
+    /// `[sonny] task_tabs = "asked"`, the default, none opens here: a task
+    /// has a tab when its starter asked for one, an agent shows it, the
+    /// person opens it or it comes to need them. With `tell`, the lead's view hears where it opened, when not
     /// beside it, or why it did not; windows closed for room are said in
     /// the status row. A task that needs the person has its window, as
     /// [`Fleet::needs_window`] opens it.
     fn show(&mut self, bot: &str, tell: bool) {
+        if !self.windows.lock().is_ok_and(|mut windows| windows.every()) {
+            self.doing(bot, "working");
+            return;
+        }
         let needs = self.needs.waits(bot);
         let doing = match needs {
             true => "needs you",
@@ -3914,7 +3996,8 @@ impl Fleet {
     }
 
     /// A task that came to need the person, its window set aside for
-    /// room, has it open again, as what needs them keeps its window: it
+    /// room or, as `task_tabs = "asked"` has it, never opened, has it open
+    /// now, as what needs them keeps its window: it
     /// closes the window they used least recently for room, never one
     /// they have not looked at yet nor one that needs them, and with no
     /// other passes the limit. The person's focus stays where it is.
@@ -3925,7 +4008,8 @@ impl Fleet {
         let (socket, project) = (self.socket.clone(), self.project.clone());
         let (place, lead) = (self.place.clone(), self.lead.clone());
         self.layout.send(move |layout| {
-            if !layout.aside(&bot) || !mux::mine(&socket, &project, &lead, &place) {
+            let every = windows.lock().is_ok_and(|mut windows| windows.every());
+            if (every && !layout.aside(&bot)) || !mux::mine(&socket, &project, &lead, &place) {
                 return;
             }
             room.most = windows.lock().map_or(0, |mut windows| windows.most());
@@ -3943,15 +4027,18 @@ impl Fleet {
 
     /// Bring the task's own tab into view in the multiplexer, as the
     /// person asked; looked for on the worker, after every window opened
-    /// so far, and opened again when it was closed for room. With none,
-    /// `beside` opens it in the pane, else says so.
+    /// so far, and opened again when it was closed for room, or opened
+    /// now, as `task_tabs = "asked"` opens a task's tab when the person
+    /// asks. With none, `beside` opens it in the pane, else says so.
     fn go_to(&mut self, bot: &str, beside: bool) {
         let doing = self.doing.get(bot).copied().unwrap_or("idle");
         let (command, name) = self.window(bot, doing);
         let (windows, mut room) = self.room();
+        let task = bot != self.lead && self.lineage.contains(bot);
         let (bot, told) = (bot.to_owned(), self.tell.clone());
         self.layout.send(move |layout| {
-            if layout.aside(&bot) {
+            let every = windows.lock().is_ok_and(|mut windows| windows.every());
+            if layout.aside(&bot) || (task && !every) {
                 room.most = windows.lock().map_or(0, |mut windows| windows.most());
                 match layout.show_task(&bot, &name, &command, &room, true) {
                     Ok(mux::Shown::Opened(closed)) if !closed.is_empty() => {
@@ -4031,8 +4118,11 @@ impl Fleet {
     }
 
     /// Close the windows of the tasks whose completed turns the finished
-    /// waits returned.
+    /// waits returned: with `task_tabs = "every"`, as each task opened one;
+    /// a tab asked for stays until the person or an agent closes it, or
+    /// the task is resolved.
     async fn close_taken(&mut self) {
+        let every = self.windows.lock().is_ok_and(|mut windows| windows.every());
         for (bot, node, call) in std::mem::take(&mut self.returned) {
             let Ok(read) = self
                 .client
@@ -4055,7 +4145,9 @@ impl Fleet {
                     && !self.needs.waits(&task)
                 {
                     self.ended.remove(&task);
-                    self.close(&task);
+                    if every {
+                        self.close(&task);
+                    }
                     self.doing.remove(&task);
                     self.activity.remove(&task);
                     self.name_windows();
@@ -4370,7 +4462,7 @@ impl App {
             react_to: None,
             profile: Default::default(),
             declare: None,
-            role: served::Role::at(2, 2),
+            role: served::Role::TASK,
             bot_reactions: Vec::new(),
             react_calls: HashMap::new(),
             picked: reactions::Picked::default(),
@@ -18159,7 +18251,7 @@ mod tests {
         })
         .await;
         let mut app = app(client);
-        app.declare = declared::declare(&json!({}), served::Role::at(2, 2));
+        app.declare = declared::declare(&json!({}), served::Role::TASK);
         app.running = Some(Running {
             turn: 1,
             started: Instant::now(),
@@ -18173,10 +18265,7 @@ mod tests {
         assert!(app.configure().await);
         let sent = asked.lock().unwrap()[0].clone();
         assert_eq!(sent["op"], "configure");
-        assert_eq!(
-            sent["declare"],
-            json!(declared::tools(served::Role::at(2, 2)))
-        );
+        assert_eq!(sent["declare"], json!(declared::tools(served::Role::TASK)));
         assert!(app.declare.is_none());
     }
 
@@ -18446,7 +18535,7 @@ mod tests {
         app.tools = vec!["shell".into()];
         let custom = json!({"gates": [{"tag": "ci", "tools": ["shell"]}]});
         app.mode = approvals::mode(&custom);
-        app.declared = declared::declare(&custom, served::Role::at(0, 2)).unwrap();
+        app.declared = declared::declare(&custom, served::Role::LEAD).unwrap();
         app.gating = Some("ask");
         assert!(app.configure().await);
         let sent = asked.lock().unwrap()[0].clone();
@@ -19954,6 +20043,7 @@ mod tests {
         fleet.windows = Arc::new(std::sync::Mutex::new(TaskWindows {
             read: Some(read),
             most: 1,
+            tabs: agent_client::config::TaskTabs::Every,
         }));
         let event = |bot: &str, kind: &str, data: Value| json!({"event": kind, "bot": bot, "turn": 1, "data": data});
         let windowed = |fleet: &Fleet| {
@@ -19998,6 +20088,71 @@ mod tests {
         let shown = windowed(fleet);
         assert!(shown.contains(&"calc.a".to_owned()) && shown.contains(&"calc.b".to_owned()));
         assert!(!fleet.layout.aside("calc.b"));
+    }
+
+    /// As `task_tabs = "asked"` has it, a task's turn opens no tab: one
+    /// opens once the task needs the person, or they go to it, and stays
+    /// once its result is taken.
+    #[tokio::test]
+    async fn a_task_opens_a_tab_only_once_it_needs_you_or_you_go_to_it() {
+        let (client, events) = daemon_with_events(json!({}), |asked| {
+            match asked["op"].as_str().unwrap_or("") {
+                "bots" => json!({"bots": [
+                    {"name": "calc.lead", "bot_id": 1, "head": 1},
+                    {"name": "calc.a", "bot_id": 2, "created_by": "calc.lead",
+                        "running_turn": 1, "head": 2},
+                    {"name": "calc.b", "bot_id": 3, "created_by": "calc.lead",
+                        "running_turn": 1, "head": 3},
+                ], "next_after": null}),
+                "approvals" => json!({"approvals": []}),
+                "turns" => json!({"turns": []}),
+                "history_nodes" => json!({"nodes": []}),
+                "history_items" => json!({"items": []}),
+                _ => json!({}),
+            }
+        })
+        .await;
+        let mut fleet = Fleet::in_memory(client.clone(), events, "calc", "calc.lead");
+        let read = (agent_client::config::path().as_ref())
+            .and_then(|path| std::fs::metadata(path).ok())
+            .and_then(|file| file.modified().ok());
+        fleet.windows = Arc::new(std::sync::Mutex::new(TaskWindows {
+            read: Some(read),
+            most: 32,
+            tabs: agent_client::config::TaskTabs::Asked,
+        }));
+        let event = |bot: &str, kind: &str, data: Value| json!({"event": kind, "bot": bot, "turn": 1, "data": data});
+        let windowed = |fleet: &Fleet| {
+            let (sent, got) = std::sync::mpsc::channel();
+            fleet.layout.send(move |layout| {
+                let labels: Vec<String> = (layout.windows().into_iter())
+                    .flat_map(|(_, labels)| labels)
+                    .collect();
+                let _ = sent.send(labels);
+            });
+            got.recv().unwrap()
+        };
+        for bot in ["calc.a", "calc.b"] {
+            fleet.lineage.insert(bot.into());
+            fleet.event(&event(bot, "accepted", json!({})));
+        }
+        fleet.layout.settle();
+        let shown = windowed(&fleet);
+        assert!(
+            !shown.iter().any(|label| label.starts_with("calc.")),
+            "{shown:?}"
+        );
+        assert_eq!(fleet.doing["calc.a"], "working");
+        // A call of its held for the person opens its tab.
+        fleet.event(&event("calc.a", "approval_asked", json!({"call_id": "c1"})));
+        assert_eq!(fleet.doing["calc.a"], "needs you");
+        fleet.layout.settle();
+        assert!(windowed(&fleet).contains(&"calc.a".to_owned()));
+        assert!(!windowed(&fleet).contains(&"calc.b".to_owned()));
+        // The person goes to the other: its tab opens.
+        fleet.go_to("calc.b", true);
+        fleet.layout.settle();
+        assert!(windowed(&fleet).contains(&"calc.b".to_owned()));
     }
 
     #[tokio::test]

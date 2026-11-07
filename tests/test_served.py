@@ -884,10 +884,70 @@ print(json.dumps({{'version': '2.5', 'ok': True, 'command': command, 'data': dat
         note = self.note_for('calc.lead', 'its goal')
         self.assertIn(f'- calc.fix: turn:calc.fix/{turn} completed, asked by the person, and gave up its goal', note)
 
+    def test_a_sandboxed_agent_no_one_reviews_sees_its_automations_and_adds_none(self):
+        made = self.daemon.request('create', bot='calc.lead', workspace=str(self.path),
+                                   model='openai/synthetic-model', instructions='Lead.',
+                                   settings={'sandbox': 'read-only'},
+                                   declare=[{**declared('automations'), 'steps': True}])
+        self.assertIn('result', made)
+        self.host()
+        # A look acts on nothing, so it needs no reviewer.
+        self.assertEqual(json.loads(self.call('calc.lead', 'automations', {})),
+                         {'automations': [], 'next_after': None})
+        missing = json.loads(self.call('calc.lead', 'automations', {'show': 'watch'}))
+        self.assertIn('automation_not_found', missing['detail'])
+        # Adding one acts outside its sandbox, and no one reviews it.
+        refused = json.loads(self.call('calc.lead', 'automations', {'add': {'every': '30m', 'message': 'Check.'}}))
+        self.assertEqual(refused['error'], 'escalation_refused')
+        self.assertFalse((self.path / '.agent/automations/jobs').exists())
+
+    def test_an_agent_s_automation_waits_for_its_gate(self):
+        self.daemon.request('create', bot='calc.lead', workspace=str(self.path), model='openai/synthetic-model',
+                            instructions='Lead.', approve=['automations'], approver='manual',
+                            declare=[{**declared('automations'), 'steps': True}])
+        self.host()
+        # A look goes by without the gate.
+        self.assertEqual(json.loads(self.call('calc.lead', 'automations', {}))['automations'], [])
+        self.assertEqual(self.daemon.request('approvals', bot='calc.lead')['result']['approvals'], [])
+        # A run is put to it first, and refused there.
+        self.script.append(('automations', {'run': 'watch'}))
+        self.model.call_script = self.script
+        turn = self.daemon.request('submit', bot='calc.lead', request_id='run', prompt='script')['result']['turn']
+        deadline = time.monotonic() + 30
+        while not (asked := self.daemon.request('approvals', bot='calc.lead')['result']['approvals']):
+            self.assertLess(time.monotonic(), deadline, 'no approval was asked')
+            time.sleep(.05)
+        self.assertEqual((asked[0]['name'], asked[0]['arguments']), ('automations', {'run': 'watch'}))
+        self.daemon.request('answer', bot='calc.lead', turn=turn, call_id=asked[0]['call_id'],
+                            request=asked[0]['request'], decision='deny', by='test')
+        self.assertEqual(self.daemon.finished(turn, 30)['data']['status'], 'completed')
+        self.assertIn('automations was not approved', self.output('calc.lead', turn))
+
+    def test_an_automation_s_time_stands_still_while_its_gate_weighs_it(self):
+        # Its answer is due two seconds after the call; the gate takes longer.
+        self.daemon.request('create', bot='calc.lead', workspace=str(self.path), model='openai/synthetic-model',
+                            instructions='Lead.', approve=['automations'], approver='manual',
+                            declare=[{**declared('automations'), 'steps': True, 'expire_ms': 2000}])
+        self.host()
+        self.script.append(('automations', {'remove': 'watch'}))
+        self.model.call_script = self.script
+        turn = self.daemon.request('submit', bot='calc.lead', request_id='remove', prompt='script')['result']['turn']
+        deadline = time.monotonic() + 30
+        while not (asked := self.daemon.request('approvals', bot='calc.lead')['result']['approvals']):
+            self.assertLess(time.monotonic(), deadline, 'no approval was asked')
+            time.sleep(.05)
+        time.sleep(3)
+        self.daemon.request('answer', bot='calc.lead', turn=turn, call_id=asked[0]['call_id'],
+                            request=asked[0]['request'], decision='allow', by='test')
+        self.assertEqual(self.daemon.finished(turn, 30)['data']['status'], 'completed')
+        output = self.output('calc.lead', turn)
+        self.assertNotIn('ran out of time', output)
+        self.assertIn('watch', output)
+
     @unittest.skipIf(sys.platform == 'darwin', "launchd runs Sonny's scheduler on a Mac")
     def test_a_trigger_with_no_systemd_running_is_refused_and_says_why(self):
         self.daemon.request('create', bot='calc.lead', workspace=str(self.path), model='openai/synthetic-model',
-                            instructions='Lead.', declare=[declared('automations')])
+                            instructions='Lead.', declare=[{**declared('automations'), 'steps': True}])
         # A runtime folder no user manager serves.
         runtime = self.path / 'runtime'
         runtime.mkdir()
