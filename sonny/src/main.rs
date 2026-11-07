@@ -6322,6 +6322,12 @@ impl App {
                 .await;
             self.unstage_landed().await;
             let now = record["running_turn"].as_i64();
+            // A turn that ran while away lets an older mark go, idle or not.
+            if let Ok(ran) = last_ran(&self.client, &self.bot, None).await
+                && let Some(turn) = ran["turn"].as_i64()
+            {
+                self.waiting.started(turn);
+            }
             // A turn that ended while away ends here as its event would have.
             if let Some(turn) = self.running.as_ref().map(|r| r.turn)
                 && now != Some(turn)
@@ -6703,7 +6709,8 @@ impl App {
                             self.checks_set.insert(bot.clone(), last);
                             waiting::spawn(self.client.clone(), store.clone(), bot.clone(), last);
                         }
-                        done = seen.itself
+                        // A task's own mark holds once its turn completed.
+                        done = (seen.itself && turn["status"] == "completed")
                             || resolved::holds(resolved::read(&store, &bot), seen.turn, false);
                         // One the lead resolved set its question aside.
                         needs.asked(&bot, seen.open(&store, &bot, false));

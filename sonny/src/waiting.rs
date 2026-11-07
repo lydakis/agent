@@ -342,7 +342,7 @@ async fn waiting_for(
         return Ok(None);
     }
     let reply = self::check(client, bot, turn).await?;
-    crate::reviews::note(store, bot, bot_id, &reviews(&reply))?;
+    crate::reviews::note(store, bot, bot_id, turn, &reviews(&reply))?;
     let waiting = answer(&reply)
         .ok_or_else(|| format!("the check's reply was not the JSON asked for: {reply}"))?;
     let asked = crate::needs::scan(client, bot, Some(turn))
